@@ -1,0 +1,18 @@
+[package]
+name = "weavepy-lexer"
+description = "Tokenizer for Python source code, used by the WeavePy interpreter."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme.workspace       = true
+keywords.workspace     = true
+categories.workspace   = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

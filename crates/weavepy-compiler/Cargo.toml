@@ -1,0 +1,19 @@
+[package]
+name = "weavepy-compiler"
+description = "Compiles a WeavePy AST to WeavePy bytecode."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme.workspace       = true
+keywords.workspace     = true
+categories.workspace   = true
+
+[dependencies]
+weavepy-parser = { workspace = true }
+thiserror      = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/weavepy",
+    "crates/weavepy-cli",
+    "crates/weavepy-compiler",
+    "crates/weavepy-lexer",
+    "crates/weavepy-parser",
+    "crates/weavepy-vm",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/weavefoundry/weavepy"
+homepage = "https://github.com/weavefoundry/weavepy"
+authors = ["The WeavePy Authors"]
+readme = "README.md"
+keywords = ["python", "interpreter", "compiler", "language", "vm"]
+categories = ["compilers", "development-tools", "parser-implementations"]
+
+[workspace.dependencies]
+# Internal crates (path deps so the workspace builds without publishing).
+weavepy             = { path = "crates/weavepy",          version = "0.0.0" }
+weavepy-compiler    = { path = "crates/weavepy-compiler", version = "0.0.0" }
+weavepy-lexer       = { path = "crates/weavepy-lexer",    version = "0.0.0" }
+weavepy-parser      = { path = "crates/weavepy-parser",   version = "0.0.0" }
+weavepy-vm          = { path = "crates/weavepy-vm",       version = "0.0.0" }
+
+# Third-party.
+anyhow      = "1.0"
+clap        = { version = "4.5", features = ["derive", "wrap_help"] }
+thiserror   = "2.0"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Test/bench-only.
+insta       = { version = "1.40", features = ["yaml"] }
+proptest    = "1.5"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unreachable_pub        = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# Sensible-but-strict default. Loosen per-crate as needed.
+all       = { level = "warn", priority = -1 }
+pedantic  = { level = "warn", priority = -1 }
+# Pragmatic opt-outs from `pedantic` that fire too often during early development:
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+must_use_candidate      = "allow"
+return_self_not_must_use = "allow"
+needless_pass_by_value  = "allow"
+
+# Profiles tuned for an interpreter: aggressive release, fast incremental dev.
+[profile.dev]
+opt-level   = 0
+debug       = true
+incremental = true
+
+[profile.dev.package."*"]
+# Compile dependencies with some optimization so dev runs aren't painful.
+opt-level = 1
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+debug         = "line-tables-only"
+strip         = "debuginfo"
+panic         = "unwind"
+
+[profile.bench]
+inherits = "release"
+debug    = true
+
+# A profile for shipping a maximally-optimized interpreter binary.
+[profile.dist]
+inherits      = "release"
+lto           = "fat"
+codegen-units = 1
+strip         = "symbols"

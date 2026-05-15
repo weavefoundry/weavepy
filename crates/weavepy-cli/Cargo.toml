@@ -1,0 +1,26 @@
+[package]
+name = "weavepy-cli"
+description = "Command-line entry point for the WeavePy interpreter (the `weavepy` binary)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme.workspace       = true
+keywords.workspace     = true
+categories.workspace   = true
+
+[[bin]]
+name = "weavepy"
+path = "src/main.rs"
+
+[dependencies]
+weavepy           = { workspace = true }
+anyhow            = { workspace = true }
+clap              = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

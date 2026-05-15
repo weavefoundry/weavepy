@@ -1,0 +1,19 @@
+[package]
+name = "weavepy-parser"
+description = "Parser producing the WeavePy AST from Python source."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme.workspace       = true
+keywords.workspace     = true
+categories.workspace   = true
+
+[dependencies]
+weavepy-lexer = { workspace = true }
+thiserror     = { workspace = true }
+
+[lints]
+workspace = true

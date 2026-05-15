@@ -1,0 +1,25 @@
+# Project-specific identifiers that clippy::doc_markdown should not flag as
+# missing backticks. Default valid idents (e.g. "Rust", "JavaScript") are
+# implicitly merged in unless a leading "..".
+doc-valid-idents = [
+    "..",
+    "WeavePy",
+    "CPython",
+    "PyPy",
+    "GraalPy",
+    "RustPython",
+    "Pyston",
+    "PEP",
+    "PyObject",
+    "PyCodeObject",
+    "PyBuildValue",
+    "Py_LIMITED_API",
+    "HPy",
+    "argv",
+    "stdin",
+    "stdout",
+    "stderr",
+    "f-string",
+    "f-strings",
+    "shebang",
+]

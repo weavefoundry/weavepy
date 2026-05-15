@@ -1,0 +1,12 @@
+edition = "2021"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+reorder_imports = true
+
+# Nightly-only options (uncomment when running `cargo +nightly fmt`):
+# imports_granularity = "Crate"
+# group_imports = "StdExternalCrate"
+# wrap_comments = true
+# comment_width = 100

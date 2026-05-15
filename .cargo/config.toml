@@ -1,0 +1,15 @@
+# Workspace-wide cargo config.
+#
+# Add target-specific build flags, alias commands, and registry settings here.
+# Keep this file minimal; per-crate options belong in each crate's Cargo.toml.
+
+[alias]
+# Convenience aliases. Run with `cargo <alias>`.
+xtest = "test --workspace --all-targets"
+xcheck = "check --workspace --all-targets --all-features"
+xclippy = "clippy --workspace --all-targets --all-features -- -D warnings"
+xfmt = "fmt --all"
+
+[build]
+# Faster incremental builds for local dev. CI overrides via env if needed.
+# rustflags = []
