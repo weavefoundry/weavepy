@@ -72,16 +72,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_class_with_named_rfc() {
-        let err = parse_module("class C: pass\n").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("RFC 0003"), "msg: {msg}");
+    fn parses_class_with_body() {
+        let module = parse_module("class C:\n    pass\n").expect("parse class");
+        assert_eq!(module.body.len(), 1);
     }
 
     #[test]
-    fn rejects_try_with_named_rfc() {
-        let err = parse_module("try:\n    pass\nexcept:\n    pass\n").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("RFC 0004"), "msg: {msg}");
+    fn parses_try_except() {
+        let module =
+            parse_module("try:\n    pass\nexcept ValueError:\n    pass\n").expect("parse try");
+        assert_eq!(module.body.len(), 1);
     }
 }

@@ -18,10 +18,29 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::builtin_types::{builtin_types, instance_is_subclass};
 use crate::error::{
     index_error, key_error, runtime_error, stop_iteration, type_error, value_error, RuntimeError,
 };
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyIterator, Range};
+
+/// Marker name on the `BuiltinFn` returned by [`build_class_builtin`].
+/// The VM looks for this when dispatching `Call` so the call can be
+/// routed through the interpreter (it needs to run the class body).
+pub const BUILD_CLASS_NAME: &str = "__build_class__";
+
+/// The `__build_class__` callable. The body always errors — the VM
+/// recognises the name and runs its own class-construction path
+/// before this is ever invoked. The placeholder is here so module
+/// dis output reads naturally.
+pub fn build_class_builtin() -> BuiltinFn {
+    BuiltinFn {
+        name: BUILD_CLASS_NAME,
+        call: Box::new(|_args: &[Object]| {
+            Err(runtime_error("internal: __build_class__ called outside VM"))
+        }),
+    }
+}
 
 /// Build the dict that backs the `builtins` module.
 pub fn default_builtins() -> DictData {
@@ -63,6 +82,8 @@ pub fn default_builtins() -> DictData {
     reg!("all", b_all);
     reg!("any", b_any);
     reg!("isinstance", b_isinstance);
+    reg!("issubclass", b_issubclass);
+    reg!("super", b_super);
     reg!("id", b_id);
     reg!("hex", b_hex);
     reg!("oct", b_oct);
@@ -298,7 +319,24 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_static(one(args, "type")?.type_name()))
+    let arg = one(args, "type")?;
+    let bt = builtin_types();
+    let ty = match arg {
+        Object::None => bt.none_type.clone(),
+        Object::Bool(_) => bt.bool_.clone(),
+        Object::Int(_) => bt.int_.clone(),
+        Object::Float(_) => bt.float_.clone(),
+        Object::Str(_) => bt.str_.clone(),
+        Object::Tuple(_) => bt.tuple_.clone(),
+        Object::List(_) => bt.list_.clone(),
+        Object::Dict(_) => bt.dict_.clone(),
+        Object::Range(_) => bt.range_.clone(),
+        Object::Function(_) | Object::Builtin(_) | Object::BoundMethod(_) => bt.function_.clone(),
+        Object::Type(_) => bt.type_.clone(),
+        Object::Instance(inst) => inst.class.clone(),
+        _ => bt.object_.clone(),
+    };
+    Ok(Object::Type(ty))
 }
 
 fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -463,9 +501,116 @@ fn b_isinstance(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("isinstance expected 2 arguments"));
     }
-    let want = args[1].to_str();
-    let got = args[0].type_name();
-    Ok(Object::Bool(got == want))
+    let obj = &args[0];
+    let class = &args[1];
+    Ok(Object::Bool(matches_classinfo(obj, class)?))
+}
+
+fn b_super(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `super(C, self)` returns a proxy instance whose class is the
+    // synthesized proxy type. Zero-arg form is handled by the VM's
+    // call path (it materialises `__class__` and `self` first).
+    if args.len() != 2 {
+        return Err(type_error(
+            "super(): expected 2 arguments (zero-arg form must be called from inside a method)",
+        ));
+    }
+    let class = match &args[0] {
+        Object::Type(t) => t.clone(),
+        _ => return Err(type_error("super() arg 1 must be a class")),
+    };
+    let receiver = args[1].clone();
+    Ok(make_super(class, receiver))
+}
+
+/// Construct a super proxy. Exposed publicly so the VM can build
+/// zero-arg super objects.
+pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Object {
+    use crate::types::TypeObject;
+    let receiver_class = match &receiver {
+        Object::Instance(inst) => inst.class.clone(),
+        _ => class.clone(),
+    };
+    let mro = receiver_class.mro.borrow();
+    let start = mro
+        .iter()
+        .position(|t| Rc::ptr_eq(t, &class))
+        .map_or(mro.len(), |i| i + 1);
+    let after: Vec<_> = mro[start..].to_vec();
+    drop(mro);
+    let proxy = Rc::new(TypeObject {
+        name: format!("super<{}>", class.name),
+        bases: after.clone(),
+        mro: RefCell::new(after),
+        dict: Rc::new(RefCell::new(DictData::new())),
+        flags: crate::types::TypeFlags::default(),
+    });
+    let inst = crate::types::PyInstance {
+        class: proxy,
+        dict: Rc::new(RefCell::new({
+            let mut d = DictData::new();
+            d.insert(DictKey(Object::from_static("__self__")), receiver);
+            d
+        })),
+    };
+    Object::Instance(Rc::new(inst))
+}
+
+fn b_issubclass(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error("issubclass expected 2 arguments"));
+    }
+    let cls = match &args[0] {
+        Object::Type(t) => t.clone(),
+        _ => return Err(type_error("issubclass() arg 1 must be a class")),
+    };
+    let info = &args[1];
+    Ok(Object::Bool(class_matches_classinfo(&cls, info)?))
+}
+
+/// Walk `cls`'s MRO against a single type or tuple of types.
+fn class_matches_classinfo(
+    cls: &crate::types::TypeObject,
+    info: &Object,
+) -> Result<bool, RuntimeError> {
+    match info {
+        Object::Type(t) => Ok(cls.is_subclass_of(t)),
+        Object::Tuple(items) => {
+            for it in items.iter() {
+                if let Object::Type(t) = it {
+                    if cls.is_subclass_of(t) {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        _ => Err(type_error(
+            "issubclass() arg 2 must be a class or tuple of classes",
+        )),
+    }
+}
+
+/// Compare a value's runtime type against a class or tuple of classes.
+fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeError> {
+    let bt = builtin_types();
+    let obj_class = match obj {
+        Object::Instance(inst) => inst.class.clone(),
+        Object::None => bt.none_type.clone(),
+        Object::Bool(_) => bt.bool_.clone(),
+        Object::Int(_) => bt.int_.clone(),
+        Object::Float(_) => bt.float_.clone(),
+        Object::Str(_) => bt.str_.clone(),
+        Object::Tuple(_) => bt.tuple_.clone(),
+        Object::List(_) => bt.list_.clone(),
+        Object::Dict(_) => bt.dict_.clone(),
+        Object::Range(_) => bt.range_.clone(),
+        Object::Type(_) => bt.type_.clone(),
+        Object::Function(_) | Object::Builtin(_) | Object::BoundMethod(_) => bt.function_.clone(),
+        _ => bt.object_.clone(),
+    };
+    let _ = instance_is_subclass;
+    class_matches_classinfo(&obj_class, info)
 }
 
 fn b_id(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -42,6 +42,15 @@ pub enum StmtKind {
         name: String,
         args: Arguments,
         body: Vec<Stmt>,
+        decorator_list: Vec<Expr>,
+    },
+    /// `class name(bases, **keywords): body`
+    ClassDef {
+        name: String,
+        bases: Vec<Expr>,
+        keywords: Vec<Keyword>,
+        body: Vec<Stmt>,
+        decorator_list: Vec<Expr>,
     },
     /// `return value`
     Return(Option<Expr>),
@@ -82,6 +91,23 @@ pub enum StmtKind {
         body: Vec<Stmt>,
         orelse: Vec<Stmt>,
     },
+    /// `try: body except: handlers else: orelse finally: finalbody`
+    Try {
+        body: Vec<Stmt>,
+        handlers: Vec<ExceptHandler>,
+        orelse: Vec<Stmt>,
+        finalbody: Vec<Stmt>,
+    },
+    /// `raise [exc [from cause]]`
+    Raise {
+        exc: Option<Expr>,
+        cause: Option<Expr>,
+    },
+    /// `with items: body`
+    With {
+        items: Vec<WithItem>,
+        body: Vec<Stmt>,
+    },
     /// `import a, b as c`
     Import(Vec<Alias>),
     /// `from m import a, b as c` (or `from m import *`)
@@ -99,6 +125,24 @@ pub enum StmtKind {
     Pass,
     Break,
     Continue,
+}
+
+/// `except [E [as e]]: body` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExceptHandler {
+    /// `None` means a bare `except:` clause.
+    pub type_: Option<Expr>,
+    pub name: Option<String>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// `with expr [as target]` element. Multi-context `with` carries one per
+/// listed item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithItem {
+    pub context_expr: Expr,
+    pub optional_vars: Option<Expr>,
 }
 
 /// `import x as y` / `from m import (n[, n]…)` element.
@@ -391,14 +435,140 @@ fn indent(out: &mut String, n: usize) {
 fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
     use StmtKind as S;
     match &s.kind {
-        S::FunctionDef { name, args, body } => {
+        S::FunctionDef {
+            name,
+            args,
+            body,
+            decorator_list,
+        } => {
             out.push_str("FunctionDef(name='");
             out.push_str(name);
             out.push_str("', args=");
             dump_arguments(out, args, depth + 2);
             out.push_str(", body=");
             dump_stmt_block(out, body, depth + 2);
-            out.push_str(", decorator_list=[], returns=None, type_comment=None)");
+            out.push_str(", decorator_list=[");
+            for (i, d) in decorator_list.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_expr(out, d, depth);
+            }
+            out.push_str("], returns=None, type_comment=None)");
+        }
+        S::ClassDef {
+            name,
+            bases,
+            keywords,
+            body,
+            decorator_list,
+        } => {
+            out.push_str("ClassDef(name='");
+            out.push_str(name);
+            out.push_str("', bases=[");
+            for (i, b) in bases.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_expr(out, b, depth);
+            }
+            out.push_str("], keywords=[");
+            for (i, k) in keywords.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str("keyword(arg=");
+                match &k.arg {
+                    Some(n) => {
+                        out.push('\'');
+                        out.push_str(n);
+                        out.push('\'');
+                    }
+                    None => out.push_str("None"),
+                }
+                out.push_str(", value=");
+                dump_expr(out, &k.value, depth);
+                out.push(')');
+            }
+            out.push_str("], body=");
+            dump_stmt_block(out, body, depth + 2);
+            out.push_str(", decorator_list=[");
+            for (i, d) in decorator_list.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_expr(out, d, depth);
+            }
+            out.push_str("])");
+        }
+        S::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            out.push_str("Try(body=");
+            dump_stmt_block(out, body, depth + 2);
+            out.push_str(", handlers=[");
+            for (i, h) in handlers.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str("ExceptHandler(type=");
+                match &h.type_ {
+                    Some(t) => dump_expr(out, t, depth),
+                    None => out.push_str("None"),
+                }
+                out.push_str(", name=");
+                match &h.name {
+                    Some(n) => {
+                        out.push('\'');
+                        out.push_str(n);
+                        out.push('\'');
+                    }
+                    None => out.push_str("None"),
+                }
+                out.push_str(", body=");
+                dump_stmt_block(out, &h.body, depth + 2);
+                out.push(')');
+            }
+            out.push_str("], orelse=");
+            dump_stmt_block(out, orelse, depth + 2);
+            out.push_str(", finalbody=");
+            dump_stmt_block(out, finalbody, depth + 2);
+            out.push(')');
+        }
+        S::Raise { exc, cause } => {
+            out.push_str("Raise(exc=");
+            match exc {
+                Some(e) => dump_expr(out, e, depth),
+                None => out.push_str("None"),
+            }
+            out.push_str(", cause=");
+            match cause {
+                Some(c) => dump_expr(out, c, depth),
+                None => out.push_str("None"),
+            }
+            out.push(')');
+        }
+        S::With { items, body } => {
+            out.push_str("With(items=[");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str("withitem(context_expr=");
+                dump_expr(out, &it.context_expr, depth);
+                out.push_str(", optional_vars=");
+                match &it.optional_vars {
+                    Some(v) => dump_expr(out, v, depth),
+                    None => out.push_str("None"),
+                }
+                out.push(')');
+            }
+            out.push_str("], body=");
+            dump_stmt_block(out, body, depth + 2);
+            out.push(')');
         }
         S::Return(value) => {
             out.push_str("Return(value=");

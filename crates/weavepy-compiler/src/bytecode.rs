@@ -222,6 +222,37 @@ pub enum OpCode {
     /// Slice — build a Slice(low, high, step) and push it.
     BuildSlice,
 
+    // Classes
+    /// Push the magic `__build_class__` builtin onto the stack.
+    LoadBuildClass,
+    /// Class-scope deref: like `LOAD_DEREF` but first tries the active
+    /// class namespace (for forward references inside a class body).
+    LoadClassderef,
+
+    // Exceptions
+    /// Pop TOS as the exception to raise. `arg` is the raise form:
+    /// 0 = re-raise current; 1 = `raise X`; 2 = `raise X from Y` (Y at TOS, X below).
+    RaiseVarargs,
+    /// Match the exception at `stack[-2]` against the type at TOS. Pops
+    /// the type, peeks the exception, pushes a bool.
+    CheckExcMatch,
+    /// Push the exception currently being handled onto the
+    /// `exception_handlers` stack — TOS is the exception value.
+    PushExcInfo,
+    /// Pop the top of the `exception_handlers` stack.
+    PopExcept,
+    /// Pop and re-raise the top of the `exception_handlers` stack.
+    Reraise,
+
+    // Context managers
+    /// `with` enter: pop cm, push `__exit__` bound to cm, then push
+    /// the result of `__enter__()`.
+    BeforeWith,
+    /// `with` exception path. Stack on entry: `[__exit__, exc]`.
+    /// Calls `__exit__(type(exc), exc, None)` and leaves `[exc, result]`
+    /// on the stack so the compiler can branch on the result.
+    WithExceptStart,
+
     /// Print the diagnostic representation of TOS — used by the
     /// `dis` formatter only. Never emitted; reserved.
     PrintExpr,
@@ -229,68 +260,68 @@ pub enum OpCode {
 
 impl OpCode {
     pub fn name(self) -> &'static str {
-        use OpCode::{
-            BinaryOp, BinarySubscr, BuildList, BuildMap, BuildSet, BuildSlice, BuildString,
-            BuildTuple, Call, CallKw, CompareOp, ContainsOp, CopyTop, DeleteAttr, DeleteFast,
-            DeleteGlobal, DeleteName, DeleteSubscr, EndFor, ForIter, GetIter, IsOp, JumpBackward,
-            JumpForward, ListAppend, LoadAttr, LoadClosure, LoadConst, LoadDeref, LoadFast,
-            LoadGlobal, LoadName, MakeCell, MakeFunction, MapAdd, Nop, PopJumpIfFalse,
-            PopJumpIfTrue, PopTop, PrintExpr, Resume, ReturnValue, SetAdd, StoreAttr, StoreDeref,
-            StoreFast, StoreGlobal, StoreName, StoreSubscr, Swap, UnaryOp, UnpackSequence,
-        };
         match self {
-            Nop => "NOP",
-            Resume => "RESUME",
-            LoadConst => "LOAD_CONST",
-            LoadName => "LOAD_NAME",
-            LoadGlobal => "LOAD_GLOBAL",
-            LoadFast => "LOAD_FAST",
-            StoreFast => "STORE_FAST",
-            StoreGlobal => "STORE_GLOBAL",
-            StoreName => "STORE_NAME",
-            DeleteFast => "DELETE_FAST",
-            DeleteGlobal => "DELETE_GLOBAL",
-            DeleteName => "DELETE_NAME",
-            LoadDeref => "LOAD_DEREF",
-            StoreDeref => "STORE_DEREF",
-            MakeCell => "MAKE_CELL",
-            LoadClosure => "LOAD_CLOSURE",
-            LoadAttr => "LOAD_ATTR",
-            StoreAttr => "STORE_ATTR",
-            DeleteAttr => "DELETE_ATTR",
-            BinarySubscr => "BINARY_SUBSCR",
-            StoreSubscr => "STORE_SUBSCR",
-            DeleteSubscr => "DELETE_SUBSCR",
-            BinaryOp => "BINARY_OP",
-            UnaryOp => "UNARY_OP",
-            CompareOp => "COMPARE_OP",
-            IsOp => "IS_OP",
-            ContainsOp => "CONTAINS_OP",
-            PopTop => "POP_TOP",
-            CopyTop => "COPY",
-            Swap => "SWAP",
-            Call => "CALL",
-            CallKw => "CALL_KW",
-            ReturnValue => "RETURN_VALUE",
-            PopJumpIfFalse => "POP_JUMP_IF_FALSE",
-            PopJumpIfTrue => "POP_JUMP_IF_TRUE",
-            JumpForward => "JUMP_FORWARD",
-            JumpBackward => "JUMP_BACKWARD",
-            GetIter => "GET_ITER",
-            ForIter => "FOR_ITER",
-            EndFor => "END_FOR",
-            BuildList => "BUILD_LIST",
-            BuildTuple => "BUILD_TUPLE",
-            BuildSet => "BUILD_SET",
-            BuildMap => "BUILD_MAP",
-            BuildString => "BUILD_STRING",
-            ListAppend => "LIST_APPEND",
-            SetAdd => "SET_ADD",
-            MapAdd => "MAP_ADD",
-            UnpackSequence => "UNPACK_SEQUENCE",
-            MakeFunction => "MAKE_FUNCTION",
-            BuildSlice => "BUILD_SLICE",
-            PrintExpr => "PRINT_EXPR",
+            OpCode::Nop => "NOP",
+            OpCode::Resume => "RESUME",
+            OpCode::LoadConst => "LOAD_CONST",
+            OpCode::LoadName => "LOAD_NAME",
+            OpCode::LoadGlobal => "LOAD_GLOBAL",
+            OpCode::LoadFast => "LOAD_FAST",
+            OpCode::StoreFast => "STORE_FAST",
+            OpCode::StoreGlobal => "STORE_GLOBAL",
+            OpCode::StoreName => "STORE_NAME",
+            OpCode::DeleteFast => "DELETE_FAST",
+            OpCode::DeleteGlobal => "DELETE_GLOBAL",
+            OpCode::DeleteName => "DELETE_NAME",
+            OpCode::LoadDeref => "LOAD_DEREF",
+            OpCode::StoreDeref => "STORE_DEREF",
+            OpCode::MakeCell => "MAKE_CELL",
+            OpCode::LoadClosure => "LOAD_CLOSURE",
+            OpCode::LoadAttr => "LOAD_ATTR",
+            OpCode::StoreAttr => "STORE_ATTR",
+            OpCode::DeleteAttr => "DELETE_ATTR",
+            OpCode::BinarySubscr => "BINARY_SUBSCR",
+            OpCode::StoreSubscr => "STORE_SUBSCR",
+            OpCode::DeleteSubscr => "DELETE_SUBSCR",
+            OpCode::BinaryOp => "BINARY_OP",
+            OpCode::UnaryOp => "UNARY_OP",
+            OpCode::CompareOp => "COMPARE_OP",
+            OpCode::IsOp => "IS_OP",
+            OpCode::ContainsOp => "CONTAINS_OP",
+            OpCode::PopTop => "POP_TOP",
+            OpCode::CopyTop => "COPY",
+            OpCode::Swap => "SWAP",
+            OpCode::Call => "CALL",
+            OpCode::CallKw => "CALL_KW",
+            OpCode::ReturnValue => "RETURN_VALUE",
+            OpCode::PopJumpIfFalse => "POP_JUMP_IF_FALSE",
+            OpCode::PopJumpIfTrue => "POP_JUMP_IF_TRUE",
+            OpCode::JumpForward => "JUMP_FORWARD",
+            OpCode::JumpBackward => "JUMP_BACKWARD",
+            OpCode::GetIter => "GET_ITER",
+            OpCode::ForIter => "FOR_ITER",
+            OpCode::EndFor => "END_FOR",
+            OpCode::BuildList => "BUILD_LIST",
+            OpCode::BuildTuple => "BUILD_TUPLE",
+            OpCode::BuildSet => "BUILD_SET",
+            OpCode::BuildMap => "BUILD_MAP",
+            OpCode::BuildString => "BUILD_STRING",
+            OpCode::ListAppend => "LIST_APPEND",
+            OpCode::SetAdd => "SET_ADD",
+            OpCode::MapAdd => "MAP_ADD",
+            OpCode::UnpackSequence => "UNPACK_SEQUENCE",
+            OpCode::MakeFunction => "MAKE_FUNCTION",
+            OpCode::BuildSlice => "BUILD_SLICE",
+            OpCode::LoadBuildClass => "LOAD_BUILD_CLASS",
+            OpCode::LoadClassderef => "LOAD_CLASSDEREF",
+            OpCode::RaiseVarargs => "RAISE_VARARGS",
+            OpCode::CheckExcMatch => "CHECK_EXC_MATCH",
+            OpCode::PushExcInfo => "PUSH_EXC_INFO",
+            OpCode::PopExcept => "POP_EXCEPT",
+            OpCode::Reraise => "RERAISE",
+            OpCode::BeforeWith => "BEFORE_WITH",
+            OpCode::WithExceptStart => "WITH_EXCEPT_START",
+            OpCode::PrintExpr => "PRINT_EXPR",
         }
     }
 }

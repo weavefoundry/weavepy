@@ -53,8 +53,20 @@ impl Error {
             Error::Runtime(vm::RuntimeError::PyException(exc)) => {
                 let mut s = String::new();
                 let _ = writeln!(s, "Traceback (most recent call last):");
-                let _ = writeln!(s, "  File \"{filename}\", line ?, in <module>");
-                let _ = writeln!(s, "{}: {}", exc.kind, exc.message);
+                // Tracebacks are accumulated from inner-most frame
+                // outward; print outer-most first to match CPython.
+                if exc.traceback.is_empty() {
+                    let _ = writeln!(s, "  File \"{filename}\", line ?, in <module>");
+                } else {
+                    for entry in exc.traceback.iter().rev() {
+                        let _ = writeln!(
+                            s,
+                            "  File \"{}\", line {}, in {}",
+                            entry.filename, entry.lineno, entry.funcname
+                        );
+                    }
+                }
+                let _ = writeln!(s, "{}: {}", exc.type_name(), exc.message());
                 s
             }
             Error::Runtime(vm::RuntimeError::Internal(msg)) => {
@@ -79,7 +91,7 @@ pub fn run_source(source: &str) -> Result<(), Error> {
 /// so traceback formatting can show it.
 pub fn run_source_with_filename(source: &str, filename: &str) -> Result<(), Error> {
     let module = parser::parse_module(source)?;
-    let code = compiler::compile_module_with_filename(&module, filename)?;
+    let code = compiler::compile_module_with_source(&module, source, filename)?;
     let mut interpreter = vm::Interpreter::default();
     let _ = interpreter.run_module(&code)?;
     Ok(())

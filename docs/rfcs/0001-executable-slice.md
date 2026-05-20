@@ -77,17 +77,19 @@ The slice tracks CPython 3.13. Specifically:
 
 | In scope                                                                       | Deferred                                          |
 |--------------------------------------------------------------------------------|---------------------------------------------------|
-| `Module`, `FunctionDef`, `Return`, `Assign`, `AugAssign`, `AnnAssign`          | `ClassDef`                                        |
-| `If`/`Elif`/`Else`, `While`, `For`, `Break`, `Continue`, `Pass`                | `Try` / `Except` / `Finally`, `Raise`             |
-| `Import`, `ImportFrom`, `Global`, `Nonlocal`                                   | `With` / `AsyncWith`                              |
-| Full expression grammar with correct precedence                                | `Match` / `Case`                                  |
-| Chained comparisons (`1 < x < 10`)                                             | `Async` / `Await` / `Yield` / `YieldFrom`         |
-| `BinOp`, `BoolOp`, `UnaryOp`, `Compare`, `IfExp`                               | f-string interior parsing                         |
+| `Module`, `FunctionDef`, `Return`, `Assign`, `AugAssign`, `AnnAssign`          | `Match` / `Case`                                  |
+| `If`/`Elif`/`Else`, `While`, `For`, `Break`, `Continue`, `Pass`                | `Async` / `Await` / `Yield` / `YieldFrom`         |
+| `Import`, `ImportFrom`, `Global`, `Nonlocal`                                   | f-string interior parsing                         |
+| `ClassDef`, `Try` / `Except` / `Finally`, `Raise`, `With` *(RFC 0003 / 0004)*  |                                                   |
+| Full expression grammar with correct precedence                                |                                                   |
+| Chained comparisons (`1 < x < 10`)                                             |                                                   |
+| `BinOp`, `BoolOp`, `UnaryOp`, `Compare`, `IfExp`                               |                                                   |
 | `Lambda`, `NamedExpr` (walrus), `Starred`                                      |                                                   |
 | Calls with positional / keyword / `*args` / `**kwargs` / pos-only / kw-only    |                                                   |
 | `Attribute`, `Subscript`, `Slice`                                              |                                                   |
 | `List` / `Tuple` / `Dict` / `Set` literals                                     |                                                   |
 | `ListComp` / `SetComp` / `DictComp` / `GeneratorExp`                           |                                                   |
+| Decorators on function and class definitions *(RFC 0003)*                      |                                                   |
 
 AST node shape mirrors CPython's `ast` module — same field names, same
 nesting — so `ast.dump` of equivalent inputs matches.
@@ -222,8 +224,8 @@ carries a `PyException` struct (type name + message) so the eventual
 
 - **RFC 0002**: object model and value representation (tagged pointers,
   NaN-boxing, type slot table).
-- **RFC 0003**: classes, methods, MRO, descriptors.
-- **RFC 0004**: exceptions, `try` / `except` / `finally` / `with`, traceback.
+- **RFC 0003**: classes, methods, MRO, descriptors. ✅ landed.
+- **RFC 0004**: exceptions, `try` / `except` / `finally` / `with`, traceback. ✅ landed.
 - **RFC 0005**: f-strings — PEP 701 lexer mode, `FSTRING_*` tokens,
   AST `JoinedStr` / `FormattedValue`.
 - **RFC 0006**: generators / coroutines / async / await.

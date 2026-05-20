@@ -1,0 +1,9 @@
+class C:
+    def __init__(self, x):
+        self.x = x
+
+    def get(self):
+        return self.x
+
+
+print(C(5).get())

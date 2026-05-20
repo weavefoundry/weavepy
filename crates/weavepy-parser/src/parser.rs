@@ -14,8 +14,8 @@
 use weavepy_lexer::{Keyword, Span, Token, TokenKind};
 
 use crate::ast::{
-    Alias, Arg, Arguments, BinOp, BoolOp, CmpOp, Comprehension, Constant, Expr, ExprKind,
-    Keyword as KwArg, Module, Stmt, StmtKind, UnaryOp,
+    Alias, Arg, Arguments, BinOp, BoolOp, CmpOp, Comprehension, Constant, ExceptHandler, Expr,
+    ExprKind, Keyword as KwArg, Module, Stmt, StmtKind, UnaryOp, WithItem,
 };
 use crate::error::ParseError;
 
@@ -123,9 +123,23 @@ impl<'src> Parser<'src> {
 
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
         self.skip_trivia();
+        // Decorators apply to the next `def` or `class`.
+        if matches!(self.peek(), TokenKind::At) {
+            let decorators = self.parse_decorators()?;
+            self.skip_trivia();
+            return match self.peek() {
+                TokenKind::Keyword(Keyword::Def) => self.parse_function_def(decorators),
+                TokenKind::Keyword(Keyword::Class) => self.parse_class_def(decorators),
+                other => Err(ParseError::Unexpected {
+                    span: self.peek_token().span,
+                    message: format!("expected `def` or `class` after decorator, got {other:?}"),
+                }),
+            };
+        }
         match self.peek() {
             TokenKind::Keyword(kw) => match kw {
-                Keyword::Def => self.parse_function_def(),
+                Keyword::Def => self.parse_function_def(Vec::new()),
+                Keyword::Class => self.parse_class_def(Vec::new()),
                 Keyword::If => self.parse_if(),
                 Keyword::While => self.parse_while(),
                 Keyword::For => self.parse_for(),
@@ -137,13 +151,9 @@ impl<'src> Parser<'src> {
                 Keyword::From => self.parse_import_from(),
                 Keyword::Global => self.parse_global(),
                 Keyword::Nonlocal => self.parse_nonlocal(),
-                Keyword::Class | Keyword::Try | Keyword::With | Keyword::Raise => {
-                    Err(ParseError::NotImplemented {
-                        span: self.peek_token().span,
-                        feature: kw.as_str(),
-                        rfc: rfc_for(*kw),
-                    })
-                }
+                Keyword::Try => self.parse_try(),
+                Keyword::Raise => self.parse_raise(),
+                Keyword::With => self.parse_with(),
                 Keyword::Async | Keyword::Await | Keyword::Yield => {
                     Err(ParseError::NotImplemented {
                         span: self.peek_token().span,
@@ -155,6 +165,20 @@ impl<'src> Parser<'src> {
             },
             _ => self.parse_simple_statement(),
         }
+    }
+
+    fn parse_decorators(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut decorators = Vec::new();
+        while matches!(self.peek(), TokenKind::At) {
+            self.bump();
+            let e = self.parse_expression(false)?;
+            // After the decorator expression, consume a NEWLINE (and any
+            // trivia leading to the next decorator or the def/class).
+            self.consume_stmt_end()?;
+            self.skip_trivia_and_newlines();
+            decorators.push(e);
+        }
+        Ok(decorators)
     }
 
     fn simple_keyword_stmt(&mut self, kind: StmtKind) -> Result<Stmt, ParseError> {
@@ -280,14 +304,13 @@ impl<'src> Parser<'src> {
         Some(op)
     }
 
-    fn parse_function_def(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_function_def(&mut self, decorator_list: Vec<Expr>) -> Result<Stmt, ParseError> {
         let def_tok = self.bump(); // `def`
         let name_tok = self.expect(&TokenKind::Name, "function name")?;
         let name = self.lexeme(name_tok.span).to_owned();
         self.expect(&TokenKind::LPar, "`(`")?;
         let args = self.parse_function_arguments()?;
         self.expect(&TokenKind::RPar, "`)`")?;
-        // Optional return-type annotation `-> ...`
         if self.eat(&TokenKind::RArrow) {
             let _ = self.parse_expression(false)?;
         }
@@ -295,8 +318,213 @@ impl<'src> Parser<'src> {
         let body = self.parse_block()?;
         let span_end = body.last().map_or(def_tok.span, |s| s.span);
         Ok(Stmt {
-            kind: StmtKind::FunctionDef { name, args, body },
+            kind: StmtKind::FunctionDef {
+                name,
+                args,
+                body,
+                decorator_list,
+            },
             span: def_tok.span.merge(span_end),
+        })
+    }
+
+    fn parse_class_def(&mut self, decorator_list: Vec<Expr>) -> Result<Stmt, ParseError> {
+        let class_tok = self.bump(); // `class`
+        let name_tok = self.expect(&TokenKind::Name, "class name")?;
+        let name = self.lexeme(name_tok.span).to_owned();
+        let (bases, keywords) = if self.eat(&TokenKind::LPar) {
+            let (a, kw) = self.parse_call_args()?;
+            self.expect(&TokenKind::RPar, "`)`")?;
+            (a, kw)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        self.expect(&TokenKind::Colon, "`:`")?;
+        let body = self.parse_block()?;
+        let span_end = body.last().map_or(class_tok.span, |s| s.span);
+        Ok(Stmt {
+            kind: StmtKind::ClassDef {
+                name,
+                bases,
+                keywords,
+                body,
+                decorator_list,
+            },
+            span: class_tok.span.merge(span_end),
+        })
+    }
+
+    fn parse_try(&mut self) -> Result<Stmt, ParseError> {
+        let try_tok = self.bump(); // `try`
+        self.expect(&TokenKind::Colon, "`:`")?;
+        let body = self.parse_block()?;
+        self.skip_trivia_and_newlines();
+        let mut handlers = Vec::new();
+        let mut orelse: Vec<Stmt> = Vec::new();
+        let mut finalbody: Vec<Stmt> = Vec::new();
+        while self.at_keyword(Keyword::Except) {
+            let exc_tok = self.bump(); // `except`
+            if matches!(self.peek(), TokenKind::Star) {
+                return Err(ParseError::NotImplemented {
+                    span: self.peek_token().span,
+                    feature: "except*",
+                    rfc: "RFC 0011",
+                });
+            }
+            let (type_, name) = if self.check(&TokenKind::Colon) {
+                (None, None)
+            } else {
+                let t = self.parse_expression(false)?;
+                let n = if self.at_keyword(Keyword::As) {
+                    self.bump();
+                    let nt = self.expect(&TokenKind::Name, "name after `as`")?;
+                    Some(self.lexeme(nt.span).to_owned())
+                } else {
+                    None
+                };
+                (Some(t), n)
+            };
+            self.expect(&TokenKind::Colon, "`:`")?;
+            let handler_body = self.parse_block()?;
+            let span_end = handler_body.last().map_or(exc_tok.span, |s| s.span);
+            handlers.push(ExceptHandler {
+                type_,
+                name,
+                body: handler_body,
+                span: exc_tok.span.merge(span_end),
+            });
+            self.skip_trivia_and_newlines();
+        }
+        if self.at_keyword(Keyword::Else) {
+            self.bump();
+            self.expect(&TokenKind::Colon, "`:`")?;
+            orelse = self.parse_block()?;
+            self.skip_trivia_and_newlines();
+        }
+        if self.at_keyword(Keyword::Finally) {
+            self.bump();
+            self.expect(&TokenKind::Colon, "`:`")?;
+            finalbody = self.parse_block()?;
+        }
+        if handlers.is_empty() && finalbody.is_empty() {
+            return Err(ParseError::Unexpected {
+                span: try_tok.span,
+                message: "expected `except` or `finally` after `try`".to_owned(),
+            });
+        }
+        let span_end = finalbody
+            .last()
+            .or_else(|| orelse.last())
+            .or_else(|| handlers.last().map(|h| &h.body).and_then(|b| b.last()))
+            .or_else(|| body.last())
+            .map_or(try_tok.span, |s| s.span);
+        Ok(Stmt {
+            kind: StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            },
+            span: try_tok.span.merge(span_end),
+        })
+    }
+
+    fn parse_raise(&mut self) -> Result<Stmt, ParseError> {
+        let kw = self.bump(); // `raise`
+        let (exc, cause) = if matches!(
+            self.peek(),
+            TokenKind::Newline | TokenKind::Semi | TokenKind::Endmarker
+        ) {
+            (None, None)
+        } else {
+            let e = self.parse_expression(false)?;
+            let c = if self.at_keyword(Keyword::From) {
+                self.bump();
+                Some(self.parse_expression(false)?)
+            } else {
+                None
+            };
+            (Some(e), c)
+        };
+        self.consume_stmt_end()?;
+        Ok(Stmt {
+            kind: StmtKind::Raise { exc, cause },
+            span: kw.span,
+        })
+    }
+
+    fn parse_with(&mut self) -> Result<Stmt, ParseError> {
+        let kw = self.bump(); // `with`
+                              // CPython 3.10+ supports `with (a, b as c, d): body` with
+                              // parenthesized item lists. The slice supports both forms.
+        let mut items = Vec::new();
+        let paren = matches!(self.peek(), TokenKind::LPar) && self.is_with_paren_list_start();
+        if paren {
+            self.bump();
+            loop {
+                items.push(self.parse_with_item()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RPar) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RPar, "`)`")?;
+        } else {
+            loop {
+                items.push(self.parse_with_item()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::Colon, "`:`")?;
+        let body = self.parse_block()?;
+        let span_end = body.last().map_or(kw.span, |s| s.span);
+        Ok(Stmt {
+            kind: StmtKind::With { items, body },
+            span: kw.span.merge(span_end),
+        })
+    }
+
+    /// Lookahead: is the `(` we just saw the start of a parenthesised
+    /// `with`-item list (rather than a parenthesised expression like
+    /// `with (a + b): ...`)? Heuristic: scan forward for `as` or `,`
+    /// at depth 0 before the closing `)` and a `:`.
+    fn is_with_paren_list_start(&self) -> bool {
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        while let Some(tok) = self.tokens.get(i) {
+            match &tok.kind {
+                TokenKind::LPar | TokenKind::LSqb | TokenKind::LBrace => depth += 1,
+                TokenKind::RPar | TokenKind::RSqb | TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                TokenKind::Comma if depth == 1 => return true,
+                TokenKind::Keyword(Keyword::As) if depth == 1 => return true,
+                TokenKind::Newline | TokenKind::Endmarker => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn parse_with_item(&mut self) -> Result<WithItem, ParseError> {
+        let context_expr = self.parse_expression(false)?;
+        let optional_vars = if self.at_keyword(Keyword::As) {
+            self.bump();
+            Some(self.parse_unary()?)
+        } else {
+            None
+        };
+        Ok(WithItem {
+            context_expr,
+            optional_vars,
         })
     }
 
@@ -664,8 +892,8 @@ impl<'src> Parser<'src> {
             }
             Ok(body)
         } else {
-            // Inline single-statement block: `if x: y = 1`
-            let s = self.parse_simple_statement()?;
+            // Inline single-statement block: `if x: y = 1`, `class A: pass`.
+            let s = self.parse_statement()?;
             Ok(vec![s])
         }
     }
@@ -1571,18 +1799,6 @@ impl<'src> Parser<'src> {
             message: m,
         })?;
         Ok(Constant::Str(s))
-    }
-}
-
-/// Map a keyword to the follow-up RFC that tracks its support.
-fn rfc_for(kw: Keyword) -> &'static str {
-    match kw {
-        Keyword::Class => "RFC 0003",
-        Keyword::Try | Keyword::Except | Keyword::Finally | Keyword::Raise | Keyword::With => {
-            "RFC 0004"
-        }
-        Keyword::Async | Keyword::Await | Keyword::Yield => "RFC 0006",
-        _ => "RFC 0001",
     }
 }
 

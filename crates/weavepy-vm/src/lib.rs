@@ -19,17 +19,24 @@ use std::cell::RefCell;
 use std::io::Write;
 use std::rc::Rc;
 
-use weavepy_compiler::{BinOpKind, CodeObject, CompareKind, Constant, OpCode, UnaryKind};
+use weavepy_compiler::{
+    BinOpKind, CodeObject, CompareKind, Constant, ExcHandler, OpCode, UnaryKind,
+};
 
+pub mod builtin_types;
 pub mod builtins;
 pub mod error;
 pub mod object;
+pub mod types;
 
+use crate::builtin_types::{builtin_types, instance_is_subclass, make_exception_with_class};
 use crate::error::{
-    attribute_error, index_error, key_error, name_error, type_error, value_error,
-    zero_division_error,
+    attribute_error, index_error, key_error, name_error, runtime_error, type_error, value_error,
+    zero_division_error, TracebackEntry,
 };
+pub use crate::error::{PyException, RuntimeError};
 use crate::object::{BoundMethod, BuiltinFn, DictData, DictKey, Object, PyFunction, PySlice};
+use crate::types::{PyInstance, TypeObject};
 
 // ---------- frame ----------
 
@@ -43,6 +50,14 @@ struct Frame {
     stack: Vec<Object>,
     /// Globals shared across frames within the same module.
     globals: Rc<RefCell<DictData>>,
+    /// For class-body frames, names are stored here instead of globals.
+    /// `None` for ordinary function and module frames.
+    class_namespace: Option<Rc<RefCell<DictData>>>,
+    /// Stack of currently-handled exceptions. `PUSH_EXC_INFO` pushes
+    /// onto this; `POP_EXCEPT` pops; `RERAISE 1` re-raises the top.
+    exc_handlers: Vec<PyException>,
+    /// pc *before* the current instruction — used to look up the
+    /// exception handler when an opcode raises.
     pc: u32,
 }
 
@@ -96,22 +111,13 @@ impl Interpreter {
     }
 
     /// Wire `print` (and friends) to this interpreter's stdout.
+    /// `print` is installed as a special builtin — the VM intercepts
+    /// the call so it can dispatch `__str__` on user types.
     fn install_print_into(&self, dict: &mut DictData) {
-        let sink = self.stdout.clone();
         let f = BuiltinFn {
             name: "print",
-            call: Box::new(move |args: &[Object]| {
-                let mut sink = sink.borrow_mut();
-                let mut first = true;
-                for a in args {
-                    if !first {
-                        write!(sink, " ").ok();
-                    }
-                    first = false;
-                    write!(sink, "{}", a.to_str()).ok();
-                }
-                writeln!(sink).ok();
-                Ok(Object::None)
+            call: Box::new(move |_args: &[Object]| {
+                Err(runtime_error("internal: print called outside VM"))
             }),
         };
         dict.insert(
@@ -123,7 +129,13 @@ impl Interpreter {
     /// Run a module-level [`CodeObject`] to completion.
     pub fn run_module(&mut self, code: &CodeObject) -> Result<Object, RuntimeError> {
         let globals = Rc::new(RefCell::new(DictData::new()));
-        self.install_print_into(&mut globals.borrow_mut());
+        {
+            let mut g = globals.borrow_mut();
+            self.install_print_into(&mut g);
+            for (name, value) in builtin_types().as_globals() {
+                g.insert(DictKey(Object::from_str(name)), value);
+            }
+        }
         let code_rc = Rc::new(code.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
         self.run_frame(&mut frame)
@@ -169,6 +181,8 @@ impl Interpreter {
             cells,
             stack: Vec::with_capacity(16),
             globals,
+            class_namespace: None,
+            exc_handlers: Vec::new(),
             pc: 0,
         }
     }
@@ -177,493 +191,795 @@ impl Interpreter {
 
     fn run_frame(&mut self, frame: &mut Frame) -> Result<Object, RuntimeError> {
         loop {
-            let ins = frame
-                .code
-                .instructions
-                .get(frame.pc as usize)
-                .copied()
-                .ok_or_else(|| {
-                    RuntimeError::Internal(format!(
-                        "pc {} out of bounds in {}",
-                        frame.pc, frame.code.name
-                    ))
-                })?;
-            frame.pc += 1;
-            match ins.op {
-                OpCode::Nop | OpCode::Resume => {}
-                OpCode::LoadConst => {
-                    let c = frame
-                        .code
-                        .constants
-                        .get(ins.arg as usize)
-                        .ok_or_else(|| RuntimeError::Internal("bad const index".to_owned()))?
-                        .clone();
-                    frame.push(constant_to_object(c));
-                }
-                OpCode::LoadName => {
-                    let name = self.name_at(&frame.code, ins.arg)?;
-                    let v = self.lookup_global_or_builtin(&frame.globals, &name)?;
-                    frame.push(v);
-                }
-                OpCode::LoadGlobal => {
-                    let name = self.name_at(&frame.code, ins.arg)?;
-                    let v = self.lookup_global_or_builtin(&frame.globals, &name)?;
-                    frame.push(v);
-                }
-                OpCode::LoadFast => {
-                    let v = frame
-                        .locals
-                        .get(ins.arg as usize)
-                        .cloned()
-                        .ok_or_else(|| RuntimeError::Internal("bad local index".to_owned()))?;
-                    if matches!(v, Object::None)
-                        && frame
-                            .code
-                            .varnames
-                            .get(ins.arg as usize)
-                            .map(|n| !is_param(&frame.code, n))
-                            .unwrap_or(false)
-                    {
-                        // It's possible the variable hasn't been
-                        // assigned yet. We push None as a placeholder.
-                    }
-                    frame.push(v);
-                }
-                OpCode::StoreFast => {
-                    let v = frame.pop()?;
-                    let slot = ins.arg as usize;
-                    if slot < frame.locals.len() {
-                        frame.locals[slot] = v;
-                    }
-                }
-                OpCode::DeleteFast => {
-                    let slot = ins.arg as usize;
-                    if slot < frame.locals.len() {
-                        frame.locals[slot] = Object::None;
-                    }
-                }
-                OpCode::StoreName => {
-                    let v = frame.pop()?;
-                    let name = self.name_at(&frame.code, ins.arg)?;
-                    frame
-                        .globals
-                        .borrow_mut()
-                        .insert(DictKey(Object::from_str(name)), v);
-                }
-                OpCode::StoreGlobal => {
-                    let v = frame.pop()?;
-                    let name = self.name_at(&frame.code, ins.arg)?;
-                    frame
-                        .globals
-                        .borrow_mut()
-                        .insert(DictKey(Object::from_str(name)), v);
-                }
-                OpCode::DeleteName | OpCode::DeleteGlobal => {
-                    let name = self.name_at(&frame.code, ins.arg)?;
-                    frame
-                        .globals
-                        .borrow_mut()
-                        .shift_remove(&DictKey(Object::from_str(name)));
-                }
-                OpCode::LoadDeref => {
-                    let cell = frame
-                        .cells
-                        .get(ins.arg as usize)
-                        .cloned()
-                        .ok_or_else(|| RuntimeError::Internal("bad cell index".to_owned()))?;
-                    let v = cell.borrow().clone();
-                    frame.push(v);
-                }
-                OpCode::StoreDeref => {
-                    let v = frame.pop()?;
-                    let cell = frame
-                        .cells
-                        .get(ins.arg as usize)
-                        .cloned()
-                        .ok_or_else(|| RuntimeError::Internal("bad cell index".to_owned()))?;
-                    *cell.borrow_mut() = v;
-                }
-                OpCode::MakeCell => {
-                    let slot = ins.arg as usize;
-                    if slot >= frame.cells.len() {
-                        return Err(RuntimeError::Internal(
-                            "MakeCell index out of bounds".to_owned(),
-                        ));
-                    }
-                }
-                OpCode::LoadClosure => {
-                    let cell = frame
-                        .cells
-                        .get(ins.arg as usize)
-                        .cloned()
-                        .ok_or_else(|| RuntimeError::Internal("bad cell index".to_owned()))?;
-                    frame.push(Object::Cell(cell));
-                }
-                OpCode::LoadAttr => {
-                    let obj = frame.pop()?;
-                    let name = self.name_at(&frame.code, ins.arg)?;
-                    let v = self.load_attr(&obj, &name)?;
-                    frame.push(v);
-                }
-                OpCode::StoreAttr => {
-                    let _obj = frame.pop()?;
-                    let _val = frame.pop()?;
-                    return Err(type_error(
-                        "attribute assignment on builtin types not supported in the slice",
-                    ));
-                }
-                OpCode::DeleteAttr => {
-                    let _obj = frame.pop()?;
-                    return Err(type_error(
-                        "attribute deletion on builtin types not supported in the slice",
-                    ));
-                }
-                OpCode::BinarySubscr => {
-                    let i = frame.pop()?;
-                    let v = frame.pop()?;
-                    let r = self.binary_subscr(&v, &i)?;
-                    frame.push(r);
-                }
-                OpCode::StoreSubscr => {
-                    let i = frame.pop()?;
-                    let target = frame.pop()?;
-                    let value = frame.pop()?;
-                    self.store_subscr(&target, &i, value)?;
-                }
-                OpCode::DeleteSubscr => {
-                    let i = frame.pop()?;
-                    let target = frame.pop()?;
-                    self.delete_subscr(&target, &i)?;
-                }
-                OpCode::BinaryOp => {
-                    let b = frame.pop()?;
-                    let a = frame.pop()?;
-                    let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
-                    let r = binary_op(&a, &b, kind)?;
-                    frame.push(r);
-                }
-                OpCode::UnaryOp => {
-                    let v = frame.pop()?;
-                    let kind: UnaryKind = unsafe { std::mem::transmute(ins.arg as u8) };
-                    let r = unary_op(&v, kind)?;
-                    frame.push(r);
-                }
-                OpCode::CompareOp => {
-                    let b = frame.pop()?;
-                    let a = frame.pop()?;
-                    let kind: CompareKind = unsafe { std::mem::transmute(ins.arg as u8) };
-                    let r = compare_op(&a, &b, kind)?;
-                    frame.push(Object::Bool(r));
-                }
-                OpCode::IsOp => {
-                    let b = frame.pop()?;
-                    let a = frame.pop()?;
-                    let same = a.is_same(&b);
-                    let result = if ins.arg == 1 { !same } else { same };
-                    frame.push(Object::Bool(result));
-                }
-                OpCode::ContainsOp => {
-                    let container = frame.pop()?;
-                    let item = frame.pop()?;
-                    let found = container.contains(&item)?;
-                    let result = if ins.arg == 1 { !found } else { found };
-                    frame.push(Object::Bool(result));
-                }
-                OpCode::PopTop => {
-                    frame.pop()?;
-                }
-                OpCode::CopyTop => {
-                    let v = frame.top()?.clone();
-                    frame.push(v);
-                }
-                OpCode::Swap => {
-                    let depth = ins.arg as usize;
-                    let n = frame.stack.len();
-                    if depth >= 1 && depth < n {
-                        frame.stack.swap(n - 1, n - depth);
-                    }
-                }
-                OpCode::Call => {
-                    let argc = ins.arg as usize;
-                    let split_at = frame.stack.len().saturating_sub(argc);
-                    let args: Vec<Object> = frame.stack.split_off(split_at);
-                    let callable = frame.pop()?;
-                    let r = self.call(&callable, &args, &[], &frame.globals)?;
-                    frame.push(r);
-                }
-                OpCode::CallKw => {
-                    let argc = ins.arg as usize;
-                    // Stack (top-down): kw_names_tuple, kw_values..., positional_values..., callable
-                    let names_obj = frame.pop()?;
-                    let names: Vec<String> = match names_obj {
-                        Object::Tuple(items) => items.iter().map(|x| x.to_str()).collect(),
-                        _ => {
-                            return Err(RuntimeError::Internal(
-                                "CallKw expects a tuple of names".to_owned(),
-                            ))
+            match self.step(frame) {
+                Ok(StepOutcome::Continue) => {}
+                Ok(StepOutcome::Return(v)) => return Ok(v),
+                Err(err) => {
+                    // Try to find a handler in the exception table.
+                    if let RuntimeError::PyException(exc) = err {
+                        match self.handle_exception(frame, exc) {
+                            Ok(Some(())) => continue,
+                            Ok(None) => unreachable!(),
+                            Err(e) => return Err(e),
                         }
-                    };
-                    let kwc = names.len();
-                    let split_kw_at = frame.stack.len().saturating_sub(kwc);
-                    let kw_values: Vec<Object> = frame.stack.split_off(split_kw_at);
-                    let split_pos_at = frame.stack.len().saturating_sub(argc);
-                    let pos_args: Vec<Object> = frame.stack.split_off(split_pos_at);
-                    let callable = frame.pop()?;
-                    let kw_pairs: Vec<(String, Object)> =
-                        names.into_iter().zip(kw_values).collect();
-                    let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
-                    frame.push(r);
-                }
-                OpCode::ReturnValue => {
-                    return frame.pop();
-                }
-                OpCode::PopJumpIfFalse => {
-                    let v = frame.pop()?;
-                    if !v.is_truthy() {
-                        frame.pc += ins.arg;
-                    }
-                }
-                OpCode::PopJumpIfTrue => {
-                    let v = frame.pop()?;
-                    if v.is_truthy() {
-                        frame.pc += ins.arg;
-                    }
-                }
-                OpCode::JumpForward => {
-                    frame.pc += ins.arg;
-                }
-                OpCode::JumpBackward => {
-                    frame.pc = frame.pc.saturating_sub(ins.arg);
-                }
-                OpCode::GetIter => {
-                    let v = frame.pop()?;
-                    let it = v.make_iter()?;
-                    frame.push(Object::Iter(Rc::new(RefCell::new(it))));
-                }
-                OpCode::ForIter => {
-                    let it_obj = frame
-                        .stack
-                        .last()
-                        .cloned()
-                        .ok_or_else(|| RuntimeError::Internal("FOR_ITER no iter".to_owned()))?;
-                    let next = match &it_obj {
-                        Object::Iter(it) => it.borrow_mut().next_value(),
-                        _ => {
-                            return Err(RuntimeError::Internal(
-                                "FOR_ITER expects iterator on stack".to_owned(),
-                            ))
-                        }
-                    };
-                    match next {
-                        Some(v) => frame.push(v),
-                        None => {
-                            // Exhausted: drop the iterator and jump out.
-                            // CPython peeks the iterator with FOR_ITER
-                            // and END_FOR pops on exit, but for the slice
-                            // we pop here and skip the END_FOR.
-                            frame.pop()?;
-                            frame.pc += ins.arg;
-                        }
-                    }
-                }
-                OpCode::EndFor => {
-                    // Iterator was already popped by the exhausted
-                    // branch of FOR_ITER. Nothing to do.
-                }
-                OpCode::BuildList => {
-                    let n = ins.arg as usize;
-                    let split = frame.stack.len().saturating_sub(n);
-                    let items = frame.stack.split_off(split);
-                    frame.push(Object::new_list(items));
-                }
-                OpCode::BuildTuple => {
-                    let n = ins.arg as usize;
-                    let split = frame.stack.len().saturating_sub(n);
-                    let items = frame.stack.split_off(split);
-                    frame.push(Object::new_tuple(items));
-                }
-                OpCode::BuildSet => {
-                    // No native set yet — represent as list-deduped value
-                    // wrapped in a dict whose values are None.
-                    let n = ins.arg as usize;
-                    let split = frame.stack.len().saturating_sub(n);
-                    let items = frame.stack.split_off(split);
-                    let mut d = DictData::new();
-                    for x in items {
-                        d.insert(DictKey(x), Object::None);
-                    }
-                    frame.push(Object::Dict(Rc::new(RefCell::new(d))));
-                }
-                OpCode::BuildMap => {
-                    let n = ins.arg as usize;
-                    let split = frame.stack.len().saturating_sub(2 * n);
-                    let pairs = frame.stack.split_off(split);
-                    let mut d = DictData::new();
-                    let mut it = pairs.into_iter();
-                    for _ in 0..n {
-                        let k = it.next().ok_or_else(|| {
-                            RuntimeError::Internal("BUILD_MAP missing key".to_owned())
-                        })?;
-                        let v = it.next().ok_or_else(|| {
-                            RuntimeError::Internal("BUILD_MAP missing value".to_owned())
-                        })?;
-                        d.insert(DictKey(k), v);
-                    }
-                    frame.push(Object::Dict(Rc::new(RefCell::new(d))));
-                }
-                OpCode::BuildString => {
-                    let n = ins.arg as usize;
-                    let split = frame.stack.len().saturating_sub(n);
-                    let parts = frame.stack.split_off(split);
-                    let mut s = String::new();
-                    for p in parts {
-                        s.push_str(&p.to_str());
-                    }
-                    frame.push(Object::from_str(s));
-                }
-                OpCode::ListAppend => {
-                    let v = frame.pop()?;
-                    let depth = ins.arg as usize;
-                    let lst = frame
-                        .stack
-                        .get(frame.stack.len().wrapping_sub(depth))
-                        .cloned()
-                        .ok_or_else(|| {
-                            RuntimeError::Internal("LIST_APPEND depth out of range".to_owned())
-                        })?;
-                    if let Object::List(lst) = lst {
-                        lst.borrow_mut().push(v);
                     } else {
-                        return Err(RuntimeError::Internal(
-                            "LIST_APPEND target is not a list".to_owned(),
-                        ));
-                    }
-                }
-                OpCode::SetAdd => {
-                    let v = frame.pop()?;
-                    let depth = ins.arg as usize;
-                    let s = frame
-                        .stack
-                        .get(frame.stack.len().wrapping_sub(depth))
-                        .cloned()
-                        .ok_or_else(|| {
-                            RuntimeError::Internal("SET_ADD depth out of range".to_owned())
-                        })?;
-                    if let Object::Dict(d) = s {
-                        d.borrow_mut().insert(DictKey(v), Object::None);
-                    }
-                }
-                OpCode::MapAdd => {
-                    let v = frame.pop()?;
-                    let k = frame.pop()?;
-                    let depth = ins.arg as usize;
-                    let d = frame
-                        .stack
-                        .get(frame.stack.len().wrapping_sub(depth))
-                        .cloned()
-                        .ok_or_else(|| {
-                            RuntimeError::Internal("MAP_ADD depth out of range".to_owned())
-                        })?;
-                    if let Object::Dict(d) = d {
-                        d.borrow_mut().insert(DictKey(k), v);
-                    }
-                }
-                OpCode::UnpackSequence => {
-                    let n = ins.arg as usize;
-                    let v = frame.pop()?;
-                    let items: Vec<Object> = match v {
-                        Object::Tuple(items) => items.iter().cloned().collect(),
-                        Object::List(items) => items.borrow().clone(),
-                        Object::Str(s) => {
-                            s.chars().map(|c| Object::from_str(c.to_string())).collect()
-                        }
-                        Object::Range(r) => {
-                            let mut out = Vec::new();
-                            let mut cur = r.start;
-                            while (r.step > 0 && cur < r.stop) || (r.step < 0 && cur > r.stop) {
-                                out.push(Object::Int(cur));
-                                cur += r.step;
-                            }
-                            out
-                        }
-                        _ => {
-                            return Err(type_error(format!(
-                                "cannot unpack non-iterable {} object",
-                                v.type_name()
-                            )))
-                        }
-                    };
-                    if items.len() != n {
-                        return Err(value_error(format!(
-                            "expected {} values to unpack, got {}",
-                            n,
-                            items.len()
-                        )));
-                    }
-                    // Push in reverse so the first element ends up
-                    // at the lowest stack position — matches the
-                    // grouped STORE_FAST sequence emitted by the
-                    // compiler.
-                    for x in items.into_iter().rev() {
-                        frame.push(x);
-                    }
-                }
-                OpCode::MakeFunction => {
-                    let code_obj = frame.pop()?;
-                    let code = match code_obj {
-                        Object::Code(c) => c,
-                        _ => {
-                            return Err(RuntimeError::Internal(
-                                "MAKE_FUNCTION expects code on top".to_owned(),
-                            ))
-                        }
-                    };
-                    let flags = ins.arg;
-                    let mut closure: Vec<Object> = Vec::new();
-                    if flags & 0x08 != 0 {
-                        let tup = frame.pop()?;
-                        if let Object::Tuple(items) = tup {
-                            closure = items.iter().cloned().collect();
-                        }
-                    }
-                    if flags & 0x04 != 0 {
-                        frame.pop()?; // annotations dict — discarded
-                    }
-                    if flags & 0x02 != 0 {
-                        frame.pop()?; // kw defaults dict — discarded
-                    }
-                    let mut defaults: Vec<Object> = Vec::new();
-                    if flags & 0x01 != 0 {
-                        let tup = frame.pop()?;
-                        if let Object::Tuple(items) = tup {
-                            defaults = items.iter().cloned().collect();
-                        }
-                    }
-                    let name = code.name.clone();
-                    let f = PyFunction {
-                        name,
-                        code,
-                        globals: frame.globals.clone(),
-                        defaults,
-                        kw_defaults: Vec::new(),
-                        closure,
-                    };
-                    frame.push(Object::Function(Rc::new(f)));
-                }
-                OpCode::BuildSlice => {
-                    let step = frame.pop()?;
-                    let stop = frame.pop()?;
-                    let start = frame.pop()?;
-                    frame.push(Object::Slice(Rc::new(PySlice { start, stop, step })));
-                }
-                OpCode::PrintExpr => {
-                    let v = frame.pop()?;
-                    if !matches!(v, Object::None) {
-                        let mut sink = self.stdout.borrow_mut();
-                        let _ = writeln!(sink, "{}", v.repr());
+                        return Err(err);
                     }
                 }
             }
+        }
+    }
+
+    /// Run a single instruction. The `pc` is advanced past it; if the
+    /// instruction returns from the frame we surface that via
+    /// `StepOutcome::Return`.
+    fn step(&mut self, frame: &mut Frame) -> Result<StepOutcome, RuntimeError> {
+        let raised_at = frame.pc;
+        let ins = frame
+            .code
+            .instructions
+            .get(frame.pc as usize)
+            .copied()
+            .ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "pc {} out of bounds in {}",
+                    frame.pc, frame.code.name
+                ))
+            })?;
+        let _ = raised_at;
+        frame.pc += 1;
+        match ins.op {
+            OpCode::Nop | OpCode::Resume => {}
+            OpCode::LoadConst => {
+                let c = frame
+                    .code
+                    .constants
+                    .get(ins.arg as usize)
+                    .ok_or_else(|| RuntimeError::Internal("bad const index".to_owned()))?
+                    .clone();
+                frame.push(constant_to_object(c));
+            }
+            OpCode::LoadName => {
+                let name = self.name_at(&frame.code, ins.arg)?;
+                let from_ns = frame
+                    .class_namespace
+                    .as_ref()
+                    .and_then(|ns| ns.borrow().get(&DictKey(Object::from_str(&name))).cloned());
+                let v = match from_ns {
+                    Some(v) => v,
+                    None => self.lookup_global_or_builtin(&frame.globals, &name)?,
+                };
+                frame.push(v);
+            }
+            OpCode::LoadGlobal => {
+                let name = self.name_at(&frame.code, ins.arg)?;
+                let v = self.lookup_global_or_builtin(&frame.globals, &name)?;
+                frame.push(v);
+            }
+            OpCode::LoadFast => {
+                let v = frame
+                    .locals
+                    .get(ins.arg as usize)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Internal("bad local index".to_owned()))?;
+                if matches!(v, Object::None)
+                    && frame
+                        .code
+                        .varnames
+                        .get(ins.arg as usize)
+                        .map(|n| !is_param(&frame.code, n))
+                        .unwrap_or(false)
+                {
+                    // It's possible the variable hasn't been
+                    // assigned yet. We push None as a placeholder.
+                }
+                frame.push(v);
+            }
+            OpCode::StoreFast => {
+                let v = frame.pop()?;
+                let slot = ins.arg as usize;
+                if slot < frame.locals.len() {
+                    frame.locals[slot] = v;
+                }
+            }
+            OpCode::DeleteFast => {
+                let slot = ins.arg as usize;
+                if slot < frame.locals.len() {
+                    frame.locals[slot] = Object::None;
+                }
+            }
+            OpCode::StoreName => {
+                let v = frame.pop()?;
+                let name = self.name_at(&frame.code, ins.arg)?;
+                if let Some(ns) = &frame.class_namespace {
+                    ns.borrow_mut().insert(DictKey(Object::from_str(name)), v);
+                } else {
+                    frame
+                        .globals
+                        .borrow_mut()
+                        .insert(DictKey(Object::from_str(name)), v);
+                }
+            }
+            OpCode::StoreGlobal => {
+                let v = frame.pop()?;
+                let name = self.name_at(&frame.code, ins.arg)?;
+                frame
+                    .globals
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(name)), v);
+            }
+            OpCode::DeleteName => {
+                let name = self.name_at(&frame.code, ins.arg)?;
+                if let Some(ns) = &frame.class_namespace {
+                    if ns
+                        .borrow_mut()
+                        .shift_remove(&DictKey(Object::from_str(&name)))
+                        .is_some()
+                    {
+                        return Ok(StepOutcome::Continue);
+                    }
+                }
+                frame
+                    .globals
+                    .borrow_mut()
+                    .shift_remove(&DictKey(Object::from_str(name)));
+            }
+            OpCode::DeleteGlobal => {
+                let name = self.name_at(&frame.code, ins.arg)?;
+                frame
+                    .globals
+                    .borrow_mut()
+                    .shift_remove(&DictKey(Object::from_str(name)));
+            }
+            OpCode::LoadDeref => {
+                let cell = frame
+                    .cells
+                    .get(ins.arg as usize)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Internal("bad cell index".to_owned()))?;
+                let v = cell.borrow().clone();
+                frame.push(v);
+            }
+            OpCode::StoreDeref => {
+                let v = frame.pop()?;
+                let cell = frame
+                    .cells
+                    .get(ins.arg as usize)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Internal("bad cell index".to_owned()))?;
+                *cell.borrow_mut() = v;
+            }
+            OpCode::MakeCell => {
+                let slot = ins.arg as usize;
+                if slot >= frame.cells.len() {
+                    return Err(RuntimeError::Internal(
+                        "MakeCell index out of bounds".to_owned(),
+                    ));
+                }
+            }
+            OpCode::LoadClosure => {
+                let cell = frame
+                    .cells
+                    .get(ins.arg as usize)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Internal("bad cell index".to_owned()))?;
+                frame.push(Object::Cell(cell));
+            }
+            OpCode::LoadAttr => {
+                let obj = frame.pop()?;
+                let name = self.name_at(&frame.code, ins.arg)?;
+                let v = self.load_attr(&obj, &name)?;
+                frame.push(v);
+            }
+            OpCode::StoreAttr => {
+                let obj = frame.pop()?;
+                let val = frame.pop()?;
+                let name = self.name_at(&frame.code, ins.arg)?;
+                self.store_attr(&obj, &name, val)?;
+            }
+            OpCode::DeleteAttr => {
+                let obj = frame.pop()?;
+                let name = self.name_at(&frame.code, ins.arg)?;
+                self.delete_attr(&obj, &name)?;
+            }
+            OpCode::BinarySubscr => {
+                let i = frame.pop()?;
+                let v = frame.pop()?;
+                let r = self.binary_subscr(&v, &i)?;
+                frame.push(r);
+            }
+            OpCode::StoreSubscr => {
+                let i = frame.pop()?;
+                let target = frame.pop()?;
+                let value = frame.pop()?;
+                self.store_subscr(&target, &i, value)?;
+            }
+            OpCode::DeleteSubscr => {
+                let i = frame.pop()?;
+                let target = frame.pop()?;
+                self.delete_subscr(&target, &i)?;
+            }
+            OpCode::BinaryOp => {
+                let b = frame.pop()?;
+                let a = frame.pop()?;
+                let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                let r = self.dispatch_binary_op(&a, &b, kind, &frame.globals)?;
+                frame.push(r);
+            }
+            OpCode::UnaryOp => {
+                let v = frame.pop()?;
+                let kind: UnaryKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                let r = unary_op(&v, kind)?;
+                frame.push(r);
+            }
+            OpCode::CompareOp => {
+                let b = frame.pop()?;
+                let a = frame.pop()?;
+                let kind: CompareKind = unsafe { std::mem::transmute(ins.arg as u8) };
+                let r = self.dispatch_compare_op(&a, &b, kind, &frame.globals)?;
+                frame.push(Object::Bool(r));
+            }
+            OpCode::IsOp => {
+                let b = frame.pop()?;
+                let a = frame.pop()?;
+                let same = a.is_same(&b);
+                let result = if ins.arg == 1 { !same } else { same };
+                frame.push(Object::Bool(result));
+            }
+            OpCode::ContainsOp => {
+                let container = frame.pop()?;
+                let item = frame.pop()?;
+                let found = container.contains(&item)?;
+                let result = if ins.arg == 1 { !found } else { found };
+                frame.push(Object::Bool(result));
+            }
+            OpCode::PopTop => {
+                frame.pop()?;
+            }
+            OpCode::CopyTop => {
+                let v = frame.top()?.clone();
+                frame.push(v);
+            }
+            OpCode::Swap => {
+                let depth = ins.arg as usize;
+                let n = frame.stack.len();
+                if depth >= 1 && depth < n {
+                    frame.stack.swap(n - 1, n - depth);
+                }
+            }
+            OpCode::Call => {
+                let argc = ins.arg as usize;
+                let split_at = frame.stack.len().saturating_sub(argc);
+                let mut args: Vec<Object> = frame.stack.split_off(split_at);
+                let callable = frame.pop()?;
+                // Zero-arg super(): inject __class__ from the free
+                // cell named "__class__" and `self` from local 0.
+                if args.is_empty() && is_super_callable(&callable) {
+                    if let Some(class_cell) = find_cell(frame, "__class__") {
+                        let class_obj = class_cell.borrow().clone();
+                        if !matches!(class_obj, Object::None) {
+                            let self_obj = frame.locals.first().cloned().unwrap_or(Object::None);
+                            args.push(class_obj);
+                            args.push(self_obj);
+                        }
+                    }
+                }
+                let r = self.call(&callable, &args, &[], &frame.globals)?;
+                frame.push(r);
+            }
+            OpCode::CallKw => {
+                let argc = ins.arg as usize;
+                // Stack (top-down): kw_names_tuple, kw_values..., positional_values..., callable
+                let names_obj = frame.pop()?;
+                let names: Vec<String> = match names_obj {
+                    Object::Tuple(items) => items.iter().map(|x| x.to_str()).collect(),
+                    _ => {
+                        return Err(RuntimeError::Internal(
+                            "CallKw expects a tuple of names".to_owned(),
+                        ))
+                    }
+                };
+                let kwc = names.len();
+                let split_kw_at = frame.stack.len().saturating_sub(kwc);
+                let kw_values: Vec<Object> = frame.stack.split_off(split_kw_at);
+                let split_pos_at = frame.stack.len().saturating_sub(argc);
+                let pos_args: Vec<Object> = frame.stack.split_off(split_pos_at);
+                let callable = frame.pop()?;
+                let kw_pairs: Vec<(String, Object)> = names.into_iter().zip(kw_values).collect();
+                let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
+                frame.push(r);
+            }
+            OpCode::ReturnValue => {
+                return Ok(StepOutcome::Return(frame.pop()?));
+            }
+            OpCode::PopJumpIfFalse => {
+                let v = frame.pop()?;
+                if !v.is_truthy() {
+                    frame.pc += ins.arg;
+                }
+            }
+            OpCode::PopJumpIfTrue => {
+                let v = frame.pop()?;
+                if v.is_truthy() {
+                    frame.pc += ins.arg;
+                }
+            }
+            OpCode::JumpForward => {
+                frame.pc += ins.arg;
+            }
+            OpCode::JumpBackward => {
+                frame.pc = frame.pc.saturating_sub(ins.arg);
+            }
+            OpCode::GetIter => {
+                let v = frame.pop()?;
+                let it = self.make_iter(&v, &frame.globals)?;
+                frame.push(it);
+            }
+            OpCode::ForIter => {
+                let it_obj = frame
+                    .stack
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Internal("FOR_ITER no iter".to_owned()))?;
+                let next = match &it_obj {
+                    Object::Iter(it) => it.borrow_mut().next_value(),
+                    Object::Instance(_) => {
+                        // Call __next__; treat StopIteration as exhaustion.
+                        match instance_method(&it_obj, "__next__") {
+                            Some(m) => match self.call(&m, &[], &[], &frame.globals) {
+                                Ok(v) => Some(v),
+                                Err(RuntimeError::PyException(exc))
+                                    if exc.type_name() == "StopIteration" =>
+                                {
+                                    None
+                                }
+                                Err(e) => return Err(e),
+                            },
+                            None => {
+                                return Err(type_error(
+                                    "iter() returned non-iterator without __next__",
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(RuntimeError::Internal(
+                            "FOR_ITER expects iterator on stack".to_owned(),
+                        ))
+                    }
+                };
+                match next {
+                    Some(v) => frame.push(v),
+                    None => {
+                        frame.pop()?;
+                        frame.pc += ins.arg;
+                    }
+                }
+            }
+            OpCode::EndFor => {
+                // Iterator was already popped by the exhausted
+                // branch of FOR_ITER. Nothing to do.
+            }
+            OpCode::BuildList => {
+                let n = ins.arg as usize;
+                let split = frame.stack.len().saturating_sub(n);
+                let items = frame.stack.split_off(split);
+                frame.push(Object::new_list(items));
+            }
+            OpCode::BuildTuple => {
+                let n = ins.arg as usize;
+                let split = frame.stack.len().saturating_sub(n);
+                let items = frame.stack.split_off(split);
+                frame.push(Object::new_tuple(items));
+            }
+            OpCode::BuildSet => {
+                // No native set yet — represent as list-deduped value
+                // wrapped in a dict whose values are None.
+                let n = ins.arg as usize;
+                let split = frame.stack.len().saturating_sub(n);
+                let items = frame.stack.split_off(split);
+                let mut d = DictData::new();
+                for x in items {
+                    d.insert(DictKey(x), Object::None);
+                }
+                frame.push(Object::Dict(Rc::new(RefCell::new(d))));
+            }
+            OpCode::BuildMap => {
+                let n = ins.arg as usize;
+                let split = frame.stack.len().saturating_sub(2 * n);
+                let pairs = frame.stack.split_off(split);
+                let mut d = DictData::new();
+                let mut it = pairs.into_iter();
+                for _ in 0..n {
+                    let k = it.next().ok_or_else(|| {
+                        RuntimeError::Internal("BUILD_MAP missing key".to_owned())
+                    })?;
+                    let v = it.next().ok_or_else(|| {
+                        RuntimeError::Internal("BUILD_MAP missing value".to_owned())
+                    })?;
+                    d.insert(DictKey(k), v);
+                }
+                frame.push(Object::Dict(Rc::new(RefCell::new(d))));
+            }
+            OpCode::BuildString => {
+                let n = ins.arg as usize;
+                let split = frame.stack.len().saturating_sub(n);
+                let parts = frame.stack.split_off(split);
+                let mut s = String::new();
+                for p in parts {
+                    s.push_str(&p.to_str());
+                }
+                frame.push(Object::from_str(s));
+            }
+            OpCode::ListAppend => {
+                let v = frame.pop()?;
+                let depth = ins.arg as usize;
+                let lst = frame
+                    .stack
+                    .get(frame.stack.len().wrapping_sub(depth))
+                    .cloned()
+                    .ok_or_else(|| {
+                        RuntimeError::Internal("LIST_APPEND depth out of range".to_owned())
+                    })?;
+                if let Object::List(lst) = lst {
+                    lst.borrow_mut().push(v);
+                } else {
+                    return Err(RuntimeError::Internal(
+                        "LIST_APPEND target is not a list".to_owned(),
+                    ));
+                }
+            }
+            OpCode::SetAdd => {
+                let v = frame.pop()?;
+                let depth = ins.arg as usize;
+                let s = frame
+                    .stack
+                    .get(frame.stack.len().wrapping_sub(depth))
+                    .cloned()
+                    .ok_or_else(|| {
+                        RuntimeError::Internal("SET_ADD depth out of range".to_owned())
+                    })?;
+                if let Object::Dict(d) = s {
+                    d.borrow_mut().insert(DictKey(v), Object::None);
+                }
+            }
+            OpCode::MapAdd => {
+                let v = frame.pop()?;
+                let k = frame.pop()?;
+                let depth = ins.arg as usize;
+                let d = frame
+                    .stack
+                    .get(frame.stack.len().wrapping_sub(depth))
+                    .cloned()
+                    .ok_or_else(|| {
+                        RuntimeError::Internal("MAP_ADD depth out of range".to_owned())
+                    })?;
+                if let Object::Dict(d) = d {
+                    d.borrow_mut().insert(DictKey(k), v);
+                }
+            }
+            OpCode::UnpackSequence => {
+                let n = ins.arg as usize;
+                let v = frame.pop()?;
+                let items: Vec<Object> = match v {
+                    Object::Tuple(items) => items.iter().cloned().collect(),
+                    Object::List(items) => items.borrow().clone(),
+                    Object::Str(s) => s.chars().map(|c| Object::from_str(c.to_string())).collect(),
+                    Object::Range(r) => {
+                        let mut out = Vec::new();
+                        let mut cur = r.start;
+                        while (r.step > 0 && cur < r.stop) || (r.step < 0 && cur > r.stop) {
+                            out.push(Object::Int(cur));
+                            cur += r.step;
+                        }
+                        out
+                    }
+                    _ => {
+                        return Err(type_error(format!(
+                            "cannot unpack non-iterable {} object",
+                            v.type_name()
+                        )))
+                    }
+                };
+                if items.len() != n {
+                    return Err(value_error(format!(
+                        "expected {} values to unpack, got {}",
+                        n,
+                        items.len()
+                    )));
+                }
+                // Push in reverse so the first element ends up
+                // at the lowest stack position — matches the
+                // grouped STORE_FAST sequence emitted by the
+                // compiler.
+                for x in items.into_iter().rev() {
+                    frame.push(x);
+                }
+            }
+            OpCode::MakeFunction => {
+                let code_obj = frame.pop()?;
+                let code = match code_obj {
+                    Object::Code(c) => c,
+                    _ => {
+                        return Err(RuntimeError::Internal(
+                            "MAKE_FUNCTION expects code on top".to_owned(),
+                        ))
+                    }
+                };
+                let flags = ins.arg;
+                let mut closure: Vec<Object> = Vec::new();
+                if flags & 0x08 != 0 {
+                    let tup = frame.pop()?;
+                    if let Object::Tuple(items) = tup {
+                        closure = items.iter().cloned().collect();
+                    }
+                }
+                if flags & 0x04 != 0 {
+                    frame.pop()?; // annotations dict — discarded
+                }
+                if flags & 0x02 != 0 {
+                    frame.pop()?; // kw defaults dict — discarded
+                }
+                let mut defaults: Vec<Object> = Vec::new();
+                if flags & 0x01 != 0 {
+                    let tup = frame.pop()?;
+                    if let Object::Tuple(items) = tup {
+                        defaults = items.iter().cloned().collect();
+                    }
+                }
+                let name = code.name.clone();
+                let f = PyFunction {
+                    name,
+                    code,
+                    globals: frame.globals.clone(),
+                    defaults,
+                    kw_defaults: Vec::new(),
+                    closure,
+                };
+                frame.push(Object::Function(Rc::new(f)));
+            }
+            OpCode::BuildSlice => {
+                let step = frame.pop()?;
+                let stop = frame.pop()?;
+                let start = frame.pop()?;
+                frame.push(Object::Slice(Rc::new(PySlice { start, stop, step })));
+            }
+            OpCode::PrintExpr => {
+                let v = frame.pop()?;
+                if !matches!(v, Object::None) {
+                    let mut sink = self.stdout.borrow_mut();
+                    let _ = writeln!(sink, "{}", v.repr());
+                }
+            }
+            OpCode::LoadBuildClass => {
+                let f = builtins::build_class_builtin();
+                frame.push(Object::Builtin(Rc::new(f)));
+            }
+            OpCode::LoadClassderef => {
+                let idx = ins.arg as usize;
+                let free_offset = frame.code.cellvars.len();
+                let free_index = idx.saturating_sub(free_offset);
+                let name = frame
+                    .code
+                    .freevars
+                    .get(free_index)
+                    .cloned()
+                    .unwrap_or_default();
+                let from_ns = frame
+                    .class_namespace
+                    .as_ref()
+                    .and_then(|ns| ns.borrow().get(&DictKey(Object::from_str(&name))).cloned());
+                let v = match from_ns {
+                    Some(v) => v,
+                    None => {
+                        let cell =
+                            frame.cells.get(idx).cloned().ok_or_else(|| {
+                                RuntimeError::Internal("bad cell index".to_owned())
+                            })?;
+                        let v = cell.borrow().clone();
+                        v
+                    }
+                };
+                frame.push(v);
+            }
+            OpCode::RaiseVarargs => {
+                let exc = match ins.arg {
+                    0 => {
+                        // Re-raise the currently-handled exception.
+                        let top = frame
+                            .exc_handlers
+                            .last()
+                            .cloned()
+                            .ok_or_else(|| runtime_error("No active exception to re-raise"))?;
+                        top
+                    }
+                    1 => {
+                        let arg = frame.pop()?;
+                        Self::normalize_exception(arg, None)?
+                    }
+                    2 => {
+                        let cause = frame.pop()?;
+                        let arg = frame.pop()?;
+                        Self::normalize_exception(arg, Some(cause))?
+                    }
+                    other => {
+                        return Err(RuntimeError::Internal(format!(
+                            "RAISE_VARARGS arg out of range: {other}"
+                        )))
+                    }
+                };
+                return Err(RuntimeError::PyException(exc));
+            }
+            OpCode::CheckExcMatch => {
+                // Stack on entry: [exc, type_or_tuple]
+                // CPython's CHECK_EXC_MATCH pops `type` and peeks
+                // `exc`. We push a bool onto the stack and leave
+                // `exc` in place so the handler can bind it.
+                let ty = frame.pop()?;
+                let exc =
+                    frame.stack.last().cloned().ok_or_else(|| {
+                        RuntimeError::Internal("CHECK_EXC_MATCH no exc".to_owned())
+                    })?;
+                let matched = self.exception_matches(&exc, &ty)?;
+                frame.push(Object::Bool(matched));
+            }
+            OpCode::PushExcInfo => {
+                // The handler entry leaves the exception on top —
+                // we record it for the duration of the handler.
+                let exc = frame.top()?.clone();
+                if let Object::Instance(_) = &exc {
+                    let pe = PyException::new(exc);
+                    frame.exc_handlers.push(pe);
+                }
+            }
+            OpCode::PopExcept => {
+                frame.exc_handlers.pop();
+            }
+            OpCode::Reraise => {
+                let exc = if ins.arg == 0 {
+                    frame.pop()?
+                } else {
+                    // `RERAISE 1` re-raises the currently-active exc.
+                    let exc = frame
+                        .exc_handlers
+                        .last()
+                        .map(|pe| pe.instance.clone())
+                        .ok_or_else(|| runtime_error("No active exception to re-raise"))?;
+                    exc
+                };
+                let pe = Self::normalize_exception(exc, None)?;
+                return Err(RuntimeError::PyException(pe));
+            }
+            OpCode::BeforeWith => {
+                let cm = frame.pop()?;
+                let exit_method = self.load_attr(&cm, "__exit__")?;
+                let enter_method = self.load_attr(&cm, "__enter__")?;
+                let entered = self.call(&enter_method, &[], &[], &frame.globals)?;
+                // Stack on exit: [exit_method, entered_value]
+                frame.push(exit_method);
+                frame.push(entered);
+            }
+            OpCode::WithExceptStart => {
+                // Stack on entry (top → bottom): [exc, exit]
+                // We call exit(type(exc), exc, None) and push the
+                // result, leaving exc and exit beneath.
+                let exc = frame
+                    .stack
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Internal("WITH_EXCEPT_START".to_owned()))?;
+                let exit_method = frame
+                    .stack
+                    .get(frame.stack.len().wrapping_sub(2))
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Internal("WITH_EXCEPT_START".to_owned()))?;
+                let ty = match &exc {
+                    Object::Instance(inst) => Object::Type(inst.class.clone()),
+                    _ => Object::None,
+                };
+                let result =
+                    self.call(&exit_method, &[ty, exc, Object::None], &[], &frame.globals)?;
+                frame.push(result);
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    // ---------- exception handling ----------
+
+    /// Look up a handler for `exc` at the current pc. If found,
+    /// truncate the stack and jump to the handler. Otherwise propagate.
+    fn handle_exception(
+        &self,
+        frame: &mut Frame,
+        mut exc: PyException,
+    ) -> Result<Option<()>, RuntimeError> {
+        // Note `pc` was already advanced past the raising instruction,
+        // so the protected range matches against `pc - 1`.
+        let raise_pc = frame.pc.saturating_sub(1);
+        if let Some(handler) = find_handler(&frame.code.exception_table, raise_pc) {
+            // Drop entries above the recorded stack depth.
+            while frame.stack.len() > handler.depth as usize {
+                frame.stack.pop();
+            }
+            // Push the exception instance for the handler to bind /
+            // CHECK_EXC_MATCH to inspect.
+            frame.stack.push(exc.instance.clone());
+            frame.pc = handler.handler;
+            return Ok(Some(()));
+        }
+        // Record this frame in the traceback and propagate.
+        let line = frame
+            .code
+            .linetable
+            .get(raise_pc as usize)
+            .copied()
+            .unwrap_or(0);
+        exc.push_traceback(TracebackEntry {
+            filename: frame.code.filename.clone(),
+            funcname: frame.code.name.clone(),
+            lineno: line,
+        });
+        Err(RuntimeError::PyException(exc))
+    }
+
+    /// Materialise a raised value into a [`PyException`]. Accepts an
+    /// exception class (instantiates it) or an instance.
+    fn normalize_exception(
+        value: Object,
+        cause: Option<Object>,
+    ) -> Result<PyException, RuntimeError> {
+        let bt = builtin_types();
+        let inst = match value {
+            Object::Type(t) => {
+                if !t.flags.is_exception {
+                    return Err(type_error(format!(
+                        "exceptions must derive from BaseException, not '{}'",
+                        t.name
+                    )));
+                }
+                make_exception_with_class(t, "")
+            }
+            Object::Instance(inst) => {
+                if !inst.class.flags.is_exception && !inst.class.is_subclass_of(&bt.base_exception)
+                {
+                    return Err(type_error("exceptions must derive from BaseException"));
+                }
+                Object::Instance(inst)
+            }
+            other => {
+                return Err(type_error(format!(
+                    "exceptions must derive from BaseException, not '{}'",
+                    other.type_name()
+                )));
+            }
+        };
+        let mut pe = PyException::new(inst);
+        if let Some(c) = cause {
+            let cpe = Self::normalize_exception(c, None)?;
+            pe.cause = Some(Box::new(cpe));
+        }
+        Ok(pe)
+    }
+
+    /// `True` if `exc`'s class is a subclass of the given type or any
+    /// element of a tuple of types.
+    fn exception_matches(&self, exc: &Object, ty: &Object) -> Result<bool, RuntimeError> {
+        match ty {
+            Object::Type(t) => Ok(instance_is_subclass(exc, t)),
+            Object::Tuple(items) => {
+                for t in items.iter() {
+                    if let Object::Type(t) = t {
+                        if instance_is_subclass(exc, t) {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
+            }
+            _ => Err(type_error(
+                "catching classes that do not inherit from BaseException is not allowed",
+            )),
         }
     }
 
@@ -692,21 +1008,310 @@ impl Interpreter {
     }
 
     fn load_attr(&self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
-        if let Some(method) = self.lookup_method(obj, name) {
-            return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                receiver: obj.clone(),
-                function: method,
-            })));
+        match obj {
+            Object::Instance(inst) => {
+                // Super proxies stash the real receiver under
+                // `__self__`. Re-bind methods looked up via the proxy
+                // so they run against the right `self`.
+                let super_receiver = inst
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("__self__")))
+                    .cloned();
+                if name != "__self__" {
+                    if let Some(receiver) = super_receiver {
+                        if let Some(v) = inst.class.lookup(name) {
+                            return Ok(self.maybe_bind(&receiver, v));
+                        }
+                        return Err(attribute_error(format!(
+                            "'super' object has no attribute '{}'",
+                            name
+                        )));
+                    }
+                }
+                if let Some(v) = inst.dict.borrow().get(&DictKey(Object::from_str(name))) {
+                    return Ok(v.clone());
+                }
+                if let Some(v) = inst.class.lookup(name) {
+                    return Ok(self.maybe_bind(obj, v));
+                }
+                Err(attribute_error(format!(
+                    "'{}' object has no attribute '{}'",
+                    inst.class.name, name
+                )))
+            }
+            Object::Type(ty) => {
+                if let Some(v) = ty.lookup(name) {
+                    return Ok(v);
+                }
+                match name {
+                    "__name__" => return Ok(Object::from_str(&ty.name)),
+                    "__qualname__" => return Ok(Object::from_str(&ty.name)),
+                    "__bases__" => {
+                        let bases = ty.bases.iter().map(|b| Object::Type(b.clone())).collect();
+                        return Ok(Object::new_tuple(bases));
+                    }
+                    "__mro__" => {
+                        let mro = ty
+                            .mro
+                            .borrow()
+                            .iter()
+                            .map(|b| Object::Type(b.clone()))
+                            .collect();
+                        return Ok(Object::new_tuple(mro));
+                    }
+                    _ => {}
+                }
+                Err(attribute_error(format!(
+                    "type object '{}' has no attribute '{}'",
+                    ty.name, name
+                )))
+            }
+            _ => {
+                if let Some(method) = self.lookup_method(obj, name) {
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: obj.clone(),
+                        function: method,
+                    })));
+                }
+                Err(attribute_error(format!(
+                    "'{}' object has no attribute '{}'",
+                    obj.type_name(),
+                    name
+                )))
+            }
         }
-        Err(attribute_error(format!(
-            "'{}' object has no attribute '{}'",
-            obj.type_name(),
-            name
-        )))
+    }
+
+    fn maybe_bind(&self, receiver: &Object, attr: Object) -> Object {
+        match &attr {
+            Object::Function(_) | Object::Builtin(_) => Object::BoundMethod(Rc::new(BoundMethod {
+                receiver: receiver.clone(),
+                function: attr,
+            })),
+            _ => attr,
+        }
     }
 
     fn lookup_method(&self, obj: &Object, name: &str) -> Option<Object> {
         builtins::lookup_method(obj, name)
+    }
+
+    /// `print(*args, sep=' ', end='\n', file=...)`. We honour `sep`
+    /// and `end` from kwargs; `file` is ignored (always our stdout).
+    fn do_print(
+        &mut self,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let mut sep = String::from(" ");
+        let mut end = String::from("\n");
+        for (k, v) in kwargs {
+            match k.as_str() {
+                "sep" => sep = v.to_str(),
+                "end" => end = v.to_str(),
+                "file" | "flush" => {}
+                other => {
+                    return Err(type_error(format!(
+                        "'{other}' is an invalid keyword argument for print()"
+                    )))
+                }
+            }
+        }
+        let mut sink = self.stdout.borrow_mut();
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                let _ = write!(sink, "{sep}");
+            }
+            drop(sink);
+            let s = self.stringify(a, globals)?;
+            sink = self.stdout.borrow_mut();
+            let _ = write!(sink, "{s}");
+        }
+        let _ = write!(sink, "{end}");
+        Ok(Object::None)
+    }
+
+    fn do_str_call(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        Ok(Object::from_str(self.stringify(v, globals)?))
+    }
+
+    fn do_repr_call(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        Ok(Object::from_str(self.repr_of(v, globals)?))
+    }
+
+    fn do_len_call(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        if let Some(method) = instance_method(v, "__len__") {
+            let r = self.call(&method, &[], &[], globals)?;
+            return match r {
+                Object::Int(i) => Ok(Object::Int(i)),
+                other => Err(type_error(format!(
+                    "'__len__' should return int, not '{}'",
+                    other.type_name()
+                ))),
+            };
+        }
+        Ok(Object::Int(v.len()? as i64))
+    }
+
+    /// Run `__str__` on instances, falling back to `__repr__` then
+    /// the default. Built-in types use their existing `to_str`.
+    fn stringify(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<String, RuntimeError> {
+        if let Object::Instance(_) = v {
+            if let Some(method) = instance_method(v, "__str__") {
+                let r = self.call(&method, &[], &[], globals)?;
+                return Ok(r.to_str());
+            }
+            return self.repr_of(v, globals);
+        }
+        Ok(v.to_str())
+    }
+
+    fn repr_of(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<String, RuntimeError> {
+        if let Object::Instance(_) = v {
+            if let Some(method) = instance_method(v, "__repr__") {
+                let r = self.call(&method, &[], &[], globals)?;
+                return Ok(r.to_str());
+            }
+        }
+        Ok(v.repr())
+    }
+
+    /// Either build a native iterator (for built-ins) or call
+    /// `__iter__` and return whatever the user method produced.
+    fn make_iter(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        match v {
+            Object::Instance(_) => {
+                if let Some(method) = instance_method(v, "__iter__") {
+                    return self.call(&method, &[], &[], globals);
+                }
+                Err(type_error(format!(
+                    "'{}' object is not iterable",
+                    v.type_name_owned()
+                )))
+            }
+            _ => {
+                let it = v.make_iter()?;
+                Ok(Object::Iter(Rc::new(RefCell::new(it))))
+            }
+        }
+    }
+
+    fn dispatch_binary_op(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: BinOpKind,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let (dunder, rdunder) = binop_dunders(op);
+        // `a.__op__(b)` first, then `b.__rop__(a)` if it returns
+        // NotImplemented. Our slice treats "no method" as
+        // NotImplemented and the missing-symmetric falls through to
+        // [`binary_op`] for built-in types.
+        if let Some(method) = instance_method(a, dunder) {
+            return self.call(&method, std::slice::from_ref(b), &[], globals);
+        }
+        if let Some(method) = instance_method(b, rdunder) {
+            return self.call(&method, std::slice::from_ref(a), &[], globals);
+        }
+        binary_op(a, b, op)
+    }
+
+    fn dispatch_compare_op(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        let (dunder, swapped) = cmp_dunder(op);
+        if let Some(method) = instance_method(a, dunder) {
+            let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
+            return Ok(r.is_truthy());
+        }
+        if let Some(method) = instance_method(b, swapped) {
+            let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
+            return Ok(r.is_truthy());
+        }
+        compare_op(a, b, op)
+    }
+
+    fn store_attr(&self, obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
+        match obj {
+            Object::Instance(inst) => {
+                inst.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(name)), value);
+                Ok(())
+            }
+            Object::Type(ty) => {
+                if ty.flags.is_builtin {
+                    return Err(type_error(format!(
+                        "cannot set '{name}' attribute of immutable type '{}'",
+                        ty.name
+                    )));
+                }
+                ty.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(name)), value);
+                Ok(())
+            }
+            _ => Err(type_error(format!(
+                "'{}' object has no attribute '{}'",
+                obj.type_name(),
+                name
+            ))),
+        }
+    }
+
+    fn delete_attr(&self, obj: &Object, name: &str) -> Result<(), RuntimeError> {
+        match obj {
+            Object::Instance(inst) => {
+                if inst
+                    .dict
+                    .borrow_mut()
+                    .shift_remove(&DictKey(Object::from_str(name)))
+                    .is_none()
+                {
+                    return Err(attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.class.name, name
+                    )));
+                }
+                Ok(())
+            }
+            _ => Err(type_error(format!(
+                "'{}' object has no attribute '{}'",
+                obj.type_name(),
+                name
+            ))),
+        }
     }
 
     fn binary_subscr(&self, container: &Object, index: &Object) -> Result<Object, RuntimeError> {
@@ -816,6 +1421,21 @@ impl Interpreter {
         let _ = outer_globals;
         match callable {
             Object::Builtin(b) => {
+                if b.name == builtins::BUILD_CLASS_NAME {
+                    return self.build_class(args, kwargs);
+                }
+                if b.name == "print" {
+                    return self.do_print(args, kwargs, outer_globals);
+                }
+                if b.name == "str" && args.len() == 1 {
+                    return self.do_str_call(&args[0], outer_globals);
+                }
+                if b.name == "repr" && args.len() == 1 {
+                    return self.do_repr_call(&args[0], outer_globals);
+                }
+                if b.name == "len" && args.len() == 1 {
+                    return self.do_len_call(&args[0], outer_globals);
+                }
                 if !kwargs.is_empty() {
                     return Err(type_error(format!(
                         "builtin '{}' does not accept keyword arguments",
@@ -831,10 +1451,174 @@ impl Interpreter {
                 combined.extend_from_slice(args);
                 self.call(&bm.function, &combined, kwargs, outer_globals)
             }
+            Object::Type(ty) => self.instantiate(ty.clone(), args, kwargs),
+            Object::Instance(inst) => {
+                // Honour __call__ if defined.
+                if let Some(m) = inst.class.lookup("__call__") {
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: Object::Instance(inst.clone()),
+                        function: m,
+                    }));
+                    self.call(&bound, args, kwargs, outer_globals)
+                } else {
+                    Err(type_error(format!(
+                        "'{}' object is not callable",
+                        inst.class.name
+                    )))
+                }
+            }
             _ => Err(type_error(format!(
                 "'{}' object is not callable",
                 callable.type_name()
             ))),
+        }
+    }
+
+    /// Run a `class` statement.
+    ///
+    /// `args[0]` is the class body function, `args[1]` is the class
+    /// name, and the rest are explicit bases. Keyword arguments carry
+    /// `metaclass=` and similar (unsupported here).
+    fn build_class(
+        &mut self,
+        args: &[Object],
+        _kwargs: &[(String, Object)],
+    ) -> Result<Object, RuntimeError> {
+        if args.len() < 2 {
+            return Err(type_error("__build_class__ takes at least 2 args"));
+        }
+        let body_fn = match &args[0] {
+            Object::Function(f) => f.clone(),
+            _ => return Err(type_error("__build_class__ arg 1 must be a function")),
+        };
+        let name = match &args[1] {
+            Object::Str(s) => s.to_string(),
+            _ => return Err(type_error("__build_class__ arg 2 must be a str")),
+        };
+        let mut bases: Vec<Rc<TypeObject>> = Vec::new();
+        for b in &args[2..] {
+            match b {
+                Object::Type(t) => bases.push(t.clone()),
+                other => {
+                    return Err(type_error(format!(
+                        "base of class '{}' must be a class, got '{}'",
+                        name,
+                        other.type_name()
+                    )));
+                }
+            }
+        }
+        if bases.is_empty() {
+            bases.push(builtin_types().object_.clone());
+        }
+        let class_ns = Rc::new(RefCell::new(DictData::new()));
+        {
+            let mut ns = class_ns.borrow_mut();
+            ns.insert(
+                DictKey(Object::from_static("__name__")),
+                Object::from_str(&name),
+            );
+            ns.insert(
+                DictKey(Object::from_static("__qualname__")),
+                Object::from_str(&name),
+            );
+        }
+        // Build a frame for the class body. Locals are unused; names
+        // store and load through `class_ns`. The body's `__class__`
+        // cell is captured so methods can reference it.
+        let code = body_fn.code.clone();
+        let mut frame = self.make_frame(
+            code,
+            Vec::new(),
+            body_fn.closure.clone(),
+            body_fn.globals.clone(),
+            false,
+        );
+        frame.class_namespace = Some(class_ns.clone());
+        let _ = self.run_frame(&mut frame)?;
+        let dict = class_ns.borrow().clone();
+        let ty = TypeObject::new_user(&name, bases, dict)?;
+        // If the body produced a `__class__` cell (because a method
+        // references super or __class__), point it at the new type.
+        for (i, cell_name) in body_fn.code.cellvars.iter().enumerate() {
+            if cell_name == "__class__" {
+                if let Some(cell) = frame.cells.get(i) {
+                    *cell.borrow_mut() = Object::Type(ty.clone());
+                }
+            }
+        }
+        Ok(Object::Type(ty))
+    }
+
+    /// Allocate an instance of `cls` and call `__init__` if defined.
+    fn instantiate(
+        &mut self,
+        cls: Rc<TypeObject>,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+    ) -> Result<Object, RuntimeError> {
+        // Built-in conversion types route to the underlying builtin
+        // function so `int("3")`, `range(5)`, `list(xs)` keep working.
+        if cls.flags.is_builtin {
+            if let Some(builtin) = self.builtin_constructor_for(&cls) {
+                if !kwargs.is_empty() {
+                    return Err(type_error(format!(
+                        "{}() does not accept keyword arguments",
+                        cls.name
+                    )));
+                }
+                return (builtin.call)(args);
+            }
+            if cls.flags.is_exception {
+                return Ok(self.build_exception_instance(cls, args));
+            }
+        }
+        let instance = Object::Instance(Rc::new(PyInstance::new(cls.clone())));
+        if let Some(init) = cls.lookup("__init__") {
+            let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                receiver: instance.clone(),
+                function: init,
+            }));
+            let result = self.call(
+                &bound,
+                args,
+                kwargs,
+                &Rc::new(RefCell::new(DictData::new())),
+            )?;
+            if !matches!(result, Object::None) {
+                return Err(type_error(format!(
+                    "__init__() should return None, not '{}'",
+                    result.type_name()
+                )));
+            }
+        } else if !args.is_empty() || !kwargs.is_empty() {
+            return Err(type_error(format!("{}() takes no arguments", cls.name)));
+        }
+        Ok(instance)
+    }
+
+    /// Construct a built-in exception instance carrying `args` as the
+    /// canonical Python `.args` tuple. Used by both `raise` and
+    /// explicit `ExceptionClass(...)` calls.
+    fn build_exception_instance(&self, cls: Rc<TypeObject>, args: &[Object]) -> Object {
+        let inst = PyInstance::new(cls);
+        let args_tuple = Object::new_tuple(args.to_vec());
+        let mut dict = inst.dict.borrow_mut();
+        dict.insert(DictKey(Object::from_static("args")), args_tuple);
+        if let Some(first) = args.first() {
+            dict.insert(DictKey(Object::from_static("message")), first.clone());
+        }
+        drop(dict);
+        Object::Instance(Rc::new(inst))
+    }
+
+    /// Look up the existing built-in callable that mirrors `cls`'s
+    /// constructor — `int`, `range`, `list`, etc.
+    fn builtin_constructor_for(&self, cls: &TypeObject) -> Option<Rc<BuiltinFn>> {
+        let key = DictKey(Object::from_str(&cls.name));
+        match self.builtins.borrow().get(&key).cloned() {
+            Some(Object::Builtin(b)) => Some(b),
+            _ => None,
         }
     }
 
@@ -982,6 +1766,85 @@ fn normalize_index(i: i64, len: usize) -> Result<usize, RuntimeError> {
         return Err(index_error("index out of range"));
     }
     Ok(idx as usize)
+}
+
+/// Outcome of executing a single instruction.
+enum StepOutcome {
+    Continue,
+    Return(Object),
+}
+
+/// If `obj` is an instance and its class defines `name`, return the
+/// bound method. Used by dunder dispatch to avoid the full
+/// `load_attr` codepath (and the AttributeError if missing).
+fn instance_method(obj: &Object, name: &str) -> Option<Object> {
+    let inst = match obj {
+        Object::Instance(i) => i.clone(),
+        _ => return None,
+    };
+    let m = inst.class.lookup(name)?;
+    Some(Object::BoundMethod(Rc::new(BoundMethod {
+        receiver: Object::Instance(inst),
+        function: m,
+    })))
+}
+
+fn binop_dunders(op: BinOpKind) -> (&'static str, &'static str) {
+    use BinOpKind as B;
+    match op {
+        B::Add => ("__add__", "__radd__"),
+        B::Sub => ("__sub__", "__rsub__"),
+        B::Mult => ("__mul__", "__rmul__"),
+        B::MatMult => ("__matmul__", "__rmatmul__"),
+        B::Div => ("__truediv__", "__rtruediv__"),
+        B::FloorDiv => ("__floordiv__", "__rfloordiv__"),
+        B::Mod => ("__mod__", "__rmod__"),
+        B::Pow => ("__pow__", "__rpow__"),
+        B::LShift => ("__lshift__", "__rlshift__"),
+        B::RShift => ("__rshift__", "__rrshift__"),
+        B::BitOr => ("__or__", "__ror__"),
+        B::BitXor => ("__xor__", "__rxor__"),
+        B::BitAnd => ("__and__", "__rand__"),
+    }
+}
+
+fn cmp_dunder(op: CompareKind) -> (&'static str, &'static str) {
+    use CompareKind as C;
+    match op {
+        C::Eq => ("__eq__", "__eq__"),
+        C::NotEq => ("__ne__", "__ne__"),
+        C::Lt => ("__lt__", "__gt__"),
+        C::LtE => ("__le__", "__ge__"),
+        C::Gt => ("__gt__", "__lt__"),
+        C::GtE => ("__ge__", "__le__"),
+    }
+}
+
+fn find_handler(table: &[ExcHandler], pc: u32) -> Option<&ExcHandler> {
+    // Innermost-first: nested `compile_try` calls push the inner
+    // entry before the outer one, so a forward scan finds the
+    // tightest range first.
+    table.iter().find(|h| pc >= h.start && pc < h.end)
+}
+
+fn is_super_callable(obj: &Object) -> bool {
+    matches!(obj, Object::Builtin(b) if b.name == "super")
+}
+
+fn find_cell(frame: &Frame, name: &str) -> Option<Rc<RefCell<Object>>> {
+    let cells = &frame.cells;
+    let cellvars = &frame.code.cellvars;
+    let freevars = &frame.code.freevars;
+    cellvars
+        .iter()
+        .position(|n| n == name)
+        .or_else(|| {
+            freevars
+                .iter()
+                .position(|n| n == name)
+                .map(|i| i + cellvars.len())
+        })
+        .and_then(|idx| cells.get(idx).cloned())
 }
 
 fn is_param(code: &CodeObject, name: &str) -> bool {
@@ -1166,7 +2029,6 @@ fn promote_bool(o: &Object) -> Object {
 
 // ---------- public re-exports ----------
 
-pub use error::{PyException, RuntimeError};
 pub use object::Object as Value;
 
 #[cfg(test)]
@@ -1245,5 +2107,161 @@ mod tests {
     fn fibonacci() {
         let src = "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\nprint(fib(10))\n";
         assert_eq!(run(src), "55\n");
+    }
+
+    #[test]
+    fn simple_class() {
+        let src = "class Greeter:\n    def __init__(self, name):\n        self.name = name\n    def hello(self):\n        return 'hello, ' + self.name\ng = Greeter('Owen')\nprint(g.hello())\n";
+        assert_eq!(run(src), "hello, Owen\n");
+    }
+
+    #[test]
+    fn class_attribute_default() {
+        let src = "class C:\n    x = 1\nc = C()\nprint(c.x)\n";
+        assert_eq!(run(src), "1\n");
+    }
+
+    #[test]
+    fn single_inheritance() {
+        let src = "class Animal:\n    def speak(self):\n        return 'generic'\nclass Dog(Animal):\n    def speak(self):\n        return 'woof'\nprint(Dog().speak())\nprint(Animal().speak())\n";
+        assert_eq!(run(src), "woof\ngeneric\n");
+    }
+
+    #[test]
+    fn isinstance_with_class() {
+        let src = "class A: pass\nclass B(A): pass\nb = B()\nprint(isinstance(b, A))\nprint(isinstance(b, B))\nprint(isinstance(1, int))\n";
+        assert_eq!(run(src), "True\nTrue\nTrue\n");
+    }
+
+    #[test]
+    fn try_except_catches() {
+        let src = "try:\n    raise ValueError('boom')\nexcept ValueError as e:\n    print('caught', e.args[0])\n";
+        assert_eq!(run(src), "caught boom\n");
+    }
+
+    #[test]
+    fn try_finally_runs() {
+        let src = "x = 0\ntry:\n    x = 1\nfinally:\n    x = x + 10\nprint(x)\n";
+        assert_eq!(run(src), "11\n");
+    }
+
+    #[test]
+    fn raise_propagates_from_function() {
+        let src = "def boom():\n    raise ValueError('nope')\ntry:\n    boom()\nexcept ValueError:\n    print('handled')\n";
+        assert_eq!(run(src), "handled\n");
+    }
+
+    #[test]
+    fn with_statement_calls_exit() {
+        let src = "class CM:\n    def __enter__(self):\n        print('enter')\n        return self\n    def __exit__(self, t, v, tb):\n        print('exit')\nwith CM() as c:\n    print('body')\n";
+        assert_eq!(run(src), "enter\nbody\nexit\n");
+    }
+
+    #[test]
+    fn except_does_not_match_other() {
+        let src = "try:\n    raise KeyError('k')\nexcept ValueError:\n    print('value')\nexcept KeyError:\n    print('key')\n";
+        assert_eq!(run(src), "key\n");
+    }
+
+    #[test]
+    fn dunder_add_dispatch() {
+        let src = "class Vec:\n    def __init__(self, x):\n        self.x = x\n    def __add__(self, other):\n        return Vec(self.x + other.x)\nv = Vec(2) + Vec(3)\nprint(v.x)\n";
+        assert_eq!(run(src), "5\n");
+    }
+
+    #[test]
+    fn dunder_repr_used_by_print() {
+        let src = "class P:\n    def __repr__(self):\n        return 'P!'\nprint(P())\n";
+        assert_eq!(run(src), "P!\n");
+    }
+
+    #[test]
+    fn dunder_str_overrides_repr() {
+        let src = concat!(
+            "class P:\n",
+            "    def __repr__(self):\n",
+            "        return 'P-repr'\n",
+            "    def __str__(self):\n",
+            "        return 'P-str'\n",
+            "print(P())\n",
+            "print(repr(P()))\n"
+        );
+        assert_eq!(run(src), "P-str\nP-repr\n");
+    }
+
+    #[test]
+    fn dunder_len_dispatch() {
+        let src = concat!(
+            "class C:\n",
+            "    def __len__(self):\n",
+            "        return 7\n",
+            "print(len(C()))\n"
+        );
+        assert_eq!(run(src), "7\n");
+    }
+
+    #[test]
+    fn super_two_arg_form() {
+        let src = concat!(
+            "class A:\n",
+            "    def hello(self):\n",
+            "        return 'A'\n",
+            "class B(A):\n",
+            "    def hello(self):\n",
+            "        return 'B-' + super(B, self).hello()\n",
+            "print(B().hello())\n"
+        );
+        assert_eq!(run(src), "B-A\n");
+    }
+
+    #[test]
+    fn nested_try_except() {
+        let src = concat!(
+            "try:\n",
+            "    try:\n",
+            "        raise ValueError('inner')\n",
+            "    except ValueError:\n",
+            "        print('caught inner')\n",
+            "        raise RuntimeError('outer')\n",
+            "except RuntimeError as r:\n",
+            "    print('caught outer', r.args[0])\n"
+        );
+        assert_eq!(run(src), "caught inner\ncaught outer outer\n");
+    }
+
+    #[test]
+    fn raise_from_chains_cause() {
+        let src = concat!(
+            "try:\n",
+            "    try:\n",
+            "        raise ValueError('inner')\n",
+            "    except ValueError as e:\n",
+            "        raise RuntimeError('outer') from e\n",
+            "except RuntimeError as r:\n",
+            "    print(type(r).__name__)\n",
+            "    print(r.args[0])\n"
+        );
+        assert_eq!(run(src), "RuntimeError\nouter\n");
+    }
+
+    #[test]
+    fn class_iter_protocol() {
+        let src = concat!(
+            "class Count:\n",
+            "    def __init__(self, n):\n",
+            "        self.n = n\n",
+            "        self.i = 0\n",
+            "    def __iter__(self):\n",
+            "        return self\n",
+            "    def __next__(self):\n",
+            "        if self.i >= self.n:\n",
+            "            raise StopIteration\n",
+            "        v = self.i\n",
+            "        self.i = v + 1\n",
+            "        return v\n",
+            "for x in Count(3):\n",
+            "    print(x)\n"
+        );
+        assert_eq!(run(src), "0\n1\n2\n");
     }
 }

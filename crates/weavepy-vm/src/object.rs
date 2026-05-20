@@ -19,6 +19,7 @@ use std::rc::Rc;
 use weavepy_compiler::CodeObject;
 
 use crate::error::{type_error, value_error, RuntimeError};
+use crate::types::{PyInstance, TypeObject};
 
 /// A Python value as seen by the interpreter.
 #[derive(Clone)]
@@ -39,6 +40,8 @@ pub enum Object {
     Cell(Rc<RefCell<Object>>),
     Iter(Rc<RefCell<PyIterator>>),
     Slice(Rc<PySlice>),
+    Type(Rc<TypeObject>),
+    Instance(Rc<PyInstance>),
 }
 
 impl fmt::Debug for Object {
@@ -67,6 +70,8 @@ impl fmt::Debug for Object {
             Object::Cell(c) => f.debug_tuple("Cell").field(&c.borrow()).finish(),
             Object::Iter(_) => write!(f, "<iterator>"),
             Object::Slice(s) => write!(f, "slice({:?}, {:?}, {:?})", s.start, s.stop, s.step),
+            Object::Type(t) => write!(f, "<class '{}'>", t.name),
+            Object::Instance(i) => write!(f, "<{} object>", i.class.name),
         }
     }
 }
@@ -291,8 +296,24 @@ impl Object {
             | Object::BoundMethod(_)
             | Object::Code(_)
             | Object::Iter(_)
-            | Object::Slice(_) => true,
+            | Object::Slice(_)
+            | Object::Type(_) => true,
             Object::Cell(inner) => inner.borrow().is_truthy(),
+            Object::Instance(inst) => {
+                // Honour __bool__ then __len__ before defaulting to True.
+                if let Some(m) = inst.class.lookup("__bool__") {
+                    // Caller dispatches; we cannot run Python here.
+                    // Default to True; the dispatch site handles the
+                    // dunder dispatch when it has interpreter access.
+                    let _ = m;
+                    true
+                } else if let Some(m) = inst.class.lookup("__len__") {
+                    let _ = m;
+                    true
+                } else {
+                    true
+                }
+            }
         }
     }
 
@@ -315,6 +336,8 @@ impl Object {
             (Object::Iter(a), Object::Iter(b)) => Rc::ptr_eq(a, b),
             (Object::Slice(a), Object::Slice(b)) => Rc::ptr_eq(a, b),
             (Object::Cell(a), Object::Cell(b)) => Rc::ptr_eq(a, b),
+            (Object::Type(a), Object::Type(b)) => Rc::ptr_eq(a, b),
+            (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -474,6 +497,21 @@ impl Object {
             Object::Iter(_) => "iterator",
             Object::Slice(_) => "slice",
             Object::Cell(_) => "cell",
+            Object::Type(_) => "type",
+            // For Instance we'd ideally return the class name, but
+            // type_name returns &'static; callers that need the real
+            // name use Object::type_name_owned below.
+            Object::Instance(_) => "object",
+        }
+    }
+
+    /// Like [`type_name`], but returns the user-class name for
+    /// `Object::Instance` instead of the static placeholder.
+    pub fn type_name_owned(&self) -> String {
+        match self {
+            Object::Instance(inst) => inst.class.name.clone(),
+            Object::Type(t) => format!("type[{}]", t.name),
+            other => other.type_name().to_owned(),
         }
     }
 
@@ -568,6 +606,29 @@ impl Object {
                 s.step.repr()
             ),
             Object::Cell(inner) => format!("<cell: {}>", inner.borrow().repr()),
+            Object::Type(t) => format!("<class '{}'>", t.name),
+            Object::Instance(inst) => {
+                // Defer to __repr__ on the class if present; otherwise
+                // synthesize a default. The caller is expected to run
+                // __repr__ through the interpreter for user methods —
+                // here we only handle the default case.
+                let key = DictKey(Object::from_static("__repr__"));
+                let has_user_repr = inst
+                    .class
+                    .mro
+                    .borrow()
+                    .iter()
+                    .any(|t| t.dict.borrow().contains_key(&key));
+                if has_user_repr {
+                    format!("<{} object>", inst.class.name)
+                } else {
+                    format!(
+                        "<{} object at 0x{:x}>",
+                        inst.class.name,
+                        Rc::as_ptr(inst) as usize
+                    )
+                }
+            }
         }
     }
 

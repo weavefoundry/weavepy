@@ -21,12 +21,13 @@
 //!   shapes that we deliberately don't reproduce.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use indexmap::IndexMap;
 use thiserror::Error;
 use weavepy_parser::ast::{
-    BinOp, BoolOp, CmpOp, Comprehension, Constant as AstConstant, Expr, ExprKind, Module, Stmt,
-    StmtKind, UnaryOp,
+    Arguments as AstArguments, BinOp, BoolOp, CmpOp, Comprehension, Constant as AstConstant,
+    ExceptHandler, Expr, ExprKind, Keyword as KwArg, Module, Stmt, StmtKind, UnaryOp, WithItem,
 };
 
 pub mod bytecode;
@@ -70,6 +71,12 @@ pub struct CodeObject {
     pub freevars: Vec<String>,
     /// Cell variables — locally defined but referenced by an inner scope.
     pub cellvars: Vec<String>,
+    /// Out-of-line exception handlers. Looked up by current PC when a
+    /// `RuntimeError::PyException` propagates through this code object.
+    pub exception_table: Vec<ExcHandler>,
+    /// Source line number (1-based) per emitted instruction. Same length
+    /// as `instructions`. Used for traceback rendering.
+    pub linetable: Vec<u32>,
     /// Number of positional + keyword arguments (excluding `*args`/`**kwargs`).
     pub arg_count: u32,
     /// Number of positional-only arguments.
@@ -80,6 +87,23 @@ pub struct CodeObject {
     pub has_varargs: bool,
     /// Set when this code object accepts `**kwargs`.
     pub has_varkeywords: bool,
+    /// `True` when this code object is the body of a `class` statement.
+    pub is_class_body: bool,
+}
+
+/// One entry in a code object's exception table. Mirrors the
+/// PEP 657-style out-of-line model CPython 3.11+ uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExcHandler {
+    /// First instruction protected (inclusive).
+    pub start: u32,
+    /// First instruction past the protected range (exclusive).
+    pub end: u32,
+    /// Handler entry point.
+    pub handler: u32,
+    /// Stack depth to restore before pushing the exception value and
+    /// jumping into the handler.
+    pub depth: u32,
 }
 
 impl CodeObject {
@@ -231,9 +255,58 @@ pub fn compile_module_with_filename(
     module: &Module,
     filename: &str,
 ) -> Result<CodeObject, CompileError> {
-    let mut top = Compiler::new("<module>".to_owned(), filename.to_owned(), CodeKind::Module);
+    compile_module_with_source(module, "", filename)
+}
+
+/// Compile with access to the original source so the resulting code
+/// object can carry per-instruction line numbers for tracebacks.
+pub fn compile_module_with_source(
+    module: &Module,
+    source: &str,
+    filename: &str,
+) -> Result<CodeObject, CompileError> {
+    let line_index = LineIndex::new(source);
+    let mut top = Compiler::new(
+        "<module>".to_owned(),
+        filename.to_owned(),
+        CodeKind::Module,
+        Rc::new(line_index),
+    );
     top.compile_module_body(module)?;
     Ok(top.finish())
+}
+
+/// Lookup table that maps a byte offset back to a 1-based line number.
+/// Filled once per top-level compile and shared by reference into every
+/// nested `Compiler` for cheap per-instruction line lookups.
+#[derive(Debug, Default)]
+struct LineIndex {
+    line_starts: Vec<u32>,
+}
+
+impl LineIndex {
+    fn new(source: &str) -> Self {
+        let mut starts = vec![0u32];
+        for (i, b) in source.bytes().enumerate() {
+            if b == b'\n' {
+                starts.push((i + 1) as u32);
+            }
+        }
+        Self {
+            line_starts: starts,
+        }
+    }
+
+    fn line_for(&self, byte: u32) -> u32 {
+        if self.line_starts.is_empty() {
+            return 0;
+        }
+        let idx = self
+            .line_starts
+            .partition_point(|&start| start <= byte)
+            .saturating_sub(1);
+        (idx as u32) + 1
+    }
 }
 
 // ---------- scope kinds ----------
@@ -243,6 +316,7 @@ enum CodeKind {
     Module,
     Function,
     Comprehension,
+    Class,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +347,18 @@ struct Compiler {
     /// Monotonic counter for synthetic locals used by chained
     /// comparisons (`.chain0`, `.chain1`, …).
     chain_counter: u32,
+    /// Monotonic counter for synthetic `with`-statement locals.
+    with_counter: u32,
+    /// Source byte→line table shared by every nested compiler from the
+    /// same `compile_module_*` call.
+    line_index: Rc<LineIndex>,
+    /// Line number assigned to the next emitted instruction; updated as
+    /// the compiler descends through the AST.
+    current_line: u32,
+    /// `True` for methods compiled inside a class body. Such methods
+    /// implicitly capture the class's `__class__` cell so `super()`
+    /// works without arguments.
+    inside_class_body: bool,
 }
 
 struct LoopFrame {
@@ -285,10 +371,11 @@ struct LoopFrame {
 }
 
 impl Compiler {
-    fn new(name: String, filename: String, kind: CodeKind) -> Self {
+    fn new(name: String, filename: String, kind: CodeKind, line_index: Rc<LineIndex>) -> Self {
         let mut co = CodeObject::default();
         co.name = name;
         co.filename = filename;
+        co.is_class_body = matches!(kind, CodeKind::Class);
         Self {
             co,
             kind,
@@ -296,6 +383,10 @@ impl Compiler {
             free_order: Vec::new(),
             loop_stack: Vec::new(),
             chain_counter: 0,
+            with_counter: 0,
+            line_index,
+            current_line: 0,
+            inside_class_body: false,
         }
     }
 
@@ -321,7 +412,15 @@ impl Compiler {
     fn emit(&mut self, op: OpCode, arg: u32) -> u32 {
         let offset = self.co.instructions.len() as u32;
         self.co.instructions.push(Instruction { op, arg });
+        self.co.linetable.push(self.current_line);
         offset
+    }
+
+    fn set_line_from(&mut self, byte: u32) {
+        let line = self.line_index.line_for(byte);
+        if line != 0 {
+            self.current_line = line;
+        }
     }
 
     fn next_offset(&self) -> u32 {
@@ -341,7 +440,7 @@ impl Compiler {
             OpCode::JumpBackward => {
                 ins.arg = from.saturating_sub(target);
             }
-            _ => panic!("patch_jump on non-jump op {:?}", ins.op),
+            other => panic!("patch_jump on non-jump op {other:?}"),
         }
     }
 
@@ -450,6 +549,7 @@ impl Compiler {
     // ---------- statements ----------
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
+        self.set_line_from(stmt.span.start.0);
         match &stmt.kind {
             StmtKind::Expr(e) => {
                 self.compile_expr(e)?;
@@ -558,8 +658,47 @@ impl Compiler {
                     self.compile_stmt(s)?;
                 }
             }
-            StmtKind::FunctionDef { name, args, body } => {
-                self.compile_function_def(name, args, body)?;
+            StmtKind::FunctionDef {
+                name,
+                args,
+                body,
+                decorator_list,
+            } => {
+                self.compile_function_def(name, args, body, decorator_list)?;
+            }
+            StmtKind::ClassDef {
+                name,
+                bases,
+                keywords,
+                body,
+                decorator_list,
+            } => {
+                self.compile_class_def(name, bases, keywords, body, decorator_list)?;
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                self.compile_try(body, handlers, orelse, finalbody)?;
+            }
+            StmtKind::Raise { exc, cause } => {
+                match (exc, cause) {
+                    (None, _) => self.emit(OpCode::RaiseVarargs, 0),
+                    (Some(e), None) => {
+                        self.compile_expr(e)?;
+                        self.emit(OpCode::RaiseVarargs, 1)
+                    }
+                    (Some(e), Some(c)) => {
+                        self.compile_expr(e)?;
+                        self.compile_expr(c)?;
+                        self.emit(OpCode::RaiseVarargs, 2)
+                    }
+                };
+            }
+            StmtKind::With { items, body } => {
+                self.compile_with(items, body)?;
             }
             StmtKind::Return(value) => {
                 if self.kind != CodeKind::Function {
@@ -609,14 +748,22 @@ impl Compiler {
     }
 
     /// Compile a function definition statement: builds the function
-    /// object and binds it to `name` in the enclosing scope.
+    /// object, threads it through any decorators, and binds the result
+    /// to `name` in the enclosing scope.
     fn compile_function_def(
         &mut self,
         name: &str,
-        args: &weavepy_parser::ast::Arguments,
+        args: &AstArguments,
         body: &[Stmt],
+        decorator_list: &[Expr],
     ) -> Result<(), CompileError> {
+        for d in decorator_list {
+            self.compile_expr(d)?;
+        }
         self.build_function_object(name, args, body)?;
+        for _ in decorator_list {
+            self.emit(OpCode::Call, 1);
+        }
         let name_expr = Expr {
             kind: ExprKind::Name(name.to_owned()),
             span: weavepy_lexer::Span::new(0, 0),
@@ -629,7 +776,7 @@ impl Compiler {
     fn build_function_object(
         &mut self,
         name: &str,
-        args: &weavepy_parser::ast::Arguments,
+        args: &AstArguments,
         body: &[Stmt],
     ) -> Result<(), CompileError> {
         let mut param_names: Vec<String> = Vec::new();
@@ -656,6 +803,7 @@ impl Compiler {
             name.to_owned(),
             self.co.filename.clone(),
             CodeKind::Function,
+            self.line_index.clone(),
         );
         inner.co.arg_count = arg_count;
         inner.co.posonly_count = posonly_count;
@@ -663,6 +811,14 @@ impl Compiler {
         inner.co.has_varargs = args.vararg.is_some();
         inner.co.has_varkeywords = args.kwarg.is_some();
         inner.co.varnames = param_names.clone();
+        inner.current_line = self.current_line;
+        // Methods compiled inside a class body get an implicit
+        // `__class__` free variable so `super()` (and explicit
+        // `__class__` references) work without arguments.
+        if self.inside_class_body && method_references_class(body) {
+            inner.bindings.insert("__class__".to_owned(), Binding::Free);
+            inner.free_order.push("__class__".to_owned());
+        }
         inner.analyze_scope_function(&param_names, body, &[&self.bindings]);
         for free in &inner.free_order {
             if matches!(self.bindings.get(free), Some(Binding::Local)) {
@@ -700,6 +856,395 @@ impl Compiler {
             .intern_constant(Constant::Code(Box::new(inner_code)));
         self.emit(OpCode::LoadConst, code_idx);
         self.emit(OpCode::MakeFunction, flags);
+        Ok(())
+    }
+
+    /// Compile a `class` statement. Emits the standard CPython recipe:
+    /// `LOAD_BUILD_CLASS, build body, name, bases, [keywords], CALL`.
+    /// Decorators wrap the result before it's stored.
+    fn compile_class_def(
+        &mut self,
+        name: &str,
+        bases: &[Expr],
+        keywords: &[KwArg],
+        body: &[Stmt],
+        decorator_list: &[Expr],
+    ) -> Result<(), CompileError> {
+        for d in decorator_list {
+            self.compile_expr(d)?;
+        }
+        self.emit(OpCode::LoadBuildClass, 0);
+        self.build_class_body(name, body)?;
+        let name_idx = self.co.intern_constant(Constant::Str(name.to_owned()));
+        self.emit(OpCode::LoadConst, name_idx);
+        for b in bases {
+            self.compile_expr(b)?;
+        }
+        if keywords.is_empty() {
+            self.emit(OpCode::Call, (bases.len() + 2) as u32);
+        } else {
+            let mut names: Vec<Constant> = Vec::with_capacity(keywords.len());
+            for k in keywords {
+                let n = k.arg.clone().ok_or_else(|| {
+                    CompileError::NotImplemented(
+                        "**kwargs splat in class header",
+                        "use explicit metaclass=… keyword form",
+                    )
+                })?;
+                names.push(Constant::Str(n));
+                self.compile_expr(&k.value)?;
+            }
+            let tup_idx = self.co.intern_constant(Constant::Tuple(names));
+            self.emit(OpCode::LoadConst, tup_idx);
+            self.emit(OpCode::CallKw, (bases.len() + 2) as u32);
+        }
+        for _ in decorator_list {
+            self.emit(OpCode::Call, 1);
+        }
+        let name_expr = Expr {
+            kind: ExprKind::Name(name.to_owned()),
+            span: weavepy_lexer::Span::new(0, 0),
+        };
+        self.compile_assign(&name_expr)
+    }
+
+    /// Build the class-body function object and leave it on the stack.
+    fn build_class_body(&mut self, name: &str, body: &[Stmt]) -> Result<(), CompileError> {
+        let mut inner = Compiler::new(
+            name.to_owned(),
+            self.co.filename.clone(),
+            CodeKind::Class,
+            self.line_index.clone(),
+        );
+        inner.current_line = self.current_line;
+        // Every class body carries a `__class__` cell so methods can
+        // close over it. `__build_class__` patches the cell with the
+        // resulting type once construction finishes.
+        inner.co.cellvars.push("__class__".to_owned());
+        inner.bindings.insert("__class__".to_owned(), Binding::Cell);
+
+        let mut assigned = HashSet::new();
+        for s in body {
+            collect_assigned(s, &mut assigned);
+        }
+        for n in assigned {
+            inner.bindings.insert(n, Binding::Global);
+        }
+
+        let outer_inside_class = inner.inside_class_body;
+        inner.inside_class_body = true;
+        let _ = outer_inside_class;
+
+        // Resolve outer-scope free vars for names read by the body that
+        // aren't bound locally.
+        let mut reads = HashSet::new();
+        for s in body {
+            collect_reads_stmt(s, &mut reads);
+        }
+        let mut needed_in_inner: HashSet<String> = HashSet::new();
+        for s in body {
+            collect_inner_free(s, &inner.bindings, &mut needed_in_inner);
+        }
+        let mut free_candidates = reads;
+        free_candidates.extend(needed_in_inner.iter().cloned());
+        free_candidates.remove("__class__");
+        for name in free_candidates {
+            if inner.bindings.contains_key(&name) {
+                continue;
+            }
+            if let Some(b) = self.bindings.get(&name) {
+                if matches!(
+                    b,
+                    Binding::Local | Binding::Cell | Binding::Free | Binding::Nonlocal
+                ) {
+                    inner.bindings.insert(name.clone(), Binding::Free);
+                    inner.free_order.push(name);
+                }
+            }
+        }
+
+        inner.emit(OpCode::Resume, 0);
+        // `__module__ = __name__` and `__qualname__ = name` boilerplate.
+        let name_const = inner.co.intern_constant(Constant::Str(name.to_owned()));
+        let qualname_idx = inner.co.intern_name("__qualname__");
+        inner.emit(OpCode::LoadConst, name_const);
+        inner.emit(OpCode::StoreName, qualname_idx);
+
+        for s in body {
+            inner.compile_stmt(s)?;
+        }
+        // Expose the `__class__` cell via `__classcell__` so the
+        // `__build_class__` builtin can patch it.
+        let class_cell_idx = inner.cell_or_free_index("__class__");
+        inner.emit(OpCode::LoadClosure, class_cell_idx);
+        let classcell_name = inner.co.intern_name("__classcell__");
+        inner.emit(OpCode::StoreName, classcell_name);
+
+        let inner_code = inner.finish();
+        let inner_freevars = inner_code.freevars.clone();
+
+        for free in &inner_freevars {
+            if matches!(self.bindings.get(free), Some(Binding::Local)) {
+                self.bindings.insert(free.clone(), Binding::Cell);
+                if !self.co.cellvars.contains(free) {
+                    self.co.cellvars.push(free.clone());
+                }
+            }
+        }
+
+        let mut flags = 0u32;
+        if !inner_freevars.is_empty() {
+            for free in &inner_freevars {
+                let idx = self.cell_or_free_index(free);
+                self.emit(OpCode::LoadClosure, idx);
+            }
+            self.emit(OpCode::BuildTuple, inner_freevars.len() as u32);
+            flags |= 0x08;
+        }
+        let code_idx = self
+            .co
+            .intern_constant(Constant::Code(Box::new(inner_code)));
+        self.emit(OpCode::LoadConst, code_idx);
+        self.emit(OpCode::MakeFunction, flags);
+        Ok(())
+    }
+
+    /// Compile `try / except / else / finally`. The body is protected
+    /// by an exception table entry; matched handlers fall through to
+    /// the `else` branch, unmatched ones re-raise. `finally` runs on
+    /// every exit path.
+    fn compile_try(
+        &mut self,
+        body: &[Stmt],
+        handlers: &[ExceptHandler],
+        orelse: &[Stmt],
+        finalbody: &[Stmt],
+    ) -> Result<(), CompileError> {
+        let has_handlers = !handlers.is_empty();
+        let has_finally = !finalbody.is_empty();
+        if !has_handlers && !has_finally {
+            // Empty try is meaningless; parse already rejected.
+            for s in body {
+                self.compile_stmt(s)?;
+            }
+            return Ok(());
+        }
+        // The handler entry point lives *after* the body. Exception
+        // tables are walked when an exception fires; the dispatch
+        // loop truncates the stack to `depth` and pushes the
+        // exception value before jumping.
+        let body_depth = 0u32;
+        let body_start = self.next_offset();
+        for s in body {
+            self.compile_stmt(s)?;
+        }
+        // Else clause runs only on normal body completion.
+        for s in orelse {
+            self.compile_stmt(s)?;
+        }
+        let body_end = self.next_offset();
+
+        // Normal-exit finally + jump to end. Falls through to the
+        // finally body, then skips past the exception handlers.
+        let normal_skip = if has_handlers || has_finally {
+            // Run finally on normal exit.
+            for s in finalbody {
+                self.compile_stmt(s)?;
+            }
+            self.emit(OpCode::JumpForward, 0)
+        } else {
+            self.next_offset()
+        };
+
+        // Handlers begin here.
+        let handlers_start = self.next_offset();
+        if has_handlers {
+            self.co.exception_table.push(ExcHandler {
+                start: body_start,
+                end: body_end,
+                handler: handlers_start,
+                depth: body_depth,
+            });
+            self.emit(OpCode::PushExcInfo, 0);
+            // Stack on entry: [exc] (pushed by dispatch loop).
+            let mut next_handler_sites: Vec<u32> = Vec::new();
+            let mut handler_exit_jumps: Vec<u32> = Vec::new();
+            // Each except clause's body lives between the body and the
+            // catch-all `RERAISE` at the bottom. If a clause's `type_`
+            // doesn't match we fall through to the next clause via the
+            // patched `next_handler_sites`. After running a clause we
+            // POP_EXCEPT and jump to `handler_exit_jumps`.
+            for (i, h) in handlers.iter().enumerate() {
+                // Patch the previous handler's "no-match" branch.
+                if i > 0 {
+                    let prev = next_handler_sites.pop();
+                    if let Some(site) = prev {
+                        let cur = self.next_offset();
+                        self.patch_jump(site, cur);
+                    }
+                }
+                match &h.type_ {
+                    Some(t) => {
+                        // Stack: [exc] → [exc, type] → [exc, bool]
+                        self.emit(OpCode::CopyTop, 0);
+                        self.compile_expr(t)?;
+                        self.emit(OpCode::CheckExcMatch, 0);
+                        let no_match = self.emit(OpCode::PopJumpIfFalse, 0);
+                        next_handler_sites.push(no_match);
+                        // Matched: Stack still [exc]. Bind or discard.
+                        if let Some(n) = &h.name {
+                            let name_expr = Expr {
+                                kind: ExprKind::Name(n.clone()),
+                                span: h.span,
+                            };
+                            self.compile_assign(&name_expr)?;
+                        } else {
+                            self.emit(OpCode::PopTop, 0);
+                        }
+                    }
+                    None => {
+                        // Bare `except:` matches anything; just discard exc.
+                        self.emit(OpCode::PopTop, 0);
+                    }
+                }
+                for s in &h.body {
+                    self.compile_stmt(s)?;
+                }
+                self.emit(OpCode::PopExcept, 0);
+                // Run finally on the matched path.
+                for s in finalbody {
+                    self.compile_stmt(s)?;
+                }
+                let exit = self.emit(OpCode::JumpForward, 0);
+                handler_exit_jumps.push(exit);
+            }
+            // Unmatched: re-raise. Patch the last failed-match jump.
+            while let Some(site) = next_handler_sites.pop() {
+                let cur = self.next_offset();
+                self.patch_jump(site, cur);
+            }
+            // Run finally on the re-raise path before propagating.
+            for s in finalbody {
+                self.compile_stmt(s)?;
+            }
+            self.emit(OpCode::Reraise, 0);
+            // Patch handler-exit jumps to end.
+            let end = self.next_offset();
+            for site in handler_exit_jumps {
+                self.patch_jump(site, end);
+            }
+        } else if has_finally {
+            // `try/finally` without except. Exception path runs
+            // finally and re-raises.
+            self.co.exception_table.push(ExcHandler {
+                start: body_start,
+                end: body_end,
+                handler: handlers_start,
+                depth: body_depth,
+            });
+            self.emit(OpCode::PopTop, 0); // discard pushed exc; we'll re-raise below
+            for s in finalbody {
+                self.compile_stmt(s)?;
+            }
+            self.emit(OpCode::Reraise, 0);
+        }
+        // Patch normal exit jump to land after handlers/finally.
+        if has_handlers || has_finally {
+            let end = self.next_offset();
+            self.patch_jump(normal_skip, end);
+        }
+        Ok(())
+    }
+
+    /// Compile a `with` statement. Each item is desugared via a
+    /// synthetic local that holds the context manager so the normal
+    /// and exception exit paths can both reach `__exit__`.
+    fn compile_with(&mut self, items: &[WithItem], body: &[Stmt]) -> Result<(), CompileError> {
+        if items.is_empty() {
+            for s in body {
+                self.compile_stmt(s)?;
+            }
+            return Ok(());
+        }
+        // Recurse on multi-item: `with a, b: body` ≡ `with a: with b: body`.
+        if items.len() > 1 {
+            let inner = vec![Stmt {
+                kind: StmtKind::With {
+                    items: items[1..].to_vec(),
+                    body: body.to_vec(),
+                },
+                span: weavepy_lexer::Span::new(0, 0),
+            }];
+            return self.compile_with(&items[..1], &inner);
+        }
+        let item = &items[0];
+        let cm_name = format!(".with_cm{}", self.with_counter);
+        self.with_counter += 1;
+        let cm_idx = self.var_index_or_add(&cm_name);
+
+        // Evaluate cm and stash it for later __exit__ access.
+        self.compile_expr(&item.context_expr)?;
+        self.emit(OpCode::StoreFast, cm_idx);
+
+        // Call __enter__ and bind (or discard).
+        self.emit(OpCode::LoadFast, cm_idx);
+        self.emit(OpCode::BeforeWith, 0);
+        if let Some(target) = &item.optional_vars {
+            self.compile_assign(target)?;
+        } else {
+            self.emit(OpCode::PopTop, 0);
+        }
+        // After BEFORE_WITH the bound __exit__ remains at TOS. We
+        // immediately pop it — the exit-path emission re-derives it
+        // from the synthetic local.
+        self.emit(OpCode::PopTop, 0);
+
+        let body_start = self.next_offset();
+        for s in body {
+            self.compile_stmt(s)?;
+        }
+        let body_end = self.next_offset();
+
+        // Normal exit: cm.__exit__(None, None, None).
+        self.emit(OpCode::LoadFast, cm_idx);
+        let exit_name = self.co.intern_name("__exit__");
+        self.emit(OpCode::LoadAttr, exit_name);
+        let none_idx = self.co.intern_constant(Constant::None);
+        self.emit(OpCode::LoadConst, none_idx);
+        self.emit(OpCode::LoadConst, none_idx);
+        self.emit(OpCode::LoadConst, none_idx);
+        self.emit(OpCode::Call, 3);
+        self.emit(OpCode::PopTop, 0);
+        let end_jump = self.emit(OpCode::JumpForward, 0);
+
+        // Exception handler: __exit__(type(exc), exc, None); if truthy, swallow.
+        let handler_start = self.next_offset();
+        self.co.exception_table.push(ExcHandler {
+            start: body_start,
+            end: body_end,
+            handler: handler_start,
+            depth: 0,
+        });
+        // Stack: [exc]
+        self.emit(OpCode::LoadFast, cm_idx);
+        self.emit(OpCode::LoadAttr, exit_name);
+        // Stack: [exc, __exit__]
+        self.emit(OpCode::Swap, 2);
+        // Stack: [__exit__, exc]
+        self.emit(OpCode::WithExceptStart, 0);
+        // Stack: [__exit__, exc, result]
+        let swallow = self.emit(OpCode::PopJumpIfTrue, 0);
+        // Falsy: re-raise. Stack: [__exit__, exc]
+        self.emit(OpCode::Swap, 2);
+        self.emit(OpCode::PopTop, 0);
+        self.emit(OpCode::RaiseVarargs, 1);
+        let swallow_target = self.next_offset();
+        self.patch_jump(swallow, swallow_target);
+        // Swallowed: Stack: [__exit__, exc]
+        self.emit(OpCode::PopTop, 0);
+        self.emit(OpCode::PopTop, 0);
+        let end = self.next_offset();
+        self.patch_jump(end_jump, end);
         Ok(())
     }
 
@@ -762,25 +1307,17 @@ impl Compiler {
                 let idx = self.var_index_or_add(name);
                 self.emit(OpCode::StoreFast, idx);
             }
-            Binding::Cell => {
-                let idx = self.cell_or_free_index(name);
-                self.emit(OpCode::StoreDeref, idx);
-            }
-            Binding::Free => {
+            Binding::Cell | Binding::Free | Binding::Nonlocal => {
                 let idx = self.cell_or_free_index(name);
                 self.emit(OpCode::StoreDeref, idx);
             }
             Binding::Global => {
                 let idx = self.co.intern_name(name);
-                if self.kind == CodeKind::Module {
+                if matches!(self.kind, CodeKind::Module | CodeKind::Class) {
                     self.emit(OpCode::StoreName, idx);
                 } else {
                     self.emit(OpCode::StoreGlobal, idx);
                 }
-            }
-            Binding::Nonlocal => {
-                let idx = self.cell_or_free_index(name);
-                self.emit(OpCode::StoreDeref, idx);
             }
         }
     }
@@ -797,7 +1334,7 @@ impl Compiler {
         match self.bindings.get(name) {
             Some(b) => *b,
             None => {
-                if self.kind == CodeKind::Module {
+                if matches!(self.kind, CodeKind::Module | CodeKind::Class) {
                     self.bindings.insert(name.to_owned(), Binding::Global);
                     Binding::Global
                 } else {
@@ -825,13 +1362,24 @@ impl Compiler {
                 let idx = self.var_index_or_add(name);
                 self.emit(OpCode::LoadFast, idx);
             }
-            Some(Binding::Cell) | Some(Binding::Free) | Some(Binding::Nonlocal) => {
+            Some(Binding::Cell) | Some(Binding::Nonlocal) => {
                 let idx = self.cell_or_free_index(name);
                 self.emit(OpCode::LoadDeref, idx);
             }
+            Some(Binding::Free) => {
+                let idx = self.cell_or_free_index(name);
+                // Inside a class body, a free name might shadow a class-local
+                // attribute (rare but legal). LOAD_CLASSDEREF tries the class
+                // namespace first, then falls back to the cell.
+                if self.kind == CodeKind::Class {
+                    self.emit(OpCode::LoadClassderef, idx);
+                } else {
+                    self.emit(OpCode::LoadDeref, idx);
+                }
+            }
             Some(Binding::Global) | None => {
                 let idx = self.co.intern_name(name);
-                if self.kind == CodeKind::Module {
+                if matches!(self.kind, CodeKind::Module | CodeKind::Class) {
                     self.emit(OpCode::LoadName, idx);
                 } else {
                     self.emit(OpCode::LoadGlobal, idx);
@@ -1114,7 +1662,9 @@ impl Compiler {
             name.to_owned(),
             self.co.filename.clone(),
             CodeKind::Comprehension,
+            self.line_index.clone(),
         );
+        inner.current_line = self.current_line;
         inner.co.arg_count = 1;
         inner.co.varnames.push(".0".to_owned());
         inner.bindings.insert(".0".to_owned(), Binding::Local);
@@ -1395,6 +1945,45 @@ fn collect_inner_free(
                 collect_inner_free(s, outer_bindings, out);
             }
         }
+        StmtKind::ClassDef {
+            bases,
+            keywords,
+            body,
+            decorator_list,
+            ..
+        } => {
+            // The class body itself is a nested scope. Any name it
+            // (or its inner methods) read that isn't bound inside
+            // surfaces here so the outer scope can promote it.
+            for d in decorator_list {
+                collect_inner_free_expr(d, outer_bindings, out);
+            }
+            for b in bases {
+                collect_inner_free_expr(b, outer_bindings, out);
+            }
+            for k in keywords {
+                collect_inner_free_expr(&k.value, outer_bindings, out);
+            }
+            let mut class_assigned = HashSet::new();
+            for s in body {
+                collect_assigned(s, &mut class_assigned);
+            }
+            // Names referenced *anywhere* in the class body (including
+            // method bodies) that aren't bound inside the class are
+            // candidates for outer-scope free promotion.
+            let mut class_reads = HashSet::new();
+            for s in body {
+                collect_reads_stmt(s, &mut class_reads);
+            }
+            for r in class_reads {
+                if !class_assigned.contains(&r) {
+                    out.insert(r);
+                }
+            }
+            for s in body {
+                collect_inner_free(s, outer_bindings, out);
+            }
+        }
         StmtKind::If { body, orelse, .. }
         | StmtKind::While { body, orelse, .. }
         | StmtKind::For { body, orelse, .. } => {
@@ -1402,6 +1991,46 @@ fn collect_inner_free(
                 collect_inner_free(s, outer_bindings, out);
             }
             for s in orelse {
+                collect_inner_free(s, outer_bindings, out);
+            }
+        }
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            for s in body {
+                collect_inner_free(s, outer_bindings, out);
+            }
+            for h in handlers {
+                if let Some(t) = &h.type_ {
+                    collect_inner_free_expr(t, outer_bindings, out);
+                }
+                for s in &h.body {
+                    collect_inner_free(s, outer_bindings, out);
+                }
+            }
+            for s in orelse {
+                collect_inner_free(s, outer_bindings, out);
+            }
+            for s in finalbody {
+                collect_inner_free(s, outer_bindings, out);
+            }
+        }
+        StmtKind::Raise { exc, cause } => {
+            if let Some(e) = exc {
+                collect_inner_free_expr(e, outer_bindings, out);
+            }
+            if let Some(c) = cause {
+                collect_inner_free_expr(c, outer_bindings, out);
+            }
+        }
+        StmtKind::With { items, body } => {
+            for it in items {
+                collect_inner_free_expr(&it.context_expr, outer_bindings, out);
+            }
+            for s in body {
                 collect_inner_free(s, outer_bindings, out);
             }
         }
@@ -1419,6 +2048,16 @@ fn collect_inner_free(
         }
         _ => {}
     }
+}
+
+/// `True` when a method body references `super` or `__class__` so the
+/// compiler knows to capture the class's `__class__` cell.
+fn method_references_class(body: &[Stmt]) -> bool {
+    let mut reads = HashSet::new();
+    for s in body {
+        collect_reads_stmt(s, &mut reads);
+    }
+    reads.contains("super") || reads.contains("__class__")
 }
 
 fn collect_inner_free_expr(
@@ -1589,8 +2228,42 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
                 collect_assigned(s, out);
             }
         }
-        StmtKind::FunctionDef { name, .. } => {
+        StmtKind::FunctionDef { name, .. } | StmtKind::ClassDef { name, .. } => {
             out.insert(name.clone());
+        }
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            for s in body {
+                collect_assigned(s, out);
+            }
+            for h in handlers {
+                if let Some(n) = &h.name {
+                    out.insert(n.clone());
+                }
+                for s in &h.body {
+                    collect_assigned(s, out);
+                }
+            }
+            for s in orelse {
+                collect_assigned(s, out);
+            }
+            for s in finalbody {
+                collect_assigned(s, out);
+            }
+        }
+        StmtKind::With { items, body } => {
+            for it in items {
+                if let Some(target) = &it.optional_vars {
+                    collect_target_names(target, out);
+                }
+            }
+            for s in body {
+                collect_assigned(s, out);
+            }
         }
         StmtKind::Import(aliases) => {
             for a in aliases {
@@ -1660,8 +2333,42 @@ fn collect_decls(
                 collect_decls(s, globals, nonlocals, assigned);
             }
         }
-        StmtKind::FunctionDef { name, .. } => {
+        StmtKind::FunctionDef { name, .. } | StmtKind::ClassDef { name, .. } => {
             assigned.insert(name.clone());
+        }
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            for s in body {
+                collect_decls(s, globals, nonlocals, assigned);
+            }
+            for h in handlers {
+                if let Some(n) = &h.name {
+                    assigned.insert(n.clone());
+                }
+                for s in &h.body {
+                    collect_decls(s, globals, nonlocals, assigned);
+                }
+            }
+            for s in orelse {
+                collect_decls(s, globals, nonlocals, assigned);
+            }
+            for s in finalbody {
+                collect_decls(s, globals, nonlocals, assigned);
+            }
+        }
+        StmtKind::With { items, body } => {
+            for it in items {
+                if let Some(target) = &it.optional_vars {
+                    collect_target_names(target, assigned);
+                }
+            }
+            for s in body {
+                collect_decls(s, globals, nonlocals, assigned);
+            }
         }
         _ => {}
     }
@@ -1725,15 +2432,84 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
                 collect_reads_stmt(s, out);
             }
         }
-        StmtKind::FunctionDef { body, args, .. } => {
+        StmtKind::FunctionDef {
+            body,
+            args,
+            decorator_list,
+            ..
+        } => {
             // Reads inside an inner function are not "reads" in the
             // current scope from the perspective of scope analysis,
-            // but defaults / annotations evaluate in the OUTER scope.
+            // but defaults / annotations and decorators evaluate in
+            // the OUTER scope.
+            for d in decorator_list {
+                collect_reads_expr(d, out);
+            }
             for d in &args.defaults {
                 collect_reads_expr(d, out);
             }
             for d in args.kw_defaults.iter().flatten() {
                 collect_reads_expr(d, out);
+            }
+            for s in body {
+                collect_reads_stmt(s, out);
+            }
+        }
+        StmtKind::ClassDef {
+            bases,
+            keywords,
+            body,
+            decorator_list,
+            ..
+        } => {
+            for d in decorator_list {
+                collect_reads_expr(d, out);
+            }
+            for b in bases {
+                collect_reads_expr(b, out);
+            }
+            for k in keywords {
+                collect_reads_expr(&k.value, out);
+            }
+            for s in body {
+                collect_reads_stmt(s, out);
+            }
+        }
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            for s in body {
+                collect_reads_stmt(s, out);
+            }
+            for h in handlers {
+                if let Some(t) = &h.type_ {
+                    collect_reads_expr(t, out);
+                }
+                for s in &h.body {
+                    collect_reads_stmt(s, out);
+                }
+            }
+            for s in orelse {
+                collect_reads_stmt(s, out);
+            }
+            for s in finalbody {
+                collect_reads_stmt(s, out);
+            }
+        }
+        StmtKind::Raise { exc, cause } => {
+            if let Some(e) = exc {
+                collect_reads_expr(e, out);
+            }
+            if let Some(c) = cause {
+                collect_reads_expr(c, out);
+            }
+        }
+        StmtKind::With { items, body } => {
+            for it in items {
+                collect_reads_expr(&it.context_expr, out);
             }
             for s in body {
                 collect_reads_stmt(s, out);
