@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;
-use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use crate::object::{BuiltinFn, DictData, DictKey, FileBackend, Object, PyFile, PyModule};
 
 /// CPython compatibility version we advertise. This is intentionally
 /// independent from the WeavePy package version (see
@@ -118,6 +118,32 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("intern")),
             builtin("intern", sys_intern),
+        );
+
+        // Standard I/O streams. We expose them as file-like objects
+        // sharing the interpreter's host sinks, so `print()` and
+        // direct writes via `sys.stdout.write(...)` agree.
+        let stdout_sink: Rc<RefCell<dyn std::io::Write>> = Rc::new(RefCell::new(std::io::stdout()));
+        let stderr_sink: Rc<RefCell<dyn std::io::Write>> = Rc::new(RefCell::new(std::io::stderr()));
+        d.insert(
+            DictKey(Object::from_static("stdout")),
+            Object::File(Rc::new(PyFile::new(
+                "<stdout>",
+                "w",
+                FileBackend::Stdout(stdout_sink),
+            ))),
+        );
+        d.insert(
+            DictKey(Object::from_static("stderr")),
+            Object::File(Rc::new(PyFile::new(
+                "<stderr>",
+                "w",
+                FileBackend::Stderr(stderr_sink),
+            ))),
+        );
+        d.insert(
+            DictKey(Object::from_static("stdin")),
+            Object::File(Rc::new(PyFile::new("<stdin>", "r", FileBackend::Stdin))),
         );
     }
     Rc::new(PyModule {

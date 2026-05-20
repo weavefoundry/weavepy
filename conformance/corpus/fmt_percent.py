@@ -1,0 +1,5 @@
+print("%d / %d = %d" % (10, 3, 10 // 3))
+print("%s says %s" % ("Ada", "hello"))
+print("%5.2f" % 3.14159)
+print("%-10s|" % "left")
+print("%(name)s/%(age)d" % {"name": "Ada", "age": 37})

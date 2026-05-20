@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::error::RuntimeError;
 use crate::object::{DictData, DictKey, Object};
 use crate::types::TypeObject;
 
@@ -28,10 +29,12 @@ pub struct BuiltinTypes {
     pub bool_: Rc<TypeObject>,
     pub str_: Rc<TypeObject>,
     pub bytes_: Rc<TypeObject>,
+    pub bytearray_: Rc<TypeObject>,
     pub tuple_: Rc<TypeObject>,
     pub list_: Rc<TypeObject>,
     pub dict_: Rc<TypeObject>,
     pub set_: Rc<TypeObject>,
+    pub frozenset_: Rc<TypeObject>,
     pub range_: Rc<TypeObject>,
     pub none_type: Rc<TypeObject>,
     pub function_: Rc<TypeObject>,
@@ -85,10 +88,12 @@ impl BuiltinTypes {
         let bool_ = mk("bool", vec![int_.clone()]);
         let str_ = mk("str", vec![object_.clone()]);
         let bytes_ = mk("bytes", vec![object_.clone()]);
+        let bytearray_ = mk("bytearray", vec![object_.clone()]);
         let tuple_ = mk("tuple", vec![object_.clone()]);
         let list_ = mk("list", vec![object_.clone()]);
         let dict_ = mk("dict", vec![object_.clone()]);
         let set_ = mk("set", vec![object_.clone()]);
+        let frozenset_ = mk("frozenset", vec![object_.clone()]);
         let range_ = mk("range", vec![object_.clone()]);
         let none_type = mk("NoneType", vec![object_.clone()]);
         let function_ = mk("function", vec![object_.clone()]);
@@ -96,6 +101,12 @@ impl BuiltinTypes {
 
         let base_exception = exc("BaseException", object_.clone());
         let exception = exc("Exception", base_exception.clone());
+
+        // Hang `__str__` / `__repr__` off `BaseException` so that
+        // `str(ValueError("msg"))` / `print(exc)` produce the
+        // CPython-familiar message rather than the generic
+        // "<X object at 0x...>" instance repr.
+        install_exception_str_repr(&base_exception);
 
         let arithmetic_error = exc("ArithmeticError", exception.clone());
         let assertion_error = exc("AssertionError", exception.clone());
@@ -129,10 +140,12 @@ impl BuiltinTypes {
             bool_,
             str_,
             bytes_,
+            bytearray_,
             tuple_,
             list_,
             dict_,
             set_,
+            frozenset_,
             range_,
             none_type,
             function_,
@@ -181,10 +194,12 @@ impl BuiltinTypes {
             pair!(bool_, "bool"),
             pair!(str_, "str"),
             pair!(bytes_, "bytes"),
+            pair!(bytearray_, "bytearray"),
             pair!(tuple_, "tuple"),
             pair!(list_, "list"),
             pair!(dict_, "dict"),
             pair!(set_, "set"),
+            pair!(frozenset_, "frozenset"),
             pair!(range_, "range"),
             pair!(base_exception, "BaseException"),
             pair!(exception, "Exception"),
@@ -226,10 +241,12 @@ impl BuiltinTypes {
             "bool" => Some(self.bool_.clone()),
             "str" => Some(self.str_.clone()),
             "bytes" => Some(self.bytes_.clone()),
+            "bytearray" => Some(self.bytearray_.clone()),
             "tuple" => Some(self.tuple_.clone()),
             "list" => Some(self.list_.clone()),
             "dict" => Some(self.dict_.clone()),
             "set" => Some(self.set_.clone()),
+            "frozenset" => Some(self.frozenset_.clone()),
             "range" => Some(self.range_.clone()),
             "BaseException" => Some(self.base_exception.clone()),
             "Exception" => Some(self.exception.clone()),
@@ -268,6 +285,22 @@ thread_local! {
 /// Per-thread accessor. The registry is constructed lazily on first
 /// access. Panics if construction fails — that means the C3 invariant
 /// is broken on the built-in hierarchy itself.
+pub fn property_class() -> Rc<TypeObject> {
+    thread_local! {
+        static PROPERTY_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    }
+    PROPERTY_CLASS.with(|slot| {
+        if let Some(c) = slot.borrow().as_ref() {
+            return c.clone();
+        }
+        let bt = builtin_types();
+        let cls = TypeObject::new_user("property", vec![bt.object_.clone()], DictData::new())
+            .expect("property type");
+        *slot.borrow_mut() = Some(cls.clone());
+        cls
+    })
+}
+
 pub fn builtin_types() -> Rc<BuiltinTypes> {
     BUILTIN_TYPES.with(|cell| {
         if cell.borrow().is_none() {
@@ -285,6 +318,70 @@ pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
         .by_name(class_name)
         .unwrap_or_else(|| bt.exception.clone());
     make_exception_with_class(class, message)
+}
+
+fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    fn exc_str(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        if let Object::Instance(inst_rc) = inst {
+            let dict = inst_rc.dict.borrow();
+            if let Some(Object::Tuple(items)) = dict.get(&DictKey(Object::from_static("args"))) {
+                return Ok(match items.as_ref() {
+                    [] => Object::from_static(""),
+                    [single] => Object::from_str(single.to_str()),
+                    _ => Object::from_str(format!(
+                        "({})",
+                        items
+                            .iter()
+                            .map(|x| x.repr())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                });
+            }
+        }
+        Ok(Object::from_static(""))
+    }
+    fn exc_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        if let Object::Instance(inst_rc) = inst {
+            let cls = inst_rc.class.name.clone();
+            let dict = inst_rc.dict.borrow();
+            let args_repr = if let Some(Object::Tuple(items)) =
+                dict.get(&DictKey(Object::from_static("args")))
+            {
+                items
+                    .iter()
+                    .map(|x| x.repr())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                String::new()
+            };
+            return Ok(Object::from_str(format!("{cls}({args_repr})")));
+        }
+        Ok(Object::from_static(""))
+    }
+    let mut dict = base_exception.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__str__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__str__",
+            call: Box::new(exc_str),
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__repr__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__repr__",
+            call: Box::new(exc_repr),
+        })),
+    );
 }
 
 pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<String>) -> Object {

@@ -15,7 +15,10 @@ categories.workspace   = true
 weavepy-compiler = { workspace = true }
 weavepy-lexer    = { workspace = true }
 weavepy-parser   = { workspace = true }
+chrono           = { workspace = true }
 indexmap         = { workspace = true }
+regex            = { workspace = true }
+serde_json       = { workspace = true }
 thiserror        = { workspace = true }
 tracing          = { workspace = true }
 

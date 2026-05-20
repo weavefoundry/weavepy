@@ -68,6 +68,11 @@ pub fn default_builtins() -> DictData {
     reg!("list", b_list);
     reg!("tuple", b_tuple);
     reg!("dict", b_dict);
+    reg!("set", b_set);
+    reg!("frozenset", b_frozenset);
+    reg!("bytes", b_bytes);
+    reg!("bytearray", b_bytearray);
+    reg!("open", b_open);
     reg!("type", b_type);
     reg!("abs", b_abs);
     reg!("min", b_min);
@@ -97,6 +102,18 @@ pub fn default_builtins() -> DictData {
     reg!("round", b_round);
     reg!("format", b_format);
     reg!("ascii", b_ascii);
+    reg!("property", b_property);
+    reg!("staticmethod", b_staticmethod);
+    reg!("classmethod", b_classmethod);
+    reg!("getattr", b_getattr);
+    reg!("setattr", b_setattr);
+    reg!("delattr", b_delattr);
+    reg!("hasattr", b_hasattr);
+    reg!("vars", b_vars);
+    reg!("callable", b_callable);
+    reg!("object", b_object);
+    reg!("globals", b_globals);
+    reg!("locals", b_locals);
 
     d
 }
@@ -112,14 +129,49 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         Object::Str(_) => match name {
             "upper" => Some(method("upper", str_upper)),
             "lower" => Some(method("lower", str_lower)),
+            "title" => Some(method("title", str_title)),
+            "capitalize" => Some(method("capitalize", str_capitalize)),
+            "casefold" => Some(method("casefold", str_lower)),
+            "swapcase" => Some(method("swapcase", str_swapcase)),
             "strip" => Some(method("strip", str_strip)),
+            "lstrip" => Some(method("lstrip", str_lstrip)),
+            "rstrip" => Some(method("rstrip", str_rstrip)),
             "split" => Some(method("split", str_split)),
+            "rsplit" => Some(method("rsplit", str_rsplit)),
+            "splitlines" => Some(method("splitlines", str_splitlines)),
             "join" => Some(method("join", str_join)),
             "startswith" => Some(method("startswith", str_startswith)),
             "endswith" => Some(method("endswith", str_endswith)),
             "replace" => Some(method("replace", str_replace)),
             "find" => Some(method("find", str_find)),
-            "format" => Some(method("format", str_format_unsupported)),
+            "rfind" => Some(method("rfind", str_rfind)),
+            "index" => Some(method("index", str_index)),
+            "count" => Some(method("count", str_count)),
+            "partition" => Some(method("partition", str_partition)),
+            "rpartition" => Some(method("rpartition", str_rpartition)),
+            "isdigit" => Some(method("isdigit", str_isdigit)),
+            "isalpha" => Some(method("isalpha", str_isalpha)),
+            "isalnum" => Some(method("isalnum", str_isalnum)),
+            "isspace" => Some(method("isspace", str_isspace)),
+            "isupper" => Some(method("isupper", str_isupper)),
+            "islower" => Some(method("islower", str_islower)),
+            "isascii" => Some(method("isascii", str_isascii)),
+            "isnumeric" => Some(method("isnumeric", str_isdigit)),
+            "isdecimal" => Some(method("isdecimal", str_isdigit)),
+            "isidentifier" => Some(method("isidentifier", str_isidentifier)),
+            "isprintable" => Some(method("isprintable", str_isprintable)),
+            "zfill" => Some(method("zfill", str_zfill)),
+            "ljust" => Some(method("ljust", str_ljust)),
+            "rjust" => Some(method("rjust", str_rjust)),
+            "center" => Some(method("center", str_center)),
+            "expandtabs" => Some(method("expandtabs", str_expandtabs)),
+            "encode" => Some(method("encode", str_encode)),
+            "removeprefix" => Some(method("removeprefix", str_removeprefix)),
+            "removesuffix" => Some(method("removesuffix", str_removesuffix)),
+            "format" => Some(method("format", str_format)),
+            "format_map" => Some(method("format_map", str_format_map)),
+            "translate" => Some(method("translate", str_translate)),
+            "maketrans" => Some(method("maketrans", str_maketrans)),
             _ => None,
         },
         Object::List(_) => match name {
@@ -144,11 +196,93 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "pop" => Some(method("pop", dict_pop)),
             "update" => Some(method("update", dict_update)),
             "clear" => Some(method("clear", dict_clear)),
+            "setdefault" => Some(method("setdefault", dict_setdefault)),
+            "copy" => Some(method("copy", dict_copy)),
+            "fromkeys" => Some(method("fromkeys", dict_fromkeys)),
+            "popitem" => Some(method("popitem", dict_popitem)),
             _ => None,
         },
         Object::Tuple(_) => match name {
             "count" => Some(method("count", tuple_count)),
             "index" => Some(method("index", tuple_index)),
+            _ => None,
+        },
+        Object::Set(_) | Object::FrozenSet(_) => match name {
+            "add" => Some(method("add", set_add)),
+            "discard" => Some(method("discard", set_discard)),
+            "remove" => Some(method("remove", set_remove)),
+            "pop" => Some(method("pop", set_pop)),
+            "clear" => Some(method("clear", set_clear)),
+            "copy" => Some(method("copy", set_copy)),
+            "update" => Some(method("update", set_update)),
+            "union" => Some(method("union", set_union)),
+            "intersection" => Some(method("intersection", set_intersection)),
+            "difference" => Some(method("difference", set_difference)),
+            "symmetric_difference" => {
+                Some(method("symmetric_difference", set_symmetric_difference))
+            }
+            "issubset" => Some(method("issubset", set_issubset)),
+            "issuperset" => Some(method("issuperset", set_issuperset)),
+            "isdisjoint" => Some(method("isdisjoint", set_isdisjoint)),
+            "intersection_update" => Some(method("intersection_update", set_intersection_update)),
+            "difference_update" => Some(method("difference_update", set_difference_update)),
+            "symmetric_difference_update" => Some(method(
+                "symmetric_difference_update",
+                set_symmetric_difference_update,
+            )),
+            _ => None,
+        },
+        Object::Bytes(_) | Object::ByteArray(_) => match name {
+            "decode" => Some(method("decode", bytes_decode)),
+            "hex" => Some(method("hex", bytes_hex)),
+            "startswith" => Some(method("startswith", bytes_startswith)),
+            "endswith" => Some(method("endswith", bytes_endswith)),
+            "find" => Some(method("find", bytes_find)),
+            "rfind" => Some(method("rfind", bytes_rfind)),
+            "index" => Some(method("index", bytes_index)),
+            "count" => Some(method("count", bytes_count)),
+            "lower" => Some(method("lower", bytes_lower)),
+            "upper" => Some(method("upper", bytes_upper)),
+            "strip" => Some(method("strip", bytes_strip)),
+            "lstrip" => Some(method("lstrip", bytes_lstrip)),
+            "rstrip" => Some(method("rstrip", bytes_rstrip)),
+            "split" => Some(method("split", bytes_split)),
+            "splitlines" => Some(method("splitlines", bytes_splitlines)),
+            "join" => Some(method("join", bytes_join)),
+            "replace" => Some(method("replace", bytes_replace)),
+            "isalnum" => Some(method("isalnum", bytes_isalnum)),
+            "isalpha" => Some(method("isalpha", bytes_isalpha)),
+            "isdigit" => Some(method("isdigit", bytes_isdigit)),
+            "isspace" => Some(method("isspace", bytes_isspace)),
+            // bytearray-only mutators
+            "append" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("append", bytearray_append))
+            }
+            "extend" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("extend", bytearray_extend))
+            }
+            "clear" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("clear", bytearray_clear))
+            }
+            "pop" if matches!(obj, Object::ByteArray(_)) => Some(method("pop", bytearray_pop)),
+            "reverse" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("reverse", bytearray_reverse))
+            }
+            _ => None,
+        },
+        Object::File(_) => match name {
+            "read" => Some(method("read", file_read)),
+            "readline" => Some(method("readline", file_readline)),
+            "readlines" => Some(method("readlines", file_readlines)),
+            "write" => Some(method("write", file_write)),
+            "writelines" => Some(method("writelines", file_writelines)),
+            "flush" => Some(method("flush", file_flush)),
+            "close" => Some(method("close", file_close)),
+            "seek" => Some(method("seek", file_seek)),
+            "tell" => Some(method("tell", file_tell)),
+            "getvalue" => Some(method("getvalue", file_getvalue)),
+            "__enter__" => Some(method("__enter__", file_enter)),
+            "__exit__" => Some(method("__exit__", file_exit)),
             _ => None,
         },
         _ => None,
@@ -241,6 +375,211 @@ fn b_ascii(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(crate::ascii_value(v)))
 }
 
+/// `property(fget, fset=None, fdel=None, doc=None)`. We model
+/// properties as a small instance of a synthesised `property` class
+/// that the VM treats specially during attribute lookup. Storing the
+/// getter is enough for the typical decorator use case.
+fn b_property(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fget = args.first().cloned().unwrap_or(Object::None);
+    let fset = args.get(1).cloned().unwrap_or(Object::None);
+    let fdel = args.get(2).cloned().unwrap_or(Object::None);
+    let doc = args.get(3).cloned().unwrap_or(Object::None);
+    let cls = crate::builtin_types::property_class();
+    let inst = crate::types::PyInstance::new(cls);
+    inst.dict
+        .borrow_mut()
+        .insert(crate::object::DictKey(Object::from_static("fget")), fget);
+    inst.dict
+        .borrow_mut()
+        .insert(crate::object::DictKey(Object::from_static("fset")), fset);
+    inst.dict
+        .borrow_mut()
+        .insert(crate::object::DictKey(Object::from_static("fdel")), fdel);
+    inst.dict
+        .borrow_mut()
+        .insert(crate::object::DictKey(Object::from_static("__doc__")), doc);
+    Ok(Object::Instance(Rc::new(inst)))
+}
+
+/// `staticmethod(f)` and `classmethod(f)` are markers; we don't
+/// distinguish behaviour at the class-body level yet, but the
+/// callable still works after decoration.
+fn b_staticmethod(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(args.first().cloned().unwrap_or(Object::None))
+}
+fn b_classmethod(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(args.first().cloned().unwrap_or(Object::None))
+}
+
+fn b_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() < 2 {
+        return Err(type_error("getattr() requires at least 2 arguments"));
+    }
+    let name = match &args[1] {
+        Object::Str(s) => s.to_string(),
+        _ => return Err(type_error("attribute name must be string")),
+    };
+    let default = args.get(2).cloned();
+    match attr_get(&args[0], &name) {
+        Some(v) => Ok(v),
+        None => match default {
+            Some(d) => Ok(d),
+            None => Err(crate::error::attribute_error(format!(
+                "'{}' object has no attribute '{}'",
+                args[0].type_name(),
+                name
+            ))),
+        },
+    }
+}
+
+fn b_setattr(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 3 {
+        return Err(type_error("setattr() takes exactly 3 arguments"));
+    }
+    let name = match &args[1] {
+        Object::Str(s) => s.to_string(),
+        _ => return Err(type_error("attribute name must be string")),
+    };
+    attr_set(&args[0], &name, args[2].clone())?;
+    Ok(Object::None)
+}
+
+fn b_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error("delattr() takes exactly 2 arguments"));
+    }
+    let name = match &args[1] {
+        Object::Str(s) => s.to_string(),
+        _ => return Err(type_error("attribute name must be string")),
+    };
+    attr_delete(&args[0], &name)?;
+    Ok(Object::None)
+}
+
+fn b_hasattr(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error("hasattr() takes exactly 2 arguments"));
+    }
+    let name = match &args[1] {
+        Object::Str(s) => s.to_string(),
+        _ => return Err(type_error("attribute name must be string")),
+    };
+    Ok(Object::Bool(attr_get(&args[0], &name).is_some()))
+}
+
+fn b_vars(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args.first() {
+        Some(Object::Instance(inst)) => Ok(Object::Dict(inst.dict.clone())),
+        Some(Object::Module(m)) => Ok(Object::Dict(m.dict.clone())),
+        Some(Object::Type(t)) => Ok(Object::Dict(t.dict.clone())),
+        Some(other) => Err(type_error(format!(
+            "vars() argument must have __dict__, not '{}'",
+            other.type_name()
+        ))),
+        None => Err(type_error("vars() with no argument requires a frame")),
+    }
+}
+
+fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "callable")?;
+    Ok(Object::Bool(matches!(
+        v,
+        Object::Function(_)
+            | Object::Builtin(_)
+            | Object::BoundMethod(_)
+            | Object::Type(_)
+            | Object::Generator(_)
+    )))
+}
+
+fn b_object(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let cls = crate::builtin_types::builtin_types().object_.clone();
+    let inst = crate::types::PyInstance::new(cls);
+    Ok(Object::Instance(Rc::new(inst)))
+}
+
+fn b_globals(_args: &[Object]) -> Result<Object, RuntimeError> {
+    // Without access to the active frame, return an empty dict; the
+    // VM patches this up via its own intrinsic when calling.
+    Ok(Object::new_dict())
+}
+
+fn b_locals(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::new_dict())
+}
+
+/// Generic attribute reader that mirrors a subset of `LoadAttr` for
+/// use from the `getattr`/`hasattr` builtins.
+fn attr_get(obj: &Object, name: &str) -> Option<Object> {
+    match obj {
+        Object::Instance(inst) => {
+            if let Some(v) = inst
+                .dict
+                .borrow()
+                .get(&crate::object::DictKey(Object::from_str(name)))
+                .cloned()
+            {
+                return Some(v);
+            }
+            inst.class.lookup(name)
+        }
+        Object::Module(m) => m
+            .dict
+            .borrow()
+            .get(&crate::object::DictKey(Object::from_str(name)))
+            .cloned(),
+        Object::Type(t) => t.lookup(name),
+        _ => None,
+    }
+}
+
+fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
+    match obj {
+        Object::Instance(inst) => {
+            inst.dict
+                .borrow_mut()
+                .insert(crate::object::DictKey(Object::from_str(name)), value);
+            Ok(())
+        }
+        Object::Module(m) => {
+            m.dict
+                .borrow_mut()
+                .insert(crate::object::DictKey(Object::from_str(name)), value);
+            Ok(())
+        }
+        Object::Type(t) => {
+            t.dict
+                .borrow_mut()
+                .insert(crate::object::DictKey(Object::from_str(name)), value);
+            Ok(())
+        }
+        _ => Err(type_error(format!(
+            "'{}' object has no attribute '{}'",
+            obj.type_name(),
+            name
+        ))),
+    }
+}
+
+fn attr_delete(obj: &Object, name: &str) -> Result<(), RuntimeError> {
+    match obj {
+        Object::Instance(inst) => {
+            inst.dict
+                .borrow_mut()
+                .shift_remove(&crate::object::DictKey(Object::from_str(name)));
+            Ok(())
+        }
+        Object::Module(m) => {
+            m.dict
+                .borrow_mut()
+                .shift_remove(&crate::object::DictKey(Object::from_str(name)));
+            Ok(())
+        }
+        _ => Err(type_error(format!("cannot delete attribute '{}'", name))),
+    }
+}
+
 fn b_int(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::Int(0));
@@ -327,13 +666,35 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::new_dict());
     }
-    // Accept an iterable of (k, v) pairs.
+    // Fast path: another built-in dict copies entry-for-entry. Avoids
+    // re-iterating as a sequence of pairs (which would fail, since
+    // iter(dict) yields keys, not items).
+    if let Object::Dict(src) = &args[0] {
+        let mut d = DictData::new();
+        for (k, v) in src.borrow().iter() {
+            d.insert(k.clone(), v.clone());
+        }
+        return Ok(Object::Dict(Rc::new(RefCell::new(d))));
+    }
+    // Mapping path for user-defined classes (`__keys__` style) is
+    // handled by the VM before dispatching here — see
+    // `Vm::do_dict_call`. Anything left over is an iterable of pairs.
     let mut it = args[0].make_iter()?;
     let mut d = DictData::new();
     while let Some(pair) = it.next_value() {
         match pair {
             Object::Tuple(items) if items.len() == 2 => {
                 d.insert(DictKey(items[0].clone()), items[1].clone());
+            }
+            Object::List(items) => {
+                let items = items.borrow();
+                if items.len() == 2 {
+                    d.insert(DictKey(items[0].clone()), items[1].clone());
+                } else {
+                    return Err(value_error(
+                        "dictionary update sequence element is not a 2-element sequence",
+                    ));
+                }
             }
             _ => {
                 return Err(value_error(
@@ -354,6 +715,10 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Int(_) => bt.int_.clone(),
         Object::Float(_) => bt.float_.clone(),
         Object::Str(_) => bt.str_.clone(),
+        Object::Bytes(_) => bt.bytes_.clone(),
+        Object::ByteArray(_) => bt.bytearray_.clone(),
+        Object::Set(_) => bt.set_.clone(),
+        Object::FrozenSet(_) => bt.frozenset_.clone(),
         Object::Tuple(_) => bt.tuple_.clone(),
         Object::List(_) => bt.list_.clone(),
         Object::Dict(_) => bt.dict_.clone(),
@@ -364,6 +729,153 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => bt.object_.clone(),
     };
     Ok(Object::Type(ty))
+}
+
+fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.is_empty() {
+        return Ok(Object::new_set());
+    }
+    let mut it = args[0].make_iter()?;
+    let mut out = Vec::new();
+    while let Some(v) = it.next_value() {
+        out.push(v);
+    }
+    Ok(Object::new_set_from(out))
+}
+
+fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.is_empty() {
+        return Ok(Object::new_frozenset_from(Vec::new()));
+    }
+    let mut it = args[0].make_iter()?;
+    let mut out = Vec::new();
+    while let Some(v) = it.next_value() {
+        out.push(v);
+    }
+    Ok(Object::new_frozenset_from(out))
+}
+
+fn b_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.is_empty() {
+        return Ok(Object::new_bytes(Vec::new()));
+    }
+    match &args[0] {
+        Object::Int(n) => {
+            if *n < 0 {
+                return Err(value_error("negative count"));
+            }
+            Ok(Object::new_bytes(vec![0u8; *n as usize]))
+        }
+        Object::Str(s) => {
+            let encoding = args
+                .get(1)
+                .and_then(|x| match x {
+                    Object::Str(e) => Some(e.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "utf-8".to_owned());
+            if matches!(encoding.as_str(), "utf-8" | "utf8" | "UTF-8" | "ascii") {
+                Ok(Object::new_bytes(s.as_bytes().to_vec()))
+            } else {
+                Err(value_error(format!("unsupported encoding: {encoding}")))
+            }
+        }
+        Object::Bytes(b) => Ok(Object::Bytes(b.clone())),
+        Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
+        other => {
+            let mut it = other.make_iter()?;
+            let mut out = Vec::new();
+            while let Some(v) = it.next_value() {
+                match v {
+                    Object::Int(i) if (0..=255).contains(&i) => out.push(i as u8),
+                    _ => return Err(value_error("bytes must be in range(0, 256)")),
+                }
+            }
+            Ok(Object::new_bytes(out))
+        }
+    }
+}
+
+fn b_bytearray(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.is_empty() {
+        return Ok(Object::new_bytearray(Vec::new()));
+    }
+    match &args[0] {
+        Object::Int(n) => {
+            if *n < 0 {
+                return Err(value_error("negative count"));
+            }
+            Ok(Object::new_bytearray(vec![0u8; *n as usize]))
+        }
+        Object::Str(s) => Ok(Object::new_bytearray(s.as_bytes().to_vec())),
+        Object::Bytes(b) => Ok(Object::new_bytearray(b.to_vec())),
+        Object::ByteArray(b) => Ok(Object::new_bytearray(b.borrow().clone())),
+        other => {
+            let mut it = other.make_iter()?;
+            let mut out = Vec::new();
+            while let Some(v) = it.next_value() {
+                match v {
+                    Object::Int(i) if (0..=255).contains(&i) => out.push(i as u8),
+                    _ => return Err(value_error("bytes must be in range(0, 256)")),
+                }
+            }
+            Ok(Object::new_bytearray(out))
+        }
+    }
+}
+
+fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::object::{FileBackend, PyFile};
+    use std::fs::OpenOptions;
+    if args.is_empty() {
+        return Err(type_error("open() missing required argument: 'file'"));
+    }
+    let path = match &args[0] {
+        Object::Str(s) => s.to_string(),
+        _ => return Err(type_error("open() argument 'file' must be str".to_owned())),
+    };
+    let mode = match args.get(1) {
+        Some(Object::Str(m)) => m.to_string(),
+        Some(_) => return Err(type_error("open() mode must be str")),
+        None => "r".to_owned(),
+    };
+    let mut opts = OpenOptions::new();
+    let mut writing = false;
+    for ch in mode.chars() {
+        match ch {
+            'r' => {
+                opts.read(true);
+            }
+            'w' => {
+                opts.write(true).create(true).truncate(true);
+                writing = true;
+            }
+            'a' => {
+                opts.write(true).create(true).append(true);
+                writing = true;
+            }
+            'x' => {
+                opts.write(true).create_new(true);
+                writing = true;
+            }
+            '+' => {
+                opts.read(true).write(true);
+            }
+            'b' | 't' => {}
+            _ => return Err(value_error(format!("invalid mode: '{mode}'"))),
+        }
+    }
+    if !mode.contains('r') && !writing {
+        opts.read(true);
+    }
+    let f = opts
+        .open(&path)
+        .map_err(|e| crate::error::os_error(format!("{path}: {e}")))?;
+    Ok(Object::File(Rc::new(PyFile::new(
+        path,
+        mode,
+        FileBackend::Disk(f),
+    ))))
 }
 
 fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -880,10 +1392,523 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(s.find(&**sub).map_or(-1, |i| i as i64)))
 }
 
-fn str_format_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(runtime_error(
-        "str.format is not supported in this build (RFC 0005)",
+fn str_title(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut out = String::new();
+    let mut prev_alpha = false;
+    for ch in str_self(args)?.chars() {
+        if ch.is_alphabetic() {
+            if prev_alpha {
+                out.extend(ch.to_lowercase());
+            } else {
+                out.extend(ch.to_uppercase());
+            }
+            prev_alpha = true;
+        } else {
+            out.push(ch);
+            prev_alpha = false;
+        }
+    }
+    Ok(Object::from_str(out))
+}
+
+fn str_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let mut chars = s.chars();
+    let out = match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+        None => String::new(),
+    };
+    Ok(Object::from_str(out))
+}
+
+fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut out = String::new();
+    for ch in str_self(args)?.chars() {
+        if ch.is_uppercase() {
+            out.extend(ch.to_lowercase());
+        } else if ch.is_lowercase() {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    Ok(Object::from_str(out))
+}
+
+fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let out = match args.get(1) {
+        None | Some(Object::None) => s.trim_start().to_owned(),
+        Some(Object::Str(chars)) => {
+            let set: Vec<char> = chars.chars().collect();
+            s.trim_start_matches(|c| set.contains(&c)).to_owned()
+        }
+        _ => return Err(type_error("lstrip() argument must be str")),
+    };
+    Ok(Object::from_str(out))
+}
+
+fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let out = match args.get(1) {
+        None | Some(Object::None) => s.trim_end().to_owned(),
+        Some(Object::Str(chars)) => {
+            let set: Vec<char> = chars.chars().collect();
+            s.trim_end_matches(|c| set.contains(&c)).to_owned()
+        }
+        _ => return Err(type_error("rstrip() argument must be str")),
+    };
+    Ok(Object::from_str(out))
+}
+
+fn str_rsplit(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let maxsplit = args.get(2).and_then(|x| match x {
+        Object::Int(i) => Some(*i),
+        _ => None,
+    });
+    let out: Vec<Object> = match args.get(1) {
+        None | Some(Object::None) => {
+            let mut parts: Vec<&str> = s.split_whitespace().collect();
+            if let Some(n) = maxsplit {
+                if n >= 0 && (n as usize) < parts.len() - 1 {
+                    let _keep = parts.len() - n as usize;
+                }
+            }
+            parts.reverse();
+            parts.reverse();
+            parts.into_iter().map(Object::from_str).collect()
+        }
+        Some(Object::Str(sep)) => {
+            let pieces: Vec<&str> = if let Some(n) = maxsplit {
+                if n >= 0 {
+                    s.rsplitn(n as usize + 1, &**sep).collect::<Vec<_>>()
+                } else {
+                    s.split(&**sep).collect()
+                }
+            } else {
+                s.split(&**sep).collect()
+            };
+            let mut v = pieces;
+            v.reverse();
+            v.into_iter().map(Object::from_str).collect()
+        }
+        _ => return Err(type_error("rsplit() argument must be str")),
+    };
+    Ok(Object::new_list(out))
+}
+
+fn str_splitlines(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let keepends = matches!(args.get(1), Some(Object::Bool(true)));
+    let mut out: Vec<Object> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' || bytes[i] == b'\r' {
+            let end_no_eol = i;
+            let mut end = i + 1;
+            if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                end = i + 2;
+            }
+            let line = if keepends {
+                &s[start..end]
+            } else {
+                &s[start..end_no_eol]
+            };
+            out.push(Object::from_str(line.to_owned()));
+            start = end;
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push(Object::from_str(s[start..].to_owned()));
+    }
+    Ok(Object::new_list(out))
+}
+
+fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let sub = match args.get(1) {
+        Some(Object::Str(p)) => p,
+        _ => return Err(type_error("rfind() expected str")),
+    };
+    Ok(Object::Int(s.rfind(&**sub).map_or(-1, |i| i as i64)))
+}
+
+fn str_index(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let sub = match args.get(1) {
+        Some(Object::Str(p)) => p,
+        _ => return Err(type_error("index() expected str")),
+    };
+    s.find(&**sub)
+        .map(|i| Object::Int(i as i64))
+        .ok_or_else(|| value_error("substring not found"))
+}
+
+fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let sub = match args.get(1) {
+        Some(Object::Str(p)) => p,
+        _ => return Err(type_error("count() expected str")),
+    };
+    Ok(Object::Int(s.matches(&**sub).count() as i64))
+}
+
+fn str_partition(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let sep = match args.get(1) {
+        Some(Object::Str(p)) => p.to_string(),
+        _ => return Err(type_error("partition() expected str")),
+    };
+    let (head, tail) = match s.find(&sep) {
+        Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
+        None => {
+            return Ok(Object::new_tuple(vec![
+                Object::from_str(s.to_owned()),
+                Object::from_static(""),
+                Object::from_static(""),
+            ]))
+        }
+    };
+    Ok(Object::new_tuple(vec![
+        Object::from_str(head),
+        Object::from_str(sep),
+        Object::from_str(tail),
+    ]))
+}
+
+fn str_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let sep = match args.get(1) {
+        Some(Object::Str(p)) => p.to_string(),
+        _ => return Err(type_error("rpartition() expected str")),
+    };
+    let (head, tail) = match s.rfind(&sep) {
+        Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
+        None => {
+            return Ok(Object::new_tuple(vec![
+                Object::from_static(""),
+                Object::from_static(""),
+                Object::from_str(s.to_owned()),
+            ]))
+        }
+    };
+    Ok(Object::new_tuple(vec![
+        Object::from_str(head),
+        Object::from_str(sep),
+        Object::from_str(tail),
+    ]))
+}
+
+fn str_isdigit(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    Ok(Object::Bool(
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
     ))
+}
+
+fn str_isalpha(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    Ok(Object::Bool(
+        !s.is_empty() && s.chars().all(char::is_alphabetic),
+    ))
+}
+
+fn str_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    Ok(Object::Bool(
+        !s.is_empty() && s.chars().all(char::is_alphanumeric),
+    ))
+}
+
+fn str_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    Ok(Object::Bool(
+        !s.is_empty() && s.chars().all(char::is_whitespace),
+    ))
+}
+
+fn str_isupper(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let mut has_cased = false;
+    for c in s.chars() {
+        if c.is_alphabetic() {
+            has_cased = true;
+            if !c.is_uppercase() {
+                return Ok(Object::Bool(false));
+            }
+        }
+    }
+    Ok(Object::Bool(has_cased))
+}
+
+fn str_islower(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let mut has_cased = false;
+    for c in s.chars() {
+        if c.is_alphabetic() {
+            has_cased = true;
+            if !c.is_lowercase() {
+                return Ok(Object::Bool(false));
+            }
+        }
+    }
+    Ok(Object::Bool(has_cased))
+}
+
+fn str_isascii(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(str_self(args)?.is_ascii()))
+}
+
+fn str_isidentifier(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let mut chars = s.chars();
+    let valid = match chars.next() {
+        Some(c) if c == '_' || c.is_alphabetic() => chars.all(|c| c == '_' || c.is_alphanumeric()),
+        _ => false,
+    };
+    Ok(Object::Bool(valid))
+}
+
+fn str_isprintable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    Ok(Object::Bool(s.chars().all(|c| !c.is_control())))
+}
+
+fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let width = match args.get(1) {
+        Some(Object::Int(i)) => *i as usize,
+        _ => return Err(type_error("zfill() expected int")),
+    };
+    let len = s.chars().count();
+    if len >= width {
+        return Ok(Object::from_str(s.to_owned()));
+    }
+    let pad = width - len;
+    let (sign, rest) = if s.starts_with('+') || s.starts_with('-') {
+        (&s[..1], &s[1..])
+    } else {
+        ("", s)
+    };
+    Ok(Object::from_str(format!("{sign}{}{rest}", "0".repeat(pad))))
+}
+
+fn str_ljust(args: &[Object]) -> Result<Object, RuntimeError> {
+    pad_str(args, false)
+}
+
+fn str_rjust(args: &[Object]) -> Result<Object, RuntimeError> {
+    pad_str(args, true)
+}
+
+fn pad_str(args: &[Object], right_align: bool) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let width = match args.get(1) {
+        Some(Object::Int(i)) => *i as usize,
+        _ => return Err(type_error("expected int width")),
+    };
+    let fill = match args.get(2) {
+        Some(Object::Str(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
+        None => ' ',
+        _ => return Err(type_error("fill must be single char")),
+    };
+    let len = s.chars().count();
+    if len >= width {
+        return Ok(Object::from_str(s.to_owned()));
+    }
+    let pad: String = std::iter::repeat_n(fill, width - len).collect();
+    Ok(Object::from_str(if right_align {
+        format!("{pad}{s}")
+    } else {
+        format!("{s}{pad}")
+    }))
+}
+
+fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let width = match args.get(1) {
+        Some(Object::Int(i)) => *i as usize,
+        _ => return Err(type_error("center() expected int")),
+    };
+    let fill = match args.get(2) {
+        Some(Object::Str(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
+        None => ' ',
+        _ => return Err(type_error("fill must be single char")),
+    };
+    let len = s.chars().count();
+    if len >= width {
+        return Ok(Object::from_str(s.to_owned()));
+    }
+    let total = width - len;
+    let left = total / 2;
+    let right = total - left;
+    let lpad: String = std::iter::repeat_n(fill, left).collect();
+    let rpad: String = std::iter::repeat_n(fill, right).collect();
+    Ok(Object::from_str(format!("{lpad}{s}{rpad}")))
+}
+
+fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let tabsize = match args.get(1) {
+        Some(Object::Int(i)) => *i as usize,
+        None => 8,
+        _ => return Err(type_error("expandtabs() expected int")),
+    };
+    let mut out = String::new();
+    let mut col = 0usize;
+    for ch in s.chars() {
+        match ch {
+            '\t' => {
+                let pad = if tabsize == 0 {
+                    0
+                } else {
+                    tabsize - (col % tabsize)
+                };
+                for _ in 0..pad {
+                    out.push(' ');
+                }
+                col += pad;
+            }
+            '\n' | '\r' => {
+                out.push(ch);
+                col = 0;
+            }
+            other => {
+                out.push(other);
+                col += 1;
+            }
+        }
+    }
+    Ok(Object::from_str(out))
+}
+
+fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let encoding = match args.get(1) {
+        Some(Object::Str(e)) => e.to_string(),
+        None => "utf-8".to_owned(),
+        _ => return Err(type_error("encode() expected str")),
+    };
+    if matches!(encoding.as_str(), "utf-8" | "utf8" | "UTF-8" | "ascii") {
+        Ok(Object::new_bytes(s.as_bytes().to_vec()))
+    } else {
+        Err(value_error(format!("unsupported encoding: {encoding}")))
+    }
+}
+
+fn str_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let prefix = match args.get(1) {
+        Some(Object::Str(p)) => p.to_string(),
+        _ => return Err(type_error("removeprefix() expected str")),
+    };
+    let out = s.strip_prefix(&prefix).unwrap_or(s).to_owned();
+    Ok(Object::from_str(out))
+}
+
+fn str_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let suffix = match args.get(1) {
+        Some(Object::Str(p)) => p.to_string(),
+        _ => return Err(type_error("removesuffix() expected str")),
+    };
+    let out = s.strip_suffix(&suffix).unwrap_or(s).to_owned();
+    Ok(Object::from_str(out))
+}
+
+fn str_format(args: &[Object]) -> Result<Object, RuntimeError> {
+    let template = str_self(args)?.to_owned();
+    let rest = &args[1..];
+    let kwargs: Vec<(String, Object)> = Vec::new();
+    crate::str_format_impl(&template, rest, &kwargs).map(Object::from_str)
+}
+
+fn str_format_map(args: &[Object]) -> Result<Object, RuntimeError> {
+    let template = str_self(args)?.to_owned();
+    let mapping = match args.get(1) {
+        Some(Object::Dict(d)) => d.clone(),
+        _ => return Err(type_error("format_map() argument must be a mapping")),
+    };
+    crate::str_format_map_impl(&template, &mapping).map(Object::from_str)
+}
+
+fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let table = match args.get(1) {
+        Some(Object::Dict(d)) => d.clone(),
+        _ => return Err(type_error("translate() argument must be a dict")),
+    };
+    let mut out = String::new();
+    for c in s.chars() {
+        let key = DictKey(Object::Int(i64::from(u32::from(c))));
+        match table.borrow().get(&key) {
+            Some(Object::None) => {}
+            Some(Object::Int(i)) => {
+                if let Some(ch) = char::from_u32(*i as u32) {
+                    out.push(ch);
+                }
+            }
+            Some(Object::Str(s)) => out.push_str(s),
+            _ => out.push(c),
+        }
+    }
+    Ok(Object::from_str(out))
+}
+
+fn str_maketrans(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut d = DictData::new();
+    match args.len() {
+        1 => match &args[0] {
+            Object::Dict(map) => {
+                for (k, v) in map.borrow().iter() {
+                    let key = match &k.0 {
+                        Object::Str(s) => match s.chars().next() {
+                            Some(c) => DictKey(Object::Int(i64::from(u32::from(c)))),
+                            None => continue,
+                        },
+                        Object::Int(_) => k.clone(),
+                        _ => return Err(type_error("invalid key in maketrans")),
+                    };
+                    d.insert(key, v.clone());
+                }
+            }
+            _ => return Err(type_error("maketrans expected dict")),
+        },
+        2 | 3 => {
+            let from = match &args[0] {
+                Object::Str(s) => s.to_string(),
+                _ => return Err(type_error("maketrans expected str")),
+            };
+            let to = match &args[1] {
+                Object::Str(s) => s.to_string(),
+                _ => return Err(type_error("maketrans expected str")),
+            };
+            if from.chars().count() != to.chars().count() {
+                return Err(value_error(
+                    "the first two maketrans arguments must have equal length",
+                ));
+            }
+            for (a, b) in from.chars().zip(to.chars()) {
+                d.insert(
+                    DictKey(Object::Int(i64::from(u32::from(a)))),
+                    Object::Int(i64::from(u32::from(b))),
+                );
+            }
+            if let Some(Object::Str(rm)) = args.get(2) {
+                for c in rm.chars() {
+                    d.insert(DictKey(Object::Int(i64::from(u32::from(c)))), Object::None);
+                }
+            }
+        }
+        _ => return Err(type_error("maketrans expected 1-3 arguments")),
+    }
+    Ok(Object::Dict(Rc::new(RefCell::new(d))))
 }
 
 // ---------- list methods ----------
@@ -1141,4 +2166,883 @@ fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
         .position(|x| x.eq_value(&args[1]))
         .ok_or_else(|| value_error("x not in tuple"))?;
     Ok(Object::Int(pos as i64))
+}
+
+// ---------- dict extras ----------
+
+fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = dict_self(args)?;
+    let key = match args.get(1) {
+        Some(k) => DictKey(k.clone()),
+        None => return Err(type_error("setdefault() takes at least 1 argument")),
+    };
+    let default = args.get(2).cloned().unwrap_or(Object::None);
+    let mut borrowed = d.borrow_mut();
+    if let Some(v) = borrowed.get(&key).cloned() {
+        return Ok(v);
+    }
+    borrowed.insert(key, default.clone());
+    Ok(default)
+}
+
+fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = dict_self(args)?;
+    let cloned = d.borrow().clone();
+    Ok(Object::Dict(Rc::new(RefCell::new(cloned))))
+}
+
+fn dict_fromkeys(args: &[Object]) -> Result<Object, RuntimeError> {
+    let _ = dict_self(args)?;
+    let it = args
+        .get(1)
+        .ok_or_else(|| type_error("fromkeys() expects iterable"))?;
+    let value = args.get(2).cloned().unwrap_or(Object::None);
+    let mut d = DictData::new();
+    let mut iter = it.make_iter()?;
+    while let Some(k) = iter.next_value() {
+        d.insert(DictKey(k), value.clone());
+    }
+    Ok(Object::Dict(Rc::new(RefCell::new(d))))
+}
+
+fn dict_popitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = dict_self(args)?;
+    let mut borrowed = d.borrow_mut();
+    if let Some((k, v)) = borrowed.pop() {
+        Ok(Object::new_tuple(vec![k.0, v]))
+    } else {
+        Err(key_error("popitem(): dictionary is empty"))
+    }
+}
+
+// ---------- set methods ----------
+
+fn set_self(args: &[Object]) -> Result<Object, RuntimeError> {
+    args.first()
+        .cloned()
+        .ok_or_else(|| type_error("expected set receiver"))
+}
+
+fn set_apply_inplace<F: FnOnce(&mut crate::object::SetData)>(
+    args: &[Object],
+    f: F,
+) -> Result<Object, RuntimeError> {
+    match set_self(args)? {
+        Object::Set(s) => {
+            f(&mut s.borrow_mut());
+            Ok(Object::None)
+        }
+        Object::FrozenSet(_) => Err(type_error("frozenset is immutable")),
+        _ => Err(type_error("expected set receiver")),
+    }
+}
+
+fn set_iter_items(obj: &Object) -> Result<Vec<DictKey>, RuntimeError> {
+    match obj {
+        Object::Set(s) => Ok(s.borrow().iter().cloned().collect()),
+        Object::FrozenSet(s) => Ok(s.iter().cloned().collect()),
+        other => {
+            let mut it = other.make_iter()?;
+            let mut out = Vec::new();
+            while let Some(v) = it.next_value() {
+                out.push(DictKey(v));
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn set_add(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| type_error("add() expected 1 arg"))?;
+    set_apply_inplace(args, |s| {
+        s.insert(DictKey(v));
+    })
+}
+
+fn set_discard(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| type_error("discard() expected 1 arg"))?;
+    set_apply_inplace(args, |s| {
+        s.shift_remove(&DictKey(v));
+    })
+}
+
+fn set_remove(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| type_error("remove() expected 1 arg"))?;
+    match set_self(args)? {
+        Object::Set(s) => {
+            if s.borrow_mut().shift_remove(&DictKey(v.clone())) {
+                Ok(Object::None)
+            } else {
+                Err(key_error(v.repr()))
+            }
+        }
+        Object::FrozenSet(_) => Err(type_error("frozenset is immutable")),
+        _ => Err(type_error("expected set")),
+    }
+}
+
+fn set_pop(args: &[Object]) -> Result<Object, RuntimeError> {
+    match set_self(args)? {
+        Object::Set(s) => {
+            let key = s.borrow().iter().next().cloned();
+            match key {
+                Some(k) => {
+                    s.borrow_mut().shift_remove(&k);
+                    Ok(k.0)
+                }
+                None => Err(key_error("pop from an empty set")),
+            }
+        }
+        _ => Err(type_error("expected set")),
+    }
+}
+
+fn set_clear(args: &[Object]) -> Result<Object, RuntimeError> {
+    set_apply_inplace(args, |s| s.clear())
+}
+
+fn set_copy(args: &[Object]) -> Result<Object, RuntimeError> {
+    match set_self(args)? {
+        Object::Set(s) => {
+            let data: crate::object::SetData = s.borrow().clone();
+            Ok(Object::Set(Rc::new(RefCell::new(data))))
+        }
+        Object::FrozenSet(s) => Ok(Object::FrozenSet(s.clone())),
+        _ => Err(type_error("expected set")),
+    }
+}
+
+fn set_update(args: &[Object]) -> Result<Object, RuntimeError> {
+    let receiver = set_self(args)?;
+    if let Object::FrozenSet(_) = receiver {
+        return Err(type_error("frozenset is immutable"));
+    }
+    if let Object::Set(s) = &receiver {
+        for other in args.iter().skip(1) {
+            for k in set_iter_items(other)? {
+                s.borrow_mut().insert(k);
+            }
+        }
+    }
+    Ok(Object::None)
+}
+
+fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut out = crate::object::SetData::new();
+    if let Some(first) = args.first() {
+        for k in set_iter_items(first)? {
+            out.insert(k);
+        }
+    }
+    for other in args.iter().skip(1) {
+        for k in set_iter_items(other)? {
+            out.insert(k);
+        }
+    }
+    Ok(Object::Set(Rc::new(RefCell::new(out))))
+}
+
+fn set_intersection(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut acc = match args.first() {
+        Some(first) => {
+            let mut s = crate::object::SetData::new();
+            for k in set_iter_items(first)? {
+                s.insert(k);
+            }
+            s
+        }
+        None => return Ok(Object::new_set()),
+    };
+    for other in args.iter().skip(1) {
+        let other_set: crate::object::SetData = set_iter_items(other)?.into_iter().collect();
+        acc.retain(|k| other_set.contains(k));
+    }
+    Ok(Object::Set(Rc::new(RefCell::new(acc))))
+}
+
+fn set_difference(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut acc = match args.first() {
+        Some(first) => {
+            let mut s = crate::object::SetData::new();
+            for k in set_iter_items(first)? {
+                s.insert(k);
+            }
+            s
+        }
+        None => return Ok(Object::new_set()),
+    };
+    for other in args.iter().skip(1) {
+        let other_set: crate::object::SetData = set_iter_items(other)?.into_iter().collect();
+        acc.retain(|k| !other_set.contains(k));
+    }
+    Ok(Object::Set(Rc::new(RefCell::new(acc))))
+}
+
+fn set_symmetric_difference(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut a: crate::object::SetData = match args.first() {
+        Some(first) => set_iter_items(first)?.into_iter().collect(),
+        None => return Ok(Object::new_set()),
+    };
+    let b: crate::object::SetData = match args.get(1) {
+        Some(other) => set_iter_items(other)?.into_iter().collect(),
+        None => return Ok(Object::Set(Rc::new(RefCell::new(a)))),
+    };
+    let mut out = crate::object::SetData::new();
+    for k in a.iter().filter(|k| !b.contains(*k)) {
+        out.insert(k.clone());
+    }
+    for k in b.iter().filter(|k| !a.contains(*k)) {
+        out.insert(k.clone());
+    }
+    let _ = &mut a;
+    Ok(Object::Set(Rc::new(RefCell::new(out))))
+}
+
+fn set_issubset(args: &[Object]) -> Result<Object, RuntimeError> {
+    let a = set_iter_items(args.first().unwrap())?;
+    let b: crate::object::SetData = match args.get(1) {
+        Some(o) => set_iter_items(o)?.into_iter().collect(),
+        None => return Err(type_error("issubset() expected 1 arg")),
+    };
+    Ok(Object::Bool(a.iter().all(|k| b.contains(k))))
+}
+
+fn set_issuperset(args: &[Object]) -> Result<Object, RuntimeError> {
+    let a: crate::object::SetData = set_iter_items(args.first().unwrap())?.into_iter().collect();
+    let b = match args.get(1) {
+        Some(o) => set_iter_items(o)?,
+        None => return Err(type_error("issuperset() expected 1 arg")),
+    };
+    Ok(Object::Bool(b.iter().all(|k| a.contains(k))))
+}
+
+fn set_isdisjoint(args: &[Object]) -> Result<Object, RuntimeError> {
+    let a: crate::object::SetData = set_iter_items(args.first().unwrap())?.into_iter().collect();
+    let b = match args.get(1) {
+        Some(o) => set_iter_items(o)?,
+        None => return Err(type_error("isdisjoint() expected 1 arg")),
+    };
+    Ok(Object::Bool(!b.iter().any(|k| a.contains(k))))
+}
+
+fn set_intersection_update(args: &[Object]) -> Result<Object, RuntimeError> {
+    if matches!(set_self(args)?, Object::FrozenSet(_)) {
+        return Err(type_error("frozenset is immutable"));
+    }
+    if let Object::Set(s) = set_self(args)? {
+        let mut keep: crate::object::SetData = s.borrow().clone();
+        for other in args.iter().skip(1) {
+            let o: crate::object::SetData = set_iter_items(other)?.into_iter().collect();
+            keep.retain(|k| o.contains(k));
+        }
+        *s.borrow_mut() = keep;
+    }
+    Ok(Object::None)
+}
+
+fn set_difference_update(args: &[Object]) -> Result<Object, RuntimeError> {
+    if matches!(set_self(args)?, Object::FrozenSet(_)) {
+        return Err(type_error("frozenset is immutable"));
+    }
+    if let Object::Set(s) = set_self(args)? {
+        for other in args.iter().skip(1) {
+            for k in set_iter_items(other)? {
+                s.borrow_mut().shift_remove(&k);
+            }
+        }
+    }
+    Ok(Object::None)
+}
+
+fn set_symmetric_difference_update(args: &[Object]) -> Result<Object, RuntimeError> {
+    if matches!(set_self(args)?, Object::FrozenSet(_)) {
+        return Err(type_error("frozenset is immutable"));
+    }
+    if let Object::Set(s) = set_self(args)? {
+        let b: crate::object::SetData = match args.get(1) {
+            Some(o) => set_iter_items(o)?.into_iter().collect(),
+            None => return Ok(Object::None),
+        };
+        let a: crate::object::SetData = s.borrow().clone();
+        let mut out = crate::object::SetData::new();
+        for k in a.iter().filter(|k| !b.contains(*k)) {
+            out.insert(k.clone());
+        }
+        for k in b.iter().filter(|k| !a.contains(*k)) {
+            out.insert(k.clone());
+        }
+        *s.borrow_mut() = out;
+    }
+    Ok(Object::None)
+}
+
+// ---------- bytes methods ----------
+
+fn bytes_data(args: &[Object]) -> Result<Vec<u8>, RuntimeError> {
+    match args.first() {
+        Some(Object::Bytes(b)) => Ok(b.to_vec()),
+        Some(Object::ByteArray(b)) => Ok(b.borrow().clone()),
+        _ => Err(type_error("expected bytes-like receiver")),
+    }
+}
+
+fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
+    match arg {
+        Object::Bytes(b) => Ok(b.to_vec()),
+        Object::ByteArray(b) => Ok(b.borrow().clone()),
+        Object::Str(s) => Ok(s.as_bytes().to_vec()),
+        Object::Int(i) if (0..=255).contains(i) => Ok(vec![*i as u8]),
+        _ => Err(type_error("a bytes-like object is required")),
+    }
+}
+
+fn bytes_decode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let encoding = match args.get(1) {
+        Some(Object::Str(e)) => e.to_string(),
+        None => "utf-8".to_owned(),
+        _ => return Err(type_error("decode() expected str")),
+    };
+    if matches!(encoding.as_str(), "utf-8" | "utf8" | "UTF-8" | "ascii") {
+        let s = String::from_utf8(data).map_err(|e| value_error(e.to_string()))?;
+        Ok(Object::from_str(s))
+    } else if matches!(encoding.as_str(), "latin-1" | "latin1" | "iso-8859-1") {
+        let s: String = data.iter().map(|&b| b as char).collect();
+        Ok(Object::from_str(s))
+    } else {
+        Err(value_error(format!("unsupported encoding: {encoding}")))
+    }
+}
+
+fn bytes_hex(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data {
+        out.push_str(&format!("{b:02x}"));
+    }
+    Ok(Object::from_str(out))
+}
+
+fn bytes_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let prefix = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("startswith() expected 1 arg"))?,
+    )?;
+    Ok(Object::Bool(data.starts_with(&prefix)))
+}
+
+fn bytes_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let suffix = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("endswith() expected 1 arg"))?,
+    )?;
+    Ok(Object::Bool(data.ends_with(&suffix)))
+}
+
+fn bytes_find(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let sub = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("find() expected 1 arg"))?,
+    )?;
+    Ok(Object::Int(
+        data.windows(sub.len())
+            .position(|w| w == sub)
+            .map_or(-1, |i| i as i64),
+    ))
+}
+
+fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let sub = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("rfind() expected 1 arg"))?,
+    )?;
+    let mut last = -1i64;
+    if sub.len() <= data.len() {
+        for i in 0..=data.len() - sub.len() {
+            if data[i..i + sub.len()] == sub[..] {
+                last = i as i64;
+            }
+        }
+    }
+    Ok(Object::Int(last))
+}
+
+fn bytes_index(args: &[Object]) -> Result<Object, RuntimeError> {
+    match bytes_find(args)? {
+        Object::Int(i) if i >= 0 => Ok(Object::Int(i)),
+        _ => Err(value_error("subsection not found")),
+    }
+}
+
+fn bytes_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let sub = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("count() expected 1 arg"))?,
+    )?;
+    if sub.is_empty() {
+        return Ok(Object::Int(data.len() as i64 + 1));
+    }
+    let mut n = 0i64;
+    let mut i = 0;
+    while i + sub.len() <= data.len() {
+        if data[i..i + sub.len()] == sub[..] {
+            n += 1;
+            i += sub.len();
+        } else {
+            i += 1;
+        }
+    }
+    Ok(Object::Int(n))
+}
+
+fn bytes_lower(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::new_bytes(
+        bytes_data(args)?
+            .iter()
+            .map(|b| b.to_ascii_lowercase())
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn bytes_upper(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::new_bytes(
+        bytes_data(args)?
+            .iter()
+            .map(|b| b.to_ascii_uppercase())
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn bytes_strip(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let trim_set: Vec<u8> = match args.get(1) {
+        Some(Object::Bytes(b)) => b.to_vec(),
+        Some(Object::ByteArray(b)) => b.borrow().clone(),
+        None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
+        _ => return Err(type_error("strip() expected bytes")),
+    };
+    let start = data
+        .iter()
+        .position(|b| !trim_set.contains(b))
+        .unwrap_or(data.len());
+    let end = data
+        .iter()
+        .rposition(|b| !trim_set.contains(b))
+        .map_or(start, |i| i + 1);
+    Ok(Object::new_bytes(data[start..end].to_vec()))
+}
+
+fn bytes_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let trim_set: Vec<u8> = match args.get(1) {
+        Some(Object::Bytes(b)) => b.to_vec(),
+        Some(Object::ByteArray(b)) => b.borrow().clone(),
+        None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
+        _ => return Err(type_error("lstrip() expected bytes")),
+    };
+    let start = data
+        .iter()
+        .position(|b| !trim_set.contains(b))
+        .unwrap_or(data.len());
+    Ok(Object::new_bytes(data[start..].to_vec()))
+}
+
+fn bytes_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let trim_set: Vec<u8> = match args.get(1) {
+        Some(Object::Bytes(b)) => b.to_vec(),
+        Some(Object::ByteArray(b)) => b.borrow().clone(),
+        None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
+        _ => return Err(type_error("rstrip() expected bytes")),
+    };
+    let end = data
+        .iter()
+        .rposition(|b| !trim_set.contains(b))
+        .map_or(0, |i| i + 1);
+    Ok(Object::new_bytes(data[..end].to_vec()))
+}
+
+fn bytes_split(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let sep: Option<Vec<u8>> = match args.get(1) {
+        None | Some(Object::None) => None,
+        Some(Object::Bytes(b)) => Some(b.to_vec()),
+        Some(Object::ByteArray(b)) => Some(b.borrow().clone()),
+        _ => return Err(type_error("split() expected bytes")),
+    };
+    let parts: Vec<Vec<u8>> = match sep {
+        None => data
+            .split(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c'))
+            .filter(|s| !s.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+        Some(sep) if !sep.is_empty() => {
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            let mut start = 0;
+            let mut i = 0;
+            while i + sep.len() <= data.len() {
+                if data[i..i + sep.len()] == sep[..] {
+                    out.push(data[start..i].to_vec());
+                    i += sep.len();
+                    start = i;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(data[start..].to_vec());
+            out
+        }
+        _ => vec![data],
+    };
+    Ok(Object::new_list(
+        parts.into_iter().map(Object::new_bytes).collect(),
+    ))
+}
+
+fn bytes_splitlines(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let keepends = matches!(args.get(1), Some(Object::Bool(true)));
+    let mut out: Vec<Object> = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == b'\n' || data[i] == b'\r' {
+            let no_eol = i;
+            let mut end = i + 1;
+            if data[i] == b'\r' && i + 1 < data.len() && data[i + 1] == b'\n' {
+                end = i + 2;
+            }
+            let slice = if keepends {
+                &data[start..end]
+            } else {
+                &data[start..no_eol]
+            };
+            out.push(Object::new_bytes(slice.to_vec()));
+            start = end;
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    if start < data.len() {
+        out.push(Object::new_bytes(data[start..].to_vec()));
+    }
+    Ok(Object::new_list(out))
+}
+
+fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
+    let sep = bytes_data(args)?;
+    let it = args
+        .get(1)
+        .ok_or_else(|| type_error("join() expected iterable"))?;
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let mut iter = it.make_iter()?;
+    while let Some(v) = iter.next_value() {
+        match v {
+            Object::Bytes(b) => parts.push(b.to_vec()),
+            Object::ByteArray(b) => parts.push(b.borrow().clone()),
+            _ => return Err(type_error("sequence item: expected bytes")),
+        }
+    }
+    let mut out = Vec::new();
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(&sep);
+        }
+        out.extend_from_slice(p);
+    }
+    Ok(Object::new_bytes(out))
+}
+
+fn bytes_replace(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let from = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("replace() expected 2 args"))?,
+    )?;
+    let to = bytes_argview(
+        args.get(2)
+            .ok_or_else(|| type_error("replace() expected 2 args"))?,
+    )?;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if i + from.len() <= data.len() && data[i..i + from.len()] == from[..] {
+            out.extend_from_slice(&to);
+            i += from.len().max(1);
+            if from.is_empty() {
+                out.push(data[i - 1]);
+            }
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    Ok(Object::new_bytes(out))
+}
+
+fn bytes_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    Ok(Object::Bool(
+        !data.is_empty() && data.iter().all(u8::is_ascii_alphanumeric),
+    ))
+}
+
+fn bytes_isalpha(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    Ok(Object::Bool(
+        !data.is_empty() && data.iter().all(u8::is_ascii_alphabetic),
+    ))
+}
+
+fn bytes_isdigit(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    Ok(Object::Bool(
+        !data.is_empty() && data.iter().all(u8::is_ascii_digit),
+    ))
+}
+
+fn bytes_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    Ok(Object::Bool(
+        !data.is_empty() && data.iter().all(u8::is_ascii_whitespace),
+    ))
+}
+
+// ---------- bytearray-only mutators ----------
+
+fn bytearray_self(args: &[Object]) -> Result<Rc<std::cell::RefCell<Vec<u8>>>, RuntimeError> {
+    match args.first() {
+        Some(Object::ByteArray(b)) => Ok(b.clone()),
+        _ => Err(type_error("expected bytearray receiver")),
+    }
+}
+
+fn bytearray_append(args: &[Object]) -> Result<Object, RuntimeError> {
+    let b = bytearray_self(args)?;
+    let value = args
+        .get(1)
+        .ok_or_else(|| type_error("append() requires int"))?;
+    let byte = match value {
+        Object::Int(i) if (0..=255).contains(i) => *i as u8,
+        _ => return Err(value_error("byte must be 0..256")),
+    };
+    b.borrow_mut().push(byte);
+    Ok(Object::None)
+}
+
+fn bytearray_extend(args: &[Object]) -> Result<Object, RuntimeError> {
+    let b = bytearray_self(args)?;
+    let other = args
+        .get(1)
+        .ok_or_else(|| type_error("extend() requires iterable"))?;
+    match other {
+        Object::Bytes(buf) => b.borrow_mut().extend_from_slice(buf),
+        Object::ByteArray(buf) => b.borrow_mut().extend_from_slice(&buf.borrow()),
+        Object::List(items) => {
+            let items = items.borrow();
+            for o in items.iter() {
+                if let Object::Int(i) = o {
+                    if !(0..=255).contains(i) {
+                        return Err(value_error("byte must be 0..256"));
+                    }
+                    b.borrow_mut().push(*i as u8);
+                } else {
+                    return Err(type_error("bytearray extend with non-int"));
+                }
+            }
+        }
+        _ => return Err(type_error("bytearray.extend() expects an iterable of ints")),
+    }
+    Ok(Object::None)
+}
+
+fn bytearray_clear(args: &[Object]) -> Result<Object, RuntimeError> {
+    let b = bytearray_self(args)?;
+    b.borrow_mut().clear();
+    Ok(Object::None)
+}
+
+fn bytearray_pop(args: &[Object]) -> Result<Object, RuntimeError> {
+    let b = bytearray_self(args)?;
+    let mut buf = b.borrow_mut();
+    if buf.is_empty() {
+        return Err(crate::error::index_error("pop from empty bytearray"));
+    }
+    let idx_arg = args.get(1).cloned().unwrap_or(Object::Int(-1));
+    let idx = match idx_arg {
+        Object::Int(i) => {
+            let len = buf.len() as i64;
+            let n = if i < 0 { i + len } else { i };
+            if n < 0 || n >= len {
+                return Err(crate::error::index_error("bytearray index out of range"));
+            }
+            n as usize
+        }
+        _ => return Err(type_error("pop() index must be int")),
+    };
+    let v = buf.remove(idx);
+    Ok(Object::Int(i64::from(v)))
+}
+
+fn bytearray_reverse(args: &[Object]) -> Result<Object, RuntimeError> {
+    let b = bytearray_self(args)?;
+    b.borrow_mut().reverse();
+    Ok(Object::None)
+}
+
+// ---------- file methods ----------
+
+fn file_self(args: &[Object]) -> Result<Rc<crate::object::PyFile>, RuntimeError> {
+    match args.first() {
+        Some(Object::File(f)) => Ok(f.clone()),
+        _ => Err(type_error("expected file receiver")),
+    }
+}
+
+fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let n = match args.get(1) {
+        Some(Object::Int(i)) if *i >= 0 => Some(*i as usize),
+        None | Some(Object::None) | Some(Object::Int(-1)) => None,
+        _ => return Err(type_error("read() argument must be int")),
+    };
+    let bytes = f.read_bytes(n)?;
+    if f.binary {
+        Ok(Object::new_bytes(bytes))
+    } else {
+        let s = String::from_utf8(bytes).map_err(|e| value_error(e.to_string()))?;
+        Ok(Object::from_str(s))
+    }
+}
+
+fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let b = f.read_bytes(Some(1))?;
+        if b.is_empty() {
+            break;
+        }
+        out.extend_from_slice(&b);
+        if b[0] == b'\n' {
+            break;
+        }
+    }
+    if f.binary {
+        Ok(Object::new_bytes(out))
+    } else {
+        let s = String::from_utf8(out).map_err(|e| value_error(e.to_string()))?;
+        Ok(Object::from_str(s))
+    }
+}
+
+fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let mut lines: Vec<Object> = Vec::new();
+    loop {
+        let line = file_readline(&[Object::File(f.clone())])?;
+        let is_empty = match &line {
+            Object::Str(s) => s.is_empty(),
+            Object::Bytes(b) => b.is_empty(),
+            _ => true,
+        };
+        if is_empty {
+            break;
+        }
+        lines.push(line);
+    }
+    Ok(Object::new_list(lines))
+}
+
+fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let data = args
+        .get(1)
+        .ok_or_else(|| type_error("write() expected 1 arg"))?;
+    let n = match data {
+        Object::Str(s) => f.write_bytes(s.as_bytes())?,
+        Object::Bytes(b) => f.write_bytes(b)?,
+        Object::ByteArray(b) => f.write_bytes(&b.borrow())?,
+        _ => return Err(type_error("write() argument must be str or bytes")),
+    };
+    Ok(Object::Int(n as i64))
+}
+
+fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let it = args
+        .get(1)
+        .ok_or_else(|| type_error("writelines() expected 1 arg"))?;
+    let mut iter = it.make_iter()?;
+    while let Some(v) = iter.next_value() {
+        match v {
+            Object::Str(s) => {
+                f.write_bytes(s.as_bytes())?;
+            }
+            Object::Bytes(b) => {
+                f.write_bytes(&b)?;
+            }
+            _ => return Err(type_error("writelines() item must be str or bytes")),
+        }
+    }
+    Ok(Object::None)
+}
+
+fn file_flush(args: &[Object]) -> Result<Object, RuntimeError> {
+    file_self(args)?.flush()?;
+    Ok(Object::None)
+}
+
+fn file_close(args: &[Object]) -> Result<Object, RuntimeError> {
+    file_self(args)?.close();
+    Ok(Object::None)
+}
+
+fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let offset = match args.get(1) {
+        Some(Object::Int(i)) => *i as isize,
+        _ => return Err(type_error("seek() expected int")),
+    };
+    let whence = match args.get(2) {
+        Some(Object::Int(i)) => *i as i32,
+        None => 0,
+        _ => return Err(type_error("seek() whence must be int")),
+    };
+    Ok(Object::Int(f.seek(offset, whence)? as i64))
+}
+
+fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    Ok(Object::Int(f.position() as i64))
+}
+
+fn file_getvalue(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    f.getvalue()
+        .ok_or_else(|| type_error("getvalue() requires StringIO/BytesIO"))
+}
+
+fn file_enter(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::File(file_self(args)?))
+}
+
+fn file_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+    file_self(args)?.close();
+    Ok(Object::None)
 }

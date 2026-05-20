@@ -1,0 +1,12 @@
+b'hello'
+5
+104
+b'hello world'
+b'HELLO'
+b'heLLo'
+[b'he', b'', b'o']
+bytearray(b'hello!')
+b'hello!'
+616263
+['a', 'b', 'c']
+b'a,b,c'

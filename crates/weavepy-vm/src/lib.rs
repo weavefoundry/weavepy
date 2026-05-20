@@ -512,19 +512,53 @@ impl Interpreter {
             OpCode::BinarySubscr => {
                 let i = frame.pop()?;
                 let v = frame.pop()?;
-                let r = self.binary_subscr(&v, &i)?;
+                let r = if let Object::Instance(_) = &v {
+                    if let Some(method) = instance_method(&v, "__getitem__") {
+                        self.call(
+                            &method,
+                            std::slice::from_ref(&i),
+                            &[],
+                            &frame.globals.clone(),
+                        )?
+                    } else {
+                        self.binary_subscr(&v, &i)?
+                    }
+                } else {
+                    self.binary_subscr(&v, &i)?
+                };
                 frame.push(r);
             }
             OpCode::StoreSubscr => {
                 let i = frame.pop()?;
                 let target = frame.pop()?;
                 let value = frame.pop()?;
-                self.store_subscr(&target, &i, value)?;
+                if let Object::Instance(_) = &target {
+                    if let Some(method) = instance_method(&target, "__setitem__") {
+                        self.call(&method, &[i.clone(), value], &[], &frame.globals.clone())?;
+                    } else {
+                        self.store_subscr(&target, &i, value)?;
+                    }
+                } else {
+                    self.store_subscr(&target, &i, value)?;
+                }
             }
             OpCode::DeleteSubscr => {
                 let i = frame.pop()?;
                 let target = frame.pop()?;
-                self.delete_subscr(&target, &i)?;
+                if let Object::Instance(_) = &target {
+                    if let Some(method) = instance_method(&target, "__delitem__") {
+                        self.call(
+                            &method,
+                            std::slice::from_ref(&i),
+                            &[],
+                            &frame.globals.clone(),
+                        )?;
+                    } else {
+                        self.delete_subscr(&target, &i)?;
+                    }
+                } else {
+                    self.delete_subscr(&target, &i)?;
+                }
             }
             OpCode::BinaryOp => {
                 let b = frame.pop()?;
@@ -613,6 +647,41 @@ impl Interpreter {
                 let pos_args: Vec<Object> = frame.stack.split_off(split_pos_at);
                 let callable = frame.pop()?;
                 let kw_pairs: Vec<(String, Object)> = names.into_iter().zip(kw_values).collect();
+                let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
+                frame.push(r);
+            }
+            OpCode::CallEx => {
+                // CALL_FUNCTION_EX: `arg = 0` → stack has (callable,
+                // args_tuple); `arg = 1` → (callable, args_tuple,
+                // kwargs_dict).
+                let has_kwargs = ins.arg == 1;
+                let kwargs_obj = if has_kwargs { Some(frame.pop()?) } else { None };
+                let args_obj = frame.pop()?;
+                let callable = frame.pop()?;
+                let pos_args: Vec<Object> = match args_obj {
+                    Object::Tuple(items) => items.iter().cloned().collect(),
+                    Object::List(items) => items.borrow().clone(),
+                    other => {
+                        return Err(crate::error::type_error(format!(
+                            "argument after * must be an iterable, not {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                let kw_pairs: Vec<(String, Object)> = match kwargs_obj {
+                    None => Vec::new(),
+                    Some(Object::Dict(d)) => d
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (k.0.to_str(), v.clone()))
+                        .collect(),
+                    Some(other) => {
+                        return Err(crate::error::type_error(format!(
+                            "argument after ** must be a mapping, not {}",
+                            other.type_name()
+                        )))
+                    }
+                };
                 let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
                 frame.push(r);
             }
@@ -709,16 +778,10 @@ impl Interpreter {
                 frame.push(Object::new_tuple(items));
             }
             OpCode::BuildSet => {
-                // No native set yet — represent as list-deduped value
-                // wrapped in a dict whose values are None.
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
-                let mut d = DictData::new();
-                for x in items {
-                    d.insert(DictKey(x), Object::None);
-                }
-                frame.push(Object::Dict(Rc::new(RefCell::new(d))));
+                frame.push(Object::new_set_from(items));
             }
             OpCode::BuildMap => {
                 let n = ins.arg as usize;
@@ -775,8 +838,8 @@ impl Interpreter {
                     .ok_or_else(|| {
                         RuntimeError::Internal("SET_ADD depth out of range".to_owned())
                     })?;
-                if let Object::Dict(d) = s {
-                    d.borrow_mut().insert(DictKey(v), Object::None);
+                if let Object::Set(s) = s {
+                    s.borrow_mut().insert(DictKey(v));
                 }
             }
             OpCode::MapAdd => {
@@ -809,6 +872,19 @@ impl Interpreter {
                             cur += r.step;
                         }
                         out
+                    }
+                    Object::Bytes(b) => b.iter().map(|x| Object::Int(i64::from(*x))).collect(),
+                    Object::ByteArray(b) => b
+                        .borrow()
+                        .iter()
+                        .map(|x| Object::Int(i64::from(*x)))
+                        .collect(),
+                    Object::Set(s) => s.borrow().iter().map(|k| k.0.clone()).collect(),
+                    Object::FrozenSet(s) => s.iter().map(|k| k.0.clone()).collect(),
+                    Object::Generator(g) => {
+                        let gen_obj = Object::Generator(g);
+                        let globals = frame.globals.clone();
+                        self.collect_iterable(&gen_obj, &globals)?
                     }
                     _ => {
                         return Err(type_error(format!(
@@ -853,8 +929,16 @@ impl Interpreter {
                 if flags & 0x04 != 0 {
                     frame.pop()?; // annotations dict — discarded
                 }
+                let mut kw_defaults: Vec<(String, Object)> = Vec::new();
                 if flags & 0x02 != 0 {
-                    frame.pop()?; // kw defaults dict — discarded
+                    let dict = frame.pop()?;
+                    if let Object::Dict(d) = dict {
+                        for (k, v) in d.borrow().iter() {
+                            if let Object::Str(name) = &k.0 {
+                                kw_defaults.push((name.to_string(), v.clone()));
+                            }
+                        }
+                    }
                 }
                 let mut defaults: Vec<Object> = Vec::new();
                 if flags & 0x01 != 0 {
@@ -869,7 +953,7 @@ impl Interpreter {
                     code,
                     globals: frame.globals.clone(),
                     defaults,
-                    kw_defaults: Vec::new(),
+                    kw_defaults,
                     closure,
                 };
                 frame.push(Object::Function(Rc::new(f)));
@@ -947,15 +1031,13 @@ impl Interpreter {
                 return Err(RuntimeError::PyException(exc));
             }
             OpCode::CheckExcMatch => {
-                // Stack on entry: [exc, type_or_tuple]
-                // CPython's CHECK_EXC_MATCH pops `type` and peeks
-                // `exc`. We push a bool onto the stack and leave
-                // `exc` in place so the handler can bind it.
+                // Compiler emits `CopyTop; <type>; CheckExcMatch`,
+                // so on entry the stack ends in `[exc, exc, type]`.
+                // We consume both the copied `exc` and the `type`,
+                // leaving `[exc, bool]` for the no-match branch to
+                // peek/POP appropriately.
                 let ty = frame.pop()?;
-                let exc =
-                    frame.stack.last().cloned().ok_or_else(|| {
-                        RuntimeError::Internal("CHECK_EXC_MATCH no exc".to_owned())
-                    })?;
+                let exc = frame.pop()?;
                 let matched = self.exception_matches(&exc, &ty)?;
                 frame.push(Object::Bool(matched));
             }
@@ -1055,7 +1137,8 @@ impl Interpreter {
                 let has_spec = (arg & 0x04) != 0;
                 let spec = if has_spec { Some(frame.pop()?) } else { None };
                 let value = frame.pop()?;
-                let formatted = self.format_value(&value, conversion, spec.as_ref())?;
+                let globals = frame.globals.clone();
+                let formatted = self.format_value(&value, conversion, spec.as_ref(), &globals)?;
                 frame.push(Object::from_str(formatted));
             }
             OpCode::YieldValue => {
@@ -1301,7 +1384,7 @@ impl Interpreter {
         Err(name_error(format!("name '{name}' is not defined")))
     }
 
-    fn load_attr(&self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
+    fn load_attr(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
         match obj {
             Object::Instance(inst) => {
                 // Super proxies stash the real receiver under
@@ -1327,6 +1410,22 @@ impl Interpreter {
                     return Ok(v.clone());
                 }
                 if let Some(v) = inst.class.lookup(name) {
+                    // Descriptor protocol (simplified): a `property`
+                    // instance resolves by invoking `fget(self)`.
+                    if let Object::Instance(prop) = &v {
+                        if prop.class.name == "property" {
+                            let fget = prop
+                                .dict
+                                .borrow()
+                                .get(&DictKey(Object::from_static("fget")))
+                                .cloned()
+                                .unwrap_or(Object::None);
+                            if !matches!(fget, Object::None) {
+                                let receiver = obj.clone();
+                                return self.call(&fget, &[receiver], &[], &self.builtins.clone());
+                            }
+                        }
+                    }
                     return Ok(self.maybe_bind(obj, v));
                 }
                 Err(attribute_error(format!(
@@ -1452,6 +1551,129 @@ impl Interpreter {
         Ok(Object::from_str(self.stringify(v, globals)?))
     }
 
+    /// VM-aware variant of [`str_format_impl`] that dispatches
+    /// `__str__` / `__repr__` for conversions on instances, so
+    /// `"{!r}".format(obj)` mirrors `repr(obj)` for user types.
+    fn do_str_format(
+        &mut self,
+        template: &str,
+        positional: &[Object],
+        keyword: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<String, RuntimeError> {
+        // Pre-stringify any Instance arg by converting through the
+        // VM so user dunders run. We don't know yet which conversion
+        // each field will pick, so we materialise both `!s` and `!r`
+        // upfront when the arg is an Instance.
+        let mut positional_resolved: Vec<Object> = Vec::with_capacity(positional.len());
+        let mut keyword_resolved: Vec<(String, Object)> = Vec::with_capacity(keyword.len());
+        // We let `str_format_impl` do the normal field resolution
+        // and conversion; the only thing we need to fix is that when
+        // the value is an Instance and there is an `!s` / `!r`
+        // conversion, the plain `to_str()` / `repr()` in
+        // `render_format_field` won't dispatch dunders. We do a
+        // pre-pass and replace bare Instances with proxy strings
+        // when no conversion is requested.
+        //
+        // Conversion dispatch: we recognise `{x!s}` / `{x!r}` by
+        // post-processing — we leave Instances alone for the
+        // straight `{x}` path (the default conversion falls back to
+        // `value.to_str()` which CPython's `format` actually also
+        // does — it calls `__format__`, but lacking that here we
+        // emit a `<X object>` placeholder).
+        for arg in positional {
+            positional_resolved.push(arg.clone());
+        }
+        for (k, v) in keyword {
+            keyword_resolved.push((k.clone(), v.clone()));
+        }
+        // The straightforward fix is to override conversion: parse
+        // each field's `!s` / `!r` and substitute the user-method
+        // result back into the field as a Str literal before
+        // delegating to `str_format_impl`. We do that with a
+        // pre-pass below.
+        let preprocessed =
+            self.preprocess_str_format(template, &positional_resolved, &keyword_resolved, globals)?;
+        str_format_impl(&preprocessed, &positional_resolved, &keyword_resolved)
+    }
+
+    /// Walk every `{...}` field; when the conversion is `!s` or `!r`
+    /// and the referenced value is an Instance, replace the field
+    /// with a pre-rendered literal so the downstream formatter sees
+    /// a string instead of the unconverted object.
+    fn preprocess_str_format(
+        &mut self,
+        template: &str,
+        positional: &[Object],
+        keyword: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<String, RuntimeError> {
+        let bytes = template.as_bytes();
+        let mut out = String::with_capacity(template.len());
+        let mut i = 0;
+        let mut auto_idx = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'{' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                    out.push_str("{{");
+                    i += 2;
+                    continue;
+                }
+                let (field, end) = scan_format_field(bytes, i + 1)?;
+                i = end;
+                let (name_part, conv, spec_part) = split_format_field(&field);
+                let conv_char = conv;
+                if matches!(conv_char, Some('s') | Some('r')) {
+                    // Resolve the value the same way render_format_field
+                    // would, so attribute / subscript trailers still work.
+                    let mut tmp_idx = auto_idx;
+                    let value =
+                        resolve_field_name(name_part, positional, keyword, &mut tmp_idx, None)?;
+                    if matches!(value, Object::Instance(_)) {
+                        let rendered = match conv_char {
+                            Some('s') => self.stringify(&value, globals)?,
+                            Some('r') => self.repr_of(&value, globals)?,
+                            _ => unreachable!(),
+                        };
+                        let final_text = match spec_part {
+                            Some(spec) => format_via_spec(&Object::from_str(rendered), spec)?,
+                            None => rendered,
+                        };
+                        // Emit as a literal — escape any `{` / `}` so
+                        // the downstream pass treats it as plain text.
+                        for ch in final_text.chars() {
+                            if ch == '{' || ch == '}' {
+                                out.push(ch);
+                                out.push(ch);
+                            } else {
+                                out.push(ch);
+                            }
+                        }
+                        auto_idx = tmp_idx;
+                        continue;
+                    }
+                }
+                out.push('{');
+                out.push_str(&field);
+                out.push('}');
+            } else if b == b'}' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                    out.push_str("}}");
+                    i += 2;
+                    continue;
+                }
+                return Err(value_error("Single '}' encountered in format string"));
+            } else {
+                let ch_len = utf8_seq_len(b);
+                let end = (i + ch_len).min(bytes.len());
+                out.push_str(&template[i..end]);
+                i = end;
+            }
+        }
+        Ok(out)
+    }
+
     fn do_repr_call(
         &mut self,
         v: &Object,
@@ -1534,6 +1756,49 @@ impl Interpreter {
         }
     }
 
+    /// CPython's `dict(obj)` checks for the mapping protocol (`keys()` +
+    /// `__getitem__`) before falling back to iter-of-pairs. We do the
+    /// same for user-defined instances: if the instance exposes
+    /// `keys()`, call it and pull each value via subscript.
+    fn try_dict_from_mapping(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let Object::Instance(inst) = v else {
+            return Ok(None);
+        };
+        // Prefer the instance's own `keys` (rare), then walk the MRO.
+        // `inst.class.lookup` already handles inheritance, which is
+        // how `_MappingMixin` subclasses (defaultdict, Counter, …)
+        // get their mapping API.
+        let keys_attr = inst
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_str("keys")))
+            .cloned()
+            .or_else(|| inst.class.lookup("keys"));
+        let Some(keys_fn) = keys_attr else {
+            return Ok(None);
+        };
+        let bound = self.maybe_bind(v, keys_fn);
+        let keys = self.call(&bound, &[], &[], globals)?;
+        let mut d = DictData::new();
+        let it = self.make_iter(&keys, globals)?;
+        while let Some(k) = self.iter_next(&it, globals)? {
+            // Use `__getitem__` if it's defined (the typical case for
+            // user mappings); fall back to native subscript for the
+            // few built-in iterables that might land here.
+            let val = if let Some(getitem) = instance_method(v, "__getitem__") {
+                self.call(&getitem, std::slice::from_ref(&k), &[], globals)?
+            } else {
+                self.binary_subscr(v, &k)?
+            };
+            d.insert(DictKey(k), val);
+        }
+        Ok(Some(Object::Dict(Rc::new(RefCell::new(d)))))
+    }
+
     fn collect_iterable(
         &mut self,
         v: &Object,
@@ -1542,6 +1807,8 @@ impl Interpreter {
         match v {
             Object::List(items) => Ok(items.borrow().clone()),
             Object::Tuple(items) => Ok(items.to_vec()),
+            Object::Set(s) => Ok(s.borrow().iter().map(|k| k.0.clone()).collect()),
+            Object::FrozenSet(s) => Ok(s.iter().map(|k| k.0.clone()).collect()),
             Object::Generator(_) | Object::Instance(_) => {
                 let it = self.make_iter(v, globals)?;
                 let mut out = Vec::new();
@@ -1590,6 +1857,9 @@ impl Interpreter {
         let default = kwargs
             .iter()
             .find_map(|(k, v)| (k == "default").then(|| v.clone()));
+        let key_fn = kwargs
+            .iter()
+            .find_map(|(k, v)| (k == "key").then(|| v.clone()));
         let items: Vec<Object> = if args.len() == 1 {
             self.collect_iterable(&args[0], globals)?
         } else {
@@ -1599,19 +1869,29 @@ impl Interpreter {
             return default
                 .ok_or_else(|| value_error(format!("{name}() arg is an empty sequence")));
         }
-        let mut best = items[0].clone();
+        let key_of = |slf: &mut Self, item: &Object| -> Result<Object, RuntimeError> {
+            if let Some(f) = &key_fn {
+                slf.call(f, std::slice::from_ref(item), &[], globals)
+            } else {
+                Ok(item.clone())
+            }
+        };
+        let mut best_value = items[0].clone();
+        let mut best_key = key_of(self, &items[0])?;
         for item in &items[1..] {
-            let order = item.cmp(&best)?;
+            let candidate_key = key_of(self, item)?;
+            let order = candidate_key.cmp(&best_key)?;
             let take = if want_max {
                 matches!(order, std::cmp::Ordering::Greater)
             } else {
                 matches!(order, std::cmp::Ordering::Less)
             };
             if take {
-                best = item.clone();
+                best_value = item.clone();
+                best_key = candidate_key;
             }
         }
-        Ok(best)
+        Ok(best_value)
     }
 
     fn do_any_all_call(
@@ -1645,11 +1925,65 @@ impl Interpreter {
             .iter()
             .find_map(|(k, v)| (k == "reverse").then(|| v.is_truthy()))
             .unwrap_or(false);
-        items.sort_by(|a, b| a.cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        if reverse {
-            items.reverse();
-        }
+        let key_fn = kwargs
+            .iter()
+            .find_map(|(k, v)| (k == "key").then(|| v.clone()));
+        self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals)?;
         Ok(Object::new_list(items))
+    }
+
+    fn do_list_sort_call(
+        &mut self,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let list = match args.first() {
+            Some(Object::List(l)) => l.clone(),
+            _ => return Err(type_error("list.sort expects a list receiver")),
+        };
+        let reverse = kwargs
+            .iter()
+            .find_map(|(k, v)| (k == "reverse").then(|| v.is_truthy()))
+            .unwrap_or(false);
+        let key_fn = kwargs
+            .iter()
+            .find_map(|(k, v)| (k == "key").then(|| v.clone()));
+        let mut items = list.borrow().clone();
+        self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals)?;
+        *list.borrow_mut() = items;
+        Ok(Object::None)
+    }
+
+    /// Stable sort over `items`. With `key`, every element is mapped
+    /// through it once and the results are sorted alongside the
+    /// originals (decorate-sort-undecorate). Errors from the key
+    /// function propagate.
+    fn sort_with_key(
+        &mut self,
+        items: &mut Vec<Object>,
+        key_fn: Option<&Object>,
+        reverse: bool,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(f) = key_fn {
+            let mut decorated: Vec<(Object, Object)> = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                let k = self.call(f, std::slice::from_ref(item), &[], globals)?;
+                decorated.push((k, item.clone()));
+            }
+            decorated.sort_by(|a, b| a.0.cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if reverse {
+                decorated.reverse();
+            }
+            *items = decorated.into_iter().map(|(_, v)| v).collect();
+        } else {
+            items.sort_by(|a, b| a.cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if reverse {
+                items.reverse();
+            }
+        }
+        Ok(())
     }
 
     /// Run `__str__` on instances, falling back to `__repr__` then
@@ -1691,7 +2025,7 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         match v {
-            Object::Generator(_) => Ok(v.clone()),
+            Object::Generator(_) | Object::Iter(_) => Ok(v.clone()),
             Object::Instance(_) => {
                 if let Some(method) = instance_method(v, "__iter__") {
                     return self.call(&method, &[], &[], globals);
@@ -1758,11 +2092,12 @@ impl Interpreter {
         value: &Object,
         conversion: u32,
         spec: Option<&Object>,
+        globals: &Rc<RefCell<DictData>>,
     ) -> Result<String, RuntimeError> {
         let s = match conversion {
-            0 => value.to_str(),
-            1 => value.to_str(), // !s
-            2 => value.repr(),   // !r
+            0 => self.stringify(value, globals)?,
+            1 => self.stringify(value, globals)?, // !s
+            2 => self.repr_of(value, globals)?,   // !r
             3 => ascii_repr(value),
             _ => {
                 return Err(RuntimeError::Internal(format!(
@@ -2095,6 +2430,40 @@ impl Interpreter {
                 let s: String = sliced.iter().map(|o| o.to_str()).collect();
                 Ok(Object::from_str(s))
             }
+            (Object::Bytes(buf), Object::Int(i)) => {
+                let idx = normalize_index(*i, buf.len())?;
+                Ok(Object::Int(i64::from(buf[idx])))
+            }
+            (Object::ByteArray(buf), Object::Int(i)) => {
+                let buf = buf.borrow();
+                let idx = normalize_index(*i, buf.len())?;
+                Ok(Object::Int(i64::from(buf[idx])))
+            }
+            (Object::Bytes(buf), Object::Slice(slc)) => {
+                let as_objs: Vec<Object> = buf.iter().map(|b| Object::Int(i64::from(*b))).collect();
+                let sliced = slice_seq(&as_objs, slc)?;
+                let mut out = Vec::with_capacity(sliced.len());
+                for o in sliced {
+                    match o {
+                        Object::Int(i) => out.push(i as u8),
+                        _ => return Err(type_error("bytes slice produced non-int")),
+                    }
+                }
+                Ok(Object::Bytes(Rc::from(out.as_slice())))
+            }
+            (Object::ByteArray(buf), Object::Slice(slc)) => {
+                let buf = buf.borrow();
+                let as_objs: Vec<Object> = buf.iter().map(|b| Object::Int(i64::from(*b))).collect();
+                let sliced = slice_seq(&as_objs, slc)?;
+                let mut out = Vec::with_capacity(sliced.len());
+                for o in sliced {
+                    match o {
+                        Object::Int(i) => out.push(i as u8),
+                        _ => return Err(type_error("bytearray slice produced non-int")),
+                    }
+                }
+                Ok(Object::ByteArray(Rc::new(RefCell::new(out))))
+            }
             (_, _) => Err(type_error(format!(
                 "'{}' object is not subscriptable with '{}'",
                 container.type_name(),
@@ -2116,8 +2485,43 @@ impl Interpreter {
                 items[idx] = value;
                 Ok(())
             }
+            (Object::List(items), Object::Slice(s)) => {
+                // CPython: `xs[start:stop:step] = iterable`. We
+                // collect the RHS, then splice in place. Supporting
+                // strided slice assignment requires that `len(rhs)`
+                // matches the slice width.
+                let replacement = match value {
+                    Object::List(l) => l.borrow().clone(),
+                    Object::Tuple(t) => t.iter().cloned().collect::<Vec<_>>(),
+                    Object::Str(ref txt) => txt
+                        .chars()
+                        .map(|c| Object::from_str(c.to_string()))
+                        .collect(),
+                    other => {
+                        let mut buf = Vec::new();
+                        let mut it = other.make_iter()?;
+                        while let Some(v) = it.next_value() {
+                            buf.push(v);
+                        }
+                        buf
+                    }
+                };
+                let mut data = items.borrow_mut();
+                apply_slice_assignment(&mut data, s, replacement)?;
+                Ok(())
+            }
             (Object::Dict(d), key) => {
                 d.borrow_mut().insert(DictKey(key.clone()), value);
+                Ok(())
+            }
+            (Object::ByteArray(b), Object::Int(i)) => {
+                let mut b = b.borrow_mut();
+                let idx = normalize_index(*i, b.len())?;
+                let byte = match value {
+                    Object::Int(v) if (0..=255).contains(&v) => v as u8,
+                    _ => return Err(value_error("byte must be in 0..256")),
+                };
+                b[idx] = byte;
                 Ok(())
             }
             _ => Err(type_error(format!(
@@ -2184,6 +2588,11 @@ impl Interpreter {
                 if (b.name == "list" || b.name == "tuple") && args.len() == 1 {
                     return self.do_list_or_tuple_call(b.name, &args[0], outer_globals);
                 }
+                if b.name == "dict" && args.len() == 1 && kwargs.is_empty() {
+                    if let Some(d) = self.try_dict_from_mapping(&args[0], outer_globals)? {
+                        return Ok(d);
+                    }
+                }
                 if b.name == "sum" {
                     return self.do_sum_call(args, outer_globals);
                 }
@@ -2196,13 +2605,35 @@ impl Interpreter {
                 if b.name == "sorted" && !args.is_empty() {
                     return self.do_sorted_call(args, kwargs, outer_globals);
                 }
-                if b.name == "format" && (args.len() == 1 || args.len() == 2) {
-                    let spec = match args.get(1) {
-                        Some(Object::Str(s)) => s.to_string(),
-                        None => String::new(),
-                        Some(_) => return Err(type_error("format() spec must be a string")),
-                    };
-                    return Ok(Object::from_str(format_via_spec(&args[0], &spec)?));
+                if b.name == "sort" && !args.is_empty() {
+                    return self.do_list_sort_call(args, kwargs, outer_globals);
+                }
+                if (b.name == "min" || b.name == "max") && !args.is_empty() {
+                    return self.do_min_max_call(b.name, args, kwargs, outer_globals);
+                }
+                // `format`'s dispatching: when args[0] is a string we
+                // assume this is `"...".format(...)` (str_format
+                // builtin) and pass kwargs through. Otherwise fall
+                // back to the global builtin `format(value, spec)`.
+                if b.name == "format" {
+                    if matches!(args.first(), Some(Object::Str(_))) && !args.is_empty() {
+                        let template = match &args[0] {
+                            Object::Str(s) => s.to_string(),
+                            _ => unreachable!(),
+                        };
+                        let rest = &args[1..];
+                        return self
+                            .do_str_format(&template, rest, kwargs, outer_globals)
+                            .map(Object::from_str);
+                    }
+                    if args.len() == 1 || args.len() == 2 {
+                        let spec = match args.get(1) {
+                            Some(Object::Str(s)) => s.to_string(),
+                            None => String::new(),
+                            Some(_) => return Err(type_error("format() spec must be a string")),
+                        };
+                        return Ok(Object::from_str(format_via_spec(&args[0], &spec)?));
+                    }
                 }
                 if !kwargs.is_empty() {
                     return Err(type_error(format!(
@@ -2219,7 +2650,21 @@ impl Interpreter {
                 combined.extend_from_slice(args);
                 self.call(&bm.function, &combined, kwargs, outer_globals)
             }
-            Object::Type(ty) => self.instantiate(ty.clone(), args, kwargs),
+            Object::Type(ty) => {
+                // CPython routes `str(x)` / `repr(x)` through dunders;
+                // intercept the built-in classes here so that the
+                // user's `__str__` / `__repr__` wins over the default
+                // type constructor.
+                if ty.flags.is_builtin && args.len() == 1 && kwargs.is_empty() {
+                    if ty.name == "str" {
+                        return self.do_str_call(&args[0], outer_globals);
+                    }
+                    if ty.name == "repr" {
+                        return self.do_repr_call(&args[0], outer_globals);
+                    }
+                }
+                self.instantiate(ty.clone(), args, kwargs)
+            }
             Object::Instance(inst) => {
                 // Honour __call__ if defined.
                 if let Some(m) = inst.class.lookup("__call__") {
@@ -2334,6 +2779,15 @@ impl Interpreter {
                 let global_dummy = Rc::new(RefCell::new(DictData::new()));
                 return self.do_list_or_tuple_call(cls.name.as_str(), &args[0], &global_dummy);
             }
+            // CPython's `dict(obj)` accepts a mapping (anything with
+            // `keys()`); recognise that path before falling through to
+            // the simple "iter of pairs" builtin.
+            if cls.name == "dict" && args.len() == 1 && kwargs.is_empty() {
+                let global_dummy = Rc::new(RefCell::new(DictData::new()));
+                if let Some(d) = self.try_dict_from_mapping(&args[0], &global_dummy)? {
+                    return Ok(d);
+                }
+            }
             if let Some(builtin) = self.builtin_constructor_for(&cls) {
                 if !kwargs.is_empty() {
                     return Err(type_error(format!(
@@ -2405,6 +2859,7 @@ impl Interpreter {
         let code = f.code.clone();
         let total_args = code.arg_count as usize;
         let has_varargs = code.has_varargs;
+        let has_varkeywords = code.has_varkeywords;
         // Bind positional args; remainder go to *args if present, else error.
         let mut positional: Vec<Object> = vec![Object::None; code.varnames.len()];
         let mut filled = vec![false; code.varnames.len()];
@@ -2425,7 +2880,72 @@ impl Interpreter {
                 f.name, total_args, provided
             )));
         }
-        // Apply defaults for any positional arg slot that wasn't filled.
+        // Keyword args: match by name. Unmatched ones go into the
+        // `**kwargs` dict if the function declares one; otherwise we
+        // raise the usual TypeError. Defaults are applied AFTER
+        // kwargs so an explicit `arg=` always wins over the default.
+        let kwargs_slot = if has_varkeywords {
+            Some(total_args + usize::from(has_varargs))
+        } else {
+            None
+        };
+        let mut extra_kwargs = crate::object::DictData::new();
+        // Keyword-binding range = positional params + kwonly params.
+        // *args/**kwargs sit just outside this range and can't be
+        // addressed by keyword. Locals beyond it MUST NOT pull the
+        // kwarg out of the **kwargs catchall.
+        let kwonly_count = code.kwonly_count as usize;
+        let kwonly_start = total_args + usize::from(has_varargs);
+        let kwonly_end = kwonly_start + kwonly_count;
+        for (name, value) in kwargs {
+            let mut slot = None;
+            if let Some(p) = code
+                .varnames
+                .iter()
+                .take(total_args)
+                .position(|n| n == name)
+            {
+                slot = Some(p);
+            } else if let Some(p) = code
+                .varnames
+                .get(kwonly_start..kwonly_end)
+                .and_then(|range| range.iter().position(|n| n == name))
+            {
+                slot = Some(kwonly_start + p);
+            }
+            match slot {
+                Some(slot) => {
+                    if filled[slot] {
+                        return Err(type_error(format!(
+                            "{}() got multiple values for argument '{}'",
+                            f.name, name
+                        )));
+                    }
+                    positional[slot] = value.clone();
+                    filled[slot] = true;
+                }
+                None => {
+                    if kwargs_slot.is_some() {
+                        extra_kwargs.insert(
+                            crate::object::DictKey(Object::from_str(name.clone())),
+                            value.clone(),
+                        );
+                    } else {
+                        return Err(type_error(format!(
+                            "{}() got an unexpected keyword argument '{}'",
+                            f.name, name
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(slot) = kwargs_slot {
+            positional[slot] = Object::Dict(Rc::new(RefCell::new(extra_kwargs)));
+            filled[slot] = true;
+        }
+        // Defaults plug remaining holes among positional args. CPython
+        // attaches positional defaults right-aligned to the param
+        // list (so `def f(a, b=1, c=2)` has `defaults = (1, 2)`).
         if filled.iter().take(total_args).any(|x| !x) {
             let needed = total_args;
             let first_default = needed.saturating_sub(f.defaults.len());
@@ -2437,27 +2957,37 @@ impl Interpreter {
                 }
             }
         }
-        // Keyword args: match by name, error on unknown.
-        for (name, value) in kwargs {
-            let Some(slot) = code.varnames.iter().position(|n| n == name) else {
-                return Err(type_error(format!(
-                    "{}() got an unexpected keyword argument '{}'",
-                    f.name, name
-                )));
-            };
-            if filled[slot] {
-                return Err(type_error(format!(
-                    "{}() got multiple values for argument '{}'",
-                    f.name, name
-                )));
+        // Then plug kwonly defaults by name.
+        for (name, default) in &f.kw_defaults {
+            if let Some(p) = code
+                .varnames
+                .get(kwonly_start..kwonly_end)
+                .and_then(|range| range.iter().position(|n| n == name))
+            {
+                let slot = kwonly_start + p;
+                if !filled[slot] {
+                    positional[slot] = default.clone();
+                    filled[slot] = true;
+                }
             }
-            positional[slot] = value.clone();
-            filled[slot] = true;
         }
         for (i, was_filled) in filled.iter().take(total_args).enumerate() {
             if !was_filled {
                 return Err(type_error(format!(
                     "{}() missing required argument: '{}'",
+                    f.name, code.varnames[i]
+                )));
+            }
+        }
+        for (i, was_filled) in filled
+            .iter()
+            .enumerate()
+            .skip(kwonly_start)
+            .take(kwonly_end - kwonly_start)
+        {
+            if !was_filled {
+                return Err(type_error(format!(
+                    "{}() missing required keyword-only argument: '{}'",
                     f.name, code.varnames[i]
                 )));
             }
@@ -2557,7 +3087,8 @@ impl Interpreter {
     }
 
     /// Load a single fully-qualified module name. Honours the cache
-    /// first, then the built-in registry, then the filesystem.
+    /// first, then the built-in registry, then frozen Python sources,
+    /// then the filesystem.
     fn load_one(&mut self, full: &str) -> Result<Object, RuntimeError> {
         if let Some(cached) = self.cache.get(full) {
             return Ok(cached);
@@ -2568,11 +3099,55 @@ impl Interpreter {
             self.cache.insert(full, obj.clone());
             return Ok(obj);
         }
+        if let Some(frozen) = self.cache.frozen_source(full) {
+            return self.load_from_source(full, frozen.source, frozen.is_package, "<frozen>");
+        }
         let (path, is_package) = self
             .cache
             .find_source(full)
             .ok_or_else(|| module_not_found_error(format!("No module named '{full}'")))?;
         self.load_from_file(full, &path, is_package)
+    }
+
+    /// Compile and execute Python source provided as a string. Used
+    /// for frozen stdlib modules; shares the post-parse path with
+    /// `load_from_file`.
+    fn load_from_source(
+        &mut self,
+        full: &str,
+        source: &str,
+        is_package: bool,
+        filename: &str,
+    ) -> Result<Object, RuntimeError> {
+        let module = weavepy_parser::parse_module(source)
+            .map_err(|e| import_error(format!("parse error in '{full}': {e}")))?;
+        let code = weavepy_compiler::compile_module_with_source(&module, source, filename)
+            .map_err(|e| import_error(format!("compile error in '{full}': {e}")))?;
+        let package = if is_package {
+            full.to_owned()
+        } else {
+            full.rsplit_once('.')
+                .map_or(String::new(), |(p, _)| p.to_owned())
+        };
+        let pkg_for_globals = if package.is_empty() {
+            None
+        } else {
+            Some(package.as_str())
+        };
+        let globals = self.build_module_globals(full, Some(filename), pkg_for_globals);
+        let module_obj = Object::Module(Rc::new(PyModule {
+            name: full.to_owned(),
+            filename: Some(filename.to_owned()),
+            dict: globals.clone(),
+        }));
+        self.cache.insert(full, module_obj.clone());
+        let code_rc = Rc::new(code);
+        let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
+        if let Err(e) = self.run_frame(&mut frame) {
+            self.cache.remove(full);
+            return Err(e);
+        }
+        Ok(module_obj)
     }
 
     /// Read, parse, compile, and execute the module's source.
@@ -2645,6 +3220,7 @@ impl Interpreter {
                 let candidate = format!("{}.{}", m.name, name);
                 if self.cache.get(&candidate).is_some()
                     || self.cache.builtin_factory(&candidate).is_some()
+                    || self.cache.frozen_source(&candidate).is_some()
                     || self.cache.find_source(&candidate).is_some()
                 {
                     let sub = self.load_one(&candidate)?;
@@ -2731,6 +3307,80 @@ fn current_package(globals: &Rc<RefCell<DictData>>) -> Option<String> {
         }
     }
     None
+}
+
+fn apply_slice_assignment(
+    data: &mut Vec<Object>,
+    s: &PySlice,
+    replacement: Vec<Object>,
+) -> Result<(), RuntimeError> {
+    let len = data.len() as i64;
+    let step = match &s.step {
+        Object::None => 1i64,
+        Object::Int(i) => *i,
+        _ => return Err(type_error("slice indices must be integers or None")),
+    };
+    if step == 0 {
+        return Err(value_error("slice step cannot be zero"));
+    }
+    let extract = |o: &Object, default: i64| -> Result<i64, RuntimeError> {
+        match o {
+            Object::None => Ok(default),
+            Object::Int(i) => Ok(*i),
+            _ => Err(type_error("slice indices must be integers or None")),
+        }
+    };
+    let start_raw = extract(&s.start, if step > 0 { 0 } else { len - 1 })?;
+    let stop_raw = extract(&s.stop, if step > 0 { len } else { -1 })?;
+    let norm = |x: i64| -> i64 {
+        if x < 0 {
+            ((x + len).max(0)).min(len)
+        } else {
+            x.min(len)
+        }
+    };
+    if step == 1 {
+        let start = norm(start_raw).max(0) as usize;
+        let stop = norm(stop_raw).max(start as i64) as usize;
+        data.splice(start..stop, replacement);
+        return Ok(());
+    }
+    // Strided assignment: build the list of indices first, then
+    // verify the lengths match before applying.
+    let mut indices: Vec<usize> = Vec::new();
+    let mut i = if step > 0 {
+        norm(start_raw)
+    } else {
+        if start_raw < 0 {
+            (start_raw + len).max(-1)
+        } else {
+            start_raw.min(len - 1)
+        }
+    };
+    let stop = if step > 0 {
+        norm(stop_raw)
+    } else if stop_raw < 0 {
+        (stop_raw + len).max(-1)
+    } else {
+        stop_raw.min(len)
+    };
+    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        if i >= 0 && (i as usize) < data.len() {
+            indices.push(i as usize);
+        }
+        i += step;
+    }
+    if indices.len() != replacement.len() {
+        return Err(value_error(format!(
+            "attempt to assign sequence of size {} to extended slice of size {}",
+            replacement.len(),
+            indices.len()
+        )));
+    }
+    for (slot, value) in indices.into_iter().zip(replacement) {
+        data[slot] = value;
+    }
+    Ok(())
 }
 
 fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, RuntimeError> {
@@ -2866,6 +3516,49 @@ fn exception_value(instance: &Object) -> Object {
     Object::None
 }
 
+fn union_sets(a: &crate::object::SetData, b: &crate::object::SetData) -> Object {
+    let mut out = a.clone();
+    for k in b.iter() {
+        out.insert(k.clone());
+    }
+    Object::Set(Rc::new(RefCell::new(out)))
+}
+
+fn intersect_sets(a: &crate::object::SetData, b: &crate::object::SetData) -> Object {
+    let mut out = crate::object::SetData::new();
+    for k in a.iter() {
+        if b.contains(k) {
+            out.insert(k.clone());
+        }
+    }
+    Object::Set(Rc::new(RefCell::new(out)))
+}
+
+fn difference_sets(a: &crate::object::SetData, b: &crate::object::SetData) -> Object {
+    let mut out = crate::object::SetData::new();
+    for k in a.iter() {
+        if !b.contains(k) {
+            out.insert(k.clone());
+        }
+    }
+    Object::Set(Rc::new(RefCell::new(out)))
+}
+
+fn symmetric_diff_sets(a: &crate::object::SetData, b: &crate::object::SetData) -> Object {
+    let mut out = crate::object::SetData::new();
+    for k in a.iter() {
+        if !b.contains(k) {
+            out.insert(k.clone());
+        }
+    }
+    for k in b.iter() {
+        if !a.contains(k) {
+            out.insert(k.clone());
+        }
+    }
+    Object::Set(Rc::new(RefCell::new(out)))
+}
+
 /// Public entry point shared with the `format` builtin: drive the
 /// format-spec mini-language without going through `FORMAT_VALUE`.
 pub(crate) fn format_via_spec(value: &Object, spec: &str) -> Result<String, RuntimeError> {
@@ -2879,6 +3572,495 @@ pub(crate) fn format_via_spec(value: &Object, spec: &str) -> Result<String, Runt
 /// Public wrapper for `ascii()`.
 pub(crate) fn ascii_value(value: &Object) -> String {
     ascii_repr(value)
+}
+
+/// Implement `str.format(*args, **kwargs)` at runtime. The grammar
+/// matches CPython's `string.Formatter.vformat`: `{}`, `{0}`,
+/// `{name}`, `{0.attr}`, `{name[key]}`, with optional `!r`/`!s`/`!a`
+/// conversion and `:spec` format spec (which itself may be an
+/// f-string-like template using `{0}`/`{name}` references).
+pub(crate) fn str_format_impl(
+    template: &str,
+    positional: &[Object],
+    keyword: &[(String, Object)],
+) -> Result<String, RuntimeError> {
+    let mut out = String::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    let mut auto_idx = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'{' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                out.push('{');
+                i += 2;
+                continue;
+            }
+            let (field, end) = scan_format_field(bytes, i + 1)?;
+            i = end;
+            let rendered = render_format_field(&field, positional, keyword, &mut auto_idx, None)?;
+            out.push_str(&rendered);
+        } else if b == b'}' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                out.push('}');
+                i += 2;
+                continue;
+            }
+            return Err(value_error("Single '}' encountered in format string"));
+        } else {
+            let ch_len = utf8_seq_len(b);
+            let end = (i + ch_len).min(bytes.len());
+            out.push_str(&template[i..end]);
+            i = end;
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn str_format_map_impl(
+    template: &str,
+    mapping: &Rc<RefCell<DictData>>,
+) -> Result<String, RuntimeError> {
+    let mut out = String::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    let mut auto_idx = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'{' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                out.push('{');
+                i += 2;
+                continue;
+            }
+            let (field, end) = scan_format_field(bytes, i + 1)?;
+            i = end;
+            let rendered = render_format_field(&field, &[], &[], &mut auto_idx, Some(mapping))?;
+            out.push_str(&rendered);
+        } else if b == b'}' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                out.push('}');
+                i += 2;
+                continue;
+            }
+            return Err(value_error("Single '}' encountered in format string"));
+        } else {
+            let ch_len = utf8_seq_len(b);
+            let end = (i + ch_len).min(bytes.len());
+            out.push_str(&template[i..end]);
+            i = end;
+        }
+    }
+    Ok(out)
+}
+
+fn utf8_seq_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b & 0xE0 == 0xC0 {
+        2
+    } else if b & 0xF0 == 0xE0 {
+        3
+    } else if b & 0xF8 == 0xF0 {
+        4
+    } else {
+        1
+    }
+}
+
+/// Scan from just past the opening `{` to the matching `}` at the
+/// same nesting depth. Returns the body and the index after the
+/// closing brace.
+fn scan_format_field(bytes: &[u8], start: usize) -> Result<(String, usize), RuntimeError> {
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                if depth == 0 {
+                    let field = std::str::from_utf8(&bytes[start..i])
+                        .map_err(|_| value_error("invalid utf-8 in format field"))?
+                        .to_owned();
+                    return Ok((field, i + 1));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Err(value_error("Single '{' encountered in format string"))
+}
+
+/// Render a single `{field}` interpolation.
+fn render_format_field(
+    field: &str,
+    positional: &[Object],
+    keyword: &[(String, Object)],
+    auto_idx: &mut usize,
+    mapping: Option<&Rc<RefCell<DictData>>>,
+) -> Result<String, RuntimeError> {
+    // Split off the conversion (`!s`/`!r`/`!a`) and spec (`:...`).
+    let (name_part, conv, spec_part) = split_format_field(field);
+    // Resolve the leading "field name" reference, applying any
+    // attribute / subscript trailers.
+    let value = resolve_field_name(name_part, positional, keyword, auto_idx, mapping)?;
+    let converted = match conv {
+        Some('s') => Object::from_str(value.to_str()),
+        Some('r') => Object::from_str(value.repr()),
+        Some('a') => Object::from_str(ascii_repr(&value)),
+        Some(other) => return Err(value_error(format!("Unknown conversion: {other}"))),
+        None => value,
+    };
+    let spec_str = match spec_part {
+        Some(s) if s.contains('{') => {
+            // Nested format spec — recursively interpolate.
+            str_format_impl(s, positional, keyword)?
+        }
+        Some(s) => s.to_owned(),
+        None => String::new(),
+    };
+    format_via_spec(&converted, &spec_str)
+}
+
+fn split_format_field(field: &str) -> (&str, Option<char>, Option<&str>) {
+    let mut name_end = field.len();
+    let mut conv: Option<char> = None;
+    let mut spec_start: Option<usize> = None;
+    let bytes = field.as_bytes();
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            b'!' if depth == 0 && conv.is_none() && spec_start.is_none() => {
+                name_end = i;
+                if let Some(&next) = bytes.get(i + 1) {
+                    conv = Some(next as char);
+                }
+            }
+            b':' if depth == 0 && spec_start.is_none() => {
+                if name_end == field.len() {
+                    name_end = i;
+                }
+                spec_start = Some(i + 1);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let name = &field[..name_end];
+    let spec = spec_start.map(|s| &field[s..]);
+    (name, conv, spec)
+}
+
+fn resolve_field_name(
+    name: &str,
+    positional: &[Object],
+    keyword: &[(String, Object)],
+    auto_idx: &mut usize,
+    mapping: Option<&Rc<RefCell<DictData>>>,
+) -> Result<Object, RuntimeError> {
+    // Split into base + trailers (`.attr`/`[idx]`).
+    let (base, trailers) = split_name_trailers(name);
+    let mut value = if base.is_empty() {
+        let idx = *auto_idx;
+        *auto_idx += 1;
+        positional
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| index_error("Replacement index out of range"))?
+    } else if let Ok(idx) = base.parse::<usize>() {
+        positional
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| index_error(format!("Replacement index {idx} out of range")))?
+    } else if let Some(map) = mapping {
+        let key = DictKey(Object::from_str(base));
+        map.borrow()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| key_error(format!("'{base}'")))?
+    } else {
+        keyword
+            .iter()
+            .find_map(|(k, v)| (k == base).then(|| v.clone()))
+            .ok_or_else(|| key_error(format!("'{base}'")))?
+    };
+    for trailer in trailers {
+        value = apply_trailer(value, trailer)?;
+    }
+    Ok(value)
+}
+
+fn split_name_trailers(name: &str) -> (&str, Vec<&str>) {
+    let mut trailers = Vec::new();
+    let bytes = name.as_bytes();
+    let mut base_end = bytes.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'.' || bytes[i] == b'[' {
+            base_end = i;
+            break;
+        }
+        i += 1;
+    }
+    let base = &name[..base_end];
+    let mut start = base_end;
+    while start < bytes.len() {
+        if bytes[start] == b'.' {
+            let mut j = start + 1;
+            while j < bytes.len() && bytes[j] != b'.' && bytes[j] != b'[' {
+                j += 1;
+            }
+            trailers.push(&name[start..j]);
+            start = j;
+        } else if bytes[start] == b'[' {
+            let mut j = start + 1;
+            while j < bytes.len() && bytes[j] != b']' {
+                j += 1;
+            }
+            if j < bytes.len() {
+                j += 1;
+            }
+            trailers.push(&name[start..j]);
+            start = j;
+        } else {
+            break;
+        }
+    }
+    (base, trailers)
+}
+
+fn apply_trailer(value: Object, trailer: &str) -> Result<Object, RuntimeError> {
+    if trailer.starts_with('.') {
+        let attr = &trailer[1..];
+        match &value {
+            Object::Module(m) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_str(attr)))
+                .cloned()
+                .ok_or_else(|| attribute_error(format!("module has no attribute '{attr}'"))),
+            Object::Instance(inst) => inst
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_str(attr)))
+                .cloned()
+                .or_else(|| inst.class.lookup(attr))
+                .ok_or_else(|| attribute_error(format!("has no attribute '{attr}'"))),
+            _ => Err(attribute_error(format!(
+                "'{}' has no attribute '{}'",
+                value.type_name(),
+                attr
+            ))),
+        }
+    } else if trailer.starts_with('[') && trailer.ends_with(']') {
+        let inner = &trailer[1..trailer.len() - 1];
+        let key: Object = if let Ok(i) = inner.parse::<i64>() {
+            Object::Int(i)
+        } else {
+            Object::from_str(inner)
+        };
+        match &value {
+            Object::List(l) => {
+                let idx = match key {
+                    Object::Int(i) => {
+                        let len = l.borrow().len() as i64;
+
+                        if i < 0 {
+                            i + len
+                        } else {
+                            i
+                        }
+                    }
+                    _ => return Err(type_error("list indices must be integers")),
+                };
+                l.borrow()
+                    .get(idx as usize)
+                    .cloned()
+                    .ok_or_else(|| index_error("list index out of range"))
+            }
+            Object::Tuple(t) => {
+                let idx = match key {
+                    Object::Int(i) => {
+                        let len = t.len() as i64;
+
+                        if i < 0 {
+                            i + len
+                        } else {
+                            i
+                        }
+                    }
+                    _ => return Err(type_error("tuple indices must be integers")),
+                };
+                t.get(idx as usize)
+                    .cloned()
+                    .ok_or_else(|| index_error("tuple index out of range"))
+            }
+            Object::Dict(d) => d
+                .borrow()
+                .get(&DictKey(key))
+                .cloned()
+                .ok_or_else(|| key_error("key not found")),
+            _ => Err(type_error(format!(
+                "'{}' is not subscriptable",
+                value.type_name()
+            ))),
+        }
+    } else {
+        Err(value_error(format!("Unknown trailer: {trailer}")))
+    }
+}
+
+/// Apply Python's `%` formatting (`'%s %d' % (x, y)`, or `'%(k)s' %
+/// {'k': v}`).
+pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, RuntimeError> {
+    let mut out = String::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    let mut idx = 0usize;
+    let positional: Vec<Object> = match value {
+        Object::Tuple(items) => items.to_vec(),
+        Object::Dict(_) => Vec::new(),
+        other => vec![other.clone()],
+    };
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            i += 1;
+            if i >= bytes.len() {
+                return Err(value_error("incomplete format"));
+            }
+            // Optional mapping key: %(name)s
+            let mut mapping_key: Option<String> = None;
+            if bytes[i] == b'(' {
+                let mut depth = 1;
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && depth > 0 {
+                    match bytes[j] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth > 0 {
+                        j += 1;
+                    }
+                }
+                mapping_key = Some(
+                    std::str::from_utf8(&bytes[start..j])
+                        .map_err(|_| value_error("invalid utf-8"))?
+                        .to_owned(),
+                );
+                i = j + 1;
+            }
+            // Flags / width / precision / type — parse loosely.
+            let mut flags = String::new();
+            while i < bytes.len() && b"#0- +".contains(&bytes[i]) {
+                flags.push(bytes[i] as char);
+                i += 1;
+            }
+            let mut width = String::new();
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                width.push(bytes[i] as char);
+                i += 1;
+            }
+            let mut precision: Option<String> = None;
+            if i < bytes.len() && bytes[i] == b'.' {
+                i += 1;
+                let mut p = String::new();
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    p.push(bytes[i] as char);
+                    i += 1;
+                }
+                precision = Some(p);
+            }
+            if i >= bytes.len() {
+                return Err(value_error("incomplete format"));
+            }
+            let kind = bytes[i] as char;
+            i += 1;
+            if kind == '%' {
+                out.push('%');
+                continue;
+            }
+            let item = if let Some(k) = mapping_key {
+                match value {
+                    Object::Dict(d) => d
+                        .borrow()
+                        .get(&DictKey(Object::from_str(&k)))
+                        .cloned()
+                        .ok_or_else(|| key_error(format!("'{k}'")))?,
+                    _ => return Err(type_error("format requires a mapping")),
+                }
+            } else {
+                let v = positional
+                    .get(idx)
+                    .cloned()
+                    .ok_or_else(|| type_error("not enough arguments for format string"))?;
+                idx += 1;
+                v
+            };
+            let mut spec = String::new();
+            if !flags.is_empty() {
+                if flags.contains('-') {
+                    spec.push('<');
+                } else if flags.contains('0') {
+                    spec.push('=');
+                }
+                if flags.contains('+') {
+                    spec.push('+');
+                } else if flags.contains(' ') {
+                    spec.push(' ');
+                }
+                if flags.contains('#') {
+                    spec.push('#');
+                }
+                if flags.contains('0') && !flags.contains('-') {
+                    spec.push('0');
+                }
+            }
+            if !width.is_empty() {
+                spec.push_str(&width);
+            }
+            if let Some(p) = precision {
+                spec.push('.');
+                spec.push_str(&p);
+            }
+            spec.push(kind);
+            let rendered = match kind {
+                's' => format_via_spec(&Object::from_str(item.to_str()), &spec)?,
+                'r' => format_via_spec(&Object::from_str(item.repr()), &spec.replace('r', "s"))?,
+                'a' => format_via_spec(
+                    &Object::from_str(ascii_repr(&item)),
+                    &spec.replace('a', "s"),
+                )?,
+                'd' | 'i' | 'u' => format_via_spec(&item, &spec.replace(['i', 'u'], "d"))?,
+                'b' | 'o' | 'x' | 'X' => format_via_spec(&item, &spec)?,
+                'f' | 'F' | 'e' | 'E' | 'g' | 'G' => format_via_spec(&item, &spec)?,
+                'c' => match &item {
+                    Object::Int(c) => {
+                        char::from_u32(*c as u32).map_or(String::new(), |c| c.to_string())
+                    }
+                    Object::Str(s) => s.to_string(),
+                    _ => return Err(type_error("%c requires int or single character")),
+                },
+                _ => {
+                    return Err(value_error(format!(
+                        "unsupported format character '{kind}'"
+                    )))
+                }
+            };
+            out.push_str(&rendered);
+        } else {
+            let ch_len = utf8_seq_len(bytes[i]);
+            let end = (i + ch_len).min(bytes.len());
+            out.push_str(&template[i..end]);
+            i = end;
+        }
+    }
+    Ok(out)
 }
 
 /// `ascii()` builtin: like `repr()` but escapes non-ASCII codepoints.
@@ -3389,7 +4571,7 @@ fn constant_to_object(c: Constant) -> Object {
         Constant::Int(i) => Object::Int(i),
         Constant::Float(f) => Object::Float(f),
         Constant::Str(s) => Object::from_str(s),
-        Constant::Bytes(_) => Object::None,
+        Constant::Bytes(b) => Object::new_bytes(b),
         Constant::Tuple(xs) => Object::new_tuple(xs.into_iter().map(constant_to_object).collect()),
         Constant::Code(c) => Object::Code(Rc::from(*c)),
         Constant::Ellipsis => Object::None,
@@ -3485,6 +4667,29 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             Ok(Object::from_str(out))
         }
+        (O::Str(template), v, B::Mod) => Ok(Object::from_str(percent_format(template, v)?)),
+        (O::Bytes(x), O::Bytes(y), B::Add) => {
+            let mut out = Vec::with_capacity(x.len() + y.len());
+            out.extend_from_slice(x);
+            out.extend_from_slice(y);
+            Ok(Object::new_bytes(out))
+        }
+        (O::Bytes(x), O::Int(n), B::Mult) | (O::Int(n), O::Bytes(x), B::Mult) => {
+            let times = if *n < 0 { 0 } else { *n as usize };
+            let mut out = Vec::with_capacity(x.len() * times);
+            for _ in 0..times {
+                out.extend_from_slice(x);
+            }
+            Ok(Object::new_bytes(out))
+        }
+        (O::Set(a), O::Set(b), B::BitOr) => Ok(union_sets(&a.borrow(), &b.borrow())),
+        (O::Set(a), O::Set(b), B::BitAnd) => Ok(intersect_sets(&a.borrow(), &b.borrow())),
+        (O::Set(a), O::Set(b), B::Sub) => Ok(difference_sets(&a.borrow(), &b.borrow())),
+        (O::Set(a), O::Set(b), B::BitXor) => Ok(symmetric_diff_sets(&a.borrow(), &b.borrow())),
+        (O::FrozenSet(a), O::FrozenSet(b), B::BitOr) => Ok(union_sets(a, b)),
+        (O::FrozenSet(a), O::FrozenSet(b), B::BitAnd) => Ok(intersect_sets(a, b)),
+        (O::FrozenSet(a), O::FrozenSet(b), B::Sub) => Ok(difference_sets(a, b)),
+        (O::FrozenSet(a), O::FrozenSet(b), B::BitXor) => Ok(symmetric_diff_sets(a, b)),
 
         (O::List(x), O::List(y), B::Add) => {
             let mut out = x.borrow().clone();

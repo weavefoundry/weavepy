@@ -25,6 +25,17 @@ use crate::object::{DictData, DictKey, Object, PyModule};
 /// can read `sys.argv` / `sys.path` at construction time).
 pub type BuiltinModuleFactory = fn(&ModuleCache) -> Rc<PyModule>;
 
+/// A frozen-Python module: source compiled at runtime and executed
+/// inside the interpreter exactly like a real `.py` file, but without
+/// touching the filesystem. Used to ship pure-Python stdlib modules
+/// inside the binary.
+#[derive(Clone, Copy, Debug)]
+pub struct FrozenSource {
+    pub name: &'static str,
+    pub source: &'static str,
+    pub is_package: bool,
+}
+
 /// Shared runtime state for the import machinery.
 ///
 /// All three `Rc`-wrapped fields double as the corresponding `sys`
@@ -39,6 +50,10 @@ pub struct ModuleCache {
     pub path: Rc<RefCell<Vec<Object>>>,
     pub argv: Rc<RefCell<Vec<Object>>>,
     pub builtins: Rc<RefCell<HashMap<&'static str, BuiltinModuleFactory>>>,
+    /// Pure-Python modules baked into the binary. Looked up after
+    /// Rust-defined built-ins so a host can override frozen stdlib by
+    /// registering a builtin with the same name.
+    pub frozen: Rc<RefCell<HashMap<&'static str, FrozenSource>>>,
 }
 
 impl Default for ModuleCache {
@@ -48,6 +63,7 @@ impl Default for ModuleCache {
             path: Rc::new(RefCell::new(Vec::new())),
             argv: Rc::new(RefCell::new(Vec::new())),
             builtins: Rc::new(RefCell::new(HashMap::new())),
+            frozen: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 }
@@ -81,6 +97,16 @@ impl ModuleCache {
 
     pub fn builtin_factory(&self, name: &str) -> Option<BuiltinModuleFactory> {
         self.builtins.borrow().get(name).copied()
+    }
+
+    /// Register a Python-source module that ships inside the binary.
+    /// The loader compiles and executes it lazily on first import.
+    pub fn register_frozen(&self, source: FrozenSource) {
+        self.frozen.borrow_mut().insert(source.name, source);
+    }
+
+    pub fn frozen_source(&self, name: &str) -> Option<FrozenSource> {
+        self.frozen.borrow().get(name).copied()
     }
 
     /// Snapshot the current `sys.path` as a list of `PathBuf`s,

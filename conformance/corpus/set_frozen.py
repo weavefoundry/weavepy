@@ -1,0 +1,5 @@
+f = frozenset([1, 2, 3])
+g = frozenset([2, 3, 4])
+print(sorted(f & g))
+print(sorted(f | g))
+print(1 in f)

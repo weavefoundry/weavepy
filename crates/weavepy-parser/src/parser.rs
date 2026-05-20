@@ -34,6 +34,16 @@ struct Parser<'src> {
 
 impl<'src> Parser<'src> {
     fn new(source: &'src str, tokens: Vec<Token>) -> Self {
+        // Strip non-significant newlines and comments up front. The
+        // lexer emits `Nl` tokens for physical newlines inside
+        // brackets so explicit `\` continuations remain a syntactic
+        // option; the parser never needs them as discrete tokens,
+        // and removing them lets every collection / call site span
+        // multiple lines without bespoke trivia handling.
+        let tokens = tokens
+            .into_iter()
+            .filter(|t| !matches!(t.kind, TokenKind::Nl | TokenKind::Comment))
+            .collect();
         Self {
             source,
             tokens,
@@ -148,6 +158,7 @@ impl<'src> Parser<'src> {
                 Keyword::Pass => self.simple_keyword_stmt(StmtKind::Pass),
                 Keyword::Break => self.simple_keyword_stmt(StmtKind::Break),
                 Keyword::Continue => self.simple_keyword_stmt(StmtKind::Continue),
+                Keyword::Del => self.parse_del(),
                 Keyword::Import => self.parse_import(),
                 Keyword::From => self.parse_import_from(),
                 Keyword::Global => self.parse_global(),
@@ -945,6 +956,28 @@ impl<'src> Parser<'src> {
         })
     }
 
+    /// `del target_list`. Each target is any assignable expression; we
+    /// reuse `parse_ternary` so subscripts and attribute access are
+    /// supported with no extra plumbing.
+    fn parse_del(&mut self) -> Result<Stmt, ParseError> {
+        let kw = self.bump();
+        let mut targets = vec![self.parse_ternary()?];
+        while self.eat(&TokenKind::Comma) {
+            if matches!(
+                self.peek(),
+                TokenKind::Newline | TokenKind::Semi | TokenKind::Endmarker
+            ) {
+                break;
+            }
+            targets.push(self.parse_ternary()?);
+        }
+        self.consume_stmt_end()?;
+        Ok(Stmt {
+            kind: StmtKind::Delete(targets),
+            span: kw.span,
+        })
+    }
+
     fn parse_name_list(&mut self) -> Result<Vec<String>, ParseError> {
         let mut names = Vec::new();
         loop {
@@ -1416,8 +1449,12 @@ impl<'src> Parser<'src> {
     /// Parse one expression. If `allow_tuple` is true, top-level
     /// `,` builds a `Tuple`; if false, comma is a delimiter that
     /// ends the expression.
-    fn parse_expression(&mut self, _allow_tuple: bool) -> Result<Expr, ParseError> {
-        self.parse_ternary()
+    fn parse_expression(&mut self, allow_tuple: bool) -> Result<Expr, ParseError> {
+        if allow_tuple {
+            self.parse_expression_list(true)
+        } else {
+            self.parse_ternary()
+        }
     }
 
     /// Parse a tuple-or-expression as it appears on the right side

@@ -180,6 +180,11 @@ pub enum OpCode {
     /// Call with keyword arguments. `arg` = positional arg count;
     /// stack also carries kw arg names (tuple) and values.
     CallKw,
+    /// Call with packed args. `arg = 0` means the stack carries only
+    /// `(callable, args_tuple)`; `arg = 1` means `(callable,
+    /// args_tuple, kwargs_dict)`. Used for `*args` and `**kwargs`
+    /// splats that can't be lowered to a static arg count.
+    CallEx,
     /// Return TOS from the current frame.
     ReturnValue,
 
@@ -352,6 +357,7 @@ impl OpCode {
             OpCode::Swap => "SWAP",
             OpCode::Call => "CALL",
             OpCode::CallKw => "CALL_KW",
+            OpCode::CallEx => "CALL_FUNCTION_EX",
             OpCode::ReturnValue => "RETURN_VALUE",
             OpCode::PopJumpIfFalse => "POP_JUMP_IF_FALSE",
             OpCode::PopJumpIfTrue => "POP_JUMP_IF_TRUE",

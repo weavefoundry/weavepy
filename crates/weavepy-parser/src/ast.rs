@@ -128,6 +128,10 @@ pub enum StmtKind {
     Pass,
     Break,
     Continue,
+    /// `del a, b[idx], c.attr`. Each target is one of the assignable
+    /// expression forms (`Name`, `Subscript`, `Attribute`, `Tuple`,
+    /// or `List`); the compiler lowers each to its delete opcode.
+    Delete(Vec<Expr>),
 }
 
 /// One `case` clause inside a `match` statement (RFC 0009).
@@ -802,6 +806,16 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
         S::Pass => out.push_str("Pass()"),
         S::Break => out.push_str("Break()"),
         S::Continue => out.push_str("Continue()"),
+        S::Delete(targets) => {
+            out.push_str("Delete(targets=[");
+            for (i, t) in targets.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_expr(out, t, depth);
+            }
+            out.push_str("])");
+        }
     }
 }
 

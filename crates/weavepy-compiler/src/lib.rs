@@ -375,6 +375,9 @@ struct LoopFrame {
     continue_target: u32,
     /// Sites that need to be patched to jump past the loop on `break`.
     break_sites: Vec<u32>,
+    /// `for` loops keep the iterator on the stack between iterations.
+    /// `break` therefore needs to drop it.
+    is_for_loop: bool,
 }
 
 impl Compiler {
@@ -564,6 +567,11 @@ impl Compiler {
                 self.emit(OpCode::PopTop, 0);
             }
             StmtKind::Pass => {}
+            StmtKind::Delete(targets) => {
+                for target in targets {
+                    self.compile_delete(target)?;
+                }
+            }
             StmtKind::Assign { targets, value } => {
                 self.compile_expr(value)?;
                 let n = targets.len();
@@ -617,6 +625,7 @@ impl Compiler {
                 self.loop_stack.push(LoopFrame {
                     continue_target: loop_start,
                     break_sites: Vec::new(),
+                    is_for_loop: false,
                 });
                 for s in body {
                     self.compile_stmt(s)?;
@@ -647,6 +656,7 @@ impl Compiler {
                 self.loop_stack.push(LoopFrame {
                     continue_target: loop_top,
                     break_sites: Vec::new(),
+                    is_for_loop: true,
                 });
                 for s in body {
                     self.compile_stmt(s)?;
@@ -656,14 +666,13 @@ impl Compiler {
                 let frame = self.loop_stack.pop().expect("loop frame");
                 let after = self.next_offset();
                 self.patch_jump(for_site, after);
-                // `END_FOR` pops the exhausted iterator, matching
-                // CPython's stack discipline.
                 self.emit(OpCode::EndFor, 0);
-                for site in frame.break_sites {
-                    self.patch_jump(site, self.next_offset());
-                }
                 for s in orelse {
                     self.compile_stmt(s)?;
+                }
+                let break_target = self.next_offset();
+                for site in frame.break_sites {
+                    self.patch_jump(site, break_target);
                 }
             }
             StmtKind::FunctionDef {
@@ -722,16 +731,24 @@ impl Compiler {
                 self.emit(OpCode::ReturnValue, 0);
             }
             StmtKind::Break => {
-                let frame = self
+                let is_for = self
                     .loop_stack
-                    .last_mut()
-                    .ok_or(CompileError::BreakOutsideLoop)?;
+                    .last()
+                    .ok_or(CompileError::BreakOutsideLoop)?
+                    .is_for_loop;
+                if is_for {
+                    self.emit(OpCode::PopTop, 0);
+                }
                 let site = self.co.instructions.len() as u32;
                 self.co.instructions.push(Instruction {
                     op: OpCode::JumpForward,
                     arg: 0,
                 });
-                frame.break_sites.push(site);
+                self.loop_stack
+                    .last_mut()
+                    .expect("loop frame")
+                    .break_sites
+                    .push(site);
             }
             StmtKind::Continue => {
                 let target = self
@@ -1283,6 +1300,25 @@ impl Compiler {
             self.emit(OpCode::BuildTuple, args.defaults.len() as u32);
             flags |= 0x01;
         }
+        // Keyword-only defaults are stored as a (name, value) dict —
+        // CPython does the same. We build it on the stack as
+        // `[name, value, name, value, ...]` and let BuildMap fold it
+        // into a dict that MakeFunction will pop.
+        let kw_default_pairs: Vec<(&str, &Expr)> = args
+            .kwonlyargs
+            .iter()
+            .zip(args.kw_defaults.iter())
+            .filter_map(|(arg, d)| d.as_ref().map(|d| (arg.name.as_str(), d)))
+            .collect();
+        if !kw_default_pairs.is_empty() {
+            for (name, default) in &kw_default_pairs {
+                let idx = self.co.intern_constant(Constant::Str((*name).into()));
+                self.emit(OpCode::LoadConst, idx);
+                self.compile_expr(default)?;
+            }
+            self.emit(OpCode::BuildMap, kw_default_pairs.len() as u32);
+            flags |= 0x02;
+        }
         if !inner_freevars.is_empty() {
             for free in &inner_freevars {
                 let idx = self.cell_or_free_index(free);
@@ -1463,17 +1499,18 @@ impl Compiler {
         let has_handlers = !handlers.is_empty();
         let has_finally = !finalbody.is_empty();
         if !has_handlers && !has_finally {
-            // Empty try is meaningless; parse already rejected.
             for s in body {
                 self.compile_stmt(s)?;
             }
             return Ok(());
         }
-        // The handler entry point lives *after* the body. Exception
-        // tables are walked when an exception fires; the dispatch
-        // loop truncates the stack to `depth` and pushes the
-        // exception value before jumping.
-        let body_depth = 0u32;
+        // Approximate stack depth at handler entry. The dispatch
+        // loop truncates everything above `depth`, so we need to
+        // preserve any state the surrounding control-flow stitched
+        // into the stack — most importantly, iterators kept live
+        // across `for` loop iterations. Without full stack-effect
+        // tracking we simply count active `for` frames.
+        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32;
         let body_start = self.next_offset();
         for s in body {
             self.compile_stmt(s)?;
@@ -1740,6 +1777,149 @@ impl Compiler {
         }
     }
 
+    /// Lower a positional argument list containing one or more
+    /// `*x` splats into a single tuple on the stack. Each contiguous
+    /// run of non-starred args becomes a `BuildTuple`; each `*x` is
+    /// added as another tuple. We then concatenate by repeated
+    /// `BinaryOp::Add` because that already does the right thing for
+    /// tuples.
+    fn compile_starred_args_tuple(&mut self, args: &[Expr]) -> Result<(), CompileError> {
+        let mut pending: Vec<&Expr> = Vec::new();
+        let mut tuple_count: u32 = 0;
+        let emit_pending = |slf: &mut Self,
+                            pending: &mut Vec<&Expr>,
+                            tuple_count: &mut u32|
+         -> Result<(), CompileError> {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            for e in pending.iter() {
+                slf.compile_expr(e)?;
+            }
+            slf.emit(OpCode::BuildTuple, pending.len() as u32);
+            pending.clear();
+            *tuple_count += 1;
+            Ok(())
+        };
+        for a in args {
+            match &a.kind {
+                ExprKind::Starred(inner) => {
+                    emit_pending(self, &mut pending, &mut tuple_count)?;
+                    // Coerce arbitrary iterable into a tuple. We load
+                    // `tuple` first so the resulting stack lines up
+                    // with `Call`'s expected layout (callable below
+                    // args), then evaluate the iterable as its sole
+                    // argument.
+                    let tup_idx = self.co.intern_name("tuple");
+                    self.emit(OpCode::LoadGlobal, tup_idx);
+                    self.compile_expr(inner)?;
+                    self.emit(OpCode::Call, 1);
+                    tuple_count += 1;
+                }
+                _ => pending.push(a),
+            }
+        }
+        emit_pending(self, &mut pending, &mut tuple_count)?;
+        if tuple_count == 0 {
+            self.emit(OpCode::BuildTuple, 0);
+        } else {
+            for _ in 1..tuple_count {
+                self.emit(OpCode::BinaryOp, BinOpKind::Add as u32);
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower a keyword-argument list, possibly with `**d` spreads,
+    /// into a single dict on the stack. Each named kwarg becomes a
+    /// `(name, value)` pair; each `**d` is merged in with `dict.update`.
+    fn compile_kwargs_dict(
+        &mut self,
+        kwargs: &[weavepy_parser::ast::Keyword],
+    ) -> Result<(), CompileError> {
+        // First materialise the named kwargs in a single BuildMap so
+        // we have a base dict on the stack. Then fold each ** splat
+        // in with `dict.update(...)`.
+        let mut explicit_count: u32 = 0;
+        for k in kwargs {
+            if let Some(name) = &k.arg {
+                let const_idx = self.co.intern_constant(Constant::Str(name.clone()));
+                self.emit(OpCode::LoadConst, const_idx);
+                self.compile_expr(&k.value)?;
+                explicit_count += 1;
+            }
+        }
+        self.emit(OpCode::BuildMap, explicit_count);
+        for k in kwargs {
+            if k.arg.is_none() {
+                let update_idx = self.co.intern_name("update");
+                self.emit(OpCode::CopyTop, 0);
+                self.emit(OpCode::LoadAttr, update_idx);
+                self.compile_expr(&k.value)?;
+                self.emit(OpCode::Call, 1);
+                self.emit(OpCode::PopTop, 0);
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_delete(&mut self, target: &Expr) -> Result<(), CompileError> {
+        match &target.kind {
+            ExprKind::Name(n) => {
+                self.emit_delete_name(n);
+                Ok(())
+            }
+            ExprKind::Attribute { value, attr } => {
+                self.compile_expr(value)?;
+                let idx = self.co.intern_name(attr);
+                self.emit(OpCode::DeleteAttr, idx);
+                Ok(())
+            }
+            ExprKind::Subscript { value, slice } => {
+                self.compile_expr(value)?;
+                self.compile_expr(slice)?;
+                self.emit(OpCode::DeleteSubscr, 0);
+                Ok(())
+            }
+            ExprKind::Tuple(items) | ExprKind::List(items) => {
+                for t in items {
+                    self.compile_delete(t)?;
+                }
+                Ok(())
+            }
+            _ => Err(CompileError::BadAssignmentTarget(format!(
+                "delete target: {:?}",
+                target.kind
+            ))),
+        }
+    }
+
+    fn emit_delete_name(&mut self, name: &str) {
+        let binding = self.classify_for_store(name);
+        match binding {
+            Binding::Local => {
+                let idx = self.var_index_or_add(name);
+                self.emit(OpCode::DeleteFast, idx);
+            }
+            Binding::Cell | Binding::Free | Binding::Nonlocal => {
+                // CPython raises NameError if the cell is empty, but
+                // simply storing nothing here matches the semantics
+                // for our current cell representation; emit DeleteDeref
+                // when we add it.
+                let idx = self.cell_or_free_index(name);
+                self.emit(OpCode::StoreDeref, idx);
+            }
+            Binding::Global => {
+                let idx = self.co.intern_name(name);
+                if matches!(self.kind, CodeKind::Module | CodeKind::Class) {
+                    self.emit(OpCode::DeleteName, idx);
+                } else {
+                    self.emit(OpCode::DeleteGlobal, idx);
+                }
+            }
+        }
+    }
+
     fn emit_store_name(&mut self, name: &str) {
         let binding = self.classify_for_store(name);
         match binding {
@@ -1911,23 +2091,32 @@ impl Compiler {
                 args,
                 keywords,
             } => {
+                let has_starred = args.iter().any(|a| matches!(a.kind, ExprKind::Starred(_)));
+                let has_kw_splat = keywords.iter().any(|k| k.arg.is_none());
                 self.compile_expr(func)?;
-                for a in args {
-                    self.compile_expr(a)?;
-                }
-                if keywords.is_empty() {
+                if has_starred || has_kw_splat {
+                    // Build a single args tuple by concatenating
+                    // positional groups split on each `*x`. The VM's
+                    // `CallEx` unpacks it once we land on the call.
+                    self.compile_starred_args_tuple(args)?;
+                    if !keywords.is_empty() || has_kw_splat {
+                        self.compile_kwargs_dict(keywords)?;
+                        self.emit(OpCode::CallEx, 1);
+                    } else {
+                        self.emit(OpCode::CallEx, 0);
+                    }
+                } else if keywords.is_empty() {
+                    for a in args {
+                        self.compile_expr(a)?;
+                    }
                     self.emit(OpCode::Call, args.len() as u32);
                 } else {
-                    // Pack kw names into a tuple constant and push
-                    // the values; the VM zips them at call time.
+                    for a in args {
+                        self.compile_expr(a)?;
+                    }
                     let mut names: Vec<Constant> = Vec::with_capacity(keywords.len());
                     for k in keywords {
-                        let n = k.arg.clone().ok_or_else(|| {
-                            CompileError::NotImplemented(
-                                "**kwargs splat",
-                                "the slice handles named kwargs but not **splat",
-                            )
-                        })?;
+                        let n = k.arg.clone().expect("checked above");
                         names.push(Constant::Str(n));
                         self.compile_expr(&k.value)?;
                     }
@@ -2670,6 +2859,7 @@ fn stmt_contains_yield(stmt: &Stmt) -> bool {
         | StmtKind::Pass
         | StmtKind::Break
         | StmtKind::Continue => false,
+        StmtKind::Delete(targets) => targets.iter().any(expr_contains_yield),
     }
 }
 

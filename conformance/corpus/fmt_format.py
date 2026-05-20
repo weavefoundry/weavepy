@@ -1,0 +1,6 @@
+print("{} + {} = {}".format(1, 2, 3))
+print("{name} is {age}".format(name="Ada", age=37))
+print("[{:>5}]".format("hi"))
+print("{:.3f}".format(3.14159))
+print("{:08.2f}".format(3.14))
+print("{:b}".format(42))
