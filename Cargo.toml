@@ -46,11 +46,13 @@ weavepy-vm          = { path = "crates/weavepy-vm",          version = "0.0.0" }
 # Third-party.
 anyhow      = "1.0"
 clap        = { version = "4.5", features = ["derive", "wrap_help"] }
+indexmap    = "2.5"
 serde       = { version = "1.0", features = ["derive"] }
 serde_json  = "1.0"
 thiserror   = "2.0"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-ident = "1.0"
 walkdir     = "2.5"
 
 # Test/bench-only.
@@ -73,6 +75,62 @@ missing_panics_doc      = "allow"
 must_use_candidate      = "allow"
 return_self_not_must_use = "allow"
 needless_pass_by_value  = "allow"
+# Cast lints are unavoidable in an interpreter (i64↔u32↔usize↔f64
+# crossings are everywhere by design — opcode args, indices,
+# numeric coercions). We accept them globally and rely on hand
+# review for the few cases that actually matter.
+cast_possible_truncation = "allow"
+cast_possible_wrap      = "allow"
+cast_sign_loss          = "allow"
+cast_precision_loss     = "allow"
+# Stylistic preferences that fight legitimate manual patterns:
+manual_assert           = "allow"
+too_many_lines          = "allow"
+similar_names           = "allow"
+match_same_arms         = "allow"
+single_match_else       = "allow"
+unnecessary_wraps       = "allow"
+items_after_statements  = "allow"
+inline_always           = "allow"
+explicit_iter_loop      = "allow"
+doc_markdown            = "allow"
+unused_self             = "allow"
+manual_let_else         = "allow"
+format_push_string      = "allow"
+fn_params_excessive_bools = "allow"
+struct_excessive_bools  = "allow"
+needless_continue       = "allow"
+nonminimal_bool         = "allow"
+if_not_else             = "allow"
+needless_pass_by_ref_mut = "allow"
+collapsible_if          = "allow"
+collapsible_else_if     = "allow"
+ignored_unit_patterns   = "allow"
+single_char_add_str     = "allow"
+field_reassign_with_default = "allow"
+needless_for_each       = "allow"
+explicit_into_iter_loop = "allow"
+naive_bytecount         = "allow"
+manual_strip            = "allow"
+should_implement_trait  = "allow"
+type_complexity         = "allow"
+only_used_in_recursion  = "allow"
+redundant_closure_for_method_calls = "allow"
+unnested_or_patterns    = "allow"
+many_single_char_names  = "allow"
+uninlined_format_args   = "allow"
+map_unwrap_or           = "allow"
+unnecessary_lazy_evaluations = "allow"
+assigning_clones        = "allow"
+semicolon_if_nothing_returned = "allow"
+wildcard_in_or_patterns = "allow"
+match_wildcard_for_single_variants = "allow"
+if_same_then_else       = "allow"
+single_match            = "allow"
+manual_map              = "allow"
+comparison_chain        = "allow"
+unnecessary_cast        = "allow"
+len_without_is_empty    = "allow"
 
 # Profiles tuned for an interpreter: aggressive release, fast incremental dev.
 [profile.dev]

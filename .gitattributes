@@ -1,0 +1,22 @@
+# Force LF line endings for every source and fixture file so Windows
+# checkouts (`actions/checkout`) don't rewrite text artefacts into CRLF
+# and break byte-exact comparisons against expected-output files.
+* text=auto eol=lf
+
+# Belt-and-suspenders: be explicit about the formats that matter.
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.py        text eol=lf
+*.out       text eol=lf
+*.json      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# Binary safety: never normalise these.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.webp      binary
+*.ico       binary

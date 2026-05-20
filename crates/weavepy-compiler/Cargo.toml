@@ -12,7 +12,9 @@ keywords.workspace     = true
 categories.workspace   = true
 
 [dependencies]
+weavepy-lexer  = { workspace = true }
 weavepy-parser = { workspace = true }
+indexmap       = { workspace = true }
 thiserror      = { workspace = true }
 
 [lints]

@@ -1,0 +1,11 @@
+s = "hello"
+print(s)
+print(s.upper())
+print(s + ", world")
+print(s * 3)
+print(len(s))
+print("a,b,c".split(","))
+print("-".join(["x", "y", "z"]))
+print("hello world".startswith("hello"))
+print("hello world".endswith("world"))
+print("hello".replace("l", "L"))

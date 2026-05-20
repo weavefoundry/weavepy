@@ -8,7 +8,7 @@
 use std::{
     fs,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
@@ -50,10 +50,17 @@ struct Cli {
     args: Vec<String>,
 }
 
+/// Sentinel string used by [`run_source`] to signal that it has already
+/// emitted a CPython-style traceback to stderr and `main` should exit
+/// without printing the generic `weavepy: ...` envelope.
+const DIAGNOSTIC_SENTINEL: &str = "exited with diagnostic";
+
 fn main() -> ExitCode {
     if let Err(err) = real_main() {
-        let mut stderr = io::stderr().lock();
-        let _ = writeln!(stderr, "weavepy: {err:#}");
+        if err.to_string() != DIAGNOSTIC_SENTINEL {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "weavepy: {err:#}");
+        }
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
@@ -69,7 +76,7 @@ fn real_main() -> Result<()> {
     }
 
     if let Some(source) = cli.command {
-        return weavepy::run_source(&source).map_err(Into::into);
+        return run_source(&source, "<string>");
     }
 
     match cli.script.as_deref() {
@@ -79,10 +86,10 @@ fn real_main() -> Result<()> {
     }
 }
 
-fn run_path(path: &std::path::Path) -> Result<()> {
+fn run_path(path: &Path) -> Result<()> {
     let source =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    weavepy::run_source(&source).map_err(Into::into)
+    run_source(&source, &path.display().to_string())
 }
 
 fn run_stdin() -> Result<()> {
@@ -90,7 +97,21 @@ fn run_stdin() -> Result<()> {
     io::stdin()
         .read_to_string(&mut buf)
         .context("failed to read stdin")?;
-    weavepy::run_source(&buf).map_err(Into::into)
+    run_source(&buf, "<stdin>")
+}
+
+/// Execute `source` and, on failure, surface a CPython-style traceback
+/// on stderr and exit with status 1 (matching `python` behaviour).
+fn run_source(source: &str, filename: &str) -> Result<()> {
+    match weavepy::run_source_with_filename(source, filename) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let mut stderr = io::stderr().lock();
+            let diag = err.format(source, filename);
+            let _ = stderr.write_all(diag.as_bytes());
+            anyhow::bail!(DIAGNOSTIC_SENTINEL);
+        }
+    }
 }
 
 fn run_repl() -> Result<()> {

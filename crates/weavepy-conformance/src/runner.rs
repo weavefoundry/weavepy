@@ -5,11 +5,17 @@
 //! never panic on bad inputs — an exception from the oracle or an error
 //! from WeavePy is itself a meaningful classification.
 //!
-//! Today only the lexer phase produces a real diff. The parser and
-//! compiler phases call the oracle (so we know the oracle works end-to-end)
-//! but report the WeavePy side as [`PhaseOutcome::Skipped`] until WeavePy
-//! can emit comparable output. This keeps the harness honest: we never
-//! claim to be measuring something we're not.
+//! Phases that compare normalised forms:
+//!
+//! * **Tokens** — `(kind, lexeme)` pairs; `INDENT`/`DEDENT` columns and
+//!   line/col attributes stripped.
+//! * **AST** — `ast.dump` flattened to whitespace-free shape; line/col
+//!   and `type_ignores`/`type_comment` fields stripped.
+//! * **`dis`** — opcode names + arg numbers, one per line.
+//!
+//! None of these comparisons are byte-exact against CPython today; the
+//! point of the harness is to track *normalised divergence* over time
+//! and produce diffable JSON reports the CI can plot.
 
 use std::fs;
 use std::path::Path;
@@ -137,8 +143,8 @@ pub fn run_file(python: &str, file: &CorpusFile) -> FileReport {
     FileReport {
         label: file.label.clone(),
         tokens: diff_tokens(python, &file.path, &source),
-        ast: diff_ast(python, &file.path),
-        dis: diff_dis(python, &file.path),
+        ast: diff_ast(python, &file.path, &source),
+        dis: diff_dis(python, &file.path, &source),
     }
 }
 
@@ -177,29 +183,77 @@ fn diff_tokens(python: &str, path: &Path, source: &str) -> PhaseOutcome {
     }
 }
 
-fn diff_ast(python: &str, path: &Path) -> PhaseOutcome {
-    // We still run the oracle so we exercise the subprocess path and
-    // surface oracle errors (e.g. SyntaxError in a corpus file) early.
-    // The WeavePy side is intentionally skipped until the parser can emit
-    // an `ast.dump`-shaped representation.
-    if let Err(e) = oracle::ast_dump(python, path) {
-        return PhaseOutcome::OracleError {
-            message: short_err(&e),
-        };
-    }
-    PhaseOutcome::Skipped {
-        reason: "weavepy parser does not yet emit ast.dump-compatible output".to_owned(),
+fn diff_ast(python: &str, path: &Path, source: &str) -> PhaseOutcome {
+    let oracle_dump = match oracle::ast_dump(python, path) {
+        Ok(t) => t,
+        Err(e) => {
+            return PhaseOutcome::OracleError {
+                message: short_err(&e),
+            };
+        }
+    };
+    let module = match weavepy::parser::parse_module(source) {
+        Ok(m) => m,
+        Err(e) => {
+            return PhaseOutcome::WeavepyError {
+                message: e.to_string(),
+            };
+        }
+    };
+    let weavepy_dump = weavepy::parser::ast::dump_module(&module);
+    let oracle_canon = normalize::canonical_ast(&oracle_dump);
+    let weavepy_canon = normalize::canonical_ast(&weavepy_dump);
+    if oracle_canon == weavepy_canon {
+        PhaseOutcome::Match
+    } else {
+        PhaseOutcome::Mismatch {
+            detail: format!(
+                "{} oracle chars vs {} weavepy chars (canonical)",
+                oracle_canon.len(),
+                weavepy_canon.len()
+            ),
+        }
     }
 }
 
-fn diff_dis(python: &str, path: &Path) -> PhaseOutcome {
-    if let Err(e) = oracle::dis(python, path) {
-        return PhaseOutcome::OracleError {
-            message: short_err(&e),
-        };
-    }
-    PhaseOutcome::Skipped {
-        reason: "weavepy compiler does not yet emit dis-compatible output".to_owned(),
+fn diff_dis(python: &str, path: &Path, source: &str) -> PhaseOutcome {
+    let oracle_dis = match oracle::dis(python, path) {
+        Ok(t) => t,
+        Err(e) => {
+            return PhaseOutcome::OracleError {
+                message: short_err(&e),
+            };
+        }
+    };
+    let module = match weavepy::parser::parse_module(source) {
+        Ok(m) => m,
+        Err(e) => {
+            return PhaseOutcome::WeavepyError {
+                message: e.to_string(),
+            };
+        }
+    };
+    let code = match weavepy::compiler::compile_module_with_filename(&module, "<conformance>") {
+        Ok(c) => c,
+        Err(e) => {
+            return PhaseOutcome::WeavepyError {
+                message: e.to_string(),
+            };
+        }
+    };
+    let weavepy_dis = code.format_dis();
+    let oracle_canon = normalize::canonical_dis(&oracle_dis);
+    let weavepy_canon = normalize::canonical_dis(&weavepy_dis);
+    if oracle_canon == weavepy_canon {
+        PhaseOutcome::Match
+    } else {
+        PhaseOutcome::Mismatch {
+            detail: format!(
+                "{} oracle lines vs {} weavepy lines (canonical)",
+                oracle_canon.lines().count(),
+                weavepy_canon.lines().count(),
+            ),
+        }
     }
 }
 

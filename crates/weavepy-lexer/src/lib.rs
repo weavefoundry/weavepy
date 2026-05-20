@@ -1,125 +1,144 @@
 //! Tokenizer for Python source code.
 //!
-//! WeavePy targets full lexical compatibility with CPython's tokenizer, including
-//! significant indentation, implicit line continuations inside brackets, f-string
-//! tokenization (PEP 701), and the full range of numeric and string literal forms.
+//! WeavePy targets lexical compatibility with CPython 3.13. The tokenizer
+//! handles significant indentation, implicit line continuation inside
+//! brackets, all integer/float/string literal forms, and the full operator
+//! and keyword set documented in `Lib/token.py` and `Parser/tokenizer.c`.
 //!
-//! The current implementation is an early skeleton; see [`tokenize`] for the
-//! single entry point we expose so far. Surface-level API is expected to stay
-//! stable as the implementation fills in.
+//! The lexer is hand-written: scanning is done by [`scanner::Scanner`]
+//! over a `&[u8]` byte buffer, with UTF-8 decoded lazily for identifier
+//! continuation. Tokens carry byte spans (not `(line, col)` pairs) so
+//! downstream phases can build their own line-mapping tables when
+//! reporting errors.
+//!
+//! # Compatibility level
+//!
+//! - **Tracks CPython** for token kinds, lexeme shapes, and indent stack
+//!   semantics.
+//! - **Experimental** for the exact `TokenKind` variants — we intentionally
+//!   carry more variants than CPython exposes via its `tokenize` module
+//!   (e.g. distinct `Plus` and `Star` rather than a single `Op`), which
+//!   makes the parser's job easier. The conformance harness normalizes
+//!   them back to CPython's `OP` umbrella before diffing.
+//! - **Experimental** for the f-string story: PEP 701 interior
+//!   tokenization is deferred to RFC 0005. F-strings tokenize as a single
+//!   `String` lexeme today.
 
-use std::fmt;
+pub mod error;
+pub mod scanner;
+pub mod token;
 
-use thiserror::Error;
-
-/// A position in a source file, measured in bytes from the start of the buffer.
-///
-/// Byte offsets (rather than `(line, column)` pairs) are the canonical form so
-/// that downstream stages can build their own line-mapping tables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BytePos(pub u32);
-
-/// Half-open byte range `[start, end)` within a source file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Span {
-    pub start: BytePos,
-    pub end: BytePos,
-}
-
-impl Span {
-    #[inline]
-    pub const fn new(start: u32, end: u32) -> Self {
-        Self {
-            start: BytePos(start),
-            end: BytePos(end),
-        }
-    }
-}
-
-/// The kind of token produced by the lexer.
-///
-/// This is intentionally a stub. The real enum will mirror CPython's
-/// `Lib/token.py` token kinds (NAME, NUMBER, STRING, OP, NEWLINE, INDENT,
-/// DEDENT, FSTRING_*, etc.).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TokenKind {
-    /// End of input.
-    Eof,
-    /// Logical newline that ends a statement.
-    Newline,
-    /// Increase in indentation level.
-    Indent,
-    /// Decrease in indentation level.
-    Dedent,
-    /// Identifier or keyword (the parser distinguishes keywords contextually).
-    Name,
-    /// Numeric literal.
-    Number,
-    /// String literal (including bytes literals; f-strings are handled separately).
-    String,
-    /// Operator or punctuation.
-    Op,
-    /// Comment, retained as a trivia token for tooling use.
-    Comment,
-}
-
-/// A single lexical token together with its source span.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Token {
-    pub kind: TokenKind,
-    pub span: Span,
-}
-
-/// Errors produced by the tokenizer.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum LexError {
-    #[error("unterminated string literal at byte {pos}")]
-    UnterminatedString { pos: u32 },
-    #[error("invalid character {ch:?} at byte {pos}")]
-    InvalidChar { ch: char, pos: u32 },
-    #[error("inconsistent indentation at byte {pos}")]
-    InconsistentIndent { pos: u32 },
-}
-
-impl fmt::Display for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:?}@{}..{}",
-            self.kind, self.span.start.0, self.span.end.0
-        )
-    }
-}
-
-/// Tokenize a complete Python source buffer.
-///
-/// This is a stub that currently produces only a single [`TokenKind::Eof`] token.
-/// It exists so that downstream crates can depend on a stable API while the
-/// implementation is fleshed out.
-pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
-    let end = u32::try_from(source.len()).unwrap_or(u32::MAX);
-    Ok(vec![Token {
-        kind: TokenKind::Eof,
-        span: Span::new(end, end),
-    }])
-}
+pub use error::LexError;
+pub use scanner::tokenize;
+pub use token::{BytePos, Keyword, Span, StringPrefix, Token, TokenKind};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_source_yields_only_eof() {
-        let tokens = tokenize("").expect("empty input should tokenize");
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].kind, TokenKind::Eof);
-        assert_eq!(tokens[0].span, Span::new(0, 0));
+    fn kinds(src: &str) -> Vec<TokenKind> {
+        tokenize(src)
+            .expect("tokenize should succeed")
+            .into_iter()
+            .map(|t| t.kind)
+            .collect()
     }
 
     #[test]
-    fn span_is_constructed_consistently() {
-        let s = Span::new(3, 7);
-        assert_eq!(s.start.0, 3);
-        assert_eq!(s.end.0, 7);
+    fn empty_source_emits_only_endmarker() {
+        let toks = tokenize("").expect("empty source tokenizes");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].kind, TokenKind::Endmarker);
+    }
+
+    #[test]
+    fn identifier_and_eof() {
+        let k = kinds("foo\n");
+        assert_eq!(
+            k,
+            vec![TokenKind::Name, TokenKind::Newline, TokenKind::Endmarker]
+        );
+    }
+
+    #[test]
+    fn integer_kinds() {
+        assert_eq!(kinds("42")[0], TokenKind::Number);
+        assert_eq!(kinds("0x1f")[0], TokenKind::Number);
+        assert_eq!(kinds("0o17")[0], TokenKind::Number);
+        assert_eq!(kinds("0b1010")[0], TokenKind::Number);
+        assert_eq!(kinds("1_000_000")[0], TokenKind::Number);
+    }
+
+    #[test]
+    fn float_kinds() {
+        assert_eq!(kinds("1.5")[0], TokenKind::Number);
+        assert_eq!(kinds(".5")[0], TokenKind::Number);
+        assert_eq!(kinds("1.")[0], TokenKind::Number);
+        assert_eq!(kinds("1e10")[0], TokenKind::Number);
+        assert_eq!(kinds("1.5e-3")[0], TokenKind::Number);
+    }
+
+    #[test]
+    fn string_kinds() {
+        assert_eq!(kinds("'hello'")[0], TokenKind::String);
+        assert_eq!(kinds("\"world\"")[0], TokenKind::String);
+        assert_eq!(kinds("r\"raw\"")[0], TokenKind::String);
+        assert_eq!(kinds("b\"bytes\"")[0], TokenKind::String);
+        assert_eq!(kinds("\"\"\"triple\"\"\"")[0], TokenKind::String);
+    }
+
+    #[test]
+    fn operators_have_distinct_kinds() {
+        assert_eq!(kinds("+")[0], TokenKind::Plus);
+        assert_eq!(kinds("-")[0], TokenKind::Minus);
+        assert_eq!(kinds("**")[0], TokenKind::DoubleStar);
+        assert_eq!(kinds("<<")[0], TokenKind::LeftShift);
+        assert_eq!(kinds("//")[0], TokenKind::DoubleSlash);
+        assert_eq!(kinds("==")[0], TokenKind::EqEqual);
+        assert_eq!(kinds("!=")[0], TokenKind::NotEqual);
+        assert_eq!(kinds(":=")[0], TokenKind::ColonEqual);
+        assert_eq!(kinds("->")[0], TokenKind::RArrow);
+        assert_eq!(kinds("...")[0], TokenKind::Ellipsis);
+    }
+
+    #[test]
+    fn keywords_classified() {
+        let toks = tokenize("if True else None").expect("ok");
+        assert!(matches!(toks[0].kind, TokenKind::Keyword(Keyword::If)));
+        assert!(matches!(toks[1].kind, TokenKind::Keyword(Keyword::True)));
+        assert!(matches!(toks[2].kind, TokenKind::Keyword(Keyword::Else)));
+        assert!(matches!(toks[3].kind, TokenKind::Keyword(Keyword::None)));
+    }
+
+    #[test]
+    fn simple_indent_dedent() {
+        let src = "if x:\n    y\n";
+        let k = kinds(src);
+        assert!(k.contains(&TokenKind::Indent));
+        assert!(k.contains(&TokenKind::Dedent));
+    }
+
+    #[test]
+    fn implicit_continuation_inside_brackets() {
+        let src = "(1,\n 2,\n 3)\n";
+        let k = kinds(src);
+        // No NEWLINE between bracketed elements — only at the end.
+        let newlines = k.iter().filter(|t| **t == TokenKind::Newline).count();
+        assert_eq!(newlines, 1);
+    }
+
+    #[test]
+    fn comments_are_emitted_as_trivia_then_nl() {
+        let toks = tokenize("# hi\nx\n").expect("ok");
+        // Comment + NL + Name + Newline + Endmarker
+        assert!(toks.iter().any(|t| t.kind == TokenKind::Comment));
+    }
+
+    #[test]
+    fn backslash_line_continuation() {
+        let src = "1 + \\\n 2\n";
+        let k = kinds(src);
+        let newlines = k.iter().filter(|t| **t == TokenKind::Newline).count();
+        assert_eq!(newlines, 1);
     }
 }
