@@ -155,3 +155,15 @@ pub fn assertion_error(message: impl Into<String>) -> RuntimeError {
 pub fn unbound_local_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("UnboundLocalError", message))
 }
+
+pub fn import_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("ImportError", message))
+}
+
+pub fn module_not_found_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("ModuleNotFoundError", message))
+}
+
+pub fn os_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("OSError", message))
+}

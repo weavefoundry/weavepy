@@ -42,6 +42,9 @@ pub enum Object {
     Slice(Rc<PySlice>),
     Type(Rc<TypeObject>),
     Instance(Rc<PyInstance>),
+    /// A loaded module (`Object::Module(Rc<PyModule>)`). Attribute
+    /// access goes through `module.dict`. Introduced in RFC 0012.
+    Module(Rc<PyModule>),
 }
 
 impl fmt::Debug for Object {
@@ -72,6 +75,7 @@ impl fmt::Debug for Object {
             Object::Slice(s) => write!(f, "slice({:?}, {:?}, {:?})", s.start, s.stop, s.step),
             Object::Type(t) => write!(f, "<class '{}'>", t.name),
             Object::Instance(i) => write!(f, "<{} object>", i.class.name),
+            Object::Module(m) => write!(f, "<module {:?}>", m.name),
         }
     }
 }
@@ -83,6 +87,26 @@ pub struct Range {
     pub start: i64,
     pub stop: i64,
     pub step: i64,
+}
+
+/// A loaded Python module: a name, an optional source filename, and
+/// a dict that doubles as `module.__dict__` and the globals namespace
+/// of code that runs *inside* the module.
+///
+/// Built-in modules (`sys`, `math`, …) have `filename = None`; modules
+/// loaded from a `.py` file carry the path used to find them. Modules
+/// are cheap-to-clone via the wrapping `Rc`, and identity (`is`)
+/// reduces to pointer equality on that `Rc`.
+pub struct PyModule {
+    pub name: String,
+    pub filename: Option<String>,
+    pub dict: Rc<RefCell<DictData>>,
+}
+
+impl fmt::Debug for PyModule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<module {:?}>", self.name)
+    }
 }
 
 /// Dictionary key: a hashable [`Object`] wrapped to satisfy the
@@ -297,7 +321,8 @@ impl Object {
             | Object::Code(_)
             | Object::Iter(_)
             | Object::Slice(_)
-            | Object::Type(_) => true,
+            | Object::Type(_)
+            | Object::Module(_) => true,
             Object::Cell(inner) => inner.borrow().is_truthy(),
             Object::Instance(inst) => {
                 // Honour __bool__ then __len__ before defaulting to True.
@@ -338,6 +363,7 @@ impl Object {
             (Object::Cell(a), Object::Cell(b)) => Rc::ptr_eq(a, b),
             (Object::Type(a), Object::Type(b)) => Rc::ptr_eq(a, b),
             (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
+            (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -502,6 +528,7 @@ impl Object {
             // type_name returns &'static; callers that need the real
             // name use Object::type_name_owned below.
             Object::Instance(_) => "object",
+            Object::Module(_) => "module",
         }
     }
 
@@ -607,6 +634,10 @@ impl Object {
             ),
             Object::Cell(inner) => format!("<cell: {}>", inner.borrow().repr()),
             Object::Type(t) => format!("<class '{}'>", t.name),
+            Object::Module(m) => match &m.filename {
+                Some(path) => format!("<module '{}' from '{}'>", m.name, path),
+                None => format!("<module '{}' (built-in)>", m.name),
+            },
             Object::Instance(inst) => {
                 // Defer to __repr__ on the class if present; otherwise
                 // synthesize a default. The caller is expected to run
@@ -698,6 +729,15 @@ impl Object {
 
     pub fn new_dict() -> Self {
         Object::Dict(Rc::new(RefCell::new(DictData::new())))
+    }
+
+    /// Build a fresh module value whose dict is empty.
+    pub fn new_module(name: impl Into<String>, filename: Option<String>) -> Self {
+        Object::Module(Rc::new(PyModule {
+            name: name.into(),
+            filename,
+            dict: Rc::new(RefCell::new(DictData::new())),
+        }))
     }
 }
 

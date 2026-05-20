@@ -570,6 +570,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "weavepy-compiler",
+ "weavepy-lexer",
  "weavepy-parser",
 ]
 

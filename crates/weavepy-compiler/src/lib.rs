@@ -155,7 +155,9 @@ impl CodeObject {
                 | OpCode::DeleteGlobal
                 | OpCode::LoadAttr
                 | OpCode::StoreAttr
-                | OpCode::DeleteAttr => {
+                | OpCode::DeleteAttr
+                | OpCode::ImportName
+                | OpCode::ImportFrom => {
                     if let Some(n) = self.names.get(ins.arg as usize) {
                         out.push('(');
                         out.push_str(n);
@@ -737,13 +739,106 @@ impl Compiler {
             StmtKind::Global(_) | StmtKind::Nonlocal(_) => {
                 // Scope analysis handled these — no code emission needed.
             }
-            StmtKind::Import(_) | StmtKind::ImportFrom { .. } => {
-                return Err(CompileError::NotImplemented(
-                    "import",
-                    "the slice parses imports but doesn't execute them",
-                ));
+            StmtKind::Import(aliases) => {
+                self.compile_import(aliases)?;
+            }
+            StmtKind::ImportFrom {
+                module,
+                names,
+                level,
+            } => {
+                self.compile_import_from(module.as_deref(), names, *level)?;
             }
         }
+        Ok(())
+    }
+
+    /// `import a`, `import a as b`, `import a.b.c`, `import a.b.c as x`.
+    ///
+    /// CPython emits, per alias:
+    /// ```text
+    /// LOAD_CONST  0          ; level
+    /// LOAD_CONST  None       ; fromlist
+    /// IMPORT_NAME a.b.c
+    /// (no asname): STORE_NAME a                    ; bind top-level
+    /// (asname  x): LOAD_ATTR b, LOAD_ATTR c, STORE_NAME x
+    /// ```
+    fn compile_import(
+        &mut self,
+        aliases: &[weavepy_parser::ast::Alias],
+    ) -> Result<(), CompileError> {
+        for alias in aliases {
+            let level_idx = self.co.intern_constant(Constant::Int(0));
+            self.emit(OpCode::LoadConst, level_idx);
+            let none_idx = self.co.intern_constant(Constant::None);
+            self.emit(OpCode::LoadConst, none_idx);
+            let name_idx = self.co.intern_name(&alias.name);
+            self.emit(OpCode::ImportName, name_idx);
+            match &alias.asname {
+                None => {
+                    // `import a.b.c` binds the top-level package name `a`.
+                    let top = alias.name.split('.').next().unwrap_or(&alias.name);
+                    self.emit_store_name(top);
+                }
+                Some(asname) => {
+                    // `import a.b.c as x` walks the attribute chain.
+                    let mut parts = alias.name.split('.');
+                    let _ = parts.next();
+                    for part in parts {
+                        let idx = self.co.intern_name(part);
+                        self.emit(OpCode::LoadAttr, idx);
+                    }
+                    self.emit_store_name(asname);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `from m import a, b as c` / `from . import x` / `from .pkg import y`.
+    ///
+    /// Per CPython:
+    /// ```text
+    /// LOAD_CONST  <level>
+    /// LOAD_CONST  (name1, name2, ...)
+    /// IMPORT_NAME m
+    /// IMPORT_FROM name1
+    /// STORE_NAME  name1_or_asname
+    /// IMPORT_FROM name2
+    /// STORE_NAME  name2_or_asname
+    /// POP_TOP                  ; discard the module
+    /// ```
+    fn compile_import_from(
+        &mut self,
+        module: Option<&str>,
+        names: &[weavepy_parser::ast::Alias],
+        level: u32,
+    ) -> Result<(), CompileError> {
+        let level_idx = self.co.intern_constant(Constant::Int(i64::from(level)));
+        self.emit(OpCode::LoadConst, level_idx);
+        let from_tuple: Vec<Constant> = names
+            .iter()
+            .map(|a| Constant::Str(a.name.clone()))
+            .collect();
+        let from_idx = self.co.intern_constant(Constant::Tuple(from_tuple));
+        self.emit(OpCode::LoadConst, from_idx);
+        let module_name = module.unwrap_or("");
+        let name_idx = self.co.intern_name(module_name);
+        self.emit(OpCode::ImportName, name_idx);
+
+        // `from m import *` is its own opcode and binds every public name.
+        if names.len() == 1 && names[0].name == "*" {
+            self.emit(OpCode::ImportStar, 0);
+            return Ok(());
+        }
+
+        for alias in names {
+            let from_idx = self.co.intern_name(&alias.name);
+            self.emit(OpCode::ImportFrom, from_idx);
+            let target = alias.asname.as_deref().unwrap_or(&alias.name);
+            self.emit_store_name(target);
+        }
+        self.emit(OpCode::PopTop, 0);
         Ok(())
     }
 

@@ -17,6 +17,7 @@
 
 use std::cell::RefCell;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use weavepy_compiler::{
@@ -26,16 +27,22 @@ use weavepy_compiler::{
 pub mod builtin_types;
 pub mod builtins;
 pub mod error;
+pub mod import;
 pub mod object;
+pub mod stdlib;
 pub mod types;
 
 use crate::builtin_types::{builtin_types, instance_is_subclass, make_exception_with_class};
 use crate::error::{
-    attribute_error, index_error, key_error, name_error, runtime_error, type_error, value_error,
-    zero_division_error, TracebackEntry,
+    attribute_error, import_error, index_error, key_error, module_not_found_error, name_error,
+    runtime_error, type_error, value_error, zero_division_error, TracebackEntry,
 };
 pub use crate::error::{PyException, RuntimeError};
-use crate::object::{BoundMethod, BuiltinFn, DictData, DictKey, Object, PyFunction, PySlice};
+pub use crate::import::ModuleCache;
+use crate::import::{package_search_path, resolve_relative};
+use crate::object::{
+    BoundMethod, BuiltinFn, DictData, DictKey, Object, PyFunction, PyModule, PySlice,
+};
 use crate::types::{PyInstance, TypeObject};
 
 // ---------- frame ----------
@@ -90,13 +97,20 @@ pub type Stdout = Rc<RefCell<dyn Write>>;
 pub struct Interpreter {
     stdout: Stdout,
     builtins: Rc<RefCell<DictData>>,
+    cache: ModuleCache,
 }
 
 impl Default for Interpreter {
     fn default() -> Self {
         let stdout: Stdout = Rc::new(RefCell::new(std::io::stdout()));
         let builtins = Rc::new(RefCell::new(builtins::default_builtins()));
-        Self { stdout, builtins }
+        let cache = ModuleCache::default();
+        stdlib::register_all(&cache);
+        Self {
+            stdout,
+            builtins,
+            cache,
+        }
     }
 }
 
@@ -108,6 +122,44 @@ impl Interpreter {
     /// Plug in a custom stdout sink (e.g. a `Vec<u8>` for tests).
     pub fn set_stdout(&mut self, stdout: Stdout) {
         self.stdout = stdout;
+    }
+
+    /// Expose the module cache (so the embedding host can poke
+    /// `sys.modules`, register custom built-in modules, etc.).
+    pub fn module_cache(&self) -> &ModuleCache {
+        &self.cache
+    }
+
+    /// Replace `sys.argv` with the given values. The first entry is
+    /// the script name; subsequent entries are passed-through args.
+    pub fn set_argv<I, S>(&self, values: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut argv = self.cache.argv.borrow_mut();
+        argv.clear();
+        for v in values {
+            argv.push(Object::from_str(v.into()));
+        }
+    }
+
+    /// Prepend a directory to `sys.path`. Idempotent.
+    pub fn prepend_path(&self, dir: impl Into<PathBuf>) {
+        let s = dir.into().to_string_lossy().into_owned();
+        let mut path = self.cache.path.borrow_mut();
+        if !path_contains(&path, &s) {
+            path.insert(0, Object::from_str(s));
+        }
+    }
+
+    /// Append a directory to `sys.path`. Idempotent.
+    pub fn append_path(&self, dir: impl Into<PathBuf>) {
+        let s = dir.into().to_string_lossy().into_owned();
+        let mut path = self.cache.path.borrow_mut();
+        if !path_contains(&path, &s) {
+            path.push(Object::from_str(s));
+        }
     }
 
     /// Wire `print` (and friends) to this interpreter's stdout.
@@ -126,19 +178,65 @@ impl Interpreter {
         );
     }
 
-    /// Run a module-level [`CodeObject`] to completion.
+    /// Run a module-level [`CodeObject`] as `__main__`. The most
+    /// common entry point for the CLI and embedding hosts.
     pub fn run_module(&mut self, code: &CodeObject) -> Result<Object, RuntimeError> {
-        let globals = Rc::new(RefCell::new(DictData::new()));
-        {
-            let mut g = globals.borrow_mut();
-            self.install_print_into(&mut g);
-            for (name, value) in builtin_types().as_globals() {
-                g.insert(DictKey(Object::from_str(name)), value);
-            }
-        }
+        self.run_module_as(code, "__main__", None)
+    }
+
+    /// As [`run_module`], but lets the caller pick the `__name__` and
+    /// optional `__file__` to install in the module's globals.
+    pub fn run_module_as(
+        &mut self,
+        code: &CodeObject,
+        name: &str,
+        file: Option<&str>,
+    ) -> Result<Object, RuntimeError> {
+        let globals = self.build_module_globals(name, file, None);
         let code_rc = Rc::new(code.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
         self.run_frame(&mut frame)
+    }
+
+    /// Populate a fresh module-globals dict with builtins, builtin
+    /// types, and the standard module dunders. Used by both
+    /// `run_module_as` and the import loader.
+    fn build_module_globals(
+        &self,
+        name: &str,
+        file: Option<&str>,
+        package: Option<&str>,
+    ) -> Rc<RefCell<DictData>> {
+        let globals = Rc::new(RefCell::new(DictData::new()));
+        let mut g = globals.borrow_mut();
+        self.install_print_into(&mut g);
+        for (n, value) in builtin_types().as_globals() {
+            g.insert(DictKey(Object::from_str(n)), value);
+        }
+        g.insert(
+            DictKey(Object::from_static("__name__")),
+            Object::from_str(name),
+        );
+        g.insert(DictKey(Object::from_static("__doc__")), Object::None);
+        g.insert(
+            DictKey(Object::from_static("__package__")),
+            match package {
+                Some(p) => Object::from_str(p),
+                None => Object::from_static(""),
+            },
+        );
+        if let Some(f) = file {
+            g.insert(
+                DictKey(Object::from_static("__file__")),
+                Object::from_str(f),
+            );
+        }
+        g.insert(
+            DictKey(Object::from_static("__builtins__")),
+            Object::Dict(self.builtins.clone()),
+        );
+        drop(g);
+        globals
     }
 
     fn make_frame(
@@ -881,6 +979,38 @@ impl Interpreter {
                     self.call(&exit_method, &[ty, exc, Object::None], &[], &frame.globals)?;
                 frame.push(result);
             }
+            OpCode::ImportName => {
+                let fromlist = frame.pop()?;
+                let level_obj = frame.pop()?;
+                let level = match level_obj {
+                    Object::Int(i) if i >= 0 => i as u32,
+                    Object::Int(_) => {
+                        return Err(value_error("relative import level must be non-negative"))
+                    }
+                    other => {
+                        return Err(type_error(format!(
+                            "level must be int, not '{}'",
+                            other.type_name()
+                        )))
+                    }
+                };
+                let name = self.name_at(&frame.code, ins.arg)?;
+                let module = self.do_import(&name, &fromlist, level, &frame.globals)?;
+                frame.push(module);
+            }
+            OpCode::ImportFrom => {
+                let module =
+                    frame.stack.last().cloned().ok_or_else(|| {
+                        RuntimeError::Internal("IMPORT_FROM empty stack".to_owned())
+                    })?;
+                let name = self.name_at(&frame.code, ins.arg)?;
+                let attr = self.import_from(&module, &name)?;
+                frame.push(attr);
+            }
+            OpCode::ImportStar => {
+                let module = frame.pop()?;
+                self.import_star(&module, &frame.globals)?;
+            }
         }
         Ok(StepOutcome::Continue)
     }
@@ -1065,6 +1195,23 @@ impl Interpreter {
                 Err(attribute_error(format!(
                     "type object '{}' has no attribute '{}'",
                     ty.name, name
+                )))
+            }
+            Object::Module(m) => {
+                if let Some(v) = m.dict.borrow().get(&DictKey(Object::from_str(name))) {
+                    return Ok(v.clone());
+                }
+                match name {
+                    "__name__" => return Ok(Object::from_str(&m.name)),
+                    "__file__" => {
+                        return Ok(m.filename.as_deref().map_or(Object::None, Object::from_str));
+                    }
+                    "__dict__" => return Ok(Object::Dict(m.dict.clone())),
+                    _ => {}
+                }
+                Err(attribute_error(format!(
+                    "module '{}' has no attribute '{}'",
+                    m.name, name
                 )))
             }
             _ => {
@@ -1278,6 +1425,12 @@ impl Interpreter {
                     )));
                 }
                 ty.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(name)), value);
+                Ok(())
+            }
+            Object::Module(m) => {
+                m.dict
                     .borrow_mut()
                     .insert(DictKey(Object::from_str(name)), value);
                 Ok(())
@@ -1697,6 +1850,249 @@ impl Interpreter {
         );
         self.run_frame(&mut frame)
     }
+
+    // ---------- imports (RFC 0012) ----------
+
+    /// `IMPORT_NAME` runtime side. Resolves relative imports against
+    /// the current frame's `__package__`/`__name__`, walks dotted
+    /// names, and returns either the top-level package (when
+    /// `fromlist` is empty/None) or the leaf module (otherwise).
+    fn do_import(
+        &mut self,
+        name: &str,
+        fromlist: &Object,
+        level: u32,
+        current_globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let package = current_package(current_globals);
+        let absolute = resolve_relative(package.as_deref(), name, level).map_err(import_error)?;
+        let leaf = self.import_path(&absolute)?;
+
+        // CPython: with no fromlist, return the top-level package.
+        // Otherwise return the leaf module — and pre-load any items
+        // listed in `fromlist` that look like submodules (so that
+        // `from pkg import sub` triggers loading of `pkg.sub`).
+        let want_leaf = !matches!(fromlist, Object::None);
+        if !want_leaf {
+            let top_name = absolute.split('.').next().unwrap_or(&absolute);
+            return self
+                .cache
+                .get(top_name)
+                .ok_or_else(|| module_not_found_error(format!("import of '{top_name}' failed")));
+        }
+        if let Object::Tuple(items) = fromlist {
+            for item in items.iter() {
+                if let Object::Str(s) = item {
+                    if s.as_ref() == "*" {
+                        continue;
+                    }
+                    let sub_name = format!("{absolute}.{s}");
+                    let _ = self.import_path(&sub_name);
+                }
+            }
+        }
+        Ok(leaf)
+    }
+
+    /// Walk a dotted name (`a.b.c`), loading each part lazily and
+    /// linking submodules into their parents' dicts. Returns the
+    /// leaf module.
+    fn import_path(&mut self, full: &str) -> Result<Object, RuntimeError> {
+        let parts: Vec<&str> = full.split('.').collect();
+        let mut so_far = String::new();
+        let mut current: Option<Object> = None;
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                so_far.push('.');
+            }
+            so_far.push_str(part);
+            let module = self.load_one(&so_far)?;
+            if let Some(Object::Module(parent_mod)) = current.as_ref() {
+                parent_mod
+                    .dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(*part)), module.clone());
+            }
+            current = Some(module);
+        }
+        current.ok_or_else(|| import_error("empty module name"))
+    }
+
+    /// Load a single fully-qualified module name. Honours the cache
+    /// first, then the built-in registry, then the filesystem.
+    fn load_one(&mut self, full: &str) -> Result<Object, RuntimeError> {
+        if let Some(cached) = self.cache.get(full) {
+            return Ok(cached);
+        }
+        if let Some(factory) = self.cache.builtin_factory(full) {
+            let module = factory(&self.cache);
+            let obj = Object::Module(module);
+            self.cache.insert(full, obj.clone());
+            return Ok(obj);
+        }
+        let (path, is_package) = self
+            .cache
+            .find_source(full)
+            .ok_or_else(|| module_not_found_error(format!("No module named '{full}'")))?;
+        self.load_from_file(full, &path, is_package)
+    }
+
+    /// Read, parse, compile, and execute the module's source.
+    /// The module is inserted into `sys.modules` *before* its body
+    /// runs so that circular imports observe a partially-initialised
+    /// module instead of looping.
+    fn load_from_file(
+        &mut self,
+        full: &str,
+        path: &Path,
+        is_package: bool,
+    ) -> Result<Object, RuntimeError> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| import_error(format!("failed to read '{}': {e}", path.display())))?;
+        let module = weavepy_parser::parse_module(&source)
+            .map_err(|e| import_error(format!("parse error in '{}': {e}", path.display())))?;
+        let filename = path.to_string_lossy().into_owned();
+        let code = weavepy_compiler::compile_module_with_source(&module, &source, &filename)
+            .map_err(|e| import_error(format!("compile error in '{}': {e}", path.display())))?;
+
+        // Build the module value first and seed sys.modules so that
+        // circular imports see a stub.
+        let package = if is_package {
+            full.to_owned()
+        } else {
+            full.rsplit_once('.')
+                .map_or(String::new(), |(p, _)| p.to_owned())
+        };
+        let pkg_for_globals = if package.is_empty() {
+            None
+        } else {
+            Some(package.as_str())
+        };
+        let globals = self.build_module_globals(full, Some(&filename), pkg_for_globals);
+        if is_package {
+            globals.borrow_mut().insert(
+                DictKey(Object::from_static("__path__")),
+                package_search_path(path),
+            );
+        }
+        let module_obj = Object::Module(Rc::new(PyModule {
+            name: full.to_owned(),
+            filename: Some(filename.clone()),
+            dict: globals.clone(),
+        }));
+        self.cache.insert(full, module_obj.clone());
+
+        // Run the body. On failure, drop the partial module so a
+        // subsequent retry can try again from scratch.
+        let code_rc = Rc::new(code);
+        let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
+        if let Err(e) = self.run_frame(&mut frame) {
+            self.cache.remove(full);
+            return Err(e);
+        }
+        Ok(module_obj)
+    }
+
+    /// `IMPORT_FROM` runtime side. Looks up `name` on the module on
+    /// top of the stack, returning the attribute or
+    /// `ImportError("cannot import name 'name' from 'module'")`.
+    fn import_from(&mut self, module: &Object, name: &str) -> Result<Object, RuntimeError> {
+        match module {
+            Object::Module(m) => {
+                if let Some(v) = m.dict.borrow().get(&DictKey(Object::from_str(name))) {
+                    return Ok(v.clone());
+                }
+                // Submodule that we deferred loading: try loading it
+                // on demand. Matches CPython's `_handle_fromlist`.
+                let candidate = format!("{}.{}", m.name, name);
+                if self.cache.get(&candidate).is_some()
+                    || self.cache.builtin_factory(&candidate).is_some()
+                    || self.cache.find_source(&candidate).is_some()
+                {
+                    let sub = self.load_one(&candidate)?;
+                    m.dict
+                        .borrow_mut()
+                        .insert(DictKey(Object::from_str(name)), sub.clone());
+                    return Ok(sub);
+                }
+                Err(import_error(format!(
+                    "cannot import name '{name}' from '{}'",
+                    m.name
+                )))
+            }
+            other => Err(type_error(format!(
+                "IMPORT_FROM on non-module: '{}'",
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// `IMPORT_STAR` runtime side. Copies every public name from the
+    /// module into the current globals. Honours `__all__` if defined.
+    fn import_star(
+        &mut self,
+        module: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        let m = match module {
+            Object::Module(m) => m,
+            other => {
+                return Err(type_error(format!(
+                    "IMPORT_STAR on non-module: '{}'",
+                    other.type_name()
+                )))
+            }
+        };
+        let dict = m.dict.borrow();
+        if let Some(Object::List(all_list)) = dict.get(&DictKey(Object::from_static("__all__"))) {
+            let names: Vec<String> = all_list
+                .borrow()
+                .iter()
+                .filter_map(|o| match o {
+                    Object::Str(s) => Some(s.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let mut g = globals.borrow_mut();
+            for n in names {
+                if let Some(v) = dict.get(&DictKey(Object::from_str(&n))) {
+                    g.insert(DictKey(Object::from_str(n)), v.clone());
+                }
+            }
+            return Ok(());
+        }
+        let mut g = globals.borrow_mut();
+        for (k, v) in dict.iter() {
+            let name = match &k.0 {
+                Object::Str(s) => s.to_string(),
+                _ => continue,
+            };
+            if name.starts_with('_') {
+                continue;
+            }
+            g.insert(DictKey(Object::from_str(name)), v.clone());
+        }
+        Ok(())
+    }
+}
+
+/// Read the current module's `__package__` (or fall back to
+/// `__name__`'s parent) so relative imports can resolve.
+fn current_package(globals: &Rc<RefCell<DictData>>) -> Option<String> {
+    let dict = globals.borrow();
+    if let Some(Object::Str(p)) = dict.get(&DictKey(Object::from_static("__package__"))) {
+        let s = p.to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    if let Some(Object::Str(n)) = dict.get(&DictKey(Object::from_static("__name__"))) {
+        let s = n.to_string();
+        if let Some((parent, _)) = s.rsplit_once('.') {
+            return Some(parent.to_owned());
+        }
+    }
+    None
 }
 
 fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, RuntimeError> {
@@ -1757,6 +2153,11 @@ fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, RuntimeError> {
         }
     }
     Ok(out)
+}
+
+fn path_contains(path: &[Object], needle: &str) -> bool {
+    path.iter()
+        .any(|o| matches!(o, Object::Str(s) if s.as_ref() == needle))
 }
 
 fn normalize_index(i: i64, len: usize) -> Result<usize, RuntimeError> {
@@ -2242,6 +2643,57 @@ mod tests {
             "    print(r.args[0])\n"
         );
         assert_eq!(run(src), "RuntimeError\nouter\n");
+    }
+
+    #[test]
+    fn imports_math_module() {
+        let src = concat!(
+            "import math\n",
+            "print(math.floor(3.7))\n",
+            "print(int(math.sqrt(9)))\n",
+        );
+        assert_eq!(run(src), "3\n3\n");
+    }
+
+    #[test]
+    fn from_import_binds_names() {
+        let src = concat!(
+            "from math import floor, gcd\n",
+            "print(floor(2.9))\n",
+            "print(gcd(8, 12))\n",
+        );
+        assert_eq!(run(src), "2\n4\n");
+    }
+
+    #[test]
+    fn import_as_renames() {
+        let src = concat!(
+            "import math as m\n",
+            "from math import pi as P\n",
+            "print(int(m.pow(2, 5)))\n",
+            "print(round(P, 4))\n",
+        );
+        assert_eq!(run(src), "32\n3.1416\n");
+    }
+
+    #[test]
+    fn missing_module_raises_module_not_found_error() {
+        let src = concat!(
+            "try:\n",
+            "    import does_not_exist\n",
+            "except ModuleNotFoundError as e:\n",
+            "    print('caught', type(e).__name__)\n",
+        );
+        assert_eq!(run(src), "caught ModuleNotFoundError\n");
+    }
+
+    #[test]
+    fn dotted_import_walks_attributes() {
+        let src = concat!(
+            "import os.path\n",
+            "print(os.path.basename('/a/b/c.txt'))\n",
+        );
+        assert_eq!(run(src), "c.txt\n");
     }
 
     #[test]

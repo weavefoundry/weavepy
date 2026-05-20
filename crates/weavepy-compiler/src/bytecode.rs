@@ -253,6 +253,22 @@ pub enum OpCode {
     /// on the stack so the compiler can branch on the result.
     WithExceptStart,
 
+    // Imports (RFC 0012)
+    /// Pop `fromlist` and `level` (top-down), look up the dotted
+    /// module name `co_names[arg]`, and push the resolved module:
+    /// the top-level package when `fromlist` is empty, the leaf
+    /// otherwise. Mirrors CPython's `IMPORT_NAME`.
+    ImportName,
+    /// Peek the module on TOS and push its attribute
+    /// `co_names[arg]`. Raises `ImportError` if the attribute is
+    /// missing. Mirrors CPython's `IMPORT_FROM`.
+    ImportFrom,
+    /// Pop the module on TOS and bind every public name into the
+    /// current namespace (locals for function scope, globals for
+    /// module scope). Honours `__all__` if defined. Mirrors
+    /// CPython's `IMPORT_STAR`.
+    ImportStar,
+
     /// Print the diagnostic representation of TOS — used by the
     /// `dis` formatter only. Never emitted; reserved.
     PrintExpr,
@@ -321,6 +337,9 @@ impl OpCode {
             OpCode::Reraise => "RERAISE",
             OpCode::BeforeWith => "BEFORE_WITH",
             OpCode::WithExceptStart => "WITH_EXCEPT_START",
+            OpCode::ImportName => "IMPORT_NAME",
+            OpCode::ImportFrom => "IMPORT_FROM",
+            OpCode::ImportStar => "IMPORT_STAR",
             OpCode::PrintExpr => "PRINT_EXPR",
         }
     }

@@ -14,6 +14,7 @@
 //! ```
 
 use std::fmt::Write;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -90,11 +91,101 @@ pub fn run_source(source: &str) -> Result<(), Error> {
 /// As [`run_source`], but tags compile-time bookkeeping with `filename`
 /// so traceback formatting can show it.
 pub fn run_source_with_filename(source: &str, filename: &str) -> Result<(), Error> {
+    let mut opts = RunOptions::new(filename);
+    if filename != "<string>" && filename != "<stdin>" {
+        opts = opts.with_script_dir(script_dir_of(filename));
+    }
+    run_source_with_options(source, &opts)
+}
+
+/// Knobs for running a Python source string.
+///
+/// Wraps the cross-cutting state — `sys.argv`, `sys.path` additions,
+/// the displayed filename — so the CLI and tests don't have to grow
+/// a function-argument soup as the feature surface expands.
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    pub filename: String,
+    pub argv: Vec<String>,
+    pub extra_path: Vec<PathBuf>,
+    /// Directory to prepend to `sys.path` (typically the script's
+    /// directory, mirroring CPython's `python script.py` behaviour).
+    pub script_dir: Option<PathBuf>,
+}
+
+impl RunOptions {
+    pub fn new(filename: impl Into<String>) -> Self {
+        Self {
+            filename: filename.into(),
+            argv: Vec::new(),
+            extra_path: Vec::new(),
+            script_dir: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_argv<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.argv = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_script_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.script_dir = Some(dir.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_extra_path<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.extra_path = paths.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// Run `source` under a fresh interpreter, threading `argv`/`path`/
+/// `filename` through `sys` and the import loader before execution.
+///
+/// This is the canonical embedding entry point: the CLI uses it to
+/// emulate `python script.py arg1 arg2`, and tests use it for
+/// multi-file fixtures.
+pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Error> {
     let module = parser::parse_module(source)?;
-    let code = compiler::compile_module_with_source(&module, source, filename)?;
+    let code = compiler::compile_module_with_source(&module, source, &opts.filename)?;
     let mut interpreter = vm::Interpreter::default();
-    let _ = interpreter.run_module(&code)?;
+    if let Some(dir) = &opts.script_dir {
+        interpreter.prepend_path(dir.clone());
+    }
+    for p in &opts.extra_path {
+        interpreter.append_path(p.clone());
+    }
+    let argv: Vec<String> = if opts.argv.is_empty() {
+        vec![opts.filename.clone()]
+    } else {
+        opts.argv.clone()
+    };
+    interpreter.set_argv(argv);
+    let file_for_main = if opts.filename == "<string>" || opts.filename == "<stdin>" {
+        None
+    } else {
+        Some(opts.filename.as_str())
+    };
+    let _ = interpreter.run_module_as(&code, "__main__", file_for_main)?;
     Ok(())
+}
+
+fn script_dir_of(filename: &str) -> PathBuf {
+    Path::new(filename)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// Render a CPython-style `SyntaxError`-shape diagnostic, with the

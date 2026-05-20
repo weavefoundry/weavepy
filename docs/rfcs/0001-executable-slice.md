@@ -79,7 +79,7 @@ The slice tracks CPython 3.13. Specifically:
 |--------------------------------------------------------------------------------|---------------------------------------------------|
 | `Module`, `FunctionDef`, `Return`, `Assign`, `AugAssign`, `AnnAssign`          | `Match` / `Case`                                  |
 | `If`/`Elif`/`Else`, `While`, `For`, `Break`, `Continue`, `Pass`                | `Async` / `Await` / `Yield` / `YieldFrom`         |
-| `Import`, `ImportFrom`, `Global`, `Nonlocal`                                   | f-string interior parsing                         |
+| `Import`, `ImportFrom`, `Global`, `Nonlocal` *(execution: RFC 0012)*           | f-string interior parsing                         |
 | `ClassDef`, `Try` / `Except` / `Finally`, `Raise`, `With` *(RFC 0003 / 0004)*  |                                                   |
 | Full expression grammar with correct precedence                                |                                                   |
 | Chained comparisons (`1 < x < 10`)                                             |                                                   |
@@ -231,3 +231,5 @@ carries a `PyException` struct (type name + message) so the eventual
 - **RFC 0006**: generators / coroutines / async / await.
 - **RFC 0007**: bytecode compaction (16-bit encoding + `EXTENDED_ARG`).
 - **RFC 0008**: arbitrary-precision integers.
+- **RFC 0012**: modules, the import system, and a minimal stdlib bootstrap
+  (`sys` / `math` / `os` / `os.path`). ✅ landed.

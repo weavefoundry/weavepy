@@ -36,16 +36,21 @@ pub struct BuiltinTypes {
     pub none_type: Rc<TypeObject>,
     pub function_: Rc<TypeObject>,
 
+    pub module_: Rc<TypeObject>,
+
     pub base_exception: Rc<TypeObject>,
     pub exception: Rc<TypeObject>,
     pub arithmetic_error: Rc<TypeObject>,
     pub assertion_error: Rc<TypeObject>,
     pub attribute_error: Rc<TypeObject>,
+    pub import_error: Rc<TypeObject>,
+    pub module_not_found_error: Rc<TypeObject>,
     pub index_error: Rc<TypeObject>,
     pub key_error: Rc<TypeObject>,
     pub lookup_error: Rc<TypeObject>,
     pub name_error: Rc<TypeObject>,
     pub not_implemented_error: Rc<TypeObject>,
+    pub os_error: Rc<TypeObject>,
     pub overflow_error: Rc<TypeObject>,
     pub runtime_error: Rc<TypeObject>,
     pub stop_iteration: Rc<TypeObject>,
@@ -87,6 +92,7 @@ impl BuiltinTypes {
         let range_ = mk("range", vec![object_.clone()]);
         let none_type = mk("NoneType", vec![object_.clone()]);
         let function_ = mk("function", vec![object_.clone()]);
+        let module_ = mk("module", vec![object_.clone()]);
 
         let base_exception = exc("BaseException", object_.clone());
         let exception = exc("Exception", base_exception.clone());
@@ -94,11 +100,14 @@ impl BuiltinTypes {
         let arithmetic_error = exc("ArithmeticError", exception.clone());
         let assertion_error = exc("AssertionError", exception.clone());
         let attribute_error = exc("AttributeError", exception.clone());
+        let import_error = exc("ImportError", exception.clone());
+        let module_not_found_error = exc("ModuleNotFoundError", import_error.clone());
         let lookup_error = exc("LookupError", exception.clone());
         let index_error = exc("IndexError", lookup_error.clone());
         let key_error = exc("KeyError", lookup_error.clone());
         let name_error = exc("NameError", exception.clone());
         let unbound_local_error = exc("UnboundLocalError", name_error.clone());
+        let os_error = exc("OSError", exception.clone());
         let runtime_error = exc("RuntimeError", exception.clone());
         let not_implemented_error = exc("NotImplementedError", runtime_error.clone());
         let recursion_error = exc("RecursionError", runtime_error.clone());
@@ -127,16 +136,20 @@ impl BuiltinTypes {
             range_,
             none_type,
             function_,
+            module_,
             base_exception,
             exception,
             arithmetic_error,
             assertion_error,
             attribute_error,
+            import_error,
+            module_not_found_error,
             index_error,
             key_error,
             lookup_error,
             name_error,
             not_implemented_error,
+            os_error,
             overflow_error,
             runtime_error,
             stop_iteration,
@@ -178,11 +191,14 @@ impl BuiltinTypes {
             pair!(arithmetic_error, "ArithmeticError"),
             pair!(assertion_error, "AssertionError"),
             pair!(attribute_error, "AttributeError"),
+            pair!(import_error, "ImportError"),
+            pair!(module_not_found_error, "ModuleNotFoundError"),
             pair!(index_error, "IndexError"),
             pair!(key_error, "KeyError"),
             pair!(lookup_error, "LookupError"),
             pair!(name_error, "NameError"),
             pair!(not_implemented_error, "NotImplementedError"),
+            pair!(os_error, "OSError"),
             pair!(overflow_error, "OverflowError"),
             pair!(runtime_error, "RuntimeError"),
             pair!(stop_iteration, "StopIteration"),
@@ -220,11 +236,14 @@ impl BuiltinTypes {
             "ArithmeticError" => Some(self.arithmetic_error.clone()),
             "AssertionError" => Some(self.assertion_error.clone()),
             "AttributeError" => Some(self.attribute_error.clone()),
+            "ImportError" => Some(self.import_error.clone()),
+            "ModuleNotFoundError" => Some(self.module_not_found_error.clone()),
             "IndexError" => Some(self.index_error.clone()),
             "KeyError" => Some(self.key_error.clone()),
             "LookupError" => Some(self.lookup_error.clone()),
             "NameError" => Some(self.name_error.clone()),
             "NotImplementedError" => Some(self.not_implemented_error.clone()),
+            "OSError" => Some(self.os_error.clone()),
             "OverflowError" => Some(self.overflow_error.clone()),
             "RuntimeError" => Some(self.runtime_error.clone()),
             "StopIteration" => Some(self.stop_iteration.clone()),

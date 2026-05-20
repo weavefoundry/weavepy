@@ -33,9 +33,18 @@ fn list_fixtures() -> Vec<PathBuf> {
     for entry in fs::read_dir(&dir).expect("read fixtures dir") {
         let entry = entry.expect("entry");
         let p = entry.path();
-        if p.extension().and_then(|s| s.to_str()) == Some("py") {
-            out.push(p);
+        if p.extension().and_then(|s| s.to_str()) != Some("py") {
+            continue;
         }
+        // Files starting with `_` are import-only helpers and not
+        // run as standalone fixtures (e.g. `_geom.py` is imported by
+        // `19_import_user_module.py`). Mirrors Python's "leading
+        // underscore means non-public" convention.
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if stem.starts_with('_') {
+            continue;
+        }
+        out.push(p);
     }
     out.sort();
     out
@@ -54,20 +63,30 @@ fn run_fixture(py_path: &Path) {
     let expected = read_text_normalized(&out_path)
         .unwrap_or_else(|_| panic!("missing expected-output file {}", out_path.display()));
 
+    let filename = py_path.display().to_string();
     let module = parser::parse_module(&source).unwrap_or_else(|e| {
         panic!("parse {}: {e}", py_path.display());
     });
-    let code = compiler::compile_module(&module).unwrap_or_else(|e| {
-        panic!("compile {}: {e}", py_path.display());
-    });
+    let code =
+        compiler::compile_module_with_source(&module, &source, &filename).unwrap_or_else(|e| {
+            panic!("compile {}: {e}", py_path.display());
+        });
 
     let mut interp = vm::Interpreter::new();
     let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
     let sink: vm::Stdout = buf.clone() as Rc<RefCell<dyn Write>>;
     interp.set_stdout(sink);
-    interp.run_module(&code).unwrap_or_else(|e| {
-        panic!("run {}: {e}", py_path.display());
-    });
+    // Sibling files in the fixtures directory must be importable so
+    // multi-file tests (e.g. `import _helper`) work.
+    if let Some(dir) = py_path.parent() {
+        interp.prepend_path(dir);
+    }
+    interp.set_argv([filename.clone()]);
+    interp
+        .run_module_as(&code, "__main__", Some(&filename))
+        .unwrap_or_else(|e| {
+            panic!("run {}: {e}", py_path.display());
+        });
 
     let actual_bytes = buf.borrow().clone();
     let actual = String::from_utf8(actual_bytes)

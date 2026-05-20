@@ -13,12 +13,11 @@ categories.workspace   = true
 
 [dependencies]
 weavepy-compiler = { workspace = true }
+weavepy-lexer    = { workspace = true }
+weavepy-parser   = { workspace = true }
 indexmap         = { workspace = true }
 thiserror        = { workspace = true }
 tracing          = { workspace = true }
-
-[dev-dependencies]
-weavepy-parser   = { workspace = true }
 
 [lints]
 workspace = true

@@ -723,9 +723,37 @@ fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_round(args: &[Object]) -> Result<Object, RuntimeError> {
-    match one(args, "round")? {
-        Object::Int(i) => Ok(Object::Int(*i)),
-        Object::Float(f) => Ok(Object::Float(f.round())),
+    let value = args
+        .first()
+        .ok_or_else(|| type_error("round() takes at least one argument"))?;
+    let ndigits = match args.get(1) {
+        None | Some(Object::None) => None,
+        Some(Object::Int(i)) => Some(*i),
+        Some(Object::Bool(b)) => Some(i64::from(*b)),
+        Some(other) => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                other.type_name()
+            )));
+        }
+    };
+    match value {
+        Object::Int(i) => match ndigits {
+            None | Some(0) => Ok(Object::Int(*i)),
+            Some(n) if n > 0 => Ok(Object::Int(*i)),
+            Some(n) => {
+                let scale = 10i64.pow(n.unsigned_abs() as u32);
+                let rounded = ((*i as f64) / scale as f64).round() as i64 * scale;
+                Ok(Object::Int(rounded))
+            }
+        },
+        Object::Float(f) => match ndigits {
+            None => Ok(Object::Float(f.round())),
+            Some(n) => {
+                let factor = 10f64.powi(n as i32);
+                Ok(Object::Float((f * factor).round() / factor))
+            }
+        },
         _ => Err(type_error("round() argument must be int or float")),
     }
 }
