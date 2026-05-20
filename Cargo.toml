@@ -4,6 +4,19 @@ members = [
     "crates/weavepy",
     "crates/weavepy-cli",
     "crates/weavepy-compiler",
+    "crates/weavepy-conformance",
+    "crates/weavepy-lexer",
+    "crates/weavepy-parser",
+    "crates/weavepy-vm",
+]
+# `weavepy-conformance` is a development tool that shells out to `python3`
+# and isn't useful to publish or to compile by default. Keep it out of
+# `default-members` so `cargo build/test --workspace` stays light; opt in
+# explicitly via `-p weavepy-conformance`.
+default-members = [
+    "crates/weavepy",
+    "crates/weavepy-cli",
+    "crates/weavepy-compiler",
     "crates/weavepy-lexer",
     "crates/weavepy-parser",
     "crates/weavepy-vm",
@@ -23,18 +36,22 @@ categories = ["compilers", "development-tools", "parser-implementations"]
 
 [workspace.dependencies]
 # Internal crates (path deps so the workspace builds without publishing).
-weavepy             = { path = "crates/weavepy",          version = "0.0.0" }
-weavepy-compiler    = { path = "crates/weavepy-compiler", version = "0.0.0" }
-weavepy-lexer       = { path = "crates/weavepy-lexer",    version = "0.0.0" }
-weavepy-parser      = { path = "crates/weavepy-parser",   version = "0.0.0" }
-weavepy-vm          = { path = "crates/weavepy-vm",       version = "0.0.0" }
+weavepy             = { path = "crates/weavepy",             version = "0.0.0" }
+weavepy-compiler    = { path = "crates/weavepy-compiler",    version = "0.0.0" }
+weavepy-conformance = { path = "crates/weavepy-conformance", version = "0.0.0" }
+weavepy-lexer       = { path = "crates/weavepy-lexer",       version = "0.0.0" }
+weavepy-parser      = { path = "crates/weavepy-parser",      version = "0.0.0" }
+weavepy-vm          = { path = "crates/weavepy-vm",          version = "0.0.0" }
 
 # Third-party.
 anyhow      = "1.0"
 clap        = { version = "4.5", features = ["derive", "wrap_help"] }
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
 thiserror   = "2.0"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+walkdir     = "2.5"
 
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }

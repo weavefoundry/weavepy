@@ -1,0 +1,28 @@
+[package]
+name = "weavepy-conformance"
+description = "CPython conformance harness for WeavePy. Compares each pipeline phase against CPython as an oracle."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme.workspace       = true
+keywords.workspace     = true
+categories.workspace   = true
+publish = false
+
+[[bin]]
+name = "weavepy-conformance"
+path = "src/bin/main.rs"
+
+[dependencies]
+weavepy    = { workspace = true }
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+walkdir    = { workspace = true }
+
+[lints]
+workspace = true

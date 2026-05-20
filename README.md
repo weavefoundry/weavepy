@@ -33,11 +33,15 @@ weavepy/
 │   ├── weavepy-compiler/       # AST   -> bytecode (CodeObject + opcodes)
 │   ├── weavepy-vm/             # bytecode interpreter + object model
 │   ├── weavepy/                # umbrella library: public Rust embedding API
-│   └── weavepy-cli/            # the `weavepy` binary, argv-compatible with `python`
+│   ├── weavepy-cli/            # the `weavepy` binary, argv-compatible with `python`
+│   └── weavepy-conformance/    # CPython-as-oracle harness (dev-only, not on crates.io)
+├── conformance/
+│   └── corpus/                 # in-tree Python fixtures graded against CPython
 ├── docs/
 │   ├── ARCHITECTURE.md         # design overview + open questions
+│   ├── CONFORMANCE.md          # how WeavePy is graded against CPython
 │   └── rfcs/                   # design documents
-└── .github/workflows/ci.yml    # fmt + clippy + tests on Linux/macOS/Windows
+└── .github/workflows/ci.yml    # fmt + clippy + tests on Linux/macOS/Windows + conformance
 ```
 
 ## Building
@@ -79,6 +83,23 @@ cargo run -p weavepy-cli -- --version
 > The above will currently run successfully but be a no-op, because the
 > compiler and VM are stubs. The plumbing is wired end-to-end so each layer
 > can be filled in independently.
+
+## CPython conformance
+
+Compatibility is graded automatically. The `weavepy-conformance` crate
+runs the host's `python3` as an oracle (tokenize, ast.parse + ast.dump,
+compile + dis.dis) and reports per-phase agreement on a corpus of
+Python fixtures. CI runs the harness on every PR and uploads the
+report as an artifact.
+
+```bash
+cargo run -p weavepy-conformance -- run            # all phases
+cargo run -p weavepy-conformance -- diff tokens    # one phase
+```
+
+See [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) for the model, the
+corpus layout, and how the harness will grow into a CPython
+`regrtest`-style runner once the VM can execute Python.
 
 ## Project goals
 

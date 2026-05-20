@@ -67,3 +67,38 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.msrv }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features
+
+  conformance:
+    name: cpython conformance (non-blocking)
+    runs-on: ubuntu-latest
+    # Non-blocking: the baseline is 0% match by design, and we don't want
+    # PRs to fail until the harness has a meaningful floor. Promote to
+    # blocking once the lexer is real (see docs/CONFORMANCE.md, Stage B).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Verify python oracle
+        run: python3 -V
+      - name: Run conformance harness
+        run: cargo run --release -p weavepy-conformance -- run
+      - name: Append report to job summary
+        if: always()
+        run: |
+          {
+            echo "## CPython conformance report"
+            echo
+            cat target/conformance/report.md || echo "(no report produced)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-report
+          path: target/conformance/
+          if-no-files-found: warn

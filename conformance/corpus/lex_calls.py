@@ -1,0 +1,6 @@
+print()
+print("hi")
+print(1, 2, 3)
+print(1 + 2)
+len([1, 2, 3])
+foo(bar(baz()))
