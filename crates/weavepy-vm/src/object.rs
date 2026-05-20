@@ -45,6 +45,10 @@ pub enum Object {
     /// A loaded module (`Object::Module(Rc<PyModule>)`). Attribute
     /// access goes through `module.dict`. Introduced in RFC 0012.
     Module(Rc<PyModule>),
+    /// A live generator object (RFC 0006). Holds a suspended frame
+    /// shared via `Rc<RefCell<…>>` so it can be resumed by `next()`,
+    /// `.send(v)`, `.throw(e)`, and `.close()`.
+    Generator(Rc<PyGenerator>),
 }
 
 impl fmt::Debug for Object {
@@ -76,6 +80,7 @@ impl fmt::Debug for Object {
             Object::Type(t) => write!(f, "<class '{}'>", t.name),
             Object::Instance(i) => write!(f, "<{} object>", i.class.name),
             Object::Module(m) => write!(f, "<module {:?}>", m.name),
+            Object::Generator(g) => write!(f, "<generator object {}>", g.name),
         }
     }
 }
@@ -210,6 +215,61 @@ pub struct PySlice {
     pub step: Object,
 }
 
+/// A live Python generator (RFC 0006). Each generator wraps a frame
+/// that the interpreter resumes from the last `YIELD_VALUE`. The frame
+/// itself is opaque to outside code — it's owned by the VM module via
+/// `state` and only legal to inspect via interpreter methods.
+pub struct PyGenerator {
+    pub name: String,
+    pub state: RefCell<GeneratorState>,
+}
+
+impl PyGenerator {
+    pub fn new(name: impl Into<String>, frame: Box<dyn std::any::Any>) -> Self {
+        Self {
+            name: name.into(),
+            state: RefCell::new(GeneratorState::Created(frame)),
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(&*self.state.borrow(), GeneratorState::Finished)
+    }
+}
+
+impl fmt::Debug for PyGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<generator {}>", self.name)
+    }
+}
+
+/// State machine for an active or exhausted generator. The frame is
+/// stored as `Box<dyn Any>` because `PyGenerator` lives in the
+/// `object` module but `Frame` lives in `vm::lib`.
+pub enum GeneratorState {
+    /// Created but not yet started — body hasn't executed past the
+    /// initial `RETURN_GENERATOR`.
+    Created(Box<dyn std::any::Any>),
+    /// Paused at a `YIELD_VALUE`.
+    Suspended(Box<dyn std::any::Any>),
+    /// Body returned (cleanly or via exception). Subsequent
+    /// `next`/`send` raise `StopIteration`.
+    Finished,
+    /// Currently executing — re-entry would be illegal.
+    Running,
+}
+
+impl fmt::Debug for GeneratorState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Created(_) => write!(f, "Created"),
+            Self::Suspended(_) => write!(f, "Suspended"),
+            Self::Finished => write!(f, "Finished"),
+            Self::Running => write!(f, "Running"),
+        }
+    }
+}
+
 /// State of an active iterator. Slim by design — every iterable
 /// type implements its own iteration here (no Python-level iterator
 /// protocol yet).
@@ -322,7 +382,8 @@ impl Object {
             | Object::Iter(_)
             | Object::Slice(_)
             | Object::Type(_)
-            | Object::Module(_) => true,
+            | Object::Module(_)
+            | Object::Generator(_) => true,
             Object::Cell(inner) => inner.borrow().is_truthy(),
             Object::Instance(inst) => {
                 // Honour __bool__ then __len__ before defaulting to True.
@@ -364,6 +425,7 @@ impl Object {
             (Object::Type(a), Object::Type(b)) => Rc::ptr_eq(a, b),
             (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
             (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
+            (Object::Generator(a), Object::Generator(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -529,6 +591,7 @@ impl Object {
             // name use Object::type_name_owned below.
             Object::Instance(_) => "object",
             Object::Module(_) => "module",
+            Object::Generator(_) => "generator",
         }
     }
 
@@ -638,6 +701,11 @@ impl Object {
                 Some(path) => format!("<module '{}' from '{}'>", m.name, path),
                 None => format!("<module '{}' (built-in)>", m.name),
             },
+            Object::Generator(g) => format!(
+                "<generator object {} at 0x{:x}>",
+                g.name,
+                Rc::as_ptr(g) as usize
+            ),
             Object::Instance(inst) => {
                 // Defer to __repr__ on the class if present; otherwise
                 // synthesize a default. The caller is expected to run

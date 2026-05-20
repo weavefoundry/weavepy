@@ -269,6 +269,49 @@ pub enum OpCode {
     /// CPython's `IMPORT_STAR`.
     ImportStar,
 
+    // f-strings (RFC 0005)
+    /// Format the value at TOS, optionally with a format spec also
+    /// on the stack. `arg & 0x03` is the conversion (0 = none,
+    /// 1 = `!s`, 2 = `!r`, 3 = `!a`); `arg & 0x04` indicates a
+    /// spec is on top (popped before the value).
+    FormatValue,
+
+    // Generators (RFC 0006)
+    /// Pop the value at TOS; suspend this frame, returning the
+    /// value to the caller's `send()` / `__next__()`. On resume,
+    /// the sent value (or `None` for `next`) is pushed at TOS.
+    YieldValue,
+    /// Pop an iterable, push its iterator. Unlike `GET_ITER`, this
+    /// returns the value unchanged when it's already a generator.
+    GetYieldFromIter,
+    /// At the top of a generator code object, suspend the frame
+    /// and push a `Generator` object to the caller. Subsequent
+    /// `__next__`/`send` calls resume the frame from here.
+    ReturnGenerator,
+    /// `SEND` runs sub-iter delegation for `yield from`. Stack on
+    /// entry: `[..., iter, value]`. The opcode calls
+    /// `iter.send(value)` (or `iter.__next__()` for `value is None`).
+    /// On `StopIteration(v)` it pops the iterator, pushes `v`, and
+    /// jumps by `arg`. Otherwise it leaves `[iter, yielded]` and
+    /// falls through.
+    Send,
+
+    // Pattern matching (RFC 0009)
+    /// Peek TOS, push True if it's a sequence (list/tuple/range).
+    MatchSequence,
+    /// Peek TOS, push True if it's a mapping (dict).
+    MatchMapping,
+    /// `arg` = positional count. Stack on entry (top-down):
+    /// names_tuple, cls, subject. Pops all three; pushes a tuple
+    /// of extracted values on success, or `None` on failure.
+    MatchClass,
+    /// Stack on entry: keys_tuple (TOS), subject (below). Pops
+    /// keys_tuple, peeks subject; pushes a tuple of looked-up
+    /// values, or `None` if any key is missing.
+    MatchKeys,
+    /// Peek TOS, push `len(TOS)` as an int.
+    GetLen,
+
     /// Print the diagnostic representation of TOS — used by the
     /// `dis` formatter only. Never emitted; reserved.
     PrintExpr,
@@ -340,6 +383,16 @@ impl OpCode {
             OpCode::ImportName => "IMPORT_NAME",
             OpCode::ImportFrom => "IMPORT_FROM",
             OpCode::ImportStar => "IMPORT_STAR",
+            OpCode::FormatValue => "FORMAT_VALUE",
+            OpCode::YieldValue => "YIELD_VALUE",
+            OpCode::GetYieldFromIter => "GET_YIELD_FROM_ITER",
+            OpCode::ReturnGenerator => "RETURN_GENERATOR",
+            OpCode::Send => "SEND",
+            OpCode::MatchSequence => "MATCH_SEQUENCE",
+            OpCode::MatchMapping => "MATCH_MAPPING",
+            OpCode::MatchClass => "MATCH_CLASS",
+            OpCode::MatchKeys => "MATCH_KEYS",
+            OpCode::GetLen => "GET_LEN",
             OpCode::PrintExpr => "PRINT_EXPR",
         }
     }

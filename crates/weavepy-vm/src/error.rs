@@ -144,6 +144,21 @@ pub fn stop_iteration() -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("StopIteration", ""))
 }
 
+/// `StopIteration(value)` — used by generators to surface the value
+/// of a `return` statement. The wrapped value is exposed as `.value`
+/// on the exception instance.
+pub fn stop_iteration_with(value: Object) -> RuntimeError {
+    let pe = PyException::from_builtin("StopIteration", "");
+    if let Object::Instance(ref inst) = pe.instance {
+        let key = crate::object::DictKey(Object::from_static("value"));
+        inst.dict.borrow_mut().insert(key, value.clone());
+        let args_key = crate::object::DictKey(Object::from_static("args"));
+        let args = Object::new_tuple(vec![value]);
+        inst.dict.borrow_mut().insert(args_key, args);
+    }
+    RuntimeError::PyException(pe)
+}
+
 pub fn runtime_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("RuntimeError", message))
 }

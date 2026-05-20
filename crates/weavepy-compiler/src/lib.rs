@@ -27,7 +27,8 @@ use indexmap::IndexMap;
 use thiserror::Error;
 use weavepy_parser::ast::{
     Arguments as AstArguments, BinOp, BoolOp, CmpOp, Comprehension, Constant as AstConstant,
-    ExceptHandler, Expr, ExprKind, Keyword as KwArg, Module, Stmt, StmtKind, UnaryOp, WithItem,
+    ExceptHandler, Expr, ExprKind, Keyword as KwArg, MatchCase, Module, Pattern, Stmt, StmtKind,
+    UnaryOp, WithItem,
 };
 
 pub mod bytecode;
@@ -89,6 +90,10 @@ pub struct CodeObject {
     pub has_varkeywords: bool,
     /// `True` when this code object is the body of a `class` statement.
     pub is_class_body: bool,
+    /// `True` when this code object is a generator function (contains
+    /// a `yield` or `yield from` expression). Calling such a function
+    /// returns a `PyGenerator` instead of running the body eagerly.
+    pub is_generator: bool,
 }
 
 /// One entry in a code object's exception table. Mirrors the
@@ -436,7 +441,8 @@ impl Compiler {
             OpCode::JumpForward
             | OpCode::PopJumpIfFalse
             | OpCode::PopJumpIfTrue
-            | OpCode::ForIter => {
+            | OpCode::ForIter
+            | OpCode::Send => {
                 ins.arg = target.saturating_sub(from);
             }
             OpCode::JumpBackward => {
@@ -749,6 +755,9 @@ impl Compiler {
             } => {
                 self.compile_import_from(module.as_deref(), names, *level)?;
             }
+            StmtKind::Match { subject, cases } => {
+                self.compile_match(subject, cases)?;
+            }
         }
         Ok(())
     }
@@ -842,6 +851,337 @@ impl Compiler {
         Ok(())
     }
 
+    // ---------- structural pattern matching (RFC 0009) ----------
+
+    /// Lower `match subject: case ...:` into bytecode.
+    ///
+    /// At runtime the subject sits on the stack while each case is
+    /// tried; we pop it (and any extracted values) on a successful
+    /// match before jumping to the chosen body. The subject is also
+    /// popped before falling off the end of the match.
+    fn compile_match(&mut self, subject: &Expr, cases: &[MatchCase]) -> Result<(), CompileError> {
+        self.compile_expr(subject)?;
+        let mut end_jumps: Vec<u32> = Vec::new();
+        for case in cases {
+            let mut fail_sites: Vec<u32> = Vec::new();
+            self.emit(OpCode::CopyTop, 0);
+            self.compile_pattern(&case.pattern, &mut fail_sites)?;
+            if let Some(guard) = &case.guard {
+                self.compile_expr(guard)?;
+                let g = self.emit(OpCode::PopJumpIfFalse, 0);
+                fail_sites.push(g);
+            }
+            self.emit(OpCode::PopTop, 0);
+            for s in &case.body {
+                self.compile_stmt(s)?;
+            }
+            let jump_end = self.emit(OpCode::JumpForward, 0);
+            end_jumps.push(jump_end);
+            let fail_target = self.next_offset();
+            for site in fail_sites {
+                self.patch_jump(site, fail_target);
+            }
+        }
+        self.emit(OpCode::PopTop, 0);
+        let end = self.next_offset();
+        for j in end_jumps {
+            self.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Compile a pattern. The subject is at TOS when this is called
+    /// and must still be there on the failure path. On success TOS
+    /// remains the subject and any captures have been stored.
+    fn compile_pattern(
+        &mut self,
+        pat: &Pattern,
+        fail_sites: &mut Vec<u32>,
+    ) -> Result<(), CompileError> {
+        match pat {
+            Pattern::Value(expr) => {
+                self.compile_expr(expr)?;
+                self.emit(OpCode::CompareOp, CompareKind::Eq as u32);
+                let j = self.emit(OpCode::PopJumpIfFalse, 0);
+                fail_sites.push(j);
+            }
+            Pattern::Singleton(c) => {
+                let idx = self.co.intern_constant(c.clone().into());
+                self.emit(OpCode::LoadConst, idx);
+                self.emit(OpCode::IsOp, 0);
+                let j = self.emit(OpCode::PopJumpIfFalse, 0);
+                fail_sites.push(j);
+            }
+            Pattern::Capture(None) => {
+                self.emit(OpCode::PopTop, 0);
+            }
+            Pattern::Capture(Some(name)) => {
+                let name_expr = Expr {
+                    kind: ExprKind::Name(name.clone()),
+                    span: weavepy_lexer::Span::new(0, 0),
+                };
+                self.compile_assign(&name_expr)?;
+            }
+            Pattern::Sequence(items) => {
+                self.compile_sequence_pattern(items, fail_sites)?;
+            }
+            Pattern::Star(_) => {
+                return Err(CompileError::Internal(
+                    "`*name` patterns may only appear inside a sequence".to_owned(),
+                ));
+            }
+            Pattern::Mapping {
+                keys,
+                patterns,
+                rest,
+            } => {
+                self.compile_mapping_pattern(keys, patterns, rest.as_ref(), fail_sites)?;
+            }
+            Pattern::Class {
+                cls,
+                positionals,
+                keywords,
+            } => {
+                self.compile_class_pattern(cls, positionals, keywords, fail_sites)?;
+            }
+            Pattern::Or(alts) => {
+                let mut end_jumps: Vec<u32> = Vec::new();
+                let n = alts.len();
+                for (i, alt) in alts.iter().enumerate() {
+                    let mut local_fail: Vec<u32> = Vec::new();
+                    if i + 1 < n {
+                        self.emit(OpCode::CopyTop, 0);
+                    }
+                    self.compile_pattern(alt, &mut local_fail)?;
+                    if i + 1 < n {
+                        let j = self.emit(OpCode::JumpForward, 0);
+                        end_jumps.push(j);
+                        let fail_target = self.next_offset();
+                        for site in local_fail {
+                            self.patch_jump(site, fail_target);
+                        }
+                    } else {
+                        for site in local_fail {
+                            fail_sites.push(site);
+                        }
+                    }
+                }
+                let end = self.next_offset();
+                for j in end_jumps {
+                    self.patch_jump(j, end);
+                }
+            }
+            Pattern::As { pattern, name } => {
+                self.emit(OpCode::CopyTop, 0);
+                let name_expr = Expr {
+                    kind: ExprKind::Name(name.clone()),
+                    span: weavepy_lexer::Span::new(0, 0),
+                };
+                self.compile_assign(&name_expr)?;
+                self.compile_pattern(pattern, fail_sites)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_sequence_pattern(
+        &mut self,
+        items: &[Pattern],
+        fail_sites: &mut Vec<u32>,
+    ) -> Result<(), CompileError> {
+        self.emit(OpCode::MatchSequence, 0);
+        let j = self.emit(OpCode::PopJumpIfFalse, 0);
+        fail_sites.push(j);
+        let star_index = items.iter().position(|p| matches!(p, Pattern::Star(_)));
+        let expected_len = if star_index.is_some() {
+            items.len() - 1
+        } else {
+            items.len()
+        };
+        self.emit(OpCode::GetLen, 0);
+        let len_idx = self.co.intern_constant(Constant::Int(expected_len as i64));
+        self.emit(OpCode::LoadConst, len_idx);
+        if star_index.is_some() {
+            self.emit(OpCode::CompareOp, CompareKind::GtE as u32);
+        } else {
+            self.emit(OpCode::CompareOp, CompareKind::Eq as u32);
+        }
+        let j = self.emit(OpCode::PopJumpIfFalse, 0);
+        fail_sites.push(j);
+        for (i, pat) in items.iter().enumerate() {
+            self.emit(OpCode::CopyTop, 0);
+            match pat {
+                Pattern::Star(name) => {
+                    let tail = items.len() - i - 1;
+                    self.emit_pattern_subscript_slice(i, tail);
+                    if let Some(n) = name {
+                        let name_expr = Expr {
+                            kind: ExprKind::Name(n.clone()),
+                            span: weavepy_lexer::Span::new(0, 0),
+                        };
+                        self.compile_assign(&name_expr)?;
+                    } else {
+                        self.emit(OpCode::PopTop, 0);
+                    }
+                }
+                _ => {
+                    let idx = if let Some(si) = star_index {
+                        if i > si {
+                            // negative index from end
+                            -((items.len() - i) as i64)
+                        } else {
+                            i as i64
+                        }
+                    } else {
+                        i as i64
+                    };
+                    let cidx = self.co.intern_constant(Constant::Int(idx));
+                    self.emit(OpCode::LoadConst, cidx);
+                    self.emit(OpCode::BinarySubscr, 0);
+                    self.compile_pattern(pat, fail_sites)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit a slice subscription `subject[head:len-tail]` for a `*name`
+    /// position inside a sequence pattern. Leaves the slice list on the
+    /// stack.
+    fn emit_pattern_subscript_slice(&mut self, head: usize, tail: usize) {
+        let lower = self.co.intern_constant(Constant::Int(head as i64));
+        self.emit(OpCode::LoadConst, lower);
+        if tail == 0 {
+            let none = self.co.intern_constant(Constant::None);
+            self.emit(OpCode::LoadConst, none);
+        } else {
+            let neg = self.co.intern_constant(Constant::Int(-(tail as i64)));
+            self.emit(OpCode::LoadConst, neg);
+        }
+        let none = self.co.intern_constant(Constant::None);
+        self.emit(OpCode::LoadConst, none);
+        self.emit(OpCode::BuildSlice, 3);
+        self.emit(OpCode::BinarySubscr, 0);
+    }
+
+    fn compile_mapping_pattern(
+        &mut self,
+        keys: &[Expr],
+        patterns: &[Pattern],
+        rest: Option<&Option<String>>,
+        fail_sites: &mut Vec<u32>,
+    ) -> Result<(), CompileError> {
+        self.emit(OpCode::MatchMapping, 0);
+        let j = self.emit(OpCode::PopJumpIfFalse, 0);
+        fail_sites.push(j);
+        if !keys.is_empty() {
+            for k in keys {
+                self.compile_expr(k)?;
+            }
+            self.emit(OpCode::BuildTuple, keys.len() as u32);
+            self.emit(OpCode::MatchKeys, 0);
+            let none_idx = self.co.intern_constant(Constant::None);
+            self.emit(OpCode::LoadConst, none_idx);
+            self.emit(OpCode::IsOp, 1);
+            let j = self.emit(OpCode::PopJumpIfFalse, 0);
+            fail_sites.push(j);
+            for (i, pat) in patterns.iter().enumerate() {
+                self.emit(OpCode::CopyTop, 0);
+                let idx = self.co.intern_constant(Constant::Int(i as i64));
+                self.emit(OpCode::LoadConst, idx);
+                self.emit(OpCode::BinarySubscr, 0);
+                self.compile_pattern(pat, fail_sites)?;
+            }
+            self.emit(OpCode::PopTop, 0);
+        }
+        if let Some(rest_name) = rest {
+            self.emit(OpCode::CopyTop, 0);
+            self.emit_dict_copy_without_keys(keys.len());
+            if let Some(n) = rest_name {
+                let name_expr = Expr {
+                    kind: ExprKind::Name(n.clone()),
+                    span: weavepy_lexer::Span::new(0, 0),
+                };
+                self.compile_assign(&name_expr)?;
+            } else {
+                self.emit(OpCode::PopTop, 0);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_dict_copy_without_keys(&mut self, _key_count: usize) {
+        // Stub: the VM provides this as a builtin call via dict.copy()
+        // for now; real CPython uses a dedicated opcode.
+        let idx = self.co.intern_name("dict");
+        self.emit(OpCode::LoadGlobal, idx);
+        self.emit(OpCode::Swap, 1);
+        self.emit(OpCode::Call, 1);
+    }
+
+    fn compile_class_pattern(
+        &mut self,
+        cls: &Expr,
+        positionals: &[Pattern],
+        keywords: &[(String, Pattern)],
+        fail_sites: &mut Vec<u32>,
+    ) -> Result<(), CompileError> {
+        // Stack on entry (top-down): subject_copy. We must end with
+        // the subject_copy popped on success, and the subject_copy
+        // popped (and fail_sites taken) on failure.
+        self.compile_expr(cls)?;
+        let kw_names: Vec<Constant> = keywords
+            .iter()
+            .map(|(n, _)| Constant::Str(n.clone()))
+            .collect();
+        let kw_idx = self.co.intern_constant(Constant::Tuple(kw_names));
+        self.emit(OpCode::LoadConst, kw_idx);
+        self.emit(OpCode::MatchClass, positionals.len() as u32);
+        // Stack now: [..., result_or_none]
+        self.emit(OpCode::CopyTop, 0);
+        let none_idx = self.co.intern_constant(Constant::None);
+        self.emit(OpCode::LoadConst, none_idx);
+        self.emit(OpCode::IsOp, 0);
+        let bad = self.emit(OpCode::PopJumpIfTrue, 0);
+        // Result is a tuple. Inner patterns get their own fail list
+        // so we can pop the tuple before joining the outer fail path.
+        let mut local_fails: Vec<u32> = Vec::new();
+        for (i, pat) in positionals.iter().enumerate() {
+            self.emit(OpCode::CopyTop, 0);
+            let idx = self.co.intern_constant(Constant::Int(i as i64));
+            self.emit(OpCode::LoadConst, idx);
+            self.emit(OpCode::BinarySubscr, 0);
+            self.compile_pattern(pat, &mut local_fails)?;
+        }
+        for (i, (_, pat)) in keywords.iter().enumerate() {
+            self.emit(OpCode::CopyTop, 0);
+            let idx = self
+                .co
+                .intern_constant(Constant::Int((positionals.len() + i) as i64));
+            self.emit(OpCode::LoadConst, idx);
+            self.emit(OpCode::BinarySubscr, 0);
+            self.compile_pattern(pat, &mut local_fails)?;
+        }
+        self.emit(OpCode::PopTop, 0); // drop result tuple
+        let success = self.emit(OpCode::JumpForward, 0);
+        // On inner failure path: stack has the result tuple. Drop it
+        // and join the outer fail_sites.
+        let inner_fail_target = self.next_offset();
+        for site in local_fails {
+            self.patch_jump(site, inner_fail_target);
+        }
+        self.emit(OpCode::PopTop, 0); // drop result tuple
+        fail_sites.push(self.emit(OpCode::JumpForward, 0));
+        // bad path: result was None; pop and join outer fail_sites.
+        let bad_target = self.next_offset();
+        self.patch_jump(bad, bad_target);
+        self.emit(OpCode::PopTop, 0); // drop the None
+        fail_sites.push(self.emit(OpCode::JumpForward, 0));
+        let end = self.next_offset();
+        self.patch_jump(success, end);
+        Ok(())
+    }
+
     /// Compile a function definition statement: builds the function
     /// object, threads it through any decorators, and binds the result
     /// to `name` in the enclosing scope.
@@ -922,6 +1262,11 @@ impl Compiler {
                     self.co.cellvars.push(free.clone());
                 }
             }
+        }
+        let is_generator = body_is_generator(body);
+        inner.co.is_generator = is_generator;
+        if is_generator {
+            inner.emit(OpCode::ReturnGenerator, 0);
         }
         inner.emit(OpCode::Resume, 0);
         for s in body {
@@ -1679,7 +2024,88 @@ impl Compiler {
                     "the slice doesn't support `*x` in this position",
                 ));
             }
+            ExprKind::JoinedStr(parts) => {
+                self.compile_joined_str(parts)?;
+            }
+            ExprKind::FormattedValue {
+                value,
+                conversion,
+                format_spec,
+            } => {
+                self.compile_formatted_value(value, *conversion, format_spec.as_deref())?;
+            }
+            ExprKind::Yield(value) => {
+                if let Some(v) = value {
+                    self.compile_expr(v)?;
+                } else {
+                    let idx = self.co.intern_constant(Constant::None);
+                    self.emit(OpCode::LoadConst, idx);
+                }
+                self.emit(OpCode::YieldValue, 0);
+            }
+            ExprKind::YieldFrom(iter) => {
+                self.compile_expr(iter)?;
+                self.emit(OpCode::GetYieldFromIter, 0);
+                let idx = self.co.intern_constant(Constant::None);
+                self.emit(OpCode::LoadConst, idx);
+                let loop_start = self.next_offset();
+                let send = self.emit(OpCode::Send, 0);
+                self.emit(OpCode::YieldValue, 0);
+                let back = self.emit(OpCode::JumpBackward, 0);
+                self.patch_jump(back, loop_start);
+                let end = self.next_offset();
+                self.patch_jump(send, end);
+            }
         }
+        Ok(())
+    }
+
+    /// Lower an `f"..."` literal into a chain of `FORMAT_VALUE` /
+    /// `BUILD_STRING` instructions. Plain `Constant::Str` parts are
+    /// pushed as-is; `FormattedValue` parts go through the format
+    /// machinery.
+    fn compile_joined_str(&mut self, parts: &[Expr]) -> Result<(), CompileError> {
+        if parts.is_empty() {
+            let idx = self.co.intern_constant(Constant::Str(String::new()));
+            self.emit(OpCode::LoadConst, idx);
+            return Ok(());
+        }
+        if parts.len() == 1 {
+            return self.compile_expr(&parts[0]);
+        }
+        for p in parts {
+            self.compile_expr(p)?;
+        }
+        self.emit(OpCode::BuildString, parts.len() as u32);
+        Ok(())
+    }
+
+    /// Emit `value` then `FORMAT_VALUE arg`. Encoding:
+    /// bits 0-1: conversion (`0` = none, `1` = !s, `2` = !r, `3` = !a)
+    /// bit 2: spec-on-stack flag (the spec is below the value).
+    fn compile_formatted_value(
+        &mut self,
+        value: &Expr,
+        conversion: i32,
+        spec: Option<&Expr>,
+    ) -> Result<(), CompileError> {
+        self.compile_expr(value)?;
+        let mut arg: u32 = match conversion {
+            -1 => 0,
+            115 => 1, // 's'
+            114 => 2, // 'r'
+            97 => 3,  // 'a'
+            other => {
+                return Err(CompileError::Internal(format!(
+                    "unknown f-string conversion {other}"
+                )));
+            }
+        };
+        if let Some(spec_expr) = spec {
+            self.compile_expr(spec_expr)?;
+            arg |= 0x04;
+        }
+        self.emit(OpCode::FormatValue, arg);
         Ok(())
     }
 
@@ -1765,15 +2191,16 @@ impl Compiler {
         inner.bindings.insert(".0".to_owned(), Binding::Local);
 
         let collector_op = match kind {
-            CompKind::List => OpCode::BuildList,
-            CompKind::Set => OpCode::BuildSet,
-            CompKind::Dict => OpCode::BuildMap,
-            CompKind::Generator => OpCode::BuildList, // sliced as list for now
+            CompKind::List => Some(OpCode::BuildList),
+            CompKind::Set => Some(OpCode::BuildSet),
+            CompKind::Dict => Some(OpCode::BuildMap),
+            CompKind::Generator => None,
         };
         let append_op = match kind {
-            CompKind::List | CompKind::Generator => OpCode::ListAppend,
+            CompKind::List => OpCode::ListAppend,
             CompKind::Set => OpCode::SetAdd,
             CompKind::Dict => OpCode::MapAdd,
+            CompKind::Generator => OpCode::YieldValue,
         };
         // Free-variable resolution from outer scope.
         let mut reads = HashSet::new();
@@ -1811,19 +2238,27 @@ impl Compiler {
             }
         }
 
+        if matches!(kind, CompKind::Generator) {
+            inner.co.is_generator = true;
+            inner.emit(OpCode::ReturnGenerator, 0);
+        }
         inner.emit(OpCode::Resume, 0);
-        inner.emit(collector_op, 0);
+        if let Some(op) = collector_op {
+            inner.emit(op, 0);
+        }
         // Outermost iterator comes in as `.0`.
         inner.emit(OpCode::LoadFast, 0);
         compile_comp_body(&mut inner, generators, 0, elt, value, append_op)?;
-        let none_idx = inner.co.intern_constant(Constant::None);
-        inner.emit(OpCode::LoadConst, none_idx);
-        // ListAppend etc. left the accumulator on the stack; the
-        // function returns that. We pushed None just to terminate
-        // the implicit return — instead, return the accumulator.
-        // Drop the None we just pushed.
-        inner.emit(OpCode::PopTop, 0);
-        inner.emit(OpCode::ReturnValue, 0);
+        if matches!(kind, CompKind::Generator) {
+            // ForIter pops the iterator on exhaustion. Return None
+            // so the generator finishes cleanly (the VM converts
+            // this to `StopIteration`).
+            let none_idx = inner.co.intern_constant(Constant::None);
+            inner.emit(OpCode::LoadConst, none_idx);
+            inner.emit(OpCode::ReturnValue, 0);
+        } else {
+            inner.emit(OpCode::ReturnValue, 0);
+        }
 
         let inner_code = inner.finish();
         let inner_freevars = inner_code.freevars.clone();
@@ -1877,13 +2312,19 @@ fn compile_comp_body(
     append_op: OpCode,
 ) -> Result<(), CompileError> {
     if depth >= generators.len() {
-        // Innermost: append (or map_add) to the accumulator.
+        // Innermost: append (or map_add) to the accumulator. For
+        // generator expressions, yield the element instead.
         match append_op {
             OpCode::MapAdd => {
                 inner.compile_expr(elt)?;
                 inner.compile_expr(value.expect("dict comp needs value"))?;
                 let i = generators.len() + 1; // stack depth to accumulator
                 inner.emit(OpCode::MapAdd, i as u32);
+            }
+            OpCode::YieldValue => {
+                inner.compile_expr(elt)?;
+                inner.emit(OpCode::YieldValue, 0);
+                inner.emit(OpCode::PopTop, 0);
             }
             _ => {
                 inner.compile_expr(elt)?;
@@ -2153,6 +2594,138 @@ fn method_references_class(body: &[Stmt]) -> bool {
         collect_reads_stmt(s, &mut reads);
     }
     reads.contains("super") || reads.contains("__class__")
+}
+
+/// `True` if any statement in `body` contains a `yield` or `yield from`
+/// in the immediate scope. Does NOT recurse into nested `def` / `lambda`
+/// / comprehension bodies — those have their own scopes.
+fn body_is_generator(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_contains_yield)
+}
+
+fn stmt_contains_yield(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::FunctionDef { .. } | StmtKind::ClassDef { .. } => false,
+        StmtKind::Expr(e) => expr_contains_yield(e),
+        StmtKind::Assign { targets, value } => {
+            expr_contains_yield(value) || targets.iter().any(expr_contains_yield)
+        }
+        StmtKind::AugAssign { target, value, .. } => {
+            expr_contains_yield(target) || expr_contains_yield(value)
+        }
+        StmtKind::AnnAssign { target, value, .. } => {
+            expr_contains_yield(target) || value.as_ref().is_some_and(expr_contains_yield)
+        }
+        StmtKind::Return(v) => v.as_ref().is_some_and(expr_contains_yield),
+        StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
+            expr_contains_yield(test)
+                || body.iter().any(stmt_contains_yield)
+                || orelse.iter().any(stmt_contains_yield)
+        }
+        StmtKind::For {
+            target,
+            iter,
+            body,
+            orelse,
+        } => {
+            expr_contains_yield(target)
+                || expr_contains_yield(iter)
+                || body.iter().any(stmt_contains_yield)
+                || orelse.iter().any(stmt_contains_yield)
+        }
+        StmtKind::With { items, body } => {
+            items.iter().any(|w| {
+                expr_contains_yield(&w.context_expr)
+                    || w.optional_vars.as_ref().is_some_and(expr_contains_yield)
+            }) || body.iter().any(stmt_contains_yield)
+        }
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            body.iter().any(stmt_contains_yield)
+                || handlers
+                    .iter()
+                    .any(|h| h.body.iter().any(stmt_contains_yield))
+                || orelse.iter().any(stmt_contains_yield)
+                || finalbody.iter().any(stmt_contains_yield)
+        }
+        StmtKind::Raise { exc, cause } => {
+            exc.as_ref().is_some_and(expr_contains_yield)
+                || cause.as_ref().is_some_and(expr_contains_yield)
+        }
+        StmtKind::Match { subject, cases } => {
+            expr_contains_yield(subject)
+                || cases.iter().any(|c| {
+                    c.guard.as_ref().is_some_and(expr_contains_yield)
+                        || c.body.iter().any(stmt_contains_yield)
+                })
+        }
+        StmtKind::Global(_)
+        | StmtKind::Nonlocal(_)
+        | StmtKind::Import(_)
+        | StmtKind::ImportFrom { .. }
+        | StmtKind::Pass
+        | StmtKind::Break
+        | StmtKind::Continue => false,
+    }
+}
+
+fn expr_contains_yield(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Yield(_) | ExprKind::YieldFrom(_) => true,
+        ExprKind::Lambda { .. } => false,
+        ExprKind::GeneratorExp { .. } => false,
+        ExprKind::JoinedStr(parts) => parts.iter().any(expr_contains_yield),
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => expr_contains_yield(value) || format_spec.as_deref().is_some_and(expr_contains_yield),
+        ExprKind::BinOp { left, right, .. } => {
+            expr_contains_yield(left) || expr_contains_yield(right)
+        }
+        ExprKind::BoolOp { values, .. } => values.iter().any(expr_contains_yield),
+        ExprKind::UnaryOp { operand, .. } => expr_contains_yield(operand),
+        ExprKind::Compare {
+            left, comparators, ..
+        } => expr_contains_yield(left) || comparators.iter().any(expr_contains_yield),
+        ExprKind::IfExp { test, body, orelse } => {
+            expr_contains_yield(test) || expr_contains_yield(body) || expr_contains_yield(orelse)
+        }
+        ExprKind::NamedExpr { target, value } => {
+            expr_contains_yield(target) || expr_contains_yield(value)
+        }
+        ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            expr_contains_yield(func)
+                || args.iter().any(expr_contains_yield)
+                || keywords.iter().any(|k| expr_contains_yield(&k.value))
+        }
+        ExprKind::Attribute { value, .. } => expr_contains_yield(value),
+        ExprKind::Subscript { value, slice } => {
+            expr_contains_yield(value) || expr_contains_yield(slice)
+        }
+        ExprKind::Slice { lower, upper, step } => {
+            lower.as_deref().is_some_and(expr_contains_yield)
+                || upper.as_deref().is_some_and(expr_contains_yield)
+                || step.as_deref().is_some_and(expr_contains_yield)
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+            items.iter().any(expr_contains_yield)
+        }
+        ExprKind::Dict { keys, values } => {
+            keys.iter()
+                .any(|k| k.as_ref().is_some_and(expr_contains_yield))
+                || values.iter().any(expr_contains_yield)
+        }
+        ExprKind::ListComp { .. } | ExprKind::SetComp { .. } | ExprKind::DictComp { .. } => false,
+        ExprKind::Starred(inner) => expr_contains_yield(inner),
+        ExprKind::Constant(_) | ExprKind::Name(_) => false,
+    }
 }
 
 fn collect_inner_free_expr(

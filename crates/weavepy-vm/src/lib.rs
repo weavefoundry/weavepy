@@ -35,13 +35,15 @@ pub mod types;
 use crate::builtin_types::{builtin_types, instance_is_subclass, make_exception_with_class};
 use crate::error::{
     attribute_error, import_error, index_error, key_error, module_not_found_error, name_error,
-    runtime_error, type_error, value_error, zero_division_error, TracebackEntry,
+    runtime_error, stop_iteration, stop_iteration_with, type_error, value_error,
+    zero_division_error, TracebackEntry,
 };
 pub use crate::error::{PyException, RuntimeError};
 pub use crate::import::ModuleCache;
 use crate::import::{package_search_path, resolve_relative};
 use crate::object::{
-    BoundMethod, BuiltinFn, DictData, DictKey, Object, PyFunction, PyModule, PySlice,
+    BoundMethod, BuiltinFn, DictData, DictKey, GeneratorState, Object, PyFunction, PyGenerator,
+    PyModule, PySlice,
 };
 use crate::types::{PyInstance, TypeObject};
 
@@ -288,12 +290,39 @@ impl Interpreter {
     // ---------- dispatch ----------
 
     fn run_frame(&mut self, frame: &mut Frame) -> Result<Object, RuntimeError> {
+        match self.run_until_yield_or_return(frame, None)? {
+            FrameOutcome::Returned(v) => Ok(v),
+            FrameOutcome::Yielded(_) => Err(RuntimeError::Internal(
+                "generator frame yielded to a non-generator caller".to_owned(),
+            )),
+            FrameOutcome::StartGenerator => {
+                // Caller of run_frame for a generator function uses
+                // call_python which handles this case separately.
+                Err(RuntimeError::Internal(
+                    "generator start outside call_python".to_owned(),
+                ))
+            }
+        }
+    }
+
+    /// Run the frame until it yields, returns, or starts a generator.
+    /// When `sent` is `Some`, push it onto the stack first — this is
+    /// how `gen.send(v)` resumes from `YIELD_VALUE`.
+    fn run_until_yield_or_return(
+        &mut self,
+        frame: &mut Frame,
+        sent: Option<Object>,
+    ) -> Result<FrameOutcome, RuntimeError> {
+        if let Some(v) = sent {
+            frame.push(v);
+        }
         loop {
             match self.step(frame) {
                 Ok(StepOutcome::Continue) => {}
-                Ok(StepOutcome::Return(v)) => return Ok(v),
+                Ok(StepOutcome::Return(v)) => return Ok(FrameOutcome::Returned(v)),
+                Ok(StepOutcome::Yield(v)) => return Ok(FrameOutcome::Yielded(v)),
+                Ok(StepOutcome::StartGenerator) => return Ok(FrameOutcome::StartGenerator),
                 Err(err) => {
-                    // Try to find a handler in the exception table.
                     if let RuntimeError::PyException(exc) = err {
                         match self.handle_exception(frame, exc) {
                             Ok(Some(())) => continue,
@@ -621,6 +650,15 @@ impl Interpreter {
                     .ok_or_else(|| RuntimeError::Internal("FOR_ITER no iter".to_owned()))?;
                 let next = match &it_obj {
                     Object::Iter(it) => it.borrow_mut().next_value(),
+                    Object::Generator(g) => match self.generator_send(g, Object::None) {
+                        Ok(v) => Some(v),
+                        Err(RuntimeError::PyException(exc))
+                            if exc.type_name() == "StopIteration" =>
+                        {
+                            None
+                        }
+                        Err(e) => return Err(e),
+                    },
                     Object::Instance(_) => {
                         // Call __next__; treat StopIteration as exhaustion.
                         match instance_method(&it_obj, "__next__") {
@@ -1011,6 +1049,132 @@ impl Interpreter {
                 let module = frame.pop()?;
                 self.import_star(&module, &frame.globals)?;
             }
+            OpCode::FormatValue => {
+                let arg = ins.arg;
+                let conversion = arg & 0x03;
+                let has_spec = (arg & 0x04) != 0;
+                let spec = if has_spec { Some(frame.pop()?) } else { None };
+                let value = frame.pop()?;
+                let formatted = self.format_value(&value, conversion, spec.as_ref())?;
+                frame.push(Object::from_str(formatted));
+            }
+            OpCode::YieldValue => {
+                let v = frame.pop()?;
+                return Ok(StepOutcome::Yield(v));
+            }
+            OpCode::ReturnGenerator => {
+                return Ok(StepOutcome::StartGenerator);
+            }
+            OpCode::GetYieldFromIter => {
+                let v = frame.pop()?;
+                let it = match v {
+                    Object::Generator(_) => v,
+                    other => self.make_iter(&other, &frame.globals)?,
+                };
+                frame.push(it);
+            }
+            OpCode::Send => {
+                let value = frame.pop()?;
+                let iter = frame
+                    .stack
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Internal("SEND empty stack".to_owned()))?;
+                let result = match &iter {
+                    Object::Generator(g) => self.generator_send(g, value),
+                    Object::Iter(_) => {
+                        // For non-generator iterators, `value` should be
+                        // None (this is the standard `next()` resume).
+                        if !matches!(value, Object::None) {
+                            return Err(type_error(
+                                "can't send non-None value to a just-started iterator",
+                            ));
+                        }
+                        match self.iter_next(&iter, &frame.globals)? {
+                            Some(v) => Ok(v),
+                            None => Err(stop_iteration()),
+                        }
+                    }
+                    _ => Err(type_error("SEND expects an iterator or generator")),
+                };
+                match result {
+                    Ok(v) => frame.push(v),
+                    Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                        frame.pop()?;
+                        let payload = exception_value(&exc.instance);
+                        frame.push(payload);
+                        frame.pc += ins.arg;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            OpCode::MatchSequence => {
+                let v = frame.top()?;
+                let is_seq = matches!(
+                    v,
+                    Object::Tuple(_) | Object::List(_) | Object::Range(_) | Object::Str(_)
+                );
+                frame.push(Object::Bool(is_seq));
+            }
+            OpCode::MatchMapping => {
+                let v = frame.top()?;
+                let is_map = matches!(v, Object::Dict(_));
+                frame.push(Object::Bool(is_map));
+            }
+            OpCode::GetLen => {
+                let len = frame.top()?.len()?;
+                frame.push(Object::Int(len as i64));
+            }
+            OpCode::MatchKeys => {
+                let keys_obj = frame.pop()?;
+                let subject = frame.top()?.clone();
+                let keys: Vec<Object> = match keys_obj {
+                    Object::Tuple(items) => items.iter().cloned().collect(),
+                    _ => {
+                        return Err(RuntimeError::Internal(
+                            "MATCH_KEYS expects tuple".to_owned(),
+                        ))
+                    }
+                };
+                let result = match &subject {
+                    Object::Dict(d) => {
+                        let d = d.borrow();
+                        let mut values = Vec::with_capacity(keys.len());
+                        let mut found = true;
+                        for k in &keys {
+                            if let Some(v) = d.get(&DictKey(k.clone())) {
+                                values.push(v.clone());
+                            } else {
+                                found = false;
+                                break;
+                            }
+                        }
+                        if found {
+                            Object::new_tuple(values)
+                        } else {
+                            Object::None
+                        }
+                    }
+                    _ => Object::None,
+                };
+                frame.push(result);
+            }
+            OpCode::MatchClass => {
+                let nargs = ins.arg as usize;
+                let names_obj = frame.pop()?;
+                let cls = frame.pop()?;
+                let subject = frame.pop()?;
+                let kw_names: Vec<String> = match names_obj {
+                    Object::Tuple(items) => items.iter().map(|x| x.to_str()).collect(),
+                    _ => {
+                        return Err(RuntimeError::Internal(
+                            "MATCH_CLASS expects tuple of names".to_owned(),
+                        ))
+                    }
+                };
+                let result = self.match_class(&subject, &cls, nargs, &kw_names, &frame.globals)?;
+                frame.push(result);
+            }
         }
         Ok(StepOutcome::Continue)
     }
@@ -1314,6 +1478,180 @@ impl Interpreter {
         Ok(Object::Int(v.len()? as i64))
     }
 
+    /// `next(it[, default])` — drives an iterator. Generators need
+    /// the interpreter on the call path, which is why this lives here
+    /// rather than in `builtins.rs`.
+    fn do_next_call(
+        &mut self,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let it = &args[0];
+        let default = args.get(1).cloned();
+        // Drive the iterator directly so we can surface a
+        // `StopIteration(value)` raised by a generator's `return`
+        // statement instead of losing the value to `iter_next`'s
+        // exhausted-or-not boolean.
+        match it {
+            Object::Generator(g) => match self.generator_send(g, Object::None) {
+                Ok(v) => Ok(v),
+                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                    if let Some(d) = default {
+                        Ok(d)
+                    } else {
+                        Err(RuntimeError::PyException(exc))
+                    }
+                }
+                Err(e) => Err(e),
+            },
+            _ => match self.iter_next(it, globals) {
+                Ok(Some(v)) => Ok(v),
+                Ok(None) => default.ok_or_else(stop_iteration),
+                Err(e) => Err(e),
+            },
+        }
+    }
+
+    fn do_iter_call(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        self.make_iter(v, globals)
+    }
+
+    fn do_list_or_tuple_call(
+        &mut self,
+        name: &str,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let collected = self.collect_iterable(v, globals)?;
+        if name == "list" {
+            Ok(Object::new_list(collected))
+        } else {
+            Ok(Object::new_tuple(collected))
+        }
+    }
+
+    fn collect_iterable(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Vec<Object>, RuntimeError> {
+        match v {
+            Object::List(items) => Ok(items.borrow().clone()),
+            Object::Tuple(items) => Ok(items.to_vec()),
+            Object::Generator(_) | Object::Instance(_) => {
+                let it = self.make_iter(v, globals)?;
+                let mut out = Vec::new();
+                while let Some(x) = self.iter_next(&it, globals)? {
+                    out.push(x);
+                }
+                Ok(out)
+            }
+            other => {
+                // Fall through to the existing builtin so we don't
+                // re-implement range/dict/str iteration here.
+                let it = self.make_iter(other, globals)?;
+                let mut out = Vec::new();
+                while let Some(x) = self.iter_next(&it, globals)? {
+                    out.push(x);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    fn do_sum_call(
+        &mut self,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        if args.is_empty() {
+            return Err(type_error("sum() expects at least one argument"));
+        }
+        let mut acc = args.get(1).cloned().unwrap_or(Object::Int(0));
+        let items = self.collect_iterable(&args[0], globals)?;
+        for x in items {
+            acc = binary_op(&acc, &x, BinOpKind::Add)?;
+        }
+        Ok(acc)
+    }
+
+    fn do_min_max_call(
+        &mut self,
+        name: &str,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let want_max = name == "max";
+        let default = kwargs
+            .iter()
+            .find_map(|(k, v)| (k == "default").then(|| v.clone()));
+        let items: Vec<Object> = if args.len() == 1 {
+            self.collect_iterable(&args[0], globals)?
+        } else {
+            args.to_vec()
+        };
+        if items.is_empty() {
+            return default
+                .ok_or_else(|| value_error(format!("{name}() arg is an empty sequence")));
+        }
+        let mut best = items[0].clone();
+        for item in &items[1..] {
+            let order = item.cmp(&best)?;
+            let take = if want_max {
+                matches!(order, std::cmp::Ordering::Greater)
+            } else {
+                matches!(order, std::cmp::Ordering::Less)
+            };
+            if take {
+                best = item.clone();
+            }
+        }
+        Ok(best)
+    }
+
+    fn do_any_all_call(
+        &mut self,
+        name: &str,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let items = self.collect_iterable(&args[0], globals)?;
+        let want_any = name == "any";
+        for x in items {
+            if x.is_truthy() {
+                if want_any {
+                    return Ok(Object::Bool(true));
+                }
+            } else if !want_any {
+                return Ok(Object::Bool(false));
+            }
+        }
+        Ok(Object::Bool(!want_any))
+    }
+
+    fn do_sorted_call(
+        &mut self,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let mut items = self.collect_iterable(&args[0], globals)?;
+        let reverse = kwargs
+            .iter()
+            .find_map(|(k, v)| (k == "reverse").then(|| v.is_truthy()))
+            .unwrap_or(false);
+        items.sort_by(|a, b| a.cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if reverse {
+            items.reverse();
+        }
+        Ok(Object::new_list(items))
+    }
+
     /// Run `__str__` on instances, falling back to `__repr__` then
     /// the default. Built-in types use their existing `to_str`.
     fn stringify(
@@ -1353,6 +1691,7 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         match v {
+            Object::Generator(_) => Ok(v.clone()),
             Object::Instance(_) => {
                 if let Some(method) = instance_method(v, "__iter__") {
                     return self.call(&method, &[], &[], globals);
@@ -1365,6 +1704,253 @@ impl Interpreter {
             _ => {
                 let it = v.make_iter()?;
                 Ok(Object::Iter(Rc::new(RefCell::new(it))))
+            }
+        }
+    }
+
+    /// Pull the next value from `iter`. Returns `Ok(None)` on
+    /// exhaustion, `Ok(Some(v))` on yield, or propagates errors.
+    fn iter_next(
+        &mut self,
+        iter: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        match iter {
+            Object::Iter(it) => Ok(it.borrow_mut().next_value()),
+            Object::Generator(g) => match self.generator_send(g, Object::None) {
+                Ok(v) => Ok(Some(v)),
+                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            },
+            Object::Instance(_) => {
+                if let Some(method) = instance_method(iter, "__next__") {
+                    match self.call(&method, &[], &[], globals) {
+                        Ok(v) => Ok(Some(v)),
+                        Err(RuntimeError::PyException(exc))
+                            if exc.type_name() == "StopIteration" =>
+                        {
+                            Ok(None)
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err(type_error(format!(
+                        "'{}' object is not an iterator",
+                        iter.type_name_owned()
+                    )))
+                }
+            }
+            _ => Err(type_error(format!(
+                "'{}' object is not an iterator",
+                iter.type_name_owned()
+            ))),
+        }
+    }
+
+    /// Format a value through the f-string mini-language. The exact
+    /// rules are CPython's: `!s` calls `str`, `!r` calls `repr`,
+    /// `!a` calls `ascii`; the optional `format_spec` then drives
+    /// width / precision / type formatting.
+    fn format_value(
+        &mut self,
+        value: &Object,
+        conversion: u32,
+        spec: Option<&Object>,
+    ) -> Result<String, RuntimeError> {
+        let s = match conversion {
+            0 => value.to_str(),
+            1 => value.to_str(), // !s
+            2 => value.repr(),   // !r
+            3 => ascii_repr(value),
+            _ => {
+                return Err(RuntimeError::Internal(format!(
+                    "unknown f-string conversion {conversion}"
+                )))
+            }
+        };
+        match spec {
+            None => Ok(s),
+            Some(Object::Str(spec_str)) => {
+                if spec_str.is_empty() {
+                    return Ok(s);
+                }
+                apply_format_spec(value, spec_str, &s)
+            }
+            Some(_) => Err(type_error("format spec must be a string")),
+        }
+    }
+
+    /// Run a generator's frame to its next yield or terminal state.
+    /// `sent` is the value pushed onto the frame's stack as the
+    /// result of the prior `YIELD_VALUE`; for `__next__()` callers
+    /// it's `None`.
+    fn generator_send(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        sent: Object,
+    ) -> Result<Object, RuntimeError> {
+        // Take ownership of the frame so we can mutate it.
+        let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
+        let (mut frame, first_resume) = match prev_state {
+            GeneratorState::Created(boxed) => (
+                *boxed
+                    .downcast::<Frame>()
+                    .map_err(|_| RuntimeError::Internal("generator frame downcast".to_owned()))?,
+                true,
+            ),
+            GeneratorState::Suspended(boxed) => (
+                *boxed
+                    .downcast::<Frame>()
+                    .map_err(|_| RuntimeError::Internal("generator frame downcast".to_owned()))?,
+                false,
+            ),
+            GeneratorState::Finished => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                return Err(stop_iteration());
+            }
+            GeneratorState::Running => {
+                return Err(value_error("generator already executing"));
+            }
+        };
+        // On the first call, `sent` must be None (or omitted).
+        if first_resume && !matches!(sent, Object::None) {
+            *gen.state.borrow_mut() = GeneratorState::Suspended(Box::new(frame));
+            return Err(type_error(
+                "can't send non-None value to a just-started generator",
+            ));
+        }
+        let sent_for_frame = if first_resume { None } else { Some(sent) };
+        match self.run_until_yield_or_return(&mut frame, sent_for_frame) {
+            Ok(FrameOutcome::Yielded(v)) => {
+                *gen.state.borrow_mut() = GeneratorState::Suspended(Box::new(frame));
+                Ok(v)
+            }
+            Ok(FrameOutcome::Returned(v)) => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                if matches!(v, Object::None) {
+                    Err(stop_iteration())
+                } else {
+                    Err(stop_iteration_with(v))
+                }
+            }
+            Ok(FrameOutcome::StartGenerator) => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                Err(RuntimeError::Internal(
+                    "RETURN_GENERATOR in already-running generator".to_owned(),
+                ))
+            }
+            Err(err) => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                Err(err)
+            }
+        }
+    }
+
+    /// Implement `MATCH_CLASS`: check `isinstance(subject, cls)` and
+    /// pull out positional + keyword sub-values into a single tuple.
+    /// Returns `None` if the type test or any attribute access fails.
+    fn match_class(
+        &mut self,
+        subject: &Object,
+        cls: &Object,
+        nargs: usize,
+        kw_names: &[String],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        // Type check.
+        let ty = match cls {
+            Object::Type(t) => t.clone(),
+            _ => return Err(type_error("called match pattern must be a type")),
+        };
+        let is_inst = match subject {
+            Object::Instance(inst) => inst.class.is_subclass_of(&ty),
+            _ => {
+                // Built-in mapping: roughly match by type_name.
+                let bt = builtin_types();
+                let expected = ty.name.as_str();
+                let actual = subject.type_name();
+                expected == actual
+                    || (expected == "object")
+                    || self.builtin_is_subtype(subject, &ty, &bt)
+            }
+        };
+        if !is_inst {
+            return Ok(Object::None);
+        }
+        // Positional matching uses `__match_args__` on the class.
+        // For the 8 "self-match" built-in types, `Cls(p)` matches by
+        // identity: the single positional captures the whole subject.
+        const SELF_MATCH: &[&str] = &[
+            "bool",
+            "bytearray",
+            "bytes",
+            "dict",
+            "float",
+            "frozenset",
+            "int",
+            "list",
+            "set",
+            "str",
+            "tuple",
+        ];
+        let mut values: Vec<Object> = Vec::with_capacity(nargs + kw_names.len());
+        if nargs > 0 {
+            let is_self_match = SELF_MATCH.contains(&ty.name.as_str()) && nargs == 1;
+            if is_self_match {
+                values.push(subject.clone());
+            } else {
+                let match_args = self
+                    .load_attr(cls, "__match_args__")
+                    .unwrap_or(Object::None);
+                let names: Vec<String> = match match_args {
+                    Object::Tuple(items) => items.iter().map(|x| x.to_str()).collect(),
+                    _ => Vec::new(),
+                };
+                if names.len() < nargs {
+                    return Ok(Object::None);
+                }
+                for name in names.iter().take(nargs) {
+                    match self.load_attr(subject, name) {
+                        Ok(v) => values.push(v),
+                        Err(_) => return Ok(Object::None),
+                    }
+                }
+            }
+        }
+        for name in kw_names {
+            match self.load_attr(subject, name) {
+                Ok(v) => values.push(v),
+                Err(_) => return Ok(Object::None),
+            }
+        }
+        let _ = globals;
+        Ok(Object::new_tuple(values))
+    }
+
+    /// Heuristic for `match Cls(...)` when `Cls` is a built-in
+    /// wrapper around a primitive type (e.g. `int`, `str`, `list`).
+    fn builtin_is_subtype(
+        &self,
+        subject: &Object,
+        ty: &Rc<TypeObject>,
+        bt: &crate::builtin_types::BuiltinTypes,
+    ) -> bool {
+        let name = ty.name.as_str();
+        match (name, subject) {
+            ("int", Object::Int(_)) => true,
+            ("int", Object::Bool(_)) => true,
+            ("bool", Object::Bool(_)) => true,
+            ("float", Object::Float(_)) => true,
+            ("str", Object::Str(_)) => true,
+            ("tuple", Object::Tuple(_)) => true,
+            ("list", Object::List(_)) => true,
+            ("dict", Object::Dict(_)) => true,
+            ("object", _) => true,
+            _ => {
+                let _ = bt;
+                false
             }
         }
     }
@@ -1589,6 +2175,35 @@ impl Interpreter {
                 if b.name == "len" && args.len() == 1 {
                     return self.do_len_call(&args[0], outer_globals);
                 }
+                if b.name == "next" && (args.len() == 1 || args.len() == 2) {
+                    return self.do_next_call(args, outer_globals);
+                }
+                if b.name == "iter" && args.len() == 1 {
+                    return self.do_iter_call(&args[0], outer_globals);
+                }
+                if (b.name == "list" || b.name == "tuple") && args.len() == 1 {
+                    return self.do_list_or_tuple_call(b.name, &args[0], outer_globals);
+                }
+                if b.name == "sum" {
+                    return self.do_sum_call(args, outer_globals);
+                }
+                if b.name == "max" || b.name == "min" {
+                    return self.do_min_max_call(b.name, args, kwargs, outer_globals);
+                }
+                if b.name == "any" || b.name == "all" {
+                    return self.do_any_all_call(b.name, args, outer_globals);
+                }
+                if b.name == "sorted" && !args.is_empty() {
+                    return self.do_sorted_call(args, kwargs, outer_globals);
+                }
+                if b.name == "format" && (args.len() == 1 || args.len() == 2) {
+                    let spec = match args.get(1) {
+                        Some(Object::Str(s)) => s.to_string(),
+                        None => String::new(),
+                        Some(_) => return Err(type_error("format() spec must be a string")),
+                    };
+                    return Ok(Object::from_str(format_via_spec(&args[0], &spec)?));
+                }
                 if !kwargs.is_empty() {
                     return Err(type_error(format!(
                         "builtin '{}' does not accept keyword arguments",
@@ -1713,6 +2328,12 @@ impl Interpreter {
         // Built-in conversion types route to the underlying builtin
         // function so `int("3")`, `range(5)`, `list(xs)` keep working.
         if cls.flags.is_builtin {
+            // Special-case `list(it)` / `tuple(it)` so generators flow
+            // through the VM-aware collector.
+            if (cls.name == "list" || cls.name == "tuple") && args.len() == 1 {
+                let global_dummy = Rc::new(RefCell::new(DictData::new()));
+                return self.do_list_or_tuple_call(cls.name.as_str(), &args[0], &global_dummy);
+            }
             if let Some(builtin) = self.builtin_constructor_for(&cls) {
                 if !kwargs.is_empty() {
                     return Err(type_error(format!(
@@ -1842,13 +2463,30 @@ impl Interpreter {
             }
         }
         let mut frame = self.make_frame(
-            code,
+            code.clone(),
             positional,
             f.closure.clone(),
             f.globals.clone(),
             false,
         );
-        self.run_frame(&mut frame)
+        if code.is_generator {
+            // Run the bootstrap so the frame is past
+            // `RETURN_GENERATOR; POP_TOP; RESUME`. We then wrap the
+            // frame in a PyGenerator and hand it back to the caller.
+            match self.run_until_yield_or_return(&mut frame, None)? {
+                FrameOutcome::StartGenerator => {
+                    let gen = PyGenerator::new(f.name.clone(), Box::new(frame));
+                    Ok(Object::Generator(Rc::new(gen)))
+                }
+                FrameOutcome::Returned(_) | FrameOutcome::Yielded(_) => {
+                    Err(RuntimeError::Internal(
+                        "generator bootstrap did not stop at RETURN_GENERATOR".to_owned(),
+                    ))
+                }
+            }
+        } else {
+            self.run_frame(&mut frame)
+        }
     }
 
     // ---------- imports (RFC 0012) ----------
@@ -2173,6 +2811,20 @@ fn normalize_index(i: i64, len: usize) -> Result<usize, RuntimeError> {
 enum StepOutcome {
     Continue,
     Return(Object),
+    /// `YIELD_VALUE` suspended the frame. The value is the yielded
+    /// object; the frame's `pc` already points past `YIELD_VALUE`.
+    Yield(Object),
+    /// `RETURN_GENERATOR` ran at the top of a generator body. The
+    /// caller should wrap this frame in a [`PyGenerator`] and return
+    /// the wrapped object instead of continuing execution.
+    StartGenerator,
+}
+
+/// Outcome of running a frame to its next suspension point.
+enum FrameOutcome {
+    Returned(Object),
+    Yielded(Object),
+    StartGenerator,
 }
 
 /// If `obj` is an instance and its class defines `name`, return the
@@ -2188,6 +2840,479 @@ fn instance_method(obj: &Object, name: &str) -> Option<Object> {
         receiver: Object::Instance(inst),
         function: m,
     })))
+}
+
+/// Look up the `value` attribute on a `StopIteration` instance. Falls
+/// back to `None` if absent.
+fn exception_value(instance: &Object) -> Object {
+    if let Object::Instance(inst) = instance {
+        if let Some(v) = inst
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("value")))
+        {
+            return v.clone();
+        }
+        if let Some(Object::Tuple(items)) = inst
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("args")))
+        {
+            if let Some(first) = items.first() {
+                return first.clone();
+            }
+        }
+    }
+    Object::None
+}
+
+/// Public entry point shared with the `format` builtin: drive the
+/// format-spec mini-language without going through `FORMAT_VALUE`.
+pub(crate) fn format_via_spec(value: &Object, spec: &str) -> Result<String, RuntimeError> {
+    let plain = value.to_str();
+    if spec.is_empty() {
+        return Ok(plain);
+    }
+    apply_format_spec(value, spec, &plain)
+}
+
+/// Public wrapper for `ascii()`.
+pub(crate) fn ascii_value(value: &Object) -> String {
+    ascii_repr(value)
+}
+
+/// `ascii()` builtin: like `repr()` but escapes non-ASCII codepoints.
+fn ascii_repr(value: &Object) -> String {
+    let r = value.repr();
+    let mut out = String::with_capacity(r.len());
+    for c in r.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let n = c as u32;
+            if n <= 0xFFFF {
+                out.push_str(&format!("\\u{n:04x}"));
+            } else {
+                out.push_str(&format!("\\U{n:08x}"));
+            }
+        }
+    }
+    out
+}
+
+/// Apply a CPython-style format spec to a value. We implement the
+/// subset needed by f-strings: fill/align, sign, width, precision,
+/// type. Anything we don't yet handle falls back to the plain string.
+fn apply_format_spec(value: &Object, spec: &str, plain: &str) -> Result<String, RuntimeError> {
+    let parsed = parse_format_spec(spec)?;
+    // Type-driven formatting first; if no type code, just pad.
+    let formatted = match parsed.type_char {
+        Some('d') => match value {
+            Object::Int(i) => format_int(*i, &parsed),
+            Object::Bool(b) => format_int(i64::from(*b), &parsed),
+            _ => return Err(value_error("Unknown format code 'd' for non-integer")),
+        },
+        Some('b') => match value {
+            Object::Int(i) => format_int_base(*i, 2, &parsed),
+            Object::Bool(b) => format_int_base(i64::from(*b), 2, &parsed),
+            _ => return Err(value_error("Unknown format code 'b' for non-integer")),
+        },
+        Some('o') => match value {
+            Object::Int(i) => format_int_base(*i, 8, &parsed),
+            Object::Bool(b) => format_int_base(i64::from(*b), 8, &parsed),
+            _ => return Err(value_error("Unknown format code 'o' for non-integer")),
+        },
+        Some('x') => match value {
+            Object::Int(i) => format_int_hex(*i, false, &parsed),
+            Object::Bool(b) => format_int_hex(i64::from(*b), false, &parsed),
+            _ => return Err(value_error("Unknown format code 'x' for non-integer")),
+        },
+        Some('X') => match value {
+            Object::Int(i) => format_int_hex(*i, true, &parsed),
+            Object::Bool(b) => format_int_hex(i64::from(*b), true, &parsed),
+            _ => return Err(value_error("Unknown format code 'X' for non-integer")),
+        },
+        Some('f') | Some('F') => {
+            let f = obj_as_float(value)?;
+            let prec = parsed.precision.unwrap_or(6);
+            format_float_fixed(f, prec, &parsed)
+        }
+        Some('e') => {
+            let f = obj_as_float(value)?;
+            let prec = parsed.precision.unwrap_or(6);
+            format_float_scientific(f, prec, false, &parsed)
+        }
+        Some('E') => {
+            let f = obj_as_float(value)?;
+            let prec = parsed.precision.unwrap_or(6);
+            format_float_scientific(f, prec, true, &parsed)
+        }
+        Some('g') | Some('G') => {
+            let f = obj_as_float(value)?;
+            let prec = parsed.precision.unwrap_or(6).max(1);
+            format_float_general(f, prec, parsed.type_char == Some('G'), &parsed)
+        }
+        Some('%') => {
+            let f = obj_as_float(value)?;
+            let prec = parsed.precision.unwrap_or(6);
+            let body = format_float_fixed(f * 100.0, prec, &parsed);
+            format!("{body}%")
+        }
+        Some('s') | None => {
+            let mut s = plain.to_owned();
+            if let Some(p) = parsed.precision {
+                if matches!(parsed.type_char, Some('s') | None) {
+                    s.truncate(p);
+                }
+            }
+            apply_alignment(&s, &parsed, false)
+        }
+        Some('c') => match value {
+            Object::Int(i) => {
+                let c = u32::try_from(*i)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or_else(|| value_error("integer is not a valid unicode codepoint"))?;
+                apply_alignment(&c.to_string(), &parsed, false)
+            }
+            _ => return Err(value_error("%c requires int or char")),
+        },
+        Some(other) => {
+            return Err(value_error(format!(
+                "Unknown format code '{other}' for object of type '{}'",
+                value.type_name()
+            )));
+        }
+    };
+    Ok(formatted)
+}
+
+#[derive(Debug, Default)]
+struct ParsedSpec {
+    fill: Option<char>,
+    align: Option<char>,
+    sign: Option<char>,
+    alt: bool,
+    zero: bool,
+    width: Option<usize>,
+    grouping: Option<char>,
+    precision: Option<usize>,
+    type_char: Option<char>,
+}
+
+fn parse_format_spec(spec: &str) -> Result<ParsedSpec, RuntimeError> {
+    let mut p = ParsedSpec::default();
+    let chars: Vec<char> = spec.chars().collect();
+    let mut i = 0;
+    // [[fill]align]
+    if chars.len() >= 2 && matches!(chars[1], '<' | '>' | '^' | '=') {
+        p.fill = Some(chars[0]);
+        p.align = Some(chars[1]);
+        i = 2;
+    } else if !chars.is_empty() && matches!(chars[0], '<' | '>' | '^' | '=') {
+        p.align = Some(chars[0]);
+        i = 1;
+    }
+    // [sign]
+    if let Some(&c) = chars.get(i) {
+        if matches!(c, '+' | '-' | ' ') {
+            p.sign = Some(c);
+            i += 1;
+        }
+    }
+    // [#]
+    if let Some(&'#') = chars.get(i) {
+        p.alt = true;
+        i += 1;
+    }
+    // [0]
+    if let Some(&'0') = chars.get(i) {
+        p.zero = true;
+        if p.align.is_none() {
+            p.align = Some('=');
+            p.fill = Some('0');
+        }
+        i += 1;
+    }
+    // [width]
+    let mut width = 0usize;
+    let mut had_width = false;
+    while let Some(&c) = chars.get(i) {
+        if c.is_ascii_digit() {
+            width = width * 10 + (c as usize - '0' as usize);
+            i += 1;
+            had_width = true;
+        } else {
+            break;
+        }
+    }
+    if had_width {
+        p.width = Some(width);
+    }
+    // [grouping]
+    if let Some(&c) = chars.get(i) {
+        if matches!(c, ',' | '_') {
+            p.grouping = Some(c);
+            i += 1;
+        }
+    }
+    // [.precision]
+    if let Some(&'.') = chars.get(i) {
+        i += 1;
+        let mut prec = 0usize;
+        let mut had_prec = false;
+        while let Some(&c) = chars.get(i) {
+            if c.is_ascii_digit() {
+                prec = prec * 10 + (c as usize - '0' as usize);
+                i += 1;
+                had_prec = true;
+            } else {
+                break;
+            }
+        }
+        if had_prec {
+            p.precision = Some(prec);
+        }
+    }
+    // [type]
+    if let Some(&c) = chars.get(i) {
+        if !c.is_whitespace() {
+            p.type_char = Some(c);
+            i += 1;
+        }
+    }
+    if i < chars.len() {
+        return Err(value_error(format!("invalid format specifier: {spec:?}")));
+    }
+    Ok(p)
+}
+
+fn obj_as_float(v: &Object) -> Result<f64, RuntimeError> {
+    match v {
+        Object::Float(f) => Ok(*f),
+        Object::Int(i) => Ok(*i as f64),
+        Object::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        _ => Err(type_error(format!(
+            "unsupported format string passed to {}",
+            v.type_name()
+        ))),
+    }
+}
+
+fn format_int(i: i64, p: &ParsedSpec) -> String {
+    let mag = i.unsigned_abs();
+    let mut body = if let Some(grp) = p.grouping {
+        group_decimal(mag, grp)
+    } else {
+        mag.to_string()
+    };
+    body = with_sign(i < 0, &body, p);
+    apply_alignment(&body, p, true)
+}
+
+fn format_int_base(i: i64, base: u32, p: &ParsedSpec) -> String {
+    let mag = i.unsigned_abs();
+    let mut body = match base {
+        2 => format!("{mag:b}"),
+        8 => format!("{mag:o}"),
+        10 => mag.to_string(),
+        _ => mag.to_string(),
+    };
+    if p.alt {
+        let prefix = match base {
+            2 => "0b",
+            8 => "0o",
+            _ => "",
+        };
+        body = format!("{prefix}{body}");
+    }
+    body = with_sign(i < 0, &body, p);
+    apply_alignment(&body, p, true)
+}
+
+fn format_int_hex(i: i64, upper: bool, p: &ParsedSpec) -> String {
+    let mag = i.unsigned_abs();
+    let body_core = if upper {
+        format!("{mag:X}")
+    } else {
+        format!("{mag:x}")
+    };
+    let mut body = if p.alt {
+        format!("{}{body_core}", if upper { "0X" } else { "0x" })
+    } else {
+        body_core
+    };
+    body = with_sign(i < 0, &body, p);
+    apply_alignment(&body, p, true)
+}
+
+fn format_float_fixed(f: f64, prec: usize, p: &ParsedSpec) -> String {
+    if f.is_nan() {
+        return apply_alignment("nan", p, false);
+    }
+    if f.is_infinite() {
+        let s = if f < 0.0 { "-inf" } else { "inf" };
+        return apply_alignment(s, p, false);
+    }
+    let neg = f.is_sign_negative();
+    let mag = f.abs();
+    let body = format!("{mag:.*}", prec);
+    let body = with_sign(neg, &body, p);
+    apply_alignment(&body, p, true)
+}
+
+fn format_float_scientific(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> String {
+    if f.is_nan() {
+        return apply_alignment(if upper { "NAN" } else { "nan" }, p, false);
+    }
+    if f.is_infinite() {
+        let s = if upper {
+            if f < 0.0 {
+                "-INF"
+            } else {
+                "INF"
+            }
+        } else if f < 0.0 {
+            "-inf"
+        } else {
+            "inf"
+        };
+        return apply_alignment(s, p, false);
+    }
+    let neg = f.is_sign_negative();
+    let mag = f.abs();
+    let raw = format!("{mag:.*e}", prec);
+    // Rust gives e.g. "1.230000e2"; CPython wants "1.230000e+02".
+    let body = normalize_exponent(&raw, upper);
+    let body = with_sign(neg, &body, p);
+    apply_alignment(&body, p, true)
+}
+
+fn normalize_exponent(raw: &str, upper: bool) -> String {
+    if let Some(idx) = raw.find('e') {
+        let (mant, exp) = raw.split_at(idx);
+        let exp = &exp[1..]; // drop 'e'
+        let (sign, digits) = if let Some(stripped) = exp.strip_prefix('-') {
+            ('-', stripped)
+        } else if let Some(stripped) = exp.strip_prefix('+') {
+            ('+', stripped)
+        } else {
+            ('+', exp)
+        };
+        let digits = if digits.len() < 2 {
+            format!("0{digits}")
+        } else {
+            digits.to_owned()
+        };
+        let e = if upper { 'E' } else { 'e' };
+        format!("{mant}{e}{sign}{digits}")
+    } else {
+        raw.to_owned()
+    }
+}
+
+fn format_float_general(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> String {
+    if f == 0.0 || f.is_nan() || f.is_infinite() {
+        return format_float_fixed(f, prec.saturating_sub(1), p);
+    }
+    let exp = f.abs().log10().floor() as i32;
+    if exp < -4 || exp >= prec as i32 {
+        format_float_scientific(f, prec.saturating_sub(1), upper, p)
+    } else {
+        let digits_after = (prec as i32 - 1 - exp).max(0) as usize;
+        format_float_fixed(f, digits_after, p)
+    }
+}
+
+fn with_sign(neg: bool, body: &str, p: &ParsedSpec) -> String {
+    if neg {
+        format!("-{body}")
+    } else {
+        match p.sign {
+            Some('+') => format!("+{body}"),
+            Some(' ') => format!(" {body}"),
+            _ => body.to_owned(),
+        }
+    }
+}
+
+fn apply_alignment(body: &str, p: &ParsedSpec, default_right: bool) -> String {
+    let width = p.width.unwrap_or(0);
+    if body.chars().count() >= width {
+        return body.to_owned();
+    }
+    let fill = p.fill.unwrap_or(' ');
+    let pad = width - body.chars().count();
+    let align = p.align.unwrap_or(if default_right { '>' } else { '<' });
+    match align {
+        '<' => {
+            let mut s = body.to_owned();
+            for _ in 0..pad {
+                s.push(fill);
+            }
+            s
+        }
+        '>' => {
+            let mut s = String::with_capacity(body.len() + pad);
+            for _ in 0..pad {
+                s.push(fill);
+            }
+            s.push_str(body);
+            s
+        }
+        '^' => {
+            let left = pad / 2;
+            let right = pad - left;
+            let mut s = String::with_capacity(body.len() + pad);
+            for _ in 0..left {
+                s.push(fill);
+            }
+            s.push_str(body);
+            for _ in 0..right {
+                s.push(fill);
+            }
+            s
+        }
+        '=' => {
+            // Pad between sign and digits.
+            let mut chars = body.chars();
+            let lead = chars
+                .next()
+                .filter(|c| matches!(*c, '+' | '-' | ' '))
+                .map_or(String::new(), |c| c.to_string());
+            let rest: String = if lead.is_empty() {
+                body.to_owned()
+            } else {
+                chars.collect()
+            };
+            let mut s = String::with_capacity(body.len() + pad);
+            s.push_str(&lead);
+            for _ in 0..pad {
+                s.push(fill);
+            }
+            s.push_str(&rest);
+            s
+        }
+        _ => body.to_owned(),
+    }
+}
+
+fn group_decimal(mag: u64, sep: char) -> String {
+    let s = mag.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let mut first = bytes.len() % 3;
+    if first == 0 {
+        first = 3;
+    }
+    out.push_str(std::str::from_utf8(&bytes[..first]).unwrap());
+    let mut i = first;
+    while i < bytes.len() {
+        out.push(sep);
+        out.push_str(std::str::from_utf8(&bytes[i..i + 3]).unwrap());
+        i += 3;
+    }
+    out
 }
 
 fn binop_dunders(op: BinOpKind) -> (&'static str, &'static str) {
@@ -2715,5 +3840,183 @@ mod tests {
             "    print(x)\n"
         );
         assert_eq!(run(src), "0\n1\n2\n");
+    }
+
+    // ---------- f-strings (RFC 0005) ----------
+
+    #[test]
+    fn fstring_plain_interpolation() {
+        let src = "name = 'Owen'\nprint(f'hello, {name}!')\n";
+        assert_eq!(run(src), "hello, Owen!\n");
+    }
+
+    #[test]
+    fn fstring_expression() {
+        let src = "x = 2\ny = 3\nprint(f'{x} + {y} = {x + y}')\n";
+        assert_eq!(run(src), "2 + 3 = 5\n");
+    }
+
+    #[test]
+    fn fstring_format_spec_fixed() {
+        let src = "import math\nprint(f'{math.pi:.3f}')\n";
+        assert_eq!(run(src), "3.142\n");
+    }
+
+    #[test]
+    fn fstring_format_spec_width_align() {
+        let src = "print(f'[{42:>5}]')\nprint(f'[{42:<5}]')\nprint(f'[{42:^5}]')\n";
+        assert_eq!(run(src), "[   42]\n[42   ]\n[ 42  ]\n");
+    }
+
+    #[test]
+    fn fstring_repr_conversion() {
+        let src = "s = 'hi'\nprint(f'{s!r}')\n";
+        assert_eq!(run(src), "'hi'\n");
+    }
+
+    #[test]
+    fn fstring_hex_and_binary() {
+        let src = "print(f'{255:#x} {7:b}')\n";
+        assert_eq!(run(src), "0xff 111\n");
+    }
+
+    // ---------- generators (RFC 0006) ----------
+
+    #[test]
+    fn generator_basic_yield() {
+        let src = concat!(
+            "def gen():\n",
+            "    yield 1\n",
+            "    yield 2\n",
+            "    yield 3\n",
+            "for x in gen():\n",
+            "    print(x)\n",
+        );
+        assert_eq!(run(src), "1\n2\n3\n");
+    }
+
+    #[test]
+    fn generator_next_then_loop() {
+        let src = concat!(
+            "def gen():\n",
+            "    yield 'a'\n",
+            "    yield 'b'\n",
+            "g = gen()\n",
+            "print(next(g))\n",
+            "print(next(g))\n",
+        );
+        assert_eq!(run(src), "a\nb\n");
+    }
+
+    #[test]
+    fn generator_yield_from() {
+        let src = concat!(
+            "def inner():\n",
+            "    yield 1\n",
+            "    yield 2\n",
+            "def outer():\n",
+            "    yield from inner()\n",
+            "    yield 3\n",
+            "for x in outer():\n",
+            "    print(x)\n",
+        );
+        assert_eq!(run(src), "1\n2\n3\n");
+    }
+
+    #[test]
+    fn generator_expression_is_lazy() {
+        let src = concat!("g = (x * x for x in range(4))\n", "print(list(g))\n",);
+        assert_eq!(run(src), "[0, 1, 4, 9]\n");
+    }
+
+    #[test]
+    fn generator_returns_value_in_stopiteration() {
+        let src = concat!(
+            "def gen():\n",
+            "    yield 1\n",
+            "    return 'done'\n",
+            "g = gen()\n",
+            "print(next(g))\n",
+            "try:\n",
+            "    next(g)\n",
+            "except StopIteration as e:\n",
+            "    print(e.value)\n",
+        );
+        assert_eq!(run(src), "1\ndone\n");
+    }
+
+    // ---------- pattern matching (RFC 0009) ----------
+
+    #[test]
+    fn match_literal_and_wildcard() {
+        let src = concat!(
+            "def describe(x):\n",
+            "    match x:\n",
+            "        case 0:\n",
+            "            return 'zero'\n",
+            "        case 1:\n",
+            "            return 'one'\n",
+            "        case _:\n",
+            "            return 'many'\n",
+            "print(describe(0))\n",
+            "print(describe(1))\n",
+            "print(describe(7))\n",
+        );
+        assert_eq!(run(src), "zero\none\nmany\n");
+    }
+
+    #[test]
+    fn match_capture_with_guard() {
+        let src = concat!(
+            "def sign(x):\n",
+            "    match x:\n",
+            "        case n if n > 0:\n",
+            "            return 'pos'\n",
+            "        case n if n < 0:\n",
+            "            return 'neg'\n",
+            "        case _:\n",
+            "            return 'zero'\n",
+            "print(sign(5))\n",
+            "print(sign(-3))\n",
+            "print(sign(0))\n",
+        );
+        assert_eq!(run(src), "pos\nneg\nzero\n");
+    }
+
+    #[test]
+    fn match_sequence_pattern() {
+        let src = concat!(
+            "def head(xs):\n",
+            "    match xs:\n",
+            "        case []:\n",
+            "            return 'empty'\n",
+            "        case [a]:\n",
+            "            return ('one', a)\n",
+            "        case [a, *rest]:\n",
+            "            return ('many', a, rest)\n",
+            "print(head([]))\n",
+            "print(head([1]))\n",
+            "print(head([1, 2, 3]))\n",
+        );
+        let out = run(src);
+        assert!(out.contains("empty"));
+        assert!(out.contains("one"));
+        assert!(out.contains("many"));
+    }
+
+    #[test]
+    fn match_or_pattern() {
+        let src = concat!(
+            "def label(x):\n",
+            "    match x:\n",
+            "        case 0 | 1 | 2:\n",
+            "            return 'small'\n",
+            "        case _:\n",
+            "            return 'large'\n",
+            "print(label(0))\n",
+            "print(label(2))\n",
+            "print(label(99))\n",
+        );
+        assert_eq!(run(src), "small\nsmall\nlarge\n");
     }
 }

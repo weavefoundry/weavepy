@@ -95,6 +95,8 @@ pub fn default_builtins() -> DictData {
     reg!("iter", b_iter);
     reg!("divmod", b_divmod);
     reg!("round", b_round);
+    reg!("format", b_format);
+    reg!("ascii", b_ascii);
 
     d
 }
@@ -212,6 +214,31 @@ fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(one(args, "repr")?.repr()))
+}
+
+fn b_format(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.is_empty() {
+        return Err(type_error("format() expects at least 1 argument"));
+    }
+    if args.len() > 2 {
+        return Err(type_error("format() takes at most 2 arguments"));
+    }
+    let value = &args[0];
+    let spec = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| Object::from_static(""));
+    let spec_str = match &spec {
+        Object::Str(s) => s.to_string(),
+        _ => return Err(type_error("format() spec must be a string")),
+    };
+    let s = crate::format_via_spec(value, &spec_str)?;
+    Ok(Object::from_str(s))
+}
+
+fn b_ascii(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "ascii")?;
+    Ok(Object::from_str(crate::ascii_value(v)))
 }
 
 fn b_int(args: &[Object]) -> Result<Object, RuntimeError> {

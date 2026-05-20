@@ -5,17 +5,18 @@
 //! language reference; chained comparisons (`a < b < c`) are
 //! collapsed into a single [`Compare`] node like CPython does.
 //!
-//! The parser is hand-written so we own diagnostics end-to-end. It
-//! intentionally rejects features the slice doesn't support
-//! (`class`, `try`, `with`, `match`, `async`, `await`, `yield`,
-//! f-string interpolation) with a [`ParseError::NotImplemented`]
-//! that names the relevant follow-up RFC.
+//! The parser is hand-written so we own diagnostics end-to-end. The
+//! feature set tracks RFC 0001 plus its follow-ups: classes (RFC 0003),
+//! exceptions and `with` (RFC 0004), f-strings (RFC 0005), generators
+//! (RFC 0006), pattern matching (RFC 0009), and imports (RFC 0012).
+//! `async def`/`await` (RFC 0006-B) and PEP 701 nested-quote f-strings
+//! (RFC 0005-B) remain explicit `ParseError::NotImplemented`s.
 
 use weavepy_lexer::{Keyword, Span, Token, TokenKind};
 
 use crate::ast::{
     Alias, Arg, Arguments, BinOp, BoolOp, CmpOp, Comprehension, Constant, ExceptHandler, Expr,
-    ExprKind, Keyword as KwArg, Module, Stmt, StmtKind, UnaryOp, WithItem,
+    ExprKind, Keyword as KwArg, MatchCase, Module, Pattern, Stmt, StmtKind, UnaryOp, WithItem,
 };
 use crate::error::ParseError;
 
@@ -154,17 +155,106 @@ impl<'src> Parser<'src> {
                 Keyword::Try => self.parse_try(),
                 Keyword::Raise => self.parse_raise(),
                 Keyword::With => self.parse_with(),
-                Keyword::Async | Keyword::Await | Keyword::Yield => {
-                    Err(ParseError::NotImplemented {
-                        span: self.peek_token().span,
-                        feature: kw.as_str(),
-                        rfc: "RFC 0006",
-                    })
-                }
+                // `yield` at statement start parses as an expression
+                // statement so the AST is `Expr(Yield(...))`, matching
+                // CPython's lowering.
+                Keyword::Yield => self.parse_simple_statement(),
+                Keyword::Async | Keyword::Await => Err(ParseError::NotImplemented {
+                    span: self.peek_token().span,
+                    feature: kw.as_str(),
+                    rfc: "RFC 0006-B",
+                }),
                 _ => self.parse_simple_statement(),
             },
+            // `match` is a soft keyword — only treated as the statement
+            // when followed by an expression, a `:`, and indented `case`.
+            TokenKind::Name if self.lexeme(self.peek_token().span) == "match" => {
+                if self.looks_like_match_statement() {
+                    self.parse_match()
+                } else {
+                    self.parse_simple_statement()
+                }
+            }
             _ => self.parse_simple_statement(),
         }
+    }
+
+    /// `match` is a soft keyword. The disambiguating signal is
+    /// `match <expr>:` followed by NEWLINE INDENT `case`. We look
+    /// ahead conservatively — if any of those signals is missing,
+    /// we fall back to treating `match` as an identifier.
+    fn looks_like_match_statement(&self) -> bool {
+        // Skip past `match`.
+        let mut i = self.pos + 1;
+        // Any non-end-of-statement token is a candidate for the subject.
+        match self.tokens.get(i).map(|t| &t.kind) {
+            Some(TokenKind::Newline)
+            | Some(TokenKind::Semi)
+            | Some(TokenKind::Endmarker)
+            | Some(TokenKind::Equal)
+            | Some(TokenKind::PlusEqual)
+            | Some(TokenKind::MinusEqual)
+            | Some(TokenKind::StarEqual)
+            | Some(TokenKind::SlashEqual)
+            | Some(TokenKind::DoubleSlashEqual)
+            | Some(TokenKind::PercentEqual)
+            | Some(TokenKind::AmperEqual)
+            | Some(TokenKind::VbarEqual)
+            | Some(TokenKind::CaretEqual)
+            | Some(TokenKind::LeftShiftEqual)
+            | Some(TokenKind::RightShiftEqual)
+            | Some(TokenKind::DoubleStarEqual)
+            | Some(TokenKind::AtEqual)
+            | Some(TokenKind::ColonEqual)
+            | Some(TokenKind::Dot)
+            | Some(TokenKind::LPar)
+            | Some(TokenKind::LSqb) => return false,
+            None => return false,
+            _ => {}
+        }
+        // Scan for a `:` at depth 0 followed by NEWLINE then `case`.
+        let mut depth = 0i32;
+        while let Some(tok) = self.tokens.get(i) {
+            match &tok.kind {
+                TokenKind::LPar | TokenKind::LSqb | TokenKind::LBrace => depth += 1,
+                TokenKind::RPar | TokenKind::RSqb | TokenKind::RBrace => depth -= 1,
+                TokenKind::Newline | TokenKind::Endmarker => return false,
+                TokenKind::Colon if depth == 0 => {
+                    // Look for NEWLINE (NL|COMMENT)* INDENT (NL|COMMENT)* `case`.
+                    let mut j = i + 1;
+                    if !matches!(
+                        self.tokens.get(j).map(|t| &t.kind),
+                        Some(TokenKind::Newline)
+                    ) {
+                        return false;
+                    }
+                    j += 1;
+                    while matches!(
+                        self.tokens.get(j).map(|t| &t.kind),
+                        Some(TokenKind::Nl | TokenKind::Comment | TokenKind::Newline)
+                    ) {
+                        j += 1;
+                    }
+                    if !matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Indent)) {
+                        return false;
+                    }
+                    j += 1;
+                    while matches!(
+                        self.tokens.get(j).map(|t| &t.kind),
+                        Some(TokenKind::Nl | TokenKind::Comment)
+                    ) {
+                        j += 1;
+                    }
+                    return matches!(
+                        self.tokens.get(j).map(|t| (&t.kind, self.lexeme(t.span))),
+                        Some((TokenKind::Name, "case"))
+                    );
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     fn parse_decorators(&mut self) -> Result<Vec<Expr>, ParseError> {
@@ -867,6 +957,427 @@ impl<'src> Parser<'src> {
         Ok(names)
     }
 
+    // ---------- match / case ----------
+
+    /// `match subject: NEWLINE INDENT (case_block)+ DEDENT`. Caller has
+    /// confirmed via [`Self::looks_like_match_statement`] that the
+    /// soft-keyword `match` is in fact starting a match statement.
+    fn parse_match(&mut self) -> Result<Stmt, ParseError> {
+        let kw = self.bump();
+        let subject = self.parse_match_subject()?;
+        self.expect(&TokenKind::Colon, "`:`")?;
+        self.expect(&TokenKind::Newline, "newline after `match ... :`")?;
+        self.skip_trivia_and_newlines();
+        self.expect(&TokenKind::Indent, "indented block")?;
+
+        let mut cases = Vec::new();
+        loop {
+            self.skip_trivia_and_newlines();
+            if matches!(self.peek(), TokenKind::Dedent | TokenKind::Endmarker) {
+                break;
+            }
+            cases.push(self.parse_case_clause()?);
+        }
+        self.eat(&TokenKind::Dedent);
+        if cases.is_empty() {
+            return Err(ParseError::Unexpected {
+                span: kw.span,
+                message: "match statement needs at least one case".to_owned(),
+            });
+        }
+        let span_end = cases.last().map_or(kw.span, |c| c.span);
+        Ok(Stmt {
+            kind: StmtKind::Match { subject, cases },
+            span: kw.span.merge(span_end),
+        })
+    }
+
+    /// CPython allows `match a, b:` (subject is an implicit tuple). We
+    /// follow.
+    fn parse_match_subject(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_ternary()?;
+        if !self.check(&TokenKind::Comma) {
+            return Ok(first);
+        }
+        let start_span = first.span;
+        let mut items = vec![first];
+        while self.eat(&TokenKind::Comma) {
+            if self.check(&TokenKind::Colon) {
+                break;
+            }
+            items.push(self.parse_ternary()?);
+        }
+        let end_span = items.last().expect("nonempty").span;
+        Ok(Expr {
+            kind: ExprKind::Tuple(items),
+            span: start_span.merge(end_span),
+        })
+    }
+
+    fn parse_case_clause(&mut self) -> Result<MatchCase, ParseError> {
+        // The contextual keyword `case` is a `Name` token.
+        let case_tok = self.peek_token().clone();
+        if !(matches!(self.peek(), TokenKind::Name) && self.lexeme(case_tok.span) == "case") {
+            return Err(ParseError::Unexpected {
+                span: case_tok.span,
+                message: "expected `case`".to_owned(),
+            });
+        }
+        self.bump();
+        let pattern = self.parse_pattern()?;
+        let guard = if self.at_keyword(Keyword::If) {
+            self.bump();
+            Some(self.parse_expression(false)?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Colon, "`:`")?;
+        let body = self.parse_block()?;
+        let span_end = body.last().map_or(case_tok.span, |s| s.span);
+        Ok(MatchCase {
+            pattern,
+            guard,
+            body,
+            span: case_tok.span.merge(span_end),
+        })
+    }
+
+    /// Top-level pattern: `or_pattern ('as' NAME)?`.
+    fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        let pat = self.parse_or_pattern()?;
+        if self.at_keyword(Keyword::As) {
+            self.bump();
+            let n = self.expect(&TokenKind::Name, "name after `as`")?;
+            let name = self.lexeme(n.span).to_owned();
+            if name == "_" {
+                return Err(ParseError::Unexpected {
+                    span: n.span,
+                    message: "cannot use `_` as a capture target".to_owned(),
+                });
+            }
+            return Ok(Pattern::As {
+                pattern: Box::new(pat),
+                name,
+            });
+        }
+        Ok(pat)
+    }
+
+    /// `or_pattern: closed_pattern ('|' closed_pattern)*`.
+    fn parse_or_pattern(&mut self) -> Result<Pattern, ParseError> {
+        let first = self.parse_closed_pattern()?;
+        if !self.check(&TokenKind::Vbar) {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while self.eat(&TokenKind::Vbar) {
+            alts.push(self.parse_closed_pattern()?);
+        }
+        Ok(Pattern::Or(alts))
+    }
+
+    /// One non-alternation pattern: literal, name, sequence, mapping,
+    /// class, parenthesized, etc.
+    fn parse_closed_pattern(&mut self) -> Result<Pattern, ParseError> {
+        // Star in sequence: `[a, *rest]` or `*_`.
+        if self.check(&TokenKind::Star) {
+            self.bump();
+            let name = match self.peek() {
+                TokenKind::Name => {
+                    let tok = self.bump();
+                    let s = self.lexeme(tok.span).to_owned();
+                    if s == "_" {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                }
+                _ => {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "expected name after `*` in pattern".to_owned(),
+                    });
+                }
+            };
+            return Ok(Pattern::Star(name));
+        }
+        // Numeric / string / singleton literal patterns. `-N` is
+        // allowed (negative numeric literal pattern).
+        if matches!(
+            self.peek(),
+            TokenKind::Number | TokenKind::String | TokenKind::Minus
+        ) {
+            let e = self.parse_literal_pattern_expr()?;
+            return Ok(Pattern::Value(e));
+        }
+        if self.at_keyword(Keyword::None) {
+            self.bump();
+            return Ok(Pattern::Singleton(Constant::None));
+        }
+        if self.at_keyword(Keyword::True) {
+            self.bump();
+            return Ok(Pattern::Singleton(Constant::Bool(true)));
+        }
+        if self.at_keyword(Keyword::False) {
+            self.bump();
+            return Ok(Pattern::Singleton(Constant::Bool(false)));
+        }
+        if self.check(&TokenKind::LSqb) {
+            return self.parse_sequence_pattern(true);
+        }
+        if self.check(&TokenKind::LPar) {
+            return self.parse_paren_or_tuple_pattern();
+        }
+        if self.check(&TokenKind::LBrace) {
+            return self.parse_mapping_pattern();
+        }
+        // Identifier-led: capture, wildcard, or value (qualified name)
+        // — and possibly a class pattern if `(` follows.
+        if matches!(self.peek(), TokenKind::Name) {
+            return self.parse_name_pattern();
+        }
+        Err(ParseError::Unexpected {
+            span: self.peek_token().span,
+            message: format!("unexpected token in pattern: {:?}", self.peek()),
+        })
+    }
+
+    /// Parse an expression that appears as the *value* of a literal
+    /// pattern. Restricted to numbers, strings, and unary `-` on
+    /// numerics — matching PEP 634.
+    fn parse_literal_pattern_expr(&mut self) -> Result<Expr, ParseError> {
+        if self.check(&TokenKind::Minus) {
+            let minus = self.bump();
+            let tok = self.peek_token().clone();
+            if !matches!(tok.kind, TokenKind::Number) {
+                return Err(ParseError::Unexpected {
+                    span: tok.span,
+                    message: "expected numeric literal after `-` in pattern".to_owned(),
+                });
+            }
+            self.bump();
+            let value =
+                parse_number(self.lexeme(tok.span)).map_err(|m| ParseError::Unexpected {
+                    span: tok.span,
+                    message: m,
+                })?;
+            let value = match value {
+                Constant::Int(i) => Constant::Int(-i),
+                Constant::Float(f) => Constant::Float(-f),
+                other => other,
+            };
+            return Ok(Expr {
+                kind: ExprKind::Constant(value),
+                span: minus.span.merge(tok.span),
+            });
+        }
+        self.parse_atom()
+    }
+
+    /// `Name (. Name)* ('(' pat_args ')')?`. The `.`-chain makes it a
+    /// value pattern; `(` makes it a class pattern; otherwise capture.
+    fn parse_name_pattern(&mut self) -> Result<Pattern, ParseError> {
+        let first = self.bump();
+        let first_name = self.lexeme(first.span).to_owned();
+        // Dotted: value pattern.
+        if self.check(&TokenKind::Dot) {
+            let mut expr = Expr {
+                kind: ExprKind::Name(first_name),
+                span: first.span,
+            };
+            while self.eat(&TokenKind::Dot) {
+                let n = self.expect(&TokenKind::Name, "attribute name in pattern")?;
+                let attr = self.lexeme(n.span).to_owned();
+                let span = expr.span.merge(n.span);
+                expr = Expr {
+                    kind: ExprKind::Attribute {
+                        value: Box::new(expr),
+                        attr,
+                    },
+                    span,
+                };
+            }
+            if self.check(&TokenKind::LPar) {
+                return self.finish_class_pattern(expr);
+            }
+            return Ok(Pattern::Value(expr));
+        }
+        // Class pattern: bare `Name(...)`.
+        if self.check(&TokenKind::LPar) {
+            let cls = Expr {
+                kind: ExprKind::Name(first_name),
+                span: first.span,
+            };
+            return self.finish_class_pattern(cls);
+        }
+        // Wildcard `_` binds nothing.
+        if first_name == "_" {
+            return Ok(Pattern::Capture(None));
+        }
+        Ok(Pattern::Capture(Some(first_name)))
+    }
+
+    fn finish_class_pattern(&mut self, cls: Expr) -> Result<Pattern, ParseError> {
+        self.expect(&TokenKind::LPar, "`(`")?;
+        let mut positionals = Vec::new();
+        let mut keywords: Vec<(String, Pattern)> = Vec::new();
+        let mut saw_kw = false;
+        while !self.check(&TokenKind::RPar) {
+            // A keyword arg: `name=pattern`.
+            if matches!(self.peek(), TokenKind::Name)
+                && matches!(self.peek_at(1), Some(TokenKind::Equal))
+            {
+                let n = self.bump();
+                let name = self.lexeme(n.span).to_owned();
+                self.bump(); // `=`
+                let p = self.parse_pattern()?;
+                keywords.push((name, p));
+                saw_kw = true;
+            } else {
+                if saw_kw {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "positional pattern after keyword pattern".to_owned(),
+                    });
+                }
+                positionals.push(self.parse_pattern()?);
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RPar, "`)`")?;
+        Ok(Pattern::Class {
+            cls,
+            positionals,
+            keywords,
+        })
+    }
+
+    fn parse_sequence_pattern(&mut self, square: bool) -> Result<Pattern, ParseError> {
+        let close = if square {
+            TokenKind::RSqb
+        } else {
+            TokenKind::RPar
+        };
+        self.bump();
+        let mut items = Vec::new();
+        while !self.check(&close) {
+            items.push(self.parse_pattern()?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&close, if square { "`]`" } else { "`)`" })?;
+        Ok(Pattern::Sequence(items))
+    }
+
+    /// `(p)` (parenthesized pattern, equivalent to `p`) or
+    /// `(p, q, ...)` (tuple sequence pattern).
+    fn parse_paren_or_tuple_pattern(&mut self) -> Result<Pattern, ParseError> {
+        self.bump();
+        if self.eat(&TokenKind::RPar) {
+            return Ok(Pattern::Sequence(Vec::new()));
+        }
+        let first = self.parse_pattern()?;
+        if !self.check(&TokenKind::Comma) {
+            self.expect(&TokenKind::RPar, "`)`")?;
+            return Ok(first);
+        }
+        let mut items = vec![first];
+        while self.eat(&TokenKind::Comma) {
+            if self.check(&TokenKind::RPar) {
+                break;
+            }
+            items.push(self.parse_pattern()?);
+        }
+        self.expect(&TokenKind::RPar, "`)`")?;
+        Ok(Pattern::Sequence(items))
+    }
+
+    fn parse_mapping_pattern(&mut self) -> Result<Pattern, ParseError> {
+        self.bump();
+        let mut keys = Vec::new();
+        let mut patterns = Vec::new();
+        let mut rest: Option<Option<String>> = None;
+        while !self.check(&TokenKind::RBrace) {
+            if self.eat(&TokenKind::DoubleStar) {
+                let n = self.expect(&TokenKind::Name, "name after `**` in mapping pattern")?;
+                let name = self.lexeme(n.span).to_owned();
+                rest = Some(if name == "_" { None } else { Some(name) });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                continue;
+            }
+            let key = self.parse_literal_or_value_key()?;
+            self.expect(&TokenKind::Colon, "`:`")?;
+            let p = self.parse_pattern()?;
+            keys.push(key);
+            patterns.push(p);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}`")?;
+        Ok(Pattern::Mapping {
+            keys,
+            patterns,
+            rest,
+        })
+    }
+
+    /// Allowed mapping keys per PEP 634: numeric/string literals or
+    /// dotted attribute expressions (value patterns).
+    fn parse_literal_or_value_key(&mut self) -> Result<Expr, ParseError> {
+        if matches!(
+            self.peek(),
+            TokenKind::Number | TokenKind::String | TokenKind::Minus
+        ) {
+            return self.parse_literal_pattern_expr();
+        }
+        if self.at_keyword(Keyword::None) {
+            let t = self.bump();
+            return Ok(Expr {
+                kind: ExprKind::Constant(Constant::None),
+                span: t.span,
+            });
+        }
+        if self.at_keyword(Keyword::True) {
+            let t = self.bump();
+            return Ok(Expr {
+                kind: ExprKind::Constant(Constant::Bool(true)),
+                span: t.span,
+            });
+        }
+        if self.at_keyword(Keyword::False) {
+            let t = self.bump();
+            return Ok(Expr {
+                kind: ExprKind::Constant(Constant::Bool(false)),
+                span: t.span,
+            });
+        }
+        // Dotted name as a value key.
+        let n = self.expect(&TokenKind::Name, "key")?;
+        let mut expr = Expr {
+            kind: ExprKind::Name(self.lexeme(n.span).to_owned()),
+            span: n.span,
+        };
+        while self.eat(&TokenKind::Dot) {
+            let attr_tok = self.expect(&TokenKind::Name, "attribute name in key")?;
+            let attr = self.lexeme(attr_tok.span).to_owned();
+            let span = expr.span.merge(attr_tok.span);
+            expr = Expr {
+                kind: ExprKind::Attribute {
+                    value: Box::new(expr),
+                    attr,
+                },
+                span,
+            };
+        }
+        Ok(expr)
+    }
+
     fn parse_block(&mut self) -> Result<Vec<Stmt>, ParseError> {
         // After the `:`, either a single inline statement or a
         // NEWLINE INDENT block DEDENT.
@@ -945,6 +1456,12 @@ impl<'src> Parser<'src> {
         if self.at_keyword(Keyword::Lambda) {
             return self.parse_lambda();
         }
+        // `yield` and `yield from` are expressions in CPython's grammar.
+        // They're only legal inside function bodies; the compiler — not
+        // the parser — enforces that.
+        if self.at_keyword(Keyword::Yield) {
+            return self.parse_yield();
+        }
         let body = self.parse_or()?;
         if self.at_keyword(Keyword::If) {
             self.bump();
@@ -968,6 +1485,45 @@ impl<'src> Parser<'src> {
             });
         }
         Ok(body)
+    }
+
+    fn parse_yield(&mut self) -> Result<Expr, ParseError> {
+        let kw = self.bump(); // `yield`
+        if self.at_keyword(Keyword::From) {
+            self.bump();
+            let value = self.parse_ternary()?;
+            let span = kw.span.merge(value.span);
+            return Ok(Expr {
+                kind: ExprKind::YieldFrom(Box::new(value)),
+                span,
+            });
+        }
+        // Bare `yield` followed by an end-of-expression token returns
+        // `Yield(value=None)`. Otherwise parse a single value (or
+        // implicit-tuple `yield 1, 2`).
+        if matches!(
+            self.peek(),
+            TokenKind::Newline
+                | TokenKind::Semi
+                | TokenKind::Endmarker
+                | TokenKind::RPar
+                | TokenKind::RSqb
+                | TokenKind::RBrace
+                | TokenKind::Comma
+                | TokenKind::Colon
+                | TokenKind::Equal
+        ) {
+            return Ok(Expr {
+                kind: ExprKind::Yield(None),
+                span: kw.span,
+            });
+        }
+        let value = self.parse_expression_list(true)?;
+        let span = kw.span.merge(value.span);
+        Ok(Expr {
+            kind: ExprKind::Yield(Some(Box::new(value))),
+            span,
+        })
     }
 
     fn parse_lambda(&mut self) -> Result<Expr, ParseError> {
@@ -1460,32 +2016,7 @@ impl<'src> Parser<'src> {
                     span: tok.span,
                 })
             }
-            TokenKind::String => {
-                // Adjacent string concatenation.
-                let mut concatenated = self.decode_string(&tok)?;
-                let mut last_span = tok.span;
-                self.bump();
-                while matches!(self.peek(), TokenKind::String) {
-                    let next_tok = self.peek_token().clone();
-                    let next = self.decode_string(&next_tok)?;
-                    last_span = next_tok.span;
-                    self.bump();
-                    match (&mut concatenated, &next) {
-                        (Constant::Str(a), Constant::Str(b)) => a.push_str(b),
-                        (Constant::Bytes(a), Constant::Bytes(b)) => a.extend_from_slice(b),
-                        _ => {
-                            return Err(ParseError::Unexpected {
-                                span: next_tok.span,
-                                message: "cannot concatenate str and bytes literals".to_owned(),
-                            });
-                        }
-                    }
-                }
-                Ok(Expr {
-                    kind: ExprKind::Constant(concatenated),
-                    span: tok.span.merge(last_span),
-                })
-            }
+            TokenKind::String => self.parse_string_concat(tok),
             TokenKind::Name => {
                 self.bump();
                 Ok(Expr {
@@ -1767,8 +2298,146 @@ impl<'src> Parser<'src> {
         })
     }
 
+    /// Handle adjacent-string concatenation, mixing plain strings,
+    /// byte strings, and f-strings. The CPython AST flattens these:
+    /// `"a" "b"` → `Constant("ab")`, `f"a" "b"` → `JoinedStr(["ab"])`,
+    /// `f"a{x}" "b"` → `JoinedStr(["a", FormattedValue(x), "b"])`.
+    fn parse_string_concat(&mut self, first: Token) -> Result<Expr, ParseError> {
+        let mut span = first.span;
+        let first_prefix = self.string_prefix(&first)?;
+        let mut accum: AccumString = if first_prefix.fstring {
+            AccumString::Joined(self.fstring_parts_for(&first)?)
+        } else if first_prefix.bytes {
+            match self.decode_string(&first)? {
+                Constant::Bytes(b) => AccumString::Bytes(b),
+                _ => unreachable!(),
+            }
+        } else {
+            match self.decode_string(&first)? {
+                Constant::Str(s) => AccumString::Plain(s),
+                _ => unreachable!(),
+            }
+        };
+        self.bump();
+        while matches!(self.peek(), TokenKind::String) {
+            let next_tok = self.peek_token().clone();
+            let next_prefix = self.string_prefix(&next_tok)?;
+            span = span.merge(next_tok.span);
+            self.bump();
+            accum = match (accum, next_prefix.fstring, next_prefix.bytes) {
+                (AccumString::Bytes(mut a), false, true) => match self.decode_string(&next_tok)? {
+                    Constant::Bytes(b) => {
+                        a.extend_from_slice(&b);
+                        AccumString::Bytes(a)
+                    }
+                    _ => unreachable!(),
+                },
+                (AccumString::Bytes(_), _, _) => {
+                    return Err(ParseError::Unexpected {
+                        span: next_tok.span,
+                        message: "cannot concatenate str and bytes literals".to_owned(),
+                    });
+                }
+                (_, _, true) => {
+                    return Err(ParseError::Unexpected {
+                        span: next_tok.span,
+                        message: "cannot concatenate str and bytes literals".to_owned(),
+                    });
+                }
+                (AccumString::Plain(mut a), false, false) => {
+                    match self.decode_string(&next_tok)? {
+                        Constant::Str(s) => {
+                            a.push_str(&s);
+                            AccumString::Plain(a)
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                (AccumString::Plain(a), true, false) => {
+                    let mut parts: Vec<Expr> = Vec::new();
+                    if !a.is_empty() {
+                        parts.push(Expr {
+                            kind: ExprKind::Constant(Constant::Str(a)),
+                            span: first.span,
+                        });
+                    }
+                    parts.extend(self.fstring_parts_for(&next_tok)?);
+                    AccumString::Joined(parts)
+                }
+                (AccumString::Joined(mut parts), false, false) => {
+                    match self.decode_string(&next_tok)? {
+                        Constant::Str(s) => {
+                            join_str_into_parts(&mut parts, s, next_tok.span);
+                            AccumString::Joined(parts)
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                (AccumString::Joined(mut parts), true, false) => {
+                    let new_parts = self.fstring_parts_for(&next_tok)?;
+                    for p in new_parts {
+                        if let ExprKind::Constant(Constant::Str(s)) = p.kind {
+                            join_str_into_parts(&mut parts, s, p.span);
+                        } else {
+                            parts.push(p);
+                        }
+                    }
+                    AccumString::Joined(parts)
+                }
+            };
+        }
+        match accum {
+            AccumString::Plain(s) => Ok(Expr {
+                kind: ExprKind::Constant(Constant::Str(s)),
+                span,
+            }),
+            AccumString::Bytes(b) => Ok(Expr {
+                kind: ExprKind::Constant(Constant::Bytes(b)),
+                span,
+            }),
+            AccumString::Joined(parts) => {
+                if parts.len() == 1 {
+                    if matches!(parts[0].kind, ExprKind::Constant(_)) {
+                        return Ok(Expr {
+                            kind: parts[0].kind.clone(),
+                            span,
+                        });
+                    }
+                }
+                Ok(Expr {
+                    kind: ExprKind::JoinedStr(parts),
+                    span,
+                })
+            }
+        }
+    }
+
+    /// Decode one f-string token, flattening any nested `JoinedStr`
+    /// produced by the debug `{x = }` shortcut into the outer parts list.
+    fn fstring_parts_for(&self, tok: &Token) -> Result<Vec<Expr>, ParseError> {
+        let parsed = self.parse_fstring_token(tok)?;
+        let mut parts = Vec::new();
+        match parsed.kind {
+            ExprKind::JoinedStr(inner) => {
+                for p in inner {
+                    if let ExprKind::JoinedStr(more) = p.kind {
+                        parts.extend(more);
+                    } else {
+                        parts.push(p);
+                    }
+                }
+            }
+            other => parts.push(Expr {
+                kind: other,
+                span: parsed.span,
+            }),
+        }
+        Ok(parts)
+    }
+
     // ---------- string / number decoding ----------
 
+    /// Decode a single (non-f) string token into a [`Constant`].
     fn decode_string(&self, tok: &Token) -> Result<Constant, ParseError> {
         let lex = self.lexeme(tok.span);
         let (prefix_str, rest) = split_string_prefix(lex);
@@ -1778,13 +2447,10 @@ impl<'src> Parser<'src> {
                 message: format!("invalid string prefix {prefix_str:?}"),
             }
         })?;
-        if prefix.fstring {
-            return Err(ParseError::NotImplemented {
-                span: tok.span,
-                feature: "f-string",
-                rfc: "RFC 0005",
-            });
-        }
+        debug_assert!(
+            !prefix.fstring,
+            "f-strings should route through decode_string_or_fstring"
+        );
         let body = strip_quotes(rest);
         let raw = prefix.raw;
         if prefix.bytes {
@@ -1800,6 +2466,371 @@ impl<'src> Parser<'src> {
         })?;
         Ok(Constant::Str(s))
     }
+
+    /// Returns the prefix info for a string token without decoding the body.
+    fn string_prefix(&self, tok: &Token) -> Result<weavepy_lexer::StringPrefix, ParseError> {
+        let lex = self.lexeme(tok.span);
+        let (prefix_str, _) = split_string_prefix(lex);
+        weavepy_lexer::StringPrefix::parse(prefix_str).ok_or_else(|| ParseError::Unexpected {
+            span: tok.span,
+            message: format!("invalid string prefix {prefix_str:?}"),
+        })
+    }
+
+    /// Parse the interior of an f-string token into an `ExprKind`.
+    ///
+    /// Walks the body character-by-character. Literal runs become
+    /// `Constant::Str` parts; `{...}` runs are re-lexed and re-parsed
+    /// to produce `FormattedValue` parts. The result is a `JoinedStr`
+    /// (or a single `Constant` when no interpolation appears).
+    fn parse_fstring_token(&self, tok: &Token) -> Result<Expr, ParseError> {
+        let lex = self.lexeme(tok.span);
+        let (_, rest) = split_string_prefix(lex);
+        let raw = self.string_prefix(tok)?.raw;
+        let body = strip_quotes(rest);
+        let parts = self.parse_fstring_body(body, raw, tok.span)?;
+        if parts.len() == 1 {
+            if let ExprKind::Constant(_) = &parts[0].kind {
+                return Ok(parts[0].clone());
+            }
+        }
+        Ok(Expr {
+            kind: ExprKind::JoinedStr(parts),
+            span: tok.span,
+        })
+    }
+
+    fn parse_fstring_body(
+        &self,
+        body: &str,
+        raw: bool,
+        anchor: Span,
+    ) -> Result<Vec<Expr>, ParseError> {
+        let mut parts = Vec::new();
+        let mut literal = String::new();
+        let bytes = body.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'{' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                    literal.push('{');
+                    i += 2;
+                    continue;
+                }
+                if !literal.is_empty() {
+                    let decoded =
+                        decode_str_body(&literal, raw).map_err(|m| ParseError::Unexpected {
+                            span: anchor,
+                            message: m,
+                        })?;
+                    parts.push(Expr {
+                        kind: ExprKind::Constant(Constant::Str(decoded)),
+                        span: anchor,
+                    });
+                    literal.clear();
+                }
+                let (field, end) = self.scan_fstring_field(body, i + 1, anchor)?;
+                let parsed = self.parse_fstring_field(&field, anchor)?;
+                parts.push(parsed);
+                i = end + 1; // skip past the closing `}`
+                continue;
+            }
+            if b == b'}' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                    literal.push('}');
+                    i += 2;
+                    continue;
+                }
+                return Err(ParseError::Unexpected {
+                    span: anchor,
+                    message: "single '}' is not allowed in f-string".to_owned(),
+                });
+            }
+            // Append the next UTF-8 character (one or more bytes).
+            let ch_len = utf8_char_len(b);
+            let end = (i + ch_len).min(bytes.len());
+            literal.push_str(&body[i..end]);
+            i = end;
+        }
+        if !literal.is_empty() || parts.is_empty() {
+            let decoded = decode_str_body(&literal, raw).map_err(|m| ParseError::Unexpected {
+                span: anchor,
+                message: m,
+            })?;
+            parts.push(Expr {
+                kind: ExprKind::Constant(Constant::Str(decoded)),
+                span: anchor,
+            });
+        }
+        Ok(parts)
+    }
+
+    /// Scan from just past the opening `{` to the matching `}` at depth 0.
+    /// Returns the field text and the index of the closing `}`.
+    fn scan_fstring_field(
+        &self,
+        body: &str,
+        start: usize,
+        anchor: Span,
+    ) -> Result<(String, usize), ParseError> {
+        let bytes = body.as_bytes();
+        let mut depth = 1i32;
+        let mut i = start;
+        // String state machine for backtick-free quotes inside the field.
+        let mut in_str: Option<u8> = None;
+        let mut triple = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(q) = in_str {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    if triple {
+                        if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                            i += 3;
+                            in_str = None;
+                            triple = false;
+                            continue;
+                        }
+                    } else {
+                        i += 1;
+                        in_str = None;
+                        continue;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' | b'\'' => {
+                    let q = b;
+                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                        in_str = Some(q);
+                        triple = true;
+                        i += 3;
+                    } else {
+                        in_str = Some(q);
+                        triple = false;
+                        i += 1;
+                    }
+                }
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b')' | b']' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                b'}' => {
+                    if depth == 1 {
+                        return Ok((body[start..i].to_owned(), i));
+                    }
+                    depth -= 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        Err(ParseError::Unexpected {
+            span: anchor,
+            message: "expected '}' to close f-string replacement field".to_owned(),
+        })
+    }
+
+    /// Parse one `expr[!conv][:spec]` field and return a
+    /// `FormattedValue` (possibly preceded by a synthetic literal
+    /// for `{x = }` debug form).
+    fn parse_fstring_field(&self, field: &str, anchor: Span) -> Result<Expr, ParseError> {
+        // Split into expr, conversion, format_spec. Backslashes inside
+        // an f-string field aren't allowed in CPython <3.12 — we
+        // surface that as a parse error for clarity.
+        if field.contains('\\') {
+            return Err(ParseError::NotImplemented {
+                span: anchor,
+                feature: "backslashes inside f-string replacement fields",
+                rfc: "RFC 0005-B",
+            });
+        }
+        let bytes = field.as_bytes();
+        // Find the `!conv` and `:spec` boundaries at top level (not
+        // inside nested parens/brackets/braces or string literals).
+        let mut expr_end = bytes.len();
+        let mut conv_start: Option<usize> = None;
+        let mut spec_start: Option<usize> = None;
+        let mut depth = 0i32;
+        let mut in_str: Option<u8> = None;
+        let mut triple = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(q) = in_str {
+                if b == q {
+                    if triple {
+                        if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                            in_str = None;
+                            triple = false;
+                            i += 3;
+                            continue;
+                        }
+                    } else {
+                        in_str = None;
+                        i += 1;
+                        continue;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' | b'\'' => {
+                    let q = b;
+                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                        in_str = Some(q);
+                        triple = true;
+                        i += 3;
+                        continue;
+                    }
+                    in_str = Some(q);
+                    triple = false;
+                    i += 1;
+                    continue;
+                }
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                if b == b'!' && conv_start.is_none() && spec_start.is_none() {
+                    // `!=` and `!<` etc. are comparison; `!` followed
+                    // by `s` / `r` / `a` is conversion.
+                    if i + 1 < bytes.len() && matches!(bytes[i + 1], b's' | b'r' | b'a') {
+                        expr_end = i;
+                        conv_start = Some(i + 1);
+                        i += 2;
+                        continue;
+                    }
+                } else if b == b':' && spec_start.is_none() {
+                    expr_end = expr_end.min(i);
+                    spec_start = Some(i + 1);
+                    i += 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        let expr_text = &field[..expr_end];
+        // Debug form `{x = }`: literal "x = " prepended, conversion
+        // forced to `r` if no explicit conversion / spec.
+        let (expr_text, debug_lit) = if expr_text.trim_end().ends_with('=') {
+            let trimmed = expr_text.trim_end();
+            let without_eq = trimmed.trim_end_matches('=');
+            let literal = format!("{without_eq}=");
+            (without_eq.trim(), Some(literal))
+        } else {
+            (expr_text.trim(), None)
+        };
+        if expr_text.is_empty() {
+            return Err(ParseError::Unexpected {
+                span: anchor,
+                message: "empty expression in f-string replacement field".to_owned(),
+            });
+        }
+        // Recursively tokenize+parse the expression.
+        let tokens = weavepy_lexer::tokenize(expr_text)?;
+        let mut sub = Parser::new(expr_text, tokens);
+        sub.skip_trivia_and_newlines();
+        let value = sub.parse_expression_list(false)?;
+        sub.skip_trivia_and_newlines();
+        if !matches!(sub.peek(), TokenKind::Endmarker) {
+            return Err(ParseError::Unexpected {
+                span: anchor,
+                message: "trailing tokens in f-string expression".to_owned(),
+            });
+        }
+
+        let conversion = match conv_start {
+            Some(idx) => i32::from(field.as_bytes()[idx]),
+            None if debug_lit.is_some() => i32::from(b'r'),
+            None => -1,
+        };
+        let format_spec = match spec_start {
+            Some(s) => {
+                let spec = &field[s..];
+                let inner = self.parse_fstring_body(spec, false, anchor)?;
+                Some(Box::new(Expr {
+                    kind: ExprKind::JoinedStr(inner),
+                    span: anchor,
+                }))
+            }
+            None => None,
+        };
+
+        let fv = Expr {
+            kind: ExprKind::FormattedValue {
+                value: Box::new(value),
+                conversion,
+                format_spec,
+            },
+            span: anchor,
+        };
+        if let Some(lit) = debug_lit {
+            // Wrap in a tiny JoinedStr-equivalent: emit a literal
+            // followed by the formatted value. The caller of
+            // parse_fstring_field appends parts directly, so we
+            // package both into a synthetic JoinedStr that will
+            // get flattened by the outer JoinedStr later.
+            return Ok(Expr {
+                kind: ExprKind::JoinedStr(vec![
+                    Expr {
+                        kind: ExprKind::Constant(Constant::Str(lit)),
+                        span: anchor,
+                    },
+                    fv,
+                ]),
+                span: anchor,
+            });
+        }
+        Ok(fv)
+    }
+}
+
+#[inline]
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b & 0b1110_0000 == 0b1100_0000 {
+        2
+    } else if b & 0b1111_0000 == 0b1110_0000 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Working state while concatenating adjacent string tokens.
+enum AccumString {
+    Plain(String),
+    Bytes(Vec<u8>),
+    Joined(Vec<Expr>),
+}
+
+/// Append a literal string onto the tail of a JoinedStr parts list.
+/// Merges with the trailing `Constant::Str` part if there is one.
+fn join_str_into_parts(parts: &mut Vec<Expr>, s: String, span: Span) {
+    if let Some(last) = parts.last_mut() {
+        if let ExprKind::Constant(Constant::Str(existing)) = &mut last.kind {
+            existing.push_str(&s);
+            return;
+        }
+    }
+    parts.push(Expr {
+        kind: ExprKind::Constant(Constant::Str(s)),
+        span,
+    });
 }
 
 fn split_string_prefix(lex: &str) -> (&str, &str) {

@@ -79,8 +79,9 @@ The slice tracks CPython 3.13. Specifically:
 |--------------------------------------------------------------------------------|---------------------------------------------------|
 | `Module`, `FunctionDef`, `Return`, `Assign`, `AugAssign`, `AnnAssign`          | `Match` / `Case`                                  |
 | `If`/`Elif`/`Else`, `While`, `For`, `Break`, `Continue`, `Pass`                | `Async` / `Await` / `Yield` / `YieldFrom`         |
-| `Import`, `ImportFrom`, `Global`, `Nonlocal` *(execution: RFC 0012)*           | f-string interior parsing                         |
-| `ClassDef`, `Try` / `Except` / `Finally`, `Raise`, `With` *(RFC 0003 / 0004)*  |                                                   |
+| `Import`, `ImportFrom`, `Global`, `Nonlocal` *(execution: RFC 0012)*           | f-string interior parsing *(RFC 0005)*            |
+| `ClassDef`, `Try` / `Except` / `Finally`, `Raise`, `With` *(RFC 0003 / 0004)*  | `yield` / `yield from` *(RFC 0006)*               |
+| `Match`, `case` patterns *(RFC 0009)*                                          | `async def`, `await` *(RFC 0006-B)*               |
 | Full expression grammar with correct precedence                                |                                                   |
 | Chained comparisons (`1 < x < 10`)                                             |                                                   |
 | `BinOp`, `BoolOp`, `UnaryOp`, `Compare`, `IfExp`                               |                                                   |
@@ -226,10 +227,14 @@ carries a `PyException` struct (type name + message) so the eventual
   NaN-boxing, type slot table).
 - **RFC 0003**: classes, methods, MRO, descriptors. ✅ landed.
 - **RFC 0004**: exceptions, `try` / `except` / `finally` / `with`, traceback. ✅ landed.
-- **RFC 0005**: f-strings — PEP 701 lexer mode, `FSTRING_*` tokens,
-  AST `JoinedStr` / `FormattedValue`.
-- **RFC 0006**: generators / coroutines / async / await.
+- **RFC 0005**: f-strings — `JoinedStr` / `FormattedValue` AST, `FORMAT_VALUE` /
+  `BUILD_STRING` opcodes, format-spec mini-language. ✅ landed.
+- **RFC 0006**: generators (synchronous half) — `yield`, `yield from`,
+  lazy `GeneratorExp`, suspendable frames. ✅ landed.
+- **RFC 0006-B**: coroutines, `async def`, `await`, `asyncio` event loop.
 - **RFC 0007**: bytecode compaction (16-bit encoding + `EXTENDED_ARG`).
 - **RFC 0008**: arbitrary-precision integers.
+- **RFC 0009**: structural pattern matching (`match` / `case`,
+  PEP 634 / 636). ✅ landed.
 - **RFC 0012**: modules, the import system, and a minimal stdlib bootstrap
   (`sys` / `math` / `os` / `os.path`). ✅ landed.

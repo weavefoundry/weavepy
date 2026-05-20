@@ -11,11 +11,9 @@
 //!   and field names (`body`, `orelse`, `args`, `kwargs`, `target`,
 //!   `iter`, `value`, …).
 //! - **Experimental** for the slice of the grammar represented. The
-//!   following CPython AST nodes are deliberately absent and are
-//!   tracked in `docs/rfcs/0001-executable-slice.md`: `ClassDef`,
-//!   `Try`, `ExceptHandler`, `Raise`, `With`/`AsyncWith`,
-//!   `Match`/`MatchValue`, `Async*`, `Await`, `Yield`,
-//!   `YieldFrom`, `JoinedStr`/`FormattedValue` (f-strings).
+//!   following CPython AST nodes are deliberately absent and tracked
+//!   in `docs/rfcs/0001-executable-slice.md`: `AsyncFunctionDef`,
+//!   `AsyncFor`, `AsyncWith`, `Await` (RFC 0006-B).
 
 use weavepy_lexer::Span;
 
@@ -120,11 +118,58 @@ pub enum StmtKind {
     Global(Vec<String>),
     /// `nonlocal a, b`
     Nonlocal(Vec<String>),
+    /// `match subject: case ...:` (PEP 634 / RFC 0009).
+    Match {
+        subject: Expr,
+        cases: Vec<MatchCase>,
+    },
     /// Expression statement.
     Expr(Expr),
     Pass,
     Break,
     Continue,
+}
+
+/// One `case` clause inside a `match` statement (RFC 0009).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchCase {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// A pattern in a `case` clause. Each variant corresponds 1:1 to a
+/// CPython `match_*` AST node so `ast.dump` output lines up.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// Literal value patterns: `0`, `"x"`, `Color.RED`. The `Expr`
+    /// must be a constant or a dotted attribute chain.
+    Value(Expr),
+    /// `None` / `True` / `False`.
+    Singleton(Constant),
+    /// Capture pattern (`x`) or wildcard (`_` → `None`).
+    Capture(Option<String>),
+    /// `[p1, p2, *rest]` or `(p1, p2)`.
+    Sequence(Vec<Pattern>),
+    /// `*rest` inside a sequence (or `*_` to discard).
+    Star(Option<String>),
+    /// `{k: p, **rest}`.
+    Mapping {
+        keys: Vec<Expr>,
+        patterns: Vec<Pattern>,
+        rest: Option<Option<String>>,
+    },
+    /// `Cls(pos1, pos2, key=val)`.
+    Class {
+        cls: Expr,
+        positionals: Vec<Pattern>,
+        keywords: Vec<(String, Pattern)>,
+    },
+    /// `p1 | p2 | p3`.
+    Or(Vec<Pattern>),
+    /// `pattern as name`.
+    As { pattern: Box<Pattern>, name: String },
 }
 
 /// `except [E [as e]]: body` clause.
@@ -270,6 +315,24 @@ pub enum ExprKind {
     },
     /// `*expr` in a call / tuple / list. (CPython has a `Starred` node.)
     Starred(Box<Expr>),
+    /// `yield` or `yield value` (RFC 0006). The optional value is the
+    /// expression yielded; bare `yield` yields `None`.
+    Yield(Option<Box<Expr>>),
+    /// `yield from value` (RFC 0006).
+    YieldFrom(Box<Expr>),
+    /// f-string body — a list of `Constant(Str)` and `FormattedValue`
+    /// nodes. Plain f-strings like `f"abc"` lower to a single
+    /// `Constant`; `JoinedStr` wraps anything with interpolations
+    /// (RFC 0005).
+    JoinedStr(Vec<Expr>),
+    /// One `{value!conv:spec}` inside an f-string (RFC 0005).
+    /// `conversion` is `-1` (none), `'s'`, `'r'`, or `'a'`.
+    FormattedValue {
+        value: Box<Expr>,
+        conversion: i32,
+        /// `None` for `{x}`; `Some(JoinedStr(...))` for `{x:spec}`.
+        format_spec: Option<Box<Expr>>,
+    },
 }
 
 /// `**kw=value` keyword argument in a call.
@@ -710,6 +773,27 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             }
             out.push_str("])");
         }
+        S::Match { subject, cases } => {
+            out.push_str("Match(subject=");
+            dump_expr(out, subject, depth);
+            out.push_str(", cases=[");
+            for (i, c) in cases.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str("match_case(pattern=");
+                dump_pattern(out, &c.pattern, depth);
+                out.push_str(", guard=");
+                match &c.guard {
+                    Some(g) => dump_expr(out, g, depth),
+                    None => out.push_str("None"),
+                }
+                out.push_str(", body=");
+                dump_stmt_block(out, &c.body, depth + 2);
+                out.push(')');
+            }
+            out.push_str("])");
+        }
         S::Expr(e) => {
             out.push_str("Expr(value=");
             dump_expr(out, e, depth);
@@ -718,6 +802,127 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
         S::Pass => out.push_str("Pass()"),
         S::Break => out.push_str("Break()"),
         S::Continue => out.push_str("Continue()"),
+    }
+}
+
+fn dump_pattern(out: &mut String, p: &Pattern, depth: usize) {
+    match p {
+        Pattern::Value(e) => {
+            out.push_str("MatchValue(value=");
+            dump_expr(out, e, depth);
+            out.push(')');
+        }
+        Pattern::Singleton(c) => {
+            out.push_str("MatchSingleton(value=");
+            dump_constant(out, c);
+            out.push(')');
+        }
+        Pattern::Capture(name) => match name {
+            Some(n) => {
+                out.push_str("MatchAs(pattern=None, name='");
+                out.push_str(n);
+                out.push_str("')");
+            }
+            None => out.push_str("MatchAs(pattern=None, name=None)"),
+        },
+        Pattern::Sequence(items) => {
+            out.push_str("MatchSequence(patterns=[");
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_pattern(out, x, depth);
+            }
+            out.push_str("])");
+        }
+        Pattern::Star(name) => match name {
+            Some(n) => {
+                out.push_str("MatchStar(name='");
+                out.push_str(n);
+                out.push_str("')");
+            }
+            None => out.push_str("MatchStar(name=None)"),
+        },
+        Pattern::Mapping {
+            keys,
+            patterns,
+            rest,
+        } => {
+            out.push_str("MatchMapping(keys=[");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_expr(out, k, depth);
+            }
+            out.push_str("], patterns=[");
+            for (i, p) in patterns.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_pattern(out, p, depth);
+            }
+            out.push_str("], rest=");
+            match rest {
+                Some(Some(n)) => {
+                    out.push('\'');
+                    out.push_str(n);
+                    out.push('\'');
+                }
+                Some(None) => out.push_str("None"),
+                None => out.push_str("None"),
+            }
+            out.push(')');
+        }
+        Pattern::Class {
+            cls,
+            positionals,
+            keywords,
+        } => {
+            out.push_str("MatchClass(cls=");
+            dump_expr(out, cls, depth);
+            out.push_str(", patterns=[");
+            for (i, p) in positionals.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_pattern(out, p, depth);
+            }
+            out.push_str("], kwd_attrs=[");
+            for (i, (n, _)) in keywords.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push('\'');
+                out.push_str(n);
+                out.push('\'');
+            }
+            out.push_str("], kwd_patterns=[");
+            for (i, (_, p)) in keywords.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_pattern(out, p, depth);
+            }
+            out.push_str("])");
+        }
+        Pattern::Or(items) => {
+            out.push_str("MatchOr(patterns=[");
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_pattern(out, x, depth);
+            }
+            out.push_str("])");
+        }
+        Pattern::As { pattern, name } => {
+            out.push_str("MatchAs(pattern=");
+            dump_pattern(out, pattern, depth);
+            out.push_str(", name='");
+            out.push_str(name);
+            out.push_str("')");
+        }
     }
 }
 
@@ -1044,6 +1249,45 @@ fn dump_expr(out: &mut String, e: &Expr, depth: usize) {
             out.push_str("Starred(value=");
             dump_expr(out, e, depth);
             out.push_str(", ctx=Load())");
+        }
+        E::Yield(value) => {
+            out.push_str("Yield(value=");
+            match value {
+                Some(v) => dump_expr(out, v, depth),
+                None => out.push_str("None"),
+            }
+            out.push(')');
+        }
+        E::YieldFrom(v) => {
+            out.push_str("YieldFrom(value=");
+            dump_expr(out, v, depth);
+            out.push(')');
+        }
+        E::JoinedStr(parts) => {
+            out.push_str("JoinedStr(values=[");
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_expr(out, p, depth);
+            }
+            out.push_str("])");
+        }
+        E::FormattedValue {
+            value,
+            conversion,
+            format_spec,
+        } => {
+            out.push_str("FormattedValue(value=");
+            dump_expr(out, value, depth);
+            out.push_str(", conversion=");
+            out.push_str(&conversion.to_string());
+            out.push_str(", format_spec=");
+            match format_spec {
+                Some(s) => dump_expr(out, s, depth),
+                None => out.push_str("None"),
+            }
+            out.push(')');
         }
     }
 }

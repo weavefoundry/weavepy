@@ -83,4 +83,65 @@ mod tests {
             parse_module("try:\n    pass\nexcept ValueError:\n    pass\n").expect("parse try");
         assert_eq!(module.body.len(), 1);
     }
+
+    #[test]
+    fn parses_simple_fstring() {
+        let m = parse_module("x = f'hello {name}'\n").expect("parse fstring");
+        assert_eq!(m.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_fstring_with_format_spec() {
+        let _ = parse_module("y = f'{val:.2f}'\n").expect("format spec");
+    }
+
+    #[test]
+    fn parses_fstring_with_conversion_and_spec() {
+        let _ = parse_module("z = f'{obj!r:>10}'\n").expect("conv + spec");
+    }
+
+    #[test]
+    fn parses_fstring_debug_form() {
+        let _ = parse_module("print(f'{x = }')\n").expect("debug f-string");
+    }
+
+    #[test]
+    fn parses_yield_expression() {
+        let _ = parse_module("def g():\n    yield 1\n    yield\n").expect("yield");
+    }
+
+    #[test]
+    fn parses_yield_from() {
+        let _ = parse_module("def g():\n    yield from range(10)\n").expect("yield from");
+    }
+
+    #[test]
+    fn parses_match_with_literal_and_capture() {
+        let src = "match x:\n    case 0:\n        pass\n    case y:\n        pass\n";
+        let _ = parse_module(src).expect("match basic");
+    }
+
+    #[test]
+    fn parses_match_with_class_pattern() {
+        let src = "match p:\n    case Point(x=0, y=0):\n        pass\n    case _:\n        pass\n";
+        let _ = parse_module(src).expect("match class");
+    }
+
+    #[test]
+    fn parses_match_with_sequence_and_star() {
+        let src = "match xs:\n    case [a, b, *rest]:\n        pass\n";
+        let _ = parse_module(src).expect("match seq");
+    }
+
+    #[test]
+    fn parses_match_with_or_and_guard() {
+        let src = "match v:\n    case 1 | 2 | 3 if v > 0:\n        pass\n";
+        let _ = parse_module(src).expect("match or+guard");
+    }
+
+    #[test]
+    fn match_is_soft_keyword_when_not_at_statement_start() {
+        // `re.match` should still parse as an identifier.
+        let _ = parse_module("x = re.match(p, s)\n").expect("match as ident");
+    }
 }
