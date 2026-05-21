@@ -23,6 +23,9 @@ use crate::types::TypeObject;
 pub struct BuiltinTypes {
     pub object_: Rc<TypeObject>,
     pub type_: Rc<TypeObject>,
+    pub property_: Rc<TypeObject>,
+    pub staticmethod_: Rc<TypeObject>,
+    pub classmethod_: Rc<TypeObject>,
 
     pub int_: Rc<TypeObject>,
     pub float_: Rc<TypeObject>,
@@ -82,6 +85,16 @@ impl BuiltinTypes {
         };
         let object_ = mk("object", vec![]);
         let type_ = mk("type", vec![object_.clone()]);
+        let property_ = mk("property", vec![object_.clone()]);
+        let staticmethod_ = mk("staticmethod", vec![object_.clone()]);
+        let classmethod_ = mk("classmethod", vec![object_.clone()]);
+        // Self-reference: `type.__class__ is type`. Every other
+        // built-in's metaclass is `type` by default, installed in
+        // bulk after the rest of the registry exists.
+        type_.set_metaclass(type_.clone());
+        object_.set_metaclass(type_.clone());
+        install_object_dunders(&object_);
+        install_type_dunders(&type_);
 
         let int_ = mk("int", vec![object_.clone()]);
         let float_ = mk("float", vec![object_.clone()]);
@@ -132,9 +145,12 @@ impl BuiltinTypes {
         let keyboard_interrupt = exc("KeyboardInterrupt", base_exception.clone());
         let system_exit = exc("SystemExit", base_exception.clone());
 
-        BuiltinTypes {
-            object_,
-            type_,
+        let bt = BuiltinTypes {
+            object_: object_.clone(),
+            type_: type_.clone(),
+            property_: property_.clone(),
+            staticmethod_: staticmethod_.clone(),
+            classmethod_: classmethod_.clone(),
             int_,
             float_,
             bool_,
@@ -175,7 +191,16 @@ impl BuiltinTypes {
             keyboard_interrupt,
             system_exit,
             recursion_error,
+        };
+        // Every other built-in type's metaclass is `type`.
+        for (_, value) in bt.as_globals() {
+            if let Object::Type(t) = value {
+                if t.metaclass.borrow().is_none() {
+                    t.set_metaclass(type_.clone());
+                }
+            }
         }
+        bt
     }
 
     /// Public copies of each built-in type as `Object::Type` values,
@@ -189,6 +214,9 @@ impl BuiltinTypes {
         vec![
             pair!(object_, "object"),
             pair!(type_, "type"),
+            pair!(property_, "property"),
+            pair!(staticmethod_, "staticmethod"),
+            pair!(classmethod_, "classmethod"),
             pair!(int_, "int"),
             pair!(float_, "float"),
             pair!(bool_, "bool"),
@@ -320,8 +348,190 @@ pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
     make_exception_with_class(class, message)
 }
 
+/// Install `object.__new__`, `object.__init__`, `object.__setattr__`
+/// and `object.__delattr__` on the root class. These are the implicit
+/// base methods every user class inherits.
+fn install_object_dunders(object_: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    use crate::types::PyInstance;
+    fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
+        // `object.__new__(cls, *args, **kwargs)` — args[0] is `cls`.
+        let cls = match args.first() {
+            Some(Object::Type(t)) => t.clone(),
+            _ => {
+                return Err(crate::error::type_error(
+                    "object.__new__(): first arg must be a class".to_owned(),
+                ))
+            }
+        };
+        Ok(Object::Instance(Rc::new(PyInstance::new(cls))))
+    }
+    fn object_init(_args: &[Object]) -> Result<Object, RuntimeError> {
+        // No-op; honours `super().__init__()` chains.
+        Ok(Object::None)
+    }
+    fn object_setattr(args: &[Object]) -> Result<Object, RuntimeError> {
+        // `object.__setattr__(self, name, value)` — write directly
+        // to the instance dict, bypassing any user `__setattr__`
+        // override on the receiver's class (used by dataclasses'
+        // frozen __init__ to populate fields).
+        if args.len() != 3 {
+            return Err(crate::error::type_error(
+                "object.__setattr__() takes 3 arguments".to_owned(),
+            ));
+        }
+        let inst = match &args[0] {
+            Object::Instance(i) => i.clone(),
+            other => {
+                return Err(crate::error::type_error(format!(
+                    "object.__setattr__() requires an instance, got '{}'",
+                    other.type_name()
+                )))
+            }
+        };
+        let name = match &args[1] {
+            Object::Str(s) => s.to_string(),
+            _ => return Err(crate::error::type_error("attribute name must be str")),
+        };
+        inst.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_str(name)), args[2].clone());
+        Ok(Object::None)
+    }
+    fn object_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
+        if args.len() != 2 {
+            return Err(crate::error::type_error(
+                "object.__delattr__() takes 2 arguments".to_owned(),
+            ));
+        }
+        let inst = match &args[0] {
+            Object::Instance(i) => i.clone(),
+            other => {
+                return Err(crate::error::type_error(format!(
+                    "object.__delattr__() requires an instance, got '{}'",
+                    other.type_name()
+                )))
+            }
+        };
+        let name = match &args[1] {
+            Object::Str(s) => s.to_string(),
+            _ => return Err(crate::error::type_error("attribute name must be str")),
+        };
+        let removed = inst
+            .dict
+            .borrow_mut()
+            .shift_remove(&DictKey(Object::from_str(&name)))
+            .is_some();
+        if !removed {
+            return Err(crate::error::attribute_error(format!(
+                "'{}' object has no attribute '{}'",
+                inst.class.name, name
+            )));
+        }
+        Ok(Object::None)
+    }
+    let mut dict = object_.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__new__")),
+        Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
+            name: "__new__",
+            call: Box::new(object_new),
+        })))),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            call: Box::new(object_init),
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__setattr__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__setattr__",
+            call: Box::new(object_setattr),
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__delattr__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__delattr__",
+            call: Box::new(object_delattr),
+        })),
+    );
+    // `object.__init_subclass__(cls)` and `object.__subclasshook__`
+    // are no-ops by default; defining them here lets every subclass
+    // chain through `super().__init_subclass__()` without raising.
+    fn object_no_op(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Ok(Object::None)
+    }
+    dict.insert(
+        DictKey(Object::from_static("__init_subclass__")),
+        Object::ClassMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init_subclass__",
+            call: Box::new(object_no_op),
+        })))),
+    );
+}
+
+/// Install `type.__new__` and `type.__init__` so user metaclasses
+/// can do `super().__new__(mcs, name, bases, ns)` to allocate a
+/// fresh class. The implementations are picked up by [`Vm::call`]
+/// via the `metaclass.__new__` lookup at class-build time.
+pub fn install_type_dunders(type_: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    fn type_new_sentinel(_args: &[Object]) -> Result<Object, RuntimeError> {
+        // Reaching this path means `type.__new__` was invoked
+        // outside the VM's class-build context. The interpreter
+        // intercepts the real path before we ever get called.
+        Err(crate::error::runtime_error(
+            "type.__new__ must be called through the VM class-build path",
+        ))
+    }
+    fn type_init(_args: &[Object]) -> Result<Object, RuntimeError> {
+        // The corresponding init is a no-op; user metaclasses can
+        // still override it.
+        Ok(Object::None)
+    }
+    let mut dict = type_.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__new__")),
+        Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
+            name: "__new__",
+            call: Box::new(type_new_sentinel),
+        })))),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            call: Box::new(type_init),
+        })),
+    );
+}
+
 fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
     use crate::object::BuiltinFn;
+    fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
+        // CPython's BaseException.__init__(self, *args) stores `args`
+        // on the instance so every subclass — built-in or user-defined
+        // — exposes `e.args` automatically.
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        if let Object::Instance(inst_rc) = inst {
+            let rest = if args.len() > 1 {
+                args[1..].to_vec()
+            } else {
+                Vec::new()
+            };
+            inst_rc.dict.borrow_mut().insert(
+                DictKey(Object::from_static("args")),
+                Object::new_tuple(rest),
+            );
+        }
+        Ok(Object::None)
+    }
     fn exc_str(args: &[Object]) -> Result<Object, RuntimeError> {
         let inst = args
             .first()
@@ -368,6 +578,13 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         Ok(Object::from_static(""))
     }
     let mut dict = base_exception.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            call: Box::new(exc_init),
+        })),
+    );
     dict.insert(
         DictKey(Object::from_static("__str__")),
         Object::Builtin(Rc::new(BuiltinFn {

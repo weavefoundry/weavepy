@@ -1,0 +1,15 @@
+Color.RED
+RED 1
+Color.GREEN
+Color.BLUE
+['RED', 'GREEN', 'BLUE']
+True
+False
+True
+True
+6
+1 2 4
+Perm.READ|WRITE
+True
+False
+unique rejected: duplicate values found in <class 'Bad'>: B -> A

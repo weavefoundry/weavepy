@@ -64,6 +64,19 @@ pub enum Object {
     /// `io.StringIO`/`io.BytesIO`, and the values behind
     /// `sys.stdin`/`stdout`/`stderr`.
     File(Rc<PyFile>),
+    /// `@property` descriptor (RFC 0015). Resolves through the
+    /// data-descriptor path on attribute access.
+    Property(Rc<PyProperty>),
+    /// `@staticmethod` descriptor (RFC 0015). Returns the wrapped
+    /// callable unchanged when accessed via instance or class.
+    StaticMethod(Rc<Object>),
+    /// `@classmethod` descriptor (RFC 0015). Returns a method bound
+    /// to the class (not the instance) on access.
+    ClassMethod(Rc<Object>),
+    /// Slot descriptor created by `__slots__` (RFC 0015). Stores a
+    /// per-instance value under the slot's name in `__dict__`,
+    /// enforcing the slot-list at the class level.
+    SlotDescriptor(Rc<SlotDescriptor>),
 }
 
 impl fmt::Debug for Object {
@@ -101,8 +114,70 @@ impl fmt::Debug for Object {
             Object::Set(s) => f.debug_set().entries(s.borrow().iter()).finish(),
             Object::FrozenSet(s) => f.debug_set().entries(s.iter()).finish(),
             Object::File(file) => write!(f, "<file {:?}>", file.name),
+            Object::Property(_) => write!(f, "<property>"),
+            Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", inner.as_ref()),
+            Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", inner.as_ref()),
+            Object::SlotDescriptor(sd) => write!(f, "<slot {:?} of {:?}>", sd.name, sd.class_name),
         }
     }
+}
+
+/// Internal payload for [`Object::Property`].
+#[derive(Debug)]
+pub struct PyProperty {
+    pub fget: Object,
+    pub fset: Object,
+    pub fdel: Object,
+    pub doc: Object,
+}
+
+impl PyProperty {
+    pub fn new(fget: Object, fset: Object, fdel: Object, doc: Object) -> Self {
+        Self {
+            fget,
+            fset,
+            fdel,
+            doc,
+        }
+    }
+
+    /// Return a clone of `self` with the given attribute replaced. Used
+    /// by `property.getter`/`setter`/`deleter` (which CPython models as
+    /// methods that return a *new* property carrying the patched
+    /// callable plus the existing ones).
+    pub fn with(&self, which: PropertyAttr, fn_: Object) -> Self {
+        let mut next = Self {
+            fget: self.fget.clone(),
+            fset: self.fset.clone(),
+            fdel: self.fdel.clone(),
+            doc: self.doc.clone(),
+        };
+        match which {
+            PropertyAttr::Get => next.fget = fn_,
+            PropertyAttr::Set => next.fset = fn_,
+            PropertyAttr::Del => next.fdel = fn_,
+        }
+        next
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PropertyAttr {
+    Get,
+    Set,
+    Del,
+}
+
+/// Internal payload for [`Object::SlotDescriptor`].
+#[derive(Debug)]
+pub struct SlotDescriptor {
+    /// The attribute name this slot guards. Used both for storage in
+    /// the instance dict and for error messages.
+    pub name: String,
+    /// The class that declared this slot, kept by name for nicer
+    /// error messages (we do not need a hard reference back to the
+    /// type for correctness).
+    pub class_name: String,
 }
 
 /// Ordered set backing for [`Object::Set`] and [`Object::FrozenSet`].
@@ -199,6 +274,11 @@ pub struct PyFunction {
     pub kw_defaults: Vec<(String, Object)>,
     /// Closure cells matching `code.freevars` in order.
     pub closure: Vec<Object>,
+    /// `__dict__` for arbitrary attribute assignment on the
+    /// function — e.g. `@functools.wraps`, `@abstractmethod`'s
+    /// `__isabstractmethod__`, or any decorator that stashes
+    /// per-callable metadata.
+    pub attrs: Rc<RefCell<DictData>>,
 }
 
 impl fmt::Debug for PyFunction {
@@ -689,7 +769,11 @@ impl Object {
             | Object::Type(_)
             | Object::Module(_)
             | Object::Generator(_)
-            | Object::File(_) => true,
+            | Object::File(_)
+            | Object::Property(_)
+            | Object::StaticMethod(_)
+            | Object::ClassMethod(_)
+            | Object::SlotDescriptor(_) => true,
             Object::Bytes(b) => !b.is_empty(),
             Object::ByteArray(b) => !b.borrow().is_empty(),
             Object::Set(s) => !s.borrow().is_empty(),
@@ -741,6 +825,10 @@ impl Object {
             (Object::Set(a), Object::Set(b)) => Rc::ptr_eq(a, b),
             (Object::FrozenSet(a), Object::FrozenSet(b)) => Rc::ptr_eq(a, b),
             (Object::File(a), Object::File(b)) => Rc::ptr_eq(a, b),
+            (Object::Property(a), Object::Property(b)) => Rc::ptr_eq(a, b),
+            (Object::StaticMethod(a), Object::StaticMethod(b)) => Rc::ptr_eq(a, b),
+            (Object::ClassMethod(a), Object::ClassMethod(b)) => Rc::ptr_eq(a, b),
+            (Object::SlotDescriptor(a), Object::SlotDescriptor(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -791,6 +879,14 @@ impl Object {
             (Object::Set(a), Object::FrozenSet(b)) | (Object::FrozenSet(b), Object::Set(a)) => {
                 sets_equal(&a.borrow(), b)
             }
+            // Reference-identity equality for class / module / function
+            // / builtin / method values. CPython falls back to identity
+            // here, and our `in` / dict-key checks rely on it.
+            (Object::Type(a), Object::Type(b)) => Rc::ptr_eq(a, b),
+            (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
+            (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
+            (Object::Builtin(a), Object::Builtin(b)) => Rc::ptr_eq(a, b),
+            (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -976,6 +1072,10 @@ impl Object {
             Object::Set(_) => "set",
             Object::FrozenSet(_) => "frozenset",
             Object::File(_) => "file",
+            Object::Property(_) => "property",
+            Object::StaticMethod(_) => "staticmethod",
+            Object::ClassMethod(_) => "classmethod",
+            Object::SlotDescriptor(_) => "member_descriptor",
         }
     }
 
@@ -1125,6 +1225,12 @@ impl Object {
                         Rc::as_ptr(inst) as usize
                     )
                 }
+            }
+            Object::Property(_) => "<property object>".to_owned(),
+            Object::StaticMethod(_) => "<staticmethod object>".to_owned(),
+            Object::ClassMethod(_) => "<classmethod object>".to_owned(),
+            Object::SlotDescriptor(sd) => {
+                format!("<member '{}' of '{}' objects>", sd.name, sd.class_name)
             }
         }
     }

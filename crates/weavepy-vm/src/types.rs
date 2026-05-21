@@ -25,6 +25,25 @@ pub struct TypeObject {
     pub mro: RefCell<Vec<Rc<TypeObject>>>,
     pub dict: Rc<RefCell<DictData>>,
     pub flags: TypeFlags,
+    /// The class's *class* — i.e. its metaclass. Defaults to `type`
+    /// (set by the constructor builders). User-defined classes pick
+    /// up a custom metaclass either via the `metaclass=` keyword or
+    /// by inheriting the highest-priority metaclass of their bases.
+    /// Wrapped in a `RefCell` so the [`crate::builtin_types`] startup
+    /// path can self-reference (`type.__class__ is type`) by patching
+    /// the slot after construction.
+    pub metaclass: RefCell<Option<Rc<TypeObject>>>,
+    /// Explicit `__slots__` declarations, in declaration order.
+    /// Empty when the class does not use slots. Used at class
+    /// creation to install [`crate::object::SlotDescriptor`]s, and at
+    /// attribute-set time to enforce slot-only access on classes
+    /// whose entire MRO declares slots.
+    pub slot_names: RefCell<Vec<String>>,
+    /// `True` for slot-using classes whose MRO carries `__slots__`
+    /// every step of the way (so the instance has no implicit
+    /// `__dict__`). Set when the user neither omits `__slots__` from
+    /// any base nor lists `"__dict__"` in slots.
+    pub forbids_dict: bool,
 }
 
 impl std::fmt::Debug for TypeObject {
@@ -100,10 +119,30 @@ impl TypeObject {
             mro: RefCell::new(Vec::new()),
             dict: Rc::new(RefCell::new(dict)),
             flags,
+            metaclass: RefCell::new(None),
+            slot_names: RefCell::new(Vec::new()),
+            forbids_dict: false,
         });
         let mro = compute_c3(&ty, &bases, name)?;
         *ty.mro.borrow_mut() = mro;
         Ok(ty)
+    }
+
+    /// Internal: install a metaclass on this type. Used at startup
+    /// to wire `type.__class__ is type` for the built-in `type`
+    /// itself, and by [`crate::Vm::build_class`] when honouring the
+    /// `metaclass=` keyword.
+    pub fn set_metaclass(&self, meta: Rc<TypeObject>) {
+        *self.metaclass.borrow_mut() = Some(meta);
+    }
+
+    /// The metaclass slot, falling back to `type` for any type that
+    /// hasn't had one installed yet.
+    pub fn metaclass_or_type(&self) -> Rc<TypeObject> {
+        if let Some(m) = self.metaclass.borrow().as_ref() {
+            return m.clone();
+        }
+        crate::builtin_types::builtin_types().type_.clone()
     }
 
     /// `True` when `self` is a subclass of `other` (including itself).

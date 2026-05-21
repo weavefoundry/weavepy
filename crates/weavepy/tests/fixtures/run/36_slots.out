@@ -1,0 +1,6 @@
+3 4
+10 4
+slot reject: 'Point' object has no attribute 'z'
+1 2 3
+nested slot reject: 'Vec3' object has no attribute 'w'
+7 8 fine

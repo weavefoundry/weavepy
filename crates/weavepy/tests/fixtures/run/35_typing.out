@@ -1,0 +1,12 @@
+typing.Optional[int]
+typing.Union[int, str]
+typing.List[int]
+typing.Dict[str, int]
+typing.Tuple[int, str, float]
+<class 'list'>
+(<class 'str'>, <class 'int'>)
+42
+True
+False
+5
+typing.Any

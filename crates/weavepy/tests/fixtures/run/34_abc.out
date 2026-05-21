@@ -1,0 +1,6 @@
+abstract reject: Can't instantiate abstract class Shape w
+square 16
+partial reject: Can't instantiate abstract class Partial
+True
+True
+False

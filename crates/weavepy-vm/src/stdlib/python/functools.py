@@ -13,6 +13,8 @@ __all__ = [
     "wraps",
     "update_wrapper",
     "cmp_to_key",
+    "singledispatch",
+    "cached_property",
 ]
 
 
@@ -219,3 +221,108 @@ def cmp_to_key(cmp):
             return cmp(self.obj, other.obj) != 0
 
     return K
+
+
+# ---- single-dispatch generic functions --------------------------------------
+
+
+class _SingleDispatchCallable:
+    """Backing object for :func:`singledispatch`.
+
+    Implementing this as a class (instead of nested closures) keeps
+    the registry visible to ``register``'s inner decorator without
+    relying on three-level freevar passthrough.
+    """
+
+    def __init__(self, func):
+        self._default = func
+        self.registry = {object: func}
+        self.__wrapped__ = func
+
+    def dispatch(self, cls):
+        for base in cls.__mro__:
+            if base in self.registry:
+                return self.registry[base]
+        return self._default
+
+    def register(self, cls, impl=None):
+        if impl is None:
+            outer_self = self
+            outer_cls = cls
+
+            def decorator(real_impl):
+                outer_self.registry[outer_cls] = real_impl
+                return real_impl
+
+            return decorator
+        self.registry[cls] = impl
+        return impl
+
+    def __call__(self, *args, **kwargs):
+        if not args:
+            raise TypeError(
+                "singledispatch function requires at least one positional argument"
+            )
+        impl = self.dispatch(type(args[0]))
+        return impl(*args, **kwargs)
+
+
+def singledispatch(func):
+    """Single-dispatch generic-function decorator.
+
+    Mirrors :func:`functools.singledispatch`. Subsequent calls to the
+    returned callable dispatch on the *runtime* type of the first
+    argument; alternative implementations are registered with
+    ``@my_func.register(type)``.
+
+    Notes:
+    - We don't honour the C-extension's caching of resolved types;
+      the linear walk over registered types is fast enough for our
+      target workloads.
+    - PEP 585 / annotation-based registration is omitted because we
+      don't yet have a stable ``get_type_hints`` story for module-
+      level functions defined in WeavePy.
+    """
+    return _SingleDispatchCallable(func)
+
+
+# ---- cached_property --------------------------------------------------------
+
+
+_MISSING = object()
+
+
+class cached_property:
+    """Method decorator turning ``self.foo`` into a once-computed attr.
+
+    Compared to :class:`property`, the value produced by the wrapped
+    function is stored back onto the instance's ``__dict__`` under the
+    attribute's name, so subsequent accesses short-circuit the
+    descriptor and don't re-enter the wrapped function.
+    """
+
+    def __init__(self, func):
+        self.func = func
+        self.attrname = None
+        self.__doc__ = getattr(func, "__doc__", None)
+
+    def __set_name__(self, owner, name):
+        if self.attrname is None:
+            self.attrname = name
+        elif name != self.attrname:
+            raise TypeError(
+                "Cannot assign the same cached_property to two different names"
+            )
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        if self.attrname is None:
+            raise TypeError(
+                "Cannot use cached_property instance without calling __set_name__"
+            )
+        cached = instance.__dict__.get(self.attrname, _MISSING)
+        if cached is _MISSING:
+            cached = self.func(instance)
+            instance.__dict__[self.attrname] = cached
+        return cached

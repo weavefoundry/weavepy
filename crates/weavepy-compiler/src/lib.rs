@@ -366,6 +366,15 @@ struct Compiler {
     /// implicitly capture the class's `__class__` cell so `super()`
     /// works without arguments.
     inside_class_body: bool,
+    /// Tracks whether this scope's `__annotations__` dict has been
+    /// initialised yet (lazily, on the first `x: T` statement in a
+    /// class or module body). Used by
+    /// [`Self::compile_annotation_record`].
+    annotations_initialized: bool,
+    /// Mirror of [`Self::code_kind`] used by annotation logic; we
+    /// expose it here rather than threading the value through every
+    /// call site.
+    code_kind: CodeKind,
 }
 
 struct LoopFrame {
@@ -397,6 +406,8 @@ impl Compiler {
             line_index,
             current_line: 0,
             inside_class_body: false,
+            annotations_initialized: false,
+            code_kind: kind,
         }
     }
 
@@ -590,12 +601,23 @@ impl Compiler {
             }
             StmtKind::AnnAssign {
                 target,
-                annotation: _,
+                annotation,
                 value,
             } => {
+                // Always assign the value if provided, matching CPython
+                // semantics: `x: int = 3` both binds `x` and records the
+                // annotation.
                 if let Some(v) = value {
                     self.compile_expr(v)?;
                     self.compile_assign(target)?;
+                }
+                // In class and module bodies, record the annotation
+                // so `cls.__annotations__[name] = annotation` is
+                // observable (used by `dataclasses`, `typing`).
+                if matches!(self.code_kind, CodeKind::Class | CodeKind::Module) {
+                    if let ExprKind::Name(name) = &target.kind {
+                        self.compile_annotation_record(name, annotation)?;
+                    }
                 }
             }
             StmtKind::If { test, body, orelse } => {
@@ -1740,6 +1762,58 @@ impl Compiler {
     }
 
     // ---------- assignment ----------
+
+    /// Emit code that ensures the current scope's `__annotations__`
+    /// dict exists and records `annotation` against `name`. Used
+    /// for class- and module-body `x: T = ...` statements.
+    fn compile_annotation_record(
+        &mut self,
+        name: &str,
+        annotation: &Expr,
+    ) -> Result<(), CompileError> {
+        // `__annotations__` is created lazily as an ordinary local
+        // binding for class bodies (so we use STORE_NAME), and as a
+        // global for module bodies. The setup code is idempotent:
+        // `__annotations__ = __annotations__` is a no-op if it's
+        // already present.
+        //
+        // The actual sequence emitted here for each annotation is:
+        //   try: __annotations__
+        //   except NameError: __annotations__ = {}
+        //   __annotations__[name] = annotation
+        //
+        // We don't have try/except as an opcode-level construct
+        // here, so we fall back to a guarded LOAD that defaults to
+        // an empty dict if absent. This is implemented via the
+        // SETUP_ANNOTATIONS pattern CPython uses, but simplified:
+        // a plain BuildMap + STORE_NAME when missing.
+        let dict_name = "__annotations__";
+        // SETUP_ANNOTATIONS-equivalent: ensure the dict exists.
+        // The simplest correct emission is: BUILD_MAP 0; STORE_NAME
+        // __annotations__ — but this would overwrite an existing
+        // dict every time. Instead we guard with a small subroutine:
+        //
+        //   if `__annotations__` not in scope: __annotations__ = {}
+        //
+        // ... which we approximate by calling a helper builtin.
+        // Since we have neither, the practical approach is to lift
+        // the dict creation to once-per-class-body via a flag.
+        if !self.annotations_initialized {
+            // BUILD_MAP 0; STORE_NAME __annotations__
+            self.emit(OpCode::BuildMap, 0);
+            let idx = self.co.intern_name(dict_name);
+            self.emit(OpCode::StoreName, idx);
+            self.annotations_initialized = true;
+        }
+        // __annotations__[name] = annotation
+        self.compile_expr(annotation)?;
+        let dict_idx = self.co.intern_name(dict_name);
+        self.emit(OpCode::LoadName, dict_idx);
+        let key_idx = self.co.intern_constant(Constant::Str(name.to_owned()));
+        self.emit(OpCode::LoadConst, key_idx);
+        self.emit(OpCode::StoreSubscr, 0);
+        Ok(())
+    }
 
     fn compile_assign(&mut self, target: &Expr) -> Result<(), CompileError> {
         match &target.kind {
@@ -3050,6 +3124,27 @@ fn collect_inner_free_expr(
             collect_inner_free_expr(value, outer_bindings, out);
             collect_inner_free_expr(slice, outer_bindings, out);
         }
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            collect_inner_free_expr(value, outer_bindings, out);
+            if let Some(fs) = format_spec.as_deref() {
+                collect_inner_free_expr(fs, outer_bindings, out);
+            }
+        }
+        ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                collect_inner_free_expr(p, outer_bindings, out);
+            }
+        }
+        ExprKind::Slice { lower, upper, step } => {
+            for x in [lower.as_deref(), upper.as_deref(), step.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                collect_inner_free_expr(x, outer_bindings, out);
+            }
+        }
         _ => {}
     }
 }
@@ -3247,10 +3342,42 @@ fn collect_target_names(expr: &Expr, out: &mut HashSet<String>) {
     }
 }
 
+/// Walk a STORE target (`a = …`, `a, b = …`, `a.b = …`, `a[i] = …`)
+/// and collect *reads* it implicitly performs. Bare `Name` targets are
+/// pure writes and contribute no reads; everything else (attribute,
+/// subscript, tuple / list unpacking, starred elements) reads its
+/// container.
+fn collect_reads_assign_target(expr: &Expr, out: &mut HashSet<String>) {
+    match &expr.kind {
+        ExprKind::Name(_) => {}
+        ExprKind::Attribute { value, .. } => collect_reads_expr(value, out),
+        ExprKind::Subscript { value, slice } => {
+            collect_reads_expr(value, out);
+            collect_reads_expr(slice, out);
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) => {
+            for it in items {
+                collect_reads_assign_target(it, out);
+            }
+        }
+        ExprKind::Starred(inner) => collect_reads_assign_target(inner, out),
+        _ => collect_reads_expr(expr, out),
+    }
+}
+
 fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
     match &stmt.kind {
         StmtKind::Expr(e) | StmtKind::Return(Some(e)) => collect_reads_expr(e, out),
-        StmtKind::Assign { value, .. } => collect_reads_expr(value, out),
+        StmtKind::Assign { targets, value } => {
+            collect_reads_expr(value, out);
+            // Compound assignment targets (`a.b = ...`, `a[i] = ...`,
+            // `a, b = ...`) contain READS of the containing object.
+            // Without this, nested scopes can't see attributes /
+            // subscripts written through an outer variable.
+            for t in targets {
+                collect_reads_assign_target(t, out);
+            }
+        }
         StmtKind::AugAssign { target, value, .. } => {
             collect_reads_expr(target, out);
             collect_reads_expr(value, out);
@@ -3603,6 +3730,19 @@ fn collect_reads_expr(expr: &Expr, out: &mut HashSet<String>) {
             }
             collect_reads_expr(key, out);
             collect_reads_expr(value, out);
+        }
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            collect_reads_expr(value, out);
+            if let Some(fs) = format_spec.as_deref() {
+                collect_reads_expr(fs, out);
+            }
+        }
+        ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                collect_reads_expr(p, out);
+            }
         }
         _ => {}
     }

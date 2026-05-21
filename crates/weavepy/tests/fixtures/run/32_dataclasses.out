@@ -1,0 +1,11 @@
+Point(x=1, y=2)
+{'x': 1, 'y': 2}
+(1, 2)
+Point(x=99, y=2)
+['x', 'y']
+Frozen(name='hi', value=10) hi 10
+frozen rejected: cannot assign to field 'name'
+True
+True
+True
+[1] []

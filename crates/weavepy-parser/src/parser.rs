@@ -906,6 +906,11 @@ impl<'src> Parser<'src> {
             let paren = self.eat(&TokenKind::LPar);
             let mut names = Vec::new();
             loop {
+                // Tolerate a trailing comma inside parenthesised
+                // `from x import (a, b,)` — common in real codebases.
+                if paren && matches!(self.peek(), TokenKind::RPar) {
+                    break;
+                }
                 let n = self.expect(&TokenKind::Name, "imported name")?;
                 let name = self.lexeme(n.span).to_owned();
                 let asname = if self.at_keyword(Keyword::As) {
@@ -1980,16 +1985,47 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_subscript(&mut self) -> Result<Expr, ParseError> {
+        // Parse a single (sub)slice (`a`, `a:b`, `a:b:c`, etc.) — the
+        // comma-separated form (`x[a, b, c]`) is handled by the outer
+        // loop after this call returns.
+        let first = self.parse_subscript_single()?;
+        if !self.check(&TokenKind::Comma) {
+            return Ok(first);
+        }
+        // Multi-element subscript: collect into a tuple. Used by
+        // generic typing (`Dict[K, V]`, `Tuple[A, B, C]`), and by
+        // NumPy-style indexing (`arr[i, j]`).
+        let mut elts = vec![first];
+        while self.eat(&TokenKind::Comma) {
+            if matches!(self.peek(), TokenKind::RSqb) {
+                break;
+            }
+            elts.push(self.parse_subscript_single()?);
+        }
+        let span = elts
+            .first()
+            .map(|e| e.span)
+            .unwrap_or_else(|| self.peek_token().span);
+        Ok(Expr {
+            kind: ExprKind::Tuple(elts),
+            span,
+        })
+    }
+
+    fn parse_subscript_single(&mut self) -> Result<Expr, ParseError> {
         // Slice grammar: `lower? ':' upper? (':' step?)?` or plain expr.
         if self.check(&TokenKind::Colon) {
             self.bump();
-            let upper = if matches!(self.peek(), TokenKind::Colon | TokenKind::RSqb) {
+            let upper = if matches!(
+                self.peek(),
+                TokenKind::Colon | TokenKind::RSqb | TokenKind::Comma
+            ) {
                 None
             } else {
                 Some(Box::new(self.parse_ternary()?))
             };
             let step = if self.eat(&TokenKind::Colon) {
-                if matches!(self.peek(), TokenKind::RSqb) {
+                if matches!(self.peek(), TokenKind::RSqb | TokenKind::Comma) {
                     None
                 } else {
                     Some(Box::new(self.parse_ternary()?))
@@ -2011,15 +2047,17 @@ impl<'src> Parser<'src> {
         if !self.check(&TokenKind::Colon) {
             return Ok(first);
         }
-        // a:b:c
         self.bump();
-        let upper = if matches!(self.peek(), TokenKind::Colon | TokenKind::RSqb) {
+        let upper = if matches!(
+            self.peek(),
+            TokenKind::Colon | TokenKind::RSqb | TokenKind::Comma
+        ) {
             None
         } else {
             Some(Box::new(self.parse_ternary()?))
         };
         let step = if self.eat(&TokenKind::Colon) {
-            if matches!(self.peek(), TokenKind::RSqb) {
+            if matches!(self.peek(), TokenKind::RSqb | TokenKind::Comma) {
                 None
             } else {
                 Some(Box::new(self.parse_ternary()?))

@@ -90,6 +90,8 @@ pub fn default_builtins() -> DictData {
     reg!("issubclass", b_issubclass);
     reg!("super", b_super);
     reg!("id", b_id);
+    reg!("hash", b_hash);
+    reg!("dir", b_dir);
     reg!("hex", b_hex);
     reg!("oct", b_oct);
     reg!("bin", b_bin);
@@ -102,9 +104,10 @@ pub fn default_builtins() -> DictData {
     reg!("round", b_round);
     reg!("format", b_format);
     reg!("ascii", b_ascii);
-    reg!("property", b_property);
-    reg!("staticmethod", b_staticmethod);
-    reg!("classmethod", b_classmethod);
+    // `property`, `staticmethod`, `classmethod` are exposed as
+    // *types* now (see [`crate::builtin_types::BuiltinTypes`]),
+    // not as bare functions. The corresponding constructors are
+    // wired through [`crate::Vm::builtin_constructor_for`].
     reg!("getattr", b_getattr);
     reg!("setattr", b_setattr);
     reg!("delattr", b_delattr);
@@ -285,6 +288,21 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__exit__" => Some(method("__exit__", file_exit)),
             _ => None,
         },
+        // `property` objects expose `getter`/`setter`/`deleter`
+        // methods that return a *new* property carrying a patched
+        // function (the underlying decorator pattern).
+        Object::Property(_) => match name {
+            "getter" => Some(method("getter", property_getter)),
+            "setter" => Some(method("setter", property_setter)),
+            "deleter" => Some(method("deleter", property_deleter)),
+            "fget" | "fset" | "fdel" | "__doc__" => {
+                // These are looked up via `lookup_attr` in the VM
+                // rather than method dispatch; we don't return them
+                // here.
+                None
+            }
+            _ => None,
+        },
         _ => None,
     };
     f.map(|f| Object::Builtin(Rc::new(f)))
@@ -375,40 +393,57 @@ fn b_ascii(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(crate::ascii_value(v)))
 }
 
-/// `property(fget, fset=None, fdel=None, doc=None)`. We model
-/// properties as a small instance of a synthesised `property` class
-/// that the VM treats specially during attribute lookup. Storing the
-/// getter is enough for the typical decorator use case.
-fn b_property(args: &[Object]) -> Result<Object, RuntimeError> {
+/// `property(fget, fset=None, fdel=None, doc=None)`. Returns a real
+/// data descriptor; the VM dispatches `__get__` / `__set__` /
+/// `__delete__` on attribute access (see `Vm::descriptor_get` and
+/// the data-descriptor branch in `Vm::store_attr` /
+/// `Vm::delete_attr`).
+pub fn construct_property(args: &[Object]) -> Result<Object, RuntimeError> {
     let fget = args.first().cloned().unwrap_or(Object::None);
     let fset = args.get(1).cloned().unwrap_or(Object::None);
     let fdel = args.get(2).cloned().unwrap_or(Object::None);
     let doc = args.get(3).cloned().unwrap_or(Object::None);
-    let cls = crate::builtin_types::property_class();
-    let inst = crate::types::PyInstance::new(cls);
-    inst.dict
-        .borrow_mut()
-        .insert(crate::object::DictKey(Object::from_static("fget")), fget);
-    inst.dict
-        .borrow_mut()
-        .insert(crate::object::DictKey(Object::from_static("fset")), fset);
-    inst.dict
-        .borrow_mut()
-        .insert(crate::object::DictKey(Object::from_static("fdel")), fdel);
-    inst.dict
-        .borrow_mut()
-        .insert(crate::object::DictKey(Object::from_static("__doc__")), doc);
-    Ok(Object::Instance(Rc::new(inst)))
+    Ok(Object::Property(Rc::new(crate::object::PyProperty::new(
+        fget, fset, fdel, doc,
+    ))))
 }
 
-/// `staticmethod(f)` and `classmethod(f)` are markers; we don't
-/// distinguish behaviour at the class-body level yet, but the
-/// callable still works after decoration.
-fn b_staticmethod(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(args.first().cloned().unwrap_or(Object::None))
+/// `staticmethod(f)` — non-data descriptor that returns the wrapped
+/// callable unchanged on access.
+pub fn construct_staticmethod(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inner = args.first().cloned().unwrap_or(Object::None);
+    Ok(Object::StaticMethod(Rc::new(inner)))
 }
-fn b_classmethod(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(args.first().cloned().unwrap_or(Object::None))
+
+/// `classmethod(f)` — non-data descriptor that binds the wrapped
+/// callable to the *class* (not the instance) on access.
+pub fn construct_classmethod(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inner = args.first().cloned().unwrap_or(Object::None);
+    Ok(Object::ClassMethod(Rc::new(inner)))
+}
+
+fn property_with(
+    args: &[Object],
+    which: crate::object::PropertyAttr,
+) -> Result<Object, RuntimeError> {
+    let prop = match args.first() {
+        Some(Object::Property(p)) => p.clone(),
+        _ => return Err(type_error("expected property as first argument")),
+    };
+    let fn_ = args.get(1).cloned().unwrap_or(Object::None);
+    Ok(Object::Property(Rc::new(prop.with(which, fn_))))
+}
+
+fn property_getter(args: &[Object]) -> Result<Object, RuntimeError> {
+    property_with(args, crate::object::PropertyAttr::Get)
+}
+
+fn property_setter(args: &[Object]) -> Result<Object, RuntimeError> {
+    property_with(args, crate::object::PropertyAttr::Set)
+}
+
+fn property_deleter(args: &[Object]) -> Result<Object, RuntimeError> {
+    property_with(args, crate::object::PropertyAttr::Del)
 }
 
 fn b_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -522,14 +557,48 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             {
                 return Some(v);
             }
-            inst.class.lookup(name)
+            if let Some(v) = inst.class.lookup(name) {
+                return Some(v);
+            }
+            match name {
+                "__dict__" => Some(Object::Dict(inst.dict.clone())),
+                "__class__" => Some(Object::Type(inst.class.clone())),
+                _ => None,
+            }
         }
         Object::Module(m) => m
             .dict
             .borrow()
             .get(&crate::object::DictKey(Object::from_str(name)))
             .cloned(),
-        Object::Type(t) => t.lookup(name),
+        Object::Type(t) => {
+            if let Some(v) = t.lookup(name) {
+                return Some(v);
+            }
+            // Mirror the synthetic dunders served by `Vm::load_attr_type`.
+            // We can't reach the VM from here, but these are pure data
+            // reads off the TypeObject and safe to inline.
+            match name {
+                "__name__" | "__qualname__" => Some(Object::from_str(&t.name)),
+                "__bases__" => Some(Object::new_tuple(
+                    t.bases.iter().map(|b| Object::Type(b.clone())).collect(),
+                )),
+                "__mro__" => Some(Object::new_tuple(
+                    t.mro
+                        .borrow()
+                        .iter()
+                        .map(|b| Object::Type(b.clone()))
+                        .collect(),
+                )),
+                "__dict__" => Some(Object::Dict(t.dict.clone())),
+                _ => None,
+            }
+        }
+        Object::Function(f) => f
+            .attrs
+            .borrow()
+            .get(&crate::object::DictKey(Object::from_str(name)))
+            .cloned(),
         _ => None,
     }
 }
@@ -554,6 +623,12 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
                 .insert(crate::object::DictKey(Object::from_str(name)), value);
             Ok(())
         }
+        Object::Function(f) => {
+            f.attrs
+                .borrow_mut()
+                .insert(crate::object::DictKey(Object::from_str(name)), value);
+            Ok(())
+        }
         _ => Err(type_error(format!(
             "'{}' object has no attribute '{}'",
             obj.type_name(),
@@ -572,6 +647,12 @@ fn attr_delete(obj: &Object, name: &str) -> Result<(), RuntimeError> {
         }
         Object::Module(m) => {
             m.dict
+                .borrow_mut()
+                .shift_remove(&crate::object::DictKey(Object::from_str(name)));
+            Ok(())
+        }
+        Object::Function(f) => {
+            f.attrs
                 .borrow_mut()
                 .shift_remove(&crate::object::DictKey(Object::from_str(name)));
             Ok(())
@@ -707,6 +788,8 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `type(name, bases, ns)` is intercepted by the VM call site
+    // (see `Vm::dynamic_type_call`); only the 1-arg form reaches us.
     let arg = one(args, "type")?;
     let bt = builtin_types();
     let ty = match arg {
@@ -724,7 +807,11 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Dict(_) => bt.dict_.clone(),
         Object::Range(_) => bt.range_.clone(),
         Object::Function(_) | Object::Builtin(_) | Object::BoundMethod(_) => bt.function_.clone(),
-        Object::Type(_) => bt.type_.clone(),
+        Object::Property(_) => bt.property_.clone(),
+        Object::StaticMethod(_) => bt.staticmethod_.clone(),
+        Object::ClassMethod(_) => bt.classmethod_.clone(),
+        // For a class object: return its metaclass.
+        Object::Type(t) => t.metaclass_or_type(),
         Object::Instance(inst) => inst.class.clone(),
         _ => bt.object_.clone(),
     };
@@ -1083,6 +1170,9 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
         mro: RefCell::new(after),
         dict: Rc::new(RefCell::new(DictData::new())),
         flags: crate::types::TypeFlags::default(),
+        metaclass: RefCell::new(None),
+        slot_names: RefCell::new(Vec::new()),
+        forbids_dict: false,
     });
     let inst = crate::types::PyInstance {
         class: proxy,
@@ -1108,7 +1198,7 @@ fn b_issubclass(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 /// Walk `cls`'s MRO against a single type or tuple of types.
-fn class_matches_classinfo(
+pub fn class_matches_classinfo(
     cls: &crate::types::TypeObject,
     info: &Object,
 ) -> Result<bool, RuntimeError> {
@@ -1131,7 +1221,7 @@ fn class_matches_classinfo(
 }
 
 /// Compare a value's runtime type against a class or tuple of classes.
-fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeError> {
+pub fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeError> {
     let bt = builtin_types();
     let obj_class = match obj {
         Object::Instance(inst) => inst.class.clone(),
@@ -1144,16 +1234,102 @@ fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeError> 
         Object::List(_) => bt.list_.clone(),
         Object::Dict(_) => bt.dict_.clone(),
         Object::Range(_) => bt.range_.clone(),
-        Object::Type(_) => bt.type_.clone(),
+        // A class is an instance of its metaclass, not of `type`
+        // unconditionally — this matters for custom metaclasses.
+        Object::Type(t) => t.metaclass_or_type(),
         Object::Function(_) | Object::Builtin(_) | Object::BoundMethod(_) => bt.function_.clone(),
+        Object::Property(_) => bt.property_.clone(),
+        Object::StaticMethod(_) => bt.staticmethod_.clone(),
+        Object::ClassMethod(_) => bt.classmethod_.clone(),
+        Object::Bytes(_) => bt.bytes_.clone(),
+        Object::ByteArray(_) => bt.bytearray_.clone(),
+        Object::Set(_) => bt.set_.clone(),
+        Object::FrozenSet(_) => bt.frozenset_.clone(),
         _ => bt.object_.clone(),
     };
+    // Honour a metaclass-defined `__instancecheck__` (PEP 3119): if
+    // `info` is a class whose metaclass overrides `__instancecheck__`,
+    // route through it. Otherwise fall back to MRO inclusion.
+    if let Object::Type(info_cls) = info {
+        let meta = info_cls.metaclass_or_type();
+        if let Some(hook) = meta.lookup("__instancecheck__") {
+            // We don't have a Vm handle here, so the dispatch path
+            // for `isinstance` with metaclass-custom hooks lives in
+            // `Vm::do_isinstance_call` (see `Vm::call` interception).
+            // Fall through to the regular path; the VM interception
+            // will short-circuit before this is reached for the
+            // metaclass case.
+            let _ = hook;
+        }
+    }
     let _ = instance_is_subclass;
     class_matches_classinfo(&obj_class, info)
 }
 
 fn b_id(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(one(args, "id")?.repr().len() as i64))
+}
+
+/// Structural hash for primitives. Mirrors CPython's "hash by value"
+/// semantics for the built-in immutable types we support.
+pub fn hash_object(obj: &Object) -> Result<Object, RuntimeError> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    crate::object::DictKey(obj.clone()).hash(&mut h);
+    Ok(Object::Int(h.finish() as i64))
+}
+
+fn b_hash(args: &[Object]) -> Result<Object, RuntimeError> {
+    hash_object(one(args, "hash")?)
+}
+
+/// `dir(obj)` — return a sorted list of names available on *obj*.
+/// Mirrors CPython's "best effort" introspection: walk the class
+/// MRO, the instance dict, the module dict, or — for built-ins —
+/// fall back to a small list of dunder names. We deliberately keep
+/// this loose because runtime helpers (typing, dataclasses, abc)
+/// only need it to enumerate user attributes.
+fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::collections::BTreeSet;
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    let obj = one(args, "dir")?;
+    match obj {
+        Object::Instance(inst) => {
+            for k in inst.dict.borrow().keys() {
+                if let Object::Str(s) = &k.0 {
+                    names.insert(s.to_string());
+                }
+            }
+            for t in inst.class.mro.borrow().iter() {
+                for k in t.dict.borrow().keys() {
+                    if let Object::Str(s) = &k.0 {
+                        names.insert(s.to_string());
+                    }
+                }
+            }
+        }
+        Object::Type(t) => {
+            for cls in t.mro.borrow().iter() {
+                for k in cls.dict.borrow().keys() {
+                    if let Object::Str(s) = &k.0 {
+                        names.insert(s.to_string());
+                    }
+                }
+            }
+        }
+        Object::Module(m) => {
+            for k in m.dict.borrow().keys() {
+                if let Object::Str(s) = &k.0 {
+                    names.insert(s.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(Object::new_list(
+        names.into_iter().map(Object::from_str).collect(),
+    ))
 }
 
 fn b_hex(args: &[Object]) -> Result<Object, RuntimeError> {

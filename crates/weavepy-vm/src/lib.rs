@@ -523,6 +523,45 @@ impl Interpreter {
                     } else {
                         self.binary_subscr(&v, &i)?
                     }
+                } else if let Object::Type(ty) = &v {
+                    // `Foo[args]` — CPython looks up `__getitem__`
+                    // on the *metaclass* first (so `EnumMeta` can
+                    // intercept `Color['RED']`), then falls back to
+                    // `__class_getitem__` on the class itself
+                    // (PEP 560).
+                    let meta = ty.metaclass_or_type();
+                    let bt = builtin_types();
+                    let meta_getitem = if Rc::ptr_eq(&meta, &bt.type_) {
+                        None
+                    } else {
+                        meta.lookup("__getitem__")
+                    };
+                    if let Some(method) = meta_getitem {
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                            receiver: Object::Type(ty.clone()),
+                            function: method,
+                        }));
+                        self.call(
+                            &bound,
+                            std::slice::from_ref(&i),
+                            &[],
+                            &frame.globals.clone(),
+                        )?
+                    } else if let Some(method) = ty.lookup("__class_getitem__") {
+                        let callable = match method {
+                            Object::ClassMethod(inner) => (*inner).clone(),
+                            Object::StaticMethod(inner) => (*inner).clone(),
+                            other => other,
+                        };
+                        self.call(
+                            &callable,
+                            &[Object::Type(ty.clone()), i.clone()],
+                            &[],
+                            &frame.globals.clone(),
+                        )?
+                    } else {
+                        self.binary_subscr(&v, &i)?
+                    }
                 } else {
                     self.binary_subscr(&v, &i)?
                 };
@@ -590,7 +629,17 @@ impl Interpreter {
             OpCode::ContainsOp => {
                 let container = frame.pop()?;
                 let item = frame.pop()?;
-                let found = container.contains(&item)?;
+                let found = if let Some(method) = instance_method(&container, "__contains__") {
+                    let r = self.call(
+                        &method,
+                        std::slice::from_ref(&item),
+                        &[],
+                        &frame.globals.clone(),
+                    )?;
+                    r.is_truthy()
+                } else {
+                    container.contains(&item)?
+                };
                 let result = if ins.arg == 1 { !found } else { found };
                 frame.push(Object::Bool(result));
             }
@@ -955,6 +1004,7 @@ impl Interpreter {
                     defaults,
                     kw_defaults,
                     closure,
+                    attrs: Rc::new(RefCell::new(DictData::new())),
                 };
                 frame.push(Object::Function(Rc::new(f)));
             }
@@ -1386,80 +1436,51 @@ impl Interpreter {
 
     fn load_attr(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
         match obj {
-            Object::Instance(inst) => {
-                // Super proxies stash the real receiver under
-                // `__self__`. Re-bind methods looked up via the proxy
-                // so they run against the right `self`.
-                let super_receiver = inst
-                    .dict
-                    .borrow()
-                    .get(&DictKey(Object::from_static("__self__")))
-                    .cloned();
-                if name != "__self__" {
-                    if let Some(receiver) = super_receiver {
-                        if let Some(v) = inst.class.lookup(name) {
-                            return Ok(self.maybe_bind(&receiver, v));
-                        }
-                        return Err(attribute_error(format!(
-                            "'super' object has no attribute '{}'",
-                            name
-                        )));
+            Object::Instance(inst) => self.load_attr_instance(inst, obj, name),
+            Object::Type(ty) => self.load_attr_type(ty, name),
+            Object::Property(p) => match name {
+                "fget" => Ok(p.fget.clone()),
+                "fset" => Ok(p.fset.clone()),
+                "fdel" => Ok(p.fdel.clone()),
+                "__doc__" => Ok(p.doc.clone()),
+                _ => {
+                    if let Some(method) = self.lookup_method(obj, name) {
+                        return Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                            receiver: obj.clone(),
+                            function: method,
+                        })));
                     }
+                    Err(attribute_error(format!(
+                        "'property' object has no attribute '{}'",
+                        name
+                    )))
                 }
-                if let Some(v) = inst.dict.borrow().get(&DictKey(Object::from_str(name))) {
-                    return Ok(v.clone());
+            },
+            Object::StaticMethod(inner) => match name {
+                "__func__" => Ok((**inner).clone()),
+                "__isabstractmethod__" => {
+                    // Honour an `@abstractmethod` decorator applied
+                    // *under* `@staticmethod` (`@staticmethod
+                    // @abstractmethod def f(): ...`).
+                    Ok(self
+                        .load_attr(inner.as_ref(), "__isabstractmethod__")
+                        .unwrap_or(Object::Bool(false)))
                 }
-                if let Some(v) = inst.class.lookup(name) {
-                    // Descriptor protocol (simplified): a `property`
-                    // instance resolves by invoking `fget(self)`.
-                    if let Object::Instance(prop) = &v {
-                        if prop.class.name == "property" {
-                            let fget = prop
-                                .dict
-                                .borrow()
-                                .get(&DictKey(Object::from_static("fget")))
-                                .cloned()
-                                .unwrap_or(Object::None);
-                            if !matches!(fget, Object::None) {
-                                let receiver = obj.clone();
-                                return self.call(&fget, &[receiver], &[], &self.builtins.clone());
-                            }
-                        }
-                    }
-                    return Ok(self.maybe_bind(obj, v));
-                }
-                Err(attribute_error(format!(
-                    "'{}' object has no attribute '{}'",
-                    inst.class.name, name
-                )))
-            }
-            Object::Type(ty) => {
-                if let Some(v) = ty.lookup(name) {
-                    return Ok(v);
-                }
-                match name {
-                    "__name__" => return Ok(Object::from_str(&ty.name)),
-                    "__qualname__" => return Ok(Object::from_str(&ty.name)),
-                    "__bases__" => {
-                        let bases = ty.bases.iter().map(|b| Object::Type(b.clone())).collect();
-                        return Ok(Object::new_tuple(bases));
-                    }
-                    "__mro__" => {
-                        let mro = ty
-                            .mro
-                            .borrow()
-                            .iter()
-                            .map(|b| Object::Type(b.clone()))
-                            .collect();
-                        return Ok(Object::new_tuple(mro));
-                    }
-                    _ => {}
-                }
-                Err(attribute_error(format!(
-                    "type object '{}' has no attribute '{}'",
-                    ty.name, name
-                )))
-            }
+                _ => Err(attribute_error(format!(
+                    "'staticmethod' object has no attribute '{}'",
+                    name
+                ))),
+            },
+            Object::ClassMethod(inner) => match name {
+                "__func__" => Ok((**inner).clone()),
+                "__isabstractmethod__" => Ok(self
+                    .load_attr(inner.as_ref(), "__isabstractmethod__")
+                    .unwrap_or(Object::Bool(false))),
+                _ => Err(attribute_error(format!(
+                    "'classmethod' object has no attribute '{}'",
+                    name
+                ))),
+            },
             Object::Module(m) => {
                 if let Some(v) = m.dict.borrow().get(&DictKey(Object::from_str(name))) {
                     return Ok(v.clone());
@@ -1475,6 +1496,22 @@ impl Interpreter {
                 Err(attribute_error(format!(
                     "module '{}' has no attribute '{}'",
                     m.name, name
+                )))
+            }
+            Object::Function(f) => {
+                if let Some(v) = f.attrs.borrow().get(&DictKey(Object::from_str(name))) {
+                    return Ok(v.clone());
+                }
+                match name {
+                    "__name__" => return Ok(Object::from_str(&f.name)),
+                    "__qualname__" => return Ok(Object::from_str(&f.name)),
+                    "__doc__" => return Ok(Object::None),
+                    "__dict__" => return Ok(Object::Dict(f.attrs.clone())),
+                    _ => {}
+                }
+                Err(attribute_error(format!(
+                    "'function' object has no attribute '{}'",
+                    name
                 )))
             }
             _ => {
@@ -1493,12 +1530,256 @@ impl Interpreter {
         }
     }
 
+    /// Attribute access on a user-defined class instance. Implements
+    /// the CPython data/non-data descriptor protocol:
+    ///
+    ///   1. Look up `name` in the type's MRO → `meta_attr`.
+    ///   2. If `meta_attr` is a *data* descriptor (`property`,
+    ///      slot descriptor, or an instance whose class defines
+    ///      `__set__`/`__delete__`), call its `__get__` and return.
+    ///   3. Otherwise, return the instance dict entry if present.
+    ///   4. Otherwise, if `meta_attr` exists, run the (possibly
+    ///      non-data) descriptor `__get__` — that's also where bare
+    ///      functions become bound methods.
+    ///   5. Otherwise, dispatch the class's `__getattr__` if any.
+    ///   6. Otherwise, raise `AttributeError`.
+    fn load_attr_instance(
+        &mut self,
+        inst: &Rc<PyInstance>,
+        instance_obj: &Object,
+        name: &str,
+    ) -> Result<Object, RuntimeError> {
+        // Super proxies stash the real receiver under `__self__`.
+        // Re-bind methods looked up via the proxy so they run
+        // against the right `self`.
+        let super_receiver = inst
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__self__")))
+            .cloned();
+        if name != "__self__" {
+            if let Some(receiver) = super_receiver {
+                if let Some(v) = inst.class.lookup(name) {
+                    let owner = Object::Type(inst.class.clone());
+                    return self.descriptor_get(&v, &receiver, &owner);
+                }
+                return Err(attribute_error(format!(
+                    "'super' object has no attribute '{}'",
+                    name
+                )));
+            }
+        }
+
+        let meta_attr = inst.class.lookup(name);
+        let owner = Object::Type(inst.class.clone());
+
+        // (1) Data descriptor on class wins over instance dict.
+        if let Some(ref attr) = meta_attr {
+            if self.is_data_descriptor(attr) {
+                return self.descriptor_get(attr, instance_obj, &owner);
+            }
+        }
+
+        // (2) Instance dict.
+        if let Some(v) = inst.dict.borrow().get(&DictKey(Object::from_str(name))) {
+            return Ok(v.clone());
+        }
+
+        // (3) Non-data descriptor / function on class.
+        if let Some(attr) = meta_attr {
+            return self.descriptor_get(&attr, instance_obj, &owner);
+        }
+
+        // (3b) Synthetic dunders served from the instance itself —
+        // `__dict__` and `__class__` aren't normally stored on the
+        // user's instance dict but Python code (e.g.
+        // `functools.cached_property`) reaches for them anyway.
+        match name {
+            "__dict__" => return Ok(Object::Dict(inst.dict.clone())),
+            "__class__" => return Ok(Object::Type(inst.class.clone())),
+            _ => {}
+        }
+
+        // (4) __getattr__ fall-back.
+        if let Some(getattr) = inst.class.lookup("__getattr__") {
+            let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                receiver: instance_obj.clone(),
+                function: getattr,
+            }));
+            return self.call(
+                &bound,
+                &[Object::from_str(name)],
+                &[],
+                &self.builtins.clone(),
+            );
+        }
+
+        Err(attribute_error(format!(
+            "'{}' object has no attribute '{}'",
+            inst.class.name, name
+        )))
+    }
+
+    /// Attribute access on a class. Mirrors CPython's
+    /// `type.__getattribute__`: the metaclass MRO contributes data
+    /// descriptors that beat class-level attrs, the class itself is
+    /// then consulted with the *unbound* descriptor protocol (so
+    /// classmethods bind to the class, plain functions stay
+    /// unbound).
+    fn load_attr_type(&mut self, ty: &Rc<TypeObject>, name: &str) -> Result<Object, RuntimeError> {
+        let meta = ty.metaclass_or_type();
+        let owner = Object::Type(ty.clone());
+        let self_as_obj = Object::Type(ty.clone());
+
+        // (1) Metaclass-level data descriptor wins.
+        let meta_attr = meta.lookup(name);
+        if let Some(ref attr) = meta_attr {
+            if self.is_data_descriptor(attr) {
+                return self.descriptor_get(attr, &self_as_obj, &Object::Type(meta.clone()));
+            }
+        }
+
+        // (2) Look up the name in `ty` itself (and its MRO).
+        if let Some(attr) = ty.lookup(name) {
+            // Apply the descriptor protocol with no instance: classmethods
+            // bind to the class, plain functions stay as functions,
+            // staticmethods unwrap, properties remain themselves.
+            return self.descriptor_get(&attr, &Object::None, &owner);
+        }
+
+        // (3) Fall-through to (possibly non-data) metaclass attribute.
+        if let Some(attr) = meta_attr {
+            return self.descriptor_get(&attr, &self_as_obj, &Object::Type(meta.clone()));
+        }
+
+        // (4) Synthetic attributes.
+        match name {
+            "__name__" => return Ok(Object::from_str(&ty.name)),
+            "__qualname__" => return Ok(Object::from_str(&ty.name)),
+            "__bases__" => {
+                let bases = ty.bases.iter().map(|b| Object::Type(b.clone())).collect();
+                return Ok(Object::new_tuple(bases));
+            }
+            "__mro__" => {
+                let mro = ty
+                    .mro
+                    .borrow()
+                    .iter()
+                    .map(|b| Object::Type(b.clone()))
+                    .collect();
+                return Ok(Object::new_tuple(mro));
+            }
+            "__class__" => return Ok(Object::Type(meta)),
+            "__dict__" => return Ok(Object::Dict(ty.dict.clone())),
+            _ => {}
+        }
+        Err(attribute_error(format!(
+            "type object '{}' has no attribute '{}'",
+            ty.name, name
+        )))
+    }
+
+    /// Does `attr`, looked up on a class, behave as a *data*
+    /// descriptor? Data descriptors win against instance `__dict__`
+    /// during attribute access.
+    fn is_data_descriptor(&self, attr: &Object) -> bool {
+        match attr {
+            Object::Property(_) | Object::SlotDescriptor(_) => true,
+            Object::Instance(inst) => {
+                inst.class.lookup("__set__").is_some() || inst.class.lookup("__delete__").is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// Run the descriptor protocol against `attr` (already resolved
+    /// from a class MRO). `instance` is `Object::None` when accessed
+    /// directly on the class (e.g. `Foo.bar`).
+    fn descriptor_get(
+        &mut self,
+        attr: &Object,
+        instance: &Object,
+        owner: &Object,
+    ) -> Result<Object, RuntimeError> {
+        match attr {
+            Object::Property(prop) => {
+                if matches!(instance, Object::None) {
+                    return Ok(attr.clone());
+                }
+                if matches!(prop.fget, Object::None) {
+                    return Err(attribute_error("unreadable attribute"));
+                }
+                self.call(
+                    &prop.fget,
+                    std::slice::from_ref(instance),
+                    &[],
+                    &self.builtins.clone(),
+                )
+            }
+            Object::StaticMethod(inner) => Ok((**inner).clone()),
+            Object::ClassMethod(inner) => Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                receiver: owner.clone(),
+                function: (**inner).clone(),
+            }))),
+            Object::SlotDescriptor(slot) => match instance {
+                Object::None => Ok(attr.clone()),
+                Object::Instance(inst) => {
+                    let key = DictKey(Object::from_str(&slot.name));
+                    match inst.dict.borrow().get(&key) {
+                        Some(v) => Ok(v.clone()),
+                        None => Err(attribute_error(format!(
+                            "'{}' object has no attribute '{}'",
+                            inst.class.name, slot.name
+                        ))),
+                    }
+                }
+                _ => Err(type_error("slot descriptor requires an instance")),
+            },
+            Object::Function(_) | Object::Builtin(_) => {
+                if matches!(instance, Object::None) {
+                    Ok(attr.clone())
+                } else {
+                    Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: instance.clone(),
+                        function: attr.clone(),
+                    })))
+                }
+            }
+            Object::Instance(inner_inst) => {
+                // User-defined descriptor: invoke its `__get__` if
+                // present, otherwise pass the descriptor through.
+                if let Some(get_method) = inner_inst.class.lookup("__get__") {
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: attr.clone(),
+                        function: get_method,
+                    }));
+                    return self.call(
+                        &bound,
+                        &[instance.clone(), owner.clone()],
+                        &[],
+                        &self.builtins.clone(),
+                    );
+                }
+                Ok(attr.clone())
+            }
+            _ => Ok(attr.clone()),
+        }
+    }
+
     fn maybe_bind(&self, receiver: &Object, attr: Object) -> Object {
         match &attr {
             Object::Function(_) | Object::Builtin(_) => Object::BoundMethod(Rc::new(BoundMethod {
                 receiver: receiver.clone(),
                 function: attr,
             })),
+            Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod {
+                receiver: match receiver {
+                    Object::Instance(inst) => Object::Type(inst.class.clone()),
+                    other => other.clone(),
+                },
+                function: (**inner).clone(),
+            })),
+            Object::StaticMethod(inner) => (**inner).clone(),
             _ => attr,
         }
     }
@@ -1914,6 +2195,114 @@ impl Interpreter {
         Ok(Object::Bool(!want_any))
     }
 
+    /// `isinstance(obj, classinfo)` — honours `__instancecheck__` on
+    /// the *metaclass* of any class in `classinfo`, falling back to
+    /// the plain MRO walk otherwise. ABCMeta uses this to register
+    /// virtual subclasses.
+    fn do_isinstance_call(
+        &mut self,
+        obj: &Object,
+        classinfo: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        // Tuple of types: short-circuit on first match.
+        if let Object::Tuple(items) = classinfo {
+            for it in items.iter() {
+                if self.do_isinstance_call(obj, it, globals)?.is_truthy() {
+                    return Ok(Object::Bool(true));
+                }
+            }
+            return Ok(Object::Bool(false));
+        }
+        if let Object::Type(cls) = classinfo {
+            let meta = cls.metaclass_or_type();
+            // Only dispatch to a *user-defined* __instancecheck__.
+            // The built-in `type.__instancecheck__` is already what
+            // we'd compute by default, so skip it to avoid recursion.
+            if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+                if let Some(hook) = meta.lookup("__instancecheck__") {
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: Object::Type(cls.clone()),
+                        function: hook,
+                    }));
+                    let res = self.call(&bound, std::slice::from_ref(obj), &[], globals)?;
+                    return Ok(Object::Bool(res.is_truthy()));
+                }
+            }
+        }
+        // Default path: delegate to the builtin.
+        Ok(Object::Bool(builtins::matches_classinfo(obj, classinfo)?))
+    }
+
+    /// `issubclass(cls, classinfo)` — same protocol as
+    /// [`do_isinstance_call`] but for class membership.
+    fn do_issubclass_call(
+        &mut self,
+        cls: &Object,
+        classinfo: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        if let Object::Tuple(items) = classinfo {
+            for it in items.iter() {
+                if self.do_issubclass_call(cls, it, globals)?.is_truthy() {
+                    return Ok(Object::Bool(true));
+                }
+            }
+            return Ok(Object::Bool(false));
+        }
+        if let Object::Type(info_cls) = classinfo {
+            let meta = info_cls.metaclass_or_type();
+            if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+                if let Some(hook) = meta.lookup("__subclasscheck__") {
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: Object::Type(info_cls.clone()),
+                        function: hook,
+                    }));
+                    let res = self.call(&bound, std::slice::from_ref(cls), &[], globals)?;
+                    return Ok(Object::Bool(res.is_truthy()));
+                }
+            }
+        }
+        let cls_inner = match cls {
+            Object::Type(t) => t.clone(),
+            _ => return Err(type_error("issubclass() arg 1 must be a class")),
+        };
+        Ok(Object::Bool(builtins::class_matches_classinfo(
+            &cls_inner, classinfo,
+        )?))
+    }
+
+    /// `hash(obj)` — dispatch through the instance's `__hash__` if
+    /// defined, otherwise fall back to the structural hash. We also
+    /// reject objects whose class has `__hash__ = None` (CPython's
+    /// "unhashable" marker, used e.g. by `dataclass(eq=True)` when
+    /// frozen is False).
+    fn do_hash_call(
+        &mut self,
+        obj: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        if let Object::Instance(inst) = obj {
+            match inst.class.lookup("__hash__") {
+                Some(Object::None) => {
+                    return Err(type_error(format!(
+                        "unhashable type: '{}'",
+                        inst.class.name
+                    )));
+                }
+                Some(method @ (Object::Function(_) | Object::BoundMethod(_))) => {
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: obj.clone(),
+                        function: method,
+                    }));
+                    return self.call(&bound, &[], &[], globals);
+                }
+                _ => {}
+            }
+        }
+        builtins::hash_object(obj)
+    }
+
     fn do_sorted_call(
         &mut self,
         args: &[Object],
@@ -2034,6 +2423,19 @@ impl Interpreter {
                     "'{}' object is not iterable",
                     v.type_name_owned()
                 )))
+            }
+            Object::Type(ty) => {
+                // Iterating a class consults the metaclass for
+                // `__iter__` — that's how `list(MyEnum)` works.
+                let meta = ty.metaclass_or_type();
+                if let Some(method) = meta.lookup("__iter__") {
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: Object::Type(ty.clone()),
+                        function: method,
+                    }));
+                    return self.call(&bound, &[], &[], globals);
+                }
+                Err(type_error("'type' object is not iterable"))
             }
             _ => {
                 let it = v.make_iter()?;
@@ -2330,14 +2732,9 @@ impl Interpreter {
         compare_op(a, b, op)
     }
 
-    fn store_attr(&self, obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
+    fn store_attr(&mut self, obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
         match obj {
-            Object::Instance(inst) => {
-                inst.dict
-                    .borrow_mut()
-                    .insert(DictKey(Object::from_str(name)), value);
-                Ok(())
-            }
+            Object::Instance(inst) => self.store_attr_instance(inst, obj, name, value),
             Object::Type(ty) => {
                 if ty.flags.is_builtin {
                     return Err(type_error(format!(
@@ -2356,6 +2753,12 @@ impl Interpreter {
                     .insert(DictKey(Object::from_str(name)), value);
                 Ok(())
             }
+            Object::Function(f) => {
+                f.attrs
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(name)), value);
+                Ok(())
+            }
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),
@@ -2364,9 +2767,136 @@ impl Interpreter {
         }
     }
 
-    fn delete_attr(&self, obj: &Object, name: &str) -> Result<(), RuntimeError> {
+    /// Attribute set on a user instance. Implements the data-descriptor
+    /// path: if the class has a descriptor with `__set__`, dispatch
+    /// through it; otherwise enforce slot membership (when the class
+    /// declares `__slots__` without `__dict__`); otherwise write to
+    /// the instance dict.
+    fn store_attr_instance(
+        &mut self,
+        inst: &Rc<PyInstance>,
+        obj: &Object,
+        name: &str,
+        value: Object,
+    ) -> Result<(), RuntimeError> {
+        // User-defined __setattr__ on the class overrides everything.
+        // We only honour Python-level overrides; the builtin default
+        // (`object.__setattr__`) falls through to direct dict writes
+        // below to keep the fast path inlineable.
+        if let Some(setattr) = inst.class.lookup("__setattr__") {
+            if matches!(
+                setattr,
+                Object::Function(_) | Object::BoundMethod(_) | Object::Instance(_)
+            ) {
+                self.call(
+                    &setattr,
+                    &[obj.clone(), Object::from_str(name), value],
+                    &[],
+                    &self.builtins.clone(),
+                )?;
+                return Ok(());
+            }
+        }
+        if let Some(attr) = inst.class.lookup(name) {
+            match &attr {
+                Object::Property(prop) => {
+                    if matches!(prop.fset, Object::None) {
+                        return Err(attribute_error(format!(
+                            "property '{}' of '{}' object has no setter",
+                            name, inst.class.name
+                        )));
+                    }
+                    let setter = prop.fset.clone();
+                    self.call(&setter, &[obj.clone(), value], &[], &self.builtins.clone())?;
+                    return Ok(());
+                }
+                Object::SlotDescriptor(_) => {
+                    inst.dict
+                        .borrow_mut()
+                        .insert(DictKey(Object::from_str(name)), value);
+                    return Ok(());
+                }
+                Object::Instance(descriptor_inst) => {
+                    if let Some(setter) = descriptor_inst.class.lookup("__set__") {
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                            receiver: attr.clone(),
+                            function: setter,
+                        }));
+                        self.call(&bound, &[obj.clone(), value], &[], &self.builtins.clone())?;
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if inst.class.forbids_dict {
+            let slots = inst.class.slot_names.borrow();
+            if !slots.iter().any(|s| s == name) {
+                return Err(attribute_error(format!(
+                    "'{}' object has no attribute '{}'",
+                    inst.class.name, name
+                )));
+            }
+        }
+        inst.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_str(name)), value);
+        Ok(())
+    }
+
+    fn delete_attr(&mut self, obj: &Object, name: &str) -> Result<(), RuntimeError> {
         match obj {
             Object::Instance(inst) => {
+                if let Some(delattr) = inst.class.lookup("__delattr__") {
+                    if matches!(
+                        delattr,
+                        Object::Function(_) | Object::BoundMethod(_) | Object::Instance(_)
+                    ) {
+                        self.call(
+                            &delattr,
+                            &[obj.clone(), Object::from_str(name)],
+                            &[],
+                            &self.builtins.clone(),
+                        )?;
+                        return Ok(());
+                    }
+                }
+                if let Some(attr) = inst.class.lookup(name) {
+                    match &attr {
+                        Object::Property(prop) => {
+                            if matches!(prop.fdel, Object::None) {
+                                return Err(attribute_error(format!(
+                                    "property '{}' of '{}' object has no deleter",
+                                    name, inst.class.name
+                                )));
+                            }
+                            let deleter = prop.fdel.clone();
+                            self.call(
+                                &deleter,
+                                std::slice::from_ref(obj),
+                                &[],
+                                &self.builtins.clone(),
+                            )?;
+                            return Ok(());
+                        }
+                        Object::Instance(descriptor_inst) => {
+                            if let Some(deleter) = descriptor_inst.class.lookup("__delete__") {
+                                let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                                    receiver: attr.clone(),
+                                    function: deleter,
+                                }));
+                                self.call(
+                                    &bound,
+                                    std::slice::from_ref(obj),
+                                    &[],
+                                    &self.builtins.clone(),
+                                )?;
+                                return Ok(());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 if inst
                     .dict
                     .borrow_mut()
@@ -2389,6 +2919,23 @@ impl Interpreter {
     }
 
     fn binary_subscr(&self, container: &Object, index: &Object) -> Result<Object, RuntimeError> {
+        // `Type[...]` dispatches to `__class_getitem__` when defined.
+        // We can't reach into Vm::call from a `&self` method, so we
+        // bail out for now and let the dispatch site handle classes
+        // via the dedicated path. Built-in subscript paths below
+        // are unchanged.
+        if let Object::Type(_) = container {
+            // Caller paths that need class subscripting go through
+            // `binary_subscr_with_class_dispatch` below.
+        }
+        self.binary_subscr_basic(container, index)
+    }
+
+    fn binary_subscr_basic(
+        &self,
+        container: &Object,
+        index: &Object,
+    ) -> Result<Object, RuntimeError> {
         match (container, index) {
             (Object::List(items), Object::Int(i)) => {
                 let items = items.borrow();
@@ -2567,6 +3114,21 @@ impl Interpreter {
                 if b.name == builtins::BUILD_CLASS_NAME {
                     return self.build_class(args, kwargs);
                 }
+                // `type.__new__(mcs, name, bases, ns)` — invoked from
+                // user metaclasses via `super().__new__(...)`. Route
+                // to the actual type-construction path so the class
+                // ends up wired with the right metaclass.
+                if b.name == "__new__" && args.len() == 4 {
+                    if let Object::Type(mcs) = &args[0] {
+                        if mcs.is_subclass_of(&builtin_types().type_) {
+                            return self.dynamic_type_call_with_meta(
+                                mcs.clone(),
+                                &args[1..],
+                                kwargs,
+                            );
+                        }
+                    }
+                }
                 if b.name == "print" {
                     return self.do_print(args, kwargs, outer_globals);
                 }
@@ -2601,6 +3163,34 @@ impl Interpreter {
                 }
                 if b.name == "any" || b.name == "all" {
                     return self.do_any_all_call(b.name, args, outer_globals);
+                }
+                if b.name == "isinstance" && args.len() == 2 {
+                    return self.do_isinstance_call(&args[0], &args[1], outer_globals);
+                }
+                if b.name == "issubclass" && args.len() == 2 {
+                    return self.do_issubclass_call(&args[0], &args[1], outer_globals);
+                }
+                if b.name == "hash" && args.len() == 1 {
+                    return self.do_hash_call(&args[0], outer_globals);
+                }
+                if b.name == "globals" && args.is_empty() && kwargs.is_empty() {
+                    // CPython returns the calling function's module
+                    // globals. With our frame-by-argument model, the
+                    // active frame's globals are whatever the caller
+                    // is currently executing inside — and that's
+                    // exactly `outer_globals`.
+                    return Ok(Object::Dict(outer_globals.clone()));
+                }
+                // Pre-materialize generator/instance iterables for
+                // builtin methods that need to iterate them. The
+                // underlying static builtins call `Object::make_iter`
+                // directly, which can't drive a Python generator.
+                if matches!(b.name, "join" | "extend") && args.len() == 2 {
+                    if matches!(&args[1], Object::Generator(_) | Object::Instance(_)) {
+                        let collected = self.collect_iterable(&args[1], outer_globals)?;
+                        let new_args = vec![args[0].clone(), Object::new_list(collected)];
+                        return (b.call)(&new_args);
+                    }
                 }
                 if b.name == "sorted" && !args.is_empty() {
                     return self.do_sorted_call(args, kwargs, outer_globals);
@@ -2663,6 +3253,29 @@ impl Interpreter {
                         return self.do_repr_call(&args[0], outer_globals);
                     }
                 }
+                // `type(name, bases, ns)` builds a new class dynamically.
+                if Rc::ptr_eq(ty, &builtin_types().type_) && args.len() == 3 {
+                    return self.dynamic_type_call_with_meta(ty.clone(), args, kwargs);
+                }
+                // `Meta(name, bases, ns)` for a user metaclass —
+                // route through the metaclass-aware class builder.
+                let bt = builtin_types();
+                if ty.is_subclass_of(&bt.type_) && !Rc::ptr_eq(ty, &bt.type_) && args.len() == 3 {
+                    return self.dynamic_type_call_with_meta(ty.clone(), args, kwargs);
+                }
+                // If the class's *metaclass* overrides `__call__`,
+                // dispatch through it so EnumMeta etc. can hook
+                // calls like `Color(3)`.
+                let meta = ty.metaclass_or_type();
+                if !Rc::ptr_eq(&meta, &bt.type_) {
+                    if let Some(call_method) = meta.lookup("__call__") {
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                            receiver: Object::Type(ty.clone()),
+                            function: call_method,
+                        }));
+                        return self.call(&bound, args, kwargs, outer_globals);
+                    }
+                }
                 self.instantiate(ty.clone(), args, kwargs)
             }
             Object::Instance(inst) => {
@@ -2691,11 +3304,12 @@ impl Interpreter {
     ///
     /// `args[0]` is the class body function, `args[1]` is the class
     /// name, and the rest are explicit bases. Keyword arguments carry
-    /// `metaclass=` and similar (unsupported here).
+    /// `metaclass=` (used to pick a custom metaclass) and any other
+    /// class-creation keywords forwarded to `__init_subclass__`.
     fn build_class(
         &mut self,
         args: &[Object],
-        _kwargs: &[(String, Object)],
+        kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
         if args.len() < 2 {
             return Err(type_error("__build_class__ takes at least 2 args"));
@@ -2724,6 +3338,28 @@ impl Interpreter {
         if bases.is_empty() {
             bases.push(builtin_types().object_.clone());
         }
+
+        // Pull `metaclass=` out of kwargs; the rest are passed to
+        // `__init_subclass__` (matching CPython's PEP 487 rules).
+        let mut metaclass_arg: Option<Rc<TypeObject>> = None;
+        let mut subclass_kwargs: Vec<(String, Object)> = Vec::new();
+        for (k, v) in kwargs {
+            if k == "metaclass" {
+                if let Object::Type(t) = v {
+                    metaclass_arg = Some(t.clone());
+                } else {
+                    return Err(type_error("metaclass= must be a type"));
+                }
+            } else {
+                subclass_kwargs.push((k.clone(), v.clone()));
+            }
+        }
+
+        // Determine the effective metaclass: explicit `metaclass=`
+        // beats anything inherited; otherwise pick the most-derived
+        // metaclass of any base.
+        let metaclass = resolve_metaclass(metaclass_arg, &bases)?;
+
         let class_ns = Rc::new(RefCell::new(DictData::new()));
         {
             let mut ns = class_ns.borrow_mut();
@@ -2749,8 +3385,98 @@ impl Interpreter {
         );
         frame.class_namespace = Some(class_ns.clone());
         let _ = self.run_frame(&mut frame)?;
-        let dict = class_ns.borrow().clone();
-        let ty = TypeObject::new_user(&name, bases, dict)?;
+
+        // Dispatch through the metaclass: this also runs any
+        // user-defined `__new__` / `__init__` chain (EnumMeta uses
+        // __new__ for member processing, ABCMeta uses __init__).
+        let bt = builtin_types();
+        let is_plain_type = Rc::ptr_eq(&metaclass, &bt.type_);
+        let ty = if is_plain_type {
+            let dict = class_ns.borrow().clone();
+            let ty = TypeObject::new_user(&name, bases.clone(), dict)?;
+            ty.set_metaclass(metaclass.clone());
+            self.finalize_class_namespace(&ty)?;
+            self.invoke_set_name_hooks(&ty)?;
+            self.invoke_init_subclass(&ty, &subclass_kwargs)?;
+            ty
+        } else {
+            // Custom metaclass: route through `metaclass(name, bases, ns)`.
+            // The metaclass's `__new__` (if any) chains into
+            // `type.__new__`, which we intercept via
+            // `dynamic_type_call_with_meta` to actually build the type.
+            let bases_tuple =
+                Object::new_tuple(bases.iter().map(|b| Object::Type(b.clone())).collect());
+            let ns_dict = Object::Dict(class_ns.clone());
+            let call_args = vec![Object::from_str(&name), bases_tuple, ns_dict];
+            // Run the metaclass's __new__ first if it defines one;
+            // otherwise fall through to the default class construction.
+            let new_method = metaclass.lookup("__new__");
+            // Detect whether the resolved __new__ is the sentinel
+            // `type.__new__` we install at startup (which would
+            // recurse) — in that case skip the call and build the
+            // class directly via `dynamic_type_call_with_meta`.
+            let is_type_new_sentinel = matches!(
+                new_method.as_ref(),
+                Some(Object::StaticMethod(inner)) if matches!(
+                    inner.as_ref(),
+                    Object::Builtin(b) if b.name == "__new__"
+                )
+            );
+            let class_obj = match &new_method {
+                Some(_) if !is_type_new_sentinel => {
+                    let callable = match new_method.as_ref().unwrap() {
+                        Object::StaticMethod(inner) => (**inner).clone(),
+                        Object::ClassMethod(inner) => (**inner).clone(),
+                        other => other.clone(),
+                    };
+                    let mut new_args = Vec::with_capacity(call_args.len() + 1);
+                    new_args.push(Object::Type(metaclass.clone()));
+                    new_args.extend(call_args.iter().cloned());
+                    self.call(
+                        &callable,
+                        &new_args,
+                        &subclass_kwargs,
+                        &Rc::new(RefCell::new(DictData::new())),
+                    )?
+                }
+                _ => self.dynamic_type_call_with_meta(
+                    metaclass.clone(),
+                    &call_args,
+                    &subclass_kwargs,
+                )?,
+            };
+            let ty = match class_obj {
+                Object::Type(t) => t,
+                other => {
+                    return Err(type_error(format!(
+                        "metaclass.__new__ must return a type, got '{}'",
+                        other.type_name()
+                    )))
+                }
+            };
+            // Run `__init__` if a user `__new__` was used (the
+            // dynamic_type_call_with_meta path already invokes
+            // __init__ when it falls through to the default).
+            if let Some(new_fn) = new_method.as_ref() {
+                if !is_type_new_sentinel {
+                    let _ = new_fn;
+                    if let Some(init) = metaclass.lookup("__init__") {
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                            receiver: Object::Type(ty.clone()),
+                            function: init,
+                        }));
+                        let _ = self.call(
+                            &bound,
+                            &call_args,
+                            &subclass_kwargs,
+                            &Rc::new(RefCell::new(DictData::new())),
+                        )?;
+                    }
+                }
+            }
+            ty
+        };
+
         // If the body produced a `__class__` cell (because a method
         // references super or __class__), point it at the new type.
         for (i, cell_name) in body_fn.code.cellvars.iter().enumerate() {
@@ -2763,7 +3489,231 @@ impl Interpreter {
         Ok(Object::Type(ty))
     }
 
-    /// Allocate an instance of `cls` and call `__init__` if defined.
+    /// `metaclass(name, bases, ns)` — the three-arg form that
+    /// builds a new class. Used by `type(name, bases, ns)`, by
+    /// custom metaclasses, and by the build_class path when the
+    /// metaclass's `__new__` chains back into `type.__new__`.
+    fn dynamic_type_call_with_meta(
+        &mut self,
+        metaclass: Rc<TypeObject>,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+    ) -> Result<Object, RuntimeError> {
+        let name = match &args[0] {
+            Object::Str(s) => s.to_string(),
+            _ => return Err(type_error("type() arg 1 must be str")),
+        };
+        let bases: Vec<Rc<TypeObject>> = match &args[1] {
+            Object::Tuple(items) => items
+                .iter()
+                .map(|b| match b {
+                    Object::Type(t) => Ok(t.clone()),
+                    other => Err(type_error(format!(
+                        "type() arg 2 entry must be a class, got '{}'",
+                        other.type_name()
+                    ))),
+                })
+                .collect::<Result<_, _>>()?,
+            _ => return Err(type_error("type() arg 2 must be tuple of bases")),
+        };
+        let ns_dict_obj = args[2].clone();
+        let ns = match &args[2] {
+            Object::Dict(d) => d.borrow().clone(),
+            _ => return Err(type_error("type() arg 3 must be a dict")),
+        };
+        let mut effective_bases = bases.clone();
+        if effective_bases.is_empty() {
+            effective_bases.push(builtin_types().object_.clone());
+        }
+        let bt = builtin_types();
+        let is_plain_type = Rc::ptr_eq(&metaclass, &bt.type_);
+
+        // Separate `metaclass=` and per-class-creation kwargs (the
+        // latter flow to `__init_subclass__` and to the metaclass's
+        // `__init__`).
+        let subclass_kwargs: Vec<(String, Object)> = kwargs
+            .iter()
+            .filter(|(k, _)| k != "metaclass")
+            .cloned()
+            .collect();
+
+        let ty = TypeObject::new_user(&name, effective_bases.clone(), ns)?;
+        ty.set_metaclass(metaclass.clone());
+        self.finalize_class_namespace(&ty)?;
+
+        // If we're under a user metaclass, run its `__init__` so it
+        // can mutate the class (member registration in EnumMeta,
+        // abstract-method tracking in ABCMeta).
+        if !is_plain_type {
+            if let Some(init) = metaclass.lookup("__init__") {
+                let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                    receiver: Object::Type(ty.clone()),
+                    function: init,
+                }));
+                let bases_tuple = Object::new_tuple(
+                    effective_bases
+                        .iter()
+                        .map(|b| Object::Type(b.clone()))
+                        .collect(),
+                );
+                let _ = self.call(
+                    &bound,
+                    &[Object::from_str(&name), bases_tuple, ns_dict_obj],
+                    &subclass_kwargs,
+                    &Rc::new(RefCell::new(DictData::new())),
+                )?;
+            }
+        }
+
+        self.invoke_set_name_hooks(&ty)?;
+        self.invoke_init_subclass(&ty, &subclass_kwargs)?;
+        Ok(Object::Type(ty))
+    }
+
+    /// Post-process a freshly built class dict: lift `__slots__`
+    /// into descriptors, and propagate the `forbids_dict` flag from
+    /// the MRO.
+    fn finalize_class_namespace(&mut self, ty: &Rc<TypeObject>) -> Result<(), RuntimeError> {
+        // Pull __slots__ out if present.
+        let slots_obj = ty
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__slots__")))
+            .cloned();
+        if let Some(slots) = slots_obj {
+            let names = match &slots {
+                Object::Str(s) => vec![s.to_string()],
+                Object::Tuple(_) | Object::List(_) => {
+                    let mut out = Vec::new();
+                    let mut it = slots.make_iter()?;
+                    while let Some(v) = it.next_value() {
+                        if let Object::Str(s) = v {
+                            out.push(s.to_string());
+                        } else {
+                            return Err(type_error("__slots__ items must be str"));
+                        }
+                    }
+                    out
+                }
+                _ => return Err(type_error("__slots__ must be a tuple/list/str")),
+            };
+            let allows_dict_in_slots = names.iter().any(|s| s == "__dict__");
+            *ty.slot_names.borrow_mut() = names.clone();
+            // Install slot descriptors for each name (skipping
+            // `__dict__` and `__weakref__` which are marker names).
+            for slot_name in &names {
+                if slot_name == "__dict__" || slot_name == "__weakref__" {
+                    continue;
+                }
+                let desc = Object::SlotDescriptor(Rc::new(crate::object::SlotDescriptor {
+                    name: slot_name.clone(),
+                    class_name: ty.name.clone(),
+                }));
+                ty.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(slot_name)), desc);
+            }
+            // If the slot list omits __dict__ AND no base allows
+            // arbitrary attrs (i.e. every base also forbids dict),
+            // mark this class as forbidding instance __dict__.
+            let bases_all_forbid = ty.bases.iter().all(|b| {
+                if Rc::ptr_eq(b, &builtin_types().object_) {
+                    return true;
+                }
+                b.forbids_dict
+            });
+            if !allows_dict_in_slots && bases_all_forbid {
+                // SAFETY: we own the only `Rc<TypeObject>` reference
+                // before installing the class anywhere; mutating
+                // `forbids_dict` is fine because no other code path
+                // observes it yet.
+                let raw = Rc::as_ptr(ty).cast_mut();
+                // SAFETY: see comment above; no aliasing reads in flight.
+                unsafe { (*raw).forbids_dict = true };
+            }
+        }
+        Ok(())
+    }
+
+    /// Invoke `__set_name__(cls, name)` for every descriptor in the
+    /// freshly-built class namespace that defines it. PEP 487.
+    fn invoke_set_name_hooks(&mut self, ty: &Rc<TypeObject>) -> Result<(), RuntimeError> {
+        let entries: Vec<(String, Object)> = ty
+            .dict
+            .borrow()
+            .iter()
+            .filter_map(|(k, v)| match &k.0 {
+                Object::Str(s) => Some((s.to_string(), v.clone())),
+                _ => None,
+            })
+            .collect();
+        for (attr_name, value) in entries {
+            if let Object::Instance(inst) = &value {
+                if let Some(hook) = inst.class.lookup("__set_name__") {
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: value.clone(),
+                        function: hook,
+                    }));
+                    let _ = self.call(
+                        &bound,
+                        &[Object::Type(ty.clone()), Object::from_str(&attr_name)],
+                        &[],
+                        &self.builtins.clone(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run `__init_subclass__` for the first base in MRO order that
+    /// defines it (excluding the new class itself). PEP 487.
+    fn invoke_init_subclass(
+        &mut self,
+        ty: &Rc<TypeObject>,
+        subclass_kwargs: &[(String, Object)],
+    ) -> Result<(), RuntimeError> {
+        // Snapshot the MRO and bind the hook into a local first so we
+        // can drop every borrow before re-entering the VM. The user
+        // hook is free to mutate any class in the chain.
+        let mro_bases: Vec<Rc<TypeObject>> = ty.mro.borrow().iter().skip(1).cloned().collect();
+        let mut hook: Option<Object> = None;
+        for base in &mro_bases {
+            if let Some(h) = base
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("__init_subclass__")))
+                .cloned()
+            {
+                hook = Some(h);
+                break;
+            }
+        }
+        let Some(hook) = hook else {
+            return Ok(());
+        };
+        // CPython treats __init_subclass__ as an implicit classmethod
+        // regardless of how it was defined.
+        let callable = match hook {
+            Object::ClassMethod(inner) => (*inner).clone(),
+            other => other,
+        };
+        let bound = Object::BoundMethod(Rc::new(BoundMethod {
+            receiver: Object::Type(ty.clone()),
+            function: callable,
+        }));
+        self.call(
+            &bound,
+            &[],
+            subclass_kwargs,
+            &Rc::new(RefCell::new(DictData::new())),
+        )?;
+        Ok(())
+    }
+
+    /// Allocate an instance of `cls`, then run the `__new__` /
+    /// `__init__` two-phase initialisation. The descriptor protocol
+    /// gives us classmethod binding for `__new__` for free.
     fn instantiate(
         &mut self,
         cls: Rc<TypeObject>,
@@ -2773,6 +3723,27 @@ impl Interpreter {
         // Built-in conversion types route to the underlying builtin
         // function so `int("3")`, `range(5)`, `list(xs)` keep working.
         if cls.flags.is_builtin {
+            // Descriptor wrapper classes (property/staticmethod/
+            // classmethod) — route to dedicated constructors.
+            match cls.name.as_str() {
+                "property" => {
+                    if !kwargs.is_empty() {
+                        // CPython accepts `fget=`, `fset=`, etc.,
+                        // but we keep the keyword form simple here.
+                        return Err(type_error(
+                            "property() takes positional arguments only here",
+                        ));
+                    }
+                    return builtins::construct_property(args);
+                }
+                "staticmethod" => {
+                    return builtins::construct_staticmethod(args);
+                }
+                "classmethod" => {
+                    return builtins::construct_classmethod(args);
+                }
+                _ => {}
+            }
             // Special-case `list(it)` / `tuple(it)` so generators flow
             // through the VM-aware collector.
             if (cls.name == "list" || cls.name == "tuple") && args.len() == 1 {
@@ -2801,26 +3772,82 @@ impl Interpreter {
                 return Ok(self.build_exception_instance(cls, args));
             }
         }
-        let instance = Object::Instance(Rc::new(PyInstance::new(cls.clone())));
-        if let Some(init) = cls.lookup("__init__") {
-            let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                receiver: instance.clone(),
-                function: init,
-            }));
-            let result = self.call(
-                &bound,
-                args,
-                kwargs,
-                &Rc::new(RefCell::new(DictData::new())),
-            )?;
-            if !matches!(result, Object::None) {
-                return Err(type_error(format!(
-                    "__init__() should return None, not '{}'",
-                    result.type_name()
-                )));
+
+        // `__new__` chain: walk the MRO; the first base that defines a
+        // user `__new__` (other than the implicit `object.__new__`)
+        // owns instance allocation. If none is found, fall back to the
+        // default allocator.
+        let new_fn = cls.lookup("__new__");
+        let is_object_new = matches!(
+            &new_fn,
+            Some(Object::StaticMethod(inner))
+                if matches!(
+                    inner.as_ref(),
+                    Object::Builtin(b) if b.name == "__new__"
+                )
+        );
+        let instance = match new_fn {
+            Some(_) if !is_object_new => {
+                // User-defined `__new__` — pass cls + args + kwargs.
+                let callable = match new_fn.unwrap() {
+                    Object::StaticMethod(inner) => (*inner).clone(),
+                    Object::ClassMethod(inner) => (*inner).clone(),
+                    other => other,
+                };
+                let mut new_args: Vec<Object> = Vec::with_capacity(args.len() + 1);
+                new_args.push(Object::Type(cls.clone()));
+                new_args.extend_from_slice(args);
+                self.call(
+                    &callable,
+                    &new_args,
+                    kwargs,
+                    &Rc::new(RefCell::new(DictData::new())),
+                )?
             }
-        } else if !args.is_empty() || !kwargs.is_empty() {
-            return Err(type_error(format!("{}() takes no arguments", cls.name)));
+            _ => Object::Instance(Rc::new(PyInstance::new(cls.clone()))),
+        };
+
+        // Only run `__init__` when `type(instance) is cls`, matching
+        // CPython. If `__new__` returned something else, leave it
+        // alone (this is how `int.__new__` etc. work for immutable
+        // subclasses).
+        let init_eligible = match &instance {
+            Object::Instance(inst) => Rc::ptr_eq(&inst.class, &cls),
+            // Built-in `__new__` returns may not be Instance; in that
+            // case don't run __init__ — the caller meant to bypass.
+            _ => false,
+        };
+        if init_eligible {
+            if let Some(init) = cls.lookup("__init__") {
+                let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                    receiver: instance.clone(),
+                    function: init,
+                }));
+                let result = self.call(
+                    &bound,
+                    args,
+                    kwargs,
+                    &Rc::new(RefCell::new(DictData::new())),
+                )?;
+                if !matches!(result, Object::None) {
+                    return Err(type_error(format!(
+                        "__init__() should return None, not '{}'",
+                        result.type_name()
+                    )));
+                }
+            } else if !args.is_empty() || !kwargs.is_empty() {
+                // Inherit `object()` semantics: object()-without-args
+                // is fine; any args trigger `TypeError`.
+                let inherits_only_object_init = cls
+                    .mro
+                    .borrow()
+                    .iter()
+                    .skip(1)
+                    .all(|t| Rc::ptr_eq(t, &builtin_types().object_));
+                if inherits_only_object_init {
+                    return Err(type_error(format!("{}() takes no arguments", cls.name)));
+                }
+            }
         }
         Ok(instance)
     }
@@ -3480,6 +4507,35 @@ enum FrameOutcome {
 /// If `obj` is an instance and its class defines `name`, return the
 /// bound method. Used by dunder dispatch to avoid the full
 /// `load_attr` codepath (and the AttributeError if missing).
+/// Resolve the effective metaclass for a new class given an explicit
+/// `metaclass=` keyword (if any) and the list of explicit bases.
+///
+/// Matches CPython's `type.__new__` rule: the chosen metaclass must
+/// be a (possibly equal) subclass of every base's metaclass, with the
+/// explicit `metaclass=` keyword acting as the seed when present.
+fn resolve_metaclass(
+    explicit: Option<Rc<TypeObject>>,
+    bases: &[Rc<TypeObject>],
+) -> Result<Rc<TypeObject>, RuntimeError> {
+    let bt = builtin_types();
+    let mut winner: Rc<TypeObject> = explicit.unwrap_or_else(|| bt.type_.clone());
+    for b in bases {
+        let m = b.metaclass_or_type();
+        if winner.is_subclass_of(&m) {
+            continue;
+        }
+        if m.is_subclass_of(&winner) {
+            winner = m;
+            continue;
+        }
+        return Err(type_error(
+            "metaclass conflict: the metaclass of a derived class must be a (non-strict) \
+             subclass of the metaclasses of all its bases",
+        ));
+    }
+    Ok(winner)
+}
+
 fn instance_method(obj: &Object, name: &str) -> Option<Object> {
     let inst = match obj {
         Object::Instance(i) => i.clone(),

@@ -76,5 +76,25 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/argparse.py"),
             is_package: false,
         },
+        FrozenSource {
+            name: "abc",
+            source: include_str!("python/abc.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "enum",
+            source: include_str!("python/enum.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "dataclasses",
+            source: include_str!("python/dataclasses.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "typing",
+            source: include_str!("python/typing.py"),
+            is_package: false,
+        },
     ]
 }
