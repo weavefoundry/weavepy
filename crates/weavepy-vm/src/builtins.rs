@@ -594,13 +594,130 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 _ => None,
             }
         }
-        Object::Function(f) => f
-            .attrs
-            .borrow()
-            .get(&crate::object::DictKey(Object::from_str(name)))
-            .cloned(),
+        Object::Function(f) => {
+            if let Some(v) = f
+                .attrs
+                .borrow()
+                .get(&crate::object::DictKey(Object::from_str(name)))
+                .cloned()
+            {
+                return Some(v);
+            }
+            // Synthetic dunders. Mirror `Vm::load_attr`'s function
+            // branch so introspection routes (`hasattr`, `getattr`,
+            // `inspect.iscoroutinefunction`) agree with direct
+            // attribute access.
+            match name {
+                "__name__" | "__qualname__" => Some(Object::from_str(&f.name)),
+                "__doc__" => Some(Object::None),
+                "__dict__" => Some(Object::Dict(f.attrs.clone())),
+                "__code__" => Some(Object::Code(f.code.clone())),
+                "__globals__" => Some(Object::Dict(f.globals.clone())),
+                "__defaults__" => {
+                    if f.defaults.is_empty() {
+                        Some(Object::None)
+                    } else {
+                        Some(Object::new_tuple(f.defaults.clone()))
+                    }
+                }
+                "__kwdefaults__" => {
+                    if f.kw_defaults.is_empty() {
+                        Some(Object::None)
+                    } else {
+                        let mut d = crate::object::DictData::new();
+                        for (k, v) in &f.kw_defaults {
+                            d.insert(crate::object::DictKey(Object::from_str(k)), v.clone());
+                        }
+                        Some(Object::Dict(Rc::new(RefCell::new(d))))
+                    }
+                }
+                "__closure__" => {
+                    if f.closure.is_empty() {
+                        Some(Object::None)
+                    } else {
+                        Some(Object::new_tuple(f.closure.clone()))
+                    }
+                }
+                _ => None,
+            }
+        }
+        Object::Code(c) => code_synthetic_attr(c, name),
         _ => None,
     }
+}
+
+/// Synthetic attribute access on a [`Object::Code`]. Matches CPython's
+/// `code` object surface for the fields user code commonly inspects
+/// (`co_flags`, `co_name`, `co_argcount`, etc.). Returning `None` falls
+/// back to the generic `AttributeError`.
+pub(crate) fn code_synthetic_attr(
+    c: &Rc<weavepy_compiler::CodeObject>,
+    name: &str,
+) -> Option<Object> {
+    match name {
+        "co_name" | "__name__" => Some(Object::from_str(&c.name)),
+        "co_qualname" | "__qualname__" => Some(Object::from_str(&c.name)),
+        "co_filename" => Some(Object::from_str(&c.filename)),
+        "co_argcount" => Some(Object::Int(i64::from(c.arg_count))),
+        "co_posonlyargcount" => Some(Object::Int(i64::from(c.posonly_count))),
+        "co_kwonlyargcount" => Some(Object::Int(i64::from(c.kwonly_count))),
+        "co_nlocals" => Some(Object::Int(c.varnames.len() as i64)),
+        "co_stacksize" => Some(Object::Int(0)),
+        "co_flags" => Some(Object::Int(i64::from(code_flags(c)))),
+        "co_varnames" => Some(Object::new_tuple(
+            c.varnames.iter().map(Object::from_str).collect(),
+        )),
+        "co_cellvars" => Some(Object::new_tuple(
+            c.cellvars.iter().map(Object::from_str).collect(),
+        )),
+        "co_freevars" => Some(Object::new_tuple(
+            c.freevars.iter().map(Object::from_str).collect(),
+        )),
+        "co_names" => Some(Object::new_tuple(
+            c.names.iter().map(Object::from_str).collect(),
+        )),
+        "co_firstlineno" => Some(Object::Int(i64::from(
+            c.linetable.first().copied().unwrap_or(0),
+        ))),
+        _ => None,
+    }
+}
+
+/// Compose CPython-shaped `co_flags` for a [`weavepy_compiler::CodeObject`].
+/// We carry the same flag bits CPython does for the cases the
+/// introspection ecosystem checks for: vararg / kwarg presence,
+/// generator / coroutine / async-generator status, and the implicit
+/// `OPTIMIZED | NEWLOCALS` pair every function frame uses.
+pub(crate) fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
+    const CO_OPTIMIZED: u32 = 0x0001;
+    const CO_NEWLOCALS: u32 = 0x0002;
+    const CO_VARARGS: u32 = 0x0004;
+    const CO_VARKEYWORDS: u32 = 0x0008;
+    const CO_GENERATOR: u32 = 0x0020;
+    const CO_NOFREE: u32 = 0x0040;
+    const CO_COROUTINE: u32 = 0x0080;
+    const CO_ITERABLE_COROUTINE: u32 = 0x0100;
+    const CO_ASYNC_GENERATOR: u32 = 0x0200;
+    let mut f = CO_OPTIMIZED | CO_NEWLOCALS;
+    if c.has_varargs {
+        f |= CO_VARARGS;
+    }
+    if c.has_varkeywords {
+        f |= CO_VARKEYWORDS;
+    }
+    if c.is_generator {
+        f |= CO_GENERATOR;
+    }
+    if c.is_coroutine {
+        f |= CO_COROUTINE | CO_ITERABLE_COROUTINE;
+    }
+    if c.is_async_generator {
+        f |= CO_ASYNC_GENERATOR;
+    }
+    if c.freevars.is_empty() && c.cellvars.is_empty() {
+        f |= CO_NOFREE;
+    }
+    f
 }
 
 fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
@@ -810,6 +927,9 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Property(_) => bt.property_.clone(),
         Object::StaticMethod(_) => bt.staticmethod_.clone(),
         Object::ClassMethod(_) => bt.classmethod_.clone(),
+        Object::Generator(_) => bt.generator_.clone(),
+        Object::Coroutine(_) => bt.coroutine_.clone(),
+        Object::AsyncGenerator(_) => bt.async_generator_.clone(),
         // For a class object: return its metaclass.
         Object::Type(t) => t.metaclass_or_type(),
         Object::Instance(inst) => inst.class.clone(),

@@ -1,0 +1,12 @@
+[0, 1, 2]
+inside lock
+locked: False
+rlock state: False
+set? False
+set? True
+set? False
+sem depleted
+sem refilled
+main name: MainThread
+active: 1
+ident: 1

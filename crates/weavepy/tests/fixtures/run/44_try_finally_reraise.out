@@ -1,0 +1,9 @@
+finally ran
+caught: boom
+1
+2
+inner finally
+caught: late boom
+inner
+outer
+caught: v

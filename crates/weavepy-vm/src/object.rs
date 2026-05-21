@@ -50,6 +50,15 @@ pub enum Object {
     /// shared via `Rc<RefCell<…>>` so it can be resumed by `next()`,
     /// `.send(v)`, `.throw(e)`, and `.close()`.
     Generator(Rc<PyGenerator>),
+    /// A live coroutine object (PEP 492, RFC 0016) — the value
+    /// returned from calling an `async def`. Reuses [`PyGenerator`]'s
+    /// suspended-frame machinery; the variant tag distinguishes it
+    /// for the awaitable protocol and `isinstance` checks.
+    Coroutine(Rc<PyGenerator>),
+    /// A live async-generator object (PEP 525, RFC 0016) — the value
+    /// returned from calling an `async def` that contains `yield`.
+    /// Consumable via `async for`.
+    AsyncGenerator(Rc<PyGenerator>),
     /// Immutable byte string `b"..."`.
     Bytes(Rc<[u8]>),
     /// Mutable byte string `bytearray(...)`.
@@ -109,6 +118,8 @@ impl fmt::Debug for Object {
             Object::Instance(i) => write!(f, "<{} object>", i.class.name),
             Object::Module(m) => write!(f, "<module {:?}>", m.name),
             Object::Generator(g) => write!(f, "<generator object {}>", g.name),
+            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name),
+            Object::AsyncGenerator(g) => write!(f, "<async_generator object {}>", g.name),
             Object::Bytes(b) => write!(f, "Bytes({})", b.len()),
             Object::ByteArray(b) => write!(f, "ByteArray({})", b.borrow().len()),
             Object::Set(s) => f.debug_set().entries(s.borrow().iter()).finish(),
@@ -344,6 +355,16 @@ impl fmt::Debug for PyGenerator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<generator {}>", self.name)
     }
+}
+
+/// Flavour of a `PyGenerator`. Stored alongside the suspended frame
+/// so the same suspension machinery serves all three async-shaped
+/// objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoroutineKind {
+    Generator,
+    Coroutine,
+    AsyncGenerator,
 }
 
 /// State machine for an active or exhausted generator. The frame is
@@ -769,6 +790,8 @@ impl Object {
             | Object::Type(_)
             | Object::Module(_)
             | Object::Generator(_)
+            | Object::Coroutine(_)
+            | Object::AsyncGenerator(_)
             | Object::File(_)
             | Object::Property(_)
             | Object::StaticMethod(_)
@@ -820,6 +843,8 @@ impl Object {
             (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
             (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
             (Object::Generator(a), Object::Generator(b)) => Rc::ptr_eq(a, b),
+            (Object::Coroutine(a), Object::Coroutine(b)) => Rc::ptr_eq(a, b),
+            (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
             (Object::Bytes(a), Object::Bytes(b)) => Rc::ptr_eq(a, b),
             (Object::ByteArray(a), Object::ByteArray(b)) => Rc::ptr_eq(a, b),
             (Object::Set(a), Object::Set(b)) => Rc::ptr_eq(a, b),
@@ -1067,6 +1092,8 @@ impl Object {
             Object::Instance(_) => "object",
             Object::Module(_) => "module",
             Object::Generator(_) => "generator",
+            Object::Coroutine(_) => "coroutine",
+            Object::AsyncGenerator(_) => "async_generator",
             Object::Bytes(_) => "bytes",
             Object::ByteArray(_) => "bytearray",
             Object::Set(_) => "set",
@@ -1187,6 +1214,16 @@ impl Object {
             },
             Object::Generator(g) => format!(
                 "<generator object {} at 0x{:x}>",
+                g.name,
+                Rc::as_ptr(g) as usize
+            ),
+            Object::Coroutine(g) => format!(
+                "<coroutine object {} at 0x{:x}>",
+                g.name,
+                Rc::as_ptr(g) as usize
+            ),
+            Object::AsyncGenerator(g) => format!(
+                "<async_generator object {} at 0x{:x}>",
                 g.name,
                 Rc::as_ptr(g) as usize
             ),

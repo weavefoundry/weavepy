@@ -300,6 +300,33 @@ pub enum OpCode {
     /// jumps by `arg`. Otherwise it leaves `[iter, yielded]` and
     /// falls through.
     Send,
+    /// `END_SEND` (RFC 0016). Stack on entry: `[..., iter, value]`.
+    /// Pops the iterator (`stack[-2]`) and leaves the value on TOS —
+    /// the result of `yield from` / `await` once the sub-iterator
+    /// completes.
+    EndSend,
+
+    // Async (RFC 0016)
+    /// Replace TOS with `TOS.__await__()` (an iterator). The `arg`
+    /// indicates the surrounding context: 0 = ordinary `await`,
+    /// 1 = `async for` (used by the runtime for error messages),
+    /// 2 = `async with`.
+    GetAwaitable,
+    /// `aiter = TOS; TOS = aiter.__aiter__()` — the async-iter
+    /// equivalent of `GET_ITER`.
+    GetAiter,
+    /// Peek the async iterator at TOS (don't pop), push
+    /// `aiter.__anext__()` (an awaitable). Used in the `async for`
+    /// loop preamble before awaiting.
+    GetAnext,
+    /// `async for` cleanup: caught `StopAsyncIteration`; pop the
+    /// exception and the underlying iterator. Stack on entry:
+    /// `[..., aiter, exc]`. Stack on exit: `[...]`.
+    EndAsyncFor,
+    /// `async with` enter: pop the context manager, push its
+    /// `__aexit__` method (saved for the exit path), then push
+    /// `cm.__aenter__()` (the awaitable that yields the bound value).
+    BeforeAsyncWith,
 
     // Pattern matching (RFC 0009)
     /// Peek TOS, push True if it's a sequence (list/tuple/range).
@@ -394,6 +421,12 @@ impl OpCode {
             OpCode::GetYieldFromIter => "GET_YIELD_FROM_ITER",
             OpCode::ReturnGenerator => "RETURN_GENERATOR",
             OpCode::Send => "SEND",
+            OpCode::EndSend => "END_SEND",
+            OpCode::GetAwaitable => "GET_AWAITABLE",
+            OpCode::GetAiter => "GET_AITER",
+            OpCode::GetAnext => "GET_ANEXT",
+            OpCode::EndAsyncFor => "END_ASYNC_FOR",
+            OpCode::BeforeAsyncWith => "BEFORE_ASYNC_WITH",
             OpCode::MatchSequence => "MATCH_SEQUENCE",
             OpCode::MatchMapping => "MATCH_MAPPING",
             OpCode::MatchClass => "MATCH_CLASS",

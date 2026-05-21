@@ -1,0 +1,13 @@
+enter a
+inside a
+exit a
+enter outer
+enter inner
+inside both
+exit inner
+exit outer
+enter x
+enter y
+inside x and y
+exit y
+exit x

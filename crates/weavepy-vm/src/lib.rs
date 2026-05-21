@@ -35,8 +35,8 @@ pub mod types;
 use crate::builtin_types::{builtin_types, instance_is_subclass, make_exception_with_class};
 use crate::error::{
     attribute_error, import_error, index_error, key_error, module_not_found_error, name_error,
-    runtime_error, stop_iteration, stop_iteration_with, type_error, value_error,
-    zero_division_error, TracebackEntry,
+    runtime_error, stop_async_iteration, stop_iteration, stop_iteration_with, type_error,
+    value_error, zero_division_error, TracebackEntry,
 };
 pub use crate::error::{PyException, RuntimeError};
 pub use crate::import::ModuleCache;
@@ -1207,6 +1207,12 @@ impl Interpreter {
                 frame.push(it);
             }
             OpCode::Send => {
+                // CPython 3.13 SEND semantics: stack on entry is
+                // `[..., iter, value]`. We pop `value`, peek `iter`,
+                // and either push the yielded value (success) or
+                // replace `value` with `e.value` and jump (StopIter).
+                // The iterator stays at sub-top in BOTH cases — the
+                // surrounding `END_SEND` pops it once the loop ends.
                 let value = frame.pop()?;
                 let iter = frame
                     .stack
@@ -1214,10 +1220,31 @@ impl Interpreter {
                     .cloned()
                     .ok_or_else(|| RuntimeError::Internal("SEND empty stack".to_owned()))?;
                 let result = match &iter {
-                    Object::Generator(g) => self.generator_send(g, value),
+                    Object::Generator(g) | Object::Coroutine(g) => self.generator_send(g, value),
+                    Object::AsyncGenerator(g) => {
+                        // Async-generator semantics under SEND
+                        // (simple cooperative model — no support for
+                        // `await` *inside* the agen body, which would
+                        // require CPython's intermediate-value
+                        // passthrough machinery):
+                        //   * `agen` yields `v` -> asend completes
+                        //     with value `v` (i.e. emulate
+                        //     `StopIteration(v)` so SEND short-
+                        //     circuits to `END_SEND`).
+                        //   * `agen` returns -> raise
+                        //     `StopAsyncIteration`.
+                        //   * `agen` raises -> propagate.
+                        match self.generator_send(g, value) {
+                            Ok(v) => Err(stop_iteration_with(v)),
+                            Err(RuntimeError::PyException(exc))
+                                if exc.type_name() == "StopIteration" =>
+                            {
+                                Err(stop_async_iteration())
+                            }
+                            other => other,
+                        }
+                    }
                     Object::Iter(_) => {
-                        // For non-generator iterators, `value` should be
-                        // None (this is the standard `next()` resume).
                         if !matches!(value, Object::None) {
                             return Err(type_error(
                                 "can't send non-None value to a just-started iterator",
@@ -1233,13 +1260,61 @@ impl Interpreter {
                 match result {
                     Ok(v) => frame.push(v),
                     Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
-                        frame.pop()?;
+                        // CPython 3.13: SEND only short-circuits on
+                        // `StopIteration`. `StopAsyncIteration` must
+                        // propagate so the surrounding async-for's
+                        // exception handler (END_ASYNC_FOR) can clean
+                        // up.
                         let payload = exception_value(&exc.instance);
                         frame.push(payload);
                         frame.pc += ins.arg;
                     }
                     Err(e) => return Err(e),
                 }
+            }
+            OpCode::EndSend => {
+                // Stack: [iter, value]. Pop iter, keep value.
+                let value = frame.pop()?;
+                let _iter = frame.pop()?;
+                frame.push(value);
+            }
+            OpCode::GetAwaitable => {
+                let v = frame.pop()?;
+                let it = self.get_awaitable(v)?;
+                frame.push(it);
+            }
+            OpCode::GetAiter => {
+                let v = frame.pop()?;
+                let it = self.get_aiter(v, &frame.globals.clone())?;
+                frame.push(it);
+            }
+            OpCode::GetAnext => {
+                let aiter =
+                    frame.stack.last().cloned().ok_or_else(|| {
+                        RuntimeError::Internal("GET_ANEXT empty stack".to_owned())
+                    })?;
+                let globals = frame.globals.clone();
+                let aw = self.get_anext(&aiter, &globals)?;
+                frame.push(aw);
+            }
+            OpCode::EndAsyncFor => {
+                // Stack: [aiter, exc]. We need to drop both. Re-raise
+                // anything that isn't StopAsyncIteration.
+                let exc = frame.pop()?;
+                let _aiter = frame.pop()?;
+                if !is_stop_async_iteration_obj(&exc) {
+                    let py_exc = PyException::new(exc);
+                    return Err(RuntimeError::PyException(py_exc));
+                }
+            }
+            OpCode::BeforeAsyncWith => {
+                let cm = frame.pop()?;
+                let globals = frame.globals.clone();
+                let aexit = self.load_attr(&cm, "__aexit__")?;
+                let aenter = self.load_attr(&cm, "__aenter__")?;
+                let aw = self.call(&aenter, &[], &[], &globals)?;
+                frame.push(aexit);
+                frame.push(aw);
             }
             OpCode::MatchSequence => {
                 let v = frame.top()?;
@@ -1436,6 +1511,28 @@ impl Interpreter {
 
     fn load_attr(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
         match obj {
+            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+                let allowed: &[&str] = match obj {
+                    Object::Generator(_) => &["send", "throw", "close", "__next__", "__iter__"],
+                    Object::Coroutine(_) => &["send", "throw", "close", "__await__"],
+                    Object::AsyncGenerator(_) => {
+                        &["__aiter__", "__anext__", "asend", "athrow", "aclose"]
+                    }
+                    _ => &[],
+                };
+                if allowed.contains(&name) {
+                    let method = make_gen_method(name, obj);
+                    return Ok(method);
+                }
+                match name {
+                    "__name__" | "__qualname__" => Ok(Object::from_str(&g.name)),
+                    _ => Err(attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        obj.type_name(),
+                        name
+                    ))),
+                }
+            }
             Object::Instance(inst) => self.load_attr_instance(inst, obj, name),
             Object::Type(ty) => self.load_attr_type(ty, name),
             Object::Property(p) => match name {
@@ -1507,10 +1604,43 @@ impl Interpreter {
                     "__qualname__" => return Ok(Object::from_str(&f.name)),
                     "__doc__" => return Ok(Object::None),
                     "__dict__" => return Ok(Object::Dict(f.attrs.clone())),
+                    "__code__" => return Ok(Object::Code(f.code.clone())),
+                    "__globals__" => return Ok(Object::Dict(f.globals.clone())),
+                    "__defaults__" => {
+                        if f.defaults.is_empty() {
+                            return Ok(Object::None);
+                        }
+                        return Ok(Object::new_tuple(f.defaults.clone()));
+                    }
+                    "__kwdefaults__" => {
+                        if f.kw_defaults.is_empty() {
+                            return Ok(Object::None);
+                        }
+                        let mut d = DictData::new();
+                        for (k, v) in &f.kw_defaults {
+                            d.insert(DictKey(Object::from_str(k)), v.clone());
+                        }
+                        return Ok(Object::Dict(Rc::new(RefCell::new(d))));
+                    }
+                    "__closure__" => {
+                        if f.closure.is_empty() {
+                            return Ok(Object::None);
+                        }
+                        return Ok(Object::new_tuple(f.closure.clone()));
+                    }
                     _ => {}
                 }
                 Err(attribute_error(format!(
                     "'function' object has no attribute '{}'",
+                    name
+                )))
+            }
+            Object::Code(c) => {
+                if let Some(v) = crate::builtins::code_synthetic_attr(c, name) {
+                    return Ok(v);
+                }
+                Err(attribute_error(format!(
+                    "'code' object has no attribute '{}'",
                     name
                 )))
             }
@@ -2444,6 +2574,90 @@ impl Interpreter {
         }
     }
 
+    /// Drive an awaitable into its underlying iterator (PEP 492 /
+    /// RFC 0016). A coroutine is itself awaitable; an async generator
+    /// is not (it must be consumed via `async for`). Any other object
+    /// is consulted via `__await__()`.
+    fn get_awaitable(&mut self, value: Object) -> Result<Object, RuntimeError> {
+        match &value {
+            // An async generator that surfaced through `__anext__` is
+            // already drivable via SEND; treat it as its own
+            // awaitable so the surrounding await-dance can run.
+            Object::Coroutine(_) | Object::Generator(_) | Object::AsyncGenerator(_) => Ok(value),
+            Object::Instance(_) => {
+                if let Some(method) = instance_method(&value, "__await__") {
+                    let it = self.call(&method, &[], &[], &fallback_globals())?;
+                    return Ok(it);
+                }
+                Err(type_error(format!(
+                    "object {} can't be used in 'await' expression",
+                    value.type_name_owned()
+                )))
+            }
+            _ => Err(type_error(format!(
+                "object {} can't be used in 'await' expression",
+                value.type_name_owned()
+            ))),
+        }
+    }
+
+    /// `__aiter__` dispatch — `aiter()`. Async generators are
+    /// directly iterable; other objects must implement `__aiter__`.
+    fn get_aiter(
+        &mut self,
+        value: Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        match &value {
+            Object::AsyncGenerator(_) => Ok(value),
+            Object::Instance(_) => {
+                if let Some(method) = instance_method(&value, "__aiter__") {
+                    return self.call(&method, &[], &[], globals);
+                }
+                Err(type_error(format!(
+                    "'{}' object is not async-iterable",
+                    value.type_name_owned()
+                )))
+            }
+            _ => Err(type_error(format!(
+                "'{}' object is not async-iterable",
+                value.type_name_owned()
+            ))),
+        }
+    }
+
+    /// `__anext__` dispatch — returns the awaitable that yields the
+    /// next value of the async iterator.
+    fn get_anext(
+        &mut self,
+        aiter: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        match aiter {
+            Object::AsyncGenerator(_) => {
+                // The async generator is itself the awaitable for the
+                // next yield (cooperative model — we don't allocate a
+                // fresh `async_generator_asend` like CPython does).
+                // `SEND` knows how to translate `StopIteration` into
+                // `StopAsyncIteration` for async generators.
+                Ok(aiter.clone())
+            }
+            Object::Instance(_) => {
+                if let Some(method) = instance_method(aiter, "__anext__") {
+                    return self.call(&method, &[], &[], globals);
+                }
+                Err(type_error(format!(
+                    "'{}' object is not an async iterator",
+                    aiter.type_name_owned()
+                )))
+            }
+            _ => Err(type_error(format!(
+                "'{}' object is not an async iterator",
+                aiter.type_name_owned()
+            ))),
+        }
+    }
+
     /// Pull the next value from `iter`. Returns `Ok(None)` on
     /// exhaustion, `Ok(Some(v))` on yield, or propagates errors.
     fn iter_next(
@@ -2519,6 +2733,137 @@ impl Interpreter {
         }
     }
 
+    /// `gen.send(value)` / `coro.send(value)` / `agen.asend(value)`
+    /// dispatch entry. The receiver is one of the three async-shaped
+    /// object kinds; this routes to [`Self::generator_send`].
+    fn gen_method_send(
+        &mut self,
+        receiver: &Object,
+        value: Object,
+    ) -> Result<Object, RuntimeError> {
+        let (g, is_async_gen) = match receiver {
+            Object::Generator(g) | Object::Coroutine(g) => (g.clone(), false),
+            Object::AsyncGenerator(g) => (g.clone(), true),
+            other => {
+                return Err(type_error(format!(
+                    "send() requires a generator/coroutine, got '{}'",
+                    other.type_name()
+                )))
+            }
+        };
+        match self.generator_send(&g, value) {
+            Err(RuntimeError::PyException(exc))
+                if is_async_gen && exc.type_name() == "StopIteration" =>
+            {
+                Err(stop_async_iteration())
+            }
+            other => other,
+        }
+    }
+
+    /// `gen.throw(exc[, val[, tb]])` — inject an exception at the
+    /// suspended yield-point. Minimal implementation: we don't try
+    /// to faithfully resume the frame; we raise the exception out of
+    /// the caller's `.throw()` call site.
+    fn gen_method_throw(
+        &mut self,
+        receiver: &Object,
+        args: &[Object],
+    ) -> Result<Object, RuntimeError> {
+        let (g, is_async_gen) = match receiver {
+            Object::Generator(g) | Object::Coroutine(g) => (g.clone(), false),
+            Object::AsyncGenerator(g) => (g.clone(), true),
+            _ => return Err(type_error("throw() requires a generator/coroutine")),
+        };
+        let exc_obj = args
+            .first()
+            .cloned()
+            .ok_or_else(|| type_error("throw() requires an exception argument"))?;
+        let instance = match &exc_obj {
+            Object::Type(t) => crate::builtin_types::make_exception_with_class(t.clone(), ""),
+            inst @ Object::Instance(_) => inst.clone(),
+            other => {
+                return Err(type_error(format!(
+                    "throw() argument must be an exception, got '{}'",
+                    other.type_name()
+                )))
+            }
+        };
+        match self.generator_throw(&g, PyException::new(instance)) {
+            Err(RuntimeError::PyException(exc))
+                if is_async_gen && exc.type_name() == "StopIteration" =>
+            {
+                Err(stop_async_iteration())
+            }
+            other => other,
+        }
+    }
+
+    /// Inject `exc` into the suspended generator at its current
+    /// resume point. The frame's exception table gets first crack;
+    /// if no handler matches the exception bubbles out of `throw()`.
+    fn generator_throw(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        exc: PyException,
+    ) -> Result<Object, RuntimeError> {
+        let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
+        let mut frame = match prev_state {
+            GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => *boxed
+                .downcast::<Frame>()
+                .map_err(|_| RuntimeError::Internal("generator frame downcast".to_owned()))?,
+            GeneratorState::Finished => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                return Err(RuntimeError::PyException(exc));
+            }
+            GeneratorState::Running => {
+                return Err(value_error("generator already executing"));
+            }
+        };
+        // Let the suspended frame handle the exception via its own
+        // exception table; if no handler claims it the error bubbles
+        // out and we mark the generator finished.
+        match self.handle_exception(&mut frame, exc) {
+            Ok(Some(())) => match self.run_until_yield_or_return(&mut frame, None) {
+                Ok(FrameOutcome::Yielded(v)) => {
+                    *gen.state.borrow_mut() = GeneratorState::Suspended(Box::new(frame));
+                    Ok(v)
+                }
+                Ok(FrameOutcome::Returned(v)) => {
+                    *gen.state.borrow_mut() = GeneratorState::Finished;
+                    Err(stop_iteration_with(v))
+                }
+                Ok(FrameOutcome::StartGenerator) => {
+                    *gen.state.borrow_mut() = GeneratorState::Finished;
+                    Err(RuntimeError::Internal(
+                        "RETURN_GENERATOR inside generator_throw".to_owned(),
+                    ))
+                }
+                Err(err) => {
+                    *gen.state.borrow_mut() = GeneratorState::Finished;
+                    Err(err)
+                }
+            },
+            Ok(None) => unreachable!(),
+            Err(err) => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                Err(err)
+            }
+        }
+    }
+
+    /// `gen.close()` — request the generator to terminate. We don't
+    /// run user `finally` blocks (CPython runs them by re-injecting
+    /// `GeneratorExit`); we just mark the generator finished.
+    fn gen_method_close(&mut self, receiver: &Object) -> Result<Object, RuntimeError> {
+        let g = match receiver {
+            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => g.clone(),
+            _ => return Err(type_error("close() requires a generator/coroutine")),
+        };
+        *g.state.borrow_mut() = GeneratorState::Finished;
+        Ok(Object::None)
+    }
+
     /// Run a generator's frame to its next yield or terminal state.
     /// `sent` is the value pushed onto the frame's stack as the
     /// result of the prior `YIELD_VALUE`; for `__next__()` callers
@@ -2565,12 +2910,15 @@ impl Interpreter {
                 Ok(v)
             }
             Ok(FrameOutcome::Returned(v)) => {
+                // Generators always surface the return value through
+                // `StopIteration.value`. Even a `return None` (or an
+                // implicit return) needs to leave the attribute set
+                // so the `SEND`/`END_SEND` machinery in the await
+                // dance unwraps to `None` rather than to the empty
+                // string we get from `from_builtin("StopIteration",
+                // "")`.
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                if matches!(v, Object::None) {
-                    Err(stop_iteration())
-                } else {
-                    Err(stop_iteration_with(v))
-                }
+                Err(stop_iteration_with(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
@@ -3235,6 +3583,59 @@ impl Interpreter {
             }
             Object::Function(f) => self.call_python(f, args, kwargs),
             Object::BoundMethod(bm) => {
+                // Generator / coroutine / async-generator methods are
+                // wired through internal builtin names so the
+                // dispatcher can see them here and run them with
+                // interpreter access. (Plain `Builtin.call` is a
+                // `fn(&[Object])` and can't.)
+                if let Object::Builtin(b) = &bm.function {
+                    match b.name {
+                        ".gen_send" => {
+                            let value = args.first().cloned().unwrap_or(Object::None);
+                            return self.gen_method_send(&bm.receiver, value);
+                        }
+                        ".gen_throw" => {
+                            return self.gen_method_throw(&bm.receiver, args);
+                        }
+                        ".gen_close" => {
+                            return self.gen_method_close(&bm.receiver);
+                        }
+                        ".gen_next" => {
+                            return self.gen_method_send(&bm.receiver, Object::None);
+                        }
+                        ".gen_iter" => {
+                            return Ok(bm.receiver.clone());
+                        }
+                        // --- async generator methods ---------------------
+                        // `__aiter__` returns the agen itself.
+                        ".agen_aiter" => return Ok(bm.receiver.clone()),
+                        // `__anext__` returns the agen wrapped as a
+                        // coroutine-shaped awaitable: when driven via
+                        // SEND, it forwards to the underlying generator
+                        // and translates StopIteration into
+                        // StopAsyncIteration so async-for can terminate.
+                        ".agen_anext" => match &bm.receiver {
+                            Object::AsyncGenerator(_) => return Ok(bm.receiver.clone()),
+                            other => {
+                                return Err(type_error(format!(
+                                    "__anext__ requires an async_generator, got '{}'",
+                                    other.type_name()
+                                )))
+                            }
+                        },
+                        ".agen_send" => {
+                            let value = args.first().cloned().unwrap_or(Object::None);
+                            return self.gen_method_send(&bm.receiver, value);
+                        }
+                        ".agen_throw" => {
+                            return self.gen_method_throw(&bm.receiver, args);
+                        }
+                        ".agen_close" => {
+                            return self.gen_method_close(&bm.receiver);
+                        }
+                        _ => {}
+                    }
+                }
                 let mut combined: Vec<Object> = Vec::with_capacity(args.len() + 1);
                 combined.push(bm.receiver.clone());
                 combined.extend_from_slice(args);
@@ -4026,14 +4427,20 @@ impl Interpreter {
             f.globals.clone(),
             false,
         );
-        if code.is_generator {
+        if code.is_generator || code.is_coroutine || code.is_async_generator {
             // Run the bootstrap so the frame is past
             // `RETURN_GENERATOR; POP_TOP; RESUME`. We then wrap the
             // frame in a PyGenerator and hand it back to the caller.
             match self.run_until_yield_or_return(&mut frame, None)? {
                 FrameOutcome::StartGenerator => {
-                    let gen = PyGenerator::new(f.name.clone(), Box::new(frame));
-                    Ok(Object::Generator(Rc::new(gen)))
+                    let gen = Rc::new(PyGenerator::new(f.name.clone(), Box::new(frame)));
+                    if code.is_coroutine {
+                        Ok(Object::Coroutine(gen))
+                    } else if code.is_async_generator {
+                        Ok(Object::AsyncGenerator(gen))
+                    } else {
+                        Ok(Object::Generator(gen))
+                    }
                 }
                 FrameOutcome::Returned(_) | FrameOutcome::Yielded(_) => {
                     Err(RuntimeError::Internal(
@@ -4546,6 +4953,56 @@ fn instance_method(obj: &Object, name: &str) -> Option<Object> {
         receiver: Object::Instance(inst),
         function: m,
     })))
+}
+
+/// Return a fresh empty globals dict — used by the awaitable
+/// dispatch paths that don't have a frame's globals handy. The
+/// dispatched method itself carries its own `__globals__`.
+fn fallback_globals() -> Rc<RefCell<DictData>> {
+    Rc::new(RefCell::new(DictData::new()))
+}
+
+/// `True` when `o` is a `StopAsyncIteration` instance (or one of
+/// its subclasses).
+fn is_stop_async_iteration_obj(o: &Object) -> bool {
+    if let Object::Instance(inst) = o {
+        let target = builtin_types().stop_async_iteration.clone();
+        return inst.class.is_subclass_of(&target);
+    }
+    false
+}
+
+/// Build the `Object::BoundMethod` returned by
+/// `<gen>.send` / `.throw` / `.close` / `.__next__` / `.__iter__`.
+/// The actual dispatch is handled by [`Interpreter::call`] via the
+/// special name prefix `.gen_*`.
+fn make_gen_method(name: &str, receiver: &Object) -> Object {
+    fn unreachable_call(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "generator method must be dispatched via Interpreter::call".to_owned(),
+        ))
+    }
+    let internal_name: &'static str = match name {
+        "send" => ".gen_send",
+        "throw" => ".gen_throw",
+        "close" => ".gen_close",
+        "__next__" => ".gen_next",
+        "__iter__" | "__await__" => ".gen_iter",
+        "__aiter__" => ".agen_aiter",
+        "__anext__" => ".agen_anext",
+        "asend" => ".agen_send",
+        "athrow" => ".agen_throw",
+        "aclose" => ".agen_close",
+        _ => ".gen_unknown",
+    };
+    let builtin = Object::Builtin(Rc::new(BuiltinFn {
+        name: internal_name,
+        call: Box::new(unreachable_call),
+    }));
+    Object::BoundMethod(Rc::new(BoundMethod {
+        receiver: receiver.clone(),
+        function: builtin,
+    }))
 }
 
 /// Look up the `value` attribute on a `StopIteration` instance. Falls

@@ -141,9 +141,12 @@ impl<'src> Parser<'src> {
             return match self.peek() {
                 TokenKind::Keyword(Keyword::Def) => self.parse_function_def(decorators),
                 TokenKind::Keyword(Keyword::Class) => self.parse_class_def(decorators),
+                TokenKind::Keyword(Keyword::Async) => self.parse_async_stmt(decorators),
                 other => Err(ParseError::Unexpected {
                     span: self.peek_token().span,
-                    message: format!("expected `def` or `class` after decorator, got {other:?}"),
+                    message: format!(
+                        "expected `def`, `async def`, or `class` after decorator, got {other:?}"
+                    ),
                 }),
             };
         }
@@ -170,11 +173,11 @@ impl<'src> Parser<'src> {
                 // statement so the AST is `Expr(Yield(...))`, matching
                 // CPython's lowering.
                 Keyword::Yield => self.parse_simple_statement(),
-                Keyword::Async | Keyword::Await => Err(ParseError::NotImplemented {
-                    span: self.peek_token().span,
-                    feature: kw.as_str(),
-                    rfc: "RFC 0006-B",
-                }),
+                Keyword::Async => self.parse_async_stmt(Vec::new()),
+                // Bare `await ...` at statement level falls through to
+                // the expression-statement path; the unary parser
+                // handles the `await` keyword as a prefix operator.
+                Keyword::Await => self.parse_simple_statement(),
                 _ => self.parse_simple_statement(),
             },
             // `match` is a soft keyword — only treated as the statement
@@ -427,6 +430,82 @@ impl<'src> Parser<'src> {
             },
             span: def_tok.span.merge(span_end),
         })
+    }
+
+    /// Dispatch on the construct that follows `async`: `def`, `for`,
+    /// or `with`. The `async` keyword itself was already detected by
+    /// [`Self::parse_statement`] (or follows a decorator chain).
+    fn parse_async_stmt(&mut self, decorator_list: Vec<Expr>) -> Result<Stmt, ParseError> {
+        let async_tok = self.bump(); // `async`
+        match self.peek() {
+            TokenKind::Keyword(Keyword::Def) => {
+                let stmt = self.parse_function_def(decorator_list)?;
+                match stmt.kind {
+                    StmtKind::FunctionDef {
+                        name,
+                        args,
+                        body,
+                        decorator_list,
+                    } => Ok(Stmt {
+                        kind: StmtKind::AsyncFunctionDef {
+                            name,
+                            args,
+                            body,
+                            decorator_list,
+                        },
+                        span: async_tok.span.merge(stmt.span),
+                    }),
+                    _ => unreachable!("parse_function_def returns FunctionDef"),
+                }
+            }
+            TokenKind::Keyword(Keyword::For) => {
+                if !decorator_list.is_empty() {
+                    return Err(ParseError::Unexpected {
+                        span: async_tok.span,
+                        message: "decorators only apply to `async def`, not `async for`".to_owned(),
+                    });
+                }
+                let stmt = self.parse_for()?;
+                match stmt.kind {
+                    StmtKind::For {
+                        target,
+                        iter,
+                        body,
+                        orelse,
+                    } => Ok(Stmt {
+                        kind: StmtKind::AsyncFor {
+                            target,
+                            iter,
+                            body,
+                            orelse,
+                        },
+                        span: async_tok.span.merge(stmt.span),
+                    }),
+                    _ => unreachable!("parse_for returns For"),
+                }
+            }
+            TokenKind::Keyword(Keyword::With) => {
+                if !decorator_list.is_empty() {
+                    return Err(ParseError::Unexpected {
+                        span: async_tok.span,
+                        message: "decorators only apply to `async def`, not `async with`"
+                            .to_owned(),
+                    });
+                }
+                let stmt = self.parse_with()?;
+                match stmt.kind {
+                    StmtKind::With { items, body } => Ok(Stmt {
+                        kind: StmtKind::AsyncWith { items, body },
+                        span: async_tok.span.merge(stmt.span),
+                    }),
+                    _ => unreachable!("parse_with returns With"),
+                }
+            }
+            other => Err(ParseError::Unexpected {
+                span: self.peek_token().span,
+                message: format!("expected `def`, `for`, or `with` after `async`, got {other:?}"),
+            }),
+        }
     }
 
     fn parse_class_def(&mut self, decorator_list: Vec<Expr>) -> Result<Stmt, ParseError> {
@@ -1833,6 +1912,18 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        // `await expr` (PEP 492 / RFC 0016). `await` sits at the
+        // unary level — `await x + y` parses as `(await x) + y`,
+        // matching CPython.
+        if self.at_keyword(Keyword::Await) {
+            let kw = self.bump();
+            let operand = self.parse_unary()?;
+            let span = kw.span.merge(operand.span);
+            return Ok(Expr {
+                kind: ExprKind::Await(Box::new(operand)),
+                span,
+            });
+        }
         let op = match self.peek() {
             TokenKind::Plus => UnaryOp::UAdd,
             TokenKind::Minus => UnaryOp::USub,
@@ -1958,7 +2049,10 @@ impl<'src> Parser<'src> {
                 } else {
                     let e = self.parse_ternary()?;
                     // Generator expression as single argument: `f(x for x in xs)`.
-                    if self.at_keyword(Keyword::For) && args.is_empty() && keywords.is_empty() {
+                    if (self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async))
+                        && args.is_empty()
+                        && keywords.is_empty()
+                    {
                         let elt = e;
                         let generators = self.parse_comp_for()?;
                         let span = elt.span;
@@ -2148,7 +2242,7 @@ impl<'src> Parser<'src> {
         }
         let first = self.parse_ternary()?;
         // Generator expression?
-        if self.at_keyword(Keyword::For) {
+        if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
             let generators = self.parse_comp_for()?;
             let rp = self.expect(&TokenKind::RPar, "`)`")?;
             let span = lp.span.merge(rp.span);
@@ -2191,7 +2285,7 @@ impl<'src> Parser<'src> {
             });
         }
         let first = self.parse_ternary()?;
-        if self.at_keyword(Keyword::For) {
+        if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
             let generators = self.parse_comp_for()?;
             let rb = self.expect(&TokenKind::RSqb, "`]`")?;
             return Ok(Expr {
@@ -2259,7 +2353,7 @@ impl<'src> Parser<'src> {
         if self.eat(&TokenKind::Colon) {
             // Dict literal (or dict comprehension).
             let v = self.parse_ternary()?;
-            if self.at_keyword(Keyword::For) {
+            if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
                 let generators = self.parse_comp_for()?;
                 let rb = self.expect(&TokenKind::RBrace, "`}`")?;
                 return Ok(Expr {
@@ -2295,7 +2389,7 @@ impl<'src> Parser<'src> {
             });
         }
         // Otherwise: set literal or set comp.
-        if self.at_keyword(Keyword::For) {
+        if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
             let generators = self.parse_comp_for()?;
             let rb = self.expect(&TokenKind::RBrace, "`}`")?;
             return Ok(Expr {
@@ -2322,7 +2416,25 @@ impl<'src> Parser<'src> {
 
     fn parse_comp_for(&mut self) -> Result<Vec<Comprehension>, ParseError> {
         let mut generators = Vec::new();
-        while self.at_keyword(Keyword::For) {
+        loop {
+            // PEP 530: `[x async for x in it]` — an `async` prefix on
+            // a comprehension `for` clause marks the generator as
+            // async-iterable. The enclosing context must be an
+            // `async def`; the compiler enforces that.
+            let is_async = if self.at_keyword(Keyword::Async) {
+                self.bump();
+                if !self.at_keyword(Keyword::For) {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "expected `for` after `async` in comprehension".to_owned(),
+                    });
+                }
+                true
+            } else if self.at_keyword(Keyword::For) {
+                false
+            } else {
+                break;
+            };
             self.bump();
             let target = self.parse_target_list_no_tuple()?;
             if !self.at_keyword(Keyword::In) {
@@ -2342,7 +2454,7 @@ impl<'src> Parser<'src> {
                 target,
                 iter,
                 ifs,
-                is_async: false,
+                is_async,
             });
         }
         if generators.is_empty() {

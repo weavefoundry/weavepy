@@ -22,6 +22,7 @@ pub mod os;
 pub mod random;
 pub mod re;
 pub mod sys;
+pub mod thread;
 pub mod time;
 
 /// Register the built-in modules into `cache`. Called once at
@@ -37,6 +38,7 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("json", json::build);
     cache.register_builtin("random", random::build);
     cache.register_builtin("time", time::build);
+    cache.register_builtin("_thread", thread::build);
 
     // Frozen Python sources (pure-Python stdlib).
     for src in frozen_sources() {
@@ -94,6 +96,43 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "typing",
             source: include_str!("python/typing.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "heapq",
+            source: include_str!("python/heapq.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "threading",
+            source: include_str!("python/threading.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "queue",
+            source: include_str!("python/queue.py"),
+            is_package: false,
+        },
+        // The `concurrent` package is a tiny shim that re-exports
+        // `futures`. We model it as a frozen package with an
+        // (effectively empty) `__init__` and a flat `futures`
+        // submodule. Note we use `concurrent_futures.py` on disk —
+        // the dotted name still resolves correctly because the
+        // import machinery keys off the registered module name, not
+        // the source filename.
+        FrozenSource {
+            name: "concurrent",
+            source: "",
+            is_package: true,
+        },
+        FrozenSource {
+            name: "concurrent.futures",
+            source: include_str!("python/concurrent_futures.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio",
+            source: include_str!("python/asyncio.py"),
             is_package: false,
         },
     ]

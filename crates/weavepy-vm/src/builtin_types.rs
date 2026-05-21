@@ -41,6 +41,9 @@ pub struct BuiltinTypes {
     pub range_: Rc<TypeObject>,
     pub none_type: Rc<TypeObject>,
     pub function_: Rc<TypeObject>,
+    pub generator_: Rc<TypeObject>,
+    pub coroutine_: Rc<TypeObject>,
+    pub async_generator_: Rc<TypeObject>,
 
     pub module_: Rc<TypeObject>,
 
@@ -60,7 +63,9 @@ pub struct BuiltinTypes {
     pub overflow_error: Rc<TypeObject>,
     pub runtime_error: Rc<TypeObject>,
     pub stop_iteration: Rc<TypeObject>,
+    pub stop_async_iteration: Rc<TypeObject>,
     pub syntax_error: Rc<TypeObject>,
+    pub timeout_error: Rc<TypeObject>,
     pub type_error: Rc<TypeObject>,
     pub unbound_local_error: Rc<TypeObject>,
     pub value_error: Rc<TypeObject>,
@@ -110,6 +115,9 @@ impl BuiltinTypes {
         let range_ = mk("range", vec![object_.clone()]);
         let none_type = mk("NoneType", vec![object_.clone()]);
         let function_ = mk("function", vec![object_.clone()]);
+        let generator_ = mk("generator", vec![object_.clone()]);
+        let coroutine_ = mk("coroutine", vec![object_.clone()]);
+        let async_generator_ = mk("async_generator", vec![object_.clone()]);
         let module_ = mk("module", vec![object_.clone()]);
 
         let base_exception = exc("BaseException", object_.clone());
@@ -138,7 +146,13 @@ impl BuiltinTypes {
         let overflow_error = exc("OverflowError", arithmetic_error.clone());
         let zero_division_error = exc("ZeroDivisionError", arithmetic_error.clone());
         let stop_iteration = exc("StopIteration", exception.clone());
+        // PEP 525: `StopAsyncIteration` is a sibling of `StopIteration`
+        // in CPython's hierarchy, not a subclass.
+        let stop_async_iteration = exc("StopAsyncIteration", exception.clone());
         let syntax_error = exc("SyntaxError", exception.clone());
+        // `TimeoutError` lands here so `asyncio.wait_for` raises a
+        // public, importable type rather than a synthetic shim.
+        let timeout_error = exc("TimeoutError", os_error.clone());
         let type_error = exc("TypeError", exception.clone());
         let value_error = exc("ValueError", exception.clone());
         let generator_exit = exc("GeneratorExit", base_exception.clone());
@@ -165,6 +179,9 @@ impl BuiltinTypes {
             range_,
             none_type,
             function_,
+            generator_,
+            coroutine_,
+            async_generator_,
             module_,
             base_exception,
             exception,
@@ -182,7 +199,9 @@ impl BuiltinTypes {
             overflow_error,
             runtime_error,
             stop_iteration,
+            stop_async_iteration,
             syntax_error,
+            timeout_error,
             type_error,
             unbound_local_error,
             value_error,
@@ -245,7 +264,9 @@ impl BuiltinTypes {
             pair!(overflow_error, "OverflowError"),
             pair!(runtime_error, "RuntimeError"),
             pair!(stop_iteration, "StopIteration"),
+            pair!(stop_async_iteration, "StopAsyncIteration"),
             pair!(syntax_error, "SyntaxError"),
+            pair!(timeout_error, "TimeoutError"),
             pair!(type_error, "TypeError"),
             pair!(unbound_local_error, "UnboundLocalError"),
             pair!(value_error, "ValueError"),
@@ -292,7 +313,9 @@ impl BuiltinTypes {
             "OverflowError" => Some(self.overflow_error.clone()),
             "RuntimeError" => Some(self.runtime_error.clone()),
             "StopIteration" => Some(self.stop_iteration.clone()),
+            "StopAsyncIteration" => Some(self.stop_async_iteration.clone()),
             "SyntaxError" => Some(self.syntax_error.clone()),
+            "TimeoutError" => Some(self.timeout_error.clone()),
             "TypeError" => Some(self.type_error.clone()),
             "UnboundLocalError" => Some(self.unbound_local_error.clone()),
             "ValueError" => Some(self.value_error.clone()),

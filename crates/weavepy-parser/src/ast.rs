@@ -11,9 +11,9 @@
 //!   and field names (`body`, `orelse`, `args`, `kwargs`, `target`,
 //!   `iter`, `value`, …).
 //! - **Experimental** for the slice of the grammar represented. The
-//!   following CPython AST nodes are deliberately absent and tracked
-//!   in `docs/rfcs/0001-executable-slice.md`: `AsyncFunctionDef`,
-//!   `AsyncFor`, `AsyncWith`, `Await` (RFC 0006-B).
+//!   async statement / expression nodes (`AsyncFunctionDef`,
+//!   `AsyncFor`, `AsyncWith`, `Await`) are produced by the parser
+//!   from RFC 0016 onwards.
 
 use weavepy_lexer::Span;
 
@@ -37,6 +37,15 @@ pub struct Stmt {
 pub enum StmtKind {
     /// `def name(args): body`
     FunctionDef {
+        name: String,
+        args: Arguments,
+        body: Vec<Stmt>,
+        decorator_list: Vec<Expr>,
+    },
+    /// `async def name(args): body` (PEP 492, RFC 0016). Same shape
+    /// as [`StmtKind::FunctionDef`]; the compiler routes the body
+    /// through the coroutine-aware code path.
+    AsyncFunctionDef {
         name: String,
         args: Arguments,
         body: Vec<Stmt>,
@@ -89,6 +98,15 @@ pub enum StmtKind {
         body: Vec<Stmt>,
         orelse: Vec<Stmt>,
     },
+    /// `async for target in iter: body else: orelse` (PEP 492,
+    /// RFC 0016). Valid only inside an `async def`; we don't
+    /// enforce that at parse time — the compiler does.
+    AsyncFor {
+        target: Expr,
+        iter: Expr,
+        body: Vec<Stmt>,
+        orelse: Vec<Stmt>,
+    },
     /// `try: body except: handlers else: orelse finally: finalbody`
     Try {
         body: Vec<Stmt>,
@@ -103,6 +121,11 @@ pub enum StmtKind {
     },
     /// `with items: body`
     With {
+        items: Vec<WithItem>,
+        body: Vec<Stmt>,
+    },
+    /// `async with items: body` (PEP 492, RFC 0016).
+    AsyncWith {
         items: Vec<WithItem>,
         body: Vec<Stmt>,
     },
@@ -324,6 +347,9 @@ pub enum ExprKind {
     Yield(Option<Box<Expr>>),
     /// `yield from value` (RFC 0006).
     YieldFrom(Box<Expr>),
+    /// `await value` (PEP 492, RFC 0016). Valid only inside an
+    /// `async def`; the compiler enforces that.
+    Await(Box<Expr>),
     /// f-string body — a list of `Constant(Str)` and `FormattedValue`
     /// nodes. Plain f-strings like `f"abc"` lower to a single
     /// `Constant`; `JoinedStr` wraps anything with interpolations
@@ -523,6 +549,27 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             }
             out.push_str("], returns=None, type_comment=None)");
         }
+        S::AsyncFunctionDef {
+            name,
+            args,
+            body,
+            decorator_list,
+        } => {
+            out.push_str("AsyncFunctionDef(name='");
+            out.push_str(name);
+            out.push_str("', args=");
+            dump_arguments(out, args, depth + 2);
+            out.push_str(", body=");
+            dump_stmt_block(out, body, depth + 2);
+            out.push_str(", decorator_list=[");
+            for (i, d) in decorator_list.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                dump_expr(out, d, depth);
+            }
+            out.push_str("], returns=None, type_comment=None)");
+        }
         S::ClassDef {
             name,
             bases,
@@ -637,6 +684,25 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             dump_stmt_block(out, body, depth + 2);
             out.push(')');
         }
+        S::AsyncWith { items, body } => {
+            out.push_str("AsyncWith(items=[");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str("withitem(context_expr=");
+                dump_expr(out, &it.context_expr, depth);
+                out.push_str(", optional_vars=");
+                match &it.optional_vars {
+                    Some(v) => dump_expr(out, v, depth),
+                    None => out.push_str("None"),
+                }
+                out.push(')');
+            }
+            out.push_str("], body=");
+            dump_stmt_block(out, body, depth + 2);
+            out.push(')');
+        }
         S::Return(value) => {
             out.push_str("Return(value=");
             if let Some(v) = value {
@@ -709,6 +775,22 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             orelse,
         } => {
             out.push_str("For(target=");
+            dump_expr(out, target, depth);
+            out.push_str(", iter=");
+            dump_expr(out, iter, depth);
+            out.push_str(", body=");
+            dump_stmt_block(out, body, depth + 2);
+            out.push_str(", orelse=");
+            dump_stmt_block(out, orelse, depth + 2);
+            out.push(')');
+        }
+        S::AsyncFor {
+            target,
+            iter,
+            body,
+            orelse,
+        } => {
+            out.push_str("AsyncFor(target=");
             dump_expr(out, target, depth);
             out.push_str(", iter=");
             dump_expr(out, iter, depth);
@@ -1274,6 +1356,11 @@ fn dump_expr(out: &mut String, e: &Expr, depth: usize) {
         }
         E::YieldFrom(v) => {
             out.push_str("YieldFrom(value=");
+            dump_expr(out, v, depth);
+            out.push(')');
+        }
+        E::Await(v) => {
+            out.push_str("Await(value=");
             dump_expr(out, v, depth);
             out.push(')');
         }

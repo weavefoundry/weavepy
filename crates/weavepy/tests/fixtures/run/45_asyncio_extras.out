@@ -1,0 +1,7 @@
+to_thread: 49
+as_completed: [0, 1, 2]
+bounded: BoundedSemaphore released too many times
+condition: woken
+lifo: [2, 1, 0]
+prio: [1, 1, 2, 3, 4, 5, 6, 9]
+introspect: True True False True

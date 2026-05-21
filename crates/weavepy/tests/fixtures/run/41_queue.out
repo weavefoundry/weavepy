@@ -1,0 +1,7 @@
+qsize: 5
+[0, 1, 2, 3, 4]
+['d', 'c', 'b', 'a']
+[1, 2, 3, 4, 5]
+2 x y True
+empty ok
+full ok

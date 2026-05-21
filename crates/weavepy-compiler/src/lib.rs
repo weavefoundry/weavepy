@@ -94,6 +94,14 @@ pub struct CodeObject {
     /// a `yield` or `yield from` expression). Calling such a function
     /// returns a `PyGenerator` instead of running the body eagerly.
     pub is_generator: bool,
+    /// `True` when this code object was produced by an `async def`
+    /// without `yield`. Calling such a function returns an
+    /// `Object::Coroutine`.
+    pub is_coroutine: bool,
+    /// `True` when this code object was produced by an `async def`
+    /// that *also* contains `yield`. Calling such a function returns
+    /// an `Object::AsyncGenerator`.
+    pub is_async_generator: bool,
 }
 
 /// One entry in a code object's exception table. Mirrors the
@@ -697,6 +705,20 @@ impl Compiler {
                     self.patch_jump(site, break_target);
                 }
             }
+            StmtKind::AsyncFor {
+                target,
+                iter,
+                body,
+                orelse,
+            } => {
+                if !self.in_async_context() {
+                    return Err(CompileError::NotImplemented(
+                        "`async for` outside `async def`",
+                        "wrap the loop in an `async def` function",
+                    ));
+                }
+                self.compile_async_for(target, iter, body, orelse)?;
+            }
             StmtKind::FunctionDef {
                 name,
                 args,
@@ -704,6 +726,14 @@ impl Compiler {
                 decorator_list,
             } => {
                 self.compile_function_def(name, args, body, decorator_list)?;
+            }
+            StmtKind::AsyncFunctionDef {
+                name,
+                args,
+                body,
+                decorator_list,
+            } => {
+                self.compile_async_function_def(name, args, body, decorator_list)?;
             }
             StmtKind::ClassDef {
                 name,
@@ -738,6 +768,15 @@ impl Compiler {
             }
             StmtKind::With { items, body } => {
                 self.compile_with(items, body)?;
+            }
+            StmtKind::AsyncWith { items, body } => {
+                if !self.in_async_context() {
+                    return Err(CompileError::NotImplemented(
+                        "`async with` outside `async def`",
+                        "wrap the block in an `async def` function",
+                    ));
+                }
+                self.compile_async_with(items, body)?;
             }
             StmtKind::Return(value) => {
                 if self.kind != CodeKind::Function {
@@ -1231,10 +1270,31 @@ impl Compiler {
         body: &[Stmt],
         decorator_list: &[Expr],
     ) -> Result<(), CompileError> {
+        self.compile_function_def_inner(name, args, body, decorator_list, false)
+    }
+
+    fn compile_async_function_def(
+        &mut self,
+        name: &str,
+        args: &AstArguments,
+        body: &[Stmt],
+        decorator_list: &[Expr],
+    ) -> Result<(), CompileError> {
+        self.compile_function_def_inner(name, args, body, decorator_list, true)
+    }
+
+    fn compile_function_def_inner(
+        &mut self,
+        name: &str,
+        args: &AstArguments,
+        body: &[Stmt],
+        decorator_list: &[Expr],
+        is_async: bool,
+    ) -> Result<(), CompileError> {
         for d in decorator_list {
             self.compile_expr(d)?;
         }
-        self.build_function_object(name, args, body)?;
+        self.build_function_object_inner(name, args, body, is_async)?;
         for _ in decorator_list {
             self.emit(OpCode::Call, 1);
         }
@@ -1252,6 +1312,16 @@ impl Compiler {
         name: &str,
         args: &AstArguments,
         body: &[Stmt],
+    ) -> Result<(), CompileError> {
+        self.build_function_object_inner(name, args, body, false)
+    }
+
+    fn build_function_object_inner(
+        &mut self,
+        name: &str,
+        args: &AstArguments,
+        body: &[Stmt],
+        is_async: bool,
     ) -> Result<(), CompileError> {
         let mut param_names: Vec<String> = Vec::new();
         for a in &args.posonlyargs {
@@ -1302,10 +1372,19 @@ impl Compiler {
                 }
             }
         }
-        let is_generator = body_is_generator(body);
-        inner.co.is_generator = is_generator;
-        if is_generator {
+        let has_yield = body_is_generator(body);
+        if is_async {
+            // PEP 492: `async def` with `yield` is an async generator;
+            // otherwise it's a coroutine. Both shapes share the
+            // generator-style suspended-frame infrastructure.
+            inner.co.is_async_generator = has_yield;
+            inner.co.is_coroutine = !has_yield;
             inner.emit(OpCode::ReturnGenerator, 0);
+        } else {
+            inner.co.is_generator = has_yield;
+            if has_yield {
+                inner.emit(OpCode::ReturnGenerator, 0);
+            }
         }
         inner.emit(OpCode::Resume, 0);
         for s in body {
@@ -1633,15 +1712,19 @@ impl Compiler {
                 self.patch_jump(site, end);
             }
         } else if has_finally {
-            // `try/finally` without except. Exception path runs
-            // finally and re-raises.
+            // `try/finally` without except. The dispatch loop has
+            // pushed the exception onto the value stack. We leave it
+            // there across `finalbody` — every statement compiles to
+            // stack-balanced bytecode — then RERAISE 0 pops it and
+            // re-raises. Popping the exception eagerly (as we did
+            // historically) left RERAISE with nothing to pop and
+            // produced a `stack underflow` once the finally ran.
             self.co.exception_table.push(ExcHandler {
                 start: body_start,
                 end: body_end,
                 handler: handlers_start,
                 depth: body_depth,
             });
-            self.emit(OpCode::PopTop, 0); // discard pushed exc; we'll re-raise below
             for s in finalbody {
                 self.compile_stmt(s)?;
             }
@@ -2307,6 +2390,16 @@ impl Compiler {
                 self.emit(OpCode::YieldValue, 0);
             }
             ExprKind::YieldFrom(iter) => {
+                // CPython 3.13 pattern:
+                //   <iter>
+                //   GET_YIELD_FROM_ITER
+                //   LOAD_CONST None
+                // loop:
+                //   SEND end          ; pushes value or jumps with [iter, value]
+                //   YIELD_VALUE       ; suspend; on resume sent_value at TOS
+                //   JUMP_BACKWARD loop
+                // end:
+                //   END_SEND          ; stack: [iter, value] -> [value]
                 self.compile_expr(iter)?;
                 self.emit(OpCode::GetYieldFromIter, 0);
                 let idx = self.co.intern_constant(Constant::None);
@@ -2318,8 +2411,146 @@ impl Compiler {
                 self.patch_jump(back, loop_start);
                 let end = self.next_offset();
                 self.patch_jump(send, end);
+                self.emit(OpCode::EndSend, 0);
+            }
+            ExprKind::Await(value) => {
+                if !self.in_async_context() {
+                    return Err(CompileError::NotImplemented(
+                        "`await` outside `async def`",
+                        "wrap the expression in an `async def` function",
+                    ));
+                }
+                self.compile_expr(value)?;
+                self.compile_await_dance(0);
             }
         }
+        Ok(())
+    }
+
+    /// Emit the "drive awaitable to completion" instruction sequence
+    /// CPython 3.13 uses for `await`. Stack on entry: `[awaitable]`;
+    /// stack on exit: `[result]`. `awaitable_arg` is passed to
+    /// `GET_AWAITABLE` (0 = plain, 1 = aiter, 2 = aenter).
+    fn compile_await_dance(&mut self, awaitable_arg: u32) {
+        self.emit(OpCode::GetAwaitable, awaitable_arg);
+        let none_idx = self.co.intern_constant(Constant::None);
+        self.emit(OpCode::LoadConst, none_idx);
+        let loop_start = self.next_offset();
+        let send = self.emit(OpCode::Send, 0);
+        self.emit(OpCode::YieldValue, 0);
+        let back = self.emit(OpCode::JumpBackward, 0);
+        self.patch_jump(back, loop_start);
+        let end = self.next_offset();
+        self.patch_jump(send, end);
+        // Stack: [iter, value]. Drop the iterator, keep the value.
+        self.emit(OpCode::EndSend, 0);
+    }
+
+    /// `True` if the current code object is the body of an `async def`
+    /// (coroutine or async-generator). Comprehensions inherit their
+    /// parent's flavour because they compile a synthetic function;
+    /// we conservatively let async-flavoured comprehensions through
+    /// at the parse layer and rely on the synthetic function being
+    /// produced with the right flag.
+    fn in_async_context(&self) -> bool {
+        self.co.is_coroutine || self.co.is_async_generator
+    }
+
+    fn compile_async_for(
+        &mut self,
+        target: &Expr,
+        iter: &Expr,
+        body: &[Stmt],
+        orelse: &[Stmt],
+    ) -> Result<(), CompileError> {
+        self.compile_expr(iter)?;
+        self.emit(OpCode::GetAiter, 0);
+        let loop_top = self.next_offset();
+        // GetAnext peeks the aiter and pushes an awaitable. The
+        // await-dance drives it; on success we land at the
+        // STORE_FAST target. On StopAsyncIteration, control flows
+        // to the cleanup block.
+        let anext_site = self.emit(OpCode::GetAnext, 0);
+        let _ = anext_site;
+        self.compile_await_dance(1);
+        // Stack: [aiter, value]. Move the value into the target.
+        self.compile_assign(target)?;
+        self.loop_stack.push(LoopFrame {
+            continue_target: loop_top,
+            break_sites: Vec::new(),
+            is_for_loop: true,
+        });
+        for s in body {
+            self.compile_stmt(s)?;
+        }
+        let back = self.emit(OpCode::JumpBackward, 0);
+        self.patch_jump(back, loop_top);
+        let frame = self.loop_stack.pop().expect("loop frame");
+        // Register an exception-table handler covering the loop body
+        // so `StopAsyncIteration` lands at the cleanup label. The
+        // aiter stays at stack depth 1 across the whole loop body —
+        // every per-iteration push lives above it.
+        let cleanup_target = self.next_offset();
+        self.co.exception_table.push(ExcHandler {
+            start: loop_top,
+            end: back,
+            handler: cleanup_target,
+            depth: 1,
+        });
+        // Cleanup: pop aiter + exception, then run the `else` clause.
+        self.emit(OpCode::EndAsyncFor, 0);
+        for s in orelse {
+            self.compile_stmt(s)?;
+        }
+        let break_target = self.next_offset();
+        for site in frame.break_sites {
+            self.patch_jump(site, break_target);
+        }
+        Ok(())
+    }
+
+    fn compile_async_with(
+        &mut self,
+        items: &[WithItem],
+        body: &[Stmt],
+    ) -> Result<(), CompileError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let (head, rest) = items.split_first().expect("nonempty");
+        self.compile_expr(&head.context_expr)?;
+        // BEFORE_ASYNC_WITH leaves [aexit, awaitable(aenter)].
+        self.emit(OpCode::BeforeAsyncWith, 0);
+        self.compile_await_dance(2);
+        // Stack: [aexit, value].
+        if let Some(target) = &head.optional_vars {
+            self.compile_assign(target)?;
+        } else {
+            self.emit(OpCode::PopTop, 0);
+        }
+        // Stash aexit in a synthetic local so we can recover it on
+        // the exit path. (We don't have a full exception table for
+        // async with yet — this is enough for the no-exception path.)
+        let slot = format!(".aexit{}", self.with_counter);
+        self.with_counter += 1;
+        let slot_idx = self.var_index_or_add(&slot);
+        self.emit(OpCode::StoreFast, slot_idx);
+        if rest.is_empty() {
+            for s in body {
+                self.compile_stmt(s)?;
+            }
+        } else {
+            self.compile_async_with(rest, body)?;
+        }
+        // Normal exit: push aexit, call with (None, None, None), await.
+        self.emit(OpCode::LoadFast, slot_idx);
+        let none_idx = self.co.intern_constant(Constant::None);
+        self.emit(OpCode::LoadConst, none_idx);
+        self.emit(OpCode::LoadConst, none_idx);
+        self.emit(OpCode::LoadConst, none_idx);
+        self.emit(OpCode::Call, 3);
+        self.compile_await_dance(0);
+        self.emit(OpCode::PopTop, 0);
         Ok(())
     }
 
@@ -2436,6 +2667,15 @@ impl Compiler {
         // Comprehensions are lowered to anonymous functions taking
         // a single argument (.0) that holds the iterator of the
         // outermost generator. This matches CPython's lowering.
+        // PEP 530: a comprehension that uses `async for` (or `await`
+        // inside the element / filter) compiles to a coroutine; the
+        // caller awaits the resulting coroutine to get the value.
+        let is_async_comp = generators.iter().any(|g| g.is_async)
+            || expr_contains_await(elt)
+            || value.map(expr_contains_await).unwrap_or(false)
+            || generators
+                .iter()
+                .any(|g| expr_contains_await(&g.iter) || g.ifs.iter().any(expr_contains_await));
         let name = match kind {
             CompKind::List => "<listcomp>",
             CompKind::Set => "<setcomp>",
@@ -2452,6 +2692,14 @@ impl Compiler {
         inner.co.arg_count = 1;
         inner.co.varnames.push(".0".to_owned());
         inner.bindings.insert(".0".to_owned(), Binding::Local);
+        if is_async_comp && !matches!(kind, CompKind::Generator) {
+            inner.co.is_coroutine = true;
+        }
+        if is_async_comp && matches!(kind, CompKind::Generator) {
+            // `(x async for x in xs)` becomes an async generator.
+            inner.co.is_async_generator = true;
+            inner.co.is_generator = true;
+        }
 
         let collector_op = match kind {
             CompKind::List => Some(OpCode::BuildList),
@@ -2501,8 +2749,12 @@ impl Compiler {
             }
         }
 
-        if matches!(kind, CompKind::Generator) {
+        if matches!(kind, CompKind::Generator) && !is_async_comp {
             inner.co.is_generator = true;
+            inner.emit(OpCode::ReturnGenerator, 0);
+        } else if is_async_comp {
+            // Both async-generator comps and async list/set/dict
+            // comps use the suspended-frame infrastructure.
             inner.emit(OpCode::ReturnGenerator, 0);
         }
         inner.emit(OpCode::Resume, 0);
@@ -2550,10 +2802,26 @@ impl Compiler {
             .intern_constant(Constant::Code(Box::new(inner_code)));
         self.emit(OpCode::LoadConst, code_idx);
         self.emit(OpCode::MakeFunction, flags);
-        // Push iterator of outermost generator as `.0`.
+        // Push iterator of outermost generator as `.0`. For an async
+        // comprehension we still pass the raw source — the inner
+        // body fetches `aiter()` when it sees `is_async`.
         self.compile_expr(&generators[0].iter)?;
-        self.emit(OpCode::GetIter, 0);
+        if !(is_async_comp && generators[0].is_async) {
+            self.emit(OpCode::GetIter, 0);
+        }
         self.emit(OpCode::Call, 1);
+        // For an async list/set/dict comprehension the call returned
+        // a coroutine; the enclosing async function awaits it so the
+        // final value (list/set/dict) ends up on the stack.
+        if is_async_comp && !matches!(kind, CompKind::Generator) {
+            if !self.in_async_context() {
+                return Err(CompileError::NotImplemented(
+                    "async comprehension outside `async def`",
+                    "wrap in an `async def` function",
+                ));
+            }
+            self.compile_await_dance(0);
+        }
         Ok(())
     }
 }
@@ -2598,6 +2866,56 @@ fn compile_comp_body(
         return Ok(());
     }
     let gen = &generators[depth];
+    if gen.is_async {
+        // depth==0: caller pushed the source expr (not yet GetAiter'd)
+        // because compile_comprehension uses GetIter for the .0 arg.
+        // We need to convert to async-iter here for the body.
+        if depth == 0 {
+            inner.emit(OpCode::PopTop, 0);
+            inner.emit(OpCode::LoadFast, 0);
+            inner.emit(OpCode::GetAiter, 0);
+            inner.emit(OpCode::CopyTop, 0);
+            inner.emit(OpCode::StoreFast, 0);
+        } else {
+            inner.compile_expr(&gen.iter)?;
+            inner.emit(OpCode::GetAiter, 0);
+        }
+        // Compute the live stack depth that should survive an
+        // exception in this loop: the accumulator (if any) + the
+        // aiters of every previous async generator + this aiter.
+        let accumulator_depth = match append_op {
+            OpCode::YieldValue => 0,
+            _ => 1,
+        };
+        let outer_iters: u32 = generators.iter().take(depth).map(|_| 1u32).sum();
+        let cleanup_depth = accumulator_depth + outer_iters + 1;
+        let loop_top = inner.next_offset();
+        inner.emit(OpCode::GetAnext, 0);
+        inner.compile_await_dance(1);
+        inner.compile_assign(&gen.target)?;
+        let mut filter_jumps = Vec::new();
+        for cond in &gen.ifs {
+            inner.compile_expr(cond)?;
+            let jf = inner.emit(OpCode::PopJumpIfFalse, 0);
+            filter_jumps.push(jf);
+        }
+        compile_comp_body(inner, generators, depth + 1, elt, value, append_op)?;
+        for jf in filter_jumps {
+            let cur = inner.next_offset();
+            inner.patch_jump(jf, cur);
+        }
+        let back = inner.emit(OpCode::JumpBackward, 0);
+        inner.patch_jump(back, loop_top);
+        let cleanup_target = inner.next_offset();
+        inner.co.exception_table.push(ExcHandler {
+            start: loop_top,
+            end: back,
+            handler: cleanup_target,
+            depth: cleanup_depth,
+        });
+        inner.emit(OpCode::EndAsyncFor, 0);
+        return Ok(());
+    }
     // For depth 0, the iterator is already on the stack (`.0` was
     // pushed). For deeper levels, push and iter the source.
     if depth > 0 {
@@ -2607,7 +2925,6 @@ fn compile_comp_body(
     let loop_top = inner.next_offset();
     let for_site = inner.emit(OpCode::ForIter, 0);
     inner.compile_assign(&gen.target)?;
-    // Apply filters.
     let mut filter_jumps = Vec::new();
     for cond in &gen.ifs {
         inner.compile_expr(cond)?;
@@ -2692,7 +3009,8 @@ fn collect_inner_free(
     out: &mut HashSet<String>,
 ) {
     match &stmt.kind {
-        StmtKind::FunctionDef { args, body, .. } => {
+        StmtKind::FunctionDef { args, body, .. }
+        | StmtKind::AsyncFunctionDef { args, body, .. } => {
             let mut inner_locals: HashSet<String> = HashSet::new();
             for a in &args.posonlyargs {
                 inner_locals.insert(a.name.clone());
@@ -2783,9 +3101,36 @@ fn collect_inner_free(
                 collect_inner_free(s, outer_bindings, out);
             }
         }
-        StmtKind::If { body, orelse, .. }
-        | StmtKind::While { body, orelse, .. }
-        | StmtKind::For { body, orelse, .. } => {
+        StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
+            collect_inner_free_expr(test, outer_bindings, out);
+            for s in body {
+                collect_inner_free(s, outer_bindings, out);
+            }
+            for s in orelse {
+                collect_inner_free(s, outer_bindings, out);
+            }
+        }
+        StmtKind::For {
+            target,
+            iter,
+            body,
+            orelse,
+        }
+        | StmtKind::AsyncFor {
+            target,
+            iter,
+            body,
+            orelse,
+        } => {
+            // The iterable expression evaluates in the loop's
+            // surrounding scope. If it contains a comprehension that
+            // captures one of our locals (a frequent shape — e.g.
+            // `for x in foo([item for item in items])`), the outer
+            // scope still needs to know so it can promote the local
+            // to a cell. Historically the iter was skipped, which
+            // produced an unfilled cell at the comp-call site.
+            collect_inner_free_expr(target, outer_bindings, out);
+            collect_inner_free_expr(iter, outer_bindings, out);
             for s in body {
                 collect_inner_free(s, outer_bindings, out);
             }
@@ -2825,7 +3170,7 @@ fn collect_inner_free(
                 collect_inner_free_expr(c, outer_bindings, out);
             }
         }
-        StmtKind::With { items, body } => {
+        StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
             for it in items {
                 collect_inner_free_expr(&it.context_expr, outer_bindings, out);
             }
@@ -2868,7 +3213,9 @@ fn body_is_generator(body: &[Stmt]) -> bool {
 
 fn stmt_contains_yield(stmt: &Stmt) -> bool {
     match &stmt.kind {
-        StmtKind::FunctionDef { .. } | StmtKind::ClassDef { .. } => false,
+        StmtKind::FunctionDef { .. }
+        | StmtKind::AsyncFunctionDef { .. }
+        | StmtKind::ClassDef { .. } => false,
         StmtKind::Expr(e) => expr_contains_yield(e),
         StmtKind::Assign { targets, value } => {
             expr_contains_yield(value) || targets.iter().any(expr_contains_yield)
@@ -2890,13 +3237,19 @@ fn stmt_contains_yield(stmt: &Stmt) -> bool {
             iter,
             body,
             orelse,
+        }
+        | StmtKind::AsyncFor {
+            target,
+            iter,
+            body,
+            orelse,
         } => {
             expr_contains_yield(target)
                 || expr_contains_yield(iter)
                 || body.iter().any(stmt_contains_yield)
                 || orelse.iter().any(stmt_contains_yield)
         }
-        StmtKind::With { items, body } => {
+        StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
             items.iter().any(|w| {
                 expr_contains_yield(&w.context_expr)
                     || w.optional_vars.as_ref().is_some_and(expr_contains_yield)
@@ -2940,6 +3293,7 @@ fn stmt_contains_yield(stmt: &Stmt) -> bool {
 fn expr_contains_yield(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Yield(_) | ExprKind::YieldFrom(_) => true,
+        ExprKind::Await(inner) => expr_contains_yield(inner),
         ExprKind::Lambda { .. } => false,
         ExprKind::GeneratorExp { .. } => false,
         ExprKind::JoinedStr(parts) => parts.iter().any(expr_contains_yield),
@@ -2988,6 +3342,68 @@ fn expr_contains_yield(expr: &Expr) -> bool {
         }
         ExprKind::ListComp { .. } | ExprKind::SetComp { .. } | ExprKind::DictComp { .. } => false,
         ExprKind::Starred(inner) => expr_contains_yield(inner),
+        ExprKind::Constant(_) | ExprKind::Name(_) => false,
+    }
+}
+
+/// `true` if `expr` contains an `await` at the surface scope (does
+/// not descend into nested lambdas or comprehensions). Used to mark
+/// comprehensions as coroutines.
+fn expr_contains_await(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Await(_) => true,
+        ExprKind::Yield(v) => v.as_deref().is_some_and(expr_contains_await),
+        ExprKind::YieldFrom(v) => expr_contains_await(v),
+        ExprKind::Lambda { .. } => false,
+        ExprKind::GeneratorExp { .. }
+        | ExprKind::ListComp { .. }
+        | ExprKind::SetComp { .. }
+        | ExprKind::DictComp { .. } => false,
+        ExprKind::JoinedStr(parts) => parts.iter().any(expr_contains_await),
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => expr_contains_await(value) || format_spec.as_deref().is_some_and(expr_contains_await),
+        ExprKind::BinOp { left, right, .. } => {
+            expr_contains_await(left) || expr_contains_await(right)
+        }
+        ExprKind::BoolOp { values, .. } => values.iter().any(expr_contains_await),
+        ExprKind::UnaryOp { operand, .. } => expr_contains_await(operand),
+        ExprKind::Compare {
+            left, comparators, ..
+        } => expr_contains_await(left) || comparators.iter().any(expr_contains_await),
+        ExprKind::IfExp { test, body, orelse } => {
+            expr_contains_await(test) || expr_contains_await(body) || expr_contains_await(orelse)
+        }
+        ExprKind::NamedExpr { target, value } => {
+            expr_contains_await(target) || expr_contains_await(value)
+        }
+        ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            expr_contains_await(func)
+                || args.iter().any(expr_contains_await)
+                || keywords.iter().any(|k| expr_contains_await(&k.value))
+        }
+        ExprKind::Attribute { value, .. } => expr_contains_await(value),
+        ExprKind::Subscript { value, slice } => {
+            expr_contains_await(value) || expr_contains_await(slice)
+        }
+        ExprKind::Slice { lower, upper, step } => {
+            lower.as_deref().is_some_and(expr_contains_await)
+                || upper.as_deref().is_some_and(expr_contains_await)
+                || step.as_deref().is_some_and(expr_contains_await)
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+            items.iter().any(expr_contains_await)
+        }
+        ExprKind::Dict { keys, values } => {
+            keys.iter()
+                .any(|k| k.as_ref().is_some_and(expr_contains_await))
+                || values.iter().any(expr_contains_await)
+        }
+        ExprKind::Starred(inner) => expr_contains_await(inner),
         ExprKind::Constant(_) | ExprKind::Name(_) => false,
     }
 }
@@ -3145,7 +3561,23 @@ fn collect_inner_free_expr(
                 collect_inner_free_expr(x, outer_bindings, out);
             }
         }
-        _ => {}
+        // `await`, `yield`, and `yield from` are arbitrary
+        // expressions that can themselves reference outer-scope
+        // locals — recurse so the comprehension / lambda detection
+        // upstream sees those reads. NamedExpr (walrus `:=`) carries
+        // a value subtree that needs the same treatment.
+        ExprKind::Await(v) | ExprKind::YieldFrom(v) => {
+            collect_inner_free_expr(v, outer_bindings, out);
+        }
+        ExprKind::Yield(value) => {
+            if let Some(v) = value {
+                collect_inner_free_expr(v, outer_bindings, out);
+            }
+        }
+        ExprKind::NamedExpr { value, .. } => {
+            collect_inner_free_expr(value, outer_bindings, out);
+        }
+        ExprKind::Name(_) | ExprKind::Constant(_) => {}
     }
 }
 
@@ -3160,6 +3592,12 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
             collect_target_names(target, out);
         }
         StmtKind::For {
+            target,
+            body,
+            orelse,
+            ..
+        }
+        | StmtKind::AsyncFor {
             target,
             body,
             orelse,
@@ -3181,7 +3619,9 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
                 collect_assigned(s, out);
             }
         }
-        StmtKind::FunctionDef { name, .. } | StmtKind::ClassDef { name, .. } => {
+        StmtKind::FunctionDef { name, .. }
+        | StmtKind::AsyncFunctionDef { name, .. }
+        | StmtKind::ClassDef { name, .. } => {
             out.insert(name.clone());
         }
         StmtKind::Try {
@@ -3208,7 +3648,7 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
                 collect_assigned(s, out);
             }
         }
-        StmtKind::With { items, body } => {
+        StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
             for it in items {
                 if let Some(target) = &it.optional_vars {
                     collect_target_names(target, out);
@@ -3269,6 +3709,12 @@ fn collect_decls(
             body,
             orelse,
             ..
+        }
+        | StmtKind::AsyncFor {
+            target,
+            body,
+            orelse,
+            ..
         } => {
             collect_target_names(target, assigned);
             for s in body {
@@ -3286,7 +3732,9 @@ fn collect_decls(
                 collect_decls(s, globals, nonlocals, assigned);
             }
         }
-        StmtKind::FunctionDef { name, .. } | StmtKind::ClassDef { name, .. } => {
+        StmtKind::FunctionDef { name, .. }
+        | StmtKind::AsyncFunctionDef { name, .. }
+        | StmtKind::ClassDef { name, .. } => {
             assigned.insert(name.clone());
         }
         StmtKind::Try {
@@ -3313,7 +3761,7 @@ fn collect_decls(
                 collect_decls(s, globals, nonlocals, assigned);
             }
         }
-        StmtKind::With { items, body } => {
+        StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
             for it in items {
                 if let Some(target) = &it.optional_vars {
                     collect_target_names(target, assigned);
@@ -3407,6 +3855,12 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
             iter,
             body,
             orelse,
+        }
+        | StmtKind::AsyncFor {
+            target,
+            iter,
+            body,
+            orelse,
         } => {
             collect_reads_expr(target, out);
             collect_reads_expr(iter, out);
@@ -3418,6 +3872,12 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
             }
         }
         StmtKind::FunctionDef {
+            body,
+            args,
+            decorator_list,
+            ..
+        }
+        | StmtKind::AsyncFunctionDef {
             body,
             args,
             decorator_list,
@@ -3492,7 +3952,7 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
                 collect_reads_expr(c, out);
             }
         }
-        StmtKind::With { items, body } => {
+        StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
             for it in items {
                 collect_reads_expr(&it.context_expr, out);
             }
@@ -3618,7 +4078,35 @@ fn collect_reads_deep(expr: &Expr, out: &mut HashSet<String>) {
                 }
             }
         }
-        _ => {}
+        // `await`, `yield`, `yield from`, and f-string parts can each
+        // carry name reads in arbitrarily nested positions. They were
+        // historically ignored here — which silently dropped free
+        // variables used only inside an `await` from the outer
+        // scope's "needs a cell" set, so a comprehension referencing
+        // `val` only inside `await f(val)` would close over an
+        // unfilled cell. Recurse like every other compound form.
+        ExprKind::Yield(value) => {
+            if let Some(v) = value {
+                collect_reads_deep(v, out);
+            }
+        }
+        ExprKind::YieldFrom(v) | ExprKind::Await(v) => {
+            collect_reads_deep(v, out);
+        }
+        ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                collect_reads_deep(p, out);
+            }
+        }
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            collect_reads_deep(value, out);
+            if let Some(fs) = format_spec.as_deref() {
+                collect_reads_deep(fs, out);
+            }
+        }
+        ExprKind::Constant(_) => {}
     }
 }
 
@@ -3744,7 +4232,15 @@ fn collect_reads_expr(expr: &Expr, out: &mut HashSet<String>) {
                 collect_reads_expr(p, out);
             }
         }
-        _ => {}
+        ExprKind::Yield(value) => {
+            if let Some(v) = value {
+                collect_reads_expr(v, out);
+            }
+        }
+        ExprKind::YieldFrom(v) | ExprKind::Await(v) => {
+            collect_reads_expr(v, out);
+        }
+        ExprKind::Constant(_) => {}
     }
 }
 

@@ -144,6 +144,14 @@ pub fn stop_iteration() -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("StopIteration", ""))
 }
 
+/// `StopAsyncIteration` (PEP 525) — raised by async iterators to
+/// signal the end of iteration. Distinct from `StopIteration` so
+/// `async for` doesn't accidentally swallow a synchronous
+/// `StopIteration` that bubbled through user code.
+pub fn stop_async_iteration() -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("StopAsyncIteration", ""))
+}
+
 /// `StopIteration(value)` — used by generators to surface the value
 /// of a `return` statement. The wrapped value is exposed as `.value`
 /// on the exception instance.
