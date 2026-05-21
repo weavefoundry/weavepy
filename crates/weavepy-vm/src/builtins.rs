@@ -779,6 +779,13 @@ fn attr_delete(obj: &Object, name: &str) -> Result<(), RuntimeError> {
 }
 
 fn b_int(args: &[Object]) -> Result<Object, RuntimeError> {
+    b_int_compat(args)
+}
+
+/// `int(x)` for the subset of input shapes that don't need a VM
+/// (literals, strings, numbers). Used both as the bare-bones registry
+/// entry and as a helper from the VM-aware dispatch path.
+pub(crate) fn b_int_compat(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::Int(0));
     }
@@ -805,6 +812,10 @@ fn b_int(args: &[Object]) -> Result<Object, RuntimeError> {
             args[0].type_name()
         ))),
     }
+}
+
+pub(crate) fn b_float_compat(args: &[Object]) -> Result<Object, RuntimeError> {
+    b_float(args)
 }
 
 fn b_float(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1685,7 +1696,47 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(p)) => p,
         _ => return Err(type_error("find() expected str")),
     };
-    Ok(Object::Int(s.find(&**sub).map_or(-1, |i| i as i64)))
+    let total_chars = s.chars().count() as i64;
+    let start = clamp_str_index(args.get(2), 0, total_chars);
+    let end = clamp_str_index(args.get(3), total_chars, total_chars);
+    if start > end || start > total_chars {
+        return Ok(Object::Int(-1));
+    }
+    let start_byte = char_offset_to_byte(s, start as usize);
+    let end_byte = char_offset_to_byte(s, end as usize);
+    let hay = &s[start_byte..end_byte];
+    match hay.find(&**sub) {
+        Some(byte_idx) => {
+            let abs_byte = byte_idx + start_byte;
+            Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
+        }
+        None => Ok(Object::Int(-1)),
+    }
+}
+
+fn clamp_str_index(arg: Option<&Object>, default: i64, len: i64) -> i64 {
+    match arg {
+        Some(Object::Int(n)) => {
+            if *n < 0 {
+                (len + n).max(0)
+            } else {
+                (*n).min(len)
+            }
+        }
+        Some(Object::None) | None => default,
+        _ => default,
+    }
+}
+
+fn char_offset_to_byte(s: &str, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+fn byte_offset_to_char(s: &str, byte: usize) -> usize {
+    s[..byte].chars().count()
 }
 
 fn str_title(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1832,18 +1883,30 @@ fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(p)) => p,
         _ => return Err(type_error("rfind() expected str")),
     };
-    Ok(Object::Int(s.rfind(&**sub).map_or(-1, |i| i as i64)))
+    let total_chars = s.chars().count() as i64;
+    let start = clamp_str_index(args.get(2), 0, total_chars);
+    let end = clamp_str_index(args.get(3), total_chars, total_chars);
+    if start > end {
+        return Ok(Object::Int(-1));
+    }
+    let start_byte = char_offset_to_byte(s, start as usize);
+    let end_byte = char_offset_to_byte(s, end as usize);
+    let hay = &s[start_byte..end_byte];
+    match hay.rfind(&**sub) {
+        Some(byte_idx) => {
+            let abs_byte = byte_idx + start_byte;
+            Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
+        }
+        None => Ok(Object::Int(-1)),
+    }
 }
 
 fn str_index(args: &[Object]) -> Result<Object, RuntimeError> {
-    let s = str_self(args)?;
-    let sub = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("index() expected str")),
-    };
-    s.find(&**sub)
-        .map(|i| Object::Int(i as i64))
-        .ok_or_else(|| value_error("substring not found"))
+    let pos = str_find(args)?;
+    match pos {
+        Object::Int(-1) => Err(value_error("substring not found")),
+        other => Ok(other),
+    }
 }
 
 fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1852,7 +1915,17 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(p)) => p,
         _ => return Err(type_error("count() expected str")),
     };
-    Ok(Object::Int(s.matches(&**sub).count() as i64))
+    let total_chars = s.chars().count() as i64;
+    let start = clamp_str_index(args.get(2), 0, total_chars);
+    let end = clamp_str_index(args.get(3), total_chars, total_chars);
+    if start > end {
+        return Ok(Object::Int(0));
+    }
+    let start_byte = char_offset_to_byte(s, start as usize);
+    let end_byte = char_offset_to_byte(s, end as usize);
+    Ok(Object::Int(
+        s[start_byte..end_byte].matches(&**sub).count() as i64
+    ))
 }
 
 fn str_partition(args: &[Object]) -> Result<Object, RuntimeError> {

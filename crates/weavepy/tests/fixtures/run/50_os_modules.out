@@ -1,0 +1,17 @@
+--- tempfile ---
+ends with suffix: True
+dir exists: True
+dir starts with prefix: True
+--- glob ---
+txt files: ['a.txt', 'b.txt']
+--- fnmatch ---
+a.txt vs *.txt: True
+a.md vs *.txt: False
+translate: (?s:.*\.py)\z ...
+--- shutil ---
+copied content: hello
+dir gone: True
+--- zlib ---
+compressed shorter: True
+roundtrip: True
+crc32: 907060870

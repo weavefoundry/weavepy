@@ -74,6 +74,28 @@ pub struct BuiltinTypes {
     pub keyboard_interrupt: Rc<TypeObject>,
     pub system_exit: Rc<TypeObject>,
     pub recursion_error: Rc<TypeObject>,
+
+    // RFC 0017 — OSError sub-hierarchy used by the new socket /
+    // subprocess / filesystem surface. Mirrors CPython's PEP 3151
+    // "exception hierarchy refactor."
+    pub blocking_io_error: Rc<TypeObject>,
+    pub broken_pipe_error: Rc<TypeObject>,
+    pub child_process_error: Rc<TypeObject>,
+    pub connection_error: Rc<TypeObject>,
+    pub connection_aborted_error: Rc<TypeObject>,
+    pub connection_refused_error: Rc<TypeObject>,
+    pub connection_reset_error: Rc<TypeObject>,
+    pub file_exists_error: Rc<TypeObject>,
+    pub file_not_found_error: Rc<TypeObject>,
+    pub interrupted_error: Rc<TypeObject>,
+    pub is_a_directory_error: Rc<TypeObject>,
+    pub not_a_directory_error: Rc<TypeObject>,
+    pub permission_error: Rc<TypeObject>,
+    pub process_lookup_error: Rc<TypeObject>,
+
+    pub eof_error: Rc<TypeObject>,
+    pub buffer_error: Rc<TypeObject>,
+    pub memory_error: Rc<TypeObject>,
 }
 
 impl BuiltinTypes {
@@ -140,6 +162,7 @@ impl BuiltinTypes {
         let name_error = exc("NameError", exception.clone());
         let unbound_local_error = exc("UnboundLocalError", name_error.clone());
         let os_error = exc("OSError", exception.clone());
+        install_os_error_init(&os_error);
         let runtime_error = exc("RuntimeError", exception.clone());
         let not_implemented_error = exc("NotImplementedError", runtime_error.clone());
         let recursion_error = exc("RecursionError", runtime_error.clone());
@@ -158,6 +181,31 @@ impl BuiltinTypes {
         let generator_exit = exc("GeneratorExit", base_exception.clone());
         let keyboard_interrupt = exc("KeyboardInterrupt", base_exception.clone());
         let system_exit = exc("SystemExit", base_exception.clone());
+
+        // PEP 3151 OSError hierarchy. ConnectionError is itself a
+        // subclass of OSError; the concrete connection types hang
+        // off it. BrokenPipeError's MRO in CPython is
+        // [BrokenPipeError, ConnectionError, OSError, ...]; we
+        // realise it via single-inheritance through ConnectionError
+        // for the same observable lookup walk.
+        let blocking_io_error = exc("BlockingIOError", os_error.clone());
+        let connection_error = exc("ConnectionError", os_error.clone());
+        let broken_pipe_error = exc("BrokenPipeError", connection_error.clone());
+        let child_process_error = exc("ChildProcessError", os_error.clone());
+        let connection_aborted_error = exc("ConnectionAbortedError", connection_error.clone());
+        let connection_refused_error = exc("ConnectionRefusedError", connection_error.clone());
+        let connection_reset_error = exc("ConnectionResetError", connection_error.clone());
+        let file_exists_error = exc("FileExistsError", os_error.clone());
+        let file_not_found_error = exc("FileNotFoundError", os_error.clone());
+        let interrupted_error = exc("InterruptedError", os_error.clone());
+        let is_a_directory_error = exc("IsADirectoryError", os_error.clone());
+        let not_a_directory_error = exc("NotADirectoryError", os_error.clone());
+        let permission_error = exc("PermissionError", os_error.clone());
+        let process_lookup_error = exc("ProcessLookupError", os_error.clone());
+
+        let eof_error = exc("EOFError", exception.clone());
+        let buffer_error = exc("BufferError", exception.clone());
+        let memory_error = exc("MemoryError", exception.clone());
 
         let bt = BuiltinTypes {
             object_: object_.clone(),
@@ -210,6 +258,23 @@ impl BuiltinTypes {
             keyboard_interrupt,
             system_exit,
             recursion_error,
+            blocking_io_error,
+            broken_pipe_error,
+            child_process_error,
+            connection_error,
+            connection_aborted_error,
+            connection_refused_error,
+            connection_reset_error,
+            file_exists_error,
+            file_not_found_error,
+            interrupted_error,
+            is_a_directory_error,
+            not_a_directory_error,
+            permission_error,
+            process_lookup_error,
+            eof_error,
+            buffer_error,
+            memory_error,
         };
         // Every other built-in type's metaclass is `type`.
         for (_, value) in bt.as_globals() {
@@ -275,6 +340,23 @@ impl BuiltinTypes {
             pair!(keyboard_interrupt, "KeyboardInterrupt"),
             pair!(system_exit, "SystemExit"),
             pair!(recursion_error, "RecursionError"),
+            pair!(blocking_io_error, "BlockingIOError"),
+            pair!(broken_pipe_error, "BrokenPipeError"),
+            pair!(child_process_error, "ChildProcessError"),
+            pair!(connection_error, "ConnectionError"),
+            pair!(connection_aborted_error, "ConnectionAbortedError"),
+            pair!(connection_refused_error, "ConnectionRefusedError"),
+            pair!(connection_reset_error, "ConnectionResetError"),
+            pair!(file_exists_error, "FileExistsError"),
+            pair!(file_not_found_error, "FileNotFoundError"),
+            pair!(interrupted_error, "InterruptedError"),
+            pair!(is_a_directory_error, "IsADirectoryError"),
+            pair!(not_a_directory_error, "NotADirectoryError"),
+            pair!(permission_error, "PermissionError"),
+            pair!(process_lookup_error, "ProcessLookupError"),
+            pair!(eof_error, "EOFError"),
+            pair!(buffer_error, "BufferError"),
+            pair!(memory_error, "MemoryError"),
         ]
     }
 
@@ -324,6 +406,23 @@ impl BuiltinTypes {
             "KeyboardInterrupt" => Some(self.keyboard_interrupt.clone()),
             "SystemExit" => Some(self.system_exit.clone()),
             "RecursionError" => Some(self.recursion_error.clone()),
+            "BlockingIOError" => Some(self.blocking_io_error.clone()),
+            "BrokenPipeError" => Some(self.broken_pipe_error.clone()),
+            "ChildProcessError" => Some(self.child_process_error.clone()),
+            "ConnectionError" => Some(self.connection_error.clone()),
+            "ConnectionAbortedError" => Some(self.connection_aborted_error.clone()),
+            "ConnectionRefusedError" => Some(self.connection_refused_error.clone()),
+            "ConnectionResetError" => Some(self.connection_reset_error.clone()),
+            "FileExistsError" => Some(self.file_exists_error.clone()),
+            "FileNotFoundError" => Some(self.file_not_found_error.clone()),
+            "InterruptedError" => Some(self.interrupted_error.clone()),
+            "IsADirectoryError" => Some(self.is_a_directory_error.clone()),
+            "NotADirectoryError" => Some(self.not_a_directory_error.clone()),
+            "PermissionError" => Some(self.permission_error.clone()),
+            "ProcessLookupError" => Some(self.process_lookup_error.clone()),
+            "EOFError" => Some(self.eof_error.clone()),
+            "BufferError" => Some(self.buffer_error.clone()),
+            "MemoryError" => Some(self.memory_error.clone()),
             _ => None,
         }
     }
@@ -533,6 +632,40 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
     );
 }
 
+fn install_os_error_init(os_error: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    fn oserror_init(args: &[Object]) -> Result<Object, RuntimeError> {
+        // OSError(errno, strerror, [filename, [winerror, filename2]])
+        // — populate named attributes from the positional args.
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        if let Object::Instance(inst_rc) = inst {
+            let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
+            let mut dict = inst_rc.dict.borrow_mut();
+            dict.insert(
+                DictKey(Object::from_static("args")),
+                Object::new_tuple(rest.to_vec()),
+            );
+            let pick = |i: usize| rest.get(i).cloned().unwrap_or(Object::None);
+            dict.insert(DictKey(Object::from_static("errno")), pick(0));
+            dict.insert(DictKey(Object::from_static("strerror")), pick(1));
+            dict.insert(DictKey(Object::from_static("filename")), pick(2));
+            dict.insert(DictKey(Object::from_static("winerror")), pick(3));
+            dict.insert(DictKey(Object::from_static("filename2")), pick(4));
+        }
+        Ok(Object::None)
+    }
+    let mut dict = os_error.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            call: Box::new(oserror_init),
+        })),
+    );
+}
+
 fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
     use crate::object::BuiltinFn;
     fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -626,16 +759,34 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
 
 pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<String>) -> Object {
     use crate::types::PyInstance;
+    let is_os = is_subclass_by_name(&class, "OSError");
     let inst = PyInstance::new(class);
     let msg = Object::from_str(message);
     let args = Object::new_tuple(vec![msg.clone()]);
-    inst.dict
-        .borrow_mut()
-        .insert(DictKey(Object::from_static("args")), args);
-    inst.dict
-        .borrow_mut()
-        .insert(DictKey(Object::from_static("message")), msg);
+    {
+        let mut dict = inst.dict.borrow_mut();
+        dict.insert(DictKey(Object::from_static("args")), args);
+        dict.insert(DictKey(Object::from_static("message")), msg);
+        if is_os {
+            // OSError attributes — populated to None when we raise
+            // from Rust so callers can still ask `exc.errno` without
+            // an AttributeError. Real values land here through the
+            // `OSError(errno, strerror, ...)` __init__ in Python.
+            for name in ["errno", "strerror", "filename", "winerror", "filename2"] {
+                dict.insert(DictKey(Object::from_static(name)), Object::None);
+            }
+        }
+    }
     Object::Instance(Rc::new(inst))
+}
+
+fn is_subclass_by_name(class: &Rc<TypeObject>, ancestor: &str) -> bool {
+    for t in class.mro.borrow().iter() {
+        if t.name == ancestor {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extract the "message" of an exception instance — used by the

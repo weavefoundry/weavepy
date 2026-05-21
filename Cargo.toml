@@ -57,6 +57,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-ident = "1.0"
 walkdir     = "2.5"
 
+# RFC 0017 — OS interface, networking, subprocess.
+mio         = { version = "1.0", features = ["os-poll", "os-ext", "net"] }
+socket2     = { version = "0.5", features = ["all"] }
+sha2        = "0.10"
+sha1        = "0.10"
+md-5        = "0.10"
+digest      = "0.10"
+hmac        = "0.12"
+base64      = "0.22"
+crc32fast   = "1.4"
+flate2      = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }
 proptest    = "1.5"

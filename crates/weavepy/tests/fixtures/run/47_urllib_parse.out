@@ -1,0 +1,19 @@
+scheme: https
+netloc: user:pass@example.com:8080
+hostname: example.com
+port: 8080
+path: /path/to
+query: key=val&x=1
+fragment: frag
+username: user
+password: pass
+unparse: https://user:pass@example.com:8080/path/to?key=val&x=1#frag
+split: https example.com /foo bar=1 z
+unsplit: https://example.com/foo?bar=1#z
+urljoin: https://a.com/z?q=1
+urljoin abs: https://b.com/y
+quote: hello%20world%20%26%20friends
+unquote: hello world & friends
+urlencode: a=1&b=two+words
+parse_qsl: [('a', '1'), ('b', 'two words'), ('a', '2')]
+parse_qs: {'a': ['1', '2'], 'b': ['two words']}

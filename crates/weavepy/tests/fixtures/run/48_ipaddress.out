@@ -1,0 +1,10 @@
+v4: 192.168.1.10 3232235786
+private: True
+loopback: False
+v4 from int: 10.0.0.1
+net: 10.0.0.0/8 broadcast: 10.255.255.255 num: 16777216
+net contains 10.1.2.3: True
+net contains 11.1.2.3: False
+v6: ::1 loopback: True
+generic: 172.16.0.1 version: 4
+interface: 192.168.1.10 network: 192.168.1.0/24

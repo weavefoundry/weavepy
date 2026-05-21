@@ -1,0 +1,16 @@
+--- csv reader ---
+['name', 'age']
+['Alice', '30']
+['Bob', '25']
+--- csv DictReader ---
+{'name': 'Alice', 'age': '30'}
+{'name': 'Bob', 'age': '25'}
+--- csv writer ---
+'x,y\r\n1,2\r\n3,4\r\n'
+--- csv DictWriter ---
+'k,v\r\na,1\r\nb,2\r\n'
+--- mimetypes ---
+json: ('application/json', None)
+png: ('image/png', None)
+tar.gz: ('application/x-tar', 'gzip')
+unknown: (None, None)

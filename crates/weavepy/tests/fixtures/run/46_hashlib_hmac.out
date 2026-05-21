@@ -1,0 +1,20 @@
+--- hashlib ---
+md5: 5eb63bbbe01eeed093cb22bb8f5acdc3
+sha1: 2aae6c35c94fcfb415dbe95f408b9ce91ee846ed
+sha256: b94d27b9934d3e08a52e ...
+incremental sha256 matches: True
+--- hmac ---
+hmac sha256: 9307b3b915efb5171ff1 ...
+hmac eq: True False
+--- base64 ---
+b64encode: b'V2VhdmVQeSByb2Nrcw=='
+b64decode: b'WeavePy rocks'
+b32encode: b'NBUQ===='
+b16encode: b'6869'
+--- binascii ---
+hex: b'4142'
+unhex: b'AB'
+crc32: 907060870
+--- secrets ---
+token_hex len: 16
+randbelow ok: True

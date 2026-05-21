@@ -1,0 +1,13 @@
+--- selectors ---
+events: 1
+data: reader
+read mask: True
+--- asyncio sleep ---
+sleep result: 42
+--- asyncio sock primitives ---
+listener up on 127.0.0.1 port>0: True
+accepted from: 127.0.0.1
+server got: b'hello async\n'
+client got: b'hi back\n'
+--- asyncio gather ---
+gathered: [4, 9, 16]

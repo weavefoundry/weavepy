@@ -935,6 +935,10 @@ impl Interpreter {
                         let globals = frame.globals.clone();
                         self.collect_iterable(&gen_obj, &globals)?
                     }
+                    Object::Instance(_) | Object::Dict(_) | Object::Iter(_) => {
+                        let globals = frame.globals.clone();
+                        self.collect_iterable(&v, &globals)?
+                    }
                     _ => {
                         return Err(type_error(format!(
                             "cannot unpack non-iterable {} object",
@@ -2035,39 +2039,78 @@ impl Interpreter {
                 i = end;
                 let (name_part, conv, spec_part) = split_format_field(&field);
                 let conv_char = conv;
+                let mut tmp_idx = auto_idx;
+                let resolved =
+                    resolve_field_name(name_part, positional, keyword, &mut tmp_idx, None);
+                let consumed_auto = name_part.is_empty();
                 if matches!(conv_char, Some('s') | Some('r')) {
-                    // Resolve the value the same way render_format_field
-                    // would, so attribute / subscript trailers still work.
-                    let mut tmp_idx = auto_idx;
-                    let value =
-                        resolve_field_name(name_part, positional, keyword, &mut tmp_idx, None)?;
-                    if matches!(value, Object::Instance(_)) {
-                        let rendered = match conv_char {
-                            Some('s') => self.stringify(&value, globals)?,
-                            Some('r') => self.repr_of(&value, globals)?,
-                            _ => unreachable!(),
-                        };
-                        let final_text = match spec_part {
-                            Some(spec) => format_via_spec(&Object::from_str(rendered), spec)?,
-                            None => rendered,
-                        };
-                        // Emit as a literal — escape any `{` / `}` so
-                        // the downstream pass treats it as plain text.
-                        for ch in final_text.chars() {
-                            if ch == '{' || ch == '}' {
-                                out.push(ch);
-                                out.push(ch);
-                            } else {
-                                out.push(ch);
+                    if let Ok(value) = resolved.as_ref() {
+                        if matches!(value, Object::Instance(_)) {
+                            let rendered = match conv_char {
+                                Some('s') => self.stringify(value, globals)?,
+                                Some('r') => self.repr_of(value, globals)?,
+                                _ => unreachable!(),
+                            };
+                            let final_text = match spec_part {
+                                Some(spec) => format_via_spec(&Object::from_str(rendered), spec)?,
+                                None => rendered,
+                            };
+                            for ch in final_text.chars() {
+                                if ch == '{' || ch == '}' {
+                                    out.push(ch);
+                                    out.push(ch);
+                                } else {
+                                    out.push(ch);
+                                }
                             }
+                            auto_idx = tmp_idx;
+                            continue;
                         }
-                        auto_idx = tmp_idx;
-                        continue;
+                    }
+                } else if conv_char.is_none() {
+                    // `{x}` with no explicit conversion: CPython calls
+                    // `__format__(x, spec)`, which on instances falls
+                    // back to `__str__`. We don't yet hop through
+                    // `__format__`, but invoking `__str__` is the
+                    // common-case match users expect.
+                    if let Ok(value) = resolved.as_ref() {
+                        if matches!(value, Object::Instance(_)) {
+                            let s = self.stringify(value, globals)?;
+                            let final_text = match spec_part {
+                                Some(spec) => format_via_spec(&Object::from_str(s), spec)?,
+                                None => s,
+                            };
+                            for ch in final_text.chars() {
+                                if ch == '{' || ch == '}' {
+                                    out.push(ch);
+                                    out.push(ch);
+                                } else {
+                                    out.push(ch);
+                                }
+                            }
+                            auto_idx = tmp_idx;
+                            continue;
+                        }
                     }
                 }
-                out.push('{');
-                out.push_str(&field);
-                out.push('}');
+                // Field unchanged. If we consumed an auto-index slot
+                // and the field doesn't carry a name, rewrite it as a
+                // positional `{N}` so the downstream formatter's
+                // separate auto-index counter doesn't desync with ours.
+                if consumed_auto {
+                    let idx = auto_idx;
+                    auto_idx = tmp_idx;
+                    out.push('{');
+                    out.push_str(&idx.to_string());
+                    // Preserve trailers (everything after the empty name_part).
+                    let after_base = &field[name_part.len()..];
+                    out.push_str(after_base);
+                    out.push('}');
+                } else {
+                    out.push('{');
+                    out.push_str(&field);
+                    out.push('}');
+                }
             } else if b == b'}' {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'}' {
                     out.push_str("}}");
@@ -2109,6 +2152,74 @@ impl Interpreter {
             };
         }
         Ok(Object::Int(v.len()? as i64))
+    }
+
+    /// `int(x)` with a fallback to the user-defined `__int__`. Matches
+    /// CPython's coercion rules well enough for the common cases —
+    /// user classes that store an integer payload (enums, ipaddress,
+    /// etc.) just work.
+    fn do_int_call(
+        &mut self,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        if args.is_empty() {
+            return Ok(Object::Int(0));
+        }
+        match &args[0] {
+            Object::Int(_) | Object::Bool(_) | Object::Float(_) | Object::Str(_) => {
+                builtins::b_int_compat(args)
+            }
+            other => {
+                if let Some(method) = instance_method(other, "__int__") {
+                    let r = self.call(&method, &[], &[], globals)?;
+                    return match r {
+                        Object::Int(i) => Ok(Object::Int(i)),
+                        Object::Bool(b) => Ok(Object::Int(i64::from(b))),
+                        other => Err(type_error(format!(
+                            "'__int__' should return int, not '{}'",
+                            other.type_name()
+                        ))),
+                    };
+                }
+                Err(type_error(format!(
+                    "int() argument must be a string or a real number, not '{}'",
+                    other.type_name()
+                )))
+            }
+        }
+    }
+
+    fn do_float_call(
+        &mut self,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        if args.is_empty() {
+            return Ok(Object::Float(0.0));
+        }
+        match &args[0] {
+            Object::Int(_) | Object::Bool(_) | Object::Float(_) | Object::Str(_) => {
+                builtins::b_float_compat(args)
+            }
+            other => {
+                if let Some(method) = instance_method(other, "__float__") {
+                    let r = self.call(&method, &[], &[], globals)?;
+                    return match r {
+                        Object::Float(f) => Ok(Object::Float(f)),
+                        Object::Int(i) => Ok(Object::Float(i as f64)),
+                        other => Err(type_error(format!(
+                            "'__float__' should return float, not '{}'",
+                            other.type_name()
+                        ))),
+                    };
+                }
+                Err(type_error(format!(
+                    "float() argument must be a string or a real number, not '{}'",
+                    other.type_name()
+                )))
+            }
+        }
     }
 
     /// `next(it[, default])` — drives an iterator. Generators need
@@ -3489,6 +3600,12 @@ impl Interpreter {
                 if b.name == "len" && args.len() == 1 {
                     return self.do_len_call(&args[0], outer_globals);
                 }
+                if b.name == "int" && args.len() <= 2 {
+                    return self.do_int_call(args, outer_globals);
+                }
+                if b.name == "float" && args.len() <= 1 {
+                    return self.do_float_call(args, outer_globals);
+                }
                 if b.name == "next" && (args.len() == 1 || args.len() == 2) {
                     return self.do_next_call(args, outer_globals);
                 }
@@ -4160,6 +4277,16 @@ impl Interpreter {
                     return Ok(d);
                 }
             }
+            // `int(x)` / `float(x)` honour the user's `__int__` /
+            // `__float__` when `x` is a non-primitive — matches CPython.
+            if cls.name == "int" && args.len() <= 2 && kwargs.is_empty() {
+                let global_dummy = Rc::new(RefCell::new(DictData::new()));
+                return self.do_int_call(args, &global_dummy);
+            }
+            if cls.name == "float" && args.len() <= 1 && kwargs.is_empty() {
+                let global_dummy = Rc::new(RefCell::new(DictData::new()));
+                return self.do_float_call(args, &global_dummy);
+            }
             if let Some(builtin) = self.builtin_constructor_for(&cls) {
                 if !kwargs.is_empty() {
                     return Err(type_error(format!(
@@ -4312,12 +4439,6 @@ impl Interpreter {
         // `**kwargs` dict if the function declares one; otherwise we
         // raise the usual TypeError. Defaults are applied AFTER
         // kwargs so an explicit `arg=` always wins over the default.
-        let kwargs_slot = if has_varkeywords {
-            Some(total_args + usize::from(has_varargs))
-        } else {
-            None
-        };
-        let mut extra_kwargs = crate::object::DictData::new();
         // Keyword-binding range = positional params + kwonly params.
         // *args/**kwargs sit just outside this range and can't be
         // addressed by keyword. Locals beyond it MUST NOT pull the
@@ -4325,6 +4446,12 @@ impl Interpreter {
         let kwonly_count = code.kwonly_count as usize;
         let kwonly_start = total_args + usize::from(has_varargs);
         let kwonly_end = kwonly_start + kwonly_count;
+        let kwargs_slot = if has_varkeywords {
+            Some(kwonly_end)
+        } else {
+            None
+        };
+        let mut extra_kwargs = crate::object::DictData::new();
         for (name, value) in kwargs {
             let mut slot = None;
             if let Some(p) = code

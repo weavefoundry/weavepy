@@ -22,5 +22,17 @@ serde_json       = { workspace = true }
 thiserror        = { workspace = true }
 tracing          = { workspace = true }
 
+# RFC 0017 — OS interface, networking, subprocess.
+mio              = { workspace = true }
+socket2          = { workspace = true }
+sha2             = { workspace = true }
+sha1             = { workspace = true }
+md-5             = { workspace = true }
+digest           = { workspace = true }
+hmac             = { workspace = true }
+base64           = { workspace = true }
+crc32fast        = { workspace = true }
+flate2           = { workspace = true }
+
 [lints]
 workspace = true

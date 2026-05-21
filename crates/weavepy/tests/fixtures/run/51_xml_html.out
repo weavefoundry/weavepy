@@ -1,0 +1,9 @@
+--- html ---
+escape: &lt;b&gt;&#x27;one&#x27; &amp; &quot;two&quot;&lt;/b&gt;
+unescape: &lt;>"AB
+--- xml.etree ---
+root tag: root
+children count: 2
+person 1 Alice 30
+person 2 Bob 25
+serialised: <greeting>hello &amp; welcome<to>world</to></greeting>

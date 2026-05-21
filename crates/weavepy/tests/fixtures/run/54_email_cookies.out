@@ -1,0 +1,13 @@
+--- email parse ---
+from: alice@example.com
+to: bob@example.com
+subject: Hello
+body starts: Hi Bob,
+--- email build ---
+From in str: True
+Body in str: True
+--- cookies ---
+contains session: True
+contains theme: True
+parsed a: 1
+parsed b: two

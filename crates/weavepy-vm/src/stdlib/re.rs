@@ -274,20 +274,42 @@ fn run_match(
     require_start: bool,
     fullmatch: bool,
 ) -> Result<Object, RuntimeError> {
-    let (pat, default_flags) = extract_pattern(
-        args.first()
-            .ok_or_else(|| type_error("expected pattern argument"))?,
-    )?;
+    let first = args
+        .first()
+        .ok_or_else(|| type_error("expected pattern argument"))?;
+    let from_pattern = matches!(first, Object::Instance(inst) if inst.class.name == "Pattern");
+    let (pat, default_flags) = extract_pattern(first)?;
     let text = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
         _ => return Err(type_error("expected str input")),
     };
-    let flags = match args.get(2) {
-        Some(Object::Int(i)) => *i,
-        _ => default_flags,
+    // Pattern method form: `pattern.match(s, pos=0, endpos=len(s))`.
+    // Module-level form: `re.match(pattern, s, flags=0)`.
+    let (flags, pos, endpos) = if from_pattern {
+        let pos = match args.get(2) {
+            Some(Object::Int(i)) => *i,
+            _ => 0,
+        };
+        let endpos = match args.get(3) {
+            Some(Object::Int(i)) => *i,
+            _ => text.chars().count() as i64,
+        };
+        (default_flags, pos, endpos)
+    } else {
+        let flags = match args.get(2) {
+            Some(Object::Int(i)) => *i,
+            _ => default_flags,
+        };
+        (flags, 0i64, text.chars().count() as i64)
     };
     let re = compile_pattern(&pat, flags)?;
-    let found = re.captures(&text);
+    let start_byte = char_index_to_byte(&text, pos.max(0) as usize);
+    let end_byte = char_index_to_byte(&text, endpos.max(0) as usize);
+    if start_byte > end_byte || start_byte > text.len() {
+        return Ok(Object::None);
+    }
+    let slice = &text[start_byte..end_byte.min(text.len())];
+    let found = re.captures(slice);
     let captures = match found {
         Some(caps) => caps,
         None => return Ok(Object::None),
@@ -297,12 +319,21 @@ fn run_match(
     }
     if fullmatch {
         if let Some(m) = captures.get(0) {
-            if m.start() != 0 || m.end() != text.len() {
+            if m.start() != 0 || m.end() != slice.len() {
                 return Ok(Object::None);
             }
         }
     }
-    Ok(make_match(&pat, &text, &captures, &re))
+    Ok(make_match(&pat, &text, &captures, &re, start_byte))
+}
+
+fn char_index_to_byte(s: &str, n: usize) -> usize {
+    for (count, (i, _)) in s.char_indices().enumerate() {
+        if count == n {
+            return i;
+        }
+    }
+    s.len()
 }
 
 fn re_match(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -317,7 +348,13 @@ fn re_fullmatch(args: &[Object]) -> Result<Object, RuntimeError> {
     run_match(args, true, true)
 }
 
-fn make_match(pat: &str, text: &str, caps: &Captures<'_>, re: &Regex) -> Object {
+fn make_match(
+    pat: &str,
+    text: &str,
+    caps: &Captures<'_>,
+    re: &Regex,
+    base_offset: usize,
+) -> Object {
     let inst = PyInstance::new(match_class());
     let m0 = caps.get(0).expect("at least one capture");
     inst.dict.borrow_mut().insert(
@@ -328,9 +365,10 @@ fn make_match(pat: &str, text: &str, caps: &Captures<'_>, re: &Regex) -> Object 
         DictKey(Object::from_static("re")),
         Object::from_str(pat.to_owned()),
     );
-    inst.dict
-        .borrow_mut()
-        .insert(DictKey(Object::from_static("pos")), Object::Int(0));
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("pos")),
+        Object::Int(base_offset as i64),
+    );
     inst.dict.borrow_mut().insert(
         DictKey(Object::from_static("endpos")),
         Object::Int(text.len() as i64),
@@ -346,8 +384,8 @@ fn make_match(pat: &str, text: &str, caps: &Captures<'_>, re: &Regex) -> Object 
     for i in 0..caps.len() {
         match caps.get(i) {
             Some(m) => spans.push(Object::new_tuple(vec![
-                Object::Int(m.start() as i64),
-                Object::Int(m.end() as i64),
+                Object::Int((m.start() + base_offset) as i64),
+                Object::Int((m.end() + base_offset) as i64),
             ])),
             None => spans.push(Object::new_tuple(vec![Object::Int(-1), Object::Int(-1)])),
         }
@@ -374,11 +412,11 @@ fn make_match(pat: &str, text: &str, caps: &Captures<'_>, re: &Regex) -> Object 
     );
     inst.dict.borrow_mut().insert(
         DictKey(Object::from_static("_full_start")),
-        Object::Int(m0.start() as i64),
+        Object::Int((m0.start() + base_offset) as i64),
     );
     inst.dict.borrow_mut().insert(
         DictKey(Object::from_static("_full_end")),
-        Object::Int(m0.end() as i64),
+        Object::Int((m0.end() + base_offset) as i64),
     );
     Object::Instance(Rc::new(inst))
 }
@@ -607,7 +645,7 @@ fn re_finditer(args: &[Object]) -> Result<Object, RuntimeError> {
     let re = compile_pattern(&pat, flags)?;
     let mut out = Vec::new();
     for caps in re.captures_iter(&text) {
-        out.push(make_match(&pat, &text, &caps, &re));
+        out.push(make_match(&pat, &text, &caps, &re, 0));
     }
     Ok(Object::new_list(out))
 }

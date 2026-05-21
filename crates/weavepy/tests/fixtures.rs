@@ -57,8 +57,39 @@ fn read_text_normalized(path: &Path) -> std::io::Result<String> {
     fs::read_to_string(path).map(|s| s.replace("\r\n", "\n"))
 }
 
+/// Some fixtures depend on platform-specific surface (e.g. the
+/// `select`/`selectors`/`asyncio` stack only works on Unix today
+/// because there's no IOCP backend). Honour a `# weavepy-skip: <os>`
+/// directive at the top of the fixture so the test can co-exist
+/// in the repo without breaking Windows CI.
+fn should_skip(source: &str) -> bool {
+    let target = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        return false;
+    };
+    source.lines().take(20).any(|line| {
+        let l = line.trim_start_matches('#').trim();
+        if let Some(rest) = l.strip_prefix("weavepy-skip:") {
+            rest.split(',')
+                .map(str::trim)
+                .any(|name| name.eq_ignore_ascii_case(target))
+        } else {
+            false
+        }
+    })
+}
+
 fn run_fixture(py_path: &Path) {
     let source = read_text_normalized(py_path).expect("read source");
+    if should_skip(&source) {
+        eprintln!("skipping fixture {} on this platform", py_path.display());
+        return;
+    }
     let out_path = py_path.with_extension("out");
     let expected = read_text_normalized(&out_path)
         .unwrap_or_else(|_| panic!("missing expected-output file {}", out_path.display()));

@@ -167,6 +167,10 @@ pub fn stop_iteration_with(value: Object) -> RuntimeError {
     RuntimeError::PyException(pe)
 }
 
+pub fn not_implemented_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("NotImplementedError", message))
+}
+
 pub fn runtime_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("RuntimeError", message))
 }
@@ -189,4 +193,91 @@ pub fn module_not_found_error(message: impl Into<String>) -> RuntimeError {
 
 pub fn os_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("OSError", message))
+}
+
+pub fn blocking_io_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("BlockingIOError", message))
+}
+
+pub fn broken_pipe_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("BrokenPipeError", message))
+}
+
+pub fn connection_aborted_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("ConnectionAbortedError", message))
+}
+
+pub fn connection_refused_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("ConnectionRefusedError", message))
+}
+
+pub fn connection_reset_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("ConnectionResetError", message))
+}
+
+pub fn file_exists_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("FileExistsError", message))
+}
+
+pub fn file_not_found_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("FileNotFoundError", message))
+}
+
+pub fn interrupted_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("InterruptedError", message))
+}
+
+pub fn is_a_directory_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("IsADirectoryError", message))
+}
+
+pub fn not_a_directory_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("NotADirectoryError", message))
+}
+
+pub fn permission_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("PermissionError", message))
+}
+
+pub fn timeout_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("TimeoutError", message))
+}
+
+pub fn child_process_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("ChildProcessError", message))
+}
+
+/// Translate a `std::io::Error` into the most specific
+/// CPython-style exception we can. Falls back to a generic
+/// `OSError` for unrecognised kinds.
+pub fn io_error_to_py(err: &std::io::Error) -> RuntimeError {
+    use std::io::ErrorKind::{
+        AlreadyExists, BrokenPipe, ConnectionAborted, ConnectionRefused, ConnectionReset,
+        Interrupted, NotFound, PermissionDenied, TimedOut, WouldBlock,
+    };
+    let message = err.to_string();
+    let mut runtime = match err.kind() {
+        NotFound => file_not_found_error(message),
+        PermissionDenied => permission_error(message),
+        ConnectionRefused => connection_refused_error(message),
+        ConnectionReset => connection_reset_error(message),
+        ConnectionAborted => connection_aborted_error(message),
+        BrokenPipe => broken_pipe_error(message),
+        TimedOut => timeout_error(message),
+        WouldBlock => blocking_io_error(message),
+        Interrupted => interrupted_error(message),
+        AlreadyExists => file_exists_error(message),
+        _ => os_error(message),
+    };
+    if let Some(errno) = err.raw_os_error() {
+        if let RuntimeError::PyException(ref mut exc) = runtime {
+            if let crate::object::Object::Instance(inst) = &exc.instance {
+                inst.dict.borrow_mut().insert(
+                    crate::object::DictKey(crate::object::Object::from_static("errno")),
+                    crate::object::Object::Int(i64::from(errno)),
+                );
+            }
+        }
+    }
+    runtime
 }

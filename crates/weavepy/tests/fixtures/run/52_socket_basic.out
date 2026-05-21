@@ -1,0 +1,18 @@
+--- constants ---
+AF_INET: 2
+SOCK_STREAM: 1
+SOL_SOCKET is int: True
+--- helpers ---
+htons(80): 20480
+ntohs(htons(80)): 80
+inet_aton('127.0.0.1'): b'\x7f\x00\x00\x01'
+inet_ntoa: 192.168.0.1
+--- getaddrinfo ---
+len: 1
+family: True kind: True
+addr: ('127.0.0.1', 80)
+--- TCP echo ---
+listening on: 127.0.0.1 with port>0: True
+accepted from: 127.0.0.1
+server got: b'ping\n'
+client got: b'pong\n'

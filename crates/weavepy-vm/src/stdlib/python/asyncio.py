@@ -21,10 +21,15 @@ What works:
 
 What does NOT work (yet):
 
-* I/O multiplexing: there are no sockets / streams. `loop.sock_*`
-  and `loop.create_connection` are absent.
-* Subprocess / signals.
+* Subprocess transports (use plain `subprocess.Popen`).
 * Real OS-level parallelism — this is a cooperative scheduler.
+
+What was just added (RFC 0017):
+
+* I/O multiplexing via the `selectors` module. `add_reader` /
+  `add_writer` / `remove_reader` / `remove_writer` plus all of the
+  `sock_*` helpers and the streams API: `open_connection` and
+  `start_server` return `StreamReader` / `StreamWriter` pairs.
 
 The event loop is a single, lazily-created instance. Once
 `asyncio.run` returns, the loop is closed; a subsequent `run` call
@@ -32,6 +37,8 @@ spins up a fresh one.
 """
 
 import time as _time
+import selectors as _selectors
+import socket as _socket
 
 
 # ---- Exceptions ---------------------------------------------------
@@ -252,6 +259,9 @@ class EventLoop:
         self._closed = False
         self._exception_handler = None
         self._tasks = []
+        self._selector = _selectors.DefaultSelector()
+        # fd -> (reader_cb, writer_cb)
+        self._fd_callbacks = {}
 
     # ---- inspection -----------------------------------------------
 
@@ -269,6 +279,11 @@ class EventLoop:
         self._ready.clear()
         self._scheduled.clear()
         self._tasks.clear()
+        try:
+            self._selector.close()
+        except Exception:
+            pass
+        self._fd_callbacks.clear()
 
     # ---- scheduling -----------------------------------------------
 
@@ -310,7 +325,8 @@ class EventLoop:
         self._running = True
         try:
             while self._running:
-                if not self._ready and not self._scheduled:
+                if (not self._ready and not self._scheduled
+                        and not self._fd_callbacks):
                     break
                 self._run_once()
         finally:
@@ -327,13 +343,28 @@ class EventLoop:
         self._running = False
 
     def _run_once(self):
-        # If there are timers but nothing immediately ready, sleep
-        # until the next deadline so we don't busy-spin.
-        if not self._ready and self._scheduled:
-            now = self.time()
-            next_when = self._scheduled[0][0]
-            if next_when > now:
-                _time.sleep(min(next_when - now, 0.05))
+        # If nothing is immediately ready, decide whether to wait for
+        # an fd event, a timer, or just yield briefly.
+        if not self._ready:
+            timeout = None
+            if self._scheduled:
+                now = self.time()
+                next_when = self._scheduled[0][0]
+                timeout = max(0.0, next_when - now)
+            if self._fd_callbacks:
+                # Block in the selector — events become ready callbacks.
+                try:
+                    events = self._selector.select(timeout if timeout is not None else 0.05)
+                except OSError:
+                    events = []
+                for key, mask in events:
+                    reader, writer = self._fd_callbacks.get(key.fd, (None, None))
+                    if reader is not None and (mask & _selectors.EVENT_READ):
+                        self._ready.append((reader, ()))
+                    if writer is not None and (mask & _selectors.EVENT_WRITE):
+                        self._ready.append((writer, ()))
+            elif timeout is not None and timeout > 0:
+                _time.sleep(min(timeout, 0.05))
         # Promote any expired timers into the ready queue.
         now = self.time()
         while self._scheduled and self._scheduled[0][0] <= now:
@@ -349,6 +380,165 @@ class EventLoop:
                 cb(*args)
             except BaseException as exc:
                 self._handle_exception(exc)
+
+    # ---- I/O multiplexing ----------------------------------------
+
+    def add_reader(self, fd, callback, *args):
+        cb = lambda: callback(*args)
+        reader, writer = self._fd_callbacks.get(fd, (None, None))
+        mask = _selectors.EVENT_READ | (_selectors.EVENT_WRITE if writer else 0)
+        try:
+            self._selector.unregister(fd)
+        except (KeyError, ValueError):
+            pass
+        self._selector.register(fd, mask)
+        self._fd_callbacks[fd] = (cb, writer)
+
+    def add_writer(self, fd, callback, *args):
+        cb = lambda: callback(*args)
+        reader, writer = self._fd_callbacks.get(fd, (None, None))
+        mask = _selectors.EVENT_WRITE | (_selectors.EVENT_READ if reader else 0)
+        try:
+            self._selector.unregister(fd)
+        except (KeyError, ValueError):
+            pass
+        self._selector.register(fd, mask)
+        self._fd_callbacks[fd] = (reader, cb)
+
+    def remove_reader(self, fd):
+        reader, writer = self._fd_callbacks.get(fd, (None, None))
+        if reader is None:
+            return False
+        try:
+            self._selector.unregister(fd)
+        except (KeyError, ValueError):
+            pass
+        if writer is not None:
+            self._selector.register(fd, _selectors.EVENT_WRITE)
+            self._fd_callbacks[fd] = (None, writer)
+        else:
+            del self._fd_callbacks[fd]
+        return True
+
+    def remove_writer(self, fd):
+        reader, writer = self._fd_callbacks.get(fd, (None, None))
+        if writer is None:
+            return False
+        try:
+            self._selector.unregister(fd)
+        except (KeyError, ValueError):
+            pass
+        if reader is not None:
+            self._selector.register(fd, _selectors.EVENT_READ)
+            self._fd_callbacks[fd] = (reader, None)
+        else:
+            del self._fd_callbacks[fd]
+        return True
+
+    # ---- Socket coroutines ---------------------------------------
+
+    async def sock_recv(self, sock, n):
+        sock.setblocking(False)
+        fut = self.create_future()
+
+        def _try_read():
+            try:
+                data = sock.recv(n)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                self.remove_reader(sock.fileno())
+                if not fut.done():
+                    fut.set_exception(exc)
+                return
+            self.remove_reader(sock.fileno())
+            if not fut.done():
+                fut.set_result(data)
+
+        self.add_reader(sock.fileno(), _try_read)
+        try:
+            return await fut
+        finally:
+            self.remove_reader(sock.fileno())
+
+    async def sock_sendall(self, sock, data):
+        sock.setblocking(False)
+        fut = self.create_future()
+        view = [data]
+
+        def _try_write():
+            buf = view[0]
+            try:
+                sent = sock.send(buf)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                self.remove_writer(sock.fileno())
+                if not fut.done():
+                    fut.set_exception(exc)
+                return
+            view[0] = buf[sent:]
+            if not view[0]:
+                self.remove_writer(sock.fileno())
+                if not fut.done():
+                    fut.set_result(None)
+
+        self.add_writer(sock.fileno(), _try_write)
+        try:
+            return await fut
+        finally:
+            self.remove_writer(sock.fileno())
+
+    async def sock_connect(self, sock, address):
+        sock.setblocking(False)
+        try:
+            sock.connect(address)
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            # EINPROGRESS is acceptable on non-blocking sockets.
+            if exc.errno not in (115, 36):
+                raise
+        fut = self.create_future()
+
+        def _check():
+            err = sock.getsockopt(_socket.SOL_SOCKET, _socket.SO_ERROR)
+            self.remove_writer(sock.fileno())
+            if not fut.done():
+                if err == 0:
+                    fut.set_result(None)
+                else:
+                    fut.set_exception(OSError(err, "connect failed"))
+
+        self.add_writer(sock.fileno(), _check)
+        try:
+            await fut
+        finally:
+            self.remove_writer(sock.fileno())
+
+    async def sock_accept(self, sock):
+        sock.setblocking(False)
+        fut = self.create_future()
+
+        def _try_accept():
+            try:
+                conn, addr = sock.accept()
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                self.remove_reader(sock.fileno())
+                if not fut.done():
+                    fut.set_exception(exc)
+                return
+            self.remove_reader(sock.fileno())
+            if not fut.done():
+                fut.set_result((conn, addr))
+
+        self.add_reader(sock.fileno(), _try_accept)
+        try:
+            return await fut
+        finally:
+            self.remove_reader(sock.fileno())
 
     def _handle_exception(self, exc):
         if self._exception_handler is not None:
@@ -1113,6 +1303,271 @@ def wrap_future(future, *, loop=None):
     return new_fut
 
 
+# ---- Streams API --------------------------------------------------
+
+
+_DEFAULT_LIMIT = 64 * 1024
+
+
+class IncompleteReadError(EOFError):
+    def __init__(self, partial, expected):
+        EOFError.__init__(self, "{}/{} bytes read".format(len(partial), expected))
+        self.partial = partial
+        self.expected = expected
+
+
+class StreamReader:
+    """Buffered reader fed by `feed_data`. Awaitable consumers like
+    `read`, `readline`, `readexactly` resolve once enough data has
+    arrived."""
+
+    def __init__(self, limit=_DEFAULT_LIMIT, loop=None):
+        self._buffer = bytearray()
+        self._eof = False
+        self._waiter = None
+        self._limit = limit
+        self._loop = loop if loop is not None else get_event_loop()
+        self._exception = None
+
+    def feed_data(self, data):
+        if not data:
+            return
+        self._buffer.extend(data)
+        self._wake()
+
+    def feed_eof(self):
+        self._eof = True
+        self._wake()
+
+    def set_exception(self, exc):
+        self._exception = exc
+        self._wake()
+
+    def at_eof(self):
+        return self._eof and not self._buffer
+
+    def _wake(self):
+        if self._waiter is not None and not self._waiter.done():
+            self._waiter.set_result(None)
+            self._waiter = None
+
+    async def _wait_for_data(self):
+        if self._waiter is not None:
+            raise RuntimeError("already waiting for data")
+        self._waiter = self._loop.create_future()
+        try:
+            await self._waiter
+        finally:
+            self._waiter = None
+        if self._exception is not None:
+            raise self._exception
+
+    async def read(self, n=-1):
+        if self._exception is not None:
+            raise self._exception
+        if n == 0:
+            return b""
+        if n < 0:
+            while not self._eof:
+                await self._wait_for_data()
+            data = bytes(self._buffer)
+            self._buffer = bytearray()
+            return data
+        while not self._buffer and not self._eof:
+            await self._wait_for_data()
+        data = bytes(self._buffer[:n])
+        self._buffer = bytearray(self._buffer[n:])
+        return data
+
+    async def readline(self):
+        if self._exception is not None:
+            raise self._exception
+        while True:
+            idx = self._buffer.find(b"\n")
+            if idx >= 0:
+                line = bytes(self._buffer[:idx + 1])
+                self._buffer = bytearray(self._buffer[idx + 1:])
+                return line
+            if self._eof:
+                line = bytes(self._buffer)
+                self._buffer = bytearray()
+                return line
+            await self._wait_for_data()
+
+    async def readexactly(self, n):
+        if n < 0:
+            raise ValueError("readexactly size cannot be negative")
+        if self._exception is not None:
+            raise self._exception
+        while len(self._buffer) < n and not self._eof:
+            await self._wait_for_data()
+        if len(self._buffer) < n:
+            partial = bytes(self._buffer)
+            self._buffer = bytearray()
+            raise IncompleteReadError(partial, n)
+        data = bytes(self._buffer[:n])
+        self._buffer = bytearray(self._buffer[n:])
+        return data
+
+
+class StreamWriter:
+    """Buffered writer that pushes through a socket."""
+
+    def __init__(self, sock, reader, loop=None):
+        self._sock = sock
+        self._reader = reader
+        self._loop = loop if loop is not None else get_event_loop()
+        self._closing = False
+        self._buffer = bytearray()
+
+    def get_extra_info(self, name, default=None):
+        if name == "socket":
+            return self._sock
+        if name == "peername":
+            try:
+                return self._sock.getpeername()
+            except Exception:
+                return default
+        if name == "sockname":
+            try:
+                return self._sock.getsockname()
+            except Exception:
+                return default
+        return default
+
+    def write(self, data):
+        self._buffer.extend(data)
+
+    async def drain(self):
+        if not self._buffer:
+            return
+        data = bytes(self._buffer)
+        self._buffer.clear()
+        await self._loop.sock_sendall(self._sock, data)
+
+    def close(self):
+        self._closing = True
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+    def is_closing(self):
+        return self._closing
+
+    async def wait_closed(self):
+        return None
+
+
+def _start_socket_reader_loop(loop, sock, reader):
+    """Drive a `StreamReader` from `sock` via the loop's reader hook."""
+    sock.setblocking(False)
+    fd = sock.fileno()
+
+    def _on_readable():
+        try:
+            data = sock.recv(8192)
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            reader.set_exception(exc)
+            loop.remove_reader(fd)
+            return
+        if not data:
+            reader.feed_eof()
+            loop.remove_reader(fd)
+            return
+        reader.feed_data(data)
+
+    loop.add_reader(fd, _on_readable)
+
+
+async def open_connection(host=None, port=None, *, loop=None, limit=_DEFAULT_LIMIT):
+    """Connect to `(host, port)` and return `(reader, writer)`."""
+    lp = loop if loop is not None else get_event_loop()
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        await lp.sock_connect(sock, (host, port))
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
+    reader = StreamReader(limit=limit, loop=lp)
+    _start_socket_reader_loop(lp, sock, reader)
+    writer = StreamWriter(sock, reader, loop=lp)
+    return reader, writer
+
+
+class Server:
+    """A simple `start_server` return value."""
+
+    def __init__(self, sock, loop, client_connected_cb):
+        self._sock = sock
+        self._loop = loop
+        self._cb = client_connected_cb
+        self._serving = False
+        self._wait_closed = loop.create_future()
+
+    def start(self):
+        if self._serving:
+            return
+        self._serving = True
+
+        async def _accept_loop():
+            try:
+                while self._serving:
+                    try:
+                        conn, addr = await self._loop.sock_accept(self._sock)
+                    except OSError:
+                        break
+                    reader = StreamReader(loop=self._loop)
+                    _start_socket_reader_loop(self._loop, conn, reader)
+                    writer = StreamWriter(conn, reader, loop=self._loop)
+                    self._loop.create_task(self._cb(reader, writer))
+            finally:
+                if not self._wait_closed.done():
+                    self._wait_closed.set_result(None)
+
+        self._loop.create_task(_accept_loop())
+
+    def close(self):
+        self._serving = False
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+    async def wait_closed(self):
+        await self._wait_closed
+
+    async def serve_forever(self):
+        self.start()
+        await self._wait_closed
+
+    @property
+    def sockets(self):
+        return [self._sock]
+
+
+async def start_server(client_connected_cb, host=None, port=None, *,
+                        loop=None, family=None, flags=None, backlog=100,
+                        reuse_address=None, reuse_port=None):
+    lp = loop if loop is not None else get_event_loop()
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    except OSError:
+        pass
+    sock.bind((host or "0.0.0.0", port or 0))
+    sock.listen(backlog)
+    sock.setblocking(False)
+    srv = Server(sock, lp, client_connected_cb)
+    srv.start()
+    return srv
+
+
 __all__ = [
     "CancelledError",
     "InvalidStateError",
@@ -1151,4 +1606,10 @@ __all__ = [
     "as_completed",
     "shield",
     "wrap_future",
+    "StreamReader",
+    "StreamWriter",
+    "IncompleteReadError",
+    "Server",
+    "open_connection",
+    "start_server",
 ]

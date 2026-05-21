@@ -1,0 +1,15 @@
+--- run / check_output ---
+returncode: 0
+stdout: 'hello world\n'
+stderr: ''
+--- check_output ---
+got: 'weave\n'
+--- stdin pipe ---
+returncode: 0
+stdout: b'HELLO WORLD'
+--- failing command ---
+returncode: 1
+--- check_call raises ---
+CalledProcessError: 1
+--- env ---
+got: 'hi\n'
