@@ -18,8 +18,10 @@ use crate::import::{FrozenSource, ModuleCache};
 pub mod base64_mod;
 pub mod binascii_mod;
 pub mod csv_mod;
+pub mod datetime_mod;
 pub mod errno_mod;
 pub mod fnmatch_mod;
+pub mod gc_mod;
 pub mod glob_mod;
 pub mod hashlib_mod;
 pub mod hmac_mod;
@@ -41,6 +43,7 @@ pub mod tempfile_mod;
 pub mod thread;
 pub mod time;
 pub mod uuid_mod;
+pub mod weakref_mod;
 pub mod zlib_mod;
 
 /// Register the built-in modules into `cache`. Called once at
@@ -75,6 +78,9 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("ssl", ssl_mod::build);
     cache.register_builtin("zlib", zlib_mod::build);
     cache.register_builtin("_csv", csv_mod::build);
+    cache.register_builtin("_weakref", weakref_mod::build);
+    cache.register_builtin("gc", gc_mod::build);
+    cache.register_builtin("_datetime", datetime_mod::build);
 
     // Frozen Python sources (pure-Python stdlib).
     for src in frozen_sources() {
@@ -314,6 +320,72 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "xml.etree.ElementTree",
             source: include_str!("python/xml_etree.py"),
+            is_package: false,
+        },
+        // RFC 0018 — introspection, test infrastructure, exception groups.
+        FrozenSource {
+            name: "weakref",
+            source: include_str!("python/weakref.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "datetime",
+            source: include_str!("python/datetime.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "linecache",
+            source: include_str!("python/linecache.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "warnings",
+            source: include_str!("python/warnings.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "traceback",
+            source: include_str!("python/traceback.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "inspect",
+            source: include_str!("python/inspect.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "contextvars",
+            source: include_str!("python/contextvars.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "logging",
+            source: include_str!("python/logging.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest",
+            source: include_str!("python/unittest.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "unittest.mock",
+            source: include_str!("python/unittest_mock.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "runpy",
+            source: include_str!("python/runpy.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "codeop",
+            source: include_str!("python/codeop.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "code",
+            source: include_str!("python/code.py"),
             is_package: false,
         },
     ]

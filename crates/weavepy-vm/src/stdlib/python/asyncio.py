@@ -1568,6 +1568,201 @@ async def start_server(client_connected_cb, host=None, port=None, *,
     return srv
 
 
+# ---- TaskGroup (PEP 654, Python 3.11+) ----------------------------
+
+
+class TaskGroup:
+    """Structured concurrency primitive: spawn tasks bounded by a
+    scope, collect all results / exceptions, and re-raise them as an
+    `ExceptionGroup` if any task failed.
+
+    Usage::
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(coro1())
+            tg.create_task(coro2())
+    """
+
+    def __init__(self):
+        self._tasks = []
+        self._errors = []
+        self._closing = False
+        self._aborting = False
+        self._exiting = False
+        self._loop = None
+        self._parent_task = None
+
+    def create_task(self, coro, *, name=None):
+        if self._closing:
+            raise RuntimeError("TaskGroup is closed")
+        if self._loop is None:
+            raise RuntimeError("TaskGroup not started yet")
+        task = self._loop.create_task(coro)
+        if name is not None:
+            try:
+                task.set_name(name)
+            except Exception:
+                pass
+        self._tasks.append(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None or isinstance(exc, CancelledError):
+            return
+        self._errors.append(exc)
+        if not self._aborting:
+            self._aborting = True
+            self._abort()
+
+    def _abort(self):
+        for t in self._tasks:
+            if not t.done():
+                t.cancel()
+
+    async def __aenter__(self):
+        self._loop = get_event_loop()
+        try:
+            self._parent_task = current_task()
+        except Exception:
+            self._parent_task = None
+        return self
+
+    async def __aexit__(self, et, ev, tb):
+        self._closing = True
+        # If the body raised, remember it as an additional error and
+        # cancel children.
+        propagate = None
+        if et is not None and not issubclass(et, CancelledError):
+            self._errors.append(ev)
+            self._aborting = True
+            self._abort()
+        elif et is not None and issubclass(et, CancelledError):
+            propagate = ev
+            self._aborting = True
+            self._abort()
+        # Wait for everyone.
+        while True:
+            pending = [t for t in self._tasks if not t.done()]
+            if not pending:
+                break
+            waiter = self._loop.create_future()
+
+            def _wake(_t, w=waiter, _self=self):
+                if all(t.done() for t in _self._tasks) and not w.done():
+                    w.set_result(None)
+
+            for t in pending:
+                t.add_done_callback(_wake)
+            try:
+                await waiter
+            except CancelledError:
+                if not self._aborting:
+                    self._aborting = True
+                    self._abort()
+                continue
+        if propagate is not None and not self._errors:
+            raise propagate
+        if self._errors:
+            errors = list(self._errors)
+            self._errors.clear()
+            if len(errors) == 1 and (et is not None) and errors[0] is ev:
+                raise errors[0]
+            try:
+                eg_cls = BaseExceptionGroup if any(not isinstance(e, Exception) for e in errors) else ExceptionGroup
+            except NameError:
+                eg_cls = Exception  # type: ignore
+            raise eg_cls("unhandled errors in a TaskGroup", errors)
+        return True if et is not None else None
+
+
+# ---- timeout / timeout_at -----------------------------------------
+
+
+class _TimeoutContext:
+    """Async context manager that cancels the body after `when` seconds.
+
+    `async with asyncio.timeout(5):` cancels its body if 5 seconds
+    elapse. The cancellation is converted to a `TimeoutError` at the
+    `__aexit__` boundary so user code observes the canonical timeout
+    error type.
+    """
+
+    def __init__(self, when):
+        self._when = when
+        self._loop = None
+        self._task = None
+        self._handle = None
+        self._expired = False
+        self._state = "created"
+
+    def when(self):
+        return self._when
+
+    def reschedule(self, when):
+        self._when = when
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        self._schedule()
+
+    def expired(self):
+        return self._expired
+
+    def _schedule(self):
+        if self._when is None or self._loop is None:
+            return
+        loop = self._loop
+        now = loop.time()
+        delay = max(0.0, self._when - now)
+
+        def _fire():
+            self._expired = True
+            if self._task is not None and not self._task.done():
+                self._task.cancel()
+
+        self._handle = loop.call_later(delay, _fire)
+
+    async def __aenter__(self):
+        self._loop = get_event_loop()
+        self._task = current_task()
+        self._state = "entered"
+        self._schedule()
+        return self
+
+    async def __aexit__(self, et, ev, tb):
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        if self._expired:
+            if et is not None and issubclass(et, CancelledError):
+                raise TimeoutError() from ev
+        return False
+
+
+def timeout(delay):
+    if delay is None:
+        return _TimeoutContext(None)
+    return _TimeoutContext(get_event_loop().time() + delay)
+
+
+def timeout_at(when):
+    return _TimeoutContext(when)
+
+
+# ---- run / run_coroutine_threadsafe extras -------------------------
+
+
+def run_coroutine_threadsafe(coro, loop=None):
+    """Schedule `coro` on `loop` and return a `concurrent.futures`-like
+    Future. Single-thread cooperative model: we just create a task."""
+    lp = loop if loop is not None else get_event_loop()
+    return lp.create_task(coro)
+
+
 __all__ = [
     "CancelledError",
     "InvalidStateError",
@@ -1612,4 +1807,8 @@ __all__ = [
     "Server",
     "open_connection",
     "start_server",
+    "TaskGroup",
+    "timeout",
+    "timeout_at",
+    "run_coroutine_threadsafe",
 ]

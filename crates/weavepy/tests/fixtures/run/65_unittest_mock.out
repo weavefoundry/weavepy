@@ -1,0 +1,11 @@
+mock call result: 42
+call count: 1
+called once: True
+do_thing called: True
+do_thing args: (3,)
+mm.thing() type: True
+seq: 10 20 30
+sentinel works: True
+sentinels distinct: True
+patched: patched
+restored: real

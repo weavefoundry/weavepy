@@ -241,6 +241,15 @@ pub enum OpCode {
     /// Match the exception at `stack[-2]` against the type at TOS. Pops
     /// the type, peeks the exception, pushes a bool.
     CheckExcMatch,
+    /// PEP 654 / RFC 0018: split an exception group. Stack on entry:
+    /// `[..., exc, type]`. Pops both; pushes `[..., rest, matched]`
+    /// where `matched` is either `None` (nothing in the group matches
+    /// `type`) or a new group of the same class containing the
+    /// matches, and `rest` is `None` (every member matched) or a
+    /// new group with the unmatched members. If `exc` is not a
+    /// group, it is treated as a singleton — `matched` is `exc` and
+    /// `rest` is `None`, or vice versa.
+    CheckEGMatch,
     /// Push the exception currently being handled onto the
     /// `exception_handlers` stack — TOS is the exception value.
     PushExcInfo,
@@ -408,6 +417,7 @@ impl OpCode {
             OpCode::LoadClassderef => "LOAD_CLASSDEREF",
             OpCode::RaiseVarargs => "RAISE_VARARGS",
             OpCode::CheckExcMatch => "CHECK_EXC_MATCH",
+            OpCode::CheckEGMatch => "CHECK_EG_MATCH",
             OpCode::PushExcInfo => "PUSH_EXC_INFO",
             OpCode::PopExcept => "POP_EXCEPT",
             OpCode::Reraise => "RERAISE",

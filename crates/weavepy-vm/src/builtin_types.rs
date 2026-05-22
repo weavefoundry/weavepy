@@ -96,6 +96,23 @@ pub struct BuiltinTypes {
     pub eof_error: Rc<TypeObject>,
     pub buffer_error: Rc<TypeObject>,
     pub memory_error: Rc<TypeObject>,
+    /// PEP 654 / RFC 0018 — exception group hierarchy.
+    pub base_exception_group: Rc<TypeObject>,
+    pub exception_group: Rc<TypeObject>,
+
+    // RFC 0018 — `warnings` module hierarchy.
+    pub warning: Rc<TypeObject>,
+    pub user_warning: Rc<TypeObject>,
+    pub deprecation_warning: Rc<TypeObject>,
+    pub pending_deprecation_warning: Rc<TypeObject>,
+    pub syntax_warning: Rc<TypeObject>,
+    pub runtime_warning: Rc<TypeObject>,
+    pub future_warning: Rc<TypeObject>,
+    pub import_warning: Rc<TypeObject>,
+    pub unicode_warning: Rc<TypeObject>,
+    pub bytes_warning: Rc<TypeObject>,
+    pub resource_warning: Rc<TypeObject>,
+    pub encoding_warning: Rc<TypeObject>,
 }
 
 impl BuiltinTypes {
@@ -207,6 +224,42 @@ impl BuiltinTypes {
         let buffer_error = exc("BufferError", exception.clone());
         let memory_error = exc("MemoryError", exception.clone());
 
+        // RFC 0018 — Warning hierarchy.
+        let warning = exc("Warning", exception.clone());
+        let user_warning = exc("UserWarning", warning.clone());
+        let deprecation_warning = exc("DeprecationWarning", warning.clone());
+        let pending_deprecation_warning = exc("PendingDeprecationWarning", warning.clone());
+        let syntax_warning = exc("SyntaxWarning", warning.clone());
+        let runtime_warning = exc("RuntimeWarning", warning.clone());
+        let future_warning = exc("FutureWarning", warning.clone());
+        let import_warning = exc("ImportWarning", warning.clone());
+        let unicode_warning = exc("UnicodeWarning", warning.clone());
+        let bytes_warning = exc("BytesWarning", warning.clone());
+        let resource_warning = exc("ResourceWarning", warning.clone());
+        let encoding_warning = exc("EncodingWarning", warning.clone());
+
+        // PEP 654: BaseExceptionGroup derives from BaseException;
+        // ExceptionGroup is a sibling subclass that also derives
+        // from Exception so it's caught by `except Exception:`. We
+        // model the dual inheritance via the C3 linearisation —
+        // ExceptionGroup's bases are (BaseExceptionGroup, Exception)
+        // and the resulting MRO is
+        //   [ExceptionGroup, BaseExceptionGroup, Exception,
+        //    BaseException, object]
+        // which matches CPython.
+        let base_exception_group = exc("BaseExceptionGroup", base_exception.clone());
+        let exception_group = TypeObject::new_with_flags(
+            "ExceptionGroup",
+            vec![base_exception_group.clone(), exception.clone()],
+            DictData::new(),
+            crate::types::TypeFlags {
+                is_exception: true,
+                is_builtin: true,
+            },
+        )
+        .expect("ExceptionGroup MRO");
+        install_exception_group_init(&base_exception_group);
+
         let bt = BuiltinTypes {
             object_: object_.clone(),
             type_: type_.clone(),
@@ -275,6 +328,20 @@ impl BuiltinTypes {
             eof_error,
             buffer_error,
             memory_error,
+            base_exception_group,
+            exception_group,
+            warning,
+            user_warning,
+            deprecation_warning,
+            pending_deprecation_warning,
+            syntax_warning,
+            runtime_warning,
+            future_warning,
+            import_warning,
+            unicode_warning,
+            bytes_warning,
+            resource_warning,
+            encoding_warning,
         };
         // Every other built-in type's metaclass is `type`.
         for (_, value) in bt.as_globals() {
@@ -357,6 +424,20 @@ impl BuiltinTypes {
             pair!(eof_error, "EOFError"),
             pair!(buffer_error, "BufferError"),
             pair!(memory_error, "MemoryError"),
+            pair!(base_exception_group, "BaseExceptionGroup"),
+            pair!(exception_group, "ExceptionGroup"),
+            pair!(warning, "Warning"),
+            pair!(user_warning, "UserWarning"),
+            pair!(deprecation_warning, "DeprecationWarning"),
+            pair!(pending_deprecation_warning, "PendingDeprecationWarning"),
+            pair!(syntax_warning, "SyntaxWarning"),
+            pair!(runtime_warning, "RuntimeWarning"),
+            pair!(future_warning, "FutureWarning"),
+            pair!(import_warning, "ImportWarning"),
+            pair!(unicode_warning, "UnicodeWarning"),
+            pair!(bytes_warning, "BytesWarning"),
+            pair!(resource_warning, "ResourceWarning"),
+            pair!(encoding_warning, "EncodingWarning"),
         ]
     }
 
@@ -423,6 +504,20 @@ impl BuiltinTypes {
             "EOFError" => Some(self.eof_error.clone()),
             "BufferError" => Some(self.buffer_error.clone()),
             "MemoryError" => Some(self.memory_error.clone()),
+            "BaseExceptionGroup" => Some(self.base_exception_group.clone()),
+            "ExceptionGroup" => Some(self.exception_group.clone()),
+            "Warning" => Some(self.warning.clone()),
+            "UserWarning" => Some(self.user_warning.clone()),
+            "DeprecationWarning" => Some(self.deprecation_warning.clone()),
+            "PendingDeprecationWarning" => Some(self.pending_deprecation_warning.clone()),
+            "SyntaxWarning" => Some(self.syntax_warning.clone()),
+            "RuntimeWarning" => Some(self.runtime_warning.clone()),
+            "FutureWarning" => Some(self.future_warning.clone()),
+            "ImportWarning" => Some(self.import_warning.clone()),
+            "UnicodeWarning" => Some(self.unicode_warning.clone()),
+            "BytesWarning" => Some(self.bytes_warning.clone()),
+            "ResourceWarning" => Some(self.resource_warning.clone()),
+            "EncodingWarning" => Some(self.encoding_warning.clone()),
             _ => None,
         }
     }
@@ -778,6 +873,259 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
         }
     }
     Object::Instance(Rc::new(inst))
+}
+
+/// PEP 654 — `BaseExceptionGroup.__init__(self, msg, exceptions)`
+/// + the `message`, `exceptions`, `split`, `subgroup`, `derive`
+///   methods. `ExceptionGroup` inherits the same `__init__` through
+///   the MRO.
+#[allow(clippy::doc_lazy_continuation)]
+fn install_exception_group_init(base: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    fn eg_init(args: &[Object]) -> Result<Object, RuntimeError> {
+        // args = (self, msg, exceptions[, ...])
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
+        let msg = args.get(1).cloned().unwrap_or(Object::from_static(""));
+        let excs = args
+            .get(2)
+            .cloned()
+            .unwrap_or(Object::new_tuple(Vec::new()));
+        // `exceptions` must be a sequence of BaseException instances;
+        // CPython raises ValueError on empty. We're lenient here —
+        // the caller may construct empty groups for split/subgroup.
+        let excs_tuple = match excs {
+            Object::Tuple(items) => items,
+            Object::List(items) => Rc::from(items.borrow().clone().into_boxed_slice()),
+            other => {
+                return Err(crate::error::type_error(format!(
+                    "second argument (exceptions) must be a sequence, not '{}'",
+                    other.type_name()
+                )))
+            }
+        };
+        if let Object::Instance(inst_rc) = inst {
+            let mut dict = inst_rc.dict.borrow_mut();
+            dict.insert(
+                DictKey(Object::from_static("args")),
+                Object::new_tuple(vec![msg.clone(), Object::Tuple(excs_tuple.clone())]),
+            );
+            dict.insert(DictKey(Object::from_static("message")), msg);
+            dict.insert(
+                DictKey(Object::from_static("exceptions")),
+                Object::Tuple(excs_tuple),
+            );
+        }
+        Ok(Object::None)
+    }
+    fn eg_str(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
+        if let Object::Instance(inst_rc) = inst {
+            let dict = inst_rc.dict.borrow();
+            let message = dict
+                .get(&DictKey(Object::from_static("message")))
+                .cloned()
+                .unwrap_or(Object::from_static(""));
+            let n = dict
+                .get(&DictKey(Object::from_static("exceptions")))
+                .and_then(|e| match e {
+                    Object::Tuple(t) => Some(t.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            return Ok(Object::from_str(format!(
+                "{} ({} sub-exception{})",
+                message.to_str(),
+                n,
+                if n == 1 { "" } else { "s" }
+            )));
+        }
+        Ok(Object::from_static(""))
+    }
+    fn eg_derive(args: &[Object]) -> Result<Object, RuntimeError> {
+        // derive(self, excs) -> new EG of the same class
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
+        let excs = args
+            .get(1)
+            .cloned()
+            .unwrap_or(Object::new_tuple(Vec::new()));
+        if let Object::Instance(inst_rc) = inst {
+            let dict = inst_rc.dict.borrow();
+            let msg = dict
+                .get(&DictKey(Object::from_static("message")))
+                .cloned()
+                .unwrap_or(Object::from_static(""));
+            drop(dict);
+            let cls = inst_rc.class.clone();
+            let new_inst = make_exception_with_class(cls, "");
+            if let Object::Instance(ni) = &new_inst {
+                let excs_tuple = match excs {
+                    Object::Tuple(t) => t,
+                    Object::List(l) => Rc::from(l.borrow().clone().into_boxed_slice()),
+                    _ => Rc::from(Vec::<Object>::new().into_boxed_slice()),
+                };
+                let mut d = ni.dict.borrow_mut();
+                d.insert(
+                    DictKey(Object::from_static("args")),
+                    Object::new_tuple(vec![msg.clone(), Object::Tuple(excs_tuple.clone())]),
+                );
+                d.insert(DictKey(Object::from_static("message")), msg);
+                d.insert(
+                    DictKey(Object::from_static("exceptions")),
+                    Object::Tuple(excs_tuple),
+                );
+            }
+            return Ok(new_inst);
+        }
+        Ok(Object::None)
+    }
+    fn eg_split(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
+        let pred = args
+            .get(1)
+            .cloned()
+            .ok_or_else(|| crate::error::type_error("split requires a type argument"))?;
+        let (m, r) = split_exception_group(inst, &pred)?;
+        Ok(Object::new_tuple(vec![m, r]))
+    }
+    fn eg_subgroup(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
+        let pred = args
+            .get(1)
+            .cloned()
+            .ok_or_else(|| crate::error::type_error("subgroup requires a type argument"))?;
+        let (m, _) = split_exception_group(inst, &pred)?;
+        Ok(m)
+    }
+    let mut dict = base.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            call: Box::new(eg_init),
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__str__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__str__",
+            call: Box::new(eg_str),
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("derive")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "derive",
+            call: Box::new(eg_derive),
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("split")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "split",
+            call: Box::new(eg_split),
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("subgroup")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "subgroup",
+            call: Box::new(eg_subgroup),
+        })),
+    );
+}
+
+/// Split an exception group instance against a type predicate. Used
+/// by the VM's `CheckEGMatch` opcode and exposed via
+/// `BaseExceptionGroup.split(typ)`.
+///
+/// Returns `(matched, rest)` where:
+/// - `matched` is `None` if no contained exception matches, otherwise
+///   a new exception group of the same class containing the matches.
+/// - `rest` is `None` if every contained exception matches, otherwise
+///   a new group with the non-matching ones.
+pub fn split_exception_group(
+    group: &Object,
+    type_pred: &Object,
+) -> Result<(Object, Object), RuntimeError> {
+    let (cls, message, excs) = match group {
+        Object::Instance(inst) => {
+            let dict = inst.dict.borrow();
+            let msg = dict
+                .get(&DictKey(Object::from_static("message")))
+                .cloned()
+                .unwrap_or(Object::from_static(""));
+            let excs = match dict.get(&DictKey(Object::from_static("exceptions"))) {
+                Some(Object::Tuple(t)) => t.to_vec(),
+                _ => Vec::new(),
+            };
+            (inst.class.clone(), msg, excs)
+        }
+        _ => {
+            return Err(crate::error::type_error(
+                "split argument must be an exception group",
+            ))
+        }
+    };
+    let mut matched = Vec::new();
+    let mut rest = Vec::new();
+    for exc in excs {
+        // For nested groups, recurse.
+        let is_group = match &exc {
+            Object::Instance(i) => is_subclass_by_name(&i.class, "BaseExceptionGroup"),
+            _ => false,
+        };
+        if is_group {
+            let (m, r) = split_exception_group(&exc, type_pred)?;
+            if !matches!(m, Object::None) {
+                matched.push(m);
+            }
+            if !matches!(r, Object::None) {
+                rest.push(r);
+            }
+        } else if exception_matches_type(&exc, type_pred) {
+            matched.push(exc);
+        } else {
+            rest.push(exc);
+        }
+    }
+    let mk = |items: Vec<Object>| -> Object {
+        if items.is_empty() {
+            return Object::None;
+        }
+        let new_inst = make_exception_with_class(cls.clone(), "");
+        if let Object::Instance(ni) = &new_inst {
+            let mut d = ni.dict.borrow_mut();
+            let items_t = Object::new_tuple(items);
+            d.insert(
+                DictKey(Object::from_static("args")),
+                Object::new_tuple(vec![message.clone(), items_t.clone()]),
+            );
+            d.insert(DictKey(Object::from_static("message")), message.clone());
+            d.insert(DictKey(Object::from_static("exceptions")), items_t);
+        }
+        new_inst
+    };
+    Ok((mk(matched), mk(rest)))
+}
+
+fn exception_matches_type(exc: &Object, type_pred: &Object) -> bool {
+    match type_pred {
+        Object::Type(t) => instance_is_subclass(exc, t),
+        Object::Tuple(items) => items
+            .iter()
+            .any(|x| matches!(x, Object::Type(t) if instance_is_subclass(exc, t))),
+        _ => false,
+    }
 }
 
 fn is_subclass_by_name(class: &Rc<TypeObject>, ancestor: &str) -> bool {

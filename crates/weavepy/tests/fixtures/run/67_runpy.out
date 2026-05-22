@@ -1,0 +1,4 @@
+module ran as __main__: 42
+namespace value: 21
+namespace doubled: 42
+value via run_path: 21

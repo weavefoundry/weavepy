@@ -1,0 +1,7 @@
+default: default
+outer: outer
+in child sees: outer
+in child set: child-only
+after run still: outer
+temp: temp
+reset: outer

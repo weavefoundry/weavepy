@@ -117,6 +117,69 @@ pub fn default_builtins() -> DictData {
     reg!("object", b_object);
     reg!("globals", b_globals);
     reg!("locals", b_locals);
+    // `__import__`, `compile`, `exec`, `eval` are VM intrinsics: the
+    // registered closures are only placeholders, the VM intercepts
+    // calls to builtins whose internal name carries the `__vm:`
+    // prefix and runs the real implementation, which needs access to
+    // the interpreter state. We use a sentinel prefix on the
+    // `BuiltinFn::name` field so user modules that re-export their
+    // own `compile`/`exec`/`eval` (e.g. the `re` module's
+    // `re.compile`) don't get hijacked by the global intrinsic
+    // dispatcher.
+    {
+        let f = BuiltinFn {
+            name: "__vm:__import__",
+            call: Box::new(b_import_placeholder),
+        };
+        d.insert(
+            DictKey(Object::from_static("__import__")),
+            Object::Builtin(Rc::new(f)),
+        );
+    }
+    {
+        let f = BuiltinFn {
+            name: "__vm:compile",
+            call: Box::new(b_vm_intrinsic),
+        };
+        d.insert(
+            DictKey(Object::from_static("compile")),
+            Object::Builtin(Rc::new(f)),
+        );
+    }
+    {
+        let f = BuiltinFn {
+            name: "__vm:exec",
+            call: Box::new(b_vm_intrinsic),
+        };
+        d.insert(
+            DictKey(Object::from_static("exec")),
+            Object::Builtin(Rc::new(f)),
+        );
+    }
+    {
+        let f = BuiltinFn {
+            name: "__vm:eval",
+            call: Box::new(b_vm_intrinsic),
+        };
+        d.insert(
+            DictKey(Object::from_static("eval")),
+            Object::Builtin(Rc::new(f)),
+        );
+    }
+
+    // CPython exposes two singletons in `builtins`: `NotImplemented`
+    // (the rich-comparison fallback sentinel) and `Ellipsis` (the
+    // value bound by `...`). We model both as fresh `object()`
+    // instances created once at registry build time so identity
+    // tests (`a is NotImplemented`) work as expected.
+    d.insert(
+        DictKey(Object::from_static("NotImplemented")),
+        crate::vm_singletons::not_implemented(),
+    );
+    d.insert(
+        DictKey(Object::from_static("Ellipsis")),
+        crate::vm_singletons::ellipsis(),
+    );
 
     d
 }
@@ -516,16 +579,44 @@ fn b_vars(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// Placeholder body for the `__import__` builtin. The VM rewrites
+/// calls to this entry point before they reach this code; the
+/// closure is only here so the registry has a well-typed value to
+/// hand back when callers ask for `builtins.__import__`.
+fn b_import_placeholder(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(crate::error::runtime_error(
+        "__import__ requires the VM context; call from within a running interpreter",
+    ))
+}
+
+/// Placeholder body for `compile`/`exec`/`eval`. The VM intercepts
+/// these before they reach this function (they need to compile
+/// Python source and execute it against the calling frame's
+/// globals, both of which require access to the interpreter).
+fn b_vm_intrinsic(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(crate::error::runtime_error(
+        "this builtin must be invoked through the WeavePy interpreter",
+    ))
+}
+
 fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = one(args, "callable")?;
-    Ok(Object::Bool(matches!(
+    let intrinsic = matches!(
         v,
         Object::Function(_)
             | Object::Builtin(_)
             | Object::BoundMethod(_)
             | Object::Type(_)
             | Object::Generator(_)
-    )))
+    );
+    if intrinsic {
+        return Ok(Object::Bool(true));
+    }
+    // Instances are callable when their class exposes `__call__`.
+    if let Object::Instance(inst) = v {
+        return Ok(Object::Bool(inst.class.lookup("__call__").is_some()));
+    }
+    Ok(Object::Bool(false))
 }
 
 fn b_object(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -546,6 +637,36 @@ fn b_locals(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// Generic attribute reader that mirrors a subset of `LoadAttr` for
 /// use from the `getattr`/`hasattr` builtins.
+/// Apply the small subset of the descriptor protocol that
+/// [`attr_get`] (the `getattr` / `hasattr` fast path) is allowed to
+/// run without the VM at hand. We bind ordinary Python functions to
+/// their receiver so `getattr(inst, "m")()` matches the behaviour of
+/// `inst.m()`; classmethods and staticmethods are unwrapped to the
+/// same forms the VM produces for `LoadAttr`. Other descriptors —
+/// `property`, `__get__` on user types — are left untouched and the
+/// caller will see the raw object; full semantics require the VM.
+fn bind_descriptor(value: &Object, receiver: &Object) -> Object {
+    match value {
+        Object::Function(_) => Object::BoundMethod(Rc::new(crate::object::BoundMethod {
+            receiver: receiver.clone(),
+            function: value.clone(),
+        })),
+        Object::StaticMethod(inner) => (**inner).clone(),
+        Object::ClassMethod(inner) => {
+            let cls = match receiver {
+                Object::Instance(inst) => Object::Type(inst.class.clone()),
+                Object::Type(_) => receiver.clone(),
+                _ => receiver.clone(),
+            };
+            Object::BoundMethod(Rc::new(crate::object::BoundMethod {
+                receiver: cls,
+                function: (**inner).clone(),
+            }))
+        }
+        _ => value.clone(),
+    }
+}
+
 fn attr_get(obj: &Object, name: &str) -> Option<Object> {
     match obj {
         Object::Instance(inst) => {
@@ -558,7 +679,10 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 return Some(v);
             }
             if let Some(v) = inst.class.lookup(name) {
-                return Some(v);
+                // Bind functions to the receiver so `getattr(inst, 'm')()`
+                // works the same as `inst.m()`. Other descriptors are
+                // left to the VM's full `descriptor_get` path.
+                return Some(bind_descriptor(&v, obj));
             }
             match name {
                 "__dict__" => Some(Object::Dict(inst.dict.clone())),
@@ -642,7 +766,35 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             }
         }
         Object::Code(c) => code_synthetic_attr(c, name),
-        _ => None,
+        Object::BoundMethod(bm) => match name {
+            "__func__" => Some(bm.function.clone()),
+            "__self__" => Some(bm.receiver.clone()),
+            "__name__" => match &bm.function {
+                Object::Function(f) => Some(Object::from_str(f.name.clone())),
+                Object::Builtin(b) => Some(Object::from_static(b.name)),
+                _ => None,
+            },
+            "__code__" => match &bm.function {
+                Object::Function(f) => Some(Object::Code(f.code.clone())),
+                _ => None,
+            },
+            "__doc__" => Some(Object::None),
+            _ => None,
+        },
+        _ => {
+            // Fall through to the method-dispatch table for built-in
+            // containers (list, tuple, dict, set, str, bytes, ...).
+            // CPython exposes these methods as bound attributes; `dir`
+            // / `hasattr` / `getattr` should agree with attribute
+            // access via the dot operator.
+            if let Some(builtin) = lookup_method(obj, name) {
+                return Some(Object::BoundMethod(Rc::new(crate::object::BoundMethod {
+                    receiver: obj.clone(),
+                    function: builtin,
+                })));
+            }
+            None
+        }
     }
 }
 

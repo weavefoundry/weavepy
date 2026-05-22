@@ -207,6 +207,11 @@ pub struct ExceptHandler {
     pub name: Option<String>,
     pub body: Vec<Stmt>,
     pub span: Span,
+    /// PEP 654 / RFC 0018: `True` when the source uses
+    /// `except*` to match against an exception group. The
+    /// compiler emits the splitting variant instead of the plain
+    /// `CheckExcMatch` path.
+    pub is_star: bool,
 }
 
 /// `with expr [as target]` element. Multi-context `with` carries one per

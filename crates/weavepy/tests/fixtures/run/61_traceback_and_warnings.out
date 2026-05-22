@@ -1,0 +1,8 @@
+has 'ValueError: hello': True
+has 'boom': True
+has 'direct cause': True
+has 'TypeError: wrapped': True
+TE has 'ValueError': True
+warnings captured: 2
+first category: UserWarning
+first msg: first warning

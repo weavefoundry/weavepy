@@ -359,11 +359,18 @@ struct Compiler {
     free_order: Vec<String>,
     /// Loop stack: each frame holds (continue_target, break_patch_sites).
     loop_stack: Vec<LoopFrame>,
+    /// Pending `finally` clauses, innermost last. Used by
+    /// `return`/`break`/`continue` to inline their bodies on exit so
+    /// the cleanup runs even when the try body is being short-circuited.
+    finally_stack: Vec<FinallyFrame>,
     /// Monotonic counter for synthetic locals used by chained
     /// comparisons (`.chain0`, `.chain1`, …).
     chain_counter: u32,
     /// Monotonic counter for synthetic `with`-statement locals.
     with_counter: u32,
+    /// Monotonic counter for synthetic locals used by `return` inside
+    /// `try/finally` to preserve the value across the finally body.
+    finally_counter: u32,
     /// Source byte→line table shared by every nested compiler from the
     /// same `compile_module_*` call.
     line_index: Rc<LineIndex>,
@@ -397,6 +404,19 @@ struct LoopFrame {
     is_for_loop: bool,
 }
 
+/// One pending `finally` clause. We hold the AST so `return`,
+/// `break`, and `continue` can each inline a fresh copy of the
+/// clause's bytecode before transferring control out.
+struct FinallyFrame {
+    /// The statements inside the `finally:` block, captured by clone
+    /// so each non-normal exit gets its own bytecode.
+    body: Vec<Stmt>,
+    /// Length of `loop_stack` when this frame was pushed. Used to
+    /// determine whether `break`/`continue` should run this finally
+    /// (only if the relevant loop is outside the finally scope).
+    loop_depth_at_push: usize,
+}
+
 impl Compiler {
     fn new(name: String, filename: String, kind: CodeKind, line_index: Rc<LineIndex>) -> Self {
         let mut co = CodeObject::default();
@@ -409,8 +429,10 @@ impl Compiler {
             bindings: IndexMap::new(),
             free_order: Vec::new(),
             loop_stack: Vec::new(),
+            finally_stack: Vec::new(),
             chain_counter: 0,
             with_counter: 0,
+            finally_counter: 0,
             line_index,
             current_line: 0,
             inside_class_body: false,
@@ -789,6 +811,46 @@ impl Compiler {
                         self.emit(OpCode::LoadConst, idx);
                     }
                 }
+                // Inline every pending finally clause from innermost
+                // outward so each runs before we leave the function.
+                // We stash the return value in a synthetic local across
+                // each finally body to keep it alive even if the body
+                // mutates the stack.
+                if !self.finally_stack.is_empty() {
+                    let tmp = format!(".retval{}", self.finally_counter);
+                    self.finally_counter += 1;
+                    let tmp_idx = self.var_index_or_add(&tmp);
+                    self.emit(OpCode::StoreFast, tmp_idx);
+                    let frames = std::mem::take(&mut self.finally_stack);
+                    let mut compiled: Result<(), CompileError> = Ok(());
+                    for (i, frame) in frames.iter().enumerate().rev() {
+                        // While compiling this finally body, hide it
+                        // from the stack so nested `return`s inside the
+                        // body don't recurse infinitely.
+                        let saved_finally: Vec<FinallyFrame> = frames
+                            .iter()
+                            .take(i)
+                            .map(|f| FinallyFrame {
+                                body: f.body.clone(),
+                                loop_depth_at_push: f.loop_depth_at_push,
+                            })
+                            .collect();
+                        self.finally_stack = saved_finally;
+                        for s in &frame.body {
+                            if let Err(e) = self.compile_stmt(s) {
+                                compiled = Err(e);
+                                break;
+                            }
+                        }
+                        self.finally_stack.clear();
+                        if compiled.is_err() {
+                            break;
+                        }
+                    }
+                    self.finally_stack = frames;
+                    compiled?;
+                    self.emit(OpCode::LoadFast, tmp_idx);
+                }
                 self.emit(OpCode::ReturnValue, 0);
             }
             StmtKind::Break => {
@@ -797,6 +859,9 @@ impl Compiler {
                     .last()
                     .ok_or(CompileError::BreakOutsideLoop)?
                     .is_for_loop;
+                // Run any `finally` clauses that lie between us and
+                // the enclosing loop, in innermost-out order.
+                self.inline_finally_for_loop_exit()?;
                 if is_for {
                     self.emit(OpCode::PopTop, 0);
                 }
@@ -817,6 +882,7 @@ impl Compiler {
                     .last()
                     .ok_or(CompileError::ContinueOutsideLoop)?
                     .continue_target;
+                self.inline_finally_for_loop_exit()?;
                 let site = self.emit(OpCode::JumpBackward, 0);
                 self.patch_jump(site, target);
             }
@@ -1590,6 +1656,45 @@ impl Compiler {
     /// by an exception table entry; matched handlers fall through to
     /// the `else` branch, unmatched ones re-raise. `finally` runs on
     /// every exit path.
+    /// Inline every `finally` clause that lives *inside* the
+    /// enclosing loop (i.e. was pushed after the current loop frame),
+    /// in innermost-out order. Used by `break` / `continue` so the
+    /// cleanup runs before we transfer control out of the loop.
+    fn inline_finally_for_loop_exit(&mut self) -> Result<(), CompileError> {
+        let loop_depth = self.loop_stack.len();
+        let mut to_inline: Vec<Vec<Stmt>> = Vec::new();
+        for frame in self.finally_stack.iter().rev() {
+            if frame.loop_depth_at_push >= loop_depth {
+                to_inline.push(frame.body.clone());
+            } else {
+                break;
+            }
+        }
+        if to_inline.is_empty() {
+            return Ok(());
+        }
+        let saved = std::mem::take(&mut self.finally_stack);
+        // Walk innermost out; on each iteration further trim the
+        // finally stack so a `return` nested inside a finally body
+        // can't re-inline its own ancestors infinitely.
+        for (offset, body) in to_inline.iter().enumerate() {
+            let outer_count = saved.len().saturating_sub(offset + 1);
+            self.finally_stack = saved
+                .iter()
+                .take(outer_count)
+                .map(|f| FinallyFrame {
+                    body: f.body.clone(),
+                    loop_depth_at_push: f.loop_depth_at_push,
+                })
+                .collect();
+            for s in body {
+                self.compile_stmt(s)?;
+            }
+        }
+        self.finally_stack = saved;
+        Ok(())
+    }
+
     fn compile_try(
         &mut self,
         body: &[Stmt],
@@ -1612,6 +1717,17 @@ impl Compiler {
         // across `for` loop iterations. Without full stack-effect
         // tracking we simply count active `for` frames.
         let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32;
+        // Make the finally body visible to any `return`/`break`/
+        // `continue` nested inside `body`/`orelse`/handlers. We pop it
+        // before emitting the *direct* normal-/exception-exit copies
+        // below — those copies must not see themselves on the stack.
+        let pushed_finally = has_finally;
+        if pushed_finally {
+            self.finally_stack.push(FinallyFrame {
+                body: finalbody.to_vec(),
+                loop_depth_at_push: self.loop_stack.len(),
+            });
+        }
         let body_start = self.next_offset();
         for s in body {
             self.compile_stmt(s)?;
@@ -1624,8 +1740,15 @@ impl Compiler {
 
         // Normal-exit finally + jump to end. Falls through to the
         // finally body, then skips past the exception handlers.
+        // We temporarily pop the finally frame so the inline copy here
+        // doesn't see itself as still-pending (which would double-run
+        // it on a nested `return`).
+        let saved_frame = if pushed_finally {
+            self.finally_stack.pop()
+        } else {
+            None
+        };
         let normal_skip = if has_handlers || has_finally {
-            // Run finally on normal exit.
             for s in finalbody {
                 self.compile_stmt(s)?;
             }
@@ -1633,10 +1756,112 @@ impl Compiler {
         } else {
             self.next_offset()
         };
+        if let Some(frame) = saved_frame {
+            self.finally_stack.push(frame);
+        }
 
         // Handlers begin here.
         let handlers_start = self.next_offset();
-        if has_handlers {
+        let is_star_try = handlers.iter().any(|h| h.is_star);
+        if has_handlers && is_star_try {
+            // PEP 654 / RFC 0018: `except*` lowering. The handlers
+            // each consume a sub-group of the caught exception; any
+            // unmatched remainder propagates as an `ExceptionGroup`.
+            self.co.exception_table.push(ExcHandler {
+                start: body_start,
+                end: body_end,
+                handler: handlers_start,
+                depth: body_depth,
+            });
+            self.emit(OpCode::PushExcInfo, 0);
+            // Stack on entry: [exc]. Stash the remainder in a
+            // synthetic local so each handler can update it.
+            let rem_name = format!(".eg_remaining{}", self.with_counter);
+            self.with_counter += 1;
+            let rem_idx = self.var_index_or_add(&rem_name);
+            self.emit(OpCode::StoreFast, rem_idx);
+
+            let mut handler_exit_jumps: Vec<u32> = Vec::new();
+            let none_idx = self.co.intern_constant(Constant::None);
+            for h in handlers {
+                // [.remaining]
+                self.emit(OpCode::LoadFast, rem_idx);
+                let ty = h
+                    .type_
+                    .as_ref()
+                    .expect("except* requires a type expression — parser must reject bare except*");
+                self.compile_expr(ty)?;
+                // [.remaining, type]
+                self.emit(OpCode::CheckEGMatch, 0);
+                // [rest, matched]
+                self.emit(OpCode::Swap, 2);
+                // [matched, rest]
+                self.emit(OpCode::StoreFast, rem_idx);
+                // [matched]
+                self.emit(OpCode::CopyTop, 0);
+                // [matched, matched]
+                self.emit(OpCode::LoadConst, none_idx);
+                // [matched, matched, None]
+                self.emit(OpCode::IsOp, 0);
+                // [matched, is_none]
+                let skip_body = self.emit(OpCode::PopJumpIfTrue, 0);
+                // matched is on stack and is not None.
+                if let Some(n) = &h.name {
+                    let name_expr = Expr {
+                        kind: ExprKind::Name(n.clone()),
+                        span: h.span,
+                    };
+                    self.compile_assign(&name_expr)?;
+                } else {
+                    self.emit(OpCode::PopTop, 0);
+                }
+                for s in &h.body {
+                    self.compile_stmt(s)?;
+                }
+                if let Some(n) = &h.name {
+                    // `e` is unbound at end of block (CPython behaviour).
+                    let nidx = self.var_index_or_add(n);
+                    self.emit(OpCode::DeleteFast, nidx);
+                }
+                let after_body = self.emit(OpCode::JumpForward, 0);
+                let skip_target = self.next_offset();
+                self.patch_jump(skip_body, skip_target);
+                // matched is on stack still (was a None) — discard.
+                self.emit(OpCode::PopTop, 0);
+                let after_skip = self.next_offset();
+                self.patch_jump(after_body, after_skip);
+            }
+            // After all handlers, check whether anything is left.
+            // If `.remaining` is None — everything matched; just pop
+            // the active exception and continue.
+            self.emit(OpCode::LoadFast, rem_idx);
+            self.emit(OpCode::LoadConst, none_idx);
+            self.emit(OpCode::IsOp, 0);
+            let all_handled = self.emit(OpCode::PopJumpIfTrue, 0);
+            // Otherwise re-raise the remainder.
+            self.emit(OpCode::LoadFast, rem_idx);
+            self.emit(OpCode::RaiseVarargs, 1);
+            let after_raise = self.next_offset();
+            self.patch_jump(all_handled, after_raise);
+            self.emit(OpCode::PopExcept, 0);
+            let saved = if pushed_finally {
+                self.finally_stack.pop()
+            } else {
+                None
+            };
+            for s in finalbody {
+                self.compile_stmt(s)?;
+            }
+            if let Some(f) = saved {
+                self.finally_stack.push(f);
+            }
+            let exit = self.emit(OpCode::JumpForward, 0);
+            handler_exit_jumps.push(exit);
+            let end = self.next_offset();
+            for site in handler_exit_jumps {
+                self.patch_jump(site, end);
+            }
+        } else if has_handlers {
             self.co.exception_table.push(ExcHandler {
                 start: body_start,
                 end: body_end,
@@ -1690,8 +1915,16 @@ impl Compiler {
                 }
                 self.emit(OpCode::PopExcept, 0);
                 // Run finally on the matched path.
+                let saved = if pushed_finally {
+                    self.finally_stack.pop()
+                } else {
+                    None
+                };
                 for s in finalbody {
                     self.compile_stmt(s)?;
+                }
+                if let Some(f) = saved {
+                    self.finally_stack.push(f);
                 }
                 let exit = self.emit(OpCode::JumpForward, 0);
                 handler_exit_jumps.push(exit);
@@ -1702,8 +1935,16 @@ impl Compiler {
                 self.patch_jump(site, cur);
             }
             // Run finally on the re-raise path before propagating.
+            let saved = if pushed_finally {
+                self.finally_stack.pop()
+            } else {
+                None
+            };
             for s in finalbody {
                 self.compile_stmt(s)?;
+            }
+            if let Some(f) = saved {
+                self.finally_stack.push(f);
             }
             self.emit(OpCode::Reraise, 0);
             // Patch handler-exit jumps to end.
@@ -1725,8 +1966,12 @@ impl Compiler {
                 handler: handlers_start,
                 depth: body_depth,
             });
+            let saved = self.finally_stack.pop();
             for s in finalbody {
                 self.compile_stmt(s)?;
+            }
+            if let Some(f) = saved {
+                self.finally_stack.push(f);
             }
             self.emit(OpCode::Reraise, 0);
         }
@@ -1734,6 +1979,9 @@ impl Compiler {
         if has_handlers || has_finally {
             let end = self.next_offset();
             self.patch_jump(normal_skip, end);
+        }
+        if pushed_finally {
+            self.finally_stack.pop();
         }
         Ok(())
     }

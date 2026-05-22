@@ -1,0 +1,15 @@
+signature: (x, y, z=10, *args, kw_only=None, **kwargs)
+params: ['x', 'y', 'z', 'args', 'kw_only', 'kwargs']
+default z: 10
+args: ['x', 'y', 'z']
+varargs: args
+varkw: kwargs
+kwonly: ['kw_only']
+method: (x, y=2)
+isfunction: True
+ismethod: True
+isclass: True
+isgeneratorfunction: True
+caller name: caller
+stack depth >= 2: True
+top name: show_stack

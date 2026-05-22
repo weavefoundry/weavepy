@@ -107,7 +107,7 @@ impl TypeObject {
         )
     }
 
-    fn new_with_flags(
+    pub fn new_with_flags(
         name: &str,
         bases: Vec<Rc<TypeObject>>,
         dict: DictData,

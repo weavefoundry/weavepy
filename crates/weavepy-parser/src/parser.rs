@@ -542,16 +542,30 @@ impl<'src> Parser<'src> {
         let mut handlers = Vec::new();
         let mut orelse: Vec<Stmt> = Vec::new();
         let mut finalbody: Vec<Stmt> = Vec::new();
+        let mut saw_star = false;
+        let mut saw_plain = false;
         while self.at_keyword(Keyword::Except) {
             let exc_tok = self.bump(); // `except`
-            if matches!(self.peek(), TokenKind::Star) {
-                return Err(ParseError::NotImplemented {
-                    span: self.peek_token().span,
-                    feature: "except*",
-                    rfc: "RFC 0011",
+            let is_star = matches!(self.peek(), TokenKind::Star);
+            if is_star {
+                self.bump();
+                saw_star = true;
+            } else {
+                saw_plain = true;
+            }
+            if saw_star && saw_plain {
+                return Err(ParseError::Unexpected {
+                    span: exc_tok.span,
+                    message: "cannot have both 'except' and 'except*' on the same try".to_owned(),
                 });
             }
             let (type_, name) = if self.check(&TokenKind::Colon) {
+                if is_star {
+                    return Err(ParseError::Unexpected {
+                        span: exc_tok.span,
+                        message: "except* requires an exception type".to_owned(),
+                    });
+                }
                 (None, None)
             } else {
                 let t = self.parse_expression(false)?;
@@ -572,6 +586,7 @@ impl<'src> Parser<'src> {
                 name,
                 body: handler_body,
                 span: exc_tok.span.merge(span_end),
+                is_star,
             });
             self.skip_trivia_and_newlines();
         }

@@ -1,0 +1,18 @@
+alive: True
+value: 42
+after release: None
+callback fired: ['died']
+in set: True 1
+size: 2
+k: True
+keys: ['k']
+gc enabled: True
+disabled: False
+re-enabled: True
+collected: 0
+threshold: (700, 10, 10)
+threshold: (800, 12, 14)
+count: (0, 0, 0)
+objects: []
+debug: 0
+debug: 1

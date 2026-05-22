@@ -1,0 +1,9 @@
+ExceptionGroup
+boom
+['ValueError', 'TypeError', 'KeyError']
+caught V: ['a']
+caught T: ['b']
+V count: 2
+remaining: ['KeyError']
+got MyError: ['b']
+got SystemExit: ['a']

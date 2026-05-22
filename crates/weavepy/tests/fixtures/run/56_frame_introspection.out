@@ -1,0 +1,8 @@
+self: inner
+parent: outer
+vars: ['x', 'y']
+values: 1 hello
+self name: trace_self
+parent name: <module>
+lineno_positive: True
+filename_set: True

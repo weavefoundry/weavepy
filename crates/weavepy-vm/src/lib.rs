@@ -15,7 +15,7 @@
 //! output (REPL, test runners, the conformance harness) plug in a
 //! `Vec<u8>` writer; the CLI uses the process stdout.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -31,6 +31,7 @@ pub mod import;
 pub mod object;
 pub mod stdlib;
 pub mod types;
+pub mod vm_singletons;
 
 use crate::builtin_types::{builtin_types, instance_is_subclass, make_exception_with_class};
 use crate::error::{
@@ -42,8 +43,8 @@ pub use crate::error::{PyException, RuntimeError};
 pub use crate::import::ModuleCache;
 use crate::import::{package_search_path, resolve_relative};
 use crate::object::{
-    BoundMethod, BuiltinFn, DictData, DictKey, GeneratorState, Object, PyFunction, PyGenerator,
-    PyModule, PySlice,
+    BoundMethod, BuiltinFn, DictData, DictKey, GeneratorState, Object, PyFrame, PyFunction,
+    PyGenerator, PyModule, PySlice, PyTraceback,
 };
 use crate::types::{PyInstance, TypeObject};
 
@@ -100,18 +101,73 @@ pub struct Interpreter {
     stdout: Stdout,
     builtins: Rc<RefCell<DictData>>,
     cache: ModuleCache,
+    /// Live call stack of Python-visible frame snapshots, in
+    /// outer-to-inner order. The topmost entry corresponds to the
+    /// currently-executing `Frame`. RFC 0018: used by
+    /// `sys._getframe`, `traceback`, and the unwind machinery.
+    pub(crate) frame_stack: Rc<RefCell<Vec<Rc<PyFrame>>>>,
+    /// Stack of currently-handled exceptions across all frames. The
+    /// top is what `sys.exc_info()` returns. Pushed by
+    /// `PUSH_EXC_INFO`; popped by `POP_EXCEPT`.
+    pub(crate) exc_info_stack: Rc<RefCell<Vec<PyException>>>,
+    /// User-installable hook called when an exception escapes the
+    /// top-level frame. Defaults to a Rust builtin that prints the
+    /// canonical CPython-style traceback to `sys.stderr`.
+    /// Reachable today through `sys.excepthook`; reserved for the
+    /// VM's top-level exit handler.
+    #[allow(dead_code)]
+    pub(crate) excepthook: Rc<RefCell<Object>>,
+    /// Companion to `excepthook` for unraisable exceptions (e.g.
+    /// errors during `__del__`). Reserved for future use.
+    #[allow(dead_code)]
+    pub(crate) unraisable_hook: Rc<RefCell<Object>>,
 }
 
 impl Default for Interpreter {
     fn default() -> Self {
         let stdout: Stdout = Rc::new(RefCell::new(std::io::stdout()));
-        let builtins = Rc::new(RefCell::new(builtins::default_builtins()));
+        let mut builtins_dict = builtins::default_builtins();
+        // Wire `print` directly into the shared builtins dict so that
+        // user-driven `exec` / `eval` (which builds an arbitrary
+        // globals dict) can still find it via the normal fallback in
+        // `lookup_global_or_builtin`. The VM still intercepts the
+        // call to drive `__str__` dispatch — only the dict entry
+        // moves; the dispatch path is unchanged.
+        builtins_dict.insert(
+            DictKey(Object::from_static("print")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "print",
+                call: Box::new(|_args| Err(runtime_error("internal: print called outside VM"))),
+            })),
+        );
+        let builtins = Rc::new(RefCell::new(builtins_dict));
         let cache = ModuleCache::default();
         stdlib::register_all(&cache);
+        let excepthook = Rc::new(RefCell::new(Object::None));
+        let unraisable_hook = Rc::new(RefCell::new(Object::None));
+        let frame_stack: Rc<RefCell<Vec<Rc<PyFrame>>>> = Rc::new(RefCell::new(Vec::new()));
+        let exc_info_stack = Rc::new(RefCell::new(Vec::new()));
+        // Eagerly build the `sys` module so the per-interpreter
+        // frame_stack / exc_info_stack are visible to user code via
+        // `sys._getframe` and `sys.exc_info()`. The factory in the
+        // module cache is left in place as a fallback for embedders
+        // that explicitly clear `sys.modules`.
+        let sys_module = crate::stdlib::sys::build_with_state(
+            &cache,
+            frame_stack.clone(),
+            exc_info_stack.clone(),
+            excepthook.clone(),
+            unraisable_hook.clone(),
+        );
+        cache.insert("sys", Object::Module(sys_module));
         Self {
             stdout,
             builtins,
             cache,
+            frame_stack,
+            exc_info_stack,
+            excepthook,
+            unraisable_hook,
         }
     }
 }
@@ -316,25 +372,136 @@ impl Interpreter {
         if let Some(v) = sent {
             frame.push(v);
         }
-        loop {
+        // Push a Python-visible frame snapshot for the duration of
+        // this run. The same frame may be entered multiple times
+        // (generators on resume) — each entry gets a fresh PyFrame
+        // because the `back` chain reflects who is calling *now*.
+        let py_frame = self.push_py_frame(frame);
+        let result = loop {
+            // Mirror the live `pc` into the snapshot so `f_lineno`
+            // reads correctly when user code introspects via
+            // `sys._getframe`.
+            py_frame.lasti.set(frame.pc);
+            // Re-sync the locals mirror so a child frame's
+            // `f_back.f_locals` reflects this frame's mutations.
+            self.sync_py_locals(frame);
             match self.step(frame) {
                 Ok(StepOutcome::Continue) => {}
-                Ok(StepOutcome::Return(v)) => return Ok(FrameOutcome::Returned(v)),
-                Ok(StepOutcome::Yield(v)) => return Ok(FrameOutcome::Yielded(v)),
-                Ok(StepOutcome::StartGenerator) => return Ok(FrameOutcome::StartGenerator),
+                Ok(StepOutcome::Return(v)) => break Ok(FrameOutcome::Returned(v)),
+                Ok(StepOutcome::Yield(v)) => break Ok(FrameOutcome::Yielded(v)),
+                Ok(StepOutcome::StartGenerator) => break Ok(FrameOutcome::StartGenerator),
                 Err(err) => {
                     if let RuntimeError::PyException(exc) = err {
                         match self.handle_exception(frame, exc) {
                             Ok(Some(())) => continue,
                             Ok(None) => unreachable!(),
-                            Err(e) => return Err(e),
+                            Err(e) => break Err(e),
                         }
                     } else {
-                        return Err(err);
+                        break Err(err);
                     }
                 }
             }
+        };
+        self.pop_py_frame();
+        result
+    }
+
+    /// Build a [`PyFrame`] snapshot for `frame` and push it onto the
+    /// interpreter's call stack. The snapshot's `back` chain points
+    /// at whatever was on top of the stack before the push, so the
+    /// call hierarchy is recoverable from any frame.
+    fn push_py_frame(&self, frame: &Frame) -> Rc<PyFrame> {
+        let varnames = frame.code.varnames.clone();
+        let locals_snapshot = Rc::new(RefCell::new(frame.locals.clone()));
+        let cell_names: Vec<String> = frame
+            .code
+            .cellvars
+            .iter()
+            .chain(frame.code.freevars.iter())
+            .cloned()
+            .collect();
+        let cells_snapshot: Vec<Rc<RefCell<Object>>> = frame.cells.clone();
+        let globals = frame.globals.clone();
+        let class_ns = frame.class_namespace.clone();
+        let snapshot_for_provider = locals_snapshot.clone();
+        let provider: Rc<dyn Fn() -> Object> = Rc::new(move || {
+            let snapshot = snapshot_for_provider.borrow();
+            // For module / class bodies the user-visible locals are
+            // the corresponding namespace dict (class_ns when set,
+            // otherwise globals).
+            if let Some(ns) = class_ns.as_ref() {
+                return Object::Dict(ns.clone());
+            }
+            // Function frames: copy the locals array into a dict so
+            // user code can read by name. We honour cell variables
+            // (their value lives in the cell, not the local slot).
+            let mut d = DictData::new();
+            for (name, value) in varnames.iter().zip(snapshot.iter()) {
+                if matches!(value, Object::None) && cell_names.iter().any(|c| c == name) {
+                    let idx = cell_names.iter().position(|c| c == name).unwrap();
+                    if let Some(cell) = cells_snapshot.get(idx) {
+                        d.insert(
+                            DictKey(Object::from_str(name.clone())),
+                            cell.borrow().clone(),
+                        );
+                        continue;
+                    }
+                }
+                if !matches!(value, Object::None) {
+                    d.insert(DictKey(Object::from_str(name.clone())), value.clone());
+                }
+            }
+            // Cellvars not present in varnames (e.g. `__class__`).
+            for (i, name) in cell_names.iter().enumerate() {
+                if varnames.iter().any(|v| v == name) {
+                    continue;
+                }
+                if let Some(cell) = cells_snapshot.get(i) {
+                    d.insert(
+                        DictKey(Object::from_str(name.clone())),
+                        cell.borrow().clone(),
+                    );
+                }
+            }
+            Object::Dict(Rc::new(RefCell::new(d)))
+        });
+        let back = self.frame_stack.borrow().last().cloned();
+        let py = Rc::new(PyFrame {
+            code: frame.code.clone(),
+            globals,
+            builtins: self.builtins.clone(),
+            lasti: Cell::new(frame.pc),
+            back: RefCell::new(back),
+            locals_cache: RefCell::new(None),
+            locals_provider: RefCell::new(Some(provider)),
+            locals_mirror: RefCell::new(Some(locals_snapshot)),
+            trace: RefCell::new(Object::None),
+            override_lineno: Cell::new(None),
+        });
+        self.frame_stack.borrow_mut().push(py.clone());
+        py
+    }
+
+    /// Refresh the live-locals mirror on the current Python frame.
+    /// Called between bytecode steps so `sys._getframe(...).f_locals`
+    /// reflects the most recent `STORE_FAST` / `DELETE_FAST`.
+    fn sync_py_locals(&self, frame: &Frame) {
+        if let Some(py) = self.frame_stack.borrow().last() {
+            if let Some(mirror) = py.locals_mirror.borrow().as_ref() {
+                let mut slot = mirror.borrow_mut();
+                if slot.len() == frame.locals.len() {
+                    slot.clone_from(&frame.locals);
+                } else {
+                    *slot = frame.locals.clone();
+                }
+            }
+            py.invalidate_locals();
         }
+    }
+
+    fn pop_py_frame(&self) {
+        self.frame_stack.borrow_mut().pop();
     }
 
     /// Run a single instruction. The `pc` is advanced past it; if the
@@ -653,7 +820,7 @@ impl Interpreter {
             OpCode::Swap => {
                 let depth = ins.arg as usize;
                 let n = frame.stack.len();
-                if depth >= 1 && depth < n {
+                if depth >= 2 && depth <= n {
                     frame.stack.swap(n - 1, n - depth);
                 }
             }
@@ -1057,7 +1224,7 @@ impl Interpreter {
                 frame.push(v);
             }
             OpCode::RaiseVarargs => {
-                let exc = match ins.arg {
+                let mut exc = match ins.arg {
                     0 => {
                         // Re-raise the currently-handled exception.
                         let top = frame
@@ -1082,6 +1249,8 @@ impl Interpreter {
                         )))
                     }
                 };
+                self.attach_implicit_context(&mut exc);
+                Self::sync_exc_attrs(&exc);
                 return Err(RuntimeError::PyException(exc));
             }
             OpCode::CheckExcMatch => {
@@ -1095,17 +1264,49 @@ impl Interpreter {
                 let matched = self.exception_matches(&exc, &ty)?;
                 frame.push(Object::Bool(matched));
             }
+            OpCode::CheckEGMatch => {
+                // PEP 654: stack on entry `[..., exc, type]`. Splits
+                // `exc` (an ExceptionGroup or a singleton) into the
+                // matched and remaining pieces.
+                let ty = frame.pop()?;
+                let exc = frame.pop()?;
+                let is_group = matches!(
+                    &exc,
+                    Object::Instance(i) if i.class.is_subclass_of(
+                        &builtin_types().base_exception_group
+                    )
+                );
+                let (matched, rest) = if is_group {
+                    crate::builtin_types::split_exception_group(&exc, &ty)?
+                } else {
+                    // Singleton: matches the type or doesn't, no
+                    // wrapping required (the spec says a bare
+                    // exception is treated as a one-element group for
+                    // matching purposes).
+                    if self.exception_matches(&exc, &ty)? {
+                        (exc.clone(), Object::None)
+                    } else {
+                        (Object::None, exc.clone())
+                    }
+                };
+                frame.push(rest);
+                frame.push(matched);
+            }
             OpCode::PushExcInfo => {
                 // The handler entry leaves the exception on top —
-                // we record it for the duration of the handler.
+                // we record it for the duration of the handler. The
+                // same exception goes onto the interpreter-wide
+                // `exc_info_stack` so `sys.exc_info()` sees it.
                 let exc = frame.top()?.clone();
                 if let Object::Instance(_) = &exc {
                     let pe = PyException::new(exc);
-                    frame.exc_handlers.push(pe);
+                    frame.exc_handlers.push(pe.clone());
+                    self.exc_info_stack.borrow_mut().push(pe);
                 }
             }
             OpCode::PopExcept => {
                 frame.exc_handlers.pop();
+                self.exc_info_stack.borrow_mut().pop();
             }
             OpCode::Reraise => {
                 let exc = if ins.arg == 0 {
@@ -1120,6 +1321,7 @@ impl Interpreter {
                     exc
                 };
                 let pe = Self::normalize_exception(exc, None)?;
+                Self::sync_exc_attrs(&pe);
                 return Err(RuntimeError::PyException(pe));
             }
             OpCode::BeforeWith => {
@@ -1403,6 +1605,17 @@ impl Interpreter {
         // Note `pc` was already advanced past the raising instruction,
         // so the protected range matches against `pc - 1`.
         let raise_pc = frame.pc.saturating_sub(1);
+        let line = frame
+            .code
+            .linetable
+            .get(raise_pc as usize)
+            .copied()
+            .unwrap_or(0);
+        // Push a traceback entry for *this* frame regardless of
+        // whether we end up handling here — CPython's `__traceback__`
+        // includes the catching frame too. The chain grows
+        // outward-from-raise as the exception propagates.
+        self.append_traceback(&mut exc, frame, raise_pc, line);
         if let Some(handler) = find_handler(&frame.code.exception_table, raise_pc) {
             // Drop entries above the recorded stack depth.
             while frame.stack.len() > handler.depth as usize {
@@ -1414,19 +1627,129 @@ impl Interpreter {
             frame.pc = handler.handler;
             return Ok(Some(()));
         }
-        // Record this frame in the traceback and propagate.
-        let line = frame
-            .code
-            .linetable
-            .get(raise_pc as usize)
-            .copied()
-            .unwrap_or(0);
+        Err(RuntimeError::PyException(exc))
+    }
+
+    /// Push one frame's worth of `tb_*` info onto the exception's
+    /// traceback chain — both the legacy `Vec<TracebackEntry>` (used
+    /// for the cheap `RuntimeError` Display impl) and the new
+    /// `PyTraceback` chain stored on the instance dict so Python code
+    /// can walk `exc.__traceback__`.
+    fn append_traceback(&self, exc: &mut PyException, frame: &Frame, lasti: u32, lineno: u32) {
         exc.push_traceback(TracebackEntry {
             filename: frame.code.filename.clone(),
             funcname: frame.code.name.clone(),
-            lineno: line,
+            lineno,
         });
-        Err(RuntimeError::PyException(exc))
+        let py_frame = self
+            .frame_stack
+            .borrow()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| {
+                // Fall back to a synthetic snapshot if for some
+                // reason the stack is empty (shouldn't happen in
+                // normal flow but keeps the chain non-empty).
+                Rc::new(PyFrame {
+                    code: frame.code.clone(),
+                    globals: frame.globals.clone(),
+                    builtins: self.builtins.clone(),
+                    lasti: Cell::new(lasti),
+                    back: RefCell::new(None),
+                    locals_cache: RefCell::new(None),
+                    locals_provider: RefCell::new(None),
+                    locals_mirror: RefCell::new(None),
+                    trace: RefCell::new(Object::None),
+                    override_lineno: Cell::new(None),
+                })
+            });
+        let new_tb = Rc::new(PyTraceback {
+            frame: py_frame,
+            lineno,
+            lasti,
+            next: RefCell::new(None),
+        });
+        // CPython chains outward: the catching frame ends up at the
+        // *head*; `tb_next` walks toward the raise site. Each
+        // propagation prepends the current frame's `tb` to the
+        // existing chain.
+        if let Object::Instance(inst) = &exc.instance {
+            let key = DictKey(Object::from_static("__traceback__"));
+            let prev = inst.dict.borrow().get(&key).cloned();
+            if let Some(Object::Traceback(prev_tb)) = prev {
+                *new_tb.next.borrow_mut() = Some(prev_tb);
+            }
+            inst.dict
+                .borrow_mut()
+                .insert(key, Object::Traceback(new_tb));
+        }
+    }
+
+    /// If the most-recent handled exception is still active when
+    /// `raise X` runs without a `from` clause, attach it as the new
+    /// exception's `__context__` so chained tracebacks render
+    /// `During handling of the above exception, another exception
+    /// occurred:`. Mirrors PEP 3134 / CPython.
+    fn attach_implicit_context(&self, exc: &mut PyException) {
+        if exc.cause.is_some() {
+            return;
+        }
+        let stack = self.exc_info_stack.borrow();
+        let Some(ctx) = stack.last() else {
+            return;
+        };
+        // Don't self-reference if user code re-raises through `raise`
+        // (the existing context-handler is the same exception).
+        if Rc::as_ptr(&match &ctx.instance {
+            Object::Instance(i) => i.clone(),
+            _ => return,
+        }) == Rc::as_ptr(&match &exc.instance {
+            Object::Instance(i) => i.clone(),
+            _ => return,
+        }) {
+            return;
+        }
+        exc.context = Some(Box::new(ctx.clone()));
+    }
+
+    /// Mirror the `cause` / `context` chain onto the instance dict so
+    /// Python code accessing `e.__cause__` / `e.__context__` sees
+    /// the canonical values. Called right before raising.
+    fn sync_exc_attrs(exc: &PyException) {
+        if let Object::Instance(inst) = &exc.instance {
+            let mut dict = inst.dict.borrow_mut();
+            if let Some(cause) = exc.cause.as_ref() {
+                dict.insert(
+                    DictKey(Object::from_static("__cause__")),
+                    cause.instance.clone(),
+                );
+                // Explicit cause suppresses __context__ rendering by
+                // default; user code can still set __suppress_context__.
+                dict.insert(
+                    DictKey(Object::from_static("__suppress_context__")),
+                    Object::Bool(true),
+                );
+            } else if !dict.contains_key(&DictKey(Object::from_static("__cause__"))) {
+                dict.insert(DictKey(Object::from_static("__cause__")), Object::None);
+            }
+            if let Some(context) = exc.context.as_ref() {
+                dict.insert(
+                    DictKey(Object::from_static("__context__")),
+                    context.instance.clone(),
+                );
+            } else if !dict.contains_key(&DictKey(Object::from_static("__context__"))) {
+                dict.insert(DictKey(Object::from_static("__context__")), Object::None);
+            }
+            if !dict.contains_key(&DictKey(Object::from_static("__suppress_context__"))) {
+                dict.insert(
+                    DictKey(Object::from_static("__suppress_context__")),
+                    Object::Bool(false),
+                );
+            }
+            if !dict.contains_key(&DictKey(Object::from_static("__traceback__"))) {
+                dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
+            }
+        }
     }
 
     /// Materialise a raised value into a [`PyException`]. Accepts an
@@ -1648,6 +1971,59 @@ impl Interpreter {
                     name
                 )))
             }
+            Object::Frame(fr) => match name {
+                "f_code" => Ok(Object::Code(fr.code.clone())),
+                "f_globals" => Ok(Object::Dict(fr.globals.clone())),
+                "f_builtins" => Ok(Object::Dict(fr.builtins.clone())),
+                "f_locals" => Ok(fr.locals()),
+                "f_lineno" => Ok(Object::Int(i64::from(fr.current_lineno()))),
+                "f_lasti" => Ok(Object::Int(i64::from(fr.lasti.get()))),
+                "f_back" => match fr.back.borrow().as_ref() {
+                    Some(parent) => Ok(Object::Frame(parent.clone())),
+                    None => Ok(Object::None),
+                },
+                "f_trace" => Ok(fr.trace.borrow().clone()),
+                "f_trace_lines" => Ok(Object::Bool(true)),
+                "f_trace_opcodes" => Ok(Object::Bool(false)),
+                _ => Err(attribute_error(format!(
+                    "'frame' object has no attribute '{}'",
+                    name
+                ))),
+            },
+            Object::Traceback(tb) => match name {
+                "tb_frame" => Ok(Object::Frame(tb.frame.clone())),
+                "tb_lineno" => Ok(Object::Int(i64::from(tb.lineno))),
+                "tb_lasti" => Ok(Object::Int(i64::from(tb.lasti))),
+                "tb_next" => match tb.next.borrow().as_ref() {
+                    Some(n) => Ok(Object::Traceback(n.clone())),
+                    None => Ok(Object::None),
+                },
+                _ => Err(attribute_error(format!(
+                    "'traceback' object has no attribute '{}'",
+                    name
+                ))),
+            },
+            Object::BoundMethod(bm) => match name {
+                "__func__" => Ok(bm.function.clone()),
+                "__self__" => Ok(bm.receiver.clone()),
+                "__name__" => match &bm.function {
+                    Object::Function(f) => Ok(Object::from_str(f.name.clone())),
+                    Object::Builtin(b) => Ok(Object::from_static(b.name)),
+                    _ => Ok(Object::from_static("?")),
+                },
+                "__doc__" => Ok(Object::None),
+                "__code__" => match &bm.function {
+                    Object::Function(f) => Ok(Object::Code(f.code.clone())),
+                    _ => Err(attribute_error(format!(
+                        "'method' object has no attribute '{}'",
+                        name
+                    ))),
+                },
+                _ => Err(attribute_error(format!(
+                    "'method' object has no attribute '{}'",
+                    name
+                ))),
+            },
             _ => {
                 if let Some(method) = self.lookup_method(obj, name) {
                     return Ok(Object::BoundMethod(Rc::new(BoundMethod {
@@ -3188,7 +3564,58 @@ impl Interpreter {
             let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
             return Ok(r.is_truthy());
         }
+        // Container equality must defer to per-element `__eq__` so
+        // that wrapper objects with custom equality (e.g. mock.ANY)
+        // compare as expected when embedded in a tuple/list.
+        if matches!(op, CompareKind::Eq | CompareKind::NotEq) {
+            if let Some(rv) = self.deep_equal_collection(a, b, globals)? {
+                let truth = match op {
+                    CompareKind::Eq => rv,
+                    _ => !rv,
+                };
+                return Ok(truth);
+            }
+        }
         compare_op(a, b, op)
+    }
+
+    /// Try to compare two container values element-wise via the full
+    /// `__eq__` protocol. Returns `None` if either argument is not a
+    /// container we recognise — the caller falls back to the
+    /// structural `compare_op`.
+    fn deep_equal_collection(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<bool>, RuntimeError> {
+        match (a, b) {
+            (Object::Tuple(xs), Object::Tuple(ys)) => {
+                if xs.len() != ys.len() {
+                    return Ok(Some(false));
+                }
+                for (x, y) in xs.iter().zip(ys.iter()) {
+                    if !self.dispatch_compare_op(x, y, CompareKind::Eq, globals)? {
+                        return Ok(Some(false));
+                    }
+                }
+                Ok(Some(true))
+            }
+            (Object::List(xs), Object::List(ys)) => {
+                let xs = xs.borrow().clone();
+                let ys = ys.borrow().clone();
+                if xs.len() != ys.len() {
+                    return Ok(Some(false));
+                }
+                for (x, y) in xs.iter().zip(ys.iter()) {
+                    if !self.dispatch_compare_op(x, y, CompareKind::Eq, globals)? {
+                        return Ok(Some(false));
+                    }
+                }
+                Ok(Some(true))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn store_attr(&mut self, obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
@@ -3218,6 +3645,47 @@ impl Interpreter {
                     .insert(DictKey(Object::from_str(name)), value);
                 Ok(())
             }
+            Object::Frame(fr) => match name {
+                "f_trace" => {
+                    *fr.trace.borrow_mut() = value;
+                    Ok(())
+                }
+                "f_trace_lines" | "f_trace_opcodes" => Ok(()),
+                "f_lineno" => match value {
+                    Object::Int(i) if i >= 0 => {
+                        fr.override_lineno.set(Some(i as u32));
+                        Ok(())
+                    }
+                    _ => Err(type_error("f_lineno must be a non-negative int")),
+                },
+                _ => Err(attribute_error(format!(
+                    "'frame' object attribute '{}' is read-only",
+                    name
+                ))),
+            },
+            Object::Traceback(tb) => match name {
+                "tb_next" => {
+                    match value {
+                        Object::None => {
+                            *tb.next.borrow_mut() = None;
+                        }
+                        Object::Traceback(next) => {
+                            *tb.next.borrow_mut() = Some(next);
+                        }
+                        other => {
+                            return Err(type_error(format!(
+                                "expected traceback, got {}",
+                                other.type_name()
+                            )))
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err(attribute_error(format!(
+                    "'traceback' object attribute '{}' is read-only",
+                    name
+                ))),
+            },
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),
@@ -3645,6 +4113,35 @@ impl Interpreter {
                     // is currently executing inside — and that's
                     // exactly `outer_globals`.
                     return Ok(Object::Dict(outer_globals.clone()));
+                }
+                if b.name == "__vm:__import__" {
+                    // ``__import__(name, globals=None, locals=None,
+                    //              fromlist=(), level=0)`` — mirror
+                    // CPython's signature. We honour the first, fourth
+                    // and fifth arguments; ``globals`` is used for
+                    // package resolution but we pass through the
+                    // calling frame's globals which is more
+                    // useful for relative imports.
+                    let name = match args.first() {
+                        Some(Object::Str(s)) => s.to_string(),
+                        _ => return Err(type_error("__import__() argument 1 must be str")),
+                    };
+                    let fromlist = args.get(3).cloned().unwrap_or(Object::None);
+                    let level = match args.get(4) {
+                        Some(Object::Int(i)) => *i as u32,
+                        Some(Object::None) | None => 0,
+                        _ => return Err(type_error("__import__() argument 5 (level) must be int")),
+                    };
+                    return self.do_import(&name, &fromlist, level, outer_globals);
+                }
+                if b.name == "__vm:compile" {
+                    return self.do_compile_call(args, outer_globals);
+                }
+                if b.name == "__vm:exec" {
+                    return self.do_exec_call(args, outer_globals);
+                }
+                if b.name == "__vm:eval" {
+                    return self.do_eval_call(args, outer_globals);
                 }
                 // Pre-materialize generator/instance iterables for
                 // builtin methods that need to iterate them. The
@@ -4297,7 +4794,32 @@ impl Interpreter {
                 return (builtin.call)(args);
             }
             if cls.flags.is_exception {
-                return Ok(self.build_exception_instance(cls, args));
+                let instance = self.build_exception_instance(cls.clone(), args);
+                // If a class anywhere between `cls` and `BaseException`
+                // (exclusive) defines its own `__init__`, run it so
+                // subclasses such as `BaseExceptionGroup` get to stitch
+                // `exceptions` onto the instance. We stop at
+                // `BaseException` because its default `__init__` only
+                // populates `args` — which the fast path already did.
+                if let Some(init) = lookup_exception_init(&cls) {
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: instance.clone(),
+                        function: init,
+                    }));
+                    let result = self.call(
+                        &bound,
+                        args,
+                        kwargs,
+                        &Rc::new(RefCell::new(DictData::new())),
+                    )?;
+                    if !matches!(result, Object::None) {
+                        return Err(type_error(format!(
+                            "__init__() should return None, not '{}'",
+                            result.type_name()
+                        )));
+                    }
+                }
+                return Ok(instance);
             }
         }
 
@@ -4347,6 +4869,15 @@ impl Interpreter {
         };
         if init_eligible {
             if let Some(init) = cls.lookup("__init__") {
+                // CPython rule: if `__new__` is overridden and
+                // `__init__` is the default `object.__init__`, skip
+                // the `__init__` call entirely so user code can pass
+                // arbitrary args to `__new__` without tripping on
+                // `object.__init__()`'s strict arity.
+                let init_owner_is_object = init_is_from_object(&cls);
+                if init_owner_is_object && !is_object_new {
+                    return Ok(instance);
+                }
                 let bound = Object::BoundMethod(Rc::new(BoundMethod {
                     receiver: instance.clone(),
                     function: init,
@@ -4586,6 +5117,176 @@ impl Interpreter {
     /// the current frame's `__package__`/`__name__`, walks dotted
     /// names, and returns either the top-level package (when
     /// `fromlist` is empty/None) or the leaf module (otherwise).
+    /// Compile a Python source string into a `code` object. Mirrors
+    /// CPython's signature `compile(source, filename, mode)`; the
+    /// `flags`/`dont_inherit`/`optimize` arguments are accepted but
+    /// ignored — they don't change WeavePy's bytecode.
+    fn do_compile_call(
+        &mut self,
+        args: &[Object],
+        _outer_globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let source = match args.first() {
+            Some(Object::Str(s)) => s.to_string(),
+            Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+            _ => {
+                return Err(type_error(
+                    "compile() argument 1 must be a string or bytes-like",
+                ))
+            }
+        };
+        let filename = match args.get(1) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => "<string>".to_owned(),
+        };
+        let mode = match args.get(2) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => "exec".to_owned(),
+        };
+        match mode.as_str() {
+            "exec" => {
+                let module = weavepy_parser::parse_module(&source)
+                    .map_err(|e| crate::error::value_error(format!("compile error: {e}")))?;
+                let code =
+                    weavepy_compiler::compile_module_with_source(&module, &source, &filename)
+                        .map_err(|e| crate::error::value_error(format!("compile error: {e}")))?;
+                Ok(Object::Code(Rc::new(code)))
+            }
+            "eval" => {
+                let module = weavepy_parser::parse_module(&source)
+                    .map_err(|e| crate::error::value_error(format!("compile error: {e}")))?;
+                let code =
+                    weavepy_compiler::compile_module_with_source(&module, &source, &filename)
+                        .map_err(|e| crate::error::value_error(format!("compile error: {e}")))?;
+                Ok(Object::Code(Rc::new(code)))
+            }
+            other => Err(crate::error::value_error(format!(
+                "compile() mode must be 'exec' or 'eval', not '{other}'"
+            ))),
+        }
+    }
+
+    /// `exec(source, globals=None, locals=None)`. Accepts either a
+    /// `Code` object (the typical CPython use case) or a Python source
+    /// string we compile on the fly. The body runs with `globals`
+    /// taking the place of the calling frame's globals, exactly the
+    /// way frozen modules execute.
+    fn do_exec_call(
+        &mut self,
+        args: &[Object],
+        outer_globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let source = args
+            .first()
+            .cloned()
+            .ok_or_else(|| type_error("exec() missing required argument 'source'"))?;
+        let globals_dict = match args.get(1) {
+            Some(Object::Dict(d)) => d.clone(),
+            Some(Object::None) | None => outer_globals.clone(),
+            _ => return Err(type_error("exec() globals must be a dict")),
+        };
+        let code_rc = match source {
+            Object::Code(c) => c,
+            Object::Str(src) => {
+                let module = weavepy_parser::parse_module(&src)
+                    .map_err(|e| crate::error::value_error(format!("exec error: {e}")))?;
+                let compiled =
+                    weavepy_compiler::compile_module_with_source(&module, &src, "<string>")
+                        .map_err(|e| crate::error::value_error(format!("exec error: {e}")))?;
+                Rc::new(compiled)
+            }
+            other => {
+                return Err(type_error(format!(
+                    "exec() expected str or code, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        // Ensure the globals dict carries a `__builtins__` entry so
+        // user code can reach `print`, `range`, etc. Mirrors how
+        // module globals are seeded by the import path.
+        {
+            let mut g = globals_dict.borrow_mut();
+            if !g.contains_key(&DictKey(Object::from_static("__builtins__"))) {
+                g.insert(
+                    DictKey(Object::from_static("__builtins__")),
+                    Object::Dict(self.builtins.clone()),
+                );
+            }
+        }
+        let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals_dict, true);
+        self.run_frame(&mut frame)?;
+        Ok(Object::None)
+    }
+
+    /// `eval(expr, globals=None, locals=None)`. Accepts a `Code`
+    /// object or a source string of a single expression. Returns the
+    /// expression's value rather than `None`.
+    fn do_eval_call(
+        &mut self,
+        args: &[Object],
+        outer_globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let source = args
+            .first()
+            .cloned()
+            .ok_or_else(|| type_error("eval() missing required argument 'source'"))?;
+        let globals_dict = match args.get(1) {
+            Some(Object::Dict(d)) => d.clone(),
+            Some(Object::None) | None => outer_globals.clone(),
+            _ => return Err(type_error("eval() globals must be a dict")),
+        };
+        let src = match source {
+            Object::Code(c) => {
+                let mut frame =
+                    self.make_frame(c, Vec::new(), Vec::new(), globals_dict.clone(), true);
+                self.run_frame(&mut frame)?;
+                return Ok(Object::None);
+            }
+            Object::Str(s) => s.to_string(),
+            other => {
+                return Err(type_error(format!(
+                    "eval() expected str or code, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        // Wrap as a single-expression module: parse the source, then
+        // synthesize a `_result_ = <expr>` statement so the value is
+        // captured in the globals dict.
+        let wrapped = format!("__weavepy_eval_result = ({})\n", src);
+        let module = weavepy_parser::parse_module(&wrapped)
+            .map_err(|e| crate::error::value_error(format!("eval error: {e}")))?;
+        let code = weavepy_compiler::compile_module_with_source(&module, &wrapped, "<eval>")
+            .map_err(|e| crate::error::value_error(format!("eval error: {e}")))?;
+        {
+            let mut g = globals_dict.borrow_mut();
+            if !g.contains_key(&DictKey(Object::from_static("__builtins__"))) {
+                g.insert(
+                    DictKey(Object::from_static("__builtins__")),
+                    Object::Dict(self.builtins.clone()),
+                );
+            }
+        }
+        let mut frame = self.make_frame(
+            Rc::new(code),
+            Vec::new(),
+            Vec::new(),
+            globals_dict.clone(),
+            true,
+        );
+        self.run_frame(&mut frame)?;
+        let result = globals_dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__weavepy_eval_result")))
+            .cloned()
+            .unwrap_or(Object::None);
+        globals_dict
+            .borrow_mut()
+            .shift_remove(&DictKey(Object::from_static("__weavepy_eval_result")));
+        Ok(result)
+    }
+
     fn do_import(
         &mut self,
         name: &str,
@@ -5095,6 +5796,38 @@ fn is_stop_async_iteration_obj(o: &Object) -> bool {
     if let Object::Instance(inst) = o {
         let target = builtin_types().stop_async_iteration.clone();
         return inst.class.is_subclass_of(&target);
+    }
+    false
+}
+
+/// Walk `cls`'s MRO until we hit `BaseException` (exclusive). If any
+/// class in that prefix carries its own `__init__`, return it.
+/// Otherwise the caller can stick with the cheap `args`-only setup.
+fn lookup_exception_init(cls: &Rc<TypeObject>) -> Option<Object> {
+    let mro = cls.mro.borrow();
+    for ty in mro.iter() {
+        if ty.name == "BaseException" || ty.name == "object" {
+            return None;
+        }
+        let dict = ty.dict.borrow();
+        if let Some(init) = dict.get(&DictKey(Object::from_static("__init__"))) {
+            return Some(init.clone());
+        }
+    }
+    None
+}
+
+/// `True` if `cls`'s `__init__` is the one defined on `object` — i.e.
+/// no class between `cls` and `object` overrides `__init__`. Used to
+/// decide whether to skip the default no-op `__init__` after a user-
+/// defined `__new__` already consumed the constructor args.
+fn init_is_from_object(cls: &Rc<TypeObject>) -> bool {
+    let mro = cls.mro.borrow();
+    for ty in mro.iter() {
+        let dict = ty.dict.borrow();
+        if dict.contains_key(&DictKey(Object::from_static("__init__"))) {
+            return ty.name == "object";
+        }
     }
     false
 }

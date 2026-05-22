@@ -10,7 +10,7 @@
 //! and value equality for the value-type variants. RFC 0002 will
 //! replace this with a proper type-slot-based object model.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -86,6 +86,15 @@ pub enum Object {
     /// per-instance value under the slot's name in `__dict__`,
     /// enforcing the slot-list at the class level.
     SlotDescriptor(Rc<SlotDescriptor>),
+    /// Python-visible frame object (RFC 0018). Created on demand by
+    /// `sys._getframe`, the `traceback` module, and the unwind
+    /// machinery. Holds the locals snapshot, globals reference, and
+    /// the chain of outer frames.
+    Frame(Rc<PyFrame>),
+    /// Python-visible traceback object (RFC 0018). Built as
+    /// exceptions propagate so user code can walk `tb_next` /
+    /// `tb_frame` / `tb_lineno` like CPython.
+    Traceback(Rc<PyTraceback>),
 }
 
 impl fmt::Debug for Object {
@@ -129,8 +138,104 @@ impl fmt::Debug for Object {
             Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", inner.as_ref()),
             Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", inner.as_ref()),
             Object::SlotDescriptor(sd) => write!(f, "<slot {:?} of {:?}>", sd.name, sd.class_name),
+            Object::Frame(fr) => write!(f, "<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
+            Object::Traceback(tb) => write!(f, "<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
         }
     }
+}
+
+/// Internal payload for [`Object::Frame`]. Captures the live state
+/// of a frame at the point the snapshot is materialised — the VM
+/// updates [`PyFrame::lasti`] before any opcode that may inspect
+/// frames so `frame.f_lineno` reads correctly.
+pub struct PyFrame {
+    pub code: Rc<CodeObject>,
+    pub globals: Rc<RefCell<DictData>>,
+    pub builtins: Rc<RefCell<DictData>>,
+    /// Index of the current instruction inside [`Self::code`]. Updated
+    /// per-instruction by the dispatch loop while this frame is the
+    /// active one.
+    pub lasti: Cell<u32>,
+    /// The enclosing frame (the next-outer in the call stack), `None`
+    /// for the module frame.
+    pub back: RefCell<Option<Rc<PyFrame>>>,
+    /// Lazy snapshot of the locals dict. Built on first access to
+    /// `frame.f_locals`. Subsequent accesses see the cached dict;
+    /// CPython does the same. The cached dict is *not* a live view —
+    /// writes to it don't propagate back to the frame's `locals`
+    /// array.
+    pub locals_cache: RefCell<Option<Object>>,
+    /// Provider closure that materialises the locals dict on first
+    /// access. Captures the (interior-mutable) locals array at the
+    /// time the snapshot is taken so the same provider can be called
+    /// again after a `clear()` to refresh.
+    pub locals_provider: RefCell<Option<Rc<dyn Fn() -> Object>>>,
+    /// Shared, mutable mirror of the running frame's `locals` array.
+    /// The VM updates this between steps so `f_locals` reflects live
+    /// state. `None` once the frame has returned.
+    pub locals_mirror: RefCell<Option<Rc<RefCell<Vec<Object>>>>>,
+    /// Per-frame trace function (PEP 669 surface — `sys.settrace` is
+    /// a no-op today, but storage exists so user code can set/get the
+    /// value without raising).
+    pub trace: RefCell<Object>,
+    /// Per-frame `f_lineno` override. CPython lets debuggers set
+    /// `f_lineno` to jump to a different line; we keep storage so
+    /// reads round-trip, even though writes don't actually move the
+    /// program counter.
+    pub override_lineno: Cell<Option<u32>>,
+}
+
+impl fmt::Debug for PyFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "<frame code={:?} lineno={}>",
+            self.code.name,
+            self.current_lineno()
+        )
+    }
+}
+
+impl PyFrame {
+    pub fn current_lineno(&self) -> u32 {
+        if let Some(v) = self.override_lineno.get() {
+            return v;
+        }
+        let pc = self.lasti.get() as usize;
+        self.code.linetable.get(pc).copied().unwrap_or(0)
+    }
+
+    /// Materialise the locals dict, caching the result. Subsequent
+    /// calls return the same dict object so `id(frame.f_locals)` is
+    /// stable.
+    pub fn locals(&self) -> Object {
+        if let Some(v) = self.locals_cache.borrow().as_ref() {
+            return v.clone();
+        }
+        let provider = self.locals_provider.borrow().clone();
+        let dict = provider
+            .as_ref()
+            .map_or_else(Object::new_dict, |provider| provider());
+        *self.locals_cache.borrow_mut() = Some(dict.clone());
+        dict
+    }
+
+    /// Force re-materialisation on the next `locals()` call. Used by
+    /// the VM after the frame has executed enough to make the cached
+    /// snapshot stale (function entry, generator resume).
+    pub fn invalidate_locals(&self) {
+        self.locals_cache.borrow_mut().take();
+    }
+}
+
+/// Internal payload for [`Object::Traceback`]. Built lazily by the
+/// unwind machinery and chained outward through [`Self::next`].
+#[derive(Debug)]
+pub struct PyTraceback {
+    pub frame: Rc<PyFrame>,
+    pub lineno: u32,
+    pub lasti: u32,
+    pub next: RefCell<Option<Rc<PyTraceback>>>,
 }
 
 /// Internal payload for [`Object::Property`].
@@ -796,7 +901,9 @@ impl Object {
             | Object::Property(_)
             | Object::StaticMethod(_)
             | Object::ClassMethod(_)
-            | Object::SlotDescriptor(_) => true,
+            | Object::SlotDescriptor(_)
+            | Object::Frame(_)
+            | Object::Traceback(_) => true,
             Object::Bytes(b) => !b.is_empty(),
             Object::ByteArray(b) => !b.borrow().is_empty(),
             Object::Set(s) => !s.borrow().is_empty(),
@@ -854,6 +961,8 @@ impl Object {
             (Object::StaticMethod(a), Object::StaticMethod(b)) => Rc::ptr_eq(a, b),
             (Object::ClassMethod(a), Object::ClassMethod(b)) => Rc::ptr_eq(a, b),
             (Object::SlotDescriptor(a), Object::SlotDescriptor(b)) => Rc::ptr_eq(a, b),
+            (Object::Frame(a), Object::Frame(b)) => Rc::ptr_eq(a, b),
+            (Object::Traceback(a), Object::Traceback(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -1103,6 +1212,8 @@ impl Object {
             Object::StaticMethod(_) => "staticmethod",
             Object::ClassMethod(_) => "classmethod",
             Object::SlotDescriptor(_) => "member_descriptor",
+            Object::Frame(_) => "frame",
+            Object::Traceback(_) => "traceback",
         }
     }
 
@@ -1269,6 +1380,8 @@ impl Object {
             Object::SlotDescriptor(sd) => {
                 format!("<member '{}' of '{}' objects>", sd.name, sd.class_name)
             }
+            Object::Frame(fr) => format!("<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
+            Object::Traceback(tb) => format!("<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
         }
     }
 
