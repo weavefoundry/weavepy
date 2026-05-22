@@ -18,6 +18,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive, Zero};
+
 use crate::builtin_types::{builtin_types, instance_is_subclass};
 use crate::error::{
     index_error, key_error, runtime_error, stop_iteration, type_error, value_error, RuntimeError,
@@ -64,6 +67,7 @@ pub fn default_builtins() -> DictData {
     reg!("repr", b_repr);
     reg!("int", b_int);
     reg!("float", b_float);
+    reg!("complex", b_complex);
     reg!("bool", b_bool);
     reg!("list", b_list);
     reg!("tuple", b_tuple);
@@ -301,6 +305,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         Object::Bytes(_) | Object::ByteArray(_) => match name {
             "decode" => Some(method("decode", bytes_decode)),
             "hex" => Some(method("hex", bytes_hex)),
+            "fromhex" => Some(method("fromhex", bytes_fromhex)),
             "startswith" => Some(method("startswith", bytes_startswith)),
             "endswith" => Some(method("endswith", bytes_endswith)),
             "find" => Some(method("find", bytes_find)),
@@ -364,6 +369,40 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                 // here.
                 None
             }
+            _ => None,
+        },
+        Object::Int(_) | Object::Long(_) | Object::Bool(_) => match name {
+            "bit_length" => Some(method("bit_length", int_bit_length)),
+            "bit_count" => Some(method("bit_count", int_bit_count)),
+            "to_bytes" => Some(method("to_bytes", int_to_bytes)),
+            "from_bytes" => Some(method("from_bytes", int_from_bytes_method)),
+            "is_integer" => Some(method("is_integer", int_is_integer)),
+            "as_integer_ratio" => Some(method("as_integer_ratio", int_as_integer_ratio)),
+            "conjugate" => Some(method("conjugate", int_conjugate)),
+            "denominator" | "numerator" | "real" | "imag" => {
+                // Property-style access: the VM routes attribute reads
+                // through this path too. Return a thunk that yields
+                // the value itself.
+                None
+            }
+            "__index__" | "__int__" => Some(method("__index__", int_conjugate)),
+            "__trunc__" => Some(method("__trunc__", int_conjugate)),
+            "__floor__" => Some(method("__floor__", int_conjugate)),
+            "__ceil__" => Some(method("__ceil__", int_conjugate)),
+            _ => None,
+        },
+        Object::Float(_) => match name {
+            "is_integer" => Some(method("is_integer", float_is_integer)),
+            "hex" => Some(method("hex", float_hex)),
+            "fromhex" => Some(method("fromhex", float_fromhex)),
+            "as_integer_ratio" => Some(method("as_integer_ratio", float_as_integer_ratio)),
+            "conjugate" => Some(method("conjugate", float_conjugate)),
+            "__trunc__" => Some(method("__trunc__", float_trunc)),
+            "__round__" => Some(method("__round__", float_round)),
+            _ => None,
+        },
+        Object::Complex(_) => match name {
+            "conjugate" => Some(method("conjugate", complex_conjugate)),
             _ => None,
         },
         _ => None,
@@ -943,21 +982,42 @@ pub(crate) fn b_int_compat(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     match &args[0] {
         Object::Int(i) => Ok(Object::Int(*i)),
+        Object::Long(b) => Ok(Object::Long(b.clone())),
         Object::Bool(b) => Ok(Object::Int(i64::from(*b))),
-        Object::Float(f) => Ok(Object::Int(*f as i64)),
-        Object::Str(s) => {
-            let trimmed = s.trim();
-            let base = if args.len() == 2 {
-                match &args[1] {
-                    Object::Int(i) => *i as u32,
-                    _ => 10,
+        Object::Float(f) => {
+            if !f.is_finite() {
+                return Err(value_error(if f.is_nan() {
+                    "cannot convert float NaN to integer"
+                } else {
+                    "cannot convert float infinity to integer"
+                }));
+            }
+            // Truncate toward zero, like Python.
+            let truncated = f.trunc();
+            if let Some(small) = i64::try_from(truncated as i128).ok().and_then(|x| {
+                if (x as f64) == truncated {
+                    Some(x)
+                } else {
+                    None
                 }
-            } else {
-                10
-            };
-            let parsed =
-                i64::from_str_radix(trimmed, base).map_err(|e| value_error(e.to_string()))?;
-            Ok(Object::Int(parsed))
+            }) {
+                return Ok(Object::Int(small));
+            }
+            Ok(Object::int_from_bigint(crate::object::bigint_from_f64_trunc(
+                truncated,
+            )))
+        }
+        Object::Str(s) => parse_int_string(s.trim(), &args[1..]),
+        Object::Bytes(b) => {
+            let s = std::str::from_utf8(b)
+                .map_err(|_| value_error("int() can't convert non-string with explicit base"))?;
+            parse_int_string(s.trim(), &args[1..])
+        }
+        Object::ByteArray(b) => {
+            let bytes = b.borrow();
+            let s = std::str::from_utf8(&bytes)
+                .map_err(|_| value_error("int() can't convert non-string with explicit base"))?;
+            parse_int_string(s.trim(), &args[1..])
         }
         _ => Err(type_error(format!(
             "int() argument must be a string or a real number, not '{}'",
@@ -966,24 +1026,557 @@ pub(crate) fn b_int_compat(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+fn parse_int_string(s: &str, base_arg: &[Object]) -> Result<Object, RuntimeError> {
+    use num_bigint::BigInt;
+
+    let mut s = s;
+    let mut sign = 1i32;
+    if let Some(stripped) = s.strip_prefix('+') {
+        s = stripped;
+    } else if let Some(stripped) = s.strip_prefix('-') {
+        s = stripped;
+        sign = -1;
+    }
+
+    let base = if base_arg.is_empty() {
+        10u32
+    } else {
+        match &base_arg[0] {
+            Object::Int(i) => u32::try_from(*i)
+                .map_err(|_| value_error("int() base must be >= 2 and <= 36, or 0"))?,
+            Object::Bool(b) => u32::from(*b),
+            _ => return Err(type_error("int() base must be an integer".to_owned())),
+        }
+    };
+    if base == 1 || base > 36 {
+        return Err(value_error("int() base must be >= 2 and <= 36, or 0"));
+    }
+
+    // Strip a 0x/0o/0b prefix when it matches the base, or pick the
+    // base from the prefix when `base == 0`.
+    let (radix, digits): (u32, &str) = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        if base == 0 || base == 16 {
+            (16, rest)
+        } else {
+            (base, s)
+        }
+    } else if let Some(rest) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+        if base == 0 || base == 8 {
+            (8, rest)
+        } else {
+            (base, s)
+        }
+    } else if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        if base == 0 || base == 2 {
+            (2, rest)
+        } else {
+            (base, s)
+        }
+    } else if base == 0 {
+        (10, s)
+    } else {
+        (base, s)
+    };
+
+    let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
+    if cleaned.is_empty() {
+        return Err(value_error(format!(
+            "invalid literal for int() with base {radix}: '{s}'"
+        )));
+    }
+
+    if let Ok(small) = i64::from_str_radix(&cleaned, radix) {
+        return Ok(Object::Int(if sign < 0 { -small } else { small }));
+    }
+    let big = BigInt::parse_bytes(cleaned.as_bytes(), radix)
+        .ok_or_else(|| value_error(format!("invalid literal for int() with base {radix}: '{s}'")))?;
+    let big = if sign < 0 { -big } else { big };
+    Ok(Object::int_from_bigint(big))
+}
+
+// ---------- int methods (RFC 0019) ----------
+
+fn int_bit_length(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "bit_length")?;
+    let n = v
+        .as_bigint()
+        .ok_or_else(|| type_error(format!("bit_length: '{}' object is not an integer", v.type_name())))?;
+    let bits = n.bits();
+    Ok(Object::Int(bits as i64))
+}
+
+fn int_bit_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "bit_count")?;
+    let n = v
+        .as_bigint()
+        .ok_or_else(|| type_error(format!("bit_count: '{}' object is not an integer", v.type_name())))?;
+    // Python: number of 1-bits in the absolute value.
+    let abs = n.abs();
+    let (_, bytes) = abs.to_bytes_be();
+    let count: u32 = bytes.iter().map(|b| b.count_ones()).sum();
+    Ok(Object::Int(count as i64))
+}
+
+fn int_conjugate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "conjugate")?;
+    Ok(v.clone())
+}
+
+fn int_is_integer(args: &[Object]) -> Result<Object, RuntimeError> {
+    let _ = one(args, "is_integer")?;
+    Ok(Object::Bool(true))
+}
+
+fn int_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "as_integer_ratio")?;
+    if !v.is_int_like() {
+        return Err(type_error(format!(
+            "as_integer_ratio: '{}' object is not an integer",
+            v.type_name()
+        )));
+    }
+    Ok(Object::new_tuple(vec![v.clone(), Object::Int(1)]))
+}
+
+fn int_to_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
+    let n_obj = args.first().ok_or_else(|| type_error("to_bytes() requires self"))?;
+    let n = n_obj
+        .as_bigint()
+        .ok_or_else(|| type_error("to_bytes(): self is not an integer"))?;
+    let length = match args.get(1) {
+        Some(Object::Int(i)) if *i >= 0 => *i as usize,
+        Some(Object::Bool(b)) => usize::from(*b),
+        Some(Object::Long(b)) if !b.is_negative() => b
+            .to_usize()
+            .ok_or_else(|| value_error("length out of range"))?,
+        None => 1,
+        _ => return Err(value_error("length argument must be a non-negative integer")),
+    };
+    let byteorder = match args.get(2) {
+        Some(Object::Str(s)) => s.to_string(),
+        None => "big".to_owned(),
+        _ => return Err(type_error("byteorder must be a string")),
+    };
+    let signed = match args.get(3) {
+        Some(o) => o.is_truthy(),
+        None => false,
+    };
+    let bytes = bigint_to_bytes(&n, length, &byteorder, signed)?;
+    Ok(Object::new_bytes(bytes))
+}
+
+fn int_from_bytes_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    // Bound-method form passes self as args[0] (the int class itself
+    // in CPython). We treat any int-like first arg as the binding
+    // receiver and ignore it.
+    let offset = if args.first().map(|o| o.is_int_like() || matches!(o, Object::Type(_))).unwrap_or(false) {
+        1
+    } else {
+        0
+    };
+    let data_obj = args.get(offset).ok_or_else(|| type_error("from_bytes() missing data"))?;
+    let data = data_obj
+        .as_bytes_view()
+        .or_else(|| {
+            // Iterables of ints: collect into bytes.
+            data_obj.make_iter().ok().map(|mut it| {
+                let mut out = Vec::new();
+                while let Some(x) = it.next_value() {
+                    if let Object::Int(b) = x {
+                        if (0..=255).contains(&b) {
+                            out.push(b as u8);
+                            continue;
+                        }
+                    }
+                    out.clear();
+                    return out;
+                }
+                out
+            })
+        })
+        .ok_or_else(|| type_error("from_bytes() requires bytes-like"))?;
+    let byteorder = match args.get(offset + 1) {
+        Some(Object::Str(s)) => s.to_string(),
+        None => "big".to_owned(),
+        _ => return Err(type_error("byteorder must be a string")),
+    };
+    let signed = match args.get(offset + 2) {
+        Some(o) => o.is_truthy(),
+        None => false,
+    };
+    let n = bytes_to_bigint(&data, &byteorder, signed)?;
+    Ok(Object::int_from_bigint(n))
+}
+
+fn bigint_to_bytes(
+    n: &BigInt,
+    length: usize,
+    byteorder: &str,
+    signed: bool,
+) -> Result<Vec<u8>, RuntimeError> {
+    if !signed && n.is_negative() {
+        return Err(value_error("can't convert negative int to unsigned"));
+    }
+    if length == 0 && !n.is_zero() {
+        return Err(value_error("int too big to convert"));
+    }
+    let bytes = if signed {
+        let raw = n.to_signed_bytes_be();
+        if raw.len() > length {
+            return Err(value_error("int too big to convert"));
+        }
+        let pad_byte = if n.is_negative() { 0xFF } else { 0x00 };
+        let mut out = vec![pad_byte; length - raw.len()];
+        out.extend_from_slice(&raw);
+        out
+    } else {
+        let (_, raw) = n.to_bytes_be();
+        if raw.len() > length {
+            return Err(value_error("int too big to convert"));
+        }
+        let mut out = vec![0u8; length - raw.len()];
+        out.extend_from_slice(&raw);
+        out
+    };
+    match byteorder {
+        "big" => Ok(bytes),
+        "little" => {
+            let mut rev = bytes;
+            rev.reverse();
+            Ok(rev)
+        }
+        _ => Err(value_error(
+            "byteorder must be either 'little' or 'big'".to_owned(),
+        )),
+    }
+}
+
+fn bytes_to_bigint(data: &[u8], byteorder: &str, signed: bool) -> Result<BigInt, RuntimeError> {
+    let buf: Vec<u8> = match byteorder {
+        "big" => data.to_vec(),
+        "little" => {
+            let mut v = data.to_vec();
+            v.reverse();
+            v
+        }
+        _ => {
+            return Err(value_error(
+                "byteorder must be either 'little' or 'big'".to_owned(),
+            ))
+        }
+    };
+    if signed {
+        Ok(BigInt::from_signed_bytes_be(&buf))
+    } else {
+        Ok(BigInt::from_bytes_be(num_bigint::Sign::Plus, &buf))
+    }
+}
+
+// ---------- float methods (RFC 0019) ----------
+
+fn float_is_integer(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "is_integer")?;
+    match v {
+        Object::Float(f) => Ok(Object::Bool(f.is_finite() && f.fract() == 0.0)),
+        _ => Err(type_error("is_integer: float expected")),
+    }
+}
+
+fn float_hex(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "hex")?;
+    match v {
+        Object::Float(f) => Ok(Object::from_str(format_float_hex(*f))),
+        _ => Err(type_error("hex: float expected")),
+    }
+}
+
+fn float_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
+    // First arg is the class (float) for classmethod-style; tolerate
+    // either form.
+    let s_obj = if matches!(args.first(), Some(Object::Type(_))) {
+        args.get(1)
+    } else {
+        args.first()
+    };
+    let s = match s_obj {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("fromhex() requires a string")),
+    };
+    parse_float_hex(&s).map(Object::Float)
+}
+
+fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "as_integer_ratio")?;
+    let f = match v {
+        Object::Float(f) => *f,
+        _ => return Err(type_error("as_integer_ratio: float expected")),
+    };
+    if !f.is_finite() {
+        return Err(value_error("cannot convert non-finite float"));
+    }
+    let bits = f.to_bits();
+    let sign = if (bits >> 63) & 1 == 1 { -1i32 } else { 1 };
+    let exp_field = ((bits >> 52) & 0x7FF) as i32;
+    let mantissa_field = bits & ((1u64 << 52) - 1);
+    let (mantissa, exponent): (BigInt, i32) = if exp_field == 0 {
+        // Subnormal.
+        (BigInt::from(mantissa_field), -1074)
+    } else {
+        let m = (1u64 << 52) | mantissa_field;
+        (BigInt::from(m), exp_field - 1075)
+    };
+    let mut num = mantissa;
+    let mut den = BigInt::from(1);
+    if exponent >= 0 {
+        num <<= exponent as usize;
+    } else {
+        den <<= (-exponent) as usize;
+    }
+    use num_integer::Integer;
+    let g = num.gcd(&den);
+    num /= &g;
+    den /= &g;
+    if sign < 0 {
+        num = -num;
+    }
+    Ok(Object::new_tuple(vec![
+        Object::int_from_bigint(num),
+        Object::int_from_bigint(den),
+    ]))
+}
+
+fn float_conjugate(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(one(args, "conjugate")?.clone())
+}
+
+fn float_trunc(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "__trunc__")?;
+    match v {
+        Object::Float(f) => Ok(Object::int_from_bigint(crate::object::bigint_from_f64_trunc(
+            f.trunc(),
+        ))),
+        _ => Err(type_error("__trunc__: float expected")),
+    }
+}
+
+fn float_round(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "__round__")?;
+    let f = match v {
+        Object::Float(f) => *f,
+        _ => return Err(type_error("__round__: float expected")),
+    };
+    let ndigits = match args.get(1) {
+        Some(Object::Int(i)) => Some(*i),
+        Some(Object::Bool(b)) => Some(i64::from(*b)),
+        Some(Object::None) | None => None,
+        _ => return Err(type_error("__round__: ndigits must be int or None")),
+    };
+    if let Some(d) = ndigits {
+        let pow = 10f64.powi(d as i32);
+        let rounded = (f * pow).round() / pow;
+        return Ok(Object::Float(rounded));
+    }
+    // Banker's rounding (CPython): round half to even.
+    let r = f.round_ties_even();
+    Ok(Object::int_from_bigint(crate::object::bigint_from_f64_trunc(r)))
+}
+
+fn format_float_hex(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_owned();
+    }
+    if f == f64::INFINITY {
+        return "inf".to_owned();
+    }
+    if f == f64::NEG_INFINITY {
+        return "-inf".to_owned();
+    }
+    let bits = f.to_bits();
+    let sign = (bits >> 63) & 1 == 1;
+    let exp_field = ((bits >> 52) & 0x7FF) as i32;
+    let mantissa = bits & ((1u64 << 52) - 1);
+    if exp_field == 0 && mantissa == 0 {
+        return if sign { "-0x0.0p+0" } else { "0x0.0p+0" }.to_owned();
+    }
+    let (m_hex, exponent) = if exp_field == 0 {
+        // Subnormal
+        let mut hex = format!("{:013x}", mantissa);
+        // Trim trailing zeroes for compactness (CPython keeps full
+        // 13 hex digits for subnormals; we follow suit).
+        let _ = &mut hex;
+        (format!("0x0.{hex}"), -1022)
+    } else {
+        let mut hex = format!("{:013x}", mantissa);
+        // Trim trailing zeroes in the fractional part.
+        while hex.ends_with('0') {
+            hex.pop();
+        }
+        if hex.is_empty() {
+            hex.push('0');
+        }
+        (format!("0x1.{hex}"), exp_field - 1023)
+    };
+    let sign_str = if sign { "-" } else { "" };
+    let exp_sign = if exponent >= 0 { "+" } else { "" };
+    format!("{sign_str}{m_hex}p{exp_sign}{exponent}")
+}
+
+fn parse_float_hex(s: &str) -> Result<f64, RuntimeError> {
+    let s = s.trim();
+    let lower = s.to_ascii_lowercase();
+    match lower.as_str() {
+        "nan" | "+nan" | "-nan" => return Ok(f64::NAN),
+        "inf" | "+inf" | "infinity" | "+infinity" => return Ok(f64::INFINITY),
+        "-inf" | "-infinity" => return Ok(f64::NEG_INFINITY),
+        _ => {}
+    }
+    // Optional sign.
+    let mut idx = 0usize;
+    let bytes = s.as_bytes();
+    let sign = if bytes.first() == Some(&b'-') {
+        idx += 1;
+        -1.0
+    } else {
+        if bytes.first() == Some(&b'+') {
+            idx += 1;
+        }
+        1.0
+    };
+    let rest = &s[idx..];
+    let rest = rest
+        .strip_prefix("0x")
+        .or_else(|| rest.strip_prefix("0X"))
+        .ok_or_else(|| value_error("invalid hexadecimal float"))?;
+    // Split on 'p' / 'P'.
+    let (mantissa_part, exp_part) = match rest.find(['p', 'P']) {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => return Err(value_error("invalid hexadecimal float")),
+    };
+    let exponent: i32 = exp_part
+        .parse()
+        .map_err(|_| value_error("invalid hexadecimal float exponent"))?;
+    let (int_part, frac_part) = match mantissa_part.find('.') {
+        Some(i) => (&mantissa_part[..i], &mantissa_part[i + 1..]),
+        None => (mantissa_part, ""),
+    };
+    let mut value: f64 = 0.0;
+    for c in int_part.chars() {
+        value = value * 16.0 + hex_digit(c)? as f64;
+    }
+    let mut frac_factor = 1.0 / 16.0;
+    for c in frac_part.chars() {
+        value += hex_digit(c)? as f64 * frac_factor;
+        frac_factor /= 16.0;
+    }
+    Ok(sign * value * 2f64.powi(exponent))
+}
+
+fn hex_digit(c: char) -> Result<u32, RuntimeError> {
+    c.to_digit(16)
+        .ok_or_else(|| value_error("invalid hex digit"))
+}
+
+// ---------- classmethod-shaped wrappers used by builtin_types ----------
+//
+// These are exposed via the type dict so `int.from_bytes(...)` and
+// `bytes.fromhex(...)` resolve correctly. The descriptor protocol
+// binds `cls` to args[0], so each helper just discards args[0] and
+// routes the rest through the underlying body.
+
+pub(crate) fn b_int_from_bytes_cls(args: &[Object]) -> Result<Object, RuntimeError> {
+    int_from_bytes_method(args)
+}
+
+pub(crate) fn b_bytes_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
+    let _cls = args.first();
+    let s = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("fromhex() argument must be str")),
+    };
+    let bytes = parse_hex_bytes(&s)?;
+    Ok(Object::new_bytes(bytes))
+}
+
+pub(crate) fn b_bytearray_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
+    let _cls = args.first();
+    let s = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("fromhex() argument must be str")),
+    };
+    let bytes = parse_hex_bytes(&s)?;
+    Ok(Object::new_bytearray(bytes))
+}
+
+pub(crate) fn b_float_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
+    let _cls = args.first();
+    let s = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("fromhex() argument must be str")),
+    };
+    parse_float_hex(&s).map(Object::Float)
+}
+
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RuntimeError> {
+    let mut bytes = Vec::new();
+    let mut last_high: Option<u8> = None;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if last_high.is_some() {
+                return Err(value_error("non-hexadecimal number"));
+            }
+            continue;
+        }
+        let v = c
+            .to_digit(16)
+            .ok_or_else(|| value_error("non-hexadecimal number"))? as u8;
+        match last_high {
+            Some(hi) => {
+                bytes.push((hi << 4) | v);
+                last_high = None;
+            }
+            None => last_high = Some(v),
+        }
+    }
+    if last_high.is_some() {
+        return Err(value_error("non-hexadecimal number"));
+    }
+    Ok(bytes)
+}
+
+// ---------- complex methods (RFC 0019) ----------
+
+fn complex_conjugate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let v = one(args, "conjugate")?;
+    match v {
+        Object::Complex(c) => Ok(Object::new_complex(c.real, -c.imag)),
+        _ => Err(type_error("conjugate: complex expected")),
+    }
+}
+
 pub(crate) fn b_float_compat(args: &[Object]) -> Result<Object, RuntimeError> {
     b_float(args)
 }
 
 fn b_float(args: &[Object]) -> Result<Object, RuntimeError> {
+    use num_traits::ToPrimitive;
+
     if args.is_empty() {
         return Ok(Object::Float(0.0));
     }
     match &args[0] {
         Object::Int(i) => Ok(Object::Float(*i as f64)),
+        Object::Long(b) => Ok(Object::Float(b.to_f64().unwrap_or(f64::INFINITY))),
         Object::Bool(b) => Ok(Object::Float(f64::from(*b))),
         Object::Float(f) => Ok(Object::Float(*f)),
-        Object::Str(s) => {
-            let parsed: f64 = s
-                .trim()
-                .parse()
-                .map_err(|e: std::num::ParseFloatError| value_error(e.to_string()))?;
-            Ok(Object::Float(parsed))
+        Object::Str(s) => parse_float_str(s.trim()).map(Object::Float),
+        Object::Bytes(b) => {
+            let s = std::str::from_utf8(b).map_err(|_| value_error("invalid bytes for float()"))?;
+            parse_float_str(s.trim()).map(Object::Float)
+        }
+        Object::ByteArray(b) => {
+            let bytes = b.borrow();
+            let s = std::str::from_utf8(&bytes).map_err(|_| value_error("invalid bytes for float()"))?;
+            parse_float_str(s.trim()).map(Object::Float)
         }
         _ => Err(type_error(format!(
             "float() argument must be a string or a number, not '{}'",
@@ -992,11 +1585,129 @@ fn b_float(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+fn parse_float_str(s: &str) -> Result<f64, RuntimeError> {
+    // Special tokens (case-insensitive). CPython accepts these forms.
+    let lower = s.to_ascii_lowercase();
+    match lower.as_str() {
+        "inf" | "infinity" | "+inf" | "+infinity" => return Ok(f64::INFINITY),
+        "-inf" | "-infinity" => return Ok(f64::NEG_INFINITY),
+        "nan" | "+nan" | "-nan" => return Ok(f64::NAN),
+        _ => {}
+    }
+    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+    cleaned
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| value_error(e.to_string()))
+}
+
 fn b_bool(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::Bool(false));
     }
     Ok(Object::Bool(args[0].is_truthy()))
+}
+
+fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.is_empty() {
+        return Ok(Object::new_complex(0.0, 0.0));
+    }
+    let real = match &args[0] {
+        Object::Complex(c) => return Ok(args.get(1).cloned().map_or_else(
+            || Object::Complex(c.clone()),
+            |b| {
+                let bc = b.as_complex().unwrap_or((0.0, 0.0));
+                Object::new_complex(c.real - bc.1, c.imag + bc.0)
+            },
+        )),
+        Object::Str(s) if args.len() == 1 => {
+            return parse_complex_string(s).map(|(r, i)| Object::new_complex(r, i));
+        }
+        Object::Int(_) | Object::Long(_) | Object::Bool(_) | Object::Float(_) => {
+            args[0].as_f64().expect("numeric")
+        }
+        other => {
+            return Err(type_error(format!(
+                "complex() argument must be a string or a number, not '{}'",
+                other.type_name()
+            )));
+        }
+    };
+    let imag = if let Some(b) = args.get(1) {
+        match b {
+            Object::Complex(c) => return Ok(Object::new_complex(real - c.imag, c.real)),
+            Object::Int(_) | Object::Long(_) | Object::Bool(_) | Object::Float(_) => {
+                b.as_f64().expect("numeric")
+            }
+            other => {
+                return Err(type_error(format!(
+                    "complex() second argument must be a number, not '{}'",
+                    other.type_name()
+                )));
+            }
+        }
+    } else {
+        0.0
+    };
+    Ok(Object::new_complex(real, imag))
+}
+
+fn parse_complex_string(s: &str) -> Result<(f64, f64), RuntimeError> {
+    // CPython accepts an optional pair of parens, then a complex
+    // number like `1+2j`, `1J`, `2.5e-1+3.4j`, with `j` or `J`
+    // suffix on the imaginary half.
+    let trimmed = s.trim();
+    let s = trimmed
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    if s.is_empty() {
+        return Err(value_error("complex() arg is an empty string"));
+    }
+    // Find a `+`/`-` that splits real and imag, skipping the
+    // exponent sign in `1e-3`.
+    let bytes = s.as_bytes();
+    let mut split = None;
+    for i in (1..bytes.len()).rev() {
+        let c = bytes[i];
+        if c == b'+' || c == b'-' {
+            let prev = bytes[i - 1];
+            if prev != b'e' && prev != b'E' {
+                split = Some(i);
+                break;
+            }
+        }
+    }
+    let (real_str, imag_str) = if let Some(i) = split {
+        (&s[..i], &s[i..])
+    } else if s.ends_with('j') || s.ends_with('J') {
+        ("0", s)
+    } else {
+        (s, "0")
+    };
+    let parse_part = |t: &str| -> Result<f64, RuntimeError> {
+        let stripped = t.strip_suffix(['j', 'J']).unwrap_or(t);
+        if stripped.is_empty() || stripped == "+" {
+            return Ok(1.0);
+        }
+        if stripped == "-" {
+            return Ok(-1.0);
+        }
+        stripped
+            .parse::<f64>()
+            .map_err(|_| value_error(format!("complex() arg is malformed: '{s}'")))
+    };
+    let imag_is_imag = imag_str.ends_with('j') || imag_str.ends_with('J');
+    let real_is_imag = real_str.ends_with('j') || real_str.ends_with('J');
+    if real_is_imag && !imag_is_imag {
+        // Single imaginary like "5j+0"  — unusual; treat as 5j+0.
+        let real = parse_part(imag_str)?;
+        let imag = parse_part(real_str)?;
+        return Ok((real, imag));
+    }
+    let real = parse_part(real_str)?;
+    let imag = parse_part(imag_str)?;
+    Ok((real, imag))
 }
 
 fn b_list(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1076,6 +1787,7 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::None => bt.none_type.clone(),
         Object::Bool(_) => bt.bool_.clone(),
         Object::Int(_) => bt.int_.clone(),
+        Object::Long(_) => bt.int_.clone(),
         Object::Float(_) => bt.float_.clone(),
         Object::Str(_) => bt.str_.clone(),
         Object::Bytes(_) => bt.bytes_.clone(),
@@ -1144,11 +1856,15 @@ fn b_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
                     _ => None,
                 })
                 .unwrap_or_else(|| "utf-8".to_owned());
-            if matches!(encoding.as_str(), "utf-8" | "utf8" | "UTF-8" | "ascii") {
-                Ok(Object::new_bytes(s.as_bytes().to_vec()))
-            } else {
-                Err(value_error(format!("unsupported encoding: {encoding}")))
-            }
+            let errors = args
+                .get(2)
+                .and_then(|x| match x {
+                    Object::Str(e) => Some(e.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "strict".to_owned());
+            let bytes = crate::stdlib::codecs_mod::encode_str(s, &encoding, &errors)?;
+            Ok(Object::new_bytes(bytes))
         }
         Object::Bytes(b) => Ok(Object::Bytes(b.clone())),
         Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
@@ -1250,8 +1966,14 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "abs")? {
-        Object::Int(i) => Ok(Object::Int(i.abs())),
+        Object::Int(i) => match i.checked_abs() {
+            Some(v) => Ok(Object::Int(v)),
+            // i64::MIN.abs() overflows; promote.
+            None => Ok(Object::int_from_bigint(num_bigint::BigInt::from(*i).abs())),
+        },
+        Object::Long(b) => Ok(Object::int_from_bigint(b.abs())),
         Object::Float(f) => Ok(Object::Float(f.abs())),
+        Object::Complex(c) => Ok(Object::Float((c.real * c.real + c.imag * c.imag).sqrt())),
         Object::Bool(b) => Ok(Object::Int(i64::from(*b))),
         other => Err(type_error(format!(
             "bad operand type for abs(): '{}'",
@@ -1511,6 +2233,7 @@ pub fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeErr
         Object::None => bt.none_type.clone(),
         Object::Bool(_) => bt.bool_.clone(),
         Object::Int(_) => bt.int_.clone(),
+        Object::Long(_) => bt.int_.clone(),
         Object::Float(_) => bt.float_.clone(),
         Object::Str(_) => bt.str_.clone(),
         Object::Tuple(_) => bt.tuple_.clone(),
@@ -1619,11 +2342,23 @@ fn b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "hex")? {
         Object::Int(i) => {
             if *i < 0 {
-                Ok(Object::from_str(format!("-0x{:x}", -i)))
+                Ok(Object::from_str(format!(
+                    "-0x{:x}",
+                    (i.unsigned_abs())
+                )))
             } else {
                 Ok(Object::from_str(format!("0x{i:x}")))
             }
         }
+        Object::Long(b) => {
+            let inner = (**b).clone();
+            if inner.is_negative() {
+                Ok(Object::from_str(format!("-0x{:x}", -inner)))
+            } else {
+                Ok(Object::from_str(format!("0x{inner:x}")))
+            }
+        }
+        Object::Bool(b) => Ok(Object::from_str(format!("0x{}", i64::from(*b)))),
         other => Err(type_error(format!(
             "'{}' object cannot be interpreted as an integer",
             other.type_name()
@@ -1635,11 +2370,20 @@ fn b_oct(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "oct")? {
         Object::Int(i) => {
             if *i < 0 {
-                Ok(Object::from_str(format!("-0o{:o}", -i)))
+                Ok(Object::from_str(format!("-0o{:o}", i.unsigned_abs())))
             } else {
                 Ok(Object::from_str(format!("0o{i:o}")))
             }
         }
+        Object::Long(b) => {
+            let inner = (**b).clone();
+            if inner.is_negative() {
+                Ok(Object::from_str(format!("-0o{:o}", -inner)))
+            } else {
+                Ok(Object::from_str(format!("0o{inner:o}")))
+            }
+        }
+        Object::Bool(b) => Ok(Object::from_str(format!("0o{}", i64::from(*b)))),
         _ => Err(type_error("expected int")),
     }
 }
@@ -1648,11 +2392,20 @@ fn b_bin(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "bin")? {
         Object::Int(i) => {
             if *i < 0 {
-                Ok(Object::from_str(format!("-0b{:b}", -i)))
+                Ok(Object::from_str(format!("-0b{:b}", i.unsigned_abs())))
             } else {
                 Ok(Object::from_str(format!("0b{i:b}")))
             }
         }
+        Object::Long(b) => {
+            let inner = (**b).clone();
+            if inner.is_negative() {
+                Ok(Object::from_str(format!("-0b{:b}", -inner)))
+            } else {
+                Ok(Object::from_str(format!("0b{inner:b}")))
+            }
+        }
+        Object::Bool(b) => Ok(Object::from_str(format!("0b{}", i64::from(*b)))),
         _ => Err(type_error("expected int")),
     }
 }
@@ -2316,11 +3069,13 @@ fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
         None => "utf-8".to_owned(),
         _ => return Err(type_error("encode() expected str")),
     };
-    if matches!(encoding.as_str(), "utf-8" | "utf8" | "UTF-8" | "ascii") {
-        Ok(Object::new_bytes(s.as_bytes().to_vec()))
-    } else {
-        Err(value_error(format!("unsupported encoding: {encoding}")))
-    }
+    let errors = match args.get(2) {
+        Some(Object::Str(e)) => e.to_string(),
+        None => "strict".to_owned(),
+        _ => "strict".to_owned(),
+    };
+    let bytes = crate::stdlib::codecs_mod::encode_str(&s, &encoding, &errors)?;
+    Ok(Object::new_bytes(bytes))
 }
 
 fn str_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3033,24 +3788,92 @@ fn bytes_decode(args: &[Object]) -> Result<Object, RuntimeError> {
         None => "utf-8".to_owned(),
         _ => return Err(type_error("decode() expected str")),
     };
-    if matches!(encoding.as_str(), "utf-8" | "utf8" | "UTF-8" | "ascii") {
-        let s = String::from_utf8(data).map_err(|e| value_error(e.to_string()))?;
-        Ok(Object::from_str(s))
-    } else if matches!(encoding.as_str(), "latin-1" | "latin1" | "iso-8859-1") {
-        let s: String = data.iter().map(|&b| b as char).collect();
-        Ok(Object::from_str(s))
-    } else {
-        Err(value_error(format!("unsupported encoding: {encoding}")))
-    }
+    let errors = match args.get(2) {
+        Some(Object::Str(e)) => e.to_string(),
+        None => "strict".to_owned(),
+        _ => "strict".to_owned(),
+    };
+    let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;
+    Ok(Object::from_str(s))
 }
 
 fn bytes_hex(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
+    let sep: Option<u8> = match args.get(1) {
+        Some(Object::Str(s)) => {
+            let bytes = s.as_bytes();
+            if bytes.len() != 1 {
+                return Err(value_error("sep must be length 1."));
+            }
+            Some(bytes[0])
+        }
+        Some(Object::Bytes(b)) if b.len() == 1 => Some(b[0]),
+        Some(Object::None) | None => None,
+        _ => return Err(type_error("sep must be a 1-byte string")),
+    };
+    let bytes_per_sep = match args.get(2) {
+        Some(Object::Int(i)) => *i,
+        Some(Object::Bool(b)) => i64::from(*b),
+        None => 1,
+        _ => return Err(type_error("bytes_per_sep must be int")),
+    };
     let mut out = String::with_capacity(data.len() * 2);
-    for b in data {
+    for (i, b) in data.iter().enumerate() {
+        if let Some(sep) = sep {
+            // Insert separators every `bytes_per_sep` bytes, counted
+            // from the appropriate side.
+            let count_from = if bytes_per_sep < 0 { i } else { data.len() - i - 1 };
+            let step = bytes_per_sep.unsigned_abs() as usize;
+            if i > 0 && step > 0 && count_from % step == 0 {
+                out.push(sep as char);
+            }
+        }
         out.push_str(&format!("{b:02x}"));
     }
     Ok(Object::from_str(out))
+}
+
+fn bytes_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
+    // First arg is `cls` for classmethod-style. Fish out the string.
+    let s_obj = if matches!(args.first(), Some(Object::Type(_)) | Some(Object::Bytes(_)) | Some(Object::ByteArray(_))) {
+        args.get(1)
+    } else {
+        args.first()
+    };
+    let s = match s_obj {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("fromhex() argument must be str")),
+    };
+    let mut bytes = Vec::new();
+    let mut last_high: Option<u8> = None;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if last_high.is_some() {
+                return Err(value_error("non-hexadecimal number"));
+            }
+            continue;
+        }
+        let v = c
+            .to_digit(16)
+            .ok_or_else(|| value_error(format!("non-hexadecimal number found in fromhex() arg at position {}", c.len_utf8())))? as u8;
+        match last_high {
+            Some(hi) => {
+                bytes.push((hi << 4) | v);
+                last_high = None;
+            }
+            None => last_high = Some(v),
+        }
+    }
+    if last_high.is_some() {
+        return Err(value_error("non-hexadecimal number"));
+    }
+    // Decide return type based on receiver: bytearray.fromhex returns bytearray;
+    // bytes.fromhex returns bytes.
+    if matches!(args.first(), Some(Object::ByteArray(_))) {
+        Ok(Object::new_bytearray(bytes))
+    } else {
+        Ok(Object::new_bytes(bytes))
+    }
 }
 
 fn bytes_startswith(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -1,0 +1,10 @@
+struct len: 10
+unpack: (305419896, -1, 3.140000104904175)
+calcsize: 10
+s.size: 8
+packed: 61626301ffff0000
+ascii: b'hello'
+latin-1: b'\xe9'
+BOM_UTF8: efbbbf
+utf-16-le bytes: 14
+decoded: WeavePy

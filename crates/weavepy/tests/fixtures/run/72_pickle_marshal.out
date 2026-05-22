@@ -1,0 +1,18 @@
+None == True
+True == True
+False == True
+0 == True
+42 == True
+-7 == True
+1267650600228229401496703205376 == True
+-1267650600228229401496703205376 == True
+1.5 == True
+'hello' == True
+b'\x00\x01\x02' == True
+[] == True
+[1, 2, 3] == True
+{'a': 1} == True
+(1, 2, 3) == True
+{1, 2, 3} == True
+frozenset({1, 2}) == True
+marshal ok: True

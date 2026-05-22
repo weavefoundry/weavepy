@@ -20,6 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use num_traits::{Signed, ToPrimitive, Zero};
 use weavepy_compiler::{
     BinOpKind, CodeObject, CompareKind, Constant, ExcHandler, OpCode, UnaryKind,
 };
@@ -2543,9 +2544,13 @@ impl Interpreter {
             return Ok(Object::Int(0));
         }
         match &args[0] {
-            Object::Int(_) | Object::Bool(_) | Object::Float(_) | Object::Str(_) => {
-                builtins::b_int_compat(args)
-            }
+            Object::Int(_)
+            | Object::Long(_)
+            | Object::Bool(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_) => builtins::b_int_compat(args),
             other => {
                 if let Some(method) = instance_method(other, "__int__") {
                     let r = self.call(&method, &[], &[], globals)?;
@@ -2575,9 +2580,13 @@ impl Interpreter {
             return Ok(Object::Float(0.0));
         }
         match &args[0] {
-            Object::Int(_) | Object::Bool(_) | Object::Float(_) | Object::Str(_) => {
-                builtins::b_float_compat(args)
-            }
+            Object::Int(_)
+            | Object::Long(_)
+            | Object::Bool(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_) => builtins::b_float_compat(args),
             other => {
                 if let Some(method) = instance_method(other, "__float__") {
                     let r = self.call(&method, &[], &[], globals)?;
@@ -6942,7 +6951,9 @@ fn constant_to_object(c: Constant) -> Object {
         Constant::None => Object::None,
         Constant::Bool(b) => Object::Bool(b),
         Constant::Int(i) => Object::Int(i),
+        Constant::BigInt(b) => Object::int_from_bigint(b),
         Constant::Float(f) => Object::Float(f),
+        Constant::Complex(real, imag) => Object::new_complex(real, imag),
         Constant::Str(s) => Object::from_str(s),
         Constant::Bytes(b) => Object::new_bytes(b),
         Constant::Tuple(xs) => Object::new_tuple(xs.into_iter().map(constant_to_object).collect()),
@@ -6956,59 +6967,21 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
     use Object as O;
     // Promote bool → int where appropriate.
     let (a, b) = (promote_bool(a), promote_bool(b));
-    match (&a, &b, op) {
-        (O::Int(x), O::Int(y), B::Add) => Ok(O::Int(x.wrapping_add(*y))),
-        (O::Int(x), O::Int(y), B::Sub) => Ok(O::Int(x.wrapping_sub(*y))),
-        (O::Int(x), O::Int(y), B::Mult) => Ok(O::Int(x.wrapping_mul(*y))),
-        (O::Int(x), O::Int(y), B::Div) => {
-            if *y == 0 {
-                Err(zero_division_error("division by zero"))
-            } else {
-                Ok(O::Float(*x as f64 / *y as f64))
-            }
-        }
-        (O::Int(x), O::Int(y), B::FloorDiv) => {
-            if *y == 0 {
-                return Err(zero_division_error("integer division or modulo by zero"));
-            }
-            // Python's `//` floors toward -∞. Rust's `/` truncates
-            // toward 0, so we adjust when the remainder is non-zero
-            // and the operand signs disagree.
-            let q = x / y;
-            let r = x % y;
-            let adjusted = if r != 0 && ((r < 0) != (*y < 0)) {
-                q - 1
-            } else {
-                q
-            };
-            Ok(O::Int(adjusted))
-        }
-        (O::Int(x), O::Int(y), B::Mod) => {
-            if *y == 0 {
-                return Err(zero_division_error("integer division or modulo by zero"));
-            }
-            // Python's `%` has the sign of the divisor.
-            let r = x % y;
-            let adjusted = if r != 0 && ((r < 0) != (*y < 0)) {
-                r + *y
-            } else {
-                r
-            };
-            Ok(O::Int(adjusted))
-        }
-        (O::Int(x), O::Int(y), B::Pow) => {
-            if *y < 0 {
-                Ok(O::Float((*x as f64).powf(*y as f64)))
-            } else {
-                Ok(O::Int(x.pow(*y as u32)))
-            }
-        }
-        (O::Int(x), O::Int(y), B::LShift) => Ok(O::Int(x.wrapping_shl(*y as u32))),
-        (O::Int(x), O::Int(y), B::RShift) => Ok(O::Int(x.wrapping_shr(*y as u32))),
-        (O::Int(x), O::Int(y), B::BitOr) => Ok(O::Int(x | y)),
-        (O::Int(x), O::Int(y), B::BitXor) => Ok(O::Int(x ^ y)),
-        (O::Int(x), O::Int(y), B::BitAnd) => Ok(O::Int(x & y)),
 
+    // Numeric tower: any (int-like, int-like) arithmetic routes
+    // through the bignum-aware path with i64 fast-track and overflow
+    // promotion to BigInt.
+    if a.is_int_like() && b.is_int_like() {
+        return bignum_op(&a, &b, op);
+    }
+    // Complex absorbs (complex, anything-numeric).
+    if matches!(a, O::Complex(_)) || matches!(b, O::Complex(_)) {
+        if let (Some(ac), Some(bc)) = (a.as_complex(), b.as_complex()) {
+            return complex_arith(ac, bc, op);
+        }
+    }
+
+    match (&a, &b, op) {
         (O::Float(x), O::Float(y), B::Add) => Ok(O::Float(x + y)),
         (O::Float(x), O::Float(y), B::Sub) => Ok(O::Float(x - y)),
         (O::Float(x), O::Float(y), B::Mult) => Ok(O::Float(x * y)),
@@ -7025,6 +6998,18 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
 
         (O::Int(x), O::Float(y), op) => binary_op(&O::Float(*x as f64), &O::Float(*y), op),
         (O::Float(x), O::Int(y), op) => binary_op(&O::Float(*x), &O::Float(*y as f64), op),
+        (O::Long(x), O::Float(y), op) => {
+            let xf = x.to_f64().ok_or_else(|| {
+                value_error("int too large to convert to float")
+            })?;
+            binary_op(&O::Float(xf), &O::Float(*y), op)
+        }
+        (O::Float(x), O::Long(y), op) => {
+            let yf = y.to_f64().ok_or_else(|| {
+                value_error("int too large to convert to float")
+            })?;
+            binary_op(&O::Float(*x), &O::Float(yf), op)
+        }
 
         (O::Str(x), O::Str(y), B::Add) => {
             let mut out = String::with_capacity(x.len() + y.len());
@@ -7097,18 +7082,259 @@ fn unary_op(v: &Object, op: UnaryKind) -> Result<Object, RuntimeError> {
     use Object as O;
     match (op, v) {
         (UnaryKind::Pos, O::Int(i)) => Ok(O::Int(*i)),
-        (UnaryKind::Neg, O::Int(i)) => Ok(O::Int(-i)),
+        (UnaryKind::Neg, O::Int(i)) => match i.checked_neg() {
+            Some(r) => Ok(O::Int(r)),
+            None => Ok(Object::int_from_bigint(-num_bigint::BigInt::from(*i))),
+        },
+        (UnaryKind::Pos, O::Long(b)) => Ok(O::Long(b.clone())),
+        (UnaryKind::Neg, O::Long(b)) => Ok(Object::int_from_bigint(-(**b).clone())),
         (UnaryKind::Pos, O::Float(f)) => Ok(O::Float(*f)),
         (UnaryKind::Neg, O::Float(f)) => Ok(O::Float(-f)),
         (UnaryKind::Pos, O::Bool(b)) => Ok(O::Int(i64::from(*b))),
         (UnaryKind::Neg, O::Bool(b)) => Ok(O::Int(-i64::from(*b))),
+        (UnaryKind::Pos, O::Complex(c)) => Ok(O::Complex(c.clone())),
+        (UnaryKind::Neg, O::Complex(c)) => Ok(Object::new_complex(-c.real, -c.imag)),
         (UnaryKind::Invert, O::Int(i)) => Ok(O::Int(!i)),
+        (UnaryKind::Invert, O::Long(b)) => Ok(Object::int_from_bigint(!(**b).clone())),
         (UnaryKind::Invert, O::Bool(b)) => Ok(O::Int(!i64::from(*b))),
         (UnaryKind::Not, x) => Ok(O::Bool(!x.is_truthy())),
         _ => Err(type_error(format!(
             "bad operand type for unary {}: '{}'",
             op.as_str(),
             v.type_name()
+        ))),
+    }
+}
+
+/// Bignum-aware integer arithmetic for `int`-flavoured operands.
+/// Both inputs are guaranteed `int`/`long`/`bool` by the caller; the
+/// fast path stays in `i64` until an overflow forces promotion.
+fn bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeError> {
+    use BinOpKind as B;
+
+    // Fast path: both sides fit in i64 *and* no operation overflows.
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        if let Some(out) = i64_op(x, y, op)? {
+            return Ok(out);
+        }
+    }
+
+    // Slow path: promote both sides to BigInt.
+    let x = a.as_bigint().expect("int-like");
+    let y = b.as_bigint().expect("int-like");
+    match op {
+        B::Add => Ok(Object::int_from_bigint(&x + &y)),
+        B::Sub => Ok(Object::int_from_bigint(&x - &y)),
+        B::Mult => Ok(Object::int_from_bigint(&x * &y)),
+        B::Div => {
+            if y.is_zero() {
+                return Err(zero_division_error("division by zero"));
+            }
+            let xf = x.to_f64().ok_or_else(|| value_error("int too large for float"))?;
+            let yf = y.to_f64().ok_or_else(|| value_error("int too large for float"))?;
+            Ok(Object::Float(xf / yf))
+        }
+        B::FloorDiv => {
+            if y.is_zero() {
+                return Err(zero_division_error("integer division or modulo by zero"));
+            }
+            // num-bigint's div truncates toward zero; adjust for
+            // floor semantics like CPython.
+            use num_integer::Integer;
+            let (q, _) = x.div_mod_floor(&y);
+            Ok(Object::int_from_bigint(q))
+        }
+        B::Mod => {
+            if y.is_zero() {
+                return Err(zero_division_error("integer division or modulo by zero"));
+            }
+            use num_integer::Integer;
+            let (_, r) = x.div_mod_floor(&y);
+            Ok(Object::int_from_bigint(r))
+        }
+        B::Pow => {
+            if y.is_negative() {
+                let xf = x.to_f64().ok_or_else(|| value_error("int too large for float"))?;
+                let yf = y.to_f64().ok_or_else(|| value_error("int too large for float"))?;
+                return Ok(Object::Float(xf.powf(yf)));
+            }
+            let exp = y.to_u32().ok_or_else(|| {
+                value_error("exponent too large for int.__pow__")
+            })?;
+            Ok(Object::int_from_bigint(x.pow(exp)))
+        }
+        B::LShift => {
+            if y.is_negative() {
+                return Err(value_error("negative shift count"));
+            }
+            let n = y.to_usize().ok_or_else(|| {
+                value_error("shift count too large")
+            })?;
+            Ok(Object::int_from_bigint(x << n))
+        }
+        B::RShift => {
+            if y.is_negative() {
+                return Err(value_error("negative shift count"));
+            }
+            let n = y.to_usize().ok_or_else(|| {
+                value_error("shift count too large")
+            })?;
+            Ok(Object::int_from_bigint(x >> n))
+        }
+        B::BitOr => Ok(Object::int_from_bigint(&x | &y)),
+        B::BitXor => Ok(Object::int_from_bigint(&x ^ &y)),
+        B::BitAnd => Ok(Object::int_from_bigint(&x & &y)),
+        B::MatMult => Err(type_error(
+            "unsupported operand type(s) for @: 'int' and 'int'".to_owned(),
+        )),
+    }
+}
+
+/// Try to perform an `i64` arithmetic op; return `None` on overflow,
+/// `Some(out)` on success.
+fn i64_op(x: i64, y: i64, op: BinOpKind) -> Result<Option<Object>, RuntimeError> {
+    use BinOpKind as B;
+    Ok(match op {
+        B::Add => x.checked_add(y).map(Object::Int),
+        B::Sub => x.checked_sub(y).map(Object::Int),
+        B::Mult => x.checked_mul(y).map(Object::Int),
+        B::Div => {
+            if y == 0 {
+                return Err(zero_division_error("division by zero"));
+            }
+            Some(Object::Float(x as f64 / y as f64))
+        }
+        B::FloorDiv => {
+            if y == 0 {
+                return Err(zero_division_error("integer division or modulo by zero"));
+            }
+            // Avoid overflow on i64::MIN / -1.
+            if x == i64::MIN && y == -1 {
+                None
+            } else {
+                let q = x / y;
+                let r = x % y;
+                let adjusted = if r != 0 && ((r < 0) != (y < 0)) {
+                    q - 1
+                } else {
+                    q
+                };
+                Some(Object::Int(adjusted))
+            }
+        }
+        B::Mod => {
+            if y == 0 {
+                return Err(zero_division_error("integer division or modulo by zero"));
+            }
+            let r = x % y;
+            let adjusted = if r != 0 && ((r < 0) != (y < 0)) {
+                r + y
+            } else {
+                r
+            };
+            Some(Object::Int(adjusted))
+        }
+        B::Pow => {
+            if y < 0 {
+                return Ok(Some(Object::Float((x as f64).powf(y as f64))));
+            }
+            // Fall through to bignum if the exponent is wide or if
+            // the result is suspected to overflow.
+            if let Ok(exp) = u32::try_from(y) {
+                if exp <= 8 {
+                    if let Some(r) = x.checked_pow(exp) {
+                        return Ok(Some(Object::Int(r)));
+                    }
+                }
+                // Larger exponents always go through bignum.
+                None
+            } else {
+                None
+            }
+        }
+        B::LShift => {
+            if y < 0 {
+                return Err(value_error("negative shift count"));
+            }
+            // Shifts beyond the i64 width fall through to bignum to
+            // avoid silent wrapping.
+            if y < 63 {
+                let candidate = (x as i128).wrapping_shl(y as u32);
+                if let Ok(small) = i64::try_from(candidate) {
+                    if (small as i128) >> y == x as i128 {
+                        Some(Object::Int(small))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        B::RShift => {
+            if y < 0 {
+                return Err(value_error("negative shift count"));
+            }
+            if y >= 64 {
+                Some(Object::Int(if x < 0 { -1 } else { 0 }))
+            } else {
+                Some(Object::Int(x >> y))
+            }
+        }
+        B::BitOr => Some(Object::Int(x | y)),
+        B::BitXor => Some(Object::Int(x ^ y)),
+        B::BitAnd => Some(Object::Int(x & y)),
+        B::MatMult => {
+            return Err(type_error(
+                "unsupported operand type(s) for @: 'int' and 'int'".to_owned(),
+            ))
+        }
+    })
+}
+
+/// Complex arithmetic. Mirrors CPython `complex.__add__` & friends.
+fn complex_arith(
+    (ar, ai): (f64, f64),
+    (br, bi): (f64, f64),
+    op: BinOpKind,
+) -> Result<Object, RuntimeError> {
+    use BinOpKind as B;
+    match op {
+        B::Add => Ok(Object::new_complex(ar + br, ai + bi)),
+        B::Sub => Ok(Object::new_complex(ar - br, ai - bi)),
+        B::Mult => Ok(Object::new_complex(ar * br - ai * bi, ar * bi + ai * br)),
+        B::Div => {
+            let denom = br * br + bi * bi;
+            if denom == 0.0 {
+                return Err(zero_division_error("complex division by zero"));
+            }
+            Ok(Object::new_complex(
+                (ar * br + ai * bi) / denom,
+                (ai * br - ar * bi) / denom,
+            ))
+        }
+        B::Pow => {
+            // Approximate via polar: r^n * cis(n*θ). Pure real
+            // exponent is the common case; fall back to numerics.
+            let base_mag = (ar * ar + ai * ai).sqrt();
+            let base_arg = ai.atan2(ar);
+            let exp_re = br;
+            let exp_im = bi;
+            let log_mag = base_mag.ln();
+            // (a + bi)^(c + di) = exp((c + di) * (log_mag + i*arg))
+            let new_log = exp_re * log_mag - exp_im * base_arg;
+            let new_arg = exp_re * base_arg + exp_im * log_mag;
+            let new_mag = new_log.exp();
+            Ok(Object::new_complex(
+                new_mag * new_arg.cos(),
+                new_mag * new_arg.sin(),
+            ))
+        }
+        _ => Err(type_error(format!(
+            "unsupported operand type(s) for {}: 'complex' and 'complex'",
+            op.as_str()
         ))),
     }
 }

@@ -1,0 +1,4 @@
+gzip ok: True
+gzip smaller: True
+bz2 ok: True
+lzma ok: True

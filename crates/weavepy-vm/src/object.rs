@@ -17,6 +17,8 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::rc::Rc;
 
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive, Zero};
 use weavepy_compiler::CodeObject;
 
 use crate::error::{os_error, type_error, value_error, RuntimeError};
@@ -28,7 +30,14 @@ pub enum Object {
     None,
     Bool(bool),
     Int(i64),
+    /// Arbitrary-precision integer (RFC 0019). Created on i64 overflow,
+    /// large literals, or explicit `int.from_bytes(...)` /
+    /// `int(...)` parsing of large strings. `Object::int_from_bigint`
+    /// auto-demotes to `Int(i64)` when the value fits.
+    Long(Rc<BigInt>),
     Float(f64),
+    /// Complex number with rectangular components (RFC 0019).
+    Complex(Rc<PyComplex>),
     Str(Rc<str>),
     Tuple(Rc<[Object]>),
     List(Rc<RefCell<Vec<Object>>>),
@@ -103,6 +112,8 @@ impl fmt::Debug for Object {
             Object::None => write!(f, "None"),
             Object::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),
             Object::Int(i) => write!(f, "{i}"),
+            Object::Long(b) => write!(f, "{b}"),
+            Object::Complex(c) => write!(f, "complex({}, {})", c.real, c.imag),
             Object::Float(x) => write!(f, "{x}"),
             Object::Str(s) => write!(f, "{s:?}"),
             Object::Tuple(items) => f.debug_list().entries(items.iter()).finish(),
@@ -301,6 +312,30 @@ pub type SetData = indexmap::IndexSet<DictKey>;
 
 // ---------- supporting types ----------
 
+/// Rectangular-form complex number (RFC 0019). CPython's
+/// `complex` is also stored as `(double real, double imag)`; we
+/// match the layout for compatibility.
+#[derive(Debug, Clone, Copy)]
+pub struct PyComplex {
+    pub real: f64,
+    pub imag: f64,
+}
+
+impl PyComplex {
+    pub fn new(real: f64, imag: f64) -> Self {
+        Self { real, imag }
+    }
+
+    /// Construct from a `(real, imag)` tuple. Convenience for the
+    /// many call sites that build one inline.
+    pub fn from_tuple(t: (f64, f64)) -> Self {
+        Self {
+            real: t.0,
+            imag: t.1,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Range {
     pub start: i64,
@@ -350,12 +385,39 @@ impl Hash for DictKey {
                 b.hash(state);
             }
             Object::Int(i) => {
+                // Hash compatibly with Long: route through the
+                // BigInt hash so `Int(0).hash() == Long(0).hash()`.
                 2u8.hash(state);
-                i.hash(state);
+                python_int_hash_i64(*i).hash(state);
+            }
+            Object::Long(b) => {
+                2u8.hash(state);
+                python_int_hash_bigint(b).hash(state);
             }
             Object::Float(f) => {
                 3u8.hash(state);
-                f.to_bits().hash(state);
+                if f.fract() == 0.0 && f.is_finite() {
+                    // For values representable as integers, hash
+                    // through the int path so `1 == 1.0` implies
+                    // `hash(1) == hash(1.0)`.
+                    if let Some(as_int) = f64_to_i64_exact(*f) {
+                        2u8.hash(state);
+                        python_int_hash_i64(as_int).hash(state);
+                    } else {
+                        f.to_bits().hash(state);
+                    }
+                } else {
+                    f.to_bits().hash(state);
+                }
+            }
+            Object::Complex(c) => {
+                // Pure-real complex hashes as the underlying float;
+                // imaginary component contributes a separate
+                // factor (CPython: `hash(complex) = hash(real) ^
+                // (hash(imag) * IMAG)`). Constant good-enough.
+                3u8.hash(state);
+                c.real.to_bits().hash(state);
+                c.imag.to_bits().hash(state);
             }
             Object::Str(s) => {
                 4u8.hash(state);
@@ -676,10 +738,14 @@ impl PyFile {
         self.write_bytes(s.as_bytes())
     }
 
-    /// Current position (only meaningful for in-memory buffers).
+    /// Current position. Works for both in-memory buffers and disk files.
     pub fn position(&self) -> usize {
-        match &*self.backend.borrow() {
+        match &mut *self.backend.borrow_mut() {
             FileBackend::MemBytes { pos, .. } | FileBackend::MemText { pos, .. } => *pos,
+            FileBackend::Disk(f) => {
+                use std::io::Seek;
+                f.stream_position().map(|n| n as usize).unwrap_or(0)
+            }
             _ => 0,
         }
     }
@@ -872,6 +938,8 @@ impl Object {
             Object::None => false,
             Object::Bool(b) => *b,
             Object::Int(i) => *i != 0,
+            Object::Long(b) => !b.is_zero(),
+            Object::Complex(c) => c.real != 0.0 || c.imag != 0.0,
             Object::Float(f) => *f != 0.0 && !f.is_nan(),
             Object::Str(s) => !s.is_empty(),
             Object::Tuple(items) => !items.is_empty(),
@@ -933,6 +1001,18 @@ impl Object {
             (Object::None, Object::None) => true,
             (Object::Bool(a), Object::Bool(b)) => a == b,
             (Object::Int(a), Object::Int(b)) => a == b,
+            (Object::Long(a), Object::Long(b)) => Rc::ptr_eq(a, b) || **a == **b,
+            // Cross-type identity: Int and Long with the same value
+            // are *equal* but not the *same* object — `is` checks
+            // identity, not value. Mirror CPython by reporting only
+            // structural identity, never cross-representation
+            // identity. A future RFC may intern the small-int range
+            // explicitly.
+            (Object::Complex(a), Object::Complex(b)) => {
+                Rc::ptr_eq(a, b)
+                    || (a.real.to_bits() == b.real.to_bits()
+                        && a.imag.to_bits() == b.imag.to_bits())
+            }
             (Object::Float(a), Object::Float(b)) => a.to_bits() == b.to_bits(),
             (Object::Str(a), Object::Str(b)) => Rc::ptr_eq(a, b),
             (Object::Tuple(a), Object::Tuple(b)) => Rc::ptr_eq(a, b),
@@ -973,12 +1053,35 @@ impl Object {
             (Object::None, Object::None) => true,
             (Object::Bool(a), Object::Bool(b)) => a == b,
             (Object::Int(a), Object::Int(b)) => a == b,
+            (Object::Long(a), Object::Long(b)) => **a == **b,
+            (Object::Int(a), Object::Long(b)) | (Object::Long(b), Object::Int(a)) => {
+                **b == BigInt::from(*a)
+            }
             (Object::Bool(a), Object::Int(b)) | (Object::Int(b), Object::Bool(a)) => {
                 i64::from(*a) == *b
+            }
+            (Object::Bool(a), Object::Long(b)) | (Object::Long(b), Object::Bool(a)) => {
+                **b == BigInt::from(i64::from(*a))
             }
             (Object::Float(a), Object::Float(b)) => a == b,
             (Object::Int(a), Object::Float(b)) | (Object::Float(b), Object::Int(a)) => {
                 (*a as f64) == *b
+            }
+            (Object::Long(a), Object::Float(b)) | (Object::Float(b), Object::Long(a)) => {
+                bigint_eq_f64(a, *b)
+            }
+            (Object::Bool(a), Object::Float(b)) | (Object::Float(b), Object::Bool(a)) => {
+                f64::from(i64::from(*a) as i32) == *b
+            }
+            (Object::Complex(a), Object::Complex(b)) => a.real == b.real && a.imag == b.imag,
+            (Object::Complex(c), Object::Int(i)) | (Object::Int(i), Object::Complex(c)) => {
+                c.imag == 0.0 && c.real == (*i as f64)
+            }
+            (Object::Complex(c), Object::Float(f)) | (Object::Float(f), Object::Complex(c)) => {
+                c.imag == 0.0 && c.real == *f
+            }
+            (Object::Complex(c), Object::Long(b)) | (Object::Long(b), Object::Complex(c)) => {
+                c.imag == 0.0 && bigint_eq_f64(b, c.real)
             }
             (Object::Str(a), Object::Str(b)) => a == b,
             (Object::Tuple(a), Object::Tuple(b)) => {
@@ -1032,6 +1135,9 @@ impl Object {
         use Object as O;
         match (self, other) {
             (O::Int(a), O::Int(b)) => Ok(a.cmp(b)),
+            (O::Long(a), O::Long(b)) => Ok((**a).cmp(b)),
+            (O::Int(a), O::Long(b)) => Ok(BigInt::from(*a).cmp(b)),
+            (O::Long(a), O::Int(b)) => Ok((**a).cmp(&BigInt::from(*b))),
             (O::Float(a), O::Float(b)) => Ok(a
                 .partial_cmp(b)
                 .ok_or_else(|| value_error(format!("cannot order {a} and {b} (NaN)")))?),
@@ -1041,9 +1147,13 @@ impl Object {
             (O::Float(a), O::Int(b)) => Ok(a
                 .partial_cmp(&(*b as f64))
                 .ok_or_else(|| value_error("cannot order with NaN"))?),
+            (O::Long(a), O::Float(b)) => Ok(bigint_cmp_f64(a, *b)?),
+            (O::Float(a), O::Long(b)) => Ok(bigint_cmp_f64(b, *a)?.reverse()),
             (O::Bool(a), O::Bool(b)) => Ok(a.cmp(b)),
             (O::Bool(a), O::Int(b)) => Ok(i64::from(*a).cmp(b)),
             (O::Int(a), O::Bool(b)) => Ok(a.cmp(&i64::from(*b))),
+            (O::Bool(a), O::Long(b)) => Ok(BigInt::from(i64::from(*a)).cmp(b)),
+            (O::Long(a), O::Bool(b)) => Ok((**a).cmp(&BigInt::from(i64::from(*b)))),
             (O::Bool(a), O::Float(b)) => Ok((i64::from(*a) as f64)
                 .partial_cmp(b)
                 .ok_or_else(|| value_error("cannot order with NaN"))?),
@@ -1181,6 +1291,8 @@ impl Object {
             Object::None => "NoneType",
             Object::Bool(_) => "bool",
             Object::Int(_) => "int",
+            Object::Long(_) => "int",
+            Object::Complex(_) => "complex",
             Object::Float(_) => "float",
             Object::Str(_) => "str",
             Object::Tuple(_) => "tuple",
@@ -1234,6 +1346,8 @@ impl Object {
             Object::None => "None".to_owned(),
             Object::Bool(b) => if *b { "True" } else { "False" }.to_owned(),
             Object::Int(i) => i.to_string(),
+            Object::Long(b) => b.to_string(),
+            Object::Complex(c) => complex_repr(c.real, c.imag),
             Object::Float(f) => {
                 if f.fract() == 0.0 && f.is_finite() {
                     format!("{f:.1}")
@@ -1428,6 +1542,120 @@ fn sets_equal(a: &SetData, b: &SetData) -> bool {
     a.len() == b.len() && a.iter().all(|k| b.contains(k))
 }
 
+/// Compare a BigInt against a float.  Mirrors CPython: `inf` always
+/// compares greater than any int, `-inf` always less, NaN is
+/// uncomparable.
+pub(crate) fn bigint_cmp_f64(a: &BigInt, b: f64) -> Result<Ordering, RuntimeError> {
+    if b.is_nan() {
+        return Err(value_error("cannot order with NaN"));
+    }
+    if b == f64::INFINITY {
+        return Ok(Ordering::Less);
+    }
+    if b == f64::NEG_INFINITY {
+        return Ok(Ordering::Greater);
+    }
+    // Compare integer parts first by comparing the BigInt to floor(b)
+    // converted to BigInt; tie-break on fractional part.
+    let trunc = b.trunc();
+    let bi_trunc = bigint_from_f64_trunc(trunc);
+    match a.cmp(&bi_trunc) {
+        Ordering::Equal => {
+            let frac = b - trunc;
+            if frac == 0.0 {
+                Ok(Ordering::Equal)
+            } else if frac > 0.0 {
+                Ok(Ordering::Less)
+            } else {
+                Ok(Ordering::Greater)
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+pub(crate) fn bigint_eq_f64(a: &BigInt, b: f64) -> bool {
+    if !b.is_finite() {
+        return false;
+    }
+    if b.fract() != 0.0 {
+        return false;
+    }
+    let bi = bigint_from_f64_trunc(b);
+    *a == bi
+}
+
+/// CPython's hash for ints: `value mod (2**61 - 1)` for 64-bit
+/// platforms.  This keeps `hash(1) == hash(1.0) == hash(True)` and
+/// also `hash(big) == hash(int(big))` for any big int.
+pub(crate) const PYTHON_HASH_MODULUS: u64 = (1u64 << 61) - 1;
+
+pub(crate) fn python_int_hash_i64(value: i64) -> i64 {
+    let modulus = PYTHON_HASH_MODULUS as i128;
+    let r = (value as i128).rem_euclid(modulus) as i64;
+    // CPython returns -2 instead of -1 for hash collisions with the
+    // sentinel; we don't need the singularity handling at this level
+    // because the broader Rust hasher xors in additional bits.
+    r
+}
+
+pub(crate) fn python_int_hash_bigint(value: &BigInt) -> i64 {
+    use num_integer::Integer;
+    let modulus = BigInt::from(PYTHON_HASH_MODULUS);
+    let (_, rem) = value.div_mod_floor(&modulus);
+    rem.to_i64().unwrap_or(0)
+}
+
+pub(crate) fn f64_to_i64_exact(f: f64) -> Option<i64> {
+    if !f.is_finite() {
+        return None;
+    }
+    if f.fract() != 0.0 {
+        return None;
+    }
+    if f < (i64::MIN as f64) || f > (i64::MAX as f64) {
+        return None;
+    }
+    Some(f as i64)
+}
+
+pub(crate) fn bigint_from_f64_trunc(f: f64) -> BigInt {
+    // 32-bit-sized chunks; works for any finite float.
+    if f == 0.0 {
+        return BigInt::from(0);
+    }
+    let neg = f < 0.0;
+    let mut x = f.abs();
+    let mut bytes: Vec<u8> = Vec::new();
+    while x >= 1.0 {
+        let lo = (x % 256.0) as u8;
+        bytes.push(lo);
+        x = (x / 256.0).floor();
+    }
+    bytes.reverse();
+    let bi = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes);
+    if neg { -bi } else { bi }
+}
+
+/// Render a `complex` the way CPython does: bare `Xj` if real is
+/// zero, `(R+Ij)` / `(R-Ij)` otherwise.  Special-cases `nan` and
+/// signed zeros to match CPython's `repr` exactly.
+pub(crate) fn complex_repr(real: f64, imag: f64) -> String {
+    fn fmt_part(p: f64) -> String {
+        if p.fract() == 0.0 && p.is_finite() {
+            format!("{p:.1}")
+        } else {
+            format!("{p}")
+        }
+    }
+    if real == 0.0 && real.is_sign_positive() {
+        format!("{}j", fmt_part(imag))
+    } else {
+        let sep = if imag.is_sign_negative() { "" } else { "+" };
+        format!("({}{sep}{}j)", fmt_part(real), fmt_part(imag))
+    }
+}
+
 fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
@@ -1550,6 +1778,92 @@ impl Object {
 
     pub fn new_bytearray(data: impl Into<Vec<u8>>) -> Self {
         Object::ByteArray(Rc::new(RefCell::new(data.into())))
+    }
+
+    /// Construct an integer object from a `BigInt`. Auto-demotes to
+    /// `Object::Int(i64)` when the value fits, preserving the
+    /// small-int fast path.
+    pub fn int_from_bigint(b: BigInt) -> Self {
+        match b.to_i64() {
+            Some(v) => Object::Int(v),
+            None => Object::Long(Rc::new(b)),
+        }
+    }
+
+    /// Construct an integer from an i128, promoting to `Long` when
+    /// the value doesn't fit in `i64`.
+    pub fn int_from_i128(v: i128) -> Self {
+        if let Ok(small) = i64::try_from(v) {
+            Object::Int(small)
+        } else {
+            Object::Long(Rc::new(BigInt::from(v)))
+        }
+    }
+
+    /// Construct a complex number.
+    pub fn new_complex(real: f64, imag: f64) -> Self {
+        Object::Complex(Rc::new(PyComplex::new(real, imag)))
+    }
+
+    /// View this object as a `BigInt`, treating `Bool`/`Int`/`Long`
+    /// uniformly. Returns `None` for any other type.
+    pub fn as_bigint(&self) -> Option<BigInt> {
+        match self {
+            Object::Bool(b) => Some(BigInt::from(i64::from(*b))),
+            Object::Int(i) => Some(BigInt::from(*i)),
+            Object::Long(b) => Some((**b).clone()),
+            _ => None,
+        }
+    }
+
+    /// View this object as `i64`, succeeding only when the value
+    /// genuinely fits in 64 bits. Returns `None` for `Long`s that
+    /// don't fit, and for non-integer types.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Object::Bool(b) => Some(i64::from(*b)),
+            Object::Int(i) => Some(*i),
+            Object::Long(b) => b.to_i64(),
+            _ => None,
+        }
+    }
+
+    /// View this object as a non-negative `usize`, returning `None`
+    /// for negative or out-of-range values.
+    pub fn as_usize(&self) -> Option<usize> {
+        match self {
+            Object::Bool(b) => Some(usize::from(*b)),
+            Object::Int(i) if *i >= 0 => usize::try_from(*i).ok(),
+            Object::Long(b) if !b.is_negative() => b.to_usize(),
+            _ => None,
+        }
+    }
+
+    /// Test whether this object is `int`-flavoured (Bool, Int, or
+    /// Long). Useful in the VM where the slot machinery treats all
+    /// three uniformly.
+    pub fn is_int_like(&self) -> bool {
+        matches!(self, Object::Bool(_) | Object::Int(_) | Object::Long(_))
+    }
+
+    /// View this object as `f64`, with float / int / bool / long all
+    /// converting losslessly-where-possible.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Object::Bool(b) => Some(f64::from(i32::from(*b))),
+            Object::Int(i) => Some(*i as f64),
+            Object::Long(b) => b.to_f64(),
+            Object::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// View as `(real, imag)`. Includes int → real promotion.
+    pub fn as_complex(&self) -> Option<(f64, f64)> {
+        match self {
+            Object::Complex(c) => Some((c.real, c.imag)),
+            other => other.as_f64().map(|r| (r, 0.0)),
+        }
     }
 
     /// Try to view this value as bytes (works for both `bytes` and

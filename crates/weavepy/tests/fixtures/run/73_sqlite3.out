@@ -1,0 +1,5 @@
+rows: [('Bob', 25), ('Alice', 30), ('Charlie', 35)]
+count: (3,)
+lastrowid: 4
+rowcount: 1
+> 27: ['Alice', 'Charlie', 'Dora']

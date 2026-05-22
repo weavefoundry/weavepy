@@ -1296,6 +1296,12 @@ impl<'src> Parser<'src> {
             let value = match value {
                 Constant::Int(i) => Constant::Int(-i),
                 Constant::Float(f) => Constant::Float(-f),
+                Constant::BigInt(s) => Constant::BigInt(if let Some(stripped) = s.strip_prefix('-') {
+                    stripped.to_owned()
+                } else {
+                    format!("-{s}")
+                }),
+                Constant::Complex(real, imag) => Constant::Complex(-real, -imag),
                 other => other,
             };
             return Ok(Expr {
@@ -3165,31 +3171,40 @@ fn decode_bytes_body(s: &str, raw: bool) -> Result<Vec<u8>, String> {
 }
 
 fn parse_number(lex: &str) -> Result<Constant, String> {
+    use num_bigint::BigInt;
+
     let cleaned: String = lex.chars().filter(|c| *c != '_').collect();
+
+    // Imaginary suffix: peel `j`/`J` and parse the body as a float.
     if cleaned.ends_with('j') || cleaned.ends_with('J') {
-        return Err("complex numbers not supported in slice (see RFC 0001)".to_owned());
+        let body = &cleaned[..cleaned.len() - 1];
+        let imag: f64 = body
+            .parse()
+            .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+        return Ok(Constant::Complex(0.0, imag));
     }
-    if let Some(rest) = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-    {
-        let n = i64::from_str_radix(rest, 16).map_err(|e| e.to_string())?;
-        return Ok(Constant::Int(n));
+
+    // Integer literal in a non-decimal radix.
+    let try_radix = |prefix_lo: &str, prefix_hi: &str, radix: u32| -> Option<&str> {
+        cleaned
+            .strip_prefix(prefix_lo)
+            .or_else(|| cleaned.strip_prefix(prefix_hi))
+            .map(|r| {
+                let _ = radix;
+                r
+            })
+    };
+    if let Some(rest) = try_radix("0x", "0X", 16) {
+        return parse_radix_int(rest, 16);
     }
-    if let Some(rest) = cleaned
-        .strip_prefix("0o")
-        .or_else(|| cleaned.strip_prefix("0O"))
-    {
-        let n = i64::from_str_radix(rest, 8).map_err(|e| e.to_string())?;
-        return Ok(Constant::Int(n));
+    if let Some(rest) = try_radix("0o", "0O", 8) {
+        return parse_radix_int(rest, 8);
     }
-    if let Some(rest) = cleaned
-        .strip_prefix("0b")
-        .or_else(|| cleaned.strip_prefix("0B"))
-    {
-        let n = i64::from_str_radix(rest, 2).map_err(|e| e.to_string())?;
-        return Ok(Constant::Int(n));
+    if let Some(rest) = try_radix("0b", "0B", 2) {
+        return parse_radix_int(rest, 2);
     }
+
+    // Float literal.
     let has_float_marker = cleaned.contains('.') || cleaned.contains('e') || cleaned.contains('E');
     if has_float_marker {
         let f: f64 = cleaned
@@ -3197,8 +3212,50 @@ fn parse_number(lex: &str) -> Result<Constant, String> {
             .map_err(|e: std::num::ParseFloatError| e.to_string())?;
         return Ok(Constant::Float(f));
     }
-    let n: i64 = cleaned
-        .parse()
-        .map_err(|e: std::num::ParseIntError| e.to_string())?;
-    Ok(Constant::Int(n))
+
+    // Decimal integer; promote to BigInt on overflow.
+    if let Ok(n) = cleaned.parse::<i64>() {
+        return Ok(Constant::Int(n));
+    }
+    let big: BigInt = cleaned.parse().map_err(|_| "invalid integer literal".to_owned())?;
+    if let Some(small) = big_to_i64(&big) {
+        return Ok(Constant::Int(small));
+    }
+    Ok(Constant::BigInt(big.to_string()))
+}
+
+fn parse_radix_int(rest: &str, radix: u32) -> Result<Constant, String> {
+    use num_bigint::BigInt;
+
+    if let Ok(n) = i64::from_str_radix(rest, radix) {
+        return Ok(Constant::Int(n));
+    }
+    let big = BigInt::parse_bytes(rest.as_bytes(), radix)
+        .ok_or_else(|| "invalid integer literal".to_owned())?;
+    if let Some(small) = big_to_i64(&big) {
+        return Ok(Constant::Int(small));
+    }
+    Ok(Constant::BigInt(big.to_string()))
+}
+
+fn big_to_i64(b: &num_bigint::BigInt) -> Option<i64> {
+    use num_bigint::Sign;
+    let (sign, digits) = b.to_u64_digits();
+    match digits.len() {
+        0 => Some(0),
+        1 => {
+            let v = digits[0];
+            match sign {
+                Sign::Plus | Sign::NoSign => i64::try_from(v).ok(),
+                Sign::Minus => {
+                    if v == (i64::MAX as u64) + 1 {
+                        Some(i64::MIN)
+                    } else {
+                        i64::try_from(v).ok().map(|n| -n)
+                    }
+                }
+            }
+        }
+        _ => None,
+    }
 }

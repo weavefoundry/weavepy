@@ -17,5 +17,8 @@ weavepy-parser = { workspace = true }
 indexmap       = { workspace = true }
 thiserror      = { workspace = true }
 
+# RFC 0019 — numerics and serialization.
+num-bigint     = { workspace = true }
+
 [lints]
 workspace = true
