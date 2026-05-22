@@ -63,7 +63,7 @@ socket2     = { version = "0.5", features = ["all"] }
 sha2        = "0.10"
 sha1        = "0.10"
 md-5        = "0.10"
-digest      = "0.10"
+digest      = "0.11"
 hmac        = "0.12"
 base64      = "0.22"
 crc32fast   = "1.4"
