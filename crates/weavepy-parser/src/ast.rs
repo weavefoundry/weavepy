@@ -155,6 +155,13 @@ pub enum StmtKind {
     /// expression forms (`Name`, `Subscript`, `Attribute`, `Tuple`,
     /// or `List`); the compiler lowers each to its delete opcode.
     Delete(Vec<Expr>),
+    /// `assert test [, msg]`. Lowered to a conditional `raise
+    /// AssertionError(msg)`; elided entirely under `-O` (the
+    /// compiler honours `optimize >= 1`).
+    Assert {
+        test: Expr,
+        msg: Option<Expr>,
+    },
 }
 
 /// One `case` clause inside a `match` statement (RFC 0009).
@@ -912,6 +919,16 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
                 dump_expr(out, t, depth);
             }
             out.push_str("])");
+        }
+        S::Assert { test, msg } => {
+            out.push_str("Assert(test=");
+            dump_expr(out, test, depth);
+            out.push_str(", msg=");
+            match msg {
+                Some(m) => dump_expr(out, m, depth),
+                None => out.push_str("None"),
+            }
+            out.push(')');
         }
     }
 }

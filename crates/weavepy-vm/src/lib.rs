@@ -30,6 +30,7 @@ pub mod builtins;
 pub mod error;
 pub mod import;
 pub mod object;
+pub mod pycache;
 pub mod stdlib;
 pub mod types;
 pub mod vm_singletons;
@@ -95,6 +96,32 @@ impl Frame {
 /// Output sink. Either the process's stdout or a `Vec<u8>` for
 /// embedding callers.
 pub type Stdout = Rc<RefCell<dyn Write>>;
+
+/// Cross-cutting CLI-driven flags the VM honours.
+///
+/// Defined here (rather than on the `weavepy` umbrella crate) so the
+/// VM can apply them without a circular dependency. The `weavepy`
+/// crate re-exports this as `weavepy::InterpreterFlags`.
+#[derive(Debug, Clone, Default)]
+pub struct InterpreterFlags {
+    pub optimize: u8,
+    pub dont_write_bytecode: bool,
+    pub inspect: bool,
+    pub verbose: bool,
+    pub no_site: bool,
+    pub no_user_site: bool,
+    pub ignore_environment: bool,
+    pub isolated: bool,
+    pub quiet: bool,
+    pub unbuffered: bool,
+    pub skip_first_line: bool,
+    pub bytes_warning: u8,
+    pub safe_path: bool,
+    pub debug: bool,
+    pub xoptions: Vec<String>,
+    pub warning_filters: Vec<String>,
+    pub hash_seed: Option<u32>,
+}
 
 /// The top-level entry point for executing WeavePy bytecode.
 #[allow(missing_debug_implementations)]
@@ -221,6 +248,117 @@ impl Interpreter {
         }
     }
 
+    /// Apply the cross-cutting `InterpreterFlags` set the embedding
+    /// host wants the VM to honour. Reflected on `sys.flags`,
+    /// `sys._xoptions`, `sys.warnoptions`, and
+    /// `sys.dont_write_bytecode`. Called once at startup before any
+    /// user code runs.
+    pub fn apply_run_options(&mut self, opts: &InterpreterFlags) {
+        let flags = &opts;
+        if let Some(Object::Module(m)) = self
+            .cache
+            .modules
+            .borrow()
+            .get(&crate::object::DictKey(Object::from_static("sys")))
+        {
+            let mut d = m.dict.borrow_mut();
+            if let Some(Object::Dict(fl)) = d
+                .get(&crate::object::DictKey(Object::from_static("flags")))
+                .cloned()
+            {
+                let mut fld = fl.borrow_mut();
+                let set = |fld: &mut crate::object::DictData, k: &'static str, v: i64| {
+                    fld.insert(
+                        crate::object::DictKey(Object::from_static(k)),
+                        Object::Int(v),
+                    );
+                };
+                set(&mut fld, "optimize", flags.optimize.into());
+                set(
+                    &mut fld,
+                    "dont_write_bytecode",
+                    i64::from(flags.dont_write_bytecode),
+                );
+                set(&mut fld, "inspect", i64::from(flags.inspect));
+                set(&mut fld, "interactive", i64::from(flags.inspect));
+                set(&mut fld, "verbose", i64::from(flags.verbose));
+                set(&mut fld, "quiet", i64::from(flags.quiet));
+                set(&mut fld, "no_site", i64::from(flags.no_site));
+                set(&mut fld, "no_user_site", i64::from(flags.no_user_site));
+                set(
+                    &mut fld,
+                    "ignore_environment",
+                    i64::from(flags.ignore_environment),
+                );
+                set(&mut fld, "isolated", i64::from(flags.isolated));
+                set(&mut fld, "bytes_warning", flags.bytes_warning.into());
+                set(&mut fld, "safe_path", i64::from(flags.safe_path));
+                set(&mut fld, "debug", i64::from(flags.debug));
+                set(
+                    &mut fld,
+                    "hash_randomization",
+                    flags.hash_seed.map_or(1, |_| 0),
+                );
+                set(&mut fld, "utf8_mode", 1);
+                set(&mut fld, "dev_mode", 0);
+                set(&mut fld, "int_max_str_digits", 4300);
+                set(&mut fld, "warn_default_encoding", 0);
+            }
+            d.insert(
+                crate::object::DictKey(Object::from_static("dont_write_bytecode")),
+                Object::Bool(flags.dont_write_bytecode),
+            );
+            d.insert(
+                crate::object::DictKey(Object::from_static("warnoptions")),
+                Object::new_list(
+                    flags
+                        .warning_filters
+                        .iter()
+                        .map(|s| Object::from_str(s.clone()))
+                        .collect(),
+                ),
+            );
+            // `sys._xoptions` is a dict whose values are either
+            // `True` (for bare keys) or the `value` part of
+            // `-X key=value`.
+            let mut xopts = crate::object::DictData::new();
+            for raw in &flags.xoptions {
+                let (k, v) = match raw.split_once('=') {
+                    Some((k, v)) => (k.to_owned(), Object::from_str(v.to_owned())),
+                    None => (raw.clone(), Object::Bool(true)),
+                };
+                xopts.insert(crate::object::DictKey(Object::from_str(k)), v);
+            }
+            d.insert(
+                crate::object::DictKey(Object::from_static("_xoptions")),
+                Object::Dict(std::rc::Rc::new(std::cell::RefCell::new(xopts))),
+            );
+        }
+    }
+
+    /// Run the `site` module on first interpreter start, mirroring
+    /// CPython's bootstrap. We `import site` if available, then call
+    /// `site.main()`. Errors are intentionally swallowed — a broken
+    /// `.pth` file shouldn't kill the whole interpreter.
+    pub fn run_site(&mut self) -> Result<(), RuntimeError> {
+        let site = match self.import_path("site") {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+        if let Object::Module(m) = site {
+            let main_fn = m
+                .dict
+                .borrow()
+                .get(&crate::object::DictKey(Object::from_static("main")))
+                .cloned();
+            if let Some(main_fn) = main_fn {
+                let globals = m.dict.clone();
+                let _ = self.call(&main_fn, &[], &[], &globals);
+            }
+        }
+        Ok(())
+    }
+
     /// Wire `print` (and friends) to this interpreter's stdout.
     /// `print` is installed as a special builtin — the VM intercepts
     /// the call so it can dispatch `__str__` on user types.
@@ -241,6 +379,44 @@ impl Interpreter {
     /// common entry point for the CLI and embedding hosts.
     pub fn run_module(&mut self, code: &CodeObject) -> Result<Object, RuntimeError> {
         self.run_module_as(code, "__main__", None)
+    }
+
+    /// Hand back the shared `__builtins__` dict so the REPL can drop
+    /// it into a synthetic `__main__` module's globals.
+    pub fn builtins_dict(&self) -> Rc<RefCell<DictData>> {
+        self.builtins.clone()
+    }
+
+    /// `True` when `__pycache__` writes are forbidden — either by
+    /// `-B` / `PYTHONDONTWRITEBYTECODE` at startup, or because user
+    /// code mutated `sys.dont_write_bytecode = True` mid-run. Reads
+    /// the live `sys` module dict.
+    fn bytecode_writes_disabled(&self) -> bool {
+        let sys = self.cache.modules.borrow();
+        let key = crate::object::DictKey(Object::from_static("sys"));
+        let Some(sys_mod) = sys.get(&key) else {
+            return false;
+        };
+        let dict = match sys_mod {
+            Object::Module(m) => m.dict.clone(),
+            _ => return false,
+        };
+        drop(sys);
+        crate::pycache::dont_write_bytecode(&dict)
+    }
+
+    /// Execute a compiled module-level code object against an
+    /// externally-supplied globals dict (rather than a fresh one
+    /// created by [`Self::build_module_globals`]). The REPL uses
+    /// this so user-typed names persist across prompts.
+    pub fn exec_module_in(
+        &mut self,
+        code: &CodeObject,
+        globals: Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let code_rc = Rc::new(code.clone());
+        let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
+        self.run_frame(&mut frame)
     }
 
     /// As [`run_module`], but lets the caller pick the `__name__` and
@@ -1127,6 +1303,109 @@ impl Interpreter {
                 // compiler.
                 for x in items.into_iter().rev() {
                     frame.push(x);
+                }
+            }
+            OpCode::UnpackEx => {
+                // RFC 0020: `a, *b, c = xs` style starred unpack.
+                let before = ((ins.arg >> 8) & 0xFF) as usize;
+                let after = (ins.arg & 0xFF) as usize;
+                let v = frame.pop()?;
+                let items: Vec<Object> = match v {
+                    Object::Tuple(items) => items.iter().cloned().collect(),
+                    Object::List(items) => items.borrow().clone(),
+                    Object::Str(s) => s.chars().map(|c| Object::from_str(c.to_string())).collect(),
+                    Object::Bytes(b) => b.iter().map(|x| Object::Int(i64::from(*x))).collect(),
+                    Object::ByteArray(b) => b
+                        .borrow()
+                        .iter()
+                        .map(|x| Object::Int(i64::from(*x)))
+                        .collect(),
+                    Object::Set(s) => s.borrow().iter().map(|k| k.0.clone()).collect(),
+                    Object::FrozenSet(s) => s.iter().map(|k| k.0.clone()).collect(),
+                    Object::Range(r) => {
+                        let mut out = Vec::new();
+                        let mut cur = r.start;
+                        while (r.step > 0 && cur < r.stop) || (r.step < 0 && cur > r.stop) {
+                            out.push(Object::Int(cur));
+                            cur += r.step;
+                        }
+                        out
+                    }
+                    Object::Generator(g) => {
+                        let gen_obj = Object::Generator(g);
+                        let globals = frame.globals.clone();
+                        self.collect_iterable(&gen_obj, &globals)?
+                    }
+                    Object::Instance(_) | Object::Dict(_) | Object::Iter(_) => {
+                        let globals = frame.globals.clone();
+                        self.collect_iterable(&v, &globals)?
+                    }
+                    _ => {
+                        return Err(type_error(format!(
+                            "cannot unpack non-iterable {} object",
+                            v.type_name()
+                        )))
+                    }
+                };
+                if items.len() < before + after {
+                    return Err(value_error(format!(
+                        "not enough values to unpack (expected at least {}, got {})",
+                        before + after,
+                        items.len()
+                    )));
+                }
+                // Pushed top-down so the next STOREs pop in source order.
+                // Stack layout after: [..., tail_last, ..., tail_first, middle_list, head_last, ..., head_first]
+                let mid_end = items.len() - after;
+                let middle: Vec<Object> = items[before..mid_end].to_vec();
+                // Tail: push reversed so STORE_FAST pops in source order.
+                for x in items[mid_end..].iter().rev() {
+                    frame.push(x.clone());
+                }
+                frame.push(Object::new_list(middle));
+                // Head: reversed.
+                for x in items[..before].iter().rev() {
+                    frame.push(x.clone());
+                }
+            }
+            OpCode::DictUpdate => {
+                // Stack: [..., dict, other] -> [..., dict (updated)].
+                let other = frame.pop()?;
+                let dict = frame.top()?.clone();
+                let target = match &dict {
+                    Object::Dict(d) => d.clone(),
+                    _ => {
+                        return Err(type_error(
+                            "DICT_UPDATE expects a dict on the stack".to_owned(),
+                        ));
+                    }
+                };
+                match other {
+                    Object::Dict(src) => {
+                        let mut t = target.borrow_mut();
+                        for (k, v) in src.borrow().iter() {
+                            t.insert(k.clone(), v.clone());
+                        }
+                    }
+                    _ => {
+                        // Iterate the mapping protocol via .keys() + subscript.
+                        let globals = frame.globals.clone();
+                        let key_method = self.load_attr(&other, "keys").map_err(|_| {
+                            type_error("argument to ** must be a mapping".to_owned())
+                        })?;
+                        let keys = self.call(&key_method, &[], &[], &globals)?;
+                        let keys = self.collect_iterable(&keys, &globals)?;
+                        let mut t = target.borrow_mut();
+                        for k in keys {
+                            let value = self.binary_subscr(&other, &k).map_err(|_| {
+                                type_error(format!(
+                                    "cannot access key in {} for ** spread",
+                                    other.type_name()
+                                ))
+                            })?;
+                            t.insert(crate::object::DictKey(k), value);
+                        }
+                    }
                 }
             }
             OpCode::MakeFunction => {
@@ -5336,7 +5615,7 @@ impl Interpreter {
     /// Walk a dotted name (`a.b.c`), loading each part lazily and
     /// linking submodules into their parents' dicts. Returns the
     /// leaf module.
-    fn import_path(&mut self, full: &str) -> Result<Object, RuntimeError> {
+    pub fn import_path(&mut self, full: &str) -> Result<Object, RuntimeError> {
         let parts: Vec<&str> = full.split('.').collect();
         let mut so_far = String::new();
         let mut current: Option<Object> = None;
@@ -5425,19 +5704,34 @@ impl Interpreter {
     /// The module is inserted into `sys.modules` *before* its body
     /// runs so that circular imports observe a partially-initialised
     /// module instead of looping.
+    ///
+    /// PEP 3147 / 0020: a `__pycache__/<name>.<cache_tag>.pyc`
+    /// sibling is consulted before parsing. On a healthy hit we
+    /// unmarshal directly to a `CodeObject` and skip the front-end
+    /// entirely; on a miss we compile and write a fresh cache
+    /// (subject to `-B` / `PYTHONDONTWRITEBYTECODE`).
     fn load_from_file(
         &mut self,
         full: &str,
         path: &Path,
         is_package: bool,
     ) -> Result<Object, RuntimeError> {
-        let source = std::fs::read_to_string(path)
-            .map_err(|e| import_error(format!("failed to read '{}': {e}", path.display())))?;
-        let module = weavepy_parser::parse_module(&source)
-            .map_err(|e| import_error(format!("parse error in '{}': {e}", path.display())))?;
         let filename = path.to_string_lossy().into_owned();
-        let code = weavepy_compiler::compile_module_with_source(&module, &source, &filename)
-            .map_err(|e| import_error(format!("compile error in '{}': {e}", path.display())))?;
+        let (code, source_for_diag) = if let Some(cached) = crate::pycache::try_load(path) {
+            (cached, String::new())
+        } else {
+            let source = std::fs::read_to_string(path)
+                .map_err(|e| import_error(format!("failed to read '{}': {e}", path.display())))?;
+            let module = weavepy_parser::parse_module(&source)
+                .map_err(|e| import_error(format!("parse error in '{}': {e}", path.display())))?;
+            let code = weavepy_compiler::compile_module_with_source(&module, &source, &filename)
+                .map_err(|e| import_error(format!("compile error in '{}': {e}", path.display())))?;
+            if !self.bytecode_writes_disabled() {
+                crate::pycache::try_write(path, &code);
+            }
+            (code, source)
+        };
+        let _ = source_for_diag;
 
         // Build the module value first and seed sys.modules so that
         // circular imports see a stub.

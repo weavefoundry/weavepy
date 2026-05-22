@@ -218,6 +218,19 @@ pub enum OpCode {
     /// Unpack iterable at TOS into `arg` values, push them in
     /// reverse order (so the first element ends up at the bottom).
     UnpackSequence,
+    /// Unpack iterable at TOS into `before + 1 + after` values, with
+    /// a starred middle that captures the remainder as a `list`.
+    /// `arg` encodes `(before << 8) | after`. The stack on exit is
+    /// `[..., after_n-1, ..., after_0, list_of_middle, before_n-1, ..., before_0]`
+    /// — i.e. all extracted values pushed top-down so a sequence of
+    /// `STORE_FAST` emitted in source order pops them in the right
+    /// order. Mirrors CPython's `UNPACK_EX`.
+    UnpackEx,
+    /// `dict.update(other)` as a pure stack op. Stack on entry:
+    /// `[..., dict, other]`. Pops `other`, applies it to `dict`
+    /// (which is left at TOS for further updates). Used for `{**d}`
+    /// dict-literal spreads.
+    DictUpdate,
 
     // Functions / closures
     /// Build a function object from the code object on TOS.
@@ -411,6 +424,8 @@ impl OpCode {
             OpCode::SetAdd => "SET_ADD",
             OpCode::MapAdd => "MAP_ADD",
             OpCode::UnpackSequence => "UNPACK_SEQUENCE",
+            OpCode::UnpackEx => "UNPACK_EX",
+            OpCode::DictUpdate => "DICT_UPDATE",
             OpCode::MakeFunction => "MAKE_FUNCTION",
             OpCode::BuildSlice => "BUILD_SLICE",
             OpCode::LoadBuildClass => "LOAD_BUILD_CLASS",

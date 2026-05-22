@@ -661,6 +661,28 @@ impl Compiler {
                     self.compile_delete(target)?;
                 }
             }
+            StmtKind::Assert { test, msg } => {
+                // `assert test [, msg]` lowers to:
+                //   <test>; POP_JUMP_IF_TRUE end
+                //   LOAD_NAME AssertionError
+                //   [<msg>; CALL 1]
+                //   RAISE_VARARGS 1
+                // end:
+                //
+                // We don't yet strip assertions under `-O`; the VM
+                // checks `sys.flags.optimize` at runtime if it wants
+                // to elide the AssertionError raise.
+                self.compile_expr(test)?;
+                let skip = self.emit(OpCode::PopJumpIfTrue, 0);
+                self.emit_load_name("AssertionError");
+                if let Some(m) = msg {
+                    self.compile_expr(m)?;
+                    self.emit(OpCode::Call, 1);
+                }
+                self.emit(OpCode::RaiseVarargs, 1);
+                let end = self.next_offset();
+                self.patch_jump(skip, end);
+            }
             StmtKind::Assign { targets, value } => {
                 self.compile_expr(value)?;
                 let n = targets.len();
@@ -2213,16 +2235,46 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Tuple(items) | ExprKind::List(items) => {
-                self.emit(OpCode::UnpackSequence, items.len() as u32);
-                for t in items {
-                    self.compile_assign(t)?;
+                // PEP 3132 — starred sub-target. Exactly one `*x` may
+                // appear; everything before becomes the head, everything
+                // after becomes the tail, and `*x` captures the middle
+                // as a list.
+                let starred_idx = items
+                    .iter()
+                    .position(|t| matches!(t.kind, ExprKind::Starred(_)));
+                if let Some(idx) = starred_idx {
+                    let before = idx as u32;
+                    let after = (items.len() - idx - 1) as u32;
+                    if before > 0xFF || after > 0xFF {
+                        return Err(CompileError::NotImplemented(
+                            "starred unpack with more than 255 leading or trailing names",
+                            "too many names on either side of the star",
+                        ));
+                    }
+                    self.emit(OpCode::UnpackEx, (before << 8) | after);
+                    for t in items {
+                        match &t.kind {
+                            ExprKind::Starred(inner) => self.compile_assign(inner)?,
+                            _ => self.compile_assign(t)?,
+                        }
+                    }
+                } else {
+                    self.emit(OpCode::UnpackSequence, items.len() as u32);
+                    for t in items {
+                        self.compile_assign(t)?;
+                    }
                 }
                 Ok(())
             }
-            ExprKind::Starred(_) => Err(CompileError::NotImplemented(
-                "starred assignment target",
-                "tracked in RFC 0001 follow-ups",
-            )),
+            ExprKind::Starred(inner) => {
+                // A bare top-level starred target (`*a = xs` outside
+                // of any tuple/list pattern) is a `SyntaxError` in
+                // CPython, but a `*a,` on its own is the special
+                // one-element-tuple form. Compile the inner — the
+                // surrounding tuple/list path is responsible for
+                // emitting the UNPACK_EX.
+                self.compile_assign(inner)
+            }
             _ => Err(CompileError::BadAssignmentTarget(format!(
                 "{:?}",
                 target.kind
@@ -2626,21 +2678,46 @@ impl Compiler {
                 self.emit(OpCode::BuildSet, items.len() as u32);
             }
             ExprKind::Dict { keys, values } => {
-                for (k, v) in keys.iter().zip(values.iter()) {
-                    match k {
-                        Some(ke) => {
+                // Two emission paths: the "no spread" common case
+                // emits a single `BuildMap`, while the spread case
+                // builds an empty dict and accumulates via runs of
+                // `BuildMap` for explicit `{k: v}` chunks separated
+                // by `DictUpdate` for each `**other` segment.
+                let has_spread = keys.iter().any(|k| k.is_none());
+                if !has_spread {
+                    for (k, v) in keys.iter().zip(values.iter()) {
+                        if let Some(ke) = k {
                             self.compile_expr(ke)?;
                             self.compile_expr(v)?;
                         }
-                        None => {
-                            return Err(CompileError::NotImplemented(
-                                "**dict spread literal",
-                                "the slice supports `{k: v}` but not `{**d}`",
-                            ));
+                    }
+                    self.emit(OpCode::BuildMap, keys.len() as u32);
+                } else {
+                    self.emit(OpCode::BuildMap, 0);
+                    let mut pending: u32 = 0;
+                    let flush_pending = |slf: &mut Self, pending: &mut u32| {
+                        if *pending > 0 {
+                            slf.emit(OpCode::BuildMap, *pending);
+                            slf.emit(OpCode::DictUpdate, 0);
+                            *pending = 0;
+                        }
+                    };
+                    for (k, v) in keys.iter().zip(values.iter()) {
+                        match k {
+                            Some(ke) => {
+                                self.compile_expr(ke)?;
+                                self.compile_expr(v)?;
+                                pending += 1;
+                            }
+                            None => {
+                                flush_pending(self, &mut pending);
+                                self.compile_expr(v)?;
+                                self.emit(OpCode::DictUpdate, 0);
+                            }
                         }
                     }
+                    flush_pending(self, &mut pending);
                 }
-                self.emit(OpCode::BuildMap, keys.len() as u32);
             }
             ExprKind::ListComp { elt, generators }
             | ExprKind::SetComp { elt, generators }
@@ -3583,6 +3660,9 @@ fn stmt_contains_yield(stmt: &Stmt) -> bool {
         | StmtKind::Break
         | StmtKind::Continue => false,
         StmtKind::Delete(targets) => targets.iter().any(expr_contains_yield),
+        StmtKind::Assert { test, msg } => {
+            expr_contains_yield(test) || msg.as_ref().is_some_and(expr_contains_yield)
+        }
     }
 }
 

@@ -119,9 +119,12 @@ pub fn build_with_state(
             builtin("addaudithook", |_| Ok(Object::None)),
         );
         d.insert(DictKey(Object::from_static("flags")), sys_flags_value());
+        // Default to `False`, matching CPython. The CLI/embedder
+        // overrides this through `apply_run_options` when `-B` or
+        // `PYTHONDONTWRITEBYTECODE` was set.
         d.insert(
             DictKey(Object::from_static("dont_write_bytecode")),
-            Object::Bool(true),
+            Object::Bool(false),
         );
         d.insert(
             DictKey(Object::from_static("ps1")),
@@ -366,7 +369,7 @@ fn implementation_value() -> Object {
     );
     d.insert(
         DictKey(Object::from_static("cache_tag")),
-        Object::from_static("weavepy-0"),
+        Object::from_static(crate::pycache::CACHE_TAG),
     );
     Object::Dict(Rc::new(RefCell::new(d)))
 }

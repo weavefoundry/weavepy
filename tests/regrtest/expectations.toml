@@ -1,0 +1,57 @@
+# Regrtest baseline.
+#
+# Each `[tests."<label>"]` entry records the *expected* status for one
+# regression test. The label format is `bundled/<filename>` for the
+# fixtures in this directory and `cpython/Lib/test/<filename>` for tests
+# pulled from a checked-out `vendor/cpython/`.
+#
+# Status values mirror `regrtest::TestStatus`:
+#   pass    — runs cleanly
+#   fail    — uncaught exception escapes the script
+#   error   — pre-execution failure (parse/compile/IO)
+#   skip    — explicitly skipped (won't run; useful for "blocked on X")
+#   timeout — exceeded the per-test budget
+#
+# Tests not listed below default to "expect pass".
+#
+# `--check` (the default) makes `weavepy-conformance regrtest` exit
+# non-zero on any divergence from this file. CI uses that to block
+# regressions; refresh the baseline with `--no-check` when intentionally
+# changing expectations.
+
+timeout_seconds = 30
+
+# ---------------------------------------------------------------------
+# Bundled regression tests — everything in `tests/regrtest/` is expected
+# to pass cleanly on `main`. Entries here document any temporary
+# deviations from that bar.
+# ---------------------------------------------------------------------
+
+# (none currently — all bundled tests are expected to pass)
+
+# ---------------------------------------------------------------------
+# CPython `Lib/test/` allowlist. These are only attempted when
+# `vendor/cpython/` is checked out; absent that, the runner silently
+# omits them from discovery. Each entry should carry a `reason` so the
+# next maintainer knows what they're looking at.
+# ---------------------------------------------------------------------
+
+[tests."cpython/Lib/test/test_grammar.py"]
+status = "fail"
+reason = "exercises features still in flight (top-level await, complex f-strings)"
+
+[tests."cpython/Lib/test/test_tokenize.py"]
+status = "skip"
+reason = "imports CPython-only internals (tokenize.tokenize, encoding cookies)"
+
+[tests."cpython/Lib/test/test_dict.py"]
+status = "fail"
+reason = "depends on dict order corner cases + leaking CPython implementation details"
+
+[tests."cpython/Lib/test/test_list.py"]
+status = "fail"
+reason = "depends on CPython sys.getsizeof / refcount behaviour"
+
+[tests."cpython/Lib/test/test_set.py"]
+status = "fail"
+reason = "exercises C-level frozenset interning + sys.getsizeof"

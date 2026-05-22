@@ -478,5 +478,150 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/compileall.py"),
             is_package: false,
         },
+        // RFC 0020 — bootstrap modules for the "real `python(1)`" arc.
+        FrozenSource {
+            name: "site",
+            source: include_str!("python/site.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib",
+            source: include_str!("python/importlib_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "importlib.machinery",
+            source: include_str!("python/importlib_machinery.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.util",
+            source: include_str!("python/importlib_util.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.abc",
+            source: include_str!("python/importlib_abc.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.metadata",
+            source: include_str!("python/importlib_metadata.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib.resources",
+            source: include_str!("python/importlib_resources.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pkgutil",
+            source: include_str!("python/pkgutil.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "venv",
+            source: include_str!("python/venv_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ensurepip",
+            source: include_str!("python/ensurepip.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_minipip",
+            source: include_str!("python/_minipip.py"),
+            is_package: false,
+        },
+        // Debugger.
+        FrozenSource {
+            name: "cmd",
+            source: include_str!("python/cmd_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "bdb",
+            source: include_str!("python/bdb_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pdb",
+            source: include_str!("python/pdb_mod.py"),
+            is_package: false,
+        },
+        // Small stdlib modules.
+        FrozenSource {
+            name: "pprint",
+            source: include_str!("python/pprint_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "tomllib",
+            source: include_str!("python/tomllib_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "configparser",
+            source: include_str!("python/configparser_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "getopt",
+            source: include_str!("python/getopt_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "optparse",
+            source: include_str!("python/optparse_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "timeit",
+            source: include_str!("python/timeit_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "profile",
+            source: include_str!("python/profile_mod.py"),
+            is_package: false,
+        },
+        // `cProfile` is an alias for `profile` in WeavePy — we don't
+        // (yet) ship a C-accelerated profiler.
+        FrozenSource {
+            name: "cProfile",
+            source: include_str!("python/profile_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pstats",
+            source: include_str!("python/pstats_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "webbrowser",
+            source: include_str!("python/webbrowser_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "array",
+            source: include_str!("python/array_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "plistlib",
+            source: include_str!("python/plistlib_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "zoneinfo",
+            source: include_str!("python/zoneinfo_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "unittest.async_case",
+            source: include_str!("python/unittest_async.py"),
+            is_package: false,
+        },
     ]
 }

@@ -16,10 +16,17 @@ name = "weavepy"
 path = "src/main.rs"
 
 [dependencies]
-weavepy           = { workspace = true }
-anyhow            = { workspace = true }
-clap              = { workspace = true }
-tracing           = { workspace = true }
+weavepy            = { workspace = true }
+weavepy-vm         = { workspace = true }
+weavepy-parser     = { workspace = true }
+weavepy-compiler   = { workspace = true }
+weavepy-conformance = { workspace = true }
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+serde_json         = { workspace = true }
+rustyline          = { workspace = true }
+dirs               = { workspace = true }
+tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints]

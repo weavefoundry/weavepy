@@ -101,9 +101,15 @@ pub fn run_source_with_filename(source: &str, filename: &str) -> Result<(), Erro
 /// Knobs for running a Python source string.
 ///
 /// Wraps the cross-cutting state — `sys.argv`, `sys.path` additions,
-/// the displayed filename — so the CLI and tests don't have to grow
-/// a function-argument soup as the feature surface expands.
-#[derive(Debug, Clone)]
+/// the displayed filename, every `-X foo=bar` / `-W ignore` / `-O`
+/// flag CPython honours — so the CLI and tests don't have to grow a
+/// function-argument soup as the surface area expands.
+///
+/// Construct with [`RunOptions::new`] and chain `with_*` setters.
+/// Defaults match `python script.py` invoked with no flags:
+/// `optimize = 0`, site enabled, env vars honoured, user site
+/// enabled.
+#[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     pub filename: String,
     pub argv: Vec<String>,
@@ -111,7 +117,13 @@ pub struct RunOptions {
     /// Directory to prepend to `sys.path` (typically the script's
     /// directory, mirroring CPython's `python script.py` behaviour).
     pub script_dir: Option<PathBuf>,
+    /// Set of flag toggles the CLI hands the VM. The VM reflects
+    /// these on `sys.flags`, `sys.dont_write_bytecode`,
+    /// `sys._xoptions`, and `sys.warnoptions`.
+    pub flags: InterpreterFlags,
 }
+
+pub use vm::InterpreterFlags;
 
 impl RunOptions {
     pub fn new(filename: impl Into<String>) -> Self {
@@ -120,6 +132,7 @@ impl RunOptions {
             argv: Vec::new(),
             extra_path: Vec::new(),
             script_dir: None,
+            flags: InterpreterFlags::default(),
         }
     }
 
@@ -148,6 +161,12 @@ impl RunOptions {
         self.extra_path = paths.into_iter().map(Into::into).collect();
         self
     }
+
+    #[must_use]
+    pub fn with_flags(mut self, flags: InterpreterFlags) -> Self {
+        self.flags = flags;
+        self
+    }
 }
 
 /// Run `source` under a fresh interpreter, threading `argv`/`path`/
@@ -157,11 +176,26 @@ impl RunOptions {
 /// emulate `python script.py arg1 arg2`, and tests use it for
 /// multi-file fixtures.
 pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Error> {
-    let module = parser::parse_module(source)?;
-    let code = compiler::compile_module_with_source(&module, source, &opts.filename)?;
+    // `-x`: drop the first physical line (typical use is to allow a
+    // shell-style shebang to live above a self-extracting payload).
+    let effective_source: String;
+    let source_ref: &str = if opts.flags.skip_first_line {
+        effective_source = match source.find('\n') {
+            Some(idx) => source[idx + 1..].to_owned(),
+            None => String::new(),
+        };
+        &effective_source
+    } else {
+        source
+    };
+    let module = parser::parse_module(source_ref)?;
+    let code = compiler::compile_module_with_source(&module, source_ref, &opts.filename)?;
     let mut interpreter = vm::Interpreter::default();
-    if let Some(dir) = &opts.script_dir {
-        interpreter.prepend_path(dir.clone());
+    interpreter.apply_run_options(&opts.flags);
+    if !opts.flags.safe_path {
+        if let Some(dir) = &opts.script_dir {
+            interpreter.prepend_path(dir.clone());
+        }
     }
     for p in &opts.extra_path {
         interpreter.append_path(p.clone());
@@ -172,6 +206,12 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
         opts.argv.clone()
     };
     interpreter.set_argv(argv);
+    if !opts.flags.no_site {
+        // Best-effort run of the `site` module — failures are
+        // suppressed (matching CPython's behaviour) so a botched
+        // `.pth` file can't break the interpreter outright.
+        let _ = interpreter.run_site();
+    }
     let file_for_main = if opts.filename == "<string>" || opts.filename == "<stdin>" {
         None
     } else {

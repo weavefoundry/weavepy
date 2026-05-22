@@ -17,9 +17,14 @@
 pub mod corpus;
 pub mod normalize;
 pub mod oracle;
+pub mod regrtest;
 pub mod report;
 pub mod runner;
 
+pub use regrtest::{
+    discover as discover_regrtest, report_to_markdown as regrtest_to_markdown, run_all,
+    Expectations, RegrtestFile, RegrtestSummary, TestReport, TestStatus, DEFAULT_TIMEOUT_SECS,
+};
 pub use runner::{run_file, FileReport, PhaseOutcome};
 
 /// The CPython release WeavePy is graded against.

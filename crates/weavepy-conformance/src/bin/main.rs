@@ -12,11 +12,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use weavepy_conformance::{corpus, oracle, oracle_python, report, runner, CPYTHON_TARGET_VERSION};
+use weavepy_conformance::{
+    corpus, oracle, oracle_python, regrtest, report, runner, CPYTHON_TARGET_VERSION,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,9 +54,32 @@ enum Cmd {
         phase: Phase,
     },
 
-    /// (Placeholder.) Run individual CPython `test_*.py` files end-to-end
-    /// through WeavePy. Wired up once the VM can execute Python.
-    Regrtest,
+    /// Run individual `test_*.py` files end-to-end through WeavePy and
+    /// grade against the checked-in expectations baseline.
+    Regrtest {
+        /// Path to the `expectations.toml` baseline. Defaults to
+        /// `<workspace>/tests/regrtest/expectations.toml`.
+        #[arg(long, value_name = "FILE")]
+        expectations: Option<PathBuf>,
+
+        /// Per-test wall budget, in seconds.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+
+        /// Only run tests whose label contains `<FILTER>` as a substring.
+        #[arg(long, value_name = "FILTER")]
+        filter: Option<String>,
+
+        /// Exit non-zero if any test diverged from its expected status.
+        /// Defaults to true; pass `--no-check` to grade without gating.
+        #[arg(long = "check", action = clap::ArgAction::SetTrue, default_value_t = true)]
+        check: bool,
+
+        /// Disable the strict-grading exit code (useful when sweeping
+        /// expectations to refresh the baseline).
+        #[arg(long = "no-check", action = clap::ArgAction::SetTrue, conflicts_with = "check")]
+        no_check: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -83,7 +109,23 @@ fn real_main() -> Result<()> {
     match cli.cmd {
         Cmd::Run => cmd_run(&workspace, &report_dir),
         Cmd::Diff { phase } => cmd_diff(&workspace, &report_dir, phase),
-        Cmd::Regrtest => cmd_regrtest(),
+        Cmd::Regrtest {
+            expectations,
+            timeout,
+            filter,
+            check,
+            no_check,
+        } => {
+            let strict = check && !no_check;
+            cmd_regrtest(
+                &workspace,
+                &report_dir,
+                expectations.as_deref(),
+                timeout,
+                filter.as_deref(),
+                strict,
+            )
+        }
     }
 }
 
@@ -155,14 +197,69 @@ fn cmd_diff(workspace: &Path, report_dir: &Path, phase: Phase) -> Result<()> {
     Ok(())
 }
 
-// Result<()> signature is preserved so this arm matches the others in
-// the dispatch match; the body will gain fallible operations in Stage B.
-#[allow(clippy::unnecessary_wraps)]
-fn cmd_regrtest() -> Result<()> {
+fn cmd_regrtest(
+    workspace: &Path,
+    report_dir: &Path,
+    expectations_path: Option<&Path>,
+    timeout_override: Option<u64>,
+    filter: Option<&str>,
+    strict: bool,
+) -> Result<()> {
+    let default_expectations = workspace.join("tests/regrtest/expectations.toml");
+    let exp_path = expectations_path.unwrap_or(&default_expectations);
+    let expectations = regrtest::Expectations::load(exp_path)?;
+    let timeout_secs = timeout_override
+        .or(expectations.timeout_seconds)
+        .unwrap_or(regrtest::DEFAULT_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let mut files = regrtest::discover(workspace);
+    if let Some(needle) = filter {
+        files.retain(|f| f.label.contains(needle));
+    }
+    if files.is_empty() {
+        eprintln!(
+            "no regrtest files found under {} (filter={:?})",
+            workspace.join("tests/regrtest").display(),
+            filter,
+        );
+    }
+
+    let reports = regrtest::run_all(&files, &expectations, timeout);
+    let summary = regrtest::RegrtestSummary::from_reports(&reports);
+    print!("{}", regrtest::report_to_markdown(&reports));
+
+    if let Err(e) = std::fs::create_dir_all(report_dir) {
+        anyhow::bail!(
+            "failed to create regrtest report dir {}: {e}",
+            report_dir.display()
+        );
+    }
+    let md_path = report_dir.join("regrtest.md");
+    std::fs::write(&md_path, regrtest::report_to_markdown(&reports))
+        .with_context(|| format!("failed to write {}", md_path.display()))?;
+    let json_path = report_dir.join("regrtest.json");
+    let json = serde_json::json!({
+        "summary": summary,
+        "reports": reports,
+    });
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&json).unwrap_or_default(),
+    )
+    .with_context(|| format!("failed to write {}", json_path.display()))?;
     eprintln!(
-        "regrtest mode is not implemented yet: it requires a working interpreter.\n\
-         Track the rollout in docs/CONFORMANCE.md (\"Stage B\")."
+        "wrote regrtest.md and regrtest.json to {}",
+        report_dir.display()
     );
+
+    if strict && summary.unexpected > 0 {
+        anyhow::bail!(
+            "{} regrtest regression(s) — see {}",
+            summary.unexpected,
+            md_path.display()
+        );
+    }
     Ok(())
 }
 

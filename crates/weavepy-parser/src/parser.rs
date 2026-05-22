@@ -162,6 +162,7 @@ impl<'src> Parser<'src> {
                 Keyword::Break => self.simple_keyword_stmt(StmtKind::Break),
                 Keyword::Continue => self.simple_keyword_stmt(StmtKind::Continue),
                 Keyword::Del => self.parse_del(),
+                Keyword::Assert => self.parse_assert(),
                 Keyword::Import => self.parse_import(),
                 Keyword::From => self.parse_import_from(),
                 Keyword::Global => self.parse_global(),
@@ -1077,6 +1078,27 @@ impl<'src> Parser<'src> {
         })
     }
 
+    /// `assert <test> [, <msg>]`
+    ///
+    /// The grammar is `'assert' test [',' test]` — the message is an
+    /// arbitrary expression (not a `,`-separated tuple shorthand). We
+    /// accept and store both for the compiler to lower.
+    fn parse_assert(&mut self) -> Result<Stmt, ParseError> {
+        let kw = self.bump();
+        let test = self.parse_ternary()?;
+        let msg = if self.eat(&TokenKind::Comma) {
+            Some(self.parse_ternary()?)
+        } else {
+            None
+        };
+        self.consume_stmt_end()?;
+        let end = msg.as_ref().map(|m| m.span).unwrap_or(test.span);
+        Ok(Stmt {
+            kind: StmtKind::Assert { test, msg },
+            span: kw.span.merge(end),
+        })
+    }
+
     fn parse_name_list(&mut self) -> Result<Vec<String>, ParseError> {
         let mut names = Vec::new();
         loop {
@@ -1566,8 +1588,13 @@ impl<'src> Parser<'src> {
 
     /// Parse a tuple-or-expression as it appears on the right side
     /// of `=` or `return`.
+    ///
+    /// Accepts `*x` as a sub-element: this is what makes both
+    /// PEP 3132 assignment targets (`a, *b, c = xs`) and the
+    /// general iterable-unpacking case in collection literals fall
+    /// out of a single parse.
     fn parse_expression_list(&mut self, _allow_trailing_comma: bool) -> Result<Expr, ParseError> {
-        let first = self.parse_ternary()?;
+        let first = self.parse_ternary_or_starred()?;
         if !self.check(&TokenKind::Comma) {
             return Ok(first);
         }
@@ -1587,13 +1614,30 @@ impl<'src> Parser<'src> {
             ) {
                 break;
             }
-            items.push(self.parse_ternary()?);
+            items.push(self.parse_ternary_or_starred()?);
         }
         let end_span = items.last().expect("nonempty").span;
         Ok(Expr {
             kind: ExprKind::Tuple(items),
             span: start_span.merge(end_span),
         })
+    }
+
+    /// `*expr` or a regular ternary. Used wherever a comma-separated
+    /// element may legitimately be a starred form (assignment
+    /// targets, tuple/list/set literals, function call arguments).
+    fn parse_ternary_or_starred(&mut self) -> Result<Expr, ParseError> {
+        if let TokenKind::Star = self.peek() {
+            let star_tok = self.peek_token().clone();
+            self.bump();
+            let inner = self.parse_ternary()?;
+            let span = star_tok.span.merge(inner.span);
+            return Ok(Expr {
+                kind: ExprKind::Starred(Box::new(inner)),
+                span,
+            });
+        }
+        self.parse_ternary()
     }
 
     fn parse_ternary(&mut self) -> Result<Expr, ParseError> {
@@ -2490,7 +2534,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_target_list_no_tuple(&mut self) -> Result<Expr, ParseError> {
-        let first = self.parse_unary()?;
+        let first = self.parse_target_or_star()?;
         if !self.check(&TokenKind::Comma) {
             return Ok(first);
         }
@@ -2499,13 +2543,31 @@ impl<'src> Parser<'src> {
             if self.at_keyword(Keyword::In) {
                 break;
             }
-            items.push(self.parse_unary()?);
+            items.push(self.parse_target_or_star()?);
         }
         let span = items[0].span.merge(items.last().unwrap().span);
         Ok(Expr {
             kind: ExprKind::Tuple(items),
             span,
         })
+    }
+
+    /// One element of an assignment target list. Accepts both plain
+    /// targets (`name`, `name.attr`, `name[i]`) and PEP 3132 starred
+    /// targets (`*name`). The compiler enforces "at most one star
+    /// per list" later.
+    fn parse_target_or_star(&mut self) -> Result<Expr, ParseError> {
+        if let TokenKind::Star = self.peek() {
+            let star_tok = self.peek_token().clone();
+            self.bump();
+            let inner = self.parse_unary()?;
+            let span = star_tok.span.merge(inner.span);
+            return Ok(Expr {
+                kind: ExprKind::Starred(Box::new(inner)),
+                span,
+            });
+        }
+        self.parse_unary()
     }
 
     /// Handle adjacent-string concatenation, mixing plain strings,

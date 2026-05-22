@@ -165,21 +165,32 @@ fn diff_tokens(python: &str, path: &Path, source: &str) -> PhaseOutcome {
             };
         }
     };
-    let oracle_norm: Vec<_> = oracle_toks.iter().map(normalize::from_oracle).collect();
-    let weavepy_norm: Vec<_> = weavepy_toks
-        .iter()
-        .map(|t| normalize::from_weavepy(source, t))
-        .collect();
+    let oracle_norm = normalize::normalize_oracle_tokens(&oracle_toks);
+    let weavepy_norm = normalize::normalize_weavepy_tokens(source, &weavepy_toks);
     if oracle_norm == weavepy_norm {
         PhaseOutcome::Match
     } else {
-        PhaseOutcome::Mismatch {
-            detail: format!(
+        // Find the first diverging index for a more useful detail message.
+        let first_diff = oracle_norm
+            .iter()
+            .zip(weavepy_norm.iter())
+            .position(|(a, b)| a != b);
+        let detail = match first_diff {
+            Some(idx) => format!(
+                "first diff at token {}: oracle {:?} vs weavepy {:?} (len {} vs {})",
+                idx,
+                oracle_norm.get(idx),
+                weavepy_norm.get(idx),
+                oracle_norm.len(),
+                weavepy_norm.len(),
+            ),
+            None => format!(
                 "{} oracle tokens vs {} weavepy tokens",
                 oracle_norm.len(),
                 weavepy_norm.len()
             ),
-        }
+        };
+        PhaseOutcome::Mismatch { detail }
     }
 }
 
