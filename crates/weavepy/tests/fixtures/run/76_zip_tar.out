@@ -1,0 +1,7 @@
+zip names: ['hello.txt', 'nested/data.txt']
+hello: b'Hello, ZIP!'
+nested len: 100
+is_zipfile: True
+tar names: ['hello.txt']
+hello: b'Hello, TAR!'
+is_tarfile: True

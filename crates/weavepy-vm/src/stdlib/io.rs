@@ -64,11 +64,13 @@ fn io_stringio(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::None) | None => String::new(),
         _ => return Err(type_error("StringIO() argument must be str")),
     };
-    let pos = initial.len();
     Ok(Object::File(Rc::new(PyFile::new(
         "<string>",
         "r+",
-        FileBackend::MemText { data: initial, pos },
+        FileBackend::MemText {
+            data: initial,
+            pos: 0,
+        },
     ))))
 }
 
@@ -79,10 +81,14 @@ fn io_bytesio(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::None) | None => Vec::new(),
         _ => return Err(value_error("BytesIO() argument must be bytes")),
     };
-    let pos = initial.len();
+    // CPython positions the read cursor at 0 even when an initial
+    // buffer is supplied, so the caller can `read()` it back.
     Ok(Object::File(Rc::new(PyFile::new(
         "<bytes>",
         "r+b",
-        FileBackend::MemBytes { data: initial, pos },
+        FileBackend::MemBytes {
+            data: initial,
+            pos: 0,
+        },
     ))))
 }

@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::io::Write;
 use std::rc::Rc;
 
-use flate2::write::{ZlibDecoder, ZlibEncoder};
+use flate2::write::{DeflateDecoder, GzDecoder, ZlibDecoder, ZlibEncoder};
 use flate2::Compression;
 
 use crate::error::{type_error, value_error, RuntimeError};
@@ -124,6 +124,8 @@ fn zlib_compress(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(n)) => *n,
         _ => -1,
     };
+    // CPython accepts an optional wbits argument too, but only via
+    // `compressobj`; the top-level `compress` always emits zlib.
     let mut encoder = ZlibEncoder::new(Vec::new(), level_for(level));
     encoder
         .write_all(&data)
@@ -132,13 +134,35 @@ fn zlib_compress(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_bytes(compressed))
 }
 
+/// Decompress with optional `wbits`:
+/// * `+9..+15` — zlib format (default 15).
+/// * `-9..-15` — raw deflate (used by ZIP files).
+/// * `+25..+31` — gzip format.
 fn zlib_decompress(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_of(args.first())?;
-    let mut decoder = ZlibDecoder::new(Vec::new());
-    decoder
-        .write_all(&data)
-        .map_err(|e| value_error(e.to_string()))?;
-    let plain = decoder.finish().map_err(|e| value_error(e.to_string()))?;
+    let wbits = match args.get(1) {
+        Some(Object::Int(n)) => *n,
+        _ => 15,
+    };
+    let plain = if (-15..=-8).contains(&wbits) {
+        let mut decoder = DeflateDecoder::new(Vec::new());
+        decoder
+            .write_all(&data)
+            .map_err(|e| value_error(e.to_string()))?;
+        decoder.finish().map_err(|e| value_error(e.to_string()))?
+    } else if (24..=31).contains(&wbits) {
+        let mut decoder = GzDecoder::new(Vec::new());
+        decoder
+            .write_all(&data)
+            .map_err(|e| value_error(e.to_string()))?;
+        decoder.finish().map_err(|e| value_error(e.to_string()))?
+    } else {
+        let mut decoder = ZlibDecoder::new(Vec::new());
+        decoder
+            .write_all(&data)
+            .map_err(|e| value_error(e.to_string()))?;
+        decoder.finish().map_err(|e| value_error(e.to_string()))?
+    };
     Ok(Object::new_bytes(plain))
 }
 

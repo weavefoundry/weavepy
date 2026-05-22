@@ -206,11 +206,20 @@ fn format_constant(c: &Constant) -> String {
         Constant::None => "None".to_owned(),
         Constant::Bool(b) => if *b { "True" } else { "False" }.to_owned(),
         Constant::Int(i) => i.to_string(),
+        Constant::BigInt(b) => b.to_string(),
         Constant::Float(f) => {
             if f.fract() == 0.0 && f.is_finite() {
                 format!("{f:.1}")
             } else {
                 f.to_string()
+            }
+        }
+        Constant::Complex(real, imag) => {
+            if *real == 0.0 {
+                format!("{imag}j")
+            } else {
+                let sep = if imag.is_sign_positive() { "+" } else { "" };
+                format!("({real}{sep}{imag}j)")
             }
         }
         Constant::Str(s) => format!("'{s}'"),
@@ -229,17 +238,48 @@ fn format_constant(c: &Constant) -> String {
 /// Includes nested [`CodeObject`]s so function definitions can carry
 /// their compiled body as a constant (matching CPython's `co_consts`
 /// containing nested code objects).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Constant {
     None,
     Bool(bool),
     Int(i64),
+    /// Arbitrary-precision integer (RFC 0019). Stored as a
+    /// `num_bigint::BigInt` so the compiler can hand it to the VM
+    /// directly without re-parsing.
+    BigInt(num_bigint::BigInt),
     Float(f64),
+    /// Complex literal `(real, imag)` (RFC 0019).
+    Complex(f64, f64),
     Str(String),
     Bytes(Vec<u8>),
     Tuple(Vec<Constant>),
     Code(Box<CodeObject>),
     Ellipsis,
+}
+
+impl PartialEq for Constant {
+    fn eq(&self, other: &Self) -> bool {
+        use Constant as C;
+        match (self, other) {
+            (C::None, C::None) => true,
+            (C::Bool(a), C::Bool(b)) => a == b,
+            (C::Int(a), C::Int(b)) => a == b,
+            (C::BigInt(a), C::BigInt(b)) => a == b,
+            (C::Float(a), C::Float(b)) => a.to_bits() == b.to_bits(),
+            (C::Complex(ar, ai), C::Complex(br, bi)) => {
+                ar.to_bits() == br.to_bits() && ai.to_bits() == bi.to_bits()
+            }
+            (C::Str(a), C::Str(b)) => a == b,
+            (C::Bytes(a), C::Bytes(b)) => a == b,
+            (C::Tuple(a), C::Tuple(b)) => a == b,
+            (C::Code(_), C::Code(_)) => false,
+            (C::Ellipsis, C::Ellipsis) => true,
+            // Cross-type equality is intentionally rejected so that
+            // the const-pool deduplication preserves CPython's
+            // `1 != 1.0` semantics for interned constants.
+            _ => false,
+        }
+    }
 }
 
 impl From<AstConstant> for Constant {
@@ -248,6 +288,14 @@ impl From<AstConstant> for Constant {
             AstConstant::None => Self::None,
             AstConstant::Bool(b) => Self::Bool(b),
             AstConstant::Int(i) => Self::Int(i),
+            AstConstant::BigInt(s) => match s.parse::<num_bigint::BigInt>() {
+                Ok(b) => Self::BigInt(b),
+                // The AST parser only produces a `BigInt` variant when
+                // the string is well-formed; round-tripping should be
+                // total. Defensive fallback to zero.
+                Err(_) => Self::Int(0),
+            },
+            AstConstant::Complex(real, imag) => Self::Complex(real, imag),
             AstConstant::Float(f) => Self::Float(f),
             AstConstant::Str(s) => Self::Str(s),
             AstConstant::Bytes(b) => Self::Bytes(b),

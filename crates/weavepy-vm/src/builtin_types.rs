@@ -351,6 +351,8 @@ impl BuiltinTypes {
                 }
             }
         }
+        // RFC 0019 — install numeric/bytes class methods.
+        install_numeric_class_methods(&bt);
         bt
     }
 
@@ -1163,4 +1165,42 @@ pub fn instance_is_subclass(obj: &Object, cls: &TypeObject) -> bool {
         Object::Instance(inst) => inst.class.is_subclass_of(cls),
         _ => false,
     }
+}
+
+/// RFC 0019 — install class methods on the numeric / bytes types.
+/// Adds `int.from_bytes`, `bytes.fromhex`, `bytearray.fromhex`,
+/// and `float.fromhex` as classmethod-shaped builtins so that
+/// `int.from_bytes(b'\\x00\\xff', 'big')` resolves through the
+/// type's MRO rather than the instance method dispatch.
+fn install_numeric_class_methods(bt: &BuiltinTypes) {
+    use crate::object::BuiltinFn;
+    fn install(
+        ty: &Rc<TypeObject>,
+        name: &'static str,
+        f: fn(&[Object]) -> Result<Object, RuntimeError>,
+    ) {
+        let builtin = Object::Builtin(Rc::new(BuiltinFn {
+            name,
+            call: Box::new(f),
+        }));
+        // Wrap as `classmethod` so descriptor binding skips the
+        // instance and routes through the class.
+        let cm = Object::ClassMethod(Rc::new(builtin));
+        ty.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static(name)), cm);
+    }
+
+    install(
+        &bt.int_,
+        "from_bytes",
+        crate::builtins::b_int_from_bytes_cls,
+    );
+    install(&bt.bytes_, "fromhex", crate::builtins::b_bytes_fromhex_cls);
+    install(
+        &bt.bytearray_,
+        "fromhex",
+        crate::builtins::b_bytearray_fromhex_cls,
+    );
+    install(&bt.float_, "fromhex", crate::builtins::b_float_fromhex_cls);
 }

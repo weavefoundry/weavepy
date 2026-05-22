@@ -393,7 +393,17 @@ pub enum Constant {
     None,
     Bool(bool),
     Int(i64),
+    /// Arbitrary-precision integer literal (RFC 0019).
+    ///
+    /// The compiler emits `Object::Long` for these. Represented as a
+    /// decimal-string + sign so the AST stays cheap to clone and
+    /// `PartialEq`-able without reaching for `num_bigint::BigInt` here.
+    BigInt(String),
     Float(f64),
+    /// `(real, imag)` for complex literals (RFC 0019). The lexer
+    /// already accepts the trailing `j`/`J`; the parser routes the
+    /// numeric body here.
+    Complex(f64, f64),
     Str(String),
     Bytes(Vec<u8>),
     Tuple(Vec<Constant>),
@@ -1420,6 +1430,19 @@ fn dump_constant(out: &mut String, c: &Constant) {
         Constant::None => out.push_str("None"),
         Constant::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
         Constant::Int(i) => out.push_str(&i.to_string()),
+        Constant::BigInt(repr) => out.push_str(repr),
+        Constant::Complex(real, imag) => {
+            if *real == 0.0 {
+                out.push_str(&format!("{imag}j"));
+            } else {
+                out.push('(');
+                out.push_str(&format!("{real}"));
+                if imag.is_sign_positive() {
+                    out.push('+');
+                }
+                out.push_str(&format!("{imag}j)"));
+            }
+        }
         Constant::Float(f) => {
             // Match CPython repr style for common floats; full
             // parity is out of scope for the slice.
