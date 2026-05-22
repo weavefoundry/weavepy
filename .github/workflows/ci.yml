@@ -96,7 +96,7 @@ jobs:
             echo
             cat target/conformance/report.md || echo "(no report produced)"
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: conformance-report
