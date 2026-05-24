@@ -28,6 +28,7 @@ use weavepy_compiler::{
 pub mod builtin_types;
 pub mod builtins;
 pub mod error;
+pub mod ext_loader;
 pub mod frozen_code_cache;
 pub mod import;
 pub mod object;
@@ -399,6 +400,36 @@ impl Interpreter {
     /// it into a synthetic `__main__` module's globals.
     pub fn builtins_dict(&self) -> Rc<RefCell<DictData>> {
         self.builtins.clone()
+    }
+
+    /// Public dispatch entry point used by the C-API
+    /// (RFC 0022). Equivalent to invoking `callable(*args, **kwargs)`
+    /// in source, but reachable from outside the VM dispatch loop.
+    /// Mostly used by `PyObject_Call` / `PyObject_CallObject` /
+    /// `PyObject_CallMethod` in the C-API bridge.
+    pub fn call_object(
+        &mut self,
+        callable: Object,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+    ) -> Result<Object, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.call(&callable, args, kwargs, &globals)
+    }
+
+    /// Public iterator-construction entry point. Mirrors `iter(o)`.
+    /// Used by `PyObject_GetIter` in the C-API.
+    pub fn iter_object(&mut self, value: Object) -> Result<Object, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.make_iter(&value, &globals)
+    }
+
+    /// Pull the next value out of an iterator (`next(it)`), returning
+    /// `Ok(None)` for `StopIteration`. Used by `PyIter_Next` in the
+    /// C-API.
+    pub fn iter_next_object(&mut self, iter: Object) -> Result<Option<Object>, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.iter_next(&iter, &globals)
     }
 
     /// `True` when `__pycache__` writes are forbidden — either by
@@ -6470,6 +6501,17 @@ impl Interpreter {
                 return self.run_frozen_compiled(full, code, frozen.is_package, "<frozen>");
             }
             return self.load_from_source(full, frozen.source, frozen.is_package, "<frozen>");
+        }
+        // RFC 0022 — try the C-extension loader before the source
+        // loader. We invoke it through a hook to keep the
+        // dependency one-way (`weavepy-capi` depends on `weavepy-vm`,
+        // not the reverse): the binary registers a callback before
+        // any user code runs.
+        if let Some(loader) = ext_loader::current_extension_loader() {
+            if let Some(loaded) = loader(self, full)? {
+                self.cache.insert(full, loaded.clone());
+                return Ok(loaded);
+            }
         }
         let (path, is_package) = self
             .cache

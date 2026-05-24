@@ -13,6 +13,7 @@ keywords.workspace     = true
 categories.workspace   = true
 
 [dependencies]
+weavepy-capi     = { workspace = true }
 weavepy-compiler = { workspace = true }
 weavepy-lexer    = { workspace = true }
 weavepy-parser   = { workspace = true }

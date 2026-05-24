@@ -15,13 +15,46 @@
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use thiserror::Error;
 
+pub use weavepy_capi as capi;
 pub use weavepy_compiler as compiler;
 pub use weavepy_lexer as lexer;
 pub use weavepy_parser as parser;
 pub use weavepy_vm as vm;
+
+/// Wire the C-extension loader (RFC 0022) into the VM. Called once
+/// at process startup before any user code runs. Idempotent — safe
+/// to call multiple times.
+pub fn install_capi_loader() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        capi::force_link();
+        vm::ext_loader::install_extension_loader(load_extension);
+    });
+}
+
+fn load_extension(
+    interp: &mut vm::Interpreter,
+    full_name: &str,
+) -> Result<Option<vm::object::Object>, vm::RuntimeError> {
+    let path = match capi::loader::find_extension_on_path(interp, full_name) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let interp_ptr: *mut vm::Interpreter = interp;
+    match capi::load_extension_module(interp_ptr, &path, full_name) {
+        Ok(module) => Ok(Some(module)),
+        Err(err) => Err(vm::RuntimeError::PyException(
+            vm::PyException::from_builtin(
+                "ImportError",
+                format!("could not load extension '{full_name}': {err}"),
+            ),
+        )),
+    }
+}
 
 /// Errors that can surface from the high-level [`run_source`] entry point.
 #[derive(Debug, Error)]
@@ -188,6 +221,7 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
     } else {
         source
     };
+    install_capi_loader();
     let module = parser::parse_module(source_ref)?;
     let code = compiler::compile_module_with_source(&module, source_ref, &opts.filename)?;
     let mut interpreter = vm::Interpreter::default();
