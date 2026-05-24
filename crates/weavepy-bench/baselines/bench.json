@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "host": "unknown",
+  "created_at": "ts=1779652079",
+  "rows": [
+    {
+      "name": "fannkuch",
+      "work": 7,
+      "weavepy": {
+        "samples": [
+          51417.0,
+          44583.0,
+          42208.0
+        ],
+        "mean_ns": 46069.333333333336,
+        "median_ns": 44583.0,
+        "p95_ns": 51417.0,
+        "stddev_ns": 4781.03653336108
+      },
+      "cpython": null
+    },
+    {
+      "name": "nbody",
+      "work": 200,
+      "weavepy": {
+        "samples": [
+          105667.0,
+          109167.0,
+          104584.0
+        ],
+        "mean_ns": 106472.66666666667,
+        "median_ns": 105667.0,
+        "p95_ns": 109167.0,
+        "stddev_ns": 2395.3697696458753
+      },
+      "cpython": null
+    },
+    {
+      "name": "fib",
+      "work": 28,
+      "weavepy": {
+        "samples": [
+          10405334.0,
+          10576333.0,
+          11119250.0
+        ],
+        "mean_ns": 10700305.666666666,
+        "median_ns": 10576333.0,
+        "p95_ns": 11119250.0,
+        "stddev_ns": 372754.5175102957
+      },
+      "cpython": null
+    },
+    {
+      "name": "pidigits",
+      "work": 100,
+      "weavepy": {
+        "samples": [
+          83292.0,
+          77042.0,
+          72584.0
+        ],
+        "mean_ns": 77639.33333333333,
+        "median_ns": 77042.0,
+        "p95_ns": 83292.0,
+        "stddev_ns": 5378.93310363062
+      },
+      "cpython": null
+    },
+    {
+      "name": "pyaes",
+      "work": 50,
+      "weavepy": {
+        "samples": [
+          9593791.0,
+          8878333.0,
+          8792875.0
+        ],
+        "mean_ns": 9088333.0,
+        "median_ns": 8878333.0,
+        "p95_ns": 9593791.0,
+        "stddev_ns": 439819.97426674474
+      },
+      "cpython": null
+    },
+    {
+      "name": "richards",
+      "work": 1,
+      "weavepy": {
+        "samples": [
+          88166.0,
+          82959.0,
+          82750.0
+        ],
+        "mean_ns": 84625.0,
+        "median_ns": 82959.0,
+        "p95_ns": 88166.0,
+        "stddev_ns": 3068.3759548008456
+      },
+      "cpython": null
+    },
+    {
+      "name": "sumvm",
+      "work": 50000,
+      "weavepy": {
+        "samples": [
+          1243792.0,
+          1147167.0,
+          1162917.0
+        ],
+        "mean_ns": 1184625.3333333333,
+        "median_ns": 1162917.0,
+        "p95_ns": 1243792.0,
+        "stddev_ns": 51841.45501751792
+      },
+      "cpython": null
+    },
+    {
+      "name": "nested_loops",
+      "work": 30,
+      "weavepy": {
+        "samples": [
+          2163000.0,
+          2122750.0,
+          2242167.0
+        ],
+        "mean_ns": 2175972.3333333335,
+        "median_ns": 2163000.0,
+        "p95_ns": 2242167.0,
+        "stddev_ns": 60756.20171088161
+      },
+      "cpython": null
+    }
+  ]
+}

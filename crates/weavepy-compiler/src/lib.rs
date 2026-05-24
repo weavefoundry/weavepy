@@ -33,7 +33,9 @@ use weavepy_parser::ast::{
 
 pub mod bytecode;
 
-pub use bytecode::{BinOpKind, CompareKind, Instruction, OpCode, UnaryKind};
+pub use bytecode::{
+    BinOpKind, CacheTable, CompareKind, InlineCache, Instruction, OpCode, UnaryKind, COOLDOWN,
+};
 
 // ---------- error type ----------
 
@@ -63,6 +65,11 @@ pub struct CodeObject {
     /// Source filename or `<string>`. Used for diagnostics only.
     pub filename: String,
     pub instructions: Vec<Instruction>,
+    /// Per-instruction inline cache slots (RFC 0021 — adaptive
+    /// specialization). Same length as [`Self::instructions`]; not
+    /// serialised by marshal (caches are re-warmed on the next run
+    /// because the type pointers they capture wouldn't be valid).
+    pub caches: CacheTable,
     pub constants: Vec<Constant>,
     /// Names referenced by `LOAD_NAME` / `LOAD_GLOBAL` / `STORE_NAME` etc.
     pub names: Vec<String>,
@@ -505,6 +512,10 @@ impl Compiler {
         // Place freevars (in declaration order) at the end of the
         // cells/freevars combined index space.
         self.co.freevars = self.free_order.clone();
+        // RFC 0021: size the inline-cache side-table to match the
+        // emitted instruction stream so the VM can index into it
+        // without bounds checks on the hot path.
+        self.co.caches.resize(self.co.instructions.len());
         self.co
     }
 

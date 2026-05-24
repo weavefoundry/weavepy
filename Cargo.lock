@@ -1520,6 +1520,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "weavepy-bench"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "weavepy",
+ "weavepy-compiler",
+ "weavepy-parser",
+ "weavepy-vm",
+]
+
+[[package]]
 name = "weavepy-cli"
 version = "0.0.0"
 dependencies = [

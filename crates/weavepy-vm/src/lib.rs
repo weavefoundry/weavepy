@@ -22,15 +22,17 @@ use std::rc::Rc;
 
 use num_traits::{Signed, ToPrimitive, Zero};
 use weavepy_compiler::{
-    BinOpKind, CodeObject, CompareKind, Constant, ExcHandler, OpCode, UnaryKind,
+    BinOpKind, CodeObject, CompareKind, Constant, ExcHandler, OpCode, UnaryKind, COOLDOWN,
 };
 
 pub mod builtin_types;
 pub mod builtins;
 pub mod error;
+pub mod frozen_code_cache;
 pub mod import;
 pub mod object;
 pub mod pycache;
+pub mod specialize;
 pub mod stdlib;
 pub mod types;
 pub mod vm_singletons;
@@ -88,6 +90,18 @@ impl Frame {
         self.stack
             .last()
             .ok_or_else(|| RuntimeError::Internal("stack empty".to_owned()))
+    }
+
+    /// Peek `n` elements down from the top (`n == 0` is TOS,
+    /// `n == 1` is TOS-1, etc.). Used by RFC 0021's specialized
+    /// fast paths to inspect operands without popping them.
+    #[inline]
+    fn peek_back(&self, n: usize) -> Option<&Object> {
+        let len = self.stack.len();
+        if n >= len {
+            return None;
+        }
+        self.stack.get(len - 1 - n)
     }
 }
 
@@ -697,7 +711,12 @@ impl Interpreter {
                     frame.pc, frame.code.name
                 ))
             })?;
-        let _ = raised_at;
+        // RFC 0021 — adaptive specialization. Each hot-opcode arm
+        // consults `frame.code.caches.get(cache_pc)` and either
+        // takes a fast path or runs the generic handler and
+        // installs a specialization on the way out.
+        let cache_pc = raised_at;
+        specialize::record_dispatch();
         frame.pc += 1;
         match ins.op {
             OpCode::Nop | OpCode::Resume => {}
@@ -723,8 +742,7 @@ impl Interpreter {
                 frame.push(v);
             }
             OpCode::LoadGlobal => {
-                let name = self.name_at(&frame.code, ins.arg)?;
-                let v = self.lookup_global_or_builtin(&frame.globals, &name)?;
+                let v = self.specialized_load_global(frame, cache_pc, ins.arg)?;
                 frame.push(v);
             }
             OpCode::LoadFast => {
@@ -837,16 +855,11 @@ impl Interpreter {
                 frame.push(Object::Cell(cell));
             }
             OpCode::LoadAttr => {
-                let obj = frame.pop()?;
-                let name = self.name_at(&frame.code, ins.arg)?;
-                let v = self.load_attr(&obj, &name)?;
+                let v = self.specialized_load_attr(frame, cache_pc, ins.arg)?;
                 frame.push(v);
             }
             OpCode::StoreAttr => {
-                let obj = frame.pop()?;
-                let val = frame.pop()?;
-                let name = self.name_at(&frame.code, ins.arg)?;
-                self.store_attr(&obj, &name, val)?;
+                self.specialized_store_attr(frame, cache_pc, ins.arg)?;
             }
             OpCode::DeleteAttr => {
                 let obj = frame.pop()?;
@@ -944,11 +957,13 @@ impl Interpreter {
                 }
             }
             OpCode::BinaryOp => {
-                let b = frame.pop()?;
-                let a = frame.pop()?;
                 let kind: BinOpKind = unsafe { std::mem::transmute(ins.arg as u8) };
-                let r = self.dispatch_binary_op(&a, &b, kind, &frame.globals)?;
-                frame.push(r);
+                if !self.specialized_binary_op(frame, cache_pc, kind)? {
+                    let b = frame.pop()?;
+                    let a = frame.pop()?;
+                    let r = self.dispatch_binary_op(&a, &b, kind, &frame.globals)?;
+                    frame.push(r);
+                }
             }
             OpCode::UnaryOp => {
                 let v = frame.pop()?;
@@ -957,11 +972,13 @@ impl Interpreter {
                 frame.push(r);
             }
             OpCode::CompareOp => {
-                let b = frame.pop()?;
-                let a = frame.pop()?;
                 let kind: CompareKind = unsafe { std::mem::transmute(ins.arg as u8) };
-                let r = self.dispatch_compare_op(&a, &b, kind, &frame.globals)?;
-                frame.push(Object::Bool(r));
+                if !self.specialized_compare_op(frame, cache_pc, kind)? {
+                    let b = frame.pop()?;
+                    let a = frame.pop()?;
+                    let r = self.dispatch_compare_op(&a, &b, kind, &frame.globals)?;
+                    frame.push(Object::Bool(r));
+                }
             }
             OpCode::IsOp => {
                 let b = frame.pop()?;
@@ -1105,6 +1122,11 @@ impl Interpreter {
                 frame.push(it);
             }
             OpCode::ForIter => {
+                if self.specialized_for_iter(frame, cache_pc, ins.arg)? {
+                    // Fast path consumed (or didn't); pc is already
+                    // adjusted for exhaustion. Continue dispatch.
+                    return Ok(StepOutcome::Continue);
+                }
                 let it_obj = frame
                     .stack
                     .last()
@@ -1252,6 +1274,9 @@ impl Interpreter {
             }
             OpCode::UnpackSequence => {
                 let n = ins.arg as usize;
+                if self.specialized_unpack_sequence(frame, cache_pc, n)? {
+                    return Ok(StepOutcome::Continue);
+                }
                 let v = frame.pop()?;
                 let items: Vec<Object> = match v {
                     Object::Tuple(items) => items.iter().cloned().collect(),
@@ -3867,6 +3892,790 @@ impl Interpreter {
         compare_op(a, b, op)
     }
 
+    // ---------- RFC 0021 specialized fast paths ----------
+
+    /// Run the `BINARY_OP` cache machinery. Returns `Ok(true)` if a
+    /// fast path consumed both operands and pushed the result,
+    /// `Ok(false)` if the caller should run the generic handler
+    /// (the operands are still on the stack), or an error from
+    /// inside a fast path.
+    ///
+    /// On `Empty` cache state, this peeks the operands and either
+    /// installs a specialization + runs the fast path or installs
+    /// `Cooldown` and yields to the generic path. On `Cooldown(n)`
+    /// it decrements and yields. Specialization installation
+    /// happens here (not after the generic path) because we have
+    /// the operands at hand; reusing them avoids a second pop +
+    /// type-inspect later.
+    fn specialized_binary_op(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        kind: BinOpKind,
+    ) -> Result<bool, RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let cache = frame.code.caches.get(cache_pc);
+        let op_idx = OpCode::BinaryOp as u8;
+        match cache {
+            IC::Empty => {
+                // Peek operands; decide specialization.
+                let (a_peek, b_peek) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(a), Some(b)) => (a.clone(), b.clone()),
+                    _ => return Ok(false),
+                };
+                specialize::record_specialize_attempt(op_idx);
+                let decision = specialize::attempt_specialize_binary_op(&a_peek, &b_peek, kind);
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                    return Ok(false);
+                }
+                specialize::record_specialize_success(op_idx);
+                // Fall through to the specialized arm below by
+                // re-reading the cache.
+                self.specialized_binary_op(frame, cache_pc, kind)
+            }
+            IC::BinOpAddInt | IC::BinOpSubInt | IC::BinOpMulInt => {
+                let (a, b) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Int(x)), Some(Object::Int(y))) => (*x, *y),
+                    _ => return self.deopt_binary_op(frame, cache_pc),
+                };
+                let (r, overflowed) = match (cache, kind) {
+                    (IC::BinOpAddInt, BinOpKind::Add) => {
+                        (a.wrapping_add(b), a.checked_add(b).is_none())
+                    }
+                    (IC::BinOpSubInt, BinOpKind::Sub) => {
+                        (a.wrapping_sub(b), a.checked_sub(b).is_none())
+                    }
+                    (IC::BinOpMulInt, BinOpKind::Mult) => {
+                        (a.wrapping_mul(b), a.checked_mul(b).is_none())
+                    }
+                    _ => return self.deopt_binary_op(frame, cache_pc),
+                };
+                if overflowed {
+                    return self.deopt_binary_op(frame, cache_pc);
+                }
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                frame.push(Object::Int(r));
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::BinOpAddFloat | IC::BinOpSubFloat | IC::BinOpMulFloat => {
+                let (a, b) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Float(x)), Some(Object::Float(y))) => (*x, *y),
+                    _ => return self.deopt_binary_op(frame, cache_pc),
+                };
+                let r = match (cache, kind) {
+                    (IC::BinOpAddFloat, BinOpKind::Add) => a + b,
+                    (IC::BinOpSubFloat, BinOpKind::Sub) => a - b,
+                    (IC::BinOpMulFloat, BinOpKind::Mult) => a * b,
+                    _ => return self.deopt_binary_op(frame, cache_pc),
+                };
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                frame.push(Object::Float(r));
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::BinOpAddStr if matches!(kind, BinOpKind::Add) => {
+                let r = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Str(x)), Some(Object::Str(y))) => {
+                        let mut out = String::with_capacity(x.len() + y.len());
+                        out.push_str(x);
+                        out.push_str(y);
+                        Object::from_str(out)
+                    }
+                    _ => return self.deopt_binary_op(frame, cache_pc),
+                };
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                frame.push(r);
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::Cooldown(n) => {
+                let next = if n > 0 {
+                    IC::Cooldown(n - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Deopt a `BINARY_OP` cache: install `Cooldown` and yield
+    /// control back to the generic handler. The operands are
+    /// already on the stack, so `Ok(false)` just lets the caller
+    /// pop them as usual.
+    #[inline]
+    fn deopt_binary_op(&self, frame: &Frame, cache_pc: u32) -> Result<bool, RuntimeError> {
+        specialize::record_miss(OpCode::BinaryOp as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+        Ok(false)
+    }
+
+    /// Run the `COMPARE_OP` cache machinery. Same shape as
+    /// [`Self::specialized_binary_op`].
+    fn specialized_compare_op(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        kind: CompareKind,
+    ) -> Result<bool, RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let cache = frame.code.caches.get(cache_pc);
+        let op_idx = OpCode::CompareOp as u8;
+        match cache {
+            IC::Empty => {
+                let (a_peek, b_peek) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(a), Some(b)) => (a.clone(), b.clone()),
+                    _ => return Ok(false),
+                };
+                specialize::record_specialize_attempt(op_idx);
+                let decision = specialize::attempt_specialize_compare_op(&a_peek, &b_peek, kind);
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                    return Ok(false);
+                }
+                specialize::record_specialize_success(op_idx);
+                self.specialized_compare_op(frame, cache_pc, kind)
+            }
+            IC::CompareOpInt => {
+                let (a, b) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Int(x)), Some(Object::Int(y))) => (*x, *y),
+                    _ => return self.deopt_compare_op(frame, cache_pc),
+                };
+                let r = compare_int(a, b, kind);
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                frame.push(Object::Bool(r));
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::CompareOpFloat => {
+                let (a, b) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Float(x)), Some(Object::Float(y))) => (*x, *y),
+                    _ => return self.deopt_compare_op(frame, cache_pc),
+                };
+                let r = compare_float(a, b, kind);
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                frame.push(Object::Bool(r));
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::CompareOpStr => {
+                let (a_str, b_str) = match (frame.peek_back(1), frame.peek_back(0)) {
+                    (Some(Object::Str(x)), Some(Object::Str(y))) => (x.clone(), y.clone()),
+                    _ => return self.deopt_compare_op(frame, cache_pc),
+                };
+                let r = compare_str(a_str.as_ref(), b_str.as_ref(), kind);
+                let len = frame.stack.len();
+                frame.stack.truncate(len - 2);
+                frame.push(Object::Bool(r));
+                specialize::record_hit(op_idx);
+                Ok(true)
+            }
+            IC::Cooldown(n) => {
+                let next = if n > 0 {
+                    IC::Cooldown(n - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Deopt a `COMPARE_OP` cache.
+    #[inline]
+    fn deopt_compare_op(&self, frame: &Frame, cache_pc: u32) -> Result<bool, RuntimeError> {
+        specialize::record_miss(OpCode::CompareOp as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+        Ok(false)
+    }
+
+    /// Specialized `LOAD_GLOBAL`. On a warm cache, looks up the
+    /// value by integer slot in the appropriate dict (skipping the
+    /// hash-keyed lookup). On `Empty` cache, performs the regular
+    /// lookup and installs a specialization. On `Cooldown`,
+    /// decrements and uses the slow path.
+    ///
+    /// The specialized paths still verify the dict's `Rc::as_ptr`
+    /// fingerprint against the cache so user code that swaps out
+    /// `globals` (rare but legal in `exec`) deopts cleanly.
+    fn specialized_load_global(
+        &mut self,
+        frame: &Frame,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Result<Object, RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let cache = frame.code.caches.get(cache_pc);
+        let op_idx = OpCode::LoadGlobal as u8;
+        match cache {
+            IC::LoadGlobalModule {
+                globals_id,
+                key_idx,
+            } => {
+                if specialize::rc_id(&frame.globals) != globals_id {
+                    return self.deopt_load_global_slow(frame, cache_pc, name_idx);
+                }
+                let g = frame.globals.borrow();
+                if let Some((_, v)) = g.get_index(key_idx as usize) {
+                    specialize::record_hit(op_idx);
+                    return Ok(v.clone());
+                }
+                drop(g);
+                self.deopt_load_global_slow(frame, cache_pc, name_idx)
+            }
+            IC::LoadGlobalBuiltin {
+                builtins_id,
+                key_idx,
+            } => {
+                if specialize::rc_id(&self.builtins) != builtins_id {
+                    return self.deopt_load_global_slow(frame, cache_pc, name_idx);
+                }
+                // Guard that the name *isn't* shadowed in globals
+                // since we last specialized — otherwise we'd
+                // bypass user code that subsequently bound the name
+                // at module scope.
+                let name = self.name_at(&frame.code, name_idx)?;
+                if frame
+                    .globals
+                    .borrow()
+                    .contains_key(&DictKey(Object::from_str(&name)))
+                {
+                    return self.deopt_load_global_slow(frame, cache_pc, name_idx);
+                }
+                let b = self.builtins.borrow();
+                if let Some((_, v)) = b.get_index(key_idx as usize) {
+                    specialize::record_hit(op_idx);
+                    return Ok(v.clone());
+                }
+                drop(b);
+                self.deopt_load_global_slow(frame, cache_pc, name_idx)
+            }
+            IC::Empty => {
+                let name = self.name_at(&frame.code, name_idx)?;
+                specialize::record_specialize_attempt(op_idx);
+                let decision = specialize::attempt_specialize_load_global(
+                    &frame.globals,
+                    &self.builtins,
+                    &name,
+                );
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                } else {
+                    specialize::record_specialize_success(op_idx);
+                }
+                self.lookup_global_or_builtin(&frame.globals, &name)
+            }
+            IC::Cooldown(n) => {
+                let next = if n > 0 {
+                    IC::Cooldown(n - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                let name = self.name_at(&frame.code, name_idx)?;
+                self.lookup_global_or_builtin(&frame.globals, &name)
+            }
+            _ => {
+                let name = self.name_at(&frame.code, name_idx)?;
+                self.lookup_global_or_builtin(&frame.globals, &name)
+            }
+        }
+    }
+
+    /// Deopt a `LOAD_GLOBAL` cache and run the generic lookup.
+    #[inline]
+    fn deopt_load_global_slow(
+        &self,
+        frame: &Frame,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Result<Object, RuntimeError> {
+        specialize::record_miss(OpCode::LoadGlobal as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+        let name = self.name_at(&frame.code, name_idx)?;
+        self.lookup_global_or_builtin(&frame.globals, &name)
+    }
+
+    /// Specialized `LOAD_ATTR`. The receiver lives at TOS; on a
+    /// warm cache we lookup by integer slot in the appropriate
+    /// dict (instance / module / type), guarded by the cached
+    /// type/module fingerprint. On miss we deopt and run the
+    /// generic [`Self::load_attr`].
+    fn specialized_load_attr(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Result<Object, RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let cache = frame.code.caches.get(cache_pc);
+        let op_idx = OpCode::LoadAttr as u8;
+        match cache {
+            IC::LoadAttrInstance { type_id, key_idx } => {
+                let receiver = frame.top()?.clone();
+                if let Object::Instance(inst) = &receiver {
+                    if specialize::rc_id(&inst.class) == type_id {
+                        let dict = inst.dict.borrow();
+                        if let Some((_, v)) = dict.get_index(key_idx as usize) {
+                            let v = v.clone();
+                            drop(dict);
+                            frame.pop()?;
+                            specialize::record_hit(op_idx);
+                            return Ok(v);
+                        }
+                    }
+                }
+                self.deopt_load_attr_slow(frame, cache_pc, name_idx)
+            }
+            IC::LoadAttrModule { module_id, key_idx } => {
+                let receiver = frame.top()?.clone();
+                if let Object::Module(m) = &receiver {
+                    if specialize::rc_id(&m.dict) == module_id {
+                        let dict = m.dict.borrow();
+                        if let Some((_, v)) = dict.get_index(key_idx as usize) {
+                            let v = v.clone();
+                            drop(dict);
+                            frame.pop()?;
+                            specialize::record_hit(op_idx);
+                            return Ok(v);
+                        }
+                    }
+                }
+                self.deopt_load_attr_slow(frame, cache_pc, name_idx)
+            }
+            IC::LoadAttrType { type_id, key_idx } => {
+                let receiver = frame.top()?.clone();
+                if let Object::Instance(inst) = &receiver {
+                    if specialize::rc_id(&inst.class) == type_id {
+                        let dict = inst.class.dict.borrow();
+                        if let Some((_, v)) = dict.get_index(key_idx as usize) {
+                            let v = v.clone();
+                            drop(dict);
+                            frame.pop()?;
+                            specialize::record_hit(op_idx);
+                            // For function descriptors found on the
+                            // type we'd normally bind to the
+                            // instance — bail to the slow path
+                            // when the value is callable, so the
+                            // generic descriptor protocol runs.
+                            // (Bound-method specialization is RFC
+                            // 0022 territory.)
+                            if matches!(
+                                v,
+                                Object::Function(_)
+                                    | Object::Builtin(_)
+                                    | Object::Property(_)
+                                    | Object::ClassMethod(_)
+                                    | Object::StaticMethod(_)
+                                    | Object::SlotDescriptor(_)
+                            ) {
+                                // Push receiver back and deopt.
+                                frame.push(receiver);
+                                return self.deopt_load_attr_slow(frame, cache_pc, name_idx);
+                            }
+                            return Ok(v);
+                        }
+                    }
+                }
+                self.deopt_load_attr_slow(frame, cache_pc, name_idx)
+            }
+            IC::Empty => {
+                let receiver = frame.top()?.clone();
+                let name = self.name_at(&frame.code, name_idx)?;
+                specialize::record_specialize_attempt(op_idx);
+                let decision = specialize::attempt_specialize_load_attr(&receiver, &name);
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                } else {
+                    specialize::record_specialize_success(op_idx);
+                }
+                let obj = frame.pop()?;
+                self.load_attr(&obj, &name)
+            }
+            IC::Cooldown(n) => {
+                let next = if n > 0 {
+                    IC::Cooldown(n - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                let obj = frame.pop()?;
+                let name = self.name_at(&frame.code, name_idx)?;
+                self.load_attr(&obj, &name)
+            }
+            _ => {
+                let obj = frame.pop()?;
+                let name = self.name_at(&frame.code, name_idx)?;
+                self.load_attr(&obj, &name)
+            }
+        }
+    }
+
+    /// Deopt a `LOAD_ATTR` cache and run the generic handler.
+    #[inline]
+    fn deopt_load_attr_slow(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Result<Object, RuntimeError> {
+        specialize::record_miss(OpCode::LoadAttr as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+        let obj = frame.pop()?;
+        let name = self.name_at(&frame.code, name_idx)?;
+        self.load_attr(&obj, &name)
+    }
+
+    /// Specialized `STORE_ATTR`. Stack discipline matches the
+    /// existing arm: TOS is the receiver, TOS-1 is the value.
+    /// On a warm cache, writes the value into the indexed dict
+    /// slot; on miss, deopts to the generic [`Self::store_attr`].
+    fn specialized_store_attr(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Result<(), RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let cache = frame.code.caches.get(cache_pc);
+        let op_idx = OpCode::StoreAttr as u8;
+        match cache {
+            IC::StoreAttrInstance { type_id, key_idx } => {
+                let receiver = frame.top()?.clone();
+                if let Object::Instance(inst) = &receiver {
+                    if specialize::rc_id(&inst.class) == type_id {
+                        let dict_len = inst.dict.borrow().len();
+                        if dict_len > key_idx as usize {
+                            frame.pop()?;
+                            let val = frame.pop()?;
+                            // The slot still exists; reach in by
+                            // index and overwrite. We rebuild the
+                            // mutable borrow here because the
+                            // earlier read-only check has been
+                            // dropped.
+                            if let Some((_, slot)) =
+                                inst.dict.borrow_mut().get_index_mut(key_idx as usize)
+                            {
+                                *slot = val;
+                                specialize::record_hit(op_idx);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                self.deopt_store_attr_slow(frame, cache_pc, name_idx)
+            }
+            IC::Empty => {
+                let receiver = frame.top()?.clone();
+                let name = self.name_at(&frame.code, name_idx)?;
+                specialize::record_specialize_attempt(op_idx);
+                let decision = specialize::attempt_specialize_store_attr(&receiver, &name);
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                } else {
+                    specialize::record_specialize_success(op_idx);
+                }
+                let obj = frame.pop()?;
+                let val = frame.pop()?;
+                self.store_attr(&obj, &name, val)
+            }
+            IC::Cooldown(n) => {
+                let next = if n > 0 {
+                    IC::Cooldown(n - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                let obj = frame.pop()?;
+                let val = frame.pop()?;
+                let name = self.name_at(&frame.code, name_idx)?;
+                self.store_attr(&obj, &name, val)
+            }
+            _ => {
+                let obj = frame.pop()?;
+                let val = frame.pop()?;
+                let name = self.name_at(&frame.code, name_idx)?;
+                self.store_attr(&obj, &name, val)
+            }
+        }
+    }
+
+    /// Deopt a `STORE_ATTR` cache.
+    #[inline]
+    fn deopt_store_attr_slow(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        name_idx: u32,
+    ) -> Result<(), RuntimeError> {
+        specialize::record_miss(OpCode::StoreAttr as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+        let obj = frame.pop()?;
+        let val = frame.pop()?;
+        let name = self.name_at(&frame.code, name_idx)?;
+        self.store_attr(&obj, &name, val)
+    }
+
+    /// Specialized `FOR_ITER`. Returns `Ok(true)` when the fast
+    /// path handled the dispatch (a value was pushed or the loop
+    /// exited), and `Ok(false)` when the caller should run the
+    /// generic `FOR_ITER` arm.
+    ///
+    /// The cache stores no fingerprint — the iterator's concrete
+    /// `PyIterator` variant is the fingerprint. If the variant
+    /// changes (the same `Iter` started life as a list iter and
+    /// somehow became a tuple iter), the guard bails into the
+    /// generic path.
+    fn specialized_for_iter(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        jump_arg: u32,
+    ) -> Result<bool, RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let cache = frame.code.caches.get(cache_pc);
+        let op_idx = OpCode::ForIter as u8;
+        let it_handle = match frame.stack.last() {
+            Some(Object::Iter(it)) => it.clone(),
+            _ => return Ok(false),
+        };
+        match cache {
+            IC::ForIterList => {
+                let mut it = it_handle.borrow_mut();
+                if let crate::object::PyIterator::List { items, index } = &mut *it {
+                    let next = items.borrow().get(*index).cloned();
+                    if let Some(v) = next {
+                        *index += 1;
+                        drop(it);
+                        frame.push(v);
+                    } else {
+                        drop(it);
+                        frame.pop()?;
+                        frame.pc += jump_arg;
+                    }
+                    specialize::record_hit(op_idx);
+                    return Ok(true);
+                }
+                drop(it);
+                self.deopt_for_iter(frame, cache_pc);
+                Ok(false)
+            }
+            IC::ForIterTuple => {
+                let mut it = it_handle.borrow_mut();
+                if let crate::object::PyIterator::Tuple { items, index } = &mut *it {
+                    let next = items.get(*index).cloned();
+                    if let Some(v) = next {
+                        *index += 1;
+                        drop(it);
+                        frame.push(v);
+                    } else {
+                        drop(it);
+                        frame.pop()?;
+                        frame.pc += jump_arg;
+                    }
+                    specialize::record_hit(op_idx);
+                    return Ok(true);
+                }
+                drop(it);
+                self.deopt_for_iter(frame, cache_pc);
+                Ok(false)
+            }
+            IC::ForIterRange => {
+                let mut it = it_handle.borrow_mut();
+                if let crate::object::PyIterator::Range {
+                    current,
+                    stop,
+                    step,
+                } = &mut *it
+                {
+                    let exhausted = if *step > 0 {
+                        *current >= *stop
+                    } else if *step < 0 {
+                        *current <= *stop
+                    } else {
+                        true
+                    };
+                    if exhausted {
+                        drop(it);
+                        frame.pop()?;
+                        frame.pc += jump_arg;
+                    } else {
+                        let v = *current;
+                        *current += *step;
+                        drop(it);
+                        frame.push(Object::Int(v));
+                    }
+                    specialize::record_hit(op_idx);
+                    return Ok(true);
+                }
+                drop(it);
+                self.deopt_for_iter(frame, cache_pc);
+                Ok(false)
+            }
+            IC::Empty => {
+                let receiver = frame.stack.last().cloned().unwrap_or(Object::None);
+                specialize::record_specialize_attempt(op_idx);
+                let decision = specialize::attempt_specialize_for_iter(&receiver);
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                } else {
+                    specialize::record_specialize_success(op_idx);
+                }
+                Ok(false)
+            }
+            IC::Cooldown(n) => {
+                let next = if n > 0 {
+                    IC::Cooldown(n - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Deopt a `FOR_ITER` cache.
+    #[inline]
+    fn deopt_for_iter(&self, frame: &Frame, cache_pc: u32) {
+        specialize::record_miss(OpCode::ForIter as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+    }
+
+    /// Specialized `UNPACK_SEQUENCE`. Tuple / list / two-tuple
+    /// fast paths skip the iterator construction the generic arm
+    /// runs for arbitrary iterables. Returns `Ok(true)` when the
+    /// fast path consumed the sequence and pushed N elements;
+    /// `Ok(false)` lets the caller run the generic arm.
+    fn specialized_unpack_sequence(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        n: usize,
+    ) -> Result<bool, RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let cache = frame.code.caches.get(cache_pc);
+        let op_idx = OpCode::UnpackSequence as u8;
+        match cache {
+            IC::UnpackSequenceTwoTuple if n == 2 => {
+                let v = frame.top()?.clone();
+                if let Object::Tuple(items) = &v {
+                    if items.len() == 2 {
+                        frame.pop()?;
+                        // Push reversed so a, b = (1, 2) -> a==1, b==2.
+                        frame.push(items[1].clone());
+                        frame.push(items[0].clone());
+                        specialize::record_hit(op_idx);
+                        return Ok(true);
+                    }
+                }
+                self.deopt_unpack_sequence(frame, cache_pc);
+                Ok(false)
+            }
+            IC::UnpackSequenceTuple => {
+                let v = frame.top()?.clone();
+                if let Object::Tuple(items) = &v {
+                    if items.len() == n {
+                        frame.pop()?;
+                        for x in items.iter().rev() {
+                            frame.push(x.clone());
+                        }
+                        specialize::record_hit(op_idx);
+                        return Ok(true);
+                    }
+                }
+                self.deopt_unpack_sequence(frame, cache_pc);
+                Ok(false)
+            }
+            IC::UnpackSequenceList => {
+                let v = frame.top()?.clone();
+                if let Object::List(items) = &v {
+                    let items_borrow = items.borrow();
+                    if items_borrow.len() == n {
+                        let snapshot: Vec<Object> = items_borrow.iter().cloned().collect();
+                        drop(items_borrow);
+                        frame.pop()?;
+                        for x in snapshot.into_iter().rev() {
+                            frame.push(x);
+                        }
+                        specialize::record_hit(op_idx);
+                        return Ok(true);
+                    }
+                }
+                self.deopt_unpack_sequence(frame, cache_pc);
+                Ok(false)
+            }
+            IC::Empty => {
+                let receiver = frame.top()?.clone();
+                specialize::record_specialize_attempt(op_idx);
+                let decision = specialize::attempt_specialize_unpack_sequence(&receiver, n);
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                } else {
+                    specialize::record_specialize_success(op_idx);
+                }
+                Ok(false)
+            }
+            IC::Cooldown(n_) => {
+                let next = if n_ > 0 {
+                    IC::Cooldown(n_ - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Deopt an `UNPACK_SEQUENCE` cache.
+    #[inline]
+    fn deopt_unpack_sequence(&self, frame: &Frame, cache_pc: u32) {
+        specialize::record_miss(OpCode::UnpackSequence as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+    }
+
     /// Try to compare two container values element-wise via the full
     /// `__eq__` protocol. Returns `None` if either argument is not a
     /// container we recognise — the caller falls back to the
@@ -5650,6 +6459,16 @@ impl Interpreter {
             return Ok(obj);
         }
         if let Some(frozen) = self.cache.frozen_source(full) {
+            // RFC 0021 — frozen modules pay a parse + compile cost
+            // on every fresh `Interpreter::new()` (tests, the REPL,
+            // and the bench harness all spin up many). A
+            // process-global cache keyed on the static name lets
+            // the *second* and subsequent interpreters skip both
+            // stages and go straight from `&'static str` source to
+            // a fully-compiled `CodeObject`.
+            if let Some(code) = frozen_code_cache::get(full) {
+                return self.run_frozen_compiled(full, code, frozen.is_package, "<frozen>");
+            }
             return self.load_from_source(full, frozen.source, frozen.is_package, "<frozen>");
         }
         let (path, is_package) = self
@@ -5673,6 +6492,27 @@ impl Interpreter {
             .map_err(|e| import_error(format!("parse error in '{full}': {e}")))?;
         let code = weavepy_compiler::compile_module_with_source(&module, source, filename)
             .map_err(|e| import_error(format!("compile error in '{full}': {e}")))?;
+        // RFC 0021 — populate the process-global frozen cache so the
+        // *next* interpreter in this process skips parse + compile.
+        // We cache only the compiled code, never the running module
+        // — module *state* is interpreter-local (different
+        // `sys.modules`, different `__name__`).
+        if filename == "<frozen>" {
+            frozen_code_cache::insert(full, &code);
+        }
+        self.run_frozen_compiled(full, code, is_package, filename)
+    }
+
+    /// Shared tail for "compile a module in this VM and run it" —
+    /// used both by the source path and by the cache-hit path that
+    /// skips the parse + compile stages.
+    fn run_frozen_compiled(
+        &mut self,
+        full: &str,
+        code: weavepy_compiler::CodeObject,
+        is_package: bool,
+        filename: &str,
+    ) -> Result<Object, RuntimeError> {
         let package = if is_package {
             full.to_owned()
         } else {
@@ -7656,6 +8496,54 @@ fn promote_bool(o: &Object) -> Object {
     match o {
         Object::Bool(b) => Object::Int(i64::from(*b)),
         other => other.clone(),
+    }
+}
+
+// ---------- RFC 0021 specialized comparison helpers ----------
+//
+// Each takes already-narrowed operands and a comparison kind and
+// returns the boolean result. The dispatcher's specialized
+// `COMPARE_OP_*` arms call these directly without paying for the
+// dunder-method search or the deep-equality walk that
+// `dispatch_compare_op` performs.
+
+#[inline]
+fn compare_int(a: i64, b: i64, op: CompareKind) -> bool {
+    match op {
+        CompareKind::Lt => a < b,
+        CompareKind::LtE => a <= b,
+        CompareKind::Eq => a == b,
+        CompareKind::NotEq => a != b,
+        CompareKind::Gt => a > b,
+        CompareKind::GtE => a >= b,
+    }
+}
+
+// Python's `==` on floats is bit-exact (and `==` ≠ `math.isclose`),
+// so the float_cmp lint here would mask correctness, not catch a
+// real bug.
+#[allow(clippy::float_cmp)]
+#[inline]
+fn compare_float(a: f64, b: f64, op: CompareKind) -> bool {
+    match op {
+        CompareKind::Lt => a < b,
+        CompareKind::LtE => a <= b,
+        CompareKind::Eq => a == b,
+        CompareKind::NotEq => a != b,
+        CompareKind::Gt => a > b,
+        CompareKind::GtE => a >= b,
+    }
+}
+
+#[inline]
+fn compare_str(a: &str, b: &str, op: CompareKind) -> bool {
+    match op {
+        CompareKind::Lt => a < b,
+        CompareKind::LtE => a <= b,
+        CompareKind::Eq => a == b,
+        CompareKind::NotEq => a != b,
+        CompareKind::Gt => a > b,
+        CompareKind::GtE => a >= b,
     }
 }
 
