@@ -1,0 +1,26 @@
+[package]
+name = "weavepy-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "RFC 0021 — pyperformance-shaped microbench harness for WeavePy."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "weavepy-bench"
+path = "src/main.rs"
+
+[dependencies]
+weavepy = { workspace = true }
+weavepy-compiler = { workspace = true }
+weavepy-parser = { workspace = true }
+weavepy-vm = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/weavepy",
+    "crates/weavepy-bench",
     "crates/weavepy-cli",
     "crates/weavepy-compiler",
     "crates/weavepy-conformance",
@@ -9,10 +10,11 @@ members = [
     "crates/weavepy-parser",
     "crates/weavepy-vm",
 ]
-# `weavepy-conformance` is a development tool that shells out to `python3`
-# and isn't useful to publish or to compile by default. Keep it out of
-# `default-members` so `cargo build/test --workspace` stays light; opt in
-# explicitly via `-p weavepy-conformance`.
+# `weavepy-conformance` and `weavepy-bench` are development tools that shell
+# out to `python3` and aren't useful to publish or to compile by default.
+# Keep them out of `default-members` so `cargo build/test --workspace`
+# stays light; opt in explicitly via `-p weavepy-conformance` /
+# `-p weavepy-bench`.
 default-members = [
     "crates/weavepy",
     "crates/weavepy-cli",

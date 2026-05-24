@@ -475,3 +475,203 @@ impl Instruction {
         Self { op, arg }
     }
 }
+
+// ---------- inline caches (RFC 0021) ----------
+
+/// Per-instruction inline cache slot. The dispatcher consults this
+/// before entering the generic handler for a hot opcode and, on
+/// recognised states, takes a type-specific fast path that skips the
+/// dunder-method search and the dict-keyed lookups.
+///
+/// The state machine is:
+///
+/// - `Empty` — the next dispatch will try to specialize.
+/// - one of the type-specific variants below — the next dispatch
+///   guards on the cached fingerprint and either fast-paths or
+///   transitions to `Cooldown`.
+/// - `Cooldown(n)` — the previous specialization attempt deopted;
+///   run the generic handler `n` more times before retrying.
+///
+/// Variants are 24 bytes or smaller; the enum is `Copy` so it fits
+/// in a `Cell<…>`.
+///
+/// `type_id` / `module_id` / `globals_id` / `builtins_id` are all
+/// `Rc::as_ptr(&value) as u64` — a cheap monotonic identity that
+/// changes when the underlying allocation does. Address reuse after
+/// drop is handled by the deopt path on the next guard miss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum InlineCache {
+    /// Initial / fully cold state. Generic handler will attempt to
+    /// install a specialized cache after running.
+    #[default]
+    Empty,
+    /// Specialization attempt declined or deopted. Skip the
+    /// fast-path machinery for `n` more dispatches.
+    Cooldown(u8),
+
+    // BINARY_OP family — both operands int / float / str.
+    BinOpAddInt,
+    BinOpSubInt,
+    BinOpMulInt,
+    BinOpAddFloat,
+    BinOpSubFloat,
+    BinOpMulFloat,
+    BinOpAddStr,
+
+    // COMPARE_OP family — both operands int / float / str.
+    CompareOpInt,
+    CompareOpFloat,
+    CompareOpStr,
+
+    // LOAD_ATTR family — fingerprint + dict slot index.
+    LoadAttrInstance { type_id: u64, key_idx: u32 },
+    LoadAttrModule { module_id: u64, key_idx: u32 },
+    LoadAttrSlot { type_id: u64, slot_idx: u32 },
+    LoadAttrType { type_id: u64, key_idx: u32 },
+
+    // LOAD_GLOBAL family — globals/builtins dict version + key idx.
+    LoadGlobalModule { globals_id: u64, key_idx: u32 },
+    LoadGlobalBuiltin { builtins_id: u64, key_idx: u32 },
+
+    // STORE_ATTR family — fingerprint + dict slot index.
+    StoreAttrInstance { type_id: u64, key_idx: u32 },
+    StoreAttrSlot { type_id: u64, slot_idx: u32 },
+
+    // FOR_ITER family.
+    ForIterList,
+    ForIterTuple,
+    ForIterRange,
+
+    // UNPACK_SEQUENCE family.
+    UnpackSequenceTuple,
+    UnpackSequenceList,
+    UnpackSequenceTwoTuple,
+}
+
+/// Number of generic dispatches a deopted cache must serve before it
+/// re-attempts specialization. Damps thrashing on polymorphic call
+/// sites.
+pub const COOLDOWN: u8 = 64;
+
+/// Parallel side-table: one [`InlineCache`] per [`Instruction`].
+///
+/// Lazily-initialised — the compiler emits an empty `CacheTable` and
+/// the VM extends it on first dispatch into a code object. Cells are
+/// interior-mutable so the dispatcher can warm them through a shared
+/// `&CodeObject`.
+#[derive(Debug, Default)]
+pub struct CacheTable {
+    pub slots: Vec<std::cell::Cell<InlineCache>>,
+}
+
+impl CacheTable {
+    /// Allocate `n` empty cache slots.
+    pub fn with_len(n: usize) -> Self {
+        Self {
+            slots: (0..n)
+                .map(|_| std::cell::Cell::new(InlineCache::Empty))
+                .collect(),
+        }
+    }
+
+    /// Read the cache for instruction `pc`. Out-of-range indices
+    /// silently return `Empty` so the dispatcher doesn't have to
+    /// branch on the table length on every step.
+    #[inline]
+    pub fn get(&self, pc: u32) -> InlineCache {
+        self.slots
+            .get(pc as usize)
+            .map(std::cell::Cell::get)
+            .unwrap_or(InlineCache::Empty)
+    }
+
+    /// Set the cache for instruction `pc`. No-op when `pc` is out of
+    /// range (matches `get`'s defensive shape).
+    #[inline]
+    pub fn set(&self, pc: u32, value: InlineCache) {
+        if let Some(slot) = self.slots.get(pc as usize) {
+            slot.set(value);
+        }
+    }
+
+    /// Clear every slot back to `Empty`. Used after an opcode
+    /// rewrite or when the user calls `gc.collect()` and we want to
+    /// discard stale type fingerprints.
+    pub fn clear(&self) {
+        for slot in &self.slots {
+            slot.set(InlineCache::Empty);
+        }
+    }
+
+    /// Resize the table to match a new instruction count. Existing
+    /// slots are preserved up to the new length; newly-added slots
+    /// start `Empty`.
+    pub fn resize(&mut self, n: usize) {
+        if self.slots.len() < n {
+            self.slots
+                .resize_with(n, || std::cell::Cell::new(InlineCache::Empty));
+        } else {
+            self.slots.truncate(n);
+        }
+    }
+}
+
+impl Clone for CacheTable {
+    fn clone(&self) -> Self {
+        Self {
+            slots: self
+                .slots
+                .iter()
+                .map(|c| std::cell::Cell::new(c.get()))
+                .collect(),
+        }
+    }
+}
+
+impl PartialEq for CacheTable {
+    /// Cache state isn't part of code-object identity. Two code
+    /// objects with the same bytecode are equal regardless of how
+    /// their caches have warmed up. This keeps `CodeObject: PartialEq`
+    /// derivable and stops `marshal` round-trips from spuriously
+    /// disagreeing on cache state that's intentionally not serialized.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_table_round_trip() {
+        let t = CacheTable::with_len(4);
+        assert_eq!(t.get(0), InlineCache::Empty);
+        t.set(2, InlineCache::BinOpAddInt);
+        assert_eq!(t.get(2), InlineCache::BinOpAddInt);
+        // Out-of-range reads are defensive.
+        assert_eq!(t.get(99), InlineCache::Empty);
+    }
+
+    #[test]
+    fn cache_table_clone_copies_state() {
+        let t = CacheTable::with_len(2);
+        t.set(0, InlineCache::CompareOpInt);
+        let u = t.clone();
+        assert_eq!(u.get(0), InlineCache::CompareOpInt);
+        // Subsequent mutations to `t` don't bleed into `u`.
+        t.set(0, InlineCache::Empty);
+        assert_eq!(u.get(0), InlineCache::CompareOpInt);
+    }
+
+    #[test]
+    fn cache_table_partial_eq_ignores_state() {
+        let a = CacheTable::with_len(3);
+        let b = CacheTable::with_len(3);
+        a.set(1, InlineCache::BinOpMulFloat);
+        // PartialEq is intentionally insensitive to specialization
+        // state.
+        assert_eq!(a, b);
+    }
+}
