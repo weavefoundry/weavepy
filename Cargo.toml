@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/weavepy",
     "crates/weavepy-bench",
+    "crates/weavepy-capi",
     "crates/weavepy-cli",
     "crates/weavepy-compiler",
     "crates/weavepy-conformance",
@@ -17,6 +18,7 @@ members = [
 # `-p weavepy-bench`.
 default-members = [
     "crates/weavepy",
+    "crates/weavepy-capi",
     "crates/weavepy-cli",
     "crates/weavepy-compiler",
     "crates/weavepy-lexer",
@@ -39,6 +41,7 @@ categories = ["compilers", "development-tools", "parser-implementations"]
 [workspace.dependencies]
 # Internal crates (path deps so the workspace builds without publishing).
 weavepy             = { path = "crates/weavepy",             version = "0.0.0" }
+weavepy-capi        = { path = "crates/weavepy-capi",        version = "0.0.0" }
 weavepy-compiler    = { path = "crates/weavepy-compiler",    version = "0.0.0" }
 weavepy-conformance = { path = "crates/weavepy-conformance", version = "0.0.0" }
 weavepy-lexer       = { path = "crates/weavepy-lexer",       version = "0.0.0" }
@@ -86,6 +89,10 @@ rust_decimal = "1.36"
 # RFC 0020 — interactive REPL + CLI surface.
 rustyline   = { version = "14.0", default-features = false, features = ["with-file-history"] }
 dirs        = "5.0"
+
+# RFC 0022 — C-API foundation (dlopen + cc-driven extension build harness).
+libloading  = "0.8"
+cc          = "1.0"
 
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }

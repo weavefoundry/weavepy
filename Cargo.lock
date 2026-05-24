@@ -635,6 +635,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,6 +1523,7 @@ name = "weavepy"
 version = "0.0.0"
 dependencies = [
  "thiserror 2.0.18",
+ "weavepy-capi",
  "weavepy-compiler",
  "weavepy-lexer",
  "weavepy-parser",
@@ -1528,6 +1539,19 @@ dependencies = [
  "weavepy",
  "weavepy-compiler",
  "weavepy-parser",
+ "weavepy-vm",
+]
+
+[[package]]
+name = "weavepy-capi"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "libloading",
+ "num-bigint",
+ "num-traits",
+ "thiserror 2.0.18",
+ "weavepy-compiler",
  "weavepy-vm",
 ]
 
