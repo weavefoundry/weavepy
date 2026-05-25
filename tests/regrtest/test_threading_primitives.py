@@ -1,11 +1,12 @@
-"""RFC 0024 — `threading` primitives backed by real OS threads + GIL.
+"""RFC 0024 + 0025 — `threading` primitives backed by real OS threads + GIL.
 
 Drives `_thread.allocate_lock` / `_thread.RLock` / `Event` /
 `Semaphore` / `Condition` / `Thread` / `Barrier` and the module-level
-helpers (`get_ident`, `active_count`, `main_thread`, `local`). The
-fixtures stay degenerate — most of them just need WeavePy to *not*
-deadlock or raise — because we don't yet have a way to assert on
-real-thread interleavings deterministically.
+helpers (`get_ident`, `active_count`, `main_thread`, `local`). Under
+RFC 0025 the workers run on real OS threads and share the heap with
+the parent, so the fixture also asserts cross-thread mutation
+visibility (`shared.append` in a worker is observable to the parent
+after `join`).
 """
 
 import threading
@@ -94,8 +95,9 @@ with cond:
 
 
 # ---------------------------------------------------------------------------
-# Thread bookkeeping. `start_new_thread` runs the target cooperatively
-# in this RFC, but the join semantics still need to flush the queue.
+# Thread bookkeeping. RFC 0025 — workers run on real OS threads and
+# share the heap with the parent; mutations to `out` from inside the
+# worker target must be observable after `join()`.
 # ---------------------------------------------------------------------------
 
 
@@ -111,6 +113,36 @@ for t in threads:
     t.join()
 
 assert sorted(out) == [0, 1, 2, 3, 4], out
+
+# Cross-thread lock contention — 4 threads × 100 increments under a
+# shared `threading.Lock` should deterministically land on 400.
+counter = [0]
+counter_lock = threading.Lock()
+
+
+def bump(n):
+    for _ in range(n):
+        with counter_lock:
+            counter[0] += 1
+
+
+workers = [threading.Thread(target=bump, args=(100,)) for _ in range(4)]
+for w in workers:
+    w.start()
+for w in workers:
+    w.join()
+assert counter[0] == 400, counter[0]
+
+# `Thread.is_alive()` must flip to False after `join()` — the worker's
+# `_tstate_lock` release is the sentinel that drives this transition.
+def short():
+    pass
+
+
+sh = threading.Thread(target=short)
+sh.start()
+sh.join()
+assert not sh.is_alive()
 
 
 # ---------------------------------------------------------------------------

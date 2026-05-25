@@ -10,9 +10,9 @@
 //! propagating to spawned processes) is intentionally absent until
 //! we have a clear story for sandboxing.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use crate::error::{os_error, type_error, RuntimeError};
 use crate::import::ModuleCache;

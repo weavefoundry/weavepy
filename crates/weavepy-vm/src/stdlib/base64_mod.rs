@@ -7,8 +7,8 @@
 //! falls back to the Python standard mapping; we ship the common
 //! 95% — Ascii85 (`a85encode`) is deferred.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;

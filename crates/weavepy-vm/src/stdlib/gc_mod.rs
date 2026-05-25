@@ -6,8 +6,8 @@
 //! tune thresholds, and disable / enable collection without raising.
 //! Real cycle collection is a follow-up to RFC 0002.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::RuntimeError;
 use crate::import::ModuleCache;

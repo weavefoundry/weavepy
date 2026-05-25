@@ -19,12 +19,12 @@
 //! - `traceback` — currently `None` (we don't synthesise tracebacks
 //!    for C-side errors yet).
 
-use std::cell::RefCell;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::rc::Rc;
 use std::sync::Mutex;
+use weavepy_vm::sync::Rc;
+use weavepy_vm::sync::RefCell;
 
 use weavepy_vm::builtin_types::{builtin_types, make_exception};
 use weavepy_vm::error::{PyException, RuntimeError};

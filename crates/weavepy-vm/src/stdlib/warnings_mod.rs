@@ -4,8 +4,8 @@
 //! `warn`/`warn_explicit` entry point. The actual rendering is done
 //! in Python; this module owns the mutable filter state.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::RuntimeError;
 use crate::import::ModuleCache;

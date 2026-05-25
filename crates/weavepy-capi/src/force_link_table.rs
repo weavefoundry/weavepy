@@ -370,10 +370,13 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(lifecycle::Py_GetCopyright),
     addr!(lifecycle::PyEval_SaveThread),
     addr!(lifecycle::PyEval_RestoreThread),
+    addr!(lifecycle::PyEval_AcquireThread),
+    addr!(lifecycle::PyEval_ReleaseThread),
     addr!(lifecycle::PyGILState_Ensure),
     addr!(lifecycle::PyGILState_Release),
     addr!(lifecycle::PyGILState_Check),
     addr!(lifecycle::PyThreadState_Get),
+    addr!(lifecycle::PyThreadState_Swap),
     // argparse.rs (the C shim calls these)
     addr!(argparse::_WeavePy_Arg_Length),
     addr!(argparse::_WeavePy_Arg_Item),

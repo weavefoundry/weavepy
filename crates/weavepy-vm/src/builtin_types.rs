@@ -10,8 +10,8 @@
 //! `BuiltinTypes::with(|bt| bt.type_error.clone())` — to construct
 //! exception instances.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::RuntimeError;
 use crate::object::{DictData, DictKey, Object};
@@ -1187,7 +1187,7 @@ fn is_subclass_by_name(class: &Rc<TypeObject>, ancestor: &str) -> bool {
 pub fn exception_message(obj: &Object) -> Option<String> {
     match obj {
         Object::Instance(inst) => {
-            let dict: std::cell::Ref<'_, DictData> = inst.dict.borrow();
+            let dict: crate::sync::Ref<'_, DictData> = inst.dict.borrow();
             if let Some(Object::Str(s)) = dict.get(&DictKey(Object::from_static("message"))) {
                 return Some(s.to_string());
             }

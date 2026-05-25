@@ -6,8 +6,8 @@
 //! ContextVar reads return the most recent binding visible through
 //! the stack.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;

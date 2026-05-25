@@ -12,8 +12,11 @@
 //! / `types.NotImplementedType`; nothing in the stdlib reaches for
 //! those directly.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
+
+use crate::sync::{Rc, RefCell};
 
 use crate::object::{DictData, Object};
 use crate::types::{PyInstance, TypeFlags, TypeObject};
@@ -109,6 +112,151 @@ pub fn interactive_printer(name: &'static str, body: &'static str) -> Object {
     // builtin's default "<built-in function ...>".
     let _ = body_for_repr;
     printer
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0025 — process-global interpreter seed.
+//
+// Each call to `Interpreter::default()` updates the seed; worker
+// threads spawned via `_thread.start_new_thread` use the seed to
+// build their own per-thread interpreter that shares the heap with
+// the parent. Without this hook, workers would have to reconstruct
+// the entire `sys.modules` table from scratch, which would break
+// `from threading import _active`-style cross-thread visibility.
+// ---------------------------------------------------------------------------
+
+static INTERPRETER_SEED: OnceLock<Mutex<Option<crate::Interpreter>>> = OnceLock::new();
+static WORKER_THREAD_ID: OnceLock<Mutex<std::collections::HashMap<u64, u64>>> = OnceLock::new();
+
+fn seed_slot() -> &'static Mutex<Option<crate::Interpreter>> {
+    INTERPRETER_SEED.get_or_init(|| Mutex::new(None))
+}
+
+fn worker_map() -> &'static Mutex<std::collections::HashMap<u64, u64>> {
+    WORKER_THREAD_ID.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Stash the parent's [`crate::Interpreter`] so future
+/// `start_new_thread` calls can fork from it. Called once by
+/// `Interpreter::default()`. Idempotent for repeat calls (the most
+/// recent interpreter wins).
+pub fn publish_interpreter_seed(interp: &crate::Interpreter) {
+    let mut slot = seed_slot().lock();
+    *slot = Some(interp.fork_for_thread());
+}
+
+/// Hand out a fresh worker [`crate::Interpreter`] cloned from the
+/// last-published seed. Returns `None` if no seed has been published
+/// yet (callers fall back to `Interpreter::new()`).
+pub fn snapshot_interpreter() -> Option<crate::Interpreter> {
+    let slot = seed_slot().lock();
+    slot.as_ref().map(|i| i.fork_for_thread())
+}
+
+/// Install the synthetic thread id (`_thread.get_ident()` value) for
+/// the currently-running OS thread. Called by `start_new_thread`'s
+/// worker body so `get_ident()` from inside the worker returns the
+/// id `threading.Thread.ident` reports, not the raw OS thread id.
+pub fn install_worker_thread_id(id: u64) {
+    let native = crate::gil::current_native_thread_id();
+    worker_map().lock().insert(native, id);
+}
+
+/// Clear the worker thread id on exit. Called by the worker body
+/// right before the OS thread terminates.
+pub fn clear_worker_thread_id() {
+    let native = crate::gil::current_native_thread_id();
+    worker_map().lock().remove(&native);
+}
+
+/// Look up the worker thread id for the currently-running OS thread,
+/// falling back to the raw OS thread id if no override is set
+/// (i.e. we're on the main thread).
+pub fn current_worker_thread_id() -> u64 {
+    let native = crate::gil::current_native_thread_id();
+    if let Some(id) = worker_map().lock().get(&native).copied() {
+        return id;
+    }
+    native
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0025 — per-thread interpreter routing.
+//
+// The frozen `sys` module captures one set of [`Rc`] handles into the
+// **main** interpreter's frame stack, exception stack, and hooks at
+// process start. Worker threads spawned via
+// `_thread.start_new_thread` get their own forked interpreter with
+// independent `frame_stack` and `exc_info_stack`. Left alone, that
+// means `sys.exc_info()` called from a worker would read the *parent*
+// thread's exception, not the worker's — observable as bogus
+// `AttributeError`s leaking into `threading.excepthook`.
+//
+// `CURRENT_THREAD_HANDLES` plugs that hole: every entry to user
+// Python code (`Interpreter::call_object`, the worker bootstrap)
+// installs the active interpreter's per-thread handles into this
+// thread-local. The `sys` builtins read through it, so they always
+// see the *current* thread's state regardless of which interpreter
+// originally registered the closure.
+// ---------------------------------------------------------------------------
+
+/// Snapshot of per-thread interpreter handles. All fields are
+/// [`crate::sync::Rc`] (i.e. `Arc`) so cloning into / out of the
+/// thread-local is cheap and the values can outlive the interpreter
+/// frame that registered them (e.g. when a builtin re-enters the VM).
+#[derive(Clone, Debug)]
+pub struct ThreadHandles {
+    pub frame_stack: Rc<RefCell<Vec<Rc<crate::object::PyFrame>>>>,
+    pub exc_info_stack: Rc<RefCell<Vec<crate::error::PyException>>>,
+    pub excepthook: Rc<RefCell<Object>>,
+    pub unraisable_hook: Rc<RefCell<Object>>,
+}
+
+thread_local! {
+    /// Stack of handles. We use a stack (not a single `Option`)
+    /// so re-entrant calls — e.g. a C-extension that runs Python
+    /// which runs another C-extension — restore the right
+    /// frame/exception state on unwind.
+    static CURRENT_THREAD_HANDLES: RefCell<Vec<ThreadHandles>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Push `handles` as the active per-thread state. Returns a guard
+/// that pops on drop, so callers can use the standard
+/// "scope-guard" idiom:
+///
+/// ```ignore
+/// let _g = vm_singletons::activate_thread_handles(handles);
+/// run_user_code();
+/// // guard drops here, restoring the prior state.
+/// ```
+pub fn activate_thread_handles(handles: ThreadHandles) -> ThreadHandlesGuard {
+    CURRENT_THREAD_HANDLES.with(|cell| cell.borrow_mut().push(handles));
+    ThreadHandlesGuard { _private: () }
+}
+
+/// Read-only view of the current thread's handles. Returns `None`
+/// if no interpreter has activated yet on this thread (e.g. the C
+/// shim is being called before `Py_Initialize`). The `sys` module
+/// builtins call this on every invocation, so cloning [`Rc`]s here
+/// is the price of admission for cross-thread correctness.
+pub fn current_thread_handles() -> Option<ThreadHandles> {
+    CURRENT_THREAD_HANDLES.with(|cell| cell.borrow().last().cloned())
+}
+
+/// Scope guard returned by [`activate_thread_handles`]. Pops the
+/// most-recently-pushed handles on drop.
+#[derive(Debug)]
+pub struct ThreadHandlesGuard {
+    _private: (),
+}
+
+impl Drop for ThreadHandlesGuard {
+    fn drop(&mut self) {
+        CURRENT_THREAD_HANDLES.with(|cell| {
+            let _ = cell.borrow_mut().pop();
+        });
+    }
 }
 
 /// `quit` and `exit` — interactive sentinels that raise `SystemExit`.

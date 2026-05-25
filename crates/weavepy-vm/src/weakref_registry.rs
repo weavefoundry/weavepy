@@ -34,7 +34,7 @@
 //! explicit `notify_clear(id)` method that callers (the GC,
 //! `gc.collect`, finaliser code) can invoke.
 
-use std::cell::RefCell;
+use crate::sync::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -272,7 +272,7 @@ pub fn next_synthetic_id() -> ObjectId {
 /// freshly-constructed `Object::Int(5)` *also* produce the
 /// same id because small ints are interned.
 pub fn id_of(obj: &Object) -> ObjectId {
-    use std::rc::Rc;
+    use crate::sync::Rc;
     match obj {
         Object::None => 1,
         Object::Bool(false) => 2,

@@ -59,6 +59,12 @@ pub struct ThreadEntry {
     /// target. `False` while the thread is queued but not
     /// yet running.
     pub started: AtomicBool,
+    /// RFC 0025: the per-thread sentinel lock that the worker
+    /// pre-acquires on entry and releases on exit. `Thread.join`
+    /// blocks on `lock.acquire(timeout=…)`, which drops the GIL
+    /// while waiting so other threads can run. `None` for the
+    /// main thread.
+    pub join_lock: parking_lot::Mutex<Option<Arc<crate::sync::RealLock>>>,
 }
 
 impl ThreadEntry {
@@ -70,7 +76,15 @@ impl ThreadEntry {
             finished: Arc::new(RealEvent::new()),
             handle: parking_lot::Mutex::new(Some(handle)),
             started: AtomicBool::new(false),
+            join_lock: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Attach the sentinel lock that workers spin against on
+    /// `Thread.join(timeout=…)`. Released by the worker body on
+    /// exit (RFC 0025).
+    pub fn attach_join_lock(&self, lock: Arc<crate::sync::RealLock>) {
+        *self.join_lock.lock() = Some(lock);
     }
 
     pub fn is_daemon(&self) -> bool {

@@ -13,8 +13,8 @@
 //! Where `utc_offset_seconds` is `None` for naive times. CPython's
 //! `_datetime` is C-only; we follow the same split.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{type_error, value_error, RuntimeError};

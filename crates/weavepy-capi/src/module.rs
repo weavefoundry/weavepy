@@ -1,11 +1,11 @@
 //! `PyModule_Create2`, `PyMethodDef`, and the bridge that turns a
 //! C function pointer into a [`weavepy_vm::object::BuiltinFn`].
 
-use std::cell::RefCell;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::rc::Rc;
+use weavepy_vm::sync::Rc;
+use weavepy_vm::sync::RefCell;
 
 use weavepy_vm::error::{type_error, RuntimeError};
 use weavepy_vm::object::{BuiltinFn, DictData, DictKey, Object, PyModule};

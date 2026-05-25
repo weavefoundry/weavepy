@@ -11,8 +11,8 @@
 //! The wrapper `urllib.request` (frozen Python) is updated to defer
 //! to this module for `https://` URLs.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;

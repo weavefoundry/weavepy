@@ -12,9 +12,9 @@
 //!   `Z_DEFAULT_COMPRESSION`, `Z_NO_FLUSH`, `Z_PARTIAL_FLUSH`,
 //!   `Z_SYNC_FLUSH`, `Z_FULL_FLUSH`, `Z_FINISH`.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::io::Write;
-use std::rc::Rc;
 
 use flate2::write::{DeflateDecoder, GzDecoder, ZlibDecoder, ZlibEncoder};
 use flate2::Compression;

@@ -6,8 +6,8 @@
 //!
 //! Calendar formatting is delegated to the `chrono` crate.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

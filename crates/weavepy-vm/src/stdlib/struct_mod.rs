@@ -19,8 +19,8 @@
 //! glue that calls `_struct.compile(...)` and stashes the result
 //! on the instance.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian};
 
@@ -687,7 +687,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn register(
     d: &mut DictData,
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) {
     let bf = BuiltinFn {
         name,

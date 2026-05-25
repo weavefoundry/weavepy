@@ -12,8 +12,8 @@
 //! Work) the `wrap_socket` path will gain real handshake / read /
 //! write code without changing the surface seen by user code.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;

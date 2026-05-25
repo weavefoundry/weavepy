@@ -1,0 +1,7 @@
+shared list after join: [1, 2, 3, 4, 5]
+locked counter total: 400
+event waiter: ['woke']
+alive after join: False
+active_count >= 4: True
+excepthook fired: ('RuntimeError', 'boom')
+ident stable: True

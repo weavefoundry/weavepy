@@ -13,9 +13,9 @@
 //! `new("md5", ...)`). FIPS-mode handling is not relevant — we don't
 //! link OpenSSL.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use digest::Digest;
 use md5::Md5;

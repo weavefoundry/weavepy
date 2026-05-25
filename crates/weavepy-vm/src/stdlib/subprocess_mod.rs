@@ -19,10 +19,10 @@
 //! `run`, `check_output`, `check_call`, `getoutput`,
 //! `CalledProcessError` and `TimeoutExpired` on top of these.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::error::{io_error_to_py, os_error, type_error, RuntimeError};

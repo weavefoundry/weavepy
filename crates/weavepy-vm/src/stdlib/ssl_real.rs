@@ -20,7 +20,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::cell::RefCell;
+use crate::sync::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;

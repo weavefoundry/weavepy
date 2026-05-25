@@ -5,11 +5,11 @@
 //! — for the common path (ASCII / UTF-8) we expose the underlying
 //! buffer directly via [`PyUnicode_AsUTF8`] without copying.
 
-use std::cell::RefCell;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::rc::Rc;
+use weavepy_vm::sync::Rc;
+use weavepy_vm::sync::RefCell;
 
 use weavepy_vm::object::Object;
 
@@ -300,7 +300,7 @@ pub unsafe extern "C" fn PyByteArray_FromStringAndSize(
     } else {
         unsafe { std::slice::from_raw_parts(s as *const u8, len).to_vec() }
     };
-    let inner = Rc::new(std::cell::RefCell::new(v));
+    let inner = Rc::new(weavepy_vm::sync::RefCell::new(v));
     crate::object::into_owned(Object::ByteArray(inner))
 }
 

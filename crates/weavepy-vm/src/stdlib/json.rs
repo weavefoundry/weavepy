@@ -5,8 +5,8 @@
 //! objects (and vice versa). This sidesteps the substantial amount
 //! of state machine code that would otherwise live in pure Rust.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use serde_json::{Map, Number, Value};
 

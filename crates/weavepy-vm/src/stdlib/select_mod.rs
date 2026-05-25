@@ -10,8 +10,8 @@
 //! integer (matching CPython). We use this fd to register with
 //! `mio::Poll` via the `mio::unix::SourceFd` wrapper.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::time::Duration;
 
 #[cfg(unix)]

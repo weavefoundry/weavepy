@@ -30,10 +30,10 @@
 //!   cheap second-line check against in-place edits that preserve mtime.
 //! - **Body**: the output of `marshal.dumps(code_object)`.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use weavepy_compiler::CodeObject;
 

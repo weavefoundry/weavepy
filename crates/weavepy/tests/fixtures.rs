@@ -9,11 +9,11 @@
 //! This is the smallest amount of plumbing that lets us add new
 //! fixtures by dropping `.py` / `.out` pairs into the directory.
 
-use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use weavepy::vm::sync::Rc;
+use weavepy::vm::sync::RefCell;
 
 use weavepy::{compiler, parser, vm};
 
@@ -105,7 +105,7 @@ fn run_fixture(py_path: &Path) {
 
     let mut interp = vm::Interpreter::new();
     let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
-    let sink: vm::Stdout = buf.clone() as Rc<RefCell<dyn Write>>;
+    let sink: vm::Stdout = buf.clone() as Rc<RefCell<dyn Write + Send + Sync>>;
     interp.set_stdout(sink);
     // Sibling files in the fixtures directory must be importable so
     // multi-file tests (e.g. `import _helper`) work.

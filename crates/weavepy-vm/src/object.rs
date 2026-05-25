@@ -10,12 +10,12 @@
 //! and value equality for the value-type variants. RFC 0002 will
 //! replace this with a proper type-slot-based object model.
 
-use std::cell::{Cell, RefCell};
+use crate::sync::Rc;
+use crate::sync::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
-use std::rc::Rc;
 
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
@@ -23,6 +23,20 @@ use weavepy_compiler::CodeObject;
 
 use crate::error::{os_error, type_error, value_error, RuntimeError};
 use crate::types::{PyInstance, TypeObject};
+
+/// RFC 0025 compile-time gate: every `Object` variant — and therefore
+/// the heap closure can cross OS thread boundaries via
+/// `_thread.start_new_thread`. The proof is that the Rust compiler
+/// successfully derives `Object: Send + Sync` from this assertion;
+/// if any future variant introduces a non-`Send` payload (a raw
+/// pointer, a `Box<dyn Fn>` without the bounds, a `std::cell::Cell`,
+/// etc.), this assertion fails to compile.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
+    assert_send::<Object>();
+    assert_sync::<Object>();
+};
 
 /// A Python value as seen by the interpreter.
 #[derive(Clone)]
@@ -217,7 +231,7 @@ pub struct PyFrame {
     /// access. Captures the (interior-mutable) locals array at the
     /// time the snapshot is taken so the same provider can be called
     /// again after a `clear()` to refresh.
-    pub locals_provider: RefCell<Option<Rc<dyn Fn() -> Object>>>,
+    pub locals_provider: RefCell<Option<Rc<dyn Fn() -> Object + Send + Sync>>>,
     /// Shared, mutable mirror of the running frame's `locals` array.
     /// The VM updates this between steps so `f_locals` reflects live
     /// state. `None` once the frame has returned.
@@ -609,9 +623,14 @@ impl fmt::Debug for BoundMethod {
 }
 
 /// A Rust function exposed to Python code.
+///
+/// The `Send + Sync` bound on the closure is what makes `Object` itself
+/// `Send + Sync` (RFC 0025). Every stdlib factory that builds a
+/// `BuiltinFn` captures only `Send + Sync` state — a property the
+/// audit checks at construction time.
 pub struct BuiltinFn {
     pub name: &'static str,
-    pub call: Box<dyn Fn(&[Object]) -> Result<Object, RuntimeError>>,
+    pub call: Box<dyn Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync>,
 }
 
 impl fmt::Debug for BuiltinFn {
@@ -637,7 +656,7 @@ pub struct PyGenerator {
 }
 
 impl PyGenerator {
-    pub fn new(name: impl Into<String>, frame: Box<dyn std::any::Any>) -> Self {
+    pub fn new(name: impl Into<String>, frame: Box<dyn std::any::Any + Send + Sync>) -> Self {
         Self {
             name: name.into(),
             state: RefCell::new(GeneratorState::Created(frame)),
@@ -671,9 +690,9 @@ pub enum CoroutineKind {
 pub enum GeneratorState {
     /// Created but not yet started — body hasn't executed past the
     /// initial `RETURN_GENERATOR`.
-    Created(Box<dyn std::any::Any>),
+    Created(Box<dyn std::any::Any + Send + Sync>),
     /// Paused at a `YIELD_VALUE`.
-    Suspended(Box<dyn std::any::Any>),
+    Suspended(Box<dyn std::any::Any + Send + Sync>),
     /// Body returned (cleanly or via exception). Subsequent
     /// `next`/`send` raise `StopIteration`.
     Finished,
@@ -949,9 +968,9 @@ pub enum FileBackend {
     /// In-memory UTF-8 buffer (`io.StringIO`).
     MemText { data: String, pos: usize },
     /// The interpreter's process stdout sink.
-    Stdout(Rc<RefCell<dyn Write>>),
+    Stdout(Rc<RefCell<dyn Write + Send + Sync>>),
     /// The interpreter's process stderr sink.
-    Stderr(Rc<RefCell<dyn Write>>),
+    Stderr(Rc<RefCell<dyn Write + Send + Sync>>),
     /// Process stdin (read-only).
     Stdin,
 }

@@ -3,9 +3,9 @@
 //! Backed by the `bzip2` crate (statically-linked libbz2). The
 //! frozen `bz2.py` builds the `BZ2File` class on top of this.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::io::{Read, Write};
-use std::rc::Rc;
 
 use bzip2::read::BzDecoder;
 use bzip2::write::BzEncoder;
@@ -40,7 +40,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn register(
     d: &mut DictData,
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) {
     let bf = BuiltinFn {
         name,

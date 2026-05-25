@@ -19,8 +19,8 @@
 //! The shim is intentionally minimal — anything that actually needs
 //! parallelism should reach for `asyncio` instead.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;

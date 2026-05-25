@@ -5,11 +5,11 @@
 //! through the same boxing machinery as scalars. Mutating operations
 //! borrow the inner `RefCell` for the duration of the call.
 
-use std::cell::RefCell;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::rc::Rc;
+use weavepy_vm::sync::Rc;
+use weavepy_vm::sync::RefCell;
 
 use weavepy_vm::object::{DictData, DictKey, Object, SetData};
 

@@ -7,9 +7,9 @@
 //! * `compress(data, compresslevel=9)` — gzip the bytes.
 //! * `decompress(data)` — gunzip the bytes.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::io::{Read, Write};
-use std::rc::Rc;
 
 use flate2::read::{GzDecoder, MultiGzDecoder};
 use flate2::write::GzEncoder;
@@ -44,7 +44,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn register(
     d: &mut DictData,
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) {
     let bf = BuiltinFn {
         name,

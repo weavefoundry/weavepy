@@ -6,8 +6,8 @@
 //! produces different bits than CPython. The contract we make is
 //! *statistical*: outputs are uniformly distributed.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;

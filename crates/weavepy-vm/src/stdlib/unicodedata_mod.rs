@@ -23,8 +23,8 @@
 //!   3.2.0 snapshot is mostly used to derive identifier rules — not
 //!   bit-perfect, but enough for `unicodedata.ucd_3_2_0.name(...)`).
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use unicode_normalization::UnicodeNormalization;
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};

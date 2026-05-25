@@ -8,9 +8,9 @@
 //! Internally we walk directories iteratively and apply the
 //! per-segment `fnmatch` translation from `fnmatch_mod`.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
 
 use regex::Regex;
 

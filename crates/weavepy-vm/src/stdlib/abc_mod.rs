@@ -6,8 +6,8 @@
 //! `_abc_subclasscheck`, `_get_dump`, `_reset_registry`,
 //! `_reset_caches`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::RuntimeError;
 use crate::import::ModuleCache;

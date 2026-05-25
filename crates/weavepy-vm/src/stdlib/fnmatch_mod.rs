@@ -13,8 +13,8 @@
 //! * `[!seq]` matches any character not in `seq`
 //! * `\` is *not* special — CPython quirk we preserve.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use regex::Regex;
 

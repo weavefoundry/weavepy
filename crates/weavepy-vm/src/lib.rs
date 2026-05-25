@@ -15,10 +15,10 @@
 //! output (REPL, test runners, the conformance harness) plug in a
 //! `Vec<u8>` writer; the CLI uses the process stdout.
 
-use std::cell::{Cell, RefCell};
+use crate::sync::Rc;
+use crate::sync::{Cell, RefCell};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use num_traits::{Signed, ToPrimitive, Zero};
 use weavepy_compiler::{
@@ -114,8 +114,10 @@ impl Frame {
 // ---------- interpreter ----------
 
 /// Output sink. Either the process's stdout or a `Vec<u8>` for
-/// embedding callers.
-pub type Stdout = Rc<RefCell<dyn Write>>;
+/// embedding callers. The `+ Send + Sync` bound is what lets
+/// `Object::File(PyFile { … stdout sink … })` cross thread
+/// boundaries (RFC 0025).
+pub type Stdout = Rc<RefCell<dyn Write + Send + Sync>>;
 
 /// Cross-cutting CLI-driven flags the VM honours.
 ///
@@ -208,7 +210,7 @@ impl Default for Interpreter {
             unraisable_hook.clone(),
         );
         cache.insert("sys", Object::Module(sys_module));
-        Self {
+        let interp = Self {
             stdout,
             builtins,
             cache,
@@ -216,7 +218,15 @@ impl Default for Interpreter {
             exc_info_stack,
             excepthook,
             unraisable_hook,
-        }
+        };
+        // RFC 0025: publish the shared parts of this interpreter
+        // (builtins / module cache / stdout / hooks) so workers
+        // spawned by `_thread.start_new_thread` can fork from us
+        // instead of paying for a fresh `Interpreter::new()`. The
+        // worker gets its own frame_stack / exc_info_stack so the
+        // dispatch loops don't trample each other.
+        crate::vm_singletons::publish_interpreter_seed(&interp);
+        interp
     }
 }
 
@@ -228,6 +238,29 @@ impl Interpreter {
     /// Plug in a custom stdout sink (e.g. a `Vec<u8>` for tests).
     pub fn set_stdout(&mut self, stdout: Stdout) {
         self.stdout = stdout;
+    }
+
+    /// RFC 0025: build a worker [`Interpreter`] that shares all
+    /// shared state with `self` (builtins, module cache, stdout,
+    /// excepthook, unraisable hook) but owns a **fresh** frame
+    /// stack and exception stack. Spawned threads call this to
+    /// get their own dispatch context without paying for a full
+    /// `Interpreter::new()` (which would re-build the entire
+    /// `sys.modules` table from scratch).
+    ///
+    /// All shared state crosses the thread boundary because every
+    /// underlying handle is `Arc<…>` and every `Object` variant is
+    /// `Send + Sync` (see the compile-time assertion in `object.rs`).
+    pub fn fork_for_thread(&self) -> Self {
+        Self {
+            stdout: self.stdout.clone(),
+            builtins: self.builtins.clone(),
+            cache: self.cache.clone(),
+            frame_stack: Rc::new(RefCell::new(Vec::new())),
+            exc_info_stack: Rc::new(RefCell::new(Vec::new())),
+            excepthook: self.excepthook.clone(),
+            unraisable_hook: self.unraisable_hook.clone(),
+        }
     }
 
     /// Expose the module cache (so the embedding host can poke
@@ -351,7 +384,7 @@ impl Interpreter {
             }
             d.insert(
                 crate::object::DictKey(Object::from_static("_xoptions")),
-                Object::Dict(std::rc::Rc::new(std::cell::RefCell::new(xopts))),
+                Object::Dict(crate::sync::Rc::new(crate::sync::RefCell::new(xopts))),
             );
         }
     }
@@ -418,6 +451,7 @@ impl Interpreter {
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
+        let _handles = self.activate_thread_handles();
         let globals = self.builtins.clone();
         self.call(&callable, args, kwargs, &globals)
     }
@@ -425,6 +459,7 @@ impl Interpreter {
     /// Public iterator-construction entry point. Mirrors `iter(o)`.
     /// Used by `PyObject_GetIter` in the C-API.
     pub fn iter_object(&mut self, value: Object) -> Result<Object, RuntimeError> {
+        let _handles = self.activate_thread_handles();
         let globals = self.builtins.clone();
         self.make_iter(&value, &globals)
     }
@@ -433,8 +468,32 @@ impl Interpreter {
     /// `Ok(None)` for `StopIteration`. Used by `PyIter_Next` in the
     /// C-API.
     pub fn iter_next_object(&mut self, iter: Object) -> Result<Option<Object>, RuntimeError> {
+        let _handles = self.activate_thread_handles();
         let globals = self.builtins.clone();
         self.iter_next(&iter, &globals)
+    }
+
+    /// RFC 0025: install this interpreter's per-thread handles as
+    /// the active set for the calling OS thread. The returned guard
+    /// pops the handles on drop, restoring the previous registration
+    /// (so re-entrant calls from a C-extension don't trample each
+    /// other).
+    ///
+    /// Every public entry point that hands control to user Python
+    /// (`call_object`, `iter_object`, `iter_next_object`,
+    /// `run_module_as`, `exec_module_in`) calls this on the way in.
+    /// The `sys` module builtins read through
+    /// `vm_singletons::current_thread_handles()` so `sys.exc_info()`,
+    /// `sys._getframe()` etc. always see the *current* thread's
+    /// state — critical now that worker threads have their own
+    /// forked interpreter with independent frame / exception stacks.
+    pub(crate) fn activate_thread_handles(&self) -> crate::vm_singletons::ThreadHandlesGuard {
+        crate::vm_singletons::activate_thread_handles(crate::vm_singletons::ThreadHandles {
+            frame_stack: self.frame_stack.clone(),
+            exc_info_stack: self.exc_info_stack.clone(),
+            excepthook: self.excepthook.clone(),
+            unraisable_hook: self.unraisable_hook.clone(),
+        })
     }
 
     /// `True` when `__pycache__` writes are forbidden — either by
@@ -464,6 +523,7 @@ impl Interpreter {
         code: &CodeObject,
         globals: Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        let _handles = self.activate_thread_handles();
         let code_rc = Rc::new(code.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
         self.run_frame(&mut frame)
@@ -477,6 +537,7 @@ impl Interpreter {
         name: &str,
         file: Option<&str>,
     ) -> Result<Object, RuntimeError> {
+        let _handles = self.activate_thread_handles();
         let globals = self.build_module_globals(name, file, None);
         let code_rc = Rc::new(code.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
@@ -685,7 +746,7 @@ impl Interpreter {
         let globals = frame.globals.clone();
         let class_ns = frame.class_namespace.clone();
         let snapshot_for_provider = locals_snapshot.clone();
-        let provider: Rc<dyn Fn() -> Object> = Rc::new(move || {
+        let provider: Rc<dyn Fn() -> Object + Send + Sync> = Rc::new(move || {
             let snapshot = snapshot_for_provider.borrow();
             // For module / class bodies the user-visible locals are
             // the corresponding namespace dict (class_ns when set,
@@ -8897,7 +8958,7 @@ mod tests {
         let code = compile_module(&module).expect("compile");
         let mut interp = Interpreter::new();
         let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
-        let writer: Stdout = buf.clone() as Rc<RefCell<dyn Write>>;
+        let writer: Stdout = buf.clone() as Rc<RefCell<dyn Write + Send + Sync>>;
         interp.set_stdout(writer);
         interp.run_module(&code).expect("run");
         let bytes = buf.borrow().clone();

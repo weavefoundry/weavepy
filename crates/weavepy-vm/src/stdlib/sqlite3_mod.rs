@@ -19,10 +19,10 @@
 //! Higher-level ergonomics (row factories, isolation levels,
 //! transaction-aware `__enter__`/`__exit__`) live in `sqlite3.py`.
 
-use std::cell::{Cell, RefCell};
+use crate::sync::Rc;
+use crate::sync::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::Path;
-use std::rc::Rc;
 
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
 
@@ -71,7 +71,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn register(
     d: &mut DictData,
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) {
     let bf = BuiltinFn {
         name,
@@ -453,7 +453,7 @@ fn column_descriptions(stmt: &rusqlite::Statement) -> Object {
 
 fn builtin<F>(name: &'static str, body: F) -> Object
 where
-    F: Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    F: Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 {
     Object::Builtin(Rc::new(BuiltinFn {
         name,

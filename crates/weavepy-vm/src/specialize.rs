@@ -52,8 +52,8 @@
 //! dispatch / hit / miss / specialization event. The counters are
 //! a no-op when the env var is unset.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use weavepy_compiler::{BinOpKind, CompareKind, InlineCache, COOLDOWN};
 

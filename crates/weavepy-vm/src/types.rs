@@ -8,8 +8,8 @@
 //! so the `Object::Type` variant carries an `Rc<TypeObject>`. The MRO
 //! is C3 linearised at class-creation time and cached on the type.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, RuntimeError};
 use crate::object::{DictData, DictKey, Object};

@@ -7,8 +7,8 @@
 //! libc-driven locales are reserved for a follow-up RFC because
 //! they require careful thread-safety and Windows differences.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{value_error, RuntimeError};
 use crate::import::ModuleCache;

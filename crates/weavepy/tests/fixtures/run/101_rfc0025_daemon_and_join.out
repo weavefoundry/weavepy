@@ -1,0 +1,5 @@
+worker saw: [('reporter', True)]
+daemon-after-start raised
+alive after short join: True
+alive after final join: False
+shutdown ran: ['done']

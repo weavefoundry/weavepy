@@ -12,8 +12,8 @@
 //! * `load(file)` / `loads(bytes)` — deserialise.
 //! * `version` — the protocol version; always 4 for now.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use num_bigint::{BigInt, Sign};
 
@@ -90,7 +90,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn register(
     d: &mut DictData,
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) {
     let bf = BuiltinFn {
         name,

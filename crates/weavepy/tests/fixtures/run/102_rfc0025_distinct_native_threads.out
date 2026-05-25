@@ -1,0 +1,6 @@
+count of workers: 4
+any matched parent: False
+ids are integers: True
+threading.get_native_id matches _thread: True
+main thread name: MainThread
+main thread has native_id: True

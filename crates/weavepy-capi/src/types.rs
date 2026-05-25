@@ -24,8 +24,8 @@ use std::cell::UnsafeCell;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::rc::Rc;
 use std::sync::Mutex;
+use weavepy_vm::sync::Rc;
 
 use weavepy_vm::object::Object;
 use weavepy_vm::types::TypeObject;

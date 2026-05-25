@@ -36,7 +36,7 @@
 //! The free-threaded build (RFC 0010 candidate) will replace this
 //! with a `Mutex` or a shard'd cache.
 
-use std::cell::RefCell;
+use crate::sync::RefCell;
 use std::collections::HashMap;
 
 use weavepy_compiler::CodeObject;

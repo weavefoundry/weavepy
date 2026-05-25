@@ -16,8 +16,8 @@
 //! This is intentionally conservative; we mostly need the module
 //! to *exist* so `import pickle` works without surprises.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;

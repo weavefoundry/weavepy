@@ -3,7 +3,7 @@
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::rc::Rc;
+use weavepy_vm::sync::Rc;
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;

@@ -10,9 +10,9 @@
 //! that owns the interpreter (WeavePy is single-threaded today),
 //! so the cell can be a plain `RefCell<Option<…>>`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Once;
+use weavepy_vm::sync::Rc;
+use weavepy_vm::sync::RefCell;
 
 use weavepy_vm::object::{DictData, Object};
 use weavepy_vm::Interpreter;
@@ -30,7 +30,7 @@ thread_local! {
 /// publish module-level state.
 pub struct ActiveContext {
     pub interp: *mut Interpreter,
-    pub globals: Option<Rc<std::cell::RefCell<DictData>>>,
+    pub globals: Option<Rc<weavepy_vm::sync::RefCell<DictData>>>,
     pub current_module: Option<Object>,
 }
 

@@ -14,8 +14,8 @@
 //! `_io.*` names so consumers like `tokenize`, `pickle`, and
 //! `warnings` can import either way.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;

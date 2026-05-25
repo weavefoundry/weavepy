@@ -4,9 +4,9 @@
 //! built where possible). The frozen `lzma.py` builds the
 //! `LZMAFile` class on top of this.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::io::{Read, Write};
-use std::rc::Rc;
 
 use xz2::read::XzDecoder;
 use xz2::write::XzEncoder;
@@ -90,7 +90,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn register(
     d: &mut DictData,
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) {
     let bf = BuiltinFn {
         name,

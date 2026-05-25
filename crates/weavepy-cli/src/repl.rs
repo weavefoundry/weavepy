@@ -18,11 +18,11 @@
 //! injects a fresh `__main__` module whose globals persist across
 //! prompts so user-typed bindings stick.
 
-use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use weavepy_vm::sync::Rc;
+use weavepy_vm::sync::RefCell;
 
 use anyhow::Result;
 use rustyline::error::ReadlineError;

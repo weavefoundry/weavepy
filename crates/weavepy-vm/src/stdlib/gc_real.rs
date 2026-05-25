@@ -28,8 +28,8 @@
 //! - **`garbage`** — uncollectable objects.
 //! - **`DEBUG_*` constants**.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::sync::atomic::Ordering;
 
 use crate::error::{type_error, RuntimeError};

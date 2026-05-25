@@ -71,7 +71,7 @@
 //! up as `gc_refs > 0`, so the cycle survives one more
 //! generation than it strictly has to).
 
-use std::cell::RefCell;
+use crate::sync::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -545,7 +545,7 @@ impl GcState {
 /// `Rc::strong_count`-like accessor that knows about every
 /// container Object variant.
 pub fn strong_count_for(obj: &Object) -> usize {
-    use std::rc::Rc;
+    use crate::sync::Rc;
     match obj {
         Object::List(l) => Rc::strong_count(l),
         Object::Dict(d) => Rc::strong_count(d),
@@ -800,8 +800,8 @@ pub fn collect_upto(upto: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use crate::sync::Rc;
+    use crate::sync::RefCell;
 
     use crate::object::DictData;
 

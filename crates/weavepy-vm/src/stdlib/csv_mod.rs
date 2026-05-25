@@ -9,8 +9,8 @@
 //! The user-visible `DictReader` / `DictWriter` / `Sniffer` live in a
 //! frozen Python wrapper on top of these primitives.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;

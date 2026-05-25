@@ -6,9 +6,9 @@
 //! context-manager helpers live in the frozen Python wrapper
 //! (`stdlib/python/tempfile.py`) on top of this surface.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::path::PathBuf;
-use std::rc::Rc;
 
 use crate::error::{io_error_to_py, type_error, RuntimeError};
 use crate::import::ModuleCache;

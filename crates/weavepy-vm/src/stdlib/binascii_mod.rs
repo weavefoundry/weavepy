@@ -10,8 +10,8 @@
 //! * `crc32`
 //! * `Error` (alias for `ValueError`)
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;

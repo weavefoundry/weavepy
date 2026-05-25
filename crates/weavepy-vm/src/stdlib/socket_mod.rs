@@ -34,11 +34,11 @@
 //! `TCP_FASTOPEN`, `IP_TRANSPARENT`), `if_*` interface enumeration,
 //! and `recvmsg`/`sendmsg` ancillary-data passing.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, ToSocketAddrs};
-use std::rc::Rc;
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};

@@ -19,7 +19,7 @@
 
 use std::ffi::CString;
 use std::path::Path;
-use std::rc::Rc;
+use weavepy_vm::sync::Rc;
 
 use libloading::{Library, Symbol};
 use weavepy_vm::object::{DictData, DictKey, Object, PyModule};
@@ -80,7 +80,7 @@ pub fn load_extension_module(
     let placeholder = Object::Module(Rc::new(PyModule {
         name: module_name.to_owned(),
         filename: Some(path.display().to_string()),
-        dict: Rc::new(std::cell::RefCell::new(DictData::new())),
+        dict: Rc::new(weavepy_vm::sync::RefCell::new(DictData::new())),
     }));
     let ctx = ActiveContext {
         interp,
@@ -194,7 +194,7 @@ pub(crate) unsafe fn _interp_smoke(
     name: &str,
     methods: &[PyMethodDef],
 ) -> Object {
-    let dict = Rc::new(std::cell::RefCell::new(DictData::new()));
+    let dict = Rc::new(weavepy_vm::sync::RefCell::new(DictData::new()));
     {
         let mut d = dict.borrow_mut();
         d.insert(

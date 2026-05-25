@@ -340,15 +340,88 @@ impl Drop for GilGuard {
 
 /// Process-wide GIL singleton. Accessed by the C-API
 /// (`PyGILState_*` / `PyEval_SaveThread` / `PyEval_RestoreThread`)
-/// and by the eval breaker. The interpreter lives in the same
-/// thread that holds the GIL today, so this is functionally
-/// equivalent to "the running interpreter's GIL"; once we lift
-/// the sub-interpreter-per-thread restriction in RFC 0025 the
-/// per-interpreter GIL will replace this.
+/// and by the eval breaker. Now (after RFC 0025) genuinely
+/// process-wide — every thread spawned by `_thread.start_new_thread`
+/// shares this lock, so bytecode execution is serialised across
+/// the entire interpreter, which is what makes the shared-heap
+/// invariant ("mutations on `list` visible across threads") sound
+/// without atomic refcounts.
 pub fn global_gil() -> Arc<GilState> {
     use std::sync::OnceLock;
     static GLOBAL: OnceLock<Arc<GilState>> = OnceLock::new();
     GLOBAL.get_or_init(|| Arc::new(GilState::new())).clone()
+}
+
+// RFC 0025: a thread-local stack of `GilGuard`s, owned per-OS-thread.
+// Both the C-API's `PyGILState_Ensure` / `PyEval_SaveThread` and the
+// VM's worker-thread entry pre-push their guard here so any Rust
+// path inside the dispatch loop (`allow_threads_then` below) can
+// pop, drop, run a blocking call, and re-acquire — without needing
+// the original guard handle.
+//
+// `RefCell` is the `crate::sync::RefCell` (`GilCell`), not `std`'s,
+// because `GilGuard` itself is `!Send`. The cell is thread-local,
+// so cross-thread access is impossible and the `Send` bound on
+// `GilCell`'s `Sync` impl never fires.
+//
+// We hide it behind plain `std::thread_local!` because the values
+// involve a non-`Send` `parking_lot::ReentrantMutexGuard` which
+// std's `thread_local!` is happy to host (the cell is dropped on
+// thread exit).
+std::thread_local! {
+    static GIL_GUARD_STACK: std::cell::RefCell<Vec<GilGuard>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Push a freshly-acquired [`GilGuard`] onto the current thread's
+/// guard stack. Called by every entry point that takes the GIL
+/// (the C-API's `PyGILState_Ensure`, the VM worker thread's
+/// `start_new_thread` body, embedders that wrap `run_module` etc.).
+pub fn push_gil_guard(g: GilGuard) {
+    GIL_GUARD_STACK.with(|cell| cell.borrow_mut().push(g));
+}
+
+/// Pop and return the top guard. Returns `None` when the calling
+/// thread doesn't hold the GIL through this stack.
+pub fn pop_gil_guard() -> Option<GilGuard> {
+    GIL_GUARD_STACK.with(|cell| cell.borrow_mut().pop())
+}
+
+/// `True` if the calling thread holds the GIL via this stack.
+pub fn current_thread_holds_gil() -> bool {
+    GIL_GUARD_STACK.with(|cell| !cell.borrow().is_empty())
+}
+
+/// RFC 0025: drop the GIL, run `f`, re-acquire the GIL, then
+/// return `f`'s result. Used by every blocking-I/O / lock-acquire
+/// path that would otherwise prevent other threads from running.
+///
+/// If the current thread doesn't hold the GIL via the guard
+/// stack (`push_gil_guard` was never called), this is a plain
+/// passthrough — useful for unit tests and for the cooperative
+/// single-thread path where the GIL isn't engaged.
+///
+/// This is the Rust-side spelling of `Py_BEGIN_ALLOW_THREADS …
+/// Py_END_ALLOW_THREADS`. The C-API macros' expansion
+/// (`PyEval_SaveThread()` / `PyEval_RestoreThread()`) lands here.
+pub fn allow_threads_then<R>(f: impl FnOnce() -> R) -> R {
+    // Pop every guard we currently hold (a worker calls
+    // `start_new_thread` -> builtin -> `allow_threads_then` with
+    // exactly one guard; nested cases pop them all).
+    let popped: Vec<GilGuard> =
+        GIL_GUARD_STACK.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    let count = popped.len();
+    drop(popped);
+    let result = f();
+    // Re-acquire one guard per popped one so callers further up
+    // the stack still see their guards on return.
+    let gil = global_gil();
+    let mut fresh = Vec::with_capacity(count);
+    for _ in 0..count {
+        fresh.push(gil.acquire());
+    }
+    GIL_GUARD_STACK.with(|cell| *cell.borrow_mut() = fresh);
+    result
 }
 
 /// Best-effort current-thread native id. Returns the OS thread
@@ -385,6 +458,16 @@ pub fn current_thread_id() -> u64 {
         std::thread::current().id().hash(&mut h);
         h.finish()
     }
+}
+
+/// Alias for [`current_thread_id`]. Reserved name so RFC 0025
+/// callers can write `current_native_thread_id()` even though
+/// today's `current_thread_id` already returns the OS thread id —
+/// the distinction matters when sub-interpreters land (PEP 684,
+/// future RFC) and "thread id" becomes ambiguous.
+#[inline]
+pub fn current_native_thread_id() -> u64 {
+    current_thread_id()
 }
 
 /// Snapshot of pending eval-breaker actions, drained as a unit

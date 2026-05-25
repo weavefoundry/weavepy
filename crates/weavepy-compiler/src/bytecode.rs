@@ -578,24 +578,96 @@ pub enum InlineCache {
 /// sites.
 pub const COOLDOWN: u8 = 64;
 
+/// One [`InlineCache`] slot. RFC 0025: needs to be `Send + Sync`
+/// because the parent `CodeObject` is shared across OS threads via
+/// `Arc<CodeObject>`. We use raw [`UnsafeCell`] and assert
+/// `unsafe impl Send + Sync` with a SAFETY note tied to the GIL.
+///
+/// Why not `parking_lot::Mutex`? Because the table is read on every
+/// single opcode (it's the dispatch hot path); even a 5ns mutex
+/// would add measurable per-instruction overhead. CPython does the
+/// same thing — its inline caches are bare arrays accessed under
+/// the GIL.
+///
+/// Why not an atomic? Because the largest [`InlineCache`] variant
+/// (`LoadAttrInstance { type_id: u64, key_idx: u32 }`) is ~24 bytes
+/// and no portable atomic is that wide.
+#[derive(Default)]
+pub struct CacheSlot {
+    inner: std::cell::UnsafeCell<InlineCache>,
+}
+
+// SAFETY: `CacheSlot::get` / `set` are only called by the dispatch
+// loop while the GIL is held (see `weavepy-vm::gil`). The GIL
+// serialises bytecode execution across threads, so concurrent reads
+// or writes to the same slot are impossible. Treating the cell as
+// `Send + Sync` is therefore sound — the `unsafe impl`s below
+// document that invariant at the type level.
+unsafe impl Send for CacheSlot {}
+unsafe impl Sync for CacheSlot {}
+
+impl CacheSlot {
+    /// Build a slot holding `value`.
+    pub const fn new(value: InlineCache) -> Self {
+        Self {
+            inner: std::cell::UnsafeCell::new(value),
+        }
+    }
+
+    /// Read the slot. SAFETY relies on the GIL invariant above.
+    #[inline]
+    pub fn get(&self) -> InlineCache {
+        // SAFETY: `&self` plus the GIL invariant guarantees no
+        // concurrent write or `&mut InlineCache` exists.
+        unsafe { *self.inner.get() }
+    }
+
+    /// Overwrite the slot. SAFETY relies on the GIL invariant above.
+    #[inline]
+    pub fn set(&self, value: InlineCache) {
+        // SAFETY: the GIL guarantees no concurrent reader or writer
+        // exists. We materialise an exclusive `&mut InlineCache`
+        // only for the duration of the assignment.
+        unsafe { *self.inner.get() = value };
+    }
+}
+
+impl std::fmt::Debug for CacheSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CacheSlot").field(&self.get()).finish()
+    }
+}
+
+impl Clone for CacheSlot {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
+
+impl PartialEq for CacheSlot {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
 /// Parallel side-table: one [`InlineCache`] per [`Instruction`].
 ///
 /// Lazily-initialised — the compiler emits an empty `CacheTable` and
-/// the VM extends it on first dispatch into a code object. Cells are
-/// interior-mutable so the dispatcher can warm them through a shared
-/// `&CodeObject`.
+/// the VM extends it on first dispatch into a code object. Slots
+/// are interior-mutable so the dispatcher can warm them through a
+/// shared `&CodeObject`. The slot type is `Send + Sync` (under the
+/// GIL invariant) so `Arc<CodeObject>` can cross thread boundaries
+/// (RFC 0025).
 #[derive(Debug, Default)]
 pub struct CacheTable {
-    pub slots: Vec<std::cell::Cell<InlineCache>>,
+    pub slots: Vec<CacheSlot>,
 }
 
 impl CacheTable {
     /// Allocate `n` empty cache slots.
     pub fn with_len(n: usize) -> Self {
         Self {
-            slots: (0..n)
-                .map(|_| std::cell::Cell::new(InlineCache::Empty))
-                .collect(),
+            slots: (0..n).map(|_| CacheSlot::new(InlineCache::Empty)).collect(),
         }
     }
 
@@ -606,7 +678,7 @@ impl CacheTable {
     pub fn get(&self, pc: u32) -> InlineCache {
         self.slots
             .get(pc as usize)
-            .map(std::cell::Cell::get)
+            .map(CacheSlot::get)
             .unwrap_or(InlineCache::Empty)
     }
 
@@ -634,7 +706,7 @@ impl CacheTable {
     pub fn resize(&mut self, n: usize) {
         if self.slots.len() < n {
             self.slots
-                .resize_with(n, || std::cell::Cell::new(InlineCache::Empty));
+                .resize_with(n, || CacheSlot::new(InlineCache::Empty));
         } else {
             self.slots.truncate(n);
         }
@@ -644,11 +716,7 @@ impl CacheTable {
 impl Clone for CacheTable {
     fn clone(&self) -> Self {
         Self {
-            slots: self
-                .slots
-                .iter()
-                .map(|c| std::cell::Cell::new(c.get()))
-                .collect(),
+            slots: self.slots.clone(),
         }
     }
 }

@@ -1,12 +1,12 @@
 //! Bench runner — times each fixture's `bench(n)` callable under
 //! WeavePy (in-process) and the host CPython (subprocess).
 
-use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::process::Command;
-use std::rc::Rc;
 use std::time::Instant;
+use weavepy_vm::sync::Rc;
+use weavepy_vm::sync::RefCell;
 
 use weavepy::{compiler, parser, vm};
 use weavepy_vm::Interpreter;
@@ -110,7 +110,7 @@ fn time_weavepy_run(src: &str, work: u32) -> io::Result<f64> {
     // results, and we don't want benchmark stdout polluting the
     // CI log.
     let buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
-    let writer: vm::Stdout = buf.clone() as Rc<RefCell<dyn std::io::Write>>;
+    let writer: vm::Stdout = buf.clone() as Rc<RefCell<dyn std::io::Write + Send + Sync>>;
     interp.set_stdout(writer);
 
     let start = Instant::now();

@@ -1,7 +1,7 @@
 //! `PySlice_New` / `PySlice_Check`.
 
 use std::os::raw::c_int;
-use std::rc::Rc;
+use weavepy_vm::sync::Rc;
 
 use weavepy_vm::object::{Object, PySlice};
 

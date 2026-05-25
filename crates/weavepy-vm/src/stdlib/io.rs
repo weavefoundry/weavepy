@@ -5,8 +5,8 @@
 //! [`crate::object::PyFile`]; this module just exposes the factory
 //! callables that wrap them.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;

@@ -10,9 +10,9 @@
 //! `ValueError`, matching CPython on systems without the corresponding
 //! OpenSSL backend.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use ::hmac::{Hmac, Mac};
 use md5::Md5;

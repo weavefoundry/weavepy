@@ -305,7 +305,9 @@ pub unsafe extern "C" fn _WeavePy_Build_FromU64(v: u64) -> *mut PyObject {
     if v <= i64::MAX as u64 {
         crate::object::into_owned(Object::Int(v as i64))
     } else {
-        crate::object::into_owned(Object::Long(std::rc::Rc::new(num_bigint::BigInt::from(v))))
+        crate::object::into_owned(Object::Long(weavepy_vm::sync::Rc::new(
+            num_bigint::BigInt::from(v),
+        )))
     }
 }
 

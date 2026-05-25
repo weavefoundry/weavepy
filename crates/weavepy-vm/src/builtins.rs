@@ -15,8 +15,8 @@
 //! `print`, which needs the interpreter's stdout sink) are installed
 //! by [`crate::Interpreter::install_print_into`].
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
@@ -485,7 +485,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
 
 fn method(
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) -> BuiltinFn {
     BuiltinFn {
         name,
@@ -2321,7 +2321,7 @@ fn generic_alias_origin(info: &Object) -> Option<Object> {
 /// `type(x)` would return. Used by `isinstance`/`type()` and a few
 /// other reflective code paths. The mapping is the canonical
 /// equivalent of CPython's `Py_TYPE(o)`.
-pub fn class_of(obj: &Object) -> std::rc::Rc<crate::types::TypeObject> {
+pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
     let bt = builtin_types();
     match obj {
         Object::Instance(inst) => inst.class.clone(),
@@ -2779,7 +2779,9 @@ fn b_typevar(args: &[Object]) -> Result<Object, RuntimeError> {
         crate::object::DictKey(Object::from_static("__weavepy_typevar__")),
         Object::Bool(true),
     );
-    Ok(Object::SimpleNamespace(Rc::new(std::cell::RefCell::new(d))))
+    Ok(Object::SimpleNamespace(Rc::new(crate::sync::RefCell::new(
+        d,
+    ))))
 }
 
 /// `memoryview(obj)` — returns a `MemoryView` over a bytes-like
@@ -2801,12 +2803,12 @@ fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
                         crate::object::MemoryViewBuffer::ByteArray(b.clone())
                     }
                 },
-                start: std::cell::Cell::new(mv.start.get()),
-                len: std::cell::Cell::new(mv.len.get()),
-                readonly: std::cell::Cell::new(mv.readonly.get()),
-                released: std::cell::Cell::new(mv.released.get()),
-                format: std::cell::RefCell::new(mv.format.borrow().clone()),
-                itemsize: std::cell::Cell::new(mv.itemsize.get()),
+                start: crate::sync::Cell::new(mv.start.get()),
+                len: crate::sync::Cell::new(mv.len.get()),
+                readonly: crate::sync::Cell::new(mv.readonly.get()),
+                released: crate::sync::Cell::new(mv.released.get()),
+                format: crate::sync::RefCell::new(mv.format.borrow().clone()),
+                itemsize: crate::sync::Cell::new(mv.itemsize.get()),
             }
         }
         other => {
@@ -4557,7 +4559,7 @@ fn bytes_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // ---------- bytearray-only mutators ----------
 
-fn bytearray_self(args: &[Object]) -> Result<Rc<std::cell::RefCell<Vec<u8>>>, RuntimeError> {
+fn bytearray_self(args: &[Object]) -> Result<Rc<crate::sync::RefCell<Vec<u8>>>, RuntimeError> {
     match args.first() {
         Some(Object::ByteArray(b)) => Ok(b.clone()),
         _ => Err(type_error("expected bytearray receiver")),

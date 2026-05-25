@@ -441,14 +441,21 @@ class local:
 # ---------------------------------------------------------------------------
 
 class Thread:
-    """A real-bookkeeping cooperative-execution thread.
+    """A real OS-thread-backed Python thread.
 
-    `start()` spawns a real OS thread (registered with the global
-    `_thread` registry) that finishes immediately, then runs the
-    target on the calling interpreter thread. This means
-    `is_alive()`, `join()`, daemon-shutdown semantics, and lock /
-    event / condition coordination all observe genuine OS-level
-    state — but the actual Python work happens cooperatively.
+    `start()` hands the bound `_bootstrap_inner` to
+    `_thread.start_new_thread`, which spawns a fresh OS thread,
+    forks an interpreter for it, and runs the target there. The
+    parent thread continues at the next statement; `join()` blocks
+    on `_tstate_lock` (which the worker releases on exit) so the
+    parent can wait without busy-spinning.
+
+    RFC 0025: workers share the heap with the parent — captured
+    closures see the *same* list, dict, etc. as the spawning
+    thread. The GIL serialises execution, so pure-Python code is
+    not yet faster than single-threaded, but every CPython
+    threading invariant (`is_alive`, `daemon`, `excepthook`, etc.)
+    now lines up with real OS-thread semantics.
     """
 
     _initialized = False
@@ -516,14 +523,18 @@ class Thread:
         try:
             self._tstate_lock = _thread.allocate_lock()
             self._tstate_lock.acquire()
-            ident = _thread.start_new_thread(self._noop, ())
+            # RFC 0025: hand `_bootstrap_inner` to `start_new_thread`
+            # so the spawned OS thread runs the target. The worker
+            # acquires the GIL on entry (see `thread_real.rs`); the
+            # parent thread continues here and only blocks on
+            # `Thread.join()` later.
+            ident = _thread.start_new_thread(self._bootstrap_inner, ())
             self._ident = ident
-            self._native_id = _thread.get_native_id()
+            self._native_id = ident
             self._started.set()
             with _active_lock:
                 _active[self._ident] = self
                 del _limbo[self]
-            self._bootstrap_inner()
         except Exception:
             with _active_lock:
                 if self in _limbo:
@@ -578,8 +589,31 @@ class Thread:
             raise RuntimeError("cannot join thread before it is started")
         if self is current_thread():
             raise RuntimeError("cannot join current thread")
-        # Cooperative: target has already finished by the time
-        # `start()` returns, so join is effectively immediate.
+        # RFC 0025: block on the `_tstate_lock` sentinel that the
+        # worker pre-acquires on entry and releases on exit. The
+        # acquire below drops the GIL while waiting, so the worker
+        # thread is free to run.
+        lock = self._tstate_lock
+        if lock is None:
+            return None
+        if timeout is None:
+            lock.acquire()
+            try:
+                pass
+            finally:
+                # Re-release so a second `join()` doesn't deadlock.
+                lock.release()
+            self._delete()
+            return None
+        # Timed wait — `acquire(blocking=True, timeout=…)` returns
+        # True if it got the lock (thread finished), False on timeout.
+        got = lock.acquire(True, timeout)
+        if got:
+            try:
+                pass
+            finally:
+                lock.release()
+            self._delete()
         return None
 
 
@@ -673,8 +707,27 @@ _trace_hook = None
 
 
 def _shutdown():
-    """Run at interpreter exit. Joins non-daemon threads."""
-    pass
+    """Run at interpreter exit. Joins non-daemon threads.
+
+    RFC 0025: with real OS threads, the main thread must wait for
+    every non-daemon thread to finish before the process exits.
+    Daemon threads are abandoned — the host runtime tears them
+    down when the process exits.
+    """
+    while True:
+        with _active_lock:
+            survivors = [t for t in _active.values()
+                         if t is not None
+                         and not t.daemon
+                         and t is not main_thread()
+                         and t.is_alive()]
+        if not survivors:
+            return
+        for t in survivors:
+            try:
+                t.join()
+            except Exception:
+                pass
 
 
 def stack_size(size=0):

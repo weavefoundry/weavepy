@@ -8,8 +8,8 @@
 //! Surface: `token_bytes`, `token_hex`, `token_urlsafe`, `choice`,
 //! `randbelow`, `randbits`, `compare_digest`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;

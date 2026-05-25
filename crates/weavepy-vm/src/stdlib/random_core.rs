@@ -5,8 +5,8 @@
 //! methods that `random.py` uses internally:
 //! `seed`, `random`, `getstate`, `setstate`, `getrandbits`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;

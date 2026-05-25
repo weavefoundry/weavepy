@@ -29,8 +29,8 @@
 //! `isinstance(w, weakref.ref)` and friends finally return
 //! `True`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::sync::Arc;
 
 use crate::error::{type_error, value_error, RuntimeError};
@@ -105,7 +105,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
 
 fn b_dyn(
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,

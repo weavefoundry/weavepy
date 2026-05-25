@@ -9,8 +9,8 @@
 //! are limited by the underlying engine. The dialect is close enough
 //! that the vast majority of everyday patterns work as expected.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use regex::{Captures, Regex};
 

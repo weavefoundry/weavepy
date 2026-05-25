@@ -5,8 +5,8 @@
 //! offset=)`, with `read`, `read_byte`, `write`, `seek`, `tell`,
 //! `size`, `flush`, `close`, slicing, and `find`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use memmap2::{Mmap, MmapMut};
 

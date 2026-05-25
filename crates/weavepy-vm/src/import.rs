@@ -14,10 +14,10 @@
 //! This file is the *plumbing* that turns a dotted name into a
 //! cached `Rc<PyModule>`.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use crate::object::{DictData, DictKey, Object, PyModule};
 

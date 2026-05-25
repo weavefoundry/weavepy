@@ -8,8 +8,8 @@
 //! `sys.stderr`) is deferred to RFC 0014, when we land the `io`
 //! module and Python file objects.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
@@ -36,20 +36,38 @@ pub fn build_with_state(
     let module = build(cache);
     {
         let mut d = module.dict.borrow_mut();
-        let fs = frame_stack.clone();
+        // RFC 0025: route through the active per-thread handles so
+        // worker threads see *their* frame / exception state, not
+        // the main interpreter's. The `frame_stack` / `exc_info_stack`
+        // closure captures below are kept as fallbacks for embedders
+        // that build the `sys` module before any interpreter has
+        // activated handles for the current thread.
+        let fs_fallback = frame_stack.clone();
         d.insert(
             DictKey(Object::from_static("_getframe")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "_getframe",
-                call: Box::new(move |args| sys_getframe(args, &fs)),
+                call: Box::new(move |args| {
+                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
+                        sys_getframe(args, &h.frame_stack)
+                    } else {
+                        sys_getframe(args, &fs_fallback)
+                    }
+                }),
             })),
         );
-        let es = exc_info_stack.clone();
+        let es_fallback = exc_info_stack.clone();
         d.insert(
             DictKey(Object::from_static("exc_info")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "exc_info",
-                call: Box::new(move |_| sys_exc_info(&es)),
+                call: Box::new(move |_| {
+                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
+                        sys_exc_info(&h.exc_info_stack)
+                    } else {
+                        sys_exc_info(&es_fallback)
+                    }
+                }),
             })),
         );
         let eh_get = excepthook.clone();
@@ -298,8 +316,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // Standard I/O streams. We expose them as file-like objects
         // sharing the interpreter's host sinks, so `print()` and
         // direct writes via `sys.stdout.write(...)` agree.
-        let stdout_sink: Rc<RefCell<dyn std::io::Write>> = Rc::new(RefCell::new(std::io::stdout()));
-        let stderr_sink: Rc<RefCell<dyn std::io::Write>> = Rc::new(RefCell::new(std::io::stderr()));
+        let stdout_sink: Rc<RefCell<dyn std::io::Write + Send + Sync>> =
+            Rc::new(RefCell::new(std::io::stdout()));
+        let stderr_sink: Rc<RefCell<dyn std::io::Write + Send + Sync>> =
+            Rc::new(RefCell::new(std::io::stderr()));
         d.insert(
             DictKey(Object::from_static("stdout")),
             Object::File(Rc::new(PyFile::new(

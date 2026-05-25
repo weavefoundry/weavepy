@@ -4,8 +4,8 @@
 //! list in a thread-local; the CLI driver calls `run_handlers` at
 //! exit time after the main module returns.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;

@@ -23,9 +23,9 @@
 //!   pending SIGINT, which we currently do only at REPL boundaries
 //!   and `asyncio.sleep` ticks.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;

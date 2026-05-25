@@ -29,8 +29,8 @@
 //! `RuntimeWarning` once per process so users can detect the
 //! divergence).
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,7 +140,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
 
 fn b_dyn(
     name: &'static str,
-    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + 'static,
+    body: impl Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
 ) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
@@ -216,11 +216,18 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         if !blocking {
             return Ok(Object::Bool(acquire_lock.try_acquire(me)));
         }
+        // RFC 0025: drop the GIL across the blocking acquire so
+        // other threads (including the one holding the lock) can
+        // run. Without this, `Thread.join` would deadlock — the
+        // joining thread sits in `acquire()` with the GIL held,
+        // and the worker can never run `_delete()` to release.
         match timeout {
             Some(Duration::ZERO) => Ok(Object::Bool(acquire_lock.try_acquire(me))),
-            Some(d) => Ok(Object::Bool(acquire_lock.acquire_timeout(me, d))),
+            Some(d) => Ok(Object::Bool(crate::gil::allow_threads_then(|| {
+                acquire_lock.acquire_timeout(me, d)
+            }))),
             None => {
-                acquire_lock.acquire(me);
+                crate::gil::allow_threads_then(|| acquire_lock.acquire(me));
                 Ok(Object::Bool(true))
             }
         }
@@ -295,11 +302,17 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         if !blocking {
             return Ok(Object::Bool(acquire_lock.try_acquire(me)));
         }
+        // Mirror the non-reentrant lock's GIL-drop behaviour
+        // (RFC 0025) — a reentrant acquire by the owning thread is
+        // a cheap counter bump and doesn't need the drop, but the
+        // blocking-on-foreign-owner case absolutely does.
         match timeout {
             Some(Duration::ZERO) => Ok(Object::Bool(acquire_lock.try_acquire(me))),
-            Some(d) => Ok(Object::Bool(acquire_lock.acquire_timeout(me, d))),
+            Some(d) => Ok(Object::Bool(crate::gil::allow_threads_then(|| {
+                acquire_lock.acquire_timeout(me, d)
+            }))),
             None => {
-                acquire_lock.acquire(me);
+                crate::gil::allow_threads_then(|| acquire_lock.acquire(me));
                 Ok(Object::Bool(true))
             }
         }
@@ -387,11 +400,18 @@ fn parse_timeout(arg: Option<&Object>) -> Option<Duration> {
 }
 
 fn get_ident(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(crate::gil::current_thread_id() as i64))
+    // RFC 0025: prefer the synthetic id assigned by
+    // `start_new_thread` so `threading.Thread.ident` matches the
+    // value the user observed at spawn time. Falls back to the
+    // native OS thread id when no worker override is installed
+    // (i.e. we're running on the main thread).
+    Ok(Object::Int(
+        crate::vm_singletons::current_worker_thread_id() as i64,
+    ))
 }
 
 fn get_native_id(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(crate::gil::current_thread_id() as i64))
+    Ok(Object::Int(crate::gil::current_native_thread_id() as i64))
 }
 
 fn stack_size(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -402,53 +422,205 @@ fn stack_size(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-/// `_thread.start_new_thread(func, args, kwargs=None)`.
+/// `_thread.start_new_thread(func, args, kwargs=None)` — RFC 0025.
 ///
-/// Today's implementation: enqueue the call onto the cooperative
-/// "ready threads" queue and return a synthetic thread id. A
-/// real OS thread is spawned in parallel for the bookkeeping
-/// (so `JoinHandle`-shaped APIs see a real handle), but the
-/// target callable still runs on the calling interpreter
-/// thread. The cycle GC + weakrefs + real lock primitives all
-/// work; CPU-bound parallel speedups land in RFC 0025.
+/// Spawns a real `std::thread` whose body:
+///
+/// 1. Forks the parent's [`crate::Interpreter`] into a worker
+///    interpreter that shares the heap (`Object: Send + Sync`,
+///    every container is `Arc<GilCell<…>>`) but owns a fresh
+///    frame stack and exception stack.
+/// 2. Acquires the process-wide GIL (`crate::gil::global_gil()`)
+///    via `GilState::acquire`. Blocks until the parent thread
+///    drops the GIL at the next periodic-yield tick.
+/// 3. Invokes the target callable with the supplied positional
+///    args (and `kwargs` dict, if provided) through
+///    [`Interpreter::call_object`].
+/// 4. Routes any uncaught exception through `threading.excepthook`
+///    (silenced for `SystemExit`, per CPython).
+/// 5. Marks the [`ThreadEntry`] as finished, releases the GIL,
+///    and exits the OS thread.
+///
+/// The returned synthetic id is the value `_thread.get_ident()`
+/// reports while the worker is alive.
 fn start_new_thread(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _func = args
+    let func = args
         .first()
         .cloned()
         .ok_or_else(|| type_error("start_new_thread() missing target"))?;
-    let _argv = args
+    let argv = args
         .get(1)
         .cloned()
         .unwrap_or_else(|| Object::new_tuple(Vec::new()));
+    let kwargs = args.get(2).cloned();
 
-    // Real OS thread for bookkeeping. Body is empty; it just
-    // exists so the JoinHandle is real and observable through
-    // the registry.
-    let registry = thread_registry();
+    // Materialise positional args once on the parent thread (cheap
+    // tuple-iteration), then move into the worker. `Object` is
+    // `Send + Sync` after RFC 0025 so the move is sound.
+    let positional: Vec<Object> = match &argv {
+        Object::Tuple(items) => items.iter().cloned().collect(),
+        Object::List(items) => items.borrow().iter().cloned().collect(),
+        Object::None => Vec::new(),
+        _ => {
+            return Err(type_error("start_new_thread(): args must be a tuple"));
+        }
+    };
+    let kwargs_pairs: Vec<(String, Object)> = match kwargs {
+        None | Some(Object::None) => Vec::new(),
+        Some(Object::Dict(d)) => {
+            let d = d.borrow();
+            d.iter()
+                .filter_map(|(k, v)| match &k.0 {
+                    Object::Str(s) => Some((s.as_ref().to_owned(), v.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+        Some(_) => {
+            return Err(type_error("start_new_thread(): kwargs must be a dict"));
+        }
+    };
+
     let synth_id = NEXT_IDENT.fetch_add(1, Ordering::AcqRel);
+    let thread_name = format!("Thread-{}", synth_id);
+
+    let registry = thread_registry();
+    let join_lock = Arc::new(RealLock::new());
+    // Pre-acquire on the parent thread's behalf — the worker
+    // releases on exit, which is what `Thread.join` blocks on.
+    join_lock.acquire(synth_id);
+
+    // Channel-of-one for handing the per-thread `ThreadEntry` back
+    // to the worker once it's been built. Lets the worker mark
+    // `started` / `finished` on the same entry the parent registered,
+    // so `threading.enumerate()` and `Thread.is_alive()` see
+    // consistent state.
+    let entry_slot: Arc<parking_lot::Mutex<Option<Arc<ThreadEntry>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    let entry_slot_worker = entry_slot.clone();
+
+    let worker_func = func.clone();
+    let worker_lock = join_lock.clone();
+    let entry_name = thread_name.clone();
     let handle = std::thread::Builder::new()
-        .name(format!("weavepy-thread-{}", synth_id))
+        .name(format!("weavepy-worker-{}", synth_id))
         .spawn(move || {
-            // The target executes on the parent interpreter
-            // thread (cooperative). The OS thread spins
-            // briefly to let any GIL-yield ticks run, then
-            // exits. Future RFC 0025 promotes the actual
-            // target invocation here.
+            crate::vm_singletons::install_worker_thread_id(synth_id);
+            // The parent published this entry into the slot below
+            // before returning from `start_new_thread`. Spin a few
+            // microseconds if we got here first (extremely unlikely
+            // because the parent holds the GIL until this worker
+            // can re-acquire it, but the slot read is cheap).
+            let entry = loop {
+                if let Some(e) = entry_slot_worker.lock().take() {
+                    break e;
+                }
+                std::thread::yield_now();
+            };
+            entry.mark_started();
+            let mut worker_interp = match crate::vm_singletons::snapshot_interpreter() {
+                Some(snap) => snap,
+                None => crate::Interpreter::new(),
+            };
+            // Acquire the process-wide GIL before touching any
+            // Python state. Push onto the shared
+            // [`crate::gil::push_gil_guard`] stack so any builtin
+            // we call (e.g. `lock.acquire()`) can drop the GIL via
+            // `allow_threads_then` for the duration of the blocking
+            // section, then re-acquire on return.
+            let gil = crate::gil::global_gil();
+            crate::gil::push_gil_guard(gil.acquire());
+            let call_result = worker_interp.call_object(worker_func, &positional, &kwargs_pairs);
+            if let Err(err) = call_result {
+                if !is_system_exit(&err) {
+                    invoke_threading_excepthook(&mut worker_interp, &entry_name, &err);
+                }
+            }
+            // Drop the guard before marking finished so the
+            // parent's `Thread.join` (which spins on
+            // `_tstate_lock`) sees the released GIL — without this
+            // the parent could re-acquire the GIL and find the
+            // worker still "running" even though its target has
+            // returned.
+            let _ = crate::gil::pop_gil_guard();
+            entry.mark_finished();
+            let _ = worker_lock.release();
+            crate::vm_singletons::clear_worker_thread_id();
         })
         .map_err(|e| runtime_error(format!("failed to spawn thread: {}", e)))?;
-    let entry = Arc::new(ThreadEntry::new(
-        synth_id,
-        format!("Thread-{}", synth_id),
-        false,
-        handle,
-    ));
-    entry.mark_started();
-    let registry_entry = entry.clone();
-    registry.register(registry_entry);
-    // Mark finished immediately because the OS thread body is
-    // empty.
-    entry.mark_finished();
+
+    let entry = Arc::new(ThreadEntry::new(synth_id, thread_name, false, handle));
+    entry.attach_join_lock(join_lock);
+    registry.register(entry.clone());
+    *entry_slot.lock() = Some(entry);
     Ok(Object::Int(synth_id as i64))
+}
+
+/// `True` if `err` is a `SystemExit`-shaped Python exception.
+/// CPython silences `SystemExit` in worker threads (the main
+/// thread is the only one that exits the process on the
+/// exception).
+fn is_system_exit(err: &RuntimeError) -> bool {
+    let RuntimeError::PyException(exc) = err else {
+        return false;
+    };
+    matches!(&exc.instance, Object::Instance(inst) if inst.class.name == "SystemExit")
+}
+
+/// Run `threading.excepthook` (if installed) with the worker's
+/// exception. Falls back to `sys.unraisablehook` semantics — a
+/// best-effort traceback printed to stderr — if no hook is
+/// installed.
+fn invoke_threading_excepthook(
+    interp: &mut crate::Interpreter,
+    thread_name: &str,
+    err: &RuntimeError,
+) {
+    let RuntimeError::PyException(exc) = err else {
+        return;
+    };
+    let mods = interp.module_cache().modules.borrow();
+    let key = DictKey(Object::from_static("threading"));
+    let threading = mods.get(&key).cloned();
+    drop(mods);
+    let Some(Object::Module(threading_mod)) = threading else {
+        return;
+    };
+    let dict = threading_mod.dict.clone();
+    let hook = {
+        let d = dict.borrow();
+        d.get(&DictKey(Object::from_static("excepthook"))).cloned()
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    if matches!(hook, Object::None) {
+        return;
+    }
+    // Build a `_thread._ExceptHookArgs`-shaped record. The frozen
+    // `threading.py` accepts a simple tuple-with-attribute shim,
+    // which we materialise here as a `SimpleNamespace`.
+    let exc_type = match &exc.instance {
+        Object::Instance(inst) => Object::Type(inst.class.clone()),
+        _ => Object::None,
+    };
+    let mut ns = DictData::new();
+    ns.insert(DictKey(Object::from_static("exc_type")), exc_type);
+    ns.insert(
+        DictKey(Object::from_static("exc_value")),
+        exc.instance.clone(),
+    );
+    // We don't materialise a full PyTraceback here — RFC 0018's
+    // surface uses `Vec<TracebackEntry>` internally; surface it as
+    // `None` for now. `threading.excepthook` accepts a `None`
+    // traceback.
+    ns.insert(DictKey(Object::from_static("exc_traceback")), Object::None);
+    ns.insert(
+        DictKey(Object::from_static("thread")),
+        Object::from_str(thread_name.to_owned()),
+    );
+    let ns = Object::SimpleNamespace(Rc::new(RefCell::new(ns)));
+    let _ = interp.call_object(hook, &[ns], &[]);
 }
 
 fn interrupt_main(_args: &[Object]) -> Result<Object, RuntimeError> {

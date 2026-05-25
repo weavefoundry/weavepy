@@ -11,8 +11,8 @@
 //! (`fields`, `time_low`/`time_mid`/…) can reach into the byte
 //! payload directly.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use digest::Digest;
 use md5::Md5;

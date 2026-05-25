@@ -6,9 +6,9 @@
 //! `which`, `disk_usage`, `get_terminal_size`) lives in the frozen
 //! Python wrapper (`stdlib/python/shutil.py`) on top.
 
-use std::cell::RefCell;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use crate::error::{io_error_to_py, type_error, RuntimeError};
 use crate::import::ModuleCache;

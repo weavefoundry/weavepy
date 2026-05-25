@@ -11,8 +11,8 @@
 //! maps the integer value back to the symbolic name — exactly the
 //! shape `traceback` / `OSError(errno, ...)` formatters expect.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::sync::Rc;
+use crate::sync::RefCell;
 
 use crate::import::ModuleCache;
 use crate::object::{DictData, DictKey, Object, PyModule};
