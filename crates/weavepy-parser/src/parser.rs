@@ -190,8 +190,158 @@ impl<'src> Parser<'src> {
                     self.parse_simple_statement()
                 }
             }
+            // PEP 695 — `type Alias = T` soft keyword. Disambiguate
+            // by requiring `type NAME = ...` shape; otherwise treat
+            // `type` as an ordinary identifier (e.g. `type(x)` and
+            // `type Name: ann = v` annotations).
+            TokenKind::Name if self.lexeme(self.peek_token().span) == "type" => {
+                if self.looks_like_type_alias_stmt() {
+                    self.parse_type_alias_stmt()
+                } else {
+                    self.parse_simple_statement()
+                }
+            }
             _ => self.parse_simple_statement(),
         }
+    }
+
+    /// PEP 695 — `type X[T] = Y` lookahead.
+    fn looks_like_type_alias_stmt(&self) -> bool {
+        let mut i = self.pos + 1;
+        // Must be followed by a name (the alias target).
+        if !matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Name)) {
+            return false;
+        }
+        i += 1;
+        // Optional `[ ... ]` type-parameter list — scan to its
+        // matching close-bracket at depth 0.
+        if matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::LSqb)) {
+            let mut depth = 1i32;
+            i += 1;
+            while let Some(tok) = self.tokens.get(i) {
+                match &tok.kind {
+                    TokenKind::LSqb => depth += 1,
+                    TokenKind::RSqb => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    TokenKind::Newline | TokenKind::Endmarker => return false,
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Equal))
+    }
+
+    /// Compile a PEP 695 type-alias statement.
+    ///
+    /// `type Foo[T, U] = body` desugars to:
+    ///
+    /// ```python
+    /// Foo = (lambda T, U: body)(TypeVar('T'), TypeVar('U'))
+    /// ```
+    ///
+    /// so the type parameters resolve as `TypeVar` instances in the
+    /// alias body without leaking into the enclosing scope. The
+    /// bare form `type Foo = body` lowers to plain `Foo = body`.
+    fn parse_type_alias_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let type_tok = self.bump(); // `type`
+        let name_tok = self.expect(&TokenKind::Name, "type alias name")?;
+        let name = self.lexeme(name_tok.span).to_owned();
+        let type_params = self.collect_pep695_type_params()?;
+        self.expect(&TokenKind::Equal, "`=`")?;
+        let value = self.parse_expression_list(true)?;
+        self.consume_stmt_end()?;
+        let span = type_tok.span.merge(value.span);
+        let target = Expr {
+            kind: ExprKind::Name(name),
+            span: name_tok.span,
+        };
+        let rhs = if type_params.is_empty() {
+            value
+        } else {
+            wrap_in_type_param_lambda(value, &type_params, name_tok.span)
+        };
+        Ok(Stmt {
+            kind: StmtKind::Assign {
+                targets: vec![target],
+                value: rhs,
+            },
+            span,
+        })
+    }
+
+    /// Like [`Self::skip_pep695_type_params`] but returns the
+    /// captured parameter names.
+    fn collect_pep695_type_params(&mut self) -> Result<Vec<String>, ParseError> {
+        if !matches!(self.peek(), TokenKind::LSqb) {
+            return Ok(Vec::new());
+        }
+        self.bump(); // `[`
+        let mut names = Vec::new();
+        loop {
+            self.skip_trivia();
+            // Allow `*Ts` and `**P` prefixes — discard the prefix.
+            while matches!(self.peek(), TokenKind::Star | TokenKind::DoubleStar) {
+                self.bump();
+            }
+            if matches!(self.peek(), TokenKind::RSqb) {
+                break;
+            }
+            let name_tok = self.expect(&TokenKind::Name, "type parameter name")?;
+            names.push(self.lexeme(name_tok.span).to_owned());
+            // Skip optional `: bound` and `= default`.
+            if matches!(self.peek(), TokenKind::Colon) {
+                self.bump();
+                let _ = self.parse_expression(false)?;
+            }
+            if matches!(self.peek(), TokenKind::Equal) {
+                self.bump();
+                let _ = self.parse_expression(false)?;
+            }
+            if matches!(self.peek(), TokenKind::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RSqb, "`]`")?;
+        Ok(names)
+    }
+
+    /// PEP 695 — `[T, *Ts, **P]` after `def`/`class`/`type` names.
+    /// We swallow the entire bracket-delimited list. This keeps
+    /// the parser permissive for any 3.12+ syntax surface; the
+    /// names are not actually bound in the function/class scope.
+    fn skip_pep695_type_params(&mut self) -> Result<(), ParseError> {
+        if !matches!(self.peek(), TokenKind::LSqb) {
+            return Ok(());
+        }
+        self.bump(); // `[`
+        let mut depth = 1i32;
+        while let Some(tok) = self.tokens.get(self.pos) {
+            match &tok.kind {
+                TokenKind::LSqb => depth += 1,
+                TokenKind::RSqb => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.bump();
+                        return Ok(());
+                    }
+                }
+                TokenKind::Endmarker => break,
+                _ => {}
+            }
+            self.bump();
+        }
+        Err(ParseError::Unexpected {
+            span: self.peek_token().span,
+            message: "unterminated type-parameter list".to_owned(),
+        })
     }
 
     /// `match` is a soft keyword. The disambiguating signal is
@@ -413,6 +563,13 @@ impl<'src> Parser<'src> {
         let def_tok = self.bump(); // `def`
         let name_tok = self.expect(&TokenKind::Name, "function name")?;
         let name = self.lexeme(name_tok.span).to_owned();
+        // PEP 695: optional `[T, *Ts, **P]` type-parameter list.
+        // Consumed-and-discarded for now — the names are real `TypeVar`-shaped
+        // objects in CPython, but the parser tolerates the syntax so generic
+        // libraries that target 3.12+ load. The compiler's downstream
+        // dataflow analysis doesn't see them today; pretty-printer round-trip
+        // loses them.
+        self.skip_pep695_type_params()?;
         self.expect(&TokenKind::LPar, "`(`")?;
         let args = self.parse_function_arguments()?;
         self.expect(&TokenKind::RPar, "`)`")?;
@@ -513,6 +670,9 @@ impl<'src> Parser<'src> {
         let class_tok = self.bump(); // `class`
         let name_tok = self.expect(&TokenKind::Name, "class name")?;
         let name = self.lexeme(name_tok.span).to_owned();
+        // PEP 695: optional `[T, *Ts, **P]` type-parameter list (same as
+        // function form).
+        self.skip_pep695_type_params()?;
         let (bases, keywords) = if self.eat(&TokenKind::LPar) {
             let (a, kw) = self.parse_call_args()?;
             self.expect(&TokenKind::RPar, "`)`")?;
@@ -1649,6 +1809,32 @@ impl<'src> Parser<'src> {
         // the parser — enforces that.
         if self.at_keyword(Keyword::Yield) {
             return self.parse_yield();
+        }
+        // PEP 572 walrus `NAME := expr`. The named-expression form
+        // must syntactically be exactly a name followed by `:=`; the
+        // compiler enforces the rest of the PEP's restrictions
+        // (no assignment expressions at module scope rules).
+        if matches!(self.peek(), TokenKind::Name) {
+            if let Some(next) = self.tokens.get(self.pos + 1) {
+                if matches!(next.kind, TokenKind::ColonEqual) {
+                    let name_tok = self.peek_token().clone();
+                    let name = self.lexeme(name_tok.span).to_owned();
+                    self.bump(); // name
+                    self.bump(); // :=
+                    let value = self.parse_ternary()?;
+                    let span = name_tok.span.merge(value.span);
+                    return Ok(Expr {
+                        kind: ExprKind::NamedExpr {
+                            target: Box::new(Expr {
+                                kind: ExprKind::Name(name),
+                                span: name_tok.span,
+                            }),
+                            value: Box::new(value),
+                        },
+                        span,
+                    });
+                }
+            }
         }
         let body = self.parse_or()?;
         if self.at_keyword(Keyword::If) {
@@ -3320,5 +3506,58 @@ fn big_to_i64(b: &num_bigint::BigInt) -> Option<i64> {
             }
         }
         _ => None,
+    }
+}
+
+/// PEP 695 helper — wrap `body` in a `(lambda T, U: body)(TypeVar('T'), TypeVar('U'))`
+/// call so type-parameter names bind locally to typevar instances.
+fn wrap_in_type_param_lambda(body: Expr, names: &[String], span: Span) -> Expr {
+    let args = Arguments {
+        posonlyargs: Vec::new(),
+        args: names
+            .iter()
+            .map(|n| Arg {
+                name: n.clone(),
+                annotation: None,
+                span,
+            })
+            .collect(),
+        vararg: None,
+        kwonlyargs: Vec::new(),
+        kw_defaults: Vec::new(),
+        kwarg: None,
+        defaults: Vec::new(),
+    };
+    let lambda = Expr {
+        kind: ExprKind::Lambda {
+            args,
+            body: Box::new(body),
+        },
+        span,
+    };
+    let typevar_calls: Vec<Expr> = names
+        .iter()
+        .map(|n| Expr {
+            kind: ExprKind::Call {
+                func: Box::new(Expr {
+                    kind: ExprKind::Name("__weavepy_typevar__".to_owned()),
+                    span,
+                }),
+                args: vec![Expr {
+                    kind: ExprKind::Constant(Constant::Str(n.clone())),
+                    span,
+                }],
+                keywords: Vec::new(),
+            },
+            span,
+        })
+        .collect();
+    Expr {
+        kind: ExprKind::Call {
+            func: Box::new(lambda),
+            args: typevar_calls,
+            keywords: Vec::new(),
+        },
+        span,
     }
 }

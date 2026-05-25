@@ -63,6 +63,21 @@ class ABCMeta(type):
                     abstracts.add(attr_name)
         cls.__abstractmethods__ = frozenset(abstracts)
         cls._abc_registry = set()
+        cls._abc_descendants = []
+        # Register this class on every ABCMeta-typed ancestor so
+        # ``Real.__subclasscheck__(...)`` can find concrete types
+        # registered on a more specific ABC like ``Integral``.
+        for base in bases:
+            if isinstance(base, ABCMeta):
+                base._abc_descendants.append(cls)
+                for ancestor in getattr(base, "_abc_descendants_parents", ()):
+                    ancestor._abc_descendants.append(cls)
+        parents = []
+        for base in bases:
+            if isinstance(base, ABCMeta):
+                parents.append(base)
+                parents.extend(getattr(base, "_abc_descendants_parents", ()))
+        cls._abc_descendants_parents = tuple(parents)
 
     def __call__(cls, *args, **kwargs):
         # Refuse to instantiate a class that still has unimplemented
@@ -110,6 +125,18 @@ class ABCMeta(type):
                 return True
             if isinstance(subclass, type) and issubclass(subclass, reg):
                 return True
+        # If we are an ABC, also consult the registries of all
+        # known descendant ABCs (tracked at class-creation time —
+        # WeavePy does not yet expose ``type.__subclasses__``).
+        for sub in getattr(cls, "_abc_descendants", ()):
+            if sub is cls:
+                continue
+            sub_registry = getattr(sub, "_abc_registry", ())
+            for reg in sub_registry:
+                if reg is subclass:
+                    return True
+                if isinstance(subclass, type) and issubclass(subclass, reg):
+                    return True
         return False
 
 

@@ -187,29 +187,41 @@ def _parse_response(raw):
 
 
 def urlopen(url, data=None, timeout=None):
-    """Open `url`. Supports plain HTTP only; HTTPS raises `URLError`."""
+    """Open `url`. HTTP via plain sockets, HTTPS via the Rust ``_https``
+    accelerator (which wraps rustls).
+    """
     if isinstance(url, Request):
         req = url
     else:
         req = Request(url, data=data)
     parts = urlparse(req.full_url)
-    if parts.scheme not in ("http",):
-        if parts.scheme == "https":
-            raise URLError("HTTPS support requires the TLS engine (RFC 0017 future work)")
+    if parts.scheme not in ("http", "https"):
         raise URLError("unsupported scheme: {!r}".format(parts.scheme))
     host = parts.hostname
     if host is None:
         raise URLError("URL has no host: {!r}".format(req.full_url))
-    port = parts.port or 80
-    path = parts.path or "/"
-    if parts.query:
-        path = path + "?" + parts.query
     body = None
     if req.data is not None:
         body = req.data
         if isinstance(body, dict):
             body = urlencode(body).encode("ascii")
-    blob = _build_request_bytes(req.get_method(), host, path, req.headers, body)
+    path = parts.path or "/"
+    if parts.query:
+        path = path + "?" + parts.query
+    method = req.get_method()
+    if parts.scheme == "https":
+        try:
+            import _https
+        except ImportError as e:
+            raise URLError("HTTPS unavailable: {}".format(e))
+        port = parts.port or 443
+        headers = dict(req.headers)
+        headers.setdefault("User-Agent", "WeavePy-urllib/1.0")
+        status, hdrs, body_bytes = _https.request(method, host, port, path, headers, body or b"")
+        reason = ""
+        return _HTTPResponse(status, reason, hdrs, body_bytes, req.full_url)
+    port = parts.port or 80
+    blob = _build_request_bytes(method, host, path, req.headers, body)
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     try:
         if timeout is not None:
@@ -277,7 +289,7 @@ class HTTPHandler(BaseHandler):
 
 class HTTPSHandler(BaseHandler):
     def https_open(self, req):
-        raise URLError("HTTPS support requires the TLS engine (RFC 0017 future work)")
+        return urlopen(req)
 
 
 class HTTPRedirectHandler(BaseHandler):

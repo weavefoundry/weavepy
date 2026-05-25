@@ -143,6 +143,22 @@ impl ModuleCache {
         }
         None
     }
+
+    /// Locate a PEP 420 namespace package — a directory on `sys.path`
+    /// with the given name that does *not* contain an `__init__.py`.
+    /// Returns the list of contributing directories (matching CPython's
+    /// `_NamespacePath`), or empty if no candidates exist.
+    pub fn find_namespace_package(&self, full_name: &str) -> Vec<PathBuf> {
+        let rel: PathBuf = full_name.split('.').collect();
+        let mut hits = Vec::new();
+        for dir in self.search_dirs() {
+            let pkg_dir = dir.join(&rel);
+            if pkg_dir.is_dir() && !pkg_dir.join("__init__.py").is_file() {
+                hits.push(pkg_dir);
+            }
+        }
+        hits
+    }
 }
 
 /// Resolution of a relative import (`from . import x` /

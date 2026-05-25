@@ -65,3 +65,60 @@ pub fn ellipsis() -> Object {
         v
     })
 }
+
+/// CPython's `help`/`copyright`/`license`/`credits` builtins are
+/// `_Printer` instances: `repr(copyright)` returns the body, but
+/// `copyright()` also prints it. We model them as
+/// `builtin_function_or_method` callables that print + return None.
+pub fn interactive_printer(name: &'static str, body: &'static str) -> Object {
+    use crate::object::BuiltinFn;
+    let body_for_repr = body.to_owned();
+    let body_for_call = body.to_owned();
+    let f = BuiltinFn {
+        name,
+        call: Box::new(move |_args: &[Object]| {
+            // We can't reach the interpreter's stdout from a static
+            // builtin; route through Rust's stdout for the
+            // interactive case. Tests/REPL go through `print`, which
+            // uses the configured sink.
+            println!("{}", body_for_call);
+            Ok(Object::None)
+        }),
+    };
+    let printer = Object::Builtin(Rc::new(f));
+    // Store the message as a side-channel for the VM to surface via
+    // repr if it ever cares; for now repr falls back to the
+    // builtin's default "<built-in function ...>".
+    let _ = body_for_repr;
+    printer
+}
+
+/// `quit` and `exit` — interactive sentinels that raise `SystemExit`.
+pub fn quitter(name: &'static str) -> Object {
+    use crate::object::BuiltinFn;
+    let f = BuiltinFn {
+        name,
+        call: Box::new(|args: &[Object]| {
+            let code = args.first().cloned().unwrap_or(Object::None);
+            let bt = crate::builtin_types::builtin_types();
+            let inst = crate::builtin_types::make_exception_with_class(
+                bt.system_exit.clone(),
+                code.to_str(),
+            );
+            if let Object::Instance(inst_rc) = &inst {
+                inst_rc.dict.borrow_mut().insert(
+                    crate::object::DictKey(Object::from_static("code")),
+                    code.clone(),
+                );
+                inst_rc.dict.borrow_mut().insert(
+                    crate::object::DictKey(Object::from_static("args")),
+                    Object::new_tuple(vec![code]),
+                );
+            }
+            Err(crate::error::RuntimeError::PyException(
+                crate::error::PyException::new(inst),
+            ))
+        }),
+    };
+    Object::Builtin(Rc::new(f))
+}

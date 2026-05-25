@@ -94,6 +94,17 @@ dirs        = "5.0"
 libloading  = "0.8"
 cc          = "1.0"
 
+# RFC 0023 — drop-in stdlib parity + HTTPS.
+unicode-normalization = "0.1"
+unicode-properties    = "0.1"
+memmap2               = "0.9"
+libc                  = "0.2"
+rustls                = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types      = "1.7"
+rustls-pemfile        = "2.1"
+rustls-native-certs   = "0.7"
+webpki-roots          = "0.26"
+
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }
 proptest    = "1.5"

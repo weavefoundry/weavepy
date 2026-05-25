@@ -49,9 +49,23 @@ pub mod sys;
 pub mod tempfile_mod;
 pub mod thread;
 pub mod time;
+pub mod unicodedata_mod;
 pub mod uuid_mod;
 pub mod weakref_mod;
 pub mod zlib_mod;
+// RFC 0023 — drop-in stdlib parity.
+pub mod abc_mod;
+pub mod atexit_mod;
+pub mod contextvars_mod;
+pub mod https_mod;
+pub mod io_full;
+pub mod locale_mod;
+pub mod mmap_mod;
+pub mod pickle_accel;
+pub mod random_core;
+pub mod ssl_real;
+pub mod string_mod;
+pub mod warnings_mod;
 
 /// Register the built-in modules into `cache`. Called once at
 /// interpreter startup.
@@ -95,6 +109,19 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_weakref", weakref_mod::build);
     cache.register_builtin("gc", gc_mod::build);
     cache.register_builtin("_datetime", datetime_mod::build);
+    // RFC 0023 — drop-in stdlib parity.
+    cache.register_builtin("unicodedata", unicodedata_mod::build);
+    cache.register_builtin("_io", io_full::build);
+    cache.register_builtin("_string", string_mod::build);
+    cache.register_builtin("_random", random_core::build);
+    cache.register_builtin("_warnings", warnings_mod::build);
+    cache.register_builtin("_pickle", pickle_accel::build);
+    cache.register_builtin("mmap", mmap_mod::build);
+    cache.register_builtin("_locale", locale_mod::build);
+    cache.register_builtin("_abc", abc_mod::build);
+    cache.register_builtin("_contextvars", contextvars_mod::build);
+    cache.register_builtin("atexit", atexit_mod::build);
+    cache.register_builtin("_https", https_mod::build);
 
     // Frozen Python sources (pure-Python stdlib).
     for src in frozen_sources() {
@@ -621,6 +648,58 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "unittest.async_case",
             source: include_str!("python/unittest_async.py"),
+            is_package: false,
+        },
+        // RFC 0023 — fill in the small but commonly-imported stdlib
+        // gaps.
+        FrozenSource {
+            name: "bisect",
+            source: include_str!("python/bisect_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "operator",
+            source: include_str!("python/operator_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "copy",
+            source: include_str!("python/copy_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "stat",
+            source: include_str!("python/stat_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "genericpath",
+            source: include_str!("python/genericpath_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "posixpath",
+            source: include_str!("python/posixpath_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ntpath",
+            source: include_str!("python/ntpath_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "textwrap",
+            source: include_str!("python/textwrap_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "numbers",
+            source: include_str!("python/numbers_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "statistics",
+            source: include_str!("python/statistics_mod.py"),
             is_package: false,
         },
     ]

@@ -117,6 +117,15 @@ fn remove_state(handle: i64) {
     });
 }
 
+/// Borrow the raw OS file descriptor for the given socket handle.
+/// Used by `_ssl` (RFC 0023) to wrap an existing socket with rustls.
+#[allow(dead_code)]
+pub(crate) fn raw_fd_for_handle(handle: i64) -> Option<i64> {
+    let state = get_state(handle)?;
+    let state = state.borrow();
+    state.inner.as_ref().and_then(raw_fd_of)
+}
+
 // ---- module entry ----
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {

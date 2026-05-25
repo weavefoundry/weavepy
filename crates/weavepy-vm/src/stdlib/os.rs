@@ -127,6 +127,107 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("stat")),
             builtin("stat", os_stat_stub),
         );
+        d.insert(
+            DictKey(Object::from_static("lstat")),
+            builtin("lstat", os_lstat),
+        );
+        d.insert(
+            DictKey(Object::from_static("readlink")),
+            builtin("readlink", os_readlink),
+        );
+        d.insert(
+            DictKey(Object::from_static("chdir")),
+            builtin("chdir", os_chdir),
+        );
+        d.insert(
+            DictKey(Object::from_static("fspath")),
+            builtin("fspath", os_fspath),
+        );
+        d.insert(
+            DictKey(Object::from_static("walk")),
+            builtin("walk", os_walk),
+        );
+        d.insert(
+            DictKey(Object::from_static("scandir")),
+            builtin("scandir", os_scandir),
+        );
+        d.insert(
+            DictKey(Object::from_static("pipe")),
+            builtin("pipe", os_pipe),
+        );
+        d.insert(DictKey(Object::from_static("dup")), builtin("dup", os_dup));
+        d.insert(
+            DictKey(Object::from_static("dup2")),
+            builtin("dup2", os_dup2),
+        );
+        d.insert(
+            DictKey(Object::from_static("isatty")),
+            builtin("isatty", os_isatty),
+        );
+        d.insert(
+            DictKey(Object::from_static("read")),
+            builtin("read", os_read),
+        );
+        d.insert(
+            DictKey(Object::from_static("write")),
+            builtin("write", os_write),
+        );
+        d.insert(
+            DictKey(Object::from_static("get_terminal_size")),
+            builtin("get_terminal_size", os_get_terminal_size),
+        );
+        d.insert(
+            DictKey(Object::from_static("cpu_count")),
+            builtin("cpu_count", os_cpu_count),
+        );
+        d.insert(
+            DictKey(Object::from_static("get_exec_path")),
+            builtin("get_exec_path", os_get_exec_path),
+        );
+        d.insert(
+            DictKey(Object::from_static("getuid")),
+            builtin("getuid", os_getuid),
+        );
+        d.insert(
+            DictKey(Object::from_static("getgid")),
+            builtin("getgid", os_getgid),
+        );
+        d.insert(
+            DictKey(Object::from_static("geteuid")),
+            builtin("geteuid", os_getuid),
+        );
+        d.insert(
+            DictKey(Object::from_static("getegid")),
+            builtin("getegid", os_getgid),
+        );
+        d.insert(
+            DictKey(Object::from_static("umask")),
+            builtin("umask", os_umask),
+        );
+        d.insert(
+            DictKey(Object::from_static("symlink")),
+            builtin("symlink", os_symlink),
+        );
+        d.insert(
+            DictKey(Object::from_static("link")),
+            builtin("link", os_link),
+        );
+        d.insert(
+            DictKey(Object::from_static("chmod")),
+            builtin("chmod", os_chmod),
+        );
+        d.insert(
+            DictKey(Object::from_static("utime")),
+            builtin("utime", os_utime),
+        );
+        d.insert(
+            DictKey(Object::from_static("replace")),
+            builtin("replace", os_rename),
+        );
+        d.insert(
+            DictKey(Object::from_static("PathLike")),
+            Object::Type(path_like_type()),
+        );
         d.insert(DictKey(Object::from_static("O_RDONLY")), Object::Int(0));
         d.insert(DictKey(Object::from_static("O_WRONLY")), Object::Int(1));
         d.insert(DictKey(Object::from_static("O_RDWR")), Object::Int(2));
@@ -134,6 +235,21 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(DictKey(Object::from_static("O_EXCL")), Object::Int(128));
         d.insert(DictKey(Object::from_static("O_TRUNC")), Object::Int(512));
         d.insert(DictKey(Object::from_static("O_APPEND")), Object::Int(1024));
+        d.insert(
+            DictKey(Object::from_static("O_NONBLOCK")),
+            Object::Int(2048),
+        );
+        d.insert(DictKey(Object::from_static("F_OK")), Object::Int(0));
+        d.insert(DictKey(Object::from_static("R_OK")), Object::Int(4));
+        d.insert(DictKey(Object::from_static("W_OK")), Object::Int(2));
+        d.insert(DictKey(Object::from_static("X_OK")), Object::Int(1));
+        d.insert(DictKey(Object::from_static("EX_OK")), Object::Int(0));
+        d.insert(DictKey(Object::from_static("EX_USAGE")), Object::Int(64));
+        d.insert(DictKey(Object::from_static("EX_DATAERR")), Object::Int(65));
+        d.insert(DictKey(Object::from_static("EX_NOINPUT")), Object::Int(66));
+        d.insert(DictKey(Object::from_static("EX_SOFTWARE")), Object::Int(70));
+        d.insert(DictKey(Object::from_static("EX_OSERR")), Object::Int(71));
+        d.insert(DictKey(Object::from_static("EX_IOERR")), Object::Int(74));
     }
     Rc::new(PyModule {
         name: "os".to_owned(),
@@ -342,23 +458,444 @@ fn os_open_stub(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_stat_stub(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "stat")?;
     let meta = std::fs::metadata(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
-    let mut d = DictData::new();
+    Ok(stat_result_from_meta(&meta))
+}
+
+fn os_lstat(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = first_path(args, "lstat")?;
+    let meta = std::fs::symlink_metadata(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    Ok(stat_result_from_meta(&meta))
+}
+
+fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
+    use crate::types::PyInstance;
+    let ty = path_like_type_singleton("stat_result");
+    let inst = PyInstance::new(ty);
+    let mut d = inst.dict.borrow_mut();
+    let mode = if meta.is_dir() {
+        0o040_755
+    } else if meta.is_file() {
+        0o100_644
+    } else {
+        0o120_644
+    };
     d.insert(
         DictKey(Object::from_static("st_size")),
         Object::Int(meta.len() as i64),
     );
-    d.insert(
-        DictKey(Object::from_static("st_mode")),
-        Object::Int(if meta.is_dir() { 0o040_755 } else { 0o100_644 }),
-    );
+    d.insert(DictKey(Object::from_static("st_mode")), Object::Int(mode));
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0.0_f64, |d| d.as_secs_f64());
+    let atime = meta
+        .accessed()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0.0_f64, |d| d.as_secs_f64());
+    let ctime = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(mtime, |d| d.as_secs_f64());
     d.insert(
         DictKey(Object::from_static("st_mtime")),
-        meta.modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(Object::Float(0.0), |d| Object::Float(d.as_secs_f64())),
+        Object::Float(mtime),
     );
-    Ok(Object::Dict(Rc::new(RefCell::new(d))))
+    d.insert(
+        DictKey(Object::from_static("st_atime")),
+        Object::Float(atime),
+    );
+    d.insert(
+        DictKey(Object::from_static("st_ctime")),
+        Object::Float(ctime),
+    );
+    d.insert(DictKey(Object::from_static("st_ino")), Object::Int(0));
+    d.insert(DictKey(Object::from_static("st_dev")), Object::Int(0));
+    d.insert(DictKey(Object::from_static("st_nlink")), Object::Int(1));
+    d.insert(DictKey(Object::from_static("st_uid")), Object::Int(0));
+    d.insert(DictKey(Object::from_static("st_gid")), Object::Int(0));
+    drop(d);
+    Object::Instance(Rc::new(inst))
+}
+
+fn os_readlink(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = first_path(args, "readlink")?;
+    let t = std::fs::read_link(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    Ok(Object::from_str(t.to_string_lossy().into_owned()))
+}
+
+fn os_chdir(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = first_path(args, "chdir")?;
+    std::env::set_current_dir(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    Ok(Object::None)
+}
+
+fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args.first() {
+        Some(Object::Str(_)) | Some(Object::Bytes(_)) => Ok(args[0].clone()),
+        Some(other) => {
+            // Best-effort: if it has __fspath__ we'd have invoked it
+            // from the VM; here we just stringify.
+            Ok(Object::from_str(format!("{:?}", other)))
+        }
+        None => Err(type_error("fspath() takes exactly one argument")),
+    }
+}
+
+fn os_walk(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = first_path(args, "walk")?;
+    let mut out = Vec::new();
+    walk_dir(Path::new(&p), &mut out);
+    Ok(Object::new_list(out))
+}
+
+fn walk_dir(root: &Path, out: &mut Vec<Object>) {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(it) => it,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+            dirs.push(Object::from_str(name));
+        } else {
+            files.push(Object::from_str(name));
+        }
+    }
+    let triple = Object::new_tuple(vec![
+        Object::from_str(root.to_string_lossy().into_owned()),
+        Object::new_list(dirs.clone()),
+        Object::new_list(files),
+    ]);
+    out.push(triple);
+    for d in dirs {
+        if let Object::Str(name) = d {
+            walk_dir(&root.join(name.as_ref()), out);
+        }
+    }
+}
+
+fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        None => ".".to_owned(),
+        _ => return Err(type_error("scandir() arg must be str")),
+    };
+    let entries: Vec<Object> = std::fs::read_dir(&p)
+        .map_err(|e| crate::error::io_error_to_py(&e))?
+        .filter_map(|r| r.ok())
+        .map(|entry| {
+            let mut d = DictData::new();
+            d.insert(
+                DictKey(Object::from_static("name")),
+                Object::from_str(entry.file_name().to_string_lossy().into_owned()),
+            );
+            d.insert(
+                DictKey(Object::from_static("path")),
+                Object::from_str(entry.path().to_string_lossy().into_owned()),
+            );
+            d.insert(
+                DictKey(Object::from_static("is_dir")),
+                Object::Bool(entry.file_type().map(|f| f.is_dir()).unwrap_or(false)),
+            );
+            d.insert(
+                DictKey(Object::from_static("is_file")),
+                Object::Bool(entry.file_type().map(|f| f.is_file()).unwrap_or(false)),
+            );
+            Object::Dict(Rc::new(RefCell::new(d)))
+        })
+        .collect();
+    Ok(Object::new_list(entries))
+}
+
+fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    {
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(crate::error::os_error("pipe() failed"));
+        }
+        Ok(Object::new_tuple(vec![
+            Object::Int(i64::from(fds[0])),
+            Object::Int(i64::from(fds[1])),
+        ]))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(crate::error::not_implemented_error(
+            "os.pipe() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+fn os_dup(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        _ => return Err(type_error("dup() arg must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let new = unsafe { libc::dup(fd) };
+        if new < 0 {
+            return Err(crate::error::os_error("dup() failed"));
+        }
+        Ok(Object::Int(i64::from(new)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        Err(crate::error::not_implemented_error(
+            "os.dup() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+fn os_dup2(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        _ => return Err(type_error("dup2() arg must be int")),
+    };
+    let newfd = match args.get(1) {
+        Some(Object::Int(i)) => *i as i32,
+        _ => return Err(type_error("dup2() arg2 must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let new = unsafe { libc::dup2(fd, newfd) };
+        if new < 0 {
+            return Err(crate::error::os_error("dup2() failed"));
+        }
+        Ok(Object::Int(i64::from(new)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fd, newfd);
+        Err(crate::error::not_implemented_error(
+            "os.dup2() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+fn os_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i,
+        _ => return Err(type_error("isatty() arg must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let r = unsafe { libc::isatty(fd as i32) };
+        Ok(Object::Bool(r != 0))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        Ok(Object::Bool(false))
+    }
+}
+
+fn os_read(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        _ => return Err(type_error("read() arg must be int")),
+    };
+    let n = match args.get(1) {
+        Some(Object::Int(n)) => *n as usize,
+        _ => return Err(type_error("read() arg2 must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let mut buf = vec![0u8; n];
+        let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), n) };
+        if r < 0 {
+            return Err(crate::error::os_error("read() failed"));
+        }
+        buf.truncate(r as usize);
+        Ok(Object::new_bytes(buf))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fd, n);
+        Err(crate::error::not_implemented_error(
+            "os.read() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        _ => return Err(type_error("write() arg must be int")),
+    };
+    let data = match args.get(1) {
+        Some(Object::Bytes(b)) => b.to_vec(),
+        Some(Object::ByteArray(b)) => b.borrow().clone(),
+        Some(Object::Str(s)) => s.as_bytes().to_vec(),
+        _ => return Err(type_error("write() arg2 must be bytes-like")),
+    };
+    #[cfg(unix)]
+    {
+        let r = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if r < 0 {
+            return Err(crate::error::os_error("write() failed"));
+        }
+        Ok(Object::Int(r as i64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fd, data);
+        Err(crate::error::not_implemented_error(
+            "os.write() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+fn os_get_terminal_size(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::new_tuple(vec![Object::Int(80), Object::Int(24)]))
+}
+
+fn os_cpu_count(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get() as i64)
+        .unwrap_or(1);
+    Ok(Object::Int(n))
+}
+
+fn os_get_exec_path(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let path = std::env::var("PATH").unwrap_or_default();
+    let parts: Vec<Object> = path
+        .split(sep)
+        .map(|s| Object::from_str(s.to_owned()))
+        .collect();
+    Ok(Object::new_list(parts))
+}
+
+fn os_getuid(_args: &[Object]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    {
+        Ok(Object::Int(i64::from(unsafe { libc::getuid() })))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Object::Int(0))
+    }
+}
+
+fn os_getgid(_args: &[Object]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    {
+        Ok(Object::Int(i64::from(unsafe { libc::getgid() })))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Object::Int(0))
+    }
+}
+
+fn os_umask(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mask = match args.first() {
+        Some(Object::Int(i)) => *i as u32,
+        _ => return Err(type_error("umask() arg must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let old = unsafe { libc::umask(mask as libc::mode_t) };
+        Ok(Object::Int(i64::from(old)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mask;
+        Ok(Object::Int(0))
+    }
+}
+
+fn os_symlink(args: &[Object]) -> Result<Object, RuntimeError> {
+    let src = first_path(args, "symlink")?;
+    let dst = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("symlink() second arg must be str")),
+    };
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&src, &dst).map_err(|e| crate::error::io_error_to_py(&e))?;
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (src, dst);
+        Err(crate::error::not_implemented_error(
+            "os.symlink() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+fn os_link(args: &[Object]) -> Result<Object, RuntimeError> {
+    let src = first_path(args, "link")?;
+    let dst = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("link() second arg must be str")),
+    };
+    std::fs::hard_link(&src, &dst).map_err(|e| crate::error::io_error_to_py(&e))?;
+    Ok(Object::None)
+}
+
+fn os_chmod(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = first_path(args, "chmod")?;
+    let mode = match args.get(1) {
+        Some(Object::Int(m)) => *m as u32,
+        _ => return Err(type_error("chmod() mode must be int")),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&p)
+            .map_err(|e| crate::error::io_error_to_py(&e))?
+            .permissions();
+        perms.set_mode(mode);
+        std::fs::set_permissions(&p, perms).map_err(|e| crate::error::io_error_to_py(&e))?;
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (p, mode);
+        Ok(Object::None)
+    }
+}
+
+fn os_utime(args: &[Object]) -> Result<Object, RuntimeError> {
+    // Minimal implementation: just touch the file by opening for
+    // append. A real version would call utimensat(2).
+    let p = first_path(args, "utime")?;
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&p)
+        .map_err(|e| crate::error::io_error_to_py(&e))?;
+    Ok(Object::None)
+}
+
+fn path_like_type() -> Rc<crate::types::TypeObject> {
+    path_like_type_singleton("PathLike")
+}
+
+fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
+    use crate::builtin_types::builtin_types;
+    use crate::types::{TypeFlags, TypeObject};
+    let bt = builtin_types();
+    TypeObject::new_with_flags(
+        Box::leak(name.to_owned().into_boxed_str()),
+        vec![bt.object_.clone()],
+        DictData::new(),
+        TypeFlags {
+            is_exception: false,
+            is_builtin: true,
+        },
+    )
+    .expect("os.PathLike")
 }
 
 // ---------- os.path ----------

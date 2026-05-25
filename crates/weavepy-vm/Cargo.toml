@@ -46,5 +46,16 @@ xz2              = { workspace = true }
 rusqlite         = { workspace = true }
 rust_decimal     = { workspace = true }
 
+# RFC 0023 — drop-in stdlib parity + HTTPS.
+unicode-normalization = { workspace = true }
+unicode-properties    = { workspace = true }
+memmap2               = { workspace = true }
+libc                  = { workspace = true }
+rustls                = { workspace = true }
+rustls-pki-types      = { workspace = true }
+rustls-pemfile        = { workspace = true }
+rustls-native-certs   = { workspace = true }
+webpki-roots          = { workspace = true }
+
 [lints]
 workspace = true

@@ -343,11 +343,10 @@ fn host_platform() -> &'static str {
 }
 
 fn implementation_value() -> Object {
-    // CPython exposes a `types.SimpleNamespace`-flavoured object on
-    // `sys.implementation`. We approximate with a `dict` until
-    // `SimpleNamespace` exists — close enough for the typical
-    // `sys.implementation.name == "cpython"` check, which our build
-    // intentionally answers `"weavepy"`.
+    // `sys.implementation` is a `types.SimpleNamespace`-shaped object
+    // in CPython. RFC 0023 added [`Object::SimpleNamespace`] so we
+    // can match the shape exactly — attribute access via `.name`
+    // / `.version` works, but the value isn't a dict.
     let mut d = DictData::new();
     d.insert(
         DictKey(Object::from_static("name")),
@@ -371,7 +370,11 @@ fn implementation_value() -> Object {
         DictKey(Object::from_static("cache_tag")),
         Object::from_static(crate::pycache::CACHE_TAG),
     );
-    Object::Dict(Rc::new(RefCell::new(d)))
+    d.insert(
+        DictKey(Object::from_static("_multiarch")),
+        Object::from_static("weavepy-x86_64"),
+    );
+    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {

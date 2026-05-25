@@ -104,6 +104,25 @@ pub enum Object {
     /// exceptions propagate so user code can walk `tb_next` /
     /// `tb_frame` / `tb_lineno` like CPython.
     Traceback(Rc<PyTraceback>),
+    /// Memory view over a bytes-like object (RFC 0023). Supports the
+    /// buffer protocol minimum: indexing, slicing, `len`, `cast`,
+    /// `tobytes`, `tolist`, `release`, `nbytes`, `format`, `itemsize`,
+    /// `ndim`, `shape`, `strides`, `readonly`, `c_contiguous`,
+    /// `f_contiguous`, `contiguous`.
+    MemoryView(Rc<PyMemoryView>),
+    /// A read-only mapping view (RFC 0023). Used by `cls.__dict__`,
+    /// `module.__dict__` reads through `vars()`, and dataclass
+    /// `__match_args__` exposure. Backed by a shared `DictData`
+    /// reference; mutations through this view raise `TypeError`.
+    MappingProxy(Rc<RefCell<DictData>>),
+    /// A view over `dict.keys() / .values() / .items()` (RFC 0023).
+    /// Keeps a reference to the source dict so the view stays live
+    /// across mutations, matching CPython's dict view semantics.
+    DictView(Rc<PyDictView>),
+    /// `types.SimpleNamespace` instance (RFC 0023). Used by
+    /// `sys.implementation`, `argparse.Namespace`-shaped fixtures, and
+    /// the conformance harness.
+    SimpleNamespace(Rc<RefCell<DictData>>),
 }
 
 impl fmt::Debug for Object {
@@ -151,6 +170,24 @@ impl fmt::Debug for Object {
             Object::SlotDescriptor(sd) => write!(f, "<slot {:?} of {:?}>", sd.name, sd.class_name),
             Object::Frame(fr) => write!(f, "<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
             Object::Traceback(tb) => write!(f, "<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
+            Object::MemoryView(mv) => write!(f, "<memory at 0x{:x}>", Rc::as_ptr(mv) as usize),
+            Object::MappingProxy(d) => {
+                let d = d.borrow();
+                let mut m = f.debug_map();
+                for (k, v) in d.iter() {
+                    m.entry(&k.0, v);
+                }
+                m.finish()
+            }
+            Object::DictView(v) => write!(f, "<{} {:?}>", v.kind.type_name(), v),
+            Object::SimpleNamespace(d) => {
+                let d = d.borrow();
+                let mut m = f.debug_struct("namespace");
+                for (k, v) in d.iter() {
+                    m.field(&k.0.to_str(), v);
+                }
+                m.finish()
+            }
         }
     }
 }
@@ -247,6 +284,100 @@ pub struct PyTraceback {
     pub lineno: u32,
     pub lasti: u32,
     pub next: RefCell<Option<Rc<PyTraceback>>>,
+}
+
+/// Backing buffer for a [`PyMemoryView`].
+#[derive(Debug)]
+pub enum MemoryViewBuffer {
+    /// Immutable bytes; the view exposes them read-only.
+    Bytes(Rc<[u8]>),
+    /// Mutable bytearray; the view participates in `bytearray`'s
+    /// shared-state semantics so writes through the view land in
+    /// the underlying buffer.
+    ByteArray(Rc<RefCell<Vec<u8>>>),
+}
+
+/// `memoryview(obj)` — a thin window into another bytes-like object.
+/// We only implement the byte-format minimum CPython itself ships
+/// (`format='B'`, `itemsize=1`, `ndim=1`). NumPy-style N-dimensional
+/// views are RFC 0023 future work; the surface is enough for
+/// `pickle.PickleBuffer`, `socket.recv_into`, and the standard
+/// `memoryview(b'hello').tobytes()` patterns.
+#[derive(Debug)]
+pub struct PyMemoryView {
+    pub buffer: MemoryViewBuffer,
+    /// Inclusive start offset into the buffer (in bytes).
+    pub start: Cell<usize>,
+    /// Number of bytes covered by the view.
+    pub len: Cell<usize>,
+    pub readonly: Cell<bool>,
+    pub released: Cell<bool>,
+    pub format: RefCell<String>,
+    pub itemsize: Cell<usize>,
+}
+
+impl PyMemoryView {
+    pub fn from_bytes(b: Rc<[u8]>) -> Self {
+        let len = b.len();
+        Self {
+            buffer: MemoryViewBuffer::Bytes(b),
+            start: Cell::new(0),
+            len: Cell::new(len),
+            readonly: Cell::new(true),
+            released: Cell::new(false),
+            format: RefCell::new("B".to_owned()),
+            itemsize: Cell::new(1),
+        }
+    }
+
+    pub fn from_bytearray(b: Rc<RefCell<Vec<u8>>>) -> Self {
+        let len = b.borrow().len();
+        Self {
+            buffer: MemoryViewBuffer::ByteArray(b),
+            start: Cell::new(0),
+            len: Cell::new(len),
+            readonly: Cell::new(false),
+            released: Cell::new(false),
+            format: RefCell::new("B".to_owned()),
+            itemsize: Cell::new(1),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let start = self.start.get();
+        let end = start + self.len.get();
+        match &self.buffer {
+            MemoryViewBuffer::Bytes(b) => b[start..end].to_vec(),
+            MemoryViewBuffer::ByteArray(b) => b.borrow()[start..end].to_vec(),
+        }
+    }
+}
+
+/// Discriminator carried on [`Object::DictView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictViewKind {
+    Keys,
+    Values,
+    Items,
+}
+
+impl DictViewKind {
+    pub fn type_name(self) -> &'static str {
+        match self {
+            DictViewKind::Keys => "dict_keys",
+            DictViewKind::Values => "dict_values",
+            DictViewKind::Items => "dict_items",
+        }
+    }
+}
+
+/// Live view over a backing `dict`. Iteration order mirrors the
+/// underlying `IndexMap`. Mutations to the dict propagate through
+/// the view (CPython invariant).
+#[derive(Debug)]
+pub struct PyDictView {
+    pub dict: Rc<RefCell<DictData>>,
+    pub kind: DictViewKind,
 }
 
 /// Internal payload for [`Object::Property`].
@@ -972,6 +1103,10 @@ impl Object {
             | Object::SlotDescriptor(_)
             | Object::Frame(_)
             | Object::Traceback(_) => true,
+            Object::MemoryView(mv) => mv.len.get() > 0,
+            Object::MappingProxy(d) => !d.borrow().is_empty(),
+            Object::DictView(v) => !v.dict.borrow().is_empty(),
+            Object::SimpleNamespace(_) => true,
             Object::Bytes(b) => !b.is_empty(),
             Object::ByteArray(b) => !b.borrow().is_empty(),
             Object::Set(s) => !s.borrow().is_empty(),
@@ -1043,6 +1178,10 @@ impl Object {
             (Object::SlotDescriptor(a), Object::SlotDescriptor(b)) => Rc::ptr_eq(a, b),
             (Object::Frame(a), Object::Frame(b)) => Rc::ptr_eq(a, b),
             (Object::Traceback(a), Object::Traceback(b)) => Rc::ptr_eq(a, b),
+            (Object::MemoryView(a), Object::MemoryView(b)) => Rc::ptr_eq(a, b),
+            (Object::MappingProxy(a), Object::MappingProxy(b)) => Rc::ptr_eq(a, b),
+            (Object::DictView(a), Object::DictView(b)) => Rc::ptr_eq(a, b),
+            (Object::SimpleNamespace(a), Object::SimpleNamespace(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -1222,6 +1361,30 @@ impl Object {
                     Ok(false)
                 }
             }
+            Object::MappingProxy(d) => Ok(d.borrow().contains_key(&DictKey(item.clone()))),
+            Object::DictView(v) => {
+                let d = v.dict.borrow();
+                match v.kind {
+                    DictViewKind::Keys => Ok(d.contains_key(&DictKey(item.clone()))),
+                    DictViewKind::Values => Ok(d.values().any(|x| x.eq_value(item))),
+                    DictViewKind::Items => {
+                        if let Object::Tuple(t) = item {
+                            if t.len() == 2 {
+                                if let Some(v) = d.get(&DictKey(t[0].clone())) {
+                                    return Ok(v.eq_value(&t[1]));
+                                }
+                            }
+                        }
+                        Ok(false)
+                    }
+                }
+            }
+            Object::MemoryView(mv) => match item {
+                Object::Int(i) => Ok(*i >= 0 && *i <= 255 && mv.to_bytes().contains(&(*i as u8))),
+                _ => Err(type_error(
+                    "a bytes-like object is required for memoryview membership",
+                )),
+            },
             _ => Err(type_error(format!(
                 "argument of type '{}' is not iterable",
                 self.type_name()
@@ -1279,6 +1442,46 @@ impl Object {
                     index: 0,
                 })
             }
+            Object::MemoryView(mv) => {
+                if mv.released.get() {
+                    return Err(value_error("memoryview: released"));
+                }
+                let snapshot: Rc<[u8]> = Rc::from(mv.to_bytes().into_boxed_slice());
+                Ok(PyIterator::Bytes {
+                    data: snapshot,
+                    index: 0,
+                })
+            }
+            Object::DictView(v) => {
+                let d = v.dict.borrow();
+                match v.kind {
+                    DictViewKind::Keys => {
+                        let keys: Vec<DictKey> = d.keys().cloned().collect();
+                        Ok(PyIterator::DictKeys { keys, index: 0 })
+                    }
+                    DictViewKind::Values => {
+                        let vs: Vec<Object> = d.values().cloned().collect();
+                        Ok(PyIterator::List {
+                            items: Rc::new(RefCell::new(vs)),
+                            index: 0,
+                        })
+                    }
+                    DictViewKind::Items => {
+                        let items: Vec<Object> = d
+                            .iter()
+                            .map(|(k, v)| Object::new_tuple(vec![k.0.clone(), v.clone()]))
+                            .collect();
+                        Ok(PyIterator::List {
+                            items: Rc::new(RefCell::new(items)),
+                            index: 0,
+                        })
+                    }
+                }
+            }
+            Object::MappingProxy(d) => {
+                let keys: Vec<DictKey> = d.borrow().keys().cloned().collect();
+                Ok(PyIterator::DictKeys { keys, index: 0 })
+            }
             _ => Err(type_error(format!(
                 "'{}' object is not iterable",
                 self.type_name()
@@ -1326,6 +1529,10 @@ impl Object {
             Object::SlotDescriptor(_) => "member_descriptor",
             Object::Frame(_) => "frame",
             Object::Traceback(_) => "traceback",
+            Object::MemoryView(_) => "memoryview",
+            Object::MappingProxy(_) => "mappingproxy",
+            Object::DictView(v) => v.kind.type_name(),
+            Object::SimpleNamespace(_) => "SimpleNamespace",
         }
     }
 
@@ -1496,6 +1703,31 @@ impl Object {
             }
             Object::Frame(fr) => format!("<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
             Object::Traceback(tb) => format!("<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
+            Object::MemoryView(mv) => format!("<memory at 0x{:x}>", Rc::as_ptr(mv) as usize),
+            Object::MappingProxy(d) => {
+                let body = Object::Dict(d.clone()).repr();
+                format!("mappingproxy({body})")
+            }
+            Object::DictView(v) => {
+                let d = v.dict.borrow();
+                let body: Vec<String> = match v.kind {
+                    DictViewKind::Keys => d.keys().map(|k| k.0.repr()).collect(),
+                    DictViewKind::Values => d.values().map(|v| v.repr()).collect(),
+                    DictViewKind::Items => d
+                        .iter()
+                        .map(|(k, v)| format!("({}, {})", k.0.repr(), v.repr()))
+                        .collect(),
+                };
+                format!("{}([{}])", v.kind.type_name(), body.join(", "))
+            }
+            Object::SimpleNamespace(d) => {
+                let d = d.borrow();
+                let parts: Vec<String> = d
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k.0.to_str(), v.repr()))
+                    .collect();
+                format!("namespace({})", parts.join(", "))
+            }
         }
     }
 
@@ -1530,6 +1762,9 @@ impl Object {
             Object::ByteArray(b) => Ok(b.borrow().len()),
             Object::Set(s) => Ok(s.borrow().len()),
             Object::FrozenSet(s) => Ok(s.len()),
+            Object::MemoryView(mv) => Ok(mv.len.get()),
+            Object::MappingProxy(d) => Ok(d.borrow().len()),
+            Object::DictView(v) => Ok(v.dict.borrow().len()),
             _ => Err(type_error(format!(
                 "object of type '{}' has no len()",
                 self.type_name()

@@ -30,6 +30,7 @@ pub struct BuiltinTypes {
     pub int_: Rc<TypeObject>,
     pub float_: Rc<TypeObject>,
     pub bool_: Rc<TypeObject>,
+    pub complex_: Rc<TypeObject>,
     pub str_: Rc<TypeObject>,
     pub bytes_: Rc<TypeObject>,
     pub bytearray_: Rc<TypeObject>,
@@ -39,7 +40,17 @@ pub struct BuiltinTypes {
     pub set_: Rc<TypeObject>,
     pub frozenset_: Rc<TypeObject>,
     pub range_: Rc<TypeObject>,
+    pub slice_: Rc<TypeObject>,
+    pub memoryview_: Rc<TypeObject>,
+    pub mappingproxy_: Rc<TypeObject>,
+    pub dict_keys_: Rc<TypeObject>,
+    pub dict_values_: Rc<TypeObject>,
+    pub dict_items_: Rc<TypeObject>,
+    pub iterator_: Rc<TypeObject>,
     pub none_type: Rc<TypeObject>,
+    pub ellipsis_: Rc<TypeObject>,
+    pub not_implemented_type_: Rc<TypeObject>,
+    pub simple_namespace_: Rc<TypeObject>,
     pub function_: Rc<TypeObject>,
     pub generator_: Rc<TypeObject>,
     pub coroutine_: Rc<TypeObject>,
@@ -143,6 +154,7 @@ impl BuiltinTypes {
         let int_ = mk("int", vec![object_.clone()]);
         let float_ = mk("float", vec![object_.clone()]);
         let bool_ = mk("bool", vec![int_.clone()]);
+        let complex_ = mk("complex", vec![object_.clone()]);
         let str_ = mk("str", vec![object_.clone()]);
         let bytes_ = mk("bytes", vec![object_.clone()]);
         let bytearray_ = mk("bytearray", vec![object_.clone()]);
@@ -152,7 +164,17 @@ impl BuiltinTypes {
         let set_ = mk("set", vec![object_.clone()]);
         let frozenset_ = mk("frozenset", vec![object_.clone()]);
         let range_ = mk("range", vec![object_.clone()]);
+        let slice_ = mk("slice", vec![object_.clone()]);
+        let memoryview_ = mk("memoryview", vec![object_.clone()]);
+        let mappingproxy_ = mk("mappingproxy", vec![object_.clone()]);
+        let dict_keys_ = mk("dict_keys", vec![object_.clone()]);
+        let dict_values_ = mk("dict_values", vec![object_.clone()]);
+        let dict_items_ = mk("dict_items", vec![object_.clone()]);
+        let iterator_ = mk("iterator", vec![object_.clone()]);
         let none_type = mk("NoneType", vec![object_.clone()]);
+        let ellipsis_ = mk("ellipsis", vec![object_.clone()]);
+        let not_implemented_type_ = mk("NotImplementedType", vec![object_.clone()]);
+        let simple_namespace_ = mk("SimpleNamespace", vec![object_.clone()]);
         let function_ = mk("function", vec![object_.clone()]);
         let generator_ = mk("generator", vec![object_.clone()]);
         let coroutine_ = mk("coroutine", vec![object_.clone()]);
@@ -269,6 +291,7 @@ impl BuiltinTypes {
             int_,
             float_,
             bool_,
+            complex_,
             str_,
             bytes_,
             bytearray_,
@@ -278,7 +301,17 @@ impl BuiltinTypes {
             set_,
             frozenset_,
             range_,
+            slice_,
+            memoryview_,
+            mappingproxy_,
+            dict_keys_,
+            dict_values_,
+            dict_items_,
+            iterator_,
             none_type,
+            ellipsis_,
+            not_implemented_type_,
+            simple_namespace_,
             function_,
             generator_,
             coroutine_,
@@ -373,6 +406,7 @@ impl BuiltinTypes {
             pair!(int_, "int"),
             pair!(float_, "float"),
             pair!(bool_, "bool"),
+            pair!(complex_, "complex"),
             pair!(str_, "str"),
             pair!(bytes_, "bytes"),
             pair!(bytearray_, "bytearray"),
@@ -382,6 +416,8 @@ impl BuiltinTypes {
             pair!(set_, "set"),
             pair!(frozenset_, "frozenset"),
             pair!(range_, "range"),
+            pair!(slice_, "slice"),
+            pair!(memoryview_, "memoryview"),
             pair!(base_exception, "BaseException"),
             pair!(exception, "Exception"),
             pair!(arithmetic_error, "ArithmeticError"),
@@ -453,6 +489,7 @@ impl BuiltinTypes {
             "int" => Some(self.int_.clone()),
             "float" => Some(self.float_.clone()),
             "bool" => Some(self.bool_.clone()),
+            "complex" => Some(self.complex_.clone()),
             "str" => Some(self.str_.clone()),
             "bytes" => Some(self.bytes_.clone()),
             "bytearray" => Some(self.bytearray_.clone()),
@@ -462,6 +499,12 @@ impl BuiltinTypes {
             "set" => Some(self.set_.clone()),
             "frozenset" => Some(self.frozenset_.clone()),
             "range" => Some(self.range_.clone()),
+            "slice" => Some(self.slice_.clone()),
+            "memoryview" => Some(self.memoryview_.clone()),
+            "mappingproxy" => Some(self.mappingproxy_.clone()),
+            "dict_keys" => Some(self.dict_keys_.clone()),
+            "dict_values" => Some(self.dict_values_.clone()),
+            "dict_items" => Some(self.dict_items_.clone()),
             "BaseException" => Some(self.base_exception.clone()),
             "Exception" => Some(self.exception.clone()),
             "ArithmeticError" => Some(self.arithmetic_error.clone()),

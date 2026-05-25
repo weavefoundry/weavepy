@@ -43,12 +43,52 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(DictKey(Object::from_static("SEEK_SET")), Object::Int(0));
         d.insert(DictKey(Object::from_static("SEEK_CUR")), Object::Int(1));
         d.insert(DictKey(Object::from_static("SEEK_END")), Object::Int(2));
+        // RFC 0023 — surface the IOBase hierarchy from `_io` so
+        // `isinstance(open(...), io.IOBase)` and similar checks work.
+        for name in [
+            "IOBase",
+            "RawIOBase",
+            "BufferedIOBase",
+            "TextIOBase",
+            "FileIO",
+            "BufferedReader",
+            "BufferedWriter",
+            "BufferedRandom",
+            "BufferedRWPair",
+            "TextIOWrapper",
+            "IncrementalNewlineDecoder",
+            "UnsupportedOperation",
+        ] {
+            let cls = make_io_protocol(name);
+            d.insert(DictKey(Object::from_static(name)), Object::Type(cls));
+        }
     }
     Rc::new(PyModule {
         name: "io".to_owned(),
         filename: None,
         dict,
     })
+}
+
+/// Build a protocol-only TypeObject for one of the `io.*` ABCs. This
+/// returns the same shape as `_io.IOBase` etc. so the two surface
+/// imports resolve to identical class identity. (We don't try to
+/// share `Rc<TypeObject>` instances across module builds because
+/// `io.IOBase` and `_io.IOBase` are recreated per-VM.)
+fn make_io_protocol(name: &'static str) -> Rc<crate::types::TypeObject> {
+    use crate::builtin_types::builtin_types;
+    use crate::types::{TypeFlags, TypeObject};
+    let bt = builtin_types();
+    TypeObject::new_with_flags(
+        name,
+        vec![bt.object_.clone()],
+        DictData::new(),
+        TypeFlags {
+            is_exception: name == "UnsupportedOperation",
+            is_builtin: true,
+        },
+    )
+    .expect("io protocol type")
 }
 
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {

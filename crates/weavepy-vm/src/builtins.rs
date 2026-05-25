@@ -121,6 +121,60 @@ pub fn default_builtins() -> DictData {
     reg!("object", b_object);
     reg!("globals", b_globals);
     reg!("locals", b_locals);
+    // RFC 0023 — the long-tail builtins that scripts routinely
+    // reach for. `breakpoint` is intercepted by the VM so it can
+    // honour `sys.breakpointhook`; `help`/`copyright`/`license` are
+    // intentionally cheap "interactive use only" stubs.
+    reg!("pow", b_pow);
+    reg!("breakpoint", b_breakpoint);
+    reg!("memoryview", b_memoryview);
+    reg!("__weavepy_typevar__", b_typevar);
+    {
+        let f = BuiltinFn {
+            name: "__vm:input",
+            call: Box::new(b_input_unsupported),
+        };
+        d.insert(
+            DictKey(Object::from_static("input")),
+            Object::Builtin(Rc::new(f)),
+        );
+    }
+    d.insert(
+        DictKey(Object::from_static("help")),
+        crate::vm_singletons::interactive_printer(
+            "help",
+            "Type help() for interactive help, or help(object) for help about object.",
+        ),
+    );
+    d.insert(
+        DictKey(Object::from_static("copyright")),
+        crate::vm_singletons::interactive_printer(
+            "copyright",
+            "Copyright (c) 2026 The WeavePy Authors.\nAll Rights Reserved.\n\nWeavePy is dual-licensed under MIT OR Apache-2.0.",
+        ),
+    );
+    d.insert(
+        DictKey(Object::from_static("license")),
+        crate::vm_singletons::interactive_printer(
+            "license",
+            "Type license() to see the full license text.\nWeavePy is licensed under MIT OR Apache-2.0.",
+        ),
+    );
+    d.insert(
+        DictKey(Object::from_static("credits")),
+        crate::vm_singletons::interactive_printer(
+            "credits",
+            "Thanks to the CPython, Rust, PyPy, and rustls communities for paving the way.",
+        ),
+    );
+    d.insert(
+        DictKey(Object::from_static("quit")),
+        crate::vm_singletons::quitter("quit"),
+    );
+    d.insert(
+        DictKey(Object::from_static("exit")),
+        crate::vm_singletons::quitter("exit"),
+    );
     // `__import__`, `compile`, `exec`, `eval` are VM intrinsics: the
     // registered closures are only placeholders, the VM intercepts
     // calls to builtins whose internal name carries the `__vm:`
@@ -354,6 +408,25 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "getvalue" => Some(method("getvalue", file_getvalue)),
             "__enter__" => Some(method("__enter__", file_enter)),
             "__exit__" => Some(method("__exit__", file_exit)),
+            _ => None,
+        },
+        Object::MemoryView(_) => match name {
+            "tobytes" => Some(method("tobytes", memoryview_tobytes)),
+            "tolist" => Some(method("tolist", memoryview_tolist)),
+            "release" => Some(method("release", memoryview_release)),
+            "cast" => Some(method("cast", memoryview_cast)),
+            "hex" => Some(method("hex", memoryview_hex)),
+            "__enter__" => Some(method("__enter__", memoryview_enter)),
+            "__exit__" => Some(method("__exit__", memoryview_exit)),
+            _ => None,
+        },
+        Object::DictView(_) | Object::MappingProxy(_) => match name {
+            "isdisjoint" => Some(method("isdisjoint", view_isdisjoint)),
+            "mapping" => None,
+            _ => None,
+        },
+        Object::SimpleNamespace(_) => match name {
+            "__repr__" => None,
             _ => None,
         },
         // `property` objects expose `getter`/`setter`/`deleter`
@@ -1807,35 +1880,7 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
     // `type(name, bases, ns)` is intercepted by the VM call site
     // (see `Vm::dynamic_type_call`); only the 1-arg form reaches us.
     let arg = one(args, "type")?;
-    let bt = builtin_types();
-    let ty = match arg {
-        Object::None => bt.none_type.clone(),
-        Object::Bool(_) => bt.bool_.clone(),
-        Object::Int(_) => bt.int_.clone(),
-        Object::Long(_) => bt.int_.clone(),
-        Object::Float(_) => bt.float_.clone(),
-        Object::Str(_) => bt.str_.clone(),
-        Object::Bytes(_) => bt.bytes_.clone(),
-        Object::ByteArray(_) => bt.bytearray_.clone(),
-        Object::Set(_) => bt.set_.clone(),
-        Object::FrozenSet(_) => bt.frozenset_.clone(),
-        Object::Tuple(_) => bt.tuple_.clone(),
-        Object::List(_) => bt.list_.clone(),
-        Object::Dict(_) => bt.dict_.clone(),
-        Object::Range(_) => bt.range_.clone(),
-        Object::Function(_) | Object::Builtin(_) | Object::BoundMethod(_) => bt.function_.clone(),
-        Object::Property(_) => bt.property_.clone(),
-        Object::StaticMethod(_) => bt.staticmethod_.clone(),
-        Object::ClassMethod(_) => bt.classmethod_.clone(),
-        Object::Generator(_) => bt.generator_.clone(),
-        Object::Coroutine(_) => bt.coroutine_.clone(),
-        Object::AsyncGenerator(_) => bt.async_generator_.clone(),
-        // For a class object: return its metaclass.
-        Object::Type(t) => t.metaclass_or_type(),
-        Object::Instance(inst) => inst.class.clone(),
-        _ => bt.object_.clone(),
-    };
-    Ok(Object::Type(ty))
+    Ok(Object::Type(class_of(arg)))
 }
 
 fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2232,11 +2277,20 @@ pub fn class_matches_classinfo(
     cls: &crate::types::TypeObject,
     info: &Object,
 ) -> Result<bool, RuntimeError> {
+    // Unwrap PEP 585 generic aliases (`list[int]` → `list`) — CPython
+    // treats `isinstance(x, list[int])` as `isinstance(x, list)`.
+    if let Some(origin) = generic_alias_origin(info) {
+        return class_matches_classinfo(cls, &origin);
+    }
     match info {
         Object::Type(t) => Ok(cls.is_subclass_of(t)),
         Object::Tuple(items) => {
             for it in items.iter() {
-                if let Object::Type(t) = it {
+                if let Some(origin) = generic_alias_origin(it) {
+                    if class_matches_classinfo(cls, &origin)? {
+                        return Ok(true);
+                    }
+                } else if let Object::Type(t) = it {
                     if cls.is_subclass_of(t) {
                         return Ok(true);
                     }
@@ -2250,23 +2304,47 @@ pub fn class_matches_classinfo(
     }
 }
 
-/// Compare a value's runtime type against a class or tuple of classes.
-pub fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeError> {
+/// Return the `__origin__` of a PEP 585 generic alias (or PEP 604
+/// union) wrapped as a `SimpleNamespace`. Returns `None` if `info`
+/// isn't a generic alias.
+fn generic_alias_origin(info: &Object) -> Option<Object> {
+    match info {
+        Object::SimpleNamespace(d) => d
+            .borrow()
+            .get(&crate::object::DictKey(Object::from_static("__origin__")))
+            .cloned(),
+        _ => None,
+    }
+}
+
+/// Map any runtime value to the [`crate::types::TypeObject`] that
+/// `type(x)` would return. Used by `isinstance`/`type()` and a few
+/// other reflective code paths. The mapping is the canonical
+/// equivalent of CPython's `Py_TYPE(o)`.
+pub fn class_of(obj: &Object) -> std::rc::Rc<crate::types::TypeObject> {
     let bt = builtin_types();
-    let obj_class = match obj {
+    match obj {
         Object::Instance(inst) => inst.class.clone(),
         Object::None => bt.none_type.clone(),
         Object::Bool(_) => bt.bool_.clone(),
         Object::Int(_) => bt.int_.clone(),
         Object::Long(_) => bt.int_.clone(),
         Object::Float(_) => bt.float_.clone(),
+        Object::Complex(_) => bt.complex_.clone(),
         Object::Str(_) => bt.str_.clone(),
         Object::Tuple(_) => bt.tuple_.clone(),
         Object::List(_) => bt.list_.clone(),
         Object::Dict(_) => bt.dict_.clone(),
         Object::Range(_) => bt.range_.clone(),
-        // A class is an instance of its metaclass, not of `type`
-        // unconditionally — this matters for custom metaclasses.
+        Object::Slice(_) => bt.slice_.clone(),
+        Object::MemoryView(_) => bt.memoryview_.clone(),
+        Object::MappingProxy(_) => bt.mappingproxy_.clone(),
+        Object::DictView(v) => match v.kind {
+            crate::object::DictViewKind::Keys => bt.dict_keys_.clone(),
+            crate::object::DictViewKind::Values => bt.dict_values_.clone(),
+            crate::object::DictViewKind::Items => bt.dict_items_.clone(),
+        },
+        Object::SimpleNamespace(_) => bt.simple_namespace_.clone(),
         Object::Type(t) => t.metaclass_or_type(),
         Object::Function(_) | Object::Builtin(_) | Object::BoundMethod(_) => bt.function_.clone(),
         Object::Property(_) => bt.property_.clone(),
@@ -2276,8 +2354,23 @@ pub fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeErr
         Object::ByteArray(_) => bt.bytearray_.clone(),
         Object::Set(_) => bt.set_.clone(),
         Object::FrozenSet(_) => bt.frozenset_.clone(),
-        _ => bt.object_.clone(),
-    };
+        Object::Iter(_) => bt.iterator_.clone(),
+        Object::Generator(_) => bt.generator_.clone(),
+        Object::Coroutine(_) => bt.coroutine_.clone(),
+        Object::AsyncGenerator(_) => bt.async_generator_.clone(),
+        Object::Module(_) => bt.module_.clone(),
+        Object::Code(_) | Object::Cell(_) | Object::SlotDescriptor(_) | Object::File(_) => {
+            bt.object_.clone()
+        }
+        Object::Frame(_) | Object::Traceback(_) => bt.object_.clone(),
+    }
+}
+
+/// Compare a value's runtime type against a class or tuple of classes.
+pub fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeError> {
+    let bt = builtin_types();
+    let obj_class = class_of(obj);
+    let _ = bt;
     // Honour a metaclass-defined `__instancecheck__` (PEP 3119): if
     // `info` is a class whose metaclass overrides `__instancecheck__`,
     // route through it. Otherwise fall back to MRO inclusion.
@@ -2298,7 +2391,78 @@ pub fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeErr
 }
 
 fn b_id(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(one(args, "id")?.repr().len() as i64))
+    let obj = one(args, "id")?;
+    Ok(Object::Int(object_identity(obj)))
+}
+
+/// Return a stable integer identity for `obj`. For heap-allocated
+/// objects (lists, dicts, tuples, strings, bytes, instances, etc.)
+/// this is the pointer to the underlying `Rc` payload, which
+/// guarantees uniqueness while the object is alive. For value
+/// objects (`int`, `float`, `bool`, `None`) we mix the value with a
+/// per-variant salt — matching CPython's "small ints have stable
+/// ids" semantics without trying to intern.
+fn object_identity(obj: &Object) -> i64 {
+    use crate::object::Object;
+    // For DST-backed Rc<T> (`Rc<str>`, `Rc<[u8]>`, `Rc<[Object]>`) we
+    // can't `as usize` the fat pointer directly; route through the
+    // thin pointer of the underlying byte/data buffer.
+    fn rc_str_ptr(s: &Rc<str>) -> i64 {
+        s.as_ptr() as usize as i64
+    }
+    fn rc_bytes_ptr(s: &Rc<[u8]>) -> i64 {
+        s.as_ptr() as usize as i64
+    }
+    fn rc_obj_slice_ptr(s: &Rc<[Object]>) -> i64 {
+        s.as_ptr() as usize as i64
+    }
+    match obj {
+        Object::Str(s) => rc_str_ptr(s),
+        Object::Bytes(b) => rc_bytes_ptr(b),
+        Object::ByteArray(b) => Rc::as_ptr(b) as usize as i64,
+        Object::List(l) => Rc::as_ptr(l) as usize as i64,
+        Object::Tuple(t) => rc_obj_slice_ptr(t),
+        Object::Dict(d) => Rc::as_ptr(d) as usize as i64,
+        Object::Set(s) => Rc::as_ptr(s) as usize as i64,
+        Object::FrozenSet(s) => Rc::as_ptr(s) as usize as i64,
+        Object::Function(f) => Rc::as_ptr(f) as usize as i64,
+        Object::Builtin(b) => Rc::as_ptr(b) as usize as i64,
+        Object::BoundMethod(m) => Rc::as_ptr(m) as usize as i64,
+        Object::Instance(i) => Rc::as_ptr(i) as usize as i64,
+        Object::Type(t) => Rc::as_ptr(t) as usize as i64,
+        Object::Module(m) => Rc::as_ptr(m) as usize as i64,
+        Object::Range(r) => Rc::as_ptr(r) as usize as i64,
+        Object::Slice(s) => Rc::as_ptr(s) as usize as i64,
+        Object::Complex(c) => Rc::as_ptr(c) as usize as i64,
+        Object::Long(l) => Rc::as_ptr(l) as usize as i64,
+        Object::Generator(g) => Rc::as_ptr(g) as usize as i64,
+        Object::Coroutine(g) => Rc::as_ptr(g) as usize as i64,
+        Object::AsyncGenerator(g) => Rc::as_ptr(g) as usize as i64,
+        Object::File(f) => Rc::as_ptr(f) as usize as i64,
+        Object::Property(p) => Rc::as_ptr(p) as usize as i64,
+        Object::StaticMethod(m) => Rc::as_ptr(m) as usize as i64,
+        Object::ClassMethod(m) => Rc::as_ptr(m) as usize as i64,
+        Object::SlotDescriptor(s) => Rc::as_ptr(s) as usize as i64,
+        Object::Frame(f) => Rc::as_ptr(f) as usize as i64,
+        Object::Traceback(t) => Rc::as_ptr(t) as usize as i64,
+        Object::MemoryView(m) => Rc::as_ptr(m) as usize as i64,
+        Object::MappingProxy(p) => Rc::as_ptr(p) as usize as i64,
+        Object::DictView(v) => Rc::as_ptr(v) as usize as i64,
+        Object::SimpleNamespace(n) => Rc::as_ptr(n) as usize as i64,
+        Object::Code(c) => Rc::as_ptr(c) as usize as i64,
+        Object::Cell(c) => Rc::as_ptr(c) as usize as i64,
+        Object::Iter(i) => Rc::as_ptr(i) as usize as i64,
+        Object::Int(i) => i.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64),
+        Object::Float(f) => (f.to_bits() as i64) ^ 0x0123_4567_89AB_CDEFu64 as i64,
+        Object::Bool(b) => {
+            if *b {
+                0x100
+            } else {
+                0x101
+            }
+        }
+        Object::None => 0x4E6F_6E65, // 'None' as bytes — stable sentinel.
+    }
 }
 
 /// Structural hash for primitives. Mirrors CPython's "hash by value"
@@ -2461,8 +2625,198 @@ fn b_ord(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// Placeholder body for `input()`. The real implementation lives in
+/// the VM so it can drive `sys.stdin` / `sys.stdout`; the registered
+/// builtin carries the `__vm:` prefix so the call-site interception
+/// picks it up. See `Vm::do_input_call`.
 fn b_input_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(runtime_error("input() is not supported in this build"))
+    Err(runtime_error("input() must be called through the VM"))
+}
+
+/// `pow(base, exp[, mod])` — modular exponentiation when `mod` is
+/// given, otherwise `base ** exp`. Mirrors CPython's three-arg
+/// `pow` including the negative-exponent + mod case (the modular
+/// inverse).
+fn b_pow(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(type_error("pow() takes 2 or 3 arguments"));
+    }
+    let base = &args[0];
+    let exp = &args[1];
+    let modulus = args.get(2);
+    if let Some(m) = modulus {
+        if !matches!(m, Object::None) {
+            return pow_modular(base, exp, m);
+        }
+    }
+    pow_simple(base, exp)
+}
+
+/// Two-argument `pow(x, y)` — pure functional implementation that
+/// covers ints, floats, complex, and bool. Mirrors the
+/// integer/float/complex arithmetic the VM's `BinaryOp::Pow` does
+/// inline.
+fn pow_simple(base: &Object, exp: &Object) -> Result<Object, RuntimeError> {
+    use num_traits::ToPrimitive;
+    match (base, exp) {
+        (Object::Int(x), Object::Int(y)) => {
+            if *y < 0 {
+                Ok(Object::Float((*x as f64).powf(*y as f64)))
+            } else if let Ok(e) = u32::try_from(*y) {
+                if let Some(r) = x.checked_pow(e) {
+                    Ok(Object::Int(r))
+                } else {
+                    let big = BigInt::from(*x).pow(e);
+                    Ok(Object::int_from_bigint(big))
+                }
+            } else {
+                Err(value_error("pow() exponent too large"))
+            }
+        }
+        (Object::Int(x), Object::Float(y)) => Ok(Object::Float((*x as f64).powf(*y))),
+        (Object::Float(x), Object::Int(y)) => Ok(Object::Float(x.powf(*y as f64))),
+        (Object::Float(x), Object::Float(y)) => Ok(Object::Float(x.powf(*y))),
+        (Object::Bool(b), other) => pow_simple(&Object::Int(i64::from(*b)), other),
+        (other, Object::Bool(b)) => pow_simple(other, &Object::Int(i64::from(*b))),
+        (Object::Long(x), Object::Int(y)) => {
+            if *y < 0 {
+                let xf = x.to_f64().ok_or_else(|| value_error("int too large"))?;
+                Ok(Object::Float(xf.powf(*y as f64)))
+            } else if let Ok(e) = u32::try_from(*y) {
+                Ok(Object::int_from_bigint(x.as_ref().pow(e)))
+            } else {
+                Err(value_error("pow() exponent too large"))
+            }
+        }
+        (Object::Int(x), Object::Long(y)) => {
+            if let Some(e) = y.to_u32() {
+                Ok(Object::int_from_bigint(BigInt::from(*x).pow(e)))
+            } else {
+                Err(value_error("pow() exponent too large"))
+            }
+        }
+        (Object::Long(x), Object::Long(y)) => {
+            if let Some(e) = y.to_u32() {
+                Ok(Object::int_from_bigint(x.as_ref().pow(e)))
+            } else {
+                Err(value_error("pow() exponent too large"))
+            }
+        }
+        _ => Err(type_error(format!(
+            "unsupported operand type(s) for pow(): '{}' and '{}'",
+            base.type_name(),
+            exp.type_name()
+        ))),
+    }
+}
+
+fn pow_modular(base: &Object, exp: &Object, m: &Object) -> Result<Object, RuntimeError> {
+    let (b, e, mm) = (
+        bigint_from(base, "pow")?,
+        bigint_from(exp, "pow")?,
+        bigint_from(m, "pow")?,
+    );
+    if mm.is_zero() {
+        return Err(value_error("pow() 3rd argument cannot be 0"));
+    }
+    if e.is_negative() {
+        return Err(value_error(
+            "pow() with 3rd arg requires non-negative integer exponent in this build",
+        ));
+    }
+    use num_bigint::BigInt;
+    use num_traits::One;
+    let mut base_mod: BigInt = ((&b % &mm) + &mm) % &mm;
+    let mut exp_val: BigInt = e.clone();
+    let mut result: BigInt = BigInt::one();
+    let zero: BigInt = BigInt::from(0i64);
+    while exp_val > zero {
+        if &exp_val % 2i64 == BigInt::one() {
+            result = (&result * &base_mod) % &mm;
+        }
+        exp_val >>= 1;
+        base_mod = (&base_mod * &base_mod) % &mm;
+    }
+    Ok(Object::int_from_bigint(result))
+}
+
+fn bigint_from(o: &Object, fn_name: &str) -> Result<BigInt, RuntimeError> {
+    match o {
+        Object::Int(i) => Ok(BigInt::from(*i)),
+        Object::Long(b) => Ok((**b).clone()),
+        Object::Bool(b) => Ok(BigInt::from(i64::from(*b))),
+        _ => Err(type_error(format!(
+            "{fn_name}() requires integer arguments, got '{}'",
+            o.type_name()
+        ))),
+    }
+}
+
+/// `breakpoint(*args, **kwargs)` placeholder — the VM intercepts this
+/// to honour `sys.breakpointhook` and `PYTHONBREAKPOINT`.
+fn b_breakpoint(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(runtime_error("breakpoint() must be called through the VM"))
+}
+
+/// `__weavepy_typevar__(name)` — internal builtin that produces a
+/// lightweight `TypeVar`-shaped placeholder. Used as the implicit
+/// binding for PEP 695 type parameters in `type X[T] = ...`,
+/// `def f[T](...)`, and `class C[T]:`. Behaves enough like
+/// `typing.TypeVar` that consumers can subscript / index / repr it
+/// without importing `typing`.
+fn b_typevar(args: &[Object]) -> Result<Object, RuntimeError> {
+    let name = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(other) => other.to_str(),
+        None => "T".to_owned(),
+    };
+    let mut d = crate::object::DictData::new();
+    d.insert(
+        crate::object::DictKey(Object::from_static("__name__")),
+        Object::from_str(&name),
+    );
+    d.insert(
+        crate::object::DictKey(Object::from_static("__weavepy_typevar__")),
+        Object::Bool(true),
+    );
+    Ok(Object::SimpleNamespace(Rc::new(std::cell::RefCell::new(d))))
+}
+
+/// `memoryview(obj)` — returns a `MemoryView` over a bytes-like
+/// object. We accept `bytes`, `bytearray`, and existing
+/// `MemoryView` (which we shallow-copy, matching CPython).
+fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
+    let arg = one(args, "memoryview")?;
+    let mv = match arg {
+        Object::Bytes(b) => crate::object::PyMemoryView::from_bytes(b.clone()),
+        Object::ByteArray(b) => crate::object::PyMemoryView::from_bytearray(b.clone()),
+        Object::MemoryView(mv) => {
+            // Shallow clone — same backing buffer, same window.
+            crate::object::PyMemoryView {
+                buffer: match &mv.buffer {
+                    crate::object::MemoryViewBuffer::Bytes(b) => {
+                        crate::object::MemoryViewBuffer::Bytes(b.clone())
+                    }
+                    crate::object::MemoryViewBuffer::ByteArray(b) => {
+                        crate::object::MemoryViewBuffer::ByteArray(b.clone())
+                    }
+                },
+                start: std::cell::Cell::new(mv.start.get()),
+                len: std::cell::Cell::new(mv.len.get()),
+                readonly: std::cell::Cell::new(mv.readonly.get()),
+                released: std::cell::Cell::new(mv.released.get()),
+                format: std::cell::RefCell::new(mv.format.borrow().clone()),
+                itemsize: std::cell::Cell::new(mv.itemsize.get()),
+            }
+        }
+        other => {
+            return Err(type_error(format!(
+                "memoryview: a bytes-like object is required, not '{}'",
+                other.type_name()
+            )));
+        }
+    };
+    Ok(Object::MemoryView(Rc::new(mv)))
 }
 
 fn b_next(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3382,24 +3736,26 @@ fn dict_get(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn dict_keys(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
-    let keys: Vec<Object> = d.borrow().keys().map(|k| k.0.clone()).collect();
-    Ok(Object::new_list(keys))
+    Ok(Object::DictView(Rc::new(crate::object::PyDictView {
+        dict: d,
+        kind: crate::object::DictViewKind::Keys,
+    })))
 }
 
 fn dict_values(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
-    let vs: Vec<Object> = d.borrow().values().cloned().collect();
-    Ok(Object::new_list(vs))
+    Ok(Object::DictView(Rc::new(crate::object::PyDictView {
+        dict: d,
+        kind: crate::object::DictViewKind::Values,
+    })))
 }
 
 fn dict_items(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
-    let items: Vec<Object> = d
-        .borrow()
-        .iter()
-        .map(|(k, v)| Object::new_tuple(vec![k.0.clone(), v.clone()]))
-        .collect();
-    Ok(Object::new_list(items))
+    Ok(Object::DictView(Rc::new(crate::object::PyDictView {
+        dict: d,
+        kind: crate::object::DictViewKind::Items,
+    })))
 }
 
 fn dict_pop(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4421,4 +4777,101 @@ fn file_enter(args: &[Object]) -> Result<Object, RuntimeError> {
 fn file_exit(args: &[Object]) -> Result<Object, RuntimeError> {
     file_self(args)?.close();
     Ok(Object::None)
+}
+
+// ----- memoryview methods (RFC 0023) -----
+
+fn memoryview_self(args: &[Object]) -> Result<Rc<crate::object::PyMemoryView>, RuntimeError> {
+    match args.first() {
+        Some(Object::MemoryView(mv)) => Ok(mv.clone()),
+        _ => Err(type_error("memoryview method requires a memoryview")),
+    }
+}
+
+fn memoryview_tobytes(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mv = memoryview_self(args)?;
+    if mv.released.get() {
+        return Err(value_error("memoryview: released"));
+    }
+    Ok(Object::Bytes(Rc::from(mv.to_bytes().into_boxed_slice())))
+}
+
+fn memoryview_tolist(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mv = memoryview_self(args)?;
+    if mv.released.get() {
+        return Err(value_error("memoryview: released"));
+    }
+    Ok(Object::new_list(
+        mv.to_bytes()
+            .into_iter()
+            .map(|b| Object::Int(i64::from(b)))
+            .collect(),
+    ))
+}
+
+fn memoryview_release(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mv = memoryview_self(args)?;
+    mv.released.set(true);
+    Ok(Object::None)
+}
+
+fn memoryview_cast(args: &[Object]) -> Result<Object, RuntimeError> {
+    let mv = memoryview_self(args)?;
+    if let Some(Object::Str(fmt)) = args.get(1) {
+        *mv.format.borrow_mut() = fmt.to_string();
+        // Itemsize: 1 for B/b, 2 for h/H, 4 for i/I/f, 8 for q/Q/d.
+        let item = match fmt.as_ref() {
+            "B" | "b" | "c" => 1,
+            "h" | "H" => 2,
+            "i" | "I" | "f" => 4,
+            "q" | "Q" | "d" => 8,
+            _ => 1,
+        };
+        mv.itemsize.set(item);
+    }
+    Ok(Object::MemoryView(mv))
+}
+
+fn memoryview_hex(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::fmt::Write;
+    let mv = memoryview_self(args)?;
+    let bytes = mv.to_bytes();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in &bytes {
+        write!(&mut s, "{b:02x}").expect("write to String");
+    }
+    Ok(Object::from_str(s))
+}
+
+fn memoryview_enter(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(args[0].clone())
+}
+
+fn memoryview_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::None)
+}
+
+// ----- dict view + mappingproxy methods (RFC 0023) -----
+
+fn view_isdisjoint(args: &[Object]) -> Result<Object, RuntimeError> {
+    let other = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| type_error("isdisjoint() expected an argument"))?;
+    let mut other_iter = other.make_iter()?;
+    // `DictKey` is hashable like CPython's dict keys; the inner Rcs are
+    // borrowed read-only during hashing, so the mutable-key-type lint
+    // doesn't apply.
+    #[allow(clippy::mutable_key_type)]
+    let mut other_set = std::collections::HashSet::new();
+    while let Some(v) = other_iter.next_value() {
+        other_set.insert(crate::object::DictKey(v));
+    }
+    let mut self_iter = args[0].make_iter()?;
+    while let Some(v) = self_iter.next_value() {
+        if other_set.contains(&crate::object::DictKey(v)) {
+            return Ok(Object::Bool(false));
+        }
+    }
+    Ok(Object::Bool(true))
 }

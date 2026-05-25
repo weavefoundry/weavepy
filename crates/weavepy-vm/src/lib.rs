@@ -947,6 +947,14 @@ impl Interpreter {
                             &[],
                             &frame.globals.clone(),
                         )?
+                    } else if ty.flags.is_builtin && !ty.flags.is_exception {
+                        // PEP 585 fallback — `list[int]`, `dict[str, int]`,
+                        // etc. We build a SimpleNamespace-shaped
+                        // GenericAlias with `__origin__` and `__args__`
+                        // attributes, matching the duck-typed surface of
+                        // `types.GenericAlias`. `isinstance(x, list[int])`
+                        // and other reflective uses go through `__origin__`.
+                        make_generic_alias(Object::Type(ty.clone()), i.clone())
                     } else {
                         self.binary_subscr(&v, &i)?
                     }
@@ -2258,6 +2266,49 @@ impl Interpreter {
                     m.name, name
                 )))
             }
+            Object::SimpleNamespace(d) => {
+                if let Some(v) = d.borrow().get(&DictKey(Object::from_str(name))) {
+                    return Ok(v.clone());
+                }
+                if name == "__dict__" {
+                    return Ok(Object::Dict(d.clone()));
+                }
+                Err(attribute_error(format!(
+                    "'SimpleNamespace' object has no attribute '{name}'"
+                )))
+            }
+            Object::MappingProxy(d) => {
+                if name == "__dict__" {
+                    return Ok(Object::Dict(d.clone()));
+                }
+                Err(attribute_error(format!(
+                    "'mappingproxy' object has no attribute '{name}'"
+                )))
+            }
+            Object::MemoryView(mv) => match name {
+                "nbytes" => Ok(Object::Int(mv.len.get() as i64)),
+                "itemsize" => Ok(Object::Int(mv.itemsize.get() as i64)),
+                "ndim" => Ok(Object::Int(1)),
+                "readonly" => Ok(Object::Bool(mv.readonly.get())),
+                "format" => Ok(Object::from_str(mv.format.borrow().as_str())),
+                "shape" => Ok(Object::new_tuple(vec![Object::Int(mv.len.get() as i64)])),
+                "strides" => Ok(Object::new_tuple(vec![Object::Int(
+                    mv.itemsize.get() as i64
+                )])),
+                "suboffsets" => Ok(Object::new_tuple(vec![])),
+                "c_contiguous" | "f_contiguous" | "contiguous" => Ok(Object::Bool(true)),
+                _ => {
+                    if let Some(m) = self.lookup_method(obj, name) {
+                        return Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                            receiver: obj.clone(),
+                            function: m,
+                        })));
+                    }
+                    Err(attribute_error(format!(
+                        "'memoryview' object has no attribute '{name}'"
+                    )))
+                }
+            },
             Object::Function(f) => {
                 if let Some(v) = f.attrs.borrow().get(&DictKey(Object::from_str(name))) {
                     return Ok(v.clone());
@@ -4773,6 +4824,15 @@ impl Interpreter {
                     .insert(DictKey(Object::from_str(name)), value);
                 Ok(())
             }
+            Object::SimpleNamespace(d) => {
+                d.borrow_mut()
+                    .insert(DictKey(Object::from_str(name)), value);
+                Ok(())
+            }
+            Object::MappingProxy(_) => Err(type_error(format!(
+                "'mappingproxy' object does not support item assignment ('{}')",
+                name
+            ))),
             Object::Frame(fr) => match name {
                 "f_trace" => {
                     *fr.trace.borrow_mut() = value;
@@ -5066,6 +5126,37 @@ impl Interpreter {
                 }
                 Ok(Object::ByteArray(Rc::new(RefCell::new(out))))
             }
+            (Object::MemoryView(mv), Object::Int(i)) => {
+                let bytes = mv.to_bytes();
+                let idx = normalize_index(*i, bytes.len())?;
+                Ok(Object::Int(i64::from(bytes[idx])))
+            }
+            (Object::MemoryView(mv), Object::Slice(slc)) => {
+                let bytes = mv.to_bytes();
+                let as_objs: Vec<Object> =
+                    bytes.iter().map(|b| Object::Int(i64::from(*b))).collect();
+                let sliced = slice_seq(&as_objs, slc)?;
+                let mut out = Vec::with_capacity(sliced.len());
+                for o in sliced {
+                    match o {
+                        Object::Int(i) => out.push(i as u8),
+                        _ => return Err(type_error("memoryview slice produced non-int")),
+                    }
+                }
+                Ok(Object::Bytes(Rc::from(out.as_slice())))
+            }
+            (Object::MappingProxy(d), key) => {
+                let d = d.borrow();
+                d.get(&DictKey(key.clone()))
+                    .cloned()
+                    .ok_or_else(|| key_error(key.repr()))
+            }
+            (Object::SimpleNamespace(d), key) => {
+                let d = d.borrow();
+                d.get(&DictKey(key.clone()))
+                    .cloned()
+                    .ok_or_else(|| key_error(key.repr()))
+            }
             (_, _) => Err(type_error(format!(
                 "'{}' object is not subscriptable with '{}'",
                 container.type_name(),
@@ -5241,6 +5332,24 @@ impl Interpreter {
                     // is currently executing inside — and that's
                     // exactly `outer_globals`.
                     return Ok(Object::Dict(outer_globals.clone()));
+                }
+                if b.name == "locals" && args.is_empty() && kwargs.is_empty() {
+                    // CPython returns a dict of the locals visible
+                    // in the calling frame. At module / class /
+                    // exec scope this *is* the module dict; in
+                    // function scope it's a fresh dict snapshot of
+                    // the locals.
+                    if let Some(top) = self.frame_stack.borrow().last() {
+                        return Ok(top.locals());
+                    }
+                    return Ok(Object::Dict(outer_globals.clone()));
+                }
+                if b.name == "breakpoint" {
+                    return self.do_breakpoint_call(args, kwargs, outer_globals);
+                }
+                let _ = kwargs;
+                if b.name == "__vm:input" {
+                    return self.do_input_call(args, outer_globals);
                 }
                 if b.name == "__vm:__import__" {
                     // ``__import__(name, globals=None, locals=None,
@@ -6249,6 +6358,81 @@ impl Interpreter {
     /// CPython's signature `compile(source, filename, mode)`; the
     /// `flags`/`dont_inherit`/`optimize` arguments are accepted but
     /// ignored — they don't change WeavePy's bytecode.
+    /// `breakpoint(*args, **kwargs)` — RFC 0023. Honours
+    /// `sys.breakpointhook`; if unset (the default), falls back to
+    /// printing a hint about how WeavePy debugging works without
+    /// actually entering pdb. Real pdb integration requires
+    /// `bdb`/`pdb` modules which are shipped as frozen Python.
+    fn do_breakpoint_call(
+        &mut self,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        outer_globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let sys_key = DictKey(Object::from_static("sys"));
+        let sys_module = self.cache.modules.borrow().get(&sys_key).cloned();
+        if let Some(Object::Module(sys_mod)) = sys_module {
+            let hook = sys_mod
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("breakpointhook")))
+                .cloned();
+            if let Some(hook) = hook {
+                if !matches!(hook, Object::None) {
+                    return self.call(&hook, args, kwargs, outer_globals);
+                }
+            }
+        }
+        let import_result = self.do_import("pdb", &Object::None, 0, outer_globals);
+        if let Ok(Object::Module(pdb)) = import_result {
+            if let Some(set_trace) = pdb
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("set_trace")))
+                .cloned()
+            {
+                return self.call(&set_trace, args, kwargs, outer_globals);
+            }
+        }
+        eprintln!("breakpoint() called but no debugger is attached.");
+        Ok(Object::None)
+    }
+
+    /// `input([prompt])` — read a line from stdin. Honours
+    /// `sys.stdin`/`sys.stdout` when wired; falls back to the host
+    /// `std::io::stdin()`.
+    fn do_input_call(
+        &mut self,
+        args: &[Object],
+        _outer_globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        use std::io::Write;
+        if let Some(prompt) = args.first() {
+            let s = prompt.to_str();
+            print!("{}", s);
+            let _ = std::io::stdout().flush();
+        }
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => Err(crate::error::RuntimeError::PyException(
+                crate::error::PyException::new(crate::builtin_types::make_exception_with_class(
+                    crate::builtin_types::builtin_types().eof_error.clone(),
+                    "EOF when reading a line",
+                )),
+            )),
+            Ok(_) => {
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                }
+                Ok(Object::from_str(line))
+            }
+            Err(e) => Err(crate::error::os_error(e.to_string())),
+        }
+    }
+
     fn do_compile_call(
         &mut self,
         args: &[Object],
@@ -6513,11 +6697,47 @@ impl Interpreter {
                 return Ok(loaded);
             }
         }
-        let (path, is_package) = self
-            .cache
-            .find_source(full)
-            .ok_or_else(|| module_not_found_error(format!("No module named '{full}'")))?;
-        self.load_from_file(full, &path, is_package)
+        if let Some((path, is_package)) = self.cache.find_source(full) {
+            return self.load_from_file(full, &path, is_package);
+        }
+        // PEP 420 — namespace packages. If we found one or more
+        // directories named `full` on `sys.path` without an
+        // `__init__.py`, construct a namespace package: a module
+        // whose `__path__` lists the contributing directories and
+        // whose `__name__` is the dotted name.
+        let ns_dirs = self.cache.find_namespace_package(full);
+        if !ns_dirs.is_empty() {
+            let pkg_for_globals = full.rsplit_once('.').map(|(p, _)| p.to_owned());
+            let globals = self.build_module_globals(full, None, pkg_for_globals.as_deref());
+            {
+                let mut g = globals.borrow_mut();
+                g.insert(
+                    crate::object::DictKey(Object::from_static("__path__")),
+                    Object::new_list(
+                        ns_dirs
+                            .iter()
+                            .map(|d| Object::from_str(d.to_string_lossy().into_owned()))
+                            .collect(),
+                    ),
+                );
+                g.insert(
+                    crate::object::DictKey(Object::from_static("__file__")),
+                    Object::None,
+                );
+                g.insert(
+                    crate::object::DictKey(Object::from_static("__spec__")),
+                    Object::None,
+                );
+            }
+            let module_obj = Object::Module(Rc::new(PyModule {
+                name: full.to_owned(),
+                filename: None,
+                dict: globals,
+            }));
+            self.cache.insert(full, module_obj.clone());
+            return Ok(module_obj);
+        }
+        Err(module_not_found_error(format!("No module named '{full}'")))
     }
 
     /// Compile and execute Python source provided as a string. Used
@@ -8479,6 +8699,22 @@ fn i64_op(x: i64, y: i64, op: BinOpKind) -> Result<Option<Object>, RuntimeError>
 }
 
 /// Complex arithmetic. Mirrors CPython `complex.__add__` & friends.
+/// PEP 585 — generic alias factory used as the fallback for
+/// `BuiltinType[params]` when the class doesn't define
+/// `__class_getitem__`. The result is a `SimpleNamespace`-shaped
+/// object with `__origin__` and `__args__` attributes; `isinstance`
+/// unwraps it via `__origin__` before walking the MRO.
+fn make_generic_alias(origin: Object, params: Object) -> Object {
+    let mut d = DictData::new();
+    let args_tuple = match &params {
+        Object::Tuple(_) => params.clone(),
+        other => Object::new_tuple(vec![other.clone()]),
+    };
+    d.insert(DictKey(Object::from_static("__origin__")), origin);
+    d.insert(DictKey(Object::from_static("__args__")), args_tuple);
+    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+}
+
 fn complex_arith(
     (ar, ai): (f64, f64),
     (br, bi): (f64, f64),
