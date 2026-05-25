@@ -462,10 +462,21 @@ struct LoopFrame {
 /// One pending `finally` clause. We hold the AST so `return`,
 /// `break`, and `continue` can each inline a fresh copy of the
 /// clause's bytecode before transferring control out.
+enum FinallyKind {
+    /// Body of a `finally:` clause; emitted by re-compiling the
+    /// statements at the non-normal exit site.
+    Stmts(Vec<Stmt>),
+    /// Synthetic frame for a `with` block: emit
+    /// `<cm_local>.__exit__(None, None, None)` directly using the
+    /// stored fast-local index. We can't represent this as an AST
+    /// Name node because the synthetic local name (".with_cm0")
+    /// isn't a valid identifier and would fail name resolution.
+    WithExit { cm_idx: u32 },
+}
+
 struct FinallyFrame {
-    /// The statements inside the `finally:` block, captured by clone
-    /// so each non-normal exit gets its own bytecode.
-    body: Vec<Stmt>,
+    /// What this frame fires at non-normal exit.
+    kind: FinallyKind,
     /// Length of `loop_stack` when this frame was pushed. Used to
     /// determine whether `break`/`continue` should run this finally
     /// (only if the relevant loop is outside the finally scope).
@@ -766,13 +777,20 @@ impl Compiler {
                 let back = self.emit(OpCode::JumpBackward, 0);
                 self.patch_jump(back, loop_start);
                 let frame = self.loop_stack.pop().expect("loop frame");
-                let exit_target = self.next_offset();
-                self.patch_jump(jump_exit, exit_target);
-                for site in frame.break_sites {
-                    self.patch_jump(site, exit_target);
-                }
+                // Natural exit: condition went false. Run the
+                // `orelse` block.
+                let orelse_target = self.next_offset();
+                self.patch_jump(jump_exit, orelse_target);
                 for s in orelse {
                     self.compile_stmt(s)?;
+                }
+                // `break` jumps here, *past* the `orelse`. This
+                // is the CPython semantics for while/else +
+                // break — the else only runs when the loop
+                // exits via its condition.
+                let exit_target = self.next_offset();
+                for site in frame.break_sites {
+                    self.patch_jump(site, exit_target);
                 }
             }
             StmtKind::For {
@@ -908,20 +926,11 @@ impl Compiler {
                         // While compiling this finally body, hide it
                         // from the stack so nested `return`s inside the
                         // body don't recurse infinitely.
-                        let saved_finally: Vec<FinallyFrame> = frames
-                            .iter()
-                            .take(i)
-                            .map(|f| FinallyFrame {
-                                body: f.body.clone(),
-                                loop_depth_at_push: f.loop_depth_at_push,
-                            })
-                            .collect();
+                        let saved_finally: Vec<FinallyFrame> =
+                            frames.iter().take(i).map(clone_finally_frame).collect();
                         self.finally_stack = saved_finally;
-                        for s in &frame.body {
-                            if let Err(e) = self.compile_stmt(s) {
-                                compiled = Err(e);
-                                break;
-                            }
+                        if let Err(e) = self.emit_finally_frame(frame) {
+                            compiled = Err(e);
                         }
                         self.finally_stack.clear();
                         if compiled.is_err() {
@@ -1743,10 +1752,10 @@ impl Compiler {
     /// cleanup runs before we transfer control out of the loop.
     fn inline_finally_for_loop_exit(&mut self) -> Result<(), CompileError> {
         let loop_depth = self.loop_stack.len();
-        let mut to_inline: Vec<Vec<Stmt>> = Vec::new();
+        let mut to_inline: Vec<FinallyFrame> = Vec::new();
         for frame in self.finally_stack.iter().rev() {
             if frame.loop_depth_at_push >= loop_depth {
-                to_inline.push(frame.body.clone());
+                to_inline.push(clone_finally_frame(frame));
             } else {
                 break;
             }
@@ -1758,22 +1767,43 @@ impl Compiler {
         // Walk innermost out; on each iteration further trim the
         // finally stack so a `return` nested inside a finally body
         // can't re-inline its own ancestors infinitely.
-        for (offset, body) in to_inline.iter().enumerate() {
+        for (offset, frame) in to_inline.iter().enumerate() {
             let outer_count = saved.len().saturating_sub(offset + 1);
             self.finally_stack = saved
                 .iter()
                 .take(outer_count)
-                .map(|f| FinallyFrame {
-                    body: f.body.clone(),
-                    loop_depth_at_push: f.loop_depth_at_push,
-                })
+                .map(clone_finally_frame)
                 .collect();
-            for s in body {
-                self.compile_stmt(s)?;
-            }
+            self.emit_finally_frame(frame)?;
         }
         self.finally_stack = saved;
         Ok(())
+    }
+
+    /// Emit cleanup code for one `FinallyFrame`. `Stmts` frames
+    /// re-compile the AST body; `WithExit` frames emit
+    /// `<cm_local>.__exit__(None, None, None)` directly.
+    fn emit_finally_frame(&mut self, frame: &FinallyFrame) -> Result<(), CompileError> {
+        match &frame.kind {
+            FinallyKind::Stmts(body) => {
+                for s in body {
+                    self.compile_stmt(s)?;
+                }
+                Ok(())
+            }
+            FinallyKind::WithExit { cm_idx } => {
+                self.emit(OpCode::LoadFast, *cm_idx);
+                let exit_name = self.co.intern_name("__exit__");
+                self.emit(OpCode::LoadAttr, exit_name);
+                let none_idx = self.co.intern_constant(Constant::None);
+                self.emit(OpCode::LoadConst, none_idx);
+                self.emit(OpCode::LoadConst, none_idx);
+                self.emit(OpCode::LoadConst, none_idx);
+                self.emit(OpCode::Call, 3);
+                self.emit(OpCode::PopTop, 0);
+                Ok(())
+            }
+        }
     }
 
     fn compile_try(
@@ -1805,7 +1835,7 @@ impl Compiler {
         let pushed_finally = has_finally;
         if pushed_finally {
             self.finally_stack.push(FinallyFrame {
-                body: finalbody.to_vec(),
+                kind: FinallyKind::Stmts(finalbody.to_vec()),
                 loop_depth_at_push: self.loop_stack.len(),
             });
         }
@@ -2110,11 +2140,26 @@ impl Compiler {
         // from the synthetic local.
         self.emit(OpCode::PopTop, 0);
 
+        // Push a synthetic finally frame so `return`, `break`, and
+        // `continue` from inside the body run `cm.__exit__(None, None, None)`
+        // before transferring control. CPython does this via
+        // CLEANUP_THROW / SETUP_WITH; we encode it as a `WithExit`
+        // frame that emits the call from the cm's fast-local index.
+        let with_loop_depth = self.loop_stack.len();
+        self.finally_stack.push(FinallyFrame {
+            kind: FinallyKind::WithExit { cm_idx },
+            loop_depth_at_push: with_loop_depth,
+        });
+
         let body_start = self.next_offset();
         for s in body {
             self.compile_stmt(s)?;
         }
         let body_end = self.next_offset();
+
+        // Pop the synthetic frame; the explicit normal-exit path
+        // below emits the same call inline.
+        self.finally_stack.pop();
 
         // Normal exit: cm.__exit__(None, None, None).
         self.emit(OpCode::LoadFast, cm_idx);
@@ -3360,6 +3405,19 @@ fn emit_cmp_op(compiler: &mut Compiler, op: CmpOp) {
         CmpOp::NotIn => {
             compiler.emit(OpCode::ContainsOp, 1);
         }
+    }
+}
+
+/// Clone a `FinallyFrame` deep enough to push onto a separate stack
+/// (used while emitting an inline copy without losing the original).
+fn clone_finally_frame(f: &FinallyFrame) -> FinallyFrame {
+    let kind = match &f.kind {
+        FinallyKind::Stmts(body) => FinallyKind::Stmts(body.clone()),
+        FinallyKind::WithExit { cm_idx } => FinallyKind::WithExit { cm_idx: *cm_idx },
+    };
+    FinallyFrame {
+        kind,
+        loop_depth_at_push: f.loop_depth_at_push,
     }
 }
 

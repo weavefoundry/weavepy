@@ -55,3 +55,47 @@ reason = "depends on CPython sys.getsizeof / refcount behaviour"
 [tests."cpython/Lib/test/test_set.py"]
 status = "fail"
 reason = "exercises C-level frozenset interning + sys.getsizeof"
+
+# RFC 0024 — real threads, GIL, cycle GC, weakrefs.
+# These tests stress hardware-thread interleavings and CPython-
+# specific GC bookkeeping. Our threading model is sub-interpreter-
+# per-thread so target callables run cooperatively for now (RFC
+# 0025 lifts that). They're listed here as `fail` so the baseline
+# captures the gap explicitly; flip them to `pass` as the gaps
+# close.
+
+[tests."cpython/Lib/test/test_threading.py"]
+status = "fail"
+reason = "RFC 0024 spawns OS threads but runs the Python target cooperatively; full thread parallelism + cross-thread heap sharing land in RFC 0025"
+
+[tests."cpython/Lib/test/test_thread.py"]
+status = "fail"
+reason = "low-level _thread tests exercise CPython-specific lock semantics not yet matched"
+
+[tests."cpython/Lib/test/test_threadedtempfile.py"]
+status = "fail"
+reason = "depends on parallel thread execution from the CPython model"
+
+[tests."cpython/Lib/test/test_gc.py"]
+status = "fail"
+reason = "RFC 0024 implements cycle GC but the detailed heuristics (gen promotion thresholds, gc.callbacks ordering, get_referrers fidelity) don't match CPython yet"
+
+[tests."cpython/Lib/test/test_weakref.py"]
+status = "fail"
+reason = "core weakref + WeakSet / WeakValueDictionary work but proxy-attr delegation lands in a follow-up"
+
+[tests."cpython/Lib/test/test_multiprocessing_main_handling.py"]
+status = "skip"
+reason = "RFC 0024's _multiprocessing core is a stub — RFC 0026 will implement real fork/spawn"
+
+[tests."cpython/Lib/test/test_multiprocessing_fork.py"]
+status = "skip"
+reason = "depends on real multiprocessing implementation (RFC 0026)"
+
+[tests."cpython/Lib/test/test_multiprocessing_spawn.py"]
+status = "skip"
+reason = "depends on real multiprocessing implementation (RFC 0026)"
+
+[tests."cpython/Lib/test/test_multiprocessing_forkserver.py"]
+status = "skip"
+reason = "depends on real multiprocessing implementation (RFC 0026)"

@@ -57,5 +57,10 @@ rustls-pemfile        = { workspace = true }
 rustls-native-certs   = { workspace = true }
 webpki-roots          = { workspace = true }
 
+# RFC 0024 — real OS threads, GIL, cycle GC, weakrefs.
+parking_lot           = { workspace = true }
+crossbeam-channel     = { workspace = true }
+crossbeam-utils       = { workspace = true }
+
 [lints]
 workspace = true

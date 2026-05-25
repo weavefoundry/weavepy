@@ -30,13 +30,18 @@ pub mod builtins;
 pub mod error;
 pub mod ext_loader;
 pub mod frozen_code_cache;
+pub mod gc_trace;
+pub mod gil;
 pub mod import;
 pub mod object;
 pub mod pycache;
 pub mod specialize;
 pub mod stdlib;
+pub mod sync;
+pub mod thread_registry;
 pub mod types;
 pub mod vm_singletons;
+pub mod weakref_registry;
 
 use crate::builtin_types::{builtin_types, instance_is_subclass, make_exception_with_class};
 use crate::error::{
@@ -475,7 +480,40 @@ impl Interpreter {
         let globals = self.build_module_globals(name, file, None);
         let code_rc = Rc::new(code.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
-        self.run_frame(&mut frame)
+        let result = self.run_frame(&mut frame);
+        // After the module finishes, run any deferred `__del__`
+        // finalizers queued by the cycle GC. Errors propagate via
+        // `sys.unraisablehook` (logged + suppressed) — a finalizer
+        // failure must not change the program's overall exit
+        // status.
+        self.run_pending_finalizers();
+        result
+    }
+
+    /// Invoke any `__del__` finalizers queued by the cycle GC.
+    /// Each finalizer runs at most once. Exceptions from a
+    /// finalizer are routed through `sys.unraisablehook` (today
+    /// just logged to stderr) so they don't propagate.
+    pub fn run_pending_finalizers(&mut self) {
+        loop {
+            let pending = crate::vm_singletons::drain_pending_finalizers();
+            if pending.is_empty() {
+                return;
+            }
+            for obj in pending {
+                if let Object::Instance(inst) = &obj {
+                    if let Some(del) = inst.class.lookup("__del__") {
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                            receiver: obj.clone(),
+                            function: del,
+                        }));
+                        let kwargs: Vec<(String, Object)> = Vec::new();
+                        let outer = Rc::new(RefCell::new(DictData::new()));
+                        let _ = self.call(&bound, &[], &kwargs, &outer);
+                    }
+                }
+            }
+        }
     }
 
     /// Populate a fresh module-globals dict with builtins, builtin
@@ -5380,6 +5418,17 @@ impl Interpreter {
                 if b.name == "__vm:eval" {
                     return self.do_eval_call(args, outer_globals);
                 }
+                // RFC 0024: `gc.collect()` is a Rust BuiltinFn that
+                // queues `__del__` finalizers but can't run them
+                // (no interpreter handle). Intercept here so we can
+                // drain the queue synchronously, matching CPython
+                // semantics where `gc.collect()` returns *after*
+                // every finaliser has fired.
+                if b.name == ".gc.collect" {
+                    let result = (b.call)(args)?;
+                    self.run_pending_finalizers();
+                    return Ok(result);
+                }
                 // Pre-materialize generator/instance iterables for
                 // builtin methods that need to iterate them. The
                 // underlying static builtins call `Object::make_iter`
@@ -6091,7 +6140,15 @@ impl Interpreter {
                     &Rc::new(RefCell::new(DictData::new())),
                 )?
             }
-            _ => Object::Instance(Rc::new(PyInstance::new(cls.clone()))),
+            _ => {
+                let inst = Object::Instance(Rc::new(PyInstance::new(cls.clone())));
+                // RFC 0024: auto-track every fresh user instance with
+                // the cycle collector. CPython does the same for any
+                // type whose `tp_traverse` is non-NULL — for us that's
+                // every Python-defined class (they all carry a dict).
+                gc_trace::track(inst.clone());
+                inst
+            }
         };
 
         // Only run `__init__` when `type(instance) is cls`, matching

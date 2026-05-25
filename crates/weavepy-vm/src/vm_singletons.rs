@@ -21,6 +21,24 @@ use crate::types::{PyInstance, TypeFlags, TypeObject};
 thread_local! {
     static NOT_IMPLEMENTED: RefCell<Option<Object>> = const { RefCell::new(None) };
     static ELLIPSIS: RefCell<Option<Object>> = const { RefCell::new(None) };
+    /// Pending `__del__` finalizer invocations queued by the cycle
+    /// GC. Drained at the next eval-loop tick by the interpreter.
+    /// See [`crate::gc_trace::run_finalizer`] for the producer side.
+    pub(crate) static PENDING_FINALIZERS: RefCell<Vec<Object>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push an instance whose `__del__` should run at the next safe
+/// point. Called by the cycle GC during its clear phase.
+pub fn push_pending_finalizer(obj: Object) {
+    PENDING_FINALIZERS.with(|cell| {
+        cell.borrow_mut().push(obj);
+    });
+}
+
+/// Drain the pending-finalizer queue. The eval loop calls this
+/// at every eval-breaker tick that has the GC flag set.
+pub fn drain_pending_finalizers() -> Vec<Object> {
+    PENDING_FINALIZERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 fn make_singleton(name: &'static str) -> Object {

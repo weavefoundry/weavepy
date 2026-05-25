@@ -1,0 +1,16 @@
+lock starts unlocked: True
+lock locked: True
+lock released: True
+inside lock context: True
+after lock context: True
+rlock fully released
+event starts cleared: True
+event set: True
+event cleared: True
+non-blocking on depleted: False
+bounded semaphore raised on over-release
+condition no-op notify ok
+worker output: [0, 1, 2, 3, 4]
+ident type: int
+active_count >= 1: True
+main thread name: MainThread

@@ -105,6 +105,11 @@ rustls-pemfile        = "2.1"
 rustls-native-certs   = "0.7"
 webpki-roots          = "0.26"
 
+# RFC 0024 — real OS threads, GIL, cycle GC, weakrefs.
+parking_lot           = "0.12"
+crossbeam-channel     = "0.5"
+crossbeam-utils       = "0.8"
+
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }
 proptest    = "1.5"

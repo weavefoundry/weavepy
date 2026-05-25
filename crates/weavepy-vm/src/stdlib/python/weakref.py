@@ -1,20 +1,14 @@
-"""WeavePy `weakref` — wrapper around the `_weakref` Rust core.
+"""WeavePy `weakref` — RFC 0024 real weakrefs.
 
-This module mirrors CPython's `weakref` surface area at a level that
-makes typical user code Just Work, even though the underlying object
-model uses strict reference counting and so cannot, in general,
-expose "true" weak references that automatically zero themselves
-out. See RFC 0018 for the documented drawback.
+After RFC 0024, `_weakref` is backed by a real per-thread weakref
+registry coordinated with the cycle GC. Calling a `ref` returns
+`None` once the GC has cleared the referent; `proxy` raises
+`ReferenceError`. `WeakValueDictionary` / `WeakKeyDictionary` /
+`WeakSet` decay their entries when their referents die.
 
-In practice this means:
-
-* `ref(obj)`, `proxy(obj)`, `WeakSet`, `WeakValueDictionary`,
-  `WeakKeyDictionary`, and `finalize` all work for the cooperative
-  pattern where users explicitly drop their last strong reference.
-* The runtime will not magically clean these structures when the
-  last strong reference disappears; users that need that behaviour
-  should drop and reset, or explicitly call `_release()` on the
-  weakref.
+The thin shims that previously held a strong reference (RFC 0018)
+are gone — `ref(obj)` / `proxy(obj)` now delegate directly to
+`_weakref.ref` / `_weakref.proxy`.
 """
 
 import _weakref
@@ -52,132 +46,73 @@ def getweakrefs(obj):
 
 
 class ref:
-    """Cooperative shim weak reference.
+    """A weak reference to `target`.
 
-    Holds a (strong) reference to its target until `_release()` is
-    called. Calling the ref returns the target — or `None` if the
-    target has been released.
+    Wraps a real `_weakref.ref` Rust core. Calling the ref
+    returns the target while it is reachable; once the cycle GC
+    has cleared the referent, the call returns `None`. The
+    optional `callback` runs at clear time.
     """
 
-    __slots__ = ("_target", "_callback", "_dead", "__weakref__")
+    __slots__ = ("_real", "_callback", "__weakref__")
 
     def __init__(self, target, callback=None):
-        object.__setattr__(self, "_target", target)
-        object.__setattr__(self, "_callback", callback)
-        object.__setattr__(self, "_dead", False)
+        self._real = _weakref.ref(target, callback)
+        self._callback = callback
 
     def __call__(self):
-        if self._dead:
-            return None
-        return self._target
-
-    def _release(self):
-        if self._dead:
-            return
-        object.__setattr__(self, "_dead", True)
-        cb = self._callback
-        object.__setattr__(self, "_target", None)
-        if cb is not None:
-            try:
-                cb(self)
-            except Exception:
-                pass
-
-    def __repr__(self):
-        if self._dead:
-            return "<weakref at 0x0; dead>"
-        return f"<weakref at 0x0; to '{type(self._target).__name__}'>"
+        return self._real.__weakref_get__()
 
     def __hash__(self):
-        return id(self)
+        return self._real.__hash__()
 
     def __eq__(self, other):
-        return self is other
+        if isinstance(other, ref):
+            return self() is other()
+        return NotImplemented
 
-
-class proxy:
-    """Attribute-delegating proxy."""
-
-    __slots__ = ("_target", "_callback", "_dead", "__weakref__")
-
-    def __init__(self, target, callback=None):
-        object.__setattr__(self, "_target", target)
-        object.__setattr__(self, "_callback", callback)
-        object.__setattr__(self, "_dead", False)
-
-    def _check(self):
-        if self._dead:
-            raise ReferenceError("weakly-referenced object no longer exists")
-        return self._target
+    def __repr__(self):
+        return self._real.__repr__()
 
     def _release(self):
-        if self._dead:
-            return
-        object.__setattr__(self, "_dead", True)
+        self._real.__clear__()
         cb = self._callback
-        object.__setattr__(self, "_target", None)
         if cb is not None:
             try:
                 cb(self)
             except Exception:
                 pass
-
-    def __getattr__(self, name):
-        return getattr(self._check(), name)
-
-    def __setattr__(self, name, value):
-        setattr(self._check(), name, value)
-
-    def __delattr__(self, name):
-        delattr(self._check(), name)
-
-    def __repr__(self):
-        if self._dead:
-            return "<weakproxy; dead>"
-        return f"<weakproxy at 0x0 to {type(self._target).__name__}>"
-
-    def __bool__(self):
-        return not self._dead and bool(self._target)
-
-    def __len__(self):
-        return len(self._check())
-
-    def __getitem__(self, key):
-        return self._check()[key]
-
-    def __setitem__(self, key, value):
-        self._check()[key] = value
-
-    def __delitem__(self, key):
-        del self._check()[key]
-
-    def __contains__(self, item):
-        return item in self._check()
-
-    def __iter__(self):
-        return iter(self._check())
-
-    def __call__(self, *args, **kwargs):
-        return self._check()(*args, **kwargs)
+        self._callback = None
 
 
-class WeakMethod(ref):
-    """Weak reference to a bound method."""
+def proxy(target, callback=None):
+    """Construct a weakly-bound proxy to `target`. Attribute /
+    item / call access goes to the live target while it is
+    reachable; once cleared, every operation raises
+    `ReferenceError`. If `target` is callable the proxy is
+    callable too (`CallableProxyType`)."""
+    return _weakref.proxy(target, callback)
 
-    def __new__(cls, meth, callback=None):
-        obj = meth.__self__
-        func = meth.__func__
-        self = super().__new__(cls)
-        ref.__init__(self, obj, callback)
-        self._func = func
-        self._meth_type = type(meth)
-        return self
+
+class WeakMethod:
+    """Weak reference to a bound method.
+
+    Holds the underlying object weakly via `weakref.ref`; calls
+    to the WeakMethod return the bound method *if* the object is
+    still alive, or `None` once the cycle GC has cleared it.
+    """
+
+    __slots__ = ("_obj_ref", "_func", "_meth_type")
 
     def __init__(self, meth, callback=None):
-        pass
+        obj = meth.__self__
+        func = meth.__func__
+        self._obj_ref = ref(obj, callback)
+        self._func = func
+        self._meth_type = type(meth)
 
     def __call__(self):
-        obj = super().__call__()
+        obj = self._obj_ref()
         if obj is None:
             return None
         try:

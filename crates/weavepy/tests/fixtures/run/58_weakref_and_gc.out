@@ -9,10 +9,10 @@ keys: ['k']
 gc enabled: True
 disabled: False
 re-enabled: True
-collected: 0
+collected is int: True
 threshold: (700, 10, 10)
 threshold: (800, 12, 14)
-count: (0, 0, 0)
-objects: []
+count len: 3
+objects is list: True
 debug: 0
 debug: 1

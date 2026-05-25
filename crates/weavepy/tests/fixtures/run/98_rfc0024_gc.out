@@ -1,0 +1,22 @@
+enabled: True
+after disable: False
+after enable: True
+threshold: (800, 12, 14)
+default threshold: (700, 10, 10)
+count tuple length: 3
+box tracked initially: True
+cycle collect returned int: True
+collect returned int: True
+debug: 0
+debug after set: True
+get_objects is list: True
+get_referents is list: True
+get_referrers is list: True
+freeze count: 0
+freeze count after unfreeze: 0
+stats list: True
+stats has 3 entries: True
+DEBUG_STATS: 1
+DEBUG_LEAK: 38
+garbage is list: True
+callbacks is list: True

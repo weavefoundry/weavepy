@@ -1,0 +1,20 @@
+alive: True
+attr through ref: 7
+ref eq same target: True
+ref hashable: True
+callback fired: True
+ref returns None after release: True
+proxy created: True
+weakset size: 3
+b in set: True
+d['a'] is b: True
+len: 2
+keys: ['a', 'b']
+wkd[b]: value-b
+wkd len: 2
+weakmethod constructed: True
+finalizer alive: True
+after fire: True
+finalizer alive after fire: False
+ReferenceType is _weakref.ReferenceType: True
+ProxyTypes is tuple: True

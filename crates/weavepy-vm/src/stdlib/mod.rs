@@ -67,6 +67,11 @@ pub mod ssl_real;
 pub mod string_mod;
 pub mod warnings_mod;
 
+pub mod gc_real;
+pub mod multiprocessing_mod;
+pub mod thread_real;
+pub mod weakref_real;
+
 /// Register the built-in modules into `cache`. Called once at
 /// interpreter startup.
 pub fn register_all(cache: &ModuleCache) {
@@ -80,7 +85,7 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("json", json::build);
     cache.register_builtin("random", random::build);
     cache.register_builtin("time", time::build);
-    cache.register_builtin("_thread", thread::build);
+    cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
     cache.register_builtin("signal", signal_mod::build);
     cache.register_builtin("select", select_mod::build);
@@ -106,8 +111,9 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_lzma", lzma_mod::build);
     cache.register_builtin("_sqlite3", sqlite3_mod::build);
     cache.register_builtin("_csv", csv_mod::build);
-    cache.register_builtin("_weakref", weakref_mod::build);
-    cache.register_builtin("gc", gc_mod::build);
+    cache.register_builtin("_weakref", weakref_real::build);
+    cache.register_builtin("gc", gc_real::build);
+    cache.register_builtin("_multiprocessing", multiprocessing_mod::build);
     cache.register_builtin("_datetime", datetime_mod::build);
     // RFC 0023 — drop-in stdlib parity.
     cache.register_builtin("unicodedata", unicodedata_mod::build);
@@ -194,6 +200,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "queue",
             source: include_str!("python/queue.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing",
+            source: include_str!("python/multiprocessing.py"),
             is_package: false,
         },
         // The `concurrent` package is a tiny shim that re-exports

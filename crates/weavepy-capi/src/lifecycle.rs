@@ -70,20 +70,68 @@ pub unsafe extern "C" fn Py_GetBuildInfo() -> *const c_char {
 }
 
 // ----------------------------------------------------------------
-// GIL stubs (single-threaded today).
+// GIL — wired to `weavepy_vm::gil::global_gil()` (RFC 0024).
 // ----------------------------------------------------------------
+//
+// We replicate the CPython contract:
+//
+// - `PyGILState_Ensure()` acquires the GIL if the calling thread
+//   doesn't already hold it. Returns an opaque token that
+//   `PyGILState_Release` consumes. `1` means "this call acquired
+//   the GIL"; `0` means "the calling thread already held it" and
+//   `Release` is a no-op.
+// - `PyGILState_Release(state)` undoes whatever `Ensure` did.
+// - `PyGILState_Check()` returns 1 if the calling thread holds
+//   the GIL, 0 otherwise.
+// - `PyEval_SaveThread()` releases the GIL and stashes a thread
+//   state for `PyEval_RestoreThread()` to re-acquire later. Used
+//   to wrap blocking C-side I/O.
+//
+// The per-thread "do I currently hold the GIL?" flag and the
+// stashed `GilGuard` live in `THREAD_GIL` below.
 
-#[no_mangle]
-pub unsafe extern "C" fn PyGILState_Ensure() -> c_int {
-    0
+use std::cell::RefCell;
+use weavepy_vm::gil::{global_gil, GilGuard};
+
+thread_local! {
+    /// Stack of GIL guards owned by this thread. Each
+    /// `PyGILState_Ensure` / `PyEval_SaveThread` pushes; the
+    /// matching release pops.
+    static THREAD_GIL: RefCell<Vec<GilGuard>> = const { RefCell::new(Vec::new()) };
+}
+
+fn currently_holding() -> bool {
+    THREAD_GIL.with(|cell| !cell.borrow().is_empty())
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyGILState_Release(_state: c_int) {}
+pub unsafe extern "C" fn PyGILState_Ensure() -> c_int {
+    if currently_holding() {
+        // Already hold it (reentrant); release will be a no-op.
+        return 0;
+    }
+    let guard = global_gil().acquire();
+    THREAD_GIL.with(|cell| cell.borrow_mut().push(guard));
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyGILState_Release(state: c_int) {
+    if state != 1 {
+        return;
+    }
+    THREAD_GIL.with(|cell| {
+        cell.borrow_mut().pop();
+    });
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn PyGILState_Check() -> c_int {
-    1
+    if currently_holding() {
+        1
+    } else {
+        0
+    }
 }
 
 #[repr(C)]
@@ -93,14 +141,34 @@ pub struct PyThreadState {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyThreadState_Get() -> *mut PyThreadState {
+    // We don't yet have per-thread state objects; return a
+    // sentinel. The interpreter doesn't dereference this.
     static mut DUMMY: u8 = 0;
     &raw mut DUMMY as *mut PyThreadState
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyEval_SaveThread() -> *mut PyThreadState {
-    unsafe { PyThreadState_Get() }
+    // Drop the GIL. Returns a token that
+    // `PyEval_RestoreThread` consumes to re-acquire. We
+    // represent the token as the count of guards we just
+    // popped, encoded into the pointer. Anything non-null
+    // restores; null means "we weren't holding the GIL".
+    let popped = THREAD_GIL.with(|cell| cell.borrow_mut().pop());
+    if popped.is_some() {
+        // Encode "1 guard popped" as a dangling sentinel; the
+        // matching `RestoreThread` call only checks for non-null.
+        std::ptr::dangling_mut::<PyThreadState>()
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyEval_RestoreThread(_t: *mut PyThreadState) {}
+pub unsafe extern "C" fn PyEval_RestoreThread(t: *mut PyThreadState) {
+    if t.is_null() {
+        return;
+    }
+    let guard = global_gil().acquire();
+    THREAD_GIL.with(|cell| cell.borrow_mut().push(guard));
+}

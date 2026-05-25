@@ -9,4 +9,4 @@ sem depleted
 sem refilled
 main name: MainThread
 active: 1
-ident: 1
+ident type: int
