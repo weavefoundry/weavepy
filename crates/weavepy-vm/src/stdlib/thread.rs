@@ -83,6 +83,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -111,14 +112,17 @@ fn allocate_lock(_args: &[Object]) -> Result<Object, RuntimeError> {
     let acquire_obj = Object::Builtin(Rc::new(BuiltinFn {
         name: "acquire",
         call: Box::new(acquire),
+        call_kw: None,
     }));
     let release_obj = Object::Builtin(Rc::new(BuiltinFn {
         name: "release",
         call: Box::new(release),
+        call_kw: None,
     }));
     let locked_obj = Object::Builtin(Rc::new(BuiltinFn {
         name: "locked",
         call: Box::new(locked),
+        call_kw: None,
     }));
     {
         let mut d = dict.borrow_mut();
@@ -138,6 +142,7 @@ fn allocate_lock(_args: &[Object]) -> Result<Object, RuntimeError> {
                         Ok(Object::Bool(false))
                     }
                 }),
+                call_kw: None,
             })),
         );
     }

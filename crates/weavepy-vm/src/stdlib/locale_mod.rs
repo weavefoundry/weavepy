@@ -84,6 +84,7 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 

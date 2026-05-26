@@ -1,17 +1,19 @@
 //! Regression test runner — drive individual `test_*.py` files end-to-end
 //! through WeavePy and grade them against a checked-in baseline.
 //!
-//! Two test pools are recognised:
+//! RFC 0026 rewrite. Three test pools are recognised:
 //!
 //! 1. **Bundled regression tests** under `tests/regrtest/` in the repo
 //!    root. These are small, hand-curated fixtures that exercise the
 //!    Rust↔Python boundary. They should all pass on `main`; a
 //!    regression breaks CI.
 //! 2. **CPython `Lib/test/`** when `vendor/cpython/` is checked out as
-//!    a submodule. The full CPython test suite is enormous so we
-//!    operate off an allowlist that grows organically as features
-//!    light up. Status per test is tracked in
-//!    `tests/regrtest/expectations.toml`.
+//!    a submodule (or its slimmer cousin `vendor/cpython-tests/`).
+//!    The full CPython test suite is enormous so we operate off an
+//!    allowlist (see [`Expectations`]) plus optional auto-discovery.
+//! 3. **Synthetic tests** generated on the fly for the
+//!    `weavepy-conformance regrtest synth --kind …` helper. Used for
+//!    quick smoke-tests in CI.
 //!
 //! Each test is graded with one of [`TestStatus`]:
 //!
@@ -21,14 +23,29 @@
 //! - `Skip`   — the expectations file marked the test as `skip`.
 //! - `Timeout`— exceeded the per-test wall budget.
 //!
-//! The runner is single-threaded; tests share no global state because each
-//! test gets a fresh [`weavepy::vm::Interpreter`]. Concurrency could be
-//! layered on later but isn't worth the complexity yet.
+//! The runner supports two execution modes:
+//!
+//! - **In-process** ([`ExecutionMode::InProcess`]). Each test gets a
+//!   fresh [`weavepy::vm::Interpreter`]; reports drop straight back into
+//!   the caller's [`Vec`]. Cheapest, fastest, but cannot recover from
+//!   real interpreter aborts (stack overflow, abort()).
+//! - **Subprocess** ([`ExecutionMode::Subprocess`]). Each test is
+//!   spawned in a fresh `weavepy --run-test PATH` child process with a
+//!   real wall-clock timer that SIGKILLs the worker on overrun. Much
+//!   slower; survives any crash; the CPython `Lib/test/` pool always
+//!   uses this mode.
+//!
+//! Parallelism is controlled by [`RunnerOptions::workers`]: a value of
+//! `1` runs serially, anything larger spreads tests across a pool of
+//! OS threads. Subprocess isolation pairs naturally with parallelism.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -174,9 +191,24 @@ pub struct RegrtestFile {
 /// Discover regrtest files under `workspace_root`.
 ///
 /// Returns the bundled tests in `tests/regrtest/` plus, when present,
-/// the CPython `Lib/test/` files from the allowlist in
-/// [`CPYTHON_REGRTEST_INCLUDE`].
+/// the CPython `Lib/test/` files. CPython tests come from one of:
+/// `vendor/cpython/Lib/test/`, `vendor/cpython-tests/`, or — when the
+/// caller passes [`DiscoveryOptions::cpython_dir`] — an explicit
+/// directory. Only the files mentioned in `expectations.toml` (or the
+/// curated [`CPYTHON_REGRTEST_INCLUDE`] list) are scheduled, unless
+/// the caller opts into auto-discovery via [`DiscoveryOptions::include_all_cpython`].
 pub fn discover(workspace_root: &Path) -> Vec<RegrtestFile> {
+    discover_with(workspace_root, &DiscoveryOptions::default(), None)
+}
+
+/// Discover regrtest files honouring the expectations file (so the
+/// CPython allowlist comes from the live config rather than only the
+/// hard-coded constant).
+pub fn discover_with(
+    workspace_root: &Path,
+    opts: &DiscoveryOptions,
+    expectations: Option<&Expectations>,
+) -> Vec<RegrtestFile> {
     let mut out = Vec::new();
 
     let bundled = workspace_root.join("tests").join("regrtest");
@@ -184,14 +216,51 @@ pub fn discover(workspace_root: &Path) -> Vec<RegrtestFile> {
         collect_bundled(&bundled, &mut out);
     }
 
-    let cpython_test = workspace_root
-        .join("vendor")
-        .join("cpython")
-        .join("Lib")
-        .join("test");
-    if cpython_test.is_dir() {
-        for name in CPYTHON_REGRTEST_INCLUDE {
-            let p = cpython_test.join(name);
+    let cpython_test = opts
+        .cpython_dir
+        .clone()
+        .or_else(|| {
+            let candidate = workspace_root
+                .join("vendor")
+                .join("cpython")
+                .join("Lib")
+                .join("test");
+            candidate.is_dir().then_some(candidate)
+        })
+        .or_else(|| {
+            let candidate = workspace_root.join("vendor").join("cpython-tests");
+            candidate.is_dir().then_some(candidate)
+        });
+
+    if let Some(dir) = cpython_test {
+        let mut allowlist: BTreeSet<String> = CPYTHON_REGRTEST_INCLUDE
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        if let Some(exp) = expectations {
+            for label in exp.tests.keys() {
+                if let Some(stripped) = label.strip_prefix("cpython/Lib/test/") {
+                    allowlist.insert(stripped.to_owned());
+                }
+            }
+        }
+        if opts.include_all_cpython {
+            for entry in walkdir::WalkDir::new(&dir)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                let p = entry.path();
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with("test_") && name.to_ascii_lowercase().ends_with(".py") {
+                    allowlist.insert(name.to_owned());
+                }
+            }
+        }
+        for name in &allowlist {
+            let p = dir.join(name);
             if p.is_file() {
                 out.push(RegrtestFile {
                     path: p,
@@ -205,14 +274,187 @@ pub fn discover(workspace_root: &Path) -> Vec<RegrtestFile> {
     out
 }
 
+/// Options that control how [`discover_with`] picks up CPython tests.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryOptions {
+    /// Explicit CPython `Lib/test/` directory. If unset, the runner
+    /// tries `vendor/cpython/Lib/test/` then `vendor/cpython-tests/`.
+    pub cpython_dir: Option<PathBuf>,
+    /// When `true`, every `test_*.py` file under the chosen CPython
+    /// directory is scheduled (subject to expectations). Defaults to
+    /// `false` so the harness stays predictable.
+    pub include_all_cpython: bool,
+}
+
 /// Curated CPython regression tests we attempt. Add to this list (and
-/// `expectations.toml`) as features come online.
+/// `expectations.toml`) as features come online. The expectations file
+/// is now the source of truth; this constant is the floor.
 pub const CPYTHON_REGRTEST_INCLUDE: &[&str] = &[
     "test_grammar.py",
     "test_tokenize.py",
     "test_dict.py",
     "test_list.py",
     "test_set.py",
+    "test_tuple.py",
+    "test_bytes.py",
+    "test_string.py",
+    "test_unicode.py",
+    "test_math.py",
+    "test_int.py",
+    "test_float.py",
+    "test_complex.py",
+    "test_decimal.py",
+    "test_fractions.py",
+    "test_collections.py",
+    "test_array.py",
+    "test_heapq.py",
+    "test_bisect.py",
+    "test_itertools.py",
+    "test_functools.py",
+    "test_operator.py",
+    "test_copy.py",
+    "test_pickle.py",
+    "test_copyreg.py",
+    "test_marshal.py",
+    "test_re.py",
+    "test_json.py",
+    "test_base64.py",
+    "test_binascii.py",
+    "test_hashlib.py",
+    "test_hmac.py",
+    "test_zlib.py",
+    "test_gzip.py",
+    "test_bz2.py",
+    "test_lzma.py",
+    "test_zipfile.py",
+    "test_tarfile.py",
+    "test_io.py",
+    "test_os.py",
+    "test_posixpath.py",
+    "test_pathlib.py",
+    "test_tempfile.py",
+    "test_glob.py",
+    "test_fnmatch.py",
+    "test_shutil.py",
+    "test_stat.py",
+    "test_textwrap.py",
+    "test_string_literals.py",
+    "test_format.py",
+    "test_fstring.py",
+    "test_class.py",
+    "test_dataclass.py",
+    "test_dataclasses.py",
+    "test_enum.py",
+    "test_inspect.py",
+    "test_typing.py",
+    "test_abc.py",
+    "test_descr.py",
+    "test_iter.py",
+    "test_generators.py",
+    "test_coroutines.py",
+    "test_asyncgen.py",
+    "test_with.py",
+    "test_exceptions.py",
+    "test_traceback.py",
+    "test_warnings.py",
+    "test_contextlib.py",
+    "test_contextlib_async.py",
+    "test_contextvars.py",
+    "test_keywordonlyarg.py",
+    "test_unpack.py",
+    "test_unpack_ex.py",
+    "test_args.py",
+    "test_compile.py",
+    "test_decorators.py",
+    "test_assert.py",
+    "test_audit.py",
+    "test_call.py",
+    "test_isinstance.py",
+    "test_subclassinit.py",
+    "test_typing_extensions.py",
+    "test_threading.py",
+    "test_thread.py",
+    "test_threadedtempfile.py",
+    "test_threadsignals.py",
+    "test_gc.py",
+    "test_weakref.py",
+    "test_weakset.py",
+    "test_socket.py",
+    "test_subprocess.py",
+    "test_select.py",
+    "test_signal.py",
+    "test_ssl.py",
+    "test_urllib.py",
+    "test_urllib2.py",
+    "test_urlparse.py",
+    "test_http_cookiejar.py",
+    "test_http_cookies.py",
+    "test_httplib.py",
+    "test_logging.py",
+    "test_csv.py",
+    "test_sqlite3.py",
+    "test_xml_etree.py",
+    "test_xml_etree_c.py",
+    "test_html.py",
+    "test_email.py",
+    "test_mimetypes.py",
+    "test_locale.py",
+    "test_calendar.py",
+    "test_time.py",
+    "test_datetime.py",
+    "test_zoneinfo.py",
+    "test_struct.py",
+    "test_codecs.py",
+    "test_bigaddrspace.py",
+    "test_bytecodes.py",
+    "test_dis.py",
+    "test_audit_class.py",
+    "test_descrtut.py",
+    "test_grammar.py",
+    "test_optparse.py",
+    "test_getopt.py",
+    "test_argparse.py",
+    "test_tomllib.py",
+    "test_pprint.py",
+    "test_pdb.py",
+    "test_bdb.py",
+    "test_pkgutil.py",
+    "test_importlib.py",
+    "test_importlib_metadata.py",
+    "test_importlib_resources.py",
+    "test_runpy.py",
+    "test_atexit.py",
+    "test_resource.py",
+    "test_fcntl.py",
+    "test_posix.py",
+    "test_uuid.py",
+    "test_secrets.py",
+    "test_hmac.py",
+    "test_random.py",
+    "test_statistics.py",
+    "test_numeric_tower.py",
+    "test_unicodedata.py",
+    "test_unicode_identifiers.py",
+    "test_string.py",
+    "test_complex.py",
+    "test_multiprocessing_main_handling.py",
+    "test_multiprocessing_fork.py",
+    "test_multiprocessing_spawn.py",
+    "test_multiprocessing_forkserver.py",
+    "test_concurrent_futures.py",
+    "test_asyncio.py",
+    "test_queue.py",
+    "test_concurrent_collections.py",
+    "test_sched.py",
+    "test_selectors.py",
+    "test_socketserver.py",
+    "test_smtplib.py",
+    "test_poplib.py",
+    "test_imaplib.py",
+    "test_nntplib.py",
+    "test_ftplib.py",
+    "test_telnetlib.py",
+    "test_socket_ipv6.py",
 ];
 
 fn collect_bundled(root: &Path, out: &mut Vec<RegrtestFile>) {
@@ -242,25 +484,136 @@ fn collect_bundled(root: &Path, out: &mut Vec<RegrtestFile>) {
     }
 }
 
-/// Run every discovered regrtest file and grade it against `expectations`.
+/// How tests should be executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionMode {
+    /// Run each test inside a fresh [`weavepy::vm::Interpreter`] in
+    /// the current process. Cheapest mode; the wall budget is honoured
+    /// politely (the next opcode dispatch tips us out of a runaway
+    /// loop) but a real crash kills the runner.
+    #[default]
+    InProcess,
+    /// Spawn each test in a `weavepy` subprocess. The wall budget is
+    /// enforced by SIGKILL; a crash (panic, abort) is captured as
+    /// `Error`. Slower but bulletproof.
+    Subprocess,
+}
+
+/// Runner knobs.
+#[derive(Debug, Clone)]
+pub struct RunnerOptions {
+    pub timeout: Duration,
+    pub mode: ExecutionMode,
+    /// Number of worker threads to use. `1` runs serially.
+    pub workers: usize,
+    /// Path to the `weavepy` binary used for [`ExecutionMode::Subprocess`].
+    /// When `None`, the runner falls back to `std::env::current_exe()`.
+    pub weavepy_binary: Option<PathBuf>,
+    /// When `true`, the per-test result is printed to stderr as it
+    /// completes (useful while a long CPython run is in flight).
+    pub stream_results: bool,
+}
+
+impl Default for RunnerOptions {
+    fn default() -> Self {
+        RunnerOptions {
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            mode: ExecutionMode::InProcess,
+            workers: 1,
+            weavepy_binary: None,
+            stream_results: false,
+        }
+    }
+}
+
+/// Drive every discovered regrtest file and grade against `expectations`.
+///
+/// Honours [`RunnerOptions::workers`] for parallelism. Tests are
+/// scheduled in input order; results come back in label order so the
+/// rendered report is stable.
 pub fn run_all(
     files: &[RegrtestFile],
     expectations: &Expectations,
     timeout: Duration,
 ) -> Vec<TestReport> {
-    files
-        .iter()
-        .map(|f| run_one(f, expectations, timeout))
-        .collect()
+    let opts = RunnerOptions {
+        timeout,
+        ..RunnerOptions::default()
+    };
+    run_all_with(files, expectations, &opts)
 }
 
-/// Drive one regression test through a fresh [`weavepy::vm::Interpreter`].
-///
-/// The wall budget is honoured by the polite path only (we don't
-/// SIGSTOP a runaway). The interpreter is single-threaded so a hang in
-/// pure Python will eat the budget gracefully when the next opcode
-/// dispatches.
+/// Like [`run_all`] but with explicit runner options.
+pub fn run_all_with(
+    files: &[RegrtestFile],
+    expectations: &Expectations,
+    opts: &RunnerOptions,
+) -> Vec<TestReport> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    if opts.workers <= 1 {
+        return files
+            .iter()
+            .map(|f| run_one_with(f, expectations, opts))
+            .collect();
+    }
+    // Parallel dispatch. Each worker pulls the next index off a
+    // shared counter; the report buffer is filled in label order so
+    // the consumer sees a deterministic sequence.
+    let total = files.len();
+    let cursor = Arc::new(Mutex::new(0usize));
+    let reports: Arc<Mutex<Vec<Option<TestReport>>>> =
+        Arc::new(Mutex::new((0..total).map(|_| None).collect()));
+    std::thread::scope(|scope| {
+        let n = opts.workers.min(total);
+        for _ in 0..n {
+            let cursor = cursor.clone();
+            let reports = reports.clone();
+            scope.spawn(move || loop {
+                let idx = {
+                    let mut c = cursor.lock().unwrap();
+                    if *c >= total {
+                        return;
+                    }
+                    let i = *c;
+                    *c += 1;
+                    i
+                };
+                let report = run_one_with(&files[idx], expectations, opts);
+                if opts.stream_results {
+                    eprintln!(
+                        "[{}/{}] {} -> {}",
+                        idx + 1,
+                        total,
+                        report.label,
+                        report.status.label()
+                    );
+                }
+                reports.lock().unwrap()[idx] = Some(report);
+            });
+        }
+    });
+    let mut buffer = reports.lock().unwrap();
+    buffer.iter_mut().filter_map(|r| r.take()).collect()
+}
+
+/// Backward-compat wrapper: drive one regrtest file through the
+/// in-process VM with the default options.
 pub fn run_one(file: &RegrtestFile, expectations: &Expectations, timeout: Duration) -> TestReport {
+    let opts = RunnerOptions {
+        timeout,
+        ..RunnerOptions::default()
+    };
+    run_one_with(file, expectations, &opts)
+}
+
+/// Drive one regression test, honouring `opts.mode`.
+pub fn run_one_with(
+    file: &RegrtestFile,
+    expectations: &Expectations,
+    opts: &RunnerOptions,
+) -> TestReport {
     let expected = expectations.get(&file.label);
 
     if expected == Some(TestStatus::Skip) {
@@ -276,6 +629,17 @@ pub fn run_one(file: &RegrtestFile, expectations: &Expectations, timeout: Durati
         };
     }
 
+    match opts.mode {
+        ExecutionMode::InProcess => run_inprocess(file, expected, opts.timeout),
+        ExecutionMode::Subprocess => run_subprocess(file, expected, opts),
+    }
+}
+
+fn run_inprocess(
+    file: &RegrtestFile,
+    expected: Option<TestStatus>,
+    timeout: Duration,
+) -> TestReport {
     let source = match fs::read_to_string(&file.path) {
         Ok(s) => s,
         Err(e) => {
@@ -327,6 +691,122 @@ pub fn run_one(file: &RegrtestFile, expectations: &Expectations, timeout: Durati
         duration_ms: Some(elapsed.as_millis()),
         detail,
         expected,
+    }
+}
+
+fn run_subprocess(
+    file: &RegrtestFile,
+    expected: Option<TestStatus>,
+    runner: &RunnerOptions,
+) -> TestReport {
+    let weavepy_bin = runner
+        .weavepy_binary
+        .clone()
+        .or_else(|| std::env::current_exe().ok())
+        .unwrap_or_else(|| PathBuf::from("weavepy"));
+    let start = Instant::now();
+    let mut cmd = std::process::Command::new(&weavepy_bin);
+    cmd.arg(&file.path);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.env("WEAVEPY_REGRTEST_CHILD", "1");
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return TestReport {
+                label: file.label.clone(),
+                status: TestStatus::Error,
+                duration_ms: Some(0),
+                detail: Some(format!("spawn failed: {e}")),
+                expected,
+            };
+        }
+    };
+
+    let outcome = wait_with_timeout(child, runner.timeout);
+    let elapsed = start.elapsed();
+    let label = file.label.clone();
+    match outcome {
+        ChildOutcome::Exited(status, stdout, stderr) => {
+            let detail = if !stderr.trim().is_empty() {
+                Some(truncate_detail(&stderr))
+            } else if !stdout.trim().is_empty() {
+                Some(truncate_detail(&stdout))
+            } else {
+                None
+            };
+            let test_status = if status.success() {
+                TestStatus::Pass
+            } else if matches!(status.code(), Some(0)) {
+                TestStatus::Pass
+            } else if let Some(code) = status.code() {
+                if code == 2 {
+                    TestStatus::Error
+                } else {
+                    TestStatus::Fail
+                }
+            } else {
+                TestStatus::Fail
+            };
+            TestReport {
+                label,
+                status: test_status,
+                duration_ms: Some(elapsed.as_millis()),
+                detail,
+                expected,
+            }
+        }
+        ChildOutcome::TimedOut => TestReport {
+            label,
+            status: TestStatus::Timeout,
+            duration_ms: Some(elapsed.as_millis()),
+            detail: Some(format!("killed after {:?}", runner.timeout)),
+            expected,
+        },
+        ChildOutcome::IoError(msg) => TestReport {
+            label,
+            status: TestStatus::Error,
+            duration_ms: Some(elapsed.as_millis()),
+            detail: Some(msg),
+            expected,
+        },
+    }
+}
+
+enum ChildOutcome {
+    Exited(std::process::ExitStatus, String, String),
+    TimedOut,
+    IoError(String),
+}
+
+/// Wait up to `timeout` for `child` to exit. If it doesn't, SIGKILL the
+/// child and return [`ChildOutcome::TimedOut`].
+fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> ChildOutcome {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                if let Some(mut s) = child.stdout.take() {
+                    let _ = s.read_to_string(&mut stdout);
+                }
+                if let Some(mut s) = child.stderr.take() {
+                    let _ = s.read_to_string(&mut stderr);
+                }
+                return ChildOutcome::Exited(status, stdout, stderr);
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return ChildOutcome::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return ChildOutcome::IoError(format!("waitpid: {e}")),
+        }
     }
 }
 

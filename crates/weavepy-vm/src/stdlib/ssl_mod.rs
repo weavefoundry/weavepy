@@ -118,6 +118,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -156,6 +157,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "wrap_socket",
                 call: Box::new(wrap_socket_stub),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -163,6 +165,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "load_default_certs",
                 call: Box::new(noop),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -170,6 +173,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "load_cert_chain",
                 call: Box::new(noop),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -177,6 +181,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "load_verify_locations",
                 call: Box::new(noop),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -184,6 +189,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "set_alpn_protocols",
                 call: Box::new(noop),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -191,6 +197,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "set_ciphers",
                 call: Box::new(noop),
+                call_kw: None,
             })),
         );
     }

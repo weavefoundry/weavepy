@@ -6,6 +6,9 @@
 //!
 //! ```text
 //! weavepy regrtest [--workspace DIR] [--filter TEXT] [--no-check]
+//!                  [--mode in-process|subprocess] [--workers N]
+//!                  [--cpython-dir DIR] [--include-all-cpython]
+//!                  [--stream]
 //! ```
 //!
 //! When the embedder needs the lower-level reports as JSON for CI, the
@@ -18,19 +21,35 @@
 //!
 //! Discovery rules mirror the conformance crate: bundled tests live in
 //! `<workspace>/tests/regrtest/`; CPython tests come from
-//! `<workspace>/vendor/cpython/Lib/test/` when present.
+//! `<workspace>/vendor/cpython/Lib/test/` (or
+//! `<workspace>/vendor/cpython-tests/`) when present.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 
 use weavepy_conformance::{
-    discover_regrtest, regrtest_to_markdown, run_all, Expectations, RegrtestSummary,
-    DEFAULT_TIMEOUT_SECS,
+    discover_regrtest_with, regrtest_to_markdown, run_all_with, DiscoveryOptions, ExecutionMode,
+    Expectations, RegrtestSummary, RunnerOptions, DEFAULT_TIMEOUT_SECS,
 };
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ModeArg {
+    InProcess,
+    Subprocess,
+}
+
+impl From<ModeArg> for ExecutionMode {
+    fn from(m: ModeArg) -> Self {
+        match m {
+            ModeArg::InProcess => ExecutionMode::InProcess,
+            ModeArg::Subprocess => ExecutionMode::Subprocess,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -72,6 +91,35 @@ struct Cli {
     /// Suppress per-test rows from stdout; print only the summary line.
     #[arg(short = 'q', long = "quiet", action = ArgAction::SetTrue)]
     quiet: bool,
+
+    /// How to execute each test. `subprocess` is mandatory if you want
+    /// hangs and crashes to be containable.
+    #[arg(long, value_enum, default_value_t = ModeArg::InProcess)]
+    mode: ModeArg,
+
+    /// Number of parallel test workers. `0` picks a sensible default
+    /// based on `available_parallelism`.
+    #[arg(long, short = 'j', value_name = "N", default_value_t = 1)]
+    workers: usize,
+
+    /// Path to the WeavePy binary used for subprocess mode. Defaults to
+    /// the currently running executable.
+    #[arg(long, value_name = "PATH")]
+    weavepy_binary: Option<PathBuf>,
+
+    /// Explicit CPython `Lib/test/` directory. Overrides auto-discovery.
+    #[arg(long, value_name = "DIR")]
+    cpython_dir: Option<PathBuf>,
+
+    /// Include every `test_*.py` in the CPython test directory (not
+    /// just the curated allowlist + the expectations.toml entries).
+    #[arg(long = "include-all-cpython", action = ArgAction::SetTrue)]
+    include_all_cpython: bool,
+
+    /// Stream per-test results to stderr as they finish. Pairs well
+    /// with `--workers > 1` so you can see live progress.
+    #[arg(long, action = ArgAction::SetTrue)]
+    stream: bool,
 }
 
 pub(crate) fn run(argv: Vec<String>) -> Result<ExitCode> {
@@ -89,7 +137,11 @@ pub(crate) fn run(argv: Vec<String>) -> Result<ExitCode> {
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
     let timeout = Duration::from_secs(timeout_secs);
 
-    let mut files = discover_regrtest(&workspace);
+    let discovery = DiscoveryOptions {
+        cpython_dir: cli.cpython_dir.clone(),
+        include_all_cpython: cli.include_all_cpython,
+    };
+    let mut files = discover_regrtest_with(&workspace, &discovery, Some(&expectations));
     if let Some(needle) = cli.filter.as_deref() {
         files.retain(|f| f.label.contains(needle));
     }
@@ -101,7 +153,21 @@ pub(crate) fn run(argv: Vec<String>) -> Result<ExitCode> {
         );
     }
 
-    let reports = run_all(&files, &expectations, timeout);
+    let workers = if cli.workers == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    } else {
+        cli.workers
+    };
+    let runner_opts = RunnerOptions {
+        timeout,
+        mode: cli.mode.into(),
+        workers,
+        weavepy_binary: cli.weavepy_binary.clone(),
+        stream_results: cli.stream,
+    };
+    let reports = run_all_with(&files, &expectations, &runner_opts);
     let summary = RegrtestSummary::from_reports(&reports);
 
     if cli.quiet {

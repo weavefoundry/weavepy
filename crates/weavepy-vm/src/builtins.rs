@@ -42,6 +42,7 @@ pub fn build_class_builtin() -> BuiltinFn {
         call: Box::new(|_args: &[Object]| {
             Err(runtime_error("internal: __build_class__ called outside VM"))
         }),
+        call_kw: None,
     }
 }
 
@@ -53,6 +54,7 @@ pub fn default_builtins() -> DictData {
             let f = BuiltinFn {
                 name: $name,
                 call: Box::new($body),
+                call_kw: None,
             };
             d.insert(
                 DictKey(Object::from_static($name)),
@@ -76,7 +78,22 @@ pub fn default_builtins() -> DictData {
     reg!("frozenset", b_frozenset);
     reg!("bytes", b_bytes);
     reg!("bytearray", b_bytearray);
-    reg!("open", b_open);
+    // `open` accepts keyword arguments (`encoding`, `errors`,
+    // `newline`, `buffering`, `closefd`, `opener`), so wire it through
+    // the kwargs-aware constructor — we silently fold known kwargs
+    // into positional slots and ignore the unimplemented ones (they
+    // mostly affect encoding handling, which we already do by default).
+    {
+        let f = BuiltinFn {
+            name: "open",
+            call: Box::new(b_open),
+            call_kw: Some(Box::new(b_open_kw)),
+        };
+        d.insert(
+            DictKey(Object::from_static("open")),
+            Object::Builtin(Rc::new(f)),
+        );
+    }
     reg!("type", b_type);
     reg!("abs", b_abs);
     reg!("min", b_min);
@@ -133,6 +150,7 @@ pub fn default_builtins() -> DictData {
         let f = BuiltinFn {
             name: "__vm:input",
             call: Box::new(b_input_unsupported),
+            call_kw: None,
         };
         d.insert(
             DictKey(Object::from_static("input")),
@@ -188,6 +206,7 @@ pub fn default_builtins() -> DictData {
         let f = BuiltinFn {
             name: "__vm:__import__",
             call: Box::new(b_import_placeholder),
+            call_kw: None,
         };
         d.insert(
             DictKey(Object::from_static("__import__")),
@@ -198,6 +217,7 @@ pub fn default_builtins() -> DictData {
         let f = BuiltinFn {
             name: "__vm:compile",
             call: Box::new(b_vm_intrinsic),
+            call_kw: None,
         };
         d.insert(
             DictKey(Object::from_static("compile")),
@@ -208,6 +228,7 @@ pub fn default_builtins() -> DictData {
         let f = BuiltinFn {
             name: "__vm:exec",
             call: Box::new(b_vm_intrinsic),
+            call_kw: None,
         };
         d.insert(
             DictKey(Object::from_static("exec")),
@@ -218,6 +239,7 @@ pub fn default_builtins() -> DictData {
         let f = BuiltinFn {
             name: "__vm:eval",
             call: Box::new(b_vm_intrinsic),
+            call_kw: None,
         };
         d.insert(
             DictKey(Object::from_static("eval")),
@@ -239,7 +261,49 @@ pub fn default_builtins() -> DictData {
         crate::vm_singletons::ellipsis(),
     );
 
+    // RFC 0026 — the shared `builtins` dict needs to mirror every
+    // *exception* type that `builtin_types().as_globals()` injects
+    // into per-module globals. Without this, code that runs in an
+    // "outside" globals dict (for example via `exec()` from runpy or
+    // `concurrent.futures` workers) can't see `Exception`,
+    // `TypeError`, …. We *only* re-add exception classes: the data
+    // types (`int`, `set`, `list`, …) already have function-flavoured
+    // entries registered above which the VM routes through its
+    // specialised constructors, and overwriting those with the bare
+    // `Object::Type` would break `set()` / `list()` instantiation.
+    for (n, value) in crate::builtin_types::builtin_types().as_globals() {
+        if !is_exception_like(&n) {
+            continue;
+        }
+        d.insert(DictKey(Object::from_str(n)), value);
+    }
+
     d
+}
+
+/// True for every CPython built-in name that exists in the `builtins`
+/// dict as a class-shaped object (every concrete exception type and the
+/// `Warning` hierarchy). Used to filter `builtin_types().as_globals()`
+/// down to entries that don't conflict with the function-flavoured
+/// `int`/`set`/`list` entries already registered.
+fn is_exception_like(name: &str) -> bool {
+    name.ends_with("Error")
+        || name.ends_with("Warning")
+        || name.ends_with("Exception")
+        || matches!(
+            name,
+            "BaseException"
+                | "Exception"
+                | "GeneratorExit"
+                | "KeyboardInterrupt"
+                | "SystemExit"
+                | "StopIteration"
+                | "StopAsyncIteration"
+                | "BaseExceptionGroup"
+                | "ExceptionGroup"
+                | "NotImplemented"
+                | "Ellipsis"
+        )
 }
 
 // ---------- method dispatch ----------
@@ -490,6 +554,7 @@ fn method(
     BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }
 }
 
@@ -878,6 +943,13 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             }
         }
         Object::Code(c) => code_synthetic_attr(c, name),
+        Object::Builtin(b) => match name {
+            "__name__" | "__qualname__" => Some(Object::from_static(b.name)),
+            "__module__" => Some(Object::from_static("builtins")),
+            "__doc__" => Some(Object::None),
+            "__self__" => Some(Object::None),
+            _ => None,
+        },
         Object::BoundMethod(bm) => match name {
             "__func__" => Some(bm.function.clone()),
             "__self__" => Some(bm.receiver.clone()),
@@ -1978,6 +2050,41 @@ fn b_bytearray(args: &[Object]) -> Result<Object, RuntimeError> {
             Ok(Object::new_bytearray(out))
         }
     }
+}
+
+/// Keyword-argument-aware wrapper for `open`. CPython's signature is
+/// `open(file, mode='r', buffering=-1, encoding=None, errors=None,
+/// newline=None, closefd=True, opener=None)`. We honour the positional
+/// arguments and silently accept the keyword-only ones — encoding /
+/// errors / newline are not yet plumbed through (text mode uses UTF-8
+/// strict by default), so the kwargs are taken into the bag but
+/// ignored unless they would change behaviour we do support.
+fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // Reuse the positional path. We fold known kwargs into positional
+    // slots and accept (but ignore) the rest.
+    let mut combined: Vec<Object> = args.to_vec();
+    let mut mode = combined.get(1).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "mode" => mode = Some(v.clone()),
+            "buffering" | "encoding" | "errors" | "newline" | "closefd" | "opener" => {
+                // Accept but don't fail: encoding is implicitly utf-8.
+            }
+            other => {
+                return Err(type_error(format!(
+                    "open() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+    if let Some(m) = mode {
+        if combined.len() < 2 {
+            combined.push(m);
+        } else {
+            combined[1] = m;
+        }
+    }
+    b_open(&combined)
 }
 
 fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -54,6 +54,7 @@ pub fn build_with_state(
                         sys_getframe(args, &fs_fallback)
                     }
                 }),
+                call_kw: None,
             })),
         );
         let es_fallback = exc_info_stack.clone();
@@ -68,6 +69,7 @@ pub fn build_with_state(
                         sys_exc_info(&es_fallback)
                     }
                 }),
+                call_kw: None,
             })),
         );
         let eh_get = excepthook.clone();
@@ -91,6 +93,7 @@ pub fn build_with_state(
                     }
                     sys_default_excepthook(args)
                 }),
+                call_kw: None,
             })),
         );
         let uh = unraisable_hook.clone();
@@ -102,6 +105,7 @@ pub fn build_with_state(
                     let _ = uh.borrow().clone();
                     Ok(Object::None)
                 }),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -300,6 +304,49 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("exit")),
             builtin("exit", sys_exit),
         );
+        // RFC 0026 — private helper so `runpy.run_module()` can
+        // execute frozen modules. Looks up a frozen source by name;
+        // returns ``None`` if the module isn't frozen (or doesn't
+        // exist). Mirrors CPython's `_imp.get_frozen_source` shape.
+        {
+            let frozen = cache.frozen.clone();
+            d.insert(
+                DictKey(Object::from_static("_get_frozen_source")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "_get_frozen_source",
+                    call: Box::new(move |args| {
+                        let name = match args.first() {
+                            Some(Object::Str(s)) => s.to_string(),
+                            _ => return Err(type_error("_get_frozen_source() expects a string")),
+                        };
+                        let table = frozen.borrow();
+                        Ok(table
+                            .get(name.as_str())
+                            .map(|src| Object::from_static(src.source))
+                            .unwrap_or(Object::None))
+                    }),
+                    call_kw: None,
+                })),
+            );
+        }
+        {
+            let frozen = cache.frozen.clone();
+            d.insert(
+                DictKey(Object::from_static("_is_frozen")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "_is_frozen",
+                    call: Box::new(move |args| {
+                        let name = match args.first() {
+                            Some(Object::Str(s)) => s.to_string(),
+                            _ => return Ok(Object::Bool(false)),
+                        };
+                        let table = frozen.borrow();
+                        Ok(Object::Bool(table.contains_key(name.as_str())))
+                    }),
+                    call_kw: None,
+                })),
+            );
+        }
         d.insert(
             DictKey(Object::from_static("getrecursionlimit")),
             builtin("getrecursionlimit", sys_getrecursionlimit),
@@ -401,6 +448,7 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 

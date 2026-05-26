@@ -31,6 +31,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "request",
                 call: Box::new(https_request),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -38,6 +39,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open",
                 call: Box::new(https_open),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -45,6 +47,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "send",
                 call: Box::new(https_send),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -52,6 +55,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "recv",
                 call: Box::new(https_recv),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -59,6 +63,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "close",
                 call: Box::new(https_close),
+                call_kw: None,
             })),
         );
     }

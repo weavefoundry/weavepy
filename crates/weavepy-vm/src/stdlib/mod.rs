@@ -22,6 +22,7 @@ pub mod codecs_mod;
 pub mod csv_mod;
 pub mod datetime_mod;
 pub mod errno_mod;
+pub mod fcntl_mod;
 pub mod fnmatch_mod;
 pub mod gc_mod;
 pub mod glob_mod;
@@ -36,6 +37,7 @@ pub mod math;
 pub mod os;
 pub mod random;
 pub mod re;
+pub mod resource_mod;
 pub mod secrets_mod;
 pub mod select_mod;
 pub mod shutil_mod;
@@ -128,6 +130,10 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_contextvars", contextvars_mod::build);
     cache.register_builtin("atexit", atexit_mod::build);
     cache.register_builtin("_https", https_mod::build);
+    // RFC 0026 — POSIX-flavoured stdlib that user code (and the
+    // multiprocessing rewrite) imports unconditionally.
+    cache.register_builtin("fcntl", fcntl_mod::build);
+    cache.register_builtin("resource", resource_mod::build);
 
     // Frozen Python sources (pure-Python stdlib).
     for src in frozen_sources() {
@@ -137,6 +143,11 @@ pub fn register_all(cache: &ModuleCache) {
 
 fn frozen_sources() -> &'static [FrozenSource] {
     &[
+        FrozenSource {
+            name: "builtins",
+            source: include_str!("python/builtins.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "collections",
             source: include_str!("python/collections.py"),
@@ -711,6 +722,27 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "statistics",
             source: include_str!("python/statistics_mod.py"),
+            is_package: false,
+        },
+        // RFC 0026 — fill in the last commonly-imported gaps.
+        FrozenSource {
+            name: "types",
+            source: include_str!("python/types_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "posix",
+            source: include_str!("python/posix_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_multiprocessing_helpers",
+            source: include_str!("python/_multiprocessing_helpers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_concurrent_process",
+            source: include_str!("python/_concurrent_process.py"),
             is_package: false,
         },
     ]

@@ -223,6 +223,7 @@ fn wrap_c_function(
     Object::Builtin(Rc::new(BuiltinFn {
         name: static_name,
         call: Box::new(f),
+        call_kw: None,
     }))
 }
 

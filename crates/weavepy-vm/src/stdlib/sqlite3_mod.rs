@@ -76,6 +76,7 @@ fn register(
     let bf = BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     };
     d.insert(
         DictKey(Object::from_static(name)),
@@ -458,5 +459,6 @@ where
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }

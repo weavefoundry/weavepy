@@ -105,6 +105,7 @@ pub fn interactive_printer(name: &'static str, body: &'static str) -> Object {
             println!("{}", body_for_call);
             Ok(Object::None)
         }),
+        call_kw: None,
     };
     let printer = Object::Builtin(Rc::new(f));
     // Store the message as a side-channel for the VM to surface via
@@ -285,6 +286,7 @@ pub fn quitter(name: &'static str) -> Object {
                 crate::error::PyException::new(inst),
             ))
         }),
+        call_kw: None,
     };
     Object::Builtin(Rc::new(f))
 }

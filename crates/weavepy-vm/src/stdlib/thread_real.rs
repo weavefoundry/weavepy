@@ -135,6 +135,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -145,6 +146,7 @@ fn b_dyn(
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 

@@ -99,3 +99,470 @@ reason = "depends on real multiprocessing implementation (RFC 0026)"
 [tests."cpython/Lib/test/test_multiprocessing_forkserver.py"]
 status = "skip"
 reason = "depends on real multiprocessing implementation (RFC 0026)"
+
+# ---------------------------------------------------------------------
+# RFC 0026 — expanded CPython baseline. Each entry is something we
+# attempt but don't yet expect to pass cleanly. The runner discovers
+# only files that exist under `vendor/cpython/Lib/test/`; missing files
+# are silently omitted so the baseline is portable.
+# ---------------------------------------------------------------------
+
+[tests."cpython/Lib/test/test_tuple.py"]
+status = "fail"
+reason = "depends on sys.getsizeof + CPython tuple interning"
+
+[tests."cpython/Lib/test/test_bytes.py"]
+status = "fail"
+reason = "bytes/bytearray methods incomplete (translate, maketrans table semantics)"
+
+[tests."cpython/Lib/test/test_string.py"]
+status = "fail"
+reason = "str.format spec mini-language coverage is partial"
+
+[tests."cpython/Lib/test/test_unicode.py"]
+status = "fail"
+reason = "depends on full unicodedata DB + width handling"
+
+[tests."cpython/Lib/test/test_math.py"]
+status = "fail"
+reason = "math module: domain edge cases (gamma, lgamma) differ from libm path"
+
+[tests."cpython/Lib/test/test_int.py"]
+status = "fail"
+reason = "PEP 467 int methods + sys.int_info shape not matched"
+
+[tests."cpython/Lib/test/test_float.py"]
+status = "fail"
+reason = "float.hex / fromhex roundtrip + repr corner cases"
+
+[tests."cpython/Lib/test/test_complex.py"]
+status = "fail"
+reason = "complex repr formatting differs in edge cases"
+
+[tests."cpython/Lib/test/test_decimal.py"]
+status = "skip"
+reason = "decimal module is pure-Python fallback only; many tests probe _decimal"
+
+[tests."cpython/Lib/test/test_fractions.py"]
+status = "fail"
+reason = "Fraction.__pow__ corner cases (rational exponent)"
+
+[tests."cpython/Lib/test/test_collections.py"]
+status = "fail"
+reason = "OrderedDict / Counter / ChainMap edge cases"
+
+[tests."cpython/Lib/test/test_array.py"]
+status = "skip"
+reason = "array module not implemented"
+
+[tests."cpython/Lib/test/test_heapq.py"]
+status = "fail"
+reason = "heapq passes core but stress tests probe C accelerator"
+
+[tests."cpython/Lib/test/test_bisect.py"]
+status = "fail"
+reason = "bisect passes core but stress tests probe C accelerator"
+
+[tests."cpython/Lib/test/test_itertools.py"]
+status = "fail"
+reason = "itertools recipes + reduce stability not matched"
+
+[tests."cpython/Lib/test/test_functools.py"]
+status = "fail"
+reason = "functools.partial / lru_cache + singledispatch edge cases"
+
+[tests."cpython/Lib/test/test_operator.py"]
+status = "fail"
+reason = "operator module: attrgetter chained lookups + methodcaller kwargs"
+
+[tests."cpython/Lib/test/test_copy.py"]
+status = "fail"
+reason = "copy/deepcopy with __copy__ / __deepcopy__ + memo edges"
+
+[tests."cpython/Lib/test/test_pickle.py"]
+status = "skip"
+reason = "pickle protocol 5 + out-of-band buffers not implemented"
+
+[tests."cpython/Lib/test/test_copyreg.py"]
+status = "fail"
+reason = "copyreg dispatch table for extension types"
+
+[tests."cpython/Lib/test/test_marshal.py"]
+status = "skip"
+reason = "marshal module not implemented"
+
+[tests."cpython/Lib/test/test_re.py"]
+status = "fail"
+reason = "re engine: Unicode property classes + atomic groups"
+
+[tests."cpython/Lib/test/test_json.py"]
+status = "fail"
+reason = "json encoder/decoder edge cases (sort_keys with non-str keys)"
+
+[tests."cpython/Lib/test/test_base64.py"]
+status = "fail"
+reason = "b85/a85 codec + standard_b64encode edge cases"
+
+[tests."cpython/Lib/test/test_binascii.py"]
+status = "fail"
+reason = "binascii: hexlify with sep + uu_codec roundtrip"
+
+[tests."cpython/Lib/test/test_hashlib.py"]
+status = "fail"
+reason = "hashlib: shake / blake2 variable-length digests + usedforsecurity flag"
+
+[tests."cpython/Lib/test/test_hmac.py"]
+status = "fail"
+reason = "hmac.compare_digest + new-style digestmod=name lookup"
+
+[tests."cpython/Lib/test/test_zlib.py"]
+status = "fail"
+reason = "zlib compressor reuse + flush() modes"
+
+[tests."cpython/Lib/test/test_gzip.py"]
+status = "fail"
+reason = "gzip module: mtime preservation + multistream"
+
+[tests."cpython/Lib/test/test_bz2.py"]
+status = "skip"
+reason = "bz2 module not implemented"
+
+[tests."cpython/Lib/test/test_lzma.py"]
+status = "skip"
+reason = "lzma module not implemented"
+
+[tests."cpython/Lib/test/test_zipfile.py"]
+status = "fail"
+reason = "zipfile: ZIP64 + STORED writes pass but DEFLATE_64 / Bzip2 paths fail"
+
+[tests."cpython/Lib/test/test_tarfile.py"]
+status = "skip"
+reason = "tarfile module not implemented"
+
+[tests."cpython/Lib/test/test_io.py"]
+status = "fail"
+reason = "io: BufferedRandom + TextIOWrapper detach/seek interactions"
+
+[tests."cpython/Lib/test/test_os.py"]
+status = "fail"
+reason = "os module: scandir nesting + os.stat_result extra fields"
+
+[tests."cpython/Lib/test/test_posixpath.py"]
+status = "fail"
+reason = "posixpath: realpath with strict=True + commonpath edge cases"
+
+[tests."cpython/Lib/test/test_pathlib.py"]
+status = "fail"
+reason = "pathlib: Path.walk + Path.full_match (3.13+)"
+
+[tests."cpython/Lib/test/test_tempfile.py"]
+status = "fail"
+reason = "tempfile: SpooledTemporaryFile + NamedTemporaryFile delete_on_close"
+
+[tests."cpython/Lib/test/test_glob.py"]
+status = "fail"
+reason = "glob: recursive ** semantics + case sensitivity"
+
+[tests."cpython/Lib/test/test_fnmatch.py"]
+status = "fail"
+reason = "fnmatch.filter performance asserts"
+
+[tests."cpython/Lib/test/test_shutil.py"]
+status = "fail"
+reason = "shutil: copytree symlinks=False + chown ownership"
+
+[tests."cpython/Lib/test/test_stat.py"]
+status = "fail"
+reason = "stat: filemode for setgid/setuid + S_ISDOOR (Solaris)"
+
+[tests."cpython/Lib/test/test_textwrap.py"]
+status = "fail"
+reason = "textwrap: drop_whitespace + break_on_hyphens edges"
+
+[tests."cpython/Lib/test/test_format.py"]
+status = "fail"
+reason = "%-formatting + str.format inter-op"
+
+[tests."cpython/Lib/test/test_fstring.py"]
+status = "fail"
+reason = "PEP 701 f-strings (nested quotes, multi-line) not fully covered"
+
+[tests."cpython/Lib/test/test_class.py"]
+status = "fail"
+reason = "class machinery: __init_subclass__ + __set_name__ ordering"
+
+[tests."cpython/Lib/test/test_dataclasses.py"]
+status = "fail"
+reason = "dataclass: __init_subclass__ + slots=True + kw_only"
+
+[tests."cpython/Lib/test/test_enum.py"]
+status = "fail"
+reason = "enum: StrEnum / IntEnum mixins + value re-use rules"
+
+[tests."cpython/Lib/test/test_inspect.py"]
+status = "fail"
+reason = "inspect: Signature from C callables + getsource for frozen"
+
+[tests."cpython/Lib/test/test_typing.py"]
+status = "fail"
+reason = "typing: PEP 695 type aliases + ParamSpec.kwargs"
+
+[tests."cpython/Lib/test/test_abc.py"]
+status = "fail"
+reason = "ABCMeta: register() ordering + virtual subclass cache invalidation"
+
+[tests."cpython/Lib/test/test_descr.py"]
+status = "fail"
+reason = "descriptor protocol: __set_name__ on inheritance + slot conflicts"
+
+[tests."cpython/Lib/test/test_iter.py"]
+status = "fail"
+reason = "iter: __length_hint__ + iter(callable, sentinel) edge cases"
+
+[tests."cpython/Lib/test/test_generators.py"]
+status = "fail"
+reason = "generator: throw() into yield from + close() during yield"
+
+[tests."cpython/Lib/test/test_coroutines.py"]
+status = "fail"
+reason = "coroutine: PEP 492 async with + async for + send/throw"
+
+[tests."cpython/Lib/test/test_asyncgen.py"]
+status = "fail"
+reason = "async generator: aclose() + asend() edge cases"
+
+[tests."cpython/Lib/test/test_with.py"]
+status = "fail"
+reason = "with: PEP 617 parenthesized context managers"
+
+[tests."cpython/Lib/test/test_exceptions.py"]
+status = "fail"
+reason = "exception: __notes__ + ExceptionGroup propagation"
+
+[tests."cpython/Lib/test/test_traceback.py"]
+status = "fail"
+reason = "traceback: exception chaining display + StackSummary format"
+
+[tests."cpython/Lib/test/test_warnings.py"]
+status = "fail"
+reason = "warnings: filter precedence + showwarning override"
+
+[tests."cpython/Lib/test/test_contextlib.py"]
+status = "fail"
+reason = "contextlib: ExitStack.callback + contextmanager generator semantics"
+
+[tests."cpython/Lib/test/test_contextvars.py"]
+status = "fail"
+reason = "contextvars: Context.run reentrance + Token.reset semantics"
+
+[tests."cpython/Lib/test/test_compile.py"]
+status = "fail"
+reason = "compile builtin: PyCF_* flags + AST input handling"
+
+[tests."cpython/Lib/test/test_decorators.py"]
+status = "fail"
+reason = "decorator stacking + classmethod/staticmethod descriptor protocol"
+
+[tests."cpython/Lib/test/test_call.py"]
+status = "fail"
+reason = "call protocol: kwargs unpacking ordering + vectorcall"
+
+[tests."cpython/Lib/test/test_isinstance.py"]
+status = "fail"
+reason = "isinstance: PEP 604 union types + ABC virtual subclass cache"
+
+[tests."cpython/Lib/test/test_dis.py"]
+status = "fail"
+reason = "dis: opcode coverage + line number table format differs"
+
+[tests."cpython/Lib/test/test_optparse.py"]
+status = "fail"
+reason = "optparse: deprecated but still expected to work; help formatting subtleties"
+
+[tests."cpython/Lib/test/test_getopt.py"]
+status = "fail"
+reason = "getopt: long option abbreviation + error messages"
+
+[tests."cpython/Lib/test/test_argparse.py"]
+status = "fail"
+reason = "argparse: subparsers + mutually exclusive groups"
+
+[tests."cpython/Lib/test/test_pprint.py"]
+status = "fail"
+reason = "pprint: width / depth + repr fallback for cycles"
+
+[tests."cpython/Lib/test/test_pdb.py"]
+status = "skip"
+reason = "pdb requires a terminal + readline; runs interactively"
+
+[tests."cpython/Lib/test/test_pkgutil.py"]
+status = "fail"
+reason = "pkgutil: ImpImporter (removed in 3.12) + namespace package walks"
+
+[tests."cpython/Lib/test/test_importlib.py"]
+status = "fail"
+reason = "importlib: full FileFinder + frozen module spec semantics"
+
+[tests."cpython/Lib/test/test_runpy.py"]
+status = "fail"
+reason = "runpy: _run_module_as_main alt_argv0 + run_path with .zip"
+
+[tests."cpython/Lib/test/test_atexit.py"]
+status = "fail"
+reason = "atexit: register/unregister ordering + exceptions in callbacks"
+
+[tests."cpython/Lib/test/test_resource.py"]
+status = "fail"
+reason = "resource: getrusage delta + setrlimit raises on permission"
+
+[tests."cpython/Lib/test/test_fcntl.py"]
+status = "fail"
+reason = "fcntl: F_SETLK byte-range locks + F_NOTIFY (Linux only)"
+
+[tests."cpython/Lib/test/test_posix.py"]
+status = "fail"
+reason = "posix wrapper: posix_spawn + os.scheduler_*"
+
+[tests."cpython/Lib/test/test_uuid.py"]
+status = "fail"
+reason = "uuid: MAC address lookup + uuid8 namespace handling"
+
+[tests."cpython/Lib/test/test_secrets.py"]
+status = "fail"
+reason = "secrets: token_urlsafe + compare_digest edge cases"
+
+[tests."cpython/Lib/test/test_random.py"]
+status = "fail"
+reason = "random: Mersenne Twister state save/load + SystemRandom"
+
+[tests."cpython/Lib/test/test_statistics.py"]
+status = "fail"
+reason = "statistics: NormalDist + harmonic_mean weighted forms"
+
+[tests."cpython/Lib/test/test_unicodedata.py"]
+status = "fail"
+reason = "unicodedata: full DB lookup + bidirectional info"
+
+[tests."cpython/Lib/test/test_struct.py"]
+status = "fail"
+reason = "struct: pack_into bounds check + endianness with @ alignment"
+
+[tests."cpython/Lib/test/test_codecs.py"]
+status = "fail"
+reason = "codecs: encoder/decoder state + error handlers"
+
+[tests."cpython/Lib/test/test_calendar.py"]
+status = "fail"
+reason = "calendar: TextCalendar formatting + html escaping"
+
+[tests."cpython/Lib/test/test_time.py"]
+status = "fail"
+reason = "time: timezone strings + monotonic stability under leap seconds"
+
+[tests."cpython/Lib/test/test_datetime.py"]
+status = "fail"
+reason = "datetime: fold attribute + tzinfo dst transitions"
+
+[tests."cpython/Lib/test/test_csv.py"]
+status = "fail"
+reason = "csv: DictReader fieldnames inference + dialect registration"
+
+[tests."cpython/Lib/test/test_email.py"]
+status = "fail"
+reason = "email: policy.utf8 + EmailMessage.iter_attachments"
+
+[tests."cpython/Lib/test/test_html.py"]
+status = "fail"
+reason = "html: parser CDATA section + entity name lookup"
+
+[tests."cpython/Lib/test/test_logging.py"]
+status = "fail"
+reason = "logging: handler hierarchy + dictConfig disable_existing_loggers"
+
+[tests."cpython/Lib/test/test_locale.py"]
+status = "skip"
+reason = "locale requires setlocale() to succeed in CI sandbox"
+
+[tests."cpython/Lib/test/test_mimetypes.py"]
+status = "fail"
+reason = "mimetypes: read_windows_registry on non-Windows + guess_type unicode"
+
+[tests."cpython/Lib/test/test_sched.py"]
+status = "fail"
+reason = "sched: enterabs + priority ordering"
+
+[tests."cpython/Lib/test/test_selectors.py"]
+status = "skip"
+reason = "selectors module covered by socket tests; standalone needs kqueue/epoll exposure"
+
+[tests."cpython/Lib/test/test_socket.py"]
+status = "skip"
+reason = "socket: most tests need network + privileged sockets"
+
+[tests."cpython/Lib/test/test_subprocess.py"]
+status = "skip"
+reason = "subprocess: Popen requires exec/fork plumbing — RFC 0026 enables it"
+
+[tests."cpython/Lib/test/test_signal.py"]
+status = "skip"
+reason = "signal handlers in test require pthread_kill + sub-interpreter coordination"
+
+[tests."cpython/Lib/test/test_ssl.py"]
+status = "skip"
+reason = "ssl module not implemented"
+
+[tests."cpython/Lib/test/test_urllib.py"]
+status = "fail"
+reason = "urllib: opener install + proxy auth handlers"
+
+[tests."cpython/Lib/test/test_urlparse.py"]
+status = "fail"
+reason = "urllib.parse: WHATWG URL conformance + IDNA edge cases"
+
+[tests."cpython/Lib/test/test_httplib.py"]
+status = "skip"
+reason = "httplib requires a live HTTP fixture server"
+
+[tests."cpython/Lib/test/test_queue.py"]
+status = "fail"
+reason = "queue: SimpleQueue thread interleaving + PriorityQueue stability"
+
+[tests."cpython/Lib/test/test_concurrent_futures.py"]
+status = "skip"
+reason = "concurrent.futures.ProcessPoolExecutor depends on real multiprocessing (RFC 0026)"
+
+[tests."cpython/Lib/test/test_asyncio.py"]
+status = "skip"
+reason = "asyncio: event loop selector backends not all wired"
+
+[tests."cpython/Lib/test/test_tomllib.py"]
+status = "fail"
+reason = "tomllib: TOML 1.0 conformance edges (datetime offsets)"
+
+[tests."cpython/Lib/test/test_typing_extensions.py"]
+status = "skip"
+reason = "typing_extensions is a third-party shim, ship-time only"
+
+[tests."cpython/Lib/test/test_weakset.py"]
+status = "fail"
+reason = "WeakSet: finalize callback ordering"
+
+[tests."cpython/Lib/test/test_subclassinit.py"]
+status = "fail"
+reason = "__init_subclass__ interactions with metaclasses"
+
+[tests."cpython/Lib/test/test_keywordonlyarg.py"]
+status = "fail"
+reason = "keyword-only argument default expression evaluation timing"
+
+[tests."cpython/Lib/test/test_unpack.py"]
+status = "fail"
+reason = "PEP 448 unpacking edge cases"
+
+[tests."cpython/Lib/test/test_unpack_ex.py"]
+status = "fail"
+reason = "starred-target unpacking with generators"
+
+[tests."cpython/Lib/test/test_audit.py"]
+status = "skip"
+reason = "sys.audit hooks not implemented"

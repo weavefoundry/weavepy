@@ -181,6 +181,20 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("cpu_count", os_cpu_count),
         );
         d.insert(
+            DictKey(Object::from_static("kill")),
+            builtin("kill", os_kill),
+        );
+        d.insert(
+            DictKey(Object::from_static("waitpid")),
+            builtin("waitpid", os_waitpid),
+        );
+        // Common signal numbers — match libc on POSIX.
+        d.insert(DictKey(Object::from_static("SIGTERM")), Object::Int(15));
+        d.insert(DictKey(Object::from_static("SIGKILL")), Object::Int(9));
+        d.insert(DictKey(Object::from_static("SIGINT")), Object::Int(2));
+        d.insert(DictKey(Object::from_static("SIGHUP")), Object::Int(1));
+        d.insert(DictKey(Object::from_static("WNOHANG")), Object::Int(1));
+        d.insert(
             DictKey(Object::from_static("get_exec_path")),
             builtin("get_exec_path", os_get_exec_path),
         );
@@ -331,6 +345,7 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -443,10 +458,30 @@ fn os_urandom(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn os_close_stub(_args: &[Object]) -> Result<Object, RuntimeError> {
-    // We don't expose raw fds yet; `close(fd)` is a no-op for the
-    // string-shaped tokens we hand out from mkstemp.
-    Ok(Object::None)
+fn os_close_stub(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `close(fd)` for integer fds (pipe, dup, multiprocessing). Older
+    // callers also passed the string tokens we hand out from `mkstemp`;
+    // those are silently accepted (closing the file in `mkstemp` is the
+    // host's concern).
+    match args.first() {
+        Some(Object::Int(fd)) => {
+            #[cfg(unix)]
+            {
+                let rc = unsafe { libc::close(*fd as i32) };
+                if rc != 0 {
+                    return Err(crate::error::io_error_to_py(
+                        &std::io::Error::last_os_error(),
+                    ));
+                }
+            }
+            Ok(Object::None)
+        }
+        Some(Object::Str(_)) | None => Ok(Object::None),
+        Some(other) => Err(type_error(format!(
+            "close() arg must be int, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 fn os_open_stub(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -610,6 +645,60 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
         })
         .collect();
     Ok(Object::new_list(entries))
+}
+
+fn os_kill(args: &[Object]) -> Result<Object, RuntimeError> {
+    let pid = match args.first() {
+        Some(Object::Int(p)) => *p as libc::pid_t,
+        _ => return Err(type_error("kill() pid must be int")),
+    };
+    let sig = match args.get(1) {
+        Some(Object::Int(s)) => *s as libc::c_int,
+        _ => return Err(type_error("kill() signal must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid, sig) };
+        if rc != 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+    }
+    Ok(Object::None)
+}
+
+fn os_waitpid(args: &[Object]) -> Result<Object, RuntimeError> {
+    let pid = match args.first() {
+        Some(Object::Int(p)) => *p as libc::pid_t,
+        _ => return Err(type_error("waitpid() pid must be int")),
+    };
+    let options = match args.get(1) {
+        Some(Object::Int(o)) => *o as libc::c_int,
+        Some(Object::None) | None => 0,
+        _ => return Err(type_error("waitpid() options must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let mut status: libc::c_int = 0;
+        let rc = unsafe { libc::waitpid(pid, &raw mut status, options) };
+        if rc < 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(Object::new_tuple(vec![
+            Object::Int(i64::from(rc)),
+            Object::Int(i64::from(status)),
+        ]))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, options);
+        Err(crate::error::not_implemented_error(
+            "os.waitpid() is only implemented on POSIX in WeavePy",
+        ))
+    }
 }
 
 fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {

@@ -188,6 +188,7 @@ impl Default for Interpreter {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "print",
                 call: Box::new(|_args| Err(runtime_error("internal: print called outside VM"))),
+                call_kw: None,
             })),
         );
         let builtins = Rc::new(RefCell::new(builtins_dict));
@@ -421,6 +422,7 @@ impl Interpreter {
             call: Box::new(move |_args: &[Object]| {
                 Err(runtime_error("internal: print called outside VM"))
             }),
+            call_kw: None,
         };
         dict.insert(
             DictKey(Object::from_static("print")),
@@ -539,6 +541,15 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         let _handles = self.activate_thread_handles();
         let globals = self.build_module_globals(name, file, None);
+        // Insert the module into `sys.modules` so callers can introspect
+        // `sys.modules["__main__"]` (pickle by qualified name and the
+        // multiprocessing spawn helper both rely on this).
+        let module = Rc::new(PyModule {
+            name: name.to_owned(),
+            filename: file.map(|f| f.to_owned()),
+            dict: globals.clone(),
+        });
+        self.cache.insert(name, Object::Module(module));
         let code_rc = Rc::new(code.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
         let result = self.run_frame(&mut frame);
@@ -1611,6 +1622,24 @@ impl Interpreter {
                     }
                 }
                 let name = code.name.clone();
+                let attrs = Rc::new(RefCell::new(DictData::new()));
+                // Stamp __module__ from globals['__name__'] (mirrors CPython's
+                // function dispatch). Pickle relies on this to serialise the
+                // function by qualified name.
+                if let Some(name_obj) = frame
+                    .globals
+                    .borrow()
+                    .get(&DictKey(Object::from_static("__name__")))
+                    .cloned()
+                {
+                    attrs
+                        .borrow_mut()
+                        .insert(DictKey(Object::from_static("__module__")), name_obj);
+                }
+                attrs.borrow_mut().insert(
+                    DictKey(Object::from_static("__qualname__")),
+                    Object::from_str(name.clone()),
+                );
                 let f = PyFunction {
                     name,
                     code,
@@ -1618,7 +1647,7 @@ impl Interpreter {
                     defaults,
                     kw_defaults,
                     closure,
-                    attrs: Rc::new(RefCell::new(DictData::new())),
+                    attrs,
                 };
                 frame.push(Object::Function(Rc::new(f)));
             }
@@ -2416,6 +2445,20 @@ impl Interpreter {
                     "__name__" => return Ok(Object::from_str(&f.name)),
                     "__qualname__" => return Ok(Object::from_str(&f.name)),
                     "__doc__" => return Ok(Object::None),
+                    "__module__" => {
+                        // Fall back to globals['__name__'] if the function's
+                        // attrs dict didn't already pin a value (e.g. for
+                        // synthesised functions in tests / REPL).
+                        if let Some(name_obj) = f
+                            .globals
+                            .borrow()
+                            .get(&DictKey(Object::from_static("__name__")))
+                            .cloned()
+                        {
+                            return Ok(name_obj);
+                        }
+                        return Ok(Object::None);
+                    }
                     "__dict__" => return Ok(Object::Dict(f.attrs.clone())),
                     "__code__" => return Ok(Object::Code(f.code.clone())),
                     "__globals__" => return Ok(Object::Dict(f.globals.clone())),
@@ -2486,6 +2529,16 @@ impl Interpreter {
                 },
                 _ => Err(attribute_error(format!(
                     "'traceback' object has no attribute '{}'",
+                    name
+                ))),
+            },
+            Object::Builtin(b) => match name {
+                "__name__" | "__qualname__" => Ok(Object::from_static(b.name)),
+                "__module__" => Ok(Object::from_static("builtins")),
+                "__doc__" => Ok(Object::None),
+                "__self__" => Ok(Object::None),
+                _ => Err(attribute_error(format!(
+                    "'builtin_function_or_method' object has no attribute '{}'",
                     name
                 ))),
             },
@@ -5534,6 +5587,9 @@ impl Interpreter {
                         return Ok(Object::from_str(format_via_spec(&args[0], &spec)?));
                     }
                 }
+                if let Some(call_kw) = b.call_kw.as_ref() {
+                    return call_kw(args, kwargs);
+                }
                 if !kwargs.is_empty() {
                     return Err(type_error(format!(
                         "builtin '{}' does not accept keyword arguments",
@@ -5733,6 +5789,19 @@ impl Interpreter {
                 DictKey(Object::from_static("__qualname__")),
                 Object::from_str(&name),
             );
+            // Stamp `__module__` so `pickle` (and any user code that
+            // introspects classes) can find the qualified name. We
+            // copy whatever `globals['__name__']` is at definition
+            // time, which is `__main__` for top-level classes and the
+            // module name for everything else.
+            if let Some(module_name) = body_fn
+                .globals
+                .borrow()
+                .get(&DictKey(Object::from_static("__name__")))
+                .cloned()
+            {
+                ns.insert(DictKey(Object::from_static("__module__")), module_name);
+            }
         }
         // Build a frame for the class body. Locals are unused; names
         // store and load through `class_ns`. The body's `__class__`
@@ -7381,6 +7450,7 @@ fn make_gen_method(name: &str, receiver: &Object) -> Object {
     let builtin = Object::Builtin(Rc::new(BuiltinFn {
         name: internal_name,
         call: Box::new(unreachable_call),
+        call_kw: None,
     }));
     Object::BoundMethod(Rc::new(BoundMethod {
         receiver: receiver.clone(),

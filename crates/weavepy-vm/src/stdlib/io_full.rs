@@ -84,6 +84,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open",
                 call: Box::new(io_open),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -91,6 +92,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open_code",
                 call: Box::new(io_open),
+                call_kw: None,
             })),
         );
     }
@@ -130,6 +132,7 @@ fn make_protocol(name: &'static str, bases: Vec<Rc<TypeObject>>) -> Rc<TypeObjec
             Object::Builtin(Rc::new(BuiltinFn {
                 name: stub_name,
                 call: Box::new(stub_method),
+                call_kw: None,
             })),
         );
     }

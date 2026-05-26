@@ -58,6 +58,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 Object::Builtin(Rc::new(BuiltinFn {
                     name,
                     call: Box::new(body),
+                    call_kw: None,
                 })),
             );
         }
