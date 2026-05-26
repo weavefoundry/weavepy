@@ -170,6 +170,45 @@ class Path(PurePath):
         for name in os.listdir(self._raw):
             yield Path(self._raw, name)
 
+    def glob(self, pattern):
+        """Yield paths matching ``pattern`` directly under this path.
+
+        Supports the same ``*``, ``?``, ``[...]``, ``**`` wildcards as
+        CPython's pathlib; ``**`` is the only wildcard that recurses
+        into subdirectories."""
+        parts = pattern.split("/")
+        yield from _glob_walk(self, parts)
+
+    def rglob(self, pattern):
+        """Recursive glob — equivalent to ``glob("**/" + pattern)``."""
+        return self.glob("**/" + pattern)
+
+    def walk(self, top_down=True, on_error=None, follow_symlinks=False):
+        """PEP 711-style ``Path.walk``: yields ``(self, dirnames,
+        filenames)`` for every directory under this path. Mirrors
+        ``os.walk`` semantics but produces ``Path`` objects."""
+        try:
+            entries = list(os.scandir(self._raw))
+        except OSError as e:
+            if on_error is not None:
+                on_error(e)
+            entries = []
+        dirs = []
+        files = []
+        for entry in entries:
+            if entry.is_dir():
+                dirs.append(entry.name)
+            else:
+                files.append(entry.name)
+        if top_down:
+            yield (self, dirs, files)
+            for d in list(dirs):
+                yield from Path(self._raw, d).walk(top_down, on_error, follow_symlinks)
+        else:
+            for d in list(dirs):
+                yield from Path(self._raw, d).walk(top_down, on_error, follow_symlinks)
+            yield (self, dirs, files)
+
     def mkdir(self, mode=0o777, parents=False, exist_ok=False):
         if parents:
             os.makedirs(self._raw, exist_ok=exist_ok)
@@ -197,3 +236,80 @@ class Path(PurePath):
     @classmethod
     def home(cls):
         return cls(os.path.expanduser("~"))
+
+    def relative_to(self, other, *, walk_up=False):
+        """Return ``self`` with ``other`` stripped from the front.
+
+        Mirrors CPython 3.13: raises ``ValueError`` when ``self`` is
+        not below ``other`` unless ``walk_up=True``, in which case we
+        emit ``..`` components to climb out."""
+        other = Path(other) if not isinstance(other, Path) else other
+        a_parts = list(self.parts)
+        b_parts = list(other.parts)
+        if a_parts[: len(b_parts)] == b_parts:
+            rest = a_parts[len(b_parts):]
+            if not rest:
+                return Path(".")
+            return Path(*rest)
+        if not walk_up:
+            raise ValueError(f"{self._raw!r} is not in the subpath of {other._raw!r}")
+        common = 0
+        while (
+            common < len(a_parts)
+            and common < len(b_parts)
+            and a_parts[common] == b_parts[common]
+        ):
+            common += 1
+        ups = [".."] * (len(b_parts) - common)
+        rest = a_parts[common:]
+        if not ups and not rest:
+            return Path(".")
+        return Path(*(ups + rest))
+
+
+def _glob_walk(base, parts):
+    """Pure-Python depth-first glob implementation. Used by
+    ``Path.glob`` / ``Path.rglob`` so we don't depend on
+    CPython-specific ``_PosixFlavour`` plumbing."""
+    import fnmatch
+
+    if not parts:
+        return
+    head, rest = parts[0], parts[1:]
+    if head == "**":
+        if not rest:
+            for p in _walk_all_under(base):
+                yield p
+            return
+        yield from _glob_walk(base, rest)
+        for entry in _list_entries(base):
+            full = Path(base._raw, entry.name)
+            if entry.is_dir():
+                yield from _glob_walk(full, parts)
+        return
+    matched = []
+    for entry in _list_entries(base):
+        if fnmatch.fnmatch(entry.name, head):
+            matched.append(entry)
+    if not rest:
+        for entry in matched:
+            yield Path(base._raw, entry.name)
+        return
+    for entry in matched:
+        if entry.is_dir():
+            yield from _glob_walk(Path(base._raw, entry.name), rest)
+
+
+def _list_entries(p):
+    try:
+        return list(os.scandir(p._raw))
+    except OSError:
+        return []
+
+
+def _walk_all_under(base):
+    for entry in _list_entries(base):
+        full = Path(base._raw, entry.name)
+        yield full
+        if entry.is_dir():
+            yield from _walk_all_under(full)

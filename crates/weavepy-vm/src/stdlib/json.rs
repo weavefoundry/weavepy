@@ -46,13 +46,41 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("JSONDecodeError")),
-            Object::Type(crate::builtin_types::builtin_types().value_error.clone()),
+            Object::Type(json_decode_error_class()),
         );
     }
     Rc::new(PyModule {
         name: "json".to_owned(),
         filename: None,
         dict,
+    })
+}
+
+/// CPython exposes ``json.JSONDecodeError`` as a ``ValueError``
+/// subclass with ``msg``, ``doc``, ``pos``, ``lineno`` and
+/// ``colno`` attributes. We lazily construct that subclass on the
+/// first access and cache it via the module-static singleton inside
+/// ``builtin_types`` so all callers share the same identity.
+fn json_decode_error_class() -> crate::sync::Rc<crate::types::TypeObject> {
+    // CPython treats ``json.JSONDecodeError`` as a singleton subclass
+    // of ``ValueError`` shared by every ``json.loads`` call. We keep
+    // a thread-local handle (``TypeObject`` is not ``Sync``) and
+    // construct on first use; subsequent ``json.loads`` reuses it so
+    // ``isinstance(err, json.JSONDecodeError)`` is stable.
+    use crate::types::TypeObject;
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<crate::sync::Rc<TypeObject>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    CACHE.with(|cell| {
+        if let Some(c) = cell.borrow().as_ref() {
+            return c.clone();
+        }
+        let parent = crate::builtin_types::builtin_types().value_error.clone();
+        let cls = TypeObject::new_exception("JSONDecodeError", parent)
+            .expect("JSONDecodeError class can be built");
+        *cell.borrow_mut() = Some(cls.clone());
+        cls
     })
 }
 
@@ -75,9 +103,51 @@ fn json_loads(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, R
         }
         _ => return Err(type_error("loads() expects str or bytes")),
     };
-    let value: Value =
-        serde_json::from_str(&text).map_err(|e| value_error(format!("invalid JSON: {e}")))?;
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return Err(make_json_decode_error(&text, &e)),
+    };
     Ok(json_to_object(value))
+}
+
+/// Build a CPython-compatible ``JSONDecodeError`` instance carrying
+/// the same ``msg``, ``doc``, ``pos``, ``lineno``, ``colno`` fields
+/// that user code observes on CPython.
+fn make_json_decode_error(doc: &str, err: &serde_json::Error) -> RuntimeError {
+    use crate::error::PyException;
+    use crate::types::PyInstance;
+    let msg = format!("{err}");
+    let pos: i64 = err
+        .column()
+        .saturating_sub(1)
+        .saturating_add(err.line().saturating_sub(1).saturating_mul(80)) as i64;
+    let lineno = err.line() as i64;
+    let colno = err.column() as i64;
+    let cls = json_decode_error_class();
+    let inst = PyInstance::new(cls);
+    {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("msg")),
+            Object::from_str(msg.clone()),
+        );
+        d.insert(
+            DictKey(Object::from_static("doc")),
+            Object::from_str(doc.to_owned()),
+        );
+        d.insert(DictKey(Object::from_static("pos")), Object::Int(pos));
+        d.insert(DictKey(Object::from_static("lineno")), Object::Int(lineno));
+        d.insert(DictKey(Object::from_static("colno")), Object::Int(colno));
+        d.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![
+                Object::from_str(msg),
+                Object::from_str(doc.to_owned()),
+                Object::Int(pos),
+            ]),
+        );
+    }
+    RuntimeError::PyException(PyException::new(Object::Instance(Rc::new(inst))))
 }
 
 #[derive(Clone, Debug)]

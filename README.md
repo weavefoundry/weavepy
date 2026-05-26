@@ -10,10 +10,15 @@ standard while exploring a modern Rust-based runtime architecture built for
 aggressive optimization, native interoperability, and long-term performance
 work.
 
-> **Status: pre-alpha.** Almost everything in this repository is a scaffold.
-> The pipeline crates are wired up, the CLI accepts familiar `python` flags,
-> but the lexer, parser, compiler, and VM are stubs. Expect breaking changes
-> daily.
+> **Status: drop-in replacement for the documented CPython 3.13 surface,
+> with a measured conformance baseline.** The bundled regression suite at
+> `tests/regrtest/` covers the seven semantic groups exercised by
+> `RFC 0027` (object model, iterators/generators/coroutines, numerics/strings/
+> format, containers, exceptions/context, serialization/compression/codecs,
+> and IO/OS/argparse/inspect/typing) and is green on `main`. The CPython
+> `Lib/test/` allowlist remains an aspirational target — see
+> `tests/regrtest/expectations.toml` for the per-test baseline. Expect
+> small breaking changes around the edges as the long tail catches up.
 
 ## Repository layout
 

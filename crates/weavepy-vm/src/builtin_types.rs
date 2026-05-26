@@ -841,11 +841,23 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
         if let Object::Instance(inst_rc) = inst {
+            // CPython's ``KeyError.__str__`` overrides the default to
+            // render the key via ``repr`` — so ``str(KeyError('x'))``
+            // is ``"'x'"`` not ``'x'``. We special-case KeyError here
+            // because the runtime constructs them from Rust and we
+            // can't easily install a per-subclass ``__str__``.
+            let is_key_error = is_subclass_by_name(&inst_rc.class, "KeyError");
             let dict = inst_rc.dict.borrow();
             if let Some(Object::Tuple(items)) = dict.get(&DictKey(Object::from_static("args"))) {
                 return Ok(match items.as_ref() {
                     [] => Object::from_static(""),
-                    [single] => Object::from_str(single.to_str()),
+                    [single] => {
+                        if is_key_error {
+                            Object::from_str(single.repr())
+                        } else {
+                            Object::from_str(single.to_str())
+                        }
+                    }
                     _ => Object::from_str(format!(
                         "({})",
                         items
@@ -881,6 +893,32 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         }
         Ok(Object::from_static(""))
     }
+    // PEP 678: ``e.add_note("...")`` appends a string note to
+    // ``__notes__``. The list is created on the first call and
+    // travels with the instance through ``raise`` (we store it on
+    // the instance ``__dict__``).
+    fn exc_add_note(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        let note = args.get(1).ok_or_else(|| {
+            crate::error::type_error("add_note() expects one argument".to_owned())
+        })?;
+        if !matches!(note, Object::Str(_)) {
+            return Err(crate::error::type_error("note must be a str".to_owned()));
+        }
+        if let Object::Instance(inst_rc) = inst {
+            let key = DictKey(Object::from_static("__notes__"));
+            let mut dict = inst_rc.dict.borrow_mut();
+            let mut notes = match dict.get(&key) {
+                Some(Object::List(l)) => l.borrow().clone(),
+                _ => Vec::new(),
+            };
+            notes.push(note.clone());
+            dict.insert(key, Object::List(Rc::new(crate::sync::GilCell::new(notes))));
+        }
+        Ok(Object::None)
+    }
     let mut dict = base_exception.dict.borrow_mut();
     dict.insert(
         DictKey(Object::from_static("__init__")),
@@ -903,6 +941,14 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__repr__",
             call: Box::new(exc_repr),
+            call_kw: None,
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("add_note")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "add_note",
+            call: Box::new(exc_add_note),
             call_kw: None,
         })),
     );

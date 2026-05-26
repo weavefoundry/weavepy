@@ -148,7 +148,13 @@ class _MappingMixin:
         self._data = {}
 
     def __getitem__(self, key):
-        return self._data[key]
+        try:
+            return self._data[key]
+        except KeyError:
+            miss = getattr(self, "__missing__", None)
+            if miss is not None:
+                return miss(key)
+            raise
 
     def __setitem__(self, key, value):
         self._data[key] = value
@@ -353,6 +359,68 @@ class Counter(_MappingMixin):
 
     def __repr__(self):
         return "Counter(" + repr(self._data) + ")"
+
+    def __add__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for k, v in self._data.items():
+            new = v + other._data.get(k, 0)
+            if new > 0:
+                result._data[k] = new
+        for k, v in other._data.items():
+            if k not in self._data and v > 0:
+                result._data[k] = v
+        return result
+
+    def __sub__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for k, v in self._data.items():
+            new = v - other._data.get(k, 0)
+            if new > 0:
+                result._data[k] = new
+        return result
+
+    def __or__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for k, v in self._data.items():
+            other_v = other._data.get(k, 0)
+            best = v if v > other_v else other_v
+            if best > 0:
+                result._data[k] = best
+        for k, v in other._data.items():
+            if k not in self._data and v > 0:
+                result._data[k] = v
+        return result
+
+    def __and__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for k, v in self._data.items():
+            other_v = other._data.get(k, 0)
+            best = v if v < other_v else other_v
+            if best > 0:
+                result._data[k] = best
+        return result
+
+    def __pos__(self):
+        result = Counter()
+        for k, v in self._data.items():
+            if v > 0:
+                result._data[k] = v
+        return result
+
+    def __neg__(self):
+        result = Counter()
+        for k, v in self._data.items():
+            if v < 0:
+                result._data[k] = -v
+        return result
 
 
 class ChainMap:

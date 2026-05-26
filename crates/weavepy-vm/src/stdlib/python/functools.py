@@ -186,7 +186,51 @@ class _LruCacheWrapper:
         self._misses = 0
 
     def cache_info(self):
-        return (self._hits, self._misses, self._maxsize, len(self._storage))
+        # CPython exposes ``cache_info`` as a named tuple with the
+        # ``hits``, ``misses``, ``maxsize``, ``currsize`` fields so
+        # callers can use attribute access (``info.hits``).
+        return _CacheInfo(
+            hits=self._hits,
+            misses=self._misses,
+            maxsize=self._maxsize,
+            currsize=len(self._storage),
+        )
+
+
+class _CacheInfo:
+    """Lightweight stand-in for ``collections.namedtuple`` that gives
+    ``functools.lru_cache.cache_info`` its CPython-compatible
+    attribute access plus tuple-style iteration. Kept local so the
+    real ``collections.namedtuple`` import isn't required."""
+
+    __slots__ = ("hits", "misses", "maxsize", "currsize")
+
+    def __init__(self, hits=0, misses=0, maxsize=None, currsize=0):
+        self.hits = hits
+        self.misses = misses
+        self.maxsize = maxsize
+        self.currsize = currsize
+
+    def __iter__(self):
+        return iter((self.hits, self.misses, self.maxsize, self.currsize))
+
+    def __eq__(self, other):
+        if isinstance(other, _CacheInfo):
+            return (
+                self.hits == other.hits
+                and self.misses == other.misses
+                and self.maxsize == other.maxsize
+                and self.currsize == other.currsize
+            )
+        if isinstance(other, tuple):
+            return (self.hits, self.misses, self.maxsize, self.currsize) == other
+        return NotImplemented
+
+    def __repr__(self):
+        return (
+            f"CacheInfo(hits={self.hits}, misses={self.misses}, "
+            f"maxsize={self.maxsize}, currsize={self.currsize})"
+        )
 
 
 def _make_lru(func, maxsize, typed):

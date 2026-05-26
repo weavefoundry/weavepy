@@ -132,10 +132,17 @@ def _is_initvar(annotation):
     return name == "InitVar"
 
 
-def _collect_fields(cls):
+def _collect_fields(cls, kw_only_at_this_class=False):
     """Walk the MRO bottom-up and gather every declared field in
-    declaration order, with subclass fields overriding base ones."""
+    declaration order, with subclass fields overriding base ones.
+
+    ``kw_only_at_this_class`` flips ``Field.kw_only`` to ``True`` on
+    fields declared at *this* class only — matching CPython's
+    semantics where ``@dataclass(kw_only=True)`` applies only to the
+    locally-declared annotations, not inherited ones.
+    """
     fields_seen = {}
+    own_annotations = getattr(cls, "__annotations__", {}) or {}
     for base in reversed(cls.__mro__):
         annotations = getattr(base, "__annotations__", {}) or {}
         for name, annotation in annotations.items():
@@ -153,23 +160,37 @@ def _collect_fields(cls):
                 f.type = annotation
             if init_only:
                 f._field_type = "_FIELD_INITVAR"
+            # `kw_only_at_this_class` only flips fields whose
+            # annotation lives on ``cls`` directly. Inherited fields
+            # keep their original `kw_only` flag — exactly what
+            # CPython's `dataclass` does.
+            if kw_only_at_this_class and base is cls and name in own_annotations:
+                if not isinstance(default, Field):
+                    f.kw_only = True
+                elif not f.kw_only:
+                    f.kw_only = True
             fields_seen[name] = f
     return list(fields_seen.values())
 
 
-def _make_init(fields, frozen, kw_only_all):
+def _make_init(fields, frozen):
     """Build the synthesised ``__init__`` as a closure over the
     field list — no source-string compilation, so it works in the
-    WeavePy runtime which does not implement :func:`exec`."""
+    WeavePy runtime which does not implement :func:`exec`.
 
-    # Split into positional and keyword-only fields, preserving order.
+    Each field's own ``kw_only`` flag controls whether it is
+    positional or keyword-only; the global ``kw_only`` decorator
+    argument has already been folded into the per-field flags by
+    :func:`_collect_fields`.
+    """
+
     init_fields = [f for f in fields if f.init]
-    pos_fields = [f for f in init_fields if not (kw_only_all or f.kw_only)]
-    kw_fields = [f for f in init_fields if (kw_only_all or f.kw_only)]
+    pos_fields = [f for f in init_fields if not f.kw_only]
+    kw_fields = [f for f in init_fields if f.kw_only]
     non_init_fields = [f for f in fields if not f.init]
+    kw_only_names = {f.name for f in kw_fields}
 
     def __init__(self, *args, **kwargs):
-        # Bind positional args first.
         if len(args) > len(pos_fields):
             raise TypeError(
                 f"__init__() takes {len(pos_fields) + 1} positional arguments "
@@ -178,7 +199,6 @@ def _make_init(fields, frozen, kw_only_all):
         provided = {}
         for f, value in zip(pos_fields, args):
             provided[f.name] = value
-        # Then kwargs (allowed for both positional fields and kw-only).
         for key, value in kwargs.items():
             if key in provided:
                 raise TypeError(
@@ -275,12 +295,18 @@ def _make_hash(fields):
 
 
 def _process_class(cls, init, repr, eq, order, frozen, slots, kw_only):
-    fields = _collect_fields(cls)
+    fields = _collect_fields(cls, kw_only_at_this_class=kw_only)
+    # When `kw_only=True` is in effect, kw-only fields must follow
+    # positional fields in the synthesised __init__ signature even
+    # if the user declared them in a different order. We re-stable-
+    # sort here so positional fields appear first and kw-only fields
+    # last; declaration order is preserved within each group.
+    fields = sorted(fields, key=lambda f: 1 if f.kw_only else 0)
     setattr(cls, "__dataclass_fields__", {f.name: f for f in fields})
     setattr(cls, "__dataclass_params__", _DataclassParams(init, repr, eq, order, frozen))
 
     if init and "__init__" not in cls.__dict__:
-        cls.__init__ = _make_init(fields, frozen=frozen, kw_only_all=kw_only)
+        cls.__init__ = _make_init(fields, frozen=frozen)
 
     if repr and "__repr__" not in cls.__dict__:
         cls.__repr__ = _make_repr(fields, cls.__name__)
@@ -315,9 +341,46 @@ def _process_class(cls, init, repr, eq, order, frozen, slots, kw_only):
         cls.__delattr__ = _frozen_delattr
 
     if slots:
-        cls.__slots__ = tuple(f.name for f in fields)
+        # CPython rebuilds the class so ``__slots__`` is in effect at
+        # construction time; assigning ``cls.__slots__ = ...`` after
+        # the fact does not give the type slot storage. We mirror the
+        # CPython logic here: collect inherited slot names, exclude
+        # them from the new tuple, and re-create the class via the
+        # original metaclass.
+        cls = _add_slots(cls, fields, frozen)
 
     return cls
+
+
+def _add_slots(cls, dc_fields, is_frozen):
+    field_names = tuple(f.name for f in dc_fields)
+    inherited_slots = set()
+    for c in cls.__mro__[1:-1]:
+        inherited_slots.update(getattr(c, "__slots__", ()) or ())
+
+    # Materialise the existing class dict into a fresh dict via the
+    # public attribute API. Going through `dir(cls)` + `getattr` is
+    # safer than `dict(cls.__dict__)` because the latter risks
+    # holding overlapping borrows of the underlying dict storage on
+    # runtimes that share the dict by reference between class and
+    # mappingproxy.
+    cls_dict = {}
+    for key in list(cls.__dict__.keys()):
+        if key == "__dict__" or key == "__weakref__":
+            continue
+        if key in field_names:
+            continue
+        cls_dict[key] = cls.__dict__[key]
+    new_slots = tuple(n for n in field_names if n not in inherited_slots)
+    cls_dict["__slots__"] = new_slots
+    qualname = getattr(cls, "__qualname__", None)
+    new_cls = type(cls)(cls.__name__, cls.__bases__, cls_dict)
+    if qualname is not None:
+        try:
+            new_cls.__qualname__ = qualname
+        except (AttributeError, TypeError):
+            pass
+    return new_cls
 
 
 class _DataclassParams:

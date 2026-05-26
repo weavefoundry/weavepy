@@ -853,6 +853,34 @@ impl PyFile {
         Ok(buf)
     }
 
+    /// Read until the next ``\n`` (inclusive) or EOF and return the
+    /// resulting string. Used by iteration over text-mode files and
+    /// ``StringIO`` instances; binary-mode files refuse the call to
+    /// avoid silently decoding non-UTF-8 bytes.
+    pub fn readline_unbounded(&self) -> Result<String, RuntimeError> {
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let b = self.read_bytes(Some(1))?;
+            if b.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&b);
+            if b[0] == b'\n' {
+                break;
+            }
+        }
+        if self.binary {
+            // Binary mode: caller should iterate by ``readline``
+            // explicitly; the iterator protocol implicitly decodes
+            // to str, which would be wrong for bytes.
+            let _ = out;
+            return Err(type_error(
+                "binary mode files are not iterable in text mode".to_owned(),
+            ));
+        }
+        String::from_utf8(out).map_err(|e| value_error(e.to_string()))
+    }
+
     pub fn write_bytes(&self, data: &[u8]) -> Result<usize, RuntimeError> {
         self.check_open()?;
         let mut backend = self.backend.borrow_mut();
@@ -1541,6 +1569,26 @@ impl Object {
             Object::MappingProxy(d) => {
                 let keys: Vec<DictKey> = d.borrow().keys().cloned().collect();
                 Ok(PyIterator::DictKeys { keys, index: 0 })
+            }
+            Object::File(file) => {
+                // CPython iterates a text-mode file by repeatedly
+                // invoking ``readline`` until it returns ``""``. We
+                // realise the buffer up front (for the in-memory
+                // backends; real OS handles read on demand inside
+                // ``readline``) and wrap the lines in a ``List``
+                // iterator — same observable behaviour.
+                let mut lines: Vec<Object> = Vec::new();
+                loop {
+                    let line = file.readline_unbounded()?;
+                    if line.is_empty() {
+                        break;
+                    }
+                    lines.push(Object::from_str(line));
+                }
+                Ok(PyIterator::List {
+                    items: Rc::new(RefCell::new(lines)),
+                    index: 0,
+                })
             }
             _ => Err(type_error(format!(
                 "'{}' object is not iterable",

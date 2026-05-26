@@ -26,6 +26,7 @@ __all__ = [
     "combinations",
     "combinations_with_replacement",
     "pairwise",
+    "batched",
 ]
 
 
@@ -83,12 +84,14 @@ def chain(*iterables):
 
 
 def chain_from_iterable(iterables):
-    """Equivalent to ``chain(*iterables)``; namespaced as a module-level
-    function because WeavePy's function objects don't accept dynamic
-    attribute assignment yet."""
+    """Equivalent to :func:`chain.from_iterable`. Kept as a module
+    level binding for callers that look it up by name."""
     for inner in iterables:
         for item in inner:
             yield item
+
+
+chain.from_iterable = chain_from_iterable
 
 
 def compress(data, selectors):
@@ -297,3 +300,24 @@ def pairwise(iterable):
     for current in it:
         yield (prev, current)
         prev = current
+
+
+def batched(iterable, n, *, strict=False):
+    """Yield successive ``n``-sized batches from *iterable* (PEP 711 /
+    new in CPython 3.12). When ``strict=True`` raises ``ValueError``
+    if the final batch is shorter than ``n``."""
+    if n < 1:
+        raise ValueError("n must be at least one")
+    it = iter(iterable)
+    while True:
+        batch = []
+        for _ in range(n):
+            try:
+                batch.append(next(it))
+            except StopIteration:
+                break
+        if not batch:
+            return
+        if strict and len(batch) != n:
+            raise ValueError("batched(): incomplete batch")
+        yield tuple(batch)

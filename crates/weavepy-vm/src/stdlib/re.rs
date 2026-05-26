@@ -130,6 +130,74 @@ fn compile_pattern(pat: &str, flags: i64) -> Result<Regex, RuntimeError> {
     })
 }
 
+/// Compile with the `fancy-regex` engine. Used as a fallback when
+/// the base `regex` crate rejects the pattern — typically because
+/// of CPython features `regex` doesn't implement (lookaround,
+/// backreferences). Returned eagerly so callers can decide whether
+/// to fall back without paying the cost on every successful
+/// compile.
+fn compile_pattern_fancy(pat: &str, flags: i64) -> Result<fancy_regex::Regex, RuntimeError> {
+    let mut translated = pat.replace("\\Z", "\\z");
+    // Apply inline flag prefix so the same CPython flag bits steer
+    // the fancy engine.
+    let mut prefix = String::new();
+    if flags & 2 != 0 {
+        prefix.push('i');
+    }
+    if flags & 8 != 0 {
+        prefix.push('m');
+    }
+    if flags & 16 != 0 {
+        prefix.push('s');
+    }
+    if flags & 64 != 0 {
+        prefix.push('x');
+    }
+    if !prefix.is_empty() {
+        translated = format!("(?{prefix}){translated}");
+    }
+    fancy_regex::Regex::new(&translated).map_err(|e| value_error(format!("invalid pattern: {e}")))
+}
+
+/// Public alias exposed to the VM dispatcher so it can route
+/// callable-replacement ``re.sub`` calls itself.
+pub fn extract_pattern_pub(arg: &Object) -> Result<(String, i64), RuntimeError> {
+    extract_pattern(arg)
+}
+
+/// Public helper: collect every non-overlapping match span +
+/// captures of ``pat`` over ``text``. Used by the VM-routed
+/// ``re.sub`` callable path so the actual ``repl(match)`` calls
+/// happen on the interpreter side.
+pub fn collect_all_matches(
+    pat: &str,
+    flags: i64,
+    text: &str,
+) -> Result<Vec<(usize, usize, Vec<Option<(usize, usize)>>)>, RuntimeError> {
+    let mut out: Vec<(usize, usize, Vec<Option<(usize, usize)>>)> = Vec::new();
+    let mut on_match = |s: usize, e: usize, groups: &[Option<(usize, usize)>]| {
+        out.push((s, e, groups.to_vec()));
+    };
+    iter_all_matches(pat, flags, text, &mut on_match)?;
+    Ok(out)
+}
+
+/// Build a ``re.Match`` object compatible with the rest of the
+/// module from a pre-extracted set of group spans.
+pub fn build_match_object(
+    pat: &str,
+    text: &str,
+    groups: &[Option<(usize, usize)>],
+    _full_start: usize,
+    _full_end: usize,
+) -> Object {
+    let caps = DualCaptures {
+        groups: groups.to_vec(),
+        named: Vec::new(),
+    };
+    make_match_from_captured(pat, text, &caps, text, 0)
+}
+
 fn extract_pattern(arg: &Object) -> Result<(String, i64), RuntimeError> {
     match arg {
         Object::Str(s) => Ok((s.to_string(), 0)),
@@ -303,29 +371,149 @@ fn run_match(
         };
         (flags, 0i64, text.chars().count() as i64)
     };
-    let re = compile_pattern(&pat, flags)?;
     let start_byte = char_index_to_byte(&text, pos.max(0) as usize);
     let end_byte = char_index_to_byte(&text, endpos.max(0) as usize);
     if start_byte > end_byte || start_byte > text.len() {
         return Ok(Object::None);
     }
-    let slice = &text[start_byte..end_byte.min(text.len())];
-    let found = re.captures(slice);
-    let captures = match found {
-        Some(caps) => caps,
+    let slice_end = end_byte.min(text.len());
+    let slice = &text[start_byte..slice_end];
+    let captured = match dual_captures(&pat, flags, slice)? {
+        Some(c) => c,
         None => return Ok(Object::None),
     };
-    if require_start && captures.get(0).map(|m| m.start()).unwrap_or(usize::MAX) != 0 {
+    let span0 = captured.groups[0].expect("group 0 always present");
+    if require_start && span0.0 != 0 {
         return Ok(Object::None);
     }
-    if fullmatch {
-        if let Some(m) = captures.get(0) {
-            if m.start() != 0 || m.end() != slice.len() {
-                return Ok(Object::None);
+    if fullmatch && (span0.0 != 0 || span0.1 != slice.len()) {
+        return Ok(Object::None);
+    }
+    Ok(make_match_from_captured(
+        &pat, &text, &captured, slice, start_byte,
+    ))
+}
+
+/// A capture result that hides which engine produced it. Spans are
+/// byte offsets into the *slice* the caller passed; the caller adds
+/// any base offset back.
+struct DualCaptures {
+    groups: Vec<Option<(usize, usize)>>,
+    /// Ordered ``(name, Option<group_idx>)`` pairs for named groups.
+    /// Group indices line up with ``groups``.
+    named: Vec<(String, usize)>,
+}
+
+fn dual_captures(pat: &str, flags: i64, slice: &str) -> Result<Option<DualCaptures>, RuntimeError> {
+    if let Ok(re) = compile_pattern(pat, flags) {
+        if let Some(caps) = re.captures(slice) {
+            let mut groups = Vec::with_capacity(caps.len());
+            for i in 0..caps.len() {
+                groups.push(caps.get(i).map(|m| (m.start(), m.end())));
+            }
+            let mut named = Vec::new();
+            for (i, name) in re.capture_names().enumerate() {
+                if let Some(n) = name {
+                    named.push((n.to_owned(), i));
+                }
+            }
+            return Ok(Some(DualCaptures { groups, named }));
+        }
+        return Ok(None);
+    }
+    // Fallback to fancy-regex.
+    let re = compile_pattern_fancy(pat, flags)?;
+    let cap = re
+        .captures(slice)
+        .map_err(|e| value_error(format!("regex error: {e}")))?;
+    let caps = match cap {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let mut groups = Vec::with_capacity(caps.len());
+    for i in 0..caps.len() {
+        groups.push(caps.get(i).map(|m| (m.start(), m.end())));
+    }
+    let mut named = Vec::new();
+    for (i, name) in re.capture_names().enumerate() {
+        if let Some(n) = name {
+            named.push((n.to_owned(), i));
+        }
+    }
+    Ok(Some(DualCaptures { groups, named }))
+}
+
+fn make_match_from_captured(
+    pat: &str,
+    text: &str,
+    caps: &DualCaptures,
+    slice: &str,
+    base_offset: usize,
+) -> Object {
+    let inst = PyInstance::new(match_class());
+    let span0 = caps.groups[0].expect("group 0 always present");
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("string")),
+        Object::from_str(text.to_owned()),
+    );
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("re")),
+        Object::from_str(pat.to_owned()),
+    );
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("pos")),
+        Object::Int(base_offset as i64),
+    );
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("endpos")),
+        Object::Int(text.len() as i64),
+    );
+    let mut groups: Vec<Object> = Vec::new();
+    let mut spans: Vec<Object> = Vec::new();
+    for span in &caps.groups {
+        match span {
+            Some((s, e)) => {
+                groups.push(Object::from_str(slice[*s..*e].to_owned()));
+                spans.push(Object::new_tuple(vec![
+                    Object::Int((s + base_offset) as i64),
+                    Object::Int((e + base_offset) as i64),
+                ]));
+            }
+            None => {
+                groups.push(Object::None);
+                spans.push(Object::new_tuple(vec![Object::Int(-1), Object::Int(-1)]));
             }
         }
     }
-    Ok(make_match(&pat, &text, &captures, &re, start_byte))
+    let mut named_dict = DictData::new();
+    for (name, idx) in &caps.named {
+        let val = match caps.groups.get(*idx).copied().flatten() {
+            Some((s, e)) => Object::from_str(slice[s..e].to_owned()),
+            None => Object::None,
+        };
+        named_dict.insert(DictKey(Object::from_str(name.clone())), val);
+    }
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("_groups")),
+        Object::new_tuple(groups),
+    );
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("_spans")),
+        Object::new_tuple(spans),
+    );
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("_named")),
+        Object::Dict(Rc::new(RefCell::new(named_dict))),
+    );
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("_full_start")),
+        Object::Int((span0.0 + base_offset) as i64),
+    );
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static("_full_end")),
+        Object::Int((span0.1 + base_offset) as i64),
+    );
+    Object::Instance(Rc::new(inst))
 }
 
 fn char_index_to_byte(s: &str, n: usize) -> usize {
@@ -349,6 +537,7 @@ fn re_fullmatch(args: &[Object]) -> Result<Object, RuntimeError> {
     run_match(args, true, true)
 }
 
+#[allow(dead_code)]
 fn make_match(
     pat: &str,
     text: &str,
@@ -602,33 +791,28 @@ fn re_findall(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(i)) => *i,
         _ => default_flags,
     };
-    let re = compile_pattern(&pat, flags)?;
     let mut out = Vec::new();
-    let has_groups = re.captures_len() > 1;
-    for caps in re.captures_iter(&text) {
+    let mut on_match = |_s: usize, _e: usize, groups: &[Option<(usize, usize)>]| {
+        let has_groups = groups.len() > 1;
         if has_groups {
-            let group_count = caps.len() - 1;
+            let group_count = groups.len() - 1;
             if group_count == 1 {
-                out.push(caps.get(1).map_or(Object::from_static(""), |m| {
-                    Object::from_str(m.as_str().to_owned())
-                }));
+                let s = groups[1].map_or(String::new(), |(s, e)| text[s..e].to_owned());
+                out.push(Object::from_str(s));
             } else {
                 let mut tup = Vec::with_capacity(group_count);
-                for i in 1..=group_count {
-                    tup.push(caps.get(i).map_or(Object::from_static(""), |m| {
-                        Object::from_str(m.as_str().to_owned())
-                    }));
+                for g in groups.iter().skip(1).take(group_count) {
+                    let s = g.map_or(String::new(), |(s, e)| text[s..e].to_owned());
+                    tup.push(Object::from_str(s));
                 }
                 out.push(Object::new_tuple(tup));
             }
         } else {
-            out.push(Object::from_str(
-                caps.get(0)
-                    .map(|m| m.as_str().to_owned())
-                    .unwrap_or_default(),
-            ));
+            let s = groups[0].map_or(String::new(), |(s, e)| text[s..e].to_owned());
+            out.push(Object::from_str(s));
         }
-    }
+    };
+    iter_all_matches(&pat, flags, &text, &mut on_match)?;
     Ok(Object::new_list(out))
 }
 
@@ -643,12 +827,56 @@ fn re_finditer(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(i)) => *i,
         _ => default_flags,
     };
-    let re = compile_pattern(&pat, flags)?;
     let mut out = Vec::new();
-    for caps in re.captures_iter(&text) {
-        out.push(make_match(&pat, &text, &caps, &re, 0));
-    }
+    let mut consume_groups = |start: usize, _end: usize, groups: &[Option<(usize, usize)>]| {
+        let groups_vec = groups.to_vec();
+        let _ = start;
+        let caps = DualCaptures {
+            groups: groups_vec,
+            named: Vec::new(),
+        };
+        out.push(make_match_from_captured(&pat, &text, &caps, &text, 0));
+    };
+    iter_all_matches(&pat, flags, &text, &mut consume_groups)?;
     Ok(Object::new_list(out))
+}
+
+/// Walk every non-overlapping match in ``text`` and invoke ``f``
+/// with the byte span and capture groups. Falls back to the
+/// ``fancy_regex`` engine if the base ``regex`` can't compile the
+/// pattern.
+fn iter_all_matches(
+    pat: &str,
+    flags: i64,
+    text: &str,
+    f: &mut dyn FnMut(usize, usize, &[Option<(usize, usize)>]),
+) -> Result<(), RuntimeError> {
+    match compile_pattern(pat, flags) {
+        Ok(re) => {
+            for caps in re.captures_iter(text) {
+                let mut groups = Vec::with_capacity(caps.len());
+                for i in 0..caps.len() {
+                    groups.push(caps.get(i).map(|m| (m.start(), m.end())));
+                }
+                let m = caps.get(0).unwrap();
+                f(m.start(), m.end(), &groups);
+            }
+            Ok(())
+        }
+        Err(_) => {
+            let re = compile_pattern_fancy(pat, flags)?;
+            for caps in re.captures_iter(text) {
+                let caps = caps.map_err(|e| value_error(format!("regex error: {e}")))?;
+                let mut groups = Vec::with_capacity(caps.len());
+                for i in 0..caps.len() {
+                    groups.push(caps.get(i).map(|m| (m.start(), m.end())));
+                }
+                let m = caps.get(0).unwrap();
+                f(m.start(), m.end(), &groups);
+            }
+            Ok(())
+        }
+    }
 }
 
 fn re_sub(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -666,7 +894,17 @@ fn re_sub_impl(args: &[Object]) -> Result<(String, i64), RuntimeError> {
         extract_pattern(args.first().ok_or_else(|| type_error("expected pattern"))?)?;
     let repl = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("repl must be str")),
+        Some(Object::Function(_)) | Some(Object::Builtin(_)) | Some(Object::BoundMethod(_)) => {
+            // ``re.sub`` with a callable replacement requires
+            // calling back into the VM. The VM intercepts the
+            // ``sub`` builtin (see ``do_re_sub_call`` in
+            // ``lib.rs``) and routes those calls itself, so the
+            // pure-data path here only services the string form.
+            return Err(type_error(
+                "internal: callable re.sub should be handled at the VM dispatch layer",
+            ));
+        }
+        _ => return Err(type_error("repl must be str or callable")),
     };
     let text = match args.get(2) {
         Some(Object::Str(s)) => s.to_string(),
@@ -680,25 +918,83 @@ fn re_sub_impl(args: &[Object]) -> Result<(String, i64), RuntimeError> {
         Some(Object::Int(i)) => *i,
         _ => default_flags,
     };
-    let re = compile_pattern(&pat, flags)?;
     let mut out = String::new();
-    let mut last_end = 0;
+    let mut last_end = 0usize;
     let mut replacements = 0i64;
-    for caps in re.captures_iter(&text) {
+    let mut on_match = |s: usize, e: usize, groups: &[Option<(usize, usize)>]| {
         if count > 0 && replacements >= count {
-            break;
+            return;
         }
-        let m = caps.get(0).expect("capture 0");
-        out.push_str(&text[last_end..m.start()]);
-        out.push_str(&expand_replacement(&repl, &caps));
-        last_end = m.end();
+        out.push_str(&text[last_end..s]);
+        out.push_str(&expand_replacement_from_groups(&repl, groups, &text));
+        last_end = e;
         replacements += 1;
-    }
+    };
+    iter_all_matches(&pat, flags, &text, &mut on_match)?;
     out.push_str(&text[last_end..]);
     Ok((out, replacements))
 }
 
+/// Same expansion rules as ``expand_replacement`` but driven by
+/// pre-extracted group spans rather than a regex ``Captures``.
+fn expand_replacement_from_groups(
+    repl: &str,
+    groups: &[Option<(usize, usize)>],
+    text: &str,
+) -> String {
+    let mut out = String::new();
+    let bytes = repl.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if next.is_ascii_digit() {
+                let idx = (next - b'0') as usize;
+                if let Some(Some((s, e))) = groups.get(idx).copied() {
+                    out.push_str(&text[s..e]);
+                }
+                i += 2;
+            } else if next == b'g' && i + 2 < bytes.len() && bytes[i + 2] == b'<' {
+                let close = bytes[i + 3..]
+                    .iter()
+                    .position(|b| *b == b'>')
+                    .map(|p| i + 3 + p);
+                if let Some(end) = close {
+                    let name = &repl[i + 3..end];
+                    if let Ok(n) = name.parse::<usize>() {
+                        if let Some(Some((s, e))) = groups.get(n).copied() {
+                            out.push_str(&text[s..e]);
+                        }
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                out.push('\\');
+                i += 1;
+            } else if next == b'n' {
+                out.push('\n');
+                i += 2;
+            } else if next == b't' {
+                out.push('\t');
+                i += 2;
+            } else if next == b'\\' {
+                out.push('\\');
+                i += 2;
+            } else {
+                out.push('\\');
+                out.push(next as char);
+                i += 2;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Expand `\1` / `\g<name>` etc. inside a `re.sub` replacement.
+#[allow(dead_code)]
 fn expand_replacement(repl: &str, caps: &Captures<'_>) -> String {
     let mut out = String::new();
     let bytes = repl.as_bytes();

@@ -139,6 +139,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("factorial")),
             builtin("factorial", math_factorial),
         );
+        d.insert(
+            DictKey(Object::from_static("isclose")),
+            builtin("isclose", math_isclose),
+        );
     }
     Rc::new(PyModule {
         name: "math".to_owned(),
@@ -365,6 +369,39 @@ fn math_factorial(args: &[Object]) -> Result<Object, RuntimeError> {
         acc = acc.saturating_mul(i);
     }
     Ok(Object::Int(acc))
+}
+
+/// `math.isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)` implementing
+/// PEP 485 — symmetric "weak" relative tolerance. We accept the two
+/// tolerance values positionally as well for the no-keywords builtin
+/// dispatch path (CPython rejects positional tolerances; we follow
+/// suit by treating extra positional args as an error).
+fn math_isclose(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() < 2 {
+        return Err(value_error("isclose() takes at least 2 arguments"));
+    }
+    let a = to_f64(args, "isclose", 0)?;
+    let b = to_f64(args, "isclose", 1)?;
+    if args.len() > 2 {
+        return Err(type_error(
+            "isclose() takes no positional arguments after b",
+        ));
+    }
+    let rel_tol = 1e-9_f64;
+    let abs_tol = 0.0_f64;
+    // Bit-exact equality is the documented fast path for ``isclose``
+    // (CPython's `_PyMath_IsClose` does the same). It's *the* reason
+    // ``isclose(inf, inf)`` returns ``True``.
+    #[allow(clippy::float_cmp)]
+    if a == b {
+        return Ok(Object::Bool(true));
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return Ok(Object::Bool(false));
+    }
+    let diff = (a - b).abs();
+    let tol = (rel_tol * a.abs().max(b.abs())).max(abs_tol);
+    Ok(Object::Bool(diff <= tol))
 }
 
 fn gcd_i64(a: i64, b: i64) -> i64 {

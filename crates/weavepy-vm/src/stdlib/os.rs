@@ -629,27 +629,125 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
         .map_err(|e| crate::error::io_error_to_py(&e))?
         .filter_map(|r| r.ok())
         .map(|entry| {
-            let mut d = DictData::new();
-            d.insert(
-                DictKey(Object::from_static("name")),
-                Object::from_str(entry.file_name().to_string_lossy().into_owned()),
-            );
-            d.insert(
-                DictKey(Object::from_static("path")),
-                Object::from_str(entry.path().to_string_lossy().into_owned()),
-            );
-            d.insert(
-                DictKey(Object::from_static("is_dir")),
-                Object::Bool(entry.file_type().map(|f| f.is_dir()).unwrap_or(false)),
-            );
-            d.insert(
-                DictKey(Object::from_static("is_file")),
-                Object::Bool(entry.file_type().map(|f| f.is_file()).unwrap_or(false)),
-            );
-            Object::Dict(Rc::new(RefCell::new(d)))
+            let ft = entry.file_type().ok();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path().to_string_lossy().into_owned();
+            let is_dir = ft.as_ref().map(|f| f.is_dir()).unwrap_or(false);
+            let is_file = ft.as_ref().map(|f| f.is_file()).unwrap_or(false);
+            let is_symlink = ft.as_ref().map(|f| f.is_symlink()).unwrap_or(false);
+            build_dir_entry(name, path, is_dir, is_file, is_symlink)
         })
         .collect();
     Ok(Object::new_list(entries))
+}
+
+/// Build a CPython-compatible ``os.DirEntry`` instance: attribute
+/// access on ``name``/``path`` returns strings, while ``is_dir()``,
+/// ``is_file()``, ``is_symlink()``, and ``stat()`` are zero-arg
+/// methods so the standard ``e.is_file()`` form works.
+fn build_dir_entry(
+    name: String,
+    path: String,
+    is_dir: bool,
+    is_file: bool,
+    is_symlink: bool,
+) -> Object {
+    use crate::object::BuiltinFn;
+    use crate::types::{PyInstance, TypeObject};
+    thread_local! {
+        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    }
+    let class = CLS.with(|slot| {
+        if let Some(c) = slot.borrow().as_ref() {
+            return c.clone();
+        }
+        let bt = crate::builtin_types::builtin_types();
+        let dict = DictData::new();
+        let cls = TypeObject::new_user("DirEntry", vec![bt.object_.clone()], dict)
+            .expect("DirEntry type");
+        *slot.borrow_mut() = Some(cls.clone());
+        cls
+    });
+    let inst = PyInstance::new(class);
+    {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(DictKey(Object::from_static("name")), Object::from_str(name));
+        d.insert(
+            DictKey(Object::from_static("path")),
+            Object::from_str(path.clone()),
+        );
+        // Per-instance closures keep this DirEntry's own flag values
+        // alive; a class-level method would otherwise leak the first
+        // entry's flags to every subsequent one.
+        let is_dir_v = is_dir;
+        d.insert(
+            DictKey(Object::from_static("is_dir")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "is_dir",
+                call: Box::new(move |_args| Ok(Object::Bool(is_dir_v))),
+                call_kw: None,
+            })),
+        );
+        let is_file_v = is_file;
+        d.insert(
+            DictKey(Object::from_static("is_file")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "is_file",
+                call: Box::new(move |_args| Ok(Object::Bool(is_file_v))),
+                call_kw: None,
+            })),
+        );
+        let is_symlink_v = is_symlink;
+        d.insert(
+            DictKey(Object::from_static("is_symlink")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "is_symlink",
+                call: Box::new(move |_args| Ok(Object::Bool(is_symlink_v))),
+                call_kw: None,
+            })),
+        );
+        let path_for_stat = path;
+        d.insert(
+            DictKey(Object::from_static("stat")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "stat",
+                call: Box::new(move |_args| {
+                    let meta = std::fs::metadata(&path_for_stat)
+                        .map_err(|e| crate::error::io_error_to_py(&e))?;
+                    os_stat_to_result(&meta)
+                }),
+                call_kw: None,
+            })),
+        );
+    }
+    Object::Instance(Rc::new(inst))
+}
+
+/// Convert ``std::fs::Metadata`` to a ``SimpleNamespace`` shaped like
+/// CPython's ``os.stat_result``. Used by ``DirEntry.stat()`` and a
+/// future ``os.stat`` to match expectations from libraries that
+/// rely on ``st_*`` attributes.
+fn os_stat_to_result(meta: &std::fs::Metadata) -> Result<Object, RuntimeError> {
+    let d = Rc::new(RefCell::new(DictData::new()));
+    {
+        let mut m = d.borrow_mut();
+        m.insert(
+            DictKey(Object::from_static("st_size")),
+            Object::Int(meta.len() as i64),
+        );
+        m.insert(DictKey(Object::from_static("st_mode")), Object::Int(0o644));
+        m.insert(
+            DictKey(Object::from_static("st_mtime")),
+            Object::Float(
+                meta.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+            ),
+        );
+    }
+    Ok(Object::SimpleNamespace(d))
 }
 
 #[cfg(unix)]

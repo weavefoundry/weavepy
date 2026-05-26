@@ -103,20 +103,26 @@ class EnumMeta(type):
 
         cls._member_map_ = {}
         cls._value2member_map_ = {}
+        # `_member_names_` is the canonical list (no aliases). CPython
+        # exposes it as the iteration order for `for x in Enum:` and
+        # for `list(Enum)` — aliases never appear there.
+        cls._member_names_ = []
         for member_name, member_value in members.items():
-            # Allow value-aliasing: re-using an existing value picks
-            # up the original member (CPython semantics).
-            if member_value in cls._value2member_map_:
+            try:
+                existing = member_value in cls._value2member_map_
+            except TypeError:
+                existing = False
+            if existing:
+                # Aliases: bind the same member at the class level so
+                # ``MyEnum.ALIAS is MyEnum.ORIGINAL`` works, but
+                # don't add to `_member_names_` so iteration skips it.
                 cls._member_map_[member_name] = cls._value2member_map_[member_value]
-                # Aliases still bind to the same member at the class
-                # level so ``MyEnum.ALIAS is MyEnum.ORIGINAL``.
                 setattr(cls, member_name, cls._value2member_map_[member_value])
                 continue
             member = cls._create_member_(member_name, member_value)
             cls._member_map_[member_name] = member
             cls._value2member_map_[member_value] = member
-            # Bind the member as a class attribute so ``Color.RED``
-            # works through ordinary attribute lookup.
+            cls._member_names_.append(member_name)
             setattr(cls, member_name, member)
         return cls
 
@@ -141,10 +147,16 @@ class EnumMeta(type):
     def __iter__(cls):
         if cls._member_map_ is None:
             return iter(())
-        return iter(cls._member_map_.values())
+        # Iterate canonical names only — aliases are intentionally
+        # skipped to match CPython's `for member in Enum:` semantics.
+        names = getattr(cls, "_member_names_", None) or list(cls._member_map_.keys())
+        return iter(cls._member_map_[n] for n in names)
 
     def __len__(cls):
-        return 0 if cls._member_map_ is None else len(cls._member_map_)
+        if cls._member_map_ is None:
+            return 0
+        names = getattr(cls, "_member_names_", None)
+        return len(names) if names is not None else len(cls._member_map_)
 
     def __contains__(cls, member):
         return cls._member_map_ is not None and member in cls._member_map_.values()

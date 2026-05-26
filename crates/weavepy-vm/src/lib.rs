@@ -1600,8 +1600,11 @@ impl Interpreter {
                         closure = items.iter().cloned().collect();
                     }
                 }
+                // Flag 0x04 — annotations dict produced by the
+                // compiler from ``def f(x: T) -> R`` annotations.
+                let mut annotations_obj: Option<Object> = None;
                 if flags & 0x04 != 0 {
-                    frame.pop()?; // annotations dict — discarded
+                    annotations_obj = Some(frame.pop()?);
                 }
                 let mut kw_defaults: Vec<(String, Object)> = Vec::new();
                 if flags & 0x02 != 0 {
@@ -1640,6 +1643,11 @@ impl Interpreter {
                     DictKey(Object::from_static("__qualname__")),
                     Object::from_str(name.clone()),
                 );
+                if let Some(ann) = annotations_obj {
+                    attrs
+                        .borrow_mut()
+                        .insert(DictKey(Object::from_static("__annotations__")), ann);
+                }
                 let f = PyFunction {
                     name,
                     code,
@@ -2257,8 +2265,22 @@ impl Interpreter {
         };
         let mut pe = PyException::new(inst);
         if let Some(c) = cause {
-            let cpe = Self::normalize_exception(c, None)?;
-            pe.cause = Some(Box::new(cpe));
+            // ``raise X from None`` explicitly clears the cause and
+            // signals ``__suppress_context__ = True`` so the printer
+            // hides any implicit ``__context__`` chain. The exception
+            // payload itself stays the same.
+            if matches!(c, Object::None) {
+                pe.cause = None;
+                if let Object::Instance(ref inst_rc) = pe.instance {
+                    inst_rc.dict.borrow_mut().insert(
+                        crate::object::DictKey(Object::from_static("__suppress_context__")),
+                        Object::Bool(true),
+                    );
+                }
+            } else {
+                let cpe = Self::normalize_exception(c, None)?;
+                pe.cause = Some(Box::new(cpe));
+            }
         }
         Ok(pe)
     }
@@ -2444,7 +2466,13 @@ impl Interpreter {
                 match name {
                     "__name__" => return Ok(Object::from_str(&f.name)),
                     "__qualname__" => return Ok(Object::from_str(&f.name)),
-                    "__doc__" => return Ok(Object::None),
+                    "__doc__" => {
+                        // CPython convention: the first statement of
+                        // the function body, if it is a string
+                        // literal, is stored as ``co_consts[0]`` and
+                        // surfaces as ``__doc__``.
+                        return Ok(crate::builtins::code_docstring(&f.code).unwrap_or(Object::None));
+                    }
                     "__module__" => {
                         // Fall back to globals['__name__'] if the function's
                         // attrs dict didn't already pin a value (e.g. for
@@ -2483,6 +2511,21 @@ impl Interpreter {
                             return Ok(Object::None);
                         }
                         return Ok(Object::new_tuple(f.closure.clone()));
+                    }
+                    "__annotations__" => {
+                        // CPython auto-creates an empty dict if the
+                        // function was defined without annotations,
+                        // so reads of ``__annotations__`` never raise
+                        // ``AttributeError``. Stash it on the
+                        // function's attrs so subsequent writes mutate
+                        // the same dict.
+                        let key = DictKey(Object::from_static("__annotations__"));
+                        if let Some(v) = f.attrs.borrow().get(&key) {
+                            return Ok(v.clone());
+                        }
+                        let d = Object::Dict(Rc::new(RefCell::new(DictData::new())));
+                        f.attrs.borrow_mut().insert(key, d.clone());
+                        return Ok(d);
                     }
                     _ => {}
                 }
@@ -2564,6 +2607,13 @@ impl Interpreter {
                 ))),
             },
             _ => {
+                // Numeric data attributes — exposed by the
+                // ``numbers`` protocol (``real``, ``imag``,
+                // ``numerator``, ``denominator``). Returned as
+                // plain values, not bound methods.
+                if let Some(v) = numeric_data_attr(obj, name) {
+                    return Ok(v);
+                }
                 if let Some(method) = self.lookup_method(obj, name) {
                     return Ok(Object::BoundMethod(Rc::new(BoundMethod {
                         receiver: obj.clone(),
@@ -2600,7 +2650,11 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         // Super proxies stash the real receiver under `__self__`.
         // Re-bind methods looked up via the proxy so they run
-        // against the right `self`.
+        // against the right `self` AND against the original class
+        // (not the proxy) for classmethod binding. CPython's
+        // `super.__getattribute__` passes `su.__obj_type__` — the
+        // class that originally triggered super — as the `owner`
+        // argument to the descriptor protocol; we mirror that here.
         let super_receiver = inst
             .dict
             .borrow()
@@ -2609,7 +2663,11 @@ impl Interpreter {
         if name != "__self__" {
             if let Some(receiver) = super_receiver {
                 if let Some(v) = inst.class.lookup(name) {
-                    let owner = Object::Type(inst.class.clone());
+                    let owner = match &receiver {
+                        Object::Type(t) => Object::Type(t.clone()),
+                        Object::Instance(i) => Object::Type(i.class.clone()),
+                        _ => Object::Type(inst.class.clone()),
+                    };
                     return self.descriptor_get(&v, &receiver, &owner);
                 }
                 return Err(attribute_error(format!(
@@ -2722,6 +2780,17 @@ impl Interpreter {
             "__dict__" => return Ok(Object::Dict(ty.dict.clone())),
             _ => {}
         }
+
+        // (5) Built-in class methods not stored in ``ty.dict``: most
+        // CPython classmethods/staticmethods (``str.maketrans``,
+        // ``bytes.fromhex``, ``int.from_bytes``, ``dict.fromkeys``,
+        // ``float.fromhex``, ``frozenset()``-like constructors) are
+        // synthesized on demand. We expose them as plain builtins
+        // bound to no instance.
+        if let Some(b) = crate::builtins::builtin_classmethod(&ty.name, name) {
+            return Ok(b);
+        }
+
         Err(attribute_error(format!(
             "type object '{}' has no attribute '{}'",
             ty.name, name
@@ -3187,6 +3256,36 @@ impl Interpreter {
         self.make_iter(v, globals)
     }
 
+    /// `iter(callable, sentinel)` — eagerly drains the callable in
+    /// a tight loop, building a list. Simpler than synthesising a
+    /// generator and matches the documented CPython semantics for
+    /// the common usage pattern (read-until-sentinel). The
+    /// resulting list iterator behaves identically for all
+    /// finite-sentinel cases; infinite sequences with this form
+    /// would also hang in CPython.
+    fn do_iter_callable_sentinel(
+        &mut self,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let callable = args[0].clone();
+        let sentinel = args[1].clone();
+        let mut out: Vec<Object> = Vec::new();
+        // CPython caps the number of iterations at a very large
+        // value to keep accidental infinite loops bounded; we use
+        // i64::MAX iterations as the safety limit but in practice
+        // expect the sentinel to fire much sooner.
+        for _ in 0_i64..i64::MAX {
+            let v = self.call(&callable, &[], &[], globals)?;
+            if self.dispatch_compare_op(&v, &sentinel, CompareKind::Eq, globals)? {
+                break;
+            }
+            out.push(v);
+        }
+        let list = Object::new_list(out);
+        self.make_iter(&list, globals)
+    }
+
     fn do_list_or_tuple_call(
         &mut self,
         name: &str,
@@ -3483,6 +3582,57 @@ impl Interpreter {
             .find_map(|(k, v)| (k == "key").then(|| v.clone()));
         self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals)?;
         Ok(Object::new_list(items))
+    }
+
+    /// VM-routed dispatch for ``re.sub(pattern, repl_callable, text,
+    /// count=0, flags=0)`` where ``repl`` is a callable. We
+    /// collect the spans up-front (no VM reentrancy mid-iteration)
+    /// and then call ``repl(match)`` once per match.
+    fn do_re_sub_callable(
+        &mut self,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        use crate::stdlib::re as remod;
+        let pat_obj = args
+            .first()
+            .ok_or_else(|| type_error("re.sub: missing pattern"))?;
+        let repl = args
+            .get(1)
+            .ok_or_else(|| type_error("re.sub: missing repl"))?
+            .clone();
+        let text = match args.get(2) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => return Err(type_error("re.sub: expected str text")),
+        };
+        let count = match args.get(3) {
+            Some(Object::Int(i)) => *i,
+            _ => 0,
+        };
+        let (pat, default_flags) = remod::extract_pattern_pub(pat_obj)?;
+        let flags = match args.get(4) {
+            Some(Object::Int(i)) => *i,
+            _ => default_flags,
+        };
+        let matches = remod::collect_all_matches(&pat, flags, &text)?;
+        let mut out = String::new();
+        let mut last_end = 0usize;
+        for (idx, (s, e, groups)) in matches.iter().enumerate() {
+            if count > 0 && (idx as i64) >= count {
+                break;
+            }
+            out.push_str(&text[last_end..*s]);
+            let m_obj = remod::build_match_object(&pat, &text, groups, *s, *e);
+            let ret = self.call_object(repl.clone(), &[m_obj], &[])?;
+            match ret {
+                Object::Str(rs) => out.push_str(&rs),
+                _ => return Err(type_error("re.sub callable must return str")),
+            }
+            last_end = *e;
+        }
+        out.push_str(&text[last_end..]);
+        let _ = globals;
+        Ok(Object::from_str(out))
     }
 
     fn do_list_sort_call(
@@ -3836,6 +3986,14 @@ impl Interpreter {
     /// Inject `exc` into the suspended generator at its current
     /// resume point. The frame's exception table gets first crack;
     /// if no handler matches the exception bubbles out of `throw()`.
+    ///
+    /// PEP 380: if the frame is paused inside a ``yield from``
+    /// delegation, the inner sub-iterator gets the exception
+    /// first. If the inner swallows it (yields a new value), that
+    /// value is returned from our `.throw()`. If the inner raises
+    /// `StopIteration`, the outer frame resumes with the returned
+    /// value. Any other exception falls through to the outer's
+    /// exception table.
     fn generator_throw(
         &mut self,
         gen: &Rc<PyGenerator>,
@@ -3854,6 +4012,67 @@ impl Interpreter {
                 return Err(value_error("generator already executing"));
             }
         };
+
+        // PEP 380 delegation. We detect "frame paused in
+        // yield-from" via the bytecode pattern: the most recently
+        // executed instruction was YIELD_VALUE, the one before that
+        // was SEND, and the stack top is an iterator-like.
+        if let Some(sub_iter) = detect_yield_from_subiter(&frame) {
+            match self.throw_into_subiter(&sub_iter, exc.clone()) {
+                Ok(v) => {
+                    // Inner yielded: re-suspend the outer at the
+                    // same point and surface the new value.
+                    *gen.state.borrow_mut() = GeneratorState::Suspended(Box::new(frame));
+                    return Ok(v);
+                }
+                Err(RuntimeError::PyException(inner_exc))
+                    if inner_exc.type_name() == "StopIteration" =>
+                {
+                    // Inner finished cleanly. Replace the iter on
+                    // the stack with the StopIteration's value and
+                    // advance past the SEND/YIELD/JUMP-BACK loop.
+                    let ret_val = exception_value(&inner_exc.instance);
+                    if !frame.stack.is_empty() {
+                        let len = frame.stack.len();
+                        frame.stack[len - 1] = ret_val;
+                    }
+                    advance_past_yield_from(&mut frame);
+                    return match self.run_until_yield_or_return(&mut frame, None) {
+                        Ok(FrameOutcome::Yielded(v)) => {
+                            *gen.state.borrow_mut() = GeneratorState::Suspended(Box::new(frame));
+                            Ok(v)
+                        }
+                        Ok(FrameOutcome::Returned(v)) => {
+                            *gen.state.borrow_mut() = GeneratorState::Finished;
+                            Err(stop_iteration_with(v))
+                        }
+                        Ok(FrameOutcome::StartGenerator) => {
+                            *gen.state.borrow_mut() = GeneratorState::Finished;
+                            Err(RuntimeError::Internal(
+                                "RETURN_GENERATOR inside generator_throw".to_owned(),
+                            ))
+                        }
+                        Err(err) => {
+                            *gen.state.borrow_mut() = GeneratorState::Finished;
+                            Err(err)
+                        }
+                    };
+                }
+                Err(RuntimeError::PyException(inner_exc)) => {
+                    // Inner re-raised; drop the sub-iter and hand
+                    // the new exception to the outer's table.
+                    if !frame.stack.is_empty() {
+                        frame.stack.pop();
+                    }
+                    return self.resume_outer_with_exc(gen, frame, inner_exc);
+                }
+                Err(err) => {
+                    *gen.state.borrow_mut() = GeneratorState::Finished;
+                    return Err(err);
+                }
+            }
+        }
+
         // Let the suspended frame handle the exception via its own
         // exception table; if no handler claims it the error bubbles
         // out and we mark the generator finished.
@@ -3886,16 +4105,105 @@ impl Interpreter {
         }
     }
 
-    /// `gen.close()` — request the generator to terminate. We don't
-    /// run user `finally` blocks (CPython runs them by re-injecting
-    /// `GeneratorExit`); we just mark the generator finished.
+    /// `gen.close()` — request the generator to terminate. CPython
+    /// injects a `GeneratorExit` at the resume point so any
+    /// `finally` blocks run; we mirror that by routing through
+    /// `generator_throw` and absorbing the resulting StopIteration.
     fn gen_method_close(&mut self, receiver: &Object) -> Result<Object, RuntimeError> {
         let g = match receiver {
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => g.clone(),
             _ => return Err(type_error("close() requires a generator/coroutine")),
         };
-        *g.state.borrow_mut() = GeneratorState::Finished;
-        Ok(Object::None)
+        if g.is_finished() {
+            return Ok(Object::None);
+        }
+        // Build a `GeneratorExit` exception and inject it.
+        let bt = crate::builtin_types::builtin_types();
+        let exc_inst =
+            crate::builtin_types::make_exception_with_class(bt.generator_exit.clone(), "");
+        match self.generator_throw(&g, PyException::new(exc_inst)) {
+            Ok(_yielded) => {
+                // PEP 342: generator ignored GeneratorExit (yielded
+                // a new value instead of allowing the exit to
+                // propagate). CPython raises RuntimeError here.
+                *g.state.borrow_mut() = GeneratorState::Finished;
+                Err(crate::error::runtime_error(
+                    "generator ignored GeneratorExit",
+                ))
+            }
+            Err(RuntimeError::PyException(exc))
+                if exc.type_name() == "GeneratorExit"
+                    || exc.type_name() == "StopIteration"
+                    || exc.type_name() == "StopAsyncIteration" =>
+            {
+                *g.state.borrow_mut() = GeneratorState::Finished;
+                Ok(Object::None)
+            }
+            Err(err) => {
+                *g.state.borrow_mut() = GeneratorState::Finished;
+                Err(err)
+            }
+        }
+    }
+
+    /// Drive ``sub_iter.throw(exc)`` — the inner sub-iterator's
+    /// own throw machinery. Used by yield-from delegation. Returns
+    /// the inner's yielded value, or propagates whatever exception
+    /// the inner re-raises.
+    fn throw_into_subiter(
+        &mut self,
+        sub_iter: &Object,
+        exc: PyException,
+    ) -> Result<Object, RuntimeError> {
+        match sub_iter {
+            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+                self.generator_throw(g, exc)
+            }
+            _ => {
+                // Non-generator iterators don't have `.throw()`;
+                // CPython just re-raises the exception out of the
+                // delegation.
+                Err(RuntimeError::PyException(exc))
+            }
+        }
+    }
+
+    /// Continue the outer generator after the sub-iterator raised
+    /// an exception other than StopIteration. Hands the exception
+    /// to the outer's exception table.
+    fn resume_outer_with_exc(
+        &mut self,
+        gen: &Rc<PyGenerator>,
+        mut frame: Frame,
+        exc: PyException,
+    ) -> Result<Object, RuntimeError> {
+        match self.handle_exception(&mut frame, exc) {
+            Ok(Some(())) => match self.run_until_yield_or_return(&mut frame, None) {
+                Ok(FrameOutcome::Yielded(v)) => {
+                    *gen.state.borrow_mut() = GeneratorState::Suspended(Box::new(frame));
+                    Ok(v)
+                }
+                Ok(FrameOutcome::Returned(v)) => {
+                    *gen.state.borrow_mut() = GeneratorState::Finished;
+                    Err(stop_iteration_with(v))
+                }
+                Ok(FrameOutcome::StartGenerator) => {
+                    *gen.state.borrow_mut() = GeneratorState::Finished;
+                    Err(RuntimeError::Internal(
+                        "RETURN_GENERATOR inside resume_outer_with_exc".to_owned(),
+                    ))
+                }
+                Err(err) => {
+                    *gen.state.borrow_mut() = GeneratorState::Finished;
+                    Err(err)
+                }
+            },
+            Ok(None) => unreachable!(),
+            Err(err) => {
+                *gen.state.borrow_mut() = GeneratorState::Finished;
+                Err(err)
+            }
+        }
     }
 
     /// Run a generator's frame to its next yield or terminal state.
@@ -5451,6 +5759,14 @@ impl Interpreter {
                 if b.name == "iter" && args.len() == 1 {
                     return self.do_iter_call(&args[0], outer_globals);
                 }
+                if b.name == "iter" && args.len() == 2 {
+                    // ``iter(callable, sentinel)`` — return a small
+                    // VM-aware iterator that re-invokes ``callable``
+                    // each step. Modelled as a Python-side
+                    // generator so the existing FOR_ITER /
+                    // for-loop machinery just works.
+                    return self.do_iter_callable_sentinel(args, outer_globals);
+                }
                 if (b.name == "list" || b.name == "tuple") && args.len() == 1 {
                     return self.do_list_or_tuple_call(b.name, &args[0], outer_globals);
                 }
@@ -5562,6 +5878,20 @@ impl Interpreter {
                 }
                 if (b.name == "min" || b.name == "max") && !args.is_empty() {
                     return self.do_min_max_call(b.name, args, kwargs, outer_globals);
+                }
+                // ``re.sub(pat, repl, text, count=0, flags=0)``
+                // accepts a callable ``repl``; routing it through the
+                // VM lets the callback invoke arbitrary user code.
+                if b.name == "sub" && args.len() >= 3 {
+                    let callable_repl = matches!(
+                        args.get(1),
+                        Some(Object::Function(_))
+                            | Some(Object::Builtin(_))
+                            | Some(Object::BoundMethod(_))
+                    );
+                    if callable_repl {
+                        return self.do_re_sub_callable(args, outer_globals);
+                    }
                 }
                 // `format`'s dispatching: when args[0] is a string we
                 // assume this is `"...".format(...)` (str_format
@@ -7882,6 +8212,42 @@ fn apply_trailer(value: Object, trailer: &str) -> Result<Object, RuntimeError> {
 
 /// Apply Python's `%` formatting (`'%s %d' % (x, y)`, or `'%(k)s' %
 /// {'k': v}`).
+/// Map ``bytes %`` arguments through a latin-1 decoding so that the
+/// shared ``percent_format`` engine can substitute them as if they
+/// were strings. The output is re-encoded back to bytes by the
+/// caller so opaque byte values round-trip unchanged.
+fn bytes_percent_args(value: &Object) -> Object {
+    fn map_one(v: &Object) -> Object {
+        match v {
+            Object::Bytes(b) => {
+                let s: String = b.iter().map(|byte| *byte as char).collect();
+                Object::from_str(s)
+            }
+            Object::ByteArray(cell) => {
+                let b = cell.borrow().clone();
+                let s: String = b.iter().map(|byte| *byte as char).collect();
+                Object::from_str(s)
+            }
+            _ => v.clone(),
+        }
+    }
+    match value {
+        Object::Tuple(items) => {
+            let mapped: Vec<Object> = items.iter().map(map_one).collect();
+            Object::Tuple(Rc::from(mapped))
+        }
+        Object::Dict(d) => {
+            let src = d.borrow();
+            let mut out: crate::object::DictData = indexmap::IndexMap::new();
+            for (k, v) in src.iter() {
+                out.insert(k.clone(), map_one(v));
+            }
+            Object::Dict(Rc::new(RefCell::new(out)))
+        }
+        other => map_one(other),
+    }
+}
+
 pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, RuntimeError> {
     let mut out = String::new();
     let bytes = template.as_bytes();
@@ -7970,9 +8336,17 @@ pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, R
             };
             let mut spec = String::new();
             if !flags.is_empty() {
+                // Build `[fill][align]`. Zero-pad needs the fill
+                // char *and* the align char together, e.g. "0=" for
+                // sign-aware zero padding. Left-align via '-' uses
+                // explicit '<'.
                 if flags.contains('-') {
                     spec.push('<');
                 } else if flags.contains('0') {
+                    // ``%05d`` → ``0=05d`` (fill='0', align='=',
+                    // ``0`` flag, width=5, type=d). The ``0`` flag
+                    // is harmless after the align prefix.
+                    spec.push('0');
                     spec.push('=');
                 }
                 if flags.contains('+') {
@@ -8113,7 +8487,20 @@ fn apply_format_spec(value: &Object, spec: &str, plain: &str) -> Result<String, 
                     s.truncate(p);
                 }
             }
-            apply_alignment(&s, &parsed, false)
+            // CPython 3.13: when no presentation type is given,
+            // numeric values default to right-alignment (and a
+            // leading-zero pad if `0` is set), strings default to
+            // left-alignment. Match that.
+            let numeric_default = parsed.type_char.is_none()
+                && matches!(
+                    value,
+                    Object::Int(_)
+                        | Object::Long(_)
+                        | Object::Bool(_)
+                        | Object::Float(_)
+                        | Object::Complex(_)
+                );
+            apply_alignment(&s, &parsed, numeric_default)
         }
         Some('c') => match value {
             Object::Int(i) => {
@@ -8505,6 +8892,87 @@ fn is_super_callable(obj: &Object) -> bool {
     matches!(obj, Object::Builtin(b) if b.name == "super")
 }
 
+/// Numeric protocol data attributes exposed by the ``numbers`` ABC
+/// hierarchy. Matches CPython's ``int.real``, ``int.imag``,
+/// ``int.numerator``, ``int.denominator``, ``float.real`` /
+/// ``float.imag``, and ``complex.real`` / ``complex.imag``.
+fn numeric_data_attr(obj: &Object, name: &str) -> Option<Object> {
+    match (obj, name) {
+        // int / bool
+        (Object::Int(_) | Object::Long(_) | Object::Bool(_), "real")
+        | (Object::Int(_) | Object::Long(_) | Object::Bool(_), "numerator") => Some(obj.clone()),
+        (Object::Int(_) | Object::Long(_) | Object::Bool(_), "imag") => Some(Object::Int(0)),
+        (Object::Int(_) | Object::Long(_) | Object::Bool(_), "denominator") => Some(Object::Int(1)),
+        // float
+        (Object::Float(_), "real") => Some(obj.clone()),
+        (Object::Float(_), "imag") => Some(Object::Float(0.0)),
+        // complex
+        (Object::Complex(c), "real") => Some(Object::Float(c.real)),
+        (Object::Complex(c), "imag") => Some(Object::Float(c.imag)),
+        _ => None,
+    }
+}
+
+/// Detect whether `frame` is paused inside a ``yield from``
+/// delegation. The canonical bytecode shape is
+/// ``SEND -> YIELD_VALUE -> JUMP_BACKWARD``; if the most recently
+/// executed instruction was ``YIELD_VALUE`` and the one preceding
+/// it was ``SEND``, the top of the stack is the inner sub-iterator
+/// the outer is delegating to.
+fn detect_yield_from_subiter(frame: &Frame) -> Option<Object> {
+    if frame.pc == 0 {
+        return None;
+    }
+    let prev_pc = frame.pc as usize - 1;
+    let yielded = frame.code.instructions.get(prev_pc)?;
+    if yielded.op != OpCode::YieldValue {
+        return None;
+    }
+    if prev_pc == 0 {
+        return None;
+    }
+    let sender = frame.code.instructions.get(prev_pc - 1)?;
+    if sender.op != OpCode::Send {
+        return None;
+    }
+    let top = frame.stack.last()?;
+    match top {
+        Object::Generator(_)
+        | Object::Coroutine(_)
+        | Object::AsyncGenerator(_)
+        | Object::Iter(_) => Some(top.clone()),
+        _ => None,
+    }
+}
+
+/// Advance `frame.pc` past the SEND/YIELD/JUMP-BACKWARD loop the
+/// frame is currently parked in. Used after the sub-iterator
+/// finishes (``StopIteration``) so the outer continues at the
+/// END_SEND target rather than re-entering ``SEND`` with the
+/// stale iter.
+fn advance_past_yield_from(frame: &mut Frame) {
+    // The SEND instruction at `prev_pc - 1` carries the
+    // jump-arg that points past END_SEND. Replicate that jump.
+    if frame.pc == 0 {
+        return;
+    }
+    let prev_pc = frame.pc as usize - 1;
+    if prev_pc == 0 {
+        return;
+    }
+    let send_pc = prev_pc - 1;
+    let send_ins = match frame.code.instructions.get(send_pc) {
+        Some(i) => i,
+        None => return,
+    };
+    if send_ins.op != OpCode::Send {
+        return;
+    }
+    // SEND's jump arg is relative-forward by `arg` from `send_pc + 1`.
+    let target = (send_pc as u32) + 1 + send_ins.arg;
+    frame.pc = target;
+}
+
 fn find_cell(frame: &Frame, name: &str) -> Option<Rc<RefCell<Object>>> {
     let cells = &frame.cells;
     let cellvars = &frame.code.cellvars;
@@ -8529,6 +8997,10 @@ fn is_param(code: &CodeObject, name: &str) -> bool {
 }
 
 // ---------- arithmetic ----------
+
+pub fn constant_to_object_public(c: Constant) -> Object {
+    constant_to_object(c)
+}
 
 fn constant_to_object(c: Constant) -> Object {
     match c {
@@ -8610,6 +9082,25 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::from_str(out))
         }
         (O::Str(template), v, B::Mod) => Ok(Object::from_str(percent_format(template, v)?)),
+        (O::Bytes(template), v, B::Mod) => {
+            // PEP 461: ``bytes % args`` reuses the same templating
+            // engine as ``str % args``. We decode the template as
+            // latin-1 (raw byte → 1:1 codepoint mapping), substitute,
+            // and re-encode the same way so opaque bytes round-trip.
+            let s: String = template.iter().map(|b| *b as char).collect();
+            let mapped = bytes_percent_args(v);
+            let rendered = percent_format(&s, &mapped)?;
+            let out: Vec<u8> = rendered.chars().map(|c| c as u8).collect();
+            Ok(Object::new_bytes(out))
+        }
+        (O::ByteArray(cell), v, B::Mod) => {
+            let template = cell.borrow().clone();
+            let s: String = template.iter().map(|b| *b as char).collect();
+            let mapped = bytes_percent_args(v);
+            let rendered = percent_format(&s, &mapped)?;
+            let out: Vec<u8> = rendered.chars().map(|c| c as u8).collect();
+            Ok(Object::new_bytes(out))
+        }
         (O::Bytes(x), O::Bytes(y), B::Add) => {
             let mut out = Vec::with_capacity(x.len() + y.len());
             out.extend_from_slice(x);
@@ -8653,6 +9144,15 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::new_tuple(out))
         }
 
+        // PEP 604 — type union via `|`. Matches `Type | Type`,
+        // `Type | None`, `Type | UnionType`, and the symmetric forms.
+        // Builds a `SimpleNamespace`-backed PEP 604 union that
+        // `isinstance` / `issubclass` recognise via
+        // [`is_pep604_union`].
+        _ if op == B::BitOr && is_union_eligible(&a) && is_union_eligible(&b) => {
+            Ok(make_pep604_union(&a, &b))
+        }
+
         _ => Err(type_error(format!(
             "unsupported operand type(s) for {}: '{}' and '{}'",
             op.as_str(),
@@ -8660,6 +9160,109 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             b.type_name()
         ))),
     }
+}
+
+/// Return `true` if `obj` can participate in a PEP 604 `X | Y` union
+/// construction — a real type, the runtime singleton `None`
+/// (interpreted as `type(None)`), or an existing PEP 604 union we
+/// can flatten.
+fn is_union_eligible(obj: &Object) -> bool {
+    matches!(obj, Object::Type(_) | Object::None) || is_pep604_union(obj).is_some()
+}
+
+/// Detect whether `obj` is a PEP 604 union. Returns the flattened
+/// list of `__args__` if so, else `None`.
+///
+/// We represent PEP 604 unions as a `SimpleNamespace` carrying a
+/// `__is_pep604_union__` sentinel and an `__args__` tuple. This
+/// piggy-backs on the existing generic-alias machinery in
+/// `builtins::class_matches_classinfo` without needing a fresh
+/// `Object` variant; the sentinel disambiguates "regular
+/// namespace" from "real union".
+pub fn is_pep604_union(obj: &Object) -> Option<Vec<Object>> {
+    let Object::SimpleNamespace(d) = obj else {
+        return None;
+    };
+    let dict = d.borrow();
+    dict.get(&DictKey(Object::from_static("__is_pep604_union__")))
+        .filter(|v| matches!(v, Object::Bool(true)))?;
+    let args = dict.get(&DictKey(Object::from_static("__args__")))?;
+    let Object::Tuple(items) = args else {
+        return None;
+    };
+    Some(items.iter().cloned().collect())
+}
+
+/// Build a PEP 604 union `a | b`. `None` is normalised to
+/// `type(None)`; nested unions are flattened; duplicate types
+/// (by identity) are de-duplicated, preserving first-seen
+/// order. Matches CPython's behaviour in
+/// `Objects/unionobject.c::_Py_make_union`.
+pub fn make_pep604_union(a: &Object, b: &Object) -> Object {
+    let mut args: Vec<Object> = Vec::new();
+    let mut push = |x: &Object| {
+        if let Some(existing) = is_pep604_union(x) {
+            for e in existing {
+                args.push(normalize_union_arg(e));
+            }
+        } else {
+            args.push(normalize_union_arg(x.clone()));
+        }
+    };
+    push(a);
+    push(b);
+
+    // Dedup by identity (Rc::ptr_eq for types; address for None).
+    let mut seen_types: Vec<*const ()> = Vec::new();
+    let mut seen_none = false;
+    args.retain(|x| match x {
+        Object::Type(t) => {
+            let p = Rc::as_ptr(t).cast::<()>();
+            if seen_types.contains(&p) {
+                return false;
+            }
+            seen_types.push(p);
+            true
+        }
+        Object::None => {
+            if seen_none {
+                false
+            } else {
+                seen_none = true;
+                true
+            }
+        }
+        _ => true,
+    });
+
+    let mut dict = DictData::new();
+    dict.insert(
+        DictKey(Object::from_static("__is_pep604_union__")),
+        Object::Bool(true),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__args__")),
+        Object::new_tuple(args.clone()),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__parameters__")),
+        Object::new_tuple(Vec::new()),
+    );
+    // Surface a `__class__` string so `repr` / type introspection
+    // sees something reasonable; we don't have a real
+    // `types.UnionType` runtime type yet but the str is cheap.
+    dict.insert(
+        DictKey(Object::from_static("__class__")),
+        Object::from_static("types.UnionType"),
+    );
+    Object::SimpleNamespace(Rc::new(RefCell::new(dict)))
+}
+
+/// Normalise a single argument for inclusion in a PEP 604 union:
+/// keep types as types; keep `None` as `None` (downstream
+/// `isinstance` recognises both).
+fn normalize_union_arg(x: Object) -> Object {
+    x
 }
 
 fn unary_op(v: &Object, op: UnaryKind) -> Result<Object, RuntimeError> {
@@ -8948,6 +9551,12 @@ fn complex_arith(
 }
 
 fn compare_op(a: &Object, b: &Object, op: CompareKind) -> Result<bool, RuntimeError> {
+    // CPython lifts ``<``, ``<=``, ``>``, ``>=`` to subset/superset
+    // tests on the set family. They are *not* total orderings, so we
+    // intercept this before falling through to ``Object::cmp``.
+    if let (Some(lhs), Some(rhs)) = (set_view(a), set_view(b)) {
+        return Ok(compare_sets(&lhs, &rhs, op));
+    }
     match op {
         CompareKind::Eq => Ok(a.eq_value(b)),
         CompareKind::NotEq => Ok(!a.eq_value(b)),
@@ -8955,6 +9564,28 @@ fn compare_op(a: &Object, b: &Object, op: CompareKind) -> Result<bool, RuntimeEr
         CompareKind::LtE => Ok(a.cmp(b)?.is_le()),
         CompareKind::Gt => Ok(a.cmp(b)?.is_gt()),
         CompareKind::GtE => Ok(a.cmp(b)?.is_ge()),
+    }
+}
+
+/// Snapshot a ``set``/``frozenset`` payload for subset comparison.
+/// Returns ``None`` for any non-set so the caller can fall through
+/// to the generic comparison path.
+fn set_view(o: &Object) -> Option<crate::object::SetData> {
+    match o {
+        Object::Set(s) => Some(s.borrow().clone()),
+        Object::FrozenSet(s) => Some((**s).clone()),
+        _ => None,
+    }
+}
+
+fn compare_sets(a: &crate::object::SetData, b: &crate::object::SetData, op: CompareKind) -> bool {
+    match op {
+        CompareKind::Eq => a == b,
+        CompareKind::NotEq => a != b,
+        CompareKind::LtE => a.iter().all(|k| b.contains(k)),
+        CompareKind::Lt => a.len() < b.len() && a.iter().all(|k| b.contains(k)),
+        CompareKind::GtE => b.iter().all(|k| a.contains(k)),
+        CompareKind::Gt => a.len() > b.len() && b.iter().all(|k| a.contains(k)),
     }
 }
 

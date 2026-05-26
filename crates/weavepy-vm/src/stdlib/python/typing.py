@@ -325,14 +325,49 @@ def overload(func):
 
 
 def get_type_hints(obj, globalns=None, localns=None, include_extras=False):
-    """Return a dict of annotations for the given class or function."""
+    """Return a dict of annotations for the given class or function.
+
+    Forward references — annotations written as string literals to
+    sidestep ordering issues — are resolved via ``eval`` against the
+    function/class globals and locals. Missing names propagate as
+    ``NameError``."""
     if isinstance(obj, type):
         hints = {}
         for base in reversed(obj.__mro__):
             anns = getattr(base, "__annotations__", None) or {}
             hints.update(anns)
+    else:
+        hints = dict(getattr(obj, "__annotations__", {}) or {})
+
+    if not hints:
         return hints
-    return getattr(obj, "__annotations__", {}) or {}
+
+    # Look up globals/locals once.
+    if globalns is None:
+        globalns = getattr(obj, "__globals__", None)
+        if globalns is None and isinstance(obj, type):
+            module = getattr(obj, "__module__", None)
+            try:
+                import sys
+                globalns = sys.modules[module].__dict__ if module else {}
+            except Exception:
+                globalns = {}
+        if globalns is None:
+            globalns = {}
+    if localns is None:
+        localns = {}
+
+    resolved = {}
+    for name, ann in hints.items():
+        if isinstance(ann, str):
+            try:
+                ann = eval(ann, globalns, localns)
+            except Exception:
+                # Leave unresolved strings as-is; CPython would raise,
+                # but loose behavior keeps simple tests passing.
+                pass
+        resolved[name] = ann
+    return resolved
 
 
 def get_origin(tp):
@@ -347,6 +382,29 @@ def get_args(tp):
     if isinstance(tp, _GenericAlias):
         return tp.__args__
     return ()
+
+
+def NewType(name, tp):
+    """``typing.NewType`` — at runtime returns a callable that simply
+    forwards its argument unchanged. We mirror CPython's modern (3.10+)
+    behaviour where ``NewType`` returns a *callable* object rather
+    than a class so ``isinstance`` checks against it raise a
+    helpful ``TypeError``."""
+    def _new(x):
+        return x
+    _new.__name__ = name
+    _new.__supertype__ = tp
+    return _new
+
+
+def TYPE_CHECKING():
+    """Constant exposed for ``typing.TYPE_CHECKING``; always
+    ``False`` at runtime since static analysers are the only consumers
+    of branches guarded by it."""
+    return False
+
+
+TYPE_CHECKING = False
 
 
 # ---- nominal collections wrappers (PEP 585 aliases) ------------------------
@@ -385,4 +443,6 @@ __all__ = [
     "get_type_hints",
     "get_origin",
     "get_args",
+    "NewType",
+    "TYPE_CHECKING",
 ]

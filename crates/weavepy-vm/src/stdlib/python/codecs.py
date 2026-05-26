@@ -92,12 +92,53 @@ def _normalise(name):
     return name.replace("-", "_").replace(" ", "_").lower()
 
 
+def _rot13_encode(s, errors="strict"):
+    out = []
+    for ch in s:
+        c = ord(ch)
+        if ord("a") <= c <= ord("z"):
+            out.append(chr((c - ord("a") + 13) % 26 + ord("a")))
+        elif ord("A") <= c <= ord("Z"):
+            out.append(chr((c - ord("A") + 13) % 26 + ord("A")))
+        else:
+            out.append(ch)
+    return "".join(out), len(s)
+
+
+def _rot13_decode(b, errors="strict"):
+    return _rot13_encode(b, errors)
+
+
+def _hex_encode(s, errors="strict"):
+    if isinstance(s, str):
+        s = s.encode("ascii")
+    return "".join(f"{x:02x}" for x in s).encode("ascii"), len(s)
+
+
+def _hex_decode(b, errors="strict"):
+    if isinstance(b, bytes):
+        b = b.decode("ascii")
+    return bytes.fromhex(b), len(b)
+
+
+_PURE_CODECS = {
+    "rot_13": (_rot13_encode, _rot13_decode),
+    "rot13": (_rot13_encode, _rot13_decode),
+    "hex": (_hex_encode, _hex_decode),
+    "hex_codec": (_hex_encode, _hex_decode),
+}
+
+
 def lookup(encoding):
     encoding = encoding.lower()
     if encoding in _USER_CODECS:
         return _USER_CODECS[encoding]
     if _normalise(encoding) in _USER_CODECS:
         return _USER_CODECS[_normalise(encoding)]
+    if encoding in _PURE_CODECS or _normalise(encoding) in _PURE_CODECS:
+        key = encoding if encoding in _PURE_CODECS else _normalise(encoding)
+        encode_fn, decode_fn = _PURE_CODECS[key]
+        return _make_codec(encoding, encode_fn, decode_fn)
     if encoding in _BUILTIN_NAMES or _normalise(encoding) in _BUILTIN_NAMES:
         key = encoding if encoding in _BUILTIN_NAMES else _normalise(encoding)
         enc_name, dec_name = _BUILTIN_NAMES[key]

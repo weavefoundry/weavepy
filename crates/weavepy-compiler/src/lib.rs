@@ -1576,6 +1576,41 @@ impl Compiler {
             self.emit(OpCode::BuildMap, kw_default_pairs.len() as u32);
             flags |= 0x02;
         }
+        // Build an annotations dict from any ``arg: T`` annotations
+        // attached to ordinary, ``*args``, or ``**kwargs`` parameters.
+        // CPython exposes the resulting dict as
+        // ``func.__annotations__``; we pop it inside MakeFunction
+        // when flag 0x04 is set.
+        let mut annotated_params: Vec<(String, &Expr)> = Vec::new();
+        for a in args
+            .posonlyargs
+            .iter()
+            .chain(args.args.iter())
+            .chain(args.kwonlyargs.iter())
+        {
+            if let Some(ann) = a.annotation.as_ref() {
+                annotated_params.push((a.name.clone(), ann));
+            }
+        }
+        if let Some(va) = &args.vararg {
+            if let Some(ann) = va.annotation.as_ref() {
+                annotated_params.push((va.name.clone(), ann));
+            }
+        }
+        if let Some(kw) = &args.kwarg {
+            if let Some(ann) = kw.annotation.as_ref() {
+                annotated_params.push((kw.name.clone(), ann));
+            }
+        }
+        if !annotated_params.is_empty() {
+            for (pname, ann) in &annotated_params {
+                let idx = self.co.intern_constant(Constant::Str(pname.clone()));
+                self.emit(OpCode::LoadConst, idx);
+                self.compile_expr(ann)?;
+            }
+            self.emit(OpCode::BuildMap, annotated_params.len() as u32);
+            flags |= 0x04;
+        }
         if !inner_freevars.is_empty() {
             for free in &inner_freevars {
                 let idx = self.cell_or_free_index(free);

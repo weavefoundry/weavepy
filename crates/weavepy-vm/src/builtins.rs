@@ -558,6 +558,23 @@ fn method(
     }
 }
 
+/// Built-in classmethod / staticmethod table: `Type.name` access for
+/// names not stored in the type's ``dict`` (e.g. `str.maketrans`,
+/// `bytes.fromhex`, `int.from_bytes`, `dict.fromkeys`,
+/// `float.fromhex`, `bytes.maketrans`). Returns an unbound builtin
+/// so the call site supplies the arguments unchanged.
+pub fn builtin_classmethod(type_name: &str, attr: &str) -> Option<Object> {
+    let f = match (type_name, attr) {
+        ("str", "maketrans") => Some(method("maketrans", str_maketrans)),
+        ("bytes", "fromhex") | ("bytearray", "fromhex") => Some(method("fromhex", bytes_fromhex)),
+        ("int", "from_bytes") => Some(method("from_bytes", int_from_bytes_method)),
+        ("float", "fromhex") => Some(method("fromhex", float_fromhex)),
+        ("dict", "fromkeys") => Some(method("fromkeys", dict_fromkeys)),
+        _ => None,
+    };
+    f.map(|f| Object::Builtin(Rc::new(f)))
+}
+
 // ---------- free builtins ----------
 
 fn one<'a>(args: &'a [Object], name: &str) -> Result<&'a Object, RuntimeError> {
@@ -910,7 +927,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             // attribute access.
             match name {
                 "__name__" | "__qualname__" => Some(Object::from_str(&f.name)),
-                "__doc__" => Some(Object::None),
+                "__doc__" => Some(code_docstring(&f.code).unwrap_or(Object::None)),
                 "__dict__" => Some(Object::Dict(f.attrs.clone())),
                 "__code__" => Some(Object::Code(f.code.clone())),
                 "__globals__" => Some(Object::Dict(f.globals.clone())),
@@ -1015,6 +1032,25 @@ pub(crate) fn code_synthetic_attr(
         "co_firstlineno" => Some(Object::Int(i64::from(
             c.linetable.first().copied().unwrap_or(0),
         ))),
+        "co_consts" => Some(Object::new_tuple(
+            c.constants
+                .iter()
+                .cloned()
+                .map(crate::constant_to_object_public)
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+/// Return the docstring extracted from a code object, if its first
+/// constant is a string literal — CPython's `__doc__` convention.
+/// The compiler keeps the leading bare string expression as
+/// ``constants[0]``; functions / modules / classes pick it up at
+/// runtime via this helper.
+pub(crate) fn code_docstring(c: &weavepy_compiler::CodeObject) -> Option<Object> {
+    match c.constants.first() {
+        Some(weavepy_compiler::Constant::Str(s)) => Some(Object::from_str(s.as_str())),
         _ => None,
     }
 }
@@ -2384,6 +2420,15 @@ pub fn class_matches_classinfo(
     cls: &crate::types::TypeObject,
     info: &Object,
 ) -> Result<bool, RuntimeError> {
+    // PEP 604 union (`int | str`) — succeed if any union arm matches.
+    if let Some(args) = crate::is_pep604_union(info) {
+        for arg in &args {
+            if class_matches_classinfo(cls, arg)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
     // Unwrap PEP 585 generic aliases (`list[int]` → `list`) — CPython
     // treats `isinstance(x, list[int])` as `isinstance(x, list)`.
     if let Some(origin) = generic_alias_origin(info) {
@@ -2391,9 +2436,19 @@ pub fn class_matches_classinfo(
     }
     match info {
         Object::Type(t) => Ok(cls.is_subclass_of(t)),
+        // `None` inside a union means `type(None)` — match by class
+        // name. The `NoneType` class is the unique class with that
+        // name (we don't allow user code to redefine it).
+        Object::None => Ok(cls.name == "NoneType"),
         Object::Tuple(items) => {
             for it in items.iter() {
-                if let Some(origin) = generic_alias_origin(it) {
+                if let Some(args) = crate::is_pep604_union(it) {
+                    for arg in &args {
+                        if class_matches_classinfo(cls, arg)? {
+                            return Ok(true);
+                        }
+                    }
+                } else if let Some(origin) = generic_alias_origin(it) {
                     if class_matches_classinfo(cls, &origin)? {
                         return Ok(true);
                     }
@@ -2401,6 +2456,8 @@ pub fn class_matches_classinfo(
                     if cls.is_subclass_of(t) {
                         return Ok(true);
                     }
+                } else if matches!(it, Object::None) && cls.name == "NoneType" {
+                    return Ok(true);
                 }
             }
             Ok(false)
@@ -2945,6 +3002,16 @@ fn b_next(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_iter(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() == 2 {
+        // The 2-arg form is handled in [`Vm::do_iter_callable_sentinel`]
+        // because it needs VM access to repeatedly invoke the
+        // callable. Reaching this builtin path means the caller
+        // bypassed the VM dispatch (e.g. via `__call__` on
+        // `builtin_iter`); fall back to a stricter error.
+        return Err(type_error(
+            "iter(callable, sentinel) must be called through the VM",
+        ));
+    }
     let it = one(args, "iter")?.make_iter()?;
     Ok(Object::Iter(Rc::new(RefCell::new(it))))
 }
@@ -3887,8 +3954,31 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(other) = args.get(1) {
         match other {
             Object::Dict(o) => {
-                for (k, v) in o.borrow().iter() {
-                    d.borrow_mut().insert(k.clone(), v.clone());
+                // Snapshot the source into a temporary first so we
+                // don't hold a borrow on `o` while reaching for
+                // `d.borrow_mut()`. The two may alias (e.g.
+                // `d.update(d)`), and even if they don't, our
+                // GilCell forbids overlapping borrows when source
+                // and destination share storage.
+                let entries: Vec<(DictKey, Object)> = o
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let mut dst = d.borrow_mut();
+                for (k, v) in entries {
+                    dst.insert(k, v);
+                }
+            }
+            Object::MappingProxy(o) => {
+                let entries: Vec<(DictKey, Object)> = o
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let mut dst = d.borrow_mut();
+                for (k, v) in entries {
+                    dst.insert(k, v);
                 }
             }
             _ => return Err(type_error("dict.update() expected dict")),
@@ -3955,11 +4045,20 @@ fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn dict_fromkeys(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _ = dict_self(args)?;
+    // ``fromkeys`` is exposed both as a bound method on a dict
+    // (``{}.fromkeys(...)``) and as an unbound classmethod
+    // (``dict.fromkeys(...)``). The two call sites have a different
+    // shape: the bound version receives the dict as ``args[0]``;
+    // the unbound version omits it. Sniff the receiver shape so a
+    // single body handles both.
+    let (it_idx, value_idx) = match args.first() {
+        Some(Object::Dict(_)) | Some(Object::Type(_)) => (1usize, 2usize),
+        _ => (0usize, 1usize),
+    };
     let it = args
-        .get(1)
+        .get(it_idx)
         .ok_or_else(|| type_error("fromkeys() expects iterable"))?;
-    let value = args.get(2).cloned().unwrap_or(Object::None);
+    let value = args.get(value_idx).cloned().unwrap_or(Object::None);
     let mut d = DictData::new();
     let mut iter = it.make_iter()?;
     while let Some(k) = iter.next_value() {
@@ -4305,18 +4404,23 @@ fn bytes_hex(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("bytes_per_sep must be int")),
     };
     let mut out = String::with_capacity(data.len() * 2);
+    let step = bytes_per_sep.unsigned_abs() as usize;
     for (i, b) in data.iter().enumerate() {
         if let Some(sep) = sep {
-            // Insert separators every `bytes_per_sep` bytes, counted
-            // from the appropriate side.
-            let count_from = if bytes_per_sep < 0 {
-                i
-            } else {
-                data.len() - i - 1
-            };
-            let step = bytes_per_sep.unsigned_abs() as usize;
-            if i > 0 && step > 0 && count_from % step == 0 {
-                out.push(sep as char);
+            if i > 0 && step > 0 {
+                // CPython 3.13: positive ``bytes_per_sep`` groups
+                // bytes from the right; negative groups from the
+                // left. The separator falls BEFORE the byte at
+                // ``i`` when the remaining or leading run lines up
+                // on a group boundary.
+                let needs_sep = if bytes_per_sep < 0 {
+                    i % step == 0
+                } else {
+                    (data.len() - i) % step == 0
+                };
+                if needs_sep {
+                    out.push(sep as char);
+                }
             }
         }
         out.push_str(&format!("{b:02x}"));
