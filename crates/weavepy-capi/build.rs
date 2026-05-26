@@ -12,8 +12,23 @@
 //! resulting object can be linked into a shared library.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Bundle of the per-extension parameters threaded through
+/// [`build_extension`]. Splitting these out keeps clippy's
+/// `too_many_arguments` lint happy while still keeping the
+/// build-script flat (no globals).
+struct ExtensionBuild<'a> {
+    cc: &'a str,
+    manifest_dir: &'a Path,
+    out_dir: &'a Path,
+    target_os: &'a str,
+    suffix: &'a str,
+    src: &'a Path,
+    name: &'a str,
+    env_var: &'a str,
+}
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -43,34 +58,48 @@ fn main() {
     build.compile("weavepy_capi_varargs");
 
     // ----------------------------------------------------------------
-    // 2) Build the integration-test extension module to a dylib
-    //    in `target/<profile>/capi_ext`. The harness in
-    //    `tests/capi_loader.rs` dlopens it and verifies the bridge.
+    // 2) Build the integration-test extension modules to dylibs in
+    //    `target/<profile>/capi_ext`. The harness in
+    //    `tests/capi_loader.rs` dlopens `_smalltest`; the buffer /
+    //    vectorcall regression tests in `tests/capi_ndarray.rs`
+    //    dlopen `_ndarray`.
     //
-    //    We only build when the tests source exists; downstream
+    //    We only build when each tests source exists; downstream
     //    consumers building only the library don't pay the cost.
     // ----------------------------------------------------------------
-    let test_src = workspace_root.join("tests/capi_ext/_smalltest.c");
-    if test_src.is_file() {
-        println!("cargo:rerun-if-changed={}", test_src.display());
-        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("capi_ext");
-        let _ = std::fs::create_dir_all(&out_dir);
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let suffix = match target_os.as_str() {
+        "windows" => "dll",
+        _ => "so",
+    };
+    let cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("capi_ext");
+    let _ = std::fs::create_dir_all(&out_dir);
 
-        let cc = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
-        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-        let suffix = match target_os.as_str() {
-            "windows" => "dll",
-            _ => "so",
-        };
-        let dylib = out_dir.join(format!("_smalltest.{suffix}"));
-        let mut cmd = Command::new(&cc);
+    fn build_extension(opts: ExtensionBuild<'_>) {
+        let ExtensionBuild {
+            cc,
+            manifest_dir,
+            out_dir,
+            target_os,
+            suffix,
+            src,
+            name,
+            env_var,
+        } = opts;
+        if !src.is_file() {
+            return;
+        }
+        println!("cargo:rerun-if-changed={}", src.display());
+        let dylib = out_dir.join(format!("{name}.{suffix}"));
+        let mut cmd = Command::new(cc);
         cmd.arg("-shared")
             .arg("-fPIC")
             .arg("-fvisibility=default")
             .arg("-O0")
             .arg("-Wno-error")
             .arg(format!("-I{}", manifest_dir.join("include").display()))
-            .arg(test_src.clone())
+            .arg(src)
             .arg("-o")
             .arg(&dylib);
         if target_os == "macos" {
@@ -80,19 +109,39 @@ fn main() {
             Ok(out) => {
                 if !out.status.success() {
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    println!("cargo:warning=test extension cc failed: {stderr}");
+                    println!("cargo:warning={name} cc failed: {stderr}");
                 } else {
-                    println!(
-                        "cargo:rustc-env=WEAVEPY_CAPI_TEST_EXTENSION={}",
-                        dylib.display()
-                    );
+                    println!("cargo:rustc-env={env_var}={}", dylib.display());
                 }
             }
             Err(err) => {
-                println!("cargo:warning=could not run cc for test extension: {err}");
+                println!("cargo:warning=could not run cc for {name}: {err}");
             }
         }
     }
+
+    let smalltest_src = workspace_root.join("tests/capi_ext/_smalltest.c");
+    build_extension(ExtensionBuild {
+        cc: &cc,
+        manifest_dir: &manifest_dir,
+        out_dir: &out_dir,
+        target_os: &target_os,
+        suffix,
+        src: &smalltest_src,
+        name: "_smalltest",
+        env_var: "WEAVEPY_CAPI_TEST_EXTENSION",
+    });
+    let ndarray_src = workspace_root.join("tests/capi_ext/_ndarray.c");
+    build_extension(ExtensionBuild {
+        cc: &cc,
+        manifest_dir: &manifest_dir,
+        out_dir: &out_dir,
+        target_os: &target_os,
+        suffix,
+        src: &ndarray_src,
+        name: "_ndarray",
+        env_var: "WEAVEPY_CAPI_NDARRAY_EXTENSION",
+    });
 
     // Re-export the include directory so dependent crates can see
     // `Python.h` via `DEP_WEAVEPY_CAPI_INCLUDE`.

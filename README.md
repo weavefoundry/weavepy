@@ -11,12 +11,17 @@ aggressive optimization, native interoperability, and long-term performance
 work.
 
 > **Status: drop-in replacement for the documented CPython 3.13 surface,
-> with a measured conformance baseline.** The bundled regression suite at
-> `tests/regrtest/` covers the seven semantic groups exercised by
-> `RFC 0027` (object model, iterators/generators/coroutines, numerics/strings/
-> format, containers, exceptions/context, serialization/compression/codecs,
-> and IO/OS/argparse/inspect/typing) and is green on `main`. The CPython
-> `Lib/test/` allowlist remains an aspirational target — see
+> with a measured conformance baseline and a live C-extension entry point.**
+> The bundled regression suite at `tests/regrtest/` covers the seven
+> semantic groups exercised by `RFC 0027` (object model, iterators/
+> generators/coroutines, numerics/strings/format, containers, exceptions/
+> context, serialization/compression/codecs, and IO/OS/argparse/inspect/
+> typing) and is green on `main`. `RFC 0028` adds the PEP 3118 buffer
+> protocol, PEP 590 vectorcall, the full `PyType_FromSpec[WithBases]`
+> slot surface, and a `_ndarray.c` C-extension fixture exercising the
+> stack end-to-end — paving the way for `numpy`, `pandas`, `pillow`,
+> and other binary-extension consumers. The CPython `Lib/test/`
+> allowlist remains an aspirational target — see
 > `tests/regrtest/expectations.toml` for the per-test baseline. Expect
 > small breaking changes around the edges as the long tail catches up.
 

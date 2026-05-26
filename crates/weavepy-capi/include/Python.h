@@ -181,10 +181,22 @@ typedef PyObject *(*newfunc)(PyTypeObject *, PyObject *, PyObject *);
 typedef PyObject *(*allocfunc)(PyTypeObject *, Py_ssize_t);
 typedef void (*destructor)(PyObject *);
 typedef void (*freefunc)(void *);
+typedef int (*visitproc)(PyObject *, void *);
+typedef int (*traverseproc)(PyObject *, visitproc, void *);
+
+/* Vectorcall — fast calling convention introduced in CPython 3.9.
+ * Receivers can decode the call without an intermediate args tuple.
+ * `nargsf` carries the argument count; the high bit
+ * (PY_VECTORCALL_ARGUMENTS_OFFSET) is a hint that the caller already
+ * reserved a slot for `self` before the args. We accept the hint and
+ * ignore it (correctness only). */
+#define PY_VECTORCALL_ARGUMENTS_OFFSET ((size_t)1 << (8 * sizeof(size_t) - 1))
+typedef PyObject *(*vectorcallfunc)(PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames);
 
 typedef PyObject *(*PyCFunction)(PyObject *self, PyObject *args);
 typedef PyObject *(*PyCFunctionWithKeywords)(PyObject *self, PyObject *args, PyObject *kwargs);
 typedef PyObject *(*_PyCFunctionFastWithKeywords)(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames);
+typedef PyObject *(*_PyCFunctionFast)(PyObject *self, PyObject *const *args, Py_ssize_t nargs);
 
 /* Method calling conventions. */
 #define METH_VARARGS    0x0001
@@ -204,8 +216,54 @@ typedef struct PyMethodDef {
     const char *ml_doc;
 } PyMethodDef;
 
-typedef struct PyMemberDef PyMemberDef;
-typedef struct PyGetSetDef PyGetSetDef;
+/* PyMemberDef: simple typed slot exposed through descriptor protocol.
+ * The runtime uses `offset` to project the field out of the instance's
+ * payload area, interpreting it according to `type`. */
+typedef struct PyMemberDef {
+    const char *name;
+    int type;
+    Py_ssize_t offset;
+    int flags;
+    const char *doc;
+} PyMemberDef;
+
+#define READONLY        1
+#define READ_RESTRICTED 2
+#define PY_AUDIT_READ   READ_RESTRICTED
+#define WRITE_RESTRICTED 4
+#define RESTRICTED      (READ_RESTRICTED | WRITE_RESTRICTED)
+
+#define T_SHORT     0
+#define T_INT       1
+#define T_LONG      2
+#define T_FLOAT     3
+#define T_DOUBLE    4
+#define T_STRING    5
+#define T_OBJECT    6
+#define T_CHAR      7
+#define T_BYTE      8
+#define T_UBYTE     9
+#define T_USHORT    10
+#define T_UINT      11
+#define T_ULONG     12
+#define T_STRING_INPLACE 13
+#define T_BOOL      14
+#define T_OBJECT_EX 16
+#define T_LONGLONG  17
+#define T_ULONGLONG 18
+#define T_PYSSIZET  19
+#define T_NONE      20
+
+/* PyGetSetDef: getter/setter slot exposed through descriptor protocol. */
+typedef PyObject *(*getter)(PyObject *, void *);
+typedef int (*setter)(PyObject *, PyObject *, void *);
+typedef struct PyGetSetDef {
+    const char *name;
+    getter get;
+    setter set;
+    const char *doc;
+    void *closure;
+} PyGetSetDef;
 
 typedef struct PyType_Slot {
     int slot;
@@ -220,27 +278,72 @@ typedef struct PyType_Spec {
     PyType_Slot *slots;
 } PyType_Spec;
 
-/* Type slot identifiers. We support a documented subset; the
- * unsupported slots are accepted by PyType_FromSpec but ignored. */
-#define Py_tp_doc           56
-#define Py_tp_base          39
-#define Py_tp_bases         40
+/* Type slot identifiers. We support the entire CPython 3.13 "stable
+ * ABI" subset; the slot IDs come from `Include/typeslots.h`. */
+#define Py_bf_getbuffer     1
+#define Py_bf_releasebuffer 2
+#define Py_mp_ass_subscript 3
+#define Py_mp_length        4
+#define Py_mp_subscript     5
+#define Py_nb_absolute      6
+#define Py_nb_add           7
+#define Py_nb_and           8
+#define Py_nb_bool          9
+#define Py_nb_divmod        10
+#define Py_nb_float         11
+#define Py_nb_floor_divide  12
+#define Py_nb_index         13
+#define Py_nb_inplace_add   14
+#define Py_nb_inplace_and   15
+#define Py_nb_inplace_floor_divide 16
+#define Py_nb_inplace_lshift 17
+#define Py_nb_inplace_multiply 18
+#define Py_nb_inplace_or    19
+#define Py_nb_inplace_power 20
+#define Py_nb_inplace_remainder 21
+#define Py_nb_inplace_rshift 22
+#define Py_nb_inplace_subtract 23
+#define Py_nb_inplace_true_divide 24
+#define Py_nb_inplace_xor   25
+#define Py_nb_int           26
+#define Py_nb_invert        27
+#define Py_nb_lshift        28
+#define Py_nb_multiply      29
+#define Py_nb_negative      30
+#define Py_nb_or            31
+#define Py_nb_positive      32
+#define Py_nb_power         33
+#define Py_nb_remainder     34
+#define Py_nb_rshift        35
+#define Py_nb_subtract      36
+#define Py_nb_true_divide   37
+#define Py_nb_xor           38
+#define Py_sq_ass_item      39
+#define Py_sq_concat        40
+#define Py_sq_contains      41
+#define Py_sq_inplace_concat 42
+#define Py_sq_inplace_repeat 43
+#define Py_sq_item          44
+#define Py_sq_length        45
+#define Py_sq_repeat        46
+#define Py_tp_alloc         47
+#define Py_tp_base          48
+#define Py_tp_bases         49
 #define Py_tp_call          50
 #define Py_tp_clear         51
 #define Py_tp_dealloc       52
 #define Py_tp_del           53
 #define Py_tp_descr_get     54
 #define Py_tp_descr_set     55
-#define Py_tp_finalize      80
-#define Py_tp_free          57
-#define Py_tp_getattr       58
-#define Py_tp_getattro      59
-#define Py_tp_hash          60
-#define Py_tp_init          61
-#define Py_tp_is_gc         62
-#define Py_tp_iter          63
-#define Py_tp_iternext      64
-#define Py_tp_methods       65
+#define Py_tp_doc           56
+#define Py_tp_getattr       57
+#define Py_tp_getattro      58
+#define Py_tp_hash          59
+#define Py_tp_init          60
+#define Py_tp_is_gc         61
+#define Py_tp_iter          62
+#define Py_tp_iternext      63
+#define Py_tp_methods       64
 #define Py_tp_new           65
 #define Py_tp_repr          66
 #define Py_tp_richcompare   67
@@ -250,31 +353,23 @@ typedef struct PyType_Spec {
 #define Py_tp_traverse      71
 #define Py_tp_members       72
 #define Py_tp_getset        73
-#define Py_nb_add           5
-#define Py_nb_subtract      11
-#define Py_nb_multiply      9
-#define Py_nb_true_divide   30
-#define Py_nb_remainder     10
-#define Py_nb_negative      8
-#define Py_nb_positive      29
-#define Py_nb_absolute      6
-#define Py_nb_bool          7
-#define Py_nb_int           8
-#define Py_nb_float         12
-#define Py_sq_length        45
-#define Py_sq_concat        42
-#define Py_sq_item          43
-#define Py_sq_ass_item      44
-#define Py_sq_contains      41
-#define Py_mp_length        29
-#define Py_mp_subscript     31
-#define Py_mp_ass_subscript 32
+#define Py_tp_free          74
+#define Py_tp_finalize      75
+#define Py_tp_vectorcall    76
+#define Py_am_await         77
+#define Py_am_aiter         78
+#define Py_am_anext         79
+#define Py_nb_matrix_multiply 80
+#define Py_nb_inplace_matrix_multiply 81
+#define Py_am_send          82
 
 /* Common type flags the typespec can carry. */
 #define Py_TPFLAGS_DEFAULT          0x00000000UL
 #define Py_TPFLAGS_BASETYPE         (1UL << 10)
 #define Py_TPFLAGS_HEAPTYPE         (1UL << 9)
 #define Py_TPFLAGS_HAVE_GC          (1UL << 14)
+#define Py_TPFLAGS_HAVE_VECTORCALL  (1UL << 11)
+#define Py_TPFLAGS_METHOD_DESCRIPTOR (1UL << 17)
 #define Py_TPFLAGS_LIST_SUBCLASS    (1UL << 25)
 #define Py_TPFLAGS_TUPLE_SUBCLASS   (1UL << 26)
 #define Py_TPFLAGS_DICT_SUBCLASS    (1UL << 29)
@@ -283,14 +378,55 @@ typedef struct PyType_Spec {
 #define Py_TPFLAGS_UNICODE_SUBCLASS (1UL << 28)
 #define Py_TPFLAGS_TYPE_SUBCLASS    (1UL << 31)
 #define Py_TPFLAGS_BASE_EXC_SUBCLASS (1UL << 30)
+#define Py_TPFLAGS_IMMUTABLETYPE    (1UL << 8)
+#define Py_TPFLAGS_DISALLOW_INSTANTIATION (1UL << 7)
+#define Py_TPFLAGS_MAPPING          (1UL << 6)
+#define Py_TPFLAGS_SEQUENCE         (1UL << 5)
 
 PyAPI_FUNC(PyObject *) PyType_FromSpec(PyType_Spec *spec);
 PyAPI_FUNC(PyObject *) PyType_FromSpecWithBases(PyType_Spec *spec, PyObject *bases);
 PyAPI_FUNC(PyObject *) PyType_FromModuleAndSpec(PyObject *module, PyType_Spec *spec, PyObject *bases);
+PyAPI_FUNC(PyObject *) PyType_FromMetaclass(PyTypeObject *metaclass, PyObject *module, PyType_Spec *spec, PyObject *bases);
 PyAPI_FUNC(int) PyType_Ready(PyTypeObject *type);
 PyAPI_FUNC(int) PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b);
 PyAPI_FUNC(int) PyObject_TypeCheck(PyObject *o, PyTypeObject *t);
 PyAPI_FUNC(const char *) PyType_GetName(PyTypeObject *t);
+PyAPI_FUNC(const char *) PyType_GetQualName(PyTypeObject *t);
+PyAPI_FUNC(unsigned long) PyType_GetFlags(PyTypeObject *t);
+PyAPI_FUNC(void *) PyType_GetSlot(PyTypeObject *t, int slot);
+PyAPI_FUNC(PyObject *) PyType_GenericAlloc(PyTypeObject *t, Py_ssize_t nitems);
+PyAPI_FUNC(PyObject *) PyType_GenericNew(PyTypeObject *t, PyObject *args, PyObject *kwds);
+PyAPI_FUNC(int) PyType_HasFeature(PyTypeObject *t, int feature);
+PyAPI_FUNC(PyObject *) PyType_GetDict(PyTypeObject *t);
+PyAPI_FUNC(PyObject *) PyType_GetModule(PyTypeObject *t);
+PyAPI_FUNC(void *) PyType_GetModuleState(PyTypeObject *t);
+
+/* Generic object lifecycle: extensions creating instances of types
+ * defined via PyType_FromSpec invoke these to allocate / initialise
+ * the storage. */
+PyAPI_FUNC(PyObject *) _PyObject_New(PyTypeObject *type);
+PyAPI_FUNC(PyObject *) _PyObject_NewVar(PyTypeObject *type, Py_ssize_t nitems);
+PyAPI_FUNC(PyObject *) PyObject_Init(PyObject *o, PyTypeObject *type);
+PyAPI_FUNC(PyObject *) PyObject_InitVar(PyObject *o, PyTypeObject *type, Py_ssize_t size);
+PyAPI_FUNC(PyObject *) PyObject_GenericGetAttr(PyObject *o, PyObject *name);
+PyAPI_FUNC(int) PyObject_GenericSetAttr(PyObject *o, PyObject *name, PyObject *value);
+PyAPI_FUNC(PyObject *) PyObject_GenericGetDict(PyObject *o, void *closure);
+PyAPI_FUNC(int) PyObject_GenericSetDict(PyObject *o, PyObject *value, void *closure);
+PyAPI_FUNC(Py_hash_t) PyObject_HashNotImplemented(PyObject *o);
+
+/* PyObject_New / PyObject_NewVar — same as the underscore-prefixed
+ * helpers but as proper macros that pass the type through verbatim. */
+#define PyObject_New(type, typeobj) \
+    ((type *) _PyObject_New((typeobj)))
+#define PyObject_NewVar(type, typeobj, n) \
+    ((type *) _PyObject_NewVar((typeobj), (n)))
+#define PyObject_GC_New(type, typeobj) \
+    ((type *) _PyObject_New((typeobj)))
+#define PyObject_GC_NewVar(type, typeobj, n) \
+    ((type *) _PyObject_NewVar((typeobj), (n)))
+#define PyObject_GC_Track(o)    ((void)(o))
+#define PyObject_GC_UnTrack(o)  ((void)(o))
+#define PyObject_GC_Del(o)      PyObject_Free((o))
 
 /* ------------------------------------------------------------------
  * Object protocol (object.h / abstract.h subset).
@@ -314,6 +450,16 @@ PyAPI_FUNC(PyObject *) PyObject_CallFunction(PyObject *callable, const char *fmt
 PyAPI_FUNC(PyObject *) PyObject_CallMethod(PyObject *o, const char *name, const char *fmt, ...);
 PyAPI_FUNC(PyObject *) PyObject_CallMethodObjArgs(PyObject *o, PyObject *name, ...);
 PyAPI_FUNC(PyObject *) PyObject_CallFunctionObjArgs(PyObject *callable, ...);
+
+/* Vectorcall — fast calling protocol bypassing the tuple/dict
+ * overhead of PyObject_Call. */
+PyAPI_FUNC(PyObject *) PyObject_Vectorcall(PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames);
+PyAPI_FUNC(PyObject *) PyObject_VectorcallDict(PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwdict);
+PyAPI_FUNC(PyObject *) PyObject_VectorcallMethod(PyObject *name, PyObject *const *args, size_t nargsf, PyObject *kwnames);
+PyAPI_FUNC(PyObject *) PyVectorcall_Call(PyObject *callable, PyObject *tuple, PyObject *kw);
+PyAPI_FUNC(Py_ssize_t) PyVectorcall_NARGS(size_t nargsf);
+PyAPI_FUNC(vectorcallfunc) PyVectorcall_Function(PyObject *callable);
+PyAPI_FUNC(PyObject *) PyObject_CallOneArg2(PyObject *callable, PyObject *arg);
 PyAPI_FUNC(int) PyObject_IsTrue(PyObject *o);
 PyAPI_FUNC(int) PyObject_Not(PyObject *o);
 PyAPI_FUNC(int) PyObject_RichCompareBool(PyObject *a, PyObject *b, int op);
@@ -338,15 +484,38 @@ PyAPI_FUNC(PyObject *) PyIter_Next(PyObject *o);
 PyAPI_FUNC(PyObject *) PyNumber_Add(PyObject *a, PyObject *b);
 PyAPI_FUNC(PyObject *) PyNumber_Subtract(PyObject *a, PyObject *b);
 PyAPI_FUNC(PyObject *) PyNumber_Multiply(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_MatrixMultiply(PyObject *a, PyObject *b);
 PyAPI_FUNC(PyObject *) PyNumber_TrueDivide(PyObject *a, PyObject *b);
 PyAPI_FUNC(PyObject *) PyNumber_FloorDivide(PyObject *a, PyObject *b);
 PyAPI_FUNC(PyObject *) PyNumber_Remainder(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_Divmod(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_Lshift(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_Rshift(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_And(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_Xor(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_Or(PyObject *a, PyObject *b);
 PyAPI_FUNC(PyObject *) PyNumber_Negative(PyObject *o);
 PyAPI_FUNC(PyObject *) PyNumber_Positive(PyObject *o);
 PyAPI_FUNC(PyObject *) PyNumber_Absolute(PyObject *o);
+PyAPI_FUNC(PyObject *) PyNumber_Invert(PyObject *o);
 PyAPI_FUNC(PyObject *) PyNumber_Long(PyObject *o);
+PyAPI_FUNC(PyObject *) PyNumber_Index(PyObject *o);
+PyAPI_FUNC(Py_ssize_t) PyNumber_AsSsize_t(PyObject *o, PyObject *exc);
 PyAPI_FUNC(PyObject *) PyNumber_Float(PyObject *o);
 PyAPI_FUNC(PyObject *) PyNumber_Power(PyObject *base, PyObject *exp, PyObject *mod);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceAdd(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceSubtract(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceMultiply(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceTrueDivide(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceFloorDivide(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceRemainder(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlacePower(PyObject *base, PyObject *exp, PyObject *mod);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceLshift(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceRshift(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceAnd(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceXor(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceOr(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceMatrixMultiply(PyObject *a, PyObject *b);
 PyAPI_FUNC(int) PyNumber_Check(PyObject *o);
 
 /* ------------------------------------------------------------------
@@ -357,10 +526,24 @@ PyAPI_FUNC(int) PySequence_Check(PyObject *o);
 PyAPI_FUNC(Py_ssize_t) PySequence_Length(PyObject *o);
 PyAPI_FUNC(Py_ssize_t) PySequence_Size(PyObject *o);
 PyAPI_FUNC(PyObject *) PySequence_GetItem(PyObject *o, Py_ssize_t i);
+PyAPI_FUNC(PyObject *) PySequence_GetSlice(PyObject *o, Py_ssize_t lo, Py_ssize_t hi);
 PyAPI_FUNC(int) PySequence_SetItem(PyObject *o, Py_ssize_t i, PyObject *v);
+PyAPI_FUNC(int) PySequence_DelItem(PyObject *o, Py_ssize_t i);
+PyAPI_FUNC(int) PySequence_SetSlice(PyObject *o, Py_ssize_t lo, Py_ssize_t hi, PyObject *v);
+PyAPI_FUNC(int) PySequence_DelSlice(PyObject *o, Py_ssize_t lo, Py_ssize_t hi);
 PyAPI_FUNC(int) PySequence_Contains(PyObject *o, PyObject *v);
+PyAPI_FUNC(Py_ssize_t) PySequence_Index(PyObject *o, PyObject *v);
+PyAPI_FUNC(Py_ssize_t) PySequence_Count(PyObject *o, PyObject *v);
+PyAPI_FUNC(PyObject *) PySequence_Concat(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PySequence_Repeat(PyObject *o, Py_ssize_t count);
+PyAPI_FUNC(PyObject *) PySequence_InPlaceConcat(PyObject *a, PyObject *b);
+PyAPI_FUNC(PyObject *) PySequence_InPlaceRepeat(PyObject *o, Py_ssize_t count);
 PyAPI_FUNC(PyObject *) PySequence_List(PyObject *o);
 PyAPI_FUNC(PyObject *) PySequence_Tuple(PyObject *o);
+PyAPI_FUNC(PyObject **) PySequence_Fast_ITEMS(PyObject *o);
+PyAPI_FUNC(PyObject *) PySequence_Fast(PyObject *o, const char *m);
+PyAPI_FUNC(Py_ssize_t) PySequence_Fast_GET_SIZE(PyObject *o);
+PyAPI_FUNC(PyObject *) PySequence_Fast_GET_ITEM(PyObject *o, Py_ssize_t i);
 PyAPI_FUNC(int) PyMapping_Check(PyObject *o);
 PyAPI_FUNC(Py_ssize_t) PyMapping_Length(PyObject *o);
 PyAPI_FUNC(Py_ssize_t) PyMapping_Size(PyObject *o);
@@ -689,12 +872,28 @@ PyAPI_FUNC(const char *) Py_GetBuildInfo(void);
 PyAPI_FUNC(int) Py_AtExit(void (*func)(void));
 
 /* ------------------------------------------------------------------
- * Buffer protocol (minimum surface needed for numpy / array-style
- * extensions to publish data).
- * ------------------------------------------------------------------ */
+ * Buffer protocol — full PEP 3118 surface.
+ *
+ * A buffer-protocol export carries a typed view of a contiguous (or
+ * strided) memory region: the raw pointer, the element type as a
+ * Python struct-style format string, the shape (per-axis sizes), the
+ * per-axis strides in bytes, and optional indirection through
+ * suboffsets. Multi-dimensional buffers store shape/strides as
+ * separate Py_ssize_t arrays whose lifetime is bound to the export.
+ *
+ * The flags passed to PyObject_GetBuffer constrain what the exporter
+ * is allowed to publish: PyBUF_FORMAT requires a non-NULL format
+ * string, PyBUF_ND requires a populated shape array, PyBUF_STRIDES
+ * additionally requires a strides array, and so on. See
+ * https://docs.python.org/3.13/c-api/buffer.html for the full
+ * semantics. The implementation in `crates/weavepy-capi/src/buffer.rs`
+ * mirrors them. */
+
+#define PyBUF_MAX_NDIM      64
 
 #define PyBUF_SIMPLE        0x0000
 #define PyBUF_WRITABLE      0x0001
+#define PyBUF_WRITEABLE     PyBUF_WRITABLE
 #define PyBUF_FORMAT        0x0004
 #define PyBUF_ND            0x0008
 #define PyBUF_STRIDES       (0x0010 | PyBUF_ND)
@@ -704,8 +903,14 @@ PyAPI_FUNC(int) Py_AtExit(void (*func)(void));
 #define PyBUF_INDIRECT      (0x0100 | PyBUF_STRIDES)
 #define PyBUF_CONTIG        (PyBUF_ND | PyBUF_WRITABLE)
 #define PyBUF_CONTIG_RO     PyBUF_ND
+#define PyBUF_STRIDED       (PyBUF_STRIDES | PyBUF_WRITABLE)
+#define PyBUF_STRIDED_RO    PyBUF_STRIDES
+#define PyBUF_RECORDS       (PyBUF_STRIDES | PyBUF_WRITABLE | PyBUF_FORMAT)
+#define PyBUF_RECORDS_RO    (PyBUF_STRIDES | PyBUF_FORMAT)
 #define PyBUF_FULL          (PyBUF_INDIRECT | PyBUF_FORMAT | PyBUF_WRITABLE)
 #define PyBUF_FULL_RO       (PyBUF_INDIRECT | PyBUF_FORMAT)
+#define PyBUF_READ          0x100
+#define PyBUF_WRITE         0x200
 
 typedef struct bufferinfo {
     void *buf;
@@ -721,9 +926,37 @@ typedef struct bufferinfo {
     void *internal;
 } Py_buffer;
 
+typedef int (*getbufferproc)(PyObject *exporter, Py_buffer *view, int flags);
+typedef void (*releasebufferproc)(PyObject *exporter, Py_buffer *view);
+
 PyAPI_FUNC(int) PyObject_GetBuffer(PyObject *exporter, Py_buffer *view, int flags);
 PyAPI_FUNC(void) PyBuffer_Release(Py_buffer *view);
 PyAPI_FUNC(int) PyObject_CheckBuffer(PyObject *o);
+PyAPI_FUNC(int) PyBuffer_FillInfo(Py_buffer *view, PyObject *exporter, void *buf,
+                                  Py_ssize_t len, int readonly, int flags);
+PyAPI_FUNC(int) PyBuffer_IsContiguous(const Py_buffer *view, char order);
+PyAPI_FUNC(int) PyBuffer_ToContiguous(void *buf, const Py_buffer *src,
+                                     Py_ssize_t len, char order);
+PyAPI_FUNC(int) PyBuffer_FromContiguous(const Py_buffer *view, void *buf,
+                                       Py_ssize_t len, char order);
+PyAPI_FUNC(void *) PyBuffer_GetPointer(const Py_buffer *view, const Py_ssize_t *indices);
+PyAPI_FUNC(void) PyBuffer_FillContiguousStrides(int ndim, Py_ssize_t *shape,
+                                                Py_ssize_t *strides, Py_ssize_t itemsize,
+                                                char order);
+PyAPI_FUNC(Py_ssize_t) PyBuffer_SizeFromFormat(const char *format);
+PyAPI_FUNC(int) PyBuffer_HasFlag(const Py_buffer *view, int flag);
+
+/* ------------------------------------------------------------------
+ * memoryview C-API.
+ * ------------------------------------------------------------------ */
+
+PyAPI_FUNC(PyObject *) PyMemoryView_FromObject(PyObject *o);
+PyAPI_FUNC(PyObject *) PyMemoryView_FromMemory(char *mem, Py_ssize_t size, int flags);
+PyAPI_FUNC(PyObject *) PyMemoryView_FromBuffer(const Py_buffer *info);
+PyAPI_FUNC(PyObject *) PyMemoryView_GetContiguous(PyObject *base, int buffertype, char order);
+PyAPI_FUNC(int) PyMemoryView_Check(PyObject *o);
+PyAPI_FUNC(Py_buffer *) PyMemoryView_GET_BUFFER(PyObject *mv);
+PyAPI_FUNC(PyObject *) PyMemoryView_GET_BASE(PyObject *mv);
 
 /* ------------------------------------------------------------------
  * Iteration helpers.
@@ -751,6 +984,30 @@ PyAPI_FUNC(PyObject *) PySlice_New(PyObject *start, PyObject *stop, PyObject *st
 PyAPI_FUNC(int) PySlice_Check(PyObject *o);
 
 /* ------------------------------------------------------------------
+ * Hash helpers and atomic refcount operations.
+ * ------------------------------------------------------------------ */
+
+/* `_Py_HashPointer` is widely used by extensions implementing tp_hash
+ * via pointer identity. The CPython implementation rotates the
+ * pointer bits; we mirror that. */
+PyAPI_FUNC(Py_hash_t) _Py_HashPointer(const void *p);
+PyAPI_FUNC(Py_hash_t) _Py_HashBytes(const void *src, Py_ssize_t len);
+PyAPI_FUNC(Py_hash_t) Py_HashPointer(const void *p);
+
+/* Conditional / equality return values used by tp_richcompare. */
+PyAPI_FUNC(PyObject *) Py_GenericAlias(PyObject *a, PyObject *b);
+
+/* ------------------------------------------------------------------
+ * List/Dict/Tuple supplementary helpers used by numpy / extensions.
+ * ------------------------------------------------------------------ */
+
+PyAPI_FUNC(PyObject *) PyList_GetSlice(PyObject *list, Py_ssize_t lo, Py_ssize_t hi);
+PyAPI_FUNC(int) PyList_SetSlice(PyObject *list, Py_ssize_t lo, Py_ssize_t hi, PyObject *values);
+PyAPI_FUNC(int) PyDict_ContainsString(PyObject *d, const char *k);
+PyAPI_FUNC(int) PyDict_GetItemRef(PyObject *d, PyObject *k, PyObject **out);
+PyAPI_FUNC(PyObject *) PyDict_GetItemWithError(PyObject *d, PyObject *k);
+
+/* ------------------------------------------------------------------
  * Convenience macros so extension authors can `#include <Python.h>`
  * exactly as they would on CPython.
  * ------------------------------------------------------------------ */
@@ -759,6 +1016,12 @@ PyAPI_FUNC(int) PySlice_Check(PyObject *o);
  * conditional compilation; expose a no-op definition so legacy
  * source builds. */
 #define _Py_DEPRECATED_EXTERNALLY(...)
+
+/* Pointer alignment helpers used by numpy-style extensions when
+ * laying out per-instance buffers. */
+#define _Py_SIZE_ROUND_UP(n, a)  (((size_t)(n) + (size_t)((a)-1)) & ~(size_t)((a)-1))
+#define _Py_SIZE_ROUND_DOWN(n, a) ((size_t)(n) & ~(size_t)((a)-1))
+#define _Py_ALIGN_UP(p, a) ((void *)_Py_SIZE_ROUND_UP((uintptr_t)(p), (a)))
 
 #ifdef __cplusplus
 }

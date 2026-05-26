@@ -27,10 +27,11 @@ use std::ptr;
 use std::sync::Mutex;
 use weavepy_vm::sync::Rc;
 
-use weavepy_vm::object::Object;
+use weavepy_vm::object::{DictData, DictKey, Object};
 use weavepy_vm::types::TypeObject;
 
 use crate::object::{PyObject, PySsizeT, IMMORTAL_REFCNT};
+use crate::slottable::SlotTable;
 
 /// Layout of a type object as the C side sees it.
 ///
@@ -87,10 +88,19 @@ pub struct PyType_Spec {
 
 /// Heap-allocated wrapper around a [`PyTypeObject`] that owns its
 /// `Rc<TypeObject>` bridge. Returned by `PyType_FromSpec` etc.
+///
+/// The [`SlotTable`] embedded here is the lookup-side mirror of the
+/// extension-supplied `tp_slots` array. Call sites that want to
+/// dispatch into a heap type's protocol slot (the buffer protocol,
+/// vectorcall, descriptor `tp_descr_get`, generic allocation, …) all
+/// route through [`crate::slottable::slot_table_for`] which reads
+/// this field.
 #[repr(C)]
 pub struct PyTypeObjectBox {
     pub head: PyTypeObject,
     pub owned_name: Vec<u8>,
+    /// O(1)-lookup table of slot pointers populated at FromSpec time.
+    pub slot_table: SlotTable,
 }
 
 /// Convenience cast.
@@ -294,9 +304,10 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
     }
 }
 
-/// Walk the static type registry looking for a slot whose bridge
-/// matches `t`. Used by [`type_for_object`]. Linear in the number
-/// of static types, which is small (~25).
+/// Walk the static type registry plus the heap-type registry
+/// looking for a slot whose bridge matches `t`. Used by
+/// [`type_for_object`]. Linear in the number of registered types
+/// (small static set + however many `PyType_FromSpec` produced).
 fn find_type_ptr(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
     let target = Rc::as_ptr(t);
     for slot in STATIC_TYPE_TABLE {
@@ -308,7 +319,41 @@ fn find_type_ptr(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
             }
         }
     }
-    None
+    HEAP_TYPES.with(|cell| {
+        for &p in cell.borrow().iter() {
+            unsafe {
+                let bridge = (*p).bridge;
+                if !bridge.is_null() && Rc::as_ptr(&*bridge) == target {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    })
+}
+
+thread_local! {
+    /// Registry of heap-allocated `PyTypeObject *` produced by
+    /// `PyType_FromSpec[WithBases]`. Looked up by [`find_type_ptr`]
+    /// when an `Object::Instance` is materialised back into a
+    /// boxed `*mut PyObject`, so the box's `ob_type` matches the
+    /// extension's declared type.
+    ///
+    /// Heap types live forever (`Box::leak`'d at construction),
+    /// so we store raw pointers — they're stable for the process
+    /// lifetime.
+    static HEAP_TYPES: std::cell::RefCell<Vec<*mut PyTypeObject>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Register a heap-allocated type pointer so subsequent
+/// `Object::Instance` boxes get the extension's declared
+/// `ob_type` instead of falling back to `PyBaseObject_Type`.
+pub fn register_heap_type(p: *mut PyTypeObject) {
+    if p.is_null() {
+        return;
+    }
+    HEAP_TYPES.with(|cell| cell.borrow_mut().push(p));
 }
 
 /// Static table used by [`find_type_ptr`]. Listed once so we don't
@@ -383,6 +428,7 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
             _filler: [0; 4],
         },
         owned_name,
+        slot_table: SlotTable::empty(),
     });
     let p = Box::leak(bx);
     &mut p.head as *mut PyTypeObject
@@ -392,30 +438,12 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
 // PyType_FromSpec — the heart of "extension defines a class".
 // ----------------------------------------------------------------
 
-const Py_TPFLAGS_BASETYPE: u32 = 1 << 10;
-const Py_TPFLAGS_HEAPTYPE: u32 = 1 << 9;
-
-/// Slot identifiers we recognise. Numbers come from CPython's
-/// `Include/typeslots.h`. Unknown slots are accepted but have no
-/// effect — extensions that depend on those slots will see
-/// `PyType_GetSlot` return null, which mirrors what CPython does
-/// for unsupported slots in the limited API.
-mod slot_ids {
-    pub const Py_tp_doc: i32 = 56;
-    pub const Py_tp_methods: i32 = 65;
-    pub const Py_tp_repr: i32 = 66;
-    pub const Py_tp_str: i32 = 70;
-    pub const Py_tp_init: i32 = 61;
-    pub const Py_tp_new: i32 = 65;
-    pub const Py_tp_call: i32 = 50;
-    pub const Py_tp_dealloc: i32 = 52;
-    pub const Py_tp_iter: i32 = 63;
-    pub const Py_tp_iternext: i32 = 64;
-    pub const Py_tp_richcompare: i32 = 67;
-    pub const Py_tp_getattro: i32 = 59;
-    pub const Py_tp_setattro: i32 = 69;
-    pub const Py_tp_hash: i32 = 60;
-}
+pub const PY_TPFLAGS_HEAPTYPE: u32 = 1 << 9;
+pub const PY_TPFLAGS_BASETYPE: u32 = 1 << 10;
+pub const PY_TPFLAGS_HAVE_GC: u32 = 1 << 14;
+pub const PY_TPFLAGS_DEFAULT: u32 = 1 << 18;
+pub const PY_TPFLAGS_HAVE_VECTORCALL: u32 = 1 << 11;
+pub const PY_TPFLAGS_DISALLOW_INSTANTIATION: u32 = 1 << 7;
 
 #[no_mangle]
 pub unsafe extern "C" fn PyType_FromSpec(spec: *mut PyType_Spec) -> *mut PyObject {
@@ -424,6 +452,16 @@ pub unsafe extern "C" fn PyType_FromSpec(spec: *mut PyType_Spec) -> *mut PyObjec
 
 #[no_mangle]
 pub unsafe extern "C" fn PyType_FromSpecWithBases(
+    spec: *mut PyType_Spec,
+    bases: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyType_FromMetaclass(ptr::null_mut(), ptr::null_mut(), spec, bases) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyType_FromMetaclass(
+    _metaclass: *mut PyTypeObject,
+    _module: *mut PyObject,
     spec: *mut PyType_Spec,
     bases: *mut PyObject,
 ) -> *mut PyObject {
@@ -446,10 +484,56 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
         .unwrap_or(&qualified)
         .to_owned();
 
-    // Resolve the base type list. Default to `object` if `bases`
-    // is null or empty.
-    let base_types: Vec<Rc<TypeObject>> = if bases.is_null() {
-        vec![weavepy_vm::builtin_types::builtin_types().object_.clone()]
+    // ----------------------------------------------------------------
+    // Resolve the base type list. Default to `object` if `bases` is
+    // null or empty. A `Py_tp_base` / `Py_tp_bases` slot in the spec
+    // wins over the explicit argument (matches CPython).
+    // ----------------------------------------------------------------
+    let mut spec_base: Option<Rc<TypeObject>> = None;
+    let mut spec_bases: Option<Vec<Rc<TypeObject>>> = None;
+    let mut slot_ptr = spec_ref.slots;
+    if !slot_ptr.is_null() {
+        let mut p = slot_ptr;
+        loop {
+            let slot = unsafe { *p };
+            if slot.slot == 0 {
+                break;
+            }
+            match slot.slot {
+                x if x == crate::slottable::Py_tp_base => {
+                    if !slot.pfunc.is_null() {
+                        let ty_ptr = slot.pfunc as *mut PyTypeObject;
+                        if let Some(t) = unsafe { bridge_type(ty_ptr) } {
+                            spec_base = Some(t);
+                        }
+                    }
+                }
+                x if x == crate::slottable::Py_tp_bases => {
+                    if !slot.pfunc.is_null() {
+                        let bases_obj =
+                            unsafe { crate::object::clone_object(slot.pfunc as *mut PyObject) };
+                        if let Object::Tuple(items) = bases_obj {
+                            spec_bases = Some(
+                                items
+                                    .iter()
+                                    .filter_map(|item| match item {
+                                        Object::Type(t) => Some(t.clone()),
+                                        _ => None,
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+            p = unsafe { p.add(1) };
+        }
+        slot_ptr = spec_ref.slots;
+    }
+
+    let arg_bases: Vec<Rc<TypeObject>> = if bases.is_null() {
+        Vec::new()
     } else {
         let cloned = unsafe { crate::object::clone_object(bases) };
         match cloned {
@@ -461,20 +545,35 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
                 })
                 .collect(),
             Object::Type(t) => vec![t],
-            _ => vec![],
+            _ => Vec::new(),
         }
     };
-    let bases_resolved = if base_types.is_empty() {
+
+    let bases_resolved: Vec<Rc<TypeObject>> = if let Some(list) = spec_bases {
+        list
+    } else if !arg_bases.is_empty() {
+        arg_bases
+    } else if let Some(b) = spec_base {
+        vec![b]
+    } else {
+        vec![weavepy_vm::builtin_types::builtin_types().object_.clone()]
+    };
+    let bases_resolved = if bases_resolved.is_empty() {
         vec![weavepy_vm::builtin_types::builtin_types().object_.clone()]
     } else {
-        base_types
+        bases_resolved
     };
 
-    // Walk the slot table, recording the methods defined on the
-    // type and a pointer to the doc string if any.
+    // ----------------------------------------------------------------
+    // First pass: scan the slot table, populate the SlotTable with
+    // every recognised slot, and harvest doc / methods / getsets /
+    // members for the dict.
+    // ----------------------------------------------------------------
+    let mut slot_table = SlotTable::empty();
     let mut methods: Vec<crate::module::MethodEntry> = Vec::new();
+    let mut getset_pairs: Vec<(String, Object)> = Vec::new();
+    let mut member_pairs: Vec<(String, Object)> = Vec::new();
     let mut doc: Option<String> = None;
-    let mut slot_ptr = spec_ref.slots;
     if !slot_ptr.is_null() {
         loop {
             let slot = unsafe { *slot_ptr };
@@ -482,13 +581,13 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
                 break;
             }
             match slot.slot {
-                x if x == slot_ids::Py_tp_doc => {
+                x if x == crate::slottable::Py_tp_doc => {
                     if !slot.pfunc.is_null() {
                         let s = unsafe { CStr::from_ptr(slot.pfunc as *const c_char) };
                         doc = Some(s.to_string_lossy().into_owned());
                     }
                 }
-                x if x == slot_ids::Py_tp_methods => {
+                x if x == crate::slottable::Py_tp_methods => {
                     if !slot.pfunc.is_null() {
                         methods.extend(unsafe {
                             crate::module::collect_methods(
@@ -497,33 +596,75 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
                         });
                     }
                 }
-                _ => { /* unsupported slot: silently accepted */ }
+                x if x == crate::slottable::Py_tp_getset => {
+                    if !slot.pfunc.is_null() {
+                        getset_pairs.extend(unsafe {
+                            crate::getset::collect_getsets(
+                                slot.pfunc as *mut crate::getset::PyGetSetDef,
+                            )
+                        });
+                    }
+                }
+                x if x == crate::slottable::Py_tp_members => {
+                    if !slot.pfunc.is_null() {
+                        member_pairs.extend(unsafe {
+                            crate::getset::collect_members(
+                                slot.pfunc as *mut crate::getset::PyMemberDef,
+                            )
+                        });
+                    }
+                }
+                x if x == crate::slottable::Py_tp_base || x == crate::slottable::Py_tp_bases => {
+                    // Already consumed in the bases pass.
+                }
+                _ => {
+                    slot_table.install(slot.slot, slot.pfunc);
+                }
             }
             slot_ptr = unsafe { slot_ptr.add(1) };
         }
     }
 
-    let mut dict = weavepy_vm::object::DictData::new();
-    for entry in &methods {
-        dict.insert(
-            weavepy_vm::object::DictKey(Object::from_str(entry.name.clone())),
-            entry.bind_unbound(),
-        );
-    }
+    // ----------------------------------------------------------------
+    // Build the type's dict: doc + module + methods + getset/member
+    // descriptors + synthesised dunder shims.
+    // ----------------------------------------------------------------
+    let mut dict = DictData::new();
     if let Some(d) = doc.as_ref() {
         dict.insert(
-            weavepy_vm::object::DictKey(Object::from_static("__doc__")),
+            DictKey(Object::from_static("__doc__")),
             Object::from_str(d.clone()),
         );
     }
     dict.insert(
-        weavepy_vm::object::DictKey(Object::from_static("__module__")),
+        DictKey(Object::from_static("__module__")),
         if let Some(idx) = qualified.rfind('.') {
             Object::from_str(qualified[..idx].to_owned())
         } else {
             Object::from_static("builtins")
         },
     );
+    dict.insert(
+        DictKey(Object::from_static("__qualname__")),
+        Object::from_str(bare.clone()),
+    );
+    for entry in &methods {
+        dict.insert(
+            DictKey(Object::from_str(entry.name.clone())),
+            entry.bind_unbound(),
+        );
+    }
+    for (name, obj) in getset_pairs {
+        dict.insert(DictKey(Object::from_str(name)), obj);
+    }
+    for (name, obj) in member_pairs {
+        dict.insert(DictKey(Object::from_str(name)), obj);
+    }
+    let dunder_pairs = crate::dunder_shim::install_dunder_shims(&slot_table, qualified.clone());
+    for (name, obj) in dunder_pairs {
+        dict.insert(DictKey(Object::from_str(name)), obj);
+    }
+
     let ty = match TypeObject::new_user(&bare, bases_resolved, dict) {
         Ok(ty) => ty,
         Err(_) => {
@@ -541,15 +682,67 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
             tp_name: owned_name.as_ptr() as *const c_char,
             tp_basicsize: spec_ref.basicsize as PySsizeT,
             tp_itemsize: spec_ref.itemsize as PySsizeT,
-            tp_flags: spec_ref.flags | Py_TPFLAGS_HEAPTYPE,
+            tp_flags: spec_ref.flags | PY_TPFLAGS_HEAPTYPE,
             tp_slots: spec_ref.slots,
             bridge: Box::into_raw(Box::new(ty)),
             _filler: [0; 4],
         },
         owned_name,
+        slot_table,
     });
     let leaked = Box::leak(bx);
-    &mut leaked.head as *mut PyTypeObject as *mut PyObject
+    let ty_ptr = &mut leaked.head as *mut PyTypeObject;
+    register_heap_type(ty_ptr);
+    ty_ptr as *mut PyObject
+}
+
+/// `PyType_GetSlot(ty, slot)` — fetch a slot pointer from `ty`'s
+/// SlotTable.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_GetSlot(ty: *mut PyTypeObject, slot: c_int) -> *mut c_void {
+    let Some(table) = (unsafe { crate::slottable::slot_table_for(ty) }) else {
+        return ptr::null_mut();
+    };
+    table.get(slot).as_void()
+}
+
+/// `PyType_HasFeature(type, flag)` — check a `Py_TPFLAGS_*` bit.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_HasFeature(ty: *mut PyTypeObject, flag: u32) -> c_int {
+    if ty.is_null() {
+        return 0;
+    }
+    let f = unsafe { (*ty).tp_flags };
+    if (f & flag) == flag {
+        1
+    } else {
+        0
+    }
+}
+
+/// `PyType_GetFlags(type)` — return the type's `tp_flags` field.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_GetFlags(ty: *mut PyTypeObject) -> u32 {
+    if ty.is_null() {
+        return 0;
+    }
+    unsafe { (*ty).tp_flags }
+}
+
+/// `PyType_GetQualName(type)` — return the type's qualified name as
+/// a fresh `str` object.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_GetQualName(ty: *mut PyTypeObject) -> *mut PyObject {
+    if ty.is_null() {
+        return ptr::null_mut();
+    }
+    let n = unsafe { (*ty).tp_name };
+    if n.is_null() {
+        return crate::object::into_owned(Object::from_static(""));
+    }
+    let s = unsafe { CStr::from_ptr(n) }.to_string_lossy().into_owned();
+    let bare = s.rsplit('.').next().unwrap_or(&s).to_owned();
+    crate::object::into_owned(Object::from_str(bare))
 }
 
 #[no_mangle]

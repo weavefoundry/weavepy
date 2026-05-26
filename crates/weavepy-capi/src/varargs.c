@@ -566,13 +566,22 @@ PyObject *Py_BuildValue(const char *fmt, ...) {
     /* If the format starts with a single unit, return that; otherwise
      * wrap in a tuple. */
     const char *p = fmt;
-    /* Quick scan to count top-level units. */
+    /* Quick scan to count top-level units. A unit at depth 0 is
+     * either an alpha format code (`i`, `s`, `O`, etc.) or an
+     * opening bracket that begins a nested tuple/list/dict. */
     int top_units = 0;
     int depth = 0;
     for (const char *q = fmt; *q; q++) {
-        if (*q == '(' || *q == '[' || *q == '{') depth++;
-        else if (*q == ')' || *q == ']' || *q == '}') depth--;
-        else if (depth == 0 && isalpha((unsigned char)*q)) top_units++;
+        if (depth == 0 && (*q == '(' || *q == '[' || *q == '{')) {
+            top_units++;
+            depth++;
+        } else if (depth == 0 && isalpha((unsigned char)*q)) {
+            top_units++;
+        } else if (*q == '(' || *q == '[' || *q == '{') {
+            depth++;
+        } else if (*q == ')' || *q == ']' || *q == '}') {
+            depth--;
+        }
     }
     if (top_units == 1) {
         result = build_one(&p, &ap);

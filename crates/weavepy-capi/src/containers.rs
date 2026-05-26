@@ -5,6 +5,8 @@
 //! through the same boxing machinery as scalars. Mutating operations
 //! borrow the inner `RefCell` for the duration of the call.
 
+use std::cell::RefCell as StdRefCell;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -14,6 +16,66 @@ use weavepy_vm::sync::RefCell;
 use weavepy_vm::object::{DictData, DictKey, Object, SetData};
 
 use crate::object::{PyObject, PySsizeT};
+
+thread_local! {
+    /// Interned `*mut PyObject` cache for `PyTuple_GetItem` /
+    /// `PyList_GetItem`'s "borrowed reference" contract. Without it
+    /// we'd either leak fresh boxes on every call or hand callers a
+    /// dangling pointer. The cache is keyed on the container's
+    /// pointer + index so repeated `PyTuple_GetItem(t, 0)` calls
+    /// return the same `*mut PyObject` (matching CPython).
+    static BORROWED_ITEM_CACHE: StdRefCell<HashMap<(usize, isize), *mut PyObject>> =
+        StdRefCell::new(HashMap::new());
+}
+
+/// Install or reuse the interned borrowed-reference pointer for the
+/// `(container, index)` slot. Subsequent calls with the same
+/// container pointer + index return the same `*mut PyObject`.
+pub(crate) fn intern_borrowed_item(container: *mut PyObject, item: Object) -> *mut PyObject {
+    intern_borrowed_at(container, isize::MIN /* sentinel */, item)
+}
+
+pub(crate) fn intern_borrowed_at(
+    container: *mut PyObject,
+    idx: isize,
+    item: Object,
+) -> *mut PyObject {
+    BORROWED_ITEM_CACHE.with(|cell| {
+        let key = (container as usize, idx);
+        let mut map = cell.borrow_mut();
+        if let Some(&p) = map.get(&key) {
+            return p;
+        }
+        let p = crate::object::into_owned(item);
+        map.insert(key, p);
+        p
+    })
+}
+
+/// Drop every cached borrowed-reference entry pinned to `container`.
+/// Called from `free_box` when the container's refcount hits zero
+/// so a later allocation that lands at the same address starts
+/// with a clean slate.
+pub(crate) fn invalidate_borrowed_cache(container: *mut crate::object::PyObject) {
+    let key = container as usize;
+    // Collect-then-drop so we never hold the cache borrow while the
+    // recursive `Py_DecRef` walks back into the cache (the freed
+    // item itself might be a container with cached entries).
+    let drained: Vec<*mut crate::object::PyObject> = BORROWED_ITEM_CACHE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let stale: Vec<(usize, isize)> = map.keys().filter(|(c, _)| *c == key).copied().collect();
+        let mut out = Vec::with_capacity(stale.len());
+        for k in stale {
+            if let Some(p) = map.remove(&k) {
+                out.push(p);
+            }
+        }
+        out
+    });
+    for p in drained {
+        unsafe { crate::object::Py_DecRef(p) };
+    }
+}
 
 // ----------------------------------------------------------------
 // PyList.
@@ -113,11 +175,10 @@ pub unsafe extern "C" fn PyList_GetItem(list: *mut PyObject, index: PySsizeT) ->
                 crate::errors::set_value_error("list index out of range");
                 ptr::null_mut()
             } else {
-                let p = crate::object::into_owned(v[index as usize].clone());
-                // PyList_GetItem returns a borrowed reference: undo
-                // the +1 we just added.
-                unsafe { crate::object::Py_DecRef(p) };
-                p
+                // Borrowed reference: intern a stable pointer keyed
+                // on the list pointer + index so callers get the
+                // same `*mut PyObject` for repeated lookups.
+                intern_borrowed_at(list, index as isize, v[index as usize].clone())
             }
         }
         _ => ptr::null_mut(),
@@ -188,11 +249,17 @@ pub unsafe extern "C" fn PyList_Check(o: *mut PyObject) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyTuple_New(n: PySsizeT) -> *mut PyObject {
-    // We encode an in-flight tuple as a list; PyTuple_SetItem
-    // mutates by index; the result is shipped as an Object::Tuple
-    // by the time C extensions return it.
+    // The new-then-fill pattern needs mutable storage, but tuples
+    // are immutable on the WeavePy side. Carry the staging area in a
+    // `List` payload but advertise `PyTuple_Type` so callers see it
+    // as a tuple; `PyObject_GetItem` / `PyTuple_GetItem` /
+    // `clone_object` all special-case the tuple-typed list and
+    // freeze it into an `Object::Tuple` on read.
     let len = n.max(0) as usize;
-    crate::object::into_owned(Object::new_list(vec![Object::None; len]))
+    crate::object::into_owned_with_type(
+        Object::new_list(vec![Object::None; len]),
+        crate::types::PyTuple_Type.as_ptr(),
+    )
 }
 
 #[no_mangle]
@@ -204,7 +271,13 @@ pub unsafe extern "C" fn PyTuple_SetItem(
     if tuple.is_null() {
         return -1;
     }
-    let result = match unsafe { crate::object::clone_object(tuple) } {
+    // Use the raw payload here (not `clone_object`) so the
+    // staged-list-with-PyTuple_Type backing isn't frozen mid-fill.
+    let raw = unsafe { crate::object::raw_payload(tuple) };
+    let Some(raw) = raw else {
+        return -1;
+    };
+    let result = match raw {
         Object::List(rc) => {
             let mut v = rc.borrow_mut();
             if pos < 0 || pos >= v.len() as PySsizeT {
@@ -255,7 +328,13 @@ pub unsafe extern "C" fn PyTuple_GetItem(tuple: *mut PyObject, pos: PySsizeT) ->
     if tuple.is_null() {
         return ptr::null_mut();
     }
-    let item = match unsafe { crate::object::clone_object(tuple) } {
+    // Use the raw payload so a staged-list-backed tuple still works
+    // when read mid-fill.
+    let raw = match unsafe { crate::object::raw_payload(tuple) } {
+        Some(r) => r,
+        None => return ptr::null_mut(),
+    };
+    let item = match raw {
         Object::Tuple(items) => {
             if pos < 0 || pos >= items.len() as PySsizeT {
                 None
@@ -277,9 +356,11 @@ pub unsafe extern "C" fn PyTuple_GetItem(tuple: *mut PyObject, pos: PySsizeT) ->
         crate::errors::set_value_error("tuple index out of range");
         return ptr::null_mut();
     };
-    let p = crate::object::into_owned(item);
-    unsafe { crate::object::Py_DecRef(p) };
-    p
+    // CPython's `PyTuple_GetItem` returns a *borrowed* reference. We
+    // don't have stable item pointers, so we materialise a fresh
+    // box and intern it on the tuple's pointer so its lifetime
+    // matches the tuple itself.
+    intern_borrowed_at(tuple, pos as isize, item)
 }
 
 #[no_mangle]

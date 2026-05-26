@@ -70,6 +70,12 @@ pub fn take_pending() -> Option<PendingError> {
     PENDING.with(|cell| cell.borrow_mut().take())
 }
 
+/// Take the pending exception out of the cell and convert to a
+/// [`RuntimeError`] suitable for returning from VM-facing trampolines.
+pub fn take_pending_error_runtime() -> Option<RuntimeError> {
+    take_pending().map(to_runtime_error)
+}
+
 /// Convert a [`PendingError`] to a [`RuntimeError`] suitable for
 /// returning from the VM.
 pub fn to_runtime_error(p: PendingError) -> RuntimeError {
@@ -127,6 +133,36 @@ pub fn set_overflow_error(msg: impl Into<String>) {
         Some(builtin_types().overflow_error.clone()),
         Object::from_str(msg.into()),
     );
+}
+
+/// Helper used by buffer-protocol code to install a `BufferError`.
+pub fn set_buffer_error(msg: impl Into<String>) {
+    set_pending(
+        Some(builtin_types().buffer_error.clone()),
+        Object::from_str(msg.into()),
+    );
+}
+
+/// Helper used by attribute-lookup code to install an `AttributeError`.
+pub fn set_attribute_error(msg: impl Into<String>) {
+    set_pending(
+        Some(builtin_types().attribute_error.clone()),
+        Object::from_str(msg.into()),
+    );
+}
+
+/// Helper used by descriptor / generic-allocator code to install a
+/// `RuntimeError`.
+pub fn set_index_error(msg: impl Into<String>) {
+    set_pending(
+        Some(builtin_types().index_error.clone()),
+        Object::from_str(msg.into()),
+    );
+}
+
+/// Helper used by stop-iteration paths.
+pub fn set_stop_iteration() {
+    set_pending(Some(builtin_types().stop_iteration.clone()), Object::None);
 }
 
 // ----------------------------------------------------------------

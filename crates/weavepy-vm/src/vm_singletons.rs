@@ -260,6 +260,51 @@ impl Drop for ThreadHandlesGuard {
     }
 }
 
+thread_local! {
+    /// Stack of `*mut Interpreter` pointers, one per active
+    /// VM-entry call (`call_object`, `iter_object`, …). The C-API
+    /// reads the top of this stack to find a live VM when an
+    /// extension function calls back into the runtime
+    /// (`PyObject_CallObject(cls, ...)`, `PyObject_GetBuffer(...)`,
+    /// etc.).
+    ///
+    /// Stored as a raw pointer because the VM owns the storage —
+    /// the guard pops on drop so the pointer never outlives the
+    /// owning `&mut Interpreter` borrow.
+    static CURRENT_INTERPRETER_PTR: RefCell<Vec<*mut crate::Interpreter>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// RAII guard that pushes `interp` onto [`CURRENT_INTERPRETER_PTR`]
+/// for the lifetime of the guard. Used by VM entry points that
+/// might run user code which re-enters the C-API.
+#[derive(Debug)]
+pub struct InterpreterGuard {
+    _private: (),
+}
+
+impl Drop for InterpreterGuard {
+    fn drop(&mut self) {
+        CURRENT_INTERPRETER_PTR.with(|cell| {
+            let _ = cell.borrow_mut().pop();
+        });
+    }
+}
+
+/// Publish `interp` as the live VM pointer for the duration of
+/// the returned guard. Re-entrant calls produce a stack so the
+/// most recent guard wins on `current_interpreter_ptr` lookups.
+pub fn publish_interpreter_ptr(interp: *mut crate::Interpreter) -> InterpreterGuard {
+    CURRENT_INTERPRETER_PTR.with(|cell| cell.borrow_mut().push(interp));
+    InterpreterGuard { _private: () }
+}
+
+/// Read the most recently published interpreter pointer, or
+/// `None` if no VM entry frame is on this thread.
+pub fn current_interpreter_ptr() -> Option<*mut crate::Interpreter> {
+    CURRENT_INTERPRETER_PTR.with(|cell| cell.borrow().last().copied())
+}
+
 /// `quit` and `exit` — interactive sentinels that raise `SystemExit`.
 pub fn quitter(name: &'static str) -> Object {
     use crate::object::BuiltinFn;

@@ -22,14 +22,17 @@ use crate::buffer;
 use crate::capsule;
 use crate::containers;
 use crate::errors;
+use crate::genericalloc;
 use crate::lifecycle;
 use crate::memory;
+use crate::memoryview;
 use crate::module;
 use crate::numbers;
 use crate::object;
 use crate::slice;
 use crate::strings;
 use crate::types;
+use crate::vectorcall;
 
 // The variadic helpers live in `varargs.c` and would otherwise be
 // dead-stripped from the host binary, since nothing on the Rust
@@ -342,8 +345,13 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(types::PyType_FromSpec),
     addr!(types::PyType_FromSpecWithBases),
     addr!(types::PyType_FromModuleAndSpec),
+    addr!(types::PyType_FromMetaclass),
     addr!(types::PyType_Ready),
     addr!(types::PyType_GetName),
+    addr!(types::PyType_GetQualName),
+    addr!(types::PyType_GetFlags),
+    addr!(types::PyType_GetSlot),
+    addr!(types::PyType_HasFeature),
     addr!(types::PyType_IsSubtype),
     // capsule.rs
     addr!(capsule::PyCapsule_New),
@@ -353,6 +361,46 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(capsule::PyCapsule_IsValid),
     // buffer.rs
     addr!(buffer::PyBuffer_Release),
+    addr!(buffer::PyBuffer_FillInfo),
+    addr!(buffer::PyBuffer_IsContiguous),
+    addr!(buffer::PyBuffer_ToContiguous),
+    addr!(buffer::PyBuffer_FromContiguous),
+    addr!(buffer::PyBuffer_GetPointer),
+    addr!(buffer::PyBuffer_FillContiguousStrides),
+    addr!(buffer::PyBuffer_SizeFromFormat),
+    addr!(buffer::PyBuffer_HasFlag),
+    // memoryview.rs
+    addr!(memoryview::PyMemoryView_Check),
+    addr!(memoryview::PyMemoryView_FromObject),
+    addr!(memoryview::PyMemoryView_FromMemory),
+    addr!(memoryview::PyMemoryView_FromBuffer),
+    addr!(memoryview::PyMemoryView_GetContiguous),
+    addr!(memoryview::PyMemoryView_GET_BUFFER),
+    addr!(memoryview::PyMemoryView_GET_BASE),
+    // vectorcall.rs
+    addr!(vectorcall::PyVectorcall_NARGS),
+    addr!(vectorcall::PyVectorcall_Function),
+    addr!(vectorcall::PyVectorcall_Call),
+    addr!(vectorcall::PyObject_Vectorcall),
+    addr!(vectorcall::PyObject_VectorcallDict),
+    addr!(vectorcall::PyObject_VectorcallMethod),
+    addr!(vectorcall::PyObject_CallOneArg2),
+    // genericalloc.rs
+    addr!(genericalloc::PyType_GenericAlloc),
+    addr!(genericalloc::PyType_GenericNew),
+    addr!(genericalloc::_PyObject_New),
+    addr!(genericalloc::_PyObject_NewVar),
+    addr!(genericalloc::PyObject_Init),
+    addr!(genericalloc::PyObject_InitVar),
+    addr!(genericalloc::PyObject_GenericGetAttr),
+    addr!(genericalloc::PyObject_GenericSetAttr),
+    addr!(genericalloc::PyObject_GenericGetDict),
+    addr!(genericalloc::PyObject_GenericSetDict),
+    addr!(genericalloc::PyObject_HashNotImplemented),
+    addr!(genericalloc::_Py_HashPointer),
+    addr!(genericalloc::Py_HashPointer),
+    addr!(genericalloc::_Py_HashBytes),
+    addr!(genericalloc::Py_GenericAlias),
     // slice.rs
     addr!(slice::PySlice_New),
     addr!(slice::PySlice_Check),

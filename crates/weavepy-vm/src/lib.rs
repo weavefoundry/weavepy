@@ -453,6 +453,8 @@ impl Interpreter {
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
         let globals = self.builtins.clone();
         self.call(&callable, args, kwargs, &globals)
@@ -461,6 +463,8 @@ impl Interpreter {
     /// Public iterator-construction entry point. Mirrors `iter(o)`.
     /// Used by `PyObject_GetIter` in the C-API.
     pub fn iter_object(&mut self, value: Object) -> Result<Object, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
         let globals = self.builtins.clone();
         self.make_iter(&value, &globals)
@@ -470,6 +474,8 @@ impl Interpreter {
     /// `Ok(None)` for `StopIteration`. Used by `PyIter_Next` in the
     /// C-API.
     pub fn iter_next_object(&mut self, iter: Object) -> Result<Option<Object>, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
         let globals = self.builtins.clone();
         self.iter_next(&iter, &globals)

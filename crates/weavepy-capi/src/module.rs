@@ -84,9 +84,11 @@ impl MethodEntry {
 
     /// Bind this method as an unbound class member: invocations
     /// through an instance will pass the instance as the first
-    /// argument.
+    /// argument. The wrapper extracts the receiver from `args[0]`
+    /// and routes it to the C function's `self` parameter, leaving
+    /// only the trailing user-supplied args in the tuple.
     pub fn bind_unbound(&self) -> Object {
-        wrap_c_function(self.name.clone(), self.func, self.flags, None)
+        wrap_c_method_function(self.name.clone(), self.func, self.flags)
     }
 }
 
@@ -167,7 +169,9 @@ fn wrap_c_function(
                     args.len()
                 )));
             }
-            unsafe { func(self_ptr, crate::singletons::none_ptr()) }
+            crate::interp::ensure_active(|| unsafe {
+                func(self_ptr, crate::singletons::none_ptr())
+            })
         } else if (flags & METH_O) != 0 {
             if args.len() != 1 {
                 return Err(type_error(format!(
@@ -176,13 +180,12 @@ fn wrap_c_function(
                 )));
             }
             let arg = crate::object::into_owned(args[0].clone());
-            let r = unsafe { func(self_ptr, arg) };
+            let r = crate::interp::ensure_active(|| unsafe { func(self_ptr, arg) });
             unsafe { crate::object::Py_DecRef(arg) };
             r
         } else {
             let tuple = crate::object::into_owned(Object::new_tuple(args.to_vec()));
             let r = if (flags & METH_KEYWORDS) != 0 {
-                // Cast the function to the kwargs-aware shape.
                 #[allow(clippy::missing_transmute_annotations)]
                 let with_kw: unsafe extern "C" fn(
                     *mut PyObject,
@@ -191,11 +194,11 @@ fn wrap_c_function(
                 )
                     -> *mut PyObject = unsafe { std::mem::transmute(func) };
                 let kw = crate::object::into_owned(Object::new_dict());
-                let r = unsafe { with_kw(self_ptr, tuple, kw) };
+                let r = crate::interp::ensure_active(|| unsafe { with_kw(self_ptr, tuple, kw) });
                 unsafe { crate::object::Py_DecRef(kw) };
                 r
             } else {
-                unsafe { func(self_ptr, tuple) }
+                crate::interp::ensure_active(|| unsafe { func(self_ptr, tuple) })
             };
             unsafe { crate::object::Py_DecRef(tuple) };
             r
@@ -214,6 +217,104 @@ fn wrap_c_function(
             }
             return Err(type_error(format!(
                 "{static_name}() returned NULL without setting an exception"
+            )));
+        }
+        let out = unsafe { crate::object::clone_object(result) };
+        unsafe { crate::object::Py_DecRef(result) };
+        Ok(out)
+    };
+    Object::Builtin(Rc::new(BuiltinFn {
+        name: static_name,
+        call: Box::new(f),
+        call_kw: None,
+    }))
+}
+
+/// Wrap a `tp_methods` entry as a class-bound method. The first
+/// element of `args` is the receiver, which is routed to the C
+/// function's `self` parameter; everything after is forwarded as
+/// the args tuple (or as the lone METH_O argument).
+///
+/// The wrapper's `BuiltinFn.name` is prefixed with `_capi:` so the
+/// VM's name-keyed builtin routing (which intercepts canonical
+/// names such as `sum`, `iter`, `min`, …) doesn't fire on a
+/// user-defined extension method that happens to share a name with
+/// a Python built-in.
+fn wrap_c_method_function(
+    name: String,
+    func: Option<unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject>,
+    flags: c_int,
+) -> Object {
+    let qualified = format!("_capi:{name}");
+    let static_name: &'static str = Box::leak(qualified.into_boxed_str());
+    let display_name: &'static str = Box::leak(name.into_boxed_str());
+    let f = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let Some(func) = func else {
+            return Err(type_error(format!("'{display_name}' is null")));
+        };
+        crate::interp::ensure_initialised();
+        crate::errors::clear_thread_local();
+
+        if args.is_empty() {
+            return Err(type_error(format!(
+                "{display_name}() takes at least 1 argument (self) (0 given)"
+            )));
+        }
+        let self_ptr = crate::object::into_owned(args[0].clone());
+        let rest = &args[1..];
+
+        let result = if (flags & METH_NOARGS) != 0 {
+            if !rest.is_empty() {
+                unsafe { crate::object::Py_DecRef(self_ptr) };
+                return Err(type_error(format!(
+                    "{display_name}() takes no arguments ({} given)",
+                    rest.len()
+                )));
+            }
+            crate::interp::ensure_active(|| unsafe {
+                func(self_ptr, crate::singletons::none_ptr())
+            })
+        } else if (flags & METH_O) != 0 {
+            if rest.len() != 1 {
+                unsafe { crate::object::Py_DecRef(self_ptr) };
+                return Err(type_error(format!(
+                    "{display_name}() takes exactly one argument ({} given)",
+                    rest.len()
+                )));
+            }
+            let arg = crate::object::into_owned(rest[0].clone());
+            let r = crate::interp::ensure_active(|| unsafe { func(self_ptr, arg) });
+            unsafe { crate::object::Py_DecRef(arg) };
+            r
+        } else {
+            let tuple = crate::object::into_owned(Object::new_tuple(rest.to_vec()));
+            let r = if (flags & METH_KEYWORDS) != 0 {
+                #[allow(clippy::missing_transmute_annotations)]
+                let with_kw: unsafe extern "C" fn(
+                    *mut PyObject,
+                    *mut PyObject,
+                    *mut PyObject,
+                )
+                    -> *mut PyObject = unsafe { std::mem::transmute(func) };
+                let kw = crate::object::into_owned(Object::new_dict());
+                let r = crate::interp::ensure_active(|| unsafe { with_kw(self_ptr, tuple, kw) });
+                unsafe { crate::object::Py_DecRef(kw) };
+                r
+            } else {
+                crate::interp::ensure_active(|| unsafe { func(self_ptr, tuple) })
+            };
+            unsafe { crate::object::Py_DecRef(tuple) };
+            r
+        };
+
+        unsafe { crate::object::Py_DecRef(self_ptr) };
+
+        if result.is_null() {
+            if let Some(p) = crate::errors::take_pending() {
+                return Err(crate::errors::to_runtime_error(p));
+            }
+            return Err(type_error(format!(
+                "{display_name}() returned NULL without setting an exception"
             )));
         }
         let out = unsafe { crate::object::clone_object(result) };

@@ -176,7 +176,39 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
         }
     }
     let bx = unsafe { &*(p as *const PyObjectBox) };
-    bx.payload.obj.clone()
+    let raw = bx.payload.obj.clone();
+    // `PyTuple_New` allocates a mutable staging List but advertises
+    // `PyTuple_Type` so it round-trips as a tuple. Freeze the list
+    // into an immutable tuple on every external clone — this is the
+    // moment a C extension hands the staged tuple back to the
+    // runtime. `PyTuple_SetItem` reaches the staged list through
+    // [`raw_payload`] to bypass this freeze.
+    if !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyTuple_Type.as_ptr()) {
+        if let weavepy_vm::object::Object::List(rc) = &raw {
+            let snapshot = rc.borrow().clone();
+            return weavepy_vm::object::Object::new_tuple(snapshot);
+        }
+    }
+    raw
+}
+
+/// Read the raw `Object` payload of a box without applying the
+/// tuple-staging freeze that [`clone_object`] performs. Internal
+/// helper used by `PyTuple_SetItem`.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn raw_payload(p: *mut PyObject) -> Option<Object> {
+    if p.is_null() {
+        return None;
+    }
+    let head = unsafe { &*(p as *const PyObject) };
+    if std::ptr::eq(head, crate::singletons::_Py_NoneStruct.as_ptr())
+        || std::ptr::eq(head, crate::singletons::_Py_TrueStruct.as_ptr())
+        || std::ptr::eq(head, crate::singletons::_Py_FalseStruct.as_ptr())
+    {
+        return None;
+    }
+    let bx = unsafe { &*(p as *const PyObjectBox) };
+    Some(bx.payload.obj.clone())
 }
 
 /// Drop a box's storage, running its destructor (if any) first.
@@ -186,15 +218,15 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
 /// helpers. Static singletons short-circuit through the immortal
 /// check in [`Py_DecRef`].
 unsafe fn free_box(p: *mut PyObject) {
+    // Invalidate any borrowed-item cache entries pinned to this
+    // box's address so subsequent reuse of the slab doesn't return
+    // stale items from the old container.
+    crate::containers::invalidate_borrowed_cache(p);
+
     let bx = unsafe { Box::from_raw(p as *mut PyObjectBox) };
     if let Some(d) = bx.payload.destructor {
-        // We need to give the destructor a `*mut PyObject` view; it
-        // expects to operate on the live box. Re-pack the contents
-        // briefly so the destructor sees the same address it stored
-        // when the capsule was created.
         let raw = Box::into_raw(bx);
         unsafe { d(raw as *mut PyObject) };
-        // Drop the (now-empty) box.
         let _ = unsafe { Box::from_raw(raw) };
     } else {
         drop(bx);
