@@ -21,6 +21,7 @@ use crate::argparse;
 use crate::buffer;
 use crate::capsule;
 use crate::containers;
+use crate::datetime_api as dt;
 use crate::errors;
 use crate::genericalloc;
 use crate::lifecycle;
@@ -358,7 +359,44 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(capsule::PyCapsule_GetPointer),
     addr!(capsule::PyCapsule_GetName),
     addr!(capsule::PyCapsule_SetPointer),
+    addr!(capsule::PyCapsule_SetName),
+    addr!(capsule::PyCapsule_GetDestructor),
+    addr!(capsule::PyCapsule_SetDestructor),
+    addr!(capsule::PyCapsule_GetContext),
+    addr!(capsule::PyCapsule_SetContext),
+    addr!(capsule::PyCapsule_Import),
     addr!(capsule::PyCapsule_IsValid),
+    // datetime_api.rs
+    addr!(dt::PyDate_FromDate),
+    addr!(dt::PyDateTime_FromDateAndTime),
+    addr!(dt::PyTime_FromTime),
+    addr!(dt::PyDelta_FromDSU),
+    addr!(dt::PyTimeZone_FromOffset),
+    addr!(dt::PyTimeZone_FromOffsetAndName),
+    addr!(dt::PyDateTime_GET_YEAR),
+    addr!(dt::PyDateTime_GET_MONTH),
+    addr!(dt::PyDateTime_GET_DAY),
+    addr!(dt::PyDateTime_DATE_GET_HOUR),
+    addr!(dt::PyDateTime_DATE_GET_MINUTE),
+    addr!(dt::PyDateTime_DATE_GET_SECOND),
+    addr!(dt::PyDateTime_DATE_GET_MICROSECOND),
+    addr!(dt::PyDateTime_TIME_GET_HOUR),
+    addr!(dt::PyDateTime_TIME_GET_MINUTE),
+    addr!(dt::PyDateTime_TIME_GET_SECOND),
+    addr!(dt::PyDateTime_TIME_GET_MICROSECOND),
+    addr!(dt::PyDateTime_DELTA_GET_DAYS),
+    addr!(dt::PyDateTime_DELTA_GET_SECONDS),
+    addr!(dt::PyDateTime_DELTA_GET_MICROSECONDS),
+    addr!(dt::PyDate_Check),
+    addr!(dt::PyDate_CheckExact),
+    addr!(dt::PyDateTime_Check),
+    addr!(dt::PyDateTime_CheckExact),
+    addr!(dt::PyTime_Check),
+    addr!(dt::PyTime_CheckExact),
+    addr!(dt::PyDelta_Check),
+    addr!(dt::PyDelta_CheckExact),
+    addr!(dt::PyTZInfo_Check),
+    addr!(dt::PyTZInfo_CheckExact),
     // buffer.rs
     addr!(buffer::PyBuffer_Release),
     addr!(buffer::PyBuffer_FillInfo),
@@ -404,6 +442,10 @@ static FORCE_LINK: &[FnPtr] = &[
     // slice.rs
     addr!(slice::PySlice_New),
     addr!(slice::PySlice_Check),
+    addr!(slice::PySlice_Unpack),
+    addr!(slice::PySlice_AdjustIndices),
+    addr!(slice::PySlice_GetIndicesEx),
+    addr!(slice::PySlice_GetIndices),
     // lifecycle.rs
     addr!(lifecycle::Py_Initialize),
     addr!(lifecycle::Py_InitializeEx),

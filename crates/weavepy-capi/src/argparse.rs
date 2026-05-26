@@ -196,6 +196,72 @@ pub unsafe extern "C" fn _WeavePy_Arg_Bool(arg: *mut PyObject, dest: *mut c_int)
     0
 }
 
+/// Lookup `kwargs[key]` (returning a new reference) or NULL when
+/// either `kwargs` is NULL or the key is absent. Used by the
+/// kw-aware C shim to bind named arguments.
+#[no_mangle]
+pub unsafe extern "C" fn _WeavePy_Kwargs_Pop(
+    kwargs: *mut PyObject,
+    key: *const c_char,
+) -> *mut PyObject {
+    if kwargs.is_null() || key.is_null() {
+        return ptr::null_mut();
+    }
+    let key_obj = unsafe { std::ffi::CStr::from_ptr(key) }
+        .to_string_lossy()
+        .into_owned();
+    let result = match unsafe { crate::object::clone_object(kwargs) } {
+        Object::Dict(d) => {
+            let k = weavepy_vm::object::DictKey(Object::from_str(key_obj));
+            d.borrow().get(&k).cloned()
+        }
+        _ => None,
+    };
+    result.map_or(ptr::null_mut(), crate::object::into_owned)
+}
+
+/// Count how many kwargs are still present (used for error
+/// reporting when extra keywords arrive).
+#[no_mangle]
+pub unsafe extern "C" fn _WeavePy_Kwargs_Len(kwargs: *mut PyObject) -> c_int {
+    if kwargs.is_null() {
+        return 0;
+    }
+    match unsafe { crate::object::clone_object(kwargs) } {
+        Object::Dict(d) => d.borrow().len() as c_int,
+        _ => 0,
+    }
+}
+
+/// Iterate `kwargs` and return the i'th key as a borrowed C string.
+/// Returns NULL when the index is out of range or when the key isn't
+/// a string. Used by the C shim to detect "unexpected keyword
+/// argument".
+#[no_mangle]
+pub unsafe extern "C" fn _WeavePy_Kwargs_KeyAt(kwargs: *mut PyObject, i: c_int) -> *const c_char {
+    if kwargs.is_null() {
+        return ptr::null();
+    }
+    match unsafe { crate::object::clone_object(kwargs) } {
+        Object::Dict(d) => {
+            let borrowed = d.borrow();
+            let entry = borrowed.iter().nth(i as usize);
+            match entry {
+                Some((k, _)) => match &k.0 {
+                    Object::Str(s) => {
+                        let mut bytes = s.as_bytes().to_vec();
+                        bytes.push(0);
+                        Box::leak(bytes.into_boxed_slice()).as_ptr() as *const c_char
+                    }
+                    _ => ptr::null(),
+                },
+                None => ptr::null(),
+            }
+        }
+        _ => ptr::null(),
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn _WeavePy_Arg_Buffer(
     arg: *mut PyObject,

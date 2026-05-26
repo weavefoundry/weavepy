@@ -101,7 +101,13 @@ def _find_wheel_on_index(name, index_url, python_version=None):
         candidates.append((version, label, url))
     if not candidates:
         return None, None
-    candidates.sort(key=lambda t: _version_key(t[0]), reverse=True)
+    # Sort by (version desc, tag-score desc) so we prefer the latest
+    # release, breaking ties in favour of the most-specific wheel
+    # we can satisfy.
+    candidates.sort(
+        key=lambda t: (_version_key(t[0]), _wheel_tag_score(t[1])),
+        reverse=True,
+    )
     _, label, url = candidates[0]
     return label, url
 
@@ -123,58 +129,184 @@ def _version_key(v):
     return tuple(out)
 
 
-def _is_compatible_wheel(filename):
-    """Crude PEP 425 tag check — accept ``py3-none-any`` and the
-    canonical ``cp3X-abi3-{platform}`` variants we can run.
+def _compatible_python_tags():
+    """The CPython tags WeavePy claims to be ABI-compatible with.
+    A wheel built for any of these is accepted.
 
-    Today we only run pure-Python wheels (no C extensions); the
-    only universally compatible tag is ``py3-none-any`` (or
-    ``py2.py3-none-any``).
+    We claim compatibility with the WeavePy major.minor (which mirrors
+    a CPython release we target) — extensions targeting that tag are
+    loadable since our `Python.h` reproduces the public API surface.
+    """
+    major, minor = sys.version_info[:2]
+    tags = [
+        'py3',
+        'py%d' % major,
+        'py%d%d' % (major, minor),
+        'py2.py3',
+        'cp%d' % major,
+        'cp%d%d' % (major, minor),
+    ]
+    return tags
+
+
+def _compatible_abi_tags():
+    """ABI tags this WeavePy binary can satisfy. `none` always works
+    (pure Python). `abi3` is the stable-ABI flavour that CPython 3.x
+    extensions can be compiled with — we support it because our
+    `Python.h` exports the stable subset.
+
+    `cp3X` (e.g. `cp313`) is the per-version full ABI that CPython
+    builds default to; we accept it because WeavePy mirrors the
+    target CPython's ABI byte-for-byte.
+    """
+    major, minor = sys.version_info[:2]
+    return ['none', 'abi3', 'cp%d%d' % (major, minor)]
+
+
+def _compatible_platform_tags():
+    """Platform tags this WeavePy binary can run.
+
+    `any` always works (pure Python). Platform-specific wheels are
+    accepted for the running OS/arch. We deliberately match a broad
+    family of glibc / macOS / Windows tags so wheel resolution
+    works without forcing every wheel to be tagged exactly for
+    `manylinux_2_28_aarch64` or similar — pip's normal fallback
+    behaviour.
+    """
+    tags = ['any']
+    platform = sys.platform
+    machine = os.uname().machine if hasattr(os, 'uname') else 'x86_64'
+    if platform == 'darwin':
+        # Universal2 + arch-specific variants for both x86_64 and
+        # arm64 hosts (macOS 10.9..14 family).
+        for ver in (10, 11, 12, 13, 14, 15):
+            for sub in range(0, 16):
+                tags.append('macosx_%d_%d_universal2' % (ver, sub))
+                tags.append('macosx_%d_%d_x86_64' % (ver, sub))
+                tags.append('macosx_%d_%d_arm64' % (ver, sub))
+    elif platform.startswith('linux'):
+        # manylinux2014 / manylinux_2_xx / linux_<arch>.
+        suffix = machine if machine else 'x86_64'
+        tags.append('linux_%s' % suffix)
+        tags.append('manylinux1_%s' % suffix)
+        tags.append('manylinux2010_%s' % suffix)
+        tags.append('manylinux2014_%s' % suffix)
+        for ver in range(17, 40):
+            tags.append('manylinux_2_%d_%s' % (ver, suffix))
+    elif platform == 'win32':
+        tags.append('win_amd64')
+        tags.append('win32')
+        tags.append('win_arm64')
+    return tags
+
+
+def _is_compatible_wheel(filename):
+    """PEP 425 wheel-tag compatibility check.
+
+    We honour the standard `python-abi-platform` triple and accept a
+    wheel if every component matches one of our compatible tags. The
+    matching is multi-tag aware: a single wheel filename can carry
+    several dot-separated python/abi/platform tags, and the wheel is
+    accepted if *any* combination is compatible.
     """
     stem = filename[:-4]  # strip ``.whl``
     parts = stem.split('-')
     if len(parts) < 5:
         return False
+    py_tag = parts[-3]
     abi_tag = parts[-2]
     plat_tag = parts[-1]
+
+    py_ok = any(p in _compatible_python_tags() for p in py_tag.split('.'))
+    abi_ok = any(a in _compatible_abi_tags() for a in abi_tag.split('.'))
+    plat_ok = any(p in _compatible_platform_tags() for p in plat_tag.split('.'))
+    return py_ok and abi_ok and plat_ok
+
+
+def _wheel_tag_score(filename):
+    """Cheap preference ordering: prefer wheels that match more
+    specifically (i.e. exact ABI / platform over `any` / `none`)
+    so users don't accidentally get a sdist-fallback when a real
+    binary is available.
+    """
+    stem = filename[:-4]
+    parts = stem.split('-')
+    if len(parts) < 5:
+        return 0
+    score = 0
     py_tag = parts[-3]
-    if abi_tag != 'none' or plat_tag != 'any':
-        return False
-    return py_tag.startswith('py3') or py_tag.startswith('py2.py3')
+    abi_tag = parts[-2]
+    plat_tag = parts[-1]
+    if 'cp' in py_tag:
+        score += 4
+    if abi_tag != 'none':
+        score += 2
+    if plat_tag != 'any':
+        score += 1
+    return score
 
 
 # --------------------------------------------------------------------- wheel install
 
+_EXT_SUFFIXES = ('.so', '.dylib', '.pyd')
+
+
+def _is_extension_module(name):
+    return any(name.endswith(s) for s in _EXT_SUFFIXES)
+
+
 def _install_wheel(wheel_path, *, dest=None, scheme='purelib'):
     """Unpack ``wheel_path`` into ``dest`` (default site-packages).
     Returns the list of installed files.
+
+    Handles both pure-Python wheels and binary wheels carrying
+    ``.so``/``.dylib``/``.pyd`` extension modules. The wheel `.data/`
+    layout is honoured: ``scripts`` go to the bin dir, ``platlib``
+    payloads are merged into site-packages alongside ``purelib``.
     """
     if dest is None:
         dest = _site_packages()
     os.makedirs(dest, exist_ok=True)
     installed = []
     scripts_dir = _bin_dir()
+    data_prefix = None
     with zipfile.ZipFile(wheel_path) as zf:
+        data_prefix = _data_prefix(zf)
         for name in zf.namelist():
             if name.endswith('/'):
                 continue
             target = os.path.join(dest, name)
-            # ``.dist-info/RECORD`` entries may include script files
-            # routed to the bin directory.
-            if name.startswith(_data_prefix(zf)):
-                # ``<distribution>-<version>.data/scripts/foo`` →
-                # ``<bin>/foo``
-                rel = name[len(_data_prefix(zf)):]
+            section = None
+            if data_prefix and name.startswith(data_prefix):
+                rel = name[len(data_prefix):]
                 section, _, payload = rel.partition('/')
                 if section == 'scripts':
                     target = os.path.join(scripts_dir, payload)
+                elif section in ('purelib', 'platlib'):
+                    target = os.path.join(dest, payload)
+                elif section == 'headers':
+                    target = os.path.join(
+                        os.environ.get('VIRTUAL_ENV') or sys.prefix,
+                        'include',
+                        payload,
+                    )
+                elif section == 'data':
+                    target = os.path.join(
+                        os.environ.get('VIRTUAL_ENV') or sys.prefix,
+                        payload,
+                    )
                 else:
+                    # Unknown section: drop the file rather than
+                    # littering site-packages with a `.data/foo/`
+                    # ghost path.
                     continue
-            os.makedirs(os.path.dirname(target), exist_ok=True)
+            target_dir = os.path.dirname(target)
+            if target_dir:
+                os.makedirs(target_dir, exist_ok=True)
             with zf.open(name) as src, open(target, 'wb') as dst:
                 shutil.copyfileobj(src, dst)
             installed.append(target)
-            if name.startswith(_data_prefix(zf)) and section == 'scripts':
+            if section == 'scripts' or _is_extension_module(name):
                 try:
                     os.chmod(target, 0o755)
                 except OSError:

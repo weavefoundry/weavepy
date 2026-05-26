@@ -307,6 +307,13 @@ fn ndarray_shape_property() {
             .map(|(_, v)| v.clone())
             .expect("shape descriptor")
     };
+    // The `tp_getset` entry now lands as a real `Property` object so
+    // it participates in the descriptor protocol. To exercise the
+    // getter directly we drill into `fget` ourselves.
+    let getter = match getter {
+        Object::Property(p) => p.fget.clone(),
+        other => other,
+    };
     let res = interp
         .call_object(getter, &[arr], &[])
         .expect("shape getter should succeed");

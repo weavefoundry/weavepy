@@ -142,6 +142,17 @@ fn main() {
         name: "_ndarray",
         env_var: "WEAVEPY_CAPI_NDARRAY_EXTENSION",
     });
+    let numpylike_src = workspace_root.join("tests/capi_ext/_numpylike.c");
+    build_extension(ExtensionBuild {
+        cc: &cc,
+        manifest_dir: &manifest_dir,
+        out_dir: &out_dir,
+        target_os: &target_os,
+        suffix,
+        src: &numpylike_src,
+        name: "_numpylike",
+        env_var: "WEAVEPY_CAPI_NUMPYLIKE_EXTENSION",
+    });
 
     // Re-export the include directory so dependent crates can see
     // `Python.h` via `DEP_WEAVEPY_CAPI_INCLUDE`.

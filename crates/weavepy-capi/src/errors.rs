@@ -113,6 +113,26 @@ pub fn set_runtime_error(msg: impl Into<String>) {
     );
 }
 
+/// Bridge a [`RuntimeError`] produced by the VM into the thread-
+/// local pending-exception cell. Mirrors the small `install_runtime_error`
+/// helper that several individual modules used to roll
+/// themselves. Centralised here so every Rust-side bridge picks
+/// up the same class/value mapping.
+pub fn set_pending_from_runtime(err: RuntimeError) {
+    match err {
+        RuntimeError::PyException(pe) => {
+            let cls = match &pe.instance {
+                Object::Instance(inst) => Some(inst.class.clone()),
+                _ => None,
+            };
+            set_pending(cls, Object::from_str(pe.message()));
+        }
+        RuntimeError::Internal(msg) => {
+            set_runtime_error(msg);
+        }
+    }
+}
+
 /// Helper used by argument-parsing code to install a `TypeError`.
 pub fn set_type_error(msg: impl Into<String>) {
     set_pending(
