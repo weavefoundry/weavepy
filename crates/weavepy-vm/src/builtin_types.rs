@@ -698,6 +698,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
             name: "__new__",
             call: Box::new(object_new),
+            call_kw: None,
         })))),
     );
     dict.insert(
@@ -705,6 +706,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
             call: Box::new(object_init),
+            call_kw: None,
         })),
     );
     dict.insert(
@@ -712,6 +714,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__setattr__",
             call: Box::new(object_setattr),
+            call_kw: None,
         })),
     );
     dict.insert(
@@ -719,6 +722,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__delattr__",
             call: Box::new(object_delattr),
+            call_kw: None,
         })),
     );
     // `object.__init_subclass__(cls)` and `object.__subclasshook__`
@@ -732,6 +736,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         Object::ClassMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
             name: "__init_subclass__",
             call: Box::new(object_no_op),
+            call_kw: None,
         })))),
     );
 }
@@ -761,6 +766,7 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
         Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
             name: "__new__",
             call: Box::new(type_new_sentinel),
+            call_kw: None,
         })))),
     );
     dict.insert(
@@ -768,6 +774,7 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
             call: Box::new(type_init),
+            call_kw: None,
         })),
     );
 }
@@ -802,6 +809,7 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
             call: Box::new(oserror_init),
+            call_kw: None,
         })),
     );
 }
@@ -879,6 +887,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
             call: Box::new(exc_init),
+            call_kw: None,
         })),
     );
     dict.insert(
@@ -886,6 +895,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__str__",
             call: Box::new(exc_str),
+            call_kw: None,
         })),
     );
     dict.insert(
@@ -893,6 +903,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__repr__",
             call: Box::new(exc_repr),
+            call_kw: None,
         })),
     );
 }
@@ -1057,6 +1068,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
             call: Box::new(eg_init),
+            call_kw: None,
         })),
     );
     dict.insert(
@@ -1064,6 +1076,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__str__",
             call: Box::new(eg_str),
+            call_kw: None,
         })),
     );
     dict.insert(
@@ -1071,6 +1084,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "derive",
             call: Box::new(eg_derive),
+            call_kw: None,
         })),
     );
     dict.insert(
@@ -1078,6 +1092,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "split",
             call: Box::new(eg_split),
+            call_kw: None,
         })),
     );
     dict.insert(
@@ -1085,6 +1100,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "subgroup",
             call: Box::new(eg_subgroup),
+            call_kw: None,
         })),
     );
 }
@@ -1225,6 +1241,7 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
         let builtin = Object::Builtin(Rc::new(BuiltinFn {
             name,
             call: Box::new(f),
+            call_kw: None,
         }));
         // Wrap as `classmethod` so descriptor binding skips the
         // instance and routes through the class.

@@ -76,13 +76,30 @@ def run_module(mod_name, init_globals=None, run_name=None, alter_sys=False):
         with open(filename, "r") as f:
             source = f.read()
     if source is None:
-        # Already imported and we don't have a file — fall back to
-        # the module's __dict__.
-        run_globals = dict(mod.__dict__)
-        if init_globals:
-            run_globals.update(init_globals)
-        run_globals["__name__"] = run_name
-        return run_globals
+        # Frozen module path — pull the original source out of the
+        # interpreter's frozen-module table. This is the only way to
+        # re-execute a frozen module under a new ``__name__`` (e.g.
+        # for ``runpy.run_module('venv')``).
+        frozen_source = None
+        getter = getattr(sys, "_get_frozen_source", None)
+        if getter is not None:
+            frozen_source = getter(mod_name)
+        if frozen_source is not None:
+            source = frozen_source
+            filename = filename or f"<frozen:{mod_name}>"
+        else:
+            # Truly no source — fall back to the existing module's
+            # __dict__ so callers at least get the imported names.
+            run_globals = dict(mod.__dict__)
+            if init_globals:
+                run_globals.update(init_globals)
+            run_globals["__name__"] = run_name
+            return run_globals
+    if alter_sys:
+        # ``argv[0]`` becomes the module filename (the Python target);
+        # the rest of argv is preserved.
+        if filename:
+            sys.argv[0] = filename
     code = compile(source, filename or f"<{name}>", "exec")
     run_globals = _make_globals(run_name, filename, spec, None, pkg)
     return _run_code(code, run_globals, init_globals, run_name, spec, pkg, filename)

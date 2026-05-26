@@ -83,6 +83,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -309,6 +310,7 @@ fn select_poll(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "register",
                 call: Box::new(register),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -316,6 +318,7 @@ fn select_poll(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "modify",
                 call: Box::new(modify),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -323,6 +326,7 @@ fn select_poll(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "unregister",
                 call: Box::new(unregister),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -330,6 +334,7 @@ fn select_poll(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "poll",
                 call: Box::new(poll_fn),
+                call_kw: None,
             })),
         );
     }

@@ -68,12 +68,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features
 
+  regrtest:
+    name: regrtest (blocking, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # Bundled regrtests are required to pass (see RFC 0026). The
+    # runner gates on `tests/regrtest/expectations.toml` by default, so
+    # any divergence — pass → fail, fail → pass — fails the job. Pull
+    # requests update both the test and the baseline in the same
+    # commit.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build weavepy CLI
+        run: cargo build --release -p weavepy-cli
+      - name: Run bundled regrtests (subprocess, parallel)
+        run: |
+          cargo run --release -p weavepy-cli -- regrtest \
+            --mode subprocess \
+            --workers 4 \
+            --timeout 60
+      - name: Append regrtest report to job summary
+        if: always()
+        run: |
+          {
+            echo "## WeavePy regrtest"
+            echo
+            cat target/regrtest/regrtest.md || echo "(no report produced)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regrtest-report-${{ matrix.os }}
+          path: target/regrtest/
+          if-no-files-found: warn
+
   conformance:
     name: cpython conformance (non-blocking)
     runs-on: ubuntu-latest
-    # Non-blocking: the baseline is 0% match by design, and we don't want
-    # PRs to fail until the harness has a meaningful floor. Promote to
-    # blocking once the lexer is real (see docs/CONFORMANCE.md, Stage B).
+    # Still non-blocking — the wider CPython suite covers ~3000 tests
+    # and the realistic match floor is still climbing. The regrtest
+    # job above is the blocking signal; this job continues to run to
+    # surface drift in the broader corpus without breaking PRs.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

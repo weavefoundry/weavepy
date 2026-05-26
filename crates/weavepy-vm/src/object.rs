@@ -631,6 +631,47 @@ impl fmt::Debug for BoundMethod {
 pub struct BuiltinFn {
     pub name: &'static str,
     pub call: Box<dyn Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync>,
+    /// Kwargs-aware entry point. When `Some`, the VM dispatch loop
+    /// calls this with both positional and keyword arguments instead
+    /// of falling through the legacy positional-only path. Builtins
+    /// that don't accept kwargs leave this as `None`; the dispatcher
+    /// then errors on any kwargs the caller passes.
+    pub call_kw: Option<
+        Box<dyn Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError> + Send + Sync>,
+    >,
+}
+
+impl BuiltinFn {
+    /// Build a positional-only builtin (the common case).
+    pub fn new<F>(name: &'static str, body: F) -> Self
+    where
+        F: Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
+    {
+        Self {
+            name,
+            call: Box::new(body),
+            call_kw: None,
+        }
+    }
+
+    /// Build a kwargs-aware builtin. The positional-only `call` field
+    /// stays wired (using a body that ignores kwargs) so dispatchers
+    /// that don't bother to check `call_kw` still work.
+    pub fn with_kwargs<F>(name: &'static str, body: F) -> Self
+    where
+        F: Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        let body_pos = body.clone();
+        Self {
+            name,
+            call: Box::new(move |args| body_pos(args, &[])),
+            call_kw: Some(Box::new(move |args, kwargs| body(args, kwargs))),
+        }
+    }
 }
 
 impl fmt::Debug for BuiltinFn {

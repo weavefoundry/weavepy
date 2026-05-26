@@ -55,6 +55,7 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -85,6 +86,7 @@ fn contextvar_type() -> Rc<TypeObject> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name,
                 call: Box::new(fn_),
+                call_kw: None,
             })),
         );
     }
@@ -124,6 +126,7 @@ fn context_type() -> Rc<TypeObject> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name,
                 call: Box::new(fn_),
+                call_kw: None,
             })),
         );
     }

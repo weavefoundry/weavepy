@@ -66,6 +66,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -273,6 +274,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                         }
                         Ok(Object::None)
                     }),
+                    call_kw: None,
                 })),
             );
         }
@@ -303,6 +305,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                         *rc.borrow_mut() = Some(code);
                         Ok(Object::Int(code))
                     }),
+                    call_kw: None,
                 })),
             );
         }
@@ -321,6 +324,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                         }
                         Ok(Object::None)
                     }),
+                    call_kw: None,
                 })),
             );
         }
@@ -348,6 +352,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                         }
                         Ok(Object::None)
                     }),
+                    call_kw: None,
                 })),
             );
         }
@@ -375,6 +380,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                         let _ = pid_val;
                         Ok(Object::None)
                     }),
+                    call_kw: None,
                 })),
             );
         }

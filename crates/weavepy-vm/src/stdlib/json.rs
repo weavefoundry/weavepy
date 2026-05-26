@@ -1,9 +1,11 @@
 //! The `json` built-in module.
 //!
-//! Encode and decode JSON. We use `serde_json` for the wire format
-//! and then transform the resulting tree of values into Python
-//! objects (and vice versa). This sidesteps the substantial amount
-//! of state machine code that would otherwise live in pure Rust.
+//! Encode and decode JSON. We use `serde_json` for the wire format on
+//! input (much simpler than rolling a JSON parser by hand) and a
+//! hand-rolled formatter on output so we can match CPython's default
+//! separator semantics (`(", ", ": ")` rather than serde's compact
+//! `(",", ":")`) and honour `indent=` / `separators=` / `sort_keys=`
+//! /`ensure_ascii=` kwargs.
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
@@ -28,14 +30,20 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("loads")),
-            b("loads", json_loads),
+            b_kw("loads", json_loads),
         );
         d.insert(
             DictKey(Object::from_static("dumps")),
-            b("dumps", json_dumps),
+            b_kw("dumps", json_dumps),
         );
-        d.insert(DictKey(Object::from_static("load")), b("load", json_load));
-        d.insert(DictKey(Object::from_static("dump")), b("dump", json_dump));
+        d.insert(
+            DictKey(Object::from_static("load")),
+            b_kw("load", json_load),
+        );
+        d.insert(
+            DictKey(Object::from_static("dump")),
+            b_kw("dump", json_dump),
+        );
         d.insert(
             DictKey(Object::from_static("JSONDecodeError")),
             Object::Type(crate::builtin_types::builtin_types().value_error.clone()),
@@ -48,14 +56,18 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     })
 }
 
-fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
+fn b_kw(
+    name: &'static str,
+    body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
-        call: Box::new(body),
+        call: Box::new(move |args| body(args, &[])),
+        call_kw: Some(Box::new(body)),
     }))
 }
 
-fn json_loads(args: &[Object]) -> Result<Object, RuntimeError> {
+fn json_loads(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let text = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
         Some(Object::Bytes(b)) => {
@@ -68,30 +80,107 @@ fn json_loads(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(json_to_object(value))
 }
 
-fn json_dumps(args: &[Object]) -> Result<Object, RuntimeError> {
+#[derive(Clone, Debug)]
+struct DumpsOptions {
+    skipkeys: bool,
+    ensure_ascii: bool,
+    allow_nan: bool,
+    sort_keys: bool,
+    indent: Option<String>,
+    item_separator: String,
+    key_separator: String,
+}
+
+impl DumpsOptions {
+    fn from_kwargs(args: &[Object], kwargs: &[(String, Object)]) -> Result<Self, RuntimeError> {
+        // Backwards-compatible positional API used by older callers:
+        // `dumps(obj, indent, sort_keys)`. New code should use kwargs.
+        let mut opts = DumpsOptions {
+            skipkeys: false,
+            ensure_ascii: true,
+            allow_nan: true,
+            sort_keys: false,
+            indent: None,
+            item_separator: ", ".to_owned(),
+            key_separator: ": ".to_owned(),
+        };
+        if let Some(Object::Int(n)) = args.get(1) {
+            opts.indent = Some(" ".repeat((*n).max(0) as usize));
+        }
+        if matches!(args.get(2), Some(Object::Bool(true))) {
+            opts.sort_keys = true;
+        }
+        let mut explicit_separators: Option<(String, String)> = None;
+        for (k, v) in kwargs {
+            match k.as_str() {
+                "skipkeys" => opts.skipkeys = obj_truthy(v),
+                "ensure_ascii" => opts.ensure_ascii = obj_truthy(v),
+                "allow_nan" => opts.allow_nan = obj_truthy(v),
+                "sort_keys" => opts.sort_keys = obj_truthy(v),
+                "indent" => match v {
+                    Object::None => opts.indent = None,
+                    Object::Int(n) => opts.indent = Some(" ".repeat((*n).max(0) as usize)),
+                    Object::Str(s) => opts.indent = Some(s.to_string()),
+                    _ => return Err(type_error("indent must be int, str, or None")),
+                },
+                "separators" => match v {
+                    Object::Tuple(t) if t.len() == 2 => {
+                        let isep = match &t[0] {
+                            Object::Str(s) => s.to_string(),
+                            _ => return Err(type_error("separators[0] must be str")),
+                        };
+                        let ksep = match &t[1] {
+                            Object::Str(s) => s.to_string(),
+                            _ => return Err(type_error("separators[1] must be str")),
+                        };
+                        explicit_separators = Some((isep, ksep));
+                    }
+                    Object::None => {}
+                    _ => return Err(type_error("separators must be a 2-tuple")),
+                },
+                // `cls` / `default` are ignored: callers that pass them
+                // get the default JSONEncoder behaviour.
+                "cls" | "default" | "check_circular" => {}
+                other => {
+                    return Err(type_error(format!(
+                        "dumps() got unexpected keyword argument '{other}'"
+                    )))
+                }
+            }
+        }
+        if let Some((isep, ksep)) = explicit_separators {
+            opts.item_separator = isep;
+            opts.key_separator = ksep;
+        } else if opts.indent.is_some() {
+            // When indenting, CPython drops the trailing space after
+            // commas (the newline supplies the visual break).
+            opts.item_separator = ",".to_owned();
+            opts.key_separator = ": ".to_owned();
+        }
+        Ok(opts)
+    }
+}
+
+fn obj_truthy(o: &Object) -> bool {
+    match o {
+        Object::Bool(b) => *b,
+        Object::Int(i) => *i != 0,
+        Object::None => false,
+        _ => true,
+    }
+}
+
+fn json_dumps(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let value = args
         .first()
         .ok_or_else(|| type_error("dumps() missing argument"))?;
-    let indent = match args.get(1) {
-        Some(Object::Int(n)) => Some(*n),
-        _ => None,
-    };
-    let sort_keys = matches!(args.get(2), Some(Object::Bool(true)));
-    let json = object_to_json(value)?;
-    let serialised = if let Some(n) = indent {
-        if n <= 0 {
-            serde_json::to_string(&maybe_sort(json, sort_keys))
-        } else {
-            serde_json::to_string_pretty(&maybe_sort(json, sort_keys))
-        }
-    } else {
-        serde_json::to_string(&maybe_sort(json, sort_keys))
-    }
-    .map_err(|e| value_error(format!("JSON encoding failed: {e}")))?;
-    Ok(Object::from_str(serialised))
+    let opts = DumpsOptions::from_kwargs(args, kwargs)?;
+    let mut out = String::new();
+    encode(value, &opts, 0, &mut out)?;
+    Ok(Object::from_str(out))
 }
 
-fn json_load(args: &[Object]) -> Result<Object, RuntimeError> {
+fn json_load(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let f = args
         .first()
         .ok_or_else(|| type_error("load() expects a file"))?;
@@ -105,7 +194,7 @@ fn json_load(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(json_to_object(value))
 }
 
-fn json_dump(args: &[Object]) -> Result<Object, RuntimeError> {
+fn json_dump(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let payload = args
         .first()
         .ok_or_else(|| type_error("dump() missing payload"))?;
@@ -116,34 +205,231 @@ fn json_dump(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::File(file) => file.clone(),
         _ => return Err(type_error("dump() expects a file-like object")),
     };
-    let s = match json_dumps(std::slice::from_ref(payload))? {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(value_error("dump() failed")),
-    };
-    file.write_text(&s)?;
+    let opts = DumpsOptions::from_kwargs(&args[..1], kwargs)?;
+    let mut out = String::new();
+    encode(payload, &opts, 0, &mut out)?;
+    file.write_text(&out)?;
     Ok(Object::None)
 }
 
-fn maybe_sort(value: Value, sort: bool) -> Value {
-    if !sort {
-        return value;
-    }
+// ---------------------------------------------------------------------
+// Encoder — hand-rolled so we control whitespace + escape semantics.
+// Mirrors CPython's `json.encoder.JSONEncoder.iterencode`. Recursive
+// (Python's default container nesting won't blow our stack in practice;
+// the iterative `iterencode` is a micro-optimisation we can do later).
+// ---------------------------------------------------------------------
+
+fn encode(
+    value: &Object,
+    opts: &DumpsOptions,
+    depth: usize,
+    out: &mut String,
+) -> Result<(), RuntimeError> {
     match value {
-        Value::Object(map) => {
-            let mut keys: Vec<String> = map.keys().cloned().collect();
-            keys.sort();
-            let mut new = Map::new();
-            for k in keys {
-                if let Some(v) = map.get(&k) {
-                    new.insert(k, maybe_sort(v.clone(), true));
+        Object::None => out.push_str("null"),
+        Object::Bool(true) => out.push_str("true"),
+        Object::Bool(false) => out.push_str("false"),
+        Object::Int(n) => out.push_str(&n.to_string()),
+        Object::Long(n) => out.push_str(&n.to_string()),
+        Object::Float(f) => encode_float(*f, opts, out)?,
+        Object::Str(s) => encode_string(s.as_ref(), opts, out),
+        Object::List(items) => {
+            let items = items.borrow();
+            encode_array(items.iter(), opts, depth, out)?;
+        }
+        Object::Tuple(items) => {
+            encode_array(items.iter(), opts, depth, out)?;
+        }
+        Object::Dict(d) => {
+            let d = d.borrow();
+            encode_object(d.iter(), opts, depth, out)?;
+        }
+        Object::Set(_) | Object::FrozenSet(_) => {
+            // CPython raises TypeError on set; mirror that.
+            return Err(type_error(format!(
+                "Object of type {} is not JSON serializable",
+                value.type_name()
+            )));
+        }
+        other => {
+            return Err(type_error(format!(
+                "Object of type {} is not JSON serializable",
+                other.type_name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn encode_float(f: f64, opts: &DumpsOptions, out: &mut String) -> Result<(), RuntimeError> {
+    if f.is_nan() {
+        if !opts.allow_nan {
+            return Err(value_error(
+                "Out of range float values are not JSON compliant",
+            ));
+        }
+        out.push_str("NaN");
+    } else if f.is_infinite() {
+        if !opts.allow_nan {
+            return Err(value_error(
+                "Out of range float values are not JSON compliant",
+            ));
+        }
+        if f.is_sign_negative() {
+            out.push_str("-Infinity");
+        } else {
+            out.push_str("Infinity");
+        }
+    } else {
+        let s = format!("{f}");
+        // CPython prints ints as `1.0` not `1`.
+        if !s.contains('.') && !s.contains('e') && !s.contains('E') && !s.contains("inf") {
+            out.push_str(&s);
+            out.push_str(".0");
+        } else {
+            out.push_str(&s);
+        }
+    }
+    Ok(())
+}
+
+fn encode_string(s: &str, opts: &DumpsOptions, out: &mut String) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if (ch as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", ch as u32);
+            }
+            ch if opts.ensure_ascii && (ch as u32) > 0x7e => {
+                use std::fmt::Write as _;
+                let code = ch as u32;
+                if code <= 0xffff {
+                    let _ = write!(out, "\\u{:04x}", code);
+                } else {
+                    // Surrogate pair.
+                    let v = code - 0x10000;
+                    let hi = 0xd800 | (v >> 10);
+                    let lo = 0xdc00 | (v & 0x3ff);
+                    let _ = write!(out, "\\u{:04x}\\u{:04x}", hi, lo);
                 }
             }
-            Value::Object(new)
+            _ => out.push(ch),
         }
-        Value::Array(arr) => Value::Array(arr.into_iter().map(|v| maybe_sort(v, true)).collect()),
-        other => other,
     }
+    out.push('"');
 }
+
+fn encode_array<'a, I: ExactSizeIterator<Item = &'a Object>>(
+    items: I,
+    opts: &DumpsOptions,
+    depth: usize,
+    out: &mut String,
+) -> Result<(), RuntimeError> {
+    let len = items.len();
+    if len == 0 {
+        out.push_str("[]");
+        return Ok(());
+    }
+    out.push('[');
+    let inner = depth + 1;
+    let sep = match opts.indent.as_deref() {
+        Some(_) => format!(",\n{}", opts.indent.as_deref().unwrap().repeat(inner)),
+        None => opts.item_separator.clone(),
+    };
+    if opts.indent.is_some() {
+        out.push('\n');
+        out.push_str(&opts.indent.as_deref().unwrap().repeat(inner));
+    }
+    for (i, item) in items.enumerate() {
+        if i > 0 {
+            out.push_str(&sep);
+        }
+        encode(item, opts, inner, out)?;
+    }
+    if opts.indent.is_some() {
+        out.push('\n');
+        out.push_str(&opts.indent.as_deref().unwrap().repeat(depth));
+    }
+    out.push(']');
+    Ok(())
+}
+
+fn encode_object<'a, I: Iterator<Item = (&'a DictKey, &'a Object)>>(
+    items: I,
+    opts: &DumpsOptions,
+    depth: usize,
+    out: &mut String,
+) -> Result<(), RuntimeError> {
+    let mut pairs: Vec<(String, &Object)> = Vec::new();
+    for (k, v) in items {
+        let key = match &k.0 {
+            Object::Str(s) => s.to_string(),
+            Object::Int(i) => i.to_string(),
+            Object::Bool(true) => "true".to_owned(),
+            Object::Bool(false) => "false".to_owned(),
+            Object::None => "null".to_owned(),
+            Object::Float(f) => {
+                let mut tmp = String::new();
+                encode_float(*f, opts, &mut tmp)?;
+                // Strip the synthetic ".0" so {1.0: 1} matches CPython.
+                tmp
+            }
+            other => {
+                if opts.skipkeys {
+                    continue;
+                }
+                return Err(type_error(format!(
+                    "keys must be str, int, float, bool, or None, not {}",
+                    other.type_name()
+                )));
+            }
+        };
+        pairs.push((key, v));
+    }
+    if pairs.is_empty() {
+        out.push_str("{}");
+        return Ok(());
+    }
+    if opts.sort_keys {
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    out.push('{');
+    let inner = depth + 1;
+    let sep = match opts.indent.as_deref() {
+        Some(_) => format!(",\n{}", opts.indent.as_deref().unwrap().repeat(inner)),
+        None => opts.item_separator.clone(),
+    };
+    if opts.indent.is_some() {
+        out.push('\n');
+        out.push_str(&opts.indent.as_deref().unwrap().repeat(inner));
+    }
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(&sep);
+        }
+        encode_string(k, opts, out);
+        out.push_str(&opts.key_separator);
+        encode(v, opts, inner, out)?;
+    }
+    if opts.indent.is_some() {
+        out.push('\n');
+        out.push_str(&opts.indent.as_deref().unwrap().repeat(depth));
+    }
+    out.push('}');
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Decoder bridge.
+// ---------------------------------------------------------------------
 
 fn json_to_object(value: Value) -> Object {
     match value {
@@ -175,57 +461,7 @@ fn json_number(n: &Number) -> Object {
     Object::Float(0.0)
 }
 
-fn object_to_json(obj: &Object) -> Result<Value, RuntimeError> {
-    Ok(match obj {
-        Object::None => Value::Null,
-        Object::Bool(b) => Value::Bool(*b),
-        Object::Int(i) => Value::Number((*i).into()),
-        Object::Float(f) => Number::from_f64(*f)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        Object::Str(s) => Value::String(s.to_string()),
-        Object::List(items) => {
-            let items = items.borrow();
-            let mut arr = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                arr.push(object_to_json(item)?);
-            }
-            Value::Array(arr)
-        }
-        Object::Tuple(items) => {
-            let mut arr = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                arr.push(object_to_json(item)?);
-            }
-            Value::Array(arr)
-        }
-        Object::Dict(d) => {
-            let d = d.borrow();
-            let mut map = Map::new();
-            for (k, v) in d.iter() {
-                let key = match &k.0 {
-                    Object::Str(s) => s.to_string(),
-                    Object::Int(i) => i.to_string(),
-                    Object::Float(f) => f.to_string(),
-                    Object::Bool(b) => {
-                        if *b {
-                            "true".to_owned()
-                        } else {
-                            "false".to_owned()
-                        }
-                    }
-                    Object::None => "null".to_owned(),
-                    _ => return Err(type_error("keys must be str, int, float, bool, or None")),
-                };
-                map.insert(key, object_to_json(v)?);
-            }
-            Value::Object(map)
-        }
-        _ => {
-            return Err(type_error(format!(
-                "Object of type {} is not JSON serializable",
-                obj.type_name()
-            )))
-        }
-    })
-}
+// `Map` is unused after the rewrite, but `serde_json::Map` is still
+// referenced by the decoder import.
+#[allow(dead_code)]
+fn _unused_map_anchor(_: Map<String, Value>) {}

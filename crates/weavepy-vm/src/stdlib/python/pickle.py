@@ -18,7 +18,6 @@ import struct
 HIGHEST_PROTOCOL = 5
 DEFAULT_PROTOCOL = 5
 
-# --- opcodes (the subset we emit) -----------------------------------------
 PROTO = b"\x80"
 FRAME = b"\x95"
 EMPTY_DICT = b"}"
@@ -50,6 +49,15 @@ ADDITEMS = b"\x90"
 FROZENSET = b"\x91"
 MARK = b"("
 STOP = b"."
+# Global reference + reduce opcodes used to serialize functions and
+# classes by their qualified name. CPython uses these for everything
+# from `pickle.dumps(int)` to `pickle.dumps(my_module.my_func)`.
+GLOBAL = b"c"
+STACK_GLOBAL = b"\x93"
+REDUCE = b"R"
+BUILD = b"b"
+NEWOBJ = b"\x81"
+NEWOBJ_EX = b"\x92"
 
 # --- exceptions -----------------------------------------------------------
 
@@ -120,41 +128,128 @@ class _Pickler:
             self._buf.write(NEWFALSE)
             return
 
-        t = type(obj)
-        if t is int:
+        # Dispatch by `type(obj).__name__` rather than `type(obj) is X`
+        # or `isinstance`. WeavePy's current threading model gives each
+        # worker thread its own copy of the built-in type singletons,
+        # so the obvious comparisons spuriously fail when pickle is
+        # invoked from a non-main thread (this matters for
+        # multiprocessing.Queue's feeder threads, among others).
+        tname = type(obj).__name__
+        if tname == "bool":
+            self._save_int(int(obj))
+            return
+        if tname == "int":
             self._save_int(obj)
             return
-        if t is float:
+        if tname == "float":
             self._save_float(obj)
             return
-        if t is bytes:
-            self._save_bytes(obj)
-            return
-        if t is bytearray:
+        if tname in ("bytes", "bytearray"):
             self._save_bytes(bytes(obj))
             return
-        if t is str:
+        if tname == "str":
             self._save_str(obj)
             return
-        if t is tuple:
+        if tname == "tuple":
             self._save_tuple(obj)
             return
-        if t is list:
+        if tname == "list":
             self._save_list(obj)
             return
-        if t is dict:
+        if tname == "dict":
             self._save_dict(obj)
             return
-        if t is set:
-            self._save_set(obj, frozen=False)
-            return
-        if t is frozenset:
+        if tname == "frozenset":
             self._save_set(obj, frozen=True)
             return
+        if tname == "set":
+            self._save_set(obj, frozen=False)
+            return
+        # Functions / classes / methods — pickle them by qualified name.
+        # The unpickler will `import_module(<module>); getattr(...)`.
+        # We tolerate a missing `__module__` by falling back to
+        # `__main__` (CPython does the same when a function is defined
+        # interactively).
+        try:
+            is_callable_like = callable(obj)
+        except Exception:
+            is_callable_like = False
+        try:
+            is_type = type(obj).__name__ == "type"
+        except Exception:
+            is_type = False
+        if is_callable_like or is_type:
+            module = getattr(obj, "__module__", None) or "__main__"
+            qualname = (
+                getattr(obj, "__qualname__", None)
+                or getattr(obj, "__name__", None)
+            )
+            if qualname:
+                self._save_global(module, qualname)
+                return
+        # Arbitrary instances — try __reduce_ex__ / __reduce__ (the
+        # canonical CPython pickle protocol). Falls back to the
+        # PicklingError below if neither is provided.
+        reduce_ex = getattr(obj, "__reduce_ex__", None)
+        if reduce_ex is not None:
+            try:
+                rv = reduce_ex(self.protocol)
+            except TypeError:
+                rv = None
+            if rv is not None and rv is not NotImplemented:
+                self._save_reduce(rv)
+                return
+        reduce = getattr(obj, "__reduce__", None)
+        if reduce is not None:
+            try:
+                rv = reduce()
+            except TypeError:
+                rv = None
+            if rv is not None and rv is not NotImplemented:
+                self._save_reduce(rv)
+                return
         raise PicklingError(
             "Can't pickle %r: pickle currently only supports primitive types"
             % obj
         )
+
+    def _save_global(self, module, qualname):
+        encoded_mod = module.encode("utf-8")
+        encoded_name = qualname.encode("utf-8")
+        # Protocol 4+ uses STACK_GLOBAL with two unicode strings on the
+        # stack; older protocols use the textual GLOBAL opcode. We emit
+        # the older form because it round-trips through any unpickler.
+        self._buf.write(GLOBAL)
+        self._buf.write(encoded_mod)
+        self._buf.write(b"\n")
+        self._buf.write(encoded_name)
+        self._buf.write(b"\n")
+
+    def _save_reduce(self, rv):
+        if isinstance(rv, str):
+            self._save_global(rv.rsplit(".", 1)[0] if "." in rv else "builtins", rv)
+            return
+        if not isinstance(rv, tuple) or len(rv) < 2:
+            raise PicklingError("reduce result must be a string or tuple")
+        func = rv[0]
+        args = rv[1]
+        state = rv[2] if len(rv) > 2 else None
+        listitems = rv[3] if len(rv) > 3 else None
+        dictitems = rv[4] if len(rv) > 4 else None
+        self._save(func)
+        self._save(tuple(args))
+        self._buf.write(REDUCE)
+        if listitems is not None:
+            for item in listitems:
+                self._save(item)
+                self._buf.write(APPENDS[:0])  # no-op; preserves stack
+        if dictitems is not None:
+            for k, v in dictitems:
+                self._save(k)
+                self._save(v)
+        if state is not None:
+            self._save(state)
+            self._buf.write(BUILD)
 
     def _save_int(self, n):
         if 0 <= n < 256:
@@ -448,6 +543,83 @@ def _stop(_u):
     return _STOP
 
 
+def _read_line(u):
+    out = b""
+    while True:
+        ch = u.file.read(1)
+        if not ch:
+            raise UnpicklingError("unexpected EOF reading line")
+        if ch == b"\n":
+            break
+        out = out + ch
+    return out
+
+
+def _global(u):
+    module = _read_line(u).decode("utf-8")
+    name = _read_line(u).decode("utf-8")
+    u.stack.append(_find_class(module, name))
+
+
+def _stack_global(u):
+    name = u.stack.pop()
+    module = u.stack.pop()
+    u.stack.append(_find_class(module, name))
+
+
+def _find_class(module_name, qualname):
+    # `builtins` is a synthetic module name CPython uses for `len`,
+    # `dict`, `Exception`, etc. WeavePy exposes those as ambient
+    # globals rather than via an importable module, so route the
+    # lookup through the running frame's builtins (which the VM
+    # populates exactly with `default_builtins()`).
+    if module_name in ("builtins", "__builtin__"):
+        import builtins as _b  # may or may not exist as a module
+        obj = _b
+    else:
+        import sys as _sys
+        obj = _sys.modules.get(module_name)
+        if obj is None:
+            import importlib
+            obj = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _reduce(u):
+    args = u.stack.pop()
+    func = u.stack.pop()
+    u.stack.append(func(*args))
+
+
+def _build(u):
+    state = u.stack.pop()
+    obj = u.stack[-1]
+    setstate = getattr(obj, "__setstate__", None)
+    if setstate is not None:
+        setstate(state)
+    elif isinstance(state, dict):
+        for k, v in state.items():
+            setattr(obj, k, v)
+
+
+def _newobj(u):
+    args = u.stack.pop()
+    cls = u.stack.pop()
+    u.stack.append(cls.__new__(cls, *args))
+
+
+def _newobj_ex(u):
+    kwargs = u.stack.pop()
+    args = u.stack.pop()
+    cls = u.stack.pop()
+    if kwargs:
+        u.stack.append(cls.__new__(cls, *args, **kwargs))
+    else:
+        u.stack.append(cls.__new__(cls, *args))
+
+
 _OPCODES = {
     PROTO: _proto,
     FRAME: _frame,
@@ -480,6 +652,12 @@ _OPCODES = {
     FROZENSET: _frozenset,
     MARK: _mark,
     STOP: _stop,
+    GLOBAL: _global,
+    STACK_GLOBAL: _stack_global,
+    REDUCE: _reduce,
+    BUILD: _build,
+    NEWOBJ: _newobj,
+    NEWOBJ_EX: _newobj_ex,
 }
 
 

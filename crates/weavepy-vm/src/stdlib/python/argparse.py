@@ -266,6 +266,115 @@ class ArgumentParser:
 
         return namespace
 
+    def parse_known_args(self, args=None, namespace=None):
+        """Same as :meth:`parse_args`, but tolerates extra arguments.
+
+        Returns ``(namespace, remaining_args)``. Used by stdlib modules
+        like ``pdb`` and ``unittest`` that want to strip off the flags
+        they understand and forward the rest to user code.
+        """
+        if args is None:
+            args = list(sys.argv[1:])
+        else:
+            args = list(args)
+        if namespace is None:
+            namespace = Namespace()
+        self._set_defaults(namespace)
+
+        consumed = [False] * len(args)
+        seen_optionals = set()
+        positional_values = []
+
+        # Two passes: first collect known options, then assign
+        # positionals. This mirrors CPython's behaviour where unknowns
+        # get returned untouched.
+        i = 0
+        while i < len(args):
+            token = args[i]
+            if token == "--":
+                # Everything after is positional.
+                consumed[i] = True
+                for j in range(i + 1, len(args)):
+                    if not consumed[j]:
+                        positional_values.append(args[j])
+                        consumed[j] = True
+                break
+            if token.startswith("-"):
+                action = self._flag_action(token)
+                if action is None:
+                    # Unknown flag — leave for caller.
+                    i += 1
+                    continue
+                consumed[i] = True
+                seen_optionals.add(action.dest)
+                if action.action == "help":
+                    self.print_help()
+                    sys.exit(0)
+                elif action.action == "store_true" or action.action == "store_false":
+                    setattr(namespace, action.dest, action.const)
+                    i += 1
+                    continue
+                elif action.action == "count":
+                    current = getattr(namespace, action.dest, 0) or 0
+                    setattr(namespace, action.dest, current + 1)
+                    i += 1
+                    continue
+                if "=" in token and token.startswith("--"):
+                    value = token.split("=", 1)[1]
+                    i += 1
+                else:
+                    if i + 1 >= len(args):
+                        self.error("argument " + token + ": expected one argument")
+                    value = args[i + 1]
+                    consumed[i + 1] = True
+                    i += 2
+                self._apply_action(action, value, namespace)
+            else:
+                i += 1
+
+        for k, was in enumerate(consumed):
+            if not was and not args[k].startswith("-"):
+                positional_values.append(args[k])
+                consumed[k] = True
+
+        positionals = [a for a in self._actions if not a.is_optional]
+        for action in positionals:
+            nargs = action.nargs
+            if nargs in (None, 1):
+                if positional_values:
+                    value = positional_values.pop(0)
+                    self._apply_action(action, value, namespace)
+                else:
+                    setattr(namespace, action.dest, action.default)
+            elif nargs == "*":
+                values = [
+                    action.type(v) if action.type else v for v in positional_values
+                ]
+                positional_values = []
+                setattr(namespace, action.dest, values)
+            elif nargs == "+":
+                values = [
+                    action.type(v) if action.type else v for v in positional_values
+                ]
+                positional_values = []
+                setattr(namespace, action.dest, values)
+            elif nargs == "?":
+                if positional_values:
+                    value = positional_values.pop(0)
+                    self._apply_action(action, value, namespace)
+                else:
+                    setattr(namespace, action.dest, action.default)
+            elif isinstance(nargs, int):
+                taken = positional_values[:nargs]
+                positional_values = positional_values[nargs:]
+                values = [action.type(v) if action.type else v for v in taken]
+                setattr(namespace, action.dest, values)
+
+        # Anything still in `args` that wasn't consumed is "unknown".
+        remaining = [args[k] for k in range(len(args)) if not consumed[k]]
+        remaining.extend(positional_values)
+        return namespace, remaining
+
     def format_help(self):
         lines = []
         if self.description:

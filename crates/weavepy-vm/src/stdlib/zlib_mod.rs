@@ -97,6 +97,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -205,6 +206,7 @@ fn zlib_compressobj(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "compress",
                 call: Box::new(compress),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -212,6 +214,7 @@ fn zlib_compressobj(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "flush",
                 call: Box::new(flush),
+                call_kw: None,
             })),
         );
     }
@@ -245,6 +248,7 @@ fn zlib_decompressobj(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "decompress",
                 call: Box::new(decompress),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -252,6 +256,7 @@ fn zlib_decompressobj(_args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "flush",
                 call: Box::new(flush),
+                call_kw: None,
             })),
         );
     }

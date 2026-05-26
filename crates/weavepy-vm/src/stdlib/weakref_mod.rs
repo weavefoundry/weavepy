@@ -67,6 +67,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -160,6 +161,7 @@ fn build_ref_object(target: Object, callback: Object) -> Object {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "__call__",
                 call: Box::new(call_target),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -167,6 +169,7 @@ fn build_ref_object(target: Object, callback: Object) -> Object {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "_get",
                 call: Box::new(get_target),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -174,6 +177,7 @@ fn build_ref_object(target: Object, callback: Object) -> Object {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "_clear",
                 call: Box::new(clear),
+                call_kw: None,
             })),
         );
         d.insert(DictKey(Object::from_static("__callback__")), callback);

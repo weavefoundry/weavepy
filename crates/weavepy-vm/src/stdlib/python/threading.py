@@ -534,7 +534,8 @@ class Thread:
             self._started.set()
             with _active_lock:
                 _active[self._ident] = self
-                del _limbo[self]
+                if self in _limbo:
+                    del _limbo[self]
         except Exception:
             with _active_lock:
                 if self in _limbo:
@@ -547,6 +548,22 @@ class Thread:
         pass
 
     def _bootstrap_inner(self):
+        # Race fix: the parent thread's `start()` registers
+        # `_active[ident] = self` *after* `_thread.start_new_thread`
+        # returns. On slow / busy hosts the worker can run
+        # `current_thread()` before that registration lands, falling
+        # back to `_main` and surfacing the parent's identity. Re-do
+        # the registration here using our own ident before any user
+        # code observes us.
+        my_ident = _thread.get_ident()
+        if self._ident is None:
+            self._ident = my_ident
+        if self._native_id is None:
+            self._native_id = my_ident
+        with _active_lock:
+            _active[my_ident] = self
+            if self in _limbo:
+                del _limbo[self]
         try:
             self.run()
         except SystemExit:

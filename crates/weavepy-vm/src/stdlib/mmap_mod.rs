@@ -89,6 +89,7 @@ fn mmap_type() -> Rc<TypeObject> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name,
                 call: Box::new(fn_),
+                call_kw: None,
             })),
         );
     }

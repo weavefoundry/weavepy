@@ -204,6 +204,41 @@ class OrderedDict(_MappingMixin):
     this is mostly the additional ``move_to_end`` /
     ``popitem(last=...)`` semantics."""
 
+    def __init__(self, *args, **kwargs):
+        _MappingMixin.__init__(self)
+        if len(args) > 1:
+            raise TypeError(
+                f"expected at most 1 positional argument, got {len(args)}"
+            )
+        if args:
+            self.update(args[0])
+        if kwargs:
+            self.update(kwargs)
+
+    def setdefault(self, key, default=None):
+        if key in self._data:
+            return self._data[key]
+        self._data[key] = default
+        return default
+
+    def __eq__(self, other):
+        if isinstance(other, OrderedDict):
+            return (list(self.items()) == list(other.items()))
+        return dict(self) == other
+
+    def __ne__(self, other):
+        return not self == other
+
+    def copy(self):
+        return OrderedDict(self)
+
+    @classmethod
+    def fromkeys(cls, iterable, value=None):
+        d = cls()
+        for k in iterable:
+            d[k] = value
+        return d
+
     def move_to_end(self, key, last=True):
         if key not in self._data:
             raise KeyError(key)

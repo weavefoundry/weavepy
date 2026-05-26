@@ -344,6 +344,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -377,6 +378,7 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: $name,
                     call: Box::new($body),
+                    call_kw: None,
                 })),
             )
         };
@@ -1018,6 +1020,7 @@ fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "read",
                 call: Box::new(read),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -1025,6 +1028,7 @@ fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "write",
                 call: Box::new(write),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -1032,6 +1036,7 @@ fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "close",
                 call: Box::new(close),
+                call_kw: None,
             })),
         );
     }

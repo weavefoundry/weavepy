@@ -22,8 +22,10 @@ pub mod report;
 pub mod runner;
 
 pub use regrtest::{
-    discover as discover_regrtest, report_to_markdown as regrtest_to_markdown, run_all,
-    Expectations, RegrtestFile, RegrtestSummary, TestReport, TestStatus, DEFAULT_TIMEOUT_SECS,
+    discover as discover_regrtest, discover_with as discover_regrtest_with,
+    report_to_markdown as regrtest_to_markdown, run_all, run_all_with, run_one, run_one_with,
+    DiscoveryOptions, ExecutionMode, Expectations, RegrtestFile, RegrtestSummary, RunnerOptions,
+    TestReport, TestStatus, DEFAULT_TIMEOUT_SECS,
 };
 pub use runner::{run_file, FileReport, PhaseOutcome};
 

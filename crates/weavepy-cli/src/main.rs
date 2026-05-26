@@ -37,6 +37,37 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// up front in `main()` keeps the unsugar trivial.
 const SUBCOMMANDS: &[&str] = &["regrtest"];
 
+/// Run a `weavepy --multiprocessing-fork` child. The parent has
+/// arranged for the pickled task to arrive on the fd named in
+/// `WEAVEPY_MP_PAYLOAD_FD` (defaults to `3`); we simply hand off to
+/// `multiprocessing._run_spawn_child()`, which knows how to read the
+/// payload, restore sys.path / cwd, and invoke the target callable.
+///
+/// The child's exit code is the value `_run_spawn_child()` returns,
+/// stashed in a sentinel env var (`WEAVEPY_MP_EXIT_CODE`) so we can
+/// re-read it from Rust without re-entering the VM.
+fn run_multiprocessing_child() -> ExitCode {
+    // `_run_spawn_child` invokes the worker target and then calls
+    // `_multiprocessing._exit(code)` which `std::process::exit`s
+    // directly — so this `Ok(())` arm is only reached when the worker
+    // chose to fall through cleanly without an explicit exit (treated
+    // as success).
+    let snippet = "import multiprocessing, _multiprocessing\n\
+                   _mp_code = multiprocessing._run_spawn_child()\n\
+                   _multiprocessing._exit(int(_mp_code) if _mp_code is not None else 0)\n";
+    let opts = RunOptions::new("<multiprocessing-fork>")
+        .with_argv(vec!["weavepy".to_owned()])
+        .with_flags(InterpreterFlags::default());
+    match weavepy::run_source_with_options(snippet, &opts) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "{}", err.format(snippet, "<multiprocessing-fork>"));
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// CPython 3.13's `python(1)` flag set.
 ///
 /// Defaults match invoking `python` with no flags. Most of the
@@ -226,10 +257,20 @@ The following implementation-specific options are available:
 fn main() -> ExitCode {
     init_tracing();
 
+    let raw: Vec<String> = env::args().collect();
+
+    // Multiprocessing spawn-child entry point. The parent passes
+    // `--multiprocessing-fork` and an optional payload fd via
+    // `WEAVEPY_MP_PAYLOAD_FD`; we hand off to
+    // `multiprocessing._run_spawn_child()` which reads the pickled
+    // task off the inherited fd and runs it.
+    if raw.iter().any(|a| a == "--multiprocessing-fork") {
+        return run_multiprocessing_child();
+    }
+
     // Bare subcommand dispatch (e.g. `weavepy regrtest ...`) — must
     // run before clap, which would try to interpret the subcommand as
     // a positional `script` and trip on unknown flags after it.
-    let raw: Vec<String> = env::args().collect();
     if raw.len() >= 2 && SUBCOMMANDS.contains(&raw[1].as_str()) {
         let sub = raw[1].clone();
         let rest: Vec<String> = std::iter::once(format!("weavepy {sub}"))
@@ -260,8 +301,75 @@ fn main() -> ExitCode {
     }
 }
 
+/// Split argv at the first `-c CMD` / `-m MODULE` / `script` / `-` / `--`
+/// boundary so flags meant for the child program don't get re-parsed by
+/// clap. Returns `(weavepy_args, mode, child_args)`.
+///
+/// `mode` is one of:
+/// - `Some(("c", "<cmd>"))` — `-c CMD` was found.
+/// - `Some(("m", "<mod>"))` — `-m MOD` was found.
+/// - `Some(("s", "<path>"))` — a positional script was found.
+/// - `Some(("-", ""))`     — `-` (stdin) was found.
+/// - `None`                — interactive mode (no boundary).
+fn split_argv(raw: Vec<String>) -> (Vec<String>, Option<(&'static str, String)>, Vec<String>) {
+    let mut wp: Vec<String> = Vec::with_capacity(raw.len());
+    let mut iter = raw.into_iter();
+    if let Some(prog) = iter.next() {
+        wp.push(prog);
+    }
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            return (wp, None, iter.collect());
+        }
+        if arg == "-c" {
+            let cmd = iter.next().unwrap_or_default();
+            let rest: Vec<String> = iter.collect();
+            return (wp, Some(("c", cmd)), rest);
+        }
+        if arg == "-m" {
+            let m = iter.next().unwrap_or_default();
+            let rest: Vec<String> = iter.collect();
+            return (wp, Some(("m", m)), rest);
+        }
+        if arg.starts_with("-c") && arg.len() > 2 {
+            let cmd = arg[2..].to_owned();
+            let rest: Vec<String> = iter.collect();
+            return (wp, Some(("c", cmd)), rest);
+        }
+        if arg.starts_with("-m") && arg.len() > 2 {
+            let m = arg[2..].to_owned();
+            let rest: Vec<String> = iter.collect();
+            return (wp, Some(("m", m)), rest);
+        }
+        if arg == "-" {
+            let rest: Vec<String> = iter.collect();
+            return (wp, Some(("-", String::new())), rest);
+        }
+        if !arg.starts_with('-') {
+            // Positional script.
+            let rest: Vec<String> = iter.collect();
+            return (wp, Some(("s", arg)), rest);
+        }
+        wp.push(arg);
+    }
+    (wp, None, Vec::new())
+}
+
 fn real_main() -> Result<ExitCode> {
-    let cli = Cli::parse();
+    let raw: Vec<String> = env::args().collect();
+    let (wp_argv, mode, child_argv) = split_argv(raw);
+    // Re-parse the WeavePy-only slice with clap.
+    let mut cli = Cli::parse_from(wp_argv);
+    // Stuff `mode` back into the parsed Cli so the rest of real_main
+    // sees a consistent view.
+    match &mode {
+        Some(("c", cmd)) => cli.command = Some(cmd.clone()),
+        Some(("m", m)) => cli.module = Some(m.clone()),
+        Some(("s", path)) => cli.script = Some(PathBuf::from(path)),
+        Some(("-", _)) => cli.script = Some(PathBuf::from("-")),
+        _ => {}
+    }
+    cli.args = child_argv;
 
     if cli.help {
         print!("{HELP_BODY}");
@@ -298,9 +406,6 @@ fn real_main() -> Result<ExitCode> {
 
     if let Some(source) = cli.command.clone() {
         let mut argv = vec!["-c".to_owned()];
-        if let Some(p) = cli.script.as_ref() {
-            argv.push(p.to_string_lossy().into_owned());
-        }
         argv.extend(cli.args.iter().cloned());
         let opts = RunOptions::new("<string>")
             .with_argv(argv)
@@ -315,11 +420,7 @@ fn real_main() -> Result<ExitCode> {
     }
 
     if let Some(module) = cli.module.clone() {
-        let mut extra = Vec::new();
-        if let Some(p) = cli.script.as_ref() {
-            extra.push(p.to_string_lossy().into_owned());
-        }
-        extra.extend(cli.args.iter().cloned());
+        let extra = cli.args.clone();
         run_module(&module, extra, &flags, &extra_path)?;
         if flags.inspect {
             run_repl(flags, env.startup.as_deref(), Vec::new())?;
@@ -459,39 +560,84 @@ impl EnvOverrides {
     }
 }
 
+/// Escape a string into a Python single-quoted string literal.
+fn quote_py_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn run_module(
     name: &str,
     args: Vec<String>,
     flags: &InterpreterFlags,
     extra_path: &[PathBuf],
 ) -> Result<()> {
+    // First look on the filesystem for a `<name>.py` / `<name>/__init__.py`.
+    // If we find one, run it directly so the filename / __file__ honour
+    // the host. Otherwise fall back to `runpy.run_module(...)` which can
+    // resolve frozen built-in modules (`venv`, `pip`, `pdb`, …).
     let mut argv = vec![name.to_owned()];
-    argv.extend(args);
+    argv.extend(args.iter().cloned());
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let rel: PathBuf = name.split('.').collect();
     let mut search: Vec<PathBuf> = vec![cwd.clone()];
     search.extend(extra_path.iter().cloned());
-    let (source_path, _) = search
-        .into_iter()
-        .find_map(|dir| {
-            let m = dir.join(&rel).with_extension("py");
-            if m.is_file() {
-                Some((m, false))
-            } else {
-                let init = dir.join(&rel).join("__init__.py");
-                init.is_file().then_some((init, true))
-            }
-        })
-        .with_context(|| format!("No module named '{name}'"))?;
-    let source = fs::read_to_string(&source_path)
-        .with_context(|| format!("failed to read {}", source_path.display()))?;
-    let filename = source_path.display().to_string();
-    let opts = RunOptions::new(filename.clone())
+    let on_disk = search.into_iter().find_map(|dir| {
+        let m = dir.join(&rel).with_extension("py");
+        if m.is_file() {
+            return Some((m, false));
+        }
+        let init = dir.join(&rel).join("__init__.py");
+        init.is_file().then_some((init, true))
+    });
+    if let Some((source_path, _)) = on_disk {
+        let source = fs::read_to_string(&source_path)
+            .with_context(|| format!("failed to read {}", source_path.display()))?;
+        let filename = source_path.display().to_string();
+        let opts = RunOptions::new(filename.clone())
+            .with_argv(argv)
+            .with_extra_path(extra_path.to_vec())
+            .with_script_dir(cwd)
+            .with_flags(flags.clone());
+        return run_source_with_options(&source, &opts);
+    }
+    // Frozen / built-in module path — delegate to runpy. The
+    // bootstrap is a tiny snippet that imports runpy and asks it to
+    // run the requested module as `__main__`. We make the host argv
+    // visible up front so the loaded module's `sys.argv` matches
+    // CPython's `python -m`.
+    let mut bootstrap = String::from("import runpy, sys\n");
+    bootstrap.push_str("try:\n");
+    bootstrap.push_str(&format!(
+        "    runpy.run_module({}, run_name='__main__', alter_sys=True)\n",
+        quote_py_string(name)
+    ));
+    bootstrap.push_str("except ImportError as e:\n");
+    bootstrap.push_str(&format!(
+        "    sys.stderr.write(\"weavepy: No module named '{}': \" + str(e) + \"\\n\")\n",
+        name
+    ));
+    bootstrap.push_str("    sys.exit(1)\n");
+    let _ = args;
+    let opts = RunOptions::new(format!("<runpy:{name}>"))
         .with_argv(argv)
         .with_extra_path(extra_path.to_vec())
         .with_script_dir(cwd)
         .with_flags(flags.clone());
-    run_source_with_options(&source, &opts)
+    run_source_with_options(&bootstrap, &opts)
 }
 
 fn run_path(

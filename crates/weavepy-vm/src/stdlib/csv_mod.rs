@@ -66,6 +66,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         call: Box::new(body),
+        call_kw: None,
     }))
 }
 
@@ -270,6 +271,7 @@ fn writer_call(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "writerow",
                 call: Box::new(writerow),
+                call_kw: None,
             })),
         );
         d.insert(
@@ -277,6 +279,7 @@ fn writer_call(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "writerows",
                 call: Box::new(writerows),
+                call_kw: None,
             })),
         );
     }
