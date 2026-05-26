@@ -19,11 +19,19 @@ work.
 > typing) and is green on `main`. `RFC 0028` adds the PEP 3118 buffer
 > protocol, PEP 590 vectorcall, the full `PyType_FromSpec[WithBases]`
 > slot surface, and a `_ndarray.c` C-extension fixture exercising the
-> stack end-to-end — paving the way for `numpy`, `pandas`, `pillow`,
-> and other binary-extension consumers. The CPython `Lib/test/`
-> allowlist remains an aspirational target — see
-> `tests/regrtest/expectations.toml` for the per-test baseline. Expect
-> small breaking changes around the edges as the long tail catches up.
+> stack end-to-end. `RFC 0029` closes the loop: the `datetime` C-API,
+> the full `PyCapsule` surface, keyword-aware `PyArg_ParseTupleAndKeywords`,
+> property-aware descriptor dispatch in `tp_getset`, a numpy-shaped
+> `_numpylike.c` fixture exercising `dtype`/ufuncs/buffer-protocol/
+> reshape/`mask_select`/`PyDateTime`, a PEP 425 wheel-tag matcher in
+> `_minipip` (so binary wheels resolve), and an end-to-end regression
+> test that installs a binary wheel under a private prefix and imports
+> the bundled extension through the regular `ExtensionFileLoader`
+> path — proving the `numpy` install-and-run story works
+> mechanically. The CPython `Lib/test/` allowlist remains an
+> aspirational target — see `tests/regrtest/expectations.toml` for
+> the per-test baseline. Expect small breaking changes around the
+> edges as the long tail catches up.
 
 ## Repository layout
 

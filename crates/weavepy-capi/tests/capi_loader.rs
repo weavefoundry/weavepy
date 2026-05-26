@@ -82,7 +82,6 @@ fn dlopen_smalltest_produces_module() {
             _ => None,
         })
         .collect();
-    eprintln!("module keys: {names:?}");
     assert!(names.iter().any(|n| n == "add"), "missing add: {names:?}");
     assert!(
         names.iter().any(|n| n == "Counter"),

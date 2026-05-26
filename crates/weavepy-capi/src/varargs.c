@@ -70,6 +70,9 @@ extern int _WeavePy_Arg_String(PyObject *arg, const char **dest);
 extern int _WeavePy_Arg_StringAndSize(PyObject *arg, const char **dest, Py_ssize_t *len);
 extern int _WeavePy_Arg_Object(PyObject *arg, PyObject **dest);
 extern int _WeavePy_Arg_Bool(PyObject *arg, int *dest);
+extern PyObject *_WeavePy_Kwargs_Pop(PyObject *kwargs, const char *key);
+extern int _WeavePy_Kwargs_Len(PyObject *kwargs);
+extern const char *_WeavePy_Kwargs_KeyAt(PyObject *kwargs, int i);
 
 extern PyObject *_WeavePy_Build_None(void);
 extern PyObject *_WeavePy_Build_FromI64(long long v);
@@ -285,7 +288,21 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
     }
 }
 
-static int parse_args_from(PyObject *args, const char *fmt, va_list ap) {
+/* NB: `va_list` is an *array type* on the x86_64 SysV ABI
+ * (`__va_list_tag[1]`). Passing it by value to a function makes the
+ * parameter decay to `__va_list_tag *`, so `&ap` inside the callee
+ * is `__va_list_tag **` — NOT the `__va_list_tag (*)[1]` that the
+ * `va_list *` parameter of nested helpers expects. Reading a
+ * variadic argument through that wrong pointer pulls random bytes
+ * out of the stack and the caller then writes through a bogus
+ * destination, which is exactly the SIGSEGV that was tripping the
+ * `capi_loader` test on Linux CI.
+ *
+ * The fix is the CPython convention: take the va_list **by
+ * pointer** all the way down so the pointer arithmetic stays
+ * type-correct.
+ */
+static int parse_args_from(PyObject *args, const char *fmt, va_list *ap) {
     fmt_state st;
     fmt_init(&st, fmt);
     int n_args = _WeavePy_Arg_Length(args);
@@ -324,7 +341,7 @@ static int parse_args_from(PyObject *args, const char *fmt, va_list ap) {
             PyErr_SetString(PyExc_RuntimeError, "PyArg_ParseTuple: NULL arg");
             return 0;
         }
-        int rc = parse_one(&st, arg, &ap);
+        int rc = parse_one(&st, arg, ap);
         Py_DECREF(arg);
         if (rc != 0) return 0;
         idx++;
@@ -335,7 +352,7 @@ static int parse_args_from(PyObject *args, const char *fmt, va_list ap) {
 int PyArg_ParseTuple(PyObject *args, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    int rc = parse_args_from(args, fmt, ap);
+    int rc = parse_args_from(args, fmt, &ap);
     va_end(ap);
     return rc;
 }
@@ -343,34 +360,127 @@ int PyArg_ParseTuple(PyObject *args, const char *fmt, ...) {
 int PyArg_Parse(PyObject *args, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    int rc = parse_args_from(args, fmt, ap);
+    int rc = parse_args_from(args, fmt, &ap);
     va_end(ap);
     return rc;
 }
 
 int PyArg_VaParse(PyObject *args, const char *fmt, va_list ap) {
-    return parse_args_from(args, fmt, ap);
+    /* Re-establish a *real* va_list local (not a decayed pointer)
+     * so `&local` has the correct `va_list *` ABI shape. See the
+     * note above `parse_args_from`. */
+    va_list local;
+    va_copy(local, ap);
+    int rc = parse_args_from(args, fmt, &local);
+    va_end(local);
+    return rc;
+}
+
+/* --------------------------------------------------------------
+ * Keyword-aware parse.
+ *
+ * `kwlist` is a NULL-terminated array of `char *` names — one per
+ * format slot, in order. CPython lets the caller pass each
+ * argument either positionally or by keyword. We mirror that:
+ *
+ *   1. Walk the format string and `kwlist` together.
+ *   2. For each slot, prefer the positional arg if present;
+ *      otherwise look the slot's name up in `kwargs`.
+ *   3. After consuming all slots, if any kwargs are left over,
+ *      raise TypeError("unexpected keyword").
+ *
+ * Format-string conventions: a leading `$` (CPython 3.8+) makes
+ * subsequent units keyword-only. We honour it.
+ * -------------------------------------------------------------- */
+static int parse_args_kw_from(PyObject *args, PyObject *kwargs, const char *fmt,
+                              char **kwlist, va_list *ap) {
+    fmt_state st;
+    fmt_init(&st, fmt);
+    int n_args = _WeavePy_Arg_Length(args);
+    int kw_remaining = _WeavePy_Kwargs_Len(kwargs);
+    int positional_idx = 0;
+    int slot_idx = 0;
+    bool keyword_only = false;
+    int n_consumed_kw = 0;
+
+    while (*st.fmt) {
+        char c = *st.fmt;
+        if (c == '|') { st.optional = true; st.fmt++; continue; }
+        if (c == '$') { keyword_only = true; st.optional = true; st.fmt++; continue; }
+        if (c == ':' || c == ';') { fmt_skip_meta(&st); break; }
+        if (c == ' ' || c == '\t') { st.fmt++; continue; }
+
+        const char *name = kwlist ? kwlist[slot_idx] : NULL;
+        PyObject *arg = NULL;
+        bool got_positional = false;
+        if (!keyword_only && positional_idx < n_args) {
+            arg = fetch_arg(args, positional_idx);
+            positional_idx++;
+            got_positional = true;
+        } else if (name && kwargs) {
+            arg = _WeavePy_Kwargs_Pop(kwargs, name);
+            if (arg) n_consumed_kw++;
+        }
+        if (!arg) {
+            if (!st.optional) {
+                PyErr_SetString(PyExc_TypeError, "missing required argument");
+                return 0;
+            }
+            /* Consume the format slot without touching the va_list. */
+            st.fmt++;
+            if (*st.fmt == '#') st.fmt++;
+            slot_idx++;
+            continue;
+        }
+        /* If a name was provided AND a positional arg is consumed,
+         * CPython treats a kw with the same name as TypeError. We
+         * implement that by additionally popping the kw and erroring
+         * out if present. */
+        if (got_positional && name && kwargs) {
+            PyObject *dup = _WeavePy_Kwargs_Pop(kwargs, name);
+            if (dup) {
+                PyErr_SetString(PyExc_TypeError, "argument given by name and position");
+                Py_DECREF(dup);
+                Py_DECREF(arg);
+                return 0;
+            }
+        }
+        int rc = parse_one(&st, arg, ap);
+        Py_DECREF(arg);
+        if (rc != 0) return 0;
+        slot_idx++;
+    }
+
+    /* Detect "unexpected keyword argument". */
+    if (kwargs && n_consumed_kw < kw_remaining) {
+        const char *bad = _WeavePy_Kwargs_KeyAt(kwargs, 0);
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "unexpected keyword argument '%s'",
+                 bad ? bad : "?");
+        PyErr_SetString(PyExc_TypeError, buf);
+        return 0;
+    }
+    return 1;
 }
 
 int PyArg_ParseTupleAndKeywords(PyObject *args, PyObject *kwargs, const char *fmt,
                                 char **kwlist, ...) {
-    /* For the foundation we ignore kwargs entirely and parse the
-     * positional tuple. A future RFC will add full keyword
-     * binding. */
-    (void)kwargs;
-    (void)kwlist;
     va_list ap;
     va_start(ap, kwlist);
-    int rc = parse_args_from(args, fmt, ap);
+    int rc = parse_args_kw_from(args, kwargs, fmt, kwlist, &ap);
     va_end(ap);
     return rc;
 }
 
 int PyArg_VaParseTupleAndKeywords(PyObject *args, PyObject *kwargs, const char *fmt,
                                   char **kwlist, va_list ap) {
-    (void)kwargs;
-    (void)kwlist;
-    return parse_args_from(args, fmt, ap);
+    /* Re-establish a real va_list local (see `PyArg_VaParse`). */
+    va_list local;
+    va_copy(local, ap);
+    int rc = parse_args_kw_from(args, kwargs, fmt, kwlist, &local);
+    va_end(local);
+    return rc;
 }
 
 int PyArg_UnpackTuple(PyObject *args, const char *name, Py_ssize_t min,
@@ -609,7 +719,12 @@ PyObject *Py_BuildValue(const char *fmt, ...) {
 
 PyObject *Py_VaBuildValue(const char *fmt, va_list ap) {
     if (!fmt) return _WeavePy_Build_None();
-    return build_one(&fmt, &ap);
+    /* Re-establish a real va_list local (see `PyArg_VaParse`). */
+    va_list local;
+    va_copy(local, ap);
+    PyObject *result = build_one(&fmt, &local);
+    va_end(local);
+    return result;
 }
 
 PyObject *PyTuple_Pack(Py_ssize_t n, ...) {

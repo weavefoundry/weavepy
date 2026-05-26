@@ -21,6 +21,7 @@ use crate::argparse;
 use crate::buffer;
 use crate::capsule;
 use crate::containers;
+use crate::datetime_api as dt;
 use crate::errors;
 use crate::genericalloc;
 use crate::lifecycle;
@@ -29,6 +30,7 @@ use crate::memoryview;
 use crate::module;
 use crate::numbers;
 use crate::object;
+use crate::singletons;
 use crate::slice;
 use crate::strings;
 use crate::types;
@@ -123,6 +125,29 @@ macro_rules! addr {
     ($f:expr) => {
         FnPtr($f as *const c_void)
     };
+}
+
+/// Take the address of a `#[no_mangle] pub static` (or `static mut`)
+/// global. Unlike functions, statics aren't naturally referenced by
+/// any code path on the Rust side, so the linker is free to dead-strip
+/// them on Linux. dlopen'd extension modules expect to resolve symbols
+/// like `PyExc_RuntimeError` and `_Py_NoneStruct` against the host
+/// binary, so we have to root every one of them through this table.
+///
+/// Note: the `mut` arm must come first because macro_rules picks the
+/// first matching arm without backtracking; a leading `mut` token
+/// would otherwise fail to parse against a bare `path` fragment.
+macro_rules! addr_static {
+    (mut $s:path) => {{
+        // SAFETY: We only ever take the address of the cell; taking
+        // the address of a `static mut` is sound and doesn't require
+        // synchronisation.
+        FnPtr(unsafe { core::ptr::addr_of_mut!($s) } as *const c_void)
+    }};
+    ($s:path) => {{
+        // SAFETY: Same as above; we never dereference.
+        FnPtr(unsafe { core::ptr::addr_of!($s) } as *const c_void)
+    }};
 }
 
 /// Sync wrapper so we can stash function pointers in a `static`.
@@ -358,7 +383,44 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(capsule::PyCapsule_GetPointer),
     addr!(capsule::PyCapsule_GetName),
     addr!(capsule::PyCapsule_SetPointer),
+    addr!(capsule::PyCapsule_SetName),
+    addr!(capsule::PyCapsule_GetDestructor),
+    addr!(capsule::PyCapsule_SetDestructor),
+    addr!(capsule::PyCapsule_GetContext),
+    addr!(capsule::PyCapsule_SetContext),
+    addr!(capsule::PyCapsule_Import),
     addr!(capsule::PyCapsule_IsValid),
+    // datetime_api.rs
+    addr!(dt::PyDate_FromDate),
+    addr!(dt::PyDateTime_FromDateAndTime),
+    addr!(dt::PyTime_FromTime),
+    addr!(dt::PyDelta_FromDSU),
+    addr!(dt::PyTimeZone_FromOffset),
+    addr!(dt::PyTimeZone_FromOffsetAndName),
+    addr!(dt::PyDateTime_GET_YEAR),
+    addr!(dt::PyDateTime_GET_MONTH),
+    addr!(dt::PyDateTime_GET_DAY),
+    addr!(dt::PyDateTime_DATE_GET_HOUR),
+    addr!(dt::PyDateTime_DATE_GET_MINUTE),
+    addr!(dt::PyDateTime_DATE_GET_SECOND),
+    addr!(dt::PyDateTime_DATE_GET_MICROSECOND),
+    addr!(dt::PyDateTime_TIME_GET_HOUR),
+    addr!(dt::PyDateTime_TIME_GET_MINUTE),
+    addr!(dt::PyDateTime_TIME_GET_SECOND),
+    addr!(dt::PyDateTime_TIME_GET_MICROSECOND),
+    addr!(dt::PyDateTime_DELTA_GET_DAYS),
+    addr!(dt::PyDateTime_DELTA_GET_SECONDS),
+    addr!(dt::PyDateTime_DELTA_GET_MICROSECONDS),
+    addr!(dt::PyDate_Check),
+    addr!(dt::PyDate_CheckExact),
+    addr!(dt::PyDateTime_Check),
+    addr!(dt::PyDateTime_CheckExact),
+    addr!(dt::PyTime_Check),
+    addr!(dt::PyTime_CheckExact),
+    addr!(dt::PyDelta_Check),
+    addr!(dt::PyDelta_CheckExact),
+    addr!(dt::PyTZInfo_Check),
+    addr!(dt::PyTZInfo_CheckExact),
     // buffer.rs
     addr!(buffer::PyBuffer_Release),
     addr!(buffer::PyBuffer_FillInfo),
@@ -404,6 +466,10 @@ static FORCE_LINK: &[FnPtr] = &[
     // slice.rs
     addr!(slice::PySlice_New),
     addr!(slice::PySlice_Check),
+    addr!(slice::PySlice_Unpack),
+    addr!(slice::PySlice_AdjustIndices),
+    addr!(slice::PySlice_GetIndicesEx),
+    addr!(slice::PySlice_GetIndices),
     // lifecycle.rs
     addr!(lifecycle::Py_Initialize),
     addr!(lifecycle::Py_InitializeEx),
@@ -469,6 +535,87 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(PyObject_CallMethod),
     addr!(PyObject_CallMethodObjArgs),
     addr!(PyObject_CallFunctionObjArgs),
+    // Static globals. Functions get picked up implicitly by the
+    // module-level references above, but `#[no_mangle] pub static`
+    // items have no automatic referrer in the host binary and would
+    // otherwise be stripped (and therefore unresolvable from dlopen'd
+    // extensions). Reference the address of each one so the linker
+    // emits them into the dynamic symbol table.
+    //
+    // singletons.rs
+    addr_static!(singletons::_Py_NoneStruct),
+    addr_static!(singletons::_Py_TrueStruct),
+    addr_static!(singletons::_Py_FalseStruct),
+    addr_static!(singletons::_Py_NotImplementedStruct),
+    addr_static!(singletons::_Py_EllipsisObject),
+    // datetime_api.rs
+    addr_static!(mut dt::PyDateTimeAPI),
+    addr_static!(dt::PyDateTimeAPI_Instance),
+    // errors.rs (PyExc_* exception type slots).
+    addr_static!(mut errors::PyExc_BaseException),
+    addr_static!(mut errors::PyExc_Exception),
+    addr_static!(mut errors::PyExc_ArithmeticError),
+    addr_static!(mut errors::PyExc_AssertionError),
+    addr_static!(mut errors::PyExc_AttributeError),
+    addr_static!(mut errors::PyExc_BufferError),
+    addr_static!(mut errors::PyExc_EOFError),
+    addr_static!(mut errors::PyExc_FloatingPointError),
+    addr_static!(mut errors::PyExc_GeneratorExit),
+    addr_static!(mut errors::PyExc_ImportError),
+    addr_static!(mut errors::PyExc_IndentationError),
+    addr_static!(mut errors::PyExc_IndexError),
+    addr_static!(mut errors::PyExc_KeyError),
+    addr_static!(mut errors::PyExc_KeyboardInterrupt),
+    addr_static!(mut errors::PyExc_LookupError),
+    addr_static!(mut errors::PyExc_MemoryError),
+    addr_static!(mut errors::PyExc_ModuleNotFoundError),
+    addr_static!(mut errors::PyExc_NameError),
+    addr_static!(mut errors::PyExc_NotImplementedError),
+    addr_static!(mut errors::PyExc_OSError),
+    addr_static!(mut errors::PyExc_OverflowError),
+    addr_static!(mut errors::PyExc_RecursionError),
+    addr_static!(mut errors::PyExc_ReferenceError),
+    addr_static!(mut errors::PyExc_RuntimeError),
+    addr_static!(mut errors::PyExc_StopAsyncIteration),
+    addr_static!(mut errors::PyExc_StopIteration),
+    addr_static!(mut errors::PyExc_SyntaxError),
+    addr_static!(mut errors::PyExc_SystemError),
+    addr_static!(mut errors::PyExc_SystemExit),
+    addr_static!(mut errors::PyExc_TabError),
+    addr_static!(mut errors::PyExc_TimeoutError),
+    addr_static!(mut errors::PyExc_TypeError),
+    addr_static!(mut errors::PyExc_UnboundLocalError),
+    addr_static!(mut errors::PyExc_UnicodeDecodeError),
+    addr_static!(mut errors::PyExc_UnicodeEncodeError),
+    addr_static!(mut errors::PyExc_UnicodeError),
+    addr_static!(mut errors::PyExc_UnicodeTranslateError),
+    addr_static!(mut errors::PyExc_ValueError),
+    addr_static!(mut errors::PyExc_ZeroDivisionError),
+    addr_static!(mut errors::PyExc_BlockingIOError),
+    addr_static!(mut errors::PyExc_BrokenPipeError),
+    addr_static!(mut errors::PyExc_ChildProcessError),
+    addr_static!(mut errors::PyExc_ConnectionAbortedError),
+    addr_static!(mut errors::PyExc_ConnectionError),
+    addr_static!(mut errors::PyExc_ConnectionRefusedError),
+    addr_static!(mut errors::PyExc_ConnectionResetError),
+    addr_static!(mut errors::PyExc_FileExistsError),
+    addr_static!(mut errors::PyExc_FileNotFoundError),
+    addr_static!(mut errors::PyExc_InterruptedError),
+    addr_static!(mut errors::PyExc_IsADirectoryError),
+    addr_static!(mut errors::PyExc_NotADirectoryError),
+    addr_static!(mut errors::PyExc_PermissionError),
+    addr_static!(mut errors::PyExc_ProcessLookupError),
+    addr_static!(mut errors::PyExc_Warning),
+    addr_static!(mut errors::PyExc_UserWarning),
+    addr_static!(mut errors::PyExc_DeprecationWarning),
+    addr_static!(mut errors::PyExc_PendingDeprecationWarning),
+    addr_static!(mut errors::PyExc_SyntaxWarning),
+    addr_static!(mut errors::PyExc_RuntimeWarning),
+    addr_static!(mut errors::PyExc_FutureWarning),
+    addr_static!(mut errors::PyExc_ImportWarning),
+    addr_static!(mut errors::PyExc_UnicodeWarning),
+    addr_static!(mut errors::PyExc_BytesWarning),
+    addr_static!(mut errors::PyExc_ResourceWarning),
 ];
 
 /// Hand-out of the table to ensure the static is referenced from

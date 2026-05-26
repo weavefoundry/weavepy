@@ -113,6 +113,26 @@ pub fn set_runtime_error(msg: impl Into<String>) {
     );
 }
 
+/// Bridge a [`RuntimeError`] produced by the VM into the thread-
+/// local pending-exception cell. Mirrors the small `install_runtime_error`
+/// helper that several individual modules used to roll
+/// themselves. Centralised here so every Rust-side bridge picks
+/// up the same class/value mapping.
+pub fn set_pending_from_runtime(err: RuntimeError) {
+    match err {
+        RuntimeError::PyException(pe) => {
+            let cls = match &pe.instance {
+                Object::Instance(inst) => Some(inst.class.clone()),
+                _ => None,
+            };
+            set_pending(cls, Object::from_str(pe.message()));
+        }
+        RuntimeError::Internal(msg) => {
+            set_runtime_error(msg);
+        }
+    }
+}
+
 /// Helper used by argument-parsing code to install a `TypeError`.
 pub fn set_type_error(msg: impl Into<String>) {
     set_pending(
@@ -258,8 +278,19 @@ pub fn init_static_exceptions() {
     }
     *done = true;
     let bt = builtin_types();
+    // Each `PyExc_*` slot needs a pointer whose memory layout is a
+    // real `PyTypeObjectBox` (i.e. it has a valid `bridge` field that
+    // resolves back to the native [`TypeObject`]). The earlier
+    // implementation handed out a `PyObjectBox` produced by
+    // [`crate::object::into_owned`], which lacks `bridge`; reading
+    // it later through `(*p as *mut PyTypeObject).bridge` produces
+    // garbage and crashes on `Rc::clone`. We dispatch via
+    // [`crate::types::install_user_type`] so every exception type
+    // gets a proper bridged static slot (or is folded into an
+    // existing one if `bt.value_error` is the same `Rc` as a
+    // built-in like `bt.unicode_error`).
     let publish = |slot: *mut *mut PyObject, ty: Rc<TypeObject>| {
-        let p = crate::object::into_owned(Object::Type(ty));
+        let p = crate::types::install_user_type(&ty) as *mut PyObject;
         // The type singleton is immortal; we don't need to track
         // an extra reference.
         unsafe { *slot = p };

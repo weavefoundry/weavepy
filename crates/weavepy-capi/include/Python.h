@@ -975,6 +975,12 @@ PyAPI_FUNC(void *) PyCapsule_GetPointer(PyObject *capsule, const char *name);
 PyAPI_FUNC(const char *) PyCapsule_GetName(PyObject *capsule);
 PyAPI_FUNC(int) PyCapsule_IsValid(PyObject *capsule, const char *name);
 PyAPI_FUNC(int) PyCapsule_SetPointer(PyObject *capsule, void *pointer);
+PyAPI_FUNC(int) PyCapsule_SetName(PyObject *capsule, const char *name);
+PyAPI_FUNC(PyCapsule_Destructor) PyCapsule_GetDestructor(PyObject *capsule);
+PyAPI_FUNC(int) PyCapsule_SetDestructor(PyObject *capsule, PyCapsule_Destructor destructor);
+PyAPI_FUNC(void *) PyCapsule_GetContext(PyObject *capsule);
+PyAPI_FUNC(int) PyCapsule_SetContext(PyObject *capsule, void *context);
+PyAPI_FUNC(void *) PyCapsule_Import(const char *name, int no_block);
 
 /* ------------------------------------------------------------------
  * Slice helpers.
@@ -982,6 +988,14 @@ PyAPI_FUNC(int) PyCapsule_SetPointer(PyObject *capsule, void *pointer);
 
 PyAPI_FUNC(PyObject *) PySlice_New(PyObject *start, PyObject *stop, PyObject *step);
 PyAPI_FUNC(int) PySlice_Check(PyObject *o);
+PyAPI_FUNC(int) PySlice_Unpack(PyObject *slice, Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t *step);
+PyAPI_FUNC(Py_ssize_t) PySlice_AdjustIndices(Py_ssize_t length, Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t step);
+PyAPI_FUNC(int) PySlice_GetIndicesEx(PyObject *slice, Py_ssize_t length,
+                                     Py_ssize_t *start, Py_ssize_t *stop,
+                                     Py_ssize_t *step, Py_ssize_t *slicelength);
+PyAPI_FUNC(int) PySlice_GetIndices(PyObject *slice, Py_ssize_t length,
+                                   Py_ssize_t *start, Py_ssize_t *stop,
+                                   Py_ssize_t *step);
 
 /* ------------------------------------------------------------------
  * Hash helpers and atomic refcount operations.
@@ -1022,6 +1036,66 @@ PyAPI_FUNC(PyObject *) PyDict_GetItemWithError(PyObject *d, PyObject *k);
 #define _Py_SIZE_ROUND_UP(n, a)  (((size_t)(n) + (size_t)((a)-1)) & ~(size_t)((a)-1))
 #define _Py_SIZE_ROUND_DOWN(n, a) ((size_t)(n) & ~(size_t)((a)-1))
 #define _Py_ALIGN_UP(p, a) ((void *)_Py_SIZE_ROUND_UP((uintptr_t)(p), (a)))
+
+/* ------------------------------------------------------------------
+ * Datetime C-API (RFC 0029).
+ *
+ * Mirrors CPython's `datetime.h` interface — the in-process capsule
+ * named `datetime.datetime_CAPI` carries the function-pointer table
+ * extensions consume to construct date/time/datetime/timedelta
+ * objects without round-tripping through Python.
+ *
+ * The actual `PyDateTime_CAPI` struct layout lives in
+ * `datetime_api.rs`; we expose the type-check and direct-constructor
+ * symbols here so simple extensions can use them without grabbing
+ * the capsule.
+ * ------------------------------------------------------------------ */
+PyAPI_FUNC(PyObject *) PyDate_FromDate(int year, int month, int day);
+PyAPI_FUNC(PyObject *) PyDateTime_FromDateAndTime(int year, int month, int day, int hour, int minute, int second, int usec);
+PyAPI_FUNC(PyObject *) PyTime_FromTime(int hour, int minute, int second, int usec);
+PyAPI_FUNC(PyObject *) PyDelta_FromDSU(int days, int seconds, int microseconds);
+PyAPI_FUNC(PyObject *) PyTimeZone_FromOffset(PyObject *offset);
+PyAPI_FUNC(PyObject *) PyTimeZone_FromOffsetAndName(PyObject *offset, PyObject *name);
+
+PyAPI_FUNC(int) PyDateTime_GET_YEAR(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_GET_MONTH(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_GET_DAY(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_DATE_GET_HOUR(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_DATE_GET_MINUTE(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_DATE_GET_SECOND(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_DATE_GET_MICROSECOND(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_TIME_GET_HOUR(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_TIME_GET_MINUTE(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_TIME_GET_SECOND(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_TIME_GET_MICROSECOND(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_DELTA_GET_DAYS(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_DELTA_GET_SECONDS(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_DELTA_GET_MICROSECONDS(PyObject *o);
+
+PyAPI_FUNC(int) PyDate_Check(PyObject *o);
+PyAPI_FUNC(int) PyDate_CheckExact(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_Check(PyObject *o);
+PyAPI_FUNC(int) PyDateTime_CheckExact(PyObject *o);
+PyAPI_FUNC(int) PyTime_Check(PyObject *o);
+PyAPI_FUNC(int) PyTime_CheckExact(PyObject *o);
+PyAPI_FUNC(int) PyDelta_Check(PyObject *o);
+PyAPI_FUNC(int) PyDelta_CheckExact(PyObject *o);
+PyAPI_FUNC(int) PyTZInfo_Check(PyObject *o);
+PyAPI_FUNC(int) PyTZInfo_CheckExact(PyObject *o);
+
+/* Convenience: pull the datetime C-API capsule. Extensions that
+ * use the `PyDateTime_IMPORT` macro from CPython's datetime.h
+ * call this once at module init. Returns NULL on failure
+ * with an ImportError pending. */
+#define PyDateTime_IMPORT \
+    (PyDateTimeAPI = (PyDateTime_CAPI *)PyCapsule_Import("datetime.datetime_CAPI", 0))
+
+/* The shape of the capsule payload — opaque to user code; the
+ * full definition lives on the Rust side. We declare it as an
+ * incomplete type and only expose it through the macros above. */
+typedef struct PyDateTime_CAPI PyDateTime_CAPI;
+PyAPI_DATA(PyDateTime_CAPI) PyDateTimeAPI_Instance;
+extern PyDateTime_CAPI *PyDateTimeAPI;
 
 #ifdef __cplusplus
 }

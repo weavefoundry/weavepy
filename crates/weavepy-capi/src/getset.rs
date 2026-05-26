@@ -19,7 +19,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 
 use weavepy_vm::error::{type_error, RuntimeError};
-use weavepy_vm::object::{BuiltinFn, Object};
+use weavepy_vm::object::{BuiltinFn, Object, PyProperty};
 use weavepy_vm::sync::Rc;
 
 use crate::object::{PyObject, PySsizeT};
@@ -105,68 +105,90 @@ pub unsafe fn collect_getsets(mut defs: *mut PyGetSetDef) -> Vec<(String, Object
         let name = unsafe { CStr::from_ptr(entry.name) }
             .to_string_lossy()
             .into_owned();
-        let get = entry.get;
-        let set = entry.set;
-        let closure = entry.closure as usize;
-
         let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
-        let f_pos = move |args: &[Object]| -> Result<Object, RuntimeError> {
-            // Dispatch on the number of arguments:
-            //   - 1 arg → getter
-            //   - 2 args → setter (signal None back)
-            match args.len() {
-                1 => match get {
-                    Some(g) => {
-                        let self_p = crate::object::into_owned(args[0].clone());
-                        let raw = unsafe { g(self_p, closure as *mut std::ffi::c_void) };
-                        unsafe { crate::object::Py_DecRef(self_p) };
-                        if raw.is_null() {
-                            return Err(take_pending_or_default());
-                        }
-                        let out = unsafe { crate::object::clone_object(raw) };
-                        unsafe { crate::object::Py_DecRef(raw) };
-                        Ok(out)
-                    }
-                    None => Err(type_error(format!(
-                        "attribute '{}' is not readable",
-                        static_name
-                    ))),
-                },
-                2 => match set {
-                    Some(s) => {
-                        let self_p = crate::object::into_owned(args[0].clone());
-                        let val_p = crate::object::into_owned(args[1].clone());
-                        let r = unsafe { s(self_p, val_p, closure as *mut std::ffi::c_void) };
-                        unsafe {
-                            crate::object::Py_DecRef(self_p);
-                            crate::object::Py_DecRef(val_p);
-                        }
-                        if r < 0 {
-                            return Err(take_pending_or_default());
-                        }
-                        Ok(Object::None)
-                    }
-                    None => Err(type_error(format!(
-                        "attribute '{}' is not writable",
-                        static_name
-                    ))),
-                },
-                _ => Err(type_error(format!(
-                    "attribute '{}' invocation expects 1 or 2 args, got {}",
-                    static_name,
-                    args.len()
-                ))),
-            }
+
+        // Build the property's three function slots out of the C
+        // getter/setter pointers. We wrap as a real `Object::Property`
+        // so the VM's descriptor protocol (data-descriptor priority,
+        // automatic invocation on attribute access) kicks in. Without
+        // this `instance.shape` would bind as a method and the caller
+        // would have to `instance.shape()` to actually get the value.
+        let fget = match entry.get {
+            Some(g) => make_getter(static_name, g, entry.closure as usize),
+            None => Object::None,
         };
-        let entry_obj = Object::Builtin(Rc::new(BuiltinFn {
-            name: static_name,
-            call: Box::new(f_pos),
-            call_kw: None,
-        }));
-        out.push((name, entry_obj));
+        let fset = match entry.set {
+            Some(s) => make_setter(static_name, s, entry.closure as usize),
+            None => Object::None,
+        };
+        let prop = Object::Property(Rc::new(PyProperty::new(
+            fget,
+            fset,
+            Object::None,
+            Object::None,
+        )));
+        out.push((name, prop));
         defs = unsafe { defs.add(1) };
     }
     out
+}
+
+fn make_getter(
+    name: &'static str,
+    g: unsafe extern "C" fn(*mut PyObject, *mut std::ffi::c_void) -> *mut PyObject,
+    closure: usize,
+) -> Object {
+    let body = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        if args.is_empty() {
+            return Err(type_error(format!(
+                "getter for '{name}' expects 1 argument"
+            )));
+        }
+        let self_p = crate::object::into_owned(args[0].clone());
+        let raw = unsafe { g(self_p, closure as *mut std::ffi::c_void) };
+        unsafe { crate::object::Py_DecRef(self_p) };
+        if raw.is_null() {
+            return Err(take_pending_or_default());
+        }
+        let out = unsafe { crate::object::clone_object(raw) };
+        unsafe { crate::object::Py_DecRef(raw) };
+        Ok(out)
+    };
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        call: Box::new(body),
+        call_kw: None,
+    }))
+}
+
+fn make_setter(
+    name: &'static str,
+    s: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut std::ffi::c_void) -> c_int,
+    closure: usize,
+) -> Object {
+    let body = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        if args.len() != 2 {
+            return Err(type_error(format!(
+                "setter for '{name}' expects 2 arguments (self, value)"
+            )));
+        }
+        let self_p = crate::object::into_owned(args[0].clone());
+        let val_p = crate::object::into_owned(args[1].clone());
+        let r = unsafe { s(self_p, val_p, closure as *mut std::ffi::c_void) };
+        unsafe {
+            crate::object::Py_DecRef(self_p);
+            crate::object::Py_DecRef(val_p);
+        }
+        if r < 0 {
+            return Err(take_pending_or_default());
+        }
+        Ok(Object::None)
+    };
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        call: Box::new(body),
+        call_kw: None,
+    }))
 }
 
 /// Decode a null-terminated `PyMemberDef[]` array into descriptor

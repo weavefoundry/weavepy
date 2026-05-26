@@ -156,7 +156,43 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
             if let Some(v) = inst.dict.borrow().get(&kk).cloned() {
                 return Some(v);
             }
-            inst.class.lookup(key)
+            // Walk the MRO and invoke descriptor protocol if the
+            // resolved attribute is a property, classmethod, or
+            // staticmethod. Mirror the VM's `LOAD_ATTR` dispatcher.
+            let raw = inst.class.lookup(key)?;
+            match &raw {
+                Object::Property(p) => {
+                    let getter = p.fget.clone();
+                    if matches!(getter, Object::None) {
+                        return Some(raw);
+                    }
+                    crate::interp::ensure_active(|| {
+                        crate::interp::with_interp_mut(|interp| {
+                            interp
+                                .call_object(getter, std::slice::from_ref(o), &[])
+                                .ok()
+                        })
+                    })
+                    .flatten()
+                }
+                Object::StaticMethod(inner) => Some((**inner).clone()),
+                Object::ClassMethod(inner) => {
+                    let class = Object::Type(inst.class.clone());
+                    Some(Object::BoundMethod(weavepy_vm::sync::Rc::new(
+                        weavepy_vm::object::BoundMethod {
+                            receiver: class,
+                            function: (**inner).clone(),
+                        },
+                    )))
+                }
+                Object::Function(_) | Object::Builtin(_) => Some(Object::BoundMethod(
+                    weavepy_vm::sync::Rc::new(weavepy_vm::object::BoundMethod {
+                        receiver: o.clone(),
+                        function: raw.clone(),
+                    }),
+                )),
+                _ => Some(raw),
+            }
         }
         _ => None,
     }
@@ -361,6 +397,31 @@ pub unsafe extern "C" fn PyObject_CallOneArg(
         unsafe { crate::object::clone_object(arg) }
     };
     invoke_callable(target, vec![arg_obj], Vec::new())
+}
+
+/// `PyObject_CallTwoArgs(callable, a, b)` — convenience for the
+/// common two-positional-arg call. CPython 3.11+ exposes this.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_CallTwoArgs(
+    callable: *mut PyObject,
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    if callable.is_null() {
+        return ptr::null_mut();
+    }
+    let target = unsafe { crate::object::clone_object(callable) };
+    let arg_a = if a.is_null() {
+        Object::None
+    } else {
+        unsafe { crate::object::clone_object(a) }
+    };
+    let arg_b = if b.is_null() {
+        Object::None
+    } else {
+        unsafe { crate::object::clone_object(b) }
+    };
+    invoke_callable(target, vec![arg_a, arg_b], Vec::new())
 }
 
 fn key_string(o: &Object) -> String {
@@ -1233,4 +1294,745 @@ pub unsafe extern "C" fn PyMapping_SetItemString(
     let result = unsafe { PyObject_SetItem(o, k, v) };
     unsafe { crate::object::Py_DecRef(k) };
     result
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyMapping_DelItemString(o: *mut PyObject, key: *const c_char) -> c_int {
+    if o.is_null() || key.is_null() {
+        return -1;
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Dict(rc) => {
+            let key_s = unsafe { CStr::from_ptr(key) }
+                .to_string_lossy()
+                .into_owned();
+            let dk = DictKey(Object::from_str(key_s.clone()));
+            if rc.borrow_mut().shift_remove(&dk).is_some() {
+                0
+            } else {
+                crate::errors::set_pending(
+                    Some(weavepy_vm::builtin_types::builtin_types().key_error.clone()),
+                    Object::from_str(key_s),
+                );
+                -1
+            }
+        }
+        _ => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyMapping_DelItem(o: *mut PyObject, k: *mut PyObject) -> c_int {
+    if o.is_null() || k.is_null() {
+        return -1;
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Dict(rc) => {
+            let dk = DictKey(unsafe { crate::object::clone_object(k) });
+            if rc.borrow_mut().shift_remove(&dk).is_some() {
+                0
+            } else {
+                crate::errors::set_pending(
+                    Some(weavepy_vm::builtin_types::builtin_types().key_error.clone()),
+                    dk.0,
+                );
+                -1
+            }
+        }
+        _ => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyMapping_Keys(o: *mut PyObject) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Dict(rc) => {
+            let items: Vec<Object> = rc.borrow().keys().map(|k| k.0.clone()).collect();
+            crate::object::into_owned(Object::new_list(items))
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyMapping_Values(o: *mut PyObject) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Dict(rc) => {
+            let items: Vec<Object> = rc.borrow().values().cloned().collect();
+            crate::object::into_owned(Object::new_list(items))
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyMapping_Items(o: *mut PyObject) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Dict(rc) => {
+            let items: Vec<Object> = rc
+                .borrow()
+                .iter()
+                .map(|(k, v)| Object::new_tuple(vec![k.0.clone(), v.clone()]))
+                .collect();
+            crate::object::into_owned(Object::new_list(items))
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
+// ----------------------------------------------------------------
+// RFC 0029 — additional `PyObject_*` surface.
+// ----------------------------------------------------------------
+
+/// `_PyObject_LookupAttr(obj, name, &result)` — CPython-private
+/// helper that distinguishes "attribute missing" (returns 0,
+/// `*result = NULL`) from "attribute lookup raised" (returns -1).
+/// numpy and pluggy depend on this helper heavily.
+#[no_mangle]
+pub unsafe extern "C" fn _PyObject_LookupAttr(
+    o: *mut PyObject,
+    attr: *mut PyObject,
+    result: *mut *mut PyObject,
+) -> c_int {
+    if !result.is_null() {
+        unsafe { *result = ptr::null_mut() };
+    }
+    if o.is_null() || attr.is_null() {
+        return -1;
+    }
+    let key = match unsafe { crate::object::clone_object(attr) } {
+        Object::Str(s) => s.to_string(),
+        _ => return -1,
+    };
+    let obj = unsafe { crate::object::clone_object(o) };
+    match attr_lookup(&obj, &key) {
+        Some(v) => {
+            if !result.is_null() {
+                unsafe { *result = crate::object::into_owned(v) };
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyObject_LookupAttrId(
+    o: *mut PyObject,
+    name: *const c_char,
+    result: *mut *mut PyObject,
+) -> c_int {
+    if !result.is_null() {
+        unsafe { *result = ptr::null_mut() };
+    }
+    if o.is_null() || name.is_null() {
+        return -1;
+    }
+    let key = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned();
+    let obj = unsafe { crate::object::clone_object(o) };
+    match attr_lookup(&obj, &key) {
+        Some(v) => {
+            if !result.is_null() {
+                unsafe { *result = crate::object::into_owned(v) };
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyObject_GenericGetAttrWithDict(
+    o: *mut PyObject,
+    attr: *mut PyObject,
+    _dict: *mut PyObject,
+    _suppress: c_int,
+) -> *mut PyObject {
+    unsafe { PyObject_GetAttr(o, attr) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyObject_GenericSetAttrWithDict(
+    o: *mut PyObject,
+    attr: *mut PyObject,
+    value: *mut PyObject,
+    _dict: *mut PyObject,
+) -> c_int {
+    unsafe { PyObject_SetAttr(o, attr, value) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_GetAttrId(
+    o: *mut PyObject,
+    name: *const c_char,
+) -> *mut PyObject {
+    unsafe { PyObject_GetAttrString(o, name) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_DelAttr(o: *mut PyObject, attr: *mut PyObject) -> c_int {
+    unsafe { PyObject_SetAttr(o, attr, ptr::null_mut()) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_LengthHint(o: *mut PyObject, default: PySsizeT) -> PySsizeT {
+    let n = unsafe { PyObject_Length(o) };
+    if n < 0 {
+        crate::errors::clear_thread_local();
+        return default;
+    }
+    n
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_Bytes(o: *mut PyObject) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Bytes(_) => unsafe {
+            crate::object::Py_IncRef(o);
+            o
+        },
+        Object::Str(s) => crate::object::into_owned(Object::Bytes(s.as_bytes().into())),
+        Object::ByteArray(b) => crate::object::into_owned(Object::Bytes(b.borrow().clone().into())),
+        _ => unsafe { crate::strings::PyBytes_FromObject(o) },
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_Format(o: *mut PyObject, _spec: *mut PyObject) -> *mut PyObject {
+    // Minimal implementation: ignore format spec, call __str__.
+    unsafe { PyObject_Str(o) }
+}
+
+// ----------------------------------------------------------------
+// RFC 0029 — recursion guards.
+// ----------------------------------------------------------------
+//
+// CPython's `Py_EnterRecursiveCall` increments a thread-local
+// counter and checks it against the recursion limit; we cheat
+// and always return success, since the host Rust stack is the
+// real bound. `_Py_CheckRecursionLimit` is the limit accessor.
+
+#[no_mangle]
+pub unsafe extern "C" fn Py_EnterRecursiveCall(_where: *const c_char) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Py_LeaveRecursiveCall() {}
+
+#[no_mangle]
+pub unsafe extern "C" fn _Py_CheckRecursionLimit() -> c_int {
+    1000
+}
+
+// ----------------------------------------------------------------
+// RFC 0029 — additional `PyNumber_*` surface.
+// ----------------------------------------------------------------
+
+/// `PyNumber_Index(o)` — call `__index__` and return the result
+/// (or raise TypeError if the object can't be losslessly turned
+/// into an int). Heavily used by numpy for size-arg coercion.
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_Index(o: *mut PyObject) -> *mut PyObject {
+    if o.is_null() {
+        crate::errors::set_type_error("PyNumber_Index: NULL");
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Int(_) | Object::Long(_) | Object::Bool(_) => unsafe {
+            crate::object::Py_IncRef(o);
+            o
+        },
+        Object::Float(_) | Object::Complex(_) => {
+            crate::errors::set_type_error(
+                "__index__ returned non-int (the object cannot be interpreted as an integer)",
+            );
+            ptr::null_mut()
+        }
+        _ => {
+            // Try `__index__` via the dunder shim.
+            let attr = "__index__";
+            let dunder = match attr_lookup(&unsafe { crate::object::clone_object(o) }, attr) {
+                Some(d) => d,
+                None => {
+                    crate::errors::set_type_error("object cannot be interpreted as an integer");
+                    return ptr::null_mut();
+                }
+            };
+            let dunder_o = crate::object::into_owned(dunder);
+            let result = unsafe { PyObject_CallOneArg(dunder_o, o) };
+            unsafe { crate::object::Py_DecRef(dunder_o) };
+            result
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_AsSsize_t(o: *mut PyObject, _exc: *mut PyObject) -> PySsizeT {
+    if o.is_null() {
+        crate::errors::set_type_error("PyNumber_AsSsize_t: NULL");
+        return -1;
+    }
+    let idx = unsafe { PyNumber_Index(o) };
+    if idx.is_null() {
+        return -1;
+    }
+    let v = unsafe { crate::numbers::PyLong_AsLong(idx) };
+    unsafe { crate::object::Py_DecRef(idx) };
+    v as PySsizeT
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_Divmod(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    if a.is_null() || b.is_null() {
+        return ptr::null_mut();
+    }
+    let q = unsafe { PyNumber_FloorDivide(a, b) };
+    if q.is_null() {
+        return ptr::null_mut();
+    }
+    let r = unsafe { PyNumber_Remainder(a, b) };
+    if r.is_null() {
+        unsafe { crate::object::Py_DecRef(q) };
+        return ptr::null_mut();
+    }
+    let tuple = crate::object::into_owned(Object::new_tuple(vec![
+        unsafe { crate::object::clone_object(q) },
+        unsafe { crate::object::clone_object(r) },
+    ]));
+    unsafe { crate::object::Py_DecRef(q) };
+    unsafe { crate::object::Py_DecRef(r) };
+    tuple
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_MatrixMultiply(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    // Default: delegate to __matmul__ via the type lookup if
+    // available. For now, error out on missing operator.
+    if a.is_null() || b.is_null() {
+        return ptr::null_mut();
+    }
+    let lhs = unsafe { crate::object::clone_object(a) };
+    let m = match attr_lookup(&lhs, "__matmul__") {
+        Some(m) => m,
+        None => {
+            crate::errors::set_type_error("unsupported operand type for @");
+            return ptr::null_mut();
+        }
+    };
+    let m_o = crate::object::into_owned(m);
+    let result = unsafe { PyObject_CallTwoArgs(m_o, a, b) };
+    unsafe { crate::object::Py_DecRef(m_o) };
+    result
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_Lshift(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    let av = unsafe { crate::numbers::PyLong_AsLong(a) };
+    let bv = unsafe { crate::numbers::PyLong_AsLong(b) };
+    if crate::errors::pending().is_some() {
+        return ptr::null_mut();
+    }
+    let shift = bv.clamp(0, 63) as u32;
+    crate::object::into_owned(Object::Int(av.wrapping_shl(shift)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_Rshift(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    let av = unsafe { crate::numbers::PyLong_AsLong(a) };
+    let bv = unsafe { crate::numbers::PyLong_AsLong(b) };
+    if crate::errors::pending().is_some() {
+        return ptr::null_mut();
+    }
+    let shift = bv.clamp(0, 63) as u32;
+    crate::object::into_owned(Object::Int(av.wrapping_shr(shift)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_And(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    let av = unsafe { crate::numbers::PyLong_AsLong(a) };
+    let bv = unsafe { crate::numbers::PyLong_AsLong(b) };
+    if crate::errors::pending().is_some() {
+        return ptr::null_mut();
+    }
+    crate::object::into_owned(Object::Int(av & bv))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_Or(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    let av = unsafe { crate::numbers::PyLong_AsLong(a) };
+    let bv = unsafe { crate::numbers::PyLong_AsLong(b) };
+    if crate::errors::pending().is_some() {
+        return ptr::null_mut();
+    }
+    crate::object::into_owned(Object::Int(av | bv))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_Xor(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    let av = unsafe { crate::numbers::PyLong_AsLong(a) };
+    let bv = unsafe { crate::numbers::PyLong_AsLong(b) };
+    if crate::errors::pending().is_some() {
+        return ptr::null_mut();
+    }
+    crate::object::into_owned(Object::Int(av ^ bv))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_Invert(o: *mut PyObject) -> *mut PyObject {
+    let v = unsafe { crate::numbers::PyLong_AsLong(o) };
+    if crate::errors::pending().is_some() {
+        return ptr::null_mut();
+    }
+    crate::object::into_owned(Object::Int(!v))
+}
+
+// In-place variants: we fall back to the immutable forms since
+// our types don't have separate in-place storage.
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceAdd(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    unsafe { PyNumber_Add(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceSubtract(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyNumber_Subtract(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceMultiply(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyNumber_Multiply(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceTrueDivide(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyNumber_TrueDivide(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceFloorDivide(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyNumber_FloorDivide(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceRemainder(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyNumber_Remainder(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlacePower(
+    a: *mut PyObject,
+    b: *mut PyObject,
+    c: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyNumber_Power(a, b, c) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceMatrixMultiply(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyNumber_MatrixMultiply(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceLshift(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyNumber_Lshift(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceRshift(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PyNumber_Rshift(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceAnd(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    unsafe { PyNumber_And(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceOr(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    unsafe { PyNumber_Or(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceXor(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    unsafe { PyNumber_Xor(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_ToBase(o: *mut PyObject, base: c_int) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    let v = unsafe { crate::numbers::PyLong_AsLong(o) };
+    if crate::errors::pending().is_some() {
+        return ptr::null_mut();
+    }
+    let s = match base {
+        2 => format!("{:#b}", v),
+        8 => format!("{:#o}", v),
+        16 => format!("{:#x}", v),
+        _ => v.to_string(),
+    };
+    crate::object::into_owned(Object::from_str(s))
+}
+
+// ----------------------------------------------------------------
+// RFC 0029 — additional `PySequence_*` surface.
+// ----------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_Concat(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    if a.is_null() || b.is_null() {
+        return ptr::null_mut();
+    }
+    match (unsafe { crate::object::clone_object(a) }, unsafe {
+        crate::object::clone_object(b)
+    }) {
+        (Object::List(la), Object::List(lb)) => {
+            let mut combined = la.borrow().clone();
+            combined.extend(lb.borrow().iter().cloned());
+            crate::object::into_owned(Object::new_list(combined))
+        }
+        (Object::Tuple(ia), Object::Tuple(ib)) => {
+            let combined: Vec<Object> = ia.iter().cloned().chain(ib.iter().cloned()).collect();
+            crate::object::into_owned(Object::new_tuple(combined))
+        }
+        _ => {
+            crate::errors::set_type_error("PySequence_Concat: incompatible types");
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_Repeat(o: *mut PyObject, n: PySsizeT) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    let n = n.max(0) as usize;
+    match unsafe { crate::object::clone_object(o) } {
+        Object::List(rc) => {
+            let mut out = Vec::with_capacity(rc.borrow().len() * n);
+            for _ in 0..n {
+                out.extend(rc.borrow().iter().cloned());
+            }
+            crate::object::into_owned(Object::new_list(out))
+        }
+        Object::Tuple(items) => {
+            let mut out = Vec::with_capacity(items.len() * n);
+            for _ in 0..n {
+                out.extend(items.iter().cloned());
+            }
+            crate::object::into_owned(Object::new_tuple(out))
+        }
+        _ => {
+            crate::errors::set_type_error("PySequence_Repeat: not a sequence");
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_InPlaceConcat(
+    a: *mut PyObject,
+    b: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { PySequence_Concat(a, b) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_InPlaceRepeat(o: *mut PyObject, n: PySsizeT) -> *mut PyObject {
+    unsafe { PySequence_Repeat(o, n) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_Count(o: *mut PyObject, v: *mut PyObject) -> PySsizeT {
+    if o.is_null() || v.is_null() {
+        return -1;
+    }
+    let target = unsafe { crate::object::clone_object(v) };
+    match unsafe { crate::object::clone_object(o) } {
+        Object::List(rc) => rc.borrow().iter().filter(|x| x.eq_value(&target)).count() as PySsizeT,
+        Object::Tuple(items) => items.iter().filter(|x| x.eq_value(&target)).count() as PySsizeT,
+        _ => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_Index(o: *mut PyObject, v: *mut PyObject) -> PySsizeT {
+    if o.is_null() || v.is_null() {
+        return -1;
+    }
+    let target = unsafe { crate::object::clone_object(v) };
+    match unsafe { crate::object::clone_object(o) } {
+        Object::List(rc) => match rc.borrow().iter().position(|x| x.eq_value(&target)) {
+            Some(idx) => idx as PySsizeT,
+            None => {
+                crate::errors::set_value_error("sequence.index(x): x not in sequence");
+                -1
+            }
+        },
+        Object::Tuple(items) => match items.iter().position(|x| x.eq_value(&target)) {
+            Some(idx) => idx as PySsizeT,
+            None => {
+                crate::errors::set_value_error("sequence.index(x): x not in sequence");
+                -1
+            }
+        },
+        _ => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_GetSlice(
+    o: *mut PyObject,
+    lo: PySsizeT,
+    hi: PySsizeT,
+) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::List(rc) => {
+            let v = rc.borrow();
+            let lo = lo.max(0).min(v.len() as PySsizeT) as usize;
+            let hi = hi.max(0).min(v.len() as PySsizeT) as usize;
+            let lo = lo.min(hi);
+            crate::object::into_owned(Object::new_list(v[lo..hi].to_vec()))
+        }
+        Object::Tuple(items) => {
+            let lo = lo.max(0).min(items.len() as PySsizeT) as usize;
+            let hi = hi.max(0).min(items.len() as PySsizeT) as usize;
+            let lo = lo.min(hi);
+            crate::object::into_owned(Object::new_tuple(items[lo..hi].to_vec()))
+        }
+        Object::Str(s) => {
+            let chars: Vec<char> = s.chars().collect();
+            let lo = lo.max(0).min(chars.len() as PySsizeT) as usize;
+            let hi = hi.max(0).min(chars.len() as PySsizeT) as usize;
+            let lo = lo.min(hi);
+            let collected: String = chars[lo..hi].iter().collect();
+            crate::object::into_owned(Object::from_str(collected))
+        }
+        _ => {
+            crate::errors::set_type_error("PySequence_GetSlice: not a sequence");
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_SetSlice(
+    o: *mut PyObject,
+    lo: PySsizeT,
+    hi: PySsizeT,
+    v: *mut PyObject,
+) -> c_int {
+    if o.is_null() {
+        return -1;
+    }
+    let replacement: Vec<Object> = if v.is_null() {
+        Vec::new()
+    } else {
+        match unsafe { crate::object::clone_object(v) } {
+            Object::List(rc) => rc.borrow().clone(),
+            Object::Tuple(items) => items.iter().cloned().collect(),
+            _ => return -1,
+        }
+    };
+    match unsafe { crate::object::clone_object(o) } {
+        Object::List(rc) => {
+            let mut list = rc.borrow_mut();
+            let len = list.len();
+            let lo = (lo.max(0) as usize).min(len);
+            let hi = (hi.max(0) as usize).min(len);
+            let hi = hi.max(lo);
+            list.splice(lo..hi, replacement);
+            0
+        }
+        _ => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_DelSlice(
+    o: *mut PyObject,
+    lo: PySsizeT,
+    hi: PySsizeT,
+) -> c_int {
+    unsafe { PySequence_SetSlice(o, lo, hi, ptr::null_mut()) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_DelItem(o: *mut PyObject, idx: PySsizeT) -> c_int {
+    if o.is_null() {
+        return -1;
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::List(rc) => {
+            let mut list = rc.borrow_mut();
+            let len = list.len();
+            let i = if idx < 0 {
+                (len as PySsizeT + idx) as usize
+            } else {
+                idx as usize
+            };
+            if i >= len {
+                crate::errors::set_pending(
+                    Some(
+                        weavepy_vm::builtin_types::builtin_types()
+                            .index_error
+                            .clone(),
+                    ),
+                    Object::from_static("list assignment index out of range"),
+                );
+                return -1;
+            }
+            list.remove(i);
+            0
+        }
+        _ => -1,
+    }
 }

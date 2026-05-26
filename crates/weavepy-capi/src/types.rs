@@ -431,7 +431,13 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
         slot_table: SlotTable::empty(),
     });
     let p = Box::leak(bx);
-    &mut p.head as *mut PyTypeObject
+    let ty_ptr = &mut p.head as *mut PyTypeObject;
+    // Cache so subsequent calls with the same native `Rc` return the
+    // same pointer instead of leaking a fresh box every time
+    // (`PyExc_*` aliases — e.g. `SystemError` → `runtime_error` —
+    // would otherwise install distinct slots for the same type).
+    register_heap_type(ty_ptr);
+    ty_ptr
 }
 
 // ----------------------------------------------------------------

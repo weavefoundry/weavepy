@@ -97,7 +97,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("makedirs")),
-            builtin("makedirs", os_makedirs),
+            builtin_kw("makedirs", os_makedirs_kw),
         );
         d.insert(
             DictKey(Object::from_static("rmdir")),
@@ -349,6 +349,20 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
     }))
 }
 
+/// As [`builtin`], but the body also takes a keyword-argument list.
+/// Use this for surfaces where CPython exposes named parameters
+/// (e.g. `os.makedirs(path, mode=0o777, exist_ok=False)`).
+fn builtin_kw(
+    name: &'static str,
+    body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+) -> Object {
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        call: Box::new(move |args| body(args, &[])),
+        call_kw: Some(Box::new(body)),
+    }))
+}
+
 fn initial_environ() -> Object {
     let mut d = DictData::new();
     for (k, v) in std::env::vars() {
@@ -389,10 +403,35 @@ fn os_mkdir(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-fn os_makedirs(args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_makedirs_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "makedirs")?;
-    std::fs::create_dir_all(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
-    Ok(Object::None)
+    let mut exist_ok = matches!(args.get(2), Some(Object::Bool(true)));
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "exist_ok" => {
+                exist_ok = matches!(v, Object::Bool(true) | Object::Int(_));
+            }
+            // `mode` is accepted but ignored — Rust's `create_dir_all`
+            // doesn't expose POSIX mode bits portably. Matching
+            // CPython on the call surface is what matters here.
+            "mode" => {}
+            other => {
+                return Err(crate::error::type_error(format!(
+                    "makedirs() got an unexpected keyword argument '{other}'"
+                )));
+            }
+        }
+    }
+    match std::fs::create_dir_all(&p) {
+        Ok(()) => Ok(Object::None),
+        Err(e) => {
+            if exist_ok && std::path::Path::new(&p).is_dir() {
+                Ok(Object::None)
+            } else {
+                Err(crate::error::io_error_to_py(&e))
+            }
+        }
+    }
 }
 
 fn os_rmdir(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -512,13 +551,32 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     let ty = path_like_type_singleton("stat_result");
     let inst = PyInstance::new(ty);
     let mut d = inst.dict.borrow_mut();
-    let mode = if meta.is_dir() {
-        0o040_755
+    let kind_bits: i64 = if meta.is_dir() {
+        0o040_000
     } else if meta.is_file() {
-        0o100_644
+        0o100_000
     } else {
-        0o120_644
+        0o120_000
     };
+    // The permission bits live in the low 9 bits of `st_mode`. On
+    // Unix we read them from the filesystem; on platforms without
+    // `PermissionsExt` we fall back to the historical hard-coded
+    // values so callers that just want to test directory/file
+    // shape still see something sensible.
+    #[cfg(unix)]
+    let perm_bits: i64 = {
+        use std::os::unix::fs::PermissionsExt;
+        i64::from(meta.permissions().mode() & 0o7777)
+    };
+    #[cfg(not(unix))]
+    let perm_bits: i64 = if meta.is_dir() {
+        0o755
+    } else if meta.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    };
+    let mode = kind_bits | perm_bits;
     d.insert(
         DictKey(Object::from_static("st_size")),
         Object::Int(meta.len() as i64),

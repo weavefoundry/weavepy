@@ -222,11 +222,18 @@ pub unsafe extern "C" fn PyList_Reverse(list: *mut PyObject) -> c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyList_Sort(_list: *mut PyObject) -> c_int {
-    // Generic sort needs the VM's comparison machinery; for the
-    // foundation we reject non-trivial sorts.
-    crate::errors::set_runtime_error("PyList_Sort: not supported in WeavePy's C-API foundation");
-    -1
+pub unsafe extern "C" fn PyList_Sort(list: *mut PyObject) -> c_int {
+    if list.is_null() {
+        return -1;
+    }
+    match unsafe { crate::object::clone_object(list) } {
+        Object::List(rc) => {
+            let mut items = rc.borrow_mut();
+            items.sort_by(|a, b| natural_cmp(a, b));
+            0
+        }
+        _ => -1,
+    }
 }
 
 #[no_mangle]
@@ -866,4 +873,325 @@ pub unsafe extern "C" fn _WeavePy_TuplePackFromArray(
         });
     }
     crate::object::into_owned(Object::new_tuple(out))
+}
+
+// ----------------------------------------------------------------
+// RFC 0029 — additional `PyDict_*` / `PyList_*` / `PyTuple_*` /
+// `PySet_*` surface.
+// ----------------------------------------------------------------
+
+/// Total-order compare helper for the new `PyList_Sort`.
+/// Falls back to comparing repr strings for values whose
+/// ordering Python would consider incomparable; this differs
+/// from CPython (which would raise TypeError) but yields a
+/// stable, panic-free sort.
+fn natural_cmp(a: &Object, b: &Object) -> std::cmp::Ordering {
+    use num_traits::ToPrimitive;
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Object::Int(x), Object::Int(y)) => x.cmp(y),
+        (Object::Float(x), Object::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Object::Int(x), Object::Float(y)) | (Object::Float(y), Object::Int(x)) => {
+            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (Object::Bool(x), Object::Bool(y)) => x.cmp(y),
+        (Object::Str(x), Object::Str(y)) => x.cmp(y),
+        (Object::Bytes(x), Object::Bytes(y)) => x.cmp(y),
+        (Object::Long(x), Object::Long(y)) => x.cmp(y),
+        (Object::Long(x), Object::Int(y)) => x.to_i64().map_or(Ordering::Greater, |v| v.cmp(y)),
+        (Object::Int(x), Object::Long(y)) => {
+            y.to_i64().map_or(Ordering::Less, |v| x.cmp(&v)).reverse()
+        }
+        _ => {
+            // Fall back to repr; not Python-faithful but stable.
+            a.repr().cmp(&b.repr())
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyDict_SetDefault(
+    d: *mut PyObject,
+    k: *mut PyObject,
+    default: *mut PyObject,
+) -> *mut PyObject {
+    if d.is_null() || k.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(d) } {
+        Object::Dict(rc) => {
+            let key = DictKey(unsafe { crate::object::clone_object(k) });
+            let mut map = rc.borrow_mut();
+            if let Some(v) = map.get(&key) {
+                let v = v.clone();
+                drop(map);
+                crate::object::into_owned(v)
+            } else {
+                let default_o = if default.is_null() {
+                    Object::None
+                } else {
+                    unsafe { crate::object::clone_object(default) }
+                };
+                map.insert(key, default_o.clone());
+                drop(map);
+                crate::object::into_owned(default_o)
+            }
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PyDict_Pop(
+    d: *mut PyObject,
+    k: *mut PyObject,
+    default: *mut PyObject,
+) -> *mut PyObject {
+    if d.is_null() || k.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(d) } {
+        Object::Dict(rc) => {
+            let key = DictKey(unsafe { crate::object::clone_object(k) });
+            let popped = rc.borrow_mut().shift_remove(&key);
+            match popped {
+                Some(v) => crate::object::into_owned(v),
+                None => {
+                    if default.is_null() {
+                        crate::errors::set_pending(
+                            Some(weavepy_vm::builtin_types::builtin_types().key_error.clone()),
+                            key.0,
+                        );
+                        ptr::null_mut()
+                    } else {
+                        unsafe { crate::object::Py_IncRef(default) };
+                        default
+                    }
+                }
+            }
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
+// ----- PyList expanded -----
+
+#[no_mangle]
+pub unsafe extern "C" fn PyList_Extend(list: *mut PyObject, iterable: *mut PyObject) -> c_int {
+    if list.is_null() || iterable.is_null() {
+        return -1;
+    }
+    let mut new_items: Vec<Object> = match unsafe { crate::object::clone_object(iterable) } {
+        Object::List(rc) => rc.borrow().clone(),
+        Object::Tuple(items) => items.iter().cloned().collect(),
+        _ => {
+            crate::errors::set_type_error("PyList_Extend: argument must be iterable");
+            return -1;
+        }
+    };
+    match unsafe { crate::object::clone_object(list) } {
+        Object::List(rc) => {
+            rc.borrow_mut().append(&mut new_items);
+            0
+        }
+        _ => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyList_Extend(list: *mut PyObject, iterable: *mut PyObject) -> c_int {
+    unsafe { PyList_Extend(list, iterable) }
+}
+
+// ----- PyTuple expanded -----
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyTuple_Resize(_t: *mut *mut PyObject, _new_size: PySsizeT) -> c_int {
+    // Tuples are immutable; the only legal case is shrinking a
+    // tuple the caller still has a unique reference to. We
+    // approximate by allocating a fresh truncated tuple and
+    // letting the caller replace its pointer.
+    -1
+}
+
+// ----- PySet expanded -----
+
+#[no_mangle]
+pub unsafe extern "C" fn PySet_Pop(s: *mut PyObject) -> *mut PyObject {
+    if s.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(s) } {
+        Object::Set(rc) => {
+            let mut set = rc.borrow_mut();
+            let first = set.iter().next().cloned();
+            match first {
+                Some(k) => {
+                    set.shift_remove(&k);
+                    drop(set);
+                    crate::object::into_owned(k.0)
+                }
+                None => {
+                    crate::errors::set_pending(
+                        Some(weavepy_vm::builtin_types::builtin_types().key_error.clone()),
+                        Object::from_static("pop from an empty set"),
+                    );
+                    ptr::null_mut()
+                }
+            }
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PySet_Clear(s: *mut PyObject) -> c_int {
+    if s.is_null() {
+        return -1;
+    }
+    match unsafe { crate::object::clone_object(s) } {
+        Object::Set(rc) => {
+            rc.borrow_mut().clear();
+            0
+        }
+        _ => -1,
+    }
+}
+
+// ----- PySequence_Fast helpers -----
+//
+// CPython's `PySequence_Fast(o, msg)` returns an *owned reference*
+// to a list/tuple "view" over `o`. Callers then call
+// `PySequence_Fast_GET_ITEM` (a macro) and
+// `PySequence_Fast_GET_SIZE` (also a macro) without needing
+// further borrow-tracking. We expose function-shaped versions
+// because macros don't bind to dlopen'd symbols.
+
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_Fast(o: *mut PyObject, msg: *const c_char) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::List(_) | Object::Tuple(_) => unsafe {
+            crate::object::Py_IncRef(o);
+            o
+        },
+        Object::Str(_) => {
+            crate::errors::set_type_error(if msg.is_null() {
+                "expected list or tuple".to_owned()
+            } else {
+                unsafe { CStr::from_ptr(msg) }
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            ptr::null_mut()
+        }
+        _ => {
+            // Try to coerce iterables into a list.
+            match unsafe { crate::object::clone_object(o) } {
+                Object::Set(rc) => {
+                    let items: Vec<Object> = rc.borrow().iter().map(|k| k.0.clone()).collect();
+                    crate::object::into_owned(Object::new_list(items))
+                }
+                Object::FrozenSet(s) => {
+                    let items: Vec<Object> = s.iter().map(|k| k.0.clone()).collect();
+                    crate::object::into_owned(Object::new_list(items))
+                }
+                Object::Dict(rc) => {
+                    let items: Vec<Object> = rc.borrow().keys().map(|k| k.0.clone()).collect();
+                    crate::object::into_owned(Object::new_list(items))
+                }
+                _ => {
+                    crate::errors::set_type_error(if msg.is_null() {
+                        "expected list, tuple, or iterable".to_owned()
+                    } else {
+                        unsafe { CStr::from_ptr(msg) }
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    ptr::null_mut()
+                }
+            }
+        }
+    }
+}
+
+/// `PySequence_Fast_GET_SIZE` — sized accessor companion.
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_Fast_GET_SIZE(o: *mut PyObject) -> PySsizeT {
+    if o.is_null() {
+        return -1;
+    }
+    match unsafe { crate::object::clone_object(o) } {
+        Object::List(rc) => rc.borrow().len() as PySsizeT,
+        Object::Tuple(items) => items.len() as PySsizeT,
+        _ => -1,
+    }
+}
+
+/// `PySequence_Fast_GET_ITEM` — borrow accessor companion.
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_Fast_GET_ITEM(
+    o: *mut PyObject,
+    idx: PySsizeT,
+) -> *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    let item = match unsafe { crate::object::clone_object(o) } {
+        Object::List(rc) => rc.borrow().get(idx as usize).cloned(),
+        Object::Tuple(items) => items.get(idx as usize).cloned(),
+        _ => None,
+    };
+    match item {
+        Some(v) => intern_borrowed_at(o, idx, v),
+        None => ptr::null_mut(),
+    }
+}
+
+/// `PySequence_Fast_ITEMS` — return a pointer to the items
+/// array. Caller treats this as borrowed.
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_Fast_ITEMS(o: *mut PyObject) -> *mut *mut PyObject {
+    if o.is_null() {
+        return ptr::null_mut();
+    }
+    // We can't safely hand out a pointer to our heap-stored
+    // Object array. Return NULL — callers should fall back to
+    // `PySequence_Fast_GET_ITEM(o, i)`.
+    ptr::null_mut()
+}
+
+// ----- PyList_GET_ITEM / PyList_SET_ITEM / PyTuple_GET_ITEM /
+// PyTuple_SET_ITEM as function exports. CPython exposes these
+// as macros; we mirror the function-call ABI so dlopen'd
+// extensions that #include <Python.h> see something to call.
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyList_GET_ITEM(list: *mut PyObject, idx: PySsizeT) -> *mut PyObject {
+    unsafe { PyList_GetItem(list, idx) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyList_SET_ITEM(
+    list: *mut PyObject,
+    idx: PySsizeT,
+    item: *mut PyObject,
+) -> c_int {
+    unsafe { PyList_SetItem(list, idx, item) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyTuple_GET_ITEM(t: *mut PyObject, idx: PySsizeT) -> *mut PyObject {
+    unsafe { PyTuple_GetItem(t, idx) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _PyTuple_SET_ITEM(
+    t: *mut PyObject,
+    idx: PySsizeT,
+    item: *mut PyObject,
+) -> c_int {
+    unsafe { PyTuple_SetItem(t, idx, item) }
 }

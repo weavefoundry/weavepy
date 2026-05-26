@@ -98,6 +98,7 @@ pub mod buffer;
 pub mod buffer_format;
 pub mod capsule;
 pub mod containers;
+pub mod datetime_api;
 pub mod dunder_shim;
 pub mod errors;
 pub mod ffi;
@@ -137,4 +138,5 @@ pub fn force_link() {
     let _ = singletons::false_ptr();
     interp::ensure_initialised();
     force_link_table::touch();
+    let _ = datetime_api::touch();
 }

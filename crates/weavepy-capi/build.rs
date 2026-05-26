@@ -142,8 +142,44 @@ fn main() {
         name: "_ndarray",
         env_var: "WEAVEPY_CAPI_NDARRAY_EXTENSION",
     });
+    let numpylike_src = workspace_root.join("tests/capi_ext/_numpylike.c");
+    build_extension(ExtensionBuild {
+        cc: &cc,
+        manifest_dir: &manifest_dir,
+        out_dir: &out_dir,
+        target_os: &target_os,
+        suffix,
+        src: &numpylike_src,
+        name: "_numpylike",
+        env_var: "WEAVEPY_CAPI_NUMPYLIKE_EXTENSION",
+    });
 
     // Re-export the include directory so dependent crates can see
     // `Python.h` via `DEP_WEAVEPY_CAPI_INCLUDE`.
     println!("cargo:include={}", manifest_dir.join("include").display());
+
+    // On Linux (and other ELF targets that aren't macOS or Windows),
+    // dlopen'd extension modules resolve symbols like
+    // `PyExc_RuntimeError` and `PyLong_FromLong` against the host
+    // executable's *dynamic* symbol table. Without `--export-dynamic`,
+    // `ld` only exposes the subset that the binary's own dependencies
+    // already asked for — which strips out essentially the entire
+    // C-API surface and produces
+    // `ImportError: undefined symbol: PyExc_RuntimeError` at load
+    // time. This is the same flag CPython itself ships with
+    // (`./configure --enable-shared` adds `-Wl,--export-dynamic`).
+    // No-op on macOS (two-level namespaces) and unrecognised by
+    // `link.exe` on Windows, hence the target-family gate.
+    //
+    // `weavepy-capi` is a library crate with no bin / example /
+    // benchmark targets (Cargo 1.95+ rejects
+    // `rustc-link-arg-bins`/`-benches`/`-examples` from a build
+    // script that doesn't produce those target kinds), so we emit
+    // the flag only for the crate's own integration tests — that's
+    // what reaches the `capi_wheel_endtoend` and `capi_loader` test
+    // binaries on CI. The production `weavepy` CLI gets the same
+    // flag through `crates/weavepy-cli/build.rs`.
+    if target_os == "linux" || target_os == "freebsd" || target_os == "android" {
+        println!("cargo:rustc-link-arg-tests=-Wl,--export-dynamic");
+    }
 }

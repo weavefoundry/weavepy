@@ -15,7 +15,9 @@ for t in threads:
     t.start()
 for t in threads:
     t.join()
-print(out)
+# Threads append in scheduler-dependent order; sort so the fixture
+# is deterministic regardless of OS thread interleaving.
+print(sorted(out))
 
 
 lock = threading.Lock()

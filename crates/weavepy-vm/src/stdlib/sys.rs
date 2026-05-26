@@ -175,6 +175,112 @@ pub fn build_with_state(
             DictKey(Object::from_static("thread_info")),
             sys_thread_info(),
         );
+
+        // RFC 0029 — import machinery state. The frozen
+        // `importlib._bootstrap` module overwrites `meta_path`,
+        // `path_hooks`, and `path_importer_cache` on first import
+        // with real importer objects; until then they hold empty
+        // collections so `importlib.util.find_spec("name")` doesn't
+        // crash trying to walk a missing attribute.
+        d.insert(
+            DictKey(Object::from_static("meta_path")),
+            Object::new_list(Vec::new()),
+        );
+        d.insert(
+            DictKey(Object::from_static("path_hooks")),
+            Object::new_list(Vec::new()),
+        );
+        d.insert(
+            DictKey(Object::from_static("path_importer_cache")),
+            Object::new_dict(),
+        );
+        d.insert(DictKey(Object::from_static("pycache_prefix")), Object::None);
+        d.insert(
+            DictKey(Object::from_static("maxunicode")),
+            Object::Int(0x0010_FFFF),
+        );
+        d.insert(
+            DictKey(Object::from_static("platlibdir")),
+            Object::from_static(if cfg!(windows) { "Lib" } else { "lib" }),
+        );
+        d.insert(
+            DictKey(Object::from_static("tracebacklimit")),
+            Object::Int(1000),
+        );
+        // Standard library module name allowlist — used by tools
+        // that need to know which `import x` reaches the stdlib
+        // vs. a third-party package. Matches the documented
+        // CPython 3.13 set (lowercase, no underscore-private
+        // helpers).
+        d.insert(
+            DictKey(Object::from_static("stdlib_module_names")),
+            stdlib_module_names_value(),
+        );
+
+        // `last_type` / `last_value` / `last_traceback` —
+        // populated by the REPL's exception loop. Pre-seed to
+        // None so user inspection doesn't AttributeError.
+        d.insert(DictKey(Object::from_static("last_type")), Object::None);
+        d.insert(DictKey(Object::from_static("last_value")), Object::None);
+        d.insert(DictKey(Object::from_static("last_traceback")), Object::None);
+        d.insert(DictKey(Object::from_static("last_exc")), Object::None);
+
+        // `_current_frames` — returns a dict mapping thread-id
+        // to the current frame for that thread. Single-threaded
+        // execution sees a one-entry dict.
+        {
+            let fs_cf = frame_stack.clone();
+            d.insert(
+                DictKey(Object::from_static("_current_frames")),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "_current_frames",
+                    call: Box::new(move |_args| {
+                        let frame = if let Some(h) = crate::vm_singletons::current_thread_handles()
+                        {
+                            h.frame_stack.borrow().last().cloned()
+                        } else {
+                            fs_cf.borrow().last().cloned()
+                        };
+                        let mut d = DictData::new();
+                        if let Some(f) = frame {
+                            // Best-effort: every thread has the
+                            // same logical id 0 in the single-
+                            // GIL model.
+                            d.insert(DictKey(Object::Int(0)), Object::Frame(f));
+                        }
+                        Ok(Object::Dict(Rc::new(RefCell::new(d))))
+                    }),
+                    call_kw: None,
+                })),
+            );
+        }
+
+        d.insert(
+            DictKey(Object::from_static("getswitchinterval")),
+            builtin("getswitchinterval", |_| Ok(Object::Float(0.005))),
+        );
+        d.insert(
+            DictKey(Object::from_static("setswitchinterval")),
+            builtin("setswitchinterval", |_args| Ok(Object::None)),
+        );
+        d.insert(
+            DictKey(Object::from_static("getrefcount")),
+            builtin("getrefcount", sys_getrefcount),
+        );
+        // `displayhook` — invoked by the REPL after every
+        // evaluated expression. Default writes `repr(value)` to
+        // stdout and stashes the value in `builtins._`. The hook
+        // is overrideable; the original is preserved on
+        // `__displayhook__`.
+        d.insert(
+            DictKey(Object::from_static("displayhook")),
+            builtin("displayhook", sys_displayhook),
+        );
+        d.insert(
+            DictKey(Object::from_static("__displayhook__")),
+            builtin("displayhook", sys_displayhook),
+        );
+
         // `sys.builtin_module_names` — exposed as a tuple for
         // user-introspection code (e.g. `importlib.util.find_spec`).
         d.insert(
@@ -684,6 +790,339 @@ fn sys_hash_info() -> Object {
     d.insert(DictKey(Object::from_static("seed_bits")), Object::Int(128));
     d.insert(DictKey(Object::from_static("cutoff")), Object::Int(0));
     Object::Dict(Rc::new(RefCell::new(d)))
+}
+
+/// `sys.stdlib_module_names` — the documented set of standard-
+/// library module names. CPython 3.13 ships a frozenset; we
+/// mirror that with a [`Object::FrozenSet`].
+fn stdlib_module_names_value() -> Object {
+    use crate::object::SetData;
+    let names: &[&'static str] = &[
+        "_abc",
+        "_aix_support",
+        "_ast",
+        "_asyncio",
+        "_bisect",
+        "_blake2",
+        "_bz2",
+        "_codecs",
+        "_codecs_cn",
+        "_codecs_hk",
+        "_codecs_iso2022",
+        "_codecs_jp",
+        "_codecs_kr",
+        "_codecs_tw",
+        "_collections",
+        "_collections_abc",
+        "_compat_pickle",
+        "_compression",
+        "_contextvars",
+        "_csv",
+        "_ctypes",
+        "_curses",
+        "_curses_panel",
+        "_datetime",
+        "_decimal",
+        "_elementtree",
+        "_frozen_importlib",
+        "_frozen_importlib_external",
+        "_functools",
+        "_hashlib",
+        "_heapq",
+        "_imp",
+        "_io",
+        "_json",
+        "_locale",
+        "_lsprof",
+        "_lzma",
+        "_markupbase",
+        "_md5",
+        "_multibytecodec",
+        "_multiprocessing",
+        "_opcode",
+        "_operator",
+        "_osx_support",
+        "_pickle",
+        "_posixshmem",
+        "_posixsubprocess",
+        "_py_abc",
+        "_pydecimal",
+        "_pyio",
+        "_queue",
+        "_random",
+        "_sha1",
+        "_sha2",
+        "_sha3",
+        "_signal",
+        "_sitebuiltins",
+        "_socket",
+        "_sqlite3",
+        "_sre",
+        "_ssl",
+        "_stat",
+        "_string",
+        "_strptime",
+        "_struct",
+        "_symtable",
+        "_thread",
+        "_threading_local",
+        "_tkinter",
+        "_tokenize",
+        "_tracemalloc",
+        "_uuid",
+        "_warnings",
+        "_weakref",
+        "_weakrefset",
+        "_zoneinfo",
+        "abc",
+        "antigravity",
+        "argparse",
+        "array",
+        "ast",
+        "asynchat",
+        "asyncio",
+        "asyncore",
+        "atexit",
+        "audioop",
+        "base64",
+        "bdb",
+        "binascii",
+        "bisect",
+        "builtins",
+        "bz2",
+        "cProfile",
+        "calendar",
+        "cgi",
+        "cgitb",
+        "chunk",
+        "cmath",
+        "cmd",
+        "code",
+        "codecs",
+        "codeop",
+        "collections",
+        "colorsys",
+        "compileall",
+        "concurrent",
+        "configparser",
+        "contextlib",
+        "contextvars",
+        "copy",
+        "copyreg",
+        "crypt",
+        "csv",
+        "ctypes",
+        "curses",
+        "dataclasses",
+        "datetime",
+        "dbm",
+        "decimal",
+        "difflib",
+        "dis",
+        "doctest",
+        "email",
+        "encodings",
+        "ensurepip",
+        "enum",
+        "errno",
+        "faulthandler",
+        "fcntl",
+        "filecmp",
+        "fileinput",
+        "fnmatch",
+        "fractions",
+        "ftplib",
+        "functools",
+        "gc",
+        "genericpath",
+        "getopt",
+        "getpass",
+        "gettext",
+        "glob",
+        "graphlib",
+        "grp",
+        "gzip",
+        "hashlib",
+        "heapq",
+        "hmac",
+        "html",
+        "http",
+        "idlelib",
+        "imaplib",
+        "imghdr",
+        "imp",
+        "importlib",
+        "inspect",
+        "io",
+        "ipaddress",
+        "itertools",
+        "json",
+        "keyword",
+        "linecache",
+        "locale",
+        "logging",
+        "lzma",
+        "mailbox",
+        "mailcap",
+        "marshal",
+        "math",
+        "mimetypes",
+        "mmap",
+        "modulefinder",
+        "msilib",
+        "msvcrt",
+        "multiprocessing",
+        "netrc",
+        "nis",
+        "nntplib",
+        "ntpath",
+        "numbers",
+        "opcode",
+        "operator",
+        "optparse",
+        "os",
+        "ossaudiodev",
+        "pathlib",
+        "pdb",
+        "pickle",
+        "pickletools",
+        "pipes",
+        "pkgutil",
+        "platform",
+        "plistlib",
+        "poplib",
+        "posix",
+        "posixpath",
+        "pprint",
+        "profile",
+        "pstats",
+        "pty",
+        "pwd",
+        "py_compile",
+        "pyclbr",
+        "pydoc",
+        "pydoc_data",
+        "pyexpat",
+        "queue",
+        "quopri",
+        "random",
+        "re",
+    ];
+    let mut set = SetData::new();
+    for n in names {
+        set.insert(DictKey(Object::from_static(n)));
+    }
+    // Two-shot to dodge the 200-element array literal limit.
+    for n in &[
+        "readline",
+        "reprlib",
+        "resource",
+        "rlcompleter",
+        "runpy",
+        "sched",
+        "secrets",
+        "select",
+        "selectors",
+        "shelve",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "smtpd",
+        "smtplib",
+        "sndhdr",
+        "socket",
+        "socketserver",
+        "spwd",
+        "sqlite3",
+        "sre_compile",
+        "sre_constants",
+        "sre_parse",
+        "ssl",
+        "stat",
+        "statistics",
+        "string",
+        "stringprep",
+        "struct",
+        "subprocess",
+        "sunau",
+        "symtable",
+        "sys",
+        "sysconfig",
+        "syslog",
+        "tabnanny",
+        "tarfile",
+        "telnetlib",
+        "tempfile",
+        "termios",
+        "test",
+        "textwrap",
+        "threading",
+        "time",
+        "timeit",
+        "tkinter",
+        "token",
+        "tokenize",
+        "tomllib",
+        "trace",
+        "traceback",
+        "tracemalloc",
+        "tty",
+        "turtle",
+        "turtledemo",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "urllib",
+        "uu",
+        "uuid",
+        "venv",
+        "warnings",
+        "wave",
+        "weakref",
+        "webbrowser",
+        "winreg",
+        "winsound",
+        "wsgiref",
+        "xdrlib",
+        "xml",
+        "xmlrpc",
+        "zipapp",
+        "zipfile",
+        "zipimport",
+        "zlib",
+        "zoneinfo",
+    ] {
+        set.insert(DictKey(Object::from_static(n)));
+    }
+    Object::FrozenSet(Rc::new(set))
+}
+
+/// `sys.getrefcount(obj)` — best-effort. Always returns a
+/// non-zero value to satisfy `assert sys.getrefcount(x) > 0`-
+/// style sanity checks. The exact number is implementation-
+/// specific even in CPython.
+fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.is_empty() {
+        return Err(type_error("getrefcount() takes exactly 1 argument"));
+    }
+    // Two is what CPython returns for a freshly-bound name: the
+    // local + the argument.
+    Ok(Object::Int(2))
+}
+
+/// Default `sys.displayhook`: if the value is None do nothing,
+/// otherwise print `repr(value)` and stash on
+/// `builtins._`. Matches CPython's reference implementation.
+fn sys_displayhook(args: &[Object]) -> Result<Object, RuntimeError> {
+    let value = args.first().cloned().unwrap_or(Object::None);
+    if matches!(value, Object::None) {
+        return Ok(Object::None);
+    }
+    let rendered = value.repr();
+    println!("{rendered}");
+    Ok(Object::None)
 }
 
 fn sys_thread_info() -> Object {

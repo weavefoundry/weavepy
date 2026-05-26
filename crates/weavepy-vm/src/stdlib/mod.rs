@@ -29,6 +29,7 @@ pub mod glob_mod;
 pub mod gzip_mod;
 pub mod hashlib_mod;
 pub mod hmac_mod;
+pub mod imp_mod;
 pub mod io;
 pub mod json;
 pub mod lzma_mod;
@@ -117,6 +118,9 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("gc", gc_real::build);
     cache.register_builtin("_multiprocessing", multiprocessing_mod::build);
     cache.register_builtin("_datetime", datetime_mod::build);
+    // RFC 0029 — `_imp` bridges the C-extension loader into the
+    // frozen `importlib.machinery.ExtensionFileLoader`.
+    cache.register_builtin("_imp", imp_mod::build);
     // RFC 0023 — drop-in stdlib parity.
     cache.register_builtin("unicodedata", unicodedata_mod::build);
     cache.register_builtin("_io", io_full::build);
