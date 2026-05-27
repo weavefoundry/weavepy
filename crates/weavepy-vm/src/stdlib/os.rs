@@ -333,6 +333,87 @@ pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("normpath")),
             builtin("normpath", path_normpath),
         );
+        d.insert(
+            DictKey(Object::from_static("normcase")),
+            builtin("normcase", path_normcase),
+        );
+        d.insert(
+            DictKey(Object::from_static("expanduser")),
+            builtin("expanduser", path_expanduser),
+        );
+        d.insert(
+            DictKey(Object::from_static("expandvars")),
+            builtin("expandvars", path_expandvars),
+        );
+        d.insert(
+            DictKey(Object::from_static("isabs")),
+            builtin("isabs", path_isabs),
+        );
+        d.insert(
+            DictKey(Object::from_static("realpath")),
+            builtin("realpath", path_abspath),
+        );
+        d.insert(
+            DictKey(Object::from_static("relpath")),
+            builtin("relpath", path_relpath),
+        );
+        d.insert(
+            DictKey(Object::from_static("commonpath")),
+            builtin("commonpath", path_commonpath),
+        );
+        d.insert(
+            DictKey(Object::from_static("commonprefix")),
+            builtin("commonprefix", path_commonprefix),
+        );
+        d.insert(
+            DictKey(Object::from_static("getsize")),
+            builtin("getsize", path_getsize),
+        );
+        d.insert(
+            DictKey(Object::from_static("getmtime")),
+            builtin("getmtime", path_getmtime),
+        );
+        d.insert(
+            DictKey(Object::from_static("getctime")),
+            builtin("getctime", path_getctime),
+        );
+        d.insert(
+            DictKey(Object::from_static("getatime")),
+            builtin("getatime", path_getmtime),
+        );
+        d.insert(
+            DictKey(Object::from_static("islink")),
+            builtin("islink", path_islink),
+        );
+        d.insert(
+            DictKey(Object::from_static("samefile")),
+            builtin("samefile", path_samefile),
+        );
+        d.insert(
+            DictKey(Object::from_static("supports_unicode_filenames")),
+            Object::Bool(true),
+        );
+        d.insert(DictKey(Object::from_static("altsep")), Object::None);
+        d.insert(
+            DictKey(Object::from_static("extsep")),
+            Object::from_static("."),
+        );
+        d.insert(
+            DictKey(Object::from_static("pardir")),
+            Object::from_static(".."),
+        );
+        d.insert(
+            DictKey(Object::from_static("curdir")),
+            Object::from_static("."),
+        );
+        d.insert(
+            DictKey(Object::from_static("pathsep")),
+            Object::from_static(if cfg!(windows) { ";" } else { ":" }),
+        );
+        d.insert(
+            DictKey(Object::from_static("devnull")),
+            Object::from_static(if cfg!(windows) { "nul" } else { "/dev/null" }),
+        );
     }
     Rc::new(PyModule {
         name: "os.path".to_owned(),
@@ -1290,6 +1371,250 @@ fn path_normpath(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = first_path(args, "normpath")?;
     let normalised = normpath_lexical(&s);
     Ok(Object::from_str(normalised))
+}
+
+fn path_normcase(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "normcase")?;
+    // On Windows, normcase lowercases the entire path and rewrites
+    // forward slashes. Elsewhere it's a no-op.
+    if cfg!(windows) {
+        let out: String = s
+            .chars()
+            .map(|c| {
+                if c == '/' {
+                    '\\'
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        Ok(Object::from_str(out))
+    } else {
+        Ok(Object::from_str(s))
+    }
+}
+
+fn path_expanduser(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "expanduser")?;
+    if !s.starts_with('~') {
+        return Ok(Object::from_str(s));
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return Ok(Object::from_str(s));
+    }
+    if s == "~" {
+        return Ok(Object::from_str(home));
+    }
+    if s.starts_with("~/") {
+        return Ok(Object::from_str(format!("{}{}", home, &s[1..])));
+    }
+    Ok(Object::from_str(s))
+}
+
+fn path_expandvars(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "expandvars")?;
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            let mut name = String::new();
+            // Support ${VAR} and $VAR
+            if chars.peek() == Some(&'{') {
+                chars.next();
+                while let Some(&nc) = chars.peek() {
+                    if nc == '}' {
+                        chars.next();
+                        break;
+                    }
+                    name.push(nc);
+                    chars.next();
+                }
+            } else {
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_ascii_alphanumeric() || nc == '_' {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if name.is_empty() {
+                out.push('$');
+            } else if let Ok(value) = std::env::var(&name) {
+                out.push_str(&value);
+            } else {
+                out.push('$');
+                out.push_str(&name);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(Object::from_str(out))
+}
+
+fn path_isabs(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "isabs")?;
+    Ok(Object::Bool(std::path::Path::new(&s).is_absolute()))
+}
+
+fn path_relpath(args: &[Object]) -> Result<Object, RuntimeError> {
+    let path = first_path(args, "relpath")?;
+    let start = match args.get(1) {
+        Some(o) => as_str(o, "relpath")?,
+        None => std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_owned()),
+    };
+    let path_abs = std::path::Path::new(&path).canonicalize();
+    let start_abs = std::path::Path::new(&start).canonicalize();
+    if let (Ok(p), Ok(s)) = (path_abs, start_abs) {
+        if let Ok(rel) = p.strip_prefix(&s) {
+            let mut r = rel.display().to_string();
+            if r.is_empty() {
+                r = ".".to_owned();
+            }
+            return Ok(Object::from_str(r));
+        }
+    }
+    Ok(Object::from_str(path))
+}
+
+fn path_commonpath(args: &[Object]) -> Result<Object, RuntimeError> {
+    let paths_obj = args
+        .first()
+        .ok_or_else(|| type_error("commonpath() requires an iterable of paths"))?;
+    let parts: Vec<String> = match paths_obj {
+        Object::List(l) => l.borrow().iter().map(|o| o.to_str()).collect(),
+        Object::Tuple(t) => t.iter().map(|o| o.to_str()).collect(),
+        _ => return Err(type_error("commonpath() requires a list or tuple of paths")),
+    };
+    if parts.is_empty() {
+        return Err(crate::error::value_error("commonpath() arg is empty"));
+    }
+    let sep = if cfg!(windows) { '\\' } else { '/' };
+    let split = |s: &str| -> Vec<String> { s.split(sep).map(str::to_owned).collect() };
+    let lists: Vec<Vec<String>> = parts.iter().map(|s| split(s)).collect();
+    let min_len = lists.iter().map(|v| v.len()).min().unwrap();
+    let mut common: Vec<String> = Vec::new();
+    for i in 0..min_len {
+        let token = &lists[0][i];
+        if lists.iter().all(|v| &v[i] == token) {
+            common.push(token.clone());
+        } else {
+            break;
+        }
+    }
+    Ok(Object::from_str(common.join(&sep.to_string())))
+}
+
+fn path_commonprefix(args: &[Object]) -> Result<Object, RuntimeError> {
+    let paths_obj = args
+        .first()
+        .ok_or_else(|| type_error("commonprefix() requires an iterable of paths"))?;
+    let parts: Vec<String> = match paths_obj {
+        Object::List(l) => l.borrow().iter().map(|o| o.to_str()).collect(),
+        Object::Tuple(t) => t.iter().map(|o| o.to_str()).collect(),
+        _ => {
+            return Err(type_error(
+                "commonprefix() requires a list or tuple of paths",
+            ))
+        }
+    };
+    if parts.is_empty() {
+        return Ok(Object::from_str(""));
+    }
+    let first = &parts[0];
+    let mut end = first.len();
+    for s in &parts[1..] {
+        let limit = end.min(s.len());
+        let mut i = 0;
+        let a = first.as_bytes();
+        let b = s.as_bytes();
+        while i < limit && a[i] == b[i] {
+            i += 1;
+        }
+        end = i;
+        if end == 0 {
+            break;
+        }
+    }
+    Ok(Object::from_str(first[..end].to_owned()))
+}
+
+fn path_getsize(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "getsize")?;
+    let md = std::fs::metadata(&s).map_err(|e| crate::error::os_error(format!("{}: {}", s, e)))?;
+    Ok(Object::Int(md.len() as i64))
+}
+
+fn path_getmtime(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "getmtime")?;
+    let md = std::fs::metadata(&s).map_err(|e| crate::error::os_error(format!("{}: {}", s, e)))?;
+    let mtime = md
+        .modified()
+        .map_err(|e| crate::error::os_error(e.to_string()))?;
+    let secs = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    Ok(Object::Float(secs))
+}
+
+fn path_getctime(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "getctime")?;
+    let md = std::fs::metadata(&s).map_err(|e| crate::error::os_error(format!("{}: {}", s, e)))?;
+    // `created` is unreliable across platforms; fall back to mtime.
+    let ct = md
+        .created()
+        .or_else(|_| md.modified())
+        .map_err(|e| crate::error::os_error(e.to_string()))?;
+    let secs = ct
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    Ok(Object::Float(secs))
+}
+
+fn path_islink(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "islink")?;
+    let md = std::fs::symlink_metadata(&s);
+    Ok(Object::Bool(
+        matches!(md, Ok(m) if m.file_type().is_symlink()),
+    ))
+}
+
+fn path_samefile(args: &[Object]) -> Result<Object, RuntimeError> {
+    let a = first_path(args, "samefile")?;
+    let b = match args.get(1) {
+        Some(o) => as_str(o, "samefile")?,
+        None => return Err(type_error("samefile() requires two paths")),
+    };
+    let am = std::fs::metadata(&a);
+    let bm = std::fs::metadata(&b);
+    match (am, bm) {
+        (Ok(am), Ok(bm)) => {
+            // On Unix the dev+inode identifies a file; on Windows
+            // we approximate by comparing canonical paths.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                Ok(Object::Bool(am.dev() == bm.dev() && am.ino() == bm.ino()))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (am, bm);
+                let acanon = std::path::Path::new(&a).canonicalize();
+                let bcanon = std::path::Path::new(&b).canonicalize();
+                Ok(Object::Bool(
+                    matches!((acanon, bcanon), (Ok(ac), Ok(bc)) if ac == bc),
+                ))
+            }
+        }
+        _ => Ok(Object::Bool(false)),
+    }
 }
 
 fn first_path(args: &[Object], func: &str) -> Result<String, RuntimeError> {

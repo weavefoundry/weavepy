@@ -461,6 +461,23 @@ impl Interpreter {
         self.call(&callable, args, kwargs, &globals)
     }
 
+    /// As [`Self::call_object`] but lets the caller pass an explicit
+    /// outer-globals dict (used by `sys.audit` hook dispatch where
+    /// we want to make builtins reachable but not pollute any
+    /// user globals).
+    pub fn call_object_with_globals(
+        &mut self,
+        callable: &Object,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let _handles = self.activate_thread_handles();
+        self.call(callable, args, kwargs, globals)
+    }
+
     /// Public iterator-construction entry point. Mirrors `iter(o)`.
     /// Used by `PyObject_GetIter` in the C-API.
     pub fn iter_object(&mut self, value: Object) -> Result<Object, RuntimeError> {
@@ -532,6 +549,8 @@ impl Interpreter {
         code: &CodeObject,
         globals: Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
         let code_rc = Rc::new(code.clone());
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
@@ -546,6 +565,8 @@ impl Interpreter {
         name: &str,
         file: Option<&str>,
     ) -> Result<Object, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
         let globals = self.build_module_globals(name, file, None);
         // Insert the module into `sys.modules` so callers can introspect
@@ -593,6 +614,18 @@ impl Interpreter {
                 }
             }
         }
+    }
+
+    /// Public re-export of [`Self::build_module_globals`] used by the
+    /// `interpreters` module to seed a fresh `__main__` dict for a
+    /// sub-interpreter (RFC 0031 — PEP 684).
+    pub fn build_module_globals_for(
+        &mut self,
+        name: &str,
+        file: Option<&str>,
+        package: Option<&str>,
+    ) -> Rc<RefCell<DictData>> {
+        self.build_module_globals(name, file, package)
     }
 
     /// Populate a fresh module-globals dict with builtins, builtin
@@ -716,6 +749,13 @@ impl Interpreter {
         // (generators on resume) — each entry gets a fresh PyFrame
         // because the `back` chain reflects who is calling *now*.
         let py_frame = self.push_py_frame(frame);
+        // RFC 0031 — fire the `'call'` event on frame entry. The
+        // hook's return value becomes the per-frame trace function
+        // for subsequent line / return / exception events.
+        let observers_active = crate::trace::any_observers_active();
+        if observers_active {
+            self.fire_call_event(&py_frame)?;
+        }
         let result = loop {
             // Mirror the live `pc` into the snapshot so `f_lineno`
             // reads correctly when user code introspects via
@@ -724,13 +764,36 @@ impl Interpreter {
             // Re-sync the locals mirror so a child frame's
             // `f_back.f_locals` reflects this frame's mutations.
             self.sync_py_locals(frame);
+            // Fire a 'line' event when the source line changes.
+            // Fast path: skip the line-table read entirely when no
+            // observer is active.
+            if crate::trace::any_observers_active() {
+                let line = py_frame.current_lineno();
+                if line != 0 && py_frame.last_line.get() != Some(line) {
+                    py_frame.last_line.set(Some(line));
+                    self.fire_line_event(&py_frame)?;
+                }
+            }
             match self.step(frame) {
                 Ok(StepOutcome::Continue) => {}
-                Ok(StepOutcome::Return(v)) => break Ok(FrameOutcome::Returned(v)),
-                Ok(StepOutcome::Yield(v)) => break Ok(FrameOutcome::Yielded(v)),
+                Ok(StepOutcome::Return(v)) => {
+                    if crate::trace::any_observers_active() {
+                        self.fire_return_event(&py_frame, &v)?;
+                    }
+                    break Ok(FrameOutcome::Returned(v));
+                }
+                Ok(StepOutcome::Yield(v)) => {
+                    if crate::trace::any_observers_active() {
+                        self.fire_yield_event(&py_frame, &v)?;
+                    }
+                    break Ok(FrameOutcome::Yielded(v));
+                }
                 Ok(StepOutcome::StartGenerator) => break Ok(FrameOutcome::StartGenerator),
                 Err(err) => {
                     if let RuntimeError::PyException(exc) = err {
+                        if crate::trace::any_observers_active() {
+                            self.fire_exception_event(&py_frame, &exc)?;
+                        }
                         match self.handle_exception(frame, exc) {
                             Ok(Some(())) => continue,
                             Ok(None) => unreachable!(),
@@ -817,6 +880,7 @@ impl Interpreter {
             locals_mirror: RefCell::new(Some(locals_snapshot)),
             trace: RefCell::new(Object::None),
             override_lineno: Cell::new(None),
+            last_line: Cell::new(None),
         });
         self.frame_stack.borrow_mut().push(py.clone());
         py
@@ -841,6 +905,218 @@ impl Interpreter {
 
     fn pop_py_frame(&self) {
         self.frame_stack.borrow_mut().pop();
+    }
+
+    // ===========================================================
+    // RFC 0031 — VM observability hooks (settrace / setprofile /
+    // sys.monitoring / sys.audit).
+    //
+    // The dispatcher calls these between bytecode steps. All four
+    // fire conditionally; in the typical no-debugger case they
+    // short-circuit on a single thread-local pointer check.
+    // ===========================================================
+
+    /// Invoke a hook with `(frame, event, arg)`. Returns the hook's
+    /// return value. Re-entrance is guarded — a hook calling Python
+    /// that itself triggers events won't infinitely recurse.
+    fn invoke_observe_hook(
+        &mut self,
+        hook: &Object,
+        py_frame: &Rc<PyFrame>,
+        event: &'static str,
+        arg: Object,
+    ) -> Result<Object, RuntimeError> {
+        let _guard = match crate::trace::ReentryGuard::acquire() {
+            Some(g) => g,
+            None => return Ok(Object::None),
+        };
+        let args = [
+            Object::Frame(py_frame.clone()),
+            Object::from_static(event),
+            arg,
+        ];
+        let outer = self.builtins.clone();
+        // Errors from the hook are deliberately swallowed in CPython
+        // (it disables the hook and prints to stderr). We mirror
+        // that behaviour: a hook crash should never take down the
+        // user program. We do let `RuntimeError::PyException` rise
+        // when the hook is observing a user-raised exception so the
+        // exception propagation in the caller stays intact.
+        match self.call(hook, &args, &[], &outer) {
+            Ok(v) => Ok(v),
+            Err(RuntimeError::PyException(_)) => Ok(Object::None),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Fire the `'call'` event when a frame is entered. Installs
+    /// the returned per-frame trace function (settrace contract).
+    fn fire_call_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        if let Some(trace) = crate::trace::trace_hook() {
+            let result = self.invoke_observe_hook(&trace, py_frame, "call", Object::None)?;
+            *py_frame.trace.borrow_mut() = result;
+        }
+        if let Some(profile) = crate::trace::profile_hook() {
+            let _ = self.invoke_observe_hook(&profile, py_frame, "call", Object::None)?;
+        }
+        self.fire_monitoring_event(py_frame, crate::trace::EVENT_PY_START, Object::None)?;
+        Ok(())
+    }
+
+    /// Fire the `'line'` event when the source line changes.
+    fn fire_line_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        let frame_trace = py_frame.trace.borrow().clone();
+        if !matches!(frame_trace, Object::None) {
+            let result = self.invoke_observe_hook(&frame_trace, py_frame, "line", Object::None)?;
+            // Per CPython: the local trace function may return a new
+            // local trace for subsequent line events.
+            *py_frame.trace.borrow_mut() = result;
+        }
+        self.fire_monitoring_event(py_frame, crate::trace::EVENT_LINE, Object::None)?;
+        Ok(())
+    }
+
+    /// Fire the `'return'` event when a frame returns normally.
+    fn fire_return_event(
+        &mut self,
+        py_frame: &Rc<PyFrame>,
+        value: &Object,
+    ) -> Result<(), RuntimeError> {
+        let frame_trace = py_frame.trace.borrow().clone();
+        if !matches!(frame_trace, Object::None) {
+            let _ = self.invoke_observe_hook(&frame_trace, py_frame, "return", value.clone())?;
+        }
+        if let Some(profile) = crate::trace::profile_hook() {
+            let _ = self.invoke_observe_hook(&profile, py_frame, "return", value.clone())?;
+        }
+        self.fire_monitoring_event(py_frame, crate::trace::EVENT_PY_RETURN, value.clone())?;
+        Ok(())
+    }
+
+    /// Fire the `'return'` event when a frame yields (the trace
+    /// API treats yield as a return-with-None; sys.monitoring has
+    /// a dedicated PY_YIELD bit).
+    fn fire_yield_event(
+        &mut self,
+        py_frame: &Rc<PyFrame>,
+        value: &Object,
+    ) -> Result<(), RuntimeError> {
+        let frame_trace = py_frame.trace.borrow().clone();
+        if !matches!(frame_trace, Object::None) {
+            let _ = self.invoke_observe_hook(&frame_trace, py_frame, "return", Object::None)?;
+        }
+        self.fire_monitoring_event(py_frame, crate::trace::EVENT_PY_YIELD, value.clone())?;
+        Ok(())
+    }
+
+    /// Fire the `'exception'` event when a frame raises.
+    fn fire_exception_event(
+        &mut self,
+        py_frame: &Rc<PyFrame>,
+        exc: &PyException,
+    ) -> Result<(), RuntimeError> {
+        let frame_trace = py_frame.trace.borrow().clone();
+        if !matches!(frame_trace, Object::None) {
+            // CPython passes a 3-tuple (type, value, traceback). We
+            // approximate with (type, value, None) — the instance
+            // already carries `__traceback__`.
+            let exc_type = match &exc.instance {
+                Object::Instance(inst) => Object::Type(inst.class.clone()),
+                _ => Object::None,
+            };
+            let arg = Object::new_tuple(vec![exc_type, exc.instance.clone(), Object::None]);
+            let _ = self.invoke_observe_hook(&frame_trace, py_frame, "exception", arg)?;
+        }
+        self.fire_monitoring_event(py_frame, crate::trace::EVENT_RAISE, exc.instance.clone())?;
+        Ok(())
+    }
+
+    /// Record an object allocation with `tracemalloc`. Fast path
+    /// short-circuits when tracking is disabled (the common case).
+    /// `nbytes` is the object's approximate footprint as reported
+    /// by `sys.getsizeof`; we use it for the bookkeeping totals.
+    #[inline]
+    fn record_alloc(&self, frame: &Frame, nbytes: u64) {
+        if !crate::stdlib::tracemalloc_real::with_state(|s| s.enabled) {
+            return;
+        }
+        let line = frame
+            .code
+            .linetable
+            .get(frame.pc as usize)
+            .copied()
+            .unwrap_or(0);
+        crate::stdlib::tracemalloc_real::record_alloc(
+            &frame.code.filename,
+            i64::from(line),
+            nbytes,
+        );
+    }
+
+    /// Fire a PEP 669 `sys.monitoring` event. Walks the registered
+    /// tools and invokes any callback whose mask includes
+    /// `event_idx`.
+    ///
+    /// PEP 669 specifies the callback signature per-event. Two-arg
+    /// events get `(code, instruction_offset)`; three-arg events
+    /// get `(code, instruction_offset, arg)` where `arg` is a
+    /// retval / yielded value / exception instance / destination
+    /// offset depending on the event.
+    fn fire_monitoring_event(
+        &mut self,
+        py_frame: &Rc<PyFrame>,
+        event_idx: usize,
+        arg: Object,
+    ) -> Result<(), RuntimeError> {
+        let bit = crate::trace::event_mask(event_idx);
+        let active: Vec<Object> = crate::trace::with_monitoring(|tools| {
+            let mut out = Vec::new();
+            for tid in 0..tools.events.len() {
+                if tools.events[tid] & bit == 0 {
+                    continue;
+                }
+                if let Some(cb) = tools.callbacks[tid][event_idx].clone() {
+                    out.push(cb);
+                }
+            }
+            out
+        });
+        if active.is_empty() {
+            return Ok(());
+        }
+        let code = Object::Code(py_frame.code.clone());
+        let offset = Object::Int(i64::from(py_frame.lasti.get()));
+        let line = Object::Int(i64::from(py_frame.current_lineno()));
+        for cb in active {
+            let guard = match crate::trace::ReentryGuard::acquire() {
+                Some(g) => g,
+                None => return Ok(()),
+            };
+            let outer = self.builtins.clone();
+            // PEP 669 callback arities:
+            //   LINE                              -> (code, line_number)
+            //   PY_START / PY_RESUME              -> (code, offset)
+            //   INSTRUCTION                       -> (code, offset)
+            //   PY_RETURN / PY_YIELD / PY_THROW
+            //   PY_UNWIND / RAISE / RERAISE
+            //   STOP_ITERATION / EXCEPTION_HANDLED-> (code, offset, arg)
+            //   BRANCH / JUMP                     -> (code, offset, dest)
+            //   CALL / C_RAISE / C_RETURN         -> (code, offset, callable, arg0)
+            //                                        (we approximate as 3-arg)
+            let args: Vec<Object> = match event_idx {
+                crate::trace::EVENT_LINE => vec![code.clone(), line.clone()],
+                crate::trace::EVENT_PY_START
+                | crate::trace::EVENT_PY_RESUME
+                | crate::trace::EVENT_INSTRUCTION => vec![code.clone(), offset.clone()],
+                _ => vec![code.clone(), offset.clone(), arg.clone()],
+            };
+            match self.call(&cb, &args, &[], &outer) {
+                Ok(_) | Err(RuntimeError::PyException(_)) => {}
+                Err(other) => return Err(other),
+            }
+            drop(guard);
+        }
+        Ok(())
     }
 
     /// Run a single instruction. The `pc` is advanced past it; if the
@@ -1340,18 +1616,21 @@ impl Interpreter {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
+                self.record_alloc(frame, 56 + (n as u64) * 8);
                 frame.push(Object::new_list(items));
             }
             OpCode::BuildTuple => {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
+                self.record_alloc(frame, 40 + (n as u64) * 8);
                 frame.push(Object::new_tuple(items));
             }
             OpCode::BuildSet => {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
+                self.record_alloc(frame, 216 + (n as u64) * 16);
                 frame.push(Object::new_set_from(items));
             }
             OpCode::BuildMap => {
@@ -1369,6 +1648,7 @@ impl Interpreter {
                     })?;
                     d.insert(DictKey(k), v);
                 }
+                self.record_alloc(frame, 64 + (n as u64) * 16);
                 frame.push(Object::Dict(Rc::new(RefCell::new(d))));
             }
             OpCode::BuildString => {
@@ -1379,6 +1659,7 @@ impl Interpreter {
                 for p in parts {
                     s.push_str(&p.to_str());
                 }
+                self.record_alloc(frame, 49 + s.len() as u64);
                 frame.push(Object::from_str(s));
             }
             OpCode::ListAppend => {
@@ -2148,6 +2429,7 @@ impl Interpreter {
                     locals_mirror: RefCell::new(None),
                     trace: RefCell::new(Object::None),
                     override_lineno: Cell::new(None),
+                    last_line: Cell::new(None),
                 })
             });
         let new_tb = Rc::new(PyTraceback {
@@ -6979,6 +7261,15 @@ impl Interpreter {
             Some(Object::Str(s)) => s.to_string(),
             _ => "exec".to_owned(),
         };
+        // PEP 578 — `compile` audits the call so security-sensitive
+        // hosts can intercept dynamic code paths.
+        crate::stdlib::sys::audit_event(
+            "compile",
+            &[
+                Object::from_str(source.clone()),
+                Object::from_str(filename.clone()),
+            ],
+        );
         match mode.as_str() {
             "exec" => {
                 let module = weavepy_parser::parse_module(&source)
@@ -7016,6 +7307,7 @@ impl Interpreter {
             .first()
             .cloned()
             .ok_or_else(|| type_error("exec() missing required argument 'source'"))?;
+        crate::stdlib::sys::audit_event("exec", std::slice::from_ref(&source));
         let globals_dict = match args.get(1) {
             Some(Object::Dict(d)) => d.clone(),
             Some(Object::None) | None => outer_globals.clone(),
@@ -7067,6 +7359,7 @@ impl Interpreter {
             .first()
             .cloned()
             .ok_or_else(|| type_error("eval() missing required argument 'source'"))?;
+        crate::stdlib::sys::audit_event("exec", std::slice::from_ref(&source));
         let globals_dict = match args.get(1) {
             Some(Object::Dict(d)) => d.clone(),
             Some(Object::None) | None => outer_globals.clone(),
@@ -7132,6 +7425,19 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         let package = current_package(current_globals);
         let absolute = resolve_relative(package.as_deref(), name, level).map_err(import_error)?;
+        // PEP 578 — `import(name, globals, locals, fromlist, level)`
+        // audit event. CPython only fires once per import name, at
+        // the point IMPORT_NAME runs.
+        crate::stdlib::sys::audit_event(
+            "import",
+            &[
+                Object::from_str(absolute.clone()),
+                Object::None,
+                Object::None,
+                fromlist.clone(),
+                Object::Int(i64::from(level)),
+            ],
+        );
         let leaf = self.import_path(&absolute)?;
 
         // CPython: with no fromlist, return the top-level package.

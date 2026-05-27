@@ -35,11 +35,23 @@ work.
 > `_numpylike`, a bundled `pytest` + `pluggy` + `iniconfig` +
 > `exceptiongroup` stack, and `sys.settrace` / `sys.setprofile` /
 > `sys.monitoring` (PEP 669) + `tracemalloc` observability so
-> debuggers, coverage tools, and profilers boot. The CPython
-> `Lib/test/` allowlist remains an aspirational target — see
-> `tests/regrtest/expectations.toml` for the per-test baseline.
-> Expect small breaking changes around the edges as the long tail
-> catches up.
+> debuggers, coverage tools, and profilers boot. `RFC 0031`
+> closes the observability loop: the VM dispatcher actually
+> *fires* the registered hooks (call / line / return / yield /
+> exception for `settrace` + `setprofile`; the PEP 669 event
+> table for `sys.monitoring`; `record_alloc` from container-
+> construction opcodes for `tracemalloc`; PEP 578 audit dispatch
+> at open / compile / exec / eval / import / marshal sites). The
+> same commit lands PEP 684 sub-interpreters (`_xxsubinterpreters`
+> + a high-level `interpreters` frontend with cross-interpreter
+> channels), wires `pdb` / `bdb` on top of the now-firing
+> `settrace`, and grows `_pytest` to handle `@pytest.mark.parametrize`
+> Cartesian matrices, indirect fixtures, `request.addfinalizer`
+> LIFO ordering, and per-scope (function / class / module /
+> session) fixture caching. The CPython `Lib/test/` allowlist
+> remains an aspirational target — see `tests/regrtest/expectations.toml`
+> for the per-test baseline. Expect small breaking changes
+> around the edges as the long tail catches up.
 
 ## Repository layout
 

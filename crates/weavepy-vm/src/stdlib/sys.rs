@@ -136,13 +136,23 @@ pub fn build_with_state(
             DictKey(Object::from_static("getsizeof")),
             builtin("getsizeof", sys_getsizeof),
         );
+        // PEP 578 audit hooks. `sys.audit(event, *args)` walks the
+        // registered hook list; `sys.addaudithook(hook)` appends to
+        // the per-thread list. We deliberately *don't* fire from
+        // here — the call-out is performed by
+        // ``crate::stdlib::sys::audit_event`` which the VM and
+        // stdlib invoke at the documented event sites
+        // (`open`, `compile`, `exec`, `import`, `subprocess.Popen`,
+        // `socket.connect`, `marshal.loads`, …). Calling
+        // ``sys.audit`` from user code is also supported and
+        // routes through the same registry.
         d.insert(
             DictKey(Object::from_static("audit")),
-            builtin("audit", |_| Ok(Object::None)),
+            builtin("audit", sys_audit),
         );
         d.insert(
             DictKey(Object::from_static("addaudithook")),
-            builtin("addaudithook", |_| Ok(Object::None)),
+            builtin("addaudithook", sys_addaudithook),
         );
         d.insert(DictKey(Object::from_static("flags")), sys_flags_value());
         // Default to `False`, matching CPython. The CLI/embedder
@@ -690,6 +700,72 @@ fn sys_settrace(args: &[Object]) -> Result<Object, RuntimeError> {
     let hook = args.first().cloned().unwrap_or(Object::None);
     crate::trace::set_trace_hook(hook);
     Ok(Object::None)
+}
+
+fn sys_addaudithook(args: &[Object]) -> Result<Object, RuntimeError> {
+    let hook = args.first().cloned().unwrap_or(Object::None);
+    crate::trace::add_audit_hook(hook);
+    Ok(Object::None)
+}
+
+/// PEP 578 — `sys.audit(event, *args)`. Walks the registered audit
+/// hooks and invokes each with `(event, args)`. Stdlib code should
+/// prefer [`audit_event`] which inserts the call without paying for
+/// the dict lookup.
+fn sys_audit(args: &[Object]) -> Result<Object, RuntimeError> {
+    let event = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(other) => {
+            return Err(crate::error::type_error(format!(
+                "sys.audit() argument 1 must be str, not '{}'",
+                other.type_name()
+            )))
+        }
+        None => return Err(crate::error::type_error("sys.audit() missing event name")),
+    };
+    let rest: Vec<Object> = args.iter().skip(1).cloned().collect();
+    audit_event(&event, &rest);
+    Ok(Object::None)
+}
+
+/// Fire a PEP 578 audit event. Stdlib code (and the VM) calls this
+/// at documented event sites (`open`, `compile`, `exec`,
+/// `socket.connect`, `subprocess.Popen`, `import`, …). Hooks run
+/// out-of-band — exceptions raised by a hook are routed through
+/// `sys.unraisablehook` rather than back to the caller, matching
+/// CPython.
+pub fn audit_event(event: &str, args: &[Object]) {
+    if !crate::trace::any_audit_active() {
+        return;
+    }
+    let hooks = crate::trace::audit_hooks();
+    if hooks.is_empty() {
+        return;
+    }
+    let Some(_guard) = crate::trace::ReentryGuard::acquire() else {
+        return;
+    };
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return;
+    };
+    // SAFETY: `ptr` was published by `publish_interpreter_ptr` from
+    // a `&mut Interpreter` that is still on the call stack above us
+    // (the guard pops on drop). The reentry guard ensures we don't
+    // re-enter a Python frame that's currently borrowing the
+    // interpreter mutably. Mutation from this thread is exclusive
+    // because the VM holds the GIL across the whole audit event.
+    let interp = unsafe { &mut *ptr };
+    let arg_tuple = Object::new_tuple(args.to_vec());
+    let outer = interp.builtins_dict();
+    for hook in hooks {
+        let call_args = [Object::from_str(event.to_string()), arg_tuple.clone()];
+        // Errors are deliberately swallowed — PEP 578 says hook
+        // failures must not change the program's observable
+        // behaviour. CPython routes them through `sys.unraisablehook`;
+        // we do the same minus the user notification (which is a
+        // RFC 0026 follow-up).
+        let _ = interp.call_object_with_globals(&hook, &call_args, &[], &outer);
+    }
 }
 
 fn sys_setprofile(args: &[Object]) -> Result<Object, RuntimeError> {

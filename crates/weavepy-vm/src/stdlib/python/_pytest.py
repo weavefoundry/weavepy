@@ -32,7 +32,7 @@ import traceback
 
 __all__ = [
     'main', 'fixture', 'raises', 'warns', 'skip', 'fail', 'xfail',
-    'approx', 'mark', 'Session', 'Item', 'Collector', 'ExitCode',
+    'approx', 'mark', 'param', 'Session', 'Item', 'Collector', 'ExitCode',
     'Module', 'Function', 'Class',
     'UsageError', 'CollectionError',
 ]
@@ -136,26 +136,97 @@ mark = _MarkModule()
 # ============================================================ fixture system
 
 
-_FIXTURE_REGISTRY = {}  # name -> (fn, scope, params)
+# `name -> _FixtureDef` registry. RFC 0031: extended to support
+# scopes, params (parametrized fixtures), autouse, and yield-style
+# fixtures with `request.addfinalizer` teardown.
+_FIXTURE_REGISTRY = {}
+
+
+class _FixtureDef:
+    __slots__ = ('fn', 'scope', 'params', 'ids', 'autouse', 'name', 'generator')
+
+    def __init__(self, fn, scope, params, ids, autouse, name):
+        self.fn = fn
+        self.scope = scope
+        self.params = params
+        self.ids = ids
+        self.autouse = autouse
+        self.name = name
+        # `True` if the fixture is a generator function (yield-style
+        # fixture). Detected up-front so request execution can drive
+        # the teardown side.
+        self.generator = inspect.isgeneratorfunction(fn)
+
+    # Backward-compatible dict-style access — older code reads
+    # `fn._pytest_fixture['scope']`.
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 def fixture(callable_=None, *, scope='function', params=None, autouse=False,
             ids=None, name=None):
-    """Mark a callable as a fixture provider."""
+    """Mark a callable as a fixture provider.
+
+    Supports ``scope`` (``'function'`` / ``'class'`` / ``'module'`` /
+    ``'session'``), ``params`` (list of values; one fixture-arg
+    binding per test), ``autouse`` (request the fixture by default
+    on every test that's reachable from the scope), and yield-style
+    teardown (use ``yield`` inside the body instead of ``return``).
+    """
+    if scope not in ('function', 'class', 'module', 'session'):
+        raise ValueError("invalid fixture scope: {!r}".format(scope))
+
     def deco(fn):
         fname = name or fn.__name__
-        fn._pytest_fixture = {
-            'scope': scope,
-            'params': params,
-            'autouse': autouse,
-            'ids': ids,
-            'name': fname,
-        }
-        _FIXTURE_REGISTRY[fname] = (fn, scope, params)
+        defn = _FixtureDef(fn, scope, params, ids, autouse, fname)
+        fn._pytest_fixture = defn
+        _FIXTURE_REGISTRY[fname] = defn
         return fn
     if callable_ is not None and callable(callable_):
         return deco(callable_)
     return deco
+
+
+# Per-scope caches, refreshed by `_FixtureManager.enter_scope`.
+class _FixtureManager:
+    """Tracks fixture instances and teardowns across scopes."""
+
+    def __init__(self):
+        self._caches = {
+            'session': {},
+            'module': {},
+            'class': {},
+            'function': {},
+        }
+        # Finalizer stacks per scope. LIFO — last-in-first-out.
+        self._finalizers = {
+            'session': [],
+            'module': [],
+            'class': [],
+            'function': [],
+        }
+
+    def reset_scope(self, scope):
+        # Run finalizers in reverse order, then clear the cache.
+        for fin in reversed(self._finalizers[scope]):
+            try:
+                fin()
+            except Exception:
+                traceback.print_exc()
+        self._finalizers[scope].clear()
+        self._caches[scope].clear()
+
+    def get_cached(self, name, scope, param):
+        return self._caches[scope].get((name, param))
+
+    def set_cached(self, name, scope, param, value):
+        self._caches[scope][(name, param)] = value
+
+    def add_finalizer(self, scope, fn):
+        self._finalizers[scope].append(fn)
 
 
 def _builtin_fixture_tmp_path(request):  # noqa: ARG001
@@ -172,6 +243,89 @@ def _builtin_fixture_tmpdir(request):  # noqa: ARG001
 def _builtin_fixture_capsys(request):  # noqa: ARG001
     import io as _io
     return _CapsysHandle(_io.StringIO(), _io.StringIO())
+
+
+def _builtin_fixture_monkeypatch(request):  # noqa: ARG001
+    return _MonkeyPatchHandle()
+
+
+class _MonkeyPatchHandle:
+    """Minimal monkeypatch fixture for swapping attrs / env vars."""
+
+    def __init__(self):
+        self._undo = []
+
+    def setattr(self, target, name=None, value=None, raising=True):
+        if isinstance(target, str):
+            if name is None or value is None:
+                raise TypeError(
+                    'monkeypatch.setattr with dotted-string target needs name+value'
+                )
+            mod_name, _, attr = target.rpartition('.')
+            mod = importlib.import_module(mod_name)
+            target = mod
+            name_for_attr = attr
+            value_for_attr = value
+        else:
+            name_for_attr = name
+            value_for_attr = value
+        if raising and not hasattr(target, name_for_attr):
+            raise AttributeError(
+                'object {!r} has no attribute {!r}'.format(target, name_for_attr)
+            )
+        old = getattr(target, name_for_attr, None)
+        had = hasattr(target, name_for_attr)
+        setattr(target, name_for_attr, value_for_attr)
+        self._undo.append(('attr', target, name_for_attr, old, had))
+
+    def setenv(self, name, value):
+        old = os.environ.get(name)
+        os.environ[name] = str(value)
+        self._undo.append(('env', name, old))
+
+    def delenv(self, name, raising=True):
+        old = os.environ.pop(name, None)
+        if old is None and raising:
+            raise KeyError(name)
+        self._undo.append(('env', name, old))
+
+    def syspath_prepend(self, path):
+        sys.path.insert(0, path)
+        self._undo.append(('syspath', path))
+
+    def chdir(self, path):
+        old = os.getcwd()
+        os.chdir(path)
+        self._undo.append(('cwd', old))
+
+    def undo(self):
+        for entry in reversed(self._undo):
+            kind = entry[0]
+            if kind == 'attr':
+                _, target, name, old, had = entry
+                if had:
+                    setattr(target, name, old)
+                else:
+                    try:
+                        delattr(target, name)
+                    except Exception:
+                        pass
+            elif kind == 'env':
+                _, name, old = entry
+                if old is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = old
+            elif kind == 'syspath':
+                _, path = entry
+                try:
+                    sys.path.remove(path)
+                except ValueError:
+                    pass
+            elif kind == 'cwd':
+                _, old = entry
+                os.chdir(old)
+        self._undo.clear()
 
 
 class _CapsysHandle:
@@ -216,25 +370,93 @@ _BUILTIN_FIXTURES = {
     'tmp_path': _builtin_fixture_tmp_path,
     'tmpdir': _builtin_fixture_tmpdir,
     'capsys': _builtin_fixture_capsys,
+    'monkeypatch': _builtin_fixture_monkeypatch,
 }
 
 
-def _resolve_fixture(name, request):
-    fn = _FIXTURE_REGISTRY.get(name)
-    if fn is not None:
-        return fn[0](request) if 'request' in inspect.signature(fn[0]).parameters else fn[0]()
+class _Request:
+    """Drop-in for ``pytest.FixtureRequest``.
+
+    Exposes ``node`` / ``item`` (the test being run), ``param`` (the
+    indirect-fixture parameter), ``fixturename``, and
+    ``addfinalizer``. Finalisers are queued at the fixture's scope.
+    """
+    __slots__ = ('node', 'item', 'param', 'fixturename', '_manager', '_scope')
+
+    def __init__(self, node, item, manager, scope, fixturename=None, param=None):
+        self.node = node
+        self.item = item
+        self.param = param
+        self.fixturename = fixturename
+        self._manager = manager
+        self._scope = scope
+
+    def addfinalizer(self, fn):
+        self._manager.add_finalizer(self._scope, fn)
+
+    def getfixturevalue(self, name):
+        return _resolve_fixture(name, self._manager, self.item, self.node)
+
+
+def _resolve_fixture(name, manager=None, item=None, node=None, param=None,
+                     parent_scope='function'):
+    """Resolve a fixture by name.
+
+    Honours scope caching, generator-style teardown, and
+    parametrised fixtures (the active ``param`` is read from the
+    item's `_params` dict if present).
+    """
+    if manager is None:
+        manager = _FIXTURE_MANAGER
+    defn = _FIXTURE_REGISTRY.get(name)
+    if defn is not None:
+        # Parametrised fixture: pick the active parameter for this
+        # item if `parametrize` filled it in.
+        active_param = param
+        if active_param is None and item is not None:
+            active_param = getattr(item, '_fixture_params', {}).get(name)
+        cache_key = active_param
+        cached = manager.get_cached(name, defn.scope, cache_key)
+        if cached is not None:
+            return cached
+        req = _Request(node=node, item=item, manager=manager,
+                       scope=defn.scope, fixturename=name, param=active_param)
+        # Build the argument bindings — recurse for any fixture deps.
+        sig = inspect.signature(defn.fn)
+        kwargs = {}
+        for pname in sig.parameters:
+            if pname == 'request':
+                kwargs[pname] = req
+            else:
+                sub = _resolve_fixture(pname, manager, item, node)
+                if sub is not None:
+                    kwargs[pname] = sub
+        if defn.generator:
+            it = defn.fn(**kwargs)
+            value = next(it)
+            def _teardown(it=it):
+                try:
+                    next(it)
+                except StopIteration:
+                    pass
+            manager.add_finalizer(defn.scope, _teardown)
+        else:
+            value = defn.fn(**kwargs)
+        manager.set_cached(name, defn.scope, cache_key, value)
+        return value
     builtin = _BUILTIN_FIXTURES.get(name)
     if builtin is not None:
-        return builtin(request)
+        req = _Request(node=node, item=item, manager=manager,
+                       scope='function', fixturename=name)
+        # monkeypatch needs an automatic teardown.
+        val = builtin(req)
+        if name == 'monkeypatch':
+            manager.add_finalizer('function', val.undo)
+        return val
     return None
 
 
-class _Request:
-    __slots__ = ('node', 'item')
-
-    def __init__(self, node, item):
-        self.node = node
-        self.item = item
+_FIXTURE_MANAGER = _FixtureManager()
 
 
 # ============================================================ raises / warns
@@ -357,25 +579,51 @@ class Collector:
 class Item(Collector):
     """A single test item (callable)."""
 
-    def __init__(self, name, parent, callable_, marks=None):
+    def __init__(self, name, parent, callable_, marks=None, params=None,
+                 param_id=None):
         super().__init__(name, parent)
         self.callable = callable_
         self.marks = marks or []
+        # Parametrize sets `_fixture_params` so the resolver picks
+        # the right value for each fixture argument.
+        self._fixture_params = params or {}
+        self._param_id = param_id
 
     @property
     def nodeid(self):
+        base = self.name
+        if self._param_id:
+            base = '{}[{}]'.format(self.name, self._param_id)
         if self.parent and hasattr(self.parent, 'nodeid'):
-            return '{}::{}'.format(self.parent.nodeid, self.name)
-        return self.name
+            return '{}::{}'.format(self.parent.nodeid, base)
+        return base
 
     def runtest(self):
         sig = inspect.signature(self.callable)
         kwargs = {}
+        # Eagerly resolve any autouse fixtures so their teardowns
+        # get queued (matches pytest's ordering: autouse fires for
+        # every test in scope even if not requested by name).
+        for fname, defn in _FIXTURE_REGISTRY.items():
+            if defn.autouse:
+                _resolve_fixture(fname, _FIXTURE_MANAGER, self, self.parent)
         for pname in sig.parameters:
-            val = _resolve_fixture(pname, _Request(self, self))
+            # Parametrize injects directly-passed values that aren't
+            # fixtures — those win over the resolver.
+            if pname in self._fixture_params:
+                kwargs[pname] = self._fixture_params[pname]
+                continue
+            val = _resolve_fixture(pname, _FIXTURE_MANAGER, self, self.parent)
             if val is not None:
                 kwargs[pname] = val
-        return self.callable(**kwargs)
+        try:
+            return self.callable(**kwargs)
+        finally:
+            _FIXTURE_MANAGER.reset_scope('function')
+
+
+# Alias matching CPython's pytest naming convention.
+Function = Item
 
 
 class Class(Collector):
@@ -397,7 +645,7 @@ class Class(Collector):
             if not callable(method):
                 continue
             marks = getattr(method, '_pytest_marks', [])
-            items.append(Item(attr, self, method, marks=marks))
+            items.extend(_expand_parametrize(attr, self, method, marks))
         return items
 
 
@@ -427,7 +675,7 @@ class Module(Collector):
             obj = getattr(mod, name)
             if name.startswith('test_') and callable(obj):
                 marks = getattr(obj, '_pytest_marks', [])
-                out.append(Item(name, self, obj, marks=marks))
+                out.extend(_expand_parametrize(name, self, obj, marks))
             elif name.startswith('Test') and inspect.isclass(obj):
                 out.append(Class(name, self, obj))
         return out
@@ -437,6 +685,94 @@ class Module(Collector):
         if base.endswith('.py'):
             base = base[:-3]
         return base
+
+
+def _expand_parametrize(name, parent, fn, marks):
+    """Expand `@pytest.mark.parametrize` markers into per-row items.
+
+    Supports the canonical pytest spellings:
+
+      @pytest.mark.parametrize('a,b', [(1, 2), (3, 4)])
+      @pytest.mark.parametrize('a', [1, 2, 3], ids=['one', 'two', 'three'])
+      @pytest.mark.parametrize('value', [pytest.param(1, id='one'), 2])
+
+    Multiple parametrize decorators stack into a Cartesian product
+    (pytest matrix semantics).
+    """
+    param_marks = [m for m in marks if m.name == 'parametrize']
+    other_marks = [m for m in marks if m.name != 'parametrize']
+    if not param_marks:
+        return [Item(name, parent, fn, marks=other_marks)]
+    matrix = [({}, [])]  # (param-binding dict, id-fragments)
+    for marker in reversed(param_marks):
+        args = marker.args
+        if len(args) < 2:
+            raise UsageError('parametrize: need (argnames, argvalues)')
+        argnames = args[0]
+        argvalues = args[1]
+        explicit_ids = marker.kwargs.get('ids')
+        if isinstance(argnames, str):
+            names = [n.strip() for n in argnames.split(',') if n.strip()]
+        else:
+            names = list(argnames)
+        new_matrix = []
+        for row_idx, row in enumerate(argvalues):
+            # Unwrap `pytest.param(value, id=..., marks=...)` if used.
+            row_id = None
+            if isinstance(row, _ParamSet):
+                row_value = row.values
+                row_id = row.id
+            else:
+                row_value = row
+            if len(names) > 1:
+                values = list(row_value) if not isinstance(row_value, (tuple, list)) \
+                                          else list(row_value)
+                if len(values) != len(names):
+                    raise UsageError(
+                        'parametrize: row {} has {} values for {} names'.format(
+                            row_idx, len(values), len(names)))
+            else:
+                values = [row_value]
+            if row_id is None and explicit_ids is not None:
+                row_id = explicit_ids[row_idx]
+            if row_id is None:
+                row_id = '-'.join(_id_for(v) for v in values)
+            for prior_params, prior_ids in matrix:
+                merged = dict(prior_params)
+                for nm, val in zip(names, values):
+                    merged[nm] = val
+                new_matrix.append((merged, prior_ids + [row_id]))
+        matrix = new_matrix
+    items = []
+    for params, id_frags in matrix:
+        pid = '-'.join(id_frags) if id_frags else None
+        items.append(Item(name, parent, fn, marks=other_marks,
+                          params=params, param_id=pid))
+    return items
+
+
+class _ParamSet:
+    """``pytest.param(value, id=..., marks=...)`` payload."""
+    __slots__ = ('values', 'id', 'marks')
+
+    def __init__(self, values, id=None, marks=()):  # noqa: A002
+        self.values = values
+        self.id = id
+        self.marks = list(marks) if marks else []
+
+
+def param(*values, id=None, marks=()):  # noqa: A002
+    """Wrap a parametrize row with an explicit id and/or marks."""
+    return _ParamSet(values if len(values) > 1 else values[0],
+                     id=id, marks=marks)
+
+
+def _id_for(value):
+    if isinstance(value, (int, float, bool, str, bytes)):
+        return repr(value)
+    if value is None:
+        return 'None'
+    return type(value).__name__
 
 
 class Session(Collector):
@@ -692,6 +1028,13 @@ def _run(config):
         summary_parts.append('{} xpassed'.format(n_xpassed))
     if not config.quiet:
         print('{}'.format(', '.join(summary_parts) or 'no tests'))
+
+    # Tear down session-scoped finalizers so any database
+    # connections, temp dirs etc. set up by `scope='session'`
+    # fixtures get cleaned before the runner exits.
+    _FIXTURE_MANAGER.reset_scope('class')
+    _FIXTURE_MANAGER.reset_scope('module')
+    _FIXTURE_MANAGER.reset_scope('session')
 
     if n_failed:
         return ExitCode.TESTS_FAILED

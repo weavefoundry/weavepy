@@ -564,5 +564,5 @@ status = "fail"
 reason = "starred-target unpacking with generators"
 
 [tests."cpython/Lib/test/test_audit.py"]
-status = "skip"
-reason = "sys.audit hooks not implemented"
+status = "fail"
+reason = "sys.audit hooks fire (RFC 0031) but the CPython test exercises hooks-via-PYTHONAUDIT envvar and audit events from C extensions (ssl/threading/io_open path-like) that WeavePy doesn't emit yet"
