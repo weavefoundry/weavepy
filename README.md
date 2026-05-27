@@ -28,10 +28,18 @@ work.
 > test that installs a binary wheel under a private prefix and imports
 > the bundled extension through the regular `ExtensionFileLoader`
 > path — proving the `numpy` install-and-run story works
-> mechanically. The CPython `Lib/test/` allowlist remains an
-> aspirational target — see `tests/regrtest/expectations.toml` for
-> the per-test baseline. Expect small breaking changes around the
-> edges as the long tail catches up.
+> mechanically. `RFC 0030` ships the *pure-Python* drop-in surface:
+> a real PyPI-compatible `pip` (PEP 440/503/508/425, dependency
+> resolver, PEP 517 sdist builds, full CLI), a `numpy` facade with
+> pure-Python fallback so `import numpy` works without compiling
+> `_numpylike`, a bundled `pytest` + `pluggy` + `iniconfig` +
+> `exceptiongroup` stack, and `sys.settrace` / `sys.setprofile` /
+> `sys.monitoring` (PEP 669) + `tracemalloc` observability so
+> debuggers, coverage tools, and profilers boot. The CPython
+> `Lib/test/` allowlist remains an aspirational target — see
+> `tests/regrtest/expectations.toml` for the per-test baseline.
+> Expect small breaking changes around the edges as the long tail
+> catches up.
 
 ## Repository layout
 

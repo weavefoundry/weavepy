@@ -39,6 +39,7 @@ pub mod specialize;
 pub mod stdlib;
 pub mod sync;
 pub mod thread_registry;
+pub mod trace;
 pub mod types;
 pub mod vm_singletons;
 pub mod weakref_registry;

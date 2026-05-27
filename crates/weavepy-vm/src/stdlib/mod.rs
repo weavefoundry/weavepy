@@ -49,9 +49,11 @@ pub mod ssl_mod;
 pub mod struct_mod;
 pub mod subprocess_mod;
 pub mod sys;
+pub mod sys_monitoring;
 pub mod tempfile_mod;
 pub mod thread;
 pub mod time;
+pub mod tracemalloc_real;
 pub mod unicodedata_mod;
 pub mod uuid_mod;
 pub mod weakref_mod;
@@ -138,6 +140,11 @@ pub fn register_all(cache: &ModuleCache) {
     // multiprocessing rewrite) imports unconditionally.
     cache.register_builtin("fcntl", fcntl_mod::build);
     cache.register_builtin("resource", resource_mod::build);
+    // RFC 0030 — debugger / profiler observability (the hook is
+    // registered through ``sys.settrace`` but the dispatch hook is
+    // gated behind RFC 0031; the snapshot/state surface is real).
+    cache.register_builtin("tracemalloc", tracemalloc_real::build);
+    cache.register_builtin("_tracemalloc", tracemalloc_real::build_ext);
 
     // Frozen Python sources (pure-Python stdlib).
     for src in frozen_sources() {
@@ -747,6 +754,100 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_concurrent_process",
             source: include_str!("python/_concurrent_process.py"),
+            is_package: false,
+        },
+        // RFC 0030 — real PyPI client (packaging utils, PEP 517 builds),
+        // numpy facade, pytest+pluggy.
+        FrozenSource {
+            name: "_packaging",
+            source: include_str!("python/_packaging.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pip_resolver",
+            source: include_str!("python/_pip_resolver.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pep517",
+            source: include_str!("python/_pep517.py"),
+            is_package: false,
+        },
+        // Expose the WeavePy pip under the canonical `pip` name as well.
+        FrozenSource {
+            name: "pip",
+            source: include_str!("python/_minipip.py"),
+            is_package: false,
+        },
+        // `packaging` is a third-party project on PyPI but extremely
+        // commonly imported. Map it to our in-tree `_packaging`.
+        FrozenSource {
+            name: "packaging",
+            source: include_str!("python/packaging_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "packaging.version",
+            source: include_str!("python/packaging_version.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "packaging.specifiers",
+            source: include_str!("python/packaging_specifiers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "packaging.requirements",
+            source: include_str!("python/packaging_requirements.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "packaging.markers",
+            source: include_str!("python/packaging_markers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "packaging.utils",
+            source: include_str!("python/packaging_utils.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "packaging.tags",
+            source: include_str!("python/packaging_tags.py"),
+            is_package: false,
+        },
+        // numpy-compatible facade over the bundled `_numpylike` C
+        // extension. Real numpy code that doesn't reach into the
+        // C-level internals "just works".
+        FrozenSource {
+            name: "_numpy_pure",
+            source: include_str!("python/_numpy_pure.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "numpy",
+            source: include_str!("python/numpy_init.py"),
+            is_package: false,
+        },
+        // pytest + pluggy shims.
+        FrozenSource {
+            name: "pluggy",
+            source: include_str!("python/_pluggy.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pytest",
+            source: include_str!("python/_pytest.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "iniconfig",
+            source: include_str!("python/iniconfig_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "exceptiongroup",
+            source: include_str!("python/exceptiongroup_mod.py"),
             is_package: false,
         },
     ]
