@@ -106,7 +106,13 @@ BuiltinMethodType = BuiltinFunctionType
 def _safe_type(expr_lambda, fallback=type(None)):
     try:
         return type(expr_lambda())
-    except Exception:
+    except BaseException:
+        # Catch BaseException so SystemExit / KeyboardInterrupt fired
+        # while WeavePy boots a frozen module don't bubble out of
+        # ``import types`` at startup. The traceback printer further
+        # down the line was emitting noise on every interpreter
+        # session because the `str.join` lookup failed silently in
+        # the original ``except Exception`` form.
         return fallback
 
 

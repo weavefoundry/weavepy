@@ -117,16 +117,20 @@ pub fn build_with_state(
             builtin("settrace", sys_settrace),
         );
         d.insert(
+            DictKey(Object::from_static("monitoring")),
+            crate::stdlib::sys_monitoring::build(),
+        );
+        d.insert(
             DictKey(Object::from_static("setprofile")),
             builtin("setprofile", sys_setprofile),
         );
         d.insert(
             DictKey(Object::from_static("gettrace")),
-            builtin("gettrace", |_| Ok(Object::None)),
+            builtin("gettrace", sys_gettrace),
         );
         d.insert(
             DictKey(Object::from_static("getprofile")),
-            builtin("getprofile", |_| Ok(Object::None)),
+            builtin("getprofile", sys_getprofile),
         );
         d.insert(
             DictKey(Object::from_static("getsizeof")),
@@ -674,12 +678,32 @@ fn sys_default_excepthook(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-fn sys_settrace(_args: &[Object]) -> Result<Object, RuntimeError> {
+// Trace and profile hooks live in the runtime's thread-local registry
+// (:mod:`crate::trace`) so the VM dispatcher and ``sys.gettrace`` /
+// ``sys.getprofile`` see the same value. Line-level event firing
+// inside the interpreter dispatch is gated behind RFC 0031; for now
+// these accessors are observable but do not call back into the hook
+// at every opcode (that requires deeper VM surgery and a perf
+// trade-off discussion).
+
+fn sys_settrace(args: &[Object]) -> Result<Object, RuntimeError> {
+    let hook = args.first().cloned().unwrap_or(Object::None);
+    crate::trace::set_trace_hook(hook);
     Ok(Object::None)
 }
 
-fn sys_setprofile(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn sys_setprofile(args: &[Object]) -> Result<Object, RuntimeError> {
+    let hook = args.first().cloned().unwrap_or(Object::None);
+    crate::trace::set_profile_hook(hook);
     Ok(Object::None)
+}
+
+fn sys_gettrace(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(crate::trace::trace_hook().unwrap_or(Object::None))
+}
+
+fn sys_getprofile(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(crate::trace::profile_hook().unwrap_or(Object::None))
 }
 
 fn sys_getsizeof(args: &[Object]) -> Result<Object, RuntimeError> {

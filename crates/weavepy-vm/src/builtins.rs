@@ -3118,20 +3118,92 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let prefix = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("startswith() expected str")),
+    // PEP 257: ``startswith`` accepts either a string *or* a tuple of strings.
+    let target = match args.get(1) {
+        Some(obj) => obj,
+        None => return Err(type_error("startswith() takes at least 1 argument")),
     };
-    Ok(Object::Bool(s.starts_with(&**prefix)))
+    let slice = str_apply_start_end(s, args.get(2), args.get(3))?;
+    Ok(Object::Bool(str_match_prefix_suffix(slice, target, true)?))
 }
 
 fn str_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let suffix = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("endswith() expected str")),
+    let target = match args.get(1) {
+        Some(obj) => obj,
+        None => return Err(type_error("endswith() takes at least 1 argument")),
     };
-    Ok(Object::Bool(s.ends_with(&**suffix)))
+    let slice = str_apply_start_end(s, args.get(2), args.get(3))?;
+    Ok(Object::Bool(str_match_prefix_suffix(slice, target, false)?))
+}
+
+fn str_apply_start_end<'a>(
+    s: &'a str,
+    start: Option<&Object>,
+    end: Option<&Object>,
+) -> Result<&'a str, RuntimeError> {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let n = chars.len() as i64;
+    let resolve = |raw: Option<&Object>, default: i64| -> Result<i64, RuntimeError> {
+        match raw {
+            None | Some(Object::None) => Ok(default),
+            Some(Object::Int(i)) => Ok(*i),
+            Some(_) => Err(type_error("slice indices must be int or None")),
+        }
+    };
+    let mut start_idx = resolve(start, 0)?;
+    let mut end_idx = resolve(end, n)?;
+    if start_idx < 0 {
+        start_idx = (start_idx + n).max(0);
+    }
+    if end_idx < 0 {
+        end_idx += n;
+    }
+    let start_idx = start_idx.clamp(0, n) as usize;
+    let end_idx = end_idx.clamp(0, n) as usize;
+    if start_idx > end_idx {
+        return Ok("");
+    }
+    let start_byte = chars.get(start_idx).map(|(i, _)| *i).unwrap_or(s.len());
+    let end_byte = chars.get(end_idx).map(|(i, _)| *i).unwrap_or(s.len());
+    Ok(&s[start_byte..end_byte])
+}
+
+fn str_match_prefix_suffix(
+    slice: &str,
+    target: &Object,
+    prefix: bool,
+) -> Result<bool, RuntimeError> {
+    let test = |needle: &str| {
+        if prefix {
+            slice.starts_with(needle)
+        } else {
+            slice.ends_with(needle)
+        }
+    };
+    match target {
+        Object::Str(s) => Ok(test(s)),
+        Object::Tuple(parts) => {
+            for item in parts.iter() {
+                match item {
+                    Object::Str(s) => {
+                        if test(s) {
+                            return Ok(true);
+                        }
+                    }
+                    _ => {
+                        return Err(type_error(
+                            "startswith/endswith first arg must be str or tuple of str",
+                        ));
+                    }
+                }
+            }
+            Ok(false)
+        }
+        _ => Err(type_error(
+            "startswith/endswith first arg must be str or tuple of str",
+        )),
+    }
 }
 
 fn str_replace(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4479,20 +4551,51 @@ fn bytes_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bytes_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let prefix = bytes_argview(
-        args.get(1)
-            .ok_or_else(|| type_error("startswith() expected 1 arg"))?,
-    )?;
-    Ok(Object::Bool(data.starts_with(&prefix)))
+    let target = args
+        .get(1)
+        .ok_or_else(|| type_error("startswith() expected 1 arg"))?;
+    Ok(Object::Bool(bytes_match_prefix_suffix(
+        &data, target, true,
+    )?))
 }
 
 fn bytes_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let suffix = bytes_argview(
-        args.get(1)
-            .ok_or_else(|| type_error("endswith() expected 1 arg"))?,
-    )?;
-    Ok(Object::Bool(data.ends_with(&suffix)))
+    let target = args
+        .get(1)
+        .ok_or_else(|| type_error("endswith() expected 1 arg"))?;
+    Ok(Object::Bool(bytes_match_prefix_suffix(
+        &data, target, false,
+    )?))
+}
+
+fn bytes_match_prefix_suffix(
+    data: &[u8],
+    target: &Object,
+    prefix: bool,
+) -> Result<bool, RuntimeError> {
+    let test = |needle: &[u8]| {
+        if prefix {
+            data.starts_with(needle)
+        } else {
+            data.ends_with(needle)
+        }
+    };
+    match target {
+        Object::Tuple(parts) => {
+            for item in parts.iter() {
+                let needle = bytes_argview(item)?;
+                if test(&needle) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => {
+            let needle = bytes_argview(target)?;
+            Ok(test(&needle))
+        }
+    }
 }
 
 fn bytes_find(args: &[Object]) -> Result<Object, RuntimeError> {
