@@ -1595,21 +1595,21 @@ fn path_samefile(args: &[Object]) -> Result<Object, RuntimeError> {
     let am = std::fs::metadata(&a);
     let bm = std::fs::metadata(&b);
     match (am, bm) {
-        (Ok(a), Ok(b)) => {
+        (Ok(am), Ok(bm)) => {
             // On Unix the dev+inode identifies a file; on Windows
             // we approximate by comparing canonical paths.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                Ok(Object::Bool(a.dev() == b.dev() && a.ino() == b.ino()))
+                Ok(Object::Bool(am.dev() == bm.dev() && am.ino() == bm.ino()))
             }
             #[cfg(not(unix))]
             {
-                let _ = (a, b);
+                let _ = (am, bm);
                 let acanon = std::path::Path::new(&a).canonicalize();
                 let bcanon = std::path::Path::new(&b).canonicalize();
                 Ok(Object::Bool(
-                    matches!((acanon, bcanon), (Ok(a), Ok(b)) if a == b),
+                    matches!((acanon, bcanon), (Ok(ac), Ok(bc)) if ac == bc),
                 ))
             }
         }
