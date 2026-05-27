@@ -236,15 +236,21 @@ pub struct PyFrame {
     /// The VM updates this between steps so `f_locals` reflects live
     /// state. `None` once the frame has returned.
     pub locals_mirror: RefCell<Option<Rc<RefCell<Vec<Object>>>>>,
-    /// Per-frame trace function (PEP 669 surface — `sys.settrace` is
-    /// a no-op today, but storage exists so user code can set/get the
-    /// value without raising).
+    /// Per-frame trace function. Returned by `sys.settrace`'s hook
+    /// (or by a previous per-frame trace), this callable receives
+    /// subsequent `'line'` / `'return'` / `'exception'` events on
+    /// the frame. `Object::None` disables tracing for the frame.
     pub trace: RefCell<Object>,
     /// Per-frame `f_lineno` override. CPython lets debuggers set
     /// `f_lineno` to jump to a different line; we keep storage so
     /// reads round-trip, even though writes don't actually move the
     /// program counter.
     pub override_lineno: Cell<Option<u32>>,
+    /// Most recently observed source line on this frame, used by
+    /// the dispatcher to know when to fire a `'line'` event. `None`
+    /// means "no line event has fired on this frame yet" — the
+    /// next `step` will fire one.
+    pub last_line: Cell<Option<u32>>,
 }
 
 impl fmt::Debug for PyFrame {

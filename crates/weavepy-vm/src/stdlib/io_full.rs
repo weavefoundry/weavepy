@@ -178,6 +178,15 @@ fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(s)) => s.to_string(),
         _ => "r".to_owned(),
     };
+    // PEP 578 — `open(file, mode, flags)` audit event.
+    crate::stdlib::sys::audit_event(
+        "open",
+        &[
+            Object::from_str(path.clone()),
+            Object::from_str(mode.clone()),
+            Object::Int(0),
+        ],
+    );
     let binary = mode.contains('b');
     let writable =
         mode.contains('w') || mode.contains('a') || mode.contains('+') || mode.contains('x');

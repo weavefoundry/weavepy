@@ -30,6 +30,7 @@ pub mod gzip_mod;
 pub mod hashlib_mod;
 pub mod hmac_mod;
 pub mod imp_mod;
+pub mod interpreters_mod;
 pub mod io;
 pub mod json;
 pub mod lzma_mod;
@@ -140,11 +141,15 @@ pub fn register_all(cache: &ModuleCache) {
     // multiprocessing rewrite) imports unconditionally.
     cache.register_builtin("fcntl", fcntl_mod::build);
     cache.register_builtin("resource", resource_mod::build);
-    // RFC 0030 — debugger / profiler observability (the hook is
-    // registered through ``sys.settrace`` but the dispatch hook is
-    // gated behind RFC 0031; the snapshot/state surface is real).
+    // RFC 0031 — debugger / profiler observability is now fully
+    // wired in the VM dispatch loop; the modules below expose the
+    // user-visible registration / snapshot API.
     cache.register_builtin("tracemalloc", tracemalloc_real::build);
     cache.register_builtin("_tracemalloc", tracemalloc_real::build_ext);
+    // RFC 0031 — PEP 684 sub-interpreters. Frontend lives in the
+    // pure-Python `interpreters.py` shim; this is the C-extension
+    // façade.
+    cache.register_builtin("_xxsubinterpreters", interpreters_mod::build);
 
     // Frozen Python sources (pure-Python stdlib).
     for src in frozen_sources() {
@@ -608,6 +613,12 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "pdb",
             source: include_str!("python/pdb_mod.py"),
+            is_package: false,
+        },
+        // RFC 0031 — PEP 684 sub-interpreters friendly frontend.
+        FrozenSource {
+            name: "interpreters",
+            source: include_str!("python/interpreters.py"),
             is_package: false,
         },
         // Small stdlib modules.
