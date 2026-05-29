@@ -19,6 +19,7 @@ pub const FIXTURES: &[&str] = &[
     "richards",
     "sumvm",
     "nested_loops",
+    "jitloop",
 ];
 
 /// Default per-fixture work parameter passed as `bench(n)`.
@@ -35,6 +36,7 @@ pub fn default_work(name: &str) -> u32 {
         "richards" => 1,
         "sumvm" => 50_000,
         "nested_loops" => 30,
+        "jitloop" => 300,
         _ => 1,
     }
 }

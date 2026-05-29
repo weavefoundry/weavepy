@@ -7,6 +7,7 @@ members = [
     "crates/weavepy-cli",
     "crates/weavepy-compiler",
     "crates/weavepy-conformance",
+    "crates/weavepy-jit",
     "crates/weavepy-lexer",
     "crates/weavepy-parser",
     "crates/weavepy-vm",
@@ -29,7 +30,11 @@ default-members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.85"
+# RFC 0032 — the tier-2 Cranelift JIT (`weavepy-jit`, behind the `jit`
+# feature) pulls in Cranelift 0.132, whose MSRV is 1.93. The JIT is
+# off by default, but CI builds it via `--all-features`, so the
+# workspace floor moves with it.
+rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/weavefoundry/weavepy"
 homepage = "https://github.com/weavefoundry/weavepy"
@@ -44,6 +49,7 @@ weavepy             = { path = "crates/weavepy",             version = "0.0.0" }
 weavepy-capi        = { path = "crates/weavepy-capi",        version = "0.0.0" }
 weavepy-compiler    = { path = "crates/weavepy-compiler",    version = "0.0.0" }
 weavepy-conformance = { path = "crates/weavepy-conformance", version = "0.0.0" }
+weavepy-jit         = { path = "crates/weavepy-jit",         version = "0.0.0" }
 weavepy-lexer       = { path = "crates/weavepy-lexer",       version = "0.0.0" }
 weavepy-parser      = { path = "crates/weavepy-parser",      version = "0.0.0" }
 weavepy-vm          = { path = "crates/weavepy-vm",          version = "0.0.0" }
@@ -110,6 +116,15 @@ webpki-roots          = "0.26"
 parking_lot           = "0.12"
 crossbeam-channel     = "0.5"
 crossbeam-utils       = "0.8"
+
+# RFC 0032 — tier-2 JIT backend (Cranelift). Only compiled when the
+# `jit` feature is enabled (off by default); CI exercises it via
+# `--all-features`. MSRV floor for these is Rust 1.93.
+cranelift-codegen     = "0.132"
+cranelift-frontend    = "0.132"
+cranelift-jit         = "0.132"
+cranelift-module      = "0.132"
+cranelift-native      = "0.132"
 
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }

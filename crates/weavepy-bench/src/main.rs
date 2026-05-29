@@ -114,6 +114,11 @@ fn cmd_run(args: &[String]) -> io::Result<()> {
             // suite. Off by default; cheap when off.
             println!();
             println!("{}", format_stats_markdown(&snapshot()));
+            // RFC 0032 — append tier-2 JIT counters when compiled in.
+            if let Some(jit) = weavepy_vm::jit_stats_markdown() {
+                println!();
+                println!("{jit}");
+            }
         }
     }
     Ok(())

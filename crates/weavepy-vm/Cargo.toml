@@ -63,5 +63,15 @@ parking_lot           = { workspace = true }
 crossbeam-channel     = { workspace = true }
 crossbeam-utils       = { workspace = true }
 
+# RFC 0032 — tier-2 Cranelift JIT, behind the (default-off) `jit` feature.
+weavepy-jit           = { workspace = true, optional = true }
+
+[features]
+default = []
+# Compile the tier-2 JIT integration (pulls in Cranelift). Off by
+# default; CI exercises it via `--all-features`. Activated at runtime
+# by `WEAVEPY_JIT=1`.
+jit = ["dep:weavepy-jit"]
+
 [lints]
 workspace = true
