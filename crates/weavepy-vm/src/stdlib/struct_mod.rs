@@ -244,7 +244,7 @@ impl CompiledFormat {
     }
 
     fn iter_unpack(&self, buf: &[u8]) -> Result<Vec<Vec<Object>>, RuntimeError> {
-        if buf.len() % self.size != 0 {
+        if !buf.len().is_multiple_of(self.size) {
             return Err(struct_error(format!(
                 "iterative unpacking requires a buffer of a multiple of {} bytes",
                 self.size

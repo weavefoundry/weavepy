@@ -39,6 +39,10 @@ pub mod specialize;
 pub mod stdlib;
 pub mod sync;
 pub mod thread_registry;
+/// RFC 0032 — tier-2 Cranelift JIT integration. Present only under the
+/// `jit` feature; the dispatch loop calls into it behind `#[cfg]` gates.
+#[cfg(feature = "jit")]
+mod tier2;
 pub mod trace;
 pub mod types;
 pub mod vm_singletons;
@@ -109,6 +113,21 @@ impl Frame {
             return None;
         }
         self.stack.get(len - 1 - n)
+    }
+}
+
+/// RFC 0032 — render the tier-2 JIT's counters as a markdown block for
+/// the `WEAVEPY_VM_STATS` report, or `None` when the `jit` feature is
+/// disabled or the JIT was never exercised on this thread.
+#[must_use]
+pub fn jit_stats_markdown() -> Option<String> {
+    #[cfg(feature = "jit")]
+    {
+        crate::tier2::format_stats_markdown()
+    }
+    #[cfg(not(feature = "jit"))]
+    {
+        None
     }
 }
 
@@ -741,6 +760,11 @@ impl Interpreter {
         frame: &mut Frame,
         sent: Option<Object>,
     ) -> Result<FrameOutcome, RuntimeError> {
+        // Captured before `sent` is consumed below; only the tier-2
+        // entry guard reads it, so it's gated to the `jit` feature to
+        // stay warning-free in default builds.
+        #[cfg(feature = "jit")]
+        let is_resume = sent.is_some();
         if let Some(v) = sent {
             frame.push(v);
         }
@@ -755,6 +779,21 @@ impl Interpreter {
         let observers_active = crate::trace::any_observers_active();
         if observers_active {
             self.fire_call_event(&py_frame)?;
+        }
+        // RFC 0032 — tier-2 entry. Only for a fresh activation (pc 0,
+        // empty stack, not a generator resume) and only when tracing is
+        // off, since native code fires no line/return events. A returned
+        // native frame short-circuits the interpreter loop; a deopt
+        // rewrites `frame` and falls through to resume interpretation.
+        #[cfg(feature = "jit")]
+        if !is_resume && !observers_active && frame.pc == 0 && frame.stack.is_empty() {
+            match crate::tier2::try_enter(frame) {
+                crate::tier2::JitEntry::Ran(v) => {
+                    self.pop_py_frame();
+                    return Ok(FrameOutcome::Returned(v));
+                }
+                crate::tier2::JitEntry::Deopt | crate::tier2::JitEntry::Skip => {}
+            }
         }
         let result = loop {
             // Mirror the live `pc` into the snapshot so `f_lineno`
@@ -1451,24 +1490,7 @@ impl Interpreter {
                 }
             }
             OpCode::Call => {
-                let argc = ins.arg as usize;
-                let split_at = frame.stack.len().saturating_sub(argc);
-                let mut args: Vec<Object> = frame.stack.split_off(split_at);
-                let callable = frame.pop()?;
-                // Zero-arg super(): inject __class__ from the free
-                // cell named "__class__" and `self` from local 0.
-                if args.is_empty() && is_super_callable(&callable) {
-                    if let Some(class_cell) = find_cell(frame, "__class__") {
-                        let class_obj = class_cell.borrow().clone();
-                        if !matches!(class_obj, Object::None) {
-                            let self_obj = frame.locals.first().cloned().unwrap_or(Object::None);
-                            args.push(class_obj);
-                            args.push(self_obj);
-                        }
-                    }
-                }
-                let r = self.call(&callable, &args, &[], &frame.globals)?;
-                frame.push(r);
+                self.dispatch_call(frame, cache_pc, ins.arg as usize)?;
             }
             OpCode::CallKw => {
                 let argc = ins.arg as usize;
@@ -1547,6 +1569,10 @@ impl Interpreter {
             }
             OpCode::JumpBackward => {
                 frame.pc = frame.pc.saturating_sub(ins.arg);
+                // RFC 0032 — a loop back-edge heats the code object so a
+                // subsequent activation can tier up to native code.
+                #[cfg(feature = "jit")]
+                crate::tier2::note_backedge(&frame.code);
             }
             OpCode::GetIter => {
                 let v = frame.pop()?;
@@ -7154,6 +7180,159 @@ impl Interpreter {
         }
     }
 
+    /// RFC 0032 — specialized `CALL`. Mirrors the RFC 0021 dispatchers:
+    /// a warm cache takes an argument-binding-free fast path for a
+    /// pinned `PyFunction`; `Empty` runs the generic call and attempts
+    /// specialization; `Cooldown` decrements and stays generic. The
+    /// super()/argument fixup and the generic dispatch are shared.
+    fn dispatch_call(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        argc: usize,
+    ) -> Result<(), RuntimeError> {
+        use weavepy_compiler::InlineCache as IC;
+        let op_idx = OpCode::Call as u8;
+        let split_at = frame.stack.len().saturating_sub(argc);
+        let mut args: Vec<Object> = frame.stack.split_off(split_at);
+        let callable = frame.pop()?;
+        // Zero-arg super(): inject __class__ and `self`. Never matches a
+        // pinned-function cache, so it always takes the generic path.
+        if args.is_empty() && is_super_callable(&callable) {
+            if let Some(class_cell) = find_cell(frame, "__class__") {
+                let class_obj = class_cell.borrow().clone();
+                if !matches!(class_obj, Object::None) {
+                    let self_obj = frame.locals.first().cloned().unwrap_or(Object::None);
+                    args.push(class_obj);
+                    args.push(self_obj);
+                }
+            }
+        }
+        let cache = frame.code.caches.get(cache_pc);
+        match cache {
+            IC::CallPyExactNoFree { func_id, argc: ca } => {
+                if ca as usize == argc {
+                    if let Object::Function(f) = &callable {
+                        if specialize::rc_id(f) == func_id && args.len() == argc {
+                            specialize::record_hit(op_idx);
+                            let f = f.clone();
+                            let r = self.run_py_exact_nofree(&f, args)?;
+                            frame.push(r);
+                            return Ok(());
+                        }
+                    }
+                }
+                self.deopt_call_generic(frame, cache_pc, &callable, &args)
+            }
+            IC::CallPyExact { func_id, argc: ca } => {
+                if ca as usize == argc {
+                    if let Object::Function(f) = &callable {
+                        if specialize::rc_id(f) == func_id && args.len() == argc {
+                            specialize::record_hit(op_idx);
+                            let f = f.clone();
+                            let r = self.run_py_exact_with_cells(&f, args)?;
+                            frame.push(r);
+                            return Ok(());
+                        }
+                    }
+                }
+                self.deopt_call_generic(frame, cache_pc, &callable, &args)
+            }
+            IC::Empty => {
+                specialize::record_specialize_attempt(op_idx);
+                let decision = specialize::attempt_specialize_call(&callable, argc);
+                frame.code.caches.set(cache_pc, decision);
+                if matches!(decision, IC::Cooldown(_)) {
+                    specialize::record_specialize_skip(op_idx);
+                } else {
+                    specialize::record_specialize_success(op_idx);
+                }
+                let r = self.call(&callable, &args, &[], &frame.globals)?;
+                frame.push(r);
+                Ok(())
+            }
+            IC::Cooldown(n) => {
+                let next = if n > 0 {
+                    IC::Cooldown(n - 1)
+                } else {
+                    IC::Empty
+                };
+                frame.code.caches.set(cache_pc, next);
+                let r = self.call(&callable, &args, &[], &frame.globals)?;
+                frame.push(r);
+                Ok(())
+            }
+            _ => {
+                let r = self.call(&callable, &args, &[], &frame.globals)?;
+                frame.push(r);
+                Ok(())
+            }
+        }
+    }
+
+    /// Deopt a `CALL` cache (guard miss): cool the slot down and run the
+    /// generic dispatch.
+    fn deopt_call_generic(
+        &mut self,
+        frame: &mut Frame,
+        cache_pc: u32,
+        callable: &Object,
+        args: &[Object],
+    ) -> Result<(), RuntimeError> {
+        specialize::record_miss(OpCode::Call as u8);
+        frame
+            .code
+            .caches
+            .set(cache_pc, weavepy_compiler::InlineCache::Cooldown(COOLDOWN));
+        let r = self.call(callable, args, &[], &frame.globals)?;
+        frame.push(r);
+        Ok(())
+    }
+
+    /// Fast frame setup for a cell-free, exact-arity Python call: build
+    /// the locals directly from the arguments (no binding pass, no
+    /// cells) and run.
+    fn run_py_exact_nofree(
+        &mut self,
+        f: &Rc<PyFunction>,
+        args: Vec<Object>,
+    ) -> Result<Object, RuntimeError> {
+        let code = f.code.clone();
+        let mut locals = vec![Object::None; code.varnames.len()];
+        for (slot, v) in args.into_iter().enumerate() {
+            locals[slot] = v;
+        }
+        let mut frame = Frame {
+            code,
+            locals,
+            cells: Vec::new(),
+            stack: Vec::with_capacity(16),
+            globals: f.globals.clone(),
+            class_namespace: None,
+            exc_handlers: Vec::new(),
+            pc: 0,
+        };
+        self.run_frame(&mut frame)
+    }
+
+    /// Like [`Self::run_py_exact_nofree`] but for functions with cells /
+    /// a closure: skips argument binding but builds the frame (and its
+    /// cells) through `make_frame`.
+    fn run_py_exact_with_cells(
+        &mut self,
+        f: &Rc<PyFunction>,
+        args: Vec<Object>,
+    ) -> Result<Object, RuntimeError> {
+        let mut frame = self.make_frame(
+            f.code.clone(),
+            args,
+            f.closure.clone(),
+            f.globals.clone(),
+            false,
+        );
+        self.run_frame(&mut frame)
+    }
+
     // ---------- imports (RFC 0012) ----------
 
     /// `IMPORT_NAME` runtime side. Resolves relative imports against
@@ -9979,6 +10158,22 @@ mod tests {
         String::from_utf8(bytes).expect("utf-8")
     }
 
+    /// RFC 0032 — run `src` with the tier-2 JIT forced on, on a fresh
+    /// thread so the thread-local JIT state can't leak into other
+    /// tests. Returns `(stdout, frames_compiled, deopts)`.
+    #[cfg(feature = "jit")]
+    fn run_jit(src: &str) -> (String, u64, u64) {
+        let src = src.to_owned();
+        std::thread::spawn(move || {
+            crate::tier2::force_enable_for_test(2);
+            let out = run(&src);
+            let (compiled, _entries, deopts) = crate::tier2::stats_for_test();
+            (out, compiled, deopts)
+        })
+        .join()
+        .expect("jit worker thread")
+    }
+
     #[test]
     fn runs_print_int() {
         assert_eq!(run("print(42)\n"), "42\n");
@@ -10025,6 +10220,135 @@ mod tests {
     fn closure() {
         let src = "def make_adder(x):\n    def add(y):\n        return x + y\n    return add\nadd5 = make_adder(5)\nprint(add5(3))\n";
         assert_eq!(run(src), "8\n");
+    }
+
+    // RFC 0032 — CALL specialization. Each of these drives a single
+    // call site in a loop so the inline cache warms up and the
+    // specialized fast path (or its deopt) is exercised, then checks
+    // the result still matches plain interpretation.
+
+    #[test]
+    fn call_spec_repeated_plain() {
+        // `add` has no cells/closure and exact arity → CallPyExactNoFree.
+        let src = "def add(a, b):\n    return a + b\n\
+                   total = 0\ni = 0\n\
+                   while i < 50:\n    total = total + add(i, i)\n    i = i + 1\n\
+                   print(total)\n";
+        assert_eq!(run(src), "2450\n");
+    }
+
+    #[test]
+    fn call_spec_repeated_closure() {
+        // `add5` closes over `x` → CallPyExact (frame built with cells).
+        let src = "def make_adder(x):\n    def add(y):\n        return x + y\n    return add\n\
+                   add5 = make_adder(5)\n\
+                   total = 0\ni = 0\n\
+                   while i < 50:\n    total = total + add5(i)\n    i = i + 1\n\
+                   print(total)\n";
+        assert_eq!(run(src), "1475\n");
+    }
+
+    #[test]
+    fn call_spec_polymorphic_site_deopts() {
+        // One call site sees two different functions on alternating
+        // iterations: the per-function guard must miss and fall back to
+        // the generic path without corrupting results.
+        let src = "def f(x):\n    return x + 1\ndef g(x):\n    return x * 2\n\
+                   funcs = [f, g]\n\
+                   total = 0\ni = 0\n\
+                   while i < 10:\n    fn = funcs[i % 2]\n    total = total + fn(i)\n    i = i + 1\n\
+                   print(total)\n";
+        assert_eq!(run(src), "75\n");
+    }
+
+    #[test]
+    fn call_spec_defaults_use_generic_path() {
+        // Calling with fewer args than params needs default binding, so
+        // the site must stay on the generic dispatch (Cooldown), not the
+        // exact-arity fast path.
+        let src = "def f(a, b=10):\n    return a + b\n\
+                   total = 0\ni = 0\n\
+                   while i < 20:\n    total = total + f(i)\n    i = i + 1\n\
+                   print(total)\n";
+        assert_eq!(run(src), "390\n");
+    }
+
+    // RFC 0032 — tier-2 JIT integration. Each test forces the JIT on,
+    // drives a hot `while`-loop kernel through many calls so it tiers
+    // up, and asserts (a) the JIT actually compiled the kernel, (b) the
+    // native result matches both the interpreter and CPython.
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_numeric_kernel_matches_interpreter() {
+        let src = "def kernel(n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n        s = s + i * 2 - (i // 3) + (i % 7)\n        i = i + 1\n\
+                   \x20   return s\n\
+                   def bench(m):\n    total = 0\n    k = 0\n\
+                   \x20   while k < m:\n        total = total + kernel(50)\n        k = k + 1\n\
+                   \x20   return total\n\
+                   print(bench(100))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the kernel");
+        assert_eq!(deopts, 0, "clean numeric kernel should not deopt");
+        assert_eq!(out, "220500\n");
+        assert_eq!(out, run(src), "JIT output diverged from the interpreter");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_floordiv_mod_negative_semantics() {
+        // Exercises Python floor-division / modulo sign rules in real
+        // compiled code (operands span negative values).
+        let src = "def fdmod(n):\n    a = 0\n    i = 0 - n\n\
+                   \x20   while i < n:\n        a = a + (i // 3) - (i % 5)\n        i = i + 1\n\
+                   \x20   return a\n\
+                   def bench(m):\n    t = 0\n    k = 0\n\
+                   \x20   while k < m:\n        t = t + fdmod(40)\n        k = k + 1\n\
+                   \x20   return t\n\
+                   print(bench(100))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the kernel");
+        assert_eq!(out, "-20000\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_branchy_kernel_matches_interpreter() {
+        // if/else inside the hot loop → multiple basic blocks and a
+        // join, exercising the block/terminator lowering.
+        let src = "def br(n):\n    c = 0\n    i = 0\n\
+                   \x20   while i < n:\n        if i % 3 == 0:\n            c = c + i\n        else:\n            c = c - 1\n        i = i + 1\n\
+                   \x20   return c\n\
+                   def bench(m):\n    t = 0\n    k = 0\n\
+                   \x20   while k < m:\n        t = t + br(60)\n        k = k + 1\n\
+                   \x20   return t\n\
+                   print(bench(100))\n";
+        let (out, compiled, _deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the kernel");
+        assert_eq!(out, "53000\n");
+        assert_eq!(out, run(src));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_overflow_deopts_to_bigint() {
+        // The accumulator overflows i64 mid-loop: the native code must
+        // deopt, hand the operands back, and let the interpreter promote
+        // to a big integer — matching CPython's arbitrary-precision int.
+        let src = "def okern(n):\n    s = 0\n    i = 0\n\
+                   \x20   while i < n:\n        s = s + 1000000000000000000\n        i = i + 1\n\
+                   \x20   return s\n\
+                   def bench(m):\n    r = 0\n    k = 0\n\
+                   \x20   while k < m:\n        r = okern(20)\n        k = k + 1\n\
+                   \x20   return r\n\
+                   print(bench(100))\n";
+        let (out, compiled, deopts) = run_jit(src);
+        assert!(compiled >= 1, "JIT never compiled the kernel");
+        assert!(deopts >= 1, "overflowing kernel should deopt at least once");
+        assert_eq!(out, "20000000000000000000\n");
+        assert_eq!(out, run(src), "deopt path diverged from the interpreter");
     }
 
     #[test]

@@ -262,6 +262,45 @@ pub fn attempt_specialize_unpack_sequence(seq: &Object, n: usize) -> InlineCache
     }
 }
 
+// ---------- specialization decisions: CALL ----------
+
+/// Decide on a `CALL` specialization (RFC 0032).
+///
+/// We only specialize the *exact positional arity, no keywords* shape —
+/// the call site supplies precisely `arg_count` positionals and the
+/// function declares no `*args`/`**kwargs`/keyword-only parameters. That
+/// lets the fast path skip the entire argument-binding pass in
+/// `call_python`. Generators/coroutines are excluded (their call returns
+/// a suspended object, not a frame result). Functions with cells take
+/// the `CallPyExact` shape (still skips binding, but builds cells via
+/// `make_frame`); cell-free functions take the leaner `CallPyExactNoFree`.
+pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
+    match callable {
+        Object::Function(f) => {
+            let code = &f.code;
+            if code.is_generator || code.is_coroutine || code.is_async_generator {
+                return InlineCache::Cooldown(COOLDOWN);
+            }
+            if code.has_varargs || code.has_varkeywords || code.kwonly_count != 0 {
+                return InlineCache::Cooldown(COOLDOWN);
+            }
+            // Only the exact-arity shape: anything needing defaults (too
+            // few) or *args overflow (too many) keeps the generic path.
+            if code.arg_count as usize != argc {
+                return InlineCache::Cooldown(COOLDOWN);
+            }
+            let func_id = rc_id(f);
+            let argc = u32::try_from(argc).unwrap_or(u32::MAX);
+            if code.cellvars.is_empty() && code.freevars.is_empty() && f.closure.is_empty() {
+                InlineCache::CallPyExactNoFree { func_id, argc }
+            } else {
+                InlineCache::CallPyExact { func_id, argc }
+            }
+        }
+        _ => InlineCache::Cooldown(COOLDOWN),
+    }
+}
+
 // ---------- shared helpers ----------
 
 /// Cheap fingerprint for an `Rc<T>`. Two clones of the same

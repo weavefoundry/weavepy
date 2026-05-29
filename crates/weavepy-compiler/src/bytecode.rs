@@ -571,6 +571,24 @@ pub enum InlineCache {
     UnpackSequenceTuple,
     UnpackSequenceList,
     UnpackSequenceTwoTuple,
+
+    // CALL family (RFC 0032). `func_id` is the `Rc::as_ptr` fingerprint
+    // of the called `PyFunction`; `argc` is the (fixed) call-site arity.
+    /// Plain Python function: exact positional arity, no keywords, no
+    /// `*args`/`**kwargs`/kw-only/defaults needed, and no cells or
+    /// closure — so the frame's locals are just the arguments padded
+    /// with `None`, skipping the whole argument-binding dance.
+    CallPyExactNoFree {
+        func_id: u64,
+        argc: u32,
+    },
+    /// Plain Python function with the same exact-arity guarantee but a
+    /// non-trivial cell/closure layout — still skips argument binding,
+    /// but builds the frame (and its cells) through `make_frame`.
+    CallPyExact {
+        func_id: u64,
+        argc: u32,
+    },
 }
 
 /// Number of generic dispatches a deopted cache must serve before it

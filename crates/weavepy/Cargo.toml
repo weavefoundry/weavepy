@@ -20,5 +20,10 @@ weavepy-parser   = { workspace = true }
 weavepy-vm       = { workspace = true }
 thiserror        = { workspace = true }
 
+[features]
+default = []
+# RFC 0032 — forward the tier-2 JIT feature down to the VM.
+jit = ["weavepy-vm/jit"]
+
 [lints]
 workspace = true

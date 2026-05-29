@@ -22,5 +22,10 @@ weavepy-vm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+default = []
+# RFC 0032 — run the bench harness with the tier-2 JIT compiled in.
+jit = ["weavepy/jit", "weavepy-vm/jit"]
+
 [lints]
 workspace = true
