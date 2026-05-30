@@ -32,10 +32,12 @@ use weavepy_parser::ast::{
 };
 
 pub mod bytecode;
+pub mod cpython_code;
 
 pub use bytecode::{
     BinOpKind, CacheTable, CompareKind, InlineCache, Instruction, OpCode, UnaryKind, COOLDOWN,
 };
+pub use cpython_code::{CpythonCode, Position};
 
 // ---------- error type ----------
 
@@ -1479,6 +1481,11 @@ impl Compiler {
         body: &[Stmt],
         is_async: bool,
     ) -> Result<(), CompileError> {
+        // Fast-local slots follow CPython's order exactly:
+        // positional-only, positional-or-keyword, keyword-only, then
+        // `*args`, then `**kwargs`. The keyword-only names sit *before*
+        // the `*args` slot — this is what `co_varnames` exposes and what
+        // tools like `inspect` and `dis` expect.
         let mut param_names: Vec<String> = Vec::new();
         for a in &args.posonlyargs {
             param_names.push(a.name.clone());
@@ -1486,11 +1493,11 @@ impl Compiler {
         for a in &args.args {
             param_names.push(a.name.clone());
         }
-        if let Some(va) = &args.vararg {
-            param_names.push(va.name.clone());
-        }
         for a in &args.kwonlyargs {
             param_names.push(a.name.clone());
+        }
+        if let Some(va) = &args.vararg {
+            param_names.push(va.name.clone());
         }
         if let Some(kw) = &args.kwarg {
             param_names.push(kw.name.clone());

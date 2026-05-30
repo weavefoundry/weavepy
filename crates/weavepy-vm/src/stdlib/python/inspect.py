@@ -445,17 +445,18 @@ def getfullargspec(func):
     nargs = getattr(code, "co_argcount", 0)
     nkwonly = getattr(code, "co_kwonlyargcount", 0)
     varnames = list(getattr(code, "co_varnames", ()))
-    # WeavePy layout: [positional, *args?, kwonly..., **kwargs?].
+    # Fast-local layout (CPython): positional args, then keyword-only
+    # args, then ``*args``, then ``**kwargs``.
     args = varnames[:nargs]
     idx = nargs
+    kwonly = varnames[idx:idx + nkwonly]
+    idx += nkwonly
     varargs = None
     varkw = None
     if flags & CO_VARARGS:
         if idx < len(varnames):
             varargs = varnames[idx]
             idx += 1
-    kwonly = varnames[idx:idx + nkwonly]
-    idx += nkwonly
     if flags & CO_VARKEYWORDS:
         if idx < len(varnames):
             varkw = varnames[idx]

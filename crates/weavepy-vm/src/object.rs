@@ -1995,8 +1995,10 @@ pub(crate) fn bigint_from_f64_trunc(f: f64) -> BigInt {
 /// signed zeros to match CPython's `repr` exactly.
 pub(crate) fn complex_repr(real: f64, imag: f64) -> String {
     fn fmt_part(p: f64) -> String {
+        // Unlike `float`, CPython renders integer-valued complex
+        // components without a trailing `.0` (e.g. `4j`, not `4.0j`).
         if p.fract() == 0.0 && p.is_finite() {
-            format!("{p:.1}")
+            format!("{p:.0}")
         } else {
             format!("{p}")
         }

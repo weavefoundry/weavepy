@@ -50,7 +50,7 @@ OPTIMIZED_BYTECODE_SUFFIXES = BYTECODE_SUFFIXES
 
 # Magic bytes used by the WeavePy ``__pycache__`` writer. Kept in
 # sync with ``crates/weavepy-vm/src/pycache.rs``.
-MAGIC_NUMBER = b'WPY0'
+MAGIC_NUMBER = b'\xf3\r\r\n'
 
 
 def all_suffixes():

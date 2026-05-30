@@ -40,10 +40,12 @@ use weavepy_compiler::CodeObject;
 use crate::object::{DictData, Object};
 use crate::stdlib::marshal_mod;
 
-/// Per-implementation magic. Bumped whenever the bytecode layout or
-/// any opcode arg meaning changes incompatibly. CPython does the same
-/// dance with `MAGIC_NUMBER` in `Lib/importlib/_bootstrap_external.py`.
-pub const MAGIC: &[u8; 4] = b"WPY0";
+/// Bytecode magic. RFC 0033 adopts CPython 3.13's value
+/// (`b"\xf3\x0d\x0d\x0a"`, surfaced via `importlib.util.MAGIC_NUMBER`
+/// and `_imp.get_magic()`). Collisions with CPython's own `.pyc`
+/// files are avoided by the distinct [`CACHE_TAG`] in the filename,
+/// so adopting the real magic costs nothing and buys tool interop.
+pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 
 /// Cache tag — appears in `__pycache__/<name>.<tag>.pyc` and on
 /// `sys.implementation.cache_tag`. Mirrors CPython's `cpython-313`.

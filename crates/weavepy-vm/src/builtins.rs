@@ -1015,7 +1015,7 @@ pub(crate) fn code_synthetic_attr(
         "co_posonlyargcount" => Some(Object::Int(i64::from(c.posonly_count))),
         "co_kwonlyargcount" => Some(Object::Int(i64::from(c.kwonly_count))),
         "co_nlocals" => Some(Object::Int(c.varnames.len() as i64)),
-        "co_stacksize" => Some(Object::Int(0)),
+        "co_stacksize" => Some(Object::Int(i64::from(c.to_cpython().stacksize))),
         "co_flags" => Some(Object::Int(i64::from(code_flags(c)))),
         "co_varnames" => Some(Object::new_tuple(
             c.varnames.iter().map(Object::from_str).collect(),
@@ -1039,8 +1039,221 @@ pub(crate) fn code_synthetic_attr(
                 .map(crate::constant_to_object_public)
                 .collect(),
         )),
+        // CPython-3.13 wire view (RFC 0033). Computed on demand.
+        "co_code" => Some(Object::Bytes(Rc::from(c.to_cpython().co_code))),
+        "co_linetable" => Some(Object::Bytes(Rc::from(c.to_cpython().co_linetable))),
+        "co_exceptiontable" => Some(Object::Bytes(Rc::from(c.to_cpython().co_exceptiontable))),
+        "co_localsplusnames" => Some(Object::new_tuple(
+            c.to_cpython()
+                .localsplusnames
+                .iter()
+                .map(Object::from_str)
+                .collect(),
+        )),
+        "co_localspluskinds" => Some(Object::Bytes(Rc::from(c.to_cpython().localspluskinds))),
+        "co_lines" => Some(code_method(c, "co_lines", code_co_lines)),
+        "co_positions" => Some(code_method(c, "co_positions", code_co_positions)),
+        "_varname_from_oparg" => Some(code_method(
+            c,
+            "_varname_from_oparg",
+            code_varname_from_oparg,
+        )),
+        "replace" => Some(code_method_kw(c, "replace", code_replace)),
         _ => None,
     }
+}
+
+/// Like [`code_method`] but for a keyword-argument-accepting method
+/// (`code.replace(**kwargs)`). Calling it with no kwargs returns an
+/// identical copy, matching CPython.
+fn code_method_kw(
+    c: &Rc<weavepy_compiler::CodeObject>,
+    name: &'static str,
+    body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+) -> Object {
+    Object::BoundMethod(Rc::new(crate::object::BoundMethod {
+        receiver: Object::Code(c.clone()),
+        function: Object::Builtin(Rc::new(BuiltinFn {
+            name,
+            call: Box::new(move |args| body(args, &[])),
+            call_kw: Some(Box::new(body)),
+        })),
+    }))
+}
+
+/// `code.replace(**kwargs)` — return a copy of the code object with
+/// the named `co_*` fields overridden (PEP 626 / `CodeType.replace`).
+///
+/// WeavePy stores the source-level fields directly, so those are
+/// honoured exactly. Fields CPython derives from the instruction
+/// stream (`co_code`, `co_linetable`, `co_stacksize`, `co_flags`, …)
+/// are accepted for drop-in compatibility but carried through from the
+/// original; an unknown keyword raises `TypeError`, as in CPython.
+fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let c = code_self(args)?;
+    let mut nc: weavepy_compiler::CodeObject = (*c).clone();
+
+    fn want_str(o: &Object, field: &str) -> Result<String, RuntimeError> {
+        match o {
+            Object::Str(s) => Ok(s.to_string()),
+            _ => Err(type_error(format!("code.replace(): {field} must be str"))),
+        }
+    }
+    fn want_u32(o: &Object, field: &str) -> Result<u32, RuntimeError> {
+        match o {
+            Object::Int(i) if *i >= 0 => Ok(*i as u32),
+            Object::Int(_) => Err(type_error(format!(
+                "code.replace(): {field} must be non-negative"
+            ))),
+            _ => Err(type_error(format!("code.replace(): {field} must be int"))),
+        }
+    }
+    fn want_str_seq(o: &Object, field: &str) -> Result<Vec<String>, RuntimeError> {
+        let items: Vec<Object> = match o {
+            Object::Tuple(t) => t.iter().cloned().collect(),
+            Object::List(l) => l.borrow().iter().cloned().collect(),
+            _ => {
+                return Err(type_error(format!(
+                    "code.replace(): {field} must be a tuple of str"
+                )))
+            }
+        };
+        items.iter().map(|it| want_str(it, field)).collect()
+    }
+
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "co_name" => nc.name = want_str(v, "co_name")?,
+            "co_filename" => nc.filename = want_str(v, "co_filename")?,
+            "co_argcount" => nc.arg_count = want_u32(v, "co_argcount")?,
+            "co_posonlyargcount" => nc.posonly_count = want_u32(v, "co_posonlyargcount")?,
+            "co_kwonlyargcount" => nc.kwonly_count = want_u32(v, "co_kwonlyargcount")?,
+            "co_varnames" => nc.varnames = want_str_seq(v, "co_varnames")?,
+            "co_names" => nc.names = want_str_seq(v, "co_names")?,
+            "co_freevars" => nc.freevars = want_str_seq(v, "co_freevars")?,
+            "co_cellvars" => nc.cellvars = want_str_seq(v, "co_cellvars")?,
+            "co_firstlineno" => {
+                // Shift the absolute per-instruction line table so the
+                // first line reports the requested value while keeping
+                // the relative line structure intact.
+                let target = want_u32(v, "co_firstlineno")?;
+                if let Some(&first) = nc.linetable.first() {
+                    let delta = i64::from(target) - i64::from(first);
+                    for l in &mut nc.linetable {
+                        *l = (i64::from(*l) + delta).max(0) as u32;
+                    }
+                }
+            }
+            // Recognised CPython fields WeavePy derives on demand rather
+            // than storing independently. Accepted (carried through) so
+            // `replace()` callers don't break, but not independently set.
+            "co_qualname" | "co_flags" | "co_stacksize" | "co_code" | "co_consts"
+            | "co_linetable" | "co_exceptiontable" | "co_nlocals" | "co_lnotab" => {}
+            other => {
+                return Err(type_error(format!(
+                    "replace() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    Ok(Object::Code(Rc::new(nc)))
+}
+
+/// Wrap a native code-object method as a bound method whose receiver is
+/// the code object (delivered to `body` as `args[0]`).
+fn code_method(
+    c: &Rc<weavepy_compiler::CodeObject>,
+    name: &'static str,
+    body: fn(&[Object]) -> Result<Object, RuntimeError>,
+) -> Object {
+    Object::BoundMethod(Rc::new(crate::object::BoundMethod {
+        receiver: Object::Code(c.clone()),
+        function: Object::Builtin(Rc::new(method(name, body))),
+    }))
+}
+
+/// Extract the receiver code object from a bound-method call's `args[0]`.
+fn code_self(args: &[Object]) -> Result<Rc<weavepy_compiler::CodeObject>, RuntimeError> {
+    match args.first() {
+        Some(Object::Code(c)) => Ok(c.clone()),
+        _ => Err(type_error(
+            "descriptor of 'code' object needs a code receiver".to_owned(),
+        )),
+    }
+}
+
+/// `code.co_positions()` — one `(lineno, end_lineno, col, end_col)` tuple
+/// per code unit (PEP 657). Columns are `None` until column plumbing
+/// lands (RFC 0033 follow-up).
+fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
+    let c = code_self(args)?;
+    let cp = c.to_cpython();
+    let col = |v: Option<u32>| v.map_or(Object::None, |x| Object::Int(i64::from(x)));
+    let items = cp
+        .positions
+        .iter()
+        .map(|p| {
+            Object::new_tuple(vec![
+                Object::Int(i64::from(p.lineno)),
+                Object::Int(i64::from(p.end_lineno)),
+                col(p.col),
+                col(p.end_col),
+            ])
+        })
+        .collect();
+    list_iter(items)
+}
+
+/// Wrap a vector of objects as a single-use iterator, mirroring the
+/// iterators CPython's `co_positions()` / `co_lines()` return.
+fn list_iter(items: Vec<Object>) -> Result<Object, RuntimeError> {
+    let it = Object::new_list(items).make_iter()?;
+    Ok(Object::Iter(Rc::new(RefCell::new(it))))
+}
+
+/// `code.co_lines()` — `(start, end, lineno)` byte ranges (PEP 626),
+/// merging consecutive code units that share a line.
+fn code_co_lines(args: &[Object]) -> Result<Object, RuntimeError> {
+    let c = code_self(args)?;
+    let cp = c.to_cpython();
+    let n = cp.positions.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let line = cp.positions[i].lineno;
+        let start = i;
+        while i < n && cp.positions[i].lineno == line {
+            i += 1;
+        }
+        out.push(Object::new_tuple(vec![
+            Object::Int((start * 2) as i64),
+            Object::Int((i * 2) as i64),
+            Object::Int(i64::from(line)),
+        ]));
+    }
+    list_iter(out)
+}
+
+/// `code._varname_from_oparg(i)` — resolve a fast-local / cell / free
+/// index into its name (`co_localsplusnames[i]`). `dis` uses this to
+/// label `LOAD_FAST` / `LOAD_DEREF`.
+fn code_varname_from_oparg(args: &[Object]) -> Result<Object, RuntimeError> {
+    let c = code_self(args)?;
+    let idx = match args.get(1) {
+        Some(Object::Int(i)) if *i >= 0 => *i as usize,
+        _ => {
+            return Err(type_error(
+                "_varname_from_oparg() requires a non-negative int".to_owned(),
+            ))
+        }
+    };
+    c.varnames
+        .iter()
+        .chain(c.cellvars.iter())
+        .chain(c.freevars.iter())
+        .nth(idx)
+        .map(Object::from_str)
+        .ok_or_else(|| type_error("_varname_from_oparg(): index out of range".to_owned()))
 }
 
 /// Return the docstring extracted from a code object, if its first

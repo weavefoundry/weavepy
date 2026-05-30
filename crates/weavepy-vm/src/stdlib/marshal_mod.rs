@@ -17,11 +17,24 @@ use crate::sync::RefCell;
 
 use num_bigint::{BigInt, Sign};
 
+use weavepy_compiler::{cpython_code, CacheTable, CodeObject, Constant};
+
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{
     BuiltinFn, DictData, DictKey, FileBackend, Object, PyComplex, PyFile, PyModule,
 };
+
+// CPython `co_flags` bits we round-trip (Include/cpython/code.h). Only the
+// bits whose meaning WeavePy tracks on its own `CodeObject` are consumed on
+// read; the rest are informational (e.g. `dis`/`inspect` flag display).
+const CO_OPTIMIZED: u32 = 0x0001;
+const CO_NEWLOCALS: u32 = 0x0002;
+const CO_VARARGS: u32 = 0x0004;
+const CO_VARKEYWORDS: u32 = 0x0008;
+const CO_GENERATOR: u32 = 0x0020;
+const CO_COROUTINE: u32 = 0x0080;
+const CO_ASYNC_GENERATOR: u32 = 0x0200;
 
 #[allow(dead_code)]
 const TYPE_NULL: u8 = b'0';
@@ -267,15 +280,8 @@ impl MarshalWriter {
                     self.write_value(&k.0)?;
                 }
             }
-            Object::Code(_co) => {
-                // We do not currently serialise code objects across
-                // process boundaries (that's the .pyc story; our
-                // .pyc writer writes a *fresh* code object via
-                // `compile`, not a marshalled one). Reject for now
-                // with a clear error.
-                return Err(value_error(
-                    "marshal: code objects are not yet serialisable across processes",
-                ));
+            Object::Code(co) => {
+                self.write_code(co)?;
             }
             other => {
                 return Err(value_error(format!(
@@ -287,23 +293,120 @@ impl MarshalWriter {
         Ok(())
     }
 
+    fn write_short(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// `TYPE_LONG` — CPython's exact bigint wire form: a signed count of
+    /// 15-bit digits (`PyLong_MARSHAL_SHIFT`) followed by each digit as a
+    /// little-endian `short`, least-significant first. Byte-compatible
+    /// with CPython 3.13's `marshal` (RFC 0033).
     fn write_long_object(&mut self, b: &BigInt) -> Result<(), RuntimeError> {
         self.write_byte(TYPE_LONG);
-        // CPython packs the bigint as 15-bit digits (PyLong_SHIFT)
-        // little-endian, with the sign encoded in the count. We
-        // approximate with a simpler 32-bit-digit layout that the
-        // reader knows how to undo.
-        let (sign, digits) = b.to_u32_digits();
-        let signed_count: i32 = match sign {
-            Sign::Minus => -(digits.len() as i32),
-            _ => digits.len() as i32,
-        };
+        let (signed_count, digits15) = bigint_to_15bit(b);
         self.write_int(signed_count);
-        for d in digits {
-            self.write_int(d as i32);
+        for d in digits15 {
+            self.write_short(d);
         }
         Ok(())
     }
+
+    /// `TYPE_CODE` — serialise a code object in CPython 3.13's exact field
+    /// order (`Python/marshal.c`). The bytecode itself is WeavePy's, but
+    /// re-expressed through the CPython codec so the container, the
+    /// location/exception tables, and `co_localsplus*` all match what
+    /// CPython would write (RFC 0033).
+    fn write_code(&mut self, co: &CodeObject) -> Result<(), RuntimeError> {
+        let cp = co.to_cpython();
+        self.write_byte(TYPE_CODE);
+        self.write_int(co.arg_count as i32);
+        self.write_int(co.posonly_count as i32);
+        self.write_int(co.kwonly_count as i32);
+        self.write_int(cp.stacksize as i32);
+        self.write_int(code_flags(co) as i32);
+        self.write_value(&Object::new_bytes(cp.co_code))?;
+        let consts: Vec<Object> = co
+            .constants
+            .iter()
+            .cloned()
+            .map(crate::constant_to_object_public)
+            .collect();
+        self.write_value(&Object::new_tuple(consts))?;
+        self.write_value(&strs_to_tuple(&co.names))?;
+        self.write_value(&strs_to_tuple(&cp.localsplusnames))?;
+        self.write_value(&Object::new_bytes(cp.localspluskinds))?;
+        self.write_value(&Object::from_str(co.filename.clone()))?;
+        self.write_value(&Object::from_str(co.name.clone()))?;
+        // We don't track a separate qualified name; the plain name is a
+        // faithful stand-in for top-level defs and is what `dis` prints.
+        self.write_value(&Object::from_str(co.name.clone()))?;
+        self.write_int(cp.firstlineno as i32);
+        self.write_value(&Object::new_bytes(cp.co_linetable))?;
+        self.write_value(&Object::new_bytes(cp.co_exceptiontable))?;
+        Ok(())
+    }
+}
+
+/// CPython `co_flags` for a WeavePy code object. Module/class bodies are
+/// not "optimized" (they use name-based locals); functions are.
+fn code_flags(co: &CodeObject) -> u32 {
+    let mut f = 0u32;
+    if co.is_class_body {
+        f |= CO_NEWLOCALS;
+    } else if co.name != "<module>" {
+        f |= CO_OPTIMIZED | CO_NEWLOCALS;
+    }
+    if co.has_varargs {
+        f |= CO_VARARGS;
+    }
+    if co.has_varkeywords {
+        f |= CO_VARKEYWORDS;
+    }
+    if co.is_generator {
+        f |= CO_GENERATOR;
+    }
+    if co.is_coroutine {
+        f |= CO_COROUTINE;
+    }
+    if co.is_async_generator {
+        f |= CO_ASYNC_GENERATOR;
+    }
+    f
+}
+
+/// Pack a `BigInt` into CPython's marshal digit form: a signed count of
+/// 15-bit little-endian digits (sign carried by the count; `0` for zero).
+fn bigint_to_15bit(b: &BigInt) -> (i32, Vec<u16>) {
+    let (sign, u32_digits) = b.to_u32_digits();
+    let mut out: Vec<u16> = Vec::new();
+    let mut acc: u64 = 0;
+    let mut nbits: u32 = 0;
+    for d in u32_digits {
+        acc |= u64::from(d) << nbits;
+        nbits += 32;
+        while nbits >= 15 {
+            out.push((acc & 0x7FFF) as u16);
+            acc >>= 15;
+            nbits -= 15;
+        }
+    }
+    if acc != 0 {
+        out.push((acc & 0x7FFF) as u16);
+    }
+    while matches!(out.last(), Some(0)) {
+        out.pop();
+    }
+    let count = out.len() as i32;
+    let signed = match sign {
+        Sign::Minus => -count,
+        _ => count,
+    };
+    (signed, out)
+}
+
+/// Build a `marshal` tuple of interned-string objects.
+fn strs_to_tuple(items: &[String]) -> Object {
+    Object::new_tuple(items.iter().map(|s| Object::from_str(s.clone())).collect())
 }
 
 // ---------- reader ----------
@@ -345,6 +448,15 @@ impl<'a> MarshalReader<'a> {
         buf.copy_from_slice(&self.bytes[self.pos..self.pos + 8]);
         self.pos += 8;
         Ok(i64::from_le_bytes(buf))
+    }
+
+    fn read_short(&mut self) -> Result<u16, RuntimeError> {
+        if self.pos + 2 > self.bytes.len() {
+            return Err(value_error("bad marshal data: short u16"));
+        }
+        let v = u16::from_le_bytes([self.bytes[self.pos], self.bytes[self.pos + 1]]);
+        self.pos += 2;
+        Ok(v)
     }
 
     fn read_n_bytes(&mut self, n: usize) -> Result<Vec<u8>, RuntimeError> {
@@ -399,22 +511,21 @@ impl<'a> MarshalReader<'a> {
                 ))))
             }
             TYPE_LONG => {
+                // Signed count of 15-bit little-endian digits (CPython
+                // marshal). Reassemble as a `BigInt`, then auto-demote.
                 let signed_count = self.read_int()?;
                 let count = signed_count.unsigned_abs() as usize;
-                let mut digits: Vec<u32> = Vec::with_capacity(count);
-                for _ in 0..count {
-                    digits.push(self.read_int()? as u32);
+                let mut value = BigInt::from(0);
+                for i in 0..count {
+                    let digit = self.read_short()?;
+                    value += BigInt::from(digit) << (15 * i);
                 }
-                let big = BigInt::from_slice(
-                    if signed_count < 0 {
-                        Sign::Minus
-                    } else {
-                        Sign::Plus
-                    },
-                    &digits,
-                );
-                Ok(Object::int_from_bigint(big))
+                if signed_count < 0 {
+                    value = -value;
+                }
+                Ok(Object::int_from_bigint(value))
             }
+            TYPE_CODE => self.read_code(),
             TYPE_STRING => {
                 let len = self.read_int()? as usize;
                 let bytes = self.read_n_bytes(len)?;
@@ -495,6 +606,102 @@ impl<'a> MarshalReader<'a> {
             }
             other => Err(value_error(format!("marshal: unknown type tag {other:?}"))),
         }
+    }
+
+    /// Read a `TYPE_CODE` body (the tag has already been consumed) and
+    /// rebuild an executable WeavePy [`CodeObject`] by inverting the
+    /// CPython codec (RFC 0033).
+    fn read_code(&mut self) -> Result<Object, RuntimeError> {
+        let arg_count = self.read_int()? as u32;
+        let posonly_count = self.read_int()? as u32;
+        let kwonly_count = self.read_int()? as u32;
+        let _stacksize = self.read_int()?;
+        let flags = self.read_int()? as u32;
+        let co_code = self.read_value()?;
+        let consts = self.read_value()?;
+        let names = self.read_value()?;
+        let localsplusnames = self.read_value()?;
+        let localspluskinds = self.read_value()?;
+        let filename = self.read_value()?;
+        let name = self.read_value()?;
+        let _qualname = self.read_value()?;
+        let firstlineno = self.read_int()? as u32;
+        let linetable = self.read_value()?;
+        let exceptiontable = self.read_value()?;
+
+        let code_bytes = bytes_of(&co_code, "co_code")?;
+        let line_bytes = bytes_of(&linetable, "co_linetable")?;
+        let exc_bytes = bytes_of(&exceptiontable, "co_exceptiontable")?;
+        let lpn = tuple_of_strings(&localsplusnames, "co_localsplusnames")?;
+        let lpk = bytes_of(&localspluskinds, "co_localspluskinds")?;
+
+        let decoded = cpython_code::decode_full(
+            &code_bytes,
+            &line_bytes,
+            &exc_bytes,
+            &lpn,
+            &lpk,
+            firstlineno,
+        )
+        .ok_or_else(|| value_error("marshal: code object uses an unsupported opcode"))?;
+
+        let co = CodeObject {
+            name: string_of(&name, "co_name")?,
+            filename: string_of(&filename, "co_filename")?,
+            caches: CacheTable::with_len(decoded.instructions.len()),
+            instructions: decoded.instructions,
+            constants: tuple_to_constants(&consts)?,
+            names: tuple_of_strings(&names, "co_names")?,
+            varnames: decoded.varnames,
+            freevars: decoded.freevars,
+            cellvars: decoded.cellvars,
+            exception_table: decoded.exception_table,
+            linetable: decoded.linetable,
+            arg_count,
+            posonly_count,
+            kwonly_count,
+            has_varargs: flags & CO_VARARGS != 0,
+            has_varkeywords: flags & CO_VARKEYWORDS != 0,
+            is_class_body: false,
+            is_generator: flags & CO_GENERATOR != 0,
+            is_coroutine: flags & CO_COROUTINE != 0,
+            is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
+        };
+        Ok(Object::Code(Rc::new(co)))
+    }
+}
+
+/// Extract a byte buffer from a marshalled value, or a descriptive error.
+fn bytes_of(o: &Object, field: &str) -> Result<Vec<u8>, RuntimeError> {
+    o.as_bytes_view()
+        .ok_or_else(|| value_error(format!("marshal: code object field '{field}' is not bytes")))
+}
+
+/// Extract a `str` from a marshalled value.
+fn string_of(o: &Object, field: &str) -> Result<String, RuntimeError> {
+    match o {
+        Object::Str(s) => Ok(s.to_string()),
+        _ => Err(value_error(format!(
+            "marshal: code object field '{field}' is not a str"
+        ))),
+    }
+}
+
+/// Extract a tuple of `str` from a marshalled value.
+fn tuple_of_strings(o: &Object, field: &str) -> Result<Vec<String>, RuntimeError> {
+    match o {
+        Object::Tuple(items) => items.iter().map(|x| string_of(x, field)).collect(),
+        _ => Err(value_error(format!(
+            "marshal: code object field '{field}' is not a tuple"
+        ))),
+    }
+}
+
+/// Fold a marshalled `co_consts` tuple back into compile-time constants.
+fn tuple_to_constants(o: &Object) -> Result<Vec<Constant>, RuntimeError> {
+    match o {
+        Object::Tuple(items) => Ok(items.iter().map(crate::object_to_constant_public).collect()),
+        _ => Err(value_error("marshal: code object co_consts is not a tuple")),
     }
 }
 

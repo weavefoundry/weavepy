@@ -52,6 +52,22 @@ work.
 > remains an aspirational target — see `tests/regrtest/expectations.toml`
 > for the per-test baseline. Expect small breaking changes
 > around the edges as the long tail catches up.
+>
+> `RFC 0033` makes WeavePy *introspectable like CPython*. It ships a
+> CPython-faithful **code-object surface** (`co_code`, `co_linetable`
+> (PEP 626), `co_exceptiontable`, `co_positions()` (PEP 657),
+> `co_stacksize`, `co_qualname`, `co_lines()`, `replace()`, …) backed by
+> a new `cpython_code` codec that re-encodes WeavePy's instruction stream
+> into CPython 3.13's 16-bit `_Py_CODEUNIT` form (`EXTENDED_ARG` + inline
+> `CACHE` entries). On top of that it lands the four introspection
+> modules every serious tool reaches for — `import ast`, `import dis`,
+> `import opcode`, `import symtable` — as frozen Python over thin Rust
+> cores (`_ast`, `_symtable`), a `marshal` that serialises code objects
+> byte-compatibly with CPython 3.13 (`TYPE_CODE` + `FLAG_REF` shared refs
+> + exact 15-bit bigint digits), and real `.pyc` read/write under
+> `__pycache__` using CPython's `b"\xf3\r\r\n"` magic + PEP 552 header
+> (kept collision-safe by a distinct `weavepy-3.13` cache tag). Six
+> bundled regrtests cross-check the whole surface against CPython 3.13.
 
 ## Repository layout
 

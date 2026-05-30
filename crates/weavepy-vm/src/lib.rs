@@ -3231,11 +3231,27 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         let mut sep = String::from(" ");
         let mut end = String::from("\n");
+        let mut file: Option<Object> = None;
         for (k, v) in kwargs {
             match k.as_str() {
-                "sep" => sep = v.to_str(),
-                "end" => end = v.to_str(),
-                "file" | "flush" => {}
+                // A `None` value means "use the default", matching
+                // CPython (`print('a', sep=None)` joins with a space).
+                "sep" => {
+                    if !matches!(v, Object::None) {
+                        sep = v.to_str();
+                    }
+                }
+                "end" => {
+                    if !matches!(v, Object::None) {
+                        end = v.to_str();
+                    }
+                }
+                "file" => {
+                    if !matches!(v, Object::None) {
+                        file = Some(v.clone());
+                    }
+                }
+                "flush" => {}
                 other => {
                     return Err(type_error(format!(
                         "'{other}' is an invalid keyword argument for print()"
@@ -3243,17 +3259,34 @@ impl Interpreter {
                 }
             }
         }
-        let mut sink = self.stdout.borrow_mut();
+
+        // Render the whole line first. Building the string up-front
+        // (rather than streaming into a held `stdout` borrow) keeps
+        // the borrow window tight and lets us route the result either
+        // to the native stdout sink or — when `file=` is supplied —
+        // through that object's `write` method, exactly like CPython.
+        let mut text = String::new();
         for (i, a) in args.iter().enumerate() {
             if i > 0 {
-                let _ = write!(sink, "{sep}");
+                text.push_str(&sep);
             }
-            drop(sink);
-            let s = self.stringify(a, globals)?;
-            sink = self.stdout.borrow_mut();
-            let _ = write!(sink, "{s}");
+            text.push_str(&self.stringify(a, globals)?);
         }
-        let _ = write!(sink, "{end}");
+        text.push_str(&end);
+
+        match file {
+            // `print(..., file=f)` calls `f.write(...)` so any
+            // file-like object works: `sys.stderr`, an open file, an
+            // `io.StringIO`, or a user type with a `write` method.
+            Some(f) => {
+                let write = self.load_attr(&f, "write")?;
+                self.call(&write, &[Object::from_str(text)], &[], globals)?;
+            }
+            None => {
+                let mut sink = self.stdout.borrow_mut();
+                let _ = write!(sink, "{text}");
+            }
+        }
         Ok(Object::None)
     }
 
@@ -3687,6 +3720,57 @@ impl Interpreter {
                 Ok(out)
             }
         }
+    }
+
+    /// `map(func, *iterables)` — VM-aware (the plain builtin can't call
+    /// back into the interpreter). Evaluated eagerly into an iterator so
+    /// generators and `next()` both work (RFC 0033). Stops at the
+    /// shortest iterable, matching CPython.
+    fn do_map_call(
+        &mut self,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let func = args[0].clone();
+        let mut cols: Vec<Vec<Object>> = Vec::with_capacity(args.len() - 1);
+        for it in &args[1..] {
+            cols.push(self.collect_iterable(it, globals)?);
+        }
+        let n = cols.iter().map(Vec::len).min().unwrap_or(0);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let call_args: Vec<Object> = cols.iter().map(|c| c[i].clone()).collect();
+            out.push(self.call(&func, &call_args, &[], globals)?);
+        }
+        let it = Object::new_list(out).make_iter()?;
+        Ok(Object::Iter(Rc::new(RefCell::new(it))))
+    }
+
+    /// `filter(func_or_None, iterable)` — VM-aware. `None` keeps truthy
+    /// items; otherwise an item is kept when `func(item)` is truthy.
+    /// Returns an iterator (RFC 0033).
+    fn do_filter_call(
+        &mut self,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let func = args[0].clone();
+        let use_pred = !matches!(func, Object::None);
+        let items = self.collect_iterable(&args[1], globals)?;
+        let mut out = Vec::new();
+        for item in items {
+            let keep = if use_pred {
+                self.call(&func, std::slice::from_ref(&item), &[], globals)?
+                    .is_truthy()
+            } else {
+                item.is_truthy()
+            };
+            if keep {
+                out.push(item);
+            }
+        }
+        let it = Object::new_list(out).make_iter()?;
+        Ok(Object::Iter(Rc::new(RefCell::new(it))))
     }
 
     fn do_sum_call(
@@ -6093,6 +6177,12 @@ impl Interpreter {
                 if b.name == "sum" {
                     return self.do_sum_call(args, outer_globals);
                 }
+                if b.name == "map" && args.len() >= 2 {
+                    return self.do_map_call(args, outer_globals);
+                }
+                if b.name == "filter" && args.len() == 2 {
+                    return self.do_filter_call(args, outer_globals);
+                }
                 if b.name == "max" || b.name == "min" {
                     return self.do_min_max_call(b.name, args, kwargs, outer_globals);
                 }
@@ -6835,6 +6925,40 @@ impl Interpreter {
                     return Ok(d);
                 }
             }
+            // `set(it)` / `frozenset(it)` / `dict(iter-of-pairs)` must
+            // route lazy iterables (generators, `zip`/`map`/`filter`
+            // views, genexprs) through the VM-aware collector — the plain
+            // builtins below can only drive eager containers (RFC 0033).
+            if matches!(&args.first(), Some(Object::Generator(_) | Object::Iter(_)))
+                && args.len() == 1
+                && kwargs.is_empty()
+            {
+                if cls.name == "set" || cls.name == "frozenset" {
+                    let global_dummy = Rc::new(RefCell::new(DictData::new()));
+                    let items = self.collect_iterable(&args[0], &global_dummy)?;
+                    return Ok(if cls.name == "set" {
+                        Object::new_set_from(items)
+                    } else {
+                        Object::new_frozenset_from(items)
+                    });
+                }
+                if cls.name == "dict" {
+                    let global_dummy = Rc::new(RefCell::new(DictData::new()));
+                    let items = self.collect_iterable(&args[0], &global_dummy)?;
+                    let mut d = DictData::new();
+                    for (i, pair) in items.into_iter().enumerate() {
+                        let kv = self.collect_iterable(&pair, &global_dummy)?;
+                        if kv.len() != 2 {
+                            return Err(type_error(format!(
+                                "dictionary update sequence element #{i} has length {}; 2 is required",
+                                kv.len()
+                            )));
+                        }
+                        d.insert(DictKey(kv[0].clone()), kv[1].clone());
+                    }
+                    return Ok(Object::Dict(Rc::new(RefCell::new(d))));
+                }
+            }
             // `int(x)` / `float(x)` honour the user's `__int__` /
             // `__float__` when `x` is a non-primitive — matches CPython.
             if cls.name == "int" && args.len() <= 2 && kwargs.is_empty() {
@@ -7015,6 +7139,22 @@ impl Interpreter {
         let total_args = code.arg_count as usize;
         let has_varargs = code.has_varargs;
         let has_varkeywords = code.has_varkeywords;
+        // Fast-local slot layout follows CPython exactly:
+        //   [0, total_args)           positional (posonly + pos-or-kw)
+        //   [total_args, kwonly_end)  keyword-only
+        //   [star_idx]                `*args`  (when present)
+        //   [kwargs_slot]             `**kwargs` (when present)
+        // Keyword-only params therefore precede `*args`, matching
+        // `co_varnames` and what the compiler emits.
+        let kwonly_count = code.kwonly_count as usize;
+        let kwonly_start = total_args;
+        let kwonly_end = kwonly_start + kwonly_count;
+        let star_idx = kwonly_end;
+        let kwargs_slot = if has_varkeywords {
+            Some(kwonly_end + usize::from(has_varargs))
+        } else {
+            None
+        };
         // Bind positional args; remainder go to *args if present, else error.
         let mut positional: Vec<Object> = vec![Object::None; code.varnames.len()];
         let mut filled = vec![false; code.varnames.len()];
@@ -7025,7 +7165,6 @@ impl Interpreter {
             filled[i] = true;
         }
         if has_varargs {
-            let star_idx = total_args;
             let rest: Vec<Object> = args.iter().skip(direct).cloned().collect();
             positional[star_idx] = Object::new_tuple(rest);
             filled[star_idx] = true;
@@ -7043,14 +7182,6 @@ impl Interpreter {
         // *args/**kwargs sit just outside this range and can't be
         // addressed by keyword. Locals beyond it MUST NOT pull the
         // kwarg out of the **kwargs catchall.
-        let kwonly_count = code.kwonly_count as usize;
-        let kwonly_start = total_args + usize::from(has_varargs);
-        let kwonly_end = kwonly_start + kwonly_count;
-        let kwargs_slot = if has_varkeywords {
-            Some(kwonly_end)
-        } else {
-            None
-        };
         let mut extra_kwargs = crate::object::DictData::new();
         for (name, value) in kwargs {
             let mut slot = None;
@@ -9510,6 +9641,34 @@ fn constant_to_object(c: Constant) -> Object {
     }
 }
 
+/// Inverse of [`constant_to_object`]: fold a runtime value back into a
+/// compile-time [`Constant`]. Used by `marshal`/`.pyc` to rebuild a code
+/// object's `co_consts` (RFC 0033). Only the value kinds that can legally
+/// appear in a constant pool are handled; anything else collapses to
+/// `None` (a marshalled constant pool never contains live containers).
+pub fn object_to_constant_public(o: &Object) -> Constant {
+    object_to_constant(o)
+}
+
+fn object_to_constant(o: &Object) -> Constant {
+    match o {
+        Object::None => Constant::None,
+        Object::Bool(b) => Constant::Bool(*b),
+        Object::Int(i) => Constant::Int(*i),
+        Object::Long(b) => Constant::BigInt((**b).clone()),
+        Object::Float(f) => Constant::Float(*f),
+        Object::Complex(c) => Constant::Complex(c.real, c.imag),
+        Object::Str(s) => Constant::Str(s.to_string()),
+        Object::Bytes(b) => Constant::Bytes(b.to_vec()),
+        Object::Tuple(xs) => Constant::Tuple(xs.iter().map(object_to_constant).collect()),
+        Object::FrozenSet(s) => {
+            Constant::Tuple(s.iter().map(|k| object_to_constant(&k.0)).collect())
+        }
+        Object::Code(c) => Constant::Code(Box::new((**c).clone())),
+        _ => Constant::None,
+    }
+}
+
 fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeError> {
     use BinOpKind as B;
     use Object as O;
@@ -9599,6 +9758,26 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             out.extend_from_slice(y);
             Ok(Object::new_bytes(out))
         }
+        // Mixed bytes/bytearray concatenation. CPython allows all four
+        // combinations and the result type follows the *left* operand
+        // (`bytearray + bytes -> bytearray`, `bytes + bytearray -> bytes`).
+        (O::ByteArray(x), O::Bytes(y), B::Add) => {
+            let mut out = x.borrow().clone();
+            out.extend_from_slice(y);
+            Ok(Object::new_bytearray(out))
+        }
+        (O::ByteArray(x), O::ByteArray(y), B::Add) => {
+            let mut out = x.borrow().clone();
+            out.extend_from_slice(&y.borrow());
+            Ok(Object::new_bytearray(out))
+        }
+        (O::Bytes(x), O::ByteArray(y), B::Add) => {
+            let yb = y.borrow();
+            let mut out = Vec::with_capacity(x.len() + yb.len());
+            out.extend_from_slice(x);
+            out.extend_from_slice(&yb);
+            Ok(Object::new_bytes(out))
+        }
         (O::Bytes(x), O::Int(n), B::Mult) | (O::Int(n), O::Bytes(x), B::Mult) => {
             let times = if *n < 0 { 0 } else { *n as usize };
             let mut out = Vec::with_capacity(x.len() * times);
@@ -9606,6 +9785,15 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
                 out.extend_from_slice(x);
             }
             Ok(Object::new_bytes(out))
+        }
+        (O::ByteArray(x), O::Int(n), B::Mult) | (O::Int(n), O::ByteArray(x), B::Mult) => {
+            let times = if *n < 0 { 0 } else { *n as usize };
+            let body = x.borrow().clone();
+            let mut out = Vec::with_capacity(body.len() * times);
+            for _ in 0..times {
+                out.extend_from_slice(&body);
+            }
+            Ok(Object::new_bytearray(out))
         }
         (O::Set(a), O::Set(b), B::BitOr) => Ok(union_sets(&a.borrow(), &b.borrow())),
         (O::Set(a), O::Set(b), B::BitAnd) => Ok(intersect_sets(&a.borrow(), &b.borrow())),
