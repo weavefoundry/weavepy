@@ -15,6 +15,7 @@
 
 use crate::import::{FrozenSource, ModuleCache};
 
+pub mod ast_mod;
 pub mod base64_mod;
 pub mod binascii_mod;
 pub mod bz2_mod;
@@ -49,6 +50,7 @@ pub mod sqlite3_mod;
 pub mod ssl_mod;
 pub mod struct_mod;
 pub mod subprocess_mod;
+pub mod symtable_mod;
 pub mod sys;
 pub mod sys_monitoring;
 pub mod tempfile_mod;
@@ -112,6 +114,10 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_struct", struct_mod::build);
     cache.register_builtin("_codecs", codecs_mod::build);
     cache.register_builtin("marshal", marshal_mod::build);
+    // RFC 0033 — native AST parsing core behind the frozen `ast` module.
+    cache.register_builtin("_ast", ast_mod::build);
+    // RFC 0033 — native symbol-table core behind the frozen `symtable` module.
+    cache.register_builtin("_symtable", symtable_mod::build);
     cache.register_builtin("_gzip", gzip_mod::build);
     cache.register_builtin("_bz2", bz2_mod::build);
     cache.register_builtin("_lzma", lzma_mod::build);
@@ -859,6 +865,27 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "exceptiongroup",
             source: include_str!("python/exceptiongroup_mod.py"),
+            is_package: false,
+        },
+        // RFC 0033 — bytecode & introspection compatibility layer.
+        FrozenSource {
+            name: "opcode",
+            source: include_str!("python/opcode.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "dis",
+            source: include_str!("python/dis.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ast",
+            source: include_str!("python/ast.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "symtable",
+            source: include_str!("python/symtable.py"),
             is_package: false,
         },
     ]

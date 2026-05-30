@@ -102,14 +102,24 @@ about WeavePy. CI pins to 3.13.
 | phase  | status |
 |--------|--------|
 | tokens | live — full diff against `tokenize.tokenize` |
-| ast    | oracle runs; WeavePy side reports **skipped** until the parser emits `ast.dump`-shaped output |
-| dis    | oracle runs; WeavePy side reports **skipped** until the compiler emits `dis`-shaped output |
+| ast    | live — graded diff against `ast.parse` + `ast.dump` |
+| dis    | live — graded diff against `compile` + `dis.dis` |
 
-The skipped phases are deliberate: we do not pretend to be measuring
-something we can't measure yet. As soon as WeavePy can emit comparable
-output for a phase, the runner switches that phase from `Skipped` to a
-real diff in a single PR. The oracle infrastructure for all three
-phases is wired up today, so we know it works.
+All three phases are wired and graded. The `ast` and `dis` phases
+compare WeavePy's **raw** parser/compiler IR (`parser::ast::dump_module`,
+`CodeObject::format_dis`) against CPython, so their match rates are a
+floor that climbs as the native pipeline converges on CPython's shapes —
+they are not yet a perfect signal and the job stays non-blocking (see
+"CI integration").
+
+> Note: RFC 0033 additionally ships **CPython-faithful frozen drop-in
+> modules** — `import ast`, `import dis`, `import opcode`,
+> `import symtable`, plus `marshal`/`.pyc` and the `code` object `co_*`
+> surface. Those are exercised as a *drop-in* (run real `dis.dis` /
+> `ast.parse` *inside* WeavePy and diff against CPython) by the bundled
+> regrtests, not by this raw-IR harness. Treat the two as complementary:
+> this harness grades the native pipeline; the regrtests grade the
+> user-visible module surface.
 
 ## Stage B: end-to-end regrtest runner
 
@@ -134,10 +144,12 @@ A `conformance` job runs on every push and pull request. It:
    `conformance-report`.
 
 The job is marked `continue-on-error: true` so it does **not** block PR
-merges — today's baseline is 0% by design, and a blocking gate would
-amount to noise until the harness has a meaningful floor. Once the
-lexer's first real commit moves the tokens phase well above zero, the
-job is promoted to blocking via a follow-up PR.
+merges — the `ast`/`dis` raw-IR match rates are still a climbing floor,
+and a blocking gate would amount to noise until the native pipeline
+converges. The blocking signal lives in the separate **`regrtest`** job
+(`cargo run -p weavepy-cli -- regrtest`), which gates on
+`tests/regrtest/expectations.toml`; this `conformance` job is promoted to
+blocking via a follow-up PR once its floor is meaningful.
 
 ## Why a separate crate?
 

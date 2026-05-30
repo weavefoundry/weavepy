@@ -55,6 +55,24 @@ impl CompareKind {
             Self::GtE => ">=",
         }
     }
+
+    /// The opcode argument that encodes this comparison.
+    pub fn as_arg(self) -> u32 {
+        self as u32
+    }
+
+    /// Recover a [`CompareKind`] from its opcode argument.
+    pub fn from_arg(arg: u32) -> Option<Self> {
+        Some(match arg {
+            0 => Self::Lt,
+            1 => Self::LtE,
+            2 => Self::Eq,
+            3 => Self::NotEq,
+            4 => Self::Gt,
+            5 => Self::GtE,
+            _ => return None,
+        })
+    }
 }
 
 impl BinOpKind {
@@ -74,6 +92,31 @@ impl BinOpKind {
             Self::BitAnd => "&",
             Self::MatMult => "@",
         }
+    }
+
+    /// The opcode argument that encodes this binary operator.
+    pub fn as_arg(self) -> u32 {
+        self as u32
+    }
+
+    /// Recover a [`BinOpKind`] from its opcode argument.
+    pub fn from_arg(arg: u32) -> Option<Self> {
+        Some(match arg {
+            0 => Self::Add,
+            1 => Self::Sub,
+            2 => Self::Mult,
+            3 => Self::Div,
+            4 => Self::FloorDiv,
+            5 => Self::Mod,
+            6 => Self::Pow,
+            7 => Self::LShift,
+            8 => Self::RShift,
+            9 => Self::BitOr,
+            10 => Self::BitXor,
+            11 => Self::BitAnd,
+            12 => Self::MatMult,
+            _ => return None,
+        })
     }
 }
 
@@ -95,6 +138,22 @@ impl UnaryKind {
             Self::Not => "not",
             Self::Invert => "~",
         }
+    }
+
+    /// The opcode argument that encodes this unary operator.
+    pub fn as_arg(self) -> u32 {
+        self as u32
+    }
+
+    /// Recover a [`UnaryKind`] from its opcode argument.
+    pub fn from_arg(arg: u32) -> Option<Self> {
+        Some(match arg {
+            0 => Self::Pos,
+            1 => Self::Neg,
+            2 => Self::Not,
+            3 => Self::Invert,
+            _ => return None,
+        })
     }
 }
 

@@ -3,14 +3,15 @@
 Compiles a single ``.py`` file to a ``.pyc`` bytecode archive that
 ``compileall`` and the WeavePy import machinery understand.
 
-The ``.pyc`` format is *not* CPython-compatible — WeavePy's
-bytecode opcodes diverge — but the framing matches CPython's
-PEP-552 magic-tag-based layout: a 16-byte header followed by a
-``marshal.dumps`` of the code object.
+The framing matches CPython's PEP-552 magic-tag-based layout: a
+16-byte header followed by a ``marshal.dumps`` of the code object.
+RFC 0033 adopts CPython 3.13's magic number; WeavePy's distinct
+cache tag (``weavepy-3.13``) keeps its ``.pyc`` files from colliding
+with CPython's ``cpython-313`` artifacts.
 
 Layout (little-endian):
 
-* 4 bytes — magic number (``WEAV-3.13`` tag).
+* 4 bytes — magic number (CPython 3.13's ``b"\\xf3\\r\\r\\n"``).
 * 4 bytes — flags (currently always 0).
 * 4 bytes — source mtime (truncated to 32 bits).
 * 4 bytes — source size (truncated to 32 bits).
@@ -20,7 +21,7 @@ import marshal
 import os
 import struct
 
-MAGIC_NUMBER = b"\x57\x45\x76\x0d"  # "W E v \r"  (RFC 0019 sentinel)
+MAGIC_NUMBER = b"\xf3\x0d\x0d\x0a"  # CPython 3.13 bytecode magic (RFC 0033)
 
 
 class PyCompileError(Exception):

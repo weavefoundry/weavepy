@@ -340,7 +340,12 @@ fn imp_extension_suffixes(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn imp_get_magic(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Bytes(Rc::from(b"WPY0".as_slice())))
+    // CPython 3.13's bytecode magic (`importlib.util.MAGIC_NUMBER`,
+    // RFC 0033). WeavePy keeps a distinct *cache tag*
+    // (`weavepy-3.13`) so its `.pyc` files never collide with
+    // CPython's `cpython-313` artifacts, which lets us adopt the
+    // real magic number for tool interop without ambiguity.
+    Ok(Object::Bytes(Rc::from(b"\xf3\x0d\x0d\x0a".as_slice())))
 }
 
 /// `_imp.source_hash(key, source)` — deterministic 8-byte hash
