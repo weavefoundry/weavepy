@@ -196,7 +196,8 @@ fn unicode_iscased(ch: u32) -> bool {
 }
 
 fn ascii_iscased(ch: u32) -> bool {
-    (u32::from(b'a')..=u32::from(b'z')).contains(&ch) || (u32::from(b'A')..=u32::from(b'Z')).contains(&ch)
+    (u32::from(b'a')..=u32::from(b'z')).contains(&ch)
+        || (u32::from(b'A')..=u32::from(b'Z')).contains(&ch)
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,17 +1452,17 @@ fn sre_exec(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sre_ascii_tolower(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(
-        i64::from(lower_ascii(arg_i64(args, 0, "ch")? as u32))
-    ))
+    Ok(Object::Int(i64::from(lower_ascii(
+        arg_i64(args, 0, "ch")? as u32
+    ))))
 }
 fn sre_ascii_iscased(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(ascii_iscased(arg_i64(args, 0, "ch")? as u32)))
 }
 fn sre_unicode_tolower(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(
-        i64::from(lower_unicode(arg_i64(args, 0, "ch")? as u32))
-    ))
+    Ok(Object::Int(i64::from(lower_unicode(
+        arg_i64(args, 0, "ch")? as u32,
+    ))))
 }
 fn sre_unicode_iscased(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(
