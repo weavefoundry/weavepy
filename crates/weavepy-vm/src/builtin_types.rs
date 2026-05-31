@@ -626,6 +626,22 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 ))
             }
         };
+        // When `cls` derives from a primitive immutable built-in (so far
+        // `int` — covering `_NamedIntConstant`, `enum.IntEnum`/`IntFlag`
+        // and hand-written `class C(int)`), capture the value the
+        // instance wraps. `super().__new__(cls, value)` passes it as the
+        // second positional argument; absent that it defaults to 0.
+        if cls.is_subclass_of(&builtin_types().int_) {
+            let native = match args.get(1) {
+                None => Object::Int(0),
+                Some(o @ (Object::Int(_) | Object::Long(_))) => o.clone(),
+                Some(Object::Bool(b)) => Object::Int(i64::from(*b)),
+                Some(o) => Object::Int(o.as_i64().unwrap_or(0)),
+            };
+            return Ok(Object::Instance(Rc::new(PyInstance::with_native(
+                cls, native,
+            ))));
+        }
         Ok(Object::Instance(Rc::new(PyInstance::new(cls))))
     }
     fn object_init(_args: &[Object]) -> Result<Object, RuntimeError> {

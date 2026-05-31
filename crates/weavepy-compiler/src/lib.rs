@@ -4337,6 +4337,27 @@ fn collect_decls(
                 collect_decls(s, globals, nonlocals, assigned);
             }
         }
+        // `import a.b.c` binds the top-level package `a` (or the
+        // asname); `from m import x as y` binds `y`. These are real
+        // local bindings and must be tracked so a name captured by a
+        // nested scope is promoted to a cellvar (CPython parity).
+        StmtKind::Import(aliases) => {
+            for a in aliases {
+                let bind = a
+                    .asname
+                    .clone()
+                    .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name).to_owned());
+                assigned.insert(bind);
+            }
+        }
+        StmtKind::ImportFrom { names, .. } => {
+            for a in names {
+                let bind = a.asname.clone().unwrap_or_else(|| a.name.clone());
+                if bind != "*" {
+                    assigned.insert(bind);
+                }
+            }
+        }
         _ => {}
     }
 }

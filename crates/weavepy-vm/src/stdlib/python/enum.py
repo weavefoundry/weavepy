@@ -166,7 +166,14 @@ class EnumMeta(type):
         return dict(cls._member_map_) if cls._member_map_ is not None else {}
 
     def _create_member_(cls, name, value):
-        member = object.__new__(cls)
+        # For int-backed enums (IntEnum/IntFlag) build a real int
+        # instance so members *are* ints — `IntEnum.X + 1`, `flags &
+        # member`, `int(member)` and dict/set interchange with the
+        # bare value all work exactly as in CPython.
+        if isinstance(value, int) and issubclass(cls, int):
+            member = int.__new__(cls, value)
+        else:
+            member = object.__new__(cls)
         member._name_ = name
         member._value_ = value
         return member
@@ -217,12 +224,10 @@ class Enum(metaclass=EnumMeta):
         return hash(self._name_)
 
 
-class IntEnum(Enum):
-    """Mirror of :class:`Enum` whose members compare equal to their
-    integer value. (CPython inherits from ``int`` directly; WeavePy
-    keeps a separate base and overloads ``__eq__`` / ``__int__`` to
-    cover the common patterns.)
-    """
+class IntEnum(int, Enum):
+    """Mirror of :class:`Enum` whose members are also genuine ints, so
+    they compare and operate exactly like their integer value
+    (CPython's ``class IntEnum(int, Enum)``)."""
 
     def __int__(self):
         return self._value_
@@ -308,7 +313,10 @@ class FlagMeta(EnumMeta):
                 combined_value |= member._value_
         if combined_value != value:
             raise ValueError(f"{value!r} is not a valid {cls.__name__}")
-        new_member = object.__new__(cls)
+        if issubclass(cls, int):
+            new_member = int.__new__(cls, value)
+        else:
+            new_member = object.__new__(cls)
         new_member._name_ = "|".join(combined_name)
         new_member._value_ = value
         return new_member
@@ -345,8 +353,9 @@ class Flag(Enum, metaclass=FlagMeta):
         return bool(self._value_)
 
 
-class IntFlag(Flag):
-    """Like :class:`IntEnum` but for bitfield-style values."""
+class IntFlag(int, Flag):
+    """Like :class:`IntEnum` but for bitfield-style values; members are
+    genuine ints (CPython's ``class IntFlag(int, Flag)``)."""
 
     def __int__(self):
         return self._value_

@@ -1427,14 +1427,15 @@ impl Interpreter {
                 let i = frame.pop()?;
                 let target = frame.pop()?;
                 let value = frame.pop()?;
+                let g = frame.globals.clone();
                 if let Object::Instance(_) = &target {
                     if let Some(method) = instance_method(&target, "__setitem__") {
-                        self.call(&method, &[i.clone(), value], &[], &frame.globals.clone())?;
+                        self.call(&method, &[i.clone(), value], &[], &g)?;
                     } else {
-                        self.store_subscr(&target, &i, value)?;
+                        self.store_subscr(&target, &i, value, &g)?;
                     }
                 } else {
-                    self.store_subscr(&target, &i, value)?;
+                    self.store_subscr(&target, &i, value, &g)?;
                 }
             }
             OpCode::DeleteSubscr => {
@@ -1467,7 +1468,13 @@ impl Interpreter {
             OpCode::UnaryOp => {
                 let v = frame.pop()?;
                 let kind: UnaryKind = unsafe { std::mem::transmute(ins.arg as u8) };
-                let r = unary_op(&v, kind)?;
+                let r = if matches!(kind, UnaryKind::Not) && matches!(v, Object::Instance(_)) {
+                    // `not obj` must honour __bool__/__len__.
+                    let g = frame.globals.clone();
+                    Object::Bool(!self.obj_truthy(&v, &g)?)
+                } else {
+                    unary_op(&v, kind)?
+                };
                 frame.push(r);
             }
             OpCode::CompareOp => {
@@ -1582,13 +1589,27 @@ impl Interpreter {
             }
             OpCode::PopJumpIfFalse => {
                 let v = frame.pop()?;
-                if !v.is_truthy() {
+                let truthy = match &v {
+                    Object::Instance(_) => {
+                        let g = frame.globals.clone();
+                        self.obj_truthy(&v, &g)?
+                    }
+                    _ => v.is_truthy(),
+                };
+                if !truthy {
                     frame.pc += ins.arg;
                 }
             }
             OpCode::PopJumpIfTrue => {
                 let v = frame.pop()?;
-                if v.is_truthy() {
+                let truthy = match &v {
+                    Object::Instance(_) => {
+                        let g = frame.globals.clone();
+                        self.obj_truthy(&v, &g)?
+                    }
+                    _ => v.is_truthy(),
+                };
+                if truthy {
                     frame.pc += ins.arg;
                 }
             }
@@ -3628,6 +3649,51 @@ impl Interpreter {
         Ok(Object::Int(v.len()? as i64))
     }
 
+    /// VM-aware Python truthiness. For instances this dispatches
+    /// `__bool__` (then `__len__`) so user classes that define either
+    /// dunder are honoured in boolean contexts; everything else falls
+    /// back to the pure [`Object::is_truthy`]. Mirrors CPython's
+    /// `PyObject_IsTrue`.
+    fn obj_truthy(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        if let Object::Instance(_) = v {
+            if let Some(method) = instance_method(v, "__bool__") {
+                let r = self.call(&method, &[], &[], globals)?;
+                return match r {
+                    Object::Bool(b) => Ok(b),
+                    other => match other.as_i64() {
+                        Some(i) => Ok(i != 0),
+                        None => Err(type_error(format!(
+                            "__bool__ should return bool, returned {}",
+                            other.type_name()
+                        ))),
+                    },
+                };
+            }
+            if let Some(method) = instance_method(v, "__len__") {
+                let r = self.call(&method, &[], &[], globals)?;
+                return Ok(r.is_truthy());
+            }
+        }
+        Ok(v.is_truthy())
+    }
+
+    /// `bool(x)` constructor — routes through [`Self::obj_truthy`] so a
+    /// custom `__bool__`/`__len__` is respected.
+    fn do_bool_call(
+        &mut self,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        match args.first() {
+            None => Ok(Object::Bool(false)),
+            Some(v) => Ok(Object::Bool(self.obj_truthy(v, globals)?)),
+        }
+    }
+
     /// `int(x)` with a fallback to the user-defined `__int__`. Matches
     /// CPython's coercion rules well enough for the common cases —
     /// user classes that store an integer payload (enums, ipaddress,
@@ -3659,6 +3725,11 @@ impl Interpreter {
                             other.type_name()
                         ))),
                     };
+                }
+                // `int` subclass instance with no `__int__` override:
+                // `int(x)` yields a plain int of the wrapped value.
+                if let Some(native) = other.native_value() {
+                    return self.do_int_call(&[native], globals);
                 }
                 Err(type_error(format!(
                     "int() argument must be a string or a real number, not '{}'",
@@ -3695,6 +3766,9 @@ impl Interpreter {
                             other.type_name()
                         ))),
                     };
+                }
+                if let Some(native) = other.native_value() {
+                    return self.do_float_call(&[native], globals);
                 }
                 Err(type_error(format!(
                     "float() argument must be a string or a real number, not '{}'",
@@ -4181,57 +4255,6 @@ impl Interpreter {
         Ok(Object::new_list(items))
     }
 
-    /// VM-routed dispatch for ``re.sub(pattern, repl_callable, text,
-    /// count=0, flags=0)`` where ``repl`` is a callable. We
-    /// collect the spans up-front (no VM reentrancy mid-iteration)
-    /// and then call ``repl(match)`` once per match.
-    fn do_re_sub_callable(
-        &mut self,
-        args: &[Object],
-        globals: &Rc<RefCell<DictData>>,
-    ) -> Result<Object, RuntimeError> {
-        use crate::stdlib::re as remod;
-        let pat_obj = args
-            .first()
-            .ok_or_else(|| type_error("re.sub: missing pattern"))?;
-        let repl = args
-            .get(1)
-            .ok_or_else(|| type_error("re.sub: missing repl"))?
-            .clone();
-        let text = match args.get(2) {
-            Some(Object::Str(s)) => s.to_string(),
-            _ => return Err(type_error("re.sub: expected str text")),
-        };
-        let count = match args.get(3) {
-            Some(Object::Int(i)) => *i,
-            _ => 0,
-        };
-        let (pat, default_flags) = remod::extract_pattern_pub(pat_obj)?;
-        let flags = match args.get(4) {
-            Some(Object::Int(i)) => *i,
-            _ => default_flags,
-        };
-        let matches = remod::collect_all_matches(&pat, flags, &text)?;
-        let mut out = String::new();
-        let mut last_end = 0usize;
-        for (idx, (s, e, groups)) in matches.iter().enumerate() {
-            if count > 0 && (idx as i64) >= count {
-                break;
-            }
-            out.push_str(&text[last_end..*s]);
-            let m_obj = remod::build_match_object(&pat, &text, groups, *s, *e);
-            let ret = self.call_object(repl.clone(), &[m_obj], &[])?;
-            match ret {
-                Object::Str(rs) => out.push_str(&rs),
-                _ => return Err(type_error("re.sub callable must return str")),
-            }
-            last_end = *e;
-        }
-        out.push_str(&text[last_end..]);
-        let _ = globals;
-        Ok(Object::from_str(out))
-    }
-
     fn do_list_sort_call(
         &mut self,
         args: &[Object],
@@ -4329,6 +4352,27 @@ impl Interpreter {
             Object::Instance(_) => {
                 if let Some(method) = instance_method(v, "__iter__") {
                     return self.call(&method, &[], &[], globals);
+                }
+                // Legacy sequence protocol: an object that defines
+                // `__getitem__` but no `__iter__` is still iterable —
+                // CPython calls `obj[0]`, `obj[1]`, … until `IndexError`.
+                // We materialise eagerly into a list (consistent with the
+                // `iter(callable, sentinel)` path above); the wrapped
+                // sequences this serves — `re`'s `SubPattern`, simple
+                // user containers — are finite and side-effect-free.
+                if let Some(getitem) = instance_method(v, "__getitem__") {
+                    let mut out: Vec<Object> = Vec::new();
+                    let mut i: i64 = 0;
+                    loop {
+                        match self.call(&getitem, &[Object::Int(i)], &[], globals) {
+                            Ok(val) => out.push(val),
+                            Err(e) if is_index_error(&e) => break,
+                            Err(e) => return Err(e),
+                        }
+                        i += 1;
+                    }
+                    let list = Object::new_list(out);
+                    return self.make_iter(&list, globals);
                 }
                 Err(type_error(format!(
                     "'{}' object is not iterable",
@@ -4996,6 +5040,33 @@ impl Interpreter {
         }
         if let Some(method) = instance_method(b, rdunder) {
             return self.call(&method, std::slice::from_ref(a), &[], globals);
+        }
+        // `str % args`: route through a VM-aware formatter so `%s` / `%r`
+        // of user instances dispatch `__str__` / `__repr__` (e.g.
+        // `"err: %s" % some_exception`). Other `%` operand types fall
+        // through to the pure `binary_op` path.
+        if matches!(op, BinOpKind::Mod) {
+            if let Object::Str(template) = a {
+                let template = template.clone();
+                let mut resolve =
+                    |obj: &Object, kind: char| -> Result<Option<String>, RuntimeError> {
+                        if let Object::Instance(_) = obj {
+                            let s = match kind {
+                                's' => self.stringify(obj, globals)?,
+                                'r' => self.repr_of(obj, globals)?,
+                                _ => return Ok(None),
+                            };
+                            Ok(Some(s))
+                        } else {
+                            Ok(None)
+                        }
+                    };
+                return Ok(Object::from_str(percent_format_with(
+                    &template,
+                    b,
+                    &mut resolve,
+                )?));
+            }
         }
         binary_op(a, b, op)
     }
@@ -6108,6 +6179,15 @@ impl Interpreter {
         container: &Object,
         index: &Object,
     ) -> Result<Object, RuntimeError> {
+        // An `int` subclass instance used as an index (`xs[op]` where
+        // `op` is e.g. a `_NamedIntConstant`) acts as its int value.
+        let unwrapped = match index {
+            Object::Instance(_) => index
+                .native_value()
+                .filter(|n| matches!(n, Object::Int(_) | Object::Long(_) | Object::Bool(_))),
+            _ => None,
+        };
+        let index = unwrapped.as_ref().unwrap_or(index);
         match (container, index) {
             (Object::List(items), Object::Int(i)) => {
                 let items = items.borrow();
@@ -6148,6 +6228,18 @@ impl Interpreter {
                 let sliced = slice_seq(&obj_chars, slc)?;
                 let s: String = sliced.iter().map(|o| o.to_str()).collect();
                 Ok(Object::from_str(s))
+            }
+            (Object::Range(r), Object::Int(i)) => {
+                let len = container.len()? as i64;
+                let idx = if *i < 0 { *i + len } else { *i };
+                if idx < 0 || idx >= len {
+                    return Err(index_error("range object index out of range"));
+                }
+                Ok(Object::Int(r.start + idx * r.step))
+            }
+            (Object::Range(r), Object::Slice(slc)) => {
+                let len = container.len()? as i64;
+                range_slice(r, len, slc)
             }
             (Object::Bytes(buf), Object::Int(i)) => {
                 let idx = normalize_index(*i, buf.len())?;
@@ -6223,10 +6315,11 @@ impl Interpreter {
     }
 
     fn store_subscr(
-        &self,
+        &mut self,
         container: &Object,
         index: &Object,
         value: Object,
+        globals: &Rc<RefCell<DictData>>,
     ) -> Result<(), RuntimeError> {
         match (container, index) {
             (Object::List(items), Object::Int(i)) => {
@@ -6239,22 +6332,17 @@ impl Interpreter {
                 // CPython: `xs[start:stop:step] = iterable`. We
                 // collect the RHS, then splice in place. Supporting
                 // strided slice assignment requires that `len(rhs)`
-                // matches the slice width.
-                let replacement = match value {
+                // matches the slice width. The RHS is collected via the
+                // full VM iteration protocol so objects that are only
+                // legacy-iterable (`__getitem__`, no `__iter__`) work.
+                let replacement = match &value {
                     Object::List(l) => l.borrow().clone(),
                     Object::Tuple(t) => t.iter().cloned().collect::<Vec<_>>(),
-                    Object::Str(ref txt) => txt
+                    Object::Str(txt) => txt
                         .chars()
                         .map(|c| Object::from_str(c.to_string()))
                         .collect(),
-                    other => {
-                        let mut buf = Vec::new();
-                        let mut it = other.make_iter()?;
-                        while let Some(v) = it.next_value() {
-                            buf.push(v);
-                        }
-                        buf
-                    }
+                    _ => self.collect_iterable(&value, globals)?,
                 };
                 let mut data = items.borrow_mut();
                 apply_slice_assignment(&mut data, s, replacement)?;
@@ -6289,9 +6377,28 @@ impl Interpreter {
                 items.remove(idx);
                 Ok(())
             }
+            (Object::List(items), Object::Slice(s)) => {
+                apply_slice_deletion(&mut items.borrow_mut(), s)
+            }
             (Object::Dict(d), key) => {
                 if d.borrow_mut().shift_remove(&DictKey(key.clone())).is_none() {
                     return Err(key_error(key.repr()));
+                }
+                Ok(())
+            }
+            (Object::ByteArray(b), Object::Int(i)) => {
+                let mut b = b.borrow_mut();
+                let idx = normalize_index(*i, b.len())?;
+                b.remove(idx);
+                Ok(())
+            }
+            (Object::ByteArray(b), Object::Slice(s)) => {
+                let mut b = b.borrow_mut();
+                let mut indices = slice_indices(b.len(), s)?;
+                indices.sort_unstable();
+                indices.dedup();
+                for idx in indices.into_iter().rev() {
+                    b.remove(idx);
                 }
                 Ok(())
             }
@@ -6343,6 +6450,9 @@ impl Interpreter {
                 }
                 if b.name == "len" && args.len() == 1 {
                     return self.do_len_call(&args[0], outer_globals);
+                }
+                if b.name == "bool" && args.len() <= 1 {
+                    return self.do_bool_call(args, outer_globals);
                 }
                 if b.name == "int" && args.len() <= 2 {
                     return self.do_int_call(args, outer_globals);
@@ -6487,20 +6597,6 @@ impl Interpreter {
                 }
                 if (b.name == "min" || b.name == "max") && !args.is_empty() {
                     return self.do_min_max_call(b.name, args, kwargs, outer_globals);
-                }
-                // ``re.sub(pat, repl, text, count=0, flags=0)``
-                // accepts a callable ``repl``; routing it through the
-                // VM lets the callback invoke arbitrary user code.
-                if b.name == "sub" && args.len() >= 3 {
-                    let callable_repl = matches!(
-                        args.get(1),
-                        Some(Object::Function(_))
-                            | Some(Object::Builtin(_))
-                            | Some(Object::BoundMethod(_))
-                    );
-                    if callable_repl {
-                        return self.do_re_sub_callable(args, outer_globals);
-                    }
                 }
                 // `format`'s dispatching: when args[0] is a string we
                 // assume this is `"...".format(...)` (str_format
@@ -7173,6 +7269,11 @@ impl Interpreter {
                 let global_dummy = Rc::new(RefCell::new(DictData::new()));
                 return self.do_float_call(args, &global_dummy);
             }
+            // `bool(x)` must consult __bool__/__len__ for instances.
+            if cls.name == "bool" && args.len() <= 1 && kwargs.is_empty() {
+                let global_dummy = Rc::new(RefCell::new(DictData::new()));
+                return self.do_bool_call(args, &global_dummy);
+            }
             if let Some(builtin) = self.builtin_constructor_for(&cls) {
                 if !kwargs.is_empty() {
                     return Err(type_error(format!(
@@ -7548,7 +7649,24 @@ impl Interpreter {
             IC::CallPyExactNoFree { func_id, argc: ca } => {
                 if ca as usize == argc {
                     if let Object::Function(f) = &callable {
-                        if specialize::rc_id(f) == func_id && args.len() == argc {
+                        // `func_id` is a raw pointer fingerprint and can
+                        // alias a *different* function after the original
+                        // was freed and its allocation reused (ABA). Re-
+                        // verify the shape this fast path assumes — exact
+                        // arity, no cells/closure — so a recycled address
+                        // can never run an incompatible function through
+                        // the no-free path (which skips defaults & cells).
+                        let code = &f.code;
+                        if specialize::rc_id(f) == func_id
+                            && args.len() == argc
+                            && code.arg_count as usize == argc
+                            && !code.has_varargs
+                            && !code.has_varkeywords
+                            && code.kwonly_count == 0
+                            && code.cellvars.is_empty()
+                            && code.freevars.is_empty()
+                            && f.closure.is_empty()
+                        {
                             specialize::record_hit(op_idx);
                             let f = f.clone();
                             let r = self.run_py_exact_nofree(&f, args)?;
@@ -7562,7 +7680,17 @@ impl Interpreter {
             IC::CallPyExact { func_id, argc: ca } => {
                 if ca as usize == argc {
                     if let Object::Function(f) = &callable {
-                        if specialize::rc_id(f) == func_id && args.len() == argc {
+                        // Same ABA guard as above: confirm exact arity
+                        // before taking the binding-free path (cells are
+                        // rebuilt from `f.code`, so they stay correct).
+                        let code = &f.code;
+                        if specialize::rc_id(f) == func_id
+                            && args.len() == argc
+                            && code.arg_count as usize == argc
+                            && !code.has_varargs
+                            && !code.has_varkeywords
+                            && code.kwonly_count == 0
+                        {
                             specialize::record_hit(op_idx);
                             let f = f.clone();
                             let r = self.run_py_exact_with_cells(&f, args)?;
@@ -8416,6 +8544,126 @@ fn apply_slice_assignment(
     Ok(())
 }
 
+/// Compute the concrete indices covered by `s` over a sequence of
+/// length `len` (CPython's `PySlice_Unpack` + `PySlice_AdjustIndices`),
+/// returned in iteration order.
+fn slice_indices(len: usize, s: &PySlice) -> Result<Vec<usize>, RuntimeError> {
+    let len = len as i64;
+    let step = match &s.step {
+        Object::None => 1i64,
+        Object::Int(i) => *i,
+        _ => return Err(type_error("slice indices must be integers or None")),
+    };
+    if step == 0 {
+        return Err(value_error("slice step cannot be zero"));
+    }
+    let (lower, upper) = if step < 0 {
+        (-1i64, len - 1)
+    } else {
+        (0i64, len)
+    };
+    // Resolve a bound: `None` falls back to its default sentinel
+    // directly (never re-mapped through the negative-index rule), while
+    // explicit values are wrapped (`+= len`) then clamped to [lower, upper].
+    let resolve = |o: &Object, default: i64| -> Result<i64, RuntimeError> {
+        match o {
+            Object::None => Ok(default),
+            Object::Int(i) => {
+                let v = if *i < 0 { *i + len } else { *i };
+                Ok(v.clamp(lower, upper))
+            }
+            _ => Err(type_error("slice indices must be integers or None")),
+        }
+    };
+    let mut i = resolve(&s.start, if step > 0 { 0 } else { len - 1 })?;
+    let stop = resolve(&s.stop, if step > 0 { len } else { -1 })?;
+    let mut out = Vec::new();
+    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        if i >= 0 && (i as usize) < len as usize {
+            out.push(i as usize);
+        }
+        i += step;
+    }
+    Ok(out)
+}
+
+/// CPython's `PySlice_Unpack` + `PySlice_AdjustIndices`: resolve a slice
+/// against a sequence of length `len`, returning
+/// `(start, stop, step, slicelength)` with the same clamping rules.
+fn adjust_slice(len: i64, s: &PySlice) -> Result<(i64, i64, i64, i64), RuntimeError> {
+    let step = match &s.step {
+        Object::None => 1i64,
+        Object::Int(i) => *i,
+        _ => return Err(type_error("slice indices must be integers or None")),
+    };
+    if step == 0 {
+        return Err(value_error("slice step cannot be zero"));
+    }
+    let (lower, upper) = if step < 0 {
+        (-1i64, len - 1)
+    } else {
+        (0i64, len)
+    };
+    let clamp = |o: &Object, dflt: i64| -> Result<i64, RuntimeError> {
+        match o {
+            Object::None => Ok(dflt),
+            Object::Int(i) => {
+                let mut x = *i;
+                if x < 0 {
+                    x += len;
+                    if x < lower {
+                        x = lower;
+                    }
+                } else if x > upper {
+                    x = upper;
+                }
+                Ok(x)
+            }
+            _ => Err(type_error("slice indices must be integers or None")),
+        }
+    };
+    let start = clamp(&s.start, if step < 0 { upper } else { lower })?;
+    let stop = clamp(&s.stop, if step < 0 { lower } else { upper })?;
+    let slicelength = if step < 0 {
+        if stop < start {
+            (start - stop - 1) / (-step) + 1
+        } else {
+            0
+        }
+    } else if start < stop {
+        (stop - start - 1) / step + 1
+    } else {
+        0
+    };
+    Ok((start, stop, step, slicelength.max(0)))
+}
+
+/// `range(...)[slice]` → a new range, mirroring CPython `compute_slice`.
+fn range_slice(r: &crate::object::Range, len: i64, s: &PySlice) -> Result<Object, RuntimeError> {
+    let (start, _stop, step, slicelen) = adjust_slice(len, s)?;
+    let new_start = r.start + start * r.step;
+    let new_step = r.step * step;
+    let new_stop = new_start + slicelen * new_step;
+    Ok(Object::Range(Rc::new(crate::object::Range {
+        start: new_start,
+        stop: new_stop,
+        step: new_step,
+    })))
+}
+
+/// `del data[start:stop:step]` — remove the slice members in place.
+fn apply_slice_deletion(data: &mut Vec<Object>, s: &PySlice) -> Result<(), RuntimeError> {
+    let mut indices = slice_indices(data.len(), s)?;
+    // Remove from highest index to lowest so earlier removals don't
+    // shift the positions still to be deleted.
+    indices.sort_unstable();
+    indices.dedup();
+    for idx in indices.into_iter().rev() {
+        data.remove(idx);
+    }
+    Ok(())
+}
+
 fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, RuntimeError> {
     let len = seq.len() as i64;
     let step = match &s.step {
@@ -8430,43 +8678,76 @@ fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, RuntimeError> {
     if step == 0 {
         return Err(value_error("slice step cannot be zero"));
     }
-    let extract = |o: &Object, default: i64| -> Result<i64, RuntimeError> {
-        match o {
-            Object::None => Ok(default),
-            Object::Int(i) => Ok(*i),
-            _ => Err(type_error(
-                "slice indices must be integers or None or have an __index__ method",
-            )),
-        }
-    };
-    let start = extract(&s.start, if step > 0 { 0 } else { len - 1 })?;
-    let stop = extract(&s.stop, if step > 0 { len } else { -1 })?;
-    let norm = |x: i64| -> i64 {
+    // Map an *explicit* index to a concrete one, mirroring CPython's
+    // `PySlice_AdjustIndices`. The clamp floor differs by step sign: a
+    // negative step can legitimately walk down to index -1 (one below
+    // the start of the sequence), whereas a positive step floors at 0.
+    let adjust = |x: i64| -> i64 {
         if x < 0 {
-            let n = x + len;
-            if n < 0 && step > 0 {
-                0
+            let v = x + len;
+            if v < 0 {
+                if step < 0 {
+                    -1
+                } else {
+                    0
+                }
             } else {
-                n
+                v
             }
-        } else if x > len {
-            len
+        } else if x >= len {
+            if step < 0 {
+                len - 1
+            } else {
+                len
+            }
         } else {
             x
         }
     };
-    let mut i = norm(start);
-    let stop_norm = norm(stop);
+    // Defaults for an omitted bound use sentinels that must *not* pass
+    // through `adjust` (e.g. an omitted `stop` with a negative step is
+    // -1, meaning "below index 0", not "the last element").
+    let start = match &s.start {
+        Object::None => {
+            if step < 0 {
+                len - 1
+            } else {
+                0
+            }
+        }
+        Object::Int(i) => adjust(*i),
+        _ => {
+            return Err(type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            ))
+        }
+    };
+    let stop = match &s.stop {
+        Object::None => {
+            if step < 0 {
+                -1
+            } else {
+                len
+            }
+        }
+        Object::Int(i) => adjust(*i),
+        _ => {
+            return Err(type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            ))
+        }
+    };
+    let mut i = start;
     let mut out = Vec::new();
     if step > 0 {
-        while i < stop_norm {
+        while i < stop {
             if (0..len).contains(&i) {
                 out.push(seq[i as usize].clone());
             }
             i += step;
         }
     } else {
-        while i > stop_norm {
+        while i > stop {
             if (0..len).contains(&i) {
                 out.push(seq[i as usize].clone());
             }
@@ -9098,6 +9379,20 @@ fn bytes_percent_args(value: &Object) -> Object {
 }
 
 pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, RuntimeError> {
+    let mut noop = |_: &Object, _: char| Ok(None);
+    percent_format_with(template, value, &mut noop)
+}
+
+/// Printf-style `%` formatting with a VM-supplied `resolve` callback.
+///
+/// `resolve(item, kind)` lets the caller render `%s` / `%r` of user
+/// instances through `__str__` / `__repr__` (returning `Some(rendered)`),
+/// falling back to the built-in conversion when it returns `None`.
+pub(crate) fn percent_format_with(
+    template: &str,
+    value: &Object,
+    resolve: &mut dyn FnMut(&Object, char) -> Result<Option<String>, RuntimeError>,
+) -> Result<String, RuntimeError> {
     let mut out = String::new();
     let bytes = template.as_bytes();
     let mut i = 0;
@@ -9219,13 +9514,36 @@ pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, R
             }
             spec.push(kind);
             let rendered = match kind {
-                's' => format_via_spec(&Object::from_str(item.to_str()), &spec)?,
-                'r' => format_via_spec(&Object::from_str(item.repr()), &spec.replace('r', "s"))?,
+                's' => {
+                    let s = match resolve(&item, 's')? {
+                        Some(s) => s,
+                        None => item.to_str(),
+                    };
+                    format_via_spec(&Object::from_str(s), &spec)?
+                }
+                'r' => {
+                    let s = match resolve(&item, 'r')? {
+                        Some(s) => s,
+                        None => item.repr(),
+                    };
+                    format_via_spec(&Object::from_str(s), &spec.replace('r', "s"))?
+                }
                 'a' => format_via_spec(
                     &Object::from_str(ascii_repr(&item)),
                     &spec.replace('a', "s"),
                 )?,
-                'd' | 'i' | 'u' => format_via_spec(&item, &spec.replace(['i', 'u'], "d"))?,
+                'd' | 'i' | 'u' => {
+                    // Unwrap `int` subclasses (enum members, _NamedIntConstant)
+                    // so `%d` sees a real integer rather than the instance.
+                    let numeric = match &item {
+                        Object::Instance(_) => match item.as_i64() {
+                            Some(n) => Object::Int(n),
+                            None => item.clone(),
+                        },
+                        _ => item.clone(),
+                    };
+                    format_via_spec(&numeric, &spec.replace(['i', 'u'], "d"))?
+                }
                 'b' | 'o' | 'x' | 'X' => format_via_spec(&item, &spec)?,
                 'f' | 'F' | 'e' | 'E' | 'g' | 'G' => format_via_spec(&item, &spec)?,
                 'c' => match &item {
@@ -9699,6 +10017,19 @@ fn group_decimal(mag: u64, sep: char) -> String {
     out
 }
 
+/// Is `e` an `IndexError` (or subclass)? Used by the legacy
+/// `__getitem__` iteration protocol to detect the end of a sequence.
+fn is_index_error(e: &RuntimeError) -> bool {
+    if let RuntimeError::PyException(pe) = e {
+        if let Object::Instance(inst) = &pe.instance {
+            return inst
+                .class
+                .is_subclass_of(&crate::builtin_types::builtin_types().index_error);
+        }
+    }
+    false
+}
+
 fn binop_dunders(op: BinOpKind) -> (&'static str, &'static str) {
     use BinOpKind as B;
     match op {
@@ -9898,8 +10229,15 @@ fn object_to_constant(o: &Object) -> Constant {
 fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeError> {
     use BinOpKind as B;
     use Object as O;
+    // Subclasses of immutable built-ins (`class C(int)`, `enum.IntEnum`,
+    // `_NamedIntConstant`, …) behave like the value they wrap. By the
+    // time we reach this primitive path the caller has already ruled
+    // out any user `__op__` / `__rop__` override, so unwrapping to the
+    // native value is the correct (and CPython-matching) fallback.
+    let a = a.native_value().unwrap_or_else(|| a.clone());
+    let b = b.native_value().unwrap_or_else(|| b.clone());
     // Promote bool → int where appropriate.
-    let (a, b) = (promote_bool(a), promote_bool(b));
+    let (a, b) = (promote_bool(&a), promote_bool(&b));
 
     // Numeric tower: any (int-like, int-like) arithmetic routes
     // through the bignum-aware path with i64 fast-track and overflow

@@ -3359,6 +3359,20 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                 let n = u32::from_str_radix(&hex, 16).map_err(|e| e.to_string())?;
                 out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
             }
+            'U' => {
+                // 8-hex code-point escape, e.g. `\U0001F600`. Required
+                // for non-BMP literals; CPython rejects out-of-range or
+                // surrogate values, so we surface a clear error.
+                let mut hex = String::new();
+                for _ in 0..8 {
+                    hex.push(chars.next().ok_or("incomplete \\U escape")?);
+                }
+                let n = u32::from_str_radix(&hex, 16).map_err(|e| e.to_string())?;
+                let ch = char::from_u32(n).ok_or_else(|| {
+                    format!("invalid \\U escape: {n:#x} is not a valid character")
+                })?;
+                out.push(ch);
+            }
             other => {
                 // CPython issues a DeprecationWarning for unknown
                 // escapes but emits both characters literally.
