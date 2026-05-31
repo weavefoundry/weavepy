@@ -152,8 +152,8 @@ status = "fail"
 reason = "OrderedDict / Counter / ChainMap edge cases"
 
 [tests."cpython/Lib/test/test_array.py"]
-status = "skip"
-reason = "array module not implemented"
+status = "fail"
+reason = "array ships (RFC 0023) and imports cleanly; full test_array.py conformance (typecode range checks + C-buffer protocol edges) unverified pending a local Lib/test checkout"
 
 [tests."cpython/Lib/test/test_heapq.py"]
 status = "fail"
@@ -188,8 +188,8 @@ status = "fail"
 reason = "copyreg dispatch table for extension types"
 
 [tests."cpython/Lib/test/test_marshal.py"]
-status = "skip"
-reason = "marshal module not implemented"
+status = "fail"
+reason = "marshal ships (RFC 0033) and imports cleanly; full test_marshal.py conformance (every object type + version/recursion limits) unverified pending a local Lib/test checkout"
 
 [tests."cpython/Lib/test/test_re.py"]
 status = "fail"
@@ -224,20 +224,20 @@ status = "fail"
 reason = "gzip module: mtime preservation + multistream"
 
 [tests."cpython/Lib/test/test_bz2.py"]
-status = "skip"
-reason = "bz2 module not implemented"
+status = "fail"
+reason = "bz2 ships and imports cleanly; full test_bz2.py conformance (BZ2File multistream + compressor reuse) unverified pending a local Lib/test checkout"
 
 [tests."cpython/Lib/test/test_lzma.py"]
-status = "skip"
-reason = "lzma module not implemented"
+status = "fail"
+reason = "lzma ships and imports cleanly; full test_lzma.py conformance (raw filters + FORMAT_ALONE edges) unverified pending a local Lib/test checkout"
 
 [tests."cpython/Lib/test/test_zipfile.py"]
 status = "fail"
 reason = "zipfile: ZIP64 + STORED writes pass but DEFLATE_64 / Bzip2 paths fail"
 
 [tests."cpython/Lib/test/test_tarfile.py"]
-status = "skip"
-reason = "tarfile module not implemented"
+status = "fail"
+reason = "tarfile ships and imports cleanly; full test_tarfile.py conformance (PAX/GNU headers + stream modes) unverified pending a local Lib/test checkout"
 
 [tests."cpython/Lib/test/test_io.py"]
 status = "fail"
@@ -509,7 +509,7 @@ reason = "signal handlers in test require pthread_kill + sub-interpreter coordin
 
 [tests."cpython/Lib/test/test_ssl.py"]
 status = "skip"
-reason = "ssl module not implemented"
+reason = "ssl ships and imports cleanly, but test_ssl.py needs live TLS endpoints + on-disk certificate fixtures unavailable in the CI sandbox (cf. test_socket / test_httplib)"
 
 [tests."cpython/Lib/test/test_urllib.py"]
 status = "fail"

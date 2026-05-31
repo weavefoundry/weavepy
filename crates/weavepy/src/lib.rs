@@ -110,6 +110,17 @@ impl Error {
             }
         }
     }
+
+    /// When this error is a `SystemExit` (or subclass) propagating out
+    /// of the program, return its exit `code` object. The CLI honours
+    /// it like CPython: terminate with the code and print no traceback.
+    /// Returns `None` for every other error.
+    pub fn system_exit_code(&self) -> Option<vm::object::Object> {
+        match self {
+            Error::Runtime(vm::RuntimeError::PyException(exc)) => exc.system_exit_code(),
+            _ => None,
+        }
+    }
 }
 
 /// Convenience: parse, compile, and execute a Python source string under a

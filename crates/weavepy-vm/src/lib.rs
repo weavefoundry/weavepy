@@ -58,8 +58,8 @@ pub use crate::error::{PyException, RuntimeError};
 pub use crate::import::ModuleCache;
 use crate::import::{package_search_path, resolve_relative};
 use crate::object::{
-    BoundMethod, BuiltinFn, DictData, DictKey, GeneratorState, Object, PyFrame, PyFunction,
-    PyGenerator, PyModule, PySlice, PyTraceback,
+    BoundMethod, BuiltinFn, DictData, DictKey, FileBackend, GeneratorState, Object, PyFrame,
+    PyFunction, PyGenerator, PyModule, PySlice, PyTraceback,
 };
 use crate::types::{PyInstance, TypeObject};
 
@@ -80,7 +80,10 @@ struct Frame {
     class_namespace: Option<Rc<RefCell<DictData>>>,
     /// Stack of currently-handled exceptions. `PUSH_EXC_INFO` pushes
     /// onto this; `POP_EXCEPT` pops; `RERAISE 1` re-raises the top.
-    exc_handlers: Vec<PyException>,
+    /// Each entry is tagged with the pc just past its handler body
+    /// (the `PUSH_EXC_INFO` arg) so the unwinder can discard handlers an
+    /// exception propagates *out of* (see `handle_exception`).
+    exc_handlers: Vec<(u32, PyException)>,
     /// pc *before* the current instruction — used to look up the
     /// exception handler when an opcode raises.
     pc: u32,
@@ -773,6 +776,11 @@ impl Interpreter {
         // (generators on resume) — each entry gets a fresh PyFrame
         // because the `back` chain reflects who is calling *now*.
         let py_frame = self.push_py_frame(frame);
+        // Depth of the interpreter-wide handled-exception stack on entry.
+        // Used on completion to discard any `PUSH_EXC_INFO` entries this
+        // activation leaves un-popped (see the reconciliation at the
+        // function's exit).
+        let exc_depth_on_entry = self.exc_info_stack.borrow().len();
         // RFC 0031 — fire the `'call'` event on frame entry. The
         // hook's return value becomes the per-frame trace function
         // for subsequent line / return / exception events.
@@ -845,6 +853,26 @@ impl Interpreter {
             }
         };
         self.pop_py_frame();
+        // Reconcile the interpreter-wide handled-exception stack. When
+        // control leaves an `except` / `finally` block *early* — a
+        // `return` out of an `except`, or an exception propagating
+        // through a handler — the matching `POP_EXCEPT` may not run, so
+        // `PUSH_EXC_INFO` entries this frame pushed can linger. Left in
+        // place they leak into `sys.exc_info()` and wrongly become the
+        // implicit `__context__` of the next, unrelated `raise`. Drop
+        // anything this activation added once it truly completes
+        // (returned or raised). A *yield* keeps its entries: a generator
+        // suspended inside a handler must see the same exc state on
+        // resume.
+        if !matches!(
+            result,
+            Ok(FrameOutcome::Yielded(_)) | Ok(FrameOutcome::StartGenerator)
+        ) {
+            let mut stack = self.exc_info_stack.borrow_mut();
+            if stack.len() > exc_depth_on_entry {
+                stack.truncate(exc_depth_on_entry);
+            }
+        }
         result
     }
 
@@ -1981,10 +2009,8 @@ impl Interpreter {
             }
             OpCode::PrintExpr => {
                 let v = frame.pop()?;
-                if !matches!(v, Object::None) {
-                    let mut sink = self.stdout.borrow_mut();
-                    let _ = writeln!(sink, "{}", v.repr());
-                }
+                let globals = frame.globals.clone();
+                self.do_print_expr(v, &globals)?;
             }
             OpCode::LoadBuildClass => {
                 let f = builtins::build_class_builtin();
@@ -2024,7 +2050,7 @@ impl Interpreter {
                         let top = frame
                             .exc_handlers
                             .last()
-                            .cloned()
+                            .map(|(_, pe)| pe.clone())
                             .ok_or_else(|| runtime_error("No active exception to re-raise"))?;
                         top
                     }
@@ -2094,7 +2120,15 @@ impl Interpreter {
                 let exc = frame.top()?.clone();
                 if let Object::Instance(_) = &exc {
                     let pe = PyException::new(exc);
-                    frame.exc_handlers.push(pe.clone());
+                    // `ins.arg` is the pc just past this handler body
+                    // (back-patched by the compiler). Tag the entry so
+                    // the unwinder can drop it when an exception escapes
+                    // the handler to an enclosing `try`. A 0 arg means
+                    // the code carries no tag (e.g. older marshalled
+                    // bytecode); leave it untagged and let frame-exit
+                    // reconciliation handle any residue.
+                    let body_end = ins.arg;
+                    frame.exc_handlers.push((body_end, pe.clone()));
                     self.exc_info_stack.borrow_mut().push(pe);
                 }
             }
@@ -2110,7 +2144,7 @@ impl Interpreter {
                     let exc = frame
                         .exc_handlers
                         .last()
-                        .map(|pe| pe.instance.clone())
+                        .map(|(_, pe)| pe.instance.clone())
                         .ok_or_else(|| runtime_error("No active exception to re-raise"))?;
                     exc
                 };
@@ -2414,6 +2448,27 @@ impl Interpreter {
             // Drop entries above the recorded stack depth.
             while frame.stack.len() > handler.depth as usize {
                 frame.stack.pop();
+            }
+            // Unwind any active exception handlers we're propagating
+            // *out of*. When an exception is raised inside an `except`
+            // body and escapes to an enclosing `try`, the inner
+            // handler's `POP_EXCEPT` never runs — so its
+            // `PUSH_EXC_INFO` entry would linger on the
+            // interpreter-wide `exc_info_stack`, corrupting
+            // `sys.exc_info()` and leaking as the implicit
+            // `__context__` of unrelated later exceptions. Each entry
+            // carries the pc just past its handler body; if the target
+            // handler lies at or beyond that point the raise is leaving
+            // that handler (an enclosing one), so undo its push. A 0
+            // tag means "untagged" — skip it (frame-exit reconciliation
+            // is the backstop).
+            let target = handler.handler;
+            while matches!(
+                frame.exc_handlers.last(),
+                Some((body_end, _)) if *body_end != 0 && target >= *body_end
+            ) {
+                frame.exc_handlers.pop();
+                self.exc_info_stack.borrow_mut().pop();
             }
             // Push the exception instance for the handler to bind /
             // CHECK_EXC_MATCH to inspect.
@@ -2916,10 +2971,22 @@ impl Interpreter {
                         name
                     ))),
                 },
-                _ => Err(attribute_error(format!(
-                    "'method' object has no attribute '{}'",
-                    name
-                ))),
+                _ => {
+                    // CPython's bound `method` forwards unknown attribute
+                    // reads to its wrapped function (`method.__getattr__`
+                    // delegates to `self.__func__`). This makes function
+                    // attributes — `__unittest_expecting_failure__`,
+                    // `__wrapped__`, `functools.wraps` metadata, and any
+                    // user-assigned attribute — visible through the method,
+                    // which `unittest`/`functools`/`inspect` rely on.
+                    if let Ok(v) = self.load_attr(&bm.function, name) {
+                        return Ok(v);
+                    }
+                    Err(attribute_error(format!(
+                        "'method' object has no attribute '{}'",
+                        name
+                    )))
+                }
             },
             _ => {
                 // Numeric data attributes — exposed by the
@@ -3283,11 +3350,86 @@ impl Interpreter {
                 self.call(&write, &[Object::from_str(text)], &[], globals)?;
             }
             None => {
-                let mut sink = self.stdout.borrow_mut();
-                let _ = write!(sink, "{text}");
+                self.write_to_stdout(&text, globals)?;
             }
         }
         Ok(Object::None)
+    }
+
+    /// Resolve `sys.<name>` from the (possibly user-mutated) cached
+    /// `sys` module. Returns `None` when `sys` hasn't been imported yet
+    /// or carries no such attribute — callers then fall back to the
+    /// host sinks, preserving the pre-redirect behaviour.
+    fn current_sys_attr(&self, name: &str) -> Option<Object> {
+        match self.cache.get("sys") {
+            Some(Object::Module(m)) => {
+                let d = m.dict.borrow();
+                d.get(&DictKey(Object::from_str(name.to_owned()))).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// Write `text` to the *current* `sys.stdout`, honouring Python-level
+    /// redirection (`contextlib.redirect_stdout`,
+    /// `test.support.captured_stdout`, `doctest`, …). The default stdout
+    /// file streams straight to the host sink `self.stdout` (so
+    /// [`Self::set_stdout`] capture and the fast path both keep working);
+    /// any reassigned object gets its `.write()` method called.
+    fn write_to_stdout(
+        &mut self,
+        text: &str,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(target) = self.current_sys_attr("stdout") {
+            let is_default_sink = matches!(
+                &target,
+                Object::File(f) if matches!(&*f.backend.borrow(), FileBackend::Stdout(_))
+            );
+            if !is_default_sink {
+                let write = self.load_attr(&target, "write")?;
+                self.call(&write, &[Object::from_str(text.to_owned())], &[], globals)?;
+                return Ok(());
+            }
+        }
+        let mut sink = self.stdout.borrow_mut();
+        let _ = write!(sink, "{text}");
+        Ok(())
+    }
+
+    /// CPython `PRINT_EXPR`: route a top-level expression-statement value
+    /// through `sys.displayhook`. A user-installed hook is called as-is;
+    /// the default hook skips `None`, echoes `repr(value)` to the current
+    /// `sys.stdout`, and stashes the value on `builtins._`.
+    fn do_print_expr(
+        &mut self,
+        value: Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(hook) = self.current_sys_attr("displayhook") {
+            let is_default = matches!(&hook, Object::Builtin(b) if b.name == "displayhook");
+            if !is_default {
+                self.call(&hook, std::slice::from_ref(&value), &[], globals)?;
+                return Ok(());
+            }
+        }
+        if matches!(value, Object::None) {
+            return Ok(());
+        }
+        let rendered = match self.do_repr_call(&value, globals)? {
+            Object::Str(s) => s.to_string(),
+            other => other.to_str(),
+        };
+        let mut text = rendered;
+        text.push('\n');
+        self.write_to_stdout(&text, globals)?;
+        // `builtins._` mirrors the last echoed value (best-effort).
+        if let Some(Object::Module(m)) = self.cache.get("builtins") {
+            m.dict
+                .borrow_mut()
+                .insert(DictKey(Object::from_static("_")), value);
+        }
+        Ok(())
     }
 
     fn do_str_call(
@@ -3963,6 +4105,62 @@ impl Interpreter {
             }
         }
         builtins::hash_object(obj)
+    }
+
+    /// VM-routed `getattr(obj, name[, default])`. Routes through the
+    /// full `load_attr` path so descriptors (properties, classmethods,
+    /// user `__get__` / `__getattr__`) behave exactly as `obj.name`
+    /// does. A supplied `default` suppresses only `AttributeError`,
+    /// matching CPython; any other exception propagates.
+    fn do_getattr_call(
+        &mut self,
+        args: &[Object],
+        _globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let name = match args.get(1) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => return Err(type_error("attribute name must be string")),
+        };
+        match self.load_attr(&args[0], &name) {
+            Ok(v) => Ok(v),
+            Err(e) if args.len() >= 3 && self.is_attribute_error(&e) => Ok(args[2].clone()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// VM-routed `hasattr(obj, name)`. Routes through `load_attr` so a
+    /// property getter / `__getattr__` is actually exercised. Like
+    /// CPython, only an `AttributeError` yields `False`; every other
+    /// exception propagates to the caller.
+    fn do_hasattr_call(
+        &mut self,
+        args: &[Object],
+        _globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let name = match args.get(1) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => return Err(type_error("attribute name must be string")),
+        };
+        match self.load_attr(&args[0], &name) {
+            Ok(_) => Ok(Object::Bool(true)),
+            Err(e) if self.is_attribute_error(&e) => Ok(Object::Bool(false)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// True when `err` is an `AttributeError` (or a subclass). Used by
+    /// `getattr` / `hasattr` to mirror CPython's narrow suppression of
+    /// attribute-lookup failures.
+    fn is_attribute_error(&self, err: &RuntimeError) -> bool {
+        match err {
+            RuntimeError::PyException(pe) => self
+                .exception_matches(
+                    &pe.instance,
+                    &Object::Type(builtin_types().attribute_error.clone()),
+                )
+                .unwrap_or(false),
+            RuntimeError::Internal(_) => false,
+        }
     }
 
     fn do_sorted_call(
@@ -6198,6 +6396,12 @@ impl Interpreter {
                 if b.name == "hash" && args.len() == 1 {
                     return self.do_hash_call(&args[0], outer_globals);
                 }
+                if b.name == "getattr" && (args.len() == 2 || args.len() == 3) {
+                    return self.do_getattr_call(args, outer_globals);
+                }
+                if b.name == "hasattr" && args.len() == 2 {
+                    return self.do_hasattr_call(args, outer_globals);
+                }
                 if b.name == "globals" && args.is_empty() && kwargs.is_empty() {
                     // CPython returns the calling function's module
                     // globals. With our frame-by-argument model, the
@@ -7597,8 +7801,19 @@ impl Interpreter {
                         .map_err(|e| crate::error::value_error(format!("compile error: {e}")))?;
                 Ok(Object::Code(Rc::new(code)))
             }
+            // Interactive mode: top-level expression statements echo
+            // through `sys.displayhook` (`PrintExpr`). Powers the REPL,
+            // `code`/`codeop`, and `doctest`'s example execution.
+            "single" => {
+                let module = weavepy_parser::parse_module(&source)
+                    .map_err(|e| crate::error::value_error(format!("compile error: {e}")))?;
+                let code =
+                    weavepy_compiler::compile_interactive_with_source(&module, &source, &filename)
+                        .map_err(|e| crate::error::value_error(format!("compile error: {e}")))?;
+                Ok(Object::Code(Rc::new(code)))
+            }
             other => Err(crate::error::value_error(format!(
-                "compile() mode must be 'exec' or 'eval', not '{other}'"
+                "compile() mode must be 'exec', 'eval' or 'single', not '{other}'"
             ))),
         }
     }
@@ -7927,6 +8142,17 @@ impl Interpreter {
             Some(package.as_str())
         };
         let globals = self.build_module_globals(full, Some(filename), pkg_for_globals);
+        // Frozen packages, like on-disk ones, expose a `__path__` so
+        // package-detection (`runpy` package → `__main__` redirect,
+        // `pkgutil`, `importlib`) treats them as packages. There is no
+        // backing directory, so the list is empty — submodules resolve
+        // through the frozen registry, not a filesystem walk.
+        if is_package {
+            globals.borrow_mut().insert(
+                DictKey(Object::from_static("__path__")),
+                Object::new_list(Vec::new()),
+            );
+        }
         let module_obj = Object::Module(Rc::new(PyModule {
             name: full.to_owned(),
             filename: Some(filename.to_owned()),

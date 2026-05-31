@@ -682,12 +682,44 @@ fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
     match weavepy::run_source_with_options(source, opts) {
         Ok(()) => Ok(()),
         Err(err) => {
+            // A `SystemExit` reaching the top level terminates the
+            // process with its code and prints no traceback — exactly
+            // like CPython. This is what makes `weavepy -m unittest`,
+            // `-m test`, and bare `sys.exit()` behave as a drop-in.
+            if let Some(code) = err.system_exit_code() {
+                exit_with_system_exit(code);
+            }
             let mut stderr = io::stderr().lock();
             let diag = err.format(source, &opts.filename);
             let _ = stderr.write_all(diag.as_bytes());
             anyhow::bail!(DIAGNOSTIC_SENTINEL);
         }
     }
+}
+
+/// Terminate the process the way CPython does when `SystemExit` reaches
+/// the top level: `None` → 0, a bool/int → that code (masked to 8
+/// bits), anything else → print `str(code)` to stderr and exit 1.
+/// Never prints a traceback.
+fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
+    use weavepy::vm::object::Object;
+    let _ = io::stdout().flush();
+    let status: i32 = match code {
+        Object::None => 0,
+        Object::Bool(b) => i32::from(b),
+        Object::Int(n) => (n & 0xFF) as i32,
+        // A bare `raise SystemExit` (and `sys.exit()`) carries no
+        // message; WeavePy models the empty payload as an empty string,
+        // which means "no error" → exit 0, not a printed message.
+        Object::Str(s) if s.is_empty() => 0,
+        other => {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "{}", other.to_str());
+            1
+        }
+    };
+    let _ = io::stderr().flush();
+    std::process::exit(status);
 }
 
 fn run_repl(flags: InterpreterFlags, startup: Option<&Path>, argv: Vec<String>) -> Result<()> {

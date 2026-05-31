@@ -43,9 +43,35 @@ def _run_code(code, run_globals, init_globals=None, mod_name=None, mod_spec=None
     return run_globals
 
 
+def _module_exists(name):
+    """True if ``name`` is importable as a frozen/builtin/file module."""
+    if name in sys.modules:
+        return True
+    getter = getattr(sys, "_get_frozen_source", None)
+    if getter is not None and getter(name) is not None:
+        return True
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+    except Exception:
+        # A module that exists but fails to import still "exists".
+        return True
+
+
 def _get_module_details(mod_name):
     _import_module(mod_name)
     mod = sys.modules.get(mod_name)
+    # CPython: running a *package* with ``-m`` runs its ``__main__``
+    # submodule (e.g. ``python -m test`` -> ``test.__main__``). Detect a
+    # package by ``__path__`` and redirect when a ``__main__`` exists;
+    # otherwise fall back to executing the package ``__init__`` so no
+    # existing ``-m <module>`` target regresses.
+    if mod is not None and hasattr(mod, "__path__"):
+        main_name = mod_name + ".__main__"
+        if _module_exists(main_name):
+            return _get_module_details(main_name)
     filename = getattr(mod, "__file__", None)
     return mod_name, getattr(mod, "__spec__", None), mod, filename
 

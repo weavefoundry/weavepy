@@ -672,16 +672,32 @@ fn run_inprocess(
     } else {
         match result {
             Ok(()) => (TestStatus::Pass, None),
-            Err(err) => match &err {
-                weavepy::Error::Parse(_) | weavepy::Error::Compile(_) => {
-                    let msg = err.format(&source, &opts.filename);
-                    (TestStatus::Error, Some(truncate_detail(&msg)))
+            Err(err) => {
+                // A `SystemExit` reaching the top level is how
+                // `unittest.main()` / `libregrtest` report their verdict
+                // (code 0 / None ≡ success, anything else ≡ failure).
+                // Grade it the same way the CLI and the subprocess path
+                // do, rather than calling every `sys.exit()` a `Fail`.
+                if let Some(code) = err.system_exit_code() {
+                    if system_exit_is_success(&code) {
+                        (TestStatus::Pass, None)
+                    } else {
+                        let msg = err.format(&source, &opts.filename);
+                        (TestStatus::Fail, Some(truncate_detail(&msg)))
+                    }
+                } else {
+                    match &err {
+                        weavepy::Error::Parse(_) | weavepy::Error::Compile(_) => {
+                            let msg = err.format(&source, &opts.filename);
+                            (TestStatus::Error, Some(truncate_detail(&msg)))
+                        }
+                        weavepy::Error::Runtime(_) => {
+                            let msg = err.format(&source, &opts.filename);
+                            (TestStatus::Fail, Some(truncate_detail(&msg)))
+                        }
+                    }
                 }
-                weavepy::Error::Runtime(_) => {
-                    let msg = err.format(&source, &opts.filename);
-                    (TestStatus::Fail, Some(truncate_detail(&msg)))
-                }
-            },
+            }
         }
     };
 
@@ -807,6 +823,26 @@ fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> Child
             }
             Err(e) => return ChildOutcome::IoError(format!("waitpid: {e}")),
         }
+    }
+}
+
+/// `true` when a `SystemExit` payload means "success" — mirroring the
+/// CLI's `exit_with_system_exit` mapping: `None` / `False` / `0` / an
+/// empty string are a clean exit; everything else is a failure.
+fn system_exit_is_success(code: &weavepy::vm::object::Object) -> bool {
+    use weavepy::vm::object::Object;
+    match code {
+        Object::None => true,
+        Object::Bool(b) => !b,
+        // Mirror the CLI's `exit_with_system_exit`: an int code becomes the
+        // OS exit status `n & 0xFF`, so the subprocess path (where the OS
+        // truncates to 8 bits) and this in-process path agree that e.g.
+        // `sys.exit(256)` is a clean exit. The explicit mask reads clearer
+        // here than clippy's `trailing_zeros` rewrite.
+        #[allow(clippy::verbose_bit_mask)]
+        Object::Int(n) => (n & 0xFF) == 0,
+        Object::Str(s) => s.is_empty(),
+        _ => false,
     }
 }
 

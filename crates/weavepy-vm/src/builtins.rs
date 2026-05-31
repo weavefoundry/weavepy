@@ -891,7 +891,23 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             .cloned(),
         Object::Type(t) => {
             if let Some(v) = t.lookup(name) {
-                return Some(v);
+                // Accessing an attribute *on the class* runs the descriptor
+                // protocol with no instance (`Vm::descriptor_get(attr, None,
+                // owner=class)`): classmethods bind to the class, staticmethods
+                // unwrap, and plain functions/properties/data stay as-is
+                // (`C.method` is a plain function in Python 3). Without this
+                // binding `getattr(Cls, "a_classmethod")` returns the raw
+                // `classmethod` descriptor, which is not callable.
+                return Some(match v {
+                    Object::ClassMethod(inner) => {
+                        Object::BoundMethod(Rc::new(crate::object::BoundMethod {
+                            receiver: Object::Type(t.clone()),
+                            function: (*inner).clone(),
+                        }))
+                    }
+                    Object::StaticMethod(inner) => (*inner).clone(),
+                    other => other,
+                });
             }
             // Mirror the synthetic dunders served by `Vm::load_attr_type`.
             // We can't reach the VM from here, but these are pure data

@@ -336,12 +336,18 @@ class Mock(NonCallableMock):
                 if rv is not DEFAULT:
                     return rv
             elif isinstance(effect, (list, tuple)) or hasattr(effect, "__iter__"):
-                if not hasattr(self, "_side_effect_iter"):
-                    object.__setattr__(self, "_side_effect_iter", iter(effect))
-                try:
-                    rv = next(self._side_effect_iter)
-                except StopIteration:
-                    raise StopIteration
+                # Probe the cached iterator via ``__dict__`` rather than
+                # ``hasattr`` / attribute access: a ``Mock``'s
+                # ``__getattr__`` auto-creates children for unknown
+                # names, so ``hasattr(self, "_side_effect_iter")`` is
+                # always true and would defeat the cache.
+                it = self.__dict__.get("_side_effect_iter")
+                if it is None:
+                    it = iter(effect)
+                    object.__setattr__(self, "_side_effect_iter", it)
+                # An exhausted side-effect iterable raises StopIteration
+                # to the caller, mirroring CPython's mock.
+                rv = next(it)
                 if isinstance(rv, BaseException) or (isinstance(rv, type) and issubclass(rv, BaseException)):
                     raise rv
                 return rv
