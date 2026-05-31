@@ -573,10 +573,12 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 }
 
 /// `sys.exit([code])` — modelled as raising `SystemExit(code)`. The
-/// VM doesn't yet special-case this in its main loop, so it walks
-/// out as an ordinary uncaught exception. That's enough for `try:
-/// sys.exit(1) except SystemExit:` to work; the CLI then renders
-/// the resulting traceback like CPython.
+/// VM doesn't special-case this in its main loop, so it walks out as
+/// an ordinary uncaught exception (so `try: sys.exit(1) except
+/// SystemExit:` works). When it reaches the top level the CLI honours
+/// it like CPython — terminating with `code` and printing no traceback
+/// (see `Interpreter`/`Error::system_exit_code` and the CLI's
+/// `exit_with_system_exit`).
 fn sys_exit(args: &[Object]) -> Result<Object, RuntimeError> {
     let code = args.first().cloned().unwrap_or(Object::None);
     let inst = crate::builtin_types::make_exception_with_class(

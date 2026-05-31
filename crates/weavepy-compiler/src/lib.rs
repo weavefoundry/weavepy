@@ -348,6 +348,28 @@ pub fn compile_module_with_source(
     Ok(top.finish())
 }
 
+/// Compile in interactive ("single") mode: identical to
+/// [`compile_module_with_source`] except top-level expression
+/// statements echo their value through `sys.displayhook`
+/// (`OpCode::PrintExpr`) the way CPython's `compile(src, fn, "single")`
+/// does. Powers the REPL (`code`/`codeop`) and `doctest`.
+pub fn compile_interactive_with_source(
+    module: &Module,
+    source: &str,
+    filename: &str,
+) -> Result<CodeObject, CompileError> {
+    let line_index = LineIndex::new(source);
+    let mut top = Compiler::new(
+        "<module>".to_owned(),
+        filename.to_owned(),
+        CodeKind::Module,
+        Rc::new(line_index),
+    );
+    top.interactive = true;
+    top.compile_module_body(module)?;
+    Ok(top.finish())
+}
+
 /// Lookup table that maps a byte offset back to a 1-based line number.
 /// Filled once per top-level compile and shared by reference into every
 /// nested `Compiler` for cheap per-instruction line lookups.
@@ -447,6 +469,14 @@ struct Compiler {
     /// expose it here rather than threading the value through every
     /// call site.
     code_kind: CodeKind,
+    /// `True` for the top-level code object compiled in interactive
+    /// ("single") mode. Module-level expression *statements* then echo
+    /// their value through `sys.displayhook` (via `OpCode::PrintExpr`)
+    /// instead of being discarded — the REPL / `code` / `doctest`
+    /// behaviour. Never set on nested function/class scopes (they get
+    /// fresh `Compiler` instances), matching CPython's
+    /// `c_interactive && nestlevel <= 1` rule.
+    interactive: bool,
 }
 
 struct LoopFrame {
@@ -506,6 +536,7 @@ impl Compiler {
             inside_class_body: false,
             annotations_initialized: false,
             code_kind: kind,
+            interactive: false,
         }
     }
 
@@ -677,7 +708,17 @@ impl Compiler {
         match &stmt.kind {
             StmtKind::Expr(e) => {
                 self.compile_expr(e)?;
-                self.emit(OpCode::PopTop, 0);
+                // Interactive ("single") mode: a top-level expression
+                // statement echoes its value via `sys.displayhook`
+                // instead of being discarded. Only the interactive
+                // top-level compiler sets this flag; nested scopes get
+                // fresh `Compiler` instances (always non-interactive),
+                // so this never fires inside functions/classes.
+                if self.interactive {
+                    self.emit(OpCode::PrintExpr, 0);
+                } else {
+                    self.emit(OpCode::PopTop, 0);
+                }
             }
             StmtKind::Pass => {}
             StmtKind::Delete(targets) => {
@@ -1550,6 +1591,19 @@ impl Compiler {
             }
         }
         inner.emit(OpCode::Resume, 0);
+        // CPython reserves `co_consts[0]` for the function docstring (or
+        // `None`). Mirror that here so `__doc__` is *only* the leading
+        // bare string-literal statement — never an unrelated string
+        // constant that merely happens to be interned first (e.g. the
+        // RHS of `x = "s"` as the first statement). `intern_constant`
+        // dedups, so a real docstring shares this slot with its own
+        // `LoadConst`, and a `None` slot is reused by the implicit
+        // `return None`.
+        let doc_slot = match first_stmt_docstring(body) {
+            Some(doc) => Constant::Str(doc.to_owned()),
+            None => Constant::None,
+        };
+        inner.co.intern_constant(doc_slot);
         for s in body {
             inner.compile_stmt(s)?;
         }
@@ -1926,7 +1980,9 @@ impl Compiler {
                 handler: handlers_start,
                 depth: body_depth,
             });
-            self.emit(OpCode::PushExcInfo, 0);
+            // Back-patched to the pc past the handler region (see the
+            // non-`except*` branch for the rationale).
+            let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
             // Stack on entry: [exc]. Stash the remainder in a
             // synthetic local so each handler can update it.
             let rem_name = format!(".eg_remaining{}", self.with_counter);
@@ -2014,6 +2070,8 @@ impl Compiler {
             for site in handler_exit_jumps {
                 self.patch_jump(site, end);
             }
+            // Record the handler-body end on PUSH_EXC_INFO (see below).
+            self.co.instructions[push_exc_site as usize].arg = end;
         } else if has_handlers {
             self.co.exception_table.push(ExcHandler {
                 start: body_start,
@@ -2021,7 +2079,12 @@ impl Compiler {
                 handler: handlers_start,
                 depth: body_depth,
             });
-            self.emit(OpCode::PushExcInfo, 0);
+            // The arg is back-patched below to the pc just past this
+            // handler region; the VM tags the active-handler entry with
+            // it so an exception escaping the handler to an enclosing
+            // `try` correctly unwinds `sys.exc_info()` (see
+            // `Interpreter::handle_exception`).
+            let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
             // Stack on entry: [exc] (pushed by dispatch loop).
             let mut next_handler_sites: Vec<u32> = Vec::new();
             let mut handler_exit_jumps: Vec<u32> = Vec::new();
@@ -2105,6 +2168,8 @@ impl Compiler {
             for site in handler_exit_jumps {
                 self.patch_jump(site, end);
             }
+            // Record the handler-body end on PUSH_EXC_INFO (see above).
+            self.co.instructions[push_exc_site as usize].arg = end;
         } else if has_finally {
             // `try/finally` without except. The dispatch loop has
             // pushed the exception onto the value stack. We leave it
@@ -3686,6 +3751,20 @@ fn method_references_class(body: &[Stmt]) -> bool {
         collect_reads_stmt(s, &mut reads);
     }
     reads.contains("super") || reads.contains("__class__")
+}
+
+/// The docstring of a body, per CPython's rule: the first statement is a
+/// bare string-literal *expression statement*. An assignment whose RHS is
+/// a string (`x = "s"`), an f-string, or any non-string first statement is
+/// **not** a docstring. Returns the string slice when present.
+fn first_stmt_docstring(body: &[Stmt]) -> Option<&str> {
+    match &body.first()?.kind {
+        StmtKind::Expr(expr) => match &expr.kind {
+            ExprKind::Constant(AstConstant::Str(s)) => Some(s.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// `True` if any statement in `body` contains a `yield` or `yield from`

@@ -681,6 +681,7 @@ fn stack_effect(opcode: OpCode, arg: u32) -> i64 {
         | O::ReturnValue
         | O::PopJumpIfFalse
         | O::PopJumpIfTrue
+        | O::PrintExpr
         | O::ImportStar => -1,
         O::CopyTop => 1,
         O::StoreAttr => -2,

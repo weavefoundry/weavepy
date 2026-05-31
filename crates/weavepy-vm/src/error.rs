@@ -68,6 +68,39 @@ impl PyException {
     pub fn push_traceback(&mut self, entry: TracebackEntry) {
         self.traceback.push(entry);
     }
+
+    /// When this exception is a `SystemExit` (or a subclass), return
+    /// its exit `code`: the explicit `.code` attribute, falling back to
+    /// the single `args` element (`()` → `None`, `(x,)` → `x`,
+    /// `(a, b, …)` → the tuple). Returns `None` for any other
+    /// exception. Used by the CLI to terminate like CPython — honouring
+    /// the code and suppressing the traceback — so `weavepy -m unittest`
+    /// / `-m test` and bare `sys.exit()` behave as a drop-in would.
+    pub fn system_exit_code(&self) -> Option<Object> {
+        let Object::Instance(inst) = &self.instance else {
+            return None;
+        };
+        if !inst
+            .class
+            .is_subclass_of(&crate::builtin_types::builtin_types().system_exit)
+        {
+            return None;
+        }
+        let dict = inst.dict.borrow();
+        if let Some(code) = dict.get(&crate::object::DictKey(Object::from_static("code"))) {
+            return Some(code.clone());
+        }
+        if let Some(Object::Tuple(args)) =
+            dict.get(&crate::object::DictKey(Object::from_static("args")))
+        {
+            return Some(match args.len() {
+                0 => Object::None,
+                1 => args[0].clone(),
+                _ => Object::Tuple(args.clone()),
+            });
+        }
+        Some(Object::None)
+    }
 }
 
 impl PartialEq for PyException {

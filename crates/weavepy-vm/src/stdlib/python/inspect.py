@@ -91,6 +91,54 @@ def _has_attrs(obj, *names):
     return True
 
 
+def cleandoc(doc):
+    """Clean up indentation from docstrings (CPython ``inspect.cleandoc``).
+
+    Any leading whitespace is removed from the first line; the minimum
+    indentation of subsequent non-blank lines is removed; leading and
+    trailing blank lines are dropped.
+    """
+    if not doc:
+        return doc
+    lines = doc.expandtabs().split('\n')
+    margin = None
+    for line in lines[1:]:
+        content = len(line.lstrip())
+        if content:
+            indent = len(line) - content
+            margin = indent if margin is None else min(margin, indent)
+    if lines:
+        lines[0] = lines[0].lstrip()
+    if margin is not None:
+        for i in range(1, len(lines)):
+            lines[i] = lines[i][margin:]
+    while lines and not lines[-1]:
+        lines.pop()
+    while lines and not lines[0]:
+        lines.pop(0)
+    return '\n'.join(lines)
+
+
+def getdoc(obj):
+    """Return the cleaned-up documentation string for *obj* (or None)."""
+    try:
+        doc = obj.__doc__
+    except AttributeError:
+        return None
+    if doc is None:
+        try:
+            cls = type(obj)
+            for base in getattr(cls, "__mro__", (cls,)):
+                doc = getattr(base, "__doc__", None)
+                if doc is not None:
+                    break
+        except Exception:
+            return None
+    if not isinstance(doc, str):
+        return None
+    return cleandoc(doc)
+
+
 def isfunction(obj):
     return type(obj).__name__ == "function"
 

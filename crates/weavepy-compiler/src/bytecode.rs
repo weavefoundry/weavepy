@@ -425,8 +425,11 @@ pub enum OpCode {
     /// Peek TOS, push `len(TOS)` as an int.
     GetLen,
 
-    /// Print the diagnostic representation of TOS — used by the
-    /// `dis` formatter only. Never emitted; reserved.
+    /// Echo TOS through `sys.displayhook` (CPython `PRINT_EXPR`).
+    /// Emitted only for top-level expression statements compiled in
+    /// interactive ("single") mode — the REPL (`code`/`codeop`) and
+    /// `doctest`. In "exec" mode an expression statement uses
+    /// `PopTop` instead.
     PrintExpr,
 }
 

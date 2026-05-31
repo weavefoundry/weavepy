@@ -469,6 +469,110 @@ fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
+            name: "unittest.__main__",
+            source: include_str!("python/unittest_main.py"),
+            is_package: false,
+        },
+        // `doctest` (RFC 0034) — interactive-example testing, used by
+        // `test.support.run_doctest` and stdlib self-tests.
+        FrozenSource {
+            name: "doctest",
+            source: include_str!("python/doctest.py"),
+            is_package: false,
+        },
+        // RFC 0034 — the `test` package: CPython's regression-test
+        // harness glue. `test.support` (+ 3.13 helper submodules) is the
+        // import-time prerequisite for every `Lib/test/test_*.py`;
+        // `test.libregrtest` + `test.__main__` drive `weavepy -m test`.
+        FrozenSource {
+            name: "test",
+            source: include_str!("python/test_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "test.support",
+            source: include_str!("python/test_support_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "test.support.os_helper",
+            source: include_str!("python/test_support_os_helper.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.import_helper",
+            source: include_str!("python/test_support_import_helper.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.warnings_helper",
+            source: include_str!("python/test_support_warnings_helper.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.threading_helper",
+            source: include_str!("python/test_support_threading_helper.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.script_helper",
+            source: include_str!("python/test_support_script_helper.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.socket_helper",
+            source: include_str!("python/test_support_socket_helper.py"),
+            is_package: false,
+        },
+        // `test.__main__` / `test.regrtest`: drive `weavepy -m test` and
+        // `weavepy -m test.regrtest`. The runner itself lives in the
+        // `test.libregrtest` package below.
+        FrozenSource {
+            name: "test.__main__",
+            source: include_str!("python/test_main.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.regrtest",
+            source: include_str!("python/test_regrtest.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest",
+            source: include_str!("python/test_libregrtest_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "test.libregrtest.result",
+            source: include_str!("python/test_libregrtest_result.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.cmdline",
+            source: include_str!("python/test_libregrtest_cmdline.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.findtests",
+            source: include_str!("python/test_libregrtest_findtests.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.save_env",
+            source: include_str!("python/test_libregrtest_save_env.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.single",
+            source: include_str!("python/test_libregrtest_single.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.libregrtest.main",
+            source: include_str!("python/test_libregrtest_main.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "runpy",
             source: include_str!("python/runpy.py"),
             is_package: false,

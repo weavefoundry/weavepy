@@ -40,3 +40,6 @@ __pycache__/
 # Generated docs
 /book/
 /site/
+
+# Local scratch / throwaway diagnostics
+.scratch/
