@@ -304,7 +304,11 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
         );
     }
 
-    Object::Instance(Rc::new(PyInstance { class, dict }))
+    Object::Instance(Rc::new(PyInstance {
+        class,
+        dict,
+        native: None,
+    }))
 }
 
 /// `_weakref.getweakrefcount(obj)` — number of live weakrefs

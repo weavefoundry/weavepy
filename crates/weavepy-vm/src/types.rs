@@ -221,6 +221,15 @@ fn compute_c3(
 pub struct PyInstance {
     pub class: Rc<TypeObject>,
     pub dict: Rc<RefCell<DictData>>,
+    /// For instances of a subclass of an immutable built-in
+    /// (`int`, `str`, `float`, `bytes`, `tuple`, …) this holds the
+    /// underlying primitive value the instance *is* — the moral
+    /// equivalent of CPython storing the C-level value in the object
+    /// struct. `None` for ordinary objects. Set once at construction
+    /// (the wrapped builtins are themselves immutable) and unwrapped
+    /// by the numeric / comparison / hashing / conversion fast paths
+    /// so e.g. `class C(int)` instances behave like real ints.
+    pub native: Option<Object>,
 }
 
 impl PyInstance {
@@ -228,6 +237,17 @@ impl PyInstance {
         Self {
             class,
             dict: Rc::new(RefCell::new(DictData::new())),
+            native: None,
+        }
+    }
+
+    /// Build an instance that wraps a primitive `native` value
+    /// (subclass of `int`/`str`/…).
+    pub fn with_native(class: Rc<TypeObject>, native: Object) -> Self {
+        Self {
+            class,
+            dict: Rc::new(RefCell::new(DictData::new())),
+            native: Some(native),
         }
     }
 }

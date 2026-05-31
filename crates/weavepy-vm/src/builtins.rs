@@ -439,6 +439,8 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "splitlines" => Some(method("splitlines", bytes_splitlines)),
             "join" => Some(method("join", bytes_join)),
             "replace" => Some(method("replace", bytes_replace)),
+            "translate" => Some(method("translate", bytes_translate)),
+            "maketrans" => Some(method("maketrans", bytes_maketrans)),
             "isalnum" => Some(method("isalnum", bytes_isalnum)),
             "isalpha" => Some(method("isalpha", bytes_isalpha)),
             "isdigit" => Some(method("isdigit", bytes_isdigit)),
@@ -617,6 +619,35 @@ fn b_range(args: &[Object]) -> Result<Object, RuntimeError> {
 fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::from_static(""));
+    }
+    // `str(object, encoding[, errors])` decodes a bytes-like object,
+    // equivalent to `object.decode(encoding, errors)`. CPython's
+    // `re._parser.Tokenizer` relies on `str(pattern, 'latin1')` to
+    // tokenize bytes patterns, so this path must decode rather than
+    // fall back to `repr`-style stringification.
+    if args.len() >= 2 {
+        match &args[0] {
+            Object::Bytes(_) | Object::ByteArray(_) => {}
+            other => {
+                return Err(type_error(format!(
+                    "decoding to str: need a bytes-like object, {} found",
+                    other.type_name()
+                )));
+            }
+        }
+        let data = bytes_data(args)?;
+        let encoding = match &args[1] {
+            Object::Str(e) => e.to_string(),
+            Object::None => "utf-8".to_owned(),
+            _ => return Err(type_error("str() argument 'encoding' must be str")),
+        };
+        let errors = match args.get(2) {
+            Some(Object::Str(e)) => e.to_string(),
+            Some(Object::None) | None => "strict".to_owned(),
+            _ => return Err(type_error("str() argument 'errors' must be str")),
+        };
+        let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;
+        return Ok(Object::from_str(s));
     }
     Ok(Object::from_str(args[0].to_str()))
 }
@@ -2628,6 +2659,7 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
             d.insert(DictKey(Object::from_static("__self__")), receiver);
             d
         })),
+        native: None,
     };
     Object::Instance(Rc::new(inst))
 }
@@ -3804,7 +3836,9 @@ fn str_isidentifier(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn str_isprintable(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    Ok(Object::Bool(s.chars().all(|c| !c.is_control())))
+    Ok(Object::Bool(
+        s.chars().all(crate::object::char_is_printable),
+    ))
 }
 
 fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4827,17 +4861,56 @@ fn bytes_match_prefix_suffix(
     }
 }
 
+/// Resolve the optional `start`/`end` arguments of `bytes.find` and
+/// friends (positions 2 and 3) into a clamped `[start, end]` byte
+/// window, applying CPython's slice-style negative-index handling.
+fn bytes_search_range(args: &[Object], len: usize) -> (usize, usize) {
+    let n = len as i64;
+    let resolve = |o: Option<&Object>, default: i64| -> i64 {
+        match o {
+            None | Some(Object::None) => default,
+            Some(obj) => match obj.as_i64() {
+                Some(mut x) => {
+                    if x < 0 {
+                        x += n;
+                    }
+                    x.clamp(0, n)
+                }
+                None => default,
+            },
+        }
+    };
+    let start = resolve(args.get(2), 0).clamp(0, n) as usize;
+    let end = resolve(args.get(3), n).clamp(0, n) as usize;
+    (start, end.max(start))
+}
+
+/// Find `sub` within `data[start..end]`, returning the *absolute*
+/// position (or -1). Mirrors `bytes.find`'s empty-needle behaviour.
+fn bytes_find_in(data: &[u8], sub: &[u8], start: usize, end: usize) -> i64 {
+    if start > end || end > data.len() {
+        return -1;
+    }
+    let hay = &data[start..end];
+    if sub.is_empty() {
+        return start as i64;
+    }
+    if sub.len() > hay.len() {
+        return -1;
+    }
+    hay.windows(sub.len())
+        .position(|w| w == sub)
+        .map_or(-1, |i| (start + i) as i64)
+}
+
 fn bytes_find(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let sub = bytes_argview(
         args.get(1)
             .ok_or_else(|| type_error("find() expected 1 arg"))?,
     )?;
-    Ok(Object::Int(
-        data.windows(sub.len())
-            .position(|w| w == sub)
-            .map_or(-1, |i| i as i64),
-    ))
+    let (start, end) = bytes_search_range(args, data.len());
+    Ok(Object::Int(bytes_find_in(&data, &sub, start, end)))
 }
 
 fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4846,9 +4919,16 @@ fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
         args.get(1)
             .ok_or_else(|| type_error("rfind() expected 1 arg"))?,
     )?;
+    let (start, end) = bytes_search_range(args, data.len());
+    if start > end || end > data.len() {
+        return Ok(Object::Int(-1));
+    }
+    if sub.is_empty() {
+        return Ok(Object::Int(end as i64));
+    }
     let mut last = -1i64;
-    if sub.len() <= data.len() {
-        for i in 0..=data.len() - sub.len() {
+    if sub.len() <= end - start {
+        for i in start..=end - sub.len() {
             if data[i..i + sub.len()] == sub[..] {
                 last = i as i64;
             }
@@ -4870,12 +4950,13 @@ fn bytes_count(args: &[Object]) -> Result<Object, RuntimeError> {
         args.get(1)
             .ok_or_else(|| type_error("count() expected 1 arg"))?,
     )?;
+    let (start, end) = bytes_search_range(args, data.len());
     if sub.is_empty() {
-        return Ok(Object::Int(data.len() as i64 + 1));
+        return Ok(Object::Int((end - start) as i64 + 1));
     }
     let mut n = 0i64;
-    let mut i = 0;
-    while i + sub.len() <= data.len() {
+    let mut i = start;
+    while i + sub.len() <= end {
         if data[i..i + sub.len()] == sub[..] {
             n += 1;
             i += sub.len();
@@ -5070,6 +5151,64 @@ fn bytes_replace(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     Ok(Object::new_bytes(out))
+}
+
+/// `bytes.translate(table, /, delete=b'')` and the `bytearray`
+/// equivalent. `table` is `None` (identity) or a bytes-like of length
+/// 256; bytes present in `delete` are dropped first. The receiver's
+/// type (bytes vs bytearray) is preserved.
+fn bytes_translate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let table = match args.get(1) {
+        None | Some(Object::None) => None,
+        Some(o) => {
+            let t = bytes_argview(o)?;
+            if t.len() != 256 {
+                return Err(value_error("translation table must be 256 characters long"));
+            }
+            Some(t)
+        }
+    };
+    let delete = match args.get(2) {
+        None | Some(Object::None) => Vec::new(),
+        Some(o) => bytes_argview(o)?,
+    };
+    let mut out = Vec::with_capacity(data.len());
+    for &b in &data {
+        if delete.contains(&b) {
+            continue;
+        }
+        out.push(match &table {
+            Some(t) => t[b as usize],
+            None => b,
+        });
+    }
+    if matches!(args.first(), Some(Object::ByteArray(_))) {
+        Ok(Object::new_bytearray(out))
+    } else {
+        Ok(Object::new_bytes(out))
+    }
+}
+
+/// `bytes.maketrans(from, to)` — builds a 256-byte translation table
+/// mapping each byte in `from` to the byte at the same index in `to`.
+fn bytes_maketrans(args: &[Object]) -> Result<Object, RuntimeError> {
+    let from = bytes_argview(
+        args.first()
+            .ok_or_else(|| type_error("maketrans() takes exactly two arguments"))?,
+    )?;
+    let to = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("maketrans() takes exactly two arguments"))?,
+    )?;
+    if from.len() != to.len() {
+        return Err(value_error("maketrans arguments must have same length"));
+    }
+    let mut table: Vec<u8> = (0u8..=255).collect();
+    for (f, t) in from.iter().zip(to.iter()) {
+        table[*f as usize] = *t;
+    }
+    Ok(Object::new_bytes(table))
 }
 
 fn bytes_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {

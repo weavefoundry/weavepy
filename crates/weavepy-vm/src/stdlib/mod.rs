@@ -39,7 +39,6 @@ pub mod marshal_mod;
 pub mod math;
 pub mod os;
 pub mod random;
-pub mod re;
 pub mod resource_mod;
 pub mod secrets_mod;
 pub mod select_mod;
@@ -47,6 +46,7 @@ pub mod shutil_mod;
 pub mod signal_mod;
 pub mod socket_mod;
 pub mod sqlite3_mod;
+pub mod sre_mod;
 pub mod ssl_mod;
 pub mod struct_mod;
 pub mod subprocess_mod;
@@ -89,7 +89,6 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("os", os::build);
     cache.register_builtin("os.path", os::build_path);
     cache.register_builtin("io", io::build);
-    cache.register_builtin("re", re::build);
     cache.register_builtin("json", json::build);
     cache.register_builtin("random", random::build);
     cache.register_builtin("time", time::build);
@@ -114,6 +113,8 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_struct", struct_mod::build);
     cache.register_builtin("_codecs", codecs_mod::build);
     cache.register_builtin("marshal", marshal_mod::build);
+    // RFC 0035 — native SRE regex core behind the frozen `re` package.
+    cache.register_builtin("_sre", sre_mod::build);
     // RFC 0033 — native AST parsing core behind the frozen `ast` module.
     cache.register_builtin("_ast", ast_mod::build);
     // RFC 0033 — native symbol-table core behind the frozen `symtable` module.
@@ -990,6 +991,57 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "symtable",
             source: include_str!("python/symtable.py"),
+            is_package: false,
+        },
+        // RFC 0035 — the `re` package: a faithful port of CPython's
+        // secret-labs engine. `_constants` / `_parser` / `_compiler` /
+        // `_casefix` are verbatim from CPython 3.13; `_engine` builds the
+        // Pattern / Match objects on top of the native `_sre` core.
+        FrozenSource {
+            name: "re",
+            source: include_str!("python/re_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "re._constants",
+            source: include_str!("python/re_constants.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "re._casefix",
+            source: include_str!("python/re_casefix.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "re._parser",
+            source: include_str!("python/re_parser.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "re._compiler",
+            source: include_str!("python/re_compiler.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "re._engine",
+            source: include_str!("python/re_engine.py"),
+            is_package: false,
+        },
+        // Deprecated 3.x aliases kept for compatibility with code that
+        // still imports the pre-3.11 module names.
+        FrozenSource {
+            name: "sre_constants",
+            source: include_str!("python/sre_constants.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "sre_parse",
+            source: include_str!("python/sre_parse.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "sre_compile",
+            source: include_str!("python/sre_compile.py"),
             is_package: false,
         },
     ]

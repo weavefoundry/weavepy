@@ -529,6 +529,12 @@ impl Eq for DictKey {}
 
 impl Hash for DictKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        // An `int`/`str`/… subclass instance hashes identically to the
+        // value it wraps, so it can be used interchangeably with that
+        // value as a dict/set key (CPython invariant).
+        if let Some(native) = self.0.native_value() {
+            return DictKey(native).hash(state);
+        }
         match &self.0 {
             Object::None => 0u8.hash(state),
             Object::Bool(b) => {
@@ -1207,6 +1213,14 @@ impl Object {
             Object::FrozenSet(s) => !s.is_empty(),
             Object::Cell(inner) => inner.borrow().is_truthy(),
             Object::Instance(inst) => {
+                // int/str/… subclass instances are truthy per their
+                // wrapped value unless the class overrides __bool__/__len__.
+                if inst.class.lookup("__bool__").is_none() && inst.class.lookup("__len__").is_none()
+                {
+                    if let Some(native) = &inst.native {
+                        return native.is_truthy();
+                    }
+                }
                 // Honour __bool__ then __len__ before defaulting to True.
                 if let Some(m) = inst.class.lookup("__bool__") {
                     // Caller dispatches; we cannot run Python here.
@@ -1282,6 +1296,17 @@ impl Object {
 
     /// `==` operator semantics — recursive value equality.
     pub fn eq_value(&self, other: &Self) -> bool {
+        // Subclasses of immutable built-ins (`class C(int)`,
+        // `enum.IntEnum`, `_NamedIntConstant`, …) compare by the value
+        // they wrap, so `C(5) == 5` and two distinct instances with the
+        // same value are equal — exactly like CPython.
+        let lhs_native = self.native_value();
+        let rhs_native = other.native_value();
+        if lhs_native.is_some() || rhs_native.is_some() {
+            let l = lhs_native.as_ref().unwrap_or(self);
+            let r = rhs_native.as_ref().unwrap_or(other);
+            return l.eq_value(r);
+        }
         match (self, other) {
             (Object::None, Object::None) => true,
             (Object::Bool(a), Object::Bool(b)) => a == b,
@@ -1366,6 +1391,14 @@ impl Object {
     /// combinations return [`Err`] mapping to Python's `TypeError`.
     pub fn cmp(&self, other: &Self) -> Result<Ordering, RuntimeError> {
         use Object as O;
+        // Order `int`/`str`/… subclass instances by the value they wrap.
+        let lhs_native = self.native_value();
+        let rhs_native = other.native_value();
+        if lhs_native.is_some() || rhs_native.is_some() {
+            let l = lhs_native.as_ref().unwrap_or(self);
+            let r = rhs_native.as_ref().unwrap_or(other);
+            return l.cmp(r);
+        }
         match (self, other) {
             (O::Int(a), O::Int(b)) => Ok(a.cmp(b)),
             (O::Long(a), O::Long(b)) => Ok((**a).cmp(b)),
@@ -1677,19 +1710,42 @@ impl Object {
                 }
             }
             Object::Str(s) => {
+                // CPython quote selection (Objects/unicodeobject.c
+                // `unicode_repr`): use '\'' unless the string contains a
+                // single quote and no double quote, in which case use '"'
+                // so the single quotes need not be escaped.
+                let has_single = s.contains('\'');
+                let has_double = s.contains('"');
+                let quote = if has_single && !has_double { '"' } else { '\'' };
                 let mut out = String::with_capacity(s.len() + 2);
-                out.push('\'');
+                out.push(quote);
                 for c in s.chars() {
                     match c {
                         '\\' => out.push_str("\\\\"),
-                        '\'' => out.push_str("\\'"),
                         '\n' => out.push_str("\\n"),
                         '\r' => out.push_str("\\r"),
                         '\t' => out.push_str("\\t"),
-                        c => out.push(c),
+                        c if c == quote => {
+                            out.push('\\');
+                            out.push(quote);
+                        }
+                        c if char_is_printable(c) => out.push(c),
+                        // Non-printable code points are escaped the way
+                        // CPython's `unicode_repr` does: \xNN, \uNNNN or
+                        // \UNNNNNNNN depending on the code-point width.
+                        c => {
+                            let n = c as u32;
+                            if n <= 0xff {
+                                out.push_str(&format!("\\x{n:02x}"));
+                            } else if n <= 0xffff {
+                                out.push_str(&format!("\\u{n:04x}"));
+                            } else {
+                                out.push_str(&format!("\\U{n:08x}"));
+                            }
+                        }
                     }
                 }
-                out.push('\'');
+                out.push(quote);
                 out
             }
             Object::Tuple(items) => {
@@ -2021,6 +2077,28 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// CPython's `Py_UNICODE_ISPRINTABLE`: every character is printable
+/// except those in the "Other" (Cc, Cf, Cs, Co, Cn) and "Separator"
+/// (Zl, Zp, Zs) general categories, with U+0020 (space) treated as
+/// printable. Used by `repr(str)` (and `str.isprintable`).
+pub(crate) fn char_is_printable(c: char) -> bool {
+    if c == ' ' {
+        return true;
+    }
+    use unicode_properties::{GeneralCategory as GC, UnicodeGeneralCategory};
+    !matches!(
+        c.general_category(),
+        GC::Control
+            | GC::Format
+            | GC::Surrogate
+            | GC::PrivateUse
+            | GC::Unassigned
+            | GC::LineSeparator
+            | GC::ParagraphSeparator
+            | GC::SpaceSeparator
+    )
+}
+
 fn bytes_repr(b: &[u8]) -> String {
     let mut out = String::with_capacity(b.len() + 3);
     out.push('b');
@@ -2174,11 +2252,25 @@ impl Object {
     /// View this object as `i64`, succeeding only when the value
     /// genuinely fits in 64 bits. Returns `None` for `Long`s that
     /// don't fit, and for non-integer types.
+    /// For an instance of a subclass of a primitive built-in
+    /// (`int`, `str`, …) return a clone of the underlying value the
+    /// instance wraps; `None` for everything else. The wrapped value
+    /// is always itself a primitive (never another `Instance`), so
+    /// callers can recurse exactly once.
+    #[inline]
+    pub fn native_value(&self) -> Option<Object> {
+        match self {
+            Object::Instance(inst) => inst.native.clone(),
+            _ => None,
+        }
+    }
+
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Object::Bool(b) => Some(i64::from(*b)),
             Object::Int(i) => Some(*i),
             Object::Long(b) => b.to_i64(),
+            Object::Instance(inst) => inst.native.as_ref().and_then(Object::as_i64),
             _ => None,
         }
     }
@@ -2190,6 +2282,7 @@ impl Object {
             Object::Bool(b) => Some(usize::from(*b)),
             Object::Int(i) if *i >= 0 => usize::try_from(*i).ok(),
             Object::Long(b) if !b.is_negative() => b.to_usize(),
+            Object::Instance(inst) => inst.native.as_ref().and_then(Object::as_usize),
             _ => None,
         }
     }
