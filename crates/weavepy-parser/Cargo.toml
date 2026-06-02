@@ -18,5 +18,9 @@ thiserror     = { workspace = true }
 # RFC 0019 — numerics and serialization.
 num-bigint    = { workspace = true }
 
+# `\N{NAME}` named Unicode escapes in string literals resolve against the
+# full UCD name table shipped by this crate (CPython parity).
+unicode_names2 = { workspace = true }
+
 [lints]
 workspace = true

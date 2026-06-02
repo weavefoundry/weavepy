@@ -48,9 +48,12 @@ work.
 > `settrace`, and grows `_pytest` to handle `@pytest.mark.parametrize`
 > Cartesian matrices, indirect fixtures, `request.addfinalizer`
 > LIFO ordering, and per-scope (function / class / module /
-> session) fixture caching. The CPython `Lib/test/` allowlist
-> remains an aspirational target — see `tests/regrtest/expectations.toml`
-> for the per-test baseline. Expect small breaking changes
+> session) fixture caching. `RFC 0036` wires a real CPython 3.13
+> `Lib/test/` checkout into the `regrtest` harness (`--cpython-dir`,
+> crash-isolated `--mode subprocess`, `--jobs`) and rewrites the touched
+> rows of `tests/regrtest/expectations.toml` from guesses to a **measured**
+> baseline (`unexpected 0` on a fresh sweep); the full allowlist is still
+> being worked through file by file. Expect small breaking changes
 > around the edges as the long tail catches up.
 >
 > `RFC 0033` makes WeavePy *introspectable like CPython*. It ships a
@@ -149,11 +152,16 @@ report as an artifact.
 ```bash
 cargo run -p weavepy-conformance -- run            # all phases
 cargo run -p weavepy-conformance -- diff tokens    # one phase
+
+# End-to-end: run CPython's own Lib/test/ files under WeavePy and grade
+# against the measured baseline (RFC 0036).
+cargo run -p weavepy-conformance -- regrtest \
+    --cpython-dir vendor/cpython/Lib/test --mode subprocess --jobs 8
 ```
 
 See [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) for the model, the
-corpus layout, and how the harness will grow into a CPython
-`regrtest`-style runner once the VM can execute Python.
+corpus layout, and the now-live CPython `regrtest`-style runner (RFC
+0034 built it; RFC 0036 wired a real CPython 3.13 checkout into the CLI).
 
 ## Project goals
 

@@ -176,6 +176,19 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/collections.py"),
             is_package: false,
         },
+        // RFC 0036 — `string` (constants + `Template` + `Formatter` over
+        // the native `_string`) and `platform`, carried verbatim from
+        // CPython 3.13.
+        FrozenSource {
+            name: "string",
+            source: include_str!("python/string.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "platform",
+            source: include_str!("python/platform.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "itertools",
             source: include_str!("python/itertools.py"),
@@ -523,6 +536,20 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "test.support.socket_helper",
             source: include_str!("python/test_support_socket_helper.py"),
+            is_package: false,
+        },
+        // RFC 0036 — two more 3.13 helper submodules carried verbatim:
+        // `testcase` (ExceptionIsLikeMixin + float/complex assertions used
+        // by test_float/test_complex) and `numbers` (the numeric-tower
+        // sample values test_int/test_complex iterate over).
+        FrozenSource {
+            name: "test.support.testcase",
+            source: include_str!("python/test_support_testcase.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.support.numbers",
+            source: include_str!("python/test_support_numbers.py"),
             is_package: false,
         },
         // `test.__main__` / `test.regrtest`: drive `weavepy -m test` and

@@ -378,25 +378,19 @@ impl<'src> Scanner<'src> {
 
         let mut is_float = false;
         if matches!(self.peek(), Some(b'.')) {
-            // `.` followed by non-digit and at end of identifier
-            // could be attribute access (e.g. `1.real`). CPython
-            // disallows that — `1.real` is a syntax error in
-            // tokenizing — but to be safe we only treat `.` as
-            // float if a digit, exponent, or end-of-token follows.
-            let after_dot = self.peek_at(1);
-            let can_be_float = match after_dot {
-                None => true,
-                Some(c) => c.is_ascii_digit() || c == b'e' || c == b'E' || c == b'j' || c == b'J',
-            };
-            if can_be_float {
-                is_float = true;
-                self.pos += 1;
-                while let Some(b) = self.peek() {
-                    if b.is_ascii_digit() || b == b'_' {
-                        self.pos += 1;
-                    } else {
-                        break;
-                    }
+            // A `.` immediately after the integer part is always part of
+            // the float in Python: `1.`, `2.+3.`, `[1.]`, `1.e3` are all
+            // valid. The dot binds to the number, never to attribute
+            // access — `1.real` tokenizes as `1.` then `real` and is a
+            // `SyntaxError` (you must write `(1).real` or `1 .real`),
+            // exactly as in CPython's tokenizer.
+            is_float = true;
+            self.pos += 1;
+            while let Some(b) = self.peek() {
+                if b.is_ascii_digit() || b == b'_' {
+                    self.pos += 1;
+                } else {
+                    break;
                 }
             }
         }

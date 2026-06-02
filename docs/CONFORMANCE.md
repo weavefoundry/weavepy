@@ -15,7 +15,8 @@ cargo run -p weavepy-conformance -- diff tokens
 cargo run -p weavepy-conformance -- diff ast
 cargo run -p weavepy-conformance -- diff dis
 
-# Placeholder for the eventual end-to-end test runner; see "Stage B" below.
+# Run Lib/test/ files end-to-end and grade against the baseline; see
+# "Stage B" below for the --cpython-dir / --mode / --jobs flags.
 cargo run -p weavepy-conformance -- regrtest
 ```
 
@@ -123,15 +124,42 @@ they are not yet a perfect signal and the job stays non-blocking (see
 
 ## Stage B: end-to-end regrtest runner
 
-Once the VM can execute Python, the harness will gain a `regrtest` mode
-that runs individual `Lib/test/test_*.py` files under WeavePy and
-compares stdout/exit/exceptions against `python3`. That mode is gated
-by an `expectations.toml` file listing currently-passing tests — CI
-fails if outcomes drift in either direction (a previously-passing test
-must not regress; a newly-passing test must be promoted).
+The `regrtest` subcommand runs individual `Lib/test/test_*.py` files
+end-to-end through WeavePy and grades each against
+`tests/regrtest/expectations.toml`. It is **live** (RFC 0026/0034 built
+the runner + `test.support`; RFC 0036 wired a real CPython checkout into
+the CLI). A test is graded `pass`/`fail`/`error`/`skip`/`timeout`, and
+the baseline gates CI in both directions: a previously-passing test must
+not regress, and a file that starts passing must be promoted.
 
-Until then, the `regrtest` subcommand is a placeholder that explains
-itself and exits cleanly.
+```bash
+# Run the curated allowlist against a vendored CPython 3.13 Lib/test/,
+# one crash-isolated subprocess per test, 8 in parallel:
+cargo run -p weavepy-conformance -- regrtest \
+    --cpython-dir vendor/cpython/Lib/test \
+    --mode subprocess --jobs 8 --timeout 45
+
+# Refresh the baseline after an intentional change (grade without gating):
+cargo run -p weavepy-conformance -- regrtest --mode subprocess --no-check
+```
+
+Key flags (the discovery/execution library has supported these since
+RFC 0026; RFC 0036 exposes them on the CLI):
+
+- `--cpython-dir DIR` — point at any CPython `Lib/test/` tree, overriding
+  the `vendor/cpython/Lib/test/` → `vendor/cpython-tests/` autodiscovery.
+- `--mode subprocess` — run each test in a fresh `weavepy` child with a
+  SIGKILL wall timer, so a stack overflow / `abort()` is captured as a
+  single failure instead of taking the runner down. (`--mode in-process`
+  is faster for the bundled fixtures but not crash-safe.)
+- `--jobs N` — fan tests across `N` worker threads; `--stream` prints
+  each verdict as it lands; `--all-cpython` schedules every `test_*.py`
+  in the directory (still graded against expectations).
+
+The committed baseline is **measured, not guessed** (RFC 0036): a fresh
+subprocess sweep reports `unexpected 0`. Each `cpython/Lib/test/*` row
+carries a `reason` that, where the file fails, quotes the measured first
+failure so the gap is concrete.
 
 ## CI integration
 

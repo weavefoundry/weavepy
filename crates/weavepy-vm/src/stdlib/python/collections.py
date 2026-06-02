@@ -19,6 +19,18 @@ __all__ = [
 ]
 
 
+def _count_elements(mapping, iterable):
+    """Tally elements from the iterable.
+
+    The pure-Python fallback CPython ships when the ``_collections``
+    C accelerator is unavailable; ``test_collections`` imports it by
+    name to exercise ``Counter`` behaviour.
+    """
+    mapping_get = mapping.get
+    for elem in iterable:
+        mapping[elem] = mapping_get(elem, 0) + 1
+
+
 class deque:
     """Double-ended queue with optional maximum length.
 
