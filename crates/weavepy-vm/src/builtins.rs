@@ -260,6 +260,14 @@ pub fn default_builtins() -> DictData {
         DictKey(Object::from_static("Ellipsis")),
         crate::vm_singletons::ellipsis(),
     );
+    // `__debug__` is a compile-time constant builtin: `True` for a normal
+    // interpreter, `False` only under `-O`. WeavePy has no `-O` mode yet,
+    // so it is unconditionally `True` (matching `python3` with no flags).
+    // Used by `assert` lowering and reached directly by test_exceptions.
+    d.insert(
+        DictKey(Object::from_static("__debug__")),
+        Object::Bool(true),
+    );
 
     // RFC 0026 — the shared `builtins` dict needs to mirror every
     // *exception* type that `builtin_types().as_globals()` injects
@@ -2550,6 +2558,13 @@ fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_zip(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `zip()` with no iterables is an empty iterator — CPython yields
+    // nothing (`list(zip()) == []`). Without this guard the loop below
+    // never reaches an exhausted iterator and spins forever appending
+    // empty tuples.
+    if args.is_empty() {
+        return Ok(Object::new_list(Vec::new()));
+    }
     let mut iters: Vec<PyIterator> = args
         .iter()
         .map(|a| a.make_iter())

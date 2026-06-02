@@ -409,32 +409,26 @@ fn key_error(msg: impl Into<String>) -> RuntimeError {
 /// nameslist; we deliberately ship a smaller subset that covers
 /// the common script blocks.
 fn char_name(ch: char) -> Option<String> {
-    // ASCII printable.
-    if (' '..='~').contains(&ch) {
-        return Some(format!("LATIN-1 {}", ascii_letter_name(ch)?));
+    // The full UCD name table (e.g. 'a' -> "LATIN SMALL LETTER A",
+    // '•' -> "BULLET"). CPython's `unicodedata.name` raises for control
+    // and unassigned code points, which `unicode_names2::name` also
+    // reports as `None`, so the caller's "no such name" path matches.
+    if let Some(name) = unicode_names2::name(ch) {
+        return Some(name.to_string());
     }
-    // Generic format for everything else.
-    Some(format!("U+{:04X}", ch as u32))
-}
-
-fn ascii_letter_name(ch: char) -> Option<String> {
-    let upper = ch.to_ascii_uppercase();
-    if ch.is_ascii_alphabetic() {
-        if ch.is_uppercase() {
-            return Some(format!("CAPITAL LETTER {}", upper));
-        }
-        return Some(format!("SMALL LETTER {}", upper));
-    }
-    if ch.is_ascii_digit() {
-        return Some(format!("DIGIT {}", ch));
-    }
-    Some(format!("CHARACTER U+{:04X}", ch as u32))
+    None
 }
 
 /// Reverse-look-up — `unicodedata.lookup('LATIN SMALL LETTER A') == 'a'`.
 /// Supports the names we synthesise plus a small hand-rolled table of
 /// commonly looked-up sequences.
 fn name_to_char(name: &str) -> Option<char> {
+    // Full UCD name table first — this is the authoritative source for
+    // `unicodedata.lookup` and `\N{NAME}` (e.g. "BULLET", "NO-BREAK
+    // SPACE", "GREEK SMALL LETTER ALPHA").
+    if let Some(ch) = unicode_names2::character(name) {
+        return Some(ch);
+    }
     // Hex form `U+1234`.
     if let Some(rest) = name.strip_prefix("U+") {
         if let Ok(n) = u32::from_str_radix(rest.trim(), 16) {

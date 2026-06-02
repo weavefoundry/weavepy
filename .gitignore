@@ -37,9 +37,19 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# CPython test scratch files: `test.support.TESTFN` is `@test_<pid>_tmp`, which
+# tests drop in the CWD and don't always clean up when run via the conformance
+# harness. Mirrors CPython's own .gitignore so these never get staged.
+@test_*
+
 # Generated docs
 /book/
 /site/
 
 # Local scratch / throwaway diagnostics
 .scratch/
+
+# Vendored CPython checkout for the regrtest harness (opt-in, machine-local).
+# The conformance runner auto-discovers vendor/cpython/Lib/test/ when present;
+# we never commit it (size + licensing) — see docs/CONFORMANCE.md.
+/vendor/

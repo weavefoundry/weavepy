@@ -185,6 +185,12 @@ pub fn build_with_state(
         d.insert(DictKey(Object::from_static("float_info")), sys_float_info());
         d.insert(DictKey(Object::from_static("int_info")), sys_int_info());
         d.insert(DictKey(Object::from_static("hash_info")), sys_hash_info());
+        // `float.__repr__` uses the shortest round-tripping form ("short"),
+        // as every modern CPython build does; test_float asserts on this.
+        d.insert(
+            DictKey(Object::from_static("float_repr_style")),
+            Object::from_static("short"),
+        );
         d.insert(
             DictKey(Object::from_static("thread_info")),
             sys_thread_info(),
@@ -853,7 +859,10 @@ fn sys_float_info() -> Object {
     d.insert(DictKey(Object::from_static("min_exp")), Object::Int(-1021));
     d.insert(DictKey(Object::from_static("radix")), Object::Int(2));
     d.insert(DictKey(Object::from_static("rounds")), Object::Int(1));
-    Object::Dict(Rc::new(RefCell::new(d)))
+    // CPython exposes `sys.float_info` as a struct-sequence, so it must
+    // answer attribute access (`sys.float_info.max`) — used pervasively
+    // by test_math / test_complex. A SimpleNamespace gives us that.
+    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
 fn sys_int_info() -> Object {
@@ -871,7 +880,7 @@ fn sys_int_info() -> Object {
         DictKey(Object::from_static("str_digits_check_threshold")),
         Object::Int(640),
     );
-    Object::Dict(Rc::new(RefCell::new(d)))
+    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
 fn sys_hash_info() -> Object {
@@ -891,7 +900,7 @@ fn sys_hash_info() -> Object {
     d.insert(DictKey(Object::from_static("hash_bits")), Object::Int(64));
     d.insert(DictKey(Object::from_static("seed_bits")), Object::Int(128));
     d.insert(DictKey(Object::from_static("cutoff")), Object::Int(0));
-    Object::Dict(Rc::new(RefCell::new(d)))
+    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
 /// `sys.stdlib_module_names` — the documented set of standard-

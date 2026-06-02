@@ -1072,7 +1072,7 @@ impl fmt::Debug for FileBackend {
 /// State of an active iterator. Slim by design — every iterable
 /// type implements its own iteration here (no Python-level iterator
 /// protocol yet).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PyIterator {
     List {
         items: Rc<RefCell<Vec<Object>>>,
@@ -1629,6 +1629,12 @@ impl Object {
                     index: 0,
                 })
             }
+            // A native iterator is its own iterable: `iter(it) is it` in
+            // Python, and passing one to a plain builtin (`dict.fromkeys`,
+            // `set`, …) must drain it rather than raise. We hand back a
+            // clone of the underlying cursor, which yields the remaining
+            // elements (the shared source `Rc` is preserved).
+            Object::Iter(it) => Ok(it.borrow().clone()),
             _ => Err(type_error(format!(
                 "'{}' object is not iterable",
                 self.type_name()

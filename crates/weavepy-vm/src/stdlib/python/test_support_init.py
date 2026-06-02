@@ -744,3 +744,192 @@ def check_sizeof(test, o, size):
 
 # Backwards-compatible aliases some tests use.
 run_doctest = run_doctest
+
+
+# ---------------------------------------------------------------------------
+# RFC 0036 — helpers reached for by `Lib/test/` files in the conformance
+# sweep: a faithful `open_urlresource` (skips unless the `urlfetch`
+# resource is enabled, exactly as CPython does), a no-op
+# `SuppressCrashReport`, and the `bigaddrspacetest` decorator.
+# ---------------------------------------------------------------------------
+
+try:
+    TEST_HOME_DIR = os.path.dirname(os.path.abspath(__file__))
+except Exception:
+    TEST_HOME_DIR = os.getcwd()
+TEST_DATA_DIR = os.path.join(TEST_HOME_DIR, "data")
+
+
+def open_urlresource(url, *args, **kw):
+    import urllib.parse
+
+    check = kw.pop('check', None)
+    filename = urllib.parse.urlparse(url)[2].split('/')[-1]  # '/': it's URL!
+    fn = os.path.join(TEST_DATA_DIR, filename)
+
+    def check_valid_file(fn):
+        f = open(fn, *args, **kw)
+        if check is None:
+            return f
+        elif check(f):
+            f.seek(0)
+            return f
+        f.close()
+
+    if os.path.exists(fn):
+        f = check_valid_file(fn)
+        if f is not None:
+            return f
+
+    # Verify the requirement before downloading the file. In the
+    # conformance sandbox the `urlfetch` resource is never enabled, so
+    # this raises `ResourceDenied` and the calling test is skipped —
+    # matching CPython's `OK (skipped=…)` outcome for network fixtures.
+    requires('urlfetch')
+
+    import urllib.request
+
+    opener = urllib.request.urlopen(url, timeout=15)
+    try:
+        with open(fn, "wb") as out:
+            out.write(opener.read())
+    finally:
+        opener.close()
+    f = check_valid_file(fn)
+    if f is not None:
+        return f
+    raise TestFailed('invalid resource %r' % fn)
+
+
+class SuppressCrashReport:
+    """Best-effort suppression of OS crash dialogs / coredumps.
+
+    WeavePy does not surface a Windows Error Reporting dialog and the
+    conformance harness already isolates each test in its own process,
+    so this is a no-op context manager that matches CPython's interface.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def bigaddrspacetest(f):
+    """Decorator for tests that fill the address space."""
+
+    def wrapper(self):
+        if max_memuse < MAX_Py_ssize_t:
+            if MAX_Py_ssize_t >= 2**63 - 1 and max_memuse >= 2**31:
+                raise unittest.SkipTest(
+                    "not enough memory: try a 32-bit build instead")
+            else:
+                raise unittest.SkipTest(
+                    "not enough memory: %.1fG minimum needed"
+                    % (MAX_Py_ssize_t / (1024 ** 3)))
+        else:
+            return f(self)
+
+    return wrapper
+
+
+_is_pgo = False
+
+# True only for a `--with-trace-refs` debug build of CPython. WeavePy is
+# always a release-shaped build, so the all-objects tracker is absent.
+Py_TRACE_REFS = hasattr(sys, "getobjects")
+
+
+@contextlib.contextmanager
+def no_color():
+    """Context manager forcing un-colorized output.
+
+    WeavePy never emits ANSI colour escapes from the interpreter or its
+    tracebacks, so there is nothing to suppress; the helper exists purely
+    so ``Lib/test/`` files that wrap assertions in it import and run.
+    """
+    yield
+
+
+def force_not_colorized(func):
+    """Force the terminal not to be colorized."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with no_color():
+            return func(*args, **kwargs)
+    return wrapper
+
+
+def force_not_colorized_test_class(cls):
+    """Force the terminal not to be colorized for the entire test class.
+
+    The CPython original swaps ``_colorize.can_colorize`` for the class via
+    ``enterClassContext``; WeavePy output is never colorized, so the class
+    is returned unchanged.
+    """
+    return cls
+
+
+def linked_to_musl():
+    """
+    Test if the Python executable is linked to the musl C library.
+    """
+    if sys.platform != 'linux':
+        return False
+
+    import subprocess
+    exe = getattr(sys, '_base_executable', sys.executable)
+    cmd = ['ldd', exe]
+    try:
+        stdout = subprocess.check_output(cmd,
+                                         text=True,
+                                         stderr=subprocess.STDOUT)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return ('musl' in stdout)
+
+
+def requires_mac_ver(*min_version):
+    """Decorator raising SkipTest if the OS is Mac OS X and the OS X
+    version if less than min_version.
+
+    For example, @requires_mac_ver(10, 5) raises SkipTest if the OS X version
+    is lesser than 10.5.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kw):
+            if sys.platform == 'darwin':
+                import platform
+                version_txt = platform.mac_ver()[0]
+                try:
+                    version = tuple(map(int, version_txt.split('.')))
+                except ValueError:
+                    pass
+                else:
+                    if version < min_version:
+                        min_version_txt = '.'.join(map(str, min_version))
+                        raise unittest.SkipTest(
+                            "Mac OS X %s or higher required, not %s"
+                            % (min_version_txt, version_txt))
+            return func(*args, **kw)
+        wrapper.min_version = min_version
+        return wrapper
+    return decorator
+
+
+def skip_if_pgo_task(test):
+    """Skip decorator for tests not run in (non-extended) PGO task.
+
+    WeavePy is never built under a profile-guided-optimisation task, so
+    `_is_pgo` is always false and the test runs unchanged.
+    """
+    msg = "Not run for (non-extended) PGO task"
+    return test if not _is_pgo else unittest.skip(msg)(test)
+
+
+__all__ += ["open_urlresource", "SuppressCrashReport", "bigaddrspacetest",
+            "TEST_DATA_DIR", "TEST_HOME_DIR", "skip_if_pgo_task", "Py_TRACE_REFS",
+            "requires_mac_ver", "no_color", "force_not_colorized",
+            "force_not_colorized_test_class", "linked_to_musl"]

@@ -2493,9 +2493,10 @@ impl<'src> Parser<'src> {
                 span: lp.span,
             });
         }
-        let first = self.parse_ternary()?;
+        let first = self.parse_ternary_or_starred()?;
+        let first_starred = matches!(first.kind, ExprKind::Starred(_));
         // Generator expression?
-        if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
+        if !first_starred && (self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async)) {
             let generators = self.parse_comp_for()?;
             let rp = self.expect(&TokenKind::RPar, "`)`")?;
             let span = lp.span.merge(rp.span);
@@ -2513,12 +2514,21 @@ impl<'src> Parser<'src> {
                 if self.check(&TokenKind::RPar) {
                     break;
                 }
-                items.push(self.parse_ternary()?);
+                items.push(self.parse_ternary_or_starred()?);
             }
             let rp = self.expect(&TokenKind::RPar, "`)`")?;
             return Ok(Expr {
                 kind: ExprKind::Tuple(items),
                 span: lp.span.merge(rp.span),
+            });
+        }
+        // A bare `(*a)` with no trailing comma is a syntax error in
+        // CPython — starred expressions are only legal inside a tuple/
+        // call/assignment context, never as a lone parenthesized value.
+        if first_starred {
+            return Err(ParseError::Unexpected {
+                span: first.span,
+                message: "can't use starred expression here".to_owned(),
             });
         }
         // Plain parenthesized expression — keep its span but no wrapper node.
@@ -2537,8 +2547,9 @@ impl<'src> Parser<'src> {
                 span: lb.span,
             });
         }
-        let first = self.parse_ternary()?;
-        if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
+        let first = self.parse_ternary_or_starred()?;
+        let first_starred = matches!(first.kind, ExprKind::Starred(_));
+        if !first_starred && (self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async)) {
             let generators = self.parse_comp_for()?;
             let rb = self.expect(&TokenKind::RSqb, "`]`")?;
             return Ok(Expr {
@@ -2554,7 +2565,7 @@ impl<'src> Parser<'src> {
             if self.check(&TokenKind::RSqb) {
                 break;
             }
-            items.push(self.parse_ternary()?);
+            items.push(self.parse_ternary_or_starred()?);
         }
         let rb = self.expect(&TokenKind::RSqb, "`]`")?;
         Ok(Expr {
@@ -2602,8 +2613,9 @@ impl<'src> Parser<'src> {
                 span: lb.span.merge(rb.span),
             });
         }
-        let first = self.parse_ternary()?;
-        if self.eat(&TokenKind::Colon) {
+        let first = self.parse_ternary_or_starred()?;
+        let first_starred = matches!(first.kind, ExprKind::Starred(_));
+        if !first_starred && self.eat(&TokenKind::Colon) {
             // Dict literal (or dict comprehension).
             let v = self.parse_ternary()?;
             if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
@@ -2642,7 +2654,7 @@ impl<'src> Parser<'src> {
             });
         }
         // Otherwise: set literal or set comp.
-        if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
+        if !first_starred && (self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async)) {
             let generators = self.parse_comp_for()?;
             let rb = self.expect(&TokenKind::RBrace, "`}`")?;
             return Ok(Expr {
@@ -2658,7 +2670,7 @@ impl<'src> Parser<'src> {
             if self.check(&TokenKind::RBrace) {
                 break;
             }
-            items.push(self.parse_ternary()?);
+            items.push(self.parse_ternary_or_starred()?);
         }
         let rb = self.expect(&TokenKind::RBrace, "`}`")?;
         Ok(Expr {
@@ -3370,6 +3382,27 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                 let n = u32::from_str_radix(&hex, 16).map_err(|e| e.to_string())?;
                 let ch = char::from_u32(n).ok_or_else(|| {
                     format!("invalid \\U escape: {n:#x} is not a valid character")
+                })?;
+                out.push(ch);
+            }
+            'N' => {
+                // `\N{UNICODE CHARACTER NAME}` — resolve the name against
+                // the full UCD name table. CPython requires the brace form
+                // and raises a SyntaxError ("malformed \N character escape"
+                // / "unknown Unicode character name") otherwise.
+                if chars.next() != Some('{') {
+                    return Err("malformed \\N character escape".to_owned());
+                }
+                let mut name = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(c) => name.push(c),
+                        None => return Err("malformed \\N character escape".to_owned()),
+                    }
+                }
+                let ch = unicode_names2::character(&name).ok_or_else(|| {
+                    format!("unknown Unicode character name in \\N escape: {name:?}")
                 })?;
                 out.push(ch);
             }

@@ -6852,6 +6852,20 @@ impl Interpreter {
         frame.class_namespace = Some(class_ns.clone());
         let _ = self.run_frame(&mut frame)?;
 
+        // A class body with a leading docstring `STORE_NAME`s it as
+        // `__doc__` (see the compiler); every other class needs an
+        // explicit `__doc__ = None` so `Cls.__doc__` reads as `None`
+        // rather than raising `AttributeError`. This mirrors CPython and
+        // keeps pure-Python stdlib that reads `type(self).__doc__` (e.g.
+        // `contextlib._GeneratorContextManager`) working.
+        {
+            let mut ns = class_ns.borrow_mut();
+            let key = DictKey(Object::from_static("__doc__"));
+            if ns.get(&key).is_none() {
+                ns.insert(key, Object::None);
+            }
+        }
+
         // Dispatch through the metaclass: this also runs any
         // user-defined `__new__` / `__init__` chain (EnumMeta uses
         // __new__ for member processing, ABCMeta uses __init__).
@@ -7040,6 +7054,22 @@ impl Interpreter {
     /// into descriptors, and propagate the `forbids_dict` flag from
     /// the MRO.
     fn finalize_class_namespace(&mut self, ty: &Rc<TypeObject>) -> Result<(), RuntimeError> {
+        // PEP 487 / CPython `type.__new__`: `__init_subclass__` and
+        // `__class_getitem__` defined as plain `def`s in the class body
+        // are implicitly converted to class methods. Without this, an
+        // explicit `Cls.__init_subclass__()` (as `string.Template` does
+        // at import) or `Cls.__class_getitem__(x)` leaves `cls` unbound
+        // and raises "missing required argument: 'cls'".
+        for hook in ["__init_subclass__", "__class_getitem__"] {
+            let key = DictKey(Object::from_static(hook));
+            let current = ty.dict.borrow().get(&key).cloned();
+            if let Some(Object::Function(f)) = current {
+                ty.dict
+                    .borrow_mut()
+                    .insert(key, Object::ClassMethod(Rc::new(Object::Function(f))));
+            }
+        }
+
         // Pull __slots__ out if present.
         let slots_obj = ty
             .dict

@@ -6,10 +6,12 @@ Provides the most common context-manager helpers: ``contextmanager``,
 """
 
 import sys
+from functools import wraps
 
 
 __all__ = [
     "contextmanager",
+    "ContextDecorator",
     "closing",
     "suppress",
     "redirect_stdout",
@@ -19,27 +21,62 @@ __all__ = [
 ]
 
 
-class _GeneratorContextManager:
-    """Wrap a generator function turned into a context manager."""
+class ContextDecorator:
+    """A base class or mixin that enables context managers to work as
+    decorators (PEP 343 / CPython ``contextlib.ContextDecorator``)."""
 
-    def __init__(self, gen):
-        self._gen = gen
+    def _recreate_cm(self):
+        """Return a recreated instance of self.
+
+        Allows an otherwise one-shot context manager like
+        ``_GeneratorContextManager`` to be used as a decorator over
+        multiple invocations of the wrapped function.
+        """
+        return self
+
+    def __call__(self, func):
+        @wraps(func)
+        def inner(*args, **kwds):
+            with self._recreate_cm():
+                return func(*args, **kwds)
+        return inner
+
+
+class _GeneratorContextManager(ContextDecorator):
+    """Wrap a generator function turned into a context manager.
+
+    Inherits :class:`ContextDecorator` so a ``@contextmanager`` result
+    can itself be used as a decorator (``@cm`` over a function), with
+    ``_recreate_cm`` rebuilding the one-shot generator each call.
+    """
+
+    def __init__(self, func, args, kwds):
+        self.gen = func(*args, **kwds)
+        self.func, self.args, self.kwds = func, args, kwds
+        # Carry the wrapped function's docstring, matching CPython.
+        doc = getattr(func, "__doc__", None)
+        if doc is None:
+            doc = type(self).__doc__
+        self.__doc__ = doc
+
+    def _recreate_cm(self):
+        return self.__class__(self.func, self.args, self.kwds)
 
     def __enter__(self):
         try:
-            return next(self._gen)
+            return next(self.gen)
         except StopIteration:
-            raise RuntimeError("generator didn't yield")
+            raise RuntimeError("generator didn't yield") from None
 
     def __exit__(self, exc_type, exc_value, traceback):
         if exc_type is None:
             try:
-                next(self._gen)
+                next(self.gen)
             except StopIteration:
                 return False
             raise RuntimeError("generator didn't stop")
         try:
-            self._gen.throw(exc_type, exc_value, traceback)
+            self.gen.throw(exc_type, exc_value, traceback)
         except StopIteration as stop:
             return stop is not exc_value
         except BaseException as exc:
@@ -50,9 +87,15 @@ class _GeneratorContextManager:
 
 
 def contextmanager(func):
-    """Decorator that turns a generator into a context manager."""
+    """Decorator that turns a generator into a context-manager factory.
+
+    The returned ``helper`` builds a fresh :class:`_GeneratorContextManager`
+    per call and is ``functools.wraps``-decorated so the factory keeps the
+    wrapped function's name/qualname/doc.
+    """
+    @wraps(func)
     def helper(*args, **kwargs):
-        return _GeneratorContextManager(func(*args, **kwargs))
+        return _GeneratorContextManager(func, args, kwargs)
     return helper
 
 

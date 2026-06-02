@@ -1799,6 +1799,20 @@ impl Compiler {
         inner.emit(OpCode::LoadConst, name_const);
         inner.emit(OpCode::StoreName, qualname_idx);
 
+        // CPython stores a class body's leading string literal as
+        // `__doc__` via a `STORE_NAME` at the top of the body. Mirror
+        // that so `Cls.__doc__` is faithful (classes without a docstring
+        // get `None` stamped by `__build_class__`). Unlike a function
+        // body — where the docstring lives in `co_consts[0]` — a class
+        // body reserves that slot for the qualname, so it must be an
+        // explicit store rather than a constant-slot convention.
+        if let Some(doc) = first_stmt_docstring(body) {
+            let doc_const = inner.co.intern_constant(Constant::Str(doc.to_owned()));
+            let doc_name = inner.co.intern_name("__doc__");
+            inner.emit(OpCode::LoadConst, doc_const);
+            inner.emit(OpCode::StoreName, doc_name);
+        }
+
         for s in body {
             inner.compile_stmt(s)?;
         }
@@ -2498,6 +2512,42 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower a list/set *display* containing one or more PEP 448 `*x`
+    /// splats. Build an empty container with `build` (count 0), then fold
+    /// each element in: a plain element via the `single` method
+    /// (`list.append` / `set.add`) and each `*x` via the `spread` method
+    /// (`list.extend` / `set.update`). The empty container comes from the
+    /// opcode itself, so the lowering is robust against `list`/`set`
+    /// being shadowed in the enclosing scope (unlike the call-site tuple
+    /// path, which loads the `tuple` builtin by name).
+    fn compile_unpacking_sequence(
+        &mut self,
+        items: &[Expr],
+        build: OpCode,
+        single: &str,
+        spread: &str,
+    ) -> Result<(), CompileError> {
+        self.emit(build, 0);
+        for item in items {
+            self.emit(OpCode::CopyTop, 0);
+            match &item.kind {
+                ExprKind::Starred(inner) => {
+                    let m = self.co.intern_name(spread);
+                    self.emit(OpCode::LoadAttr, m);
+                    self.compile_expr(inner)?;
+                }
+                _ => {
+                    let m = self.co.intern_name(single);
+                    self.emit(OpCode::LoadAttr, m);
+                    self.compile_expr(item)?;
+                }
+            }
+            self.emit(OpCode::Call, 1);
+            self.emit(OpCode::PopTop, 0);
+        }
+        Ok(())
+    }
+
     /// Lower a keyword-argument list, possibly with `**d` spreads,
     /// into a single dict on the stack. Each named kwarg becomes a
     /// `(name, value)` pair; each `**d` is merged in with `dict.update`.
@@ -2823,22 +2873,36 @@ impl Compiler {
                 self.emit(OpCode::BuildSlice, 3);
             }
             ExprKind::Tuple(items) => {
-                for x in items {
-                    self.compile_expr(x)?;
+                if items.iter().any(|x| matches!(x.kind, ExprKind::Starred(_))) {
+                    // PEP 448: `(*a, b, *c)` — reuse the call-site splat
+                    // lowering, which concatenates tuple segments.
+                    self.compile_starred_args_tuple(items)?;
+                } else {
+                    for x in items {
+                        self.compile_expr(x)?;
+                    }
+                    self.emit(OpCode::BuildTuple, items.len() as u32);
                 }
-                self.emit(OpCode::BuildTuple, items.len() as u32);
             }
             ExprKind::List(items) => {
-                for x in items {
-                    self.compile_expr(x)?;
+                if items.iter().any(|x| matches!(x.kind, ExprKind::Starred(_))) {
+                    self.compile_unpacking_sequence(items, OpCode::BuildList, "append", "extend")?;
+                } else {
+                    for x in items {
+                        self.compile_expr(x)?;
+                    }
+                    self.emit(OpCode::BuildList, items.len() as u32);
                 }
-                self.emit(OpCode::BuildList, items.len() as u32);
             }
             ExprKind::Set(items) => {
-                for x in items {
-                    self.compile_expr(x)?;
+                if items.iter().any(|x| matches!(x.kind, ExprKind::Starred(_))) {
+                    self.compile_unpacking_sequence(items, OpCode::BuildSet, "add", "update")?;
+                } else {
+                    for x in items {
+                        self.compile_expr(x)?;
+                    }
+                    self.emit(OpCode::BuildSet, items.len() as u32);
                 }
-                self.emit(OpCode::BuildSet, items.len() as u32);
             }
             ExprKind::Dict { keys, values } => {
                 // Two emission paths: the "no spread" common case
