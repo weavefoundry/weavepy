@@ -43,7 +43,6 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -798,25 +797,49 @@ enum ChildOutcome {
 
 /// Wait up to `timeout` for `child` to exit. If it doesn't, SIGKILL the
 /// child and return [`ChildOutcome::TimedOut`].
+///
+/// stdout/stderr are drained on dedicated threads from the moment the
+/// child starts. Reading only *after* the child exits (the obvious
+/// approach) deadlocks against any child that writes more than one pipe
+/// buffer's worth of output (~64 KiB): the child blocks in `write()`
+/// waiting for us to read, while we block in `wait()` waiting for it to
+/// exit. A `unittest` file with hundreds of failing assertions trips this
+/// instantly, so the reader threads are load-bearing for subprocess mode.
 fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> ChildOutcome {
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        pipe.map(|mut s| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf);
+                buf
+            })
+        })
+    }
+    fn collect(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> String {
+        handle
+            .and_then(|h| h.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    }
+
+    let out_handle = drain(child.stdout.take());
+    let err_handle = drain(child.stderr.take());
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    let _ = s.read_to_string(&mut stdout);
-                }
-                if let Some(mut s) = child.stderr.take() {
-                    let _ = s.read_to_string(&mut stderr);
-                }
-                return ChildOutcome::Exited(status, stdout, stderr);
+                return ChildOutcome::Exited(status, collect(out_handle), collect(err_handle));
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Join the readers so the threads don't outlive us;
+                    // the pipes close on kill, so they return promptly.
+                    let _ = collect(out_handle);
+                    let _ = collect(err_handle);
                     return ChildOutcome::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(50));

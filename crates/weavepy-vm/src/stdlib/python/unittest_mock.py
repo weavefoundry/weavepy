@@ -6,7 +6,17 @@ and `call_count` / `call_args` / `call_args_list`. Not a full port
 but enough to run most test suites that lean on `mock.patch`.
 """
 
+import builtins
 import sys
+
+
+# Public builtin names. Patching one of these onto a *module* implicitly
+# creates it (CPython does the same): a module's functions resolve a bare
+# name through the module globals before falling back to builtins, so the
+# patched name is what they'll see. Lets e.g. `patch.object(mod, 'open')`
+# work even though `mod` never bound `open` itself.
+_builtins = {name for name in dir(builtins) if not name.startswith("_")}
+_ModuleType = type(sys)
 
 
 __all__ = [
@@ -457,9 +467,14 @@ class _patch:
     def __enter__(self):
         obj = self._resolve_target()
         self._had = hasattr(obj, self.attribute)
+        # A builtin name patched onto a module is created implicitly (see
+        # `_builtins`), matching CPython's `_patch.get_original`.
+        create = self.create or (
+            self.attribute in _builtins and isinstance(obj, _ModuleType)
+        )
         if self._had:
             self._original = getattr(obj, self.attribute)
-        elif not self.create:
+        elif not create:
             raise AttributeError(f"{obj!r} does not have the attribute {self.attribute!r}")
         new = self.new
         if new is DEFAULT:

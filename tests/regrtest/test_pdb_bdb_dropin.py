@@ -111,14 +111,34 @@ def test_bdb_clear_break():
     class B(bdb.Bdb):
         pass
 
+    # CPython's ``set_break`` requires the target source line to exist
+    # (it consults ``linecache``), so use real lines from a local function
+    # rather than a synthetic filename. ``get_all_breaks()`` returns the
+    # ``{filename: [lineno, ...]}`` map keyed by file, so assert the
+    # per-file line list via ``get_file_breaks``.
+    def victim():
+        a = 1
+        b_ = 2
+        return a + b_
+
+    # Breakpoints live in the class-level ``Breakpoint`` registry and a new
+    # ``Bdb`` loads them, so clear any left over by earlier tests first
+    # (CPython's own test suite does the same in ``setUp``).
+    bdb.Breakpoint.clearBreakpoints()
     b = B()
-    b.set_break('<test>', 10)
-    b.set_break('<test>', 20)
-    breaks = b.get_all_breaks()
-    assert_eq(len(breaks), 2, 'two breakpoints registered')
-    b.clear_break('<test>', 10)
-    breaks_after = b.get_all_breaks()
-    assert_eq(len(breaks_after), 1, 'one breakpoint after clear')
+    code = victim.__code__
+    fn = code.co_filename
+    line1 = code.co_firstlineno + 1  # ``a = 1``
+    line2 = code.co_firstlineno + 2  # ``b_ = 2``
+    assert_true(b.set_break(fn, line1) is None, 'set_break line1 succeeds')
+    assert_true(b.set_break(fn, line2) is None, 'set_break line2 succeeds')
+    assert_eq(sorted(b.get_file_breaks(fn)), [line1, line2],
+              'two breakpoints registered')
+    assert_true(b.get_break(fn, line1) and b.get_break(fn, line2),
+                'both breakpoints present')
+    b.clear_break(fn, line1)
+    assert_true(not b.get_break(fn, line1), 'break at line1 cleared')
+    assert_eq(b.get_file_breaks(fn), [line2], 'one breakpoint after clear')
 
 
 def main():

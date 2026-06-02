@@ -409,7 +409,17 @@ impl GcState {
         // `Rc::strong_count - 1` (the candidate set holds one
         // reference itself, in `TrackedHandle::object`).
         for handle in &candidate_set {
-            let outer = strong_count_for(&handle.object).saturating_sub(1) as i64;
+            // A weak reference must not keep its referent reachable, but
+            // each live slot holds a strong `Object` clone of the target
+            // (the registry's drop-driven clear model). Discount those
+            // clones here so an object reachable *only* through weakrefs
+            // collapses to `gc_refs == 0` and is collected — which fires
+            // `notify_clear` and flips `weakref.ref(obj)()` to `None`.
+            let weak_clones =
+                crate::weakref_registry::strong_clone_count(handle.id) as i64;
+            let outer = strong_count_for(&handle.object)
+                .saturating_sub(1)
+                .saturating_sub(weak_clones as usize) as i64;
             handle.gc_refs.store(outer, Ordering::Release);
             handle.color.store(color::White, Ordering::Release);
         }

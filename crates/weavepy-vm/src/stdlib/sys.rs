@@ -72,6 +72,21 @@ pub fn build_with_state(
                 call_kw: None,
             })),
         );
+        let es_fallback_exc = exc_info_stack.clone();
+        d.insert(
+            DictKey(Object::from_static("exception")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "exception",
+                call: Box::new(move |_| {
+                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
+                        sys_exception(&h.exc_info_stack)
+                    } else {
+                        sys_exception(&es_fallback_exc)
+                    }
+                }),
+                call_kw: None,
+            })),
+        );
         let eh_get = excepthook.clone();
         d.insert(
             DictKey(Object::from_static("__excepthook__")),
@@ -482,8 +497,28 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("setrecursionlimit", sys_setrecursionlimit),
         );
         d.insert(
+            DictKey(Object::from_static("get_int_max_str_digits")),
+            builtin("get_int_max_str_digits", sys_get_int_max_str_digits),
+        );
+        d.insert(
+            DictKey(Object::from_static("set_int_max_str_digits")),
+            builtin("set_int_max_str_digits", sys_set_int_max_str_digits),
+        );
+        d.insert(
             DictKey(Object::from_static("intern")),
             builtin("intern", sys_intern),
+        );
+        d.insert(
+            DictKey(Object::from_static("getdefaultencoding")),
+            builtin("getdefaultencoding", sys_getdefaultencoding),
+        );
+        d.insert(
+            DictKey(Object::from_static("getfilesystemencoding")),
+            builtin("getfilesystemencoding", sys_getfilesystemencoding),
+        );
+        d.insert(
+            DictKey(Object::from_static("getfilesystemencodeerrors")),
+            builtin("getfilesystemencodeerrors", sys_getfilesystemencodeerrors),
         );
 
         // Standard I/O streams. We expose them as file-like objects
@@ -607,13 +642,81 @@ fn sys_exit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sys_getrecursionlimit(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(1000))
+    Ok(Object::Int(crate::recursion::recursion_limit() as i64))
+}
+
+thread_local! {
+    // PEP 0467 int<->str conversion cap. WeavePy doesn't yet *enforce* the
+    // limit on conversion, but `sys.get/set_int_max_str_digits` must round-trip
+    // (test_int reads/sets it; many modules query it at import).
+    static INT_MAX_STR_DIGITS: std::cell::Cell<i64> = const { std::cell::Cell::new(4300) };
+}
+
+/// The current per-thread int↔str conversion digit cap (0 = unlimited).
+/// Read by the str→int / int→str conversion paths to enforce PEP 0467.
+pub fn int_max_str_digits() -> i64 {
+    INT_MAX_STR_DIGITS.with(|c| c.get())
+}
+
+fn sys_get_int_max_str_digits(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Int(INT_MAX_STR_DIGITS.with(|c| c.get())))
+}
+
+fn sys_set_int_max_str_digits(args: &[Object]) -> Result<Object, RuntimeError> {
+    let n = match args.first() {
+        Some(Object::Int(n)) => *n,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => return Err(type_error("'maxdigits' must be an integer")),
+    };
+    // CPython rejects values in (0, 640); 0 disables the limit.
+    if n != 0 && n < 640 {
+        return Err(value_error(
+            "maxdigits must be 0 or larger than 640",
+        ));
+    }
+    INT_MAX_STR_DIGITS.with(|c| c.set(n));
+    Ok(Object::None)
 }
 
 fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _ = args;
-    // No-op for now: the host stack does the bounding.
-    Ok(Object::None)
+    // RFC 0037 (WS1) — the limit is now enforced by the dispatch loop's
+    // recursion guard rather than left to the native stack.
+    let limit = match args.first() {
+        Some(Object::Int(n)) => *n,
+        Some(Object::Bool(b)) => i64::from(*b),
+        Some(Object::Long(n)) => {
+            // Absurdly large limits are accepted by CPython; clamp to a
+            // value the usize counter can represent.
+            use num_traits::ToPrimitive;
+            n.to_i64().unwrap_or(i64::MAX)
+        }
+        Some(_) => {
+            return Err(type_error(
+                "'limit' must be an integer",
+            ))
+        }
+        None => {
+            return Err(type_error(
+                "setrecursionlimit expected 1 argument, got 0",
+            ))
+        }
+    };
+    if limit < 1 {
+        return Err(value_error(
+            "recursion limit must be greater or equal than 1",
+        ));
+    }
+    match crate::recursion::set_limit(limit as usize) {
+        Ok(()) => Ok(Object::None),
+        Err(depth) => Err(RuntimeError::PyException(crate::error::PyException::new(
+            crate::builtin_types::make_exception(
+                "RecursionError",
+                format!(
+                    "cannot set the recursion limit to {limit} at the recursion depth {depth}: the limit is too low"
+                ),
+            ),
+        ))),
+    }
 }
 
 fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -621,6 +724,19 @@ fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(_)) => Ok(args[0].clone()),
         _ => Err(type_error("sys.intern() argument must be str")),
     }
+}
+
+fn sys_getdefaultencoding(_args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython 3 always returns "utf-8" here.
+    Ok(Object::from_static("utf-8"))
+}
+
+fn sys_getfilesystemencoding(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::from_static("utf-8"))
+}
+
+fn sys_getfilesystemencodeerrors(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::from_static("surrogatepass"))
 }
 
 fn sys_getframe(
@@ -644,6 +760,19 @@ fn sys_getframe(
     }
     let idx = stack.len() - 1 - depth;
     Ok(Object::Frame(stack[idx].clone()))
+}
+
+/// `sys.exception()` (PEP 3134 / 3.11+): the exception instance currently
+/// being handled, or `None` if not in an `except`. Equivalent to
+/// `sys.exc_info()[1]`. The verbatim CPython `contextlib` relies on this.
+fn sys_exception(
+    exc_info_stack: &Rc<RefCell<Vec<crate::error::PyException>>>,
+) -> Result<Object, RuntimeError> {
+    let stack = exc_info_stack.borrow();
+    Ok(stack
+        .last()
+        .map(|top| top.instance.clone())
+        .unwrap_or(Object::None))
 }
 
 fn sys_exc_info(
@@ -829,12 +958,21 @@ fn sys_flags_value() -> Object {
         "dev_mode",
         "utf8_mode",
         "safe_path",
-        "int_max_str_digits",
         "warn_default_encoding",
     ] {
         d.insert(DictKey(Object::from_static(name)), Object::Int(0));
     }
-    Object::Dict(Rc::new(RefCell::new(d)))
+    // CPython's default cap on int<->str conversion size (PEP 0467 /
+    // `-X int_max_str_digits`). test_int reads this off `sys.flags`.
+    d.insert(
+        DictKey(Object::from_static("int_max_str_digits")),
+        Object::Int(4300),
+    );
+    // CPython exposes `sys.flags` as a struct-sequence answering attribute
+    // access (`sys.flags.optimize`, `sys.flags.bytes_warning`, …), used by
+    // test_descr / test_bytes / test_collections. A SimpleNamespace gives
+    // us that attribute surface (mirrors `sys.float_info` above).
+    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
 fn sys_float_info() -> Object {
@@ -886,9 +1024,13 @@ fn sys_int_info() -> Object {
 fn sys_hash_info() -> Object {
     let mut d = DictData::new();
     d.insert(DictKey(Object::from_static("width")), Object::Int(64));
+    // `_PyHASH_MODULUS` on a 64-bit build is the Mersenne prime 2**61-1,
+    // which is also the modulus `python_int_hash`/`py_hash_double` reduce
+    // through. test_numeric_tower derives `_PyHASH_MODULUS` from this field
+    // and checks exact Fraction hashes against it, so it must match.
     d.insert(
         DictKey(Object::from_static("modulus")),
-        Object::Int(i64::MAX),
+        Object::Int((1i64 << 61) - 1),
     );
     d.insert(DictKey(Object::from_static("inf")), Object::Int(314_159));
     d.insert(DictKey(Object::from_static("nan")), Object::Int(0));

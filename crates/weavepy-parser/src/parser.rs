@@ -55,6 +55,26 @@ impl<'src> Parser<'src> {
         &self.source[span.start.0 as usize..span.end.0 as usize]
     }
 
+    /// Identifier text for a NAME token, NFKC-normalized per PEP 3131.
+    ///
+    /// CPython normalizes every identifier to Normalization Form KC at
+    /// parse time (`unicodeobject.c: _PyUnicode_TransformDecimalAndSpaceToASCII`
+    /// → `compile.c`/`tokenizer` actually use `PyUnicode_FromString` +
+    /// `unicodedata.normalize('NFKC', …)`), so `µ` (U+00B5) and `μ`
+    /// (U+03BC) bind the same name, and the mathematical-alphabet
+    /// `𝔘𝔫𝔦𝔠𝔬𝔡𝔢` folds to plain `Unicode`. ASCII identifiers — the
+    /// overwhelmingly common case — are already in NFKC, so we return the
+    /// borrowed slice without touching the normalizer.
+    fn ident(&self, span: Span) -> String {
+        let raw = self.lexeme(span);
+        if raw.is_ascii() {
+            raw.to_owned()
+        } else {
+            use unicode_normalization::UnicodeNormalization;
+            raw.nfkc().collect()
+        }
+    }
+
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.pos].kind
     }
@@ -251,7 +271,7 @@ impl<'src> Parser<'src> {
     fn parse_type_alias_stmt(&mut self) -> Result<Stmt, ParseError> {
         let type_tok = self.bump(); // `type`
         let name_tok = self.expect(&TokenKind::Name, "type alias name")?;
-        let name = self.lexeme(name_tok.span).to_owned();
+        let name = self.ident(name_tok.span);
         let type_params = self.collect_pep695_type_params()?;
         self.expect(&TokenKind::Equal, "`=`")?;
         let value = self.parse_expression_list(true)?;
@@ -293,7 +313,7 @@ impl<'src> Parser<'src> {
                 break;
             }
             let name_tok = self.expect(&TokenKind::Name, "type parameter name")?;
-            names.push(self.lexeme(name_tok.span).to_owned());
+            names.push(self.ident(name_tok.span));
             // Skip optional `: bound` and `= default`.
             if matches!(self.peek(), TokenKind::Colon) {
                 self.bump();
@@ -453,9 +473,12 @@ impl<'src> Parser<'src> {
                 }
                 Ok(())
             }
-            other => Err(ParseError::Unexpected {
+            // Leftover tokens after an otherwise-complete statement are
+            // CPython's catch-all "invalid syntax" (e.g. `1 2`, or a bad
+            // string prefix like `fu''` which tokenises as NAME + STRING).
+            _ => Err(ParseError::Unexpected {
                 span: self.peek_token().span,
-                message: format!("expected end of statement, got {other:?}"),
+                message: "invalid syntax".to_owned(),
             }),
         }
     }
@@ -562,7 +585,7 @@ impl<'src> Parser<'src> {
     fn parse_function_def(&mut self, decorator_list: Vec<Expr>) -> Result<Stmt, ParseError> {
         let def_tok = self.bump(); // `def`
         let name_tok = self.expect(&TokenKind::Name, "function name")?;
-        let name = self.lexeme(name_tok.span).to_owned();
+        let name = self.ident(name_tok.span);
         // PEP 695: optional `[T, *Ts, **P]` type-parameter list.
         // Consumed-and-discarded for now — the names are real `TypeVar`-shaped
         // objects in CPython, but the parser tolerates the syntax so generic
@@ -669,7 +692,7 @@ impl<'src> Parser<'src> {
     fn parse_class_def(&mut self, decorator_list: Vec<Expr>) -> Result<Stmt, ParseError> {
         let class_tok = self.bump(); // `class`
         let name_tok = self.expect(&TokenKind::Name, "class name")?;
-        let name = self.lexeme(name_tok.span).to_owned();
+        let name = self.ident(name_tok.span);
         // PEP 695: optional `[T, *Ts, **P]` type-parameter list (same as
         // function form).
         self.skip_pep695_type_params()?;
@@ -733,7 +756,7 @@ impl<'src> Parser<'src> {
                 let n = if self.at_keyword(Keyword::As) {
                     self.bump();
                     let nt = self.expect(&TokenKind::Name, "name after `as`")?;
-                    Some(self.lexeme(nt.span).to_owned())
+                    Some(self.ident(nt.span))
                 } else {
                     None
                 };
@@ -904,6 +927,10 @@ impl<'src> Parser<'src> {
         // 2 = keyword-only (after `*`)
         let mut phase = 0u8;
         let mut had_default = false;
+        // A bare `*` separator (no `*args` name) requires at least one
+        // keyword-only argument to follow it; CPython rejects `def f(p, *)`
+        // and `def f(p, *, **kw)` with "named arguments must follow bare *".
+        let mut bare_star_span: Option<Span> = None;
         loop {
             if self.check(&TokenKind::RPar) || self.check(&TokenKind::Colon) {
                 break;
@@ -913,10 +940,12 @@ impl<'src> Parser<'src> {
                 if matches!(self.peek(), TokenKind::Name) {
                     let n = self.bump();
                     args.vararg = Some(Arg {
-                        name: self.lexeme(n.span).to_owned(),
+                        name: self.ident(n.span),
                         annotation: self.try_arg_annotation(allow_annotation)?,
                         span: n.span,
                     });
+                } else {
+                    bare_star_span = Some(self.peek_token().span);
                 }
                 phase = 2;
                 if !self.eat(&TokenKind::Comma) {
@@ -928,7 +957,7 @@ impl<'src> Parser<'src> {
             if self.eat(&TokenKind::DoubleStar) {
                 let n = self.expect(&TokenKind::Name, "kwarg name")?;
                 args.kwarg = Some(Arg {
-                    name: self.lexeme(n.span).to_owned(),
+                    name: self.ident(n.span),
                     annotation: self.try_arg_annotation(allow_annotation)?,
                     span: n.span,
                 });
@@ -948,7 +977,7 @@ impl<'src> Parser<'src> {
             }
 
             let n = self.expect(&TokenKind::Name, "parameter name")?;
-            let name = self.lexeme(n.span).to_owned();
+            let name = self.ident(n.span);
             let annotation = self.try_arg_annotation(allow_annotation)?;
             let default = if self.eat(&TokenKind::Equal) {
                 Some(self.parse_expression(false)?)
@@ -979,6 +1008,38 @@ impl<'src> Parser<'src> {
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
+        }
+        // A bare `*` must be followed by at least one keyword-only
+        // argument (CPython: "named arguments must follow bare *").
+        if let Some(span) = bare_star_span {
+            if args.kwonlyargs.is_empty() {
+                return Err(ParseError::Unexpected {
+                    span,
+                    message: "named arguments must follow bare *".to_owned(),
+                });
+            }
+        }
+        // No parameter name may repeat across any section
+        // (positional-only, positional-or-keyword, `*args`, keyword-only,
+        // `**kwargs`) — CPython raises "duplicate argument '<n>' in
+        // function definition".
+        let mut seen: Vec<&str> = Vec::new();
+        let dup_span = |span: Span, name: &str| ParseError::Unexpected {
+            span,
+            message: format!("duplicate argument '{name}' in function definition"),
+        };
+        for a in args
+            .posonlyargs
+            .iter()
+            .chain(args.args.iter())
+            .chain(args.vararg.iter())
+            .chain(args.kwonlyargs.iter())
+            .chain(args.kwarg.iter())
+        {
+            if seen.contains(&a.name.as_str()) {
+                return Err(dup_span(a.span, &a.name));
+            }
+            seen.push(a.name.as_str());
         }
         Ok(args)
     }
@@ -1104,7 +1165,7 @@ impl<'src> Parser<'src> {
             let asname = if self.at_keyword(Keyword::As) {
                 self.bump();
                 let n = self.expect(&TokenKind::Name, "name after `as`")?;
-                Some(self.lexeme(n.span).to_owned())
+                Some(self.ident(n.span))
             } else {
                 None
             };
@@ -1125,11 +1186,11 @@ impl<'src> Parser<'src> {
 
     fn parse_dotted_name(&mut self) -> Result<String, ParseError> {
         let first = self.expect(&TokenKind::Name, "module name")?;
-        let mut out = self.lexeme(first.span).to_owned();
+        let mut out = self.ident(first.span);
         while self.eat(&TokenKind::Dot) {
             let n = self.expect(&TokenKind::Name, "name after `.`")?;
             out.push('.');
-            out.push_str(self.lexeme(n.span));
+            out.push_str(&self.ident(n.span));
         }
         Ok(out)
     }
@@ -1167,11 +1228,11 @@ impl<'src> Parser<'src> {
                     break;
                 }
                 let n = self.expect(&TokenKind::Name, "imported name")?;
-                let name = self.lexeme(n.span).to_owned();
+                let name = self.ident(n.span);
                 let asname = if self.at_keyword(Keyword::As) {
                     self.bump();
                     let n2 = self.expect(&TokenKind::Name, "name after `as`")?;
-                    Some(self.lexeme(n2.span).to_owned())
+                    Some(self.ident(n2.span))
                 } else {
                     None
                 };
@@ -1263,7 +1324,7 @@ impl<'src> Parser<'src> {
         let mut names = Vec::new();
         loop {
             let n = self.expect(&TokenKind::Name, "name")?;
-            names.push(self.lexeme(n.span).to_owned());
+            names.push(self.ident(n.span));
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -1362,7 +1423,7 @@ impl<'src> Parser<'src> {
         if self.at_keyword(Keyword::As) {
             self.bump();
             let n = self.expect(&TokenKind::Name, "name after `as`")?;
-            let name = self.lexeme(n.span).to_owned();
+            let name = self.ident(n.span);
             if name == "_" {
                 return Err(ParseError::Unexpected {
                     span: n.span,
@@ -1399,7 +1460,7 @@ impl<'src> Parser<'src> {
             let name = match self.peek() {
                 TokenKind::Name => {
                     let tok = self.bump();
-                    let s = self.lexeme(tok.span).to_owned();
+                    let s = self.ident(tok.span);
                     if s == "_" {
                         None
                     } else {
@@ -1500,7 +1561,7 @@ impl<'src> Parser<'src> {
     /// value pattern; `(` makes it a class pattern; otherwise capture.
     fn parse_name_pattern(&mut self) -> Result<Pattern, ParseError> {
         let first = self.bump();
-        let first_name = self.lexeme(first.span).to_owned();
+        let first_name = self.ident(first.span);
         // Dotted: value pattern.
         if self.check(&TokenKind::Dot) {
             let mut expr = Expr {
@@ -1509,7 +1570,7 @@ impl<'src> Parser<'src> {
             };
             while self.eat(&TokenKind::Dot) {
                 let n = self.expect(&TokenKind::Name, "attribute name in pattern")?;
-                let attr = self.lexeme(n.span).to_owned();
+                let attr = self.ident(n.span);
                 let span = expr.span.merge(n.span);
                 expr = Expr {
                     kind: ExprKind::Attribute {
@@ -1550,7 +1611,7 @@ impl<'src> Parser<'src> {
                 && matches!(self.peek_at(1), Some(TokenKind::Equal))
             {
                 let n = self.bump();
-                let name = self.lexeme(n.span).to_owned();
+                let name = self.ident(n.span);
                 self.bump(); // `=`
                 let p = self.parse_pattern()?;
                 keywords.push((name, p));
@@ -1625,7 +1686,7 @@ impl<'src> Parser<'src> {
         while !self.check(&TokenKind::RBrace) {
             if self.eat(&TokenKind::DoubleStar) {
                 let n = self.expect(&TokenKind::Name, "name after `**` in mapping pattern")?;
-                let name = self.lexeme(n.span).to_owned();
+                let name = self.ident(n.span);
                 rest = Some(if name == "_" { None } else { Some(name) });
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -1682,12 +1743,12 @@ impl<'src> Parser<'src> {
         // Dotted name as a value key.
         let n = self.expect(&TokenKind::Name, "key")?;
         let mut expr = Expr {
-            kind: ExprKind::Name(self.lexeme(n.span).to_owned()),
+            kind: ExprKind::Name(self.ident(n.span)),
             span: n.span,
         };
         while self.eat(&TokenKind::Dot) {
             let attr_tok = self.expect(&TokenKind::Name, "attribute name in key")?;
-            let attr = self.lexeme(attr_tok.span).to_owned();
+            let attr = self.ident(attr_tok.span);
             let span = expr.span.merge(attr_tok.span);
             expr = Expr {
                 kind: ExprKind::Attribute {
@@ -1725,9 +1786,39 @@ impl<'src> Parser<'src> {
             }
             Ok(body)
         } else {
-            // Inline single-statement block: `if x: y = 1`, `class A: pass`.
-            let s = self.parse_statement()?;
-            Ok(vec![s])
+            // Inline suite after `:` — Python's `simple_stmt`:
+            //   small_stmt (';' small_stmt)* [';'] NEWLINE
+            // e.g. `if x: y = 1`, `class A: pass`, and crucially the
+            // multi-statement form `def f(): a = 1; return a`. We used to
+            // parse only the first statement, leaving `; return a` to be
+            // re-parsed by the *enclosing* scope — which then rejected the
+            // `return` as "outside function". Each `parse_statement`
+            // consumes its own terminator (`;` or NEWLINE via
+            // `consume_stmt_end`), so we keep going while that terminator
+            // was a `;` and another small statement follows on the line.
+            let mut body = Vec::new();
+            loop {
+                body.push(self.parse_statement()?);
+                let ended_with_semi = matches!(
+                    self.tokens.get(self.pos.wrapping_sub(1)).map(|t| &t.kind),
+                    Some(TokenKind::Semi)
+                );
+                if !ended_with_semi {
+                    break;
+                }
+                // A trailing `;` right before the line break (`a = 1;`)
+                // ends the suite; consume the closing NEWLINE so the
+                // caller resumes from a clean statement boundary.
+                match self.peek() {
+                    TokenKind::Newline => {
+                        self.bump();
+                        break;
+                    }
+                    TokenKind::Endmarker | TokenKind::Dedent => break,
+                    _ => {}
+                }
+            }
+            Ok(body)
         }
     }
 
@@ -1818,7 +1909,7 @@ impl<'src> Parser<'src> {
             if let Some(next) = self.tokens.get(self.pos + 1) {
                 if matches!(next.kind, TokenKind::ColonEqual) {
                     let name_tok = self.peek_token().clone();
-                    let name = self.lexeme(name_tok.span).to_owned();
+                    let name = self.ident(name_tok.span);
                     self.bump(); // name
                     self.bump(); // :=
                     let value = self.parse_ternary()?;
@@ -2250,7 +2341,7 @@ impl<'src> Parser<'src> {
                 TokenKind::Dot => {
                     self.bump();
                     let n = self.expect(&TokenKind::Name, "attribute name")?;
-                    let attr = self.lexeme(n.span).to_owned();
+                    let attr = self.ident(n.span);
                     let span = base.span.merge(n.span);
                     base = Expr {
                         kind: ExprKind::Attribute {
@@ -2272,9 +2363,16 @@ impl<'src> Parser<'src> {
         if self.check(&TokenKind::RPar) {
             return Ok((args, keywords));
         }
+        // Track keyword state so we can reject a plain positional argument
+        // that follows a keyword (CPython: "positional argument follows
+        // keyword argument") and a repeated keyword name (CPython:
+        // "keyword argument repeated: <name>").
+        let mut seen_keyword = false;
+        let mut kw_names: Vec<String> = Vec::new();
         loop {
             if self.eat(&TokenKind::DoubleStar) {
                 let val = self.parse_ternary()?;
+                seen_keyword = true;
                 keywords.push(KwArg {
                     arg: None,
                     value: val,
@@ -2292,14 +2390,28 @@ impl<'src> Parser<'src> {
                     && matches!(self.peek_at(1), Some(TokenKind::Equal))
                 {
                     let nt = self.bump();
-                    let name = self.lexeme(nt.span).to_owned();
+                    let name = self.ident(nt.span);
+                    if kw_names.contains(&name) {
+                        return Err(ParseError::Unexpected {
+                            span: nt.span,
+                            message: format!("keyword argument repeated: {name}"),
+                        });
+                    }
                     self.bump(); // `=`
                     let val = self.parse_ternary()?;
+                    seen_keyword = true;
+                    kw_names.push(name.clone());
                     keywords.push(KwArg {
                         arg: Some(name),
                         value: val,
                     });
                 } else {
+                    if seen_keyword {
+                        return Err(ParseError::Unexpected {
+                            span: self.peek_token().span,
+                            message: "positional argument follows keyword argument".to_owned(),
+                        });
+                    }
                     let e = self.parse_ternary()?;
                     // Generator expression as single argument: `f(x for x in xs)`.
                     if (self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async))
@@ -2442,7 +2554,7 @@ impl<'src> Parser<'src> {
             TokenKind::Name => {
                 self.bump();
                 Ok(Expr {
-                    kind: ExprKind::Name(self.lexeme(tok.span).to_owned()),
+                    kind: ExprKind::Name(self.ident(tok.span)),
                     span: tok.span,
                 })
             }
@@ -2982,6 +3094,42 @@ impl<'src> Parser<'src> {
         let mut i = 0usize;
         while i < bytes.len() {
             let b = bytes[i];
+            // Non-raw backslash escapes are copied into the literal as a
+            // unit so the decoder interprets them — and, crucially, so an
+            // escaped backslash (`\\`) can't have its second byte misread
+            // as the start of a new escape (e.g. `f'\\N{AMPERSAND}'` is a
+            // literal `\` then the field `{AMPERSAND}`, not `\N{...}`).
+            if b == b'\\' && !raw {
+                // `\N{NAME}` named-character escape: the brace group is
+                // the Unicode character name, not a replacement field.
+                if bytes.get(i + 1) == Some(&b'N') && bytes.get(i + 2) == Some(&b'{') {
+                    let mut j = i + 3;
+                    while j < bytes.len() && bytes[j] != b'}' {
+                        j += 1;
+                    }
+                    if j < bytes.len() {
+                        j += 1; // include the closing `}`
+                    }
+                    literal.push_str(&body[i..j]);
+                    i = j;
+                    continue;
+                }
+                // Any other escape: copy the backslash, then its escaped
+                // character — except `{`/`}`, which stay structural (a
+                // lone `\` before a brace is a literal backslash followed
+                // by a replacement field / brace escape, e.g. `\{6*7}`).
+                literal.push('\\');
+                i += 1;
+                if let Some(&n) = bytes.get(i) {
+                    if n != b'{' && n != b'}' {
+                        let ch_len = utf8_char_len(n);
+                        let end = (i + ch_len).min(bytes.len());
+                        literal.push_str(&body[i..end]);
+                        i = end;
+                    }
+                }
+                continue;
+            }
             if b == b'{' {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                     literal.push('{');
@@ -3014,7 +3162,7 @@ impl<'src> Parser<'src> {
                 }
                 return Err(ParseError::Unexpected {
                     span: anchor,
-                    message: "single '}' is not allowed in f-string".to_owned(),
+                    message: "f-string: single '}' is not allowed".to_owned(),
                 });
             }
             // Append the next UTF-8 character (one or more bytes).
@@ -3036,8 +3184,16 @@ impl<'src> Parser<'src> {
         Ok(parts)
     }
 
-    /// Scan from just past the opening `{` to the matching `}` at depth 0.
-    /// Returns the field text and the index of the closing `}`.
+    /// Scan from just past the opening `{` to the matching `}` at the
+    /// field's top level. Returns the field text and the index of that
+    /// closing `}`.
+    ///
+    /// Bracket nesting is tracked with an explicit stack so we can report
+    /// CPython's PEP 701 diagnostics: a `)`/`]`/`}` that doesn't match the
+    /// innermost opener yields "closing parenthesis 'X' does not match
+    /// opening parenthesis 'Y'", a `)`/`]` with nothing open yields
+    /// "f-string: unmatched ')'", and running off the end yields
+    /// "f-string: expecting '}'".
     fn scan_fstring_field(
         &self,
         body: &str,
@@ -3045,11 +3201,18 @@ impl<'src> Parser<'src> {
         anchor: Span,
     ) -> Result<(String, usize), ParseError> {
         let bytes = body.as_bytes();
-        let mut depth = 1i32;
+        // Openers seen *inside* the field (the field's own `{` is implicit
+        // and not pushed); a top-level `}` closes the field.
+        let mut stack: Vec<u8> = Vec::new();
         let mut i = start;
-        // String state machine for backtick-free quotes inside the field.
+        // String state machine for quotes inside the field.
         let mut in_str: Option<u8> = None;
         let mut triple = false;
+        // Once the top-level `:` is seen we're in the format spec, where
+        // `#` is literal (e.g. `{x:#06x}`); before it, in the expression
+        // part, `#` starts a comment to end of line (legal in multi-line
+        // f-strings, PEP 701).
+        let mut in_spec = false;
         while i < bytes.len() {
             let b = bytes[i];
             if let Some(q) = in_str {
@@ -3088,26 +3251,60 @@ impl<'src> Parser<'src> {
                     }
                 }
                 b'(' | b'[' | b'{' => {
-                    depth += 1;
+                    stack.push(b);
                     i += 1;
                 }
-                b')' | b']' => {
-                    depth -= 1;
-                    i += 1;
-                }
-                b'}' => {
-                    if depth == 1 {
-                        return Ok((body[start..i].to_owned(), i));
+                b')' => match stack.last() {
+                    Some(b'(') => {
+                        stack.pop();
+                        i += 1;
                     }
-                    depth -= 1;
+                    Some(&open) => return Err(fstring_paren_mismatch(')', open, anchor)),
+                    None => {
+                        return Err(ParseError::Unexpected {
+                            span: anchor,
+                            message: "f-string: unmatched ')'".to_owned(),
+                        })
+                    }
+                },
+                b']' => match stack.last() {
+                    Some(b'[') => {
+                        stack.pop();
+                        i += 1;
+                    }
+                    Some(&open) => return Err(fstring_paren_mismatch(']', open, anchor)),
+                    None => {
+                        return Err(ParseError::Unexpected {
+                            span: anchor,
+                            message: "f-string: unmatched ']'".to_owned(),
+                        })
+                    }
+                },
+                b'}' => match stack.last() {
+                    None => return Ok((body[start..i].to_owned(), i)),
+                    Some(b'{') => {
+                        stack.pop();
+                        i += 1;
+                    }
+                    Some(&open) => return Err(fstring_paren_mismatch('}', open, anchor)),
+                },
+                b':' if stack.is_empty() && !in_spec => {
+                    in_spec = true;
                     i += 1;
+                }
+                b'#' if !in_spec => {
+                    // Comment to end of line; the brackets/quotes it may
+                    // contain must not perturb depth or string tracking.
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
                 }
                 _ => i += 1,
             }
         }
         Err(ParseError::Unexpected {
             span: anchor,
-            message: "expected '}' to close f-string replacement field".to_owned(),
+            message: "f-string: expecting '}'".to_owned(),
         })
     }
 
@@ -3115,16 +3312,11 @@ impl<'src> Parser<'src> {
     /// `FormattedValue` (possibly preceded by a synthetic literal
     /// for `{x = }` debug form).
     fn parse_fstring_field(&self, field: &str, anchor: Span) -> Result<Expr, ParseError> {
-        // Split into expr, conversion, format_spec. Backslashes inside
-        // an f-string field aren't allowed in CPython <3.12 — we
-        // surface that as a parse error for clarity.
-        if field.contains('\\') {
-            return Err(ParseError::NotImplemented {
-                span: anchor,
-                feature: "backslashes inside f-string replacement fields",
-                rfc: "RFC 0005-B",
-            });
-        }
+        // PEP 701 (3.12+): backslashes *are* allowed inside replacement
+        // fields (e.g. `f"{d["a\tb"]}"`). The expression is re-tokenized
+        // below, so escapes inside nested string literals are handled by
+        // the sub-lexer; a stray backslash in the expression itself just
+        // surfaces as a normal sub-parse error.
         let bytes = field.as_bytes();
         // Find the `!conv` and `:spec` boundaries at top level (not
         // inside nested parens/brackets/braces or string literals).
@@ -3137,6 +3329,20 @@ impl<'src> Parser<'src> {
         let mut i = 0;
         while i < bytes.len() {
             let b = bytes[i];
+            // A `#` in the expression part (before any `!conv`/`:spec`,
+            // and not inside a string) is a comment to end of line. Skip
+            // it so quotes/`!`/`:` it contains can't be mistaken for
+            // string delimiters or conv/spec boundaries.
+            if in_str.is_none()
+                && b == b'#'
+                && conv_start.is_none()
+                && spec_start.is_none()
+            {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
             if let Some(q) = in_str {
                 if b == q {
                     if triple {
@@ -3175,12 +3381,16 @@ impl<'src> Parser<'src> {
             }
             if depth == 0 {
                 if b == b'!' && conv_start.is_none() && spec_start.is_none() {
-                    // `!=` and `!<` etc. are comparison; `!` followed
-                    // by `s` / `r` / `a` is conversion.
-                    if i + 1 < bytes.len() && matches!(bytes[i + 1], b's' | b'r' | b'a') {
+                    // `!=` is the only `!` that stays part of the
+                    // expression (comparison); any other `!` ends the
+                    // expression and opens the conversion clause. Catching
+                    // it here (rather than only before `s`/`r`/`a`) lets an
+                    // empty expression before `!` surface CPython's
+                    // "valid expression required before '!'".
+                    if bytes.get(i + 1) != Some(&b'=') {
                         expr_end = i;
                         conv_start = Some(i + 1);
-                        i += 2;
+                        i += 1;
                         continue;
                     }
                 } else if b == b':' && spec_start.is_none() {
@@ -3192,39 +3402,122 @@ impl<'src> Parser<'src> {
             }
             i += 1;
         }
-        let expr_text = &field[..expr_end];
-        // Debug form `{x = }`: literal "x = " prepended, conversion
-        // forced to `r` if no explicit conversion / spec.
-        let (expr_text, debug_lit) = if expr_text.trim_end().ends_with('=') {
-            let trimmed = expr_text.trim_end();
-            let without_eq = trimmed.trim_end_matches('=');
-            let literal = format!("{without_eq}=");
-            (without_eq.trim(), Some(literal))
+        let expr_slice = &field[..expr_end];
+        // Debug form `{expr=}`: CPython echoes the *verbatim* source of
+        // the expression part (preserving the author's whitespace, e.g.
+        // `{val = }` -> "val = 7") and then formats the value. A trailing
+        // single `=` triggers it, but `==`/`!=`/`<=`/`>=` must not.
+        //
+        // PEP 701 allows `#` comments inside (multi-line) replacement
+        // fields, e.g.
+        //   f"{1+2 = # my comment
+        //     }"   ==  '1+2 = \n  3'
+        // The comment is removed but the surrounding whitespace stays, and
+        // it must not hide the debug `=`. Strip comments first, then both
+        // the detection and the echoed literal work on the cleaned text.
+        let clean = strip_fstring_field_comments(expr_slice);
+        // Only ASCII whitespace is insignificant around the expression
+        // (space, tab, formfeed, CR/LF, VT). Notably *not* U+00A0 etc. —
+        // CPython rejects those as "invalid non-printable character".
+        let ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c');
+        let trimmed_end = clean.trim_end_matches(ws);
+        let is_debug = trimmed_end.ends_with('=')
+            && !trimmed_end.ends_with("==")
+            && !trimmed_end.ends_with("!=")
+            && !trimmed_end.ends_with("<=")
+            && !trimmed_end.ends_with(">=");
+        let (expr_text, debug_lit) = if is_debug {
+            let value_src = trimmed_end[..trimmed_end.len() - 1].trim_matches(ws);
+            // Verbatim expression-part slice (through the `=`, including
+            // any surrounding spaces, comments removed) is echoed.
+            (value_src, Some(clean.clone()))
         } else {
-            (expr_text.trim(), None)
+            (clean.trim_matches(ws), None)
         };
         if expr_text.is_empty() {
+            // Name the terminator that followed the (empty) expression,
+            // mirroring CPython: "f-string: valid expression required
+            // before '}'/'!'/':'/'='".
+            let before = if is_debug {
+                '='
+            } else if conv_start.is_some() {
+                '!'
+            } else if spec_start.is_some() {
+                ':'
+            } else {
+                '}'
+            };
             return Err(ParseError::Unexpected {
                 span: anchor,
-                message: "empty expression in f-string replacement field".to_owned(),
+                message: format!("f-string: valid expression required before '{before}'"),
             });
         }
-        // Recursively tokenize+parse the expression.
-        let tokens = weavepy_lexer::tokenize(expr_text)?;
-        let mut sub = Parser::new(expr_text, tokens);
-        sub.skip_trivia_and_newlines();
-        let value = sub.parse_expression_list(false)?;
-        sub.skip_trivia_and_newlines();
-        if !matches!(sub.peek(), TokenKind::Endmarker) {
+        // A field whose expression can't even *begin* (a leading `,`, or a
+        // `.` not starting a float) is CPython's "expecting a valid
+        // expression after '{'", distinct from a malformed-but-started
+        // expression (which is just "invalid syntax").
+        if fstring_expr_cannot_start(expr_text) {
             return Err(ParseError::Unexpected {
                 span: anchor,
-                message: "trailing tokens in f-string expression".to_owned(),
+                message: "f-string: expecting a valid expression after '{'".to_owned(),
             });
         }
+        // Recursively tokenize+parse the expression. Inside an f-string
+        // replacement field, newlines, comments and indentation are
+        // insignificant (PEP 701: the field is parsed in the same
+        // implicit line-continuation context as the surrounding `{...}`),
+        // so a multi-line field like
+        //   f'''{
+        //   40  # forty
+        //   + 2 # two
+        //   }'''
+        // must read as `40 + 2`. Wrapping the expression in parentheses
+        // reproduces that joining exactly; the parens are transparent for
+        // a plain expression (and for a top-level comma the result is the
+        // same tuple `parse_expression_list` would have built). The
+        // closing paren goes on its own line so a trailing `# comment` in
+        // the field can't swallow it.
+        // Any failure parsing the embedded expression collapses to
+        // CPython's generic "invalid syntax" (the specific shapes it does
+        // name — empty expression, bad leading token, bracket mismatch —
+        // were already handled above / during the field scan).
+        let value = (|| -> Result<Expr, ParseError> {
+            let wrapped = format!("({expr_text}\n)");
+            let tokens = weavepy_lexer::tokenize(&wrapped)?;
+            let mut sub = Parser::new(&wrapped, tokens);
+            sub.skip_trivia_and_newlines();
+            let value = sub.parse_expression_list(false)?;
+            sub.skip_trivia_and_newlines();
+            if !matches!(sub.peek(), TokenKind::Endmarker) {
+                return Err(ParseError::Unexpected {
+                    span: anchor,
+                    message: "trailing".to_owned(),
+                });
+            }
+            Ok(value)
+        })()
+        .map_err(|_| ParseError::Unexpected {
+            span: anchor,
+            message: "invalid syntax".to_owned(),
+        })?;
 
         let conversion = match conv_start {
-            Some(idx) => i32::from(field.as_bytes()[idx]),
-            None if debug_lit.is_some() => i32::from(b'r'),
+            // A `!` with no following conversion char (e.g. `f'{a!}'`) is
+            // malformed; fall through to a generic error rather than
+            // indexing past the field.
+            Some(idx) => match field.as_bytes().get(idx) {
+                Some(&c) => i32::from(c),
+                None => {
+                    return Err(ParseError::Unexpected {
+                        span: anchor,
+                        message: "f-string: expecting '}'".to_owned(),
+                    })
+                }
+            },
+            // Debug form defaults to `!r`, but only when no explicit
+            // conversion *and* no format spec is given (`{x=:.2f}` uses
+            // the spec, not repr).
+            None if debug_lit.is_some() && spec_start.is_none() => i32::from(b'r'),
             None => -1,
         };
         let format_spec = match spec_start {
@@ -3281,6 +3574,117 @@ fn utf8_char_len(b: u8) -> usize {
     }
 }
 
+/// Build CPython's "closing parenthesis 'X' does not match opening
+/// parenthesis 'Y'" diagnostic for a mismatched bracket inside an f-string
+/// replacement field.
+fn fstring_paren_mismatch(close: char, open: u8, anchor: Span) -> ParseError {
+    ParseError::Unexpected {
+        span: anchor,
+        message: format!(
+            "closing parenthesis '{close}' does not match opening parenthesis '{}'",
+            open as char
+        ),
+    }
+}
+
+/// True when an f-string replacement-field expression can't even begin —
+/// i.e. it leads with a token that is never a valid expression start. We
+/// only flag the cases CPython names distinctly with "expecting a valid
+/// expression after '{'": a leading `,`, or a `.` that isn't the start of
+/// a float literal (`.5`). Anything else that fails to parse is reported as
+/// the generic "invalid syntax".
+fn fstring_expr_cannot_start(expr: &str) -> bool {
+    let mut chars = expr.chars();
+    match chars.next() {
+        Some(',') => true,
+        Some('.') => !matches!(chars.next(), Some(c) if c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+/// Remove `#` comments from the expression part of an f-string replacement
+/// field while leaving everything else (including whitespace and newlines)
+/// byte-for-byte intact. PEP 701 permits comments inside multi-line fields;
+/// a `#` only starts a comment outside of string literals, so this tracks
+/// single/triple-quoted strings (and their backslash escapes) to avoid
+/// mangling a `#` that lives inside a string. A comment runs to the next
+/// newline (the newline itself is preserved).
+fn strip_fstring_field_comments(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    // `Some(quote)` while inside a string literal; `triple` tracks `"""`/`'''`.
+    let mut in_str: Option<u8> = None;
+    let mut triple = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                // Copy the backslash and its escaped char as a unit so an
+                // escaped quote can't be read as closing the string.
+                out.push('\\');
+                i += 1;
+                if i < bytes.len() {
+                    let cl = utf8_char_len(bytes[i]);
+                    let e = (i + cl).min(bytes.len());
+                    out.push_str(&s[i..e]);
+                    i = e;
+                }
+                continue;
+            }
+            if b == q {
+                if triple {
+                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                        out.push_str(&s[i..i + 3]);
+                        i += 3;
+                        in_str = None;
+                        triple = false;
+                        continue;
+                    }
+                } else {
+                    out.push(q as char);
+                    i += 1;
+                    in_str = None;
+                    continue;
+                }
+            }
+            let cl = utf8_char_len(b);
+            let e = (i + cl).min(bytes.len());
+            out.push_str(&s[i..e]);
+            i = e;
+            continue;
+        }
+        match b {
+            b'#' => {
+                // Drop the comment up to (but not including) the newline.
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' | b'\'' => {
+                if i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b {
+                    in_str = Some(b);
+                    triple = true;
+                    out.push_str(&s[i..i + 3]);
+                    i += 3;
+                } else {
+                    in_str = Some(b);
+                    triple = false;
+                    out.push(b as char);
+                    i += 1;
+                }
+            }
+            _ => {
+                let cl = utf8_char_len(b);
+                let e = (i + cl).min(bytes.len());
+                out.push_str(&s[i..e]);
+                i = e;
+            }
+        }
+    }
+    out
+}
+
 /// Working state while concatenating adjacent string tokens.
 enum AccumString {
     Plain(String),
@@ -3328,12 +3732,17 @@ fn strip_quotes(s: &str) -> &str {
     }
 }
 
+/// Decode a (non-f) string-literal body. Returns the decoded text plus
+/// any invalid-escape diagnostics CPython would surface as a
+/// `SyntaxWarning` (unrecognised escapes and octal escapes `> \377`).
+/// Each diagnostic carries the byte offset of its backslash *within the
+/// body* so the caller can map it back to an absolute source position.
 fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
     if raw {
         return Ok(s.to_owned());
     }
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
@@ -3350,7 +3759,23 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
             '\\' => out.push('\\'),
             '\'' => out.push('\''),
             '"' => out.push('"'),
-            '0' => out.push('\0'),
+            // Octal escape `\ooo`: 1–3 octal digits (CPython accepts up
+            // to `\777` = 511 in a str literal). `\0` is just the
+            // zero-length-tail case of this rule. Values above `\377`
+            // draw a `SyntaxWarning`, detected by the lexer.
+            '0'..='7' => {
+                let mut val = esc as u32 - '0' as u32;
+                for _ in 0..2 {
+                    match chars.peek().copied() {
+                        Some(d @ '0'..='7') => {
+                            val = val * 8 + (d as u32 - '0' as u32);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(char::from_u32(val).unwrap_or('\u{FFFD}'));
+            }
             'a' => out.push('\x07'),
             'b' => out.push('\x08'),
             'f' => out.push('\x0c'),
@@ -3366,7 +3791,8 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
             'u' => {
                 let mut hex = String::new();
                 for _ in 0..4 {
-                    hex.push(chars.next().ok_or("incomplete \\u escape")?);
+                    let h = chars.next().ok_or("incomplete \\u escape")?;
+                    hex.push(h);
                 }
                 let n = u32::from_str_radix(&hex, 16).map_err(|e| e.to_string())?;
                 out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
@@ -3377,7 +3803,8 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                 // surrogate values, so we surface a clear error.
                 let mut hex = String::new();
                 for _ in 0..8 {
-                    hex.push(chars.next().ok_or("incomplete \\U escape")?);
+                    let h = chars.next().ok_or("incomplete \\U escape")?;
+                    hex.push(h);
                 }
                 let n = u32::from_str_radix(&hex, 16).map_err(|e| e.to_string())?;
                 let ch = char::from_u32(n).ok_or_else(|| {
@@ -3390,7 +3817,7 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                 // the full UCD name table. CPython requires the brace form
                 // and raises a SyntaxError ("malformed \N character escape"
                 // / "unknown Unicode character name") otherwise.
-                if chars.next() != Some('{') {
+                if !matches!(chars.next(), Some('{')) {
                     return Err("malformed \\N character escape".to_owned());
                 }
                 let mut name = String::new();
@@ -3407,8 +3834,8 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                 out.push(ch);
             }
             other => {
-                // CPython issues a DeprecationWarning for unknown
-                // escapes but emits both characters literally.
+                // CPython issues a `SyntaxWarning` for unknown escapes (the
+                // lexer records it) but emits both characters literally.
                 out.push('\\');
                 out.push(other);
             }
@@ -3417,12 +3844,25 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
     Ok(out)
 }
 
+/// Decode a bytes-literal body. Like [`decode_str_body`] but bytes-valued
+/// and ASCII-only: a non-ASCII source character is a `SyntaxError` ("bytes
+/// can only contain ASCII literal characters") in both raw and cooked
+/// forms, and octal escapes wrap mod 256. Invalid-escape `SyntaxWarning`s
+/// are detected separately by the lexer (see
+/// [`weavepy_lexer::tokenize_with_escapes`]).
 fn decode_bytes_body(s: &str, raw: bool) -> Result<Vec<u8>, String> {
     if raw {
-        return Ok(s.as_bytes().to_vec());
+        let mut out = Vec::with_capacity(s.len());
+        for c in s.chars() {
+            if !c.is_ascii() {
+                return Err("bytes can only contain ASCII literal characters".to_owned());
+            }
+            out.push(c as u8);
+        }
+        return Ok(out);
     }
     let mut out = Vec::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c.is_ascii() {
             if c != '\\' {
@@ -3430,7 +3870,7 @@ fn decode_bytes_body(s: &str, raw: bool) -> Result<Vec<u8>, String> {
                 continue;
             }
         } else {
-            return Err("non-ascii character in bytes literal".to_owned());
+            return Err("bytes can only contain ASCII literal characters".to_owned());
         }
         let Some(esc) = chars.next() else {
             out.push(b'\\');
@@ -3443,7 +3883,22 @@ fn decode_bytes_body(s: &str, raw: bool) -> Result<Vec<u8>, String> {
             '\\' => out.push(b'\\'),
             '\'' => out.push(b'\''),
             '"' => out.push(b'"'),
-            '0' => out.push(0),
+            // Octal escape `\ooo` (1–3 digits). In a bytes literal the
+            // value is stored as a single byte, so CPython wraps it mod
+            // 256 (`b'\400'` -> 0x00, `b'\777'` -> 0xFF).
+            '0'..='7' => {
+                let mut val: u32 = esc as u32 - '0' as u32;
+                for _ in 0..2 {
+                    match chars.peek().copied() {
+                        Some(d @ '0'..='7') => {
+                            val = val * 8 + (d as u32 - '0' as u32);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push((val & 0xFF) as u8);
+            }
             'a' => out.push(0x07),
             'b' => out.push(0x08),
             'f' => out.push(0x0c),

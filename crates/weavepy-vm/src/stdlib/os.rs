@@ -144,6 +144,14 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("fspath", os_fspath),
         );
         d.insert(
+            DictKey(Object::from_static("fsdecode")),
+            builtin("fsdecode", os_fsdecode),
+        );
+        d.insert(
+            DictKey(Object::from_static("fsencode")),
+            builtin("fsencode", os_fsencode),
+        );
+        d.insert(
             DictKey(Object::from_static("walk")),
             builtin("walk", os_walk),
         );
@@ -304,6 +312,10 @@ pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("splitext")),
             builtin("splitext", path_splitext),
+        );
+        d.insert(
+            DictKey(Object::from_static("splitdrive")),
+            builtin("splitdrive", path_splitdrive),
         );
         d.insert(
             DictKey(Object::from_static("basename")),
@@ -720,6 +732,54 @@ fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
             Ok(Object::from_str(format!("{:?}", other)))
         }
         None => Err(type_error("fspath() takes exactly one argument")),
+    }
+}
+
+/// Reduce a path-like argument to a `str` or `bytes` object, mirroring
+/// CPython's `os.fspath`: `str`/`bytes` pass through, an `str`/`bytes`
+/// subclass instance reduces to its native value. Used by `fsdecode`/
+/// `fsencode` (which themselves only special-case the str/bytes split).
+fn fspath_to_str_or_bytes(obj: &Object, func: &str) -> Result<Object, RuntimeError> {
+    match obj {
+        Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
+        Object::Instance(_) => match obj.native_value() {
+            Some(n @ (Object::Str(_) | Object::Bytes(_))) => Ok(n),
+            _ => Err(type_error(format!(
+                "expected str, bytes or os.PathLike object, not {}",
+                obj.type_name()
+            ))),
+        },
+        other => Err(type_error(format!(
+            "{}() argument must be str, bytes, or os.PathLike object, not {}",
+            func,
+            other.type_name()
+        ))),
+    }
+}
+
+/// `os.fsdecode(filename)` — decode a `bytes` path to `str` (the filesystem
+/// encoding is UTF-8 here), pass a `str` through unchanged.
+fn os_fsdecode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error("fsdecode() takes exactly one argument (0 given)"))?;
+    match fspath_to_str_or_bytes(obj, "fsdecode")? {
+        s @ Object::Str(_) => Ok(s),
+        Object::Bytes(b) => Ok(Object::from_str(String::from_utf8_lossy(&b).into_owned())),
+        _ => unreachable!("fspath_to_str_or_bytes returns only str/bytes"),
+    }
+}
+
+/// `os.fsencode(filename)` — encode a `str` path to `bytes` (UTF-8), pass a
+/// `bytes` through unchanged.
+fn os_fsencode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error("fsencode() takes exactly one argument (0 given)"))?;
+    match fspath_to_str_or_bytes(obj, "fsencode")? {
+        Object::Str(s) => Ok(Object::Bytes(Rc::from(s.as_bytes()))),
+        b @ Object::Bytes(_) => Ok(b),
+        _ => unreachable!("fspath_to_str_or_bytes returns only str/bytes"),
     }
 }
 
@@ -1291,6 +1351,18 @@ fn path_splitext(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::from_static(""),
         ]))
     }
+}
+
+/// `os.path.splitdrive(p)` — on POSIX the drive component is always empty,
+/// so this returns `("", p)` (matching `posixpath.splitdrive`). Paths here
+/// are already `str` by the time callers reach this (e.g. `mimetypes`
+/// `fsdecode`s first), so we reuse the `first_path` string coercion.
+fn path_splitdrive(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "splitdrive")?;
+    Ok(Object::new_tuple(vec![
+        Object::from_static(""),
+        Object::from_str(s),
+    ]))
 }
 
 /// Mirror CPython's `os.path.splitext`: split on the *last* dot, but

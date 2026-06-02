@@ -723,17 +723,33 @@ class Signature:
         return BoundArguments(self, arguments)
 
     def __str__(self):
-        parts = []
-        kind_seen = None
+        result = []
+        render_pos_only_separator = False
+        render_kw_only_separator = True
         for p in self._parameters.values():
-            if p.kind == Parameter.KEYWORD_ONLY and kind_seen != Parameter.VAR_POSITIONAL and kind_seen != Parameter.KEYWORD_ONLY:
-                parts.append("*")
-            parts.append(str(p))
-            kind_seen = p.kind
+            formatted = str(p)
+            kind = p.kind
+            if kind == Parameter.POSITIONAL_ONLY:
+                render_pos_only_separator = True
+            elif render_pos_only_separator:
+                # We have a separator, and we've just got to a non-pos-only param.
+                result.append("/")
+                render_pos_only_separator = False
+            if kind == Parameter.VAR_POSITIONAL:
+                # OK, we have an '*args'-like parameter, so we won't need '*'.
+                render_kw_only_separator = False
+            elif kind == Parameter.KEYWORD_ONLY and render_kw_only_separator:
+                result.append("*")
+                render_kw_only_separator = False
+            result.append(formatted)
+        if render_pos_only_separator:
+            # There were only positional-only parameters, hence the flag was
+            # not reset to 'False'.
+            result.append("/")
         ret = ""
         if self._return_annotation is not _empty:
             ret = f" -> {self._return_annotation!r}"
-        return "(" + ", ".join(parts) + ")" + ret
+        return "(" + ", ".join(result) + ")" + ret
 
     @classmethod
     def from_callable(cls, func):
@@ -742,17 +758,31 @@ class Signature:
 
 def signature(callable_):
     if isclass(callable_):
+        # Prefer __new__ when it is overridden (e.g. functools.partial), then
+        # fall back to __init__. A class signature carries no return annotation.
+        new = getattr(callable_, "__new__", None)
+        if new is not None and new is not object.__new__:
+            sig = signature(new)
+            params = [p for name, p in sig.parameters.items() if name != "cls"]
+            return Signature(params)
         init = getattr(callable_, "__init__", None)
         if init is not None and init is not object.__init__:
             sig = signature(init)
             params = [p for name, p in sig.parameters.items() if name != "self"]
-            return Signature(params, return_annotation=callable_)
+            return Signature(params)
         return Signature([])
     if ismethod(callable_):
         sig = signature(callable_.__func__)
         params = [p for name, p in sig.parameters.items() if name != "self"]
         return Signature(params, return_annotation=sig.return_annotation)
     if not isfunction(callable_):
+        # A callable instance (defines __call__ on its type): derive the
+        # signature from the type's __call__, dropping the bound `self`.
+        call = getattr(type(callable_), "__call__", None)
+        if call is not None and (isfunction(call) or ismethod(call)):
+            sig = signature(call)
+            params = [p for name, p in sig.parameters.items() if name != "self"]
+            return Signature(params, return_annotation=sig.return_annotation)
         # Best effort: return an "unknown" signature.
         return Signature([Parameter("args", Parameter.VAR_POSITIONAL),
                           Parameter("kwargs", Parameter.VAR_KEYWORD)])
@@ -761,13 +791,16 @@ def signature(callable_):
     defaults = spec.defaults or ()
     n_defaults = len(defaults)
     n_args = len(spec.args)
+    f = _func_of(callable_)
+    posonly = getattr(f.__code__, "co_posonlyargcount", 0) if f is not None else 0
     for i, name in enumerate(spec.args):
         if i >= n_args - n_defaults:
             default = defaults[i - (n_args - n_defaults)]
         else:
             default = _empty
         annotation = spec.annotations.get(name, _empty)
-        params.append(Parameter(name, Parameter.POSITIONAL_OR_KEYWORD,
+        kind = Parameter.POSITIONAL_ONLY if i < posonly else Parameter.POSITIONAL_OR_KEYWORD
+        params.append(Parameter(name, kind,
                                 default=default, annotation=annotation))
     if spec.varargs:
         params.append(Parameter(spec.varargs, Parameter.VAR_POSITIONAL,

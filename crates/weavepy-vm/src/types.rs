@@ -8,8 +8,10 @@
 //! so the `Object::Type` variant carries an `Rc<TypeObject>`. The MRO
 //! is C3 linearised at class-creation time and cached on the type.
 
+use crate::sync::Cell;
 use crate::sync::Rc;
 use crate::sync::RefCell;
+use crate::sync::Weak;
 
 use crate::error::{type_error, RuntimeError};
 use crate::object::{DictData, DictKey, Object};
@@ -44,6 +46,18 @@ pub struct TypeObject {
     /// `__dict__`). Set when the user neither omits `__slots__` from
     /// any base nor lists `"__dict__"` in slots.
     pub forbids_dict: bool,
+    /// Direct subclasses of this type, tracked as *weak* references so
+    /// the parent→child edge doesn't form an uncollectable `Rc` cycle
+    /// with the strong child→parent `bases` edge. Mirrors CPython's
+    /// `tp_subclasses`; surfaced by `type.__subclasses__()` and used by
+    /// the ABC virtual-subclass machinery.
+    pub subclasses: RefCell<Vec<Weak<TypeObject>>>,
+    /// Cached classification of this type's `__getattribute__` slot, so the
+    /// hot attribute path can skip an MRO walk: `0` = not yet computed,
+    /// `1` = default (`object.__getattribute__`), `2` = a user override.
+    /// Invalidated (reset to `0`) for the type and its subclasses whenever
+    /// `__getattribute__` is assigned to / deleted from a type's dict.
+    pub getattribute_kind: Cell<u8>,
 }
 
 impl std::fmt::Debug for TypeObject {
@@ -122,10 +136,37 @@ impl TypeObject {
             metaclass: RefCell::new(None),
             slot_names: RefCell::new(Vec::new()),
             forbids_dict: false,
+            subclasses: RefCell::new(Vec::new()),
+            getattribute_kind: Cell::new(0),
         });
         let mro = compute_c3(&ty, &bases, name)?;
         *ty.mro.borrow_mut() = mro;
+        // Register the new class as a (weak) direct subclass of each of
+        // its bases so `base.__subclasses__()` reports it.
+        for base in &bases {
+            base.subclasses.borrow_mut().push(Rc::downgrade(&ty));
+        }
         Ok(ty)
+    }
+
+    /// Reset the cached `__getattribute__` classification for this type and
+    /// every (transitive) subclass. Called when `__getattribute__` is
+    /// assigned to or deleted from a type's dict, since that can change the
+    /// resolved slot for the type *and* anything inheriting from it. Class
+    /// hierarchies are acyclic, so the recursion terminates.
+    pub fn invalidate_getattribute_cache(&self) {
+        self.getattribute_kind.set(0);
+        for sub in self.subclasses() {
+            sub.invalidate_getattribute_cache();
+        }
+    }
+
+    /// Live direct subclasses, in registration order. Dead weak refs
+    /// (subclasses that have been dropped) are pruned as a side effect.
+    pub fn subclasses(&self) -> Vec<Rc<TypeObject>> {
+        let mut subs = self.subclasses.borrow_mut();
+        subs.retain(|w| w.strong_count() > 0);
+        subs.iter().filter_map(Weak::upgrade).collect()
     }
 
     /// Internal: install a metaclass on this type. Used at startup

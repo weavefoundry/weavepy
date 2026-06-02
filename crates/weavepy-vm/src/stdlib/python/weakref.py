@@ -231,6 +231,26 @@ class WeakValueDictionary:
             new[k] = self[k]
         return new
 
+    __copy__ = copy
+
+    def __deepcopy__(self, memo):
+        from copy import deepcopy
+
+        new = WeakValueDictionary()
+        for k in self.keys():
+            new[deepcopy(k, memo)] = self[k]
+        return new
+
+    def __eq__(self, other):
+        # Mirror `_collections_abc.Mapping.__eq__`: two weak mappings are
+        # equal iff their *live* items compare equal as plain dicts. Needed
+        # so `copy.copy(wd) == wd` (test_copy) holds.
+        if not isinstance(other, WeakValueDictionary):
+            return NotImplemented
+        return dict(self.items()) == dict(other.items())
+
+    __hash__ = None
+
     def expire(self, key):
         self._data.pop(key, None)
 
@@ -344,6 +364,24 @@ class WeakKeyDictionary:
         for k, v in self.items():
             new[k] = v
         return new
+
+    __copy__ = copy
+
+    def __deepcopy__(self, memo):
+        from copy import deepcopy
+
+        new = WeakKeyDictionary()
+        for key, value in self.items():
+            new[key] = deepcopy(value, memo)
+        return new
+
+    def __eq__(self, other):
+        # See WeakValueDictionary.__eq__ — equal iff live items match.
+        if not isinstance(other, WeakKeyDictionary):
+            return NotImplemented
+        return dict(self.items()) == dict(other.items())
+
+    __hash__ = None
 
     def keyrefs(self):
         return [k for (k, _) in self._entries]

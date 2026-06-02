@@ -319,8 +319,14 @@ fn type_has_attr_override(ty: &Rc<TypeObject>) -> bool {
     if ty.lookup("__getattr__").is_some() {
         return true;
     }
-    if ty.lookup("__getattribute__").is_some() {
-        return true;
+    // `object.__getattribute__` lives in `object`'s dict as a sentinel, so a
+    // bare `is_some()` would match *every* class. Only a genuine user override
+    // (anything other than that sentinel) should disable the dict-slot fast
+    // path — the default lookup is exactly what the fast path reproduces.
+    match ty.lookup("__getattribute__") {
+        Some(Object::Builtin(b)) if b.name == ".object_getattribute" => {}
+        Some(_) => return true,
+        None => {}
     }
     if ty.lookup("__setattr__").is_some() {
         return true;

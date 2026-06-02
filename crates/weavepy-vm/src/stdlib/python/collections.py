@@ -16,7 +16,15 @@ __all__ = [
     "Counter",
     "ChainMap",
     "namedtuple",
+    "UserDict",
+    "UserList",
+    "UserString",
 ]
+
+# `UserDict`/`UserList`/`UserString` are verbatim CPython and depend on
+# `collections.abc`, so they live in a sibling frozen module (imported at
+# the end of this file, after the package is otherwise initialised) to keep
+# the import graph acyclic.
 
 
 def _count_elements(mapping, iterable):
@@ -507,7 +515,7 @@ class ChainMap:
         return "ChainMap(" + ", ".join(repr(m) for m in self.maps) + ")"
 
 
-def namedtuple(typename, field_names, *, rename=False, defaults=None):
+def namedtuple(typename, field_names, *, rename=False, defaults=None, module=None):
     """Return a new lightweight class with the given fields.
 
     The result mirrors CPython's ``namedtuple`` API surface — iteration,
@@ -586,11 +594,19 @@ def namedtuple(typename, field_names, *, rename=False, defaults=None):
 
         def _replace(self, **changes):
             values = list(self._values)
-            for k, v in changes.items():
-                if k not in field_names:
-                    raise ValueError("unknown field: " + k)
-                values[field_names.index(k)] = v
+            for i, name in enumerate(field_names):
+                if name in changes:
+                    values[i] = changes.pop(name)
+            if changes:
+                # Match CPython: leftover keys are reported as a TypeError
+                # ("Got unexpected field names: [...]").
+                raise TypeError(
+                    "Got unexpected field names: " + repr(list(changes))
+                )
             return type(self)(*values)
+
+        def __replace__(self, **changes):
+            return self._replace(**changes)
 
         def __repr__(self):
             parts = []
@@ -600,5 +616,11 @@ def namedtuple(typename, field_names, *, rename=False, defaults=None):
 
     _NT.__name__ = typename
     _NT.__qualname__ = typename
+    if module is not None:
+        _NT.__module__ = module
 
     return _NT
+
+
+# Pull in the abc-backed user wrappers last (see note near `__all__`).
+from _collections_user import UserDict, UserList, UserString

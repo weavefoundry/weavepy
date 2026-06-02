@@ -519,9 +519,69 @@ impl fmt::Debug for PyModule {
 #[derive(Clone, Debug)]
 pub struct DictKey(pub Object);
 
+/// Reach for the running interpreter to compute a user instance's Python
+/// `__hash__`. `DictKey`'s `Hash`/`Eq` impls have no interpreter handle, so
+/// they borrow the thread's published interpreter pointer — the same bridge
+/// `_imp`/`_thread`/the C-API iterator use. Returns `None` when no
+/// interpreter is active (e.g. a dict built from pure-Rust setup), so the
+/// caller falls back to the native structural behaviour.
+fn current_interp_hash(obj: &Object) -> Option<i64> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: the pointer is published by the bytecode dispatch loop for the
+    // running thread and used only to re-enter the interpreter synchronously,
+    // mirroring the established reentrant-callback pattern in `_imp`/`_thread`.
+    let interp = unsafe { &mut *ptr };
+    interp.reentrant_py_hash(obj)
+}
+
+/// Companion to [`current_interp_hash`] for `a == b` via Python `__eq__`.
+fn current_interp_eq(a: &Object, b: &Object) -> Option<bool> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: see `current_interp_hash`.
+    let interp = unsafe { &mut *ptr };
+    interp.reentrant_py_eq(a, b)
+}
+
+/// True when `obj` is a user instance whose class supplies a *callable*
+/// `name` dunder (a real Python `def`, not the inherited identity default).
+/// Used to gate the reentrant `__eq__` dispatch so plain instances keep the
+/// native identity fast path.
+fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
+    matches!(
+        obj,
+        Object::Instance(inst)
+            if matches!(
+                inst.class.lookup(name),
+                Some(Object::Function(_) | Object::BoundMethod(_))
+            )
+    )
+}
+
 impl PartialEq for DictKey {
     fn eq(&self, other: &Self) -> bool {
-        self.0.eq_value(&other.0)
+        // CPython compares dict/set keys with `a is b or a == b`; the identity
+        // half makes a stored `nan` findable by itself (`{nan}` contains its
+        // own nan even though `nan != nan`).
+        if self.0.is_same(&other.0) {
+            return true;
+        }
+        // Native fast path also covers instance *identity* (`Rc::ptr_eq`),
+        // which is the `a is b` half of CPython's dict-key comparison.
+        if self.0.eq_value(&other.0) {
+            return true;
+        }
+        // Distinct user instances with a custom `__eq__` compare through it
+        // so a class defining `__eq__`/`__hash__` works as a `set`/`dict`
+        // key. Plain instances (no custom `__eq__`) keep identity semantics,
+        // already decided by the `eq_value` fast path above.
+        if instance_has_custom_dunder(&self.0, "__eq__")
+            || instance_has_custom_dunder(&other.0, "__eq__")
+        {
+            if let Some(eq) = current_interp_eq(&self.0, &other.0) {
+                return eq;
+            }
+        }
+        false
     }
 }
 
@@ -529,71 +589,18 @@ impl Eq for DictKey {}
 
 impl Hash for DictKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // An `int`/`str`/… subclass instance hashes identically to the
-        // value it wraps, so it can be used interchangeably with that
-        // value as a dict/set key (CPython invariant).
-        if let Some(native) = self.0.native_value() {
-            return DictKey(native).hash(state);
-        }
-        match &self.0 {
-            Object::None => 0u8.hash(state),
-            Object::Bool(b) => {
-                1u8.hash(state);
-                b.hash(state);
-            }
-            Object::Int(i) => {
-                // Hash compatibly with Long: route through the
-                // BigInt hash so `Int(0).hash() == Long(0).hash()`.
-                2u8.hash(state);
-                python_int_hash_i64(*i).hash(state);
-            }
-            Object::Long(b) => {
-                2u8.hash(state);
-                python_int_hash_bigint(b).hash(state);
-            }
-            Object::Float(f) => {
-                3u8.hash(state);
-                if f.fract() == 0.0 && f.is_finite() {
-                    // For values representable as integers, hash
-                    // through the int path so `1 == 1.0` implies
-                    // `hash(1) == hash(1.0)`.
-                    if let Some(as_int) = f64_to_i64_exact(*f) {
-                        2u8.hash(state);
-                        python_int_hash_i64(as_int).hash(state);
-                    } else {
-                        f.to_bits().hash(state);
-                    }
-                } else {
-                    f.to_bits().hash(state);
-                }
-            }
-            Object::Complex(c) => {
-                // Pure-real complex hashes as the underlying float;
-                // imaginary component contributes a separate
-                // factor (CPython: `hash(complex) = hash(real) ^
-                // (hash(imag) * IMAG)`). Constant good-enough.
-                3u8.hash(state);
-                c.real.to_bits().hash(state);
-                c.imag.to_bits().hash(state);
-            }
-            Object::Str(s) => {
-                4u8.hash(state);
-                s.hash(state);
-            }
-            Object::Tuple(items) => {
-                5u8.hash(state);
-                items.len().hash(state);
-                for x in items.iter() {
-                    DictKey(x.clone()).hash(state);
-                }
-            }
-            _ => {
-                // Unhashable types — hash to a constant. Python would
-                // raise TypeError; we keep it well-defined for now and
-                // let the runtime raise lazily when this key is used.
-                255u8.hash(state);
-            }
-        }
+        // Bucket every key by its single canonical Python hash value, so any
+        // two keys Python deems equal-and-hashable collide here regardless of
+        // their Rust representation: equal numeric types (`1 == 1.0 == True`),
+        // an `int`/`str`/… subclass and its wrapped value, and — crucially —
+        // a custom `__hash__` that returns a built-in value (e.g.
+        // `hash('halibut')`) and the string itself. `DictKey::eq` then decides
+        // actual equality within the bucket. Identity-hashable objects
+        // (functions, types, plain instances, …) fold in their allocation
+        // identity; truly unhashable keys share a constant bucket and the
+        // runtime raises lazily when used.
+        let h = py_hash_value(&self.0).unwrap_or_else(|| identity_hash(&self.0));
+        h.hash(state);
     }
 }
 
@@ -1099,6 +1106,14 @@ pub enum PyIterator {
         data: Rc<[u8]>,
         index: usize,
     },
+    /// Lazy `enumerate(...)`. Holds a *shared* handle to the wrapped
+    /// iterator so consuming the enumerate also advances the original
+    /// (CPython: `enumerate(it)` yields from the same `it`, leaving it
+    /// positioned right after the last item produced).
+    Enumerate {
+        inner: Rc<RefCell<PyIterator>>,
+        count: i64,
+    },
 }
 
 impl PyIterator {
@@ -1155,6 +1170,44 @@ impl PyIterator {
                 let v = data.get(*index).copied()?;
                 *index += 1;
                 Some(Object::Int(i64::from(v)))
+            }
+            PyIterator::Enumerate { inner, count } => {
+                let v = inner.borrow_mut().next_value()?;
+                let i = *count;
+                *count += 1;
+                Some(Object::new_tuple(vec![Object::Int(i), v]))
+            }
+        }
+    }
+
+    /// Number of items remaining, when cheaply known. Backs the
+    /// `__length_hint__` slot CPython's built-in iterators expose
+    /// (`operator.length_hint`, list pre-sizing, …). Returns `None`
+    /// for sources whose remaining length isn't known in O(1).
+    pub fn remaining(&self) -> Option<usize> {
+        match self {
+            PyIterator::List { items, index } => {
+                Some(items.borrow().len().saturating_sub(*index))
+            }
+            PyIterator::Tuple { items, index } => Some(items.len().saturating_sub(*index)),
+            PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
+            PyIterator::DictKeys { keys, index } => Some(keys.len().saturating_sub(*index)),
+            PyIterator::Bytes { data, index } => Some(data.len().saturating_sub(*index)),
+            PyIterator::Enumerate { inner, .. } => inner.borrow().remaining(),
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => {
+                if *step > 0 && *current < *stop {
+                    Some((((*stop - *current) as i128 + i128::from(*step) - 1)
+                        / i128::from(*step)) as usize)
+                } else if *step < 0 && *current > *stop {
+                    Some((((*current - *stop) as i128 + i128::from(-*step) - 1)
+                        / i128::from(-*step)) as usize)
+                } else {
+                    Some(0)
+                }
             }
         }
     }
@@ -1323,7 +1376,7 @@ impl Object {
             }
             (Object::Float(a), Object::Float(b)) => a == b,
             (Object::Int(a), Object::Float(b)) | (Object::Float(b), Object::Int(a)) => {
-                (*a as f64) == *b
+                i64_eq_f64(*a, *b)
             }
             (Object::Long(a), Object::Float(b)) | (Object::Float(b), Object::Long(a)) => {
                 bigint_eq_f64(a, *b)
@@ -1333,7 +1386,7 @@ impl Object {
             }
             (Object::Complex(a), Object::Complex(b)) => a.real == b.real && a.imag == b.imag,
             (Object::Complex(c), Object::Int(i)) | (Object::Int(i), Object::Complex(c)) => {
-                c.imag == 0.0 && c.real == (*i as f64)
+                c.imag == 0.0 && i64_eq_f64(*i, c.real)
             }
             (Object::Complex(c), Object::Float(f)) | (Object::Float(f), Object::Complex(c)) => {
                 c.imag == 0.0 && c.real == *f
@@ -1342,13 +1395,21 @@ impl Object {
                 c.imag == 0.0 && bigint_eq_f64(b, c.real)
             }
             (Object::Str(a), Object::Str(b)) => a == b,
+            // Sequence comparison is element-wise `PyObject_RichCompareBool`,
+            // which is identity-first — so `[nan] == [nan]` (same nan) is true.
             (Object::Tuple(a), Object::Tuple(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_value(y))
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| x.is_same(y) || x.eq_value(y))
             }
             (Object::List(a), Object::List(b)) => {
                 let a = a.borrow();
                 let b = b.borrow();
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_value(y))
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| x.is_same(y) || x.eq_value(y))
             }
             (Object::Dict(a), Object::Dict(b)) => {
                 let a = a.borrow();
@@ -1374,6 +1435,14 @@ impl Object {
             (Object::Set(a), Object::FrozenSet(b)) | (Object::FrozenSet(b), Object::Set(a)) => {
                 sets_equal(&a.borrow(), b)
             }
+            // `slice` objects compare as the `(start, stop, step)` triple
+            // (CPython's `slice_richcompare`), identity-first per field so
+            // `slice(None)` fields (NaN-free here, but consistent) match.
+            (Object::Slice(a), Object::Slice(b)) => {
+                (a.start.is_same(&b.start) || a.start.eq_value(&b.start))
+                    && (a.stop.is_same(&b.stop) || a.stop.eq_value(&b.stop))
+                    && (a.step.is_same(&b.step) || a.step.eq_value(&b.step))
+            }
             // Reference-identity equality for class / module / function
             // / builtin / method values. CPython falls back to identity
             // here, and our `in` / dict-key checks rely on it.
@@ -1382,6 +1451,13 @@ impl Object {
             (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
             (Object::Builtin(a), Object::Builtin(b)) => Rc::ptr_eq(a, b),
             (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
+            // Bound methods compare like CPython's `method_richcompare`:
+            // `__func__` by equality, `__self__` by identity. Two freshly
+            // bound references to the same method on the same object are
+            // therefore equal even though they're distinct allocations.
+            (Object::BoundMethod(a), Object::BoundMethod(b)) => {
+                a.function.eq_value(&b.function) && a.receiver.is_same(&b.receiver)
+            }
             _ => false,
         }
     }
@@ -1407,12 +1483,8 @@ impl Object {
             (O::Float(a), O::Float(b)) => Ok(a
                 .partial_cmp(b)
                 .ok_or_else(|| value_error(format!("cannot order {a} and {b} (NaN)")))?),
-            (O::Int(a), O::Float(b)) => Ok((*a as f64)
-                .partial_cmp(b)
-                .ok_or_else(|| value_error("cannot order with NaN"))?),
-            (O::Float(a), O::Int(b)) => Ok(a
-                .partial_cmp(&(*b as f64))
-                .ok_or_else(|| value_error("cannot order with NaN"))?),
+            (O::Int(a), O::Float(b)) => i64_cmp_f64(*a, *b),
+            (O::Float(a), O::Int(b)) => Ok(i64_cmp_f64(*b, *a)?.reverse()),
             (O::Long(a), O::Float(b)) => Ok(bigint_cmp_f64(a, *b)?),
             (O::Float(a), O::Long(b)) => Ok(bigint_cmp_f64(b, *a)?.reverse()),
             (O::Bool(a), O::Bool(b)) => Ok(a.cmp(b)),
@@ -1444,8 +1516,13 @@ impl Object {
     /// Membership: `x in container`.
     pub fn contains(&self, item: &Self) -> Result<bool, RuntimeError> {
         match self {
-            Object::Tuple(items) => Ok(items.iter().any(|x| x.eq_value(item))),
-            Object::List(items) => Ok(items.borrow().iter().any(|x| x.eq_value(item))),
+            // CPython's `PyObject_RichCompareBool` short-circuits on identity
+            // before `==`, so `nan in [nan]` (the *same* nan) is `True`.
+            Object::Tuple(items) => Ok(items.iter().any(|x| x.is_same(item) || x.eq_value(item))),
+            Object::List(items) => Ok(items
+                .borrow()
+                .iter()
+                .any(|x| x.is_same(item) || x.eq_value(item))),
             Object::Str(haystack) => match item {
                 Object::Str(needle) => Ok(haystack.contains(&**needle)),
                 _ => Err(type_error(
@@ -1708,13 +1785,7 @@ impl Object {
             Object::Int(i) => i.to_string(),
             Object::Long(b) => b.to_string(),
             Object::Complex(c) => complex_repr(c.real, c.imag),
-            Object::Float(f) => {
-                if f.fract() == 0.0 && f.is_finite() {
-                    format!("{f:.1}")
-                } else {
-                    f.to_string()
-                }
-            }
+            Object::Float(f) => float_repr(*f),
             Object::Str(s) => {
                 // CPython quote selection (Objects/unicodeobject.c
                 // `unicode_repr`): use '\'' unless the string contains a
@@ -1872,8 +1943,11 @@ impl Object {
                 }
             }
             Object::Property(_) => "<property object>".to_owned(),
-            Object::StaticMethod(_) => "<staticmethod object>".to_owned(),
-            Object::ClassMethod(_) => "<classmethod object>".to_owned(),
+            // CPython 3.10+: `<staticmethod(<function f at 0x..>)>` — the
+            // wrapped callable's repr is embedded so the address matches
+            // `'{!r}'.format(func)`.
+            Object::StaticMethod(inner) => format!("<staticmethod({})>", inner.repr()),
+            Object::ClassMethod(inner) => format!("<classmethod({})>", inner.repr()),
             Object::SlotDescriptor(sd) => {
                 format!("<member '{}' of '{}' objects>", sd.name, sd.class_name)
             }
@@ -1941,6 +2015,15 @@ impl Object {
             Object::MemoryView(mv) => Ok(mv.len.get()),
             Object::MappingProxy(d) => Ok(d.borrow().len()),
             Object::DictView(v) => Ok(v.dict.borrow().len()),
+            // A subclass of a built-in container (`class C(list)`, …)
+            // measures the length of the native payload it wraps.
+            Object::Instance(inst) => match &inst.native {
+                Some(native) => native.len(),
+                None => Err(type_error(format!(
+                    "object of type '{}' has no len()",
+                    self.type_name()
+                ))),
+            },
             _ => Err(type_error(format!(
                 "object of type '{}' has no len()",
                 self.type_name()
@@ -1996,6 +2079,62 @@ pub(crate) fn bigint_eq_f64(a: &BigInt, b: f64) -> bool {
     *a == bi
 }
 
+/// Smallest power of two that is *not* exactly representable beyond the
+/// f64 integer-precision boundary; `2f64.powi(63)` as a literal so the
+/// i64-range checks below stay branch-cheap.
+const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// Exact `i64 == f64`. A plain `a as f64 == b` loses precision for
+/// `|a| > 2**53`, making e.g. `float(2**53 + 1) == 2**53 + 1` wrongly
+/// `True`. CPython compares an int and a float *exactly*; this mirrors
+/// that without allocating a `BigInt` for the common in-range case.
+pub(crate) fn i64_eq_f64(a: i64, b: f64) -> bool {
+    if !b.is_finite() || b.fract() != 0.0 {
+        return false;
+    }
+    // `b` is integral; it can equal an `i64` only inside `[-2**63, 2**63)`.
+    if (-TWO_POW_63..TWO_POW_63).contains(&b) {
+        (b as i64) == a
+    } else {
+        false
+    }
+}
+
+/// Exact `i64` vs `f64` ordering (see [`i64_eq_f64`]).
+pub(crate) fn i64_cmp_f64(a: i64, b: f64) -> Result<Ordering, RuntimeError> {
+    if b.is_nan() {
+        return Err(value_error("cannot order with NaN"));
+    }
+    if b == f64::INFINITY {
+        return Ok(Ordering::Less);
+    }
+    if b == f64::NEG_INFINITY {
+        return Ok(Ordering::Greater);
+    }
+    let trunc = b.trunc();
+    if (-TWO_POW_63..TWO_POW_63).contains(&trunc) {
+        let ti = trunc as i64;
+        match a.cmp(&ti) {
+            Ordering::Equal => {
+                let frac = b - trunc;
+                if frac == 0.0 {
+                    Ok(Ordering::Equal)
+                } else if frac > 0.0 {
+                    Ok(Ordering::Less)
+                } else {
+                    Ok(Ordering::Greater)
+                }
+            }
+            other => Ok(other),
+        }
+    } else if trunc > 0.0 {
+        // |b| ≥ 2**63 is larger in magnitude than any i64.
+        Ok(Ordering::Less)
+    } else {
+        Ok(Ordering::Greater)
+    }
+}
+
 /// CPython's hash for ints: `value mod (2**61 - 1)` for 64-bit
 /// platforms.  This keeps `hash(1) == hash(1.0) == hash(True)` and
 /// also `hash(big) == hash(int(big))` for any big int.
@@ -2015,6 +2154,263 @@ pub(crate) fn python_int_hash_bigint(value: &BigInt) -> i64 {
     let modulus = BigInt::from(PYTHON_HASH_MODULUS);
     let (_, rem) = value.div_mod_floor(&modulus);
     rem.to_i64().unwrap_or(0)
+}
+
+/// Width of the Python numeric hash reduction: `_PyHASH_BITS` (61 on
+/// 64-bit, so the modulus is the Mersenne prime `2**61 - 1`).
+const PY_HASH_BITS: u32 = 61;
+/// `sys.hash_info.inf` — the hash of `±inf` (CPython `_PyHASH_INF`).
+pub(crate) const PY_HASH_INF: i64 = 314_159;
+/// `sys.hash_info.imag` — the multiplier for a complex's imaginary part.
+const PY_HASH_IMAG: u64 = 1_000_003;
+
+/// C `frexp`: split `x` into `(m, e)` with `x == m * 2**e` and
+/// `0.5 <= |m| < 1` (or `m == 0`). Handles subnormals; callers guard
+/// against non-finite inputs.
+fn py_frexp(x: f64) -> (f64, i32) {
+    if x == 0.0 || !x.is_finite() {
+        return (x, 0);
+    }
+    let bits = x.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
+    if raw_exp == 0 {
+        // Subnormal: scale into the normal range (× 2**54), then correct.
+        let (m, e) = py_frexp(x * 18_014_398_509_481_984.0_f64);
+        return (m, e - 54);
+    }
+    // Normal value = ±(1.frac) * 2**(raw_exp-1023). Forcing the stored
+    // exponent field to 1022 (factor 2**-1) yields a mantissa in [0.5, 1);
+    // the true binary exponent is then `raw_exp - 1022`.
+    let e = raw_exp - 1022;
+    let m = f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | (1022u64 << 52));
+    (m, e)
+}
+
+/// CPython `_Py_HashDouble`: the canonical hash of a finite double via
+/// reduction modulo `2**61 - 1`, so an integer-valued float hashes equal
+/// to the corresponding `int` and a `Fraction`/`Decimal` of equal value.
+pub(crate) fn py_hash_double(v: f64) -> i64 {
+    const MOD: u64 = (1u64 << PY_HASH_BITS) - 1;
+    if !v.is_finite() {
+        if v.is_infinite() {
+            return if v > 0.0 { PY_HASH_INF } else { -PY_HASH_INF };
+        }
+        // NaN. CPython 3.10+ uses the object's identity; for value hashing
+        // 0 is a stable, collision-tolerant choice (matches sys.hash_info.nan).
+        return 0;
+    }
+    let (mut m, mut e) = py_frexp(v);
+    let sign: i64 = if m < 0.0 {
+        m = -m;
+        -1
+    } else {
+        1
+    };
+    // Accumulate 28 bits of mantissa at a time, rotating left within the
+    // 61-bit field (mirrors the C loop exactly).
+    let mut x: u64 = 0;
+    while m != 0.0 {
+        x = ((x << 28) & MOD) | (x >> (PY_HASH_BITS - 28));
+        m *= 268_435_456.0; // 2**28
+        e -= 28;
+        let y = m as u64;
+        m -= y as f64;
+        x += y;
+        if x >= MOD {
+            x -= MOD;
+        }
+    }
+    // Fold in the leftover power of two via a 61-bit rotate.
+    let mut e = e % (PY_HASH_BITS as i32);
+    if e < 0 {
+        e += PY_HASH_BITS as i32;
+    }
+    let e = e as u32;
+    x = ((x << e) & MOD) | (x >> (PY_HASH_BITS - e));
+    let mut res = (x as i64) * sign;
+    if res == -1 {
+        res = -2;
+    }
+    res
+}
+
+/// CPython `long_hash` for a machine int: `sign * (|n| mod (2**61-1))`,
+/// with the reserved `-1` remapped to `-2`.
+pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
+    const MOD: u128 = (1u128 << PY_HASH_BITS) - 1;
+    let mut x = ((n as i128).unsigned_abs() % MOD) as i64;
+    if n < 0 {
+        x = -x;
+    }
+    if x == -1 {
+        x = -2;
+    }
+    x
+}
+
+/// CPython `long_hash` for a big int. `BigInt %` is truncating, so it
+/// already carries the dividend's sign with magnitude `|n| mod P`.
+pub(crate) fn py_hash_long_bigint(value: &BigInt) -> i64 {
+    let modulus = BigInt::from((1u64 << PY_HASH_BITS) - 1);
+    let rem = value % &modulus;
+    let mut x = rem.to_i64().unwrap_or(0);
+    if x == -1 {
+        x = -2;
+    }
+    x
+}
+
+/// CPython `complex_hash`: `hash(real) + _PyHASH_IMAG * hash(imag)` in
+/// wrapping (mod 2**64) arithmetic, with `-1` remapped to `-2`. A
+/// zero-imaginary complex therefore hashes equal to the bare float.
+pub(crate) fn py_hash_complex(re: f64, im: f64) -> i64 {
+    let hr = py_hash_double(re) as u64;
+    let hi = py_hash_double(im) as u64;
+    let combined = hr.wrapping_add(PY_HASH_IMAG.wrapping_mul(hi));
+    let res = combined as i64;
+    if res == -1 {
+        -2
+    } else {
+        res
+    }
+}
+
+/// Exact CPython `hash()` for the built-in numeric types, so that equal
+/// values across `bool`/`int`/`float`/`complex` (and the pure-Python
+/// `Fraction`/`Decimal`, which implement the same reduction) all agree.
+/// Returns `None` for non-numeric objects.
+pub(crate) fn numeric_hash(obj: &Object) -> Option<i64> {
+    match obj {
+        Object::Bool(b) => Some(py_hash_long_i64(i64::from(*b))),
+        Object::Int(i) => Some(py_hash_long_i64(*i)),
+        Object::Long(b) => Some(py_hash_long_bigint(b)),
+        Object::Float(f) => Some(py_hash_double(*f)),
+        Object::Complex(c) => Some(py_hash_complex(c.real, c.imag)),
+        _ => None,
+    }
+}
+
+/// `hash(None)` — CPython 3.12 returns this fixed constant rather than a
+/// pointer-derived value.
+const PY_HASH_NONE: i64 = 0xFCA8_6420;
+
+/// Deterministic structural hash for a byte slice (backs both `str` and
+/// `bytes`). CPython randomises string hashing per process via SipHash, so
+/// we don't need to reproduce its exact output — only to be stable within a
+/// run so equal strings bucket together. `hash("") == hash(b"") == 0`,
+/// matching CPython, and the reserved `-1` is remapped to `-2`.
+fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let v = h.finish() as i64;
+    if v == -1 {
+        -2
+    } else {
+        v
+    }
+}
+
+/// Identity-based hash for objects that hash by allocation identity in
+/// CPython (functions, types, modules, plain instances without a custom
+/// `__hash__`, …). Mirrors CPython's pointer hash: rotate so the low
+/// alignment zero-bits don't waste bucket entropy, remapping `-1` to `-2`.
+pub(crate) fn identity_hash(obj: &Object) -> i64 {
+    fn rot(p: *const ()) -> i64 {
+        let u = p as usize as u64;
+        let v = (u >> 4 | u << 60) as i64;
+        if v == -1 {
+            -2
+        } else {
+            v
+        }
+    }
+    match obj {
+        Object::Function(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Builtin(r) => rot(Rc::as_ptr(r).cast()),
+        Object::BoundMethod(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Code(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Cell(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Iter(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Slice(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Type(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Instance(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Module(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Generator(r) | Object::Coroutine(r) | Object::AsyncGenerator(r) => {
+            rot(Rc::as_ptr(r).cast())
+        }
+        Object::File(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Property(r) => rot(Rc::as_ptr(r).cast()),
+        Object::StaticMethod(r) => rot(Rc::as_ptr(r).cast()),
+        Object::ClassMethod(r) => rot(Rc::as_ptr(r).cast()),
+        Object::SlotDescriptor(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Frame(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Traceback(r) => rot(Rc::as_ptr(r).cast()),
+        Object::MemoryView(r) => rot(Rc::as_ptr(r).cast()),
+        Object::SimpleNamespace(r) => rot(Rc::as_ptr(r).cast()),
+        // Value-hashable variants never reach here (handled by
+        // `py_hash_value`); anything else gets a stable constant.
+        _ => 0,
+    }
+}
+
+/// Canonical Python `hash(obj)` value, shared by the `hash()` builtin and
+/// the [`DictKey`] hasher. Bucketing every key by this single value (rather
+/// than a type-tagged structural hash) is what lets objects Python considers
+/// equal-and-hashable collide regardless of Rust representation — e.g. a
+/// custom `__hash__` returning `hash('halibut')` buckets with the actual
+/// string, so a `set`/`dict` can dedup them via [`DictKey::eq`].
+///
+/// Returns `None` for objects with no *value* hash (identity-hashable or
+/// unhashable); callers fall back to [`identity_hash`].
+pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
+    if let Some(h) = numeric_hash(obj) {
+        return Some(h);
+    }
+    match obj {
+        Object::None => Some(PY_HASH_NONE),
+        Object::Str(s) => Some(py_hash_bytes_slice(s.as_bytes())),
+        Object::Bytes(b) => Some(py_hash_bytes_slice(b)),
+        Object::Tuple(items) => {
+            // Order-sensitive mix (FNV-style) over element hashes so equal
+            // tuples bucket together; unhashable elements would raise at the
+            // `hash()` builtin, here they just fold their identity in.
+            let mut acc: u64 = 0x345678;
+            for x in items.iter() {
+                let eh = py_hash_value(x).unwrap_or_else(|| identity_hash(x)) as u64;
+                acc = (acc ^ eh).wrapping_mul(1_000_003).wrapping_add(items.len() as u64);
+            }
+            let v = acc as i64;
+            Some(if v == -1 { -2 } else { v })
+        }
+        Object::FrozenSet(s) => {
+            // Order-independent: xor scrambled element hashes (mirrors the
+            // key property of CPython's `frozenset_hash`).
+            let mut acc: u64 = 0;
+            for k in s.iter() {
+                let eh = py_hash_value(&k.0).unwrap_or_else(|| identity_hash(&k.0)) as u64;
+                acc ^= eh
+                    .wrapping_mul(89_869_747)
+                    .wrapping_add(0x2545_F491_4F6C_DD1D);
+            }
+            let v = acc as i64;
+            Some(if v == -1 { -2 } else { v })
+        }
+        Object::Instance(inst) => {
+            if let Some(native) = &inst.native {
+                // int/str/… subclass instance hashes as the wrapped value.
+                return py_hash_value(native);
+            }
+            // Custom `__hash__` via the interpreter; `None` (no active
+            // interpreter or only the inherited identity hash) falls through
+            // to `identity_hash` at the call site.
+            current_interp_hash(obj)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn f64_to_i64_exact(f: f64) -> Option<i64> {
@@ -2055,21 +2451,94 @@ pub(crate) fn bigint_from_f64_trunc(f: f64) -> BigInt {
 /// Render a `complex` the way CPython does: bare `Xj` if real is
 /// zero, `(R+Ij)` / `(R-Ij)` otherwise.  Special-cases `nan` and
 /// signed zeros to match CPython's `repr` exactly.
-pub(crate) fn complex_repr(real: f64, imag: f64) -> String {
-    fn fmt_part(p: f64) -> String {
-        // Unlike `float`, CPython renders integer-valued complex
-        // components without a trailing `.0` (e.g. `4j`, not `4.0j`).
-        if p.fract() == 0.0 && p.is_finite() {
-            format!("{p:.0}")
-        } else {
-            format!("{p}")
-        }
+/// CPython-compatible `repr(float)` — the shortest decimal string that
+/// round-trips, switching to exponential notation exactly when CPython
+/// does (`decpt <= -4 || decpt > 16`, i.e. magnitudes below 1e-4 or at
+/// or above 1e16). Mirrors `float_repr` /
+/// `PyOS_double_to_string(v, 'r', 0, Py_DTSF_ADD_DOT_0, ...)`.
+///
+/// Rust's `f64::to_string()` is *also* shortest-round-trip, but never
+/// uses exponential form, so `1e100` would otherwise print as a 101-digit
+/// integer. We recover the shortest digits + decimal exponent from
+/// `{:e}` (Ryū) and reassemble them under CPython's rules.
+pub(crate) fn float_repr(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_owned();
     }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf" } else { "inf" }.to_owned();
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_owned();
+    }
+    let neg = f.is_sign_negative();
+    let a = f.abs();
+    let sci = format!("{a:e}");
+    let (mant, exp_str) = sci.split_once('e').expect("scientific form has 'e'");
+    let exp: i32 = exp_str.parse().expect("valid exponent");
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let ndigits = digits.len() as i32;
+    let decpt = exp + 1; // count of digits left of the decimal point
+    let body = if decpt <= -4 || decpt > 16 {
+        let e = decpt - 1;
+        let mut s = digits[..1].to_owned();
+        if digits.len() > 1 {
+            s.push('.');
+            s.push_str(&digits[1..]);
+        }
+        s.push('e');
+        s.push(if e < 0 { '-' } else { '+' });
+        s.push_str(&format!("{:02}", e.unsigned_abs()));
+        s
+    } else if decpt <= 0 {
+        let mut s = String::from("0.");
+        for _ in 0..(-decpt) {
+            s.push('0');
+        }
+        s.push_str(&digits);
+        s
+    } else if decpt >= ndigits {
+        let mut s = digits.clone();
+        for _ in 0..(decpt - ndigits) {
+            s.push('0');
+        }
+        s.push_str(".0");
+        s
+    } else {
+        let d = decpt as usize;
+        format!("{}.{}", &digits[..d], &digits[d..])
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// `repr`-shortest rendering of a single complex component. Unlike
+/// `float`, CPython renders integer-valued complex components without a
+/// trailing `.0` (e.g. `4j`, not `4.0j`), but otherwise uses the same
+/// shortest/exponential rules.
+pub(crate) fn complex_component_repr(p: f64) -> String {
+    let r = float_repr(p);
+    match r.strip_suffix(".0") {
+        Some(stripped) => stripped.to_owned(),
+        None => r,
+    }
+}
+
+pub(crate) fn complex_repr(real: f64, imag: f64) -> String {
+    let fmt_part = complex_component_repr;
     if real == 0.0 && real.is_sign_positive() {
         format!("{}j", fmt_part(imag))
     } else {
-        let sep = if imag.is_sign_negative() { "" } else { "+" };
-        format!("({}{sep}{}j)", fmt_part(real), fmt_part(imag))
+        // Insert the joining sign based on the *rendered* imaginary part,
+        // not its raw sign bit: `-nan` keeps a set sign bit yet renders as
+        // "nan" (no leading '-'), so CPython prints `(nan+nanj)`, and a
+        // genuine negative like -2.0 renders "-2" and needs no extra '+'.
+        let im = fmt_part(imag);
+        let sep = if im.starts_with('-') { "" } else { "+" };
+        format!("({}{sep}{im}j)", fmt_part(real))
     }
 }
 
@@ -2320,12 +2789,13 @@ impl Object {
         }
     }
 
-    /// Try to view this value as bytes (works for both `bytes` and
-    /// `bytearray`). Returns `None` for any other type.
+    /// Try to view this value as bytes (works for `bytes`, `bytearray`,
+    /// and contiguous `memoryview`). Returns `None` for any other type.
     pub fn as_bytes_view(&self) -> Option<Vec<u8>> {
         match self {
             Object::Bytes(b) => Some(b.to_vec()),
             Object::ByteArray(b) => Some(b.borrow().clone()),
+            Object::MemoryView(mv) => Some(mv.to_bytes()),
             _ => None,
         }
     }

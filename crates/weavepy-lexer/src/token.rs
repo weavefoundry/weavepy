@@ -41,6 +41,22 @@ impl Span {
     }
 }
 
+/// A deferred compile-time diagnostic discovered while scanning a string
+/// or bytes literal: CPython's invalid-escape and oversized-octal-escape
+/// `SyntaxWarning`s (e.g. `invalid escape sequence '\z'`).
+///
+/// The tokenizer detects these (matching CPython, which warns from the
+/// tokenizer/parser) but cannot emit them — that needs the runtime
+/// `warnings` machinery. They are surfaced to the compile path, which
+/// replays them through `warnings.warn_explicit`; an active `error`
+/// filter then turns them into `SyntaxError`s. `offset` is the absolute
+/// byte offset of the offending backslash within the source buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscapeWarning {
+    pub offset: u32,
+    pub message: String,
+}
+
 /// The lexical category of a token.
 ///
 /// Operator and punctuation variants are distinct so parser dispatch
@@ -318,8 +334,14 @@ impl StringPrefix {
                 _ => return None,
             }
         }
-        // CPython rejects bytes + unicode, bytes + f, f + u combinations.
-        if (p.bytes && p.unicode) || (p.bytes && p.fstring) || (p.fstring && p.unicode) {
+        // CPython rejects every combination of the `u` prefix with another
+        // marker (`ur`, `ru`, `bu`, `fu`) and of bytes with `f`. The `u`
+        // prefix is only valid standing alone (kept for Py2 source compat).
+        if (p.bytes && p.unicode)
+            || (p.bytes && p.fstring)
+            || (p.fstring && p.unicode)
+            || (p.raw && p.unicode)
+        {
             return None;
         }
         Some(p)

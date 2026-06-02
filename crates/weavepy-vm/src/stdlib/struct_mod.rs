@@ -28,6 +28,12 @@ use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
+/// Upper bound on a computed struct size, mirroring CPython's
+/// `PY_SSIZE_T_MAX` guard in `_struct` (`prepare_s`). Beyond this we
+/// raise `struct.error: total struct size too long` rather than letting
+/// the repeat-count arithmetic overflow and panic the `Vec` allocator.
+const MAX_STRUCT_SIZE: usize = isize::MAX as usize;
+
 /// Format-string byte-order prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Endian {
@@ -115,10 +121,14 @@ impl CompiledFormat {
             let unit = element_size(code, endian)?;
             // For 's' / 'p' the count is the byte count of the string;
             // each field is a single value but consumes `n` bytes.
-            let bytes = match code {
-                's' | 'p' => unit * n,
-                _ => unit * n,
-            };
+            // Use checked arithmetic so a pathological repeat count
+            // (e.g. `struct.calcsize('999999999999s')`) raises CPython's
+            // `struct.error: total struct size too long` instead of
+            // overflowing and panicking the `Vec` allocator.
+            let bytes = unit
+                .checked_mul(n)
+                .filter(|b| *b <= MAX_STRUCT_SIZE)
+                .ok_or_else(|| struct_error("total struct size too long"))?;
             // Native alignment: pad to alignment if @ mode.
             if endian == Endian::Native {
                 let align = native_align(code);
@@ -134,7 +144,10 @@ impl CompiledFormat {
                 }
             }
             fields.push(Field { code, count: n });
-            size += bytes;
+            size = size
+                .checked_add(bytes)
+                .filter(|s| *s <= MAX_STRUCT_SIZE)
+                .ok_or_else(|| struct_error("total struct size too long"))?;
         }
         Ok(Self {
             endian,
@@ -160,7 +173,10 @@ impl CompiledFormat {
                 values.len()
             )));
         }
-        let mut out = Vec::with_capacity(self.size);
+        // Cap the up-front reservation: `self.size` is already bounded by
+        // `MAX_STRUCT_SIZE`, but a multi-gigabyte format shouldn't pre-
+        // allocate everything at once — let the buffer grow as we write.
+        let mut out = Vec::with_capacity(self.size.min(1 << 20));
         let mut idx = 0usize;
         for f in &self.fields {
             match f.code {
@@ -229,18 +245,6 @@ impl CompiledFormat {
             )));
         }
         self.unpack_from_offset(buf, 0).map(|(v, _)| v)
-    }
-
-    fn unpack_from(&self, buf: &[u8], offset: usize) -> Result<Vec<Object>, RuntimeError> {
-        if buf.len() < offset + self.size {
-            return Err(struct_error(format!(
-                "unpack_from requires a buffer of at least {} bytes for unpacking {} bytes at offset {}",
-                offset + self.size,
-                self.size,
-                offset
-            )));
-        }
-        self.unpack_from_offset(buf, offset).map(|(v, _)| v)
     }
 
     fn iter_unpack(&self, buf: &[u8]) -> Result<Vec<Vec<Object>>, RuntimeError> {
@@ -747,10 +751,10 @@ fn b_pack_into(args: &[Object]) -> Result<Object, RuntimeError> {
     match &args[1] {
         Object::ByteArray(buf) => {
             let mut buf = buf.borrow_mut();
-            let off = offset.max(0) as usize;
-            if buf.len() < off + bytes.len() {
-                buf.resize(off + bytes.len(), 0);
-            }
+            // Resolve the (possibly negative) offset against the buffer
+            // and bounds-check without growing it — CPython's
+            // `pack_into` writes in place and never resizes.
+            let off = resolve_buffer_offset(offset, buf.len(), cf.size, "pack_into", true)?;
             buf[off..off + bytes.len()].copy_from_slice(&bytes);
             Ok(Object::None)
         }
@@ -760,6 +764,55 @@ fn b_pack_into(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// Resolve a `pack_into`/`unpack_from` offset against a buffer of
+/// `buf_len` bytes, matching CPython's `_struct` boundary diagnostics.
+/// `size` is the struct's byte size; `for_pack` toggles the
+/// pack- vs unpack-flavoured messages. Returns the non-negative byte
+/// offset to start at, or a `struct.error` describing the overflow.
+fn resolve_buffer_offset(
+    offset: i64,
+    buf_len: usize,
+    size: usize,
+    op: &str,
+    for_pack: bool,
+) -> Result<usize, RuntimeError> {
+    let size_i = size as i128;
+    let len_i = buf_len as i128;
+    let off = offset as i128;
+    let resolved = if off < 0 {
+        if off + size_i > 0 {
+            let verb = if for_pack { "pack" } else { "unpack" };
+            let lead = if for_pack {
+                "no space to"
+            } else {
+                "not enough data to"
+            };
+            return Err(struct_error(format!(
+                "{lead} {verb} {size} bytes at offset {offset}"
+            )));
+        }
+        if off + len_i < 0 {
+            return Err(struct_error(format!(
+                "offset {offset} out of range for {buf_len}-byte buffer"
+            )));
+        }
+        off + len_i
+    } else {
+        off
+    };
+    // `resolved` is now non-negative. Check that `size` bytes fit.
+    if len_i - resolved < size_i {
+        let needed = (resolved as u128) + (size as u128);
+        let verb = if for_pack { "packing" } else { "unpacking" };
+        return Err(struct_error(format!(
+            "{op} requires a buffer of at least {needed} bytes for \
+             {verb} {size} bytes at offset {resolved} \
+             (actual buffer size is {buf_len})"
+        )));
+    }
+    Ok(resolved as usize)
+}
+
 fn b_unpack_from(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 {
         return Err(type_error("unpack_from() requires at least 2 arguments"));
@@ -767,8 +820,9 @@ fn b_unpack_from(args: &[Object]) -> Result<Object, RuntimeError> {
     let fmt = fmt_arg(args, 0)?;
     let cf = CompiledFormat::parse(&fmt)?;
     let buf = buffer_arg(&args[1])?;
-    let offset = args.get(2).and_then(|o| o.as_i64()).unwrap_or(0).max(0) as usize;
-    let vals = cf.unpack_from(&buf, offset)?;
+    let offset = args.get(2).and_then(|o| o.as_i64()).unwrap_or(0);
+    let off = resolve_buffer_offset(offset, buf.len(), cf.size, "unpack_from", false)?;
+    let (vals, _) = cf.unpack_from_offset(&buf, off)?;
     Ok(Object::new_tuple(vals))
 }
 

@@ -22,5 +22,9 @@ num-bigint    = { workspace = true }
 # full UCD name table shipped by this crate (CPython parity).
 unicode_names2 = { workspace = true }
 
+# PEP 3131: identifiers are NFKC-normalized at parse time, so `µ` (U+00B5)
+# and `μ` (U+03BC) name the same binding and `𝔘𝔫𝔦𝔠𝔬𝔡𝔢` folds to `Unicode`.
+unicode-normalization = { workspace = true }
+
 [lints]
 workspace = true

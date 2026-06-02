@@ -190,7 +190,17 @@ class Rational(Real):
         ...
 
     def __float__(self):
-        return self.numerator / self.denominator
+        """float(self) = self.numerator / self.denominator
+
+        It's important that this conversion use the integer's "true"
+        division rather than casting one side to float before dividing
+        so that ratios of huge integers convert without overflowing.
+        The explicit ``int()`` coercions let a Rational whose
+        numerator/denominator are themselves Integral (but not built-in
+        ``int``) still convert — e.g. ``DummyIntegral`` in the
+        numeric-tower tests, whose own ``__truediv__`` declines.
+        """
+        return int(self.numerator) / int(self.denominator)
 
 
 class Integral(Rational):

@@ -277,6 +277,11 @@ fn needs_continuation(source: &str) -> bool {
             span.end.0 as usize >= source.len().saturating_sub(1)
         }
         Err(parser::ParseError::Lex(lexer::LexError::UnterminatedString { .. })) => true,
+        // An unterminated (possibly triple-quoted) f-string literal is the
+        // multi-line-continuation case too — the user is still typing it.
+        // (`FstringExpectingBrace`/`...OrSpec` are real errors, not these.)
+        Err(parser::ParseError::Lex(lexer::LexError::UnterminatedFstring { .. })) => true,
+        Err(parser::ParseError::Lex(lexer::LexError::UnterminatedTripleFstring { .. })) => true,
         Err(parser::ParseError::Lex(lexer::LexError::UnexpectedEof { .. })) => true,
         Err(_) => false,
     }

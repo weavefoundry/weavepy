@@ -103,6 +103,12 @@ class array:
     def tobytes(self):
         return b''.join(_struct.pack(self._fmt, v) for v in self._data)
 
+    def __buffer__(self, flags):
+        # PEP 688 buffer protocol: expose the packed bytes so buffer
+        # consumers (``float``/``int``/``bytes``/``memoryview``) can read the
+        # array's contents, mirroring CPython's C-level buffer export.
+        return memoryview(self.tobytes())
+
     def fromlist(self, seq):
         for v in seq:
             self._data.append(self._coerce(v))

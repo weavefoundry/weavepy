@@ -19,11 +19,28 @@ mod parser;
 
 pub use ast::{dump_module, Module};
 pub use error::ParseError;
+pub use weavepy_lexer::EscapeWarning;
 
 /// Parse a Python source buffer into a [`Module`].
 pub fn parse_module(source: &str) -> Result<Module, ParseError> {
-    let tokens = weavepy_lexer::tokenize(source)?;
-    parser::parse(source, tokens)
+    parse_module_with_warnings(source).0
+}
+
+/// Like [`parse_module`], but also returns the deferred [`EscapeWarning`]s
+/// the tokenizer found in string/bytes literals.
+///
+/// Warnings are returned on **both** the success and error paths: an
+/// invalid escape in an earlier literal must still surface (as a
+/// `SyntaxWarning`, or a `SyntaxError` under an `error` filter) even when
+/// a later token fails to lex/parse — e.g. `eval("'\\e' $")`. The VM
+/// replays the warnings before propagating any parse error.
+pub fn parse_module_with_warnings(source: &str) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
+    let (tok_result, warnings) = weavepy_lexer::tokenize_with_escapes(source);
+    let module = match tok_result {
+        Ok(tokens) => parser::parse(source, tokens),
+        Err(e) => Err(ParseError::from(e)),
+    };
+    (module, warnings)
 }
 
 #[cfg(test)]

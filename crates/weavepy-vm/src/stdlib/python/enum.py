@@ -386,6 +386,33 @@ def unique(enumeration):
     return enumeration
 
 
+def global_enum_repr(self):
+    """`repr` that references the member's *module* rather than its class —
+    used for enums hoisted into a module namespace via :func:`global_enum`
+    (e.g. ``calendar.JANUARY``)."""
+    return f"{self.__class__.__module__}.{self._name_}"
+
+
+def global_str(self):
+    cls_name = self.__class__.__name__
+    return f"{cls_name}.{self._name_}"
+
+
+def global_enum(cls, update_str=False):
+    """Class decorator that exports an enum's members into its defining
+    module's global namespace and switches member ``repr`` to the
+    module-qualified form (CPython's ``enum.global_enum``). ``IntEnum``
+    keeps ``int``'s ``__str__`` unless ``update_str`` is set."""
+    import sys
+    cls.__repr__ = global_enum_repr
+    if update_str:
+        cls.__str__ = global_str
+    module = sys.modules.get(cls.__module__)
+    if module is not None:
+        module.__dict__.update(cls.__members__)
+    return cls
+
+
 __all__ = [
     "auto",
     "EnumMeta",
@@ -395,4 +422,5 @@ __all__ = [
     "Flag",
     "IntFlag",
     "unique",
+    "global_enum",
 ]

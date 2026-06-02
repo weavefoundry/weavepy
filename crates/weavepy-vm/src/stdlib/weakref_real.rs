@@ -115,15 +115,45 @@ fn b_dyn(
     }))
 }
 
+/// Type-level `__call__` for `weakref`/proxy instances.
+///
+/// CPython looks up special methods (here `__call__`) on the *type*,
+/// not the instance, so `weakref.ref(obj)()` must resolve `__call__`
+/// via the class MRO. Each ref instance stores its per-target deref
+/// closure under `__weakref_get__` in its own dict; this shared
+/// type-level method bridges to it so `r()` returns the live target
+/// (or `None` once the referent is collected).
+fn ref_type_call(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = args
+        .first()
+        .ok_or_else(|| type_error("__call__() missing self"))?;
+    if let Object::Instance(inst) = me {
+        let getter = inst
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__weakref_get__")))
+            .cloned();
+        if let Some(Object::Builtin(b)) = getter {
+            return (b.call)(&[]);
+        }
+    }
+    Err(type_error("__call__() requires a weakref instance"))
+}
+
 fn ref_type() -> Rc<TypeObject> {
     REF_TYPE.with(|cell| {
         if let Some(t) = cell.borrow().clone() {
             return t;
         }
+        let mut type_dict = DictData::new();
+        type_dict.insert(
+            DictKey(Object::from_static("__call__")),
+            b("__call__", ref_type_call),
+        );
         let t = TypeObject::new_with_flags(
             "weakref",
             vec![crate::builtin_types::builtin_types().object_.clone()],
-            DictData::new(),
+            type_dict,
             TypeFlags {
                 is_exception: false,
                 is_builtin: true,

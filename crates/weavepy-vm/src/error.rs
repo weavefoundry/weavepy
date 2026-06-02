@@ -69,6 +69,29 @@ impl PyException {
         self.traceback.push(entry);
     }
 
+    /// PEP 678: append a string note to the wrapped instance's
+    /// `__notes__` list (created on first use). Mirrors
+    /// `BaseException.add_note`, but callable from Rust-side machinery
+    /// that needs to annotate an exception before re-raising it — e.g.
+    /// CPython's `type.__new__` decorates a `__set_name__` failure with
+    /// "Error calling __set_name__ on '…' instance '…' in '…'".
+    pub fn add_note(&self, note: impl Into<String>) {
+        use crate::object::DictKey;
+        if let Object::Instance(inst) = &self.instance {
+            let key = DictKey(Object::from_static("__notes__"));
+            let mut dict = inst.dict.borrow_mut();
+            let mut notes = match dict.get(&key) {
+                Some(Object::List(l)) => l.borrow().clone(),
+                _ => Vec::new(),
+            };
+            notes.push(Object::from_str(note.into()));
+            dict.insert(
+                key,
+                Object::List(crate::sync::Rc::new(crate::sync::GilCell::new(notes))),
+            );
+        }
+    }
+
     /// When this exception is a `SystemExit` (or a subclass), return
     /// its exit `code`: the explicit `.code` attribute, falling back to
     /// the single `args` element (`()` → `None`, `(x,)` → `x`,
@@ -173,6 +196,18 @@ pub fn zero_division_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("ZeroDivisionError", message))
 }
 
+pub fn overflow_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("OverflowError", message))
+}
+
+/// `RecursionError` — raised when the per-thread Python call depth /
+/// native-recursion guard (RFC 0037 WS1) is exceeded. CPython raises
+/// this from `Py_EnterRecursiveCall`, including on the C-level recursion
+/// inside `do_richcompare`/`repr` of reflexive containers.
+pub fn recursion_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("RecursionError", message))
+}
+
 pub fn stop_iteration() -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("StopIteration", ""))
 }
@@ -218,6 +253,57 @@ pub fn unbound_local_error(message: impl Into<String>) -> RuntimeError {
 
 pub fn import_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("ImportError", message))
+}
+
+/// A bare `SyntaxError` carrying only a message — no source location.
+/// Used for compiler-phase failures (e.g. `'return' outside function`)
+/// that don't track a byte offset, so `str(e)` is just the message.
+pub fn syntax_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("SyntaxError", message))
+}
+
+/// A `SyntaxError` with CPython's full location payload. Sets `.msg`,
+/// `.filename`, `.lineno`, `.offset`, and `.text` on the instance and
+/// shapes `args` as `(msg, (filename, lineno, offset, text))`, exactly as
+/// CPython's parser does — so `str(e)` renders
+/// `"<msg> (<basename>, line <lineno>)"` and the attributes are
+/// inspectable (`e.lineno`, `e.offset`, …).
+pub fn syntax_error_located(
+    message: impl Into<String>,
+    filename: Option<&str>,
+    lineno: Option<u32>,
+    offset: Option<u32>,
+    text: Option<&str>,
+) -> RuntimeError {
+    use crate::object::DictKey;
+    let message = message.into();
+    let pe = PyException::from_builtin("SyntaxError", message.clone());
+    if let Object::Instance(inst) = &pe.instance {
+        let msg_obj = Object::from_str(message);
+        let file_obj = filename.map_or(Object::None, |s| Object::from_str(s));
+        let line_obj = lineno.map_or(Object::None, |n| Object::Int(i64::from(n)));
+        let off_obj = offset.map_or(Object::None, |n| Object::Int(i64::from(n)));
+        let text_obj = text.map_or(Object::None, |s| Object::from_str(s));
+        let detail = Object::new_tuple(vec![
+            file_obj.clone(),
+            line_obj.clone(),
+            off_obj.clone(),
+            text_obj.clone(),
+        ]);
+        let mut dict = inst.dict.borrow_mut();
+        dict.insert(DictKey(Object::from_static("msg")), msg_obj.clone());
+        dict.insert(DictKey(Object::from_static("filename")), file_obj);
+        dict.insert(DictKey(Object::from_static("lineno")), line_obj);
+        dict.insert(DictKey(Object::from_static("offset")), off_obj);
+        dict.insert(DictKey(Object::from_static("text")), text_obj);
+        dict.insert(DictKey(Object::from_static("end_lineno")), Object::None);
+        dict.insert(DictKey(Object::from_static("end_offset")), Object::None);
+        dict.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![msg_obj, detail]),
+        );
+    }
+    RuntimeError::PyException(pe)
 }
 
 pub fn module_not_found_error(message: impl Into<String>) -> RuntimeError {

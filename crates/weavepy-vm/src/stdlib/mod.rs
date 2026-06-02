@@ -171,9 +171,60 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/builtins.py"),
             is_package: false,
         },
+        // `collections` is a package so `collections.abc` resolves; the
+        // verbatim CPython `_collections_abc` carries the ABC definitions
+        // and `collections.abc` re-exports them (RFC 0037 WS8).
         FrozenSource {
             name: "collections",
             source: include_str!("python/collections.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "_collections_abc",
+            source: include_str!("python/_collections_abc.py"),
+            is_package: false,
+        },
+        // `_weakrefset` (verbatim CPython): the `WeakSet` source module
+        // that `abc`/`_py_abc` import directly to back the ABC virtual-
+        // subclass registry/caches (RFC 0037 WS8).
+        FrozenSource {
+            name: "_weakrefset",
+            source: include_str!("python/_weakrefset.py"),
+            is_package: false,
+        },
+        // `_py_abc` (verbatim CPython): the pure-Python `ABCMeta`
+        // reference implementation. `test_abc` imports it directly to
+        // exercise the Python ABC machinery alongside the C `_abc` path.
+        FrozenSource {
+            name: "_py_abc",
+            source: include_str!("python/_py_abc.py"),
+            is_package: false,
+        },
+        // `_colorize`: CPython 3.13's ANSI-colour helper (verbatim). Imported
+        // by `traceback`/`test_traceback` (and the 3.13 REPL); honours
+        // NO_COLOR/FORCE_COLOR and TTY detection.
+        FrozenSource {
+            name: "_colorize",
+            source: include_str!("python/_colorize.py"),
+            is_package: false,
+        },
+        // `__future__`: the feature-flag table (verbatim CPython 3.13).
+        // `from __future__ import annotations` is a compiler directive, but
+        // the module must still be importable because real modules read its
+        // `_Feature` objects (e.g. `__future__.annotations`).
+        FrozenSource {
+            name: "__future__",
+            source: include_str!("python/future_module.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "collections.abc",
+            source: include_str!("python/collections_abc.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_collections_user",
+            source: include_str!("python/_collections_user.py"),
             is_package: false,
         },
         // RFC 0036 — `string` (constants + `Template` + `Formatter` over
@@ -197,6 +248,26 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "functools",
             source: include_str!("python/functools.py"),
+            is_package: false,
+        },
+        // RFC 0037 WS8 verbatim/faithful module ports that gate import-time
+        // clusters: `cmath` (pure-Python over the `math` core) unblocks
+        // `test_fractions`; the C-locale `locale` unblocks `test_format`
+        // and backs `calendar`'s `LocaleTextCalendar`; `calendar` is the
+        // verbatim CPython 3.13 module.
+        FrozenSource {
+            name: "cmath",
+            source: include_str!("python/cmath.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "locale",
+            source: include_str!("python/locale.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "calendar",
+            source: include_str!("python/calendar.py"),
             is_package: false,
         },
         FrozenSource {
@@ -332,6 +403,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/html_parser.py"),
             is_package: false,
         },
+        FrozenSource {
+            name: "html.entities",
+            source: include_str!("python/html_entities.py"),
+            is_package: false,
+        },
         // `urllib` is a package containing three submodules.
         FrozenSource {
             name: "urllib",
@@ -448,6 +524,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
+            name: "reprlib",
+            source: include_str!("python/reprlib.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "warnings",
             source: include_str!("python/warnings.py"),
             is_package: false,
@@ -538,6 +619,20 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/test_support_socket_helper.py"),
             is_package: false,
         },
+        // `test.support.hashlib_helper` (verbatim) — `requires_hashdigest`
+        // gate used by test_hmac and friends.
+        FrozenSource {
+            name: "test.support.hashlib_helper",
+            source: include_str!("python/test_support_hashlib_helper.py"),
+            is_package: false,
+        },
+        // `test.support.i18n_helper` — minimal shim (snapshot tests skip) so
+        // test_getopt/test_optparse import; their own tests still run.
+        FrozenSource {
+            name: "test.support.i18n_helper",
+            source: include_str!("python/test_support_i18n_helper.py"),
+            is_package: false,
+        },
         // RFC 0036 — two more 3.13 helper submodules carried verbatim:
         // `testcase` (ExceptionIsLikeMixin + float/complex assertions used
         // by test_float/test_complex) and `numbers` (the numeric-tower
@@ -550,6 +645,47 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "test.support.numbers",
             source: include_str!("python/test_support_numbers.py"),
+            is_package: false,
+        },
+        // `test.tokenizedata`: vendored lexer/tokenizer fixtures.
+        // `test_unicode_identifiers` imports `badsyntax_3131` to assert the
+        // exact `SyntaxError` for an invalid PEP 3131 identifier (`€`).
+        FrozenSource {
+            name: "test.tokenizedata",
+            source: include_str!("python/test_tokenizedata_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "test.tokenizedata.badsyntax_3131",
+            source: include_str!("python/test_tokenizedata_badsyntax_3131.py"),
+            is_package: false,
+        },
+        // `test.string_tests`: the shared CommonTest/MixinStrUnicodeUserStringTest
+        // base classes that `test_bytes`/`test_bytearray`/`test_str` derive
+        // from. Carried verbatim from CPython 3.13.
+        FrozenSource {
+            name: "test.string_tests",
+            source: include_str!("python/test_string_tests.py"),
+            is_package: false,
+        },
+        // `test.seq_tests` / `test.list_tests`: shared sequence/list test
+        // mixins (verbatim CPython 3.13) that `test_bytes`/`test_list`/
+        // `test_tuple`/`test_deque` and friends import.
+        FrozenSource {
+            name: "test.seq_tests",
+            source: include_str!("python/test_seq_tests.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.list_tests",
+            source: include_str!("python/test_list_tests.py"),
+            is_package: false,
+        },
+        // `test.pickletester`: only `ExtensionSaver` is carried (test_copyreg
+        // imports it); the full CPython file is ~4900 lines of pickle matrix.
+        FrozenSource {
+            name: "test.pickletester",
+            source: include_str!("python/test_pickletester.py"),
             is_package: false,
         },
         // `test.__main__` / `test.regrtest`: drive `weavepy -m test` and
@@ -669,6 +805,14 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "decimal",
             source: include_str!("python/decimal.py"),
+            is_package: false,
+        },
+        // Full CPython pure-Python decimal (IEEE 754-2008: NaN/Infinity,
+        // contexts, traps, exact float/Decimal comparison + hashing). The
+        // `decimal` shim above re-exports this via `sys.modules` like CPython.
+        FrozenSource {
+            name: "_pydecimal",
+            source: include_str!("python/_pydecimal.py"),
             is_package: false,
         },
         FrozenSource {

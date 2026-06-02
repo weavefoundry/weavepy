@@ -248,6 +248,7 @@ fn map_to_cpython(ins: Instruction, nlocals: u32) -> MappedOp {
         O::DeleteName => (op::DELETE_NAME, ins.arg),
         O::LoadDeref => (op::LOAD_DEREF, ins.arg + nlocals),
         O::StoreDeref => (op::STORE_DEREF, ins.arg + nlocals),
+        O::DeleteDeref => (op::DELETE_DEREF, ins.arg + nlocals),
         O::MakeCell => (op::MAKE_CELL, ins.arg + nlocals),
         // 3.13 has no real LOAD_CLOSURE opcode; cells live in the fast
         // array and are loaded with LOAD_FAST.
@@ -1002,6 +1003,7 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
         op::DELETE_NAME => (O::DeleteName, arg),
         op::LOAD_DEREF => (O::LoadDeref, arg.saturating_sub(nlocals)),
         op::STORE_DEREF => (O::StoreDeref, arg.saturating_sub(nlocals)),
+        op::DELETE_DEREF => (O::DeleteDeref, arg.saturating_sub(nlocals)),
         op::MAKE_CELL => (O::MakeCell, arg.saturating_sub(nlocals)),
         op::LOAD_ATTR => (O::LoadAttr, arg >> 1),
         op::STORE_ATTR => (O::StoreAttr, arg),

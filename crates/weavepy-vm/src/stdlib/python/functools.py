@@ -13,6 +13,7 @@ __all__ = [
     "wraps",
     "update_wrapper",
     "cmp_to_key",
+    "total_ordering",
     "singledispatch",
     "cached_property",
 ]
@@ -45,40 +46,90 @@ def reduce(function, iterable, *initial):
 
 
 class partial:
-    """Callable that pre-applies positional and keyword arguments."""
+    """Callable that pre-applies positional and keyword arguments.
 
-    def __init__(self, func, *args, **kwargs):
+    `func` is positional-only (CPython's `partial.__new__(cls, func, /,
+    *args, **keywords)`): without that, a keyword named `func`/`self`
+    passed through to the wrapped callable — e.g. `operator.methodcaller`'s
+    pickle reduce builds `partial(methodcaller, name, self=..., name=...)`
+    — would collide with the constructor's own parameter and raise
+    "got multiple values for argument 'self'".
+    """
+
+    def __new__(cls, func, /, *args, **keywords):
+        if not callable(func):
+            raise TypeError("the first argument must be callable")
         if isinstance(func, partial):
             args = func.args + args
-            new_kwargs = dict(func.keywords)
-            new_kwargs.update(kwargs)
-            kwargs = new_kwargs
+            keywords = {**func.keywords, **keywords}
             func = func.func
+        self = super(partial, cls).__new__(cls)
         self.func = func
         self.args = args
-        self.keywords = kwargs
+        self.keywords = keywords
+        return self
 
-    def __call__(self, *args, **kwargs):
-        merged = dict(self.keywords)
-        merged.update(kwargs)
-        return self.func(*self.args, *args, **merged)
+    def __call__(self, /, *args, **keywords):
+        keywords = {**self.keywords, **keywords}
+        return self.func(*self.args, *args, **keywords)
 
     def __repr__(self):
+        qualname = type(self).__qualname__
+        module = type(self).__module__ or "functools"
         parts = [repr(self.func)]
         for a in self.args:
             parts.append(repr(a))
         for k, v in self.keywords.items():
             parts.append(k + "=" + repr(v))
-        return "functools.partial(" + ", ".join(parts) + ")"
+        return module + "." + qualname + "(" + ", ".join(parts) + ")"
+
+    def __reduce__(self):
+        return (
+            type(self),
+            (self.func,),
+            (self.func, self.args, self.keywords or None, self.__dict__ or None),
+        )
+
+    def __setstate__(self, state):
+        if not isinstance(state, tuple):
+            raise TypeError("argument to __setstate__ must be a tuple")
+        if len(state) != 4:
+            raise TypeError("expected 4 items in state, got %d" % len(state))
+        func, args, kwds, namespace = state
+        if (not callable(func) or not isinstance(args, tuple) or
+                (kwds is not None and not isinstance(kwds, dict)) or
+                (namespace is not None and not isinstance(namespace, dict))):
+            raise TypeError("invalid partial state")
+        args = tuple(args)
+        if kwds is None:
+            kwds = {}
+        elif type(kwds) is not dict:
+            kwds = dict(kwds)
+        if namespace is None:
+            namespace = {}
+        self.__dict__ = namespace
+        self.func = func
+        self.args = args
+        self.keywords = kwds
 
 
 class partialmethod:
     """Descriptor form of :class:`partial` for methods."""
 
-    def __init__(self, func, *args, **kwargs):
-        self.func = func
-        self.args = args
-        self.keywords = kwargs
+    def __init__(self, func, /, *args, **keywords):
+        # `func` is positional-only (PEP 570) so a wrapped callable may itself
+        # take `self`/`func` keyword arguments without colliding — matches
+        # CPython's `partialmethod.__init__` signature.
+        if isinstance(func, partialmethod):
+            # Flatten nested partialmethods so cls/self stay ahead of all
+            # other arguments and only one underlying call happens.
+            self.func = func.func
+            self.args = func.args + args
+            self.keywords = {**func.keywords, **keywords}
+        else:
+            self.func = func
+            self.args = args
+            self.keywords = keywords
 
     def __get__(self, instance, owner=None):
         if instance is None:
@@ -265,6 +316,123 @@ def cmp_to_key(cmp):
             return cmp(self.obj, other.obj) != 0
 
     return K
+
+
+# ---- total_ordering ----------------------------------------------------------
+# Verbatim CPython 3.13: fills in the missing rich-comparison methods from a
+# single defined one (RFC 0037 WS8 functools edges).
+
+def _gt_from_lt(self, other, NotImplemented=NotImplemented):
+    'Return a > b.  Computed by @total_ordering from (not a < b) and (a != b).'
+    op_result = type(self).__lt__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return not op_result and self != other
+
+def _le_from_lt(self, other, NotImplemented=NotImplemented):
+    'Return a <= b.  Computed by @total_ordering from (a < b) or (a == b).'
+    op_result = type(self).__lt__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return op_result or self == other
+
+def _ge_from_lt(self, other, NotImplemented=NotImplemented):
+    'Return a >= b.  Computed by @total_ordering from (not a < b).'
+    op_result = type(self).__lt__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return not op_result
+
+def _ge_from_le(self, other, NotImplemented=NotImplemented):
+    'Return a >= b.  Computed by @total_ordering from (not a <= b) or (a == b).'
+    op_result = type(self).__le__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return not op_result or self == other
+
+def _lt_from_le(self, other, NotImplemented=NotImplemented):
+    'Return a < b.  Computed by @total_ordering from (a <= b) and (a != b).'
+    op_result = type(self).__le__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return op_result and self != other
+
+def _gt_from_le(self, other, NotImplemented=NotImplemented):
+    'Return a > b.  Computed by @total_ordering from (not a <= b).'
+    op_result = type(self).__le__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return not op_result
+
+def _lt_from_gt(self, other, NotImplemented=NotImplemented):
+    'Return a < b.  Computed by @total_ordering from (not a > b) and (a != b).'
+    op_result = type(self).__gt__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return not op_result and self != other
+
+def _ge_from_gt(self, other, NotImplemented=NotImplemented):
+    'Return a >= b.  Computed by @total_ordering from (a > b) or (a == b).'
+    op_result = type(self).__gt__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return op_result or self == other
+
+def _le_from_gt(self, other, NotImplemented=NotImplemented):
+    'Return a <= b.  Computed by @total_ordering from (not a > b).'
+    op_result = type(self).__gt__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return not op_result
+
+def _le_from_ge(self, other, NotImplemented=NotImplemented):
+    'Return a <= b.  Computed by @total_ordering from (not a >= b) or (a == b).'
+    op_result = type(self).__ge__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return not op_result or self == other
+
+def _gt_from_ge(self, other, NotImplemented=NotImplemented):
+    'Return a > b.  Computed by @total_ordering from (a >= b) and (a != b).'
+    op_result = type(self).__ge__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return op_result and self != other
+
+def _lt_from_ge(self, other, NotImplemented=NotImplemented):
+    'Return a < b.  Computed by @total_ordering from (not a >= b).'
+    op_result = type(self).__ge__(self, other)
+    if op_result is NotImplemented:
+        return op_result
+    return not op_result
+
+_convert = {
+    '__lt__': [('__gt__', _gt_from_lt),
+               ('__le__', _le_from_lt),
+               ('__ge__', _ge_from_lt)],
+    '__le__': [('__ge__', _ge_from_le),
+               ('__lt__', _lt_from_le),
+               ('__gt__', _gt_from_le)],
+    '__gt__': [('__lt__', _lt_from_gt),
+               ('__ge__', _ge_from_gt),
+               ('__le__', _le_from_gt)],
+    '__ge__': [('__le__', _le_from_ge),
+               ('__gt__', _gt_from_ge),
+               ('__lt__', _lt_from_ge)],
+}
+
+def total_ordering(cls):
+    """Class decorator that fills in missing ordering methods"""
+    # Find user-defined comparisons (not those inherited from object).
+    roots = {op for op in _convert if getattr(cls, op, None) is not getattr(object, op, None)}
+    if not roots:
+        raise ValueError('must define at least one ordering operation: < > <= >=')
+    root = max(roots)       # prefer __lt__ to __le__ to __gt__ to __ge__
+    for opname, opfunc in _convert[root]:
+        if opname not in roots:
+            opfunc.__name__ = opname
+            setattr(cls, opname, opfunc)
+    return cls
 
 
 # ---- single-dispatch generic functions --------------------------------------

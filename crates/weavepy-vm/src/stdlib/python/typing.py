@@ -169,6 +169,49 @@ class _GenericAlias:
         # ``List[int](...)`` constructs the *origin* class.
         return self.__origin__(*args, **kwargs)
 
+    def __or__(self, other):
+        return _make_union(self, other)
+
+    def __ror__(self, other):
+        return _make_union(other, self)
+
+    def __instancecheck__(self, obj):
+        # PEP 3119 hook. Only ``Union`` supports instance checks; any
+        # other subscripted generic (``List[int]``) is rejected exactly
+        # as CPython does — you can't ask "is x a list-of-int?".
+        if self.__origin__ is Union:
+            return any(isinstance(obj, arg) for arg in self.__args__)
+        raise TypeError(
+            "Subscripted generics cannot be used with class and instance checks"
+        )
+
+    def __subclasscheck__(self, cls):
+        if self.__origin__ is Union:
+            return any(issubclass(cls, arg) for arg in self.__args__)
+        raise TypeError(
+            "Subscripted generics cannot be used with class and instance checks"
+        )
+
+
+def _as_class(x):
+    """Coerce a bare typing alias to the runtime class it stands in for,
+    so ``issubclass``/``isinstance`` can compare against it."""
+    if isinstance(x, _OriginAlias):
+        return x._origin
+    return x
+
+
+def _make_union(a, b):
+    """Build ``a | b`` as ``Union[a, b]`` (PEP 604), flattening any
+    nested unions so ``int | str | bytes`` has three flat args."""
+
+    def flatten(x):
+        if isinstance(x, _GenericAlias) and x.__origin__ is Union:
+            return list(x.__args__)
+        return [x]
+
+    return _GenericAlias(Union, tuple(flatten(a) + flatten(b)))
+
 
 def _type_repr(t):
     if t is type(None):
@@ -202,6 +245,20 @@ class _OriginAlias(_SpecialForm):
         alias = _GenericAlias(self._origin, params)
         alias._name = self._name
         return alias
+
+    def __or__(self, other):
+        return _make_union(self, other)
+
+    def __ror__(self, other):
+        return _make_union(other, self)
+
+    def __instancecheck__(self, obj):
+        # A bare alias (``typing.List``) checks against its origin class,
+        # mirroring ``isinstance(x, list)``.
+        return isinstance(obj, self._origin)
+
+    def __subclasscheck__(self, cls):
+        return issubclass(_as_class(cls), self._origin)
 
 
 List = _OriginAlias("List", list)
@@ -281,6 +338,62 @@ class Protocol(Generic, metaclass=_ProtocolMeta):
         cls._is_protocol = True
 
 
+# Infrastructure names that are never part of a protocol's structural
+# signature. Mirrors CPython's ``typing.EXCLUDED_ATTRIBUTES`` so that
+# *special* methods (``__int__``, ``__float__``, ``__abs__``, …) — which
+# are exactly what protocols like ``SupportsInt`` describe — are retained
+# while dunders that every object carries are dropped.
+_PROTOCOL_EXCLUDED_ATTRS = frozenset(
+    {
+        "__abstractmethods__",
+        "__annotations__",
+        "__dict__",
+        "__doc__",
+        "__init__",
+        "__module__",
+        "__name__",
+        "__qualname__",
+        "__new__",
+        "__slots__",
+        "__subclasshook__",
+        "__weakref__",
+        "__class_getitem__",
+        "__init_subclass__",
+        "__orig_bases__",
+        "__parameters__",
+        "__classcell__",
+        "__mro__",
+        "__bases__",
+        "_is_protocol",
+        "_is_runtime_protocol",
+        "_protocol_attrs",
+    }
+)
+
+
+def _get_protocol_attrs(cls):
+    """Collect the structural attribute names a protocol requires.
+
+    Walks the protocol's own MRO (skipping ``object``/``Protocol``/
+    ``Generic``) and unions each base's namespace and annotations,
+    dropping the infrastructure dunders in
+    :data:`_PROTOCOL_EXCLUDED_ATTRS`.
+    """
+    attrs = set()
+    for base in getattr(cls, "__mro__", (cls,)):
+        if getattr(base, "__name__", "") in ("Protocol", "Generic", "object"):
+            continue
+        names = list(getattr(base, "__dict__", ()) or ())
+        names += list(getattr(base, "__annotations__", {}) or {})
+        for name in names:
+            if name.startswith("_abc_"):
+                continue
+            if name in _PROTOCOL_EXCLUDED_ATTRS:
+                continue
+            attrs.add(name)
+    return attrs
+
+
 def runtime_checkable(cls):
     """Enable ``isinstance``/``issubclass`` against a Protocol class.
 
@@ -291,13 +404,85 @@ def runtime_checkable(cls):
     if not getattr(cls, "_is_protocol", False):
         raise TypeError("runtime_checkable expects a Protocol subclass")
     cls._is_runtime_protocol = True
-    protocol_attrs = set()
-    for name in dir(cls):
-        if name.startswith("_"):
-            continue
-        protocol_attrs.add(name)
-    cls._protocol_attrs = protocol_attrs
+    cls._protocol_attrs = _get_protocol_attrs(cls)
     return cls
+
+
+# ---- numeric "Supports*" protocols ------------------------------------------
+# Runtime-checkable structural protocols from the stdlib. ``isinstance(x, P)``
+# is True iff ``x`` exposes the corresponding special method.
+
+
+@runtime_checkable
+class SupportsInt(Protocol):
+    """An ABC with one abstract method ``__int__``."""
+
+    __slots__ = ()
+
+    def __int__(self) -> int:
+        pass
+
+
+@runtime_checkable
+class SupportsFloat(Protocol):
+    """An ABC with one abstract method ``__float__``."""
+
+    __slots__ = ()
+
+    def __float__(self) -> float:
+        pass
+
+
+@runtime_checkable
+class SupportsComplex(Protocol):
+    """An ABC with one abstract method ``__complex__``."""
+
+    __slots__ = ()
+
+    def __complex__(self) -> complex:
+        pass
+
+
+@runtime_checkable
+class SupportsBytes(Protocol):
+    """An ABC with one abstract method ``__bytes__``."""
+
+    __slots__ = ()
+
+    def __bytes__(self) -> bytes:
+        pass
+
+
+@runtime_checkable
+class SupportsAbs(Protocol):
+    """An ABC with one abstract method ``__abs__`` that is covariant in
+    its return type."""
+
+    __slots__ = ()
+
+    def __abs__(self):
+        pass
+
+
+@runtime_checkable
+class SupportsRound(Protocol):
+    """An ABC with one abstract method ``__round__`` that is covariant in
+    its return type."""
+
+    __slots__ = ()
+
+    def __round__(self, ndigits: int = 0):
+        pass
+
+
+@runtime_checkable
+class SupportsIndex(Protocol):
+    """An ABC with one abstract method ``__index__``."""
+
+    __slots__ = ()
+
+    def __index__(self) -> int:
+        pass
 
 
 # ---- functional helpers -----------------------------------------------------
@@ -407,6 +592,116 @@ def TYPE_CHECKING():
 TYPE_CHECKING = False
 
 
+# ---- NamedTuple (PEP 526 class syntax + functional syntax) -----------------
+
+
+def _make_nmtuple(name, types, module, defaults=()):
+    """Build a ``collections.namedtuple`` carrying ``__annotations__``.
+
+    ``types`` is an iterable of ``(field_name, annotation)`` pairs. We
+    keep the annotation as-is (weavepy's typing is intentionally
+    permissive — no runtime ``_type_check``).
+    """
+    import collections
+
+    types = dict(types)
+    fields = list(types)
+    nm_tpl = collections.namedtuple(name, fields, defaults=defaults, module=module)
+    nm_tpl.__annotations__ = types
+    # CPython also stamps the synthesised ``__new__`` with the same
+    # annotations; weavepy's namedtuple ``__new__`` may be a builtin that
+    # rejects attribute assignment, so make this best-effort.
+    try:
+        nm_tpl.__new__.__annotations__ = types
+    except (AttributeError, TypeError):
+        pass
+    return nm_tpl
+
+
+# Attributes that NamedTuple class syntax may not override, and the
+# class-machinery attributes that are copied through verbatim.
+_prohibited = frozenset(
+    {
+        "__new__",
+        "__init__",
+        "__slots__",
+        "__getnewargs__",
+        "_fields",
+        "_field_defaults",
+        "_make",
+        "_replace",
+        "_asdict",
+        "_source",
+    }
+)
+_special = frozenset({"__module__", "__name__", "__annotations__", "__orig_bases__"})
+
+
+class NamedTupleMeta(type):
+    def __new__(cls, typename, bases, ns):
+        if _NamedTuple not in bases:
+            # Plain ``type.__new__`` bootstrap of ``_NamedTuple`` itself.
+            return super().__new__(cls, typename, bases, ns)
+        types = ns.get("__annotations__", {})
+        default_names = []
+        for field_name in types:
+            if field_name in ns:
+                default_names.append(field_name)
+            elif default_names:
+                raise TypeError(
+                    "Non-default namedtuple field {} cannot follow default "
+                    "field{} {}".format(
+                        field_name,
+                        "s" if len(default_names) > 1 else "",
+                        ", ".join(default_names),
+                    )
+                )
+        nm_tpl = _make_nmtuple(
+            typename,
+            types.items(),
+            defaults=[ns[n] for n in default_names],
+            module=ns.get("__module__", None),
+        )
+        # Copy user-defined methods/attributes that aren't part of the
+        # namedtuple machinery (mirrors CPython's NamedTupleMeta).
+        for key, val in ns.items():
+            if key in _prohibited:
+                raise AttributeError("Cannot overwrite NamedTuple attribute " + key)
+            elif key not in _special and key not in nm_tpl._fields:
+                setattr(nm_tpl, key, val)
+        return nm_tpl
+
+
+def NamedTuple(typename, fields=None, /, **kwargs):
+    """Typed version of ``collections.namedtuple``.
+
+    Supports the class-based syntax::
+
+        class Employee(NamedTuple):
+            name: str
+            id: int = 0
+
+    and the functional syntax::
+
+        Employee = NamedTuple('Employee', [('name', str), ('id', int)])
+    """
+    if fields is None:
+        fields = kwargs.items()
+    nt = _make_nmtuple(typename, fields, module=None)
+    nt.__orig_bases__ = (NamedTuple,)
+    return nt
+
+
+_NamedTuple = type.__new__(NamedTupleMeta, "NamedTuple", (), {})
+
+
+def _namedtuple_mro_entries(bases):
+    return (_NamedTuple,)
+
+
+NamedTuple.__mro_entries__ = _namedtuple_mro_entries
+
+
 # ---- nominal collections wrappers (PEP 585 aliases) ------------------------
 
 # CPython 3.9+ deprecated ``typing.List`` etc. in favour of bare
@@ -434,6 +729,14 @@ __all__ = [
     "Annotated",
     "Generic",
     "Protocol",
+    "NamedTuple",
+    "SupportsInt",
+    "SupportsFloat",
+    "SupportsComplex",
+    "SupportsBytes",
+    "SupportsAbs",
+    "SupportsRound",
+    "SupportsIndex",
     "TypeVar",
     "ParamSpec",
     "TypeVarTuple",

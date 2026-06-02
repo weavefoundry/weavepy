@@ -2377,6 +2377,7 @@ version = "0.0.0"
 dependencies = [
  "num-bigint",
  "thiserror 2.0.18",
+ "unicode-normalization",
  "unicode_names2",
  "weavepy-lexer",
 ]

@@ -99,6 +99,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("gauss")),
             b("gauss", random_gauss),
         );
+        d.insert(
+            DictKey(Object::from_static("getrandbits")),
+            b("getrandbits", random_getrandbits),
+        );
     }
     Rc::new(PyModule {
         name: "random".to_owned(),
@@ -132,6 +136,40 @@ fn random_random(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Float(v))
 }
 
+/// Module-level `random.getrandbits(k)` — a non-negative int with `k`
+/// random bits (`0 <= result < 2**k`), drawn from the module RNG.
+fn random_getrandbits(args: &[Object]) -> Result<Object, RuntimeError> {
+    use num_bigint::{BigInt, Sign};
+    let k = match args.first() {
+        Some(Object::Bool(b)) => u64::from(*b),
+        Some(Object::Int(n)) if *n >= 0 => *n as u64,
+        Some(Object::Int(_)) => {
+            return Err(value_error("number of bits must be non-negative"))
+        }
+        _ => return Err(type_error("getrandbits() requires an integer argument")),
+    };
+    if k == 0 {
+        return Ok(Object::Int(0));
+    }
+    let nbytes = ((k + 7) / 8) as usize;
+    let excess = (nbytes as u64) * 8 - k;
+    let mut buf = vec![0u8; nbytes];
+    RNG.with(|r| {
+        let mut rng = r.borrow_mut();
+        let mut i = 0;
+        while i < nbytes {
+            let w = rng.next_u64().to_le_bytes();
+            let take = (nbytes - i).min(8);
+            buf[i..i + take].copy_from_slice(&w[..take]);
+            i += take;
+        }
+    });
+    if excess > 0 {
+        buf[nbytes - 1] &= 0xFFu8 >> excess;
+    }
+    Ok(Object::int_from_bigint(BigInt::from_bytes_le(Sign::Plus, &buf)))
+}
+
 fn random_uniform(args: &[Object]) -> Result<Object, RuntimeError> {
     let a = to_f64(args.first())?;
     let b = to_f64(args.get(1))?;
@@ -150,39 +188,93 @@ fn random_randint(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(a + (raw % span) as i64))
 }
 
+/// Coerce a `randrange` bound to a `BigInt`, accepting any integer
+/// (incl. arbitrary-precision) — CPython's `randrange` has no upper
+/// bound on the magnitude of its arguments.
+fn to_bigint(arg: Option<&Object>) -> Result<num_bigint::BigInt, RuntimeError> {
+    use num_bigint::BigInt;
+    match arg {
+        Some(Object::Int(i)) => Ok(BigInt::from(*i)),
+        Some(Object::Bool(b)) => Ok(BigInt::from(i64::from(*b))),
+        Some(Object::Long(b)) => Ok((**b).clone()),
+        _ => Err(type_error("expected int")),
+    }
+}
+
+/// Uniform random `BigInt` in `[0, n)` via rejection sampling on a
+/// bit-masked candidate (`n` must be positive). Mirrors the shape of
+/// CPython's `Random._randbelow` without depending on i64 width.
+fn rand_below_bigint(n: &num_bigint::BigInt) -> num_bigint::BigInt {
+    use num_bigint::{BigInt, Sign};
+    let bits = n.bits();
+    if bits == 0 {
+        return BigInt::from(0);
+    }
+    let nbytes = ((bits + 7) / 8) as usize;
+    let excess = (nbytes as u64) * 8 - bits;
+    loop {
+        let mut buf = vec![0u8; nbytes];
+        RNG.with(|r| {
+            let mut rng = r.borrow_mut();
+            let mut i = 0;
+            while i < nbytes {
+                let w = rng.next_u64().to_le_bytes();
+                let take = (nbytes - i).min(8);
+                buf[i..i + take].copy_from_slice(&w[..take]);
+                i += take;
+            }
+        });
+        if excess > 0 {
+            buf[nbytes - 1] &= 0xFFu8 >> excess;
+        }
+        let cand = BigInt::from_bytes_le(Sign::Plus, &buf);
+        if &cand < n {
+            return cand;
+        }
+    }
+}
+
 fn random_randrange(args: &[Object]) -> Result<Object, RuntimeError> {
+    use num_bigint::BigInt;
+    use num_integer::Integer;
+    let zero = BigInt::from(0);
     match args.len() {
         1 => {
-            let stop = to_i64(args.first())?;
-            if stop <= 0 {
-                return Err(value_error("empty range for randrange"));
+            let stop = to_bigint(args.first())?;
+            if stop <= zero {
+                return Err(value_error("empty range for randrange()"));
             }
-            let raw = RNG.with(|r| r.borrow_mut().next_u64());
-            Ok(Object::Int((raw % stop as u64) as i64))
+            Ok(Object::int_from_bigint(rand_below_bigint(&stop)))
         }
         2 => {
-            let start = to_i64(args.first())?;
-            let stop = to_i64(args.get(1))?;
-            if stop <= start {
-                return Err(value_error("empty range for randrange"));
+            let start = to_bigint(args.first())?;
+            let stop = to_bigint(args.get(1))?;
+            let width = &stop - &start;
+            if width <= zero {
+                return Err(value_error("empty range for randrange()"));
             }
-            let span = (stop - start) as u64;
-            let raw = RNG.with(|r| r.borrow_mut().next_u64());
-            Ok(Object::Int(start + (raw % span) as i64))
+            Ok(Object::int_from_bigint(start + rand_below_bigint(&width)))
         }
         3 => {
-            let start = to_i64(args.first())?;
-            let stop = to_i64(args.get(1))?;
-            let step = to_i64(args.get(2))?;
-            if step == 0 {
-                return Err(value_error("zero step for randrange"));
+            let start = to_bigint(args.first())?;
+            let stop = to_bigint(args.get(1))?;
+            let step = to_bigint(args.get(2))?;
+            if step == zero {
+                return Err(value_error("zero step for randrange()"));
             }
-            let span = ((stop - start) / step) as u64;
-            if span == 0 {
-                return Err(value_error("empty range for randrange"));
+            let width = &stop - &start;
+            let one = BigInt::from(1);
+            // Count of reachable values: ceil(width/step), via floor div
+            // on the CPython-adjusted numerator (matches `range` length).
+            let n = if step > zero {
+                (&width + &step - &one).div_floor(&step)
+            } else {
+                (&width + &step + &one).div_floor(&step)
+            };
+            if n <= zero {
+                return Err(value_error("empty range for randrange()"));
             }
-            let raw = RNG.with(|r| r.borrow_mut().next_u64());
-            Ok(Object::Int(start + (raw % span) as i64 * step))
+            Ok(Object::int_from_bigint(start + step * rand_below_bigint(&n)))
         }
         _ => Err(type_error("randrange expects 1-3 args")),
     }

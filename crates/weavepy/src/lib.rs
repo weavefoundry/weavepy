@@ -287,17 +287,7 @@ fn format_syntax_error(source: &str, filename: &str, byte: u32, message: &str) -
 }
 
 fn format_lex_error(source: &str, filename: &str, err: &lexer::LexError) -> String {
-    let byte = match err {
-        lexer::LexError::UnterminatedString { pos }
-        | lexer::LexError::InvalidChar { pos, .. }
-        | lexer::LexError::InconsistentIndent { pos }
-        | lexer::LexError::UnknownDedent { pos }
-        | lexer::LexError::InvalidNumber { pos, .. }
-        | lexer::LexError::InvalidStringPrefix { pos, .. }
-        | lexer::LexError::StrayBackslash { pos }
-        | lexer::LexError::UnexpectedEof { pos, .. } => *pos,
-    };
-    format_syntax_error(source, filename, byte, &err.to_string())
+    format_syntax_error(source, filename, err.byte_offset(), &err.to_string())
 }
 
 /// `(line, column, line_text)` derived from a byte offset.

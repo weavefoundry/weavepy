@@ -12,24 +12,39 @@
 //! goal here is correctness against CPython 3.13.
 
 use crate::error::LexError;
-use crate::token::{Keyword, Span, StringPrefix, Token, TokenKind};
+use crate::token::{EscapeWarning, Keyword, Span, StringPrefix, Token, TokenKind};
 
 /// Tokenize a complete Python source buffer.
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
+    tokenize_with_escapes(source).0
+}
+
+/// Tokenize, also returning the invalid-escape [`EscapeWarning`]s found
+/// while scanning string/bytes literals.
+///
+/// The warnings are returned **even when tokenizing fails**: CPython
+/// detects invalid escapes as the tokenizer walks each string, so a
+/// `SyntaxWarning` from an earlier literal must still fire before a
+/// later hard error (e.g. `eval("'\\e' $")` warns once *and* raises a
+/// `SyntaxError` for the stray `$`). Collecting them on the scanner and
+/// handing them back regardless of the result preserves that ordering.
+pub fn tokenize_with_escapes(source: &str) -> (Result<Vec<Token>, LexError>, Vec<EscapeWarning>) {
     let mut scanner = Scanner::new(source);
     let mut out = Vec::new();
-    loop {
-        match scanner.next_token()? {
-            Some(tok) => {
+    let result = loop {
+        match scanner.next_token() {
+            Ok(Some(tok)) => {
                 let is_endmarker = matches!(tok.kind, TokenKind::Endmarker);
                 out.push(tok);
                 if is_endmarker {
-                    return Ok(out);
+                    break Ok(out);
                 }
             }
-            None => continue,
+            Ok(None) => continue,
+            Err(e) => break Err(e),
         }
-    }
+    };
+    (result, scanner.escape_warnings)
 }
 
 struct Scanner<'src> {
@@ -51,6 +66,10 @@ struct Scanner<'src> {
     pending_indent: bool,
     /// True after we emitted ENDMARKER; further calls return None.
     finished: bool,
+    /// Invalid-escape `SyntaxWarning`s gathered while scanning string and
+    /// bytes literals, in source order (the first invalid escape *per
+    /// literal*, matching CPython's `first_invalid_escape` tracking).
+    escape_warnings: Vec<EscapeWarning>,
 }
 
 impl<'src> Scanner<'src> {
@@ -64,7 +83,82 @@ impl<'src> Scanner<'src> {
             pending_dedents: 0,
             pending_indent: false,
             finished: false,
+            escape_warnings: Vec::new(),
         }
+    }
+
+    /// Inspect the escape that begins at the backslash at absolute offset
+    /// `bs` (in a non-raw string/bytes body) and, if it is one CPython
+    /// would flag, record a [`EscapeWarning`]. Returns `true` when a
+    /// warning was recorded so the caller can stop after the *first*
+    /// invalid escape in a literal (CPython warns once per literal).
+    ///
+    /// `is_bytes` selects the bytes alphabet, which has no `\N`/`\u`/`\U`
+    /// named/Unicode escapes — those letters are invalid escapes there.
+    /// Valid escapes (and the incomplete `\x`/`\u`/`\U`/`\N` forms, which
+    /// the parser turns into hard `SyntaxError`s at decode time) are left
+    /// alone here.
+    fn note_invalid_escape(&mut self, bs: usize, is_bytes: bool) -> bool {
+        let Some(&esc) = self.src.get(bs + 1) else {
+            return false;
+        };
+        // Octal escape: warn when the written value exceeds `\377`.
+        if (b'0'..=b'7').contains(&esc) {
+            let mut val = (esc - b'0') as u32;
+            let mut digits = String::new();
+            digits.push(esc as char);
+            let mut k = bs + 2;
+            for _ in 0..2 {
+                match self.src.get(k) {
+                    Some(&d) if (b'0'..=b'7').contains(&d) => {
+                        val = val * 8 + (d - b'0') as u32;
+                        digits.push(d as char);
+                        k += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if val > 0o377 {
+                self.escape_warnings.push(EscapeWarning {
+                    offset: bs as u32,
+                    message: format!("invalid octal escape sequence '\\{digits}'"),
+                });
+                return true;
+            }
+            return false;
+        }
+        // Recognised single-character / sized escapes. `x`/`u`/`U`/`N`
+        // are accepted here (a malformed one is a decode-time error, not
+        // a warning); bytes literals have no `u`/`U`/`N`.
+        let recognised = matches!(
+            esc,
+            b'\n' | b'\r'
+                | b'\\'
+                | b'\''
+                | b'"'
+                | b'a'
+                | b'b'
+                | b'f'
+                | b'n'
+                | b'r'
+                | b't'
+                | b'v'
+                | b'x'
+        ) || (!is_bytes && matches!(esc, b'u' | b'U' | b'N'));
+        if recognised {
+            return false;
+        }
+        // Unknown escape — render the *character* (decoding UTF-8 so a
+        // non-ASCII escape like `\€` shows the glyph, not a stray byte).
+        let esc_char = std::str::from_utf8(&self.src[bs + 1..])
+            .ok()
+            .and_then(|s| s.chars().next())
+            .unwrap_or(esc as char);
+        self.escape_warnings.push(EscapeWarning {
+            offset: bs as u32,
+            message: format!("invalid escape sequence '\\{esc_char}'"),
+        });
+        true
     }
 
     /// Produce the next token, or `Ok(None)` if the scanner consumed
@@ -162,6 +256,21 @@ impl<'src> Scanner<'src> {
         // Identifiers (and prefix-then-string-quote case).
         if is_ident_start(b) {
             return self.scan_ident_or_prefixed_string().map(Some);
+        }
+        // PEP 3131: non-ASCII identifier start (e.g. `π`, `名前`, `Δt`).
+        // The ASCII fast path above is the common case; here we decode a
+        // single UTF-8 scalar and admit it when it's an `XID_Start`
+        // character. The continuation loop in
+        // `scan_ident_or_prefixed_string` already consumes `XID_Continue`,
+        // so the rest of the identifier falls out uniformly. (NFKC
+        // normalization of the resulting name is a documented follow-up;
+        // we currently key identifiers on their source spelling.)
+        if b >= 0x80 {
+            if let Some((ch, _)) = decode_utf8(&self.src[self.pos..]) {
+                if unicode_ident::is_xid_start(ch) {
+                    return self.scan_ident_or_prefixed_string().map(Some);
+                }
+            }
         }
 
         // Numbers.
@@ -434,12 +543,328 @@ impl<'src> Scanner<'src> {
         let quote = self.peek().expect("scan_string at quote");
         debug_assert!(quote == b'"' || quote == b'\'');
         let triple = self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote);
+        // PEP 701 — f-strings need a structure-aware scan so that quotes,
+        // braces, backslashes, comments, newlines, and even nested
+        // f-strings *inside* replacement fields don't prematurely
+        // terminate the literal. We still emit a single `String` token
+        // (the parser re-scans the interior); this just finds the true
+        // extent. Non-f strings keep the simple fast paths below.
+        if prefix.fstring {
+            if triple {
+                self.pos += 3;
+            } else {
+                self.pos += 1;
+            }
+            self.scan_fstring_extent(start, quote, triple, prefix.raw)?;
+            return Ok(self.token(TokenKind::String, start, self.pos));
+        }
         if triple {
             self.pos += 3;
             self.scan_triple_string(start, quote, prefix)
         } else {
             self.pos += 1;
             self.scan_single_line_string(start, quote, prefix)
+        }
+    }
+
+    /// PEP 701 — scan the literal part of a (possibly nested) f-string,
+    /// recursing through `{ ... }` replacement fields. On entry `self.pos`
+    /// is just past the opening quote(s); on success it ends just past
+    /// the matching closing quote(s).
+    fn scan_fstring_extent(
+        &mut self,
+        start: usize,
+        quote: u8,
+        triple: bool,
+        _raw: bool,
+    ) -> Result<(), LexError> {
+        loop {
+            let Some(b) = self.peek() else {
+                // Ran off the end with the literal still open: CPython
+                // names the quote style ("unterminated f-string literal"
+                // vs "...triple-quoted f-string literal").
+                return Err(if triple {
+                    LexError::UnterminatedTripleFstring { pos: start as u32 }
+                } else {
+                    LexError::UnterminatedFstring { pos: start as u32 }
+                });
+            };
+            if b == quote {
+                if triple {
+                    if self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote) {
+                        self.pos += 3;
+                        return Ok(());
+                    }
+                    self.pos += 1;
+                    continue;
+                }
+                self.pos += 1;
+                return Ok(());
+            }
+            match b {
+                // A single-line f-string's *literal* text can't span
+                // lines; newlines are only legal inside `{ }`.
+                b'\n' | b'\r' if !triple => {
+                    return Err(LexError::UnterminatedFstring { pos: start as u32 });
+                }
+                // Escape in the literal part — consume the backslash and
+                // the byte it escapes (full validation happens at decode
+                // time). This applies in raw f-strings too: the backslash
+                // stays literal, but per CPython a `\<quote>` still does
+                // not terminate the string (e.g. `fr'\'\"'`), so we must
+                // consume both bytes here rather than letting the quote
+                // close the literal early. Exception: `{`/`}` are always
+                // structural in an f-string (escaped only as `{{`/`}}`,
+                // never by a backslash), so a backslash never swallows
+                // them — `fr'\{{'` is a literal backslash followed by the
+                // brace escape.
+                b'\\' => {
+                    self.pos += 1;
+                    if matches!(self.peek(), Some(n) if n != b'{' && n != b'}') {
+                        self.pos += 1;
+                    }
+                }
+                b'{' => {
+                    if self.peek_at(1) == Some(b'{') {
+                        self.pos += 2; // `{{` literal-brace escape
+                    } else {
+                        self.pos += 1;
+                        self.scan_fstring_field_extent(start, quote, triple)?;
+                    }
+                }
+                b'}' => {
+                    // `}}` is a literal-brace escape; a lone `}` is
+                    // invalid, but we defer that diagnostic to the parser,
+                    // which carries span context for a good message.
+                    if self.peek_at(1) == Some(b'}') {
+                        self.pos += 2;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// Scan a replacement field's *expression* part from just past its
+    /// opening `{`. Tracks `()[]{}` nesting and skips nested strings
+    /// (including nested f-strings) and comments so their contents can't
+    /// close the field early. A top-level `:` hands off to the
+    /// format-spec scan; a top-level `}` ends the field.
+    fn scan_fstring_field_extent(
+        &mut self,
+        start: usize,
+        outer_quote: u8,
+        outer_triple: bool,
+    ) -> Result<(), LexError> {
+        // Explicit bracket stack (mirroring the parser) so we reproduce
+        // CPython's precise PEP 701 diagnostics rather than masking a
+        // mismatch behind a generic "expecting '}'". `in_comment` records a
+        // `#` comment that ran to EOF, which CPython reports as the innermost
+        // open bracket having "never closed" (distinct from a plain
+        // unterminated field).
+        let mut stack: Vec<u8> = Vec::new();
+        let mut in_comment = false;
+        loop {
+            let Some(b) = self.peek() else {
+                if in_comment {
+                    let open = stack.last().copied().unwrap_or(b'{');
+                    return Err(LexError::BracketNeverClosed {
+                        open: open as char,
+                        pos: start as u32,
+                    });
+                }
+                return Err(LexError::FstringExpectingBrace { pos: start as u32 });
+            };
+            match b {
+                b'}' if stack.is_empty() => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                // Top-level `:` begins the format spec, where `#`, quotes
+                // and `:` are literal and only `{ }` nest replacement
+                // fields (e.g. `{x:#06x}`, `{x:.{prec}f}`).
+                b':' if stack.is_empty() => {
+                    self.pos += 1;
+                    return self.scan_fstring_format_spec_extent(start, outer_quote, outer_triple);
+                }
+                b'(' | b'[' | b'{' => {
+                    stack.push(b);
+                    self.pos += 1;
+                }
+                b')' | b']' | b'}' => {
+                    let want = match b {
+                        b')' => b'(',
+                        b']' => b'[',
+                        _ => b'{',
+                    };
+                    match stack.last() {
+                        Some(&open) if open == want => {
+                            stack.pop();
+                            self.pos += 1;
+                        }
+                        // A close that doesn't match the innermost opener
+                        // ("closing parenthesis 'X' does not match opening
+                        // parenthesis 'Y'").
+                        Some(&open) => {
+                            return Err(LexError::FstringParenMismatch {
+                                close: b as char,
+                                open: open as char,
+                                pos: self.pos as u32,
+                            })
+                        }
+                        // A `)`/`]` with nothing open ("f-string: unmatched
+                        // 'X'"). A top-level `}` was the field terminator,
+                        // already handled above.
+                        None => {
+                            return Err(LexError::FstringUnmatchedParen {
+                                close: b as char,
+                                pos: self.pos as u32,
+                            })
+                        }
+                    }
+                }
+                b'"' | b'\'' => self.scan_fstring_nested_string(outer_quote)?,
+                // In the *expression* part, `#` starts a comment to end
+                // of line (only meaningful in multiline fields). A comment
+                // terminated by a newline resumes normal scanning; one that
+                // reaches EOF leaves the innermost bracket "never closed".
+                b'#' => {
+                    in_comment = true;
+                    while let Some(c) = self.peek() {
+                        if c == b'\n' {
+                            in_comment = false;
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                }
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// Scan a format spec from just past the field's top-level `:` to the
+    /// closing `}`. The spec is literal text except that `{` opens a
+    /// nested replacement field (its own expression) — so `#`, quotes and
+    /// `:` here are *not* special.
+    fn scan_fstring_format_spec_extent(
+        &mut self,
+        start: usize,
+        outer_quote: u8,
+        outer_triple: bool,
+    ) -> Result<(), LexError> {
+        loop {
+            let Some(b) = self.peek() else {
+                // Spec ran to EOF with the field still open. CPython's spec
+                // diagnostic names the spec too: "expecting '}', or format
+                // specs" (vs the plain "expecting '}'" for the expr part).
+                return Err(LexError::FstringExpectingBraceOrSpec { pos: start as u32 });
+            };
+            match b {
+                b'}' => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                b'{' => {
+                    self.pos += 1;
+                    self.scan_fstring_field_extent(start, outer_quote, outer_triple)?;
+                }
+                // The spec is literal text, so the *outer* quote here is the
+                // f-string's own terminator (a quote-as-fill must use the
+                // other quote, e.g. `f"{x:'>10}"`). Reaching it means the
+                // field never closed: "expecting '}', or format specs".
+                _ if b == outer_quote => {
+                    return Err(LexError::FstringExpectingBraceOrSpec { pos: self.pos as u32 });
+                }
+                // A literal newline in the spec is only legal inside a
+                // triple-quoted f-string; in a single-line one CPython
+                // raises the "newlines are not allowed in format
+                // specifiers..." error. (Newlines reached *inside* a nested
+                // `{...}` field are consumed by the recursion above.)
+                b'\n' | b'\r' if !outer_triple => {
+                    return Err(LexError::FstringNewlineInSpec { pos: self.pos as u32 });
+                }
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// Skip a nested string literal that appears inside a replacement
+    /// field. Detects an immediately-preceding string prefix so a nested
+    /// f-string recurses (its own fields may reuse the outer quote).
+    fn scan_fstring_nested_string(&mut self, outer_quote: u8) -> Result<(), LexError> {
+        let quote = self.peek().expect("nested string at quote");
+        let triple = self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote);
+        // When a lone quote *matching the enclosing f-string's* quote can't
+        // form a complete string (runs to EOF unpaired), it was never a
+        // nested string — it's the f-string's own terminator, and the field
+        // is what's unterminated. CPython surfaces "f-string: expecting '}'",
+        // not "unterminated string literal". (`f'{3'` vs the valid `f'{3''}'`
+        // empty string, or `f'{3 + 'a'}'` which finds its pair.)
+        let unterminated = |pos: u32| {
+            if quote == outer_quote {
+                LexError::FstringExpectingBrace { pos }
+            } else {
+                LexError::UnterminatedString { pos }
+            }
+        };
+        // Walk back over the immediately-preceding ASCII-letter run to
+        // recover any prefix (`f`, `r`, `rb`, ...). It's a real prefix
+        // only when not glued to a longer identifier.
+        let mut s = self.pos;
+        while s > 0 && self.src[s - 1].is_ascii_alphabetic() {
+            s -= 1;
+        }
+        let glued_to_ident =
+            s > 0 && (self.src[s - 1] == b'_' || self.src[s - 1].is_ascii_digit());
+        let prefix = if !glued_to_ident && s < self.pos {
+            std::str::from_utf8(&self.src[s..self.pos])
+                .ok()
+                .and_then(StringPrefix::parse)
+                .unwrap_or_default()
+        } else {
+            StringPrefix::default()
+        };
+        if triple {
+            self.pos += 3;
+        } else {
+            self.pos += 1;
+        }
+        if prefix.fstring {
+            return self.scan_fstring_extent(self.pos, quote, triple, prefix.raw);
+        }
+        let _ = prefix.raw;
+        loop {
+            let Some(b) = self.peek() else {
+                return Err(unterminated(self.pos as u32));
+            };
+            if b == b'\\' {
+                // A backslash escapes the next byte for tokenizing in raw
+                // and non-raw strings alike (raw-ness only changes decode).
+                self.pos += 1;
+                if self.peek().is_some() {
+                    self.pos += 1;
+                }
+                continue;
+            }
+            if b == quote {
+                if triple {
+                    if self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote) {
+                        self.pos += 3;
+                        return Ok(());
+                    }
+                    self.pos += 1;
+                    continue;
+                }
+                self.pos += 1;
+                return Ok(());
+            }
+            if (b == b'\n' || b == b'\r') && !triple {
+                return Err(unterminated(self.pos as u32));
+            }
+            self.pos += 1;
         }
     }
 
@@ -450,11 +875,15 @@ impl<'src> Scanner<'src> {
         prefix: StringPrefix,
     ) -> Result<Token, LexError> {
         let raw = prefix.raw;
+        let mut warned = false;
         while let Some(b) = self.peek() {
             if b == b'\n' || b == b'\r' {
                 return Err(LexError::UnterminatedString { pos: start as u32 });
             }
             if b == b'\\' && !raw {
+                if !warned {
+                    warned = self.note_invalid_escape(self.pos, prefix.bytes);
+                }
                 // Skip the backslash and one following byte (the escape).
                 self.pos += 1;
                 if let Some(next) = self.peek() {
@@ -501,11 +930,18 @@ impl<'src> Scanner<'src> {
         prefix: StringPrefix,
     ) -> Result<Token, LexError> {
         let raw = prefix.raw;
+        let mut warned = false;
         loop {
             let Some(b) = self.peek() else {
                 return Err(LexError::UnterminatedString { pos: start as u32 });
             };
-            if b == b'\\' && !raw {
+            if b == b'\\' {
+                // Backslash escapes the next byte for tokenizing in raw
+                // and non-raw triple strings alike (a raw `\"""` therefore
+                // does not close the literal); decode handles raw-ness.
+                if !raw && !warned {
+                    warned = self.note_invalid_escape(self.pos, prefix.bytes);
+                }
                 self.pos += 1;
                 if self.peek().is_some() {
                     self.pos += 1;

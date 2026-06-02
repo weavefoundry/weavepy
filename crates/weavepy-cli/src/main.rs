@@ -255,6 +255,35 @@ The following implementation-specific options are available:
 ";
 
 fn main() -> ExitCode {
+    run_on_large_stack(main_dispatch)
+}
+
+/// WeavePy evaluates Python by recursive descent, so Python call depth
+/// maps onto native (Rust) stack depth (see `crates/weavepy-vm/src/
+/// recursion.rs`). Run the whole interpreter on a thread with a large
+/// stack reserve so that `sys.setrecursionlimit` — enforced by the VM's
+/// recursion guard (RFC 0037) — is what bounds recursion, rather than
+/// the fixed OS main-thread stack (8 MiB on Linux/macOS). This makes the
+/// behaviour uniform across platforms *and* build profiles: debug builds
+/// have much larger per-activation stack frames than release, so without
+/// this a default `setrecursionlimit(1000)` would overflow the native
+/// stack in debug before the guard could fire. The reserve is committed
+/// lazily by the OS, so it costs address space, not memory.
+fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
+    const STACK_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB reserve
+    match std::thread::Builder::new()
+        .name("weavepy-main".to_owned())
+        .stack_size(STACK_BYTES)
+        .spawn(entry)
+    {
+        Ok(handle) => handle.join().unwrap_or(ExitCode::FAILURE),
+        // Extremely unlikely, but if the OS refuses the thread, fall
+        // back to running on the current (main) thread.
+        Err(_) => entry(),
+    }
+}
+
+fn main_dispatch() -> ExitCode {
     init_tracing();
 
     let raw: Vec<String> = env::args().collect();

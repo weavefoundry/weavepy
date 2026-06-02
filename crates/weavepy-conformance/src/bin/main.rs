@@ -141,12 +141,36 @@ impl From<Mode> for regrtest::ExecutionMode {
 }
 
 fn main() -> ExitCode {
+    run_on_large_stack(run_real_main)
+}
+
+fn run_real_main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("weavepy-conformance: {err:#}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Run the harness on a generously-sized stack, mirroring `weavepy-cli`'s
+/// `run_on_large_stack`. `--mode in-process` executes each `test_*.py`
+/// inside *this* process, so without a large reserve a deep-but-bounded
+/// Python recursion (e.g. a `RecursionError` guard test, or the recursive
+/// drop of its traceback chain) overflows the fixed 8 MiB OS main-thread
+/// stack before the interpreter's own recursion guard can fire. The 1 GiB
+/// reserve is committed lazily by the OS, so it costs address space, not
+/// resident memory.
+fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
+    const STACK_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB reserve
+    match std::thread::Builder::new()
+        .name("weavepy-conformance-main".to_owned())
+        .stack_size(STACK_BYTES)
+        .spawn(entry)
+    {
+        Ok(handle) => handle.join().unwrap_or(ExitCode::FAILURE),
+        Err(_) => entry(),
     }
 }
 

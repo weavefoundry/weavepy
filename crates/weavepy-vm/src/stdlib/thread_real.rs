@@ -506,8 +506,15 @@ fn start_new_thread(args: &[Object]) -> Result<Object, RuntimeError> {
     let worker_func = func.clone();
     let worker_lock = join_lock.clone();
     let entry_name = thread_name.clone();
+    // RFC 0037 (WS1): worker threads recurse through the same
+    // recursive-descent evaluator as the main thread, so they need the
+    // same generous stack reserve for `sys.setrecursionlimit` to bind
+    // before the native stack. (std's default thread stack is only
+    // ~2 MiB.) The reserve is committed lazily by the OS.
+    const WORKER_STACK_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
     let handle = std::thread::Builder::new()
         .name(format!("weavepy-worker-{}", synth_id))
+        .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
             crate::vm_singletons::install_worker_thread_id(synth_id);
             // The parent published this entry into the slot below

@@ -280,13 +280,13 @@ fn total_f64() -> &'static [(&'static str, fn(&[Object]) -> Result<Object, Runti
 
 fn to_f64(args: &[Object], func: &str, idx: usize) -> Result<f64, RuntimeError> {
     match args.get(idx) {
-        Some(Object::Float(f)) => Ok(*f),
-        Some(Object::Int(i)) => Ok(*i as f64),
-        Some(Object::Bool(b)) => Ok(if *b { 1.0 } else { 0.0 }),
-        Some(other) => Err(type_error(format!(
-            "{func}() argument must be int or float, not '{}'",
-            other.type_name()
-        ))),
+        Some(other) => match crate::builtins::coerce_f64_opt(other)? {
+            Some(f) => Ok(f),
+            None => Err(type_error(format!(
+                "{func}() argument must be int or float, not '{}'",
+                other.type_name()
+            ))),
+        },
         None => Err(type_error(format!(
             "{func}() takes at least {} argument(s)",
             idx + 1
@@ -307,6 +307,32 @@ fn to_i64(args: &[Object], func: &str, idx: usize) -> Result<i64, RuntimeError> 
             idx + 1
         ))),
     }
+}
+
+/// Coerce an argument to an arbitrary-precision integer, accepting the
+/// full integer tower (`bool`, `int`, big `int`, and integer-backed
+/// subclasses). Mirrors CPython's "object cannot be interpreted as an
+/// integer" TypeError for everything else — this is what lets `math.gcd`,
+/// `math.lcm`, etc. operate on values that overflow 64 bits (e.g. the
+/// `10**23` denominators that `fractions.Fraction.__new__` feeds in).
+fn to_bigint(args: &[Object], idx: usize) -> Result<num_bigint::BigInt, RuntimeError> {
+    let obj = args.get(idx);
+    if let Some(o) = obj {
+        if let Some(bi) = o.as_bigint() {
+            return Ok(bi);
+        }
+        // Honor int subclasses whose native payload is itself an integer.
+        if let Some(native) = o.native_value() {
+            if let Some(bi) = native.as_bigint() {
+                return Ok(bi);
+            }
+        }
+        return Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            o.type_name()
+        )));
+    }
+    Err(type_error("expected at least one integer argument"))
 }
 
 fn math_sqrt(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -386,19 +412,73 @@ fn math_pow(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Float(x.powf(y)))
 }
 
+/// Convert an (already integral) `f64` to a Python int, promoting to a
+/// big integer when the value exceeds the 64-bit range so we never wrap.
+fn float_to_int_obj(f: f64) -> Result<Object, RuntimeError> {
+    use num_traits::FromPrimitive;
+    if !f.is_finite() {
+        return Err(value_error("cannot convert float infinity to integer"));
+    }
+    if (i64::MIN as f64..=i64::MAX as f64).contains(&f) {
+        Ok(Object::Int(f as i64))
+    } else {
+        let big = num_bigint::BigInt::from_f64(f)
+            .ok_or_else(|| value_error("cannot convert float to integer"))?;
+        Ok(Object::int_from_bigint(big))
+    }
+}
+
+/// Shared core for `math.floor`/`ceil`/`trunc`. CPython dispatches the
+/// matching dunder (`type(x).__floor__(x)`, …) for non-float arguments,
+/// which is exactly how `fractions.Fraction`, `decimal.Decimal`, and any
+/// user numeric type participate. Integers floor/ceil/trunc to themselves;
+/// floats use the native rounding op.
+fn floor_ceil_trunc(
+    args: &[Object],
+    func: &str,
+    dunder: &str,
+    op: fn(f64) -> f64,
+) -> Result<Object, RuntimeError> {
+    match args.first() {
+        Some(Object::Int(i)) => Ok(Object::Int(*i)),
+        Some(Object::Bool(b)) => Ok(Object::Int(i64::from(*b))),
+        Some(Object::Long(b)) => Ok(Object::Long(b.clone())),
+        Some(Object::Float(f)) => float_to_int_obj(op(*f)),
+        Some(obj @ Object::Instance(_)) => {
+            if let Some(method) = crate::instance_method(obj, dunder) {
+                let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                    type_error(format!("{func}() requires an active interpreter"))
+                })?;
+                // SAFETY: the pointer was published by an enclosing VM call
+                // frame still live on this thread's stack; the GIL makes the
+                // mutable access exclusive.
+                let interp = unsafe { &mut *ptr };
+                let globals = interp.builtins_dict();
+                return interp.call_object_with_globals(&method, &[], &[], &globals);
+            }
+            Err(type_error(format!(
+                "type {} doesn't define {} method",
+                obj.type_name(),
+                dunder
+            )))
+        }
+        Some(_) => float_to_int_obj(op(to_f64(args, func, 0)?)),
+        None => Err(type_error(format!(
+            "{func}() takes exactly one argument (0 given)"
+        ))),
+    }
+}
+
 fn math_floor(args: &[Object]) -> Result<Object, RuntimeError> {
-    let x = to_f64(args, "floor", 0)?;
-    Ok(Object::Int(x.floor() as i64))
+    floor_ceil_trunc(args, "floor", "__floor__", f64::floor)
 }
 
 fn math_ceil(args: &[Object]) -> Result<Object, RuntimeError> {
-    let x = to_f64(args, "ceil", 0)?;
-    Ok(Object::Int(x.ceil() as i64))
+    floor_ceil_trunc(args, "ceil", "__ceil__", f64::ceil)
 }
 
 fn math_trunc(args: &[Object]) -> Result<Object, RuntimeError> {
-    let x = to_f64(args, "trunc", 0)?;
-    Ok(Object::Int(x.trunc() as i64))
+    floor_ceil_trunc(args, "trunc", "__trunc__", f64::trunc)
 }
 
 fn math_isnan(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -429,32 +509,27 @@ fn math_fmod(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn math_gcd(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::Int(0));
+    use num_integer::Integer;
+    let mut acc = num_bigint::BigInt::from(0);
+    for i in 0..args.len() {
+        let v = to_bigint(args, i)?;
+        acc = acc.gcd(&v);
     }
-    let mut acc: i64 = 0;
-    for (i, _) in args.iter().enumerate() {
-        let v = to_i64(args, "gcd", i)?.unsigned_abs() as i64;
-        acc = gcd_i64(acc, v);
-    }
-    Ok(Object::Int(acc))
+    Ok(Object::int_from_bigint(acc))
 }
 
 fn math_lcm(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::Int(1));
-    }
-    let mut acc: i64 = 1;
-    for (i, _) in args.iter().enumerate() {
-        let v = to_i64(args, "lcm", i)?.unsigned_abs() as i64;
-        if v == 0 {
+    use num_integer::Integer;
+    use num_traits::Zero;
+    let mut acc = num_bigint::BigInt::from(1);
+    for i in 0..args.len() {
+        let v = to_bigint(args, i)?;
+        if v.is_zero() {
             return Ok(Object::Int(0));
         }
-        let g = gcd_i64(acc, v);
-        // acc * v / g
-        acc = (acc / g).saturating_mul(v);
+        acc = acc.lcm(&v);
     }
-    Ok(Object::Int(acc))
+    Ok(Object::int_from_bigint(acc))
 }
 
 fn math_factorial(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -462,11 +537,13 @@ fn math_factorial(args: &[Object]) -> Result<Object, RuntimeError> {
     if n < 0 {
         return Err(value_error("factorial() not defined for negative values"));
     }
-    let mut acc: i64 = 1;
-    for i in 1..=n {
-        acc = acc.saturating_mul(i);
+    // Accumulate in arbitrary precision: a plain `i64` overflows past 20!,
+    // which silently produced wrong answers under the old `saturating_mul`.
+    let mut acc = num_bigint::BigInt::from(1);
+    for i in 2..=n {
+        acc *= i;
     }
-    Ok(Object::Int(acc))
+    Ok(Object::int_from_bigint(acc))
 }
 
 /// `math.isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)` implementing
@@ -500,17 +577,6 @@ fn math_isclose(args: &[Object]) -> Result<Object, RuntimeError> {
     let diff = (a - b).abs();
     let tol = (rel_tol * a.abs().max(b.abs())).max(abs_tol);
     Ok(Object::Bool(diff <= tol))
-}
-
-fn gcd_i64(a: i64, b: i64) -> i64 {
-    let mut a = a.unsigned_abs();
-    let mut b = b.unsigned_abs();
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a as i64
 }
 
 // ---------------------------------------------------------------------
@@ -649,7 +715,43 @@ fn math_log1p(args: &[Object]) -> Result<Object, RuntimeError> {
 fn math_ldexp(args: &[Object]) -> Result<Object, RuntimeError> {
     let x = to_f64(args, "ldexp", 0)?;
     let i = to_i64(args, "ldexp", 1)?;
-    Ok(Object::Float(x * 2f64.powi(i as i32)))
+    // Saturate the exponent: anything past these bounds overflows to ±inf or
+    // underflows to ±0 anyway, and keeps `ldexp`'s `i32` happy.
+    let n = i.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    Ok(Object::Float(ldexp(x, n)))
+}
+
+/// Correctly-rounded `x * 2**n` (C `scalbn`/`ldexp`), including the
+/// subnormal range — `2f64.powi(n)` underflows to 0 for `n < -1022`, so a
+/// naive `x * 2f64.powi(n)` cannot produce subnormals like `ldexp(1.0,
+/// -1074)` (the smallest positive double). Mirrors musl's `scalbn`.
+pub(crate) fn ldexp(mut x: f64, mut n: i32) -> f64 {
+    let p1023 = 2f64.powi(1023);
+    // 2**-1022 * 2**53 == 2**-969, applied in steps so the running value
+    // never underflows before the final scaling (avoids double rounding).
+    let p_minus_969 = 2f64.powi(-969);
+    if n > 1023 {
+        x *= p1023;
+        n -= 1023;
+        if n > 1023 {
+            x *= p1023;
+            n -= 1023;
+            if n > 1023 {
+                n = 1023;
+            }
+        }
+    } else if n < -1022 {
+        x *= p_minus_969;
+        n += 969;
+        if n < -1022 {
+            x *= p_minus_969;
+            n += 969;
+            if n < -1022 {
+                n = -1022;
+            }
+        }
+    }
+    x * f64::from_bits(((0x3ff + n) as u64) << 52)
 }
 
 fn math_frexp(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -854,20 +956,27 @@ fn math_lgamma(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn math_isqrt(args: &[Object]) -> Result<Object, RuntimeError> {
-    let n = to_i64(args, "isqrt", 0)?;
-    if n < 0 {
-        return Err(value_error("isqrt() argument must be non-negative"));
+    use num_bigint::BigInt;
+    use num_traits::Signed;
+    // Accept any integer, including arbitrary-precision values, matching
+    // CPython. A float-based approximation overflows for large inputs, so
+    // we compute the exact integer square root over BigInt.
+    let n: BigInt = match args.first() {
+        Some(Object::Int(i)) => BigInt::from(*i),
+        Some(Object::Bool(b)) => BigInt::from(i64::from(*b)),
+        Some(Object::Long(b)) => (**b).clone(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                other.type_name()
+            )))
+        }
+        None => return Err(type_error("isqrt() takes exactly one argument (0 given)")),
+    };
+    if n.is_negative() {
+        return Err(value_error("isqrt() argument must be nonnegative"));
     }
-    let approx = (n as f64).sqrt().floor() as i64;
-    // Adjust for rounding error at the boundary.
-    let mut root = approx;
-    while root > 0 && root * root > n {
-        root -= 1;
-    }
-    while (root + 1) * (root + 1) <= n {
-        root += 1;
-    }
-    Ok(Object::Int(root))
+    Ok(Object::int_from_bigint(n.sqrt()))
 }
 
 fn math_cbrt(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -103,6 +103,24 @@ def load(file, *, fix_imports=True, encoding="ASCII", errors="strict"):
 # --- pickler --------------------------------------------------------------
 
 
+def _resolves_to_self(module, qualname, obj):
+    """True when ``module.qualname`` imports back to *obj* itself.
+
+    This is CPython's ``save_global`` self-consistency check: an object is
+    only safe to pickle by reference (functions, classes, module globals)
+    when the dotted name found in its declaring module *is* that object.
+    Callable instances inherit their class's ``__qualname__`` and would
+    otherwise be mistaken for the class.
+    """
+    try:
+        target = __import__(module, fromlist=["_"])
+        for part in qualname.split("."):
+            target = getattr(target, part)
+        return target is obj
+    except Exception:
+        return False
+
+
 class _Pickler:
     def __init__(self, buf, protocol):
         self._buf = buf
@@ -184,7 +202,13 @@ class _Pickler:
                 getattr(obj, "__qualname__", None)
                 or getattr(obj, "__name__", None)
             )
-            if qualname:
+            # Only pickle by name when that name actually resolves back to
+            # *this* object (CPython's `save_global` self-check). A callable
+            # *instance* — e.g. `operator.attrgetter('x')` — inherits its
+            # class's `__qualname__`, so without this guard it would be
+            # saved as the bare class and unpickle to the class object
+            # rather than round-tripping through `__reduce__`.
+            if qualname and _resolves_to_self(module, qualname, obj):
                 self._save_global(module, qualname)
                 return
         # Arbitrary instances — try __reduce_ex__ / __reduce__ (the

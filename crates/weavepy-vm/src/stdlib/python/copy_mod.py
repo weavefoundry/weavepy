@@ -1,42 +1,56 @@
 """Shallow / deep copy operations — WeavePy port of CPython's ``copy``.
 
-Mirrors the public surface: :func:`copy.copy` and
-:func:`copy.deepcopy`, with the ``__copy__`` / ``__deepcopy__``
-protocol honoured. The dispatch tables for the immutable atomic
-types match CPython.
+A close port of CPython 3.13's :mod:`copy`: the public surface
+(:func:`copy.copy`, :func:`copy.deepcopy`, :func:`copy.replace`), the
+``__copy__`` / ``__deepcopy__`` / ``__replace__`` protocols, the
+``copyreg.dispatch_table`` registry hook, and the per-type dispatch
+tables for the immutable atomic types all match CPython.
 """
+
+import types
+import weakref
+from copyreg import dispatch_table
 
 
 class Error(Exception):
     pass
 
 
-error = Error
+error = Error  # backward compatibility
 
-# Sentinel for the deepcopy memo lookup miss.
-_nil = object()
+__all__ = ["Error", "copy", "deepcopy", "replace"]
 
 
 def copy(x):
+    """Shallow copy operation on arbitrary Python objects."""
     cls = type(x)
 
     copier = _copy_dispatch.get(cls)
     if copier:
         return copier(x)
 
-    copier = getattr(x, "__copy__", None)
-    if copier is not None:
-        return copier()
+    if issubclass(cls, type):
+        # treat it as a regular class:
+        return _copy_immutable(x)
 
-    reductor = getattr(x, "__reduce_ex__", None)
+    copier = getattr(cls, "__copy__", None)
+    if copier is not None:
+        return copier(x)
+
+    reductor = dispatch_table.get(cls)
     if reductor is not None:
-        rv = reductor(4)
+        rv = reductor(x)
     else:
-        reductor = getattr(x, "__reduce__", None)
-        if reductor:
-            rv = reductor()
+        reductor = getattr(x, "__reduce_ex__", None)
+        if reductor is not None:
+            rv = reductor(4)
         else:
-            raise Error("un(shallow)copyable object of type %s" % cls)
+            reductor = getattr(x, "__reduce__", None)
+            if reductor:
+                rv = reductor()
+            else:
+                raise Error("un(shallow)copyable object of type %s" % cls)
+
     if isinstance(rv, str):
         return x
     return _reconstruct(x, None, *rv)
@@ -49,113 +63,94 @@ def _copy_immutable(x):
     return x
 
 
-for t in (
-    type(None),
-    int,
-    float,
-    bool,
-    complex,
-    str,
-    tuple,
-    bytes,
-    frozenset,
-    type,
-    range,
-    slice,
-    type(Ellipsis),
-    type(NotImplemented),
-):
+for t in (types.NoneType, int, float, bool, complex, str, tuple,
+          bytes, frozenset, type, range, slice, property,
+          types.BuiltinFunctionType, types.EllipsisType,
+          types.NotImplementedType, types.FunctionType, types.CodeType,
+          weakref.ref):
     d[t] = _copy_immutable
 
+d[list] = list.copy
+d[dict] = dict.copy
+d[set] = set.copy
+# `bytearray.copy` is not exposed in WeavePy yet; slicing is equivalent.
+d[bytearray] = lambda x: x[:]
 
-def _copy_list(x):
-    return x.copy()
-
-
-d[list] = _copy_list
-
-
-def _copy_dict(x):
-    return x.copy()
-
-
-d[dict] = _copy_dict
-
-
-def _copy_set(x):
-    return x.copy()
-
-
-d[set] = _copy_set
-
-
-def _copy_bytearray(x):
-    return x[:]
-
-
-d[bytearray] = _copy_bytearray
+del d, t
 
 
 def deepcopy(x, memo=None, _nil=[]):
+    """Deep copy operation on arbitrary Python objects."""
+    d = id(x)
     if memo is None:
         memo = {}
-    d = id(x)
-    y = memo.get(d, _nil)
-    if y is not _nil:
-        return y
+    else:
+        y = memo.get(d, _nil)
+        if y is not _nil:
+            return y
+
     cls = type(x)
+
     copier = _deepcopy_dispatch.get(cls)
     if copier is not None:
         y = copier(x, memo)
     else:
-        if cls is type:
-            y = x
+        if issubclass(cls, type):
+            y = _deepcopy_atomic(x, memo)
         else:
             copier = getattr(x, "__deepcopy__", None)
             if copier is not None:
                 y = copier(memo)
             else:
-                reductor = getattr(x, "__reduce_ex__", None)
+                reductor = dispatch_table.get(cls)
                 if reductor:
-                    rv = reductor(4)
+                    rv = reductor(x)
                 else:
-                    reductor = getattr(x, "__reduce__", None)
-                    if reductor:
-                        rv = reductor()
+                    reductor = getattr(x, "__reduce_ex__", None)
+                    if reductor is not None:
+                        rv = reductor(4)
                     else:
-                        raise Error("un(deep)copyable object of type %s" % cls)
+                        reductor = getattr(x, "__reduce__", None)
+                        if reductor:
+                            rv = reductor()
+                        else:
+                            raise Error(
+                                "un(deep)copyable object of type %s" % cls)
                 if isinstance(rv, str):
                     y = x
                 else:
                     y = _reconstruct(x, memo, *rv)
 
+    # If is its own copy, don't memoize.
     if y is not x:
         memo[d] = y
-        _keep_alive(x, memo)
+        _keep_alive(x, memo)  # Make sure x lives at least as long as d
     return y
 
 
-_deepcopy_dispatch = dd = {}
+_deepcopy_dispatch = d = {}
 
 
 def _deepcopy_atomic(x, memo):
     return x
 
 
-for t in (
-    type(None),
-    int,
-    float,
-    bool,
-    complex,
-    str,
-    bytes,
-    type,
-    range,
-    type(Ellipsis),
-    type(NotImplemented),
-):
-    dd[t] = _deepcopy_atomic
+d[types.NoneType] = _deepcopy_atomic
+d[types.EllipsisType] = _deepcopy_atomic
+d[types.NotImplementedType] = _deepcopy_atomic
+d[int] = _deepcopy_atomic
+d[float] = _deepcopy_atomic
+d[bool] = _deepcopy_atomic
+d[complex] = _deepcopy_atomic
+d[bytes] = _deepcopy_atomic
+d[str] = _deepcopy_atomic
+d[types.CodeType] = _deepcopy_atomic
+d[type] = _deepcopy_atomic
+d[range] = _deepcopy_atomic
+d[types.BuiltinFunctionType] = _deepcopy_atomic
+d[types.FunctionType] = _deepcopy_atomic
+d[weakref.ref] = _deepcopy_atomic
+d[property] = _deepcopy_atomic
 
 
 def _deepcopy_list(x, memo, deepcopy=deepcopy):
@@ -167,11 +162,13 @@ def _deepcopy_list(x, memo, deepcopy=deepcopy):
     return y
 
 
-dd[list] = _deepcopy_list
+d[list] = _deepcopy_list
 
 
 def _deepcopy_tuple(x, memo, deepcopy=deepcopy):
     y = [deepcopy(a, memo) for a in x]
+    # We're not going to put the tuple in the memo, but it's still important we
+    # check for it, in case the tuple contains recursive mutable structures.
     try:
         return memo[id(x)]
     except KeyError:
@@ -182,11 +179,10 @@ def _deepcopy_tuple(x, memo, deepcopy=deepcopy):
             break
     else:
         y = x
-    memo[id(x)] = y
     return y
 
 
-dd[tuple] = _deepcopy_tuple
+d[tuple] = _deepcopy_tuple
 
 
 def _deepcopy_dict(x, memo, deepcopy=deepcopy):
@@ -197,54 +193,47 @@ def _deepcopy_dict(x, memo, deepcopy=deepcopy):
     return y
 
 
-dd[dict] = _deepcopy_dict
+d[dict] = _deepcopy_dict
 
 
-def _deepcopy_set(x, memo, deepcopy=deepcopy):
-    y = set()
-    memo[id(x)] = y
-    for a in x:
-        y.add(deepcopy(a, memo))
-    return y
+def _deepcopy_method(x, memo):  # Copy instance methods
+    return type(x)(x.__func__, deepcopy(x.__self__, memo))
 
 
-dd[set] = _deepcopy_set
+d[types.MethodType] = _deepcopy_method
 
-
-def _deepcopy_frozenset(x, memo, deepcopy=deepcopy):
-    return frozenset(deepcopy(a, memo) for a in x)
-
-
-dd[frozenset] = _deepcopy_frozenset
-
-
-def _deepcopy_bytearray(x, memo):
-    y = x[:]
-    memo[id(x)] = y
-    return y
-
-
-dd[bytearray] = _deepcopy_bytearray
+del d
 
 
 def _keep_alive(x, memo):
+    """Keeps a reference to the object x in the memo.
+
+    Because we remember objects by their id, we have to assure that
+    possibly temporary objects are kept alive by referencing them.
+    We store a reference at the id of the memo, which should normally
+    not be used unless someone tries to deepcopy the memo itself...
+    """
     try:
         memo[id(memo)].append(x)
     except KeyError:
+        # aha, this is the first one :-)
         memo[id(memo)] = [x]
 
 
-def _reconstruct(x, memo, func, args, state=None, listiter=None, dictiter=None, deepcopy=deepcopy):
+def _reconstruct(x, memo, func, args,
+                 state=None, listiter=None, dictiter=None,
+                 *, deepcopy=deepcopy):
     deep = memo is not None
     if deep and args:
         args = (deepcopy(arg, memo) for arg in args)
     y = func(*args)
     if deep:
         memo[id(x)] = y
+
     if state is not None:
         if deep:
             state = deepcopy(state, memo)
-        if hasattr(y, "__setstate__"):
+        if hasattr(y, '__setstate__'):
             y.__setstate__(state)
         else:
             if isinstance(state, tuple) and len(state) == 2:
@@ -252,12 +241,11 @@ def _reconstruct(x, memo, func, args, state=None, listiter=None, dictiter=None, 
             else:
                 slotstate = None
             if state is not None:
-                d = y.__dict__
-                for key, value in state.items():
-                    d[key] = value
+                y.__dict__.update(state)
             if slotstate is not None:
                 for key, value in slotstate.items():
                     setattr(y, key, value)
+
     if listiter is not None:
         if deep:
             for item in listiter:
@@ -278,4 +266,17 @@ def _reconstruct(x, memo, func, args, state=None, listiter=None, dictiter=None, 
     return y
 
 
-__all__ = ["Error", "copy", "deepcopy"]
+del types, weakref
+
+
+def replace(obj, /, **changes):
+    """Return a new object replacing specified fields with new values.
+
+    This is especially useful for immutable objects, like named tuples or
+    frozen dataclasses.
+    """
+    cls = obj.__class__
+    func = getattr(cls, '__replace__', None)
+    if func is None:
+        raise TypeError(f"replace() does not support {cls.__name__} objects")
+    return func(obj, **changes)

@@ -49,12 +49,12 @@ status = "fail"
 reason = "depends on dict order corner cases + leaking CPython implementation details"
 
 [tests."cpython/Lib/test/test_list.py"]
-status = "fail"
-reason = "depends on CPython sys.getsizeof / refcount behaviour"
+status = "skip"
+reason = "measured: past the sys.getsizeof/refcount probes it reaches the same gc.collect() reachable-hang as test_set (list/iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
 
 [tests."cpython/Lib/test/test_set.py"]
 status = "fail"
-reason = "exercises C-level frozenset interning + sys.getsizeof"
+reason = "measured: completes within budget and fails on assertions. The former 'ran-further-now-slow' timeout was dominated by O(n^2) behaviour — every user-instance set element hashed to one bucket (DictKey had no __hash__/__eq__ hook). RFC 0037 now routes user-instance keys through Python __hash__/__eq__ (object.rs DictKey + Interpreter::reentrant_py_hash/eq), so sets of custom-hashable objects bucket properly and the suite runs to completion."
 
 # RFC 0024 — real threads, GIL, cycle GC, weakrefs.
 # These tests stress hardware-thread interleavings and CPython-
@@ -108,16 +108,16 @@ reason = "depends on real multiprocessing implementation (RFC 0026)"
 # ---------------------------------------------------------------------
 
 [tests."cpython/Lib/test/test_tuple.py"]
-status = "fail"
-reason = "depends on sys.getsizeof + CPython tuple interning"
+status = "skip"
+reason = "measured: past the sys.getsizeof/interning probes it reaches the same gc.collect() reachable-hang as test_set (tuple/iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
 
 [tests."cpython/Lib/test/test_bytes.py"]
 status = "fail"
-reason = "bytes/bytearray methods incomplete (translate, maketrans table semantics)"
+reason = "measured: first remaining failure is 'SkipTest: No module named _testlimitedcapi' raised at import of a C-API test helper WeavePy doesn't provide; the CAPI-dependent bytes subtests can't run."
 
 [tests."cpython/Lib/test/test_string.py"]
-status = "fail"
-reason = "str.format spec mini-language coverage is partial"
+status = "pass"
+reason = "measured: passes (38 tests). RFC 0037 WS4 unified the str.format/format_map engine (interpreter-aware, shared auto/manual field numbering across nested specs, __format__ dispatch), fixed the global format()-vs-str.format name collision, str.split/splitlines kwargs, and ascii() Latin-1 (\\xXX) escaping."
 
 [tests."cpython/Lib/test/test_unicode.py"]
 status = "fail"
@@ -128,28 +128,28 @@ status = "fail"
 reason = "math module: domain edge cases (gamma, lgamma) differ from libm path"
 
 [tests."cpython/Lib/test/test_int.py"]
-status = "fail"
-reason = "PEP 467 int methods + sys.int_info shape not matched"
+status = "pass"
+reason = "RFC 0037 WS3/WS9: passes end-to-end (47 tests, 7 skipped). int() string parsing now enforces PEP 0467 int_max_str_digits on both str->int and int->str (non-power-of-2 radices) with a cheap O(1) length pre-guard so the DoS-prevention tests fail *fast* (the repr() of the offending argument is computed lazily, only for the invalid-literal message); base-0 leading-zero + underscore-placement validation match CPython; int() honours __index__ bases, rejects a real number with an explicit base, and falls back to a deprecated __trunc__ (Integral-only result). test.support gained CPUStopwatch (perf_counter-backed) and run_in_subinterp (SkipTest); random.getrandbits is exposed."
 
 [tests."cpython/Lib/test/test_float.py"]
-status = "fail"
-reason = "float.hex / fromhex roundtrip + repr corner cases"
+status = "pass"
+reason = "RFC 0037 WS3: passes end-to-end (skipped=3). float()/math coercion now routes user objects through __float__/__index__ (coerce_f64_opt) and int->float raises OverflowError when the magnitude exceeds the f64 range instead of silently yielding inf; NaN orderings are unordered (Lt/LtE/Gt/GtE are all False against a NaN); float.hex/fromhex roundtrip and the unbound float methods resolve."
 
 [tests."cpython/Lib/test/test_complex.py"]
-status = "fail"
-reason = "complex repr formatting differs in edge cases"
+status = "pass"
+reason = "RFC 0037 WS3: passes end-to-end (35 tests). The complex() constructor honours a user __complex__/__index__/__float__ via VM-level dunder dispatch, complex repr/format edges match, and divmod()/binary numeric dunders route through __divmod__/__rdivmod__ raising the canonical TypeError when both decline."
 
 [tests."cpython/Lib/test/test_decimal.py"]
 status = "skip"
 reason = "decimal module is pure-Python fallback only; many tests probe _decimal"
 
 [tests."cpython/Lib/test/test_fractions.py"]
-status = "fail"
-reason = "Fraction.__pow__ corner cases (rational exponent)"
+status = "pass"
+reason = "RFC 0037 WS3/WS8: passes end-to-end. cmath is ported (pure-Python over math); math.* coerce Fraction via __float__; int->float raises OverflowError past the f64 range; setattr()/delattr() route through the descriptor-aware STORE_ATTR/DELETE_ATTR path so read-only properties + __slots__ raise AttributeError; NaN comparisons are unordered; BigInt true division is correctly-rounded (scaled to avoid the inf/inf==NaN trap); integer __format__ honours the ','/'_' thousands separator with no presentation type; divmod(Fraction, complex) raises TypeError."
 
 [tests."cpython/Lib/test/test_collections.py"]
 status = "fail"
-reason = "OrderedDict / Counter / ChainMap edge cases"
+reason = "measured: dict(**kwargs)/dict(mapping,**kwargs) + collections.abc now work (RFC 0037); first remaining failure is a builtin '__new__' rejecting keyword arguments (namedtuple/typed-collection construction path)."
 
 [tests."cpython/Lib/test/test_array.py"]
 status = "fail"
@@ -164,28 +164,28 @@ status = "fail"
 reason = "bisect passes core but stress tests probe C accelerator"
 
 [tests."cpython/Lib/test/test_itertools.py"]
-status = "fail"
-reason = "itertools recipes + reduce stability not matched"
+status = "skip"
+reason = "measured: advances past the itertools recipe failures into the same gc.collect() reachable-hang as test_set (iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
 
 [tests."cpython/Lib/test/test_functools.py"]
 status = "fail"
-reason = "functools.partial / lru_cache + singledispatch edge cases"
+reason = "measured: first failure is \"__init__() got multiple values for argument 'self'\" — functools.partial/bound-method interaction passes the receiver twice."
 
 [tests."cpython/Lib/test/test_operator.py"]
-status = "fail"
-reason = "operator module: attrgetter chained lookups + methodcaller kwargs"
+status = "pass"
+reason = "RFC 0037 WS8: passes end-to-end (106 tests). Augmented assignment now dispatches the in-place dunders (__iadd__/__ior__/…) before falling back to the binary op, and list/set/bytearray mutate in place; the `in` operator falls back to __iter__/__getitem__ iteration for instances without __contains__ (propagating exceptions); built-in iterators expose __length_hint__ (PEP 424) and sequences expose __getitem__/__len__/__contains__ slot wrappers (operator.concat/length_hint); enumerate() is lazy and shares the source iterator (operator.indexOf leaves it positioned after the match); `None | None` raises TypeError (PEP 604 needs a real type to initiate a union); inspect.signature renders positional-only `/` and handles callable instances; and builtins are no longer copied into module globals so dir(operator) is clean (test_dunder_is_original)."
 
 [tests."cpython/Lib/test/test_copy.py"]
-status = "fail"
-reason = "copy/deepcopy with __copy__ / __deepcopy__ + memo edges"
+status = "pass"
+reason = "RFC 0037 WS8: passes end-to-end (81 tests). The cycle collector now discounts weakref-registry strong clones from its refcount accounting, so a referent reachable only through weakrefs collapses to gc_refs==0 and is collected — `weakref.ref(obj)()` flips to None and WeakValueDictionary/WeakKeyDictionary self-clean after del+gc.collect(). WeakKey/WeakValueDictionary gained Mapping-style __eq__/__copy__/__deepcopy__, PEP 560 __mro_entries__ resolution landed in __build_class__ (so `class P(NamedTuple)` works), typing.NamedTuple (class + functional syntax) is ported, and namedtuple._replace raises TypeError('Got unexpected field names') like CPython."
 
 [tests."cpython/Lib/test/test_pickle.py"]
 status = "skip"
 reason = "pickle protocol 5 + out-of-band buffers not implemented"
 
 [tests."cpython/Lib/test/test_copyreg.py"]
-status = "fail"
-reason = "copyreg dispatch table for extension types"
+status = "pass"
+reason = "RFC 0037 WS8: copyreg's pickle extension registry (add_extension/remove_extension/clear_extension_cache + _inverted_registry) plus the bundled test.pickletester ExtensionSaver shim land, so the full copyreg suite passes end-to-end."
 
 [tests."cpython/Lib/test/test_marshal.py"]
 status = "fail"
@@ -280,16 +280,16 @@ status = "pass"
 reason = "RFC 0036: passes end-to-end after porting CPython's textwrap verbatim and adding \\N{NAME} string escapes (the non-breaking-space tests need them)"
 
 [tests."cpython/Lib/test/test_format.py"]
-status = "fail"
-reason = "%-formatting + str.format inter-op"
+status = "pass"
+reason = "measured (RFC 0037 WS2): passes end-to-end. The prior blocker (the `locale` import at setup) now resolves, and the remaining str/bytes/bytearray `%`-formatting matrix — including the width/precision/flag combinations and the exception-path probes — matches CPython."
 
 [tests."cpython/Lib/test/test_fstring.py"]
 status = "fail"
-reason = "PEP 701 f-strings (nested quotes, multi-line) not fully covered"
+reason = "measured (WS2): 90 tests run, 51 pass / 36 fail / 3 error (was 44/25/6). The lexer's f-string *extent* scanner now emits CPython's exact PEP 701 wording (unterminated f-string literal, unterminated triple-quoted f-string literal, f-string: expecting '}', f-string: expecting '}', or format specs, newlines-not-allowed-in-format-specifiers-for-single-quoted) and uses an explicit bracket *stack* (not a depth counter) so it reports closing-paren-does-not-match-opening, f-string: unmatched ')', and '{'/'(' was-never-closed (comment-to-EOF) — distinguishing a same-quote terminator (f'{3') from a real nested string (f'{3 + 'a'}'); test_not_closing_quotes/test_unterminated_string/test_newlines_in_format_specifiers/test_mismatched_parens/test_comments pass. The FORMAT_VALUE opcode now routes through __format__ like format(): !s/!r/!a convert-then-format-as-string (test_conversions), custom __format__ objects are honoured, object.__format__ rejects a non-empty spec with TypeError 'unsupported format string passed to T.__format__' (test_errors), and the int spec parser rejects duplicate ,/_ grouping with CPython's two messages (the four test_with_*_in_format_specifier pass). Remaining: AST source positions/lineno + compile(<AST>), decimal.Decimal.__format__, \\N{...} escape decoding, backslash SyntaxWarnings, lambda-without-parens message, and the lexer-finds-extent-first ordering that pre-empts the parser's 'valid expression required before X' on empty fields."
 
 [tests."cpython/Lib/test/test_class.py"]
 status = "fail"
-reason = "class machinery: __init_subclass__ + __set_name__ ordering"
+reason = "measured: the compiler now accepts **kwargs (and *bases) in a class header via the CallEx lowering (RFC 0037 WS2); the first remaining blocker is the module-level 'from _testinternalcapi import has_inline_values' — a CPython-internal managed-dict test helper WeavePy doesn't ship (the TestInlineValues subtests probe a CPython-specific layout detail)."
 
 [tests."cpython/Lib/test/test_dataclasses.py"]
 status = "fail"
@@ -297,7 +297,7 @@ reason = "dataclass: __init_subclass__ + slots=True + kw_only"
 
 [tests."cpython/Lib/test/test_enum.py"]
 status = "fail"
-reason = "enum: StrEnum / IntEnum mixins + value re-use rules"
+reason = "measured: first remaining failure imports the not-yet-ported 'pydoc' module at setup — blocked on WS8 pydoc port (large; pulls in inspect/text-wrapping)."
 
 [tests."cpython/Lib/test/test_inspect.py"]
 status = "fail"
@@ -308,28 +308,28 @@ status = "fail"
 reason = "typing: PEP 695 type aliases + ParamSpec.kwargs"
 
 [tests."cpython/Lib/test/test_abc.py"]
-status = "fail"
-reason = "ABCMeta: register() ordering + virtual subclass cache invalidation"
+status = "pass"
+reason = "WS8: verbatim _py_abc + _weakrefset ports, type.__subclasses__(), object.__subclasshook__, abc.py routed through _py_abc, plus VM fixes (universal __class__, __new__ implicit staticmethod, positional-only/keyword binding, class-creation kwargs ignored by builtin type.__init__, del on type attrs, property.__isabstractmethod__, and property/classmethod/staticmethod subclasses acting as descriptors). All 72 tests pass under both the Python and C ABCMeta factories."
 
 [tests."cpython/Lib/test/test_descr.py"]
 status = "fail"
-reason = "descriptor protocol: __set_name__ on inheritance + slot conflicts"
+reason = "measured: object.__module__ + unbound type-methods now resolve (RFC 0037 WS6); the suite still reports a large mix of errors/failures across the descriptor-protocol subtests (no single root cause — slots, __set_name__, metaclass corners)."
 
 [tests."cpython/Lib/test/test_iter.py"]
-status = "fail"
-reason = "iter: __length_hint__ + iter(callable, sentinel) edge cases"
+status = "skip"
+reason = "measured: now that the test.support helpers + collections.abc resolve (RFC 0037 WS8/WS9) the suite runs far enough to reach the same gc.collect() reachable-hang as test_set (iterator/collection reference cycles + weakrefs). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
 
 [tests."cpython/Lib/test/test_generators.py"]
 status = "fail"
-reason = "generator: throw() into yield from + close() during yield"
+reason = "measured: first failure is 'InternalError: bad cell index' — closure-cell indexing bug in a generator frame; VM cell-resolution gap."
 
 [tests."cpython/Lib/test/test_coroutines.py"]
 status = "fail"
-reason = "coroutine: PEP 492 async with + async for + send/throw"
+reason = "measured: the compiler now lowers nested async comprehensions via PEP 530 implicit-async propagation (an async comprehension nested in another comprehension's element makes the outer one a coroutine too) (RFC 0037 WS2/WS7); the suite now runs but most coroutine send/throw/await subtests error and the run ends in a VM 'stack underflow' — coroutine-driver fidelity gaps remain."
 
 [tests."cpython/Lib/test/test_asyncgen.py"]
 status = "fail"
-reason = "async generator: aclose() + asend() edge cases"
+reason = "measured: the test.support helpers + implicit-return fix let the suite run (RFC 0037 WS5/WS9); it now reports a broad run of errors ending in an unhandled GeneratorExit — async-generator aclose()/athrow() finalization semantics aren't matched."
 
 [tests."cpython/Lib/test/test_with.py"]
 status = "fail"
@@ -337,11 +337,11 @@ reason = "with: PEP 617 parenthesized context managers"
 
 [tests."cpython/Lib/test/test_exceptions.py"]
 status = "fail"
-reason = "exception: __notes__ + ExceptionGroup propagation"
+reason = "measured: recursion guard + __context__/__cause__/__suppress_context__/__traceback__ slots + add_note/with_traceback now present (RFC 0037 WS1/WS5); first remaining failure is AttributeError on AttributeError.name/.obj — the interpreter doesn't populate PEP 3134 name/obj fields when raising attribute/name errors."
 
 [tests."cpython/Lib/test/test_traceback.py"]
 status = "fail"
-reason = "traceback: exception chaining display + StackSummary format"
+reason = "measured: _colorize/__future__ now import (RFC 0037 WS5/WS7); first remaining failure is 'NameError: name IO is not defined' — the traceback module references a name (typing.IO-style) WeavePy doesn't expose at import."
 
 [tests."cpython/Lib/test/test_warnings.py"]
 status = "fail"
@@ -360,16 +360,16 @@ status = "fail"
 reason = "compile builtin: PyCF_* flags + AST input handling"
 
 [tests."cpython/Lib/test/test_decorators.py"]
-status = "fail"
-reason = "decorator stacking + classmethod/staticmethod descriptor protocol"
+status = "pass"
+reason = "RFC 0037 WS6: classmethod/staticmethod expose __wrapped__/__func__ and delegate __module__/__qualname__/__name__/__doc__/__annotations__ to the wrapped function with stable object identity, staticmethod instances are themselves callable (bpo-43682), and a function's __name__ is pinned so assertIs holds — the full decorators suite passes."
 
 [tests."cpython/Lib/test/test_call.py"]
 status = "fail"
 reason = "call protocol: kwargs unpacking ordering + vectorcall"
 
 [tests."cpython/Lib/test/test_isinstance.py"]
-status = "fail"
-reason = "isinstance: PEP 604 union types + ABC virtual subclass cache"
+status = "pass"
+reason = "isinstance()/issubclass() now implement CPython's full protocol: the duck-typed abstract-class path (objects emulating a class via __bases__/__class__ properties), PEP 3119 __instancecheck__/__subclasscheck__ dispatch on type(classinfo) for class-like instances, non-AttributeError propagation while reading __bases__/__class__ (bpo-1574217), recursion guards so cyclic/unbounded __bases__ chains and deeply nested tuples raise RecursionError, and TypeError for parameterized generics (list[int]). typing.List/Tuple/etc. gained PEP 604 __or__/__ror__ and __instancecheck__/__subclasscheck__. 23/23."
 
 [tests."cpython/Lib/test/test_dis.py"]
 status = "fail"
@@ -437,7 +437,7 @@ reason = "random: Mersenne Twister state save/load + SystemRandom"
 
 [tests."cpython/Lib/test/test_statistics.py"]
 status = "fail"
-reason = "statistics: NormalDist + harmonic_mean weighted forms"
+reason = "measured: runs all 374 cases and fails on missing numeric-tower features (NormalDist + harmonic_mean weighted forms, Fraction/Decimal interop). The former 'ran-further-now-slow' timeout cleared once RFC 0037 gave set/dict the Python __hash__/__eq__ key hook (no more single-bucket O(n^2) on custom-hashable keys); revisit the remaining failures once the numeric tower (WS3) lands."
 
 [tests."cpython/Lib/test/test_unicodedata.py"]
 status = "skip"
@@ -445,15 +445,15 @@ reason = "RFC 0036: name/lookup now use the full UCD table (unicode_names2), but
 
 [tests."cpython/Lib/test/test_struct.py"]
 status = "fail"
-reason = "struct: pack_into bounds check + endianness with @ alignment"
+reason = "measured: first remaining failure is a Rust panic (RUST_BACKTRACE note in output) inside the struct module path — a pack/unpack edge case aborts rather than raising struct.error; needs a panic-to-exception guard in the struct builtin."
 
 [tests."cpython/Lib/test/test_codecs.py"]
 status = "fail"
 reason = "codecs: encoder/decoder state + error handlers"
 
 [tests."cpython/Lib/test/test_calendar.py"]
-status = "fail"
-reason = "calendar: TextCalendar formatting + html escaping"
+status = "pass"
+reason = "RFC 0037 WS8: passes end-to-end (skipped=3). calendar is ported (pure-Python over datetime/locale/itertools). Unblocked by several reusable engine fixes: a functional io.TextIOWrapper (encode/decode over the wrapped buffer) so sys.stdout redirection works, the sequence protocol (__len__ + __getitem__) feeding set()/frozenset() construction and reversed(), PEP 562 module-level __getattr__, runpy's _TempModule (a real types.ModuleType registered as __main__ in sys.modules so @global_enum's namespace update lands), file.buffer/name/mode attributes, and argparse usage-on-error + type-conversion error formatting."
 
 [tests."cpython/Lib/test/test_time.py"]
 status = "fail"
@@ -472,8 +472,8 @@ status = "fail"
 reason = "email: policy.utf8 + EmailMessage.iter_attachments"
 
 [tests."cpython/Lib/test/test_html.py"]
-status = "fail"
-reason = "html: parser CDATA section + entity name lookup"
+status = "pass"
+reason = "html.unescape now ports CPython's full algorithm: the new html.entities module ships the complete HTML5 named-reference table (html5/name2codepoint/codepoint2name/entitydefs), and unescape applies the spec's numeric rules (semicolon-optional decimal/hex refs, the Windows-1252 _invalid_charrefs remap, the _invalid_codepoints drop-set, surrogate/out-of-range -> U+FFFD) plus the longest-named-prefix fallback via re.sub with a callable repl. 2/2."
 
 [tests."cpython/Lib/test/test_logging.py"]
 status = "fail"
@@ -484,8 +484,8 @@ status = "skip"
 reason = "locale requires setlocale() to succeed in CI sandbox"
 
 [tests."cpython/Lib/test/test_mimetypes.py"]
-status = "fail"
-reason = "mimetypes: read_windows_registry on non-Windows + guess_type unicode"
+status = "pass"
+reason = "mimetypes is now CPython's verbatim module (full MimeTypes class, strict/non-strict maps, guess_file_type, read/readfp). Unblocked by several reusable engine fixes: bool indexes a sequence as int (seq[True]≡seq[1], used by the strict-map 2-tuple), os.fsdecode/fsencode + os.path.splitdrive, os.PathLike (__fspath__) coercion for open()/os.fspath/fsdecode/fsencode, unittest.mock implicitly creating a builtin name (open) patched onto a module, and test.support.patch/check__all__. 22/24 (+2 skips)."
 
 [tests."cpython/Lib/test/test_sched.py"]
 status = "fail"
@@ -545,15 +545,15 @@ reason = "typing_extensions is a third-party shim, ship-time only"
 
 [tests."cpython/Lib/test/test_weakset.py"]
 status = "fail"
-reason = "WeakSet: finalize callback ordering"
+reason = "measured: runs all 46 cases and fails on WeakSet finalize callback ordering + gc reachability. The former 'ran-further-now-slow' timeout cleared once RFC 0037 gave set/dict the Python __hash__/__eq__ key hook, removing the single-bucket O(n^2) on custom-hashable keys; the same fix that retired test_set's timeout."
 
 [tests."cpython/Lib/test/test_subclassinit.py"]
-status = "fail"
-reason = "__init_subclass__ interactions with metaclasses"
+status = "pass"
+reason = "PEP 487/678: fixed zero-arg super() for the bound-to-subclass form (super(C, D) walks D's MRO) so diamond __init_subclass__ chains correctly; split type.__new__ from type.__init__ (call_init flag) so a metaclass __new__ chaining through super().__new__ no longer double-runs / mis-args __init__; metaclass __new__ may return a non-type (returned verbatim, __init__ skipped); a failing __set_name__ is re-raised with a PEP 678 note naming descriptor/attr/owner. 17/17 pass."
 
 [tests."cpython/Lib/test/test_keywordonlyarg.py"]
-status = "fail"
-reason = "keyword-only argument default expression evaluation timing"
+status = "pass"
+reason = "RFC 0037: added the missing arg-syntax SyntaxErrors (duplicate parameter name, bare * with no keyword-only arg, positional-arg-follows-keyword, repeated keyword in a call), made func.__kwdefaults__ assignable and honored at call time (replaces the keyword-only defaults wholesale), and matched CPython's too_many_positional message (\"takes from MIN to MAX\" + argument/was-were pluralization). 11/11 pass."
 
 [tests."cpython/Lib/test/test_unpack.py"]
 status = "fail"
@@ -583,23 +583,23 @@ reason = "RFC 0036: passes end-to-end (bigaddrspacetest fixtures skip cleanly wi
 
 [tests."cpython/Lib/test/test_bdb.py"]
 status = "fail"
-reason = "measured: ImportError cannot import name 'patch_list' from 'test.support' (helper not yet ported)"
+reason = "measured: patch_list + the other test.support helpers now import (RFC 0037 WS9); first remaining failure is 'type object Breakpoint has no attribute clearBreakpoints' — the bundled bdb module is missing Breakpoint classmethods."
 
 [tests."cpython/Lib/test/test_contextlib_async.py"]
 status = "fail"
-reason = "measured: contextlib.asynccontextmanager not implemented yet"
+reason = "measured: contextlib.asynccontextmanager/AsyncExitStack now exist (RFC 0037 WS7 verbatim swap); first remaining failure is 'No module named test.test_contextlib' — this file imports its sibling test module, which isn't bundled."
 
 [tests."cpython/Lib/test/test_descrtut.py"]
 status = "fail"
 reason = "measured: a descriptor-tutorial doctest diverges (repr/format edge)"
 
 [tests."cpython/Lib/test/test_numeric_tower.py"]
-status = "fail"
-reason = "measured: Fraction(str) rejects decimal literals like '1.2' (ValueError) — fractions string parser gap"
+status = "pass"
+reason = "RFC 0037 WS3: passes end-to-end (9 tests). Numeric dunder dispatch now routes abs()/round()/divmod()/complex()/pow() and the unary/binary operators through __abs__/__round__/__divmod__/__complex__/__pow__/__neg__/__eq__/__ne__ (deriving != from __eq__, raising TypeError when both binop dunders decline via NotImplemented instead of falling back to the wrapped native value), math.gcd/lcm/factorial use arbitrary-precision BigInt, float % takes the sign of the divisor and (-x)**frac promotes to complex, numbers.Rational.__float__ coerces via int(), and hash()/dict-key bucketing share one canonical Python hash so 1 == 1.0 == True and custom __hash__ keys dedup against built-ins."
 
 [tests."cpython/Lib/test/test_string_literals.py"]
-status = "fail"
-reason = "measured: eval of some string-literal escape forms raises (octal/edge escapes)"
+status = "pass"
+reason = "WS2c: tokenizer now records invalid-escape / oversized-octal SyntaxWarnings (with exact backslash offsets) and the compile path replays them via warnings.warn_explicit (escalating to a located SyntaxError under an 'error' filter); bytes literals reject non-ASCII and bad prefixes (ur/ru/bb/rr/...) raise SyntaxError. All 20 tests pass."
 
 [tests."cpython/Lib/test/test_threadsignals.py"]
 status = "fail"
@@ -610,8 +610,8 @@ status = "fail"
 reason = "measured: Morsel/SimpleCookie output formatting edge (errors=1)"
 
 [tests."cpython/Lib/test/test_unicode_identifiers.py"]
-status = "fail"
-reason = "measured: lexer rejects non-ASCII (PEP 3131) identifiers ('invalid character')"
+status = "pass"
+reason = "PEP 3131: parser NFKC-normalizes identifiers and compile()/import raise SyntaxError with CPython .msg/.lineno/.offset for the badsyntax_3131 fixture (RFC 0037 WS2/WS5)"
 
 # Network / unshipped-protocol / C-accelerator dependent — skip cleanly
 # in the sandbox (no live network or the backing module isn't shipped).

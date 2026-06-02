@@ -196,10 +196,19 @@ def _make_init(fields, frozen):
                 f"__init__() takes {len(pos_fields) + 1} positional arguments "
                 f"but {len(args) + 1} were given"
             )
+        init_field_names = {fld.name for fld in init_fields}
         provided = {}
         for f, value in zip(pos_fields, args):
             provided[f.name] = value
         for key, value in kwargs.items():
+            # An explicit-parameter `__init__` (CPython) rejects names that
+            # aren't init fields; mirror that so `C(unknown=…)` (and thus
+            # `copy.replace(obj, unknown=…)`) raises instead of silently
+            # dropping the value.
+            if key not in init_field_names:
+                raise TypeError(
+                    f"__init__() got an unexpected keyword argument {key!r}"
+                )
             if key in provided:
                 raise TypeError(
                     f"__init__() got multiple values for argument {key!r}"
@@ -339,6 +348,10 @@ def _process_class(cls, init, repr, eq, order, frozen, slots, kw_only):
 
         cls.__setattr__ = _frozen_setattr
         cls.__delattr__ = _frozen_delattr
+
+    # `copy.replace(obj)` (Python 3.13+) dispatches through `__replace__`.
+    if "__replace__" not in cls.__dict__:
+        cls.__replace__ = _replace
 
     if slots:
         # CPython rebuilds the class so ``__slots__`` is in effect at
@@ -491,12 +504,21 @@ def _astuple_inner(obj, tuple_factory):
     return obj
 
 
+def _replace(self, /, **changes):
+    """`__replace__` implementation bound on each dataclass — delegates
+    to `replace` so `copy.replace(obj, **changes)` works (Python 3.13+)."""
+    return replace(self, **changes)
+
+
 def replace(obj, /, **changes):
     """Return a new dataclass instance with `changes` applied, all
     other fields copied from `obj`."""
     if not is_dataclass(obj) or isinstance(obj, type):
         raise TypeError("replace() expects a dataclass instance")
-    kwargs = {}
+    # Fill in field values not being changed, mutating `changes` in place
+    # (CPython semantics). Any leftover keys that aren't init fields stay in
+    # `changes` and reach `__init__`, which rejects them with `TypeError` —
+    # so `replace(obj, not_a_field=…)` raises, as CPython requires.
     for f in fields(obj):
         if not f.init:
             if f.name in changes:
@@ -504,11 +526,9 @@ def replace(obj, /, **changes):
                     f"cannot replace non-init field {f.name!r}"
                 )
             continue
-        if f.name in changes:
-            kwargs[f.name] = changes[f.name]
-        else:
-            kwargs[f.name] = getattr(obj, f.name)
-    return type(obj)(**kwargs)
+        if f.name not in changes:
+            changes[f.name] = getattr(obj, f.name)
+    return type(obj)(**changes)
 
 
 def make_dataclass(cls_name, fields_spec, *, bases=(), namespace=None, **kwargs):

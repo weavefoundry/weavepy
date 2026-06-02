@@ -29,8 +29,8 @@ pub mod scanner;
 pub mod token;
 
 pub use error::LexError;
-pub use scanner::tokenize;
-pub use token::{BytePos, Keyword, Span, StringPrefix, Token, TokenKind};
+pub use scanner::{tokenize, tokenize_with_escapes};
+pub use token::{BytePos, EscapeWarning, Keyword, Span, StringPrefix, Token, TokenKind};
 
 #[cfg(test)]
 mod tests {
@@ -140,5 +140,138 @@ mod tests {
         let k = kinds(src);
         let newlines = k.iter().filter(|t| **t == TokenKind::Newline).count();
         assert_eq!(newlines, 1);
+    }
+
+    fn lex_err_msg(src: &str) -> String {
+        tokenize(src)
+            .expect_err("source should fail to tokenize")
+            .to_string()
+    }
+
+    // PEP 701 — the lexer must reproduce CPython's f-string diagnostics
+    // verbatim; `test_fstring.py` asserts on these exact strings.
+    #[test]
+    fn fstring_unterminated_literal_messages() {
+        // test_not_closing_quotes: bare `f"` / `f'`.
+        assert_eq!(lex_err_msg("f\""), "unterminated f-string literal");
+        assert_eq!(lex_err_msg("f'"), "unterminated f-string literal");
+        // A single-line f-string may not span a newline in its literal part.
+        assert_eq!(lex_err_msg("f'abc\n"), "unterminated f-string literal");
+    }
+
+    #[test]
+    fn fstring_unterminated_triple_messages() {
+        // test_not_closing_quotes: `f"""` / `f'''`.
+        assert_eq!(
+            lex_err_msg("f\"\"\""),
+            "unterminated triple-quoted f-string literal"
+        );
+        assert_eq!(
+            lex_err_msg("f'''"),
+            "unterminated triple-quoted f-string literal"
+        );
+    }
+
+    #[test]
+    fn fstring_unterminated_field_is_expecting_brace() {
+        // An open replacement *expression* that runs off the end is
+        // "f-string: expecting '}'" — including when a same-quote that
+        // can't find its pair was really the f-string terminator (`f'{3'`).
+        assert_eq!(lex_err_msg("f'{3'"), "f-string: expecting '}'");
+        assert_eq!(lex_err_msg("f'{3!'"), "f-string: expecting '}'");
+        assert_eq!(lex_err_msg("f'{3!s'"), "f-string: expecting '}'");
+        assert_eq!(lex_err_msg("f'{(3)'"), "f-string: expecting '}'");
+        // `{{` is a brace escape; the trailing `{` then opens an (empty)
+        // field that hits raw EOF.
+        assert_eq!(lex_err_msg("f'{{{'"), "f-string: expecting '}'");
+    }
+
+    #[test]
+    fn fstring_unterminated_spec_names_format_specs() {
+        // An open *format spec* gets CPython's spec-specific wording. The
+        // outer quote inside a single-quoted spec is the terminator (a
+        // fill-char must use the other quote), so this also triggers it.
+        assert_eq!(
+            lex_err_msg("f'{3:'"),
+            "f-string: expecting '}', or format specs"
+        );
+        assert_eq!(
+            lex_err_msg("f'{x:>'"),
+            "f-string: expecting '}', or format specs"
+        );
+    }
+
+    #[test]
+    fn fstring_same_quote_reuse_is_valid() {
+        // PEP 701 quote reuse: a same-quote that *does* find its pair is a
+        // genuine nested string, not the terminator.
+        assert_eq!(kinds("f'{3 + 'a'}'")[0], TokenKind::String);
+        assert_eq!(kinds("f'{3''}'")[0], TokenKind::String); // empty nested str
+        // The other quote is literal inside a format spec.
+        assert_eq!(kinds("f\"{x:'>10}\"")[0], TokenKind::String);
+    }
+
+    #[test]
+    fn fstring_newline_in_single_line_spec() {
+        // test_newlines_in_format_specifiers: a newline in the format spec
+        // of a single-line f-string is rejected (CPython's full wording
+        // ends "...for single quoted f-strings")...
+        assert_eq!(
+            lex_err_msg("f'{1:d\n}'"),
+            "f-string: newlines are not allowed in format specifiers for single quoted f-strings"
+        );
+        // ...but is perfectly legal inside a triple-quoted f-string.
+        assert_eq!(kinds("f'''{1:d\n}'''")[0], TokenKind::String);
+    }
+
+    #[test]
+    fn fstring_bracket_mismatch_messages() {
+        // A close that doesn't match the innermost opener names both, like
+        // CPython (test_mismatched_parens).
+        assert_eq!(
+            lex_err_msg("f'{((}'"),
+            "closing parenthesis '}' does not match opening parenthesis '('"
+        );
+        assert_eq!(
+            lex_err_msg("f'{a[4}'"),
+            "closing parenthesis '}' does not match opening parenthesis '['"
+        );
+        assert_eq!(
+            lex_err_msg("f'{a(4}'"),
+            "closing parenthesis '}' does not match opening parenthesis '('"
+        );
+    }
+
+    #[test]
+    fn fstring_unmatched_and_never_closed() {
+        // A `)` with nothing open.
+        assert_eq!(lex_err_msg("f'{)}'"), "f-string: unmatched ')'");
+        assert_eq!(lex_err_msg("f'{)#}'"), "f-string: unmatched ')'");
+        // A `#` comment that eats the rest to EOF leaves the innermost
+        // bracket "never closed" (the field `{`, or a nested opener).
+        assert_eq!(lex_err_msg("f'{1#}'"), "'{' was never closed");
+        assert_eq!(lex_err_msg("f'{#}'"), "'{' was never closed");
+        assert_eq!(lex_err_msg("f'{(1#}'"), "'(' was never closed");
+        // A comment terminated by a newline is *not* "never closed".
+        assert_eq!(lex_err_msg("f'{1#}\n'"), "f-string: expecting '}'");
+    }
+
+    #[test]
+    fn fstring_nested_dict_and_calls_still_valid() {
+        // The stack-based scanner must keep accepting balanced nesting.
+        assert_eq!(kinds("f'{ {1:2} }'")[0], TokenKind::String);
+        assert_eq!(kinds("f'{d[\"k\"]}'")[0], TokenKind::String);
+        assert_eq!(kinds("f'{f(a, b)}'")[0], TokenKind::String);
+        assert_eq!(kinds("f'{x:{y}}'")[0], TokenKind::String);
+    }
+
+    #[test]
+    fn fstring_unterminated_nested_string_stays_string_error() {
+        // test_unterminated_string: a *different*-quoted nested string is
+        // what's unterminated, so CPython keeps the generic wording
+        // ("unterminated string literal", which our Display extends with a
+        // byte offset — still a regex match for the test).
+        assert!(lex_err_msg("f'{\"x'").starts_with("unterminated string literal"));
+        assert!(lex_err_msg("f'{(\"x'").starts_with("unterminated string literal"));
     }
 }

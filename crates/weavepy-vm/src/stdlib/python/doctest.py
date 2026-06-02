@@ -1204,8 +1204,13 @@ def DocFileTest(path, module_relative=True, package=None, globs=None,
 
 def DocFileSuite(*paths, **kw):
     suite = _DocTestSuite()
+    # We do this here so that _normalize_module is called at the right
+    # level. If it were called in DocFileTest, then this function would be
+    # the caller and we might guess the package incorrectly. Depth 2 (the
+    # default) names the caller of DocFileSuite — i.e. the module whose
+    # directory the relative paths resolve against.
     if kw.get('module_relative', True):
-        kw['package'] = _normalize_module(kw.get('package'), 3)
+        kw['package'] = _normalize_module(kw.get('package'))
     for path in paths:
         suite.addTest(DocFileTest(path, **kw))
     return suite

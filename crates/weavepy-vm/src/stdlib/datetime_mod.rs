@@ -248,7 +248,11 @@ fn arg_int(args: &[Object], idx: usize) -> Result<i64, RuntimeError> {
     match args.get(idx) {
         Some(Object::Int(i)) => Ok(*i),
         Some(Object::Bool(b)) => Ok(i64::from(*b)),
-        _ => Err(type_error("expected int")),
+        // Honour the `__index__` protocol so integer-backed instances
+        // (e.g. `IntEnum` members like `calendar.Month`) are accepted, like
+        // CPython's `PyDateTime` argument parsing.
+        Some(o) => crate::builtins::coerce_index_i64(o).map_err(|_| type_error("expected int")),
+        None => Err(type_error("expected int")),
     }
 }
 
@@ -257,7 +261,7 @@ fn arg_int_or(args: &[Object], idx: usize, default: i64) -> Result<i64, RuntimeE
         None | Some(Object::None) => Ok(default),
         Some(Object::Int(i)) => Ok(*i),
         Some(Object::Bool(b)) => Ok(i64::from(*b)),
-        _ => Err(type_error("expected int")),
+        Some(o) => crate::builtins::coerce_index_i64(o).map_err(|_| type_error("expected int")),
     }
 }
 

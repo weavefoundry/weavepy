@@ -52,6 +52,7 @@ pub struct BuiltinTypes {
     pub not_implemented_type_: Rc<TypeObject>,
     pub simple_namespace_: Rc<TypeObject>,
     pub function_: Rc<TypeObject>,
+    pub method_: Rc<TypeObject>,
     pub generator_: Rc<TypeObject>,
     pub coroutine_: Rc<TypeObject>,
     pub async_generator_: Rc<TypeObject>,
@@ -80,6 +81,10 @@ pub struct BuiltinTypes {
     pub type_error: Rc<TypeObject>,
     pub unbound_local_error: Rc<TypeObject>,
     pub value_error: Rc<TypeObject>,
+    pub unicode_error: Rc<TypeObject>,
+    pub unicode_encode_error: Rc<TypeObject>,
+    pub unicode_decode_error: Rc<TypeObject>,
+    pub unicode_translate_error: Rc<TypeObject>,
     pub zero_division_error: Rc<TypeObject>,
     pub generator_exit: Rc<TypeObject>,
     pub keyboard_interrupt: Rc<TypeObject>,
@@ -176,6 +181,10 @@ impl BuiltinTypes {
         let not_implemented_type_ = mk("NotImplementedType", vec![object_.clone()]);
         let simple_namespace_ = mk("SimpleNamespace", vec![object_.clone()]);
         let function_ = mk("function", vec![object_.clone()]);
+        // `types.MethodType` — the bound-method type. Distinct from
+        // `function` so `type(obj.meth)` is `method` (as in CPython) and
+        // `types.MethodType(func, obj)` can construct a bound method.
+        let method_ = mk("method", vec![object_.clone()]);
         let generator_ = mk("generator", vec![object_.clone()]);
         let coroutine_ = mk("coroutine", vec![object_.clone()]);
         let async_generator_ = mk("async_generator", vec![object_.clone()]);
@@ -212,11 +221,30 @@ impl BuiltinTypes {
         // in CPython's hierarchy, not a subclass.
         let stop_async_iteration = exc("StopAsyncIteration", exception.clone());
         let syntax_error = exc("SyntaxError", exception.clone());
+        // CPython's `SyntaxError.__init__` unpacks the
+        // `(filename, lineno, offset, text[, end_lineno, end_offset])`
+        // detail tuple into attributes, and its `__str__` appends
+        // `" (<basename>, line N)"`. Install both so the type behaves as a
+        // drop-in whether constructed from Python or raised from Rust.
+        install_syntax_error_dunders(&syntax_error);
         // `TimeoutError` lands here so `asyncio.wait_for` raises a
         // public, importable type rather than a synthetic shim.
         let timeout_error = exc("TimeoutError", os_error.clone());
         let type_error = exc("TypeError", exception.clone());
         let value_error = exc("ValueError", exception.clone());
+        // Unicode error hierarchy: `UnicodeError` derives from
+        // `ValueError`, and the three concrete codecs errors derive from
+        // it. CPython gives the concrete three extra attributes
+        // (`encoding`/`object`/`start`/`end`/`reason`) populated by their
+        // `__init__`; install those so `str(UnicodeDecodeError(...))` and
+        // attribute access match.
+        let unicode_error = exc("UnicodeError", value_error.clone());
+        let unicode_encode_error = exc("UnicodeEncodeError", unicode_error.clone());
+        let unicode_decode_error = exc("UnicodeDecodeError", unicode_error.clone());
+        let unicode_translate_error = exc("UnicodeTranslateError", unicode_error.clone());
+        install_unicode_error_dunders(&unicode_encode_error, UnicodeErrorKind::Encode);
+        install_unicode_error_dunders(&unicode_decode_error, UnicodeErrorKind::Decode);
+        install_unicode_error_dunders(&unicode_translate_error, UnicodeErrorKind::Translate);
         let generator_exit = exc("GeneratorExit", base_exception.clone());
         let keyboard_interrupt = exc("KeyboardInterrupt", base_exception.clone());
         let system_exit = exc("SystemExit", base_exception.clone());
@@ -313,6 +341,7 @@ impl BuiltinTypes {
             not_implemented_type_,
             simple_namespace_,
             function_,
+            method_,
             generator_,
             coroutine_,
             async_generator_,
@@ -339,6 +368,10 @@ impl BuiltinTypes {
             type_error,
             unbound_local_error,
             value_error,
+            unicode_error,
+            unicode_encode_error,
+            unicode_decode_error,
+            unicode_translate_error,
             zero_division_error,
             generator_exit,
             keyboard_interrupt,
@@ -440,6 +473,10 @@ impl BuiltinTypes {
             pair!(type_error, "TypeError"),
             pair!(unbound_local_error, "UnboundLocalError"),
             pair!(value_error, "ValueError"),
+            pair!(unicode_error, "UnicodeError"),
+            pair!(unicode_encode_error, "UnicodeEncodeError"),
+            pair!(unicode_decode_error, "UnicodeDecodeError"),
+            pair!(unicode_translate_error, "UnicodeTranslateError"),
             pair!(zero_division_error, "ZeroDivisionError"),
             pair!(generator_exit, "GeneratorExit"),
             pair!(keyboard_interrupt, "KeyboardInterrupt"),
@@ -527,6 +564,10 @@ impl BuiltinTypes {
             "TypeError" => Some(self.type_error.clone()),
             "UnboundLocalError" => Some(self.unbound_local_error.clone()),
             "ValueError" => Some(self.value_error.clone()),
+            "UnicodeError" => Some(self.unicode_error.clone()),
+            "UnicodeEncodeError" => Some(self.unicode_encode_error.clone()),
+            "UnicodeDecodeError" => Some(self.unicode_decode_error.clone()),
+            "UnicodeTranslateError" => Some(self.unicode_translate_error.clone()),
             "ZeroDivisionError" => Some(self.zero_division_error.clone()),
             "GeneratorExit" => Some(self.generator_exit.clone()),
             "KeyboardInterrupt" => Some(self.keyboard_interrupt.clone()),
@@ -610,6 +651,104 @@ pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
     make_exception_with_class(class, message)
 }
 
+/// Extract the elements of a *concrete* iterable (one that doesn't need
+/// the interpreter to drive). Used by `object.__new__` to seed the
+/// native payload of an immutable-container subclass from a
+/// `__getnewargs__`-supplied value. Returns `None` for anything that
+/// would require VM iteration (generators, user iterators), which
+/// `object.__new__` can't run.
+fn concrete_elements(obj: &Object) -> Option<Vec<Object>> {
+    match obj {
+        Object::List(items) => Some(items.borrow().clone()),
+        Object::Tuple(items) => Some(items.to_vec()),
+        Object::Set(s) => Some(s.borrow().iter().map(|k| k.0.clone()).collect()),
+        Object::FrozenSet(s) => Some(s.iter().map(|k| k.0.clone()).collect()),
+        Object::Str(s) => Some(s.chars().map(|c| Object::from_str(c.to_string())).collect()),
+        Object::Bytes(b) => Some(b.iter().map(|&x| Object::Int(i64::from(x))).collect()),
+        Object::ByteArray(b) => Some(
+            b.borrow()
+                .iter()
+                .map(|&x| Object::Int(i64::from(x)))
+                .collect(),
+        ),
+        // A subclass instance wrapping a concrete native container.
+        Object::Instance(inst) => inst.native.as_ref().and_then(concrete_elements),
+        _ => None,
+    }
+}
+
+/// Build the native payload `object.__new__(cls, value?)` should stash
+/// on an instance of a value/container built-in subclass, or `None` for
+/// an ordinary `object` subclass. Mutable containers (`list`/`dict`/
+/// `set`/`bytearray`) start empty regardless of `value` — they're filled
+/// afterwards by `__init__`/`__setstate__`/the copy reconstruction loop;
+/// immutable ones (`int`/`float`/`complex`/`str`/`bytes`/`tuple`/
+/// `frozenset`) capture `value` here because they can't be mutated later.
+fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<Object> {
+    if cls.flags.is_builtin {
+        return None;
+    }
+    let bt = builtin_types();
+    let is_strict = |base: &Rc<TypeObject>| cls.is_subclass_of(base) && !Rc::ptr_eq(cls, base);
+    if is_strict(&bt.int_) {
+        return Some(match value {
+            None => Object::Int(0),
+            Some(o @ (Object::Int(_) | Object::Long(_))) => o.clone(),
+            Some(Object::Bool(b)) => Object::Int(i64::from(*b)),
+            Some(o) => o.native_value().unwrap_or_else(|| Object::Int(o.as_i64().unwrap_or(0))),
+        });
+    }
+    if is_strict(&bt.float_) {
+        let f = value.and_then(Object::as_f64).unwrap_or(0.0);
+        return Some(Object::Float(f));
+    }
+    if is_strict(&bt.complex_) {
+        return Some(match value {
+            Some(c @ Object::Complex(_)) => c.clone(),
+            Some(o) => o.native_value().filter(|n| matches!(n, Object::Complex(_))).unwrap_or(o.clone()),
+            None => Object::new_complex(0.0, 0.0),
+        });
+    }
+    if is_strict(&bt.str_) {
+        return Some(match value {
+            Some(s @ Object::Str(_)) => s.clone(),
+            _ => Object::from_static(""),
+        });
+    }
+    if is_strict(&bt.bytearray_) {
+        let bytes = value
+            .and_then(concrete_elements)
+            .map(|els| els.iter().filter_map(|o| o.as_i64()).map(|i| i as u8).collect())
+            .unwrap_or_default();
+        return Some(Object::ByteArray(Rc::new(RefCell::new(bytes))));
+    }
+    if is_strict(&bt.bytes_) {
+        let bytes: Vec<u8> = value
+            .and_then(concrete_elements)
+            .map(|els| els.iter().filter_map(|o| o.as_i64()).map(|i| i as u8).collect())
+            .unwrap_or_default();
+        return Some(Object::Bytes(Rc::from(bytes.as_slice())));
+    }
+    if is_strict(&bt.tuple_) {
+        let els = value.and_then(concrete_elements).unwrap_or_default();
+        return Some(Object::new_tuple(els));
+    }
+    if is_strict(&bt.frozenset_) {
+        let els = value.and_then(concrete_elements).unwrap_or_default();
+        return Some(Object::new_frozenset_from(els));
+    }
+    if is_strict(&bt.list_) {
+        return Some(Object::new_list(Vec::new()));
+    }
+    if is_strict(&bt.set_) {
+        return Some(Object::new_set_from(Vec::<Object>::new()));
+    }
+    if is_strict(&bt.dict_) {
+        return Some(Object::Dict(Rc::new(RefCell::new(DictData::new()))));
+    }
+    None
+}
+
 /// Install `object.__new__`, `object.__init__`, `object.__setattr__`
 /// and `object.__delattr__` on the root class. These are the implicit
 /// base methods every user class inherits.
@@ -626,18 +765,15 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 ))
             }
         };
-        // When `cls` derives from a primitive immutable built-in (so far
-        // `int` — covering `_NamedIntConstant`, `enum.IntEnum`/`IntFlag`
-        // and hand-written `class C(int)`), capture the value the
-        // instance wraps. `super().__new__(cls, value)` passes it as the
-        // second positional argument; absent that it defaults to 0.
-        if cls.is_subclass_of(&builtin_types().int_) {
-            let native = match args.get(1) {
-                None => Object::Int(0),
-                Some(o @ (Object::Int(_) | Object::Long(_))) => o.clone(),
-                Some(Object::Bool(b)) => Object::Int(i64::from(*b)),
-                Some(o) => Object::Int(o.as_i64().unwrap_or(0)),
-            };
+        // When `cls` derives from a value/container built-in (`int`,
+        // `float`, `str`, `tuple`, `list`, `dict`, …) capture the native
+        // payload the instance wraps so the inherited protocols keep
+        // firing through the subclass. `super().__new__(cls, value)`
+        // passes the seed value as the second positional argument (how
+        // `copyreg.__newobj__` reconstructs immutable subclasses); mutable
+        // containers start empty and are filled by `__init__` /
+        // `__setstate__` / the `_reconstruct` append-and-update loop.
+        if let Some(native) = native_seed_for_new(&cls, args.get(1)) {
             return Ok(Object::Instance(Rc::new(PyInstance::with_native(
                 cls, native,
             ))));
@@ -708,7 +844,24 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         }
         Ok(Object::None)
     }
+    fn object_hash(args: &[Object]) -> Result<Object, RuntimeError> {
+        // Default `object.__hash__`: the same canonical hash the `hash()`
+        // builtin falls back to when no custom `__hash__` is defined, so
+        // `object.__hash__(x) == hash(x)` for any object using the default.
+        let obj = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("object.__hash__() takes exactly 1 argument"))?;
+        crate::builtins::hash_object(obj)
+    }
     let mut dict = object_.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__hash__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__hash__",
+            call: Box::new(object_hash),
+            call_kw: None,
+        })),
+    );
     dict.insert(
         DictKey(Object::from_static("__new__")),
         Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
@@ -754,6 +907,75 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
             call: Box::new(object_no_op),
             call_kw: None,
         })))),
+    );
+    // `object.__subclasshook__(cls, subclass)` returns `NotImplemented`
+    // by default (CPython), telling `issubclass`/ABCMeta to fall back to
+    // the normal MRO/registry check. ABCs override it to implement
+    // structural ("duck typing") subclass tests.
+    fn object_subclasshook(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Ok(crate::vm_singletons::not_implemented())
+    }
+    dict.insert(
+        DictKey(Object::from_static("__subclasshook__")),
+        Object::ClassMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
+            name: "__subclasshook__",
+            call: Box::new(object_subclasshook),
+            call_kw: None,
+        })))),
+    );
+    // `object.__reduce_ex__(self, protocol)` / `object.__reduce__(self)`
+    // need interpreter access (to import `copyreg` and call the receiver's
+    // `__getstate__`/`__getnewargs__` hooks), so they are registered under
+    // sentinel names that `Interpreter::call` intercepts (see the
+    // `.object_reduce_ex` / `.object_reduce` arms there). Plain
+    // `BuiltinFn::call` is a `fn(&[Object])` and can't reach the VM.
+    fn object_reduce_ex_sentinel(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Err(crate::error::runtime_error(
+            "object.__reduce_ex__ must be dispatched via Interpreter::call",
+        ))
+    }
+    fn object_reduce_sentinel(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Err(crate::error::runtime_error(
+            "object.__reduce__ must be dispatched via Interpreter::call",
+        ))
+    }
+    dict.insert(
+        DictKey(Object::from_static("__reduce_ex__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: ".object_reduce_ex",
+            call: Box::new(object_reduce_ex_sentinel),
+            call_kw: None,
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__reduce__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: ".object_reduce",
+            call: Box::new(object_reduce_sentinel),
+            call_kw: None,
+        })),
+    );
+    // `object.__getattribute__(self, name)` — the default attribute
+    // lookup (data descriptor → instance dict → class attr → AttributeError).
+    // Needs VM access to run the descriptor protocol and walk the MRO, so it
+    // is wired through a sentinel name that `Interpreter::call` intercepts
+    // (both bound `x.__getattribute__(name)` and unbound
+    // `object.__getattribute__(x, name)` forms). Exposing it here lets a
+    // user-defined `__getattribute__` delegate to `object.__getattribute__`
+    // (the canonical CPython idiom), and lets `load_attr` distinguish a real
+    // override from this default without a special is-defined-on-object flag.
+    fn object_getattribute_sentinel(_args: &[Object]) -> Result<Object, RuntimeError> {
+        Err(crate::error::runtime_error(
+            "object.__getattribute__ must be dispatched via Interpreter::call",
+        ))
+    }
+    dict.insert(
+        DictKey(Object::from_static("__getattribute__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: ".object_getattribute",
+            call: Box::new(object_getattribute_sentinel),
+            call_kw: None,
+        })),
     );
 }
 
@@ -828,6 +1050,329 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
             call_kw: None,
         })),
     );
+}
+
+/// Which of the three concrete unicode errors we're installing dunders
+/// for. They share storage (`object`/`start`/`end`/`reason`, plus
+/// `encoding` for the codec variants) but differ in constructor arity
+/// and the `__str__` message shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnicodeErrorKind {
+    Encode,
+    Decode,
+    Translate,
+}
+
+/// Install `__init__` / `__str__` for `UnicodeEncodeError`,
+/// `UnicodeDecodeError`, and `UnicodeTranslateError`, mirroring CPython's
+/// `Objects/exceptions.c` (`UnicodeEncodeError_init`, `…_str`, etc.).
+///
+/// Constructors:
+///   * encode/decode: `(encoding, object, start, end, reason)`
+///   * translate:     `(object, start, end, reason)`
+///
+/// `__str__` reproduces the exact CPython wording, including the
+/// single-element `'\\xXX'` / `'\\uXXXX'` / `'\\UXXXXXXXX'` escape for a
+/// one-position slice and the `position M-N` form for a range.
+fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
+    use crate::object::BuiltinFn;
+
+    fn set(dict: &mut crate::object::DictData, name: &'static str, value: Object) {
+        dict.insert(DictKey(Object::from_static(name)), value);
+    }
+
+    let init = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let Some(Object::Instance(inst_rc)) = args.first() else {
+            return Ok(Object::None);
+        };
+        let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
+        let want = if kind == UnicodeErrorKind::Translate {
+            4
+        } else {
+            5
+        };
+        if rest.len() != want {
+            return Err(crate::error::type_error(format!(
+                "function takes exactly {} arguments ({} given)",
+                want,
+                rest.len()
+            )));
+        }
+        let mut dict = inst_rc.dict.borrow_mut();
+        set(&mut dict, "args", Object::new_tuple(rest.to_vec()));
+        let mut i = 0;
+        if kind != UnicodeErrorKind::Translate {
+            set(&mut dict, "encoding", rest[i].clone());
+            i += 1;
+        }
+        set(&mut dict, "object", rest[i].clone());
+        set(&mut dict, "start", rest[i + 1].clone());
+        set(&mut dict, "end", rest[i + 2].clone());
+        set(&mut dict, "reason", rest[i + 3].clone());
+        Ok(Object::None)
+    };
+
+    let str_fn = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let Some(Object::Instance(inst_rc)) = args.first() else {
+            return Ok(Object::from_static(""));
+        };
+        let dict = inst_rc.dict.borrow();
+        let get = |name: &'static str| dict.get(&DictKey(Object::from_static(name))).cloned();
+        let as_i = |o: &Object| -> i64 {
+            match o {
+                Object::Int(n) => *n,
+                Object::Bool(b) => i64::from(*b),
+                _ => 0,
+            }
+        };
+        let encoding = match get("encoding") {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        let reason = match get("reason") {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        let start = get("start").as_ref().map(as_i).unwrap_or(0);
+        let end = get("end").as_ref().map(as_i).unwrap_or(0);
+        let obj = get("object").unwrap_or(Object::None);
+
+        // Escape a single offending scalar exactly as CPython does.
+        let escape = |c: u32| -> String {
+            if c < 0x100 {
+                format!("\\x{c:02x}")
+            } else if c < 0x10000 {
+                format!("\\u{c:04x}")
+            } else {
+                format!("\\U{c:08x}")
+            }
+        };
+
+        let msg = match kind {
+            UnicodeErrorKind::Encode => {
+                let s: Vec<char> = match &obj {
+                    Object::Str(s) => s.chars().collect(),
+                    _ => Vec::new(),
+                };
+                if start >= 0 && (start as usize) < s.len() && end == start + 1 {
+                    let c = s[start as usize] as u32;
+                    format!(
+                        "'{encoding}' codec can't encode character '{}' in position {start}: {reason}",
+                        escape(c)
+                    )
+                } else {
+                    format!(
+                        "'{encoding}' codec can't encode characters in position {start}-{}: {reason}",
+                        end - 1
+                    )
+                }
+            }
+            UnicodeErrorKind::Decode => {
+                let b: &[u8] = match &obj {
+                    Object::Bytes(b) => b,
+                    _ => &[],
+                };
+                if start >= 0 && (start as usize) < b.len() && end == start + 1 {
+                    format!(
+                        "'{encoding}' codec can't decode byte 0x{:02x} in position {start}: {reason}",
+                        b[start as usize]
+                    )
+                } else {
+                    format!(
+                        "'{encoding}' codec can't decode bytes in position {start}-{}: {reason}",
+                        end - 1
+                    )
+                }
+            }
+            UnicodeErrorKind::Translate => {
+                let s: Vec<char> = match &obj {
+                    Object::Str(s) => s.chars().collect(),
+                    _ => Vec::new(),
+                };
+                if start >= 0 && (start as usize) < s.len() && end == start + 1 {
+                    let c = s[start as usize] as u32;
+                    format!(
+                        "can't translate character '{}' in position {start}: {reason}",
+                        escape(c)
+                    )
+                } else {
+                    format!(
+                        "can't translate characters in position {start}-{}: {reason}",
+                        end - 1
+                    )
+                }
+            }
+        };
+        Ok(Object::from_str(msg))
+    };
+
+    let mut dict = ty.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            call: Box::new(init),
+            call_kw: None,
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__str__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__str__",
+            call: Box::new(str_fn),
+            call_kw: None,
+        })),
+    );
+}
+
+/// CPython's `SyntaxError.__init__` / `__str__`.
+///
+/// `__init__(self, *args)` stores `args` like `BaseException`, then — when
+/// called as `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno,
+/// end_offset]))` — unpacks the detail sequence into named attributes.
+/// `__str__` reproduces CPython's `SyntaxError_str`: bare `msg` unless a
+/// filename and/or line are present, in which case it appends
+/// `" (<basename>, line N)"` / `" (<basename>)"` / `" (line N)"`.
+fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+
+    fn set(dict: &mut crate::object::DictData, name: &'static str, value: Object) {
+        dict.insert(DictKey(Object::from_static(name)), value);
+    }
+
+    fn syntaxerror_init(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        let Object::Instance(inst_rc) = inst else {
+            return Ok(Object::None);
+        };
+        let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
+        let mut dict = inst_rc.dict.borrow_mut();
+        set(&mut dict, "args", Object::new_tuple(rest.to_vec()));
+        // Defaults — CPython always defines these slots.
+        for name in [
+            "msg",
+            "filename",
+            "lineno",
+            "offset",
+            "text",
+            "end_lineno",
+            "end_offset",
+        ] {
+            set(&mut dict, name, Object::None);
+        }
+        if let Some(msg) = rest.first() {
+            set(&mut dict, "msg", msg.clone());
+        }
+        // `SyntaxError(msg, detail)` — `detail` is a 2-to-6 element
+        // sequence `(filename, lineno, offset, text[, end_lineno,
+        // end_offset])`.
+        if rest.len() == 2 {
+            let info: Option<&[Object]> = match &rest[1] {
+                Object::Tuple(items) => Some(items.as_ref()),
+                Object::List(items) => {
+                    // Borrow can't outlive the match arm; handle inline.
+                    let v = items.borrow();
+                    let pick = |i: usize| v.get(i).cloned().unwrap_or(Object::None);
+                    set(&mut dict, "filename", pick(0));
+                    set(&mut dict, "lineno", pick(1));
+                    set(&mut dict, "offset", pick(2));
+                    set(&mut dict, "text", pick(3));
+                    if v.len() > 4 {
+                        set(&mut dict, "end_lineno", pick(4));
+                        set(&mut dict, "end_offset", pick(5));
+                    }
+                    None
+                }
+                // Non-sequence second arg: CPython leaves the location
+                // attributes at their `None` defaults.
+                _ => None,
+            };
+            if let Some(items) = info {
+                let pick = |i: usize| items.get(i).cloned().unwrap_or(Object::None);
+                set(&mut dict, "filename", pick(0));
+                set(&mut dict, "lineno", pick(1));
+                set(&mut dict, "offset", pick(2));
+                set(&mut dict, "text", pick(3));
+                if items.len() > 4 {
+                    set(&mut dict, "end_lineno", pick(4));
+                    set(&mut dict, "end_offset", pick(5));
+                }
+            }
+        }
+        Ok(Object::None)
+    }
+
+    fn syntaxerror_str(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        let Object::Instance(inst_rc) = inst else {
+            return Ok(Object::from_static(""));
+        };
+        let dict = inst_rc.dict.borrow();
+        let get = |name: &'static str| {
+            dict.get(&DictKey(Object::from_static(name)))
+                .cloned()
+                .unwrap_or(Object::None)
+        };
+        let msg = get("msg");
+        // CPython renders the message via `str(self.msg)`.
+        let msg_str = match &msg {
+            Object::None => "None".to_owned(),
+            other => other.to_str(),
+        };
+        let filename = get("filename");
+        let lineno = get("lineno");
+        let have_filename = matches!(filename, Object::Str(_));
+        let lineno_val = match &lineno {
+            Object::Int(n) => Some(*n),
+            Object::Bool(b) => Some(i64::from(*b)),
+            _ => None,
+        };
+        let result = match (have_filename, lineno_val) {
+            (true, Some(n)) => {
+                format!("{msg_str} ({}, line {n})", syntax_basename(&filename))
+            }
+            (true, None) => format!("{msg_str} ({})", syntax_basename(&filename)),
+            (false, Some(n)) => format!("{msg_str} (line {n})"),
+            (false, None) => msg_str,
+        };
+        Ok(Object::from_str(result))
+    }
+
+    let mut dict = syntax_error.dict.borrow_mut();
+    set(
+        &mut dict,
+        "__init__",
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            call: Box::new(syntaxerror_init),
+            call_kw: None,
+        })),
+    );
+    set(
+        &mut dict,
+        "__str__",
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__str__",
+            call: Box::new(syntaxerror_str),
+            call_kw: None,
+        })),
+    );
+}
+
+/// Last path component of a `SyntaxError.filename`, mirroring CPython's
+/// `my_basename` (split on `/` — and `\\` on the same footing so Windows
+/// paths render the same). Non-string filenames yield an empty string.
+fn syntax_basename(filename: &Object) -> String {
+    let Object::Str(s) = filename else {
+        return String::new();
+    };
+    let s = s.as_ref();
+    let cut = s.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    s[cut..].to_owned()
 }
 
 fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
@@ -935,6 +1480,21 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         }
         Ok(Object::None)
     }
+    // `e.with_traceback(tb)` sets `__traceback__` and returns `self`, so
+    // `raise e.with_traceback(tb)` and chained-exception helpers work.
+    fn exc_with_traceback(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        let tb = args.get(1).cloned().unwrap_or(Object::None);
+        if let Object::Instance(inst_rc) = inst {
+            inst_rc
+                .dict
+                .borrow_mut()
+                .insert(DictKey(Object::from_static("__traceback__")), tb);
+        }
+        Ok(inst.clone())
+    }
     let mut dict = base_exception.dict.borrow_mut();
     dict.insert(
         DictKey(Object::from_static("__init__")),
@@ -968,24 +1528,55 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
             call_kw: None,
         })),
     );
+    dict.insert(
+        DictKey(Object::from_static("with_traceback")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "with_traceback",
+            call: Box::new(exc_with_traceback),
+            call_kw: None,
+        })),
+    );
 }
 
 pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<String>) -> Object {
     use crate::types::PyInstance;
     let is_os = is_subclass_by_name(&class, "OSError");
+    let is_syntax = is_subclass_by_name(&class, "SyntaxError");
     let inst = PyInstance::new(class);
     let msg = Object::from_str(message);
     let args = Object::new_tuple(vec![msg.clone()]);
     {
         let mut dict = inst.dict.borrow_mut();
         dict.insert(DictKey(Object::from_static("args")), args);
-        dict.insert(DictKey(Object::from_static("message")), msg);
+        dict.insert(DictKey(Object::from_static("message")), msg.clone());
+        // Always-present `BaseException` slots (see `build_exception_instance`):
+        // default None/None/False/None so attribute access and context-chain
+        // walks never `AttributeError`.
+        dict.insert(DictKey(Object::from_static("__context__")), Object::None);
+        dict.insert(DictKey(Object::from_static("__cause__")), Object::None);
+        dict.insert(
+            DictKey(Object::from_static("__suppress_context__")),
+            Object::Bool(false),
+        );
+        dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
         if is_os {
             // OSError attributes — populated to None when we raise
             // from Rust so callers can still ask `exc.errno` without
             // an AttributeError. Real values land here through the
             // `OSError(errno, strerror, ...)` __init__ in Python.
             for name in ["errno", "strerror", "filename", "winerror", "filename2"] {
+                dict.insert(DictKey(Object::from_static(name)), Object::None);
+            }
+        }
+        if is_syntax {
+            // SyntaxError exposes `msg` plus a location payload. CPython
+            // always defines these slots (default `None`); a Rust-raised
+            // bare SyntaxError gets `msg` from `args[0]` and `None`
+            // elsewhere so `e.lineno` / `e.offset` never `AttributeError`.
+            // `error::syntax_error_located` overwrites them with real
+            // values when a byte offset is available.
+            dict.insert(DictKey(Object::from_static("msg")), msg);
+            for name in ["filename", "lineno", "offset", "text", "end_lineno", "end_offset"] {
                 dict.insert(DictKey(Object::from_static(name)), Object::None);
             }
         }
@@ -1325,4 +1916,86 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
         crate::builtins::b_bytearray_fromhex_cls,
     );
     install(&bt.float_, "fromhex", crate::builtins::b_float_fromhex_cls);
+
+    // Expose `__hash__` on the hashable value built-ins so it sits in their
+    // type dict. Without this, a mixin like `class F(float, H)` would resolve
+    // `H.__hash__` (the first `__hash__` found in the MRO) instead of
+    // `float.__hash__`; CPython resolves `float.__hash__` because `float`
+    // precedes `H`. The method itself defers to the canonical `hash()`
+    // (which unwraps the native payload), so `object.__hash__(x) == hash(x)`.
+    fn install_hash(ty: &Rc<TypeObject>) {
+        fn value_hash(args: &[Object]) -> Result<Object, RuntimeError> {
+            crate::builtins::hash_object(args.first().unwrap_or(&Object::None))
+        }
+        ty.dict.borrow_mut().insert(
+            DictKey(Object::from_static("__hash__")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__hash__",
+                call: Box::new(value_hash),
+                call_kw: None,
+            })),
+        );
+    }
+    for ty in [
+        &bt.int_,
+        &bt.float_,
+        &bt.complex_,
+        &bt.str_,
+        &bt.bytes_,
+        &bt.tuple_,
+        &bt.frozenset_,
+    ] {
+        install_hash(ty);
+    }
+
+    // Expose the inherited numeric coercion dunders so a subclass that does
+    // *not* override them (`class C(int)` with only `__index__`) still
+    // resolves the base type's value-returning `__int__`/`__index__`/
+    // `__float__` through the MRO — matching CPython, where `int(C())` uses
+    // the wrapped value rather than the overriding hook.
+    fn install_method(
+        ty: &Rc<TypeObject>,
+        name: &'static str,
+        f: fn(&[Object]) -> Result<Object, RuntimeError>,
+    ) {
+        ty.dict.borrow_mut().insert(
+            DictKey(Object::from_static(name)),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name,
+                call: Box::new(f),
+                call_kw: None,
+            })),
+        );
+    }
+    fn self_as_int(args: &[Object]) -> Result<Object, RuntimeError> {
+        let o = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("__int__ requires an argument"))?;
+        let native = o.native_value();
+        match native.as_ref().unwrap_or(o) {
+            Object::Int(i) => Ok(Object::Int(*i)),
+            Object::Long(b) => Ok(Object::Long(b.clone())),
+            Object::Bool(b) => Ok(Object::Int(i64::from(*b))),
+            other => Err(crate::error::type_error(format!(
+                "descriptor '__int__' requires a 'int' object but received a '{}'",
+                other.type_name()
+            ))),
+        }
+    }
+    fn self_as_float(args: &[Object]) -> Result<Object, RuntimeError> {
+        let o = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("__float__ requires an argument"))?;
+        let native = o.native_value();
+        match native.as_ref().unwrap_or(o) {
+            Object::Float(f) => Ok(Object::Float(*f)),
+            other => Err(crate::error::type_error(format!(
+                "descriptor '__float__' requires a 'float' object but received a '{}'",
+                other.type_name()
+            ))),
+        }
+    }
+    install_method(&bt.int_, "__int__", self_as_int);
+    install_method(&bt.int_, "__index__", self_as_int);
+    install_method(&bt.float_, "__float__", self_as_float);
 }

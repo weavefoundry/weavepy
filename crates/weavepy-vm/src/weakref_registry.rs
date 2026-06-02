@@ -190,6 +190,27 @@ impl WeakRefRegistry {
             .unwrap_or(0)
     }
 
+    /// How many *strong clones* of the referent the registry is
+    /// currently holding for `id`. Every live, un-cleared slot keeps
+    /// one `Object` clone of its target alive (see
+    /// [`WeakRefSlot::target`]). The cycle collector subtracts this
+    /// from an object's outer refcount so a weakref does **not** keep
+    /// its referent reachable — otherwise `weakref.ref(obj)()` would
+    /// stay live forever and `WeakKeyDictionary`/`WeakValueDictionary`
+    /// would never self-clean after `del obj; gc.collect()`.
+    pub fn strong_clone_count(&self, id: ObjectId) -> usize {
+        let g = self.inner.borrow();
+        g.slots
+            .get(&id)
+            .map(|v| {
+                v.iter()
+                    .filter_map(Weak::upgrade)
+                    .filter(|s| !s.is_dead() && s.target.borrow().is_some())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Snapshot the live weakrefs targeting `id` as
     /// `Arc<WeakRefSlot>` values. Used by
     /// `_weakref.getweakrefs(obj)`.
@@ -250,6 +271,12 @@ pub fn notify_clear(id: ObjectId) -> Vec<(Arc<WeakRefSlot>, Option<Object>)> {
 /// Convenience: weakref count for `id` in the current thread.
 pub fn count_for(id: ObjectId) -> usize {
     with_registry(|r| r.count(id))
+}
+
+/// Convenience: count of registry-held strong clones of `id` in the
+/// current thread. Used by the cycle collector's refcount accounting.
+pub fn strong_clone_count(id: ObjectId) -> usize {
+    with_registry(|r| r.strong_clone_count(id))
 }
 
 /// Convenience: collect every live weakref for `id` in the
