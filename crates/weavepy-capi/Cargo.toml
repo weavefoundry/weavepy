@@ -28,7 +28,7 @@ num-traits      = { workspace = true }
 thiserror       = { workspace = true }
 
 [build-dependencies]
-cc = "1.0"
+cc = "1.2"
 
 [dev-dependencies]
 weavepy   = { workspace = true }
