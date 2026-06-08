@@ -57,6 +57,10 @@ ClassVar = _SpecialForm("ClassVar")
 InitVar = _SpecialForm("InitVar")
 Union = _SpecialForm("Union")
 Literal = _SpecialForm("Literal")
+# PEP 646: ``Unpack[Ts]`` / ``*Ts``. Iterating a PEP 585 generic alias
+# (``tuple[int]``) yields ``Unpack[self]`` exactly once, mirroring
+# CPython's ``ga_iternext`` (which lazily reaches ``typing.Unpack``).
+Unpack = _SpecialForm("Unpack")
 
 
 def Optional(*params):

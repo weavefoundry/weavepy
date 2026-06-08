@@ -49,6 +49,19 @@ ADDITEMS = b"\x90"
 FROZENSET = b"\x91"
 MARK = b"("
 STOP = b"."
+POP = b"0"
+POP_MARK = b"1"
+# Memo opcodes — preserve object identity/sharing and enable cyclic
+# structures. PUT/GET use a textual index (protocol 0), BINPUT/BINGET a
+# 1-byte index, LONG_BINPUT/LONG_BINGET a 4-byte index, and MEMOIZE
+# (protocol 4+) appends the stack top to the memo with no explicit index.
+PUT = b"p"
+BINPUT = b"q"
+LONG_BINPUT = b"r"
+GET = b"g"
+BINGET = b"h"
+LONG_BINGET = b"j"
+MEMOIZE = b"\x94"
 # Global reference + reduce opcodes used to serialize functions and
 # classes by their qualified name. CPython uses these for everything
 # from `pickle.dumps(int)` to `pickle.dumps(my_module.my_func)`.
@@ -127,11 +140,40 @@ class _Pickler:
         self.protocol = protocol
         self.bin = protocol >= 1
         self.fast = False
+        # id(obj) -> (memo_index, obj). Keeping a reference to `obj`
+        # prevents its id from being reused mid-pickle.
+        self.memo = {}
 
     def dump(self, obj):
         self._buf.write(PROTO + bytes([self.protocol]))
         self._save(obj)
         self._buf.write(STOP)
+
+    def _memoize(self, obj):
+        """Record `obj` (already written / on the stack) in the memo and
+        emit the PUT opcode so a later occurrence can reference it."""
+        if self.fast or id(obj) in self.memo:
+            return
+        idx = len(self.memo)
+        if self.protocol >= 4:
+            self._buf.write(MEMOIZE)
+        elif self.bin:
+            if idx < 256:
+                self._buf.write(BINPUT + bytes([idx]))
+            else:
+                self._buf.write(LONG_BINPUT + struct.pack("<I", idx))
+        else:
+            self._buf.write(PUT + repr(idx).encode("ascii") + b"\n")
+        self.memo[id(obj)] = (idx, obj)
+
+    def _write_get(self, idx):
+        if self.bin:
+            if idx < 256:
+                self._buf.write(BINGET + bytes([idx]))
+            else:
+                self._buf.write(LONG_BINGET + struct.pack("<I", idx))
+        else:
+            self._buf.write(GET + repr(idx).encode("ascii") + b"\n")
 
     def _save(self, obj):
         # In the order CPython tries dispatch:
@@ -144,6 +186,14 @@ class _Pickler:
             return
         if obj is False:
             self._buf.write(NEWFALSE)
+            return
+
+        # Already pickled this exact object? Emit a back-reference so
+        # sharing (and cycles) are preserved on load. Atomic immutables
+        # (int/float) are never memoized, so they simply miss here.
+        x = self.memo.get(id(obj))
+        if x is not None:
+            self._write_get(x[0])
             return
 
         # Dispatch by `type(obj).__name__` rather than `type(obj) is X`
@@ -221,7 +271,7 @@ class _Pickler:
             except TypeError:
                 rv = None
             if rv is not None and rv is not NotImplemented:
-                self._save_reduce(rv)
+                self._save_reduce(rv, obj)
                 return
         reduce = getattr(obj, "__reduce__", None)
         if reduce is not None:
@@ -230,7 +280,7 @@ class _Pickler:
             except TypeError:
                 rv = None
             if rv is not None and rv is not NotImplemented:
-                self._save_reduce(rv)
+                self._save_reduce(rv, obj)
                 return
         raise PicklingError(
             "Can't pickle %r: pickle currently only supports primitive types"
@@ -249,7 +299,7 @@ class _Pickler:
         self._buf.write(encoded_name)
         self._buf.write(b"\n")
 
-    def _save_reduce(self, rv):
+    def _save_reduce(self, rv, obj=None):
         if isinstance(rv, str):
             self._save_global(rv.rsplit(".", 1)[0] if "." in rv else "builtins", rv)
             return
@@ -263,6 +313,10 @@ class _Pickler:
         self._save(func)
         self._save(tuple(args))
         self._buf.write(REDUCE)
+        # Memoize the just-constructed object *before* applying state /
+        # items, so a self-referential object can back-reference itself.
+        if obj is not None:
+            self._memoize(obj)
         if listitems is not None:
             for item in listitems:
                 self._save(item)
@@ -308,6 +362,7 @@ class _Pickler:
             self._buf.write(BINBYTES + struct.pack("<I", n) + b)
         else:
             self._buf.write(BINBYTES8 + struct.pack("<Q", n) + b)
+        self._memoize(b)
 
     def _save_str(self, s):
         encoded = s.encode("utf-8", "surrogatepass")
@@ -318,33 +373,40 @@ class _Pickler:
             self._buf.write(BINUNICODE + struct.pack("<I", n) + encoded)
         else:
             self._buf.write(BINUNICODE8 + struct.pack("<Q", n) + encoded)
+        self._memoize(s)
 
     def _save_tuple(self, t):
         n = len(t)
         if n == 0:
             self._buf.write(EMPTY_TUPLE)
             return
-        if n == 1:
-            self._save(t[0])
-            self._buf.write(TUPLE1)
-            return
-        if n == 2:
-            self._save(t[0])
-            self._save(t[1])
-            self._buf.write(TUPLE2)
-            return
-        if n == 3:
+        if n <= 3:
             for item in t:
                 self._save(item)
-            self._buf.write(TUPLE3)
+            # A nested element may have memoized *this* tuple (a cycle via
+            # reduce); if so, drop what we wrote and emit the reference.
+            x = self.memo.get(id(t))
+            if x is not None:
+                self._buf.write(POP * n)
+                self._write_get(x[0])
+                return
+            self._buf.write((TUPLE1, TUPLE2, TUPLE3)[n - 1])
+            self._memoize(t)
             return
         self._buf.write(MARK)
         for item in t:
             self._save(item)
+        x = self.memo.get(id(t))
+        if x is not None:
+            self._buf.write(POP_MARK)
+            self._write_get(x[0])
+            return
         self._buf.write(TUPLE)
+        self._memoize(t)
 
     def _save_list(self, lst):
         self._buf.write(EMPTY_LIST)
+        self._memoize(lst)
         if lst:
             self._buf.write(MARK)
             for item in lst:
@@ -353,6 +415,7 @@ class _Pickler:
 
     def _save_dict(self, d):
         self._buf.write(EMPTY_DICT)
+        self._memoize(d)
         if d:
             self._buf.write(MARK)
             for k, v in d.items():
@@ -368,8 +431,10 @@ class _Pickler:
             for it in items:
                 self._save(it)
             self._buf.write(FROZENSET)
+            self._memoize(s)
         else:
             self._buf.write(EMPTY_SET)
+            self._memoize(s)
             if items:
                 self._buf.write(MARK)
                 for it in items:
@@ -567,6 +632,49 @@ def _stop(_u):
     return _STOP
 
 
+def _pop(u):
+    u.stack.pop()
+
+
+def _pop_mark(u):
+    idx = u.markers.pop()
+    del u.stack[idx:]
+
+
+def _put(u):
+    idx = int(_read_line(u))
+    u.memo[idx] = u.stack[-1]
+
+
+def _binput(u):
+    idx = u.file.read(1)[0]
+    u.memo[idx] = u.stack[-1]
+
+
+def _long_binput(u):
+    idx = struct.unpack("<I", u._read_short(4))[0]
+    u.memo[idx] = u.stack[-1]
+
+
+def _memoize(u):
+    u.memo[len(u.memo)] = u.stack[-1]
+
+
+def _get(u):
+    idx = int(_read_line(u))
+    u.stack.append(u.memo[idx])
+
+
+def _binget(u):
+    idx = u.file.read(1)[0]
+    u.stack.append(u.memo[idx])
+
+
+def _long_binget(u):
+    idx = struct.unpack("<I", u._read_short(4))[0]
+    u.stack.append(u.memo[idx])
+
+
 def _read_line(u):
     out = b""
     while True:
@@ -676,6 +784,15 @@ _OPCODES = {
     FROZENSET: _frozenset,
     MARK: _mark,
     STOP: _stop,
+    POP: _pop,
+    POP_MARK: _pop_mark,
+    PUT: _put,
+    BINPUT: _binput,
+    LONG_BINPUT: _long_binput,
+    MEMOIZE: _memoize,
+    GET: _get,
+    BINGET: _binget,
+    LONG_BINGET: _long_binget,
     GLOBAL: _global,
     STACK_GLOBAL: _stack_global,
     REDUCE: _reduce,

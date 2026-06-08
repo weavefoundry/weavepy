@@ -171,6 +171,15 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/builtins.py"),
             is_package: false,
         },
+        // Internal: `_SeqIter`, the lazy legacy-`__getitem__` iterator
+        // `iter(obj)` returns when *obj* has no `__iter__` (CPython's
+        // built-in `iterator`/seqiterobject). Kept out of `builtins` to
+        // avoid leaking a name into every module's global namespace.
+        FrozenSource {
+            name: "_seqtools",
+            source: include_str!("python/_seqtools.py"),
+            is_package: false,
+        },
         // `collections` is a package so `collections.abc` resolves; the
         // verbatim CPython `_collections_abc` carries the ABC definitions
         // and `collections.abc` re-exports them (RFC 0037 WS8).

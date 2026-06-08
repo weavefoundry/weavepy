@@ -110,6 +110,37 @@ def walk_tb(tb):
         tb = tb.tb_next
 
 
+def _get_code_position(code, instruction_index):
+    """PEP-657 (lineno, end_lineno, colno, end_colno) for a bytecode offset.
+
+    `co_positions()` yields one tuple per *code unit* (2 bytes), so the
+    instruction byte offset maps to entry `instruction_index // 2`.
+    """
+    if instruction_index is None or instruction_index < 0:
+        return (None, None, None, None)
+    try:
+        positions = list(code.co_positions())
+    except Exception:
+        return (None, None, None, None)
+    idx = instruction_index // 2
+    if 0 <= idx < len(positions):
+        return positions[idx]
+    return (None, None, None, None)
+
+
+def _walk_tb_with_full_positions(tb):
+    # Like walk_tb, but yields full code positions (end line + columns).
+    while tb is not None:
+        positions = _get_code_position(tb.tb_frame.f_code, tb.tb_lasti)
+        # Fall back to tb_lineno when co_positions has no line, matching
+        # walk_tb's behavior.
+        if positions[0] is None:
+            yield tb.tb_frame, (tb.tb_lineno,) + tuple(positions[1:])
+        else:
+            yield tb.tb_frame, positions
+        tb = tb.tb_next
+
+
 class StackSummary:
     """A sequence of FrameSummary objects with extra formatting helpers.
 
@@ -138,6 +169,22 @@ class StackSummary:
 
     @classmethod
     def extract(cls, frame_gen, *, limit=None, lookup_lines=True, capture_locals=False):
+        # `frame_gen` yields plain (frame, lineno) pairs (no column info).
+        # Adapt to the extended generator the position-aware path consumes.
+        def extended_frame_gen():
+            for f, lineno in frame_gen:
+                yield f, (lineno, None, None, None)
+
+        return cls._extract_from_extended_frame_gen(
+            extended_frame_gen(), limit=limit, lookup_lines=lookup_lines,
+            capture_locals=capture_locals)
+
+    @classmethod
+    def _extract_from_extended_frame_gen(cls, frame_gen, *, limit=None,
+                                         lookup_lines=True, capture_locals=False):
+        # Like `extract`, but consumes (frame, (lineno, end_lineno, colno,
+        # end_colno)) tuples so PEP-657 column anchors survive into each
+        # FrameSummary. Only lineno is required; the rest may be None.
         if limit is None:
             limit = getattr(sys, "tracebacklimit", None)
         if isinstance(limit, int) and limit < 0:
@@ -146,7 +193,7 @@ class StackSummary:
         frames = list(frame_gen)
         if isinstance(limit, int):
             frames = frames[-limit:] if limit else []
-        for f, lineno in frames:
+        for f, (lineno, end_lineno, colno, end_colno) in frames:
             try:
                 co = f.f_code
                 filename = getattr(co, "co_filename", "<unknown>")
@@ -157,7 +204,8 @@ class StackSummary:
             locals_ = f.f_locals if capture_locals else None
             result.append(
                 FrameSummary(filename, lineno, name, lookup_line=lookup_lines,
-                             locals=locals_)
+                             locals=locals_, end_lineno=end_lineno,
+                             colno=colno, end_colno=end_colno)
             )
         return result
 
@@ -210,7 +258,8 @@ class StackSummary:
 
 
 def extract_tb(tb, limit=None):
-    return StackSummary.extract(walk_tb(tb), limit=limit)
+    return StackSummary._extract_from_extended_frame_gen(
+        _walk_tb_with_full_positions(tb), limit=limit)
 
 
 def extract_stack(f=None, limit=None):
@@ -319,9 +368,9 @@ class TracebackException:
                  max_group_width=15, max_group_depth=10, _seen=None):
         self.exc_type = exc_type
         self._str = str(exc_value) if exc_value is not None else ""
-        self.stack = StackSummary.extract(walk_tb(exc_tb), limit=limit,
-                                          lookup_lines=lookup_lines,
-                                          capture_locals=capture_locals)
+        self.stack = StackSummary._extract_from_extended_frame_gen(
+            _walk_tb_with_full_positions(exc_tb), limit=limit,
+            lookup_lines=lookup_lines, capture_locals=capture_locals)
         self.filename = getattr(exc_value, "filename", None)
         self.lineno = getattr(exc_value, "lineno", None)
         self.text = getattr(exc_value, "text", None)

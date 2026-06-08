@@ -251,6 +251,14 @@ pub struct PyFrame {
     /// means "no line event has fired on this frame yet" — the
     /// next `step` will fire one.
     pub last_line: Cell<Option<u32>>,
+    /// Mirrors CPython's `frame.f_trace_lines`. When `true` (the
+    /// default) the dispatcher fires `'line'` events; debuggers set it
+    /// `false` to suppress them.
+    pub trace_lines: Cell<bool>,
+    /// Mirrors CPython's `frame.f_trace_opcodes`. When `true` the
+    /// dispatcher fires an `'opcode'` event before every instruction
+    /// (used by `bdb`/`pdb` instruction stepping). Defaults to `false`.
+    pub trace_opcodes: Cell<bool>,
 }
 
 impl fmt::Debug for PyFrame {
@@ -1114,6 +1122,15 @@ pub enum PyIterator {
         inner: Rc<RefCell<PyIterator>>,
         count: i64,
     },
+    /// `reversed(seq)` — yields `items[index]`, `items[index-1]`, … down
+    /// to `items[0]`. `items` is held in *forward* order (matching
+    /// CPython's `list_reverseiterator`, whose `__reduce__` is
+    /// `(reversed, (forward_seq,), index)`); `index` counts down and the
+    /// backing vector is detached on exhaustion.
+    Reversed {
+        items: Rc<RefCell<Vec<Object>>>,
+        index: i64,
+    },
 }
 
 impl PyIterator {
@@ -1121,9 +1138,21 @@ impl PyIterator {
     pub fn next_value(&mut self) -> Option<Object> {
         match self {
             PyIterator::List { items, index } => {
-                let v = items.borrow().get(*index).cloned()?;
-                *index += 1;
-                Some(v)
+                let next = items.borrow().get(*index).cloned();
+                match next {
+                    Some(v) => {
+                        *index += 1;
+                        Some(v)
+                    }
+                    None => {
+                        // Exhausted. Detach from the backing list so a
+                        // later `append`/`extend` can't resurrect the
+                        // iterator — CPython clears `it_seq` on the first
+                        // StopIteration and the iterator stays empty.
+                        *items = Rc::new(RefCell::new(Vec::new()));
+                        None
+                    }
+                }
             }
             PyIterator::Tuple { items, index } => {
                 let v = items.get(*index).cloned()?;
@@ -1177,6 +1206,25 @@ impl PyIterator {
                 *count += 1;
                 Some(Object::new_tuple(vec![Object::Int(i), v]))
             }
+            PyIterator::Reversed { items, index } => {
+                if *index < 0 {
+                    *items = Rc::new(RefCell::new(Vec::new()));
+                    return None;
+                }
+                let v = items.borrow().get(*index as usize).cloned();
+                match v {
+                    Some(val) => {
+                        *index -= 1;
+                        Some(val)
+                    }
+                    None => {
+                        // Index out of range (list shrank): exhaust + detach.
+                        *items = Rc::new(RefCell::new(Vec::new()));
+                        *index = -1;
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -1194,6 +1242,7 @@ impl PyIterator {
             PyIterator::DictKeys { keys, index } => Some(keys.len().saturating_sub(*index)),
             PyIterator::Bytes { data, index } => Some(data.len().saturating_sub(*index)),
             PyIterator::Enumerate { inner, .. } => inner.borrow().remaining(),
+            PyIterator::Reversed { index, .. } => Some((*index + 1).max(0) as usize),
             PyIterator::Range {
                 current,
                 stop,
@@ -1209,6 +1258,120 @@ impl PyIterator {
                     Some(0)
                 }
             }
+        }
+    }
+
+    /// Snapshot the items the iterator would still yield, *without*
+    /// consuming it. Backs the built-in iterator's `__reduce__`
+    /// (pickling): CPython reduces e.g. a list-iterator to
+    /// `(iter, (remaining_list,))`, so a freshly-unpickled iterator
+    /// replays exactly the not-yet-seen elements. A shared
+    /// (`Enumerate`) inner is read through its `RefCell` borrow, never
+    /// advanced.
+    pub fn remaining_items(&self) -> Vec<Object> {
+        match self {
+            PyIterator::List { items, index } => {
+                items.borrow().get(*index..).map(<[_]>::to_vec).unwrap_or_default()
+            }
+            PyIterator::Tuple { items, index } => {
+                items.get(*index..).map(<[_]>::to_vec).unwrap_or_default()
+            }
+            PyIterator::Str { s, index } => {
+                let start = (*index).min(s.len());
+                s[start..]
+                    .chars()
+                    .map(|c| Object::Str(Rc::from(c.to_string().as_str())))
+                    .collect()
+            }
+            PyIterator::DictKeys { keys, index } => keys
+                .get(*index..)
+                .map(|rest| rest.iter().map(|k| k.0.clone()).collect())
+                .unwrap_or_default(),
+            PyIterator::Bytes { data, index } => data
+                .get(*index..)
+                .map(|rest| rest.iter().map(|b| Object::Int(i64::from(*b))).collect())
+                .unwrap_or_default(),
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => {
+                let mut out = Vec::new();
+                let (mut c, st, sp) = (*current, *stop, *step);
+                if sp > 0 {
+                    while c < st {
+                        out.push(Object::Int(c));
+                        c += sp;
+                    }
+                } else if sp < 0 {
+                    while c > st {
+                        out.push(Object::Int(c));
+                        c += sp;
+                    }
+                }
+                out
+            }
+            PyIterator::Enumerate { inner, count } => {
+                let rest = inner.borrow().remaining_items();
+                let mut out = Vec::with_capacity(rest.len());
+                let mut i = *count;
+                for v in rest {
+                    out.push(Object::new_tuple(vec![Object::Int(i), v]));
+                    i += 1;
+                }
+                out
+            }
+            PyIterator::Reversed { items, index } => {
+                // Not-yet-yielded values, in yield order: items[index]..items[0].
+                let items = items.borrow();
+                let mut out = Vec::new();
+                let mut i = *index;
+                while i >= 0 {
+                    if let Some(v) = items.get(i as usize) {
+                        out.push(v.clone());
+                    }
+                    i -= 1;
+                }
+                out
+            }
+        }
+    }
+
+    /// The forward slice a `reversed`-iterator reduces with: re-applying
+    /// `reversed` to it reproduces the not-yet-yielded values in order.
+    /// Empty when exhausted, giving CPython's `(reversed, ([],))`.
+    pub fn reversed_reduce_arg(&self) -> Option<Object> {
+        match self {
+            PyIterator::Reversed { items, index } => {
+                let items = items.borrow();
+                let end = ((*index).max(-1) + 1) as usize;
+                let slice = items.get(..end.min(items.len())).unwrap_or(&[]);
+                Some(Object::new_list(slice.to_vec()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The remaining items packaged in the *native container type*
+    /// CPython uses for that iterator's `__reduce__` argument, so the
+    /// reduction tuple compares equal to CPython's: a string-iterator
+    /// reduces with a `str`, a tuple-iterator with a `tuple`, a
+    /// list-iterator with a `list`. (Bytes and the generic seqiter use a
+    /// `tuple`, so an exhausted one reduces to `(iter, ((),))`.)
+    /// Re-applying `iter` to this value replays exactly the not-yet-seen
+    /// elements.
+    pub fn reduce_remaining(&self) -> Object {
+        match self {
+            PyIterator::Tuple { .. } | PyIterator::Bytes { .. } => {
+                Object::new_tuple(self.remaining_items())
+            }
+            PyIterator::Str { s, index } => {
+                let start = (*index).min(s.len());
+                Object::from_str(&s[start..])
+            }
+            // list / dict / range / enumerate reduce through a plain list
+            // (dict iterators explicitly unpickle as list iterators).
+            _ => Object::new_list(self.remaining_items()),
         }
     }
 }
@@ -1458,7 +1621,14 @@ impl Object {
             (Object::BoundMethod(a), Object::BoundMethod(b)) => {
                 a.function.eq_value(&b.function) && a.receiver.is_same(&b.receiver)
             }
-            _ => false,
+            // CPython's default `tp_richcompare` (no user `__eq__`) falls
+            // back to *identity*: `x == x` is True and `x == y` is False
+            // for distinct objects. This covers reference types without
+            // value semantics — frames, generators, tracebacks, cells,
+            // code objects, … — where `bdb`/`pdb` rely on `frame ==
+            // self.returnframe`. Returning a flat `false` here would make
+            // even `frame == frame` False.
+            _ => self.is_same(other),
         }
     }
 

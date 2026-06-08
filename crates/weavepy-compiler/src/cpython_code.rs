@@ -384,6 +384,11 @@ pub struct CpythonCode {
     pub firstlineno: u32,
     /// One [`Position`] per code unit.
     pub positions: Vec<Position>,
+    /// Code-unit offset of each WeavePy instruction's *opcode* unit (i.e.
+    /// past any `EXTENDED_ARG` prefix), indexed by WeavePy instruction
+    /// index. Multiply by 2 for the `co_code` byte offset CPython's
+    /// `f_lasti`/`tb_lasti` expose. Length equals the instruction count.
+    pub inst_offsets: Vec<u32>,
 }
 
 const CO_FAST_LOCAL: u8 = 0x20;
@@ -481,14 +486,24 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
     // Emit code units + per-unit positions.
     let mut co_code: Vec<u8> = Vec::with_capacity(starts[n] * 2);
     let mut positions: Vec<Position> = Vec::with_capacity(starts[n]);
+    let mut inst_offsets: Vec<u32> = Vec::with_capacity(n);
     let firstlineno = code.linetable.first().copied().unwrap_or(1);
     for i in 0..n {
         let line = code.linetable.get(i).copied().unwrap_or(firstlineno) as i32;
+        // PEP-657 columns, when the compiler tracked them for this
+        // instruction. `col`/`end_col` are byte offsets (`-1` = unknown);
+        // `end_lineno` is `0` when unknown (fall back to the start line).
+        let cs = code.coltable.get(i).copied().unwrap_or_default();
+        let end_lineno = if cs.end_lineno != 0 {
+            cs.end_lineno as i32
+        } else {
+            line
+        };
         let pos = Position {
             lineno: line,
-            end_lineno: line,
-            col: None,
-            end_col: None,
+            end_lineno,
+            col: (cs.col >= 0).then_some(cs.col as u32),
+            end_col: (cs.end_col >= 0).then_some(cs.end_col as u32),
         };
         let arg = args[i];
         // EXTENDED_ARG units carry the high base-256 digits, MSB first.
@@ -498,6 +513,9 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
             co_code.push(byte);
             positions.push(pos);
         }
+        // The opcode unit lands here, past any EXTENDED_ARG prefix — this is
+        // the code-unit offset CPython's `f_lasti`/`tb_lasti` point at.
+        inst_offsets.push((co_code.len() / 2) as u32);
         co_code.push(mapped[i].cp_op);
         co_code.push((arg & 0xFF) as u8);
         positions.push(pos);
@@ -518,6 +536,7 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
         stacksize: compute_stacksize(code),
         firstlineno,
         positions,
+        inst_offsets,
     }
 }
 
@@ -1090,6 +1109,19 @@ impl CodeObject {
     #[must_use]
     pub fn to_cpython(&self) -> CpythonCode {
         encode(self)
+    }
+
+    /// Translate a WeavePy instruction index into the `co_code` byte offset
+    /// CPython's `f_lasti`/`tb_lasti` expose (2 bytes/code unit, opcode past
+    /// any `EXTENDED_ARG` prefix). Keeps `co_positions()` / `dis` anchoring
+    /// consistent across the cache- and extended-arg-inflated encoding.
+    #[must_use]
+    pub fn cpython_lasti(&self, weavepy_index: u32) -> u32 {
+        let cp = self.to_cpython();
+        cp.inst_offsets
+            .get(weavepy_index as usize)
+            .map(|&unit| unit * 2)
+            .unwrap_or(weavepy_index * 2)
     }
 }
 

@@ -316,8 +316,8 @@ status = "fail"
 reason = "measured: object.__module__ + unbound type-methods now resolve (RFC 0037 WS6); the suite still reports a large mix of errors/failures across the descriptor-protocol subtests (no single root cause — slots, __set_name__, metaclass corners)."
 
 [tests."cpython/Lib/test/test_iter.py"]
-status = "skip"
-reason = "measured: now that the test.support helpers + collections.abc resolve (RFC 0037 WS8/WS9) the suite runs far enough to reach the same gc.collect() reachable-hang as test_set (iterator/collection reference cycles + weakrefs). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
+status = "pass"
+reason = "RFC 0037 WS7: full iterator-protocol fidelity. The prior gc-reachable hang is gone — the legacy __getitem__ sequence protocol and iter(callable, sentinel) now build *lazy* iterators (frozen _seqtools _SeqIter/_CallableIter) instead of eagerly materialising, so an unbounded sequence iterates on demand. Built-in iterators gained a faithful __reduce__ ((iter, (remaining,)) / (reversed, (fwd,), idx)) that resolves the iter/reversed builtin through the live builtins module dict so a hash-colliding custom __eq__ exhausts the iterator before its state is snapshotted (gh-101765); a PEP 585 generic alias iterates by yielding typing.Unpack[self] once (matching CPython ga_iternext). Plus: file objects are iterable (for line in f / x in f / list(f)) and writelines accepts any iterable; pickle gained memoisation so co-referenced instances unpickle shared; closures over enclosing-function locals resolve in nested methods; and tracebacks carry PEP 657 column offsets (co_positions/f_lasti/tb_lasti translated to CPython byte offsets). (skipped=2 are @cpython_only refcount subtests.)"
 
 [tests."cpython/Lib/test/test_generators.py"]
 status = "fail"
@@ -444,8 +444,8 @@ status = "skip"
 reason = "RFC 0036: name/lookup now use the full UCD table (unicode_names2), but the full NormalizationTest sweep exceeds the per-test budget and residual failures track the UCD-version skew (engine ships 16.0.0, CPython 3.13 pins 15.1.0)"
 
 [tests."cpython/Lib/test/test_struct.py"]
-status = "fail"
-reason = "measured: first remaining failure is a Rust panic (RUST_BACKTRACE note in output) inside the struct module path — a pack/unpack edge case aborts rather than raising struct.error; needs a panic-to-exception guard in the struct builtin."
+status = "pass"
+reason = "RFC 0037 WS8: faithful struct port (buffer-protocol pack_into/unpack_from, half-float round-half-to-even with OverflowError, embedded-NUL/format validation, UnicodeEncodeError on non-ASCII formats, real unpack_iterator). The reference-cycle and runtime-shutdown subtests pass via new interpreter features: import_fresh_module hands back a collectable copy of native singletons, and shutdown finalization runs __del__ for live objects with the default sys.unraisablehook printing 'Exception ignored in:'. (skipped=4 are CPython _testcapi/refcount-only subtests.)"
 
 [tests."cpython/Lib/test/test_codecs.py"]
 status = "fail"
@@ -582,8 +582,8 @@ reason = "RFC 0036: passes end-to-end (bigaddrspacetest fixtures skip cleanly wi
 # Genuine WeavePy gaps — run far enough to fail with a specific cause.
 
 [tests."cpython/Lib/test/test_bdb.py"]
-status = "fail"
-reason = "measured: patch_list + the other test.support helpers now import (RFC 0037 WS9); first remaining failure is 'type object Breakpoint has no attribute clearBreakpoints' — the bundled bdb module is missing Breakpoint classmethods."
+status = "pass"
+reason = "RFC 0037 WS9: passes end-to-end (36 tests). Required faithful sys.settrace event fidelity in the VM dispatch loop: the frame-entry RESUME no longer emits a spurious 'line' event; an exception raised *inside* a trace callback propagates into the traced program (and disables the offending hook) for non-'exception' events while being swallowed on 'exception' events, matching CPython's call_trace_protected; Object::Frame compares by identity so bdb's `frame == self.stopframe`/returnframe checks work; generator/coroutine frames reuse one cached PyFrame snapshot across suspensions so frame identity is stable for set_next/until/return; FOR_ITER and SEND (`yield from`) surface a generator's terminating StopIteration to the 'exception' hook before swallowing it; END_FOR is attributed to the `for` line (not the loop body) so an exhausted loop emits no spurious body-line event; a frame popped by a propagating exception fires a 'return' event with arg None (sys.monitoring PY_UNWIND); and f_trace_lines / f_trace_opcodes are real per-frame flags driving 'opcode' events for bdb/pdb instruction stepping (set_stepinstr)."
 
 [tests."cpython/Lib/test/test_contextlib_async.py"]
 status = "fail"

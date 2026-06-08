@@ -88,6 +88,15 @@ struct Frame {
     /// pc *before* the current instruction — used to look up the
     /// exception handler when an opcode raises.
     pc: u32,
+    /// Persistent Python-visible frame snapshot for generator /
+    /// coroutine / async-generator frames. A generator is re-entered
+    /// on every `next()`/`send()`; CPython keeps a single `gi_frame`
+    /// object alive for the generator's whole lifetime, and
+    /// debuggers (`bdb`/`pdb`) rely on `frame is self.stopframe`
+    /// holding across suspensions. We cache the `Rc<PyFrame>` here on
+    /// first entry and re-push the same object on each resume.
+    /// `None` for ordinary frames, which are only ever entered once.
+    py_frame: Option<Rc<PyFrame>>,
 }
 
 impl Frame {
@@ -626,8 +635,9 @@ impl Interpreter {
 
     /// Invoke any `__del__` finalizers queued by the cycle GC.
     /// Each finalizer runs at most once. Exceptions from a
-    /// finalizer are routed through `sys.unraisablehook` (today
-    /// just logged to stderr) so they don't propagate.
+    /// finalizer are routed through `sys.unraisablehook` (the
+    /// default hook prints `Exception ignored in: …` to stderr,
+    /// exactly like CPython) so they don't propagate.
     pub fn run_pending_finalizers(&mut self) {
         loop {
             let pending = crate::vm_singletons::drain_pending_finalizers();
@@ -635,19 +645,200 @@ impl Interpreter {
                 return;
             }
             for obj in pending {
-                if let Object::Instance(inst) = &obj {
-                    if let Some(del) = inst.class.lookup("__del__") {
-                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: obj.clone(),
-                            function: del,
-                        }));
-                        let kwargs: Vec<(String, Object)> = Vec::new();
-                        let outer = Rc::new(RefCell::new(DictData::new()));
-                        let _ = self.call(&bound, &[], &kwargs, &outer);
-                    }
-                }
+                self.invoke_finalizer(&obj);
             }
         }
+    }
+
+    /// Run finalizers (`__del__`) for every object still alive at
+    /// interpreter shutdown. CPython finalizes *all* reachable objects
+    /// during teardown, not just cyclic garbage, so a module-global
+    /// instance (`module.x = C()`) still has its `__del__` called. We
+    /// walk the cycle collector's tracked set — every user instance is
+    /// tracked at construction — and run any unrun finalizer, routing
+    /// errors through `sys.unraisablehook`. A bounded number of passes
+    /// lets a finalizer that resurrects/creates new finalizable objects
+    /// settle without risking an unbounded loop at exit.
+    pub fn run_shutdown_finalizers(&mut self) {
+        self.run_pending_finalizers();
+        for _ in 0..8 {
+            let candidates = crate::gc_trace::finalization_candidates();
+            if candidates.is_empty() {
+                break;
+            }
+            for handle in candidates {
+                // `swap` claims the finalizer so the cycle collector
+                // and a later shutdown pass can't double-run it.
+                if handle.finalized.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    continue;
+                }
+                self.invoke_finalizer(&handle.object);
+            }
+            // A finalizer may have queued cyclic finalizers of its own.
+            self.run_pending_finalizers();
+        }
+    }
+
+    /// Call `obj.__del__()` if present, routing any raised exception
+    /// through the unraisable hook. Used by both the cycle-GC drain and
+    /// the shutdown pass.
+    fn invoke_finalizer(&mut self, obj: &Object) {
+        let Object::Instance(inst) = obj else {
+            return;
+        };
+        let Some(del) = inst.class.lookup("__del__") else {
+            return;
+        };
+        let class_name = inst.class.name.clone();
+        let bound = Object::BoundMethod(Rc::new(BoundMethod {
+            receiver: obj.clone(),
+            function: del,
+        }));
+        let kwargs: Vec<(String, Object)> = Vec::new();
+        let outer = Rc::new(RefCell::new(DictData::new()));
+        if let Err(err) = self.call(&bound, &[], &kwargs, &outer) {
+            // The finalizer is the `object` reported to the hook; the
+            // printed context mirrors CPython's bound-method repr so a
+            // default hook emits `… <bound method C.__del__ of …>`.
+            let receiver_repr = self
+                .repr_of(obj, &outer)
+                .unwrap_or_else(|_| obj.repr());
+            let context_repr = format!("<bound method {class_name}.__del__ of {receiver_repr}>");
+            self.write_unraisable(&err, &bound, &context_repr);
+        }
+    }
+
+    /// Route an out-of-band exception (raised by a `__del__` finalizer,
+    /// and in future weakref callbacks) through `sys.unraisablehook`,
+    /// mirroring CPython's `_PyErr_WriteUnraisable`. A user-installed
+    /// hook (e.g. `test.support.catch_unraisable_exception`) is invoked
+    /// with an `UnraisableHookArgs`-shaped namespace; the default hook
+    /// prints `Exception ignored in: <context>` plus the traceback to
+    /// stderr and swallows the error so it can't change the exit status.
+    fn write_unraisable(&mut self, err: &RuntimeError, object: &Object, context_repr: &str) {
+        let (exc_value, exc_type, traceback) = match err {
+            RuntimeError::PyException(pyexc) => {
+                let inst = pyexc.instance.clone();
+                let ty = match &inst {
+                    Object::Instance(i) => Object::Type(i.class.clone()),
+                    _ => Object::None,
+                };
+                (inst, ty, pyexc.traceback.clone())
+            }
+            other => {
+                let inst =
+                    crate::builtin_types::make_exception("RuntimeError", other.to_string());
+                let ty = match &inst {
+                    Object::Instance(i) => Object::Type(i.class.clone()),
+                    _ => Object::None,
+                };
+                (inst, ty, Vec::new())
+            }
+        };
+
+        // Honour a user-installed `sys.unraisablehook`. Assignment to
+        // `sys.unraisablehook` updates the `sys` module dict (not the
+        // VM's reserved slot), so read it from there.
+        let hook = {
+            let sys_module = self
+                .cache
+                .modules
+                .borrow()
+                .get(&DictKey(Object::from_static("sys")))
+                .cloned();
+            match sys_module {
+                Some(Object::Module(m)) => m
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("unraisablehook")))
+                    .cloned(),
+                _ => None,
+            }
+        };
+        let is_default = match &hook {
+            None | Some(Object::None) => true,
+            // The built-in placeholder installed at startup is a no-op;
+            // treat it as "default" and print ourselves.
+            Some(Object::Builtin(b)) => b.name == "unraisablehook",
+            _ => false,
+        };
+        if !is_default {
+            if let Some(hook) = hook {
+                let args_obj =
+                    self.make_unraisable_args(&exc_type, &exc_value, object);
+                let outer = self.builtins_dict();
+                if self.call(&hook, &[args_obj], &[], &outer).is_err() {
+                    self.print_unraisable_default(&exc_value, &traceback, context_repr, true);
+                }
+                return;
+            }
+        }
+        self.print_unraisable_default(&exc_value, &traceback, context_repr, false);
+    }
+
+    /// Build the `UnraisableHookArgs`-shaped object passed to a custom
+    /// `sys.unraisablehook` — a namespace exposing `exc_type`,
+    /// `exc_value`, `exc_traceback`, `err_msg`, and `object`.
+    fn make_unraisable_args(
+        &self,
+        exc_type: &Object,
+        exc_value: &Object,
+        object: &Object,
+    ) -> Object {
+        let mut d = DictData::new();
+        d.insert(DictKey(Object::from_static("exc_type")), exc_type.clone());
+        d.insert(DictKey(Object::from_static("exc_value")), exc_value.clone());
+        d.insert(
+            DictKey(Object::from_static("exc_traceback")),
+            Object::None,
+        );
+        d.insert(DictKey(Object::from_static("err_msg")), Object::None);
+        d.insert(DictKey(Object::from_static("object")), object.clone());
+        Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+    }
+
+    /// CPython's default `sys.unraisablehook`: write the
+    /// `Exception ignored in: …` header, the traceback, and the
+    /// exception line to stderr.
+    fn print_unraisable_default(
+        &self,
+        exc_value: &Object,
+        traceback: &[crate::error::TracebackEntry],
+        context_repr: &str,
+        hook_failed: bool,
+    ) {
+        use std::io::Write;
+        let mut s = String::new();
+        if hook_failed {
+            s.push_str("Exception ignored in sys.unraisablehook: ");
+        } else {
+            s.push_str("Exception ignored in: ");
+        }
+        s.push_str(context_repr);
+        s.push('\n');
+        if !traceback.is_empty() {
+            s.push_str("Traceback (most recent call last):\n");
+            for e in traceback {
+                s.push_str(&format!(
+                    "  File \"{}\", line {}, in {}\n",
+                    e.filename, e.lineno, e.funcname
+                ));
+            }
+        }
+        let (kind, msg) = match exc_value {
+            Object::Instance(i) => (
+                i.class.name.clone(),
+                crate::builtin_types::exception_message(exc_value).unwrap_or_default(),
+            ),
+            _ => ("Exception".to_owned(), String::new()),
+        };
+        if msg.is_empty() {
+            s.push_str(&format!("{kind}\n"));
+        } else {
+            s.push_str(&format!("{kind}: {msg}\n"));
+        }
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(s.as_bytes());
     }
 
     /// Public re-export of [`Self::build_module_globals`] used by the
@@ -751,6 +942,7 @@ impl Interpreter {
             class_namespace: None,
             exc_handlers: Vec::new(),
             pc: 0,
+            py_frame: None,
         }
     }
 
@@ -814,12 +1006,46 @@ impl Interpreter {
         // activation leaves un-popped (see the reconciliation at the
         // function's exit).
         let exc_depth_on_entry = self.exc_info_stack.borrow().len();
+        // Distinguish the three ways control can enter a frame here:
+        //
+        //   * a fresh ordinary call          (pc == 0, not gen code)
+        //   * a generator/coroutine bootstrap (pc == 0, gen code) — the
+        //     `RETURN_GENERATOR` prologue that merely *creates* the
+        //     suspended object; CPython runs no user code and fires no
+        //     trace events for it.
+        //   * a generator/coroutine *resume*  (pc != 0, gen code) — a
+        //     real `next()`/`send()` that fires a `call` event and then
+        //     continues line tracing from the suspension point.
+        let code_is_gen = frame.code.is_generator
+            || frame.code.is_coroutine
+            || frame.code.is_async_generator;
+        let is_gen_bootstrap = code_is_gen && frame.pc == 0;
+        let is_gen_resume = code_is_gen && frame.pc != 0;
         // RFC 0031 — fire the `'call'` event on frame entry. The
         // hook's return value becomes the per-frame trace function
-        // for subsequent line / return / exception events.
+        // for subsequent line / return / exception events. The
+        // generator-creation bootstrap is invisible to tracers.
         let observers_active = crate::trace::any_observers_active();
-        if observers_active {
+        if observers_active && !is_gen_bootstrap {
             self.fire_call_event(&py_frame)?;
+            // On a resume, line tracing must continue from the line
+            // where the frame suspended — CPython reports the `call`
+            // event at the suspension line and only emits the next
+            // `line` event once execution crosses into a *different*
+            // line. Seed `last_line` with the resume line so the
+            // prologue (`POP_TOP; RESUME`) and the suspension line
+            // itself don't surface as a spurious `line` event.
+            if is_gen_resume {
+                let line = frame
+                    .code
+                    .linetable
+                    .get(frame.pc as usize)
+                    .copied()
+                    .unwrap_or(0);
+                if line != 0 {
+                    py_frame.last_line.set(Some(line));
+                }
+            }
         }
         // RFC 0032 — tier-2 entry. Only for a fresh activation (pc 0,
         // empty stack, not a generator resume) and only when tracing is
@@ -846,12 +1072,38 @@ impl Interpreter {
             self.sync_py_locals(frame);
             // Fire a 'line' event when the source line changes.
             // Fast path: skip the line-table read entirely when no
-            // observer is active.
-            if crate::trace::any_observers_active() {
+            // observer is active. The generator-creation bootstrap
+            // (`RETURN_GENERATOR`) fires no line events either.
+            if crate::trace::any_observers_active() && !is_gen_bootstrap {
                 let line = py_frame.current_lineno();
-                if line != 0 && py_frame.last_line.get() != Some(line) {
+                // CPython never emits a `line` event for the
+                // frame-entry `RESUME`: the `call` event covers entry
+                // and line tracing begins at the first *real*
+                // instruction (the first body line). Firing here would
+                // inject a spurious `line` event at the `def` line,
+                // desyncing trace consumers like `bdb`/`pdb`. We skip
+                // firing *and* leave `last_line` untouched so a one-line
+                // body (`def f(): return 1`) still reports its single
+                // line event from the following instruction.
+                let at_resume = matches!(
+                    frame.code.instructions.get(frame.pc as usize).map(|i| i.op),
+                    Some(OpCode::Resume)
+                );
+                if !at_resume && line != 0 && py_frame.last_line.get() != Some(line) {
                     py_frame.last_line.set(Some(line));
-                    self.fire_line_event(&py_frame)?;
+                    // `f_trace_lines = False` suppresses the callback but the
+                    // line bookkeeping above still advances (mirrors CPython,
+                    // which keeps tracking the line for later re-enable).
+                    if py_frame.trace_lines.get() {
+                        self.fire_line_event(&py_frame)?;
+                    }
+                }
+                // A `'line'` callback may have just enabled opcode tracing
+                // (bdb's `stepinstr`); CPython then fires the `'opcode'`
+                // event for this same instruction before it runs. The
+                // frame-entry RESUME carries no opcode event.
+                if !at_resume && py_frame.trace_opcodes.get() {
+                    self.fire_opcode_event(&py_frame)?;
                 }
             }
             match self.step(frame) {
@@ -877,7 +1129,18 @@ impl Interpreter {
                         match self.handle_exception(frame, exc) {
                             Ok(Some(())) => continue,
                             Ok(None) => unreachable!(),
-                            Err(e) => break Err(e),
+                            Err(e) => {
+                                // No handler in this frame: it is about to be
+                                // popped by the propagating exception. CPython
+                                // delivers a `'return'` event with arg `None`
+                                // to the trace/profile callbacks on this unwind
+                                // path (sys.monitoring sees PY_UNWIND). bdb's
+                                // `set_return` waits for exactly this event.
+                                if crate::trace::any_observers_active() {
+                                    self.fire_unwind_event(&py_frame)?;
+                                }
+                                break Err(e);
+                            }
                         }
                     } else {
                         break Err(err);
@@ -913,7 +1176,22 @@ impl Interpreter {
     /// interpreter's call stack. The snapshot's `back` chain points
     /// at whatever was on top of the stack before the push, so the
     /// call hierarchy is recoverable from any frame.
-    fn push_py_frame(&self, frame: &Frame) -> Rc<PyFrame> {
+    fn push_py_frame(&self, frame: &mut Frame) -> Rc<PyFrame> {
+        // Generator-family frames are re-entered on every resume.
+        // Reuse the cached `PyFrame` so the Python-visible frame keeps
+        // a stable identity across suspensions (CPython's `gi_frame`),
+        // only refreshing the bits that change per resume: the `back`
+        // pointer (who's resuming us now) and `lasti`. The locals
+        // mirror is shared by reference and kept current by
+        // `sync_py_locals`, so we just drop the materialised cache.
+        if let Some(existing) = frame.py_frame.clone() {
+            let back = self.frame_stack.borrow().last().cloned();
+            *existing.back.borrow_mut() = back;
+            existing.lasti.set(frame.pc);
+            existing.invalidate_locals();
+            self.frame_stack.borrow_mut().push(existing.clone());
+            return existing;
+        }
         let varnames = frame.code.varnames.clone();
         let locals_snapshot = Rc::new(RefCell::new(frame.locals.clone()));
         let cell_names: Vec<String> = frame
@@ -990,7 +1268,16 @@ impl Interpreter {
             trace: RefCell::new(Object::None),
             override_lineno: Cell::new(None),
             last_line: Cell::new(None),
+            trace_lines: Cell::new(true),
+            trace_opcodes: Cell::new(false),
         });
+        // Cache the snapshot on generator-family frames so the next
+        // resume re-pushes this very object (stable identity). Plain
+        // function frames run exactly once and are never re-entered,
+        // so caching them would only waste a clone.
+        if frame.code.is_generator || frame.code.is_coroutine || frame.code.is_async_generator {
+            frame.py_frame = Some(py.clone());
+        }
         self.frame_stack.borrow_mut().push(py.clone());
         py
     }
@@ -1034,6 +1321,7 @@ impl Interpreter {
         py_frame: &Rc<PyFrame>,
         event: &'static str,
         arg: Object,
+        kind: crate::trace::HookKind,
     ) -> Result<Object, RuntimeError> {
         let _guard = match crate::trace::ReentryGuard::acquire() {
             Some(g) => g,
@@ -1045,15 +1333,38 @@ impl Interpreter {
             arg,
         ];
         let outer = self.builtins.clone();
-        // Errors from the hook are deliberately swallowed in CPython
-        // (it disables the hook and prints to stderr). We mirror
-        // that behaviour: a hook crash should never take down the
-        // user program. We do let `RuntimeError::PyException` rise
-        // when the hook is observing a user-raised exception so the
-        // exception propagation in the caller stays intact.
+        // CPython's trace/profile contract for a raised exception:
+        //
+        //   * On an `'exception'` event the exception is discarded
+        //     (`call_trace_protected` / `call_exc_trace`) so that it
+        //     doesn't clobber the exception already being propagated.
+        //   * On every other event (`'call'`, `'line'`, `'return'`,
+        //     `'opcode'`) the exception propagates into the traced
+        //     program *and* tracing is turned off (the offending
+        //     trace/profile function is cleared) so no further events
+        //     fire while the exception unwinds.
+        //
+        // Clearing the global hook is sufficient to silence all
+        // subsequent events: the dispatcher gates every callout on the
+        // hook being installed (see `any_observers_active`).
         match self.call(hook, &args, &[], &outer) {
             Ok(v) => Ok(v),
-            Err(RuntimeError::PyException(_)) => Ok(Object::None),
+            Err(RuntimeError::PyException(exc)) => {
+                if event == "exception" {
+                    Ok(Object::None)
+                } else {
+                    match kind {
+                        crate::trace::HookKind::Trace => {
+                            crate::trace::set_trace_hook(Object::None);
+                            *py_frame.trace.borrow_mut() = Object::None;
+                        }
+                        crate::trace::HookKind::Profile => {
+                            crate::trace::set_profile_hook(Object::None);
+                        }
+                    }
+                    Err(RuntimeError::PyException(exc))
+                }
+            }
             Err(other) => Err(other),
         }
     }
@@ -1062,11 +1373,23 @@ impl Interpreter {
     /// the returned per-frame trace function (settrace contract).
     fn fire_call_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
         if let Some(trace) = crate::trace::trace_hook() {
-            let result = self.invoke_observe_hook(&trace, py_frame, "call", Object::None)?;
+            let result = self.invoke_observe_hook(
+                &trace,
+                py_frame,
+                "call",
+                Object::None,
+                crate::trace::HookKind::Trace,
+            )?;
             *py_frame.trace.borrow_mut() = result;
         }
         if let Some(profile) = crate::trace::profile_hook() {
-            let _ = self.invoke_observe_hook(&profile, py_frame, "call", Object::None)?;
+            let _ = self.invoke_observe_hook(
+                &profile,
+                py_frame,
+                "call",
+                Object::None,
+                crate::trace::HookKind::Profile,
+            )?;
         }
         self.fire_monitoring_event(py_frame, crate::trace::EVENT_PY_START, Object::None)?;
         Ok(())
@@ -1076,12 +1399,39 @@ impl Interpreter {
     fn fire_line_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
         let frame_trace = py_frame.trace.borrow().clone();
         if !matches!(frame_trace, Object::None) {
-            let result = self.invoke_observe_hook(&frame_trace, py_frame, "line", Object::None)?;
+            let result = self.invoke_observe_hook(
+                &frame_trace,
+                py_frame,
+                "line",
+                Object::None,
+                crate::trace::HookKind::Trace,
+            )?;
             // Per CPython: the local trace function may return a new
             // local trace for subsequent line events.
             *py_frame.trace.borrow_mut() = result;
         }
         self.fire_monitoring_event(py_frame, crate::trace::EVENT_LINE, Object::None)?;
+        Ok(())
+    }
+
+    /// Fire the `'opcode'` event before an instruction executes. Only
+    /// reached when the frame opted in via `f_trace_opcodes = True`
+    /// (CPython's per-instruction stepping used by `bdb`/`pdb`). Like
+    /// `'line'`, the callback's return value replaces the per-frame
+    /// trace; `sys.monitoring` observes INSTRUCTION.
+    fn fire_opcode_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        let frame_trace = py_frame.trace.borrow().clone();
+        if !matches!(frame_trace, Object::None) {
+            let result = self.invoke_observe_hook(
+                &frame_trace,
+                py_frame,
+                "opcode",
+                Object::None,
+                crate::trace::HookKind::Trace,
+            )?;
+            *py_frame.trace.borrow_mut() = result;
+        }
+        self.fire_monitoring_event(py_frame, crate::trace::EVENT_INSTRUCTION, Object::None)?;
         Ok(())
     }
 
@@ -1093,10 +1443,22 @@ impl Interpreter {
     ) -> Result<(), RuntimeError> {
         let frame_trace = py_frame.trace.borrow().clone();
         if !matches!(frame_trace, Object::None) {
-            let _ = self.invoke_observe_hook(&frame_trace, py_frame, "return", value.clone())?;
+            let _ = self.invoke_observe_hook(
+                &frame_trace,
+                py_frame,
+                "return",
+                value.clone(),
+                crate::trace::HookKind::Trace,
+            )?;
         }
         if let Some(profile) = crate::trace::profile_hook() {
-            let _ = self.invoke_observe_hook(&profile, py_frame, "return", value.clone())?;
+            let _ = self.invoke_observe_hook(
+                &profile,
+                py_frame,
+                "return",
+                value.clone(),
+                crate::trace::HookKind::Profile,
+            )?;
         }
         self.fire_monitoring_event(py_frame, crate::trace::EVENT_PY_RETURN, value.clone())?;
         Ok(())
@@ -1112,7 +1474,13 @@ impl Interpreter {
     ) -> Result<(), RuntimeError> {
         let frame_trace = py_frame.trace.borrow().clone();
         if !matches!(frame_trace, Object::None) {
-            let _ = self.invoke_observe_hook(&frame_trace, py_frame, "return", Object::None)?;
+            let _ = self.invoke_observe_hook(
+                &frame_trace,
+                py_frame,
+                "return",
+                Object::None,
+                crate::trace::HookKind::Trace,
+            )?;
         }
         self.fire_monitoring_event(py_frame, crate::trace::EVENT_PY_YIELD, value.clone())?;
         Ok(())
@@ -1134,9 +1502,66 @@ impl Interpreter {
                 _ => Object::None,
             };
             let arg = Object::new_tuple(vec![exc_type, exc.instance.clone(), Object::None]);
-            let _ = self.invoke_observe_hook(&frame_trace, py_frame, "exception", arg)?;
+            let _ = self.invoke_observe_hook(
+                &frame_trace,
+                py_frame,
+                "exception",
+                arg,
+                crate::trace::HookKind::Trace,
+            )?;
         }
         self.fire_monitoring_event(py_frame, crate::trace::EVENT_RAISE, exc.instance.clone())?;
+        Ok(())
+    }
+
+    /// Surface a `StopIteration` that an opcode catches *inline* to the
+    /// trace `'exception'` hook. CPython lets such a `StopIteration`
+    /// reach the trace machinery — firing an `'exception'` event in the
+    /// current frame — before the opcode clears it and continues:
+    ///   * `FOR_ITER`: the iterator's `StopIteration` ends the loop.
+    ///   * `SEND` (`yield from`/`await`): the sub-iterator's
+    ///     `StopIteration` carries the delegated `return` value.
+    /// Built-in iterators (`list`/`tuple`/`range`) don't raise, so only
+    /// the generator / custom-`__next__` paths call this. Fires nothing
+    /// on the fast no-observer path.
+    fn fire_caught_stop_iteration(&mut self, exc: &PyException) -> Result<(), RuntimeError> {
+        if !crate::trace::any_observers_active() {
+            return Ok(());
+        }
+        let py_frame = self.frame_stack.borrow().last().cloned();
+        if let Some(py_frame) = py_frame {
+            self.fire_exception_event(&py_frame, exc)?;
+        }
+        Ok(())
+    }
+
+    /// Fire the local trace function's `'return'` event (with `arg`
+    /// `None`) when a frame is popped because an exception is
+    /// propagating out of it. CPython delivers a `PyTrace_RETURN` /
+    /// `None` to both the `settrace` and `setprofile` callbacks on this
+    /// unwind path, while `sys.monitoring` observes `PY_UNWIND` rather
+    /// than `PY_RETURN`. Fires nothing on the fast no-observer path.
+    fn fire_unwind_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        let frame_trace = py_frame.trace.borrow().clone();
+        if !matches!(frame_trace, Object::None) {
+            let _ = self.invoke_observe_hook(
+                &frame_trace,
+                py_frame,
+                "return",
+                Object::None,
+                crate::trace::HookKind::Trace,
+            )?;
+        }
+        if let Some(profile) = crate::trace::profile_hook() {
+            let _ = self.invoke_observe_hook(
+                &profile,
+                py_frame,
+                "return",
+                Object::None,
+                crate::trace::HookKind::Profile,
+            )?;
+        }
+        self.fire_monitoring_event(py_frame, crate::trace::EVENT_PY_UNWIND, Object::None)?;
         Ok(())
     }
 
@@ -1602,6 +2027,10 @@ impl Interpreter {
                         // Exceptions raised while iterating propagate.
                         self.contains_via_iter(&container, &item, &frame.globals.clone())?
                     }
+                } else if matches!(&container, Object::File(_)) {
+                    // A file has no native `contains`; CPython tests
+                    // membership by iterating its lines (`line in f`).
+                    self.contains_via_iter(&container, &item, &frame.globals.clone())?
                 } else {
                     container.contains(&item)?
                 };
@@ -1744,6 +2173,12 @@ impl Interpreter {
                         Err(RuntimeError::PyException(exc))
                             if exc.type_name() == "StopIteration" =>
                         {
+                            // CPython surfaces the terminating
+                            // `StopIteration` to the trace `'exception'`
+                            // hook (in *this* frame, at the `for` line)
+                            // before `FOR_ITER` swallows it. bdb/pdb need
+                            // this event to stop on a generator's exit.
+                            self.fire_caught_stop_iteration(&exc)?;
                             None
                         }
                         Err(e) => return Err(e),
@@ -1756,6 +2191,7 @@ impl Interpreter {
                                 Err(RuntimeError::PyException(exc))
                                     if exc.type_name() == "StopIteration" =>
                                 {
+                                    self.fire_caught_stop_iteration(&exc)?;
                                     None
                                 }
                                 Err(e) => return Err(e),
@@ -1918,11 +2354,22 @@ impl Interpreter {
                         let globals = frame.globals.clone();
                         self.collect_iterable(&v, &globals)?
                     }
+                    // Any other value: defer to the general iterator
+                    // protocol (covers `dict_keys`/`dict_values`/`dict_items`
+                    // views, `map`/`filter`/`zip`, etc.). Only a genuine
+                    // non-iterable becomes the unpack TypeError.
                     _ => {
-                        return Err(type_error(format!(
-                            "cannot unpack non-iterable {} object",
-                            v.type_name()
-                        )))
+                        let globals = frame.globals.clone();
+                        match self.collect_iterable(&v, &globals) {
+                            Ok(items) => items,
+                            Err(e) if is_type_error(&e) => {
+                                return Err(type_error(format!(
+                                    "cannot unpack non-iterable {} object",
+                                    v.type_name()
+                                )))
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 };
                 // CPython distinguishes the two arity errors: it stops
@@ -1984,11 +2431,21 @@ impl Interpreter {
                         let globals = frame.globals.clone();
                         self.collect_iterable(&v, &globals)?
                     }
+                    // Defer any other value to the general iterator protocol
+                    // (dict views, map/filter/zip, …); only a genuine
+                    // non-iterable becomes the unpack TypeError.
                     _ => {
-                        return Err(type_error(format!(
-                            "cannot unpack non-iterable {} object",
-                            v.type_name()
-                        )))
+                        let globals = frame.globals.clone();
+                        match self.collect_iterable(&v, &globals) {
+                            Ok(items) => items,
+                            Err(e) if is_type_error(&e) => {
+                                return Err(type_error(format!(
+                                    "cannot unpack non-iterable {} object",
+                                    v.type_name()
+                                )))
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 };
                 if items.len() < before + after {
@@ -2438,6 +2895,14 @@ impl Interpreter {
                         // propagate so the surrounding async-for's
                         // exception handler (END_ASYNC_FOR) can clean
                         // up.
+                        //
+                        // The delegated `StopIteration` is briefly visible
+                        // in *this* (delegating) frame before SEND swallows
+                        // it to extract the `yield from`/`await` value, so
+                        // CPython fires an `'exception'` trace event at the
+                        // `yield from` line. bdb/pdb rely on this to stop a
+                        // `return`/`next` command at the delegating frame.
+                        self.fire_caught_stop_iteration(&exc)?;
                         let payload = exception_value(&exc.instance);
                         frame.push(payload);
                         frame.pc += ins.arg;
@@ -2650,6 +3115,8 @@ impl Interpreter {
                     trace: RefCell::new(Object::None),
                     override_lineno: Cell::new(None),
                     last_line: Cell::new(None),
+                    trace_lines: Cell::new(true),
+                    trace_opcodes: Cell::new(false),
                 })
             });
         let new_tb = Rc::new(PyTraceback {
@@ -2930,6 +3397,14 @@ impl Interpreter {
             Object::StaticMethod(inner) => match name {
                 // `__func__`/`__wrapped__` expose the wrapped callable.
                 "__func__" | "__wrapped__" => Ok((**inner).clone()),
+                // The descriptor hook. `staticmethod` is a non-data
+                // descriptor; `sm.__get__(obj, cls)` returns the wrapped
+                // function. Descriptor-aware library code (e.g.
+                // `functools.partialmethod`) relies on this being present.
+                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                    receiver: Object::StaticMethod(inner.clone()),
+                    function: crate::builtins::descriptor_get_builtin(true),
+                }))),
                 "__isabstractmethod__" => {
                     // Honour an `@abstractmethod` decorator applied
                     // *under* `@staticmethod` (`@staticmethod
@@ -2951,6 +3426,13 @@ impl Interpreter {
                 // `__func__` and `__wrapped__` both expose the underlying
                 // callable; `functools.wraps`/inspect walk `__wrapped__`.
                 "__func__" | "__wrapped__" => Ok((**inner).clone()),
+                // The descriptor hook. `cm.__get__(obj, cls)` returns the
+                // wrapped callable bound to the owning class. Library code
+                // such as `functools.partialmethod` invokes it directly.
+                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                    receiver: Object::ClassMethod(inner.clone()),
+                    function: crate::builtins::descriptor_get_builtin(false),
+                }))),
                 "__isabstractmethod__" => Ok(self
                     .load_attr(inner.as_ref(), "__isabstractmethod__")
                     .unwrap_or(Object::Bool(false))),
@@ -3104,6 +3586,19 @@ impl Interpreter {
                         f.attrs.borrow_mut().insert(key, d.clone());
                         return Ok(d);
                     }
+                    // PEP 695: every function carries `__type_params__`
+                    // (an empty tuple unless it declares type parameters).
+                    "__type_params__" => return Ok(Object::new_tuple(vec![])),
+                    // A function is a non-data descriptor; `f.__get__(obj,
+                    // cls)` binds it. Exposing the hook lets descriptor-aware
+                    // code (`functools.partialmethod`, custom descriptors)
+                    // treat a plain function uniformly with methods.
+                    "__get__" => {
+                        return Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                            receiver: obj.clone(),
+                            function: crate::builtins::function_get_builtin(),
+                        })))
+                    }
                     _ => {}
                 }
                 Err(attribute_error(format!(
@@ -3126,14 +3621,16 @@ impl Interpreter {
                 "f_builtins" => Ok(Object::Dict(fr.builtins.clone())),
                 "f_locals" => Ok(fr.locals()),
                 "f_lineno" => Ok(Object::Int(i64::from(fr.current_lineno()))),
-                "f_lasti" => Ok(Object::Int(i64::from(fr.lasti.get()))),
+                "f_lasti" => Ok(Object::Int(i64::from(
+                    fr.code.cpython_lasti(fr.lasti.get()),
+                ))),
                 "f_back" => match fr.back.borrow().as_ref() {
                     Some(parent) => Ok(Object::Frame(parent.clone())),
                     None => Ok(Object::None),
                 },
                 "f_trace" => Ok(fr.trace.borrow().clone()),
-                "f_trace_lines" => Ok(Object::Bool(true)),
-                "f_trace_opcodes" => Ok(Object::Bool(false)),
+                "f_trace_lines" => Ok(Object::Bool(fr.trace_lines.get())),
+                "f_trace_opcodes" => Ok(Object::Bool(fr.trace_opcodes.get())),
                 _ => Err(attribute_error(format!(
                     "'frame' object has no attribute '{}'",
                     name
@@ -3142,7 +3639,9 @@ impl Interpreter {
             Object::Traceback(tb) => match name {
                 "tb_frame" => Ok(Object::Frame(tb.frame.clone())),
                 "tb_lineno" => Ok(Object::Int(i64::from(tb.lineno))),
-                "tb_lasti" => Ok(Object::Int(i64::from(tb.lasti))),
+                "tb_lasti" => Ok(Object::Int(i64::from(
+                    tb.frame.code.cpython_lasti(tb.lasti),
+                ))),
                 "tb_next" => match tb.next.borrow().as_ref() {
                     Some(n) => Ok(Object::Traceback(n.clone())),
                     None => Ok(Object::None),
@@ -4772,7 +5271,23 @@ impl Interpreter {
         // statement instead of losing the value to `iter_next`'s
         // exhausted-or-not boolean.
         match it {
+            // A coroutine drives itself as its own awaitable iterator
+            // (WeavePy returns the coroutine from ``__await__``), so
+            // ``next(coro)`` advances it with ``send(None)`` exactly like
+            // a generator. CPython hides this behind a ``coroutine_wrapper``;
+            // here the coroutine *is* the wrapper.
             Object::Generator(g) => match self.generator_send(g, Object::None) {
+                Ok(v) => Ok(v),
+                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                    if let Some(d) = default {
+                        Ok(d)
+                    } else {
+                        Err(RuntimeError::PyException(exc))
+                    }
+                }
+                Err(e) => Err(e),
+            },
+            Object::Coroutine(_) => match self.gen_method_send(it, Object::None) {
                 Ok(v) => Ok(v),
                 Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
                     if let Some(d) = default {
@@ -4799,25 +5314,28 @@ impl Interpreter {
         self.make_iter(v, globals)
     }
 
-    /// `iter(callable, sentinel)` — eagerly drains the callable in
-    /// a tight loop, building a list. Simpler than synthesising a
-    /// generator and matches the documented CPython semantics for
-    /// the common usage pattern (read-until-sentinel). The
-    /// resulting list iterator behaves identically for all
-    /// finite-sentinel cases; infinite sequences with this form
-    /// would also hang in CPython.
+    /// `iter(callable, sentinel)` — returns a *lazy* callable-iterator
+    /// (CPython's `calliterobject`). Each `next()` invokes the callable
+    /// once and stops when a result equals the sentinel. Driving it
+    /// lazily (rather than eagerly draining into a list) is required for
+    /// correctness, not just performance: an exception raised by the
+    /// callable must surface mid-stream, a `StopIteration` it raises must
+    /// end iteration, and an unbounded source must not hang at
+    /// construction. The behaviour lives in the frozen `_CallableIter`
+    /// helper, driven through the normal `__next__` dispatch.
     fn do_iter_callable_sentinel(
         &mut self,
         args: &[Object],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        if let Some(it) = self.make_callable_iterator(&args[0], &args[1], globals)? {
+            return Ok(it);
+        }
+        // Fallback (helper module unavailable): eagerly drain. Retains the
+        // historical behaviour for the common finite-sentinel case.
         let callable = args[0].clone();
         let sentinel = args[1].clone();
         let mut out: Vec<Object> = Vec::new();
-        // CPython caps the number of iterations at a very large
-        // value to keep accidental infinite loops bounded; we use
-        // i64::MAX iterations as the safety limit but in practice
-        // expect the sentinel to fire much sooner.
         for _ in 0_i64..i64::MAX {
             let v = self.call(&callable, &[], &[], globals)?;
             if self.dispatch_compare_op(&v, &sentinel, CompareKind::Eq, globals)? {
@@ -4827,6 +5345,38 @@ impl Interpreter {
         }
         let list = Object::new_list(out);
         self.make_iter(&list, globals)
+    }
+
+    /// Instantiate the frozen `_CallableIter` for `iter(callable, sentinel)`.
+    /// Returns `None` if the helper module can't be imported, letting the
+    /// caller fall back to eager draining.
+    fn make_callable_iterator(
+        &mut self,
+        callable: &Object,
+        sentinel: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let module = match self.do_import("_seqtools", &Object::None, 0, globals) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let cls = match &module {
+            Object::Module(m) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("_CallableIter")))
+                .cloned(),
+            _ => None,
+        };
+        match cls {
+            Some(cls) => Ok(Some(self.call(
+                &cls,
+                &[callable.clone(), sentinel.clone()],
+                &[],
+                globals,
+            )?)),
+            None => Ok(None),
+        }
     }
 
     fn do_list_or_tuple_call(
@@ -5754,13 +6304,45 @@ impl Interpreter {
             Err(e) => return Err(e),
         };
         while let Some(x) = self.iter_next(&it, globals)? {
+            // CPython compares the *element* against the search target
+            // (`PyObject_RichCompareBool(obj, item, Py_EQ)`), so the
+            // element's `__eq__` runs first. Order matters for asymmetric
+            // `__eq__` (e.g. an element that compares unequal to everything
+            // must not be "found" by a target that compares equal to all).
             if item.is_same(&x)
-                || self.dispatch_compare_op(item, &x, CompareKind::Eq, globals)?
+                || self.dispatch_compare_op(&x, item, CompareKind::Eq, globals)?
             {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Construct the lazy legacy-`__getitem__` iterator (`_SeqIter`)
+    /// for `seq`. Returns `Ok(None)` only if the internal `_seqtools`
+    /// helper module is somehow unavailable, letting the caller fall
+    /// back; in practice it is always frozen in.
+    fn make_seq_iterator(
+        &mut self,
+        seq: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let module = match self.do_import("_seqtools", &Object::None, 0, globals) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let cls = match &module {
+            Object::Module(m) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("_SeqIter")))
+                .cloned(),
+            _ => None,
+        };
+        match cls {
+            Some(cls) => Ok(Some(self.call(&cls, std::slice::from_ref(seq), &[], globals)?)),
+            None => Ok(None),
+        }
     }
 
     fn make_iter(
@@ -5772,28 +6354,33 @@ impl Interpreter {
             Object::Generator(_) | Object::Iter(_) => Ok(v.clone()),
             Object::Instance(_) => {
                 if let Some(method) = instance_method(v, "__iter__") {
-                    return self.call(&method, &[], &[], globals);
+                    let result = self.call(&method, &[], &[], globals)?;
+                    // CPython requires `__iter__` to return an actual
+                    // iterator: a result lacking `__next__` is a TypeError
+                    // ("iter() returned non-iterator of type 'X'"), surfaced
+                    // here rather than deferred to the first `next()`.
+                    if let Object::Instance(_) = &result {
+                        if instance_method(&result, "__next__").is_none() {
+                            return Err(type_error(format!(
+                                "iter() returned non-iterator of type '{}'",
+                                result.type_name_owned()
+                            )));
+                        }
+                    }
+                    return Ok(result);
                 }
                 // Legacy sequence protocol: an object that defines
                 // `__getitem__` but no `__iter__` is still iterable —
                 // CPython calls `obj[0]`, `obj[1]`, … until `IndexError`.
-                // We materialise eagerly into a list (consistent with the
-                // `iter(callable, sentinel)` path above); the wrapped
-                // sequences this serves — `re`'s `SubPattern`, simple
-                // user containers — are finite and side-effect-free.
-                if let Some(getitem) = instance_method(v, "__getitem__") {
-                    let mut out: Vec<Object> = Vec::new();
-                    let mut i: i64 = 0;
-                    loop {
-                        match self.call(&getitem, &[Object::Int(i)], &[], globals) {
-                            Ok(val) => out.push(val),
-                            Err(e) if is_index_error(&e) => break,
-                            Err(e) => return Err(e),
-                        }
-                        i += 1;
+                // Return a *lazy* iterator (CPython's seqiterobject) so an
+                // unbounded sequence iterates forever instead of hanging
+                // at construction, and each element's side effects happen
+                // on demand. `_SeqIter` is a frozen helper class driven
+                // through the normal `__next__` dispatch.
+                if instance_method(v, "__getitem__").is_some() {
+                    if let Some(it) = self.make_seq_iterator(v, globals)? {
+                        return Ok(it);
                     }
-                    let list = Object::new_list(out);
-                    return self.make_iter(&list, globals);
                 }
                 // A subclass of a built-in container (`class C(list)`,
                 // `class C(dict)`, …) that doesn't override `__iter__`
@@ -5823,10 +6410,59 @@ impl Interpreter {
                 Err(type_error("'type' object is not iterable"))
             }
             _ => {
+                // A PEP 585 generic alias (`tuple[int]`, `list[str]`, …) is
+                // iterable: CPython's `ga_iternext` yields `typing.Unpack[self]`
+                // exactly once and then stops (the PEP 646 star-unpack form).
+                if is_generic_alias(v) {
+                    return self.make_generic_alias_iter(v, globals);
+                }
                 let it = v.make_iter()?;
                 Ok(Object::Iter(Rc::new(RefCell::new(it))))
             }
         }
+    }
+
+    /// `iter()` of a PEP 585 generic alias. Mirrors CPython's
+    /// `ga_iternext`, which yields `typing.Unpack[self]` exactly once
+    /// before the iterator is exhausted. The single value is wrapped in a
+    /// tuple-style iterator so the exhausted `__reduce__` collapses to the
+    /// empty-tuple form `(iter, ((),))`, matching `tupleiterator`.
+    fn make_generic_alias_iter(
+        &mut self,
+        alias: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let starred = self.build_unpack_form(alias, globals)?;
+        let it = crate::object::PyIterator::Tuple {
+            items: Rc::from(vec![starred]),
+            index: 0,
+        };
+        Ok(Object::Iter(Rc::new(RefCell::new(it))))
+    }
+
+    /// Build `typing.Unpack[alias]` — the PEP 646 star-unpack form a
+    /// generic alias yields when iterated. CPython lazily imports `typing`
+    /// at this point too; if `typing.Unpack` is somehow unavailable we
+    /// degrade to yielding the alias itself (the value is rarely inspected,
+    /// only the exhausted-iterator `__reduce__` is observable in practice).
+    fn build_unpack_form(
+        &mut self,
+        alias: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        if let Ok(Object::Module(m)) = self.do_import("typing", &Object::None, 0, globals) {
+            let unpack = m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("Unpack")))
+                .cloned();
+            if let Some(unpack) = unpack {
+                if let Some(method) = instance_method(&unpack, "__getitem__") {
+                    return self.call(&method, std::slice::from_ref(alias), &[], globals);
+                }
+            }
+        }
+        Ok(alias.clone())
     }
 
     /// Drive an awaitable into its underlying iterator (PEP 492 /
@@ -5923,6 +6559,15 @@ impl Interpreter {
         match iter {
             Object::Iter(it) => Ok(it.borrow_mut().next_value()),
             Object::Generator(g) => match self.generator_send(g, Object::None) {
+                Ok(v) => Ok(Some(v)),
+                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            },
+            // ``__await__`` returns the coroutine itself, so driving it via
+            // ``next()`` must advance it with ``send(None)`` like a generator.
+            Object::Coroutine(_) => match self.gen_method_send(iter, Object::None) {
                 Ok(v) => Ok(Some(v)),
                 Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
                     Ok(None)
@@ -6113,14 +6758,19 @@ impl Interpreter {
                 Err(RuntimeError::PyException(inner_exc))
                     if inner_exc.type_name() == "StopIteration" =>
                 {
-                    // Inner finished cleanly. Replace the iter on
-                    // the stack with the StopIteration's value and
-                    // advance past the SEND/YIELD/JUMP-BACK loop.
+                    // Inner finished cleanly (the thrown exception was
+                    // handled and the sub-iterator returned). The frame is
+                    // parked at YIELD_VALUE with the sub-iterator on top —
+                    // its yielded value was already popped. We resume into
+                    // END_SEND (the SEND loop's jump target), which expects
+                    // `[..., iter, value]` and pops the iterator. So leave
+                    // the return value *above* the iterator rather than
+                    // overwriting it, mirroring the normal
+                    // SEND-sees-StopIteration path; overwriting it left only
+                    // one operand and underflowed END_SEND (gh: coroutine
+                    // close delegating through `yield from`/`await`).
                     let ret_val = exception_value(&inner_exc.instance);
-                    if !frame.stack.is_empty() {
-                        let len = frame.stack.len();
-                        frame.stack[len - 1] = ret_val;
-                    }
+                    frame.stack.push(ret_val);
                     advance_past_yield_from(&mut frame);
                     return match self.run_until_yield_or_return(&mut frame, None) {
                         Ok(FrameOutcome::Yielded(v)) => {
@@ -7728,7 +8378,14 @@ impl Interpreter {
                     *fr.trace.borrow_mut() = value;
                     Ok(())
                 }
-                "f_trace_lines" | "f_trace_opcodes" => Ok(()),
+                "f_trace_lines" => {
+                    fr.trace_lines.set(value.is_truthy());
+                    Ok(())
+                }
+                "f_trace_opcodes" => {
+                    fr.trace_opcodes.set(value.is_truthy());
+                    Ok(())
+                }
                 "f_lineno" => match value {
                     Object::Int(i) if i >= 0 => {
                         fr.override_lineno.set(Some(i as u32));
@@ -8802,6 +9459,19 @@ impl Interpreter {
                                 2,
                                 outer_globals,
                             );
+                        }
+                        // `<builtin-iterator>.__reduce__()` — reduce to
+                        // `(iter, (remaining_items,))` so the iterator
+                        // pickles/copies and replays its not-yet-yielded
+                        // items, matching CPython's seqiterobject reduction.
+                        ".iter_reduce" => {
+                            return self.iter_reduce(&bm.receiver, outer_globals);
+                        }
+                        // `file.writelines(iterable)` — stream the iterable
+                        // through the full iterator protocol so any iterable
+                        // (generators, custom `__iter__`, views, …) works.
+                        ".file_writelines" => {
+                            return self.do_file_writelines(&bm.receiver, args, outer_globals);
                         }
                         // Bound `x.__getattribute__(name)` resolving to
                         // `object.__getattribute__` (i.e. no user override):
@@ -10397,6 +11067,7 @@ impl Interpreter {
             class_namespace: None,
             exc_handlers: Vec::new(),
             pc: 0,
+            py_frame: None,
         };
         self.run_frame(&mut frame)
     }
@@ -10640,6 +11311,100 @@ impl Interpreter {
             .module_attr("copyreg", "_reduce_newobj")
             .ok_or_else(|| runtime_error("copyreg._reduce_newobj unavailable"))?;
         self.call(&helper, &[recv.clone(), Object::Int(proto)], &[], globals)
+    }
+
+    /// `<builtin-iterator>.__reduce__()` → `(iter, (remaining_items,))`.
+    /// Mirrors CPython's reduction of built-in iterators: the
+    /// not-yet-yielded items are snapshotted into a list, and re-applying
+    /// the canonical `iter` builtin to that list reproduces an iterator
+    /// that replays exactly those items. (Dict/bytes/range iterators thus
+    /// unpickle as a list-iterator, which `test_iter` explicitly allows.)
+    /// The `iter` builtin is fetched from the live `__builtins__` so it
+    /// pickles by name and round-trips through any unpickler.
+    fn iter_reduce(
+        &mut self,
+        recv: &Object,
+        _globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        // A reverse-iterator reduces through `reversed` with a forward list;
+        // everything else reduces through `iter` with a native-typed
+        // remaining container.
+        let it = match recv {
+            Object::Iter(it) => it,
+            _ => return Err(type_error("__reduce__() requires an iterator")),
+        };
+        // Sniff the variant with a borrow that is released immediately —
+        // the builtin lookup below may run arbitrary `__eq__` that re-enters
+        // and mutates (e.g. exhausts) this very iterator.
+        let is_reversed = matches!(&*it.borrow(), crate::object::PyIterator::Reversed { .. });
+        let builtin_name = if is_reversed { "reversed" } else { "iter" };
+        // CPython fetches the builtin via `_PyEval_GetBuiltin`, which reads the
+        // live `builtins` *module* dict — a namespace user code can mutate.
+        // Resolve there first (not the VM's private fast-path map) so a
+        // hash-colliding custom key runs its Python `__eq__`, both returning
+        // the current binding and letting side effects fire before we read the
+        // iterator's remaining state (issue gh-101765). No iterator borrow is
+        // held across this lookup.
+        let key = DictKey(Object::from_static(builtin_name));
+        let module_dict = match self.cache.get("builtins") {
+            Some(Object::Module(m)) => Some(m.dict.clone()),
+            _ => None,
+        };
+        let builtin = module_dict
+            .as_ref()
+            .and_then(|d| d.borrow().get(&key).cloned())
+            .or_else(|| self.builtins.borrow().get(&key).cloned())
+            .ok_or_else(|| runtime_error(format!("builtin '{builtin_name}' unavailable")))?;
+        // Snapshot remaining *after* the lookup, mirroring CPython reading
+        // `it_seq`/index post-`_PyEval_GetBuiltin`.
+        let remaining = {
+            let it = it.borrow();
+            if is_reversed {
+                it.reversed_reduce_arg()
+                    .unwrap_or_else(|| Object::new_list(Vec::new()))
+            } else {
+                it.reduce_remaining()
+            }
+        };
+        let args_tuple = Object::new_tuple(vec![remaining]);
+        Ok(Object::new_tuple(vec![builtin, args_tuple]))
+    }
+
+    /// `file.writelines(iterable)` — write each item, pulling them lazily
+    /// through the general iterator protocol (so generators and objects
+    /// with a custom `__iter__` work, not just native sequences). A
+    /// non-iterable argument raises TypeError, matching CPython.
+    fn do_file_writelines(
+        &mut self,
+        receiver: &Object,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let file = match receiver {
+            Object::File(f) => f.clone(),
+            _ => return Err(type_error("writelines() requires a file receiver")),
+        };
+        let iterable = args
+            .first()
+            .ok_or_else(|| type_error("writelines() takes exactly one argument"))?;
+        let it = self.make_iter(iterable, globals)?;
+        while let Some(line) = self.iter_next(&it, globals)? {
+            match line {
+                Object::Str(s) => {
+                    file.write_bytes(s.as_bytes())?;
+                }
+                Object::Bytes(b) => {
+                    file.write_bytes(&b)?;
+                }
+                other => {
+                    return Err(type_error(format!(
+                        "writelines() argument must be a list of strings, not '{}'",
+                        other.type_name_owned()
+                    )))
+                }
+            }
+        }
+        Ok(Object::None)
     }
 
     fn do_compile_call(

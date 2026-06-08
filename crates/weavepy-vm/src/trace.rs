@@ -80,6 +80,16 @@ impl MonitoringTools {
     }
 }
 
+/// Which observer slot a hook invocation belongs to. Used so that
+/// when a hook raises on a non-`exception` event we can disable the
+/// *right* hook (CPython turns off the offending trace/profile
+/// function and re-raises).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HookKind {
+    Trace,
+    Profile,
+}
+
 pub fn set_trace_hook(hook: Object) {
     TRACE_HOOK.with(|cell| {
         *cell.borrow_mut() = match hook {

@@ -52,6 +52,11 @@ pub enum CompileError {
     ContinueOutsideLoop,
     #[error("`return` outside function")]
     ReturnOutsideFunction,
+    /// A `yield` / `yield from` expression outside a function body.
+    /// `{0}` is the keyword (`yield` or `yield from`) so the message
+    /// matches CPython's `SyntaxError: 'yield' outside function`.
+    #[error("'{0}' outside function")]
+    YieldOutsideFunction(&'static str),
     #[error("`{0}` is not yet supported by the compiler ({1})")]
     NotImplemented(&'static str, &'static str),
     #[error("internal compiler error: {0}")]
@@ -88,6 +93,11 @@ pub struct CodeObject {
     /// Source line number (1-based) per emitted instruction. Same length
     /// as `instructions`. Used for traceback rendering.
     pub linetable: Vec<u32>,
+    /// PEP-657 fine-grained column spans, one per instruction (same length
+    /// as `instructions` once emission finishes). Drives the column fields
+    /// of `co_positions()`. Empty when never populated (e.g. code objects
+    /// reconstructed from marshal, which doesn't carry columns).
+    pub coltable: Vec<ColSpan>,
     /// Number of positional + keyword arguments (excluding `*args`/`**kwargs`).
     pub arg_count: u32,
     /// Number of positional-only arguments.
@@ -112,6 +122,28 @@ pub struct CodeObject {
     /// that *also* contains `yield`. Calling such a function returns
     /// an `Object::AsyncGenerator`.
     pub is_async_generator: bool,
+}
+
+/// A per-instruction source-column span (PEP-657). `col`/`end_col` are
+/// 0-based UTF-8 byte offsets within their respective source lines, and
+/// are `-1` when the column was not tracked. `end_lineno` is `0` when
+/// unknown (callers fall back to the instruction's start line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColSpan {
+    pub end_lineno: u32,
+    pub col: i32,
+    pub end_col: i32,
+}
+
+impl Default for ColSpan {
+    fn default() -> Self {
+        // "Unknown" sentinel — matches an instruction with no tracked span.
+        Self {
+            end_lineno: 0,
+            col: -1,
+            end_col: -1,
+        }
+    }
 }
 
 /// One entry in a code object's exception table. Mirrors the
@@ -445,6 +477,17 @@ impl LineIndex {
             .saturating_sub(1);
         (idx as u32) + 1
     }
+
+    /// 1-based line and 0-based byte column for a source byte offset.
+    /// Returns `(0, 0)` when the index is empty.
+    fn pos_for(&self, byte: u32) -> (u32, u32) {
+        let line = self.line_for(byte);
+        if line == 0 {
+            return (0, 0);
+        }
+        let line_start = self.line_starts[(line - 1) as usize];
+        (line, byte.saturating_sub(line_start))
+    }
 }
 
 // ---------- scope kinds ----------
@@ -500,6 +543,10 @@ struct Compiler {
     /// Line number assigned to the next emitted instruction; updated as
     /// the compiler descends through the AST.
     current_line: u32,
+    /// Source byte span `(start, end)` for the AST node currently being
+    /// emitted. Drives PEP-657 column tracking in [`Self::emit`]. Updated
+    /// at statement and expression granularity as the compiler descends.
+    current_span: (u32, u32),
     /// `True` for methods compiled inside a class body. Such methods
     /// implicitly capture the class's `__class__` cell so `super()`
     /// works without arguments.
@@ -599,6 +646,7 @@ impl Compiler {
             finally_counter: 0,
             line_index,
             current_line: 0,
+            current_span: (0, 0),
             inside_class_body: false,
             annotations_initialized: false,
             code_kind: kind,
@@ -640,6 +688,7 @@ impl Compiler {
         let offset = self.co.instructions.len() as u32;
         self.co.instructions.push(Instruction { op, arg });
         self.co.linetable.push(self.current_line);
+        self.co.coltable.push(self.resolve_colspan());
         offset
     }
 
@@ -648,6 +697,30 @@ impl Compiler {
         if line != 0 {
             self.current_line = line;
         }
+    }
+
+    /// Resolve [`Self::current_span`] into a PEP-657 [`ColSpan`] for the
+    /// next emitted instruction. Columns are 0-based byte offsets into
+    /// their source lines; a degenerate `(0, 0)` span yields "unknown".
+    fn resolve_colspan(&self) -> ColSpan {
+        let (start, end) = self.current_span;
+        if start == 0 && end == 0 {
+            return ColSpan::default();
+        }
+        let (_start_line, start_col) = self.line_index.pos_for(start);
+        let (end_line, end_col) = self.line_index.pos_for(end);
+        ColSpan {
+            end_lineno: end_line,
+            col: start_col as i32,
+            end_col: end_col as i32,
+        }
+    }
+
+    /// Point [`Self::current_span`] at an AST node's source span so the
+    /// instructions emitted for it carry the node's columns.
+    #[inline]
+    fn set_span(&mut self, span: weavepy_lexer::Span) {
+        self.current_span = (span.start.0, span.end.0);
     }
 
     fn next_offset(&self) -> u32 {
@@ -778,6 +851,7 @@ impl Compiler {
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         self.set_line_from(stmt.span.start.0);
+        self.set_span(stmt.span);
         match &stmt.kind {
             StmtKind::Expr(e) => {
                 self.compile_expr(e)?;
@@ -922,9 +996,17 @@ impl Compiler {
                 orelse,
             } => {
                 self.compile_expr(iter)?;
+                // PEP-657: `GET_ITER` (iter() failure) and `FOR_ITER`
+                // (__next__ failure) report the iterator *expression* as
+                // the error location, matching CPython's traceback columns.
+                self.set_span(iter.span);
                 self.emit(OpCode::GetIter, 0);
                 let loop_top = self.next_offset();
+                self.set_span(iter.span);
                 let for_site = self.emit(OpCode::ForIter, 0);
+                // Remember FOR_ITER's source line so END_FOR can reuse it (see
+                // the END_FOR emission below).
+                let for_line = self.current_line;
                 self.compile_assign(target)?;
                 self.loop_stack.push(LoopFrame {
                     continue_target: loop_top,
@@ -939,6 +1021,12 @@ impl Compiler {
                 let frame = self.loop_stack.pop().expect("loop frame");
                 let after = self.next_offset();
                 self.patch_jump(for_site, after);
+                // Attribute END_FOR to the iterator expression (the `for` line),
+                // matching CPython. FOR_ITER already fired a line event for this
+                // line on the final iteration, so reusing the line prevents a
+                // spurious `line` event for the loop body after exhaustion.
+                self.set_span(iter.span);
+                self.current_line = for_line;
                 self.emit(OpCode::EndFor, 0);
                 for s in orelse {
                     self.compile_stmt(s)?;
@@ -1077,11 +1165,9 @@ impl Compiler {
                 if is_for {
                     self.emit(OpCode::PopTop, 0);
                 }
-                let site = self.co.instructions.len() as u32;
-                self.co.instructions.push(Instruction {
-                    op: OpCode::JumpForward,
-                    arg: 0,
-                });
+                // Route through `emit` so the line/column side-tables stay
+                // length-aligned with the instruction stream.
+                let site = self.emit(OpCode::JumpForward, 0);
                 self.loop_stack
                     .last_mut()
                     .expect("loop frame")
@@ -2879,6 +2965,19 @@ impl Compiler {
     // ---------- expressions ----------
 
     fn compile_expr(&mut self, e: &Expr) -> Result<(), CompileError> {
+        // PEP-657 column tracking: emit this node's instructions under its
+        // own source span. Sub-expressions are compiled through this same
+        // wrapper, so each restores the parent span on return — leaving
+        // `current_span` pointing at *this* node when its own opcode is
+        // finally emitted (e.g. the `BinaryOp` after both operands).
+        let saved = self.current_span;
+        self.set_span(e.span);
+        let r = self.compile_expr_inner(e);
+        self.current_span = saved;
+        r
+    }
+
+    fn compile_expr_inner(&mut self, e: &Expr) -> Result<(), CompileError> {
         match &e.kind {
             ExprKind::Constant(c) => {
                 let idx = self.co.intern_constant(c.clone().into());
@@ -3131,6 +3230,14 @@ impl Compiler {
                 self.compile_formatted_value(value, *conversion, format_spec.as_deref())?;
             }
             ExprKind::Yield(value) => {
+                // `yield` is only legal in a function body. At module or
+                // class scope (or inside a comprehension's own frame) it is
+                // a SyntaxError — CPython reports "'yield' outside function".
+                // Catching it here also prevents a non-generator frame from
+                // ever executing `YIELD_VALUE` at runtime.
+                if self.kind != CodeKind::Function {
+                    return Err(CompileError::YieldOutsideFunction("yield"));
+                }
                 if let Some(v) = value {
                     self.compile_expr(v)?;
                 } else {
@@ -3140,6 +3247,9 @@ impl Compiler {
                 self.emit(OpCode::YieldValue, 0);
             }
             ExprKind::YieldFrom(iter) => {
+                if self.kind != CodeKind::Function {
+                    return Err(CompileError::YieldOutsideFunction("yield from"));
+                }
                 // CPython 3.13 pattern:
                 //   <iter>
                 //   GET_YIELD_FROM_ITER
@@ -3723,6 +3833,7 @@ fn compile_comp_body(
     }
     let loop_top = inner.next_offset();
     let for_site = inner.emit(OpCode::ForIter, 0);
+    let for_line = inner.current_line;
     inner.compile_assign(&gen.target)?;
     let mut filter_jumps = Vec::new();
     for cond in &gen.ifs {
@@ -3739,6 +3850,10 @@ fn compile_comp_body(
     inner.patch_jump(back, loop_top);
     let after = inner.next_offset();
     inner.patch_jump(for_site, after);
+    // Keep END_FOR on the iterator line (see statement-level for loop) so a
+    // comprehension's loop exhaustion does not emit a spurious `line` event.
+    inner.set_span(gen.iter.span);
+    inner.current_line = for_line;
     inner.emit(OpCode::EndFor, 0);
     Ok(())
 }
@@ -4123,8 +4238,28 @@ fn expr_contains_yield(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Yield(_) | ExprKind::YieldFrom(_) => true,
         ExprKind::Await(inner) => expr_contains_yield(inner),
-        ExprKind::Lambda { .. } => false,
-        ExprKind::GeneratorExp { .. } => false,
+        // A lambda body runs in its own scope, but its *default argument
+        // values* are evaluated in the enclosing scope — so a `yield` there
+        // belongs to the enclosing function, e.g. `def f(): lambda x=(yield): 1`
+        // makes `f` a generator. The body is excluded.
+        ExprKind::Lambda { args, .. } => {
+            args.defaults.iter().any(expr_contains_yield)
+                || args
+                    .kw_defaults
+                    .iter()
+                    .flatten()
+                    .any(expr_contains_yield)
+        }
+        // A comprehension runs in its own scope, but the *leftmost* `for`
+        // clause's iterable is evaluated in the enclosing scope and passed
+        // in as the `.0` argument. A `yield` there therefore belongs to the
+        // enclosing function and makes it a generator — e.g.
+        // `def f(): list(i for i in [(yield 26)])`. (A `yield` anywhere else
+        // in a comprehension is a SyntaxError, so only the first iterable
+        // can contribute.)
+        ExprKind::GeneratorExp { generators, .. } => {
+            generators.first().is_some_and(|g| expr_contains_yield(&g.iter))
+        }
         ExprKind::JoinedStr(parts) => parts.iter().any(expr_contains_yield),
         ExprKind::FormattedValue {
             value, format_spec, ..
@@ -4169,7 +4304,11 @@ fn expr_contains_yield(expr: &Expr) -> bool {
                 .any(|k| k.as_ref().is_some_and(expr_contains_yield))
                 || values.iter().any(expr_contains_yield)
         }
-        ExprKind::ListComp { .. } | ExprKind::SetComp { .. } | ExprKind::DictComp { .. } => false,
+        ExprKind::ListComp { generators, .. }
+        | ExprKind::SetComp { generators, .. }
+        | ExprKind::DictComp { generators, .. } => {
+            generators.first().is_some_and(|g| expr_contains_yield(&g.iter))
+        }
         ExprKind::Starred(inner) => expr_contains_yield(inner),
         ExprKind::Constant(_) | ExprKind::Name(_) => false,
     }
@@ -4916,6 +5055,21 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
             }
             for s in body {
                 collect_reads_stmt(s, out);
+            }
+        }
+        StmtKind::Delete(targets) => {
+            // `del x.attr` / `del x[i]` *read* the container `x` (it must be
+            // loaded to perform the delete), so the name must surface for
+            // free-variable promotion. A bare `del x` is a binding op, not a
+            // read — `collect_reads_assign_target` handles that distinction.
+            for t in targets {
+                collect_reads_assign_target(t, out);
+            }
+        }
+        StmtKind::Assert { test, msg } => {
+            collect_reads_expr(test, out);
+            if let Some(m) = msg {
+                collect_reads_expr(m, out);
             }
         }
         _ => {}

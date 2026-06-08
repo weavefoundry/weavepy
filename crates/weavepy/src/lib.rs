@@ -262,7 +262,14 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
     } else {
         Some(opts.filename.as_str())
     };
-    let _ = interpreter.run_module_as(&code, "__main__", file_for_main)?;
+    let result = interpreter.run_module_as(&code, "__main__", file_for_main);
+    // CPython runs finalizers for everything still alive during
+    // interpreter shutdown — including a module-global object whose
+    // `__del__` raises (which is reported via `sys.unraisablehook`).
+    // Do this whether the module returned normally or via `SystemExit`,
+    // before the caller turns a `SystemExit` into a process exit.
+    interpreter.run_shutdown_finalizers();
+    result?;
     Ok(())
 }
 

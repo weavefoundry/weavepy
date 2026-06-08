@@ -477,6 +477,13 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__setitem__" => Some(method("__setitem__", dict_setitem)),
             "__getitem__" => Some(method("__getitem__", dict_getitem)),
             "__delitem__" => Some(method("__delitem__", dict_delitem)),
+            // Mapping-protocol dunders exposed as bound methods so code can
+            // grab them directly — CPython's `functools._lru_cache_wrapper`
+            // caches `cache_len = cache.__len__`, and `__contains__` /
+            // `__iter__` round out `hasattr(d, …)` / explicit-call parity.
+            "__len__" => Some(method("__len__", obj_len)),
+            "__contains__" => Some(method("__contains__", obj_contains)),
+            "__iter__" => Some(method("__iter__", dict_iter_method)),
             "__init__" => Some(method("__init__", dict_update)),
             _ => None,
         },
@@ -559,7 +566,10 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "readline" => Some(method("readline", file_readline)),
             "readlines" => Some(method("readlines", file_readlines)),
             "write" => Some(method("write", file_write)),
-            "writelines" => Some(method("writelines", file_writelines)),
+            // Routed through the interpreter (sentinel name) so it can
+            // consume *any* iterable via the full `__iter__`/`__next__`
+            // protocol, not just native sequences.
+            "writelines" => Some(method(".file_writelines", file_writelines)),
             "flush" => Some(method("flush", file_flush)),
             "close" => Some(method("close", file_close)),
             "seek" => Some(method("seek", file_seek)),
@@ -567,6 +577,13 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "getvalue" => Some(method("getvalue", file_getvalue)),
             "__enter__" => Some(method("__enter__", file_enter)),
             "__exit__" => Some(method("__exit__", file_exit)),
+            // A file is its own iterator (CPython): `iter(f) is f`, and
+            // each `next(f)` returns the next line, raising StopIteration
+            // at EOF.
+            "__iter__" => Some(method("__iter__", |args| {
+                file_self(args).map(Object::File)
+            })),
+            "__next__" => Some(method("__next__", file_next)),
             _ => None,
         },
         Object::MemoryView(_) => match name {
@@ -662,6 +679,13 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                 args.first()
                     .cloned()
                     .ok_or_else(|| type_error("__iter__() missing self"))
+            })),
+            // Pickling support. The actual reduction needs the canonical
+            // `iter` builtin (so the result pickles by name and round-trips),
+            // which requires interpreter access — the VM intercepts this
+            // sentinel name in its bound-method dispatch.
+            "__reduce__" => Some(method(".iter_reduce", |_| {
+                Err(type_error("iterator.__reduce__ requires the interpreter"))
             })),
             _ => None,
         },
@@ -1404,6 +1428,87 @@ pub fn construct_classmethod(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::ClassMethod(Rc::new(inner)))
 }
 
+/// `staticmethod.__get__(self, obj, objtype=None)` — the descriptor hook.
+/// A staticmethod ignores the binding context and hands back the wrapped
+/// callable unchanged (matching CPython's `sm_descr_get`). Exposing it as
+/// a real method lets descriptor-aware code — notably
+/// `functools.partialmethod`, which does `self.func.__get__(obj, cls)` —
+/// treat a wrapped `staticmethod` correctly. `args[0]` is the descriptor
+/// itself (the bound receiver).
+pub(crate) fn staticmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args.first() {
+        Some(Object::StaticMethod(inner)) => Ok((**inner).clone()),
+        // Tolerate an already-unwrapped callable (defensive).
+        Some(other) => Ok(other.clone()),
+        None => Err(type_error("staticmethod.__get__() missing self")),
+    }
+}
+
+/// `classmethod.__get__(self, obj, objtype=None)` — binds the wrapped
+/// callable to the owning *class* and returns a bound method (CPython's
+/// `cm_descr_get`). The owner is the explicit `objtype` when supplied,
+/// otherwise `type(obj)`.
+pub(crate) fn classmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inner = match args.first() {
+        Some(Object::ClassMethod(i)) => (**i).clone(),
+        _ => return Err(type_error("classmethod.__get__() missing self")),
+    };
+    let owner = match args.get(2) {
+        Some(o) if !matches!(o, Object::None) => o.clone(),
+        _ => match args.get(1) {
+            Some(o) if !matches!(o, Object::None) => Object::Type(class_of(o)),
+            _ => {
+                return Err(type_error(
+                    "classmethod.__get__(None, None) is not valid",
+                ))
+            }
+        },
+    };
+    Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod {
+        receiver: owner,
+        function: inner,
+    })))
+}
+
+/// `function.__get__(self, obj, objtype=None)` — a plain Python function
+/// is a non-data descriptor: bound to an instance it yields a bound
+/// method, bound to `None` (class access) it returns the function itself
+/// (CPython's `func_descr_get`). Exposing it makes functions usable with
+/// descriptor-aware library code such as `functools.partialmethod`.
+pub(crate) fn function_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let func = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("__get__() missing self"))?;
+    match args.get(1) {
+        Some(obj) if !matches!(obj, Object::None) => {
+            Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod {
+                receiver: obj.clone(),
+                function: func,
+            })))
+        }
+        _ => Ok(func),
+    }
+}
+
+/// Build the callable `Object::Builtin` backing `staticmethod.__get__` /
+/// `classmethod.__get__`. The VM wires this into a `BoundMethod` whose
+/// receiver is the descriptor object, so `args[0]` arrives as the
+/// descriptor when the hook runs.
+pub(crate) fn descriptor_get_builtin(is_static: bool) -> Object {
+    let f = if is_static {
+        method("__get__", staticmethod_descr_get)
+    } else {
+        method("__get__", classmethod_descr_get)
+    };
+    Object::Builtin(Rc::new(f))
+}
+
+/// Build the callable `Object::Builtin` backing `function.__get__`.
+pub(crate) fn function_get_builtin() -> Object {
+    Object::Builtin(Rc::new(method("__get__", function_descr_get)))
+}
+
 fn property_with(
     args: &[Object],
     which: crate::object::PropertyAttr,
@@ -1527,6 +1632,9 @@ fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
             | Object::BoundMethod(_)
             | Object::Type(_)
             | Object::Generator(_)
+            // Since Python 3.10 (bpo-43682) `staticmethod` objects are
+            // themselves callable, forwarding to the wrapped function.
+            | Object::StaticMethod(_)
     );
     if intrinsic {
         return Ok(Object::Bool(true));
@@ -3809,13 +3917,20 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
     let iterable = one(args, "reversed")?;
+    // Materialize the source in *forward* order; the Reversed iterator
+    // walks it back-to-front. (CPython's `reversed` uses `__reversed__`
+    // or `__len__`+`__getitem__`; a forward snapshot reproduces the same
+    // sequence for the finite iterables WeavePy handles here.)
     let mut it = iterable.make_iter()?;
     let mut buf = Vec::new();
     while let Some(v) = it.next_value() {
         buf.push(v);
     }
-    buf.reverse();
-    Ok(Object::new_list(buf))
+    let index = buf.len() as i64 - 1;
+    Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Reversed {
+        items: Rc::new(RefCell::new(buf)),
+        index,
+    }))))
 }
 
 fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5901,6 +6016,16 @@ fn list_copy(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // ---------- dict methods ----------
 
+/// `dict.__iter__(self)` → a key iterator (CPython's `dict_iter`), so
+/// `iter(d)` parity holds when the dunder is fetched explicitly.
+fn dict_iter_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let recv = args
+        .first()
+        .ok_or_else(|| type_error("__iter__() missing self"))?;
+    let it = recv.make_iter()?;
+    Ok(Object::Iter(Rc::new(RefCell::new(it))))
+}
+
 fn dict_self(args: &[Object]) -> Result<Rc<RefCell<DictData>>, RuntimeError> {
     match args.first() {
         Some(Object::Dict(d)) => Ok(d.clone()),
@@ -7090,6 +7215,22 @@ fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         let s = String::from_utf8(out).map_err(|e| value_error(e.to_string()))?;
         Ok(Object::from_str(s))
+    }
+}
+
+/// `next(file)` — return the next line, or raise StopIteration at EOF.
+/// Backs both the `__next__` method and the VM's native file iteration.
+pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    let line = file_readline(args)?;
+    let empty = match &line {
+        Object::Str(s) => s.is_empty(),
+        Object::Bytes(b) => b.is_empty(),
+        _ => true,
+    };
+    if empty {
+        Err(stop_iteration())
+    } else {
+        Ok(line)
     }
 }
 

@@ -657,6 +657,9 @@ impl<'a> MarshalReader<'a> {
             cellvars: decoded.cellvars,
             exception_table: decoded.exception_table,
             linetable: decoded.linetable,
+            // Marshal doesn't round-trip PEP-657 columns yet; co_positions()
+            // on an unmarshalled code object reports lines only.
+            coltable: Vec::new(),
             arg_count,
             posonly_count,
             kwonly_count,

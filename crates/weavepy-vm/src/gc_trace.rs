@@ -270,6 +270,30 @@ impl GcState {
             || self.frozen.borrow().iter().any(|h| h.id == id)
     }
 
+    /// Snapshot every tracked object that still carries an unrun
+    /// `__del__`. The interpreter's shutdown pass walks this list to
+    /// finalize objects that are still alive at exit — CPython runs
+    /// finalizers for everything during interpreter teardown, not just
+    /// for cyclic garbage. The per-handle `finalized` flag (shared with
+    /// the cycle collector) guarantees each `__del__` runs at most once.
+    pub fn finalization_candidates(&self) -> Vec<Arc<TrackedHandle>> {
+        let mut out = Vec::new();
+        let gens = self.generations.borrow();
+        for gen in gens.iter() {
+            for h in &gen.handles {
+                if !h.finalized.load(Ordering::Acquire) && has_finalizer(&h.object) {
+                    out.push(h.clone());
+                }
+            }
+        }
+        for h in self.frozen.borrow().iter() {
+            if !h.finalized.load(Ordering::Acquire) && has_finalizer(&h.object) {
+                out.push(h.clone());
+            }
+        }
+        out
+    }
+
     /// Number of tracked objects in each generation.
     pub fn counts(&self) -> [usize; N_GENERATIONS] {
         *self.counts.borrow()
@@ -793,6 +817,12 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 /// Convenience: track `obj` in the current thread's GC.
 pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
+}
+
+/// Convenience: snapshot all tracked objects with an unrun `__del__`
+/// on the current thread's GC (see [`GcState::finalization_candidates`]).
+pub fn finalization_candidates() -> Vec<Arc<TrackedHandle>> {
+    with_state(|s| s.finalization_candidates())
 }
 
 /// Convenience: run a full collection on the current thread's
