@@ -106,8 +106,14 @@ class array:
     def __buffer__(self, flags):
         # PEP 688 buffer protocol: expose the packed bytes so buffer
         # consumers (``float``/``int``/``bytes``/``memoryview``) can read the
-        # array's contents, mirroring CPython's C-level buffer export.
-        return memoryview(self.tobytes())
+        # array's contents, mirroring CPython's C-level buffer export. Back
+        # the view with a ``bytearray`` so it's *writable* — that's what lets
+        # ``struct.pack_into(memoryview(array(...)), ...)`` write through it
+        # (test_struct.test_pack_into). (The bytes are a snapshot; this
+        # list-backed array doesn't share storage with the view, but the view
+        # itself is a coherent read/write buffer, which is what consumers
+        # operate on.)
+        return memoryview(bytearray(self.tobytes()))
 
     def fromlist(self, seq):
         for v in seq:

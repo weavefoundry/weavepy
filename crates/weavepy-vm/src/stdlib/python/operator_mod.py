@@ -86,7 +86,23 @@ def floordiv(a, b):
 
 def index(a):
     "Same as a.__index__()."
-    return a.__index__()
+    # Mirror CPython's ``PyNumber_Index``: a missing ``__index__`` is a
+    # ``TypeError`` ("object cannot be interpreted as an integer"), not the
+    # ``AttributeError`` a bare ``a.__index__()`` would surface, and the
+    # result must itself be an ``int``.
+    if isinstance(a, int):
+        return a
+    m = getattr(type(a), "__index__", None)
+    if m is None:
+        raise TypeError(
+            "'%s' object cannot be interpreted as an integer" % type(a).__name__
+        )
+    result = m(a)
+    if not isinstance(result, int):
+        raise TypeError(
+            "__index__ returned non-int (type %s)" % type(result).__name__
+        )
+    return result
 
 def inv(a):
     "Same as ~a."

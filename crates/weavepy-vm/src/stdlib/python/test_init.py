@@ -12,3 +12,38 @@ fixtures — can be discovered and run by ``weavepy -m test``.
 # harness, so ``support`` / ``libregrtest`` are imported lazily by the
 # things that need them.
 __all__ = []
+
+# CPython resolves ``test.<name>`` submodules against this package's
+# ``__path__``. WeavePy ships ``test`` (and ``test.support``) frozen, so
+# the package has no backing directory by default — which means a
+# vendored test that imports a *sibling* test module (e.g.
+# ``from test import test_contextlib`` in ``test_contextlib_async``, or
+# ``test.pickletester``) can't find it. Point ``__path__`` at any on-disk
+# ``test/`` directory currently on ``sys.path`` (a checked-out
+# ``Lib/test/`` is ``sys.path[0]`` when its files are run directly), so
+# those siblings load from disk. Frozen modules still win — the import
+# machinery consults the frozen registry before walking ``__path__`` — so
+# ``test.support`` keeps using the faithful frozen port.
+import os as _os
+import sys as _sys
+
+try:
+    __path__
+except NameError:
+    __path__ = []
+for _p in _sys.path:
+    try:
+        if (
+            _p
+            and _os.path.basename(_os.path.normpath(_p)) == "test"
+            and _os.path.isdir(_p)
+            and _p not in __path__
+        ):
+            __path__.append(_p)
+    except (TypeError, ValueError):
+        pass
+del _os, _sys
+try:
+    del _p
+except NameError:
+    pass

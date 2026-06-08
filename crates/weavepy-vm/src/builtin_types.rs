@@ -651,6 +651,60 @@ pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
     make_exception_with_class(class, message)
 }
 
+/// Build a faithful `UnicodeEncodeError` instance carrying the 5-tuple
+/// `(encoding, object, start, end, reason)` its custom `__init__`/`__str__`
+/// expect (see [`install_unicode_error_dunders`]). The strict-mode codec
+/// uses this so `str.encode()` of an unencodable character raises a real
+/// `UnicodeEncodeError` (a `ValueError` subclass) — matching CPython —
+/// rather than the bare `ValueError` we used to surface
+/// (test_struct.test_Struct_reinitialization, test_exceptions unicode-error
+/// cases).
+pub fn make_unicode_encode_error(
+    encoding: &str,
+    object: &str,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> Object {
+    use crate::types::PyInstance;
+    let bt = builtin_types();
+    let class = bt
+        .by_name("UnicodeEncodeError")
+        .unwrap_or_else(|| bt.value_error.clone());
+    let inst = PyInstance::new(class);
+    let enc = Object::from_str(encoding);
+    let obj = Object::from_str(object);
+    let start_o = Object::Int(start as i64);
+    let end_o = Object::Int(end as i64);
+    let reason_o = Object::from_str(reason);
+    {
+        let mut dict = inst.dict.borrow_mut();
+        dict.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![
+                enc.clone(),
+                obj.clone(),
+                start_o.clone(),
+                end_o.clone(),
+                reason_o.clone(),
+            ]),
+        );
+        dict.insert(DictKey(Object::from_static("encoding")), enc);
+        dict.insert(DictKey(Object::from_static("object")), obj);
+        dict.insert(DictKey(Object::from_static("start")), start_o);
+        dict.insert(DictKey(Object::from_static("end")), end_o);
+        dict.insert(DictKey(Object::from_static("reason")), reason_o);
+        dict.insert(DictKey(Object::from_static("__context__")), Object::None);
+        dict.insert(DictKey(Object::from_static("__cause__")), Object::None);
+        dict.insert(
+            DictKey(Object::from_static("__suppress_context__")),
+            Object::Bool(false),
+        );
+        dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
+    }
+    Object::Instance(Rc::new(inst))
+}
+
 /// Extract the elements of a *concrete* iterable (one that doesn't need
 /// the interpreter to drive). Used by `object.__new__` to seed the
 /// native payload of an immutable-container subclass from a

@@ -542,12 +542,20 @@ impl FromUtf8Lenient for String {
 
 fn encode_ascii(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
     let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
+    for (pos, c) in s.chars().enumerate() {
         let cp = c as u32;
         if cp < 0x80 {
             out.push(cp as u8);
         } else {
-            handle_encode_error(&mut out, c, errors, "ascii")?;
+            handle_encode_error(
+                &mut out,
+                s,
+                pos,
+                c,
+                errors,
+                "ascii",
+                "ordinal not in range(128)",
+            )?;
         }
     }
     Ok(out)
@@ -567,12 +575,20 @@ fn decode_ascii(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
 
 fn encode_latin1(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
     let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
+    for (pos, c) in s.chars().enumerate() {
         let cp = c as u32;
         if cp < 0x100 {
             out.push(cp as u8);
         } else {
-            handle_encode_error(&mut out, c, errors, "latin-1")?;
+            handle_encode_error(
+                &mut out,
+                s,
+                pos,
+                c,
+                errors,
+                "latin-1",
+                "ordinal not in range(256)",
+            )?;
         }
     }
     Ok(out)
@@ -584,15 +600,24 @@ fn decode_latin1(bytes: &[u8]) -> String {
 
 fn handle_encode_error(
     out: &mut Vec<u8>,
+    source: &str,
+    pos: usize,
     c: char,
     errors: &str,
     encoding: &str,
+    reason: &str,
 ) -> Result<(), RuntimeError> {
     match errors {
-        "strict" => Err(value_error(format!(
-            "'{encoding}' codec can't encode character '\\u{{{:x}}}'",
-            c as u32
-        ))),
+        // Strict mode raises a real `UnicodeEncodeError` (a `ValueError`
+        // subclass) carrying the canonical `(encoding, object, start, end,
+        // reason)` payload, matching CPython — not a bare `ValueError`.
+        "strict" => Err(crate::error::unicode_encode_error(
+            encoding,
+            source,
+            pos,
+            pos + 1,
+            reason,
+        )),
         "ignore" => Ok(()),
         "replace" => {
             out.push(b'?');

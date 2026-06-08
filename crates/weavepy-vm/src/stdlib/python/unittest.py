@@ -466,6 +466,12 @@ class TestCase:
     def skipTest(self, reason):
         raise SkipTest(reason)
 
+    def _callTestMethod(self, method):
+        # Indirection point CPython uses so ``IsolatedAsyncioTestCase``
+        # can drive an ``async def`` test through an event loop. The
+        # default just calls the (synchronous) method.
+        method()
+
     def shortDescription(self):
         doc = self._testMethodDoc
         return doc.strip().split("\n")[0].strip() if doc else None
@@ -610,7 +616,7 @@ class TestCase:
             n_err = len(result.errors)
             ok = False
             try:
-                testMethod()
+                self._callTestMethod(testMethod)
             except KeyboardInterrupt:
                 raise
             except SkipTest as e:
@@ -1730,3 +1736,10 @@ def main(module="__main__", defaultTest=None, argv=None, testRunner=None,
         verbosity=verbosity, failfast=failfast, catchbreak=catchbreak,
         buffer=buffer, warnings=warnings, tb_locals=tb_locals)
     return getattr(program, "result", None)
+
+
+# Re-export the async TestCase (CPython does this at the bottom of
+# ``unittest/__init__.py``). Done last so ``unittest.TestCase`` is fully
+# defined when ``async_case`` imports the package.
+from .async_case import IsolatedAsyncioTestCase  # noqa: E402
+__all__.append("IsolatedAsyncioTestCase")

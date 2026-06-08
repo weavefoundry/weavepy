@@ -200,6 +200,22 @@ pub fn overflow_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("OverflowError", message))
 }
 
+/// `UnicodeEncodeError` carrying the canonical `(encoding, object, start,
+/// end, reason)` payload. Surfaced by the strict-mode codec when a
+/// character can't be encoded, so `str.encode()` failures are catchable as
+/// `UnicodeEncodeError` (not just `ValueError`).
+pub fn unicode_encode_error(
+    encoding: &str,
+    object: &str,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> RuntimeError {
+    RuntimeError::PyException(PyException::new(
+        crate::builtin_types::make_unicode_encode_error(encoding, object, start, end, reason),
+    ))
+}
+
 /// `RecursionError` — raised when the per-thread Python call depth /
 /// native-recursion guard (RFC 0037 WS1) is exceeded. CPython raises
 /// this from `Py_EnterRecursiveCall`, including on the C-level recursion

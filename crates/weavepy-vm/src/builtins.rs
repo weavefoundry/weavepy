@@ -4623,7 +4623,7 @@ fn b_typevar(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `memoryview(obj)` — returns a `MemoryView` over a bytes-like
 /// object. We accept `bytes`, `bytearray`, and existing
 /// `MemoryView` (which we shallow-copy, matching CPython).
-fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
+pub fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
     let arg = one(args, "memoryview")?;
     let mv = match arg {
         Object::Bytes(b) => crate::object::PyMemoryView::from_bytes(b.clone()),

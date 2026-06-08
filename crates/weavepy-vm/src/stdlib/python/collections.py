@@ -552,6 +552,14 @@ def namedtuple(typename, field_names, *, rename=False, defaults=None, module=Non
     class _NT:
         _fields = tuple(field_names)
         _field_defaults = field_defaults
+        __match_args__ = tuple(field_names)
+
+        @classmethod
+        def _make(cls, iterable):
+            return cls(*iterable)
+
+        def __getnewargs__(self):
+            return tuple(self._values)
 
         def __init__(self, *args, **kwargs):
             values = list(args)

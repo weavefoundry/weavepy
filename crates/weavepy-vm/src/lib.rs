@@ -8358,6 +8358,28 @@ impl Interpreter {
                 if b.name == "float" && args.len() <= 1 {
                     return self.do_float_call(args, outer_globals);
                 }
+                if b.name == "memoryview" && args.len() == 1 {
+                    // Native bytes-like inputs use the plain builtin; any
+                    // other object is taken through the PEP 688 buffer
+                    // protocol (`__buffer__`), so `memoryview(array('b', …))`
+                    // yields a real view over the array's exported buffer
+                    // (test_struct.test_pack_into / test_unpack_with_buffer).
+                    match &args[0] {
+                        Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {}
+                        other => {
+                            if let Some(method) = instance_method(other, "__buffer__") {
+                                let view =
+                                    self.call(&method, &[Object::Int(0)], &[], outer_globals)?;
+                                // `__buffer__` returns a memoryview; adopt it
+                                // directly so writes land in its buffer.
+                                if matches!(view, Object::MemoryView(_)) {
+                                    return Ok(view);
+                                }
+                                return builtins::b_memoryview(std::slice::from_ref(&view));
+                            }
+                        }
+                    }
+                }
                 if b.name == "next" && (args.len() == 1 || args.len() == 2) {
                     return self.do_next_call(args, outer_globals);
                 }
@@ -8426,6 +8448,25 @@ impl Interpreter {
                         }
                     };
                     return self.object_default_getattribute(&recv, &name);
+                }
+                // Unbound `object.__reduce_ex__(self, protocol)` /
+                // `object.__reduce__(self)` — the default copy/pickle
+                // reduction. These need VM access (to import `copyreg` and
+                // run the receiver's `__getstate__`/`__getnewargs__` hooks),
+                // so the plain `BuiltinFn` is a sentinel; intercept the
+                // unbound form here exactly like the bound form is handled
+                // for `BoundMethod` targets below. Reached when code calls
+                // `object.__reduce_ex__(obj, proto)` directly (the canonical
+                // idiom inside `copyreg`/`copy`/`pickle` and in subclasses
+                // that delegate up to `object`).
+                if b.name == ".object_reduce_ex" && !args.is_empty() {
+                    let recv = args[0].clone();
+                    let proto = args.get(1).and_then(|o| o.as_i64()).unwrap_or(0);
+                    return self.object_reduce_ex(&recv, proto, outer_globals);
+                }
+                if b.name == ".object_reduce" && !args.is_empty() {
+                    let recv = args[0].clone();
+                    return self.object_default_reduce(&recv, 2, outer_globals);
                 }
                 if b.name == "globals" && args.is_empty() && kwargs.is_empty() {
                     // CPython returns the calling function's module
@@ -8802,6 +8843,32 @@ impl Interpreter {
                     }
                     if ty.name == "repr" {
                         return self.do_repr_call(&args[0], outer_globals);
+                    }
+                    if ty.name == "memoryview" {
+                        // `memoryview(x)` reaches here (the type is the
+                        // callable). Native bytes-like inputs fall through to
+                        // the normal constructor; anything else is taken
+                        // through the PEP 688 buffer protocol (`__buffer__`)
+                        // so `memoryview(array('b', …))` yields a real view
+                        // over the array's exported buffer
+                        // (test_struct.test_pack_into / test_unpack_with_buffer).
+                        match &args[0] {
+                            Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {}
+                            other => {
+                                if let Some(method) = instance_method(other, "__buffer__") {
+                                    let view = self.call(
+                                        &method,
+                                        &[Object::Int(0)],
+                                        &[],
+                                        outer_globals,
+                                    )?;
+                                    if matches!(view, Object::MemoryView(_)) {
+                                        return Ok(view);
+                                    }
+                                    return builtins::b_memoryview(std::slice::from_ref(&view));
+                                }
+                            }
+                        }
                     }
                 }
                 // `type(name, bases, ns)` builds a new class dynamically.
@@ -10908,6 +10975,43 @@ impl Interpreter {
         }
         if let Some((path, is_package)) = self.cache.find_source(full) {
             return self.load_from_file(full, &path, is_package);
+        }
+        // Submodule search along the parent package's `__path__`
+        // (CPython semantics: `pkg.sub` is resolved against
+        // `pkg.__path__`, not just `sys.path`). This is what lets a
+        // frozen/namespace package whose backing directory isn't on
+        // `sys.path` still load on-disk submodules — e.g. a vendored
+        // CPython `test` package importing a sibling `test.test_xxx`
+        // module that lives next to the running script.
+        if let Some((parent, leaf)) = full.rsplit_once('.') {
+            if let Some(Object::Module(parent_mod)) = self.cache.get(parent) {
+                let path_dirs: Vec<PathBuf> = parent_mod
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("__path__")))
+                    .map(|p| match p {
+                        Object::List(l) => l
+                            .borrow()
+                            .iter()
+                            .filter_map(|o| match o {
+                                Object::Str(s) => Some(PathBuf::from(s.as_ref())),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                    .unwrap_or_default();
+                for dir in path_dirs {
+                    let module_file = dir.join(leaf).with_extension("py");
+                    if module_file.is_file() {
+                        return self.load_from_file(full, &module_file, false);
+                    }
+                    let pkg_init = dir.join(leaf).join("__init__.py");
+                    if pkg_init.is_file() {
+                        return self.load_from_file(full, &pkg_init, true);
+                    }
+                }
+            }
         }
         // PEP 420 — namespace packages. If we found one or more
         // directories named `full` on `sys.path` without an
