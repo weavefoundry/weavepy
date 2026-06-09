@@ -5379,6 +5379,39 @@ impl Interpreter {
         }
     }
 
+    /// `anext(aiter, default)` — wrap the `__anext__` awaitable in a frozen
+    /// coroutine that returns `default` on `StopAsyncIteration`. Returns
+    /// `None` if the helper module is unavailable so the caller can fall
+    /// back to the bare (no-default) awaitable.
+    fn make_anext_with_default(
+        &mut self,
+        awaitable: &Object,
+        default: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let module = match self.do_import("_seqtools", &Object::None, 0, globals) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let func = match &module {
+            Object::Module(m) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("_anext_with_default")))
+                .cloned(),
+            _ => None,
+        };
+        match func {
+            Some(func) => Ok(Some(self.call(
+                &func,
+                &[awaitable.clone(), default.clone()],
+                &[],
+                globals,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
     fn do_list_or_tuple_call(
         &mut self,
         name: &str,
@@ -9051,6 +9084,26 @@ impl Interpreter {
                     // for-loop machinery just works.
                     return self.do_iter_callable_sentinel(args, outer_globals);
                 }
+                // ``aiter(async_iterable)`` / ``anext(async_iterator[, default])``
+                // — the PEP 525 async builtins (3.10+). Routed through the
+                // VM so `__aiter__` / `__anext__` dispatch runs (including
+                // for native async generators that don't carry the dunders
+                // as ordinary methods).
+                if b.name == "aiter" && args.len() == 1 {
+                    return self.get_aiter(args[0].clone(), outer_globals);
+                }
+                if b.name == "anext" && args.len() == 1 {
+                    return self.get_anext(&args[0], outer_globals);
+                }
+                if b.name == "anext" && args.len() == 2 {
+                    let awaitable = self.get_anext(&args[0], outer_globals)?;
+                    if let Some(coro) =
+                        self.make_anext_with_default(&awaitable, &args[1], outer_globals)?
+                    {
+                        return Ok(coro);
+                    }
+                    return Ok(awaitable);
+                }
                 if (b.name == "list" || b.name == "tuple") && args.len() == 1 {
                     return self.do_list_or_tuple_call(b.name, &args[0], outer_globals);
                 }
@@ -11488,6 +11541,17 @@ impl Interpreter {
             Some(Object::None) | None => outer_globals.clone(),
             _ => return Err(type_error("exec() globals must be a dict")),
         };
+        // The optional third argument is the *locals* namespace. When a
+        // distinct mapping is supplied, top-level `STORE_NAME`/`def`/`class`
+        // must land there (not in globals) and bare-name lookups resolve
+        // it first — exactly the class-body scoping the VM already models
+        // via `class_namespace`. CPython drives `exec(src, g, l)` codegen
+        // (e.g. `dataclasses` building `__init__`) this way.
+        let exec_locals: Option<Rc<RefCell<DictData>>> = match args.get(2) {
+            Some(Object::Dict(d)) if !Rc::ptr_eq(d, &globals_dict) => Some(d.clone()),
+            Some(Object::Dict(_)) | Some(Object::None) | None => None,
+            _ => return Err(type_error("exec() locals must be a mapping")),
+        };
         let code_rc = match source {
             Object::Code(c) => c,
             Object::Str(src) => {
@@ -11521,6 +11585,10 @@ impl Interpreter {
             }
         }
         let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals_dict, true);
+        // Run top-level names into the distinct locals mapping when present.
+        if let Some(locals) = exec_locals {
+            frame.class_namespace = Some(locals);
+        }
         self.run_frame(&mut frame)?;
         Ok(Object::None)
     }
@@ -11990,6 +12058,24 @@ impl Interpreter {
                         .borrow_mut()
                         .insert(DictKey(Object::from_str(name)), sub.clone());
                     return Ok(sub);
+                }
+                // PEP 562: `from module import name` consults a module-level
+                // `__getattr__(name)` before failing, mirroring CPython's
+                // `import_from`, which falls back to `getattr(module, name)`.
+                let getattr = m
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_str("__getattr__")))
+                    .cloned();
+                if let Some(getattr) = getattr {
+                    let globals = m.dict.clone();
+                    match self.call(&getattr, &[Object::from_str(name)], &[], &globals) {
+                        Ok(v) => return Ok(v),
+                        // An `AttributeError` from `__getattr__` becomes the
+                        // canonical `ImportError`; anything else propagates.
+                        Err(e) if self.is_attribute_error(&e) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(import_error(format!(
                     "cannot import name '{name}' from '{}'",

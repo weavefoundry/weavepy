@@ -184,6 +184,8 @@ pub fn default_builtins() -> DictData {
     reg!("input", b_input_unsupported);
     reg!("next", b_next);
     reg!("iter", b_iter);
+    reg!("aiter", b_aiter);
+    reg!("anext", b_anext);
     reg!("divmod", b_divmod);
     reg!("round", b_round);
     reg!("format", b_format);
@@ -518,6 +520,11 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                 "symmetric_difference_update",
                 set_symmetric_difference_update,
             )),
+            // Membership dunder exposed as a bound method: CPython's
+            // `keyword.iskeyword = frozenset(kwlist).__contains__` grabs it
+            // directly, and `hasattr(s, '__contains__')` must hold.
+            "__contains__" => Some(method("__contains__", obj_contains)),
+            "__len__" => Some(method("__len__", obj_len)),
             _ => None,
         },
         Object::Bytes(_) | Object::ByteArray(_) => match name {
@@ -559,6 +566,10 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "reverse" if matches!(obj, Object::ByteArray(_)) => {
                 Some(method("reverse", bytearray_reverse))
             }
+            // Sequence dunders so direct calls / `hasattr` parity hold.
+            "__contains__" => Some(method("__contains__", obj_contains)),
+            "__len__" => Some(method("__len__", obj_len)),
+            "__getitem__" => Some(method("__getitem__", seq_getitem)),
             _ => None,
         },
         Object::File(_) => match name {
@@ -4801,6 +4812,19 @@ fn b_iter(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let it = one(args, "iter")?.make_iter()?;
     Ok(Object::Iter(Rc::new(RefCell::new(it))))
+}
+
+/// `aiter(async_iterable)` — return its async iterator (PEP 525 builtin,
+/// 3.10+). VM-routed through [`crate::Vm::get_aiter`] so `__aiter__`
+/// dispatch runs; this fallback only fires if invoked outside the VM.
+fn b_aiter(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(type_error("aiter() must be called through the VM"))
+}
+
+/// `anext(async_iterator[, default])` — return the awaitable from
+/// `__anext__` (3.10+). VM-routed through [`crate::Vm::get_anext`].
+fn b_anext(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(type_error("anext() must be called through the VM"))
 }
 
 pub(crate) fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {

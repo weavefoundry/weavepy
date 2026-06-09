@@ -171,6 +171,14 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/builtins.py"),
             is_package: false,
         },
+        // `keyword` — verbatim CPython keyword/soft-keyword lists +
+        // membership predicates. Imported by `dataclasses` (field-name
+        // validation) and `pydoc`/`inspect`-adjacent code.
+        FrozenSource {
+            name: "keyword",
+            source: include_str!("python/keyword.py"),
+            is_package: false,
+        },
         // Internal: `_SeqIter`, the lazy legacy-`__getitem__` iterator
         // `iter(obj)` returns when *obj* has no `__iter__` (CPython's
         // built-in `iterator`/seqiterobject). Kept out of `builtins` to

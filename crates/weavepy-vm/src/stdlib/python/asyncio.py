@@ -598,6 +598,57 @@ def get_running_loop():
     return _current_loop
 
 
+# ---- event loop policy --------------------------------------------
+#
+# The policy layer is deprecated in 3.12+ but the stdlib and its test
+# suite (e.g. ``IsolatedAsyncioTestCase`` helpers in test_contextlib_async)
+# still reach for ``get_event_loop_policy().get_event_loop()``. We ship a
+# faithful default policy that simply delegates to the module-level loop
+# accessors above.
+
+
+class AbstractEventLoopPolicy:
+    def get_event_loop(self):
+        raise NotImplementedError
+
+    def set_event_loop(self, loop):
+        raise NotImplementedError
+
+    def new_event_loop(self):
+        raise NotImplementedError
+
+
+class DefaultEventLoopPolicy(AbstractEventLoopPolicy):
+    def get_event_loop(self):
+        return get_event_loop()
+
+    def set_event_loop(self, loop):
+        set_event_loop(loop)
+
+    def new_event_loop(self):
+        return new_event_loop()
+
+
+_event_loop_policy = None
+
+
+def get_event_loop_policy():
+    global _event_loop_policy
+    if _event_loop_policy is None:
+        _event_loop_policy = DefaultEventLoopPolicy()
+    return _event_loop_policy
+
+
+def set_event_loop_policy(policy):
+    global _event_loop_policy
+    if policy is not None and not isinstance(policy, AbstractEventLoopPolicy):
+        raise TypeError(
+            f"policy must be an instance of AbstractEventLoopPolicy or None, "
+            f"not '{type(policy).__name__}'"
+        )
+    _event_loop_policy = policy
+
+
 # ---- run / ensure_future ------------------------------------------
 
 
@@ -1786,6 +1837,10 @@ __all__ = [
     "new_event_loop",
     "set_event_loop",
     "get_running_loop",
+    "get_event_loop_policy",
+    "set_event_loop_policy",
+    "AbstractEventLoopPolicy",
+    "DefaultEventLoopPolicy",
     "Lock",
     "Event",
     "Semaphore",

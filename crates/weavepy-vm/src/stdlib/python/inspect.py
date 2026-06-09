@@ -10,6 +10,8 @@ introspection (`getmro`, `getmembers`).
 
 import sys
 import linecache
+import types
+import functools
 
 
 __all__ = [
@@ -62,6 +64,7 @@ __all__ = [
     "CO_COROUTINE",
     "CO_ITERABLE_COROUTINE",
     "CO_ASYNC_GENERATOR",
+    "get_annotations",
 ]
 
 
@@ -80,6 +83,99 @@ CO_ASYNC_GENERATOR = 0x0400
 
 def _safe_type_name(t):
     return getattr(t, "__name__", repr(t))
+
+
+def get_annotations(obj, *, globals=None, locals=None, eval_str=False):
+    """Compute the annotations dict for an object.
+
+    Verbatim port of CPython 3.13's ``inspect.get_annotations``: ``obj``
+    may be a callable, class, or module, and the result is always a
+    freshly-created dict. ``dataclasses`` relies on this to read a
+    class's own ``__annotations__`` while ignoring inherited ones.
+    """
+    if isinstance(obj, type):
+        # class
+        obj_dict = getattr(obj, '__dict__', None)
+        if obj_dict and hasattr(obj_dict, 'get'):
+            ann = obj_dict.get('__annotations__', None)
+            if isinstance(ann, types.GetSetDescriptorType):
+                ann = None
+        else:
+            ann = None
+
+        obj_globals = None
+        module_name = getattr(obj, '__module__', None)
+        if module_name:
+            module = sys.modules.get(module_name, None)
+            if module:
+                obj_globals = getattr(module, '__dict__', None)
+        obj_locals = dict(vars(obj))
+        unwrap = obj
+    elif isinstance(obj, types.ModuleType):
+        # module
+        ann = getattr(obj, '__annotations__', None)
+        obj_globals = getattr(obj, '__dict__')
+        obj_locals = None
+        unwrap = None
+    elif callable(obj):
+        # this includes types.Function, types.BuiltinFunctionType,
+        # types.BuiltinMethodType, functools.partial, functools.singledispatch,
+        # "class funclike" from Lib/test/test_inspect... on and on it goes.
+        ann = getattr(obj, '__annotations__', None)
+        obj_globals = getattr(obj, '__globals__', None)
+        obj_locals = None
+        unwrap = obj
+    else:
+        raise TypeError(f"{obj!r} is not a module, class, or callable.")
+
+    if ann is None:
+        return {}
+
+    if not isinstance(ann, dict):
+        raise ValueError(f"{obj!r}.__annotations__ is neither a dict nor None")
+
+    if not ann:
+        return {}
+
+    if not eval_str:
+        return dict(ann)
+
+    if unwrap is not None:
+        while True:
+            if hasattr(unwrap, '__wrapped__'):
+                unwrap = unwrap.__wrapped__
+                continue
+            if isinstance(unwrap, functools.partial):
+                unwrap = unwrap.func
+                continue
+            break
+        if hasattr(unwrap, "__globals__"):
+            obj_globals = unwrap.__globals__
+
+    if globals is None:
+        globals = obj_globals
+    if locals is None:
+        locals = obj_locals or {}
+
+    # "Inject" type parameters into the local namespace
+    # (unless they are shadowed by assignments *in* the local namespace),
+    # as a way of emulating annotation scopes when calling `eval()`
+    if type_params := getattr(obj, "__type_params__", ()):
+        locals = {param.__name__: param for param in type_params} | locals
+
+    # PEP 646 star-unpack rewriting lives in `typing` on CPython 3.13; fall
+    # back to a no-op when that internal helper isn't available.
+    try:
+        from typing import _rewrite_star_unpack as _rewrite
+    except ImportError:
+        def _rewrite(value):
+            return value
+
+    return_value = {
+        key: value if not isinstance(value, str)
+        else eval(_rewrite(value), globals, locals)
+        for key, value in ann.items() }
+    return return_value
 
 
 # ---------------- predicates ---------------- #

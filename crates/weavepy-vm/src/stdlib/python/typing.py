@@ -752,4 +752,33 @@ __all__ = [
     "get_args",
     "NewType",
     "TYPE_CHECKING",
+    "Deque",
+    "DefaultDict",
+    "OrderedDict",
+    "Counter",
+    "ChainMap",
 ]
+
+
+# Container aliases backed by the ``collections`` module (the legacy
+# ``typing.Deque`` / ``typing.DefaultDict`` spellings). Resolved lazily via
+# PEP 562 so importing ``typing`` never forces ``collections`` during
+# interpreter bootstrap (avoids an import cycle).
+_LAZY_COLLECTION_ALIASES = {
+    "Deque": "deque",
+    "DefaultDict": "defaultdict",
+    "OrderedDict": "OrderedDict",
+    "Counter": "Counter",
+    "ChainMap": "ChainMap",
+}
+
+
+def __getattr__(name):
+    target = _LAZY_COLLECTION_ALIASES.get(name)
+    if target is not None:
+        import collections
+
+        alias = _OriginAlias(name, getattr(collections, target))
+        globals()[name] = alias
+        return alias
+    raise AttributeError(f"module 'typing' has no attribute {name!r}")

@@ -14,6 +14,19 @@ It also implements the pickling protocol (``__reduce__`` /
 """
 
 
+async def _anext_with_default(awaitable, default):
+    """Back the two-argument ``anext(aiter, default)`` builtin.
+
+    The VM hands us the already-resolved ``__anext__`` awaitable; we
+    return ``default`` when the async iterator is exhausted, matching
+    CPython's ``anext`` C wrapper.
+    """
+    try:
+        return await awaitable
+    except StopAsyncIteration:
+        return default
+
+
 def _builtin_iter():
     """Fetch ``iter`` from the live ``builtins`` *module* namespace.
 
