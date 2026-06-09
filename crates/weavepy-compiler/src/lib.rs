@@ -70,6 +70,12 @@ pub enum CompileError {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CodeObject {
     pub name: String,
+    /// Dotted qualified name (PEP 3155), computed at compile time from the
+    /// lexical scope nesting: `outer.<locals>.inner` for a function nested
+    /// in `outer`, `C.method` for a method of class `C`. Equals `name` for
+    /// module-level definitions. Drives `function.__qualname__` /
+    /// `type.__qualname__` (and thus reprs, error messages, and pickling).
+    pub qualname: String,
     /// Source filename or `<string>`. Used for diagnostics only.
     pub filename: String,
     pub instructions: Vec<Instruction>,
@@ -631,6 +637,9 @@ impl Compiler {
         future_annotations: bool,
     ) -> Self {
         let mut co = CodeObject::default();
+        // Default qualname == name; nested scopes overwrite this via
+        // `compute_child_qualname` once the parent context is known.
+        co.qualname = name.clone();
         co.name = name;
         co.filename = filename;
         co.is_class_body = matches!(kind, CodeKind::Class);
@@ -655,6 +664,29 @@ impl Compiler {
             source,
             future_annotations,
         }
+    }
+
+    /// Compute the PEP 3155 `__qualname__` for a function/class named
+    /// `name` defined directly inside *this* (the parent) scope. Mirrors
+    /// CPython's `compiler_set_qualname` (`Python/compile.c`):
+    ///
+    /// - A definition whose parent is the module gets the bare `name`.
+    /// - Otherwise the parent's qualname is the base, with `.<locals>`
+    ///   appended when the parent is a function/lambda scope (so a nested
+    ///   `def`/`class` reads `outer.<locals>.inner`), and just the parent
+    ///   qualname when the parent is a class body (so a method reads
+    ///   `C.method`). The child name is then dotted onto that base.
+    fn compute_child_qualname(&self, name: &str) -> String {
+        if matches!(self.kind, CodeKind::Module) {
+            return name.to_owned();
+        }
+        let mut base = self.co.qualname.clone();
+        if matches!(self.kind, CodeKind::Function) {
+            base.push_str(".<locals>");
+        }
+        base.push('.');
+        base.push_str(name);
+        base
     }
 
     fn finish(mut self) -> CodeObject {
@@ -1720,6 +1752,7 @@ impl Compiler {
             self.source.clone(),
             self.future_annotations,
         );
+        inner.co.qualname = self.compute_child_qualname(name);
         inner.co.arg_count = arg_count;
         inner.co.posonly_count = posonly_count;
         inner.co.kwonly_count = kwonly_count;
@@ -1933,6 +1966,7 @@ impl Compiler {
             self.source.clone(),
             self.future_annotations,
         );
+        inner.co.qualname = self.compute_child_qualname(name);
         inner.current_line = self.current_line;
         // Every class body carries a `__class__` cell so methods can
         // close over it. `__build_class__` patches the cell with the
@@ -1981,10 +2015,14 @@ impl Compiler {
         }
 
         inner.emit(OpCode::Resume, 0);
-        // `__module__ = __name__` and `__qualname__ = name` boilerplate.
-        let name_const = inner.co.intern_constant(Constant::Str(name.to_owned()));
+        // `__module__ = __name__` and `__qualname__ = <computed>`
+        // boilerplate. The class body stores its full PEP 3155 qualname
+        // (e.g. `Outer.method.<locals>.C`), not the bare name, so
+        // `C.__qualname__` and `repr`s built from it match CPython.
+        let qualname_str = inner.co.qualname.clone();
+        let qualname_const = inner.co.intern_constant(Constant::Str(qualname_str));
         let qualname_idx = inner.co.intern_name("__qualname__");
-        inner.emit(OpCode::LoadConst, name_const);
+        inner.emit(OpCode::LoadConst, qualname_const);
         inner.emit(OpCode::StoreName, qualname_idx);
 
         // CPython stores a class body's leading string literal as

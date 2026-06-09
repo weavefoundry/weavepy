@@ -1677,8 +1677,8 @@ impl Object {
             }
             _ => Err(type_error(format!(
                 "'<' not supported between instances of '{}' and '{}'",
-                self.type_name(),
-                other.type_name()
+                self.type_name_owned(),
+                other.type_name_owned()
             ))),
         }
     }

@@ -61,6 +61,44 @@ mod tests {
     }
 
     #[test]
+    fn eof_without_trailing_newline_terminates_indented_block() {
+        // CPython injects an implicit NEWLINE before the closing DEDENTs
+        // when the final logical line lacks a trailing newline. This is the
+        // exact shape `dataclasses`/`namedtuple` codegen feeds to `exec`.
+        let k = kinds("def f():\n return (x,)");
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Keyword(Keyword::Def),
+                TokenKind::Name,
+                TokenKind::LPar,
+                TokenKind::RPar,
+                TokenKind::Colon,
+                TokenKind::Newline,
+                TokenKind::Indent,
+                TokenKind::Keyword(Keyword::Return),
+                TokenKind::LPar,
+                TokenKind::Name,
+                TokenKind::Comma,
+                TokenKind::RPar,
+                TokenKind::Newline,
+                TokenKind::Dedent,
+                TokenKind::Endmarker,
+            ]
+        );
+    }
+
+    #[test]
+    fn eof_bare_identifier_no_newline_gets_newline() {
+        // `foo` with no trailing newline still terminates with NEWLINE.
+        let k = kinds("foo");
+        assert_eq!(
+            k,
+            vec![TokenKind::Name, TokenKind::Newline, TokenKind::Endmarker]
+        );
+    }
+
+    #[test]
     fn integer_kinds() {
         assert_eq!(kinds("42")[0], TokenKind::Number);
         assert_eq!(kinds("0x1f")[0], TokenKind::Number);

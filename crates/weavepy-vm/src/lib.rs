@@ -2577,9 +2577,12 @@ impl Interpreter {
                     DictKey(Object::from_static("__name__")),
                     name_obj.clone(),
                 );
+                // `__qualname__` is the code object's PEP 3155 dotted name
+                // (computed at compile time from lexical nesting), not the
+                // bare `__name__`. Pinned as a stable object like `__name__`.
                 attrs.borrow_mut().insert(
                     DictKey(Object::from_static("__qualname__")),
-                    name_obj,
+                    Object::from_str(code.qualname.clone()),
                 );
                 if let Some(ann) = annotations_obj {
                     attrs
@@ -3524,7 +3527,11 @@ impl Interpreter {
                 }
                 match name {
                     "__name__" => return Ok(Object::from_str(&f.name)),
-                    "__qualname__" => return Ok(Object::from_str(&f.name)),
+                    // PEP 3155 qualname comes from the code object (computed
+                    // at compile time from lexical nesting), unless user code
+                    // has overridden it via `f.__qualname__ = …` (handled by
+                    // the `f.attrs` lookup above).
+                    "__qualname__" => return Ok(Object::from_str(&f.code.qualname)),
                     "__doc__" => {
                         // CPython convention: the first statement of
                         // the function body, if it is a string
@@ -9963,10 +9970,21 @@ impl Interpreter {
             _ => return Err(type_error("type() arg 2 must be tuple of bases")),
         };
         let ns_dict_obj = args[2].clone();
-        let ns = match &args[2] {
+        let mut ns = match &args[2] {
             Object::Dict(d) => d.borrow().clone(),
             _ => return Err(type_error("type() arg 3 must be a dict")),
         };
+        // CPython's `type.__new__` defaults `__doc__` to `None` when the
+        // namespace doesn't define one, so `Cls.__doc__` reads `None`
+        // rather than raising `AttributeError`. The `class` statement path
+        // does this in `build_class`; the dynamic `type(name, bases, ns)` /
+        // `types.new_class` / `dataclasses.make_dataclass` path must match.
+        {
+            let key = DictKey(Object::from_static("__doc__"));
+            if ns.get(&key).is_none() {
+                ns.insert(key, Object::None);
+            }
+        }
         let mut effective_bases = bases.clone();
         if effective_bases.is_empty() {
             effective_bases.push(builtin_types().object_.clone());
@@ -10908,26 +10926,39 @@ impl Interpreter {
                 }
             }
         }
-        for (i, was_filled) in filled.iter().take(total_args).enumerate() {
-            if !was_filled {
-                return Err(type_error(format!(
-                    "{}() missing required argument: '{}'",
-                    f.name, code.varnames[i]
-                )));
-            }
+        // CPython renders missing arguments as e.g.
+        // `f() missing 1 required positional argument: 'x'` or
+        // `f() missing 2 required positional arguments: 'x' and 'y'`,
+        // listing *all* of them (Oxford-comma joined for 3+). Many stdlib
+        // tests assertRaisesRegex against this exact wording.
+        let missing_positional: Vec<&str> = filled
+            .iter()
+            .take(total_args)
+            .enumerate()
+            .filter(|(_, was_filled)| !**was_filled)
+            .map(|(i, _)| code.varnames[i].as_str())
+            .collect();
+        if !missing_positional.is_empty() {
+            return Err(type_error(format_missing_arguments(
+                &f.name,
+                "positional",
+                &missing_positional,
+            )));
         }
-        for (i, was_filled) in filled
+        let missing_kwonly: Vec<&str> = filled
             .iter()
             .enumerate()
             .skip(kwonly_start)
             .take(kwonly_end - kwonly_start)
-        {
-            if !was_filled {
-                return Err(type_error(format!(
-                    "{}() missing required keyword-only argument: '{}'",
-                    f.name, code.varnames[i]
-                )));
-            }
+            .filter(|(_, was_filled)| !**was_filled)
+            .map(|(i, _)| code.varnames[i].as_str())
+            .collect();
+        if !missing_kwonly.is_empty() {
+            return Err(type_error(format_missing_arguments(
+                &f.name,
+                "keyword-only",
+                &missing_kwonly,
+            )));
         }
         let mut frame = self.make_frame(
             code.clone(),
@@ -13676,6 +13707,32 @@ fn ascii_escape(r: &str) -> String {
         }
     }
     out
+}
+
+/// Render a "missing required argument(s)" `TypeError` message in
+/// CPython's exact phrasing (`Python/ceval.c` `format_missing`):
+///
+/// - `f() missing 1 required positional argument: 'x'`
+/// - `f() missing 2 required positional arguments: 'x' and 'y'`
+/// - `f() missing 3 required positional arguments: 'x', 'y', and 'z'`
+///
+/// `kind` is `"positional"` or `"keyword-only"`. `names` must be non-empty.
+fn format_missing_arguments(func_name: &str, kind: &str, names: &[&str]) -> String {
+    let count = names.len();
+    let joined = match names {
+        [one] => format!("'{one}'"),
+        [a, b] => format!("'{a}' and '{b}'"),
+        _ => {
+            let head = names[..count - 1]
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{head}, and '{}'", names[count - 1])
+        }
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{func_name}() missing {count} required {kind} argument{plural}: {joined}")
 }
 
 /// The user-visible `__name__`/`__qualname__` for a builtin. Internal

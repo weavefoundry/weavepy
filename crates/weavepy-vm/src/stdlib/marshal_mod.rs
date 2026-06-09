@@ -337,9 +337,10 @@ impl MarshalWriter {
         self.write_value(&Object::new_bytes(cp.localspluskinds))?;
         self.write_value(&Object::from_str(co.filename.clone()))?;
         self.write_value(&Object::from_str(co.name.clone()))?;
-        // We don't track a separate qualified name; the plain name is a
-        // faithful stand-in for top-level defs and is what `dis` prints.
-        self.write_value(&Object::from_str(co.name.clone()))?;
+        // PEP 3155 qualified name, computed at compile time from lexical
+        // nesting (`outer.<locals>.inner`, `C.method`). Round-trips so an
+        // unmarshalled function/class keeps a faithful `__qualname__`.
+        self.write_value(&Object::from_str(co.qualname.clone()))?;
         self.write_int(cp.firstlineno as i32);
         self.write_value(&Object::new_bytes(cp.co_linetable))?;
         self.write_value(&Object::new_bytes(cp.co_exceptiontable))?;
@@ -624,7 +625,7 @@ impl<'a> MarshalReader<'a> {
         let localspluskinds = self.read_value()?;
         let filename = self.read_value()?;
         let name = self.read_value()?;
-        let _qualname = self.read_value()?;
+        let qualname = self.read_value()?;
         let firstlineno = self.read_int()? as u32;
         let linetable = self.read_value()?;
         let exceptiontable = self.read_value()?;
@@ -645,8 +646,13 @@ impl<'a> MarshalReader<'a> {
         )
         .ok_or_else(|| value_error("marshal: code object uses an unsupported opcode"))?;
 
+        let co_name = string_of(&name, "co_name")?;
+        // Fall back to the bare name when the producer didn't record a
+        // qualname (e.g. older marshal payloads); CPython always writes one.
+        let co_qualname = string_of(&qualname, "co_qualname").unwrap_or_else(|_| co_name.clone());
         let co = CodeObject {
-            name: string_of(&name, "co_name")?,
+            name: co_name,
+            qualname: co_qualname,
             filename: string_of(&filename, "co_filename")?,
             caches: CacheTable::with_len(decoded.instructions.len()),
             instructions: decoded.instructions,

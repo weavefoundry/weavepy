@@ -35,6 +35,20 @@ pub fn tokenize_with_escapes(source: &str) -> (Result<Vec<Token>, LexError>, Vec
         match scanner.next_token() {
             Ok(Some(tok)) => {
                 let is_endmarker = matches!(tok.kind, TokenKind::Endmarker);
+                // Track whether the most recent token leaves a logical line
+                // "open" (i.e. needs a NEWLINE to terminate it). The EOF
+                // branch of `next_token` consults this to synthesize the
+                // implicit final NEWLINE CPython emits for source lacking a
+                // trailing newline. Structural/trivia tokens don't open a
+                // logical line.
+                scanner.last_was_content = !matches!(
+                    tok.kind,
+                    TokenKind::Newline
+                        | TokenKind::Nl
+                        | TokenKind::Indent
+                        | TokenKind::Dedent
+                        | TokenKind::Endmarker
+                );
                 out.push(tok);
                 if is_endmarker {
                     break Ok(out);
@@ -66,6 +80,11 @@ struct Scanner<'src> {
     pending_indent: bool,
     /// True after we emitted ENDMARKER; further calls return None.
     finished: bool,
+    /// True when the most recently emitted token leaves a logical line
+    /// "open" — any token other than NEWLINE/NL/INDENT/DEDENT/ENDMARKER.
+    /// Drives the implicit final-NEWLINE synthesis in `next_token`'s EOF
+    /// branch (CPython terminates an unterminated last line this way).
+    last_was_content: bool,
     /// Invalid-escape `SyntaxWarning`s gathered while scanning string and
     /// bytes literals, in source order (the first invalid escape *per
     /// literal*, matching CPython's `first_invalid_escape` tracking).
@@ -83,6 +102,7 @@ impl<'src> Scanner<'src> {
             pending_dedents: 0,
             pending_indent: false,
             finished: false,
+            last_was_content: false,
             escape_warnings: Vec::new(),
         }
     }
@@ -201,6 +221,21 @@ impl<'src> Scanner<'src> {
         }
 
         let Some(b) = self.peek() else {
+            // CPython's tokenizer implicitly terminates a final logical line
+            // that lacks a trailing newline with a NEWLINE token *before*
+            // emitting the closing DEDENTs. Without it, source whose last
+            // line sits inside an indented block — e.g.
+            // `compile("def f():\n return (x,)", ...)`, exactly the shape
+            // `dataclasses`/`namedtuple`/`functools` codegen produces via
+            // `exec` — fails to parse, because the parser never sees the
+            // NEWLINE that closes the statement and the suite. We mirror
+            // CPython here. `last_was_content` is the reliable signal —
+            // `at_line_start` is cleared by `handle_line_start` at EOF even
+            // for newline-terminated input, which would double-emit.
+            if self.paren_depth == 0 && self.last_was_content {
+                self.last_was_content = false;
+                return Ok(Some(self.token(TokenKind::Newline, self.pos, self.pos)));
+            }
             return Ok(Some(self.emit_endmarker()));
         };
 
