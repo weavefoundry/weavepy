@@ -94,6 +94,7 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("time", time::build);
     cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
+    cache.register_builtin("_testinternalcapi", testinternalcapi_mod::build);
     cache.register_builtin("signal", signal_mod::build);
     cache.register_builtin("select", select_mod::build);
     cache.register_builtin("_socket", socket_mod::build);
@@ -878,9 +879,52 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/importlib_resources.py"),
             is_package: false,
         },
+        // CPython's frozen import-core modules; stdlib code (pydoc,
+        // pkgutil-adjacent paths) imports these by name.
+        FrozenSource {
+            name: "importlib._bootstrap",
+            source: include_str!("python/importlib_bootstrap.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib._bootstrap_external",
+            source: include_str!("python/importlib_bootstrap_external.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "pkgutil",
             source: include_str!("python/pkgutil.py"),
+            is_package: false,
+        },
+        // RFC 0037 WS8 — pydoc and its dependency closure.
+        FrozenSource {
+            name: "pydoc",
+            source: include_str!("python/pydoc.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "token",
+            source: include_str!("python/token.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "tokenize",
+            source: include_str!("python/tokenize.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "sysconfig",
+            source: include_str!("python/sysconfig.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl",
+            source: include_str!("python/_pyrepl_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "_pyrepl.pager",
+            source: include_str!("python/_pyrepl_pager.py"),
             is_package: false,
         },
         FrozenSource {
@@ -1230,6 +1274,16 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "sre_compile",
             source: include_str!("python/sre_compile.py"),
+            is_package: false,
+        },
+        // Pure-Python stand-in for CPython's `_testlimitedcapi` C test
+        // helper. The conformance suite (e.g. `test_bytes`) imports it at
+        // class-body scope; without it the whole module aborts. We supply
+        // faithful Python equivalents of the abstract `PySequence_*`
+        // wrappers it exercises.
+        FrozenSource {
+            name: "_testlimitedcapi",
+            source: include_str!("python/_testlimitedcapi.py"),
             is_package: false,
         },
     ]

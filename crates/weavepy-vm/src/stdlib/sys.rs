@@ -415,6 +415,13 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("platform")),
             Object::from_static(host_platform()),
         );
+        // CPython-on-macOS build detail: the framework name when built
+        // as a macOS framework, `""` otherwise (the common case, and
+        // ours). `pydoc`/`platform`/`site` read it unconditionally.
+        d.insert(
+            DictKey(Object::from_static("_framework")),
+            Object::from_static(""),
+        );
         d.insert(
             DictKey(Object::from_static("byteorder")),
             Object::from_static(if cfg!(target_endian = "little") {

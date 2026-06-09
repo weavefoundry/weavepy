@@ -82,6 +82,10 @@ pub enum Object {
     /// returned from calling an `async def` that contains `yield`.
     /// Consumable via `async for`.
     AsyncGenerator(Rc<PyGenerator>),
+    /// Deferred awaitable produced by `agen.asend()` / `.athrow()` /
+    /// `.aclose()` (PEP 525). Awaiting it applies the operation to the
+    /// underlying async generator. See [`AsyncGenAwait`].
+    AsyncGenAwait(Rc<AsyncGenAwait>),
     /// Immutable byte string `b"..."`.
     Bytes(Rc<[u8]>),
     /// Mutable byte string `bytearray(...)`.
@@ -170,9 +174,12 @@ impl fmt::Debug for Object {
             Object::Type(t) => write!(f, "<class '{}'>", t.name),
             Object::Instance(i) => write!(f, "<{} object>", i.class.name),
             Object::Module(m) => write!(f, "<module {:?}>", m.name),
-            Object::Generator(g) => write!(f, "<generator object {}>", g.name),
-            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name),
-            Object::AsyncGenerator(g) => write!(f, "<async_generator object {}>", g.name),
+            Object::Generator(g) => write!(f, "<generator object {}>", g.name.borrow()),
+            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name.borrow()),
+            Object::AsyncGenerator(g) => {
+                write!(f, "<async_generator object {}>", g.name.borrow())
+            }
+            Object::AsyncGenAwait(a) => write!(f, "<{} object>", a.kind.type_name()),
             Object::Bytes(b) => write!(f, "Bytes({})", b.len()),
             Object::ByteArray(b) => write!(f, "ByteArray({})", b.borrow().len()),
             Object::Set(s) => f.debug_set().entries(s.borrow().iter()).finish(),
@@ -719,14 +726,31 @@ pub struct PySlice {
 /// itself is opaque to outside code — it's owned by the VM module via
 /// `state` and only legal to inspect via interpreter methods.
 pub struct PyGenerator {
-    pub name: String,
+    /// `gi_name`. Seeded from the function's `__name__` at call time;
+    /// user code may reassign it (`gen.__name__ = ...`).
+    pub name: RefCell<String>,
+    /// `gi_qualname` (PEP 3155). Seeded from the function's
+    /// `__qualname__` at call time; reassignable like `name`.
+    pub qualname: RefCell<String>,
+    /// Whether this is a plain generator, a coroutine, or an async
+    /// generator. Needed so the shared send/throw machinery can apply
+    /// PEP 479 (a `StopIteration` escaping the *body* becomes a
+    /// `RuntimeError`) with the right wording per flavour.
+    pub kind: CoroutineKind,
     pub state: RefCell<GeneratorState>,
 }
 
 impl PyGenerator {
-    pub fn new(name: impl Into<String>, frame: Box<dyn std::any::Any + Send + Sync>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        qualname: impl Into<String>,
+        kind: CoroutineKind,
+        frame: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
         Self {
-            name: name.into(),
+            name: RefCell::new(name.into()),
+            qualname: RefCell::new(qualname.into()),
+            kind,
             state: RefCell::new(GeneratorState::Created(frame)),
         }
     }
@@ -738,7 +762,7 @@ impl PyGenerator {
 
 impl fmt::Debug for PyGenerator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<generator {}>", self.name)
+        write!(f, "<generator {}>", self.name.borrow())
     }
 }
 
@@ -776,6 +800,63 @@ impl fmt::Debug for GeneratorState {
             Self::Finished => write!(f, "Finished"),
             Self::Running => write!(f, "Running"),
         }
+    }
+}
+
+/// The deferred operation carried by an [`AsyncGenAwait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgenAwaitKind {
+    /// `agen.asend(value)` — resume the agen, sending `value` in.
+    Send,
+    /// `agen.athrow(exc[, val[, tb]])` — throw into the agen.
+    Throw,
+    /// `agen.aclose()` — throw `GeneratorExit` into the agen.
+    Close,
+}
+
+impl AgenAwaitKind {
+    /// CPython type name of the awaitable this op produces: `asend`
+    /// yields `async_generator_asend`; `athrow`/`aclose` both yield
+    /// `async_generator_athrow`.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            AgenAwaitKind::Send => "async_generator_asend",
+            AgenAwaitKind::Throw | AgenAwaitKind::Close => "async_generator_athrow",
+        }
+    }
+}
+
+/// Deferred awaitable returned by `agen.asend(v)` / `agen.athrow(e)` /
+/// `agen.aclose()` (PEP 525). Mirrors CPython's `async_generator_asend`
+/// and `async_generator_athrow`: the operation on the underlying async
+/// generator is *deferred* until the awaitable is driven (`await`ed),
+/// rather than running eagerly at call time. WeavePy's cooperative async
+/// model has no real suspension inside the agen body, so a single drive
+/// applies the op and completes the await — but routing through an
+/// awaitable (instead of executing inside `asend`/`athrow`/`aclose`) is
+/// exactly what makes `await agen.aclose()` legal rather than the bug it
+/// replaces (`await None`).
+pub struct AsyncGenAwait {
+    /// The `Object::AsyncGenerator` this operation targets.
+    pub agen: Object,
+    pub kind: AgenAwaitKind,
+    /// Operation payload: `asend` -> `[value]`, `athrow` -> the throw
+    /// args (`[exc, val?, tb?]`), `aclose` -> empty.
+    pub args: Vec<Object>,
+    /// Set once the awaitable has been driven, so a second pull behaves
+    /// like an exhausted iterator (`StopIteration`) instead of replaying
+    /// the operation.
+    pub consumed: Cell<bool>,
+    /// Set on the first drive. The first drive applies the operation payload
+    /// (`args`); later drives — reached only when the agen suspended on an
+    /// inner `await` and we passed its value through — forward the caller's
+    /// sent value to resume that inner await.
+    pub started: Cell<bool>,
+}
+
+impl fmt::Debug for AsyncGenAwait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} object>", self.kind.type_name())
     }
 }
 
@@ -1412,6 +1493,7 @@ impl Object {
             | Object::Generator(_)
             | Object::Coroutine(_)
             | Object::AsyncGenerator(_)
+            | Object::AsyncGenAwait(_)
             | Object::File(_)
             | Object::Property(_)
             | Object::StaticMethod(_)
@@ -1491,6 +1573,7 @@ impl Object {
             (Object::Generator(a), Object::Generator(b)) => Rc::ptr_eq(a, b),
             (Object::Coroutine(a), Object::Coroutine(b)) => Rc::ptr_eq(a, b),
             (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
+            (Object::AsyncGenAwait(a), Object::AsyncGenAwait(b)) => Rc::ptr_eq(a, b),
             (Object::Bytes(a), Object::Bytes(b)) => Rc::ptr_eq(a, b),
             (Object::ByteArray(a), Object::ByteArray(b)) => Rc::ptr_eq(a, b),
             (Object::Set(a), Object::Set(b)) => Rc::ptr_eq(a, b),
@@ -1918,6 +2001,7 @@ impl Object {
             Object::Generator(_) => "generator",
             Object::Coroutine(_) => "coroutine",
             Object::AsyncGenerator(_) => "async_generator",
+            Object::AsyncGenAwait(a) => a.kind.type_name(),
             Object::Bytes(_) => "bytes",
             Object::ByteArray(_) => "bytearray",
             Object::Set(_) => "set",
@@ -2061,20 +2145,26 @@ impl Object {
                 Some(path) => format!("<module '{}' from '{}'>", m.name, path),
                 None => format!("<module '{}' (built-in)>", m.name),
             },
+            // CPython's repr shows the qualified name (PEP 3155).
             Object::Generator(g) => format!(
                 "<generator object {} at 0x{:x}>",
-                g.name,
+                g.qualname.borrow(),
                 Rc::as_ptr(g) as usize
             ),
             Object::Coroutine(g) => format!(
                 "<coroutine object {} at 0x{:x}>",
-                g.name,
+                g.qualname.borrow(),
                 Rc::as_ptr(g) as usize
             ),
             Object::AsyncGenerator(g) => format!(
                 "<async_generator object {} at 0x{:x}>",
-                g.name,
+                g.qualname.borrow(),
                 Rc::as_ptr(g) as usize
+            ),
+            Object::AsyncGenAwait(a) => format!(
+                "<{} object at 0x{:x}>",
+                a.kind.type_name(),
+                Rc::as_ptr(a) as usize
             ),
             Object::Bytes(b) => bytes_repr(b),
             Object::ByteArray(b) => format!("bytearray({})", bytes_repr(&b.borrow())),
@@ -2091,10 +2181,13 @@ impl Object {
                 file.mode
             ),
             Object::Instance(inst) => {
-                // Defer to __repr__ on the class if present; otherwise
-                // synthesize a default. The caller is expected to run
-                // __repr__ through the interpreter for user methods —
-                // here we only handle the default case.
+                // Defer to __repr__ on the class when present. This path
+                // is reached from *native* rendering (container reprs,
+                // error messages, the Debug impl), so the user `__repr__`
+                // must be run by re-entering the live interpreter — the
+                // same reentry the dunder coercions use. Without it,
+                // `repr([Color.RED])` would render the elements as
+                // `<Color object>` instead of `<Color.RED: 1>`.
                 let key = DictKey(Object::from_static("__repr__"));
                 let has_user_repr = inst
                     .class
@@ -2103,6 +2196,19 @@ impl Object {
                     .iter()
                     .any(|t| t.dict.borrow().contains_key(&key));
                 if has_user_repr {
+                    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                        // SAFETY: published by an enclosing VM frame still
+                        // live on this thread; the GIL keeps it exclusive.
+                        let interp = unsafe { &mut *ptr };
+                        if let Some(method) = crate::instance_method(self, "__repr__") {
+                            let globals = interp.builtins_dict();
+                            if let Ok(r) =
+                                interp.call_object_with_globals(&method, &[], &[], &globals)
+                            {
+                                return r.to_str();
+                            }
+                        }
+                    }
                     format!("<{} object>", inst.class.name)
                 } else {
                     format!(
@@ -2512,6 +2618,7 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
         Object::Generator(r) | Object::Coroutine(r) | Object::AsyncGenerator(r) => {
             rot(Rc::as_ptr(r).cast())
         }
+        Object::AsyncGenAwait(r) => rot(Rc::as_ptr(r).cast()),
         Object::File(r) => rot(Rc::as_ptr(r).cast()),
         Object::Property(r) => rot(Rc::as_ptr(r).cast()),
         Object::StaticMethod(r) => rot(Rc::as_ptr(r).cast()),

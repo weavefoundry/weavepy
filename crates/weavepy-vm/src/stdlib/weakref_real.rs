@@ -338,6 +338,7 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
         class,
         dict,
         native: None,
+        inline_values: crate::sync::Cell::new(true),
     }))
 }
 

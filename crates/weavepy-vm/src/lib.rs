@@ -79,12 +79,40 @@ struct Frame {
     /// For class-body frames, names are stored here instead of globals.
     /// `None` for ordinary function and module frames.
     class_namespace: Option<Rc<RefCell<DictData>>>,
+    /// PEP 3115: when a metaclass `__prepare__` returns a *custom* mapping
+    /// (not a plain `dict`), class-body `STORE_NAME`/`LOAD_NAME`/`DELETE_NAME`
+    /// route through this object's `__setitem__`/`__getitem__`/`__delitem__`
+    /// so the mapping observes every binding (e.g. `enum._EnumDict` detecting
+    /// members). `None` for the common plain-dict path, which keeps using the
+    /// fast `class_namespace` `DictData`.
+    class_namespace_obj: Option<Object>,
     /// Stack of currently-handled exceptions. `PUSH_EXC_INFO` pushes
     /// onto this; `POP_EXCEPT` pops; `RERAISE 1` re-raises the top.
     /// Each entry is tagged with the pc just past its handler body
     /// (the `PUSH_EXC_INFO` arg) so the unwinder can discard handlers an
     /// exception propagates *out of* (see `handle_exception`).
     exc_handlers: Vec<(u32, PyException)>,
+    /// A *generator/coroutine* frame's own handled-exception entries,
+    /// detached from the interpreter-wide `exc_info_stack` while it is
+    /// suspended at a `yield`. CPython stores this as the generator's
+    /// `exc_state`: on resume the entries are pushed back so an
+    /// `except`/`with` block the generator suspended inside is active
+    /// again (and `gen.throw` chains its `__context__`); on suspend they
+    /// are peeled back off so they don't leak into the *resumer's*
+    /// `sys.exc_info()`. Always empty for ordinary frames (they never
+    /// suspend).
+    saved_exc_info: Vec<PyException>,
+    /// For an async-generator frame: was the most recent suspension caused
+    /// by the agen's *own* `yield` (a value for the consumer) rather than an
+    /// inner `await` passing a suspension's value through? Set by the
+    /// `YIELD_VALUE` handler from the opcode's arg (the compiler marks
+    /// async-gen yields with arg 1). Read after the frame re-suspends to
+    /// decide whether `__anext__`/`SEND` should report `StopIteration(value)`
+    /// (agen yielded) or yield the value onward (inner-await passthrough).
+    /// Mirrors CPython's `PyAsyncGenWrappedValue`. `true` by default so a
+    /// non-async-gen frame (or one that hasn't yielded) keeps the historical
+    /// "completes with value" behavior.
+    agen_yielded_value: bool,
     /// pc *before* the current instruction — used to look up the
     /// exception handler when an opcode raises.
     pc: u32,
@@ -940,7 +968,10 @@ impl Interpreter {
             stack: Vec::with_capacity(16),
             globals,
             class_namespace: None,
+            class_namespace_obj: None,
             exc_handlers: Vec::new(),
+            saved_exc_info: Vec::new(),
+            agen_yielded_value: true,
             pc: 0,
             py_frame: None,
         }
@@ -1006,6 +1037,15 @@ impl Interpreter {
         // activation leaves un-popped (see the reconciliation at the
         // function's exit).
         let exc_depth_on_entry = self.exc_info_stack.borrow().len();
+        // Restore a resumed generator/coroutine's own handled-exception
+        // entries (detached when it last suspended) so an `except` /
+        // `with` block it yielded inside is the active handled exception
+        // again. Empty for ordinary frames and a generator's first run,
+        // so this is a no-op there.
+        if !frame.saved_exc_info.is_empty() {
+            let restored = std::mem::take(&mut frame.saved_exc_info);
+            self.exc_info_stack.borrow_mut().extend(restored);
+        }
         // Distinguish the three ways control can enter a frame here:
         //
         //   * a fresh ordinary call          (pc == 0, not gen code)
@@ -1155,18 +1195,33 @@ impl Interpreter {
         // through a handler — the matching `POP_EXCEPT` may not run, so
         // `PUSH_EXC_INFO` entries this frame pushed can linger. Left in
         // place they leak into `sys.exc_info()` and wrongly become the
-        // implicit `__context__` of the next, unrelated `raise`. Drop
-        // anything this activation added once it truly completes
-        // (returned or raised). A *yield* keeps its entries: a generator
-        // suspended inside a handler must see the same exc state on
-        // resume.
-        if !matches!(
-            result,
-            Ok(FrameOutcome::Yielded(_)) | Ok(FrameOutcome::StartGenerator)
-        ) {
-            let mut stack = self.exc_info_stack.borrow_mut();
-            if stack.len() > exc_depth_on_entry {
-                stack.truncate(exc_depth_on_entry);
+        // implicit `__context__` of the next, unrelated `raise`.
+        match &result {
+            Ok(FrameOutcome::Yielded(_)) => {
+                // A generator/coroutine suspended. Peel its own
+                // handled-exception entries back off the interpreter-wide
+                // stack and stash them on the frame: they must NOT be
+                // visible to whoever resumes us (CPython swaps the
+                // generator's `exc_state` out on suspend), yet must be
+                // restored on the next resume. Without this the
+                // generator's `except` exception leaks into the resumer's
+                // `sys.exc_info()`.
+                let mut stack = self.exc_info_stack.borrow_mut();
+                if stack.len() > exc_depth_on_entry {
+                    frame.saved_exc_info = stack.split_off(exc_depth_on_entry);
+                }
+            }
+            Ok(FrameOutcome::StartGenerator) => {
+                // Bootstrap only creates the suspended object; no user
+                // code ran, so leave the stack untouched.
+            }
+            _ => {
+                // Returned or raised: this activation is done. Drop any
+                // entries it left un-popped.
+                let mut stack = self.exc_info_stack.borrow_mut();
+                if stack.len() > exc_depth_on_entry {
+                    stack.truncate(exc_depth_on_entry);
+                }
             }
         }
         result
@@ -1192,6 +1247,28 @@ impl Interpreter {
             self.frame_stack.borrow_mut().push(existing.clone());
             return existing;
         }
+        let back = self.frame_stack.borrow().last().cloned();
+        let py = self.build_py_frame(frame, back);
+        // Cache the snapshot on generator-family frames so the next
+        // resume re-pushes this very object (stable identity). Plain
+        // function frames run exactly once and are never re-entered,
+        // so caching them would only waste a clone.
+        if frame.code.is_generator || frame.code.is_coroutine || frame.code.is_async_generator {
+            frame.py_frame = Some(py.clone());
+        }
+        self.frame_stack.borrow_mut().push(py.clone());
+        py
+    }
+
+    /// Construct a [`PyFrame`] snapshot for `frame` with the given
+    /// `back` pointer, *without* touching the interpreter's call stack
+    /// or caching it on the frame. [`Self::push_py_frame`] uses this for
+    /// live frames (passing the current stack top as `back`); generator
+    /// introspection (`gi_frame`/`cr_frame`/`ag_frame`) uses it to
+    /// materialise the frame of a not-yet-started generator on demand,
+    /// where `back` is `None` (a suspended/created generator frame has
+    /// no live caller).
+    fn build_py_frame(&self, frame: &Frame, back: Option<Rc<PyFrame>>) -> Rc<PyFrame> {
         let varnames = frame.code.varnames.clone();
         let locals_snapshot = Rc::new(RefCell::new(frame.locals.clone()));
         let cell_names: Vec<String> = frame
@@ -1255,8 +1332,7 @@ impl Interpreter {
             }
             Object::Dict(Rc::new(RefCell::new(d)))
         });
-        let back = self.frame_stack.borrow().last().cloned();
-        let py = Rc::new(PyFrame {
+        Rc::new(PyFrame {
             code: frame.code.clone(),
             globals,
             builtins: self.builtins.clone(),
@@ -1270,16 +1346,7 @@ impl Interpreter {
             last_line: Cell::new(None),
             trace_lines: Cell::new(true),
             trace_opcodes: Cell::new(false),
-        });
-        // Cache the snapshot on generator-family frames so the next
-        // resume re-pushes this very object (stable identity). Plain
-        // function frames run exactly once and are never re-entered,
-        // so caching them would only waste a clone.
-        if frame.code.is_generator || frame.code.is_coroutine || frame.code.is_async_generator {
-            frame.py_frame = Some(py.clone());
-        }
-        self.frame_stack.borrow_mut().push(py.clone());
-        py
+        })
     }
 
     /// Refresh the live-locals mirror on the current Python frame.
@@ -1300,7 +1367,68 @@ impl Interpreter {
     }
 
     fn pop_py_frame(&self) {
-        self.frame_stack.borrow_mut().pop();
+        let popped = self.frame_stack.borrow_mut().pop();
+        // A generator-family frame that just suspended (yielded) or
+        // finished is no longer reachable from a live caller. CPython
+        // reports `gi_frame.f_back is None` whenever the generator is not
+        // currently executing, so drop the resumer link we set on entry.
+        // Ordinary function frames keep their `back` (tracebacks chain
+        // through it); only generator-family frames are re-entered and
+        // observed while suspended.
+        if let Some(popped) = popped {
+            if popped.code.is_generator
+                || popped.code.is_coroutine
+                || popped.code.is_async_generator
+            {
+                *popped.back.borrow_mut() = None;
+            }
+        }
+    }
+
+    /// The code object backing a generator/coroutine/async-generator
+    /// (`gi_code`/`cr_code`/`ag_code`), read from its execution frame.
+    /// `None` while running (the frame is on the call stack) or finished
+    /// (the frame is gone); the suspended/created case covers the
+    /// introspection the conformance suite performs.
+    fn gen_code_object(&self, g: &Rc<PyGenerator>) -> Object {
+        match &*g.state.borrow() {
+            GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => boxed
+                .downcast_ref::<Frame>()
+                .map_or(Object::None, |f| Object::Code(f.code.clone())),
+            GeneratorState::Running | GeneratorState::Finished => Object::None,
+        }
+    }
+
+    /// The stable Python-visible frame of a generator/coroutine/async
+    /// generator (`gi_frame`/`cr_frame`/`ag_frame`). Materialised on
+    /// demand for a not-yet-started generator (with `f_back is None`),
+    /// then reused across resumes for a stable identity (CPython keeps a
+    /// single `gi_frame` alive for the generator's lifetime). `None` once
+    /// the generator has finished.
+    fn gen_py_frame(&self, g: &Rc<PyGenerator>) -> Object {
+        let mut state = g.state.borrow_mut();
+        match &mut *state {
+            GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => {
+                match boxed.downcast_mut::<Frame>() {
+                    Some(frame) => {
+                        if let Some(py) = frame.py_frame.clone() {
+                            return Object::Frame(py);
+                        }
+                        // Not yet entered: build the frame snapshot now so
+                        // `gi_frame` is observable before the first
+                        // `next()`. `back` is None — a created/suspended
+                        // generator frame has no live caller.
+                        let py = self.build_py_frame(frame, None);
+                        frame.py_frame = Some(py.clone());
+                        Object::Frame(py)
+                    }
+                    None => Object::None,
+                }
+            }
+            // Running: the frame is live on the interpreter call stack,
+            // not in the box. Finished: the frame has been dropped.
+            GeneratorState::Running | GeneratorState::Finished => Object::None,
+        }
     }
 
     // ===========================================================
@@ -1689,10 +1817,14 @@ impl Interpreter {
             }
             OpCode::LoadName => {
                 let name = self.name_at(&frame.code, ins.arg)?;
-                let from_ns = frame
-                    .class_namespace
-                    .as_ref()
-                    .and_then(|ns| ns.borrow().get(&DictKey(Object::from_str(&name))).cloned());
+                let from_ns = match &frame.class_namespace_obj {
+                    // PEP 3115 custom namespace: read it before globals.
+                    Some(ns_obj) => self.class_ns_load(ns_obj, &name),
+                    None => frame
+                        .class_namespace
+                        .as_ref()
+                        .and_then(|ns| ns.borrow().get(&DictKey(Object::from_str(&name))).cloned()),
+                };
                 let v = match from_ns {
                     Some(v) => v,
                     None => self.lookup_global_or_builtin(&frame.globals, &name)?,
@@ -1738,7 +1870,12 @@ impl Interpreter {
             OpCode::StoreName => {
                 let v = frame.pop()?;
                 let name = self.name_at(&frame.code, ins.arg)?;
-                if let Some(ns) = &frame.class_namespace {
+                if let Some(ns_obj) = frame.class_namespace_obj.clone() {
+                    // PEP 3115: a custom class namespace observes the binding
+                    // through its `__setitem__` (e.g. `enum._EnumDict`).
+                    let g = frame.globals.clone();
+                    self.class_ns_store(&ns_obj, &name, v, &g)?;
+                } else if let Some(ns) = &frame.class_namespace {
                     ns.borrow_mut().insert(DictKey(Object::from_str(name)), v);
                 } else {
                     frame
@@ -1757,6 +1894,11 @@ impl Interpreter {
             }
             OpCode::DeleteName => {
                 let name = self.name_at(&frame.code, ins.arg)?;
+                if let Some(ns_obj) = frame.class_namespace_obj.clone() {
+                    let g = frame.globals.clone();
+                    self.class_ns_delete(&ns_obj, &name, &g)?;
+                    return Ok(StepOutcome::Continue);
+                }
                 if let Some(ns) = &frame.class_namespace {
                     if ns
                         .borrow_mut()
@@ -2002,7 +2144,9 @@ impl Interpreter {
             OpCode::ContainsOp => {
                 let container = frame.pop()?;
                 let item = frame.pop()?;
-                let found = if let Some(method) = instance_method(&container, "__contains__") {
+                let found = if let Some(method) = instance_method(&container, "__contains__")
+                    .or_else(|| metaclass_method(&container, "__contains__"))
+                {
                     let r = self.call(
                         &method,
                         std::slice::from_ref(&item),
@@ -2826,6 +2970,11 @@ impl Interpreter {
             }
             OpCode::YieldValue => {
                 let v = frame.pop()?;
+                // arg 1 = the async generator's own `yield` (a consumer
+                // value); arg 0 = the `await`/`yield from` dance passing an
+                // inner suspension's value through. `__anext__`/`SEND` read
+                // this after the frame re-suspends. See `Frame.agen_yielded_value`.
+                frame.agen_yielded_value = ins.arg == 1;
                 return Ok(StepOutcome::Yield(v));
             }
             OpCode::ReturnGenerator => {
@@ -2855,20 +3004,27 @@ impl Interpreter {
                 let result = match &iter {
                     Object::Generator(g) | Object::Coroutine(g) => self.generator_send(g, value),
                     Object::AsyncGenerator(g) => {
-                        // Async-generator semantics under SEND
-                        // (simple cooperative model — no support for
-                        // `await` *inside* the agen body, which would
-                        // require CPython's intermediate-value
-                        // passthrough machinery):
-                        //   * `agen` yields `v` -> asend completes
-                        //     with value `v` (i.e. emulate
-                        //     `StopIteration(v)` so SEND short-
-                        //     circuits to `END_SEND`).
-                        //   * `agen` returns -> raise
-                        //     `StopAsyncIteration`.
+                        // Async-generator semantics under SEND:
+                        //   * `agen` yields `v` via its own `yield` -> the
+                        //     asend completes with value `v` (emulate
+                        //     `StopIteration(v)` so SEND short-circuits to
+                        //     `END_SEND`; the async-for/await sees the item).
+                        //   * `agen` suspends on an inner `await` that yielded
+                        //     `v` -> pass `v` through (Ok), so the surrounding
+                        //     coroutine's following YIELD_VALUE re-suspends it
+                        //     and `v` reaches the event loop. The next SEND
+                        //     resumes the inner await. This is CPython's
+                        //     intermediate-value passthrough.
+                        //   * `agen` returns -> raise `StopAsyncIteration`.
                         //   * `agen` raises -> propagate.
                         match self.generator_send(g, value) {
-                            Ok(v) => Err(stop_iteration_with(v)),
+                            Ok(v) => {
+                                if Self::agen_yielded_a_value(g) {
+                                    Err(stop_iteration_with(v))
+                                } else {
+                                    Ok(v)
+                                }
+                            }
                             Err(RuntimeError::PyException(exc))
                                 if exc.type_name() == "StopIteration" =>
                             {
@@ -2877,6 +3033,14 @@ impl Interpreter {
                             other => other,
                         }
                     }
+                    // Driving `await agen.asend()/athrow()/aclose()`: apply
+                    // the deferred op. `step_agen_await` reports completion as
+                    // `StopIteration(value)` and lets `StopAsyncIteration`/
+                    // exceptions propagate, exactly the shape SEND's result
+                    // handler below expects. The first drive uses the op's
+                    // fixed payload; the popped `value` is forwarded so a
+                    // re-drive (after an inner-await passthrough) resumes it.
+                    Object::AsyncGenAwait(a) => self.step_agen_await(a, value),
                     Object::Iter(_) => {
                         if !matches!(value, Object::None) {
                             return Err(type_error(
@@ -3145,30 +3309,113 @@ impl Interpreter {
     }
 
     /// If the most-recent handled exception is still active when
-    /// `raise X` runs without a `from` clause, attach it as the new
-    /// exception's `__context__` so chained tracebacks render
-    /// `During handling of the above exception, another exception
-    /// occurred:`. Mirrors PEP 3134 / CPython.
+    /// `raise X` runs, attach it as the new exception's `__context__`
+    /// so chained tracebacks render `During handling of the above
+    /// exception, another exception occurred:`. Mirrors PEP 3134 /
+    /// CPython `_PyErr_SetObject`.
+    ///
+    /// The implicit context is set even when an explicit `from` cause is
+    /// present: `raise X from Y` sets *both* `__cause__ = Y` and
+    /// `__context__ = <active exc>`. The `from` clause only flips
+    /// `__suppress_context__` (handled in `sync_exc_attrs`), which
+    /// governs *display*, not whether `__context__` exists.
     fn attach_implicit_context(&self, exc: &mut PyException) {
-        if exc.cause.is_some() {
-            return;
-        }
         let stack = self.exc_info_stack.borrow();
         let Some(ctx) = stack.last() else {
             return;
         };
+        let Object::Instance(ctx_inst) = &ctx.instance else {
+            return;
+        };
+        let Object::Instance(exc_inst) = &exc.instance else {
+            return;
+        };
         // Don't self-reference if user code re-raises through `raise`
         // (the existing context-handler is the same exception).
-        if Rc::as_ptr(&match &ctx.instance {
-            Object::Instance(i) => i.clone(),
-            _ => return,
-        }) == Rc::as_ptr(&match &exc.instance {
-            Object::Instance(i) => i.clone(),
-            _ => return,
-        }) {
+        if Rc::ptr_eq(ctx_inst, exc_inst) {
             return;
         }
+        // bpo-27122: avoid building an implicit-context *cycle*. If the
+        // exception we're about to chain (`ctx`) already reaches the new
+        // exception via its own `__context__` chain, sever that link
+        // first so traceback walkers can't loop. CPython does the same
+        // before assigning the new `__context__`.
+        Self::break_implicit_context_cycle(ctx_inst, exc_inst);
         exc.context = Some(Box::new(ctx.clone()));
+    }
+
+    /// Chain an exception injected by `gen.throw()` to whatever the
+    /// generator was handling at its suspend point. CPython's
+    /// `_gen_throw` calls `_PyErr_SetObject`, which sets the new
+    /// exception's `__context__` to the generator's current `exc_state`.
+    /// The suspended generator's active handled exception is the top of
+    /// the entries we detached on suspend (`frame.saved_exc_info`).
+    fn chain_thrown_context(exc: &mut PyException, frame: &Frame) {
+        let Some(active) = frame.saved_exc_info.last() else {
+            return;
+        };
+        let Object::Instance(active_inst) = &active.instance else {
+            return;
+        };
+        let Object::Instance(exc_inst) = &exc.instance else {
+            return;
+        };
+        if Rc::ptr_eq(active_inst, exc_inst) {
+            return;
+        }
+        Self::break_implicit_context_cycle(active_inst, exc_inst);
+        exc.context = Some(Box::new(active.clone()));
+        // Mirror onto the instance dict so Python's `e.__context__` sees
+        // it (the throw path doesn't go through `RAISE_VARARGS`, which is
+        // where `sync_exc_attrs` normally runs).
+        Self::sync_exc_attrs(exc);
+    }
+
+    /// Walk `holder`'s `__context__` chain (instance dicts, the canonical
+    /// chain Python walks) and, if it reaches `target`, drop the link
+    /// that points at `target`. Bounded by a Floyd tortoise/hare so a
+    /// pre-existing cycle can't hang us.
+    fn break_implicit_context_cycle(
+        holder: &Rc<crate::types::PyInstance>,
+        target: &Rc<crate::types::PyInstance>,
+    ) {
+        fn ctx_of(inst: &Rc<crate::types::PyInstance>) -> Option<Rc<crate::types::PyInstance>> {
+            let dict = inst.dict.borrow();
+            match dict.get(&DictKey(Object::from_static("__context__"))) {
+                Some(Object::Instance(i)) => Some(i.clone()),
+                _ => None,
+            }
+        }
+        let mut slow = holder.clone();
+        let mut fast = holder.clone();
+        loop {
+            // Advance `fast` two steps, severing a link to `target`.
+            let Some(next) = ctx_of(&fast) else { return };
+            if Rc::ptr_eq(&next, target) {
+                fast.dict.borrow_mut().insert(
+                    DictKey(Object::from_static("__context__")),
+                    Object::None,
+                );
+                return;
+            }
+            fast = next;
+            let Some(next) = ctx_of(&fast) else { return };
+            if Rc::ptr_eq(&next, target) {
+                fast.dict.borrow_mut().insert(
+                    DictKey(Object::from_static("__context__")),
+                    Object::None,
+                );
+                return;
+            }
+            fast = next;
+            // Advance `slow` one step; if it meets `fast` we're on a
+            // pre-existing cycle with no `target` link — stop.
+            let Some(next_slow) = ctx_of(&slow) else { return };
+            slow = next_slow;
+            if Rc::ptr_eq(&slow, &fast) {
+                return;
+            }
+        }
     }
 
     /// Mirror the `cause` / `context` chain onto the instance dict so
@@ -3325,6 +3572,29 @@ impl Interpreter {
     }
 
     fn load_attr(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
+        let result = self.load_attr_inner(obj, name);
+        // CPython's `object.__getattribute__` final step: after the
+        // per-variant lookup misses, resolve the name through
+        // `type(obj)`'s MRO slot-wrapper table and bind it
+        // (`object().__str__`, `(1).__neg__`, `len.__call__`,
+        // `prop.__set__`, …). Types are excluded — `load_attr_type`
+        // already consults the slot table itself — as are dunder misses
+        // raised *from within* a successful lookup (we only rescue
+        // genuine AttributeErrors for `name` itself).
+        if let Err(err) = &result {
+            if !matches!(obj, Object::Type(_)) && self.is_attribute_error(err) {
+                if let Some(f) = builtin_slot_wrapper(&crate::builtins::class_of(obj), name) {
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: obj.clone(),
+                        function: f,
+                    })));
+                }
+            }
+        }
+        result
+    }
+
+    fn load_attr_inner(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
         // `__class__` is readable on *every* object and returns its
         // type. Instances and classes keep their dedicated handling
         // below (which honours `__class__` reassignment and the
@@ -3334,6 +3604,16 @@ impl Interpreter {
         // `instance.__class__` working for primitive instances.
         if name == "__class__" && !matches!(obj, Object::Instance(_) | Object::Type(_)) {
             return Ok(Object::Type(crate::builtins::class_of(obj)));
+        }
+        // `__new__` is resolvable on *every* object via its type's MRO
+        // (it lives on `object` as a staticmethod). Our primitive arms below
+        // don't carry it, so resolve `obj.__new__` uniformly through
+        // `type(obj)` — `None.__new__`, `(1).__new__`, `"".__new__` all
+        // return the same function `type(obj).__new__` does. `enum`'s
+        // `_find_new_` builds the set `{None, None.__new__, object.__new__,
+        // ...}` and relies on this.
+        if name == "__new__" && !matches!(obj, Object::Instance(_) | Object::Type(_)) {
+            return self.load_attr_type(&crate::builtins::class_of(obj), "__new__");
         }
         match obj {
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
@@ -3349,8 +3629,65 @@ impl Interpreter {
                     let method = make_gen_method(name, obj);
                     return Ok(method);
                 }
+                // Frame/code introspection. Each flavour uses its own
+                // attribute prefix (`gi_` generator, `cr_` coroutine,
+                // `ag_` async generator) over the same underlying state.
+                let prefix = match obj {
+                    Object::Coroutine(_) => "cr_",
+                    Object::AsyncGenerator(_) => "ag_",
+                    _ => "gi_",
+                };
+                if let Some(suffix) = name.strip_prefix(prefix) {
+                    match suffix {
+                        // The code object backing the generator.
+                        "code" => return Ok(self.gen_code_object(g)),
+                        // Currently executing (illegal to re-enter)?
+                        "running" => {
+                            return Ok(Object::Bool(matches!(
+                                &*g.state.borrow(),
+                                GeneratorState::Running
+                            )))
+                        }
+                        // The (stable) Python-visible frame, or None once
+                        // the generator has finished.
+                        "frame" => return Ok(self.gen_py_frame(g)),
+                        // PEP 580-era `gi_suspended` (generators only).
+                        "suspended" if prefix == "gi_" => {
+                            return Ok(Object::Bool(matches!(
+                                &*g.state.borrow(),
+                                GeneratorState::Suspended(_)
+                            )))
+                        }
+                        // The sub-iterator a `yield from` / `await` is
+                        // currently delegating to. We don't track the
+                        // active delegate yet, so report "not delegating".
+                        "yieldfrom" if prefix == "gi_" => return Ok(Object::None),
+                        "await" if prefix == "cr_" || prefix == "ag_" => {
+                            return Ok(Object::None)
+                        }
+                        _ => {}
+                    }
+                }
+                // `object.__reduce_ex__` exists on every CPython object;
+                // for generator-family objects invoking it raises
+                // `TypeError` ("cannot pickle ..."). `copy.copy` and
+                // `pickle` both rely on getting TypeError (not
+                // AttributeError) here.
+                if matches!(name, "__reduce__" | "__reduce_ex__") {
+                    let type_name = obj.type_name().to_owned();
+                    return Ok(Object::Builtin(Rc::new(BuiltinFn {
+                        name: "__reduce_ex__",
+                        call: Box::new(move |_args| {
+                            Err(type_error(format!(
+                                "cannot pickle '{type_name}' object"
+                            )))
+                        }),
+                        call_kw: None,
+                    })));
+                }
                 match name {
-                    "__name__" | "__qualname__" => Ok(Object::from_str(&g.name)),
+                    "__name__" => Ok(Object::from_str(g.name.borrow().clone())),
+                    "__qualname__" => Ok(Object::from_str(g.qualname.borrow().clone())),
                     _ => Err(attribute_error(format!(
                         "'{}' object has no attribute '{}'",
                         obj.type_name(),
@@ -3358,6 +3695,21 @@ impl Interpreter {
                     ))),
                 }
             }
+            // The deferred `asend`/`athrow`/`aclose`/`__anext__` awaitable
+            // is its own iterator (CPython's `async_generator_asend`):
+            // `__next__`/`send` drive it one step, `__iter__`/`__await__`
+            // return it. The drive routes through `gen_method_send`, which
+            // dispatches `AsyncGenAwait` to `step_agen_await`.
+            Object::AsyncGenAwait(_) => match name {
+                "__next__" | "send" | "__iter__" | "__await__" | "throw" | "close" => {
+                    Ok(make_gen_method(name, obj))
+                }
+                _ => Err(attribute_error(format!(
+                    "'{}' object has no attribute '{}'",
+                    obj.type_name(),
+                    name
+                ))),
+            },
             Object::Instance(inst) => self.load_attr_instance(inst, obj, name),
             Object::Type(ty) => self.load_attr_type(ty, name),
             Object::Property(p) => match name {
@@ -3889,12 +4241,33 @@ impl Interpreter {
         if name != "__self__" {
             if let Some(receiver) = super_receiver {
                 if let Some(v) = inst.class.lookup(name) {
-                    let owner = match &receiver {
-                        Object::Type(t) => Object::Type(t.clone()),
-                        Object::Instance(i) => Object::Type(i.class.clone()),
+                    // CPython passes `su->obj_type` (the MRO-walk start
+                    // class) as `owner`, and a NULL instance when
+                    // `su->obj == starttype` — the class-bound form
+                    // `super(C, cls)` inside `__new__`/classmethods —
+                    // so plain functions come back unbound while
+                    // classmethods still bind to the class.
+                    let obj_type = inst
+                        .dict
+                        .borrow()
+                        .get(&DictKey(Object::from_static("__obj_type__")))
+                        .cloned();
+                    let owner = match (&obj_type, &receiver) {
+                        (Some(Object::Type(t)), _) => Object::Type(t.clone()),
+                        (_, Object::Type(t)) => Object::Type(t.clone()),
+                        (_, Object::Instance(i)) => Object::Type(i.class.clone()),
                         _ => Object::Type(inst.class.clone()),
                     };
-                    return self.descriptor_get(&v, &receiver, &owner);
+                    let instance_for_get = match (&receiver, &owner) {
+                        (Object::Type(r), Object::Type(o)) if Rc::ptr_eq(r, o) => {
+                            Object::None
+                        }
+                        _ => receiver.clone(),
+                    };
+                    let bound = self.descriptor_get(&v, &instance_for_get, &owner)?;
+                    // `classmethod.__get__(NULL, starttype)` binds to the
+                    // class; plain functions return themselves unbound.
+                    return Ok(bound);
                 }
                 // The MRO beyond the starting class reaches a built-in base
                 // (`dict`, `list`, …) whose methods aren't stored on the type
@@ -4017,6 +4390,20 @@ impl Interpreter {
     /// classmethods bind to the class, plain functions stay
     /// unbound).
     fn load_attr_type(&mut self, ty: &Rc<TypeObject>, name: &str) -> Result<Object, RuntimeError> {
+        // (0) `__name__`/`__qualname__` are `type` getset descriptors in
+        // CPython — they never resolve through the MRO or the metaclass.
+        // Honour an *own*-dict entry (static class bodies record one, and
+        // assignment writes one), otherwise synthesize from the type
+        // itself. Without the own-only rule, a dynamically created class
+        // (`type('D', (A,), {})`, enum's functional API) would inherit
+        // its base's or metaclass's `__name__`.
+        if name == "__name__" || name == "__qualname__" {
+            if let Some(v) = ty.dict.borrow().get(&DictKey(Object::from_str(name))) {
+                return Ok(v.clone());
+            }
+            return Ok(Object::from_str(&ty.name));
+        }
+
         let meta = ty.metaclass_or_type();
         let owner = Object::Type(ty.clone());
         let self_as_obj = Object::Type(ty.clone());
@@ -4061,6 +4448,7 @@ impl Interpreter {
             }
             "__class__" => return Ok(Object::Type(meta)),
             "__dict__" => return Ok(Object::Dict(ty.dict.clone())),
+            "__flags__" => return Ok(Object::Int(ty.flags_bits())),
             "__subclasses__" => {
                 // `type.__subclasses__` is a bound method; the actual
                 // work is done in `Interpreter::call` via the sentinel
@@ -4098,6 +4486,24 @@ impl Interpreter {
             _ => {}
         }
 
+        // (4b) Generator/coroutine/async-generator methods are reachable as
+        // *unbound* functions through the type: `type(agen).__anext__(agen)`,
+        // which test_asyncgen's `py_anext` relies on. Synthesize the unbound
+        // builtin; `Interpreter::call` routes the `.u.*` sentinel using
+        // `args[0]` as the receiver.
+        if let Some(internal) = unbound_gen_method_sentinel(ty, name) {
+            return Ok(Object::Builtin(Rc::new(BuiltinFn {
+                name: internal,
+                call: Box::new(|_args| {
+                    Err(RuntimeError::Internal(
+                        "unbound generator method must be dispatched via Interpreter::call"
+                            .to_owned(),
+                    ))
+                }),
+                call_kw: None,
+            })));
+        }
+
         // (5) Built-in class methods not stored in ``ty.dict``: most
         // CPython classmethods/staticmethods (``str.maketrans``,
         // ``bytes.fromhex``, ``int.from_bytes``, ``dict.fromkeys``,
@@ -4108,13 +4514,45 @@ impl Interpreter {
             return Ok(b);
         }
 
-        // (6) Unbound instance methods reached via the type: `str.upper`,
-        // `float.hex`, `list.append`, … CPython exposes every instance method
-        // on its type as a function taking `self` explicitly. The builtins
-        // already treat `args[0]` as the receiver, so we hand back the raw
-        // function object (unbound) rather than binding it to the class.
-        if let Some(b) = crate::builtins::unbound_method(&ty.name, name) {
+        // (6) Slot-wrapper dunders and unbound instance methods reached via
+        // the type: `str.upper`, `list.append`, `int.__add__`, and the
+        // object-protocol dunders `object.__repr__` / `int.__str__` /
+        // `str.__format__`. CPython exposes every instance method on its type
+        // as a function taking `self` explicitly (the builtins already treat
+        // `args[0]` as the receiver), and stores identity-stable slot wrappers
+        // in each type's `tp_dict`. [`builtin_slot_wrapper`] reproduces that:
+        // it walks the MRO so a subclass resolves to the *defining* built-in
+        // base's wrapper, and caches per `(type, name)` so repeated access
+        // returns the same object — identity the `enum` bootstrap relies on.
+        if let Some(b) = builtin_slot_wrapper(ty, name) {
             return Ok(b);
+        }
+
+        // (7) `object.__dir__` / `type.__dir__` reached as an unbound
+        // method (`object.__dir__(self)` — enum's `Enum.__dir__` uses it
+        // to seed the interesting-name set). The default implementation
+        // is the same namespace walk `dir()` performs.
+        if name == "__dir__" {
+            return Ok(Object::Builtin(Rc::new(BuiltinFn {
+                name: "__dir__",
+                call: Box::new(crate::builtins::b_dir),
+                call_kw: None,
+            })));
+        }
+
+        // `type.mro()` — bound method on every class returning a copy
+        // of the MRO list (CPython exposes it as a method of `type`).
+        if name == "mro" {
+            let t = ty.clone();
+            return Ok(Object::Builtin(Rc::new(BuiltinFn {
+                name: "mro",
+                call: Box::new(move |_args| {
+                    Ok(Object::new_list(
+                        t.mro.borrow().iter().cloned().map(Object::Type).collect(),
+                    ))
+                }),
+                call_kw: None,
+            })));
         }
 
         Err(attribute_error(format!(
@@ -4634,6 +5072,21 @@ impl Interpreter {
                 Err(unsupported_format_string(value))
             };
         }
+        // `format(SomeClass)` — a class consults its *metaclass*
+        // `__format__`, defaulting to `object.__format__` (str(cls), which
+        // itself dispatches the metaclass `__str__`/`__repr__`).
+        if let Object::Type(_) = value {
+            if let Some(method) = metaclass_method(value, "__format__") {
+                let r = self.call(&method, &[Object::from_str(spec)], &[], globals)?;
+                return Ok(r.to_str());
+            }
+            let s = self.stringify(value, globals)?;
+            return if spec.is_empty() {
+                Ok(s)
+            } else {
+                Err(unsupported_format_string(value))
+            };
+        }
         format_via_spec(value, spec)
     }
 
@@ -4660,7 +5113,11 @@ impl Interpreter {
         v: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        if let Some(method) = instance_method(v, "__len__") {
+        // `len(x)` is `type(x).__len__(x)` — for an *instance* that's the
+        // class's method; for a *class* it's the metaclass's
+        // (`len(SomeEnum)` → `EnumType.__len__`).
+        let method = instance_method(v, "__len__").or_else(|| metaclass_method(v, "__len__"));
+        if let Some(method) = method {
             let r = self.call(&method, &[], &[], globals)?;
             return match r {
                 Object::Int(i) => Ok(Object::Int(i)),
@@ -5530,15 +5987,55 @@ impl Interpreter {
         }
     }
 
+    /// Instantiate one of `_seqtools`'s lazy iterator classes
+    /// (`_FilterIter` / `_MapIter` / `_ZipIter`). Returns `Ok(None)` only
+    /// if the frozen helper module is somehow unavailable, letting the
+    /// caller fall back; in practice it is always frozen in.
+    fn make_seqtools_iter(
+        &mut self,
+        class_name: &'static str,
+        args: &[Object],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let module = match self.do_import("_seqtools", &Object::None, 0, globals) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let cls = match &module {
+            Object::Module(m) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static(class_name)))
+                .cloned(),
+            _ => None,
+        };
+        match cls {
+            Some(cls) => Ok(Some(self.call(&cls, args, &[], globals)?)),
+            None => Ok(None),
+        }
+    }
+
     /// `map(func, *iterables)` — VM-aware (the plain builtin can't call
-    /// back into the interpreter). Evaluated eagerly into an iterator so
-    /// generators and `next()` both work (RFC 0033). Stops at the
-    /// shortest iterable, matching CPython.
+    /// back into the interpreter).
+    ///
+    /// When any input is a VM-driven iterable (generator, instance with
+    /// `__next__`, …) the result is a *lazy* `_seqtools._MapIter`
+    /// (CPython's `map` object): `func` runs on demand, so mapping over
+    /// an unbounded source works. For plain native containers we keep
+    /// the eager fast path — observably equivalent for finite pure
+    /// inputs, and crucially the returned native iterator stays
+    /// consumable by native builtins (e.g. `dict.fromkeys(map(...))`).
     fn do_map_call(
         &mut self,
         args: &[Object],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        if args[1..].iter().any(object_needs_vm_iter) {
+            return match self.make_seqtools_iter("_MapIter", args, globals)? {
+                Some(it) => Ok(it),
+                None => Err(runtime_error("internal: _seqtools._MapIter unavailable")),
+            };
+        }
         let func = args[0].clone();
         let mut cols: Vec<Vec<Object>> = Vec::with_capacity(args.len() - 1);
         for it in &args[1..] {
@@ -5556,12 +6053,22 @@ impl Interpreter {
 
     /// `filter(func_or_None, iterable)` — VM-aware. `None` keeps truthy
     /// items; otherwise an item is kept when `func(item)` is truthy.
-    /// Returns an iterator (RFC 0033).
+    /// Lazy (`_seqtools._FilterIter`) when the input is a VM-driven
+    /// iterable so filtering an unbounded source terminates; eager
+    /// native iterator otherwise (see [`Self::do_map_call`]).
     fn do_filter_call(
         &mut self,
         args: &[Object],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        if object_needs_vm_iter(&args[1]) {
+            return match self.make_seqtools_iter("_FilterIter", args, globals)? {
+                Some(it) => Ok(it),
+                None => Err(runtime_error(
+                    "internal: _seqtools._FilterIter unavailable",
+                )),
+            };
+        }
         let func = args[0].clone();
         let use_pred = !matches!(func, Object::None);
         let items = self.collect_iterable(&args[1], globals)?;
@@ -5688,6 +6195,21 @@ impl Interpreter {
                 )));
             }
         }
+        // Lazy (CPython's `zip` object) when any input is VM-driven: no
+        // iterable is pre-materialised, so `zip(count(), count())`
+        // constructs instantly and pulls one tuple per `next()`.
+        // `_ZipIter` also carries the strict-mode mismatch diagnostics.
+        if args.iter().any(object_needs_vm_iter) {
+            let mut ctor_args = Vec::with_capacity(args.len() + 1);
+            ctor_args.push(Object::Bool(strict));
+            ctor_args.extend_from_slice(args);
+            return match self.make_seqtools_iter("_ZipIter", &ctor_args, globals)? {
+                Some(it) => Ok(it),
+                None => Err(runtime_error("internal: _seqtools._ZipIter unavailable")),
+            };
+        }
+        // Eager fast path for native finite containers; the result is a
+        // native iterator that plain builtins can consume directly.
         if args.is_empty() {
             return Ok(Object::new_list(Vec::new()));
         }
@@ -5726,7 +6248,8 @@ impl Interpreter {
                                 }
                             }
                         }
-                        return Ok(Object::new_list(out));
+                        let it = Object::new_list(out).make_iter()?;
+                        return Ok(Object::Iter(Rc::new(RefCell::new(it))));
                     }
                 }
             }
@@ -6164,6 +6687,140 @@ impl Interpreter {
     /// reverse: a user `__reversed__`, or the legacy sequence protocol
     /// (`__len__` + `__getitem__`) when no `__reversed__` exists. Returns
     /// an iterator over the reversed items.
+    /// `dict.update([other], **kwargs)` with CPython's full protocol:
+    /// `other` may be a dict / mappingproxy (fast path), an arbitrary
+    /// mapping (defined by having a callable `keys`), or an iterable of
+    /// 2-element key/value sequences; keyword args are merged last.
+    fn do_dict_update_call(
+        &mut self,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let receiver = args.first().cloned();
+        let Some(receiver @ Object::Dict(_)) = receiver else {
+            return Err(type_error("update() requires a 'dict' receiver"));
+        };
+        if args.len() > 2 {
+            return Err(type_error(format!(
+                "update expected at most 1 argument, got {}",
+                args.len() - 1
+            )));
+        }
+        if let Some(other) = args.get(1) {
+            self.dict_merge_from(&receiver, other, globals)?;
+        }
+        for (k, v) in kwargs {
+            self.store_subscr(&receiver, &Object::from_str(k.as_str()), v.clone(), globals)?;
+        }
+        Ok(Object::None)
+    }
+
+    fn dict_merge_from(
+        &mut self,
+        dst: &Object,
+        other: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        // Fast paths: snapshot first — source and destination may alias
+        // (`d.update(d)`), and GilCell forbids overlapping borrows.
+        let native_entries = match other {
+            Object::Dict(o) => Some(
+                o.borrow()
+                    .iter()
+                    .map(|(k, v)| (k.0.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            Object::MappingProxy(o) => Some(
+                o.borrow()
+                    .iter()
+                    .map(|(k, v)| (k.0.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            // dict subclass instance without custom `keys`/`__getitem__`
+            // still snapshots natively only when it *is* dict-backed; a
+            // subclass overriding `keys` must go through the protocol, so
+            // don't shortcut instances here.
+            _ => None,
+        };
+        if let Some(entries) = native_entries {
+            for (k, v) in entries {
+                self.store_subscr(dst, &k, v, globals)?;
+            }
+            return Ok(());
+        }
+        // Mapping protocol: `if hasattr(other, "keys")`.
+        let keys_fn = self.load_attr(other, "keys").ok();
+        if let Some(keys_fn) = keys_fn {
+            let keys = self.call(&keys_fn, &[], &[], globals)?;
+            let it = self.make_iter(&keys, globals)?;
+            while let Some(k) = self.iter_next(&it, globals)? {
+                let v = self.subscr_via_protocol(other, &k, globals)?;
+                self.store_subscr(dst, &k, v, globals)?;
+            }
+            return Ok(());
+        }
+        // Iterable of key/value pairs.
+        let it = self.make_iter(other, globals).map_err(|e| {
+            if is_type_error(&e) {
+                type_error(format!(
+                    "'{}' object is not iterable",
+                    other.type_name_owned()
+                ))
+            } else {
+                e
+            }
+        })?;
+        let mut idx: usize = 0;
+        while let Some(pair) = self.iter_next(&it, globals)? {
+            let inner = self.make_iter(&pair, globals).map_err(|e| {
+                if is_type_error(&e) {
+                    type_error(format!(
+                        "cannot convert dictionary update sequence element #{idx} to a sequence"
+                    ))
+                } else {
+                    e
+                }
+            })?;
+            // CPython materializes each element (PySequence_Fast) and
+            // reports its real length when it isn't exactly 2.
+            let mut kv: Vec<Object> = Vec::with_capacity(2);
+            let mut n: usize = 0;
+            while let Some(x) = self.iter_next(&inner, globals)? {
+                if kv.len() < 2 {
+                    kv.push(x);
+                }
+                n += 1;
+            }
+            if n != 2 {
+                return Err(crate::error::value_error(format!(
+                    "dictionary update sequence element #{idx} has length {n}; 2 is required"
+                )));
+            }
+            let v = kv.pop().expect("len 2");
+            let k = kv.pop().expect("len 2");
+            self.store_subscr(dst, &k, v, globals)?;
+            idx += 1;
+        }
+        Ok(())
+    }
+
+    /// `other[key]` honouring a user `__getitem__` before the native
+    /// subscript (the merge protocol must call overridden lookups).
+    fn subscr_via_protocol(
+        &mut self,
+        container: &Object,
+        key: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        if matches!(container, Object::Instance(_)) {
+            if let Some(m) = instance_method(container, "__getitem__") {
+                return self.call(&m, &[key.clone()], &[], globals);
+            }
+        }
+        self.binary_subscr(container, key)
+    }
+
     fn do_reversed_call(
         &mut self,
         args: &[Object],
@@ -6172,6 +6829,11 @@ impl Interpreter {
         let obj = args
             .first()
             .ok_or_else(|| type_error("reversed() missing required argument"))?;
+        // `reversed(SomeEnum)` — the metaclass's `__reversed__` bound to
+        // the class (CPython: `type(x).__reversed__(x)`).
+        if let Some(method) = metaclass_method(obj, "__reversed__") {
+            return self.call(&method, &[], &[], globals);
+        }
         if let Object::Instance(inst) = obj {
             if let Some(method) = instance_method(obj, "__reversed__") {
                 return self.call(&method, &[], &[], globals);
@@ -6288,6 +6950,14 @@ impl Interpreter {
             }
             return self.repr_of(v, globals);
         }
+        // `str(SomeClass)` consults the metaclass (`EnumType.__str__`).
+        if let Object::Type(_) = v {
+            if let Some(method) = metaclass_method(v, "__str__") {
+                let r = self.call(&method, &[], &[], globals)?;
+                return Ok(r.to_str());
+            }
+            return self.repr_of(v, globals);
+        }
         if let Object::Long(b) = v {
             crate::builtins::long_str_limit_check(b)?;
         }
@@ -6310,6 +6980,14 @@ impl Interpreter {
             if let Some(native) = &inst.native {
                 let native = native.clone();
                 return self.repr_of(&native, globals);
+            }
+        }
+        // `repr(SomeClass)` consults the metaclass (`EnumType.__repr__`
+        // renders `<enum 'Color'>` instead of `<class 'Color'>`).
+        if let Object::Type(_) = v {
+            if let Some(method) = metaclass_method(v, "__repr__") {
+                let r = self.call(&method, &[], &[], globals)?;
+                return Ok(r.to_str());
             }
         }
         if let Object::Long(b) = v {
@@ -6392,6 +7070,12 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         match v {
             Object::Generator(_) | Object::Iter(_) => Ok(v.clone()),
+            // `iter(SomeClass)` — `type(x).__iter__(x)` where `type(x)` is
+            // the metaclass (`iter(SomeEnum)` → `EnumType.__iter__`).
+            Object::Type(_) if metaclass_method(v, "__iter__").is_some() => {
+                let method = metaclass_method(v, "__iter__").expect("checked");
+                self.call(&method, &[], &[], globals)
+            }
             Object::Instance(_) => {
                 if let Some(method) = instance_method(v, "__iter__") {
                     let result = self.call(&method, &[], &[], globals)?;
@@ -6515,6 +7199,9 @@ impl Interpreter {
             // already drivable via SEND; treat it as its own
             // awaitable so the surrounding await-dance can run.
             Object::Coroutine(_) | Object::Generator(_) | Object::AsyncGenerator(_) => Ok(value),
+            // The deferred `asend`/`athrow`/`aclose` awaitable is already a
+            // drivable awaitable (SEND applies the op via `step_agen_await`).
+            Object::AsyncGenAwait(_) => Ok(value),
             Object::Instance(_) => {
                 if let Some(method) = instance_method(&value, "__await__") {
                     let it = self.call(&method, &[], &[], &fallback_globals())?;
@@ -6695,6 +7382,13 @@ impl Interpreter {
         receiver: &Object,
         value: Object,
     ) -> Result<Object, RuntimeError> {
+        // Driving the deferred `asend`/`athrow`/`aclose` awaitable directly
+        // (e.g. an event loop calling `.send(None)` on it): apply the op.
+        // `value` is forwarded so a re-drive (after the agen suspended on an
+        // inner `await`) resumes that await with the sent value.
+        if let Object::AsyncGenAwait(a) = receiver {
+            return self.step_agen_await(a, value);
+        }
         let (g, is_async_gen) = match receiver {
             Object::Generator(g) | Object::Coroutine(g) => (g.clone(), false),
             Object::AsyncGenerator(g) => (g.clone(), true),
@@ -6715,6 +7409,183 @@ impl Interpreter {
         }
     }
 
+    /// Drive an [`AsyncGenAwait`] (the awaitable behind `agen.asend()` /
+    /// `.athrow()` / `.aclose()`) one step. In WeavePy's cooperative async
+    /// model the underlying op completes synchronously, so a drive always
+    /// *finishes* the await: success is reported the way the await/SEND
+    /// machinery expects a coroutine to finish — as `StopIteration(value)`
+    /// — while `StopAsyncIteration` (agen exhausted) and any real exception
+    /// from the agen body propagate verbatim. A second drive of an
+    /// already-consumed awaitable raises bare `StopIteration` (exhausted
+    /// iterator), matching CPython's single-shot `async_generator_asend`.
+    /// `asend_obj.throw(exc)` — CPython's `async_gen_asend_throw`: forward
+    /// the exception into the suspended agen, then report the outcome with
+    /// the same completion protocol as a normal drive (own-yield completes
+    /// as `StopIteration(value)`, inner-await passthrough stays pending).
+    fn agen_await_throw(
+        &mut self,
+        a: &Rc<crate::object::AsyncGenAwait>,
+        args: &[Object],
+    ) -> Result<Object, RuntimeError> {
+        use crate::object::AgenAwaitKind;
+        // CPython has two awaitable types with distinct reuse messages:
+        // `async_generator_asend` vs `async_generator_athrow` (which
+        // backs both `athrow(...)` and `aclose()`).
+        let is_close = matches!(a.kind, AgenAwaitKind::Close);
+        if a.consumed.get() {
+            return Err(Self::agen_await_reuse_error(a.kind));
+        }
+        if !a.started.get() {
+            if let Some(err) = Self::agen_await_running_guard(a) {
+                return Err(err);
+            }
+        }
+        a.started.set(true);
+        let agen = a.agen.clone();
+        let outcome = self.gen_method_throw(&agen, args);
+        match outcome {
+            Ok(value) => {
+                if let Object::AsyncGenerator(g) = &a.agen {
+                    if !Self::agen_yielded_a_value(g) {
+                        return Ok(value);
+                    }
+                }
+                a.consumed.set(true);
+                if is_close {
+                    // aclose-mode (CPython `async_gen_athrow_throw` with
+                    // no args): the agen answered the thrown exception
+                    // with another yield — it ignored the close.
+                    return Err(crate::error::runtime_error(
+                        "async generator ignored GeneratorExit",
+                    ));
+                }
+                Err(stop_iteration_with(value))
+            }
+            Err(e) => {
+                a.consumed.set(true);
+                // aclose-mode: the agen finishing (StopAsyncIteration) or
+                // letting GeneratorExit out is a *successful* close —
+                // reported as bare StopIteration.
+                if is_close
+                    && matches!(&e, RuntimeError::PyException(pe) if matches!(pe.type_name().as_str(), "GeneratorExit" | "StopAsyncIteration"))
+                {
+                    return Err(stop_iteration());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// CPython's `AWAITABLE_STATE_CLOSED` error: driving (or throwing into)
+    /// an awaitable that already completed.
+    fn agen_await_reuse_error(kind: crate::object::AgenAwaitKind) -> RuntimeError {
+        use crate::object::AgenAwaitKind;
+        crate::error::runtime_error(if matches!(kind, AgenAwaitKind::Send) {
+            "cannot reuse already awaited __anext__()/asend()"
+        } else {
+            "cannot reuse already awaited aclose()/athrow()"
+        })
+    }
+
+    /// CPython's `ag_running_async` guard: starting a *new* awaitable while
+    /// the agen is suspended inside an inner `await` (still being driven by
+    /// another awaitable) is a `RuntimeError`, and the rejected awaitable is
+    /// closed. Returns the error to raise, or `None` when starting is fine.
+    fn agen_await_running_guard(a: &Rc<crate::object::AsyncGenAwait>) -> Option<RuntimeError> {
+        use crate::object::AgenAwaitKind;
+        let Object::AsyncGenerator(g) = &a.agen else {
+            return None;
+        };
+        let mid_await = matches!(
+            &*g.state.borrow(),
+            GeneratorState::Suspended(boxed)
+                if boxed.downcast_ref::<Frame>().is_some_and(|f| !f.agen_yielded_value)
+        );
+        if !mid_await {
+            return None;
+        }
+        a.consumed.set(true);
+        Some(crate::error::runtime_error(match a.kind {
+            AgenAwaitKind::Send => "anext(): asynchronous generator is already running",
+            AgenAwaitKind::Throw => "athrow(): asynchronous generator is already running",
+            AgenAwaitKind::Close => "aclose(): asynchronous generator is already running",
+        }))
+    }
+
+    fn step_agen_await(
+        &mut self,
+        a: &Rc<crate::object::AsyncGenAwait>,
+        send_value: Object,
+    ) -> Result<Object, RuntimeError> {
+        use crate::object::AgenAwaitKind;
+        if a.consumed.get() {
+            return Err(Self::agen_await_reuse_error(a.kind));
+        }
+        // The first drive applies the operation's payload (`asend`'s value,
+        // `athrow`'s exception, `aclose`); a later drive is reached only when
+        // the agen suspended on an inner `await` and we passed its value
+        // through — then we forward the caller's sent value to resume it.
+        let first = !a.started.get();
+        if first {
+            if let Some(err) = Self::agen_await_running_guard(a) {
+                return Err(err);
+            }
+        }
+        a.started.set(true);
+        let outcome = if first {
+            match a.kind {
+                AgenAwaitKind::Send => {
+                    let value = a.args.first().cloned().unwrap_or(Object::None);
+                    self.gen_method_send(&a.agen, value)
+                }
+                AgenAwaitKind::Throw => self.gen_method_throw(&a.agen, &a.args),
+                AgenAwaitKind::Close => self.gen_method_close(&a.agen),
+            }
+        } else {
+            self.gen_method_send(&a.agen, send_value)
+        };
+        match outcome {
+            Ok(value) => {
+                // Did the agen suspend on an inner `await` (passing `value`
+                // through) rather than produce a value via its own `yield`?
+                // Then this awaitable is *not* done: yield `value` onward so
+                // the surrounding coroutine re-suspends, and keep ourselves
+                // drivable for the next resume.
+                if let Object::AsyncGenerator(g) = &a.agen {
+                    if !Self::agen_yielded_a_value(g) {
+                        return Ok(value);
+                    }
+                }
+                // The agen yielded a consumer value / the op completed:
+                // express completion as `StopIteration(value)` so the SEND
+                // handler short-circuits.
+                a.consumed.set(true);
+                Err(stop_iteration_with(value))
+            }
+            // `StopAsyncIteration` (agen finished) and genuine exceptions
+            // raised in the agen body propagate out of the await.
+            Err(e) => {
+                a.consumed.set(true);
+                Err(e)
+            }
+        }
+    }
+
+    /// Did async generator `g`'s most recent suspension come from its own
+    /// `yield` (a value for the consumer), as opposed to an inner `await`
+    /// passing a suspension's value through? Read from the suspended frame's
+    /// [`Frame::agen_yielded_value`]. Defaults to `true` (the historical
+    /// "completes with value" behavior) when the frame can't be inspected
+    /// (e.g. the generator already finished).
+    fn agen_yielded_a_value(g: &Rc<PyGenerator>) -> bool {
+        match &*g.state.borrow() {
+            GeneratorState::Suspended(boxed) => boxed
+                .downcast_ref::<Frame>()
+                .map_or(true, |f| f.agen_yielded_value),
+            _ => true,
+        }
+    }
+
     /// `gen.throw(exc[, val[, tb]])` — inject an exception at the
     /// suspended yield-point. Minimal implementation: we don't try
     /// to faithfully resume the frame; we raise the exception out of
@@ -6724,6 +7595,13 @@ impl Interpreter {
         receiver: &Object,
         args: &[Object],
     ) -> Result<Object, RuntimeError> {
+        // `asend(...)/athrow(...)/__anext__()` awaitables expose `throw`
+        // too (CPython `async_gen_asend_throw`): forward the exception
+        // into the agen and report completion the way a drive does.
+        if let Object::AsyncGenAwait(a) = receiver {
+            let a = a.clone();
+            return self.agen_await_throw(&a, args);
+        }
         let (g, is_async_gen) = match receiver {
             Object::Generator(g) | Object::Coroutine(g) => (g.clone(), false),
             Object::AsyncGenerator(g) => (g.clone(), true),
@@ -6753,6 +7631,51 @@ impl Interpreter {
         }
     }
 
+    /// PEP 479. A `StopIteration` raised inside (and escaping) the body
+    /// of a generator or coroutine is silently confusing — it looks
+    /// just like the generator finishing — so Python 3.7+ replaces it
+    /// with a `RuntimeError` chained (`__cause__`) to the original. For
+    /// an async generator the same applies to both `StopIteration` and
+    /// `StopAsyncIteration` escaping the body.
+    ///
+    /// Only genuine body escapes reach here: the normal "I'm done"
+    /// signal a `return` produces (`stop_iteration_with`, from the
+    /// `Returned` arms) is left untouched so `send`/`next`/`yield from`
+    /// keep working.
+    fn pep479_escape(&self, gen: &Rc<PyGenerator>, err: RuntimeError) -> RuntimeError {
+        use crate::object::CoroutineKind;
+        let RuntimeError::PyException(exc) = err else {
+            return err;
+        };
+        let Object::Instance(inst) = &exc.instance else {
+            return RuntimeError::PyException(exc);
+        };
+        let bt = crate::builtin_types::builtin_types();
+        let is_stop_iter = inst.class.is_subclass_of(&bt.stop_iteration);
+        let is_stop_async = inst.class.is_subclass_of(&bt.stop_async_iteration);
+        let msg = match gen.kind {
+            CoroutineKind::Generator if is_stop_iter => "generator raised StopIteration",
+            CoroutineKind::Coroutine if is_stop_iter => "coroutine raised StopIteration",
+            CoroutineKind::AsyncGenerator if is_stop_iter => {
+                "async generator raised StopIteration"
+            }
+            CoroutineKind::AsyncGenerator if is_stop_async => {
+                "async generator raised StopAsyncIteration"
+            }
+            _ => return RuntimeError::PyException(exc),
+        };
+        let rt_inst =
+            crate::builtin_types::make_exception_with_class(bt.runtime_error.clone(), msg);
+        let mut new_exc = PyException::new(rt_inst);
+        // Keep the in-flight traceback so the RuntimeError points at the
+        // offending frame; chain the original as cause + context.
+        new_exc.traceback = exc.traceback.clone();
+        new_exc.cause = Some(Box::new(exc.clone()));
+        new_exc.context = Some(Box::new(exc));
+        Self::sync_exc_attrs(&new_exc);
+        RuntimeError::PyException(new_exc)
+    }
+
     /// Inject `exc` into the suspended generator at its current
     /// resume point. The frame's exception table gets first crack;
     /// if no handler matches the exception bubbles out of `throw()`.
@@ -6767,7 +7690,7 @@ impl Interpreter {
     fn generator_throw(
         &mut self,
         gen: &Rc<PyGenerator>,
-        exc: PyException,
+        mut exc: PyException,
     ) -> Result<Object, RuntimeError> {
         let prev_state = std::mem::replace(&mut *gen.state.borrow_mut(), GeneratorState::Running);
         let mut frame = match prev_state {
@@ -6782,6 +7705,11 @@ impl Interpreter {
                 return Err(value_error("generator already executing"));
             }
         };
+        // PEP 3134: an exception thrown into a generator suspended inside
+        // an `except`/`with` block chains to the exception that block was
+        // handling. Done before delegation/handling so the `__context__`
+        // travels with the exception however it propagates.
+        Self::chain_thrown_context(&mut exc, &frame);
 
         // PEP 380 delegation. We detect "frame paused in
         // yield-from" via the bytecode pattern: the most recently
@@ -6829,7 +7757,7 @@ impl Interpreter {
                         }
                         Err(err) => {
                             *gen.state.borrow_mut() = GeneratorState::Finished;
-                            Err(err)
+                            Err(self.pep479_escape(gen, err))
                         }
                     };
                 }
@@ -6869,13 +7797,13 @@ impl Interpreter {
                 }
                 Err(err) => {
                     *gen.state.borrow_mut() = GeneratorState::Finished;
-                    Err(err)
+                    Err(self.pep479_escape(gen, err))
                 }
             },
             Ok(None) => unreachable!(),
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                Err(err)
+                Err(self.pep479_escape(gen, err))
             }
         }
     }
@@ -6885,6 +7813,38 @@ impl Interpreter {
     /// `finally` blocks run; we mirror that by routing through
     /// `generator_throw` and absorbing the resulting StopIteration.
     fn gen_method_close(&mut self, receiver: &Object) -> Result<Object, RuntimeError> {
+        // Closing a deferred `asend`/`athrow` awaitable (CPython
+        // `async_gen_asend_close`): a not-yet-started awaitable just flips
+        // to CLOSED; a started one must deliver `GeneratorExit` to the
+        // suspended agen, and the agen answering with another suspension
+        // means it ignored the exit.
+        if let Object::AsyncGenAwait(a) = receiver {
+            let a = a.clone();
+            if a.consumed.get() {
+                return Ok(Object::None);
+            }
+            a.consumed.set(true);
+            if !a.started.get() {
+                return Ok(Object::None);
+            }
+            let bt = crate::builtin_types::builtin_types();
+            let exc_inst =
+                crate::builtin_types::make_exception_with_class(bt.generator_exit.clone(), "");
+            return match self.gen_method_throw(&a.agen, &[exc_inst]) {
+                Ok(_yielded) => Err(crate::error::runtime_error(
+                    "coroutine ignored GeneratorExit",
+                )),
+                Err(RuntimeError::PyException(exc))
+                    if matches!(
+                        exc.type_name().as_str(),
+                        "GeneratorExit" | "StopIteration" | "StopAsyncIteration"
+                    ) =>
+                {
+                    Ok(Object::None)
+                }
+                Err(err) => Err(err),
+            };
+        }
         let g = match receiver {
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => g.clone(),
             _ => return Err(type_error("close() requires a generator/coroutine")),
@@ -6912,6 +7872,21 @@ impl Interpreter {
                     || exc.type_name() == "StopAsyncIteration" =>
             {
                 *g.state.borrow_mut() = GeneratorState::Finished;
+                // Python 3.13 (gh-104770): if the generator catches
+                // `GeneratorExit` and then *returns* a value, `close()`
+                // returns it. The return surfaces as `StopIteration(value)`;
+                // GeneratorExit propagating (exit not caught) yields None.
+                if exc.type_name() == "StopIteration" {
+                    if let Object::Instance(inst) = &exc.instance {
+                        if let Some(v) = inst
+                            .dict
+                            .borrow()
+                            .get(&DictKey(Object::from_static("value")))
+                        {
+                            return Ok(v.clone());
+                        }
+                    }
+                }
                 Ok(Object::None)
             }
             Err(err) => {
@@ -6970,13 +7945,13 @@ impl Interpreter {
                 }
                 Err(err) => {
                     *gen.state.borrow_mut() = GeneratorState::Finished;
-                    Err(err)
+                    Err(self.pep479_escape(gen, err))
                 }
             },
             Ok(None) => unreachable!(),
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                Err(err)
+                Err(self.pep479_escape(gen, err))
             }
         }
     }
@@ -7045,7 +8020,7 @@ impl Interpreter {
             }
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                Err(err)
+                Err(self.pep479_escape(gen, err))
             }
         }
     }
@@ -8382,6 +9357,24 @@ impl Interpreter {
                         ty.name
                     )));
                 }
+                // A user metaclass `__setattr__` intercepts class-attribute
+                // writes (CPython: `type(cls).__setattr__(cls, …)` —
+                // `EnumType.__setattr__` raises on member reassignment).
+                if let Some(method) = metaclass_method(obj, "__setattr__") {
+                    if !matches!(
+                        method,
+                        Object::BoundMethod(ref bm) if matches!(&bm.function, Object::Builtin(_))
+                    ) {
+                        let g = self.builtins.clone();
+                        self.call(
+                            &method,
+                            &[Object::from_str(name), value],
+                            &[],
+                            &g,
+                        )?;
+                        return Ok(());
+                    }
+                }
                 ty.dict
                     .borrow_mut()
                     .insert(DictKey(Object::from_str(name)), value);
@@ -8461,6 +9454,32 @@ impl Interpreter {
                     name
                 ))),
             },
+            // `gen.__name__` / `gen.__qualname__` are writable (str only)
+            // on all three generator flavours, mirroring CPython's
+            // `gi_name`/`gi_qualname` setters.
+            Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+                match name {
+                    "__name__" | "__qualname__" => match value {
+                        Object::Str(s) => {
+                            let target = if name == "__name__" {
+                                &g.name
+                            } else {
+                                &g.qualname
+                            };
+                            *target.borrow_mut() = s.to_string();
+                            Ok(())
+                        }
+                        _ => Err(type_error(format!(
+                            "{name} must be set to a string object"
+                        ))),
+                    },
+                    _ => Err(attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        obj.type_name(),
+                        name
+                    ))),
+                }
+            }
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),
@@ -8498,6 +9517,23 @@ impl Interpreter {
                 )?;
                 return Ok(());
             }
+        }
+        // `obj.__dict__ = d` (CPython's `__dict__` getset descriptor):
+        // replace the instance dict's contents wholesale. Inline-values
+        // state is permanently cleared. Divergence: CPython aliases `d`
+        // itself as the instance dict; our `Rc` field can't be swapped,
+        // so we copy `d`'s contents instead.
+        if name == "__dict__" && !inst.class.forbids_dict {
+            let Object::Dict(src) = &value else {
+                return Err(type_error(format!(
+                    "__dict__ must be set to a dictionary, not a '{}'",
+                    value.type_name()
+                )));
+            };
+            let copied = src.borrow().clone();
+            *inst.dict.borrow_mut() = copied;
+            inst.inline_values.set(false);
+            return Ok(());
         }
         if let Some(attr) = inst.class.lookup(name) {
             match &attr {
@@ -8563,6 +9599,15 @@ impl Interpreter {
                         return Ok(());
                     }
                 }
+                // `del obj.__dict__` (CPython's `__dict__` getset
+                // descriptor): detach the instance dict. The values are
+                // dropped and the instance reverts to an empty dict; the
+                // inline-values state is permanently cleared.
+                if name == "__dict__" && !inst.class.forbids_dict {
+                    inst.dict.borrow_mut().clear();
+                    inst.inline_values.set(false);
+                    return Ok(());
+                }
                 if let Some(attr) = inst.class.lookup(name) {
                     match &attr {
                         Object::Property(prop) => {
@@ -8613,6 +9658,18 @@ impl Interpreter {
                 Ok(())
             }
             Object::Type(ty) => {
+                // A user metaclass `__delattr__` intercepts class-attribute
+                // deletion (`EnumType.__delattr__` raises for members).
+                if let Some(method) = metaclass_method(obj, "__delattr__") {
+                    if !matches!(
+                        method,
+                        Object::BoundMethod(ref bm) if matches!(&bm.function, Object::Builtin(_))
+                    ) {
+                        let g = self.builtins.clone();
+                        self.call(&method, &[Object::from_str(name)], &[], &g)?;
+                        return Ok(());
+                    }
+                }
                 // `del Cls.attr` (CPython `type.__delattr__`) removes the
                 // name from the class's *own* dict only — inherited
                 // attributes can't be deleted via a subclass. Mirrors
@@ -8995,6 +10052,58 @@ impl Interpreter {
         let _ = outer_globals;
         match callable {
             Object::Builtin(b) => {
+                // Unbound generator-family methods reached via the type
+                // (`type(agen).__anext__`): the instance arrives as `args[0]`.
+                // Route to the same machinery the bound `.gen_*`/`.agen_*`
+                // sentinels use. See `unbound_gen_method_sentinel`.
+                if b.name.starts_with(".u.") {
+                    let receiver = args.first().cloned().ok_or_else(|| {
+                        type_error(format!(
+                            "unbound method {}() needs an argument",
+                            &b.name[3..]
+                        ))
+                    })?;
+                    let rest: &[Object] = if args.is_empty() { &[] } else { &args[1..] };
+                    return match b.name {
+                        ".u.gen_send" => self
+                            .gen_method_send(&receiver, rest.first().cloned().unwrap_or(Object::None)),
+                        ".u.gen_throw" => self.gen_method_throw(&receiver, rest),
+                        ".u.gen_close" => self.gen_method_close(&receiver),
+                        ".u.gen_next" => self.gen_method_send(&receiver, Object::None),
+                        ".u.gen_iter" => Ok(receiver.clone()),
+                        ".u.agen_aiter" => Ok(receiver.clone()),
+                        ".u.agen_anext" => match &receiver {
+                            Object::AsyncGenerator(_) => Ok(make_agen_await(
+                                &receiver,
+                                crate::object::AgenAwaitKind::Send,
+                                vec![Object::None],
+                            )),
+                            other => Err(type_error(format!(
+                                "__anext__ requires an async_generator, got '{}'",
+                                other.type_name()
+                            ))),
+                        },
+                        ".u.agen_send" => Ok(make_agen_await(
+                            &receiver,
+                            crate::object::AgenAwaitKind::Send,
+                            vec![rest.first().cloned().unwrap_or(Object::None)],
+                        )),
+                        ".u.agen_throw" => Ok(make_agen_await(
+                            &receiver,
+                            crate::object::AgenAwaitKind::Throw,
+                            rest.to_vec(),
+                        )),
+                        ".u.agen_close" => Ok(make_agen_await(
+                            &receiver,
+                            crate::object::AgenAwaitKind::Close,
+                            Vec::new(),
+                        )),
+                        _ => Err(RuntimeError::Internal(format!(
+                            "unknown unbound gen sentinel {}",
+                            b.name
+                        ))),
+                    };
+                }
                 if b.name == builtins::BUILD_CLASS_NAME {
                     return self.build_class(args, kwargs);
                 }
@@ -9273,14 +10382,43 @@ impl Interpreter {
                     self.run_pending_finalizers();
                     return Ok(result);
                 }
-                // Pre-materialize generator/instance iterables for
-                // builtin methods that need to iterate them. The
+                // Pre-materialize VM-only iterables (generators, user
+                // `__iter__` instances, metaclass-iterable classes) for
+                // builtin methods that iterate their arguments. The
                 // underlying static builtins call `Object::make_iter`
-                // directly, which can't drive a Python generator.
-                if matches!(b.name, "join" | "extend") && args.len() == 2 {
-                    if matches!(&args[1], Object::Generator(_) | Object::Instance(_)) {
-                        let collected = self.collect_iterable(&args[1], outer_globals)?;
-                        let new_args = vec![args[0].clone(), Object::new_list(collected)];
+                // directly, which can't drive a Python frame. `dict.update`
+                // has its own richer protocol below, so it's excluded here.
+                if matches!(
+                    b.name,
+                    "join"
+                        | "extend"
+                        | "update"
+                        | "fromkeys"
+                        | "union"
+                        | "intersection"
+                        | "difference"
+                        | "symmetric_difference"
+                        | "intersection_update"
+                        | "difference_update"
+                        | "symmetric_difference_update"
+                        | "issubset"
+                        | "issuperset"
+                        | "isdisjoint"
+                        | "writelines"
+                ) && !(b.name == "update" && !matches!(args.first(), Some(Object::Set(_))))
+                {
+                    // `fromkeys` may take its iterable in slot 0 (unbound
+                    // classmethod form); the others iterate args[1..].
+                    let scan_from = usize::from(b.name != "fromkeys");
+                    if args.iter().skip(scan_from).any(object_needs_vm_iter) {
+                        let mut new_args = args.to_vec();
+                        for a in new_args.iter_mut().skip(scan_from) {
+                            if object_needs_vm_iter(a) {
+                                *a = Object::new_list(
+                                    self.collect_iterable(a, outer_globals)?,
+                                );
+                            }
+                        }
                         return (b.call)(&new_args);
                     }
                 }
@@ -9292,15 +10430,7 @@ impl Interpreter {
                 // `collect_iterable` when handed something only the
                 // interpreter can iterate. Single-iterable builtins take it
                 // in `args[0]`; `zip` takes one per argument.
-                fn needs_vm_iter(o: &Object) -> bool {
-                    matches!(
-                        o,
-                        Object::Generator(_)
-                            | Object::Coroutine(_)
-                            | Object::AsyncGenerator(_)
-                            | Object::Instance(_)
-                    )
-                }
+                let needs_vm_iter = object_needs_vm_iter;
                 if matches!(b.name, "enumerate" | "sum" | "all" | "any")
                     && args.first().is_some_and(needs_vm_iter)
                 {
@@ -9315,7 +10445,9 @@ impl Interpreter {
                 // `zip` must NOT pre-materialise — it stops at the shortest
                 // iterable, so a paired unbounded iterator (`itertools.count`)
                 // would hang. Drive it lazily through the interpreter instead.
-                if b.name == "zip" && args.iter().any(needs_vm_iter) {
+                // Also route any `strict=` call here: the plain builtin
+                // can't take keywords.
+                if b.name == "zip" && (args.iter().any(needs_vm_iter) || !kwargs.is_empty()) {
                     return self.do_zip_call(args, kwargs, outer_globals);
                 }
                 if b.name == "sorted" && !args.is_empty() {
@@ -9329,6 +10461,36 @@ impl Interpreter {
                 }
                 if b.name == "reversed" && args.first().is_some_and(needs_vm_iter) {
                     return self.do_reversed_call(args, outer_globals);
+                }
+                // `dict.update` accepts another dict, an arbitrary mapping
+                // (anything with `.keys()`), an iterable of key/value
+                // pairs, and keyword arguments — the latter three need the
+                // interpreter (user `keys`/`__getitem__`/`__iter__`), so
+                // route dict receivers here instead of the native builtin.
+                if b.name == "update"
+                    && matches!(args.first(), Some(Object::Dict(_)))
+                {
+                    return self.do_dict_update_call(args, kwargs, outer_globals);
+                }
+                // `dir(x)` honours a user `__dir__` — the instance's class
+                // method, or for a class the *metaclass* method
+                // (`dir(SomeEnum)` → `EnumType.__dir__`). CPython sorts
+                // the result.
+                if b.name == "dir" && args.len() == 1 {
+                    let method = instance_method(&args[0], "__dir__")
+                        .or_else(|| metaclass_method(&args[0], "__dir__"));
+                    if let Some(method) = method {
+                        let r = self.call(&method, &[], &[], outer_globals)?;
+                        let it = self.make_iter(&r, outer_globals)?;
+                        let mut names: Vec<String> = Vec::new();
+                        while let Some(x) = self.iter_next(&it, outer_globals)? {
+                            names.push(x.to_str());
+                        }
+                        names.sort();
+                        return Ok(Object::new_list(
+                            names.into_iter().map(Object::from_str).collect(),
+                        ));
+                    }
                 }
                 // `setattr`/`delattr` must honour the descriptor protocol
                 // (data descriptors / `property` setters), `__slots__`
@@ -9473,13 +10635,25 @@ impl Interpreter {
                         // --- async generator methods ---------------------
                         // `__aiter__` returns the agen itself.
                         ".agen_aiter" => return Ok(bm.receiver.clone()),
-                        // `__anext__` returns the agen wrapped as a
-                        // coroutine-shaped awaitable: when driven via
-                        // SEND, it forwards to the underlying generator
-                        // and translates StopIteration into
-                        // StopAsyncIteration so async-for can terminate.
+                        // `g.__anext__()` returns a deferred awaitable
+                        // (CPython's `async_generator_asend`) that, when
+                        // driven, advances the agen once. Returning a proper
+                        // awaitable — rather than the agen itself — is what
+                        // makes the manual-drive idiom `g.__anext__().__next__()`
+                        // work (it raises `StopIteration(value)` per step and
+                        // `StopAsyncIteration` at exhaustion); `await
+                        // g.__anext__()` and `async for` keep working since the
+                        // awaitable drives via SEND exactly like the agen did.
+                        // (`anext()`/`async for` use `get_anext`, a separate
+                        // path, so they are unaffected.)
                         ".agen_anext" => match &bm.receiver {
-                            Object::AsyncGenerator(_) => return Ok(bm.receiver.clone()),
+                            Object::AsyncGenerator(_) => {
+                                return Ok(make_agen_await(
+                                    &bm.receiver,
+                                    crate::object::AgenAwaitKind::Send,
+                                    vec![Object::None],
+                                ))
+                            }
                             other => {
                                 return Err(type_error(format!(
                                     "__anext__ requires an async_generator, got '{}'",
@@ -9487,15 +10661,34 @@ impl Interpreter {
                                 )))
                             }
                         },
+                        // `asend`/`athrow`/`aclose` return a *deferred*
+                        // awaitable (CPython `async_generator_asend` /
+                        // `async_generator_athrow`); the operation runs only
+                        // when the awaitable is driven, so `await
+                        // agen.aclose()` is legal (the previous code executed
+                        // eagerly and returned the result, yielding `await
+                        // None`). See [`Self::step_agen_await`].
                         ".agen_send" => {
                             let value = args.first().cloned().unwrap_or(Object::None);
-                            return self.gen_method_send(&bm.receiver, value);
+                            return Ok(make_agen_await(
+                                &bm.receiver,
+                                crate::object::AgenAwaitKind::Send,
+                                vec![value],
+                            ));
                         }
                         ".agen_throw" => {
-                            return self.gen_method_throw(&bm.receiver, args);
+                            return Ok(make_agen_await(
+                                &bm.receiver,
+                                crate::object::AgenAwaitKind::Throw,
+                                args.to_vec(),
+                            ));
                         }
                         ".agen_close" => {
-                            return self.gen_method_close(&bm.receiver);
+                            return Ok(make_agen_await(
+                                &bm.receiver,
+                                crate::object::AgenAwaitKind::Close,
+                                Vec::new(),
+                            ));
                         }
                         // `object.__reduce_ex__(self, protocol)` — the
                         // default pickling/copy reduction. Needs VM access
@@ -9601,15 +10794,12 @@ impl Interpreter {
                         }
                     }
                 }
-                // `type(name, bases, ns)` builds a new class dynamically.
-                if Rc::ptr_eq(ty, &builtin_types().type_) && args.len() == 3 {
-                    return self.dynamic_type_call_with_meta(ty.clone(), args, kwargs, true);
-                }
-                // `Meta(name, bases, ns)` for a user metaclass —
-                // route through the metaclass-aware class builder.
+                // `type(name, bases, ns)` / `Meta(name, bases, ns)` build a
+                // new class dynamically — through the winner-metaclass
+                // delegation that CPython's `type_new` performs.
                 let bt = builtin_types();
-                if ty.is_subclass_of(&bt.type_) && !Rc::ptr_eq(ty, &bt.type_) && args.len() == 3 {
-                    return self.dynamic_type_call_with_meta(ty.clone(), args, kwargs, true);
+                if ty.is_subclass_of(&bt.type_) && args.len() == 3 {
+                    return self.winner_aware_dynamic_type_call(ty.clone(), args, kwargs);
                 }
                 // If the class's *metaclass* overrides `__call__`,
                 // dispatch through it so EnumMeta etc. can hook
@@ -9645,6 +10835,116 @@ impl Interpreter {
                 "'{}' object is not callable",
                 callable.type_name()
             ))),
+        }
+    }
+
+    /// PEP 3115: store `name = value` into a custom class namespace by
+    /// dispatching through its `__setitem__` (so the mapping observes the
+    /// binding — `enum._EnumDict` records members this way). Falls back to
+    /// the generic subscript-store for non-overriding mappings.
+    fn class_ns_store(
+        &mut self,
+        ns_obj: &Object,
+        name: &str,
+        value: Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        let key = Object::from_str(name);
+        if let Some(method) = instance_method(ns_obj, "__setitem__") {
+            self.call(&method, &[key, value], &[], globals)?;
+            return Ok(());
+        }
+        self.store_subscr(ns_obj, &key, value, globals)
+    }
+
+    /// PEP 3115: read a name from a custom class namespace. For the
+    /// practical case — a `dict` subclass like `_EnumDict` — this reads the
+    /// wrapped native dict directly; `None` means "not bound here" so the
+    /// caller falls through to globals/builtins (matching CPython's
+    /// `LOAD_NAME`).
+    fn class_ns_load(&self, ns_obj: &Object, name: &str) -> Option<Object> {
+        let key = DictKey(Object::from_str(name));
+        match ns_obj {
+            Object::Dict(d) => d.borrow().get(&key).cloned(),
+            Object::Instance(inst) => match &inst.native {
+                Some(Object::Dict(d)) => d.borrow().get(&key).cloned(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// PEP 3115: `del name` in a class body with a custom namespace.
+    fn class_ns_delete(
+        &mut self,
+        ns_obj: &Object,
+        name: &str,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        let key = Object::from_str(name);
+        if let Some(method) = instance_method(ns_obj, "__delitem__") {
+            self.call(&method, std::slice::from_ref(&key), &[], globals)?;
+            return Ok(());
+        }
+        self.delete_subscr(ns_obj, &key)
+    }
+
+    /// Copy a class namespace mapping into a plain `DictData` for type
+    /// creation, like CPython's `type.__new__` folding the mapping into the
+    /// type dict. Handles a plain dict or a `dict` subclass instance (the
+    /// practical PEP 3115 case, e.g. `_EnumDict`, which stores into its
+    /// wrapped native dict).
+    fn materialize_class_mapping(&self, ns_obj: &Object) -> Result<DictData, RuntimeError> {
+        match ns_obj {
+            Object::Dict(d) => Ok(d.borrow().clone()),
+            Object::Instance(inst) => match &inst.native {
+                Some(Object::Dict(d)) => Ok(d.borrow().clone()),
+                _ => Err(type_error(
+                    "class namespace must be a dict or dict subclass",
+                )),
+            },
+            _ => Err(type_error(
+                "class namespace must be a dict or dict subclass",
+            )),
+        }
+    }
+
+    /// PEP 3115: invoke `metaclass.__prepare__(name, bases, **kwds)` when the
+    /// metaclass overrides it, returning the namespace mapping the class body
+    /// should populate. `type` defines no `__prepare__`, so a `Some` result
+    /// here always reflects a genuine user override.
+    fn call_metaclass_prepare(
+        &mut self,
+        metaclass: &Rc<TypeObject>,
+        name: &str,
+        bases: &[Rc<TypeObject>],
+        kwds: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let prep = match metaclass.lookup("__prepare__") {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        // `__prepare__` is conventionally a classmethod; bind the metaclass
+        // as the implicit first argument when needed.
+        let (callable, prefix): (Object, Vec<Object>) = match &prep {
+            Object::ClassMethod(inner) => {
+                ((**inner).clone(), vec![Object::Type(metaclass.clone())])
+            }
+            Object::StaticMethod(inner) => ((**inner).clone(), Vec::new()),
+            other => (other.clone(), vec![Object::Type(metaclass.clone())]),
+        };
+        let bases_tuple =
+            Object::new_tuple(bases.iter().map(|b| Object::Type(b.clone())).collect());
+        let mut call_args = prefix;
+        call_args.push(Object::from_str(name));
+        call_args.push(bases_tuple);
+        let result = self.call(&callable, &call_args, kwds, globals)?;
+        // A plain dict means there's nothing to observe — keep the fast path.
+        if matches!(result, Object::Dict(_)) {
+            Ok(None)
+        } else {
+            Ok(Some(result))
         }
     }
 
@@ -9723,6 +11023,13 @@ impl Interpreter {
                 }
             }
         }
+        // CPython passes the *original* user bases (before defaulting to
+        // `object`) to the metaclass `__prepare__`/`__new__`; only the real
+        // `type.__new__` defaults an empty base list to `object`. `enum`
+        // depends on this: the base `Enum` class is created with no bases,
+        // and `EnumType._get_mixins_` rejects a stray `object` as the final
+        // base. Keep the injected list for the plain-`type` fast path.
+        let prepare_bases: Vec<Rc<TypeObject>> = bases.clone();
         if bases.is_empty() {
             bases.push(builtin_types().object_.clone());
         }
@@ -9748,8 +11055,50 @@ impl Interpreter {
         // metaclass of any base.
         let metaclass = resolve_metaclass(metaclass_arg, &bases)?;
 
+        // PEP 3115: a metaclass may supply a custom namespace mapping via
+        // `__prepare__`. When it does, the class body's name bindings flow
+        // through that mapping's `__setitem__` (see `class_ns_store`) so it
+        // observes every definition — `enum._EnumDict` records members and
+        // their order this way.
+        let ns_obj = self.call_metaclass_prepare(
+            &metaclass,
+            &name,
+            &prepare_bases,
+            &subclass_kwargs,
+            &body_fn.globals,
+        )?;
+
+        // The dict the new type is ultimately built from. For the custom
+        // `__prepare__` path it is materialised from `ns_obj` after the body.
         let class_ns = Rc::new(RefCell::new(DictData::new()));
-        {
+
+        // `__module__` copies whatever `globals['__name__']` is at definition
+        // time (`__main__` for top-level classes, else the module name) so
+        // `pickle`/introspection can find the qualified name. PEP 560 keeps
+        // the pre-resolution bases on `__orig_bases__`.
+        let module_name = body_fn
+            .globals
+            .borrow()
+            .get(&DictKey(Object::from_static("__name__")))
+            .cloned();
+        let orig_bases_obj = if bases_replaced {
+            Some(Object::new_tuple(orig_bases.clone()))
+        } else {
+            None
+        };
+        if let Some(obj) = &ns_obj {
+            // Route the implicit names through the custom mapping so it sees
+            // them exactly as CPython does.
+            let g = body_fn.globals.clone();
+            self.class_ns_store(obj, "__name__", Object::from_str(&name), &g)?;
+            self.class_ns_store(obj, "__qualname__", Object::from_str(&name), &g)?;
+            if let Some(m) = module_name {
+                self.class_ns_store(obj, "__module__", m, &g)?;
+            }
+            if let Some(ob) = orig_bases_obj {
+                self.class_ns_store(obj, "__orig_bases__", ob, &g)?;
+            }
+        } else {
             let mut ns = class_ns.borrow_mut();
             ns.insert(
                 DictKey(Object::from_static("__name__")),
@@ -9759,27 +11108,11 @@ impl Interpreter {
                 DictKey(Object::from_static("__qualname__")),
                 Object::from_str(&name),
             );
-            // Stamp `__module__` so `pickle` (and any user code that
-            // introspects classes) can find the qualified name. We
-            // copy whatever `globals['__name__']` is at definition
-            // time, which is `__main__` for top-level classes and the
-            // module name for everything else.
-            if let Some(module_name) = body_fn
-                .globals
-                .borrow()
-                .get(&DictKey(Object::from_static("__name__")))
-                .cloned()
-            {
-                ns.insert(DictKey(Object::from_static("__module__")), module_name);
+            if let Some(m) = module_name {
+                ns.insert(DictKey(Object::from_static("__module__")), m);
             }
-            // PEP 560: preserve the pre-resolution bases so `typing` /
-            // `dataclasses` introspection (and `NamedTuple`/`Generic`)
-            // can read the original `(NamedTuple,)` / `(Generic[T],)`.
-            if bases_replaced {
-                ns.insert(
-                    DictKey(Object::from_static("__orig_bases__")),
-                    Object::new_tuple(orig_bases.clone()),
-                );
+            if let Some(ob) = orig_bases_obj {
+                ns.insert(DictKey(Object::from_static("__orig_bases__")), ob);
             }
         }
         // Build a frame for the class body. Locals are unused; names
@@ -9793,8 +11126,44 @@ impl Interpreter {
             body_fn.globals.clone(),
             false,
         );
-        frame.class_namespace = Some(class_ns.clone());
+        if let Some(obj) = &ns_obj {
+            frame.class_namespace_obj = Some(obj.clone());
+        } else {
+            frame.class_namespace = Some(class_ns.clone());
+        }
         let _ = self.run_frame(&mut frame)?;
+
+        // PEP 3135: when the body created a `__class__` cell (a method
+        // references `super`/`__class__`), propagate it through the
+        // namespace as `__classcell__` — exactly like CPython's compiler.
+        // `type.__new__` (our construction cores) pops it and points it at
+        // the new class *before* `__set_name__`/`__init_subclass__` run,
+        // so zero-arg `super()` works inside hooks fired during class
+        // creation (e.g. enum member `__new__` via `_proto_member`).
+        let class_cell: Option<Rc<RefCell<Object>>> = body_fn
+            .code
+            .cellvars
+            .iter()
+            .position(|c| c == "__class__")
+            .and_then(|i| frame.cells.get(i).cloned());
+        if let Some(cell) = &class_cell {
+            let cell_obj = Object::Cell(cell.clone());
+            if let Some(obj) = &ns_obj {
+                let g = body_fn.globals.clone();
+                self.class_ns_store(obj, "__classcell__", cell_obj, &g)?;
+            } else {
+                class_ns.borrow_mut().insert(
+                    DictKey(Object::from_static("__classcell__")),
+                    cell_obj,
+                );
+            }
+        }
+
+        // PEP 3115: fold the custom mapping back into `class_ns` so doc
+        // defaulting and the plain-type fast path see the final namespace.
+        if let Some(obj) = &ns_obj {
+            *class_ns.borrow_mut() = self.materialize_class_mapping(obj)?;
+        }
 
         // A class body with a leading docstring `STORE_NAME`s it as
         // `__doc__` (see the compiler); every other class needs an
@@ -9816,9 +11185,15 @@ impl Interpreter {
         let bt = builtin_types();
         let is_plain_type = Rc::ptr_eq(&metaclass, &bt.type_);
         let ty = if is_plain_type {
-            let dict = class_ns.borrow().clone();
+            let mut dict = class_ns.borrow().clone();
+            let classcell =
+                dict.shift_remove(&DictKey(Object::from_static("__classcell__")));
             let ty = TypeObject::new_user(&name, bases.clone(), dict)?;
             ty.set_metaclass(metaclass.clone());
+            // PEP 3135: fill the `__class__` cell before any hook runs.
+            if let Some(Object::Cell(cell)) = classcell {
+                *cell.borrow_mut() = Object::Type(ty.clone());
+            }
             self.finalize_class_namespace(&ty)?;
             self.invoke_set_name_hooks(&ty)?;
             self.invoke_init_subclass(&ty, &subclass_kwargs)?;
@@ -9828,9 +11203,20 @@ impl Interpreter {
             // The metaclass's `__new__` (if any) chains into
             // `type.__new__`, which we intercept via
             // `dynamic_type_call_with_meta` to actually build the type.
-            let bases_tuple =
-                Object::new_tuple(bases.iter().map(|b| Object::Type(b.clone())).collect());
-            let ns_dict = Object::Dict(class_ns.clone());
+            let bases_tuple = Object::new_tuple(
+                prepare_bases
+                    .iter()
+                    .map(|b| Object::Type(b.clone()))
+                    .collect(),
+            );
+            // PEP 3115: hand the metaclass the *same* mapping its
+            // `__prepare__` produced (e.g. the populated `_EnumDict`), so its
+            // `__new__` can read the metadata recorded during the body. Plain
+            // namespaces pass the materialised dict as before.
+            let ns_dict = match &ns_obj {
+                Some(obj) => obj.clone(),
+                None => Object::Dict(class_ns.clone()),
+            };
             let call_args = vec![Object::from_str(&name), bases_tuple, ns_dict];
             // Run the metaclass's __new__ first if it defines one;
             // otherwise fall through to the default class construction.
@@ -9934,6 +11320,78 @@ impl Interpreter {
         Ok(Object::Type(ty))
     }
 
+    /// Dynamic 3-arg class construction (`type(name, bases, ns)` or
+    /// `Meta(name, bases, ns)`) with CPython `type_new`'s winner rule:
+    /// the build is owned by the most-derived metaclass among the seed
+    /// and the bases' metaclasses. When that winner defines its own
+    /// (Python) `__new__`, delegate to it — that is how
+    /// `type(name, (member,), ns, boundary=…, _simple=True)` re-enters
+    /// `EnumType.__new__` so the metaclass keywords are consumed by the
+    /// code that understands them — then run the winner's `__init__`
+    /// exactly as `type.__call__` would. Otherwise fall through to the
+    /// default builder.
+    fn winner_aware_dynamic_type_call(
+        &mut self,
+        seed: Rc<TypeObject>,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+    ) -> Result<Object, RuntimeError> {
+        let bases: Vec<Rc<TypeObject>> = match args.get(1) {
+            Some(Object::Tuple(items)) => items
+                .iter()
+                .filter_map(|b| match b {
+                    Object::Type(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let winner = resolve_metaclass(Some(seed), &bases)?;
+        let new_method = winner.lookup("__new__");
+        // The sentinel `type.__new__` builtin would recurse; the default
+        // builder below *is* that construction.
+        let is_type_new_sentinel = matches!(
+            new_method.as_ref(),
+            Some(Object::StaticMethod(inner)) if matches!(
+                inner.as_ref(),
+                Object::Builtin(b) if b.name == "__new__"
+            )
+        );
+        if let Some(new_method) = new_method {
+            if !is_type_new_sentinel {
+                let callable = match &new_method {
+                    Object::StaticMethod(inner) | Object::ClassMethod(inner) => (**inner).clone(),
+                    other => other.clone(),
+                };
+                let mut new_args = Vec::with_capacity(args.len() + 1);
+                new_args.push(Object::Type(winner.clone()));
+                new_args.extend(args.iter().cloned());
+                let result = self.call(&callable, &new_args, kwargs, &fallback_globals())?;
+                // `type.__call__` then runs `__init__` — only when
+                // `__new__` actually produced an instance of the winner.
+                if let Object::Type(created) = &result {
+                    if created.metaclass_or_type().is_subclass_of(&winner) {
+                        if let Some(init) = winner.lookup("__init__") {
+                            // Only a Python metaclass `__init__` consumes
+                            // class-creation keywords; the builtin
+                            // `type.__init__` ignores them.
+                            let init_consumes_kwargs = matches!(init, Object::Function(_));
+                            if init_consumes_kwargs {
+                                let bound = Object::BoundMethod(Rc::new(BoundMethod {
+                                    receiver: result.clone(),
+                                    function: init,
+                                }));
+                                let _ = self.call(&bound, args, kwargs, &fallback_globals())?;
+                            }
+                        }
+                    }
+                }
+                return Ok(result);
+            }
+        }
+        self.dynamic_type_call_with_meta(winner, args, kwargs, true)
+    }
+
     /// `metaclass(name, bases, ns)` — the three-arg form that
     /// builds a new class. Used by `type(name, bases, ns)`, by
     /// custom metaclasses, and by the build_class path when the
@@ -9972,6 +11430,14 @@ impl Interpreter {
         let ns_dict_obj = args[2].clone();
         let mut ns = match &args[2] {
             Object::Dict(d) => d.borrow().clone(),
+            // PEP 3115: `type.__new__` accepts any mapping for the namespace
+            // and copies it. A metaclass chaining `super().__new__(...)` may
+            // pass the custom mapping from `__prepare__` directly (e.g.
+            // `enum.EnumMeta` forwarding its populated `_EnumDict`).
+            Object::Instance(inst) => match &inst.native {
+                Some(Object::Dict(d)) => d.borrow().clone(),
+                _ => return Err(type_error("type() arg 3 must be a dict")),
+            },
             _ => return Err(type_error("type() arg 3 must be a dict")),
         };
         // CPython's `type.__new__` defaults `__doc__` to `None` when the
@@ -10001,8 +11467,14 @@ impl Interpreter {
             .cloned()
             .collect();
 
+        // PEP 3135: `type.__new__` pops `__classcell__` from the namespace
+        // and points it at the new class before any creation hook runs.
+        let classcell = ns.shift_remove(&DictKey(Object::from_static("__classcell__")));
         let ty = TypeObject::new_user(&name, effective_bases.clone(), ns)?;
         ty.set_metaclass(metaclass.clone());
+        if let Some(Object::Cell(cell)) = classcell {
+            *cell.borrow_mut() = Object::Type(ty.clone());
+        }
         self.finalize_class_namespace(&ty)?;
 
         // If we're under a user metaclass, run its `__init__` so it
@@ -10390,10 +11862,11 @@ impl Interpreter {
             // route lazy iterables (generators, `zip`/`map`/`filter`
             // views, genexprs) through the VM-aware collector — the plain
             // builtins below can only drive eager containers (RFC 0033).
-            if matches!(
+            if (matches!(
                 &args.first(),
                 Some(Object::Generator(_) | Object::Iter(_) | Object::Instance(_))
-            ) && args.len() == 1
+            ) || args.first().is_some_and(object_needs_vm_iter))
+                && args.len() == 1
                 && kwargs.is_empty()
             {
                 if cls.name == "set" || cls.name == "frozenset" {
@@ -10701,12 +12174,27 @@ impl Interpreter {
     /// canonical Python `.args` tuple. Used by both `raise` and
     /// explicit `ExceptionClass(...)` calls.
     fn build_exception_instance(&self, cls: Rc<TypeObject>, args: &[Object]) -> Object {
+        let is_stop_iteration = cls
+            .mro
+            .borrow()
+            .iter()
+            .any(|t| t.name == "StopIteration");
         let inst = PyInstance::new(cls);
         let args_tuple = Object::new_tuple(args.to_vec());
         let mut dict = inst.dict.borrow_mut();
         dict.insert(DictKey(Object::from_static("args")), args_tuple);
         if let Some(first) = args.first() {
             dict.insert(DictKey(Object::from_static("message")), first.clone());
+        }
+        // PEP 380: `StopIteration.value` is the first constructor arg
+        // (or None). Generator `return` goes through
+        // `stop_iteration_with`, but user code constructs
+        // `StopIteration(x)` directly and reads `.value` too.
+        if is_stop_iteration {
+            dict.insert(
+                DictKey(Object::from_static("value")),
+                args.first().cloned().unwrap_or(Object::None),
+            );
         }
         // CPython's `BaseException` always exposes these slots (default
         // None/None/False/None), so attribute access and exception-context
@@ -10973,7 +12461,32 @@ impl Interpreter {
             // frame in a PyGenerator and hand it back to the caller.
             match self.run_until_yield_or_return(&mut frame, None)? {
                 FrameOutcome::StartGenerator => {
-                    let gen = Rc::new(PyGenerator::new(f.name.clone(), Box::new(frame)));
+                    let kind = if code.is_coroutine {
+                        crate::object::CoroutineKind::Coroutine
+                    } else if code.is_async_generator {
+                        crate::object::CoroutineKind::AsyncGenerator
+                    } else {
+                        crate::object::CoroutineKind::Generator
+                    };
+                    // CPython snapshots the *function's* current
+                    // `__name__`/`__qualname__` (which user code may have
+                    // reassigned; overrides live in `f.attrs`) into
+                    // `gi_name`/`gi_qualname` at call time.
+                    let attr_str = |attr: &'static str| -> Option<String> {
+                        match f.attrs.borrow().get(&DictKey(Object::from_static(attr))) {
+                            Some(Object::Str(s)) => Some(s.to_string()),
+                            _ => None,
+                        }
+                    };
+                    let gen_name = attr_str("__name__").unwrap_or_else(|| f.name.clone());
+                    let gen_qualname =
+                        attr_str("__qualname__").unwrap_or_else(|| code.qualname.clone());
+                    let gen = Rc::new(PyGenerator::new(
+                        gen_name,
+                        gen_qualname,
+                        kind,
+                        Box::new(frame),
+                    ));
                     if code.is_coroutine {
                         Ok(Object::Coroutine(gen))
                     } else if code.is_async_generator {
@@ -11149,7 +12662,10 @@ impl Interpreter {
             stack: Vec::with_capacity(16),
             globals: f.globals.clone(),
             class_namespace: None,
+            class_namespace_obj: None,
             exc_handlers: Vec::new(),
+            saved_exc_info: Vec::new(),
+            agen_yielded_value: true,
             pc: 0,
             py_frame: None,
         };
@@ -12593,6 +14109,34 @@ fn resolve_metaclass(
     Ok(winner)
 }
 
+/// Bind callable `m` to `receiver` (the dunder-dispatch convention used
+/// throughout: the receiver flows in as the first argument).
+pub(crate) fn bind_method(receiver: &Object, m: Object) -> Object {
+    Object::BoundMethod(Rc::new(BoundMethod {
+        receiver: receiver.clone(),
+        function: m,
+    }))
+}
+
+/// Resolve `name` through the *metaclass* of class `v` and bind it to the
+/// class — the dispatch CPython performs for protocol operations applied
+/// to a class object itself (`len(SomeEnum)`, `x in SomeEnum`,
+/// `reversed(SomeEnum)`, …): `type(cls).__dunder__(cls)`.
+pub(crate) fn metaclass_method(v: &Object, name: &str) -> Option<Object> {
+    match v {
+        Object::Type(t) => {
+            let meta = t.metaclass_or_type();
+            // `type` itself contributes no protocol dunders here; only a
+            // user metaclass (EnumType, ABCMeta, …) does.
+            if Rc::ptr_eq(&meta, &builtin_types().type_) {
+                return None;
+            }
+            meta.lookup(name).map(|m| bind_method(v, m))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn instance_method(obj: &Object, name: &str) -> Option<Object> {
     let inst = match obj {
         Object::Instance(i) => i.clone(),
@@ -12603,6 +14147,52 @@ pub(crate) fn instance_method(obj: &Object, name: &str) -> Option<Object> {
         receiver: Object::Instance(inst),
         function: m,
     })))
+}
+
+thread_local! {
+    /// Cache of synthesized built-in slot wrappers, keyed by
+    /// `(type pointer, dunder name)`. Built-in types are per-thread
+    /// singletons with stable addresses, so caching by raw pointer keeps
+    /// type-level dunder access identity-stable: `int.__add__ is int.__add__`
+    /// and `getattr(object, '__repr__') is getattr(object, '__repr__')` — the
+    /// identity `enum`'s bootstrap (`found in (data_type_method, object_method)`)
+    /// depends on. Only built-in types are keyed, so the entries live as long
+    /// as the type singletons themselves.
+    static SLOT_WRAPPER_CACHE: std::cell::RefCell<std::collections::HashMap<(usize, String), Object>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Resolve a built-in slot-wrapper dunder reached via *type-level* attribute
+/// access (`int.__add__`, `object.__repr__`, `MyClass.__str__`). Walks `ty`'s
+/// MRO and returns the wrapper contributed by the first *built-in* base that
+/// defines `name`, synthesizing it once and caching it for stable identity. A
+/// user subclass that doesn't override the slot therefore resolves to the
+/// defining base's wrapper (so `MyClass.__repr__ is object.__repr__`, as in
+/// CPython). Returns `None` when no built-in base defines the dunder, letting
+/// the caller raise `AttributeError`.
+///
+/// This is reached only from [`Interpreter::load_attr_type`] (the type-level
+/// path); instance attribute access keeps using `repr_of` / `stringify` /
+/// `instance_method`, so the hot per-object dispatch is unchanged.
+fn builtin_slot_wrapper(ty: &Rc<TypeObject>, name: &str) -> Option<Object> {
+    let mro: Vec<Rc<TypeObject>> = ty.mro.borrow().iter().cloned().collect();
+    for base in mro {
+        if !base.flags.is_builtin {
+            continue;
+        }
+        let ptr = Rc::as_ptr(&base) as usize;
+        if let Some(o) = SLOT_WRAPPER_CACHE.with(|c| c.borrow().get(&(ptr, name.to_owned())).cloned())
+        {
+            return Some(o);
+        }
+        if let Some(o) = crate::builtins::builtin_type_dunder(&base.name, name) {
+            SLOT_WRAPPER_CACHE.with(|c| {
+                c.borrow_mut().insert((ptr, name.to_owned()), o.clone());
+            });
+            return Some(o);
+        }
+    }
+    None
 }
 
 /// Return a fresh empty globals dict — used by the awaitable
@@ -12654,6 +14244,23 @@ fn init_is_from_object(cls: &Rc<TypeObject>) -> bool {
     false
 }
 
+/// Build the deferred awaitable returned by `agen.asend(v)` /
+/// `.athrow(e)` / `.aclose()` (PEP 525). The operation is applied only
+/// when the awaitable is driven — see [`Interpreter::step_agen_await`].
+fn make_agen_await(
+    receiver: &Object,
+    kind: crate::object::AgenAwaitKind,
+    args: Vec<Object>,
+) -> Object {
+    Object::AsyncGenAwait(Rc::new(crate::object::AsyncGenAwait {
+        agen: receiver.clone(),
+        kind,
+        args,
+        consumed: crate::sync::Cell::new(false),
+        started: crate::sync::Cell::new(false),
+    }))
+}
+
 /// Build the `Object::BoundMethod` returned by
 /// `<gen>.send` / `.throw` / `.close` / `.__next__` / `.__iter__`.
 /// The actual dispatch is handled by [`Interpreter::call`] via the
@@ -12686,6 +14293,50 @@ fn make_gen_method(name: &str, receiver: &Object) -> Object {
         receiver: receiver.clone(),
         function: builtin,
     }))
+}
+
+/// Map a `type(<gen-family obj>).<method>` access to the sentinel name for
+/// its *unbound* form — the function that takes the instance as `args[0]`,
+/// e.g. `type(agen).__anext__(agen)`. CPython exposes generator/coroutine/
+/// async-generator methods as `method_descriptor`s on the type; pure-Python
+/// code such as test_asyncgen's `py_anext` reads `type(it).__anext__` and
+/// then calls it with the instance. The `.u.` namespace is dispatched in
+/// [`Interpreter::call`]'s plain-`Builtin` arm with `args[0]` as receiver.
+///
+/// Gated on `Rc::ptr_eq` against the canonical built-in types so a user
+/// class merely *named* "generator" can't accidentally borrow these.
+fn unbound_gen_method_sentinel(ty: &Rc<TypeObject>, name: &str) -> Option<&'static str> {
+    let bt = builtin_types();
+    if Rc::ptr_eq(ty, &bt.generator_) {
+        return match name {
+            "send" => Some(".u.gen_send"),
+            "throw" => Some(".u.gen_throw"),
+            "close" => Some(".u.gen_close"),
+            "__next__" => Some(".u.gen_next"),
+            "__iter__" => Some(".u.gen_iter"),
+            _ => None,
+        };
+    }
+    if Rc::ptr_eq(ty, &bt.coroutine_) {
+        return match name {
+            "send" => Some(".u.gen_send"),
+            "throw" => Some(".u.gen_throw"),
+            "close" => Some(".u.gen_close"),
+            "__await__" => Some(".u.gen_iter"),
+            _ => None,
+        };
+    }
+    if Rc::ptr_eq(ty, &bt.async_generator_) {
+        return match name {
+            "__aiter__" => Some(".u.agen_aiter"),
+            "__anext__" => Some(".u.agen_anext"),
+            "asend" => Some(".u.agen_send"),
+            "athrow" => Some(".u.agen_throw"),
+            "aclose" => Some(".u.agen_close"),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Look up the `value` attribute on a `StopIteration` instance. Falls
@@ -14643,6 +16294,26 @@ fn group_decimal(mag: u64, sep: char) -> String {
     out
 }
 
+/// Does iterating `o` require driving the interpreter (a generator
+/// resume or an instance `__next__`/`__iter__` call)? Such sources are
+/// potentially unbounded and side-effecting, so `map`/`filter`/`zip`
+/// build *lazy* iterators over them; plain native containers take the
+/// eager fast path.
+fn object_needs_vm_iter(o: &Object) -> bool {
+    // A class whose *metaclass* defines `__iter__` (e.g. `list(SomeEnum)`
+    // → `EnumType.__iter__`) iterates through the interpreter too.
+    if let Object::Type(_) = o {
+        return metaclass_method(o, "__iter__").is_some();
+    }
+    matches!(
+        o,
+        Object::Generator(_)
+            | Object::Coroutine(_)
+            | Object::AsyncGenerator(_)
+            | Object::Instance(_)
+    )
+}
+
 /// Is `e` an `IndexError` (or subclass)? Used by the legacy
 /// `__getitem__` iteration protocol to detect the end of a sequence.
 fn is_index_error(e: &RuntimeError) -> bool {
@@ -16088,6 +17759,69 @@ mod tests {
             "print(B().hello())\n"
         );
         assert_eq!(run(src), "B-A\n");
+    }
+
+    #[test]
+    fn metaclass_prepare_custom_namespace() {
+        // PEP 3115: a metaclass `__prepare__` returning a custom mapping must
+        // observe every class-body binding through its `__setitem__`, and the
+        // metaclass `__new__` must receive that same mapping.
+        let src = concat!(
+            "class NS(dict):\n",
+            "    log = None\n",
+            "    def __init__(self):\n",
+            "        super().__init__()\n",
+            "        type(self).log = []\n",
+            "    def __setitem__(self, k, v):\n",
+            "        if not k.startswith('__'):\n",
+            "            NS.log.append(k)\n",
+            "        super().__setitem__(k, v)\n",
+            "class Meta(type):\n",
+            "    @classmethod\n",
+            "    def __prepare__(mcs, name, bases, **kw):\n",
+            "        return NS()\n",
+            "    def __new__(mcs, name, bases, ns, **kw):\n",
+            "        return super().__new__(mcs, name, bases, dict(ns))\n",
+            "class C(metaclass=Meta):\n",
+            "    A = 1\n",
+            "    B = 2\n",
+            "    def m(self):\n",
+            "        return self.A\n",
+            "print(NS.log)\n",
+            "print(type(C).__name__)\n",
+            "print(C().m())\n",
+        );
+        assert_eq!(run(src), "['A', 'B', 'm']\nMeta\n1\n");
+    }
+
+    #[test]
+    fn builtin_slot_wrappers_identity_and_calls() {
+        // Type-level object-protocol dunders are gettable, identity-stable, and
+        // resolve through the MRO to the defining built-in base — the contract
+        // CPython's `enum` bootstrap relies on
+        // (`found_method in (data_type_method, object_method)`).
+        let src = concat!(
+            // gettable on object / int / str
+            "print(callable(object.__repr__), callable(int.__str__), callable(str.__format__))\n",
+            // identity stability
+            "print(object.__repr__ is object.__repr__)\n",
+            "print(int.__add__ is int.__add__)\n",
+            // int inherits object.__str__ (CPython: int has no own __str__),
+            // str overrides it
+            "print(int.__str__ is object.__str__)\n",
+            "print(str.__str__ is object.__str__)\n",
+            // a user class inherits object's wrappers
+            "class C: pass\n",
+            "print(C.__repr__ is object.__repr__)\n",
+            // calls unwrap native payloads correctly
+            "print(int.__repr__(5), int.__format__(255, 'x'), str.__repr__('hi'))\n",
+            // the exact enum-bootstrap membership shape
+            "print(int.__repr__ in (int.__repr__, object.__repr__))\n",
+        );
+        assert_eq!(
+            run(src),
+            "True True True\nTrue\nTrue\nTrue\nFalse\nTrue\n5 ff 'hi'\nTrue\n"
+        );
     }
 
     #[test]

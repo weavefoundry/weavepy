@@ -244,8 +244,15 @@ pub fn stop_iteration_with(value: Object) -> RuntimeError {
     if let Object::Instance(ref inst) = pe.instance {
         let key = crate::object::DictKey(Object::from_static("value"));
         inst.dict.borrow_mut().insert(key, value.clone());
+        // A bare `return` (value None) raises `StopIteration()` with
+        // *empty* args, so `str(e)` renders bare and `e.args` is `()` —
+        // CPython's `gen_return` only packs non-None return values.
         let args_key = crate::object::DictKey(Object::from_static("args"));
-        let args = Object::new_tuple(vec![value]);
+        let args = if matches!(value, Object::None) {
+            Object::new_tuple(Vec::new())
+        } else {
+            Object::new_tuple(vec![value])
+        };
         inst.dict.borrow_mut().insert(args_key, args);
     }
     RuntimeError::PyException(pe)

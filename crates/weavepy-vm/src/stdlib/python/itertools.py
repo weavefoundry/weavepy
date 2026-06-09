@@ -177,9 +177,68 @@ def takewhile(predicate, iterable):
         yield item
 
 
+class _TeeState:
+    """Source iterator shared by the branches of one ``tee()`` call.
+
+    ``busy`` guards the source pull: CPython's C ``tee`` raises
+    ``RuntimeError`` when one branch tries to advance the shared source
+    while another is already blocked inside it (test_tee_concurrent).
+    """
+
+    __slots__ = ("it", "busy")
+
+    def __init__(self, it):
+        self.it = it
+        self.busy = False
+
+
+class _TeeIter:
+    """One branch of a lazy ``tee()``.
+
+    Branches share a singly-linked buffer of ``[value, next_link]``
+    cells; ``next_link is None`` marks the frontier where the source
+    iterator must be advanced. The source is consumed on demand, so
+    ``tee`` works on infinite and partially-consumed iterators.
+    """
+
+    __slots__ = ("_state", "_link")
+
+    def __init__(self, state, link):
+        self._state = state
+        self._link = link
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        link = self._link
+        if link is None:
+            raise StopIteration
+        if link[1] is None:
+            state = self._state
+            if state.busy:
+                raise RuntimeError("cannot re-enter the tee iterator")
+            state.busy = True
+            try:
+                value = next(state.it)
+            except StopIteration:
+                self._link = None
+                raise
+            finally:
+                state.busy = False
+            link[0] = value
+            link[1] = [None, None]
+        value, self._link = link
+        return value
+
+
 def tee(iterable, n=2):
-    items = list(iterable)
-    return tuple(iter(items) for _ in range(n))
+    if n < 0:
+        raise ValueError("n must be >= 0")
+    it = iter(iterable)
+    state = _TeeState(it)
+    link = [None, None]
+    return tuple(_TeeIter(state, link) for _ in range(n))
 
 
 def zip_longest(*iterables, fillvalue=None):

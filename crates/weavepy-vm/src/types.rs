@@ -149,6 +149,115 @@ impl TypeObject {
         Ok(ty)
     }
 
+    /// Does this type have a CPython "managed `__dict__`" — i.e. do its
+    /// instances carry an attribute dict? True for user-defined classes
+    /// whose MRO doesn't declare slots-without-dict the whole way down.
+    pub fn has_managed_dict(&self) -> bool {
+        !self.flags.is_builtin && !self.forbids_dict
+    }
+
+    /// Does this type inherit from a *variable-sized* built-in
+    /// (`tp_itemsize != 0` in CPython: `int`, `tuple`, `str`, `bytes`,
+    /// `type`)? Such types get a managed dict but no inline values.
+    pub fn has_var_sized_base(&self) -> bool {
+        self.mro.borrow().iter().any(|t| {
+            t.flags.is_builtin
+                && matches!(t.name.as_str(), "int" | "tuple" | "str" | "bytes" | "type")
+        })
+    }
+
+    /// CPython `type.__flags__` (`tp_flags`), computed from this type's
+    /// observable properties. Covers the documented/queried bits:
+    /// inline-values + managed-dict (`test_class`), heap/base/ready/gc,
+    /// abstractness, and the `*_SUBCLASS` fast-classification bits.
+    pub fn flags_bits(&self) -> i64 {
+        const INLINE_VALUES: i64 = 1 << 2;
+        const MANAGED_WEAKREF: i64 = 1 << 3;
+        const MANAGED_DICT: i64 = 1 << 4;
+        const IMMUTABLETYPE: i64 = 1 << 8;
+        const HEAPTYPE: i64 = 1 << 9;
+        const BASETYPE: i64 = 1 << 10;
+        const READY: i64 = 1 << 12;
+        const HAVE_GC: i64 = 1 << 14;
+        const IS_ABSTRACT: i64 = 1 << 20;
+        const LONG_SUBCLASS: i64 = 1 << 24;
+        const LIST_SUBCLASS: i64 = 1 << 25;
+        const TUPLE_SUBCLASS: i64 = 1 << 26;
+        const BYTES_SUBCLASS: i64 = 1 << 27;
+        const UNICODE_SUBCLASS: i64 = 1 << 28;
+        const DICT_SUBCLASS: i64 = 1 << 29;
+        const BASE_EXC_SUBCLASS: i64 = 1 << 30;
+        const TYPE_SUBCLASS: i64 = 1 << 31;
+
+        let mut bits = READY;
+        if self.flags.is_builtin {
+            bits |= IMMUTABLETYPE;
+            // Built-ins that refuse subclassing.
+            let is_final = matches!(
+                self.name.as_str(),
+                "bool"
+                    | "NoneType"
+                    | "NotImplementedType"
+                    | "ellipsis"
+                    | "range"
+                    | "slice"
+                    | "memoryview"
+                    | "generator"
+                    | "coroutine"
+                    | "async_generator"
+                    | "function"
+                    | "builtin_function_or_method"
+                    | "method_wrapper"
+                    | "mappingproxy"
+            );
+            if !is_final {
+                bits |= BASETYPE;
+            }
+            if matches!(
+                self.name.as_str(),
+                "list" | "dict" | "set" | "frozenset" | "tuple" | "type"
+            ) || self.flags.is_exception
+            {
+                bits |= HAVE_GC;
+            }
+        } else {
+            bits |= HEAPTYPE | BASETYPE | HAVE_GC | MANAGED_WEAKREF;
+            if self.has_managed_dict() {
+                bits |= MANAGED_DICT;
+                if !self.has_var_sized_base() {
+                    bits |= INLINE_VALUES;
+                }
+            }
+        }
+        match self
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__abstractmethods__")))
+        {
+            Some(Object::Set(s)) if !s.borrow().is_empty() => bits |= IS_ABSTRACT,
+            Some(Object::FrozenSet(s)) if !s.is_empty() => bits |= IS_ABSTRACT,
+            _ => {}
+        }
+        for t in self.mro.borrow().iter() {
+            if t.flags.is_builtin {
+                match t.name.as_str() {
+                    "int" => bits |= LONG_SUBCLASS,
+                    "list" => bits |= LIST_SUBCLASS,
+                    "tuple" => bits |= TUPLE_SUBCLASS,
+                    "bytes" => bits |= BYTES_SUBCLASS,
+                    "str" => bits |= UNICODE_SUBCLASS,
+                    "dict" => bits |= DICT_SUBCLASS,
+                    "type" => bits |= TYPE_SUBCLASS,
+                    _ => {}
+                }
+            }
+        }
+        if self.flags.is_exception {
+            bits |= BASE_EXC_SUBCLASS;
+        }
+        bits
+    }
+
     /// Reset the cached `__getattribute__` classification for this type and
     /// every (transitive) subclass. Called when `__getattribute__` is
     /// assigned to or deleted from a type's dict, since that can change the
@@ -271,6 +380,13 @@ pub struct PyInstance {
     /// by the numeric / comparison / hashing / conversion fast paths
     /// so e.g. `class C(int)` instances behave like real ints.
     pub native: Option<Object>,
+    /// Mirrors CPython 3.13's "inline values" state observable through
+    /// `_testinternalcapi.has_inline_values`: starts `true` and is
+    /// permanently cleared when the instance's `__dict__` is deleted or
+    /// replaced wholesale (`del obj.__dict__` / `obj.__dict__ = d`).
+    /// The capacity-overflow half of the state (too many attributes)
+    /// is computed at query time from the dict size.
+    pub inline_values: Cell<bool>,
 }
 
 impl PyInstance {
@@ -279,6 +395,7 @@ impl PyInstance {
             class,
             dict: Rc::new(RefCell::new(DictData::new())),
             native: None,
+            inline_values: Cell::new(true),
         }
     }
 
@@ -289,6 +406,7 @@ impl PyInstance {
             class,
             dict: Rc::new(RefCell::new(DictData::new())),
             native: Some(native),
+            inline_values: Cell::new(true),
         }
     }
 }

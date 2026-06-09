@@ -849,6 +849,7 @@ Py_DEBUG = hasattr(sys, 'gettotalrefcount')
 TEST_HOME_DIR = os.path.dirname(os.path.abspath(__file__))
 TEST_SUPPORT_DIR = TEST_HOME_DIR
 STDLIB_DIR = os.path.dirname(os.path.dirname(TEST_HOME_DIR))
+REPO_ROOT = os.path.dirname(STDLIB_DIR)
 
 
 # ---------------------------------------------------------------------------

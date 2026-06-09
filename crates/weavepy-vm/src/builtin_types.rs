@@ -53,6 +53,12 @@ pub struct BuiltinTypes {
     pub simple_namespace_: Rc<TypeObject>,
     pub function_: Rc<TypeObject>,
     pub method_: Rc<TypeObject>,
+    /// `builtin_function_or_method` — the type of Rust-implemented
+    /// callables (`type(len)`), distinct from `function` as in CPython.
+    pub builtin_function_: Rc<TypeObject>,
+    /// `method-wrapper` — the type of a slot wrapper bound to an
+    /// instance (`type(object().__str__)`).
+    pub method_wrapper_: Rc<TypeObject>,
     pub generator_: Rc<TypeObject>,
     pub coroutine_: Rc<TypeObject>,
     pub async_generator_: Rc<TypeObject>,
@@ -185,6 +191,14 @@ impl BuiltinTypes {
         // `function` so `type(obj.meth)` is `method` (as in CPython) and
         // `types.MethodType(func, obj)` can construct a bound method.
         let method_ = mk("method", vec![object_.clone()]);
+        // `types.BuiltinFunctionType` — Rust-implemented callables.
+        // CPython keeps this distinct from `function` (`type(len) is not
+        // type(lambda: 0)`); `inspect`/`pydoc` classification relies on
+        // the distinction.
+        let builtin_function_ = mk("builtin_function_or_method", vec![object_.clone()]);
+        // `types.MethodWrapperType` — a slot-wrapper dunder bound to an
+        // instance (`object().__str__`).
+        let method_wrapper_ = mk("method-wrapper", vec![object_.clone()]);
         let generator_ = mk("generator", vec![object_.clone()]);
         let coroutine_ = mk("coroutine", vec![object_.clone()]);
         let async_generator_ = mk("async_generator", vec![object_.clone()]);
@@ -342,6 +356,8 @@ impl BuiltinTypes {
             simple_namespace_,
             function_,
             method_,
+            builtin_function_,
+            method_wrapper_,
             generator_,
             coroutine_,
             async_generator_,
@@ -419,6 +435,11 @@ impl BuiltinTypes {
         }
         // RFC 0019 — install numeric/bytes class methods.
         install_numeric_class_methods(&bt);
+        // Install `__new__` in each value/container type's own dict (CPython
+        // keeps a distinct `tp_new` per type). Needed so `'__new__' in
+        // int.__dict__` is True — `enum._find_data_type_` uses exactly this to
+        // recognise `int`/`str`/… as the mix-in data type.
+        install_value_type_new(&bt);
         bt
     }
 
@@ -803,37 +824,52 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
     None
 }
 
+/// `object.__new__(cls, *args, **kwargs)` — the default allocator, shared by
+/// `object.__new__` and the value-type `__new__`s (`int.__new__`, …) installed
+/// by [`install_value_type_new`]. `args[0]` is `cls`; for a subclass of a
+/// value/container built-in the native payload is captured so the inherited
+/// protocols keep firing through the subclass.
+pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::types::PyInstance;
+    let cls = match args.first() {
+        Some(Object::Type(t)) => t.clone(),
+        _ => {
+            return Err(crate::error::type_error(
+                "object.__new__(): first arg must be a class".to_owned(),
+            ))
+        }
+    };
+    // When `cls` derives from a value/container built-in (`int`, `float`,
+    // `str`, `tuple`, `list`, `dict`, …) capture the native payload the
+    // instance wraps so the inherited protocols keep firing through the
+    // subclass. `super().__new__(cls, value)` passes the seed value as the
+    // second positional argument (how `copyreg.__newobj__` reconstructs
+    // immutable subclasses); mutable containers start empty and are filled by
+    // `__init__` / `__setstate__` / the `_reconstruct` append-and-update loop.
+    if let Some(native) = native_seed_for_new(&cls, args.get(1)) {
+        return Ok(Object::Instance(Rc::new(PyInstance::with_native(cls, native))));
+    }
+    Ok(Object::Instance(Rc::new(PyInstance::new(cls))))
+}
+
+/// A fresh `Object::StaticMethod(Builtin "__new__")` wrapping [`object_new`].
+/// Each call returns a *distinct* object so `int.__new__ is object.__new__`
+/// is `False` (matching CPython) while the instantiation path still treats it
+/// as the default allocator (it keys on the builtin's `"__new__"` name).
+fn make_default_new() -> Object {
+    use crate::object::BuiltinFn;
+    Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
+        name: "__new__",
+        call: Box::new(object_new),
+        call_kw: None,
+    }))))
+}
+
 /// Install `object.__new__`, `object.__init__`, `object.__setattr__`
 /// and `object.__delattr__` on the root class. These are the implicit
 /// base methods every user class inherits.
 fn install_object_dunders(object_: &Rc<TypeObject>) {
     use crate::object::BuiltinFn;
-    use crate::types::PyInstance;
-    fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
-        // `object.__new__(cls, *args, **kwargs)` — args[0] is `cls`.
-        let cls = match args.first() {
-            Some(Object::Type(t)) => t.clone(),
-            _ => {
-                return Err(crate::error::type_error(
-                    "object.__new__(): first arg must be a class".to_owned(),
-                ))
-            }
-        };
-        // When `cls` derives from a value/container built-in (`int`,
-        // `float`, `str`, `tuple`, `list`, `dict`, …) capture the native
-        // payload the instance wraps so the inherited protocols keep
-        // firing through the subclass. `super().__new__(cls, value)`
-        // passes the seed value as the second positional argument (how
-        // `copyreg.__newobj__` reconstructs immutable subclasses); mutable
-        // containers start empty and are filled by `__init__` /
-        // `__setstate__` / the `_reconstruct` append-and-update loop.
-        if let Some(native) = native_seed_for_new(&cls, args.get(1)) {
-            return Ok(Object::Instance(Rc::new(PyInstance::with_native(
-                cls, native,
-            ))));
-        }
-        Ok(Object::Instance(Rc::new(PyInstance::new(cls))))
-    }
     fn object_init(_args: &[Object]) -> Result<Object, RuntimeError> {
         // No-op; honours `super().__init__()` chains.
         Ok(Object::None)
@@ -848,23 +884,40 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 "object.__setattr__() takes 3 arguments".to_owned(),
             ));
         }
-        let inst = match &args[0] {
-            Object::Instance(i) => i.clone(),
-            other => {
-                return Err(crate::error::type_error(format!(
-                    "object.__setattr__() requires an instance, got '{}'",
-                    other.type_name()
-                )))
-            }
-        };
         let name = match &args[1] {
             Object::Str(s) => s.to_string(),
             _ => return Err(crate::error::type_error("attribute name must be str")),
         };
-        inst.dict
-            .borrow_mut()
-            .insert(DictKey(Object::from_str(name)), args[2].clone());
-        Ok(Object::None)
+        match &args[0] {
+            Object::Instance(inst) => {
+                inst.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(name)), args[2].clone());
+                Ok(Object::None)
+            }
+            // `type.__setattr__` semantics for a class receiver — reached
+            // via `super().__setattr__(…)` inside a metaclass override
+            // (e.g. `EnumType.__setattr__` chaining to the default).
+            Object::Type(ty) => {
+                if ty.flags.is_builtin {
+                    return Err(crate::error::type_error(format!(
+                        "cannot set '{name}' attribute of immutable type '{}'",
+                        ty.name
+                    )));
+                }
+                ty.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(&name)), args[2].clone());
+                if name == "__getattribute__" {
+                    ty.invalidate_getattribute_cache();
+                }
+                Ok(Object::None)
+            }
+            other => Err(crate::error::type_error(format!(
+                "object.__setattr__() requires an instance, got '{}'",
+                other.type_name()
+            ))),
+        }
     }
     fn object_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
         if args.len() != 2 {
@@ -872,31 +925,52 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 "object.__delattr__() takes 2 arguments".to_owned(),
             ));
         }
-        let inst = match &args[0] {
-            Object::Instance(i) => i.clone(),
-            other => {
-                return Err(crate::error::type_error(format!(
-                    "object.__delattr__() requires an instance, got '{}'",
-                    other.type_name()
-                )))
-            }
-        };
         let name = match &args[1] {
             Object::Str(s) => s.to_string(),
             _ => return Err(crate::error::type_error("attribute name must be str")),
         };
-        let removed = inst
-            .dict
-            .borrow_mut()
-            .shift_remove(&DictKey(Object::from_str(&name)))
-            .is_some();
-        if !removed {
-            return Err(crate::error::attribute_error(format!(
-                "'{}' object has no attribute '{}'",
-                inst.class.name, name
-            )));
+        match &args[0] {
+            Object::Instance(inst) => {
+                let removed = inst
+                    .dict
+                    .borrow_mut()
+                    .shift_remove(&DictKey(Object::from_str(&name)))
+                    .is_some();
+                if !removed {
+                    return Err(crate::error::attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.class.name, name
+                    )));
+                }
+                Ok(Object::None)
+            }
+            // `type.__delattr__` semantics for a class receiver (chained
+            // via `super().__delattr__(…)` in a metaclass override).
+            Object::Type(ty) => {
+                if ty.flags.is_builtin {
+                    return Err(crate::error::type_error(format!(
+                        "cannot delete '{name}' attribute of immutable type '{}'",
+                        ty.name
+                    )));
+                }
+                let removed = ty
+                    .dict
+                    .borrow_mut()
+                    .shift_remove(&DictKey(Object::from_str(&name)))
+                    .is_some();
+                if !removed {
+                    return Err(crate::error::attribute_error(format!(
+                        "type object '{}' has no attribute '{}'",
+                        ty.name, name
+                    )));
+                }
+                Ok(Object::None)
+            }
+            other => Err(crate::error::type_error(format!(
+                "object.__delattr__() requires an instance, got '{}'",
+                other.type_name()
+            ))),
         }
-        Ok(Object::None)
     }
     fn object_hash(args: &[Object]) -> Result<Object, RuntimeError> {
         // Default `object.__hash__`: the same canonical hash the `hash()`
@@ -918,11 +992,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
     );
     dict.insert(
         DictKey(Object::from_static("__new__")),
-        Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
-            name: "__new__",
-            call: Box::new(object_new),
-            call_kw: None,
-        })))),
+        make_default_new(),
     );
     dict.insert(
         DictKey(Object::from_static("__init__")),
@@ -1930,6 +2000,35 @@ pub fn instance_is_subclass(obj: &Object, cls: &TypeObject) -> bool {
     match obj {
         Object::Instance(inst) => inst.class.is_subclass_of(cls),
         _ => false,
+    }
+}
+
+/// Install a distinct `__new__` in each value/container built-in's own dict.
+///
+/// CPython exposes a per-type `tp_new` in `tp_dict`, so `'__new__' in
+/// int.__dict__` is True and `int.__new__ is not object.__new__`. WeavePy's
+/// instantiation path keys the "default allocator" check on the builtin's
+/// `"__new__"` name (not its type), so these all route through the same
+/// native-seeding allocator — only their *identity* differs, which is what
+/// `enum`'s `_find_data_type_` / `_find_new_` inspect.
+fn install_value_type_new(bt: &BuiltinTypes) {
+    for ty in [
+        &bt.int_,
+        &bt.float_,
+        &bt.bool_,
+        &bt.complex_,
+        &bt.str_,
+        &bt.bytes_,
+        &bt.bytearray_,
+        &bt.tuple_,
+        &bt.list_,
+        &bt.dict_,
+        &bt.set_,
+        &bt.frozenset_,
+    ] {
+        ty.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("__new__")), make_default_new());
     }
 }
 

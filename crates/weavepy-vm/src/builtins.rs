@@ -618,17 +618,35 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         },
         // `property` objects expose `getter`/`setter`/`deleter`
         // methods that return a *new* property carrying a patched
-        // function (the underlying decorator pattern).
+        // function (the underlying decorator pattern), plus the
+        // explicit descriptor-protocol slots — CPython's `property` is
+        // a data descriptor precisely because its *type* defines
+        // `__set__`/`__delete__`, and `inspect.isdatadescriptor`
+        // checks exactly that.
         Object::Property(_) => match name {
             "getter" => Some(method("getter", property_getter)),
             "setter" => Some(method("setter", property_setter)),
             "deleter" => Some(method("deleter", property_deleter)),
+            "__get__" => Some(method("__get__", property_dunder_get)),
+            "__set__" => Some(method("__set__", property_dunder_set)),
+            "__delete__" => Some(method("__delete__", property_dunder_delete)),
             "fget" | "fset" | "fdel" | "__doc__" => {
                 // These are looked up via `lookup_attr` in the VM
                 // rather than method dispatch; we don't return them
                 // here.
                 None
             }
+            _ => None,
+        },
+        // Non-data descriptor protocol slots, reachable both bound
+        // (`sm.__get__`) via `load_attr` and unbound
+        // (`staticmethod.__get__`) via the slot-wrapper table.
+        Object::StaticMethod(_) => match name {
+            "__get__" => Some(method("__get__", staticmethod_descr_get)),
+            _ => None,
+        },
+        Object::ClassMethod(_) => match name {
+            "__get__" => Some(method("__get__", classmethod_descr_get)),
             _ => None,
         },
         Object::Int(_) | Object::Long(_) | Object::Bool(_) => match name {
@@ -1052,6 +1070,10 @@ fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn> {
         }),
         "__format__" => method("__format__", |args| {
             let value = args.first().cloned().unwrap_or(Object::None);
+            // A subclass instance (e.g. an `IntEnum` member) formats its
+            // native payload — `int.__format__(member, '')` is `'3'`,
+            // never the instance repr.
+            let value = value.native_value().unwrap_or(value);
             let spec = match args.get(1) {
                 Some(Object::Str(s)) => s.to_string(),
                 Some(other) => {
@@ -1192,9 +1214,133 @@ pub fn unbound_method(type_name: &str, name: &str) -> Option<Object> {
             items: Rc::from(Vec::<Object>::new()),
             index: 0,
         }))),
+        // Descriptor types: expose their protocol slots
+        // (`property.__set__`, `staticmethod.__get__`, …) for
+        // type-level access; the call receives the real descriptor as
+        // `self` via `args[0]`.
+        "property" => Object::Property(Rc::new(crate::object::PyProperty::new(
+            Object::None,
+            Object::None,
+            Object::None,
+            Object::None,
+        ))),
+        "staticmethod" => Object::StaticMethod(Rc::new(Object::None)),
+        "classmethod" => Object::ClassMethod(Rc::new(Object::None)),
         _ => return None,
     };
     lookup_method(&rep, name)
+}
+
+// ---- universal object-protocol slot wrappers (`object.__repr__`, …) ----
+//
+// CPython stores a slot wrapper for the object protocol in every type's
+// `tp_dict` (`object.__repr__`, `int.__str__`, `str.__format__`, …). WeavePy
+// synthesizes these on demand for *type-level* attribute access only (the
+// instance path keeps using `repr_of` / `stringify`), and the caller caches
+// the result per `(type, name)` so identity is stable — `enum`'s bootstrap
+// compares `getattr(member_type, '__str__') is object.__str__` and
+// `found_method in (data_type_method, object_method)`.
+
+/// `object.__repr__(self)` / `int.__repr__(self)` / … — the default repr of
+/// `self`, unwrapping a built-in subclass's native payload first (so
+/// `int.__repr__(IntEnumMember)` renders the wrapped integer).
+fn slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__repr__() takes exactly one argument (0 given)"))?;
+    let native = o.native_value();
+    Ok(Object::from_str(native.as_ref().unwrap_or(o).repr()))
+}
+
+/// `str.__str__(self)` / `object.__str__(self)` — `str()` of `self`. Mirrors
+/// CPython: for a value that doesn't define its own `__str__`, this is the
+/// `repr`-derived default; for `str`/`bytes` it returns the payload.
+fn slot_str(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__str__() takes exactly one argument (0 given)"))?;
+    let native = o.native_value();
+    Ok(Object::from_str(native.as_ref().unwrap_or(o).to_str()))
+}
+
+/// `object.__format__(self, spec)` / `str.__format__(self, spec)` — format
+/// `self` per `spec`, unwrapping a native payload first. An empty spec is
+/// equivalent to `str(self)`.
+fn slot_format(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__format__() takes exactly 2 arguments (0 given)"))?;
+    let spec = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(Object::None) | None => String::new(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "__format__() argument 1 must be str, not {}",
+                other.type_name()
+            )))
+        }
+    };
+    let native = o.native_value();
+    crate::format_via_spec(native.as_ref().unwrap_or(o), &spec).map(Object::from_str)
+}
+
+/// `type.__call__` / `function.__call__` / … — invoke `args[0]` with the
+/// remaining arguments (CPython's `tp_call` slot exposed as a wrapper).
+fn slot_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let callee = args
+        .first()
+        .ok_or_else(|| type_error("__call__ needs an argument"))?;
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+    // SAFETY: published by an enclosing VM frame still live on this
+    // thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    interp.call_object_with_globals(callee, &args[1..], kwargs, &globals)
+}
+
+/// Resolve the slot wrapper a *built-in* type `base_name` contributes for the
+/// dunder `name`, or `None` if that type does not define it (so the caller's
+/// MRO walk falls through to the next built-in base). Reuses the canonical
+/// value-type implementations ([`unbound_method`]) and adds the universal
+/// object-protocol dunders (`__repr__`/`__str__`/`__format__`) that aren't
+/// modeled there.
+///
+/// `__str__` is intentionally restricted to the string-like built-ins; the
+/// numeric/container types inherit `object.__str__` exactly as in CPython, so
+/// `int.__str__ is object.__str__` holds and `IntEnum` correctly falls back to
+/// `int.__repr__` for member stringification.
+pub fn builtin_type_dunder(base_name: &str, name: &str) -> Option<Object> {
+    if let Some(o) = unbound_method(base_name, name) {
+        return Some(o);
+    }
+    // `__call__` lives only on the callable types (CPython: `tp_call`
+    // present on `type`, functions, methods — not on `object`).
+    if name == "__call__"
+        && matches!(
+            base_name,
+            "type" | "function" | "builtin_function_or_method" | "method" | "method-wrapper"
+        )
+    {
+        return Some(Object::Builtin(Rc::new(method_kw("__call__", slot_call))));
+    }
+    let f: fn(&[Object]) -> Result<Object, RuntimeError> = match name {
+        "__repr__" => slot_repr,
+        "__format__" => slot_format,
+        // Every built-in value type has its own `tp_str` in CPython
+        // (`int.__str__ is not object.__str__` — enum's ReprEnum wiring
+        // tests that identity), and `slot_str` already stringifies the
+        // receiver's native payload per type.
+        "__str__" => slot_str,
+        _ => return None,
+    };
+    let static_name = match name {
+        "__repr__" => "__repr__",
+        "__str__" => "__str__",
+        "__format__" => "__format__",
+        _ => return None,
+    };
+    Some(Object::Builtin(Rc::new(method(static_name, f))))
 }
 
 // ---------- free builtins ----------
@@ -1542,6 +1688,77 @@ fn property_setter(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn property_deleter(args: &[Object]) -> Result<Object, RuntimeError> {
     property_with(args, crate::object::PropertyAttr::Del)
+}
+
+/// Re-enter the running interpreter to call a Python-level callable from
+/// builtin context. Shared by the explicit descriptor-protocol slots
+/// (`property.__get__` / `__set__` / `__delete__`), whose accessors are
+/// ordinary Python functions.
+fn reentrant_call(callable: &Object, args: &[Object]) -> Result<Object, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    interp.call_object_with_globals(callable, args, &[], &globals)
+}
+
+fn property_self(args: &[Object], op: &str) -> Result<Rc<crate::object::PyProperty>, RuntimeError> {
+    match args.first() {
+        Some(Object::Property(p)) => Ok(p.clone()),
+        _ => Err(type_error(format!(
+            "descriptor '{op}' requires a 'property' object"
+        ))),
+    }
+}
+
+/// `property.__get__(self, obj, objtype=None)` — CPython's
+/// `property_descr_get`: class access (obj is None) returns the property
+/// itself; instance access invokes `fget`.
+fn property_dunder_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = property_self(args, "__get__")?;
+    match args.get(1) {
+        Some(obj) if !matches!(obj, Object::None) => {
+            if matches!(p.fget, Object::None) {
+                return Err(crate::error::attribute_error("unreadable attribute"));
+            }
+            reentrant_call(&p.fget, &[obj.clone()])
+        }
+        _ => Ok(args[0].clone()),
+    }
+}
+
+/// `property.__set__(self, obj, value)` — CPython's `property_descr_set`.
+fn property_dunder_set(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = property_self(args, "__set__")?;
+    let (obj, value) = match (args.get(1), args.get(2)) {
+        (Some(o), Some(v)) => (o.clone(), v.clone()),
+        _ => return Err(type_error("__set__() takes exactly 3 arguments")),
+    };
+    if matches!(p.fset, Object::None) {
+        return Err(crate::error::attribute_error(
+            "property has no setter".to_owned(),
+        ));
+    }
+    reentrant_call(&p.fset, &[obj, value])?;
+    Ok(Object::None)
+}
+
+/// `property.__delete__(self, obj)` — CPython's deleter slot.
+fn property_dunder_delete(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = property_self(args, "__delete__")?;
+    let obj = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| type_error("__delete__() takes exactly 2 arguments"))?;
+    if matches!(p.fdel, Object::None) {
+        return Err(crate::error::attribute_error(
+            "property has no deleter".to_owned(),
+        ));
+    }
+    reentrant_call(&p.fdel, &[obj])?;
+    Ok(Object::None)
 }
 
 fn b_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4101,9 +4318,20 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
         dict: Rc::new(RefCell::new({
             let mut d = DictData::new();
             d.insert(DictKey(Object::from_static("__self__")), receiver);
+            // CPython's `su->obj_type` — the class whose MRO is walked,
+            // passed as `owner` to descriptor `__get__`s. Also used to
+            // detect the class-bound form (`su->obj == starttype`),
+            // where descriptors get a NULL instance (so plain functions
+            // come back *unbound*: `super().__new__(cls, v)` must not
+            // prepend a second `cls`).
+            d.insert(
+                DictKey(Object::from_static("__obj_type__")),
+                Object::Type(receiver_class.clone()),
+            );
             d
         })),
         native: None,
+        inline_values: crate::sync::Cell::new(true),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -4215,10 +4443,28 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         },
         Object::SimpleNamespace(_) => bt.simple_namespace_.clone(),
         Object::Type(t) => t.metaclass_or_type(),
-        Object::Function(_) | Object::Builtin(_) => bt.function_.clone(),
+        Object::Function(_) => bt.function_.clone(),
+        // Rust-implemented callables are `builtin_function_or_method`,
+        // distinct from `function`, exactly as in CPython (`type(len)`).
+        Object::Builtin(_) => bt.builtin_function_.clone(),
         // A bound method is its own type in CPython (`type(o.m)` is `method`),
         // which also makes `types.MethodType(func, obj)` construct one.
-        Object::BoundMethod(_) => bt.method_.clone(),
+        // Distinguish what the method wraps, as CPython does:
+        //   * Python function        -> `method`
+        //   * builtin slot dunder    -> `method-wrapper` (`x.__add__`)
+        //   * other builtin callable -> `builtin_function_or_method`
+        //     (`[].append` — bound C methods share the C-function type)
+        Object::BoundMethod(bm) => match &bm.function {
+            Object::Builtin(b) => {
+                let n = b.name.trim_start_matches('.');
+                if n.starts_with("__") && n.ends_with("__") {
+                    bt.method_wrapper_.clone()
+                } else {
+                    bt.builtin_function_.clone()
+                }
+            }
+            _ => bt.method_.clone(),
+        },
         Object::Property(_) => bt.property_.clone(),
         Object::StaticMethod(_) => bt.staticmethod_.clone(),
         Object::ClassMethod(_) => bt.classmethod_.clone(),
@@ -4230,6 +4476,11 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Generator(_) => bt.generator_.clone(),
         Object::Coroutine(_) => bt.coroutine_.clone(),
         Object::AsyncGenerator(_) => bt.async_generator_.clone(),
+        // The transient `asend`/`athrow`/`aclose` awaitables have no
+        // dedicated singleton type; treat them as plain objects for
+        // `type()` (their faithful CPython name is still surfaced by
+        // `repr`/error messages via `Object::type_name`).
+        Object::AsyncGenAwait(_) => bt.object_.clone(),
         Object::Module(_) => bt.module_.clone(),
         Object::Code(_) | Object::Cell(_) | Object::SlotDescriptor(_) | Object::File(_) => {
             bt.object_.clone()
@@ -4310,6 +4561,7 @@ fn object_identity(obj: &Object) -> i64 {
         Object::Generator(g) => Rc::as_ptr(g) as usize as i64,
         Object::Coroutine(g) => Rc::as_ptr(g) as usize as i64,
         Object::AsyncGenerator(g) => Rc::as_ptr(g) as usize as i64,
+        Object::AsyncGenAwait(a) => Rc::as_ptr(a) as usize as i64,
         Object::File(f) => Rc::as_ptr(f) as usize as i64,
         Object::Property(p) => Rc::as_ptr(p) as usize as i64,
         Object::StaticMethod(m) => Rc::as_ptr(m) as usize as i64,
@@ -4389,7 +4641,7 @@ fn b_hash(args: &[Object]) -> Result<Object, RuntimeError> {
 /// fall back to a small list of dunder names. We deliberately keep
 /// this loose because runtime helpers (typing, dataclasses, abc)
 /// only need it to enumerate user attributes.
-fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
     use std::collections::BTreeSet;
     let mut names: BTreeSet<String> = BTreeSet::new();
     let obj = one(args, "dir")?;

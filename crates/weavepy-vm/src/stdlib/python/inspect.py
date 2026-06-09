@@ -35,6 +35,16 @@ __all__ = [
     "isgetsetdescriptor",
     "isdatadescriptor",
     "ismethoddescriptor",
+    "ismethodwrapper",
+    "classify_class_attrs",
+    "Attribute",
+    "getclasstree",
+    "walktree",
+    "getcomments",
+    "getabsfile",
+    "getattr_static",
+    "indentsize",
+    "findsource",
     "currentframe",
     "stack",
     "trace",
@@ -317,11 +327,30 @@ def isgetsetdescriptor(obj):
 
 
 def isdatadescriptor(obj):
-    return hasattr(obj, "__set__") and hasattr(obj, "__get__")
+    """CPython semantics: data descriptors define `__set__` or
+    `__delete__` *on their type* (properties, slots, C getsets)."""
+    if isclass(obj) or ismethod(obj) or isfunction(obj):
+        # mutual exclusion, as in CPython
+        return False
+    tp = type(obj)
+    return hasattr(tp, "__set__") or hasattr(tp, "__delete__")
 
 
 def ismethoddescriptor(obj):
-    return hasattr(obj, "__get__") and not hasattr(obj, "__set__") and not hasattr(obj, "__delete__")
+    """CPython semantics: non-data descriptors with a `__get__` whose
+    type carries neither `__set__` nor `__delete__`."""
+    if isclass(obj) or ismethod(obj) or isfunction(obj):
+        # mutual exclusion, as in CPython
+        return False
+    tp = type(obj)
+    return (hasattr(tp, "__get__")
+            and not hasattr(tp, "__set__")
+            and not hasattr(tp, "__delete__"))
+
+
+def ismethodwrapper(obj):
+    """Return true if the object is a method wrapper (bound slot wrapper)."""
+    return isinstance(obj, types.MethodWrapperType)
 
 
 # ---------------- frames / stack ---------------- #
@@ -465,6 +494,110 @@ def getsource(obj):
     return "".join(lines)
 
 
+def getabsfile(obj, _filename=None):
+    """Return an absolute path to the source or compiled file for an object.
+
+    The idea is for each object to have a unique origin, so this routine
+    normalizes the result as much as possible. (CPython `inspect.getabsfile`.)
+    """
+    import os
+    if _filename is None:
+        _filename = getsourcefile(obj) or getfile(obj)
+    return os.path.normcase(os.path.abspath(_filename))
+
+
+def indentsize(line):
+    """Return the indent size, in spaces, at the start of a line of text."""
+    expline = line.expandtabs()
+    return len(expline) - len(expline.lstrip())
+
+
+def findsource(obj):
+    """Return the entire source file and starting line number for an object.
+
+    The argument may be a module, class, method, function, traceback, frame,
+    or code object.  The source code is returned as a list of all the lines
+    in the file and the line number indexes a line in that list.  An OSError
+    is raised if the source code cannot be retrieved.
+    """
+    filename = getsourcefile(obj)
+    if filename is None:
+        raise OSError("source code not available")
+    lines = linecache.getlines(filename)
+    if not lines:
+        raise OSError("could not get source code")
+    if ismodule(obj):
+        return lines, 0
+    if isclass(obj):
+        block, lnum = _class_block(lines, obj.__name__)
+        if not block:
+            raise OSError("could not find class definition")
+        return lines, lnum - 1
+    if ismethod(obj):
+        obj = obj.__func__
+    if isfunction(obj):
+        obj = getattr(obj, "__code__", None)
+    if istraceback(obj):
+        obj = obj.tb_frame
+    if isframe(obj):
+        obj = obj.f_code
+    if iscode(obj):
+        lnum = obj.co_firstlineno - 1
+        if lnum < 0 or lnum >= len(lines):
+            raise OSError("lineno is out of bounds")
+        return lines, lnum
+    raise OSError("could not find code object")
+
+
+def getcomments(obj):
+    """Get lines of comments immediately preceding an object's source code.
+
+    Returns None when source can't be found. (CPython `inspect.getcomments`.)
+    """
+    try:
+        lines, lnum = findsource(obj)
+    except (OSError, TypeError):
+        return None
+
+    if ismodule(obj):
+        # Look for a comment block at the top of the file.
+        start = 0
+        if lines and lines[0][:2] == '#!':
+            start = 1
+        while start < len(lines) and lines[start].strip() in ('', '#'):
+            start = start + 1
+        if start < len(lines) and lines[start][:1] == '#':
+            comments = []
+            end = start
+            while end < len(lines) and lines[end][:1] == '#':
+                comments.append(lines[end].expandtabs())
+                end = end + 1
+            return ''.join(comments)
+
+    # Look for a comment block preceding the object.
+    elif lnum > 0:
+        indent = indentsize(lines[lnum])
+        end = lnum - 1
+        if end >= 0 and lines[end].lstrip()[:1] == '#' and \
+                indentsize(lines[end]) == indent:
+            comments = [lines[end].expandtabs().lstrip()]
+            if end > 0:
+                end = end - 1
+                comment = lines[end].expandtabs().lstrip()
+                while comment[:1] == '#' and indentsize(lines[end]) == indent:
+                    comments[:0] = [comment]
+                    end = end - 1
+                    if end < 0:
+                        break
+                    comment = lines[end].expandtabs().lstrip()
+            while comments and comments[0].strip() == '#':
+                comments[:1] = []
+            while comments and comments[-1].strip() == '#':
+                comments[-1:] = []
+            return ''.join(comments)
+    return None
+
+
 def _block_around(lines, start):
     if start < 0 or start >= len(lines):
         return [], 1
@@ -544,6 +677,197 @@ def getmembers(obj, predicate=None):
             out.append((name, value))
     out.sort(key=lambda kv: kv[0])
     return out
+
+
+try:
+    from collections import namedtuple as _namedtuple
+
+    Attribute = _namedtuple('Attribute', 'name kind defining_class object')
+except Exception:  # pragma: no cover - collections is always frozen
+    Attribute = None
+
+
+def classify_class_attrs(cls):
+    """Return list of attribute-descriptor tuples.
+
+    CPython `inspect.classify_class_attrs`: for each name in `dir(cls)`
+    (plus DynamicClassAttributes found on the MRO), a 4-tuple of
+    (name, kind, defining class, object). Kind is one of 'class method',
+    'static method', 'property', 'method', 'data'.
+    """
+    mro = getmro(cls)
+    metamro = getmro(type(cls))  # for attributes stored in the metaclass
+    metamro = tuple(c for c in metamro if c not in (type, object))
+    class_bases = (cls,) + tuple(mro)
+    all_bases = class_bases + metamro
+    names = dir(cls)
+    # Add any DynamicClassAttributes to the list of names;
+    # this may result in duplicate entries if, for example, a virtual
+    # attribute with the same name as a DynamicClassAttribute exists.
+    for base in mro:
+        for k, v in base.__dict__.items():
+            if isinstance(v, types.DynamicClassAttribute) and v.fget is not None:
+                names.append(k)
+    result = []
+    processed = set()
+
+    for name in names:
+        # Get the object associated with the name, and where it was defined.
+        homecls = None
+        get_obj = None
+        dict_obj = None
+        if name not in processed:
+            try:
+                if name == '__dict__':
+                    raise Exception("__dict__ is special, don't want the proxy")
+                get_obj = getattr(cls, name)
+            except Exception:
+                pass
+            else:
+                homecls = getattr(get_obj, "__objclass__", homecls)
+                if homecls not in class_bases:
+                    # if the resulting object does not live somewhere in the
+                    # mro, drop it and search the mro manually
+                    homecls = None
+                    last_cls = None
+                    # first look in the classes
+                    for srch_cls in class_bases:
+                        srch_obj = getattr(srch_cls, name, None)
+                        if srch_obj is get_obj:
+                            last_cls = srch_cls
+                    # then check the metaclasses
+                    for srch_cls in metamro:
+                        try:
+                            srch_obj = srch_cls.__getattr__(cls, name)
+                        except AttributeError:
+                            continue
+                        if srch_obj is get_obj:
+                            last_cls = srch_cls
+                    if last_cls is not None:
+                        homecls = last_cls
+        for base in all_bases:
+            if name in base.__dict__:
+                dict_obj = base.__dict__[name]
+                if homecls not in metamro:
+                    homecls = base
+                break
+        if homecls is None:
+            # unable to locate the attribute anywhere, most likely due to
+            # buggy custom __dir__; discard and move on
+            continue
+        obj = get_obj if get_obj is not None else dict_obj
+        # Classify the object or its descriptor.
+        if isinstance(dict_obj, (staticmethod, types.BuiltinMethodType)):
+            kind = "static method"
+            obj = dict_obj
+        elif isinstance(dict_obj, (classmethod, types.ClassMethodDescriptorType)):
+            kind = "class method"
+            obj = dict_obj
+        elif isinstance(dict_obj, property):
+            kind = "property"
+            obj = dict_obj
+        elif isroutine(obj):
+            kind = "method"
+        else:
+            kind = "data"
+        result.append(Attribute(name, kind, homecls, obj))
+        processed.add(name)
+    return result
+
+
+def walktree(classes, children, parent):
+    """Recursive helper function for getclasstree()."""
+    results = []
+    classes.sort(key=lambda c: (c.__module__, c.__name__))
+    for c in classes:
+        results.append((c, c.__bases__))
+        if c in children:
+            results.append(walktree(children[c], children, c))
+    return results
+
+
+def getclasstree(classes, unique=False):
+    """Arrange the given list of classes into a hierarchy of nested lists.
+
+    Where a nested list appears, it contains classes derived from the class
+    whose entry immediately precedes the list. (CPython `inspect.getclasstree`.)
+    """
+    children = {}
+    roots = []
+    for c in classes:
+        if c.__bases__:
+            for parent in c.__bases__:
+                if parent not in children:
+                    children[parent] = []
+                if c not in children[parent]:
+                    children[parent].append(c)
+                if unique and parent in classes:
+                    break
+        elif c not in roots:
+            roots.append(c)
+    for parent in children:
+        if parent not in classes:
+            roots.append(parent)
+    return walktree(roots, children, None)
+
+
+_static_sentinel = object()
+
+
+def _static_lookup_in_dict(obj_dict, attr):
+    try:
+        return obj_dict[attr], True
+    except (KeyError, TypeError):
+        return None, False
+
+
+def getattr_static(obj, attr, default=_static_sentinel):
+    """Retrieve attributes without triggering dynamic lookup via the
+    descriptor protocol, __getattr__ or __getattribute__.
+
+    Behavioural port of CPython `inspect.getattr_static`: walk the
+    instance `__dict__` and the type's MRO dictionaries directly. Data
+    descriptors found on the type take precedence over instance
+    attributes, mirroring `object.__getattribute__`'s static order.
+    """
+    instance_result = _static_sentinel
+    klass = type(obj)
+    if not isclass(obj):
+        dict_attr, found = _static_lookup_in_dict(
+            getattr(obj, "__dict__", {}) or {}, attr)
+        if found:
+            instance_result = dict_attr
+    else:
+        klass = obj
+
+    klass_result = _static_sentinel
+    for entry in getmro(klass):
+        d = entry.__dict__
+        if attr in d:
+            klass_result = d[attr]
+            break
+
+    if instance_result is not _static_sentinel and \
+            klass_result is not _static_sentinel:
+        # A data descriptor on the class shadows the instance dict.
+        if hasattr(type(klass_result), "__set__") or \
+                hasattr(type(klass_result), "__delete__"):
+            return klass_result
+        return instance_result
+    if instance_result is not _static_sentinel:
+        return instance_result
+    if klass_result is not _static_sentinel:
+        return klass_result
+
+    if isclass(obj):
+        # Search the metaclass MRO as well.
+        for entry in getmro(type(obj)):
+            d = entry.__dict__
+            if attr in d:
+                return d[attr]
+    if default is not _static_sentinel:
+        return default
+    raise AttributeError(attr)
 
 
 # ---------------- argspec / signature ---------------- #
@@ -818,7 +1142,13 @@ class Signature:
                     raise TypeError(f"missing a required argument: {p.name!r}")
         return BoundArguments(self, arguments)
 
-    def __str__(self):
+    def format(self, *, max_width=None):
+        """Create a string representation of the Signature object.
+
+        If *max_width* is passed and the one-line rendering is longer,
+        every parameter goes on its own line (CPython 3.13
+        `Signature.format`).
+        """
         result = []
         render_pos_only_separator = False
         render_kw_only_separator = True
@@ -842,10 +1172,15 @@ class Signature:
             # There were only positional-only parameters, hence the flag was
             # not reset to 'False'.
             result.append("/")
-        ret = ""
+        rendered = "(" + ", ".join(result) + ")"
+        if max_width is not None and len(rendered) > max_width:
+            rendered = "(\n    " + ",\n    ".join(result) + "\n)"
         if self._return_annotation is not _empty:
-            ret = f" -> {self._return_annotation!r}"
-        return "(" + ", ".join(result) + ")" + ret
+            rendered += f" -> {self._return_annotation!r}"
+        return rendered
+
+    def __str__(self):
+        return self.format()
 
     @classmethod
     def from_callable(cls, func):

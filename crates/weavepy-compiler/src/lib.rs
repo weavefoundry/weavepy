@@ -616,6 +616,11 @@ enum FinallyKind {
     /// Name node because the synthetic local name (".with_cm0")
     /// isn't a valid identifier and would fail name resolution.
     WithExit { cm_idx: u32 },
+    /// Synthetic frame for an `async with` block: emit
+    /// `await <aexit_local>(None, None, None)`. Mirrors `WithExit`
+    /// but awaits the `__aexit__` coroutine, so a `return`/`break`/
+    /// `continue` out of an `async with` body still runs the exit.
+    AsyncWithExit { aexit_idx: u32 },
 }
 
 struct FinallyFrame {
@@ -2139,6 +2144,19 @@ impl Compiler {
                 self.emit(OpCode::PopTop, 0);
                 Ok(())
             }
+            FinallyKind::AsyncWithExit { aexit_idx } => {
+                // `await <aexit>(None, None, None)`. The bound coroutine
+                // method was stashed at `aexit_idx` by `compile_async_with`.
+                self.emit(OpCode::LoadFast, *aexit_idx);
+                let none_idx = self.co.intern_constant(Constant::None);
+                self.emit(OpCode::LoadConst, none_idx);
+                self.emit(OpCode::LoadConst, none_idx);
+                self.emit(OpCode::LoadConst, none_idx);
+                self.emit(OpCode::Call, 3);
+                self.compile_await_dance(2);
+                self.emit(OpCode::PopTop, 0);
+                Ok(())
+            }
         }
     }
 
@@ -2424,6 +2442,14 @@ impl Compiler {
                 handler: handlers_start,
                 depth: body_depth,
             });
+            // Record the propagating exception as the active handled
+            // exception for the duration of the finally body. Without
+            // this a `raise` inside `finally` (e.g. a `@contextmanager`
+            // generator's `finally: raise`) gets no implicit
+            // `__context__`, breaking PEP 3134 chaining. `PUSH_EXC_INFO`
+            // only peeks the value-stack top in this VM, so the
+            // exception stays put for the trailing `RERAISE 0`.
+            let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
             let saved = self.finally_stack.pop();
             for s in finalbody {
                 self.compile_stmt(s)?;
@@ -2432,6 +2458,12 @@ impl Compiler {
                 self.finally_stack.push(f);
             }
             self.emit(OpCode::Reraise, 0);
+            // Tag the active-handler entry with the pc just past the
+            // RERAISE so the unwinder drops it when a `raise` inside the
+            // finally escapes to an enclosing `try` (mirrors the
+            // except-handler path above).
+            let end = self.next_offset();
+            self.co.instructions[push_exc_site as usize].arg = end;
         }
         // Patch normal exit jump to land after handlers/finally.
         if has_handlers || has_finally {
@@ -2536,7 +2568,15 @@ impl Compiler {
             handler: handler_start,
             depth: body_depth,
         });
-        // Stack: [exc]
+        // Stack: [exc]. Record the propagating exception as the active
+        // handled exception for the duration of the `__exit__` call so a
+        // `raise` inside `__exit__` chains it as the new exception's
+        // implicit `__context__` (PEP 3134). This is what makes
+        // `contextlib.ExitStack`'s `_fix_exception_context` work — it
+        // walks each callback exception's context back to
+        // `sys.exc_info()[1]`. `PUSH_EXC_INFO` only peeks the value-stack
+        // top in this VM, so `[exc]` is preserved for `WITH_EXCEPT_START`.
+        let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
         self.emit(OpCode::LoadFast, cm_idx);
         self.emit(OpCode::LoadAttr, exit_name);
         // Stack: [exc, __exit__]
@@ -2551,11 +2591,17 @@ impl Compiler {
         self.emit(OpCode::RaiseVarargs, 1);
         let swallow_target = self.next_offset();
         self.patch_jump(swallow, swallow_target);
-        // Swallowed: Stack: [__exit__, exc]
+        // Swallowed: Stack: [__exit__, exc]. Drop the active handled-exc
+        // entry now that the suppressing `__exit__` returned cleanly.
+        self.emit(OpCode::PopExcept, 0);
         self.emit(OpCode::PopTop, 0);
         self.emit(OpCode::PopTop, 0);
         let end = self.next_offset();
         self.patch_jump(end_jump, end);
+        // Tag the active-handler entry with the pc just past the handler
+        // so the unwinder drops it if `__exit__` raises and the new
+        // exception escapes to an enclosing `try`.
+        self.co.instructions[push_exc_site as usize].arg = end;
         Ok(())
     }
 
@@ -3282,7 +3328,15 @@ impl Compiler {
                     let idx = self.co.intern_constant(Constant::None);
                     self.emit(OpCode::LoadConst, idx);
                 }
-                self.emit(OpCode::YieldValue, 0);
+                // An async generator's *own* `yield` produces a value for the
+                // consumer (`__anext__`), distinct from the `YIELD_VALUE` the
+                // `await`/`yield from` dance emits to pass an inner
+                // suspension's value through (oparg 0). The runtime uses this
+                // marker (CPython's `PyAsyncGenWrappedValue`) to tell "the
+                // agen yielded X" from "the agen is suspended on an inner
+                // await that yielded X".
+                let yield_arg = u32::from(self.co.is_async_generator);
+                self.emit(OpCode::YieldValue, yield_arg);
             }
             ExprKind::YieldFrom(iter) => {
                 if self.kind != CodeKind::Function {
@@ -3427,12 +3481,27 @@ impl Compiler {
             self.emit(OpCode::PopTop, 0);
         }
         // Stash aexit in a synthetic local so we can recover it on
-        // the exit path. (We don't have a full exception table for
-        // async with yet — this is enough for the no-exception path.)
+        // both the normal-exit and the exception-cleanup paths.
         let slot = format!(".aexit{}", self.with_counter);
         self.with_counter += 1;
         let slot_idx = self.var_index_or_add(&slot);
         self.emit(OpCode::StoreFast, slot_idx);
+
+        // Synthetic finally frame so `return`/`break`/`continue` out of
+        // the body still `await __aexit__(None, None, None)`. Mirrors the
+        // `WithExit` frame `compile_with` pushes; without it an early exit
+        // from an `async with` body skipped the exit entirely (e.g. an
+        // `@asynccontextmanager` used as a decorator never ran its
+        // post-`yield` cleanup).
+        let awith_loop_depth = self.loop_stack.len();
+        self.finally_stack.push(FinallyFrame {
+            kind: FinallyKind::AsyncWithExit {
+                aexit_idx: slot_idx,
+            },
+            loop_depth_at_push: awith_loop_depth,
+        });
+
+        let body_start = self.next_offset();
         if rest.is_empty() {
             for s in body {
                 self.compile_stmt(s)?;
@@ -3440,15 +3509,75 @@ impl Compiler {
         } else {
             self.compile_async_with(rest, body)?;
         }
-        // Normal exit: push aexit, call with (None, None, None), await.
+        let body_end = self.next_offset();
+
+        // Pop the synthetic frame; the explicit normal-exit and
+        // exception-cleanup paths below emit their own `__aexit__` call.
+        self.finally_stack.pop();
+
+        // Normal exit: `await aexit(None, None, None)`.
         self.emit(OpCode::LoadFast, slot_idx);
         let none_idx = self.co.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::Call, 3);
-        self.compile_await_dance(0);
+        self.compile_await_dance(2);
         self.emit(OpCode::PopTop, 0);
+        let end_jump = self.emit(OpCode::JumpForward, 0);
+
+        // Exception-cleanup path — the async counterpart of the handler
+        // emitted by `compile_with`: `result = await aexit(type(exc), exc,
+        // None)`; if `result` is truthy the exception is swallowed,
+        // otherwise it is re-raised. The previous codegen omitted this
+        // entirely, so an exception escaping an `async with` body never
+        // reached `__aexit__` and could not be suppressed (the `with`
+        // statement's `__exit__` already had this).
+        let handler_start = self.next_offset();
+        // Preserve enclosing for-loop iterators on the operand stack, the
+        // same depth convention used by `try`/`except` and `compile_with`.
+        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32;
+        self.co.exception_table.push(ExcHandler {
+            start: body_start,
+            end: body_end,
+            handler: handler_start,
+            depth: body_depth,
+        });
+        // Stack: [exc]. Record the propagating exception as the active
+        // handled exception for the duration of the awaited `__aexit__`,
+        // exactly as the sync `with` handler does. Without it the body's
+        // exception isn't visible via `sys.exc_info()` inside `__aexit__`
+        // (a coroutine driven by the await dance below), so a `raise`
+        // there gets no implicit `__context__` and
+        // `contextlib.AsyncExitStack`'s `_fix_exception_context` (which
+        // walks each callback exception back to `sys.exc_info()[1]`)
+        // cannot reconstruct the chain.
+        let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
+        self.emit(OpCode::LoadFast, slot_idx);
+        // Stack: [exc, aexit]
+        self.emit(OpCode::Swap, 2);
+        // Stack: [aexit, exc]
+        self.emit(OpCode::WithExceptStart, 0);
+        // Stack: [aexit, exc, awaitable] — await the `__aexit__` coroutine.
+        self.compile_await_dance(2);
+        // Stack: [aexit, exc, result]
+        let swallow = self.emit(OpCode::PopJumpIfTrue, 0);
+        // Falsy: re-raise. Stack: [aexit, exc]
+        self.emit(OpCode::Swap, 2);
+        self.emit(OpCode::PopTop, 0);
+        self.emit(OpCode::RaiseVarargs, 1);
+        let swallow_target = self.next_offset();
+        self.patch_jump(swallow, swallow_target);
+        // Swallowed: Stack: [aexit, exc]. Drop the active handled-exc
+        // entry now that the suppressing `__aexit__` returned cleanly.
+        self.emit(OpCode::PopExcept, 0);
+        self.emit(OpCode::PopTop, 0);
+        self.emit(OpCode::PopTop, 0);
+        let end = self.next_offset();
+        self.patch_jump(end_jump, end);
+        // Tag the active-handler entry with the pc just past the handler
+        // so the unwinder drops it if `__aexit__` raises a new exception.
+        self.co.instructions[push_exc_site as usize].arg = end;
         Ok(())
     }
 
@@ -3593,6 +3722,10 @@ impl Compiler {
             self.future_annotations,
         );
         inner.current_line = self.current_line;
+        // PEP 3155: a comprehension scope gets a dotted qualname like any
+        // other nested scope (`C.m.<locals>.<genexpr>`); CPython's
+        // `compiler_set_qualname` doesn't special-case comprehensions.
+        inner.co.qualname = self.compute_child_qualname(name);
         inner.co.arg_count = 1;
         inner.co.varnames.push(".0".to_owned());
         inner.bindings.insert(".0".to_owned(), Binding::Local);
@@ -3801,7 +3934,12 @@ fn compile_comp_body(
             }
             OpCode::YieldValue => {
                 inner.compile_expr(elt)?;
-                inner.emit(OpCode::YieldValue, 0);
+                // An async-generator comprehension `(x async for x in xs)`
+                // yields a consumer value here; mark it (arg 1) like a plain
+                // async-gen `yield` so the runtime's passthrough machinery
+                // doesn't mistake it for an inner-await suspension. Sync
+                // genexps stay arg 0.
+                inner.emit(OpCode::YieldValue, u32::from(inner.co.is_async_generator));
                 inner.emit(OpCode::PopTop, 0);
             }
             _ => {
@@ -3937,6 +4075,9 @@ fn clone_finally_frame(f: &FinallyFrame) -> FinallyFrame {
     let kind = match &f.kind {
         FinallyKind::Stmts(body) => FinallyKind::Stmts(body.clone()),
         FinallyKind::WithExit { cm_idx } => FinallyKind::WithExit { cm_idx: *cm_idx },
+        FinallyKind::AsyncWithExit { aexit_idx } => {
+            FinallyKind::AsyncWithExit { aexit_idx: *aexit_idx }
+        }
     };
     FinallyFrame {
         kind,

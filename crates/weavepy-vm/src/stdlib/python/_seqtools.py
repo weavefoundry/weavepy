@@ -140,3 +140,121 @@ class _CallableIter:
         if self._callable is None:
             return (_iter, ((),))
         return (_iter, (self._callable, self._sentinel))
+
+
+class _FilterIter:
+    """Lazy ``filter(func, iterable)`` — CPython's ``filterobject``.
+
+    Items are pulled (and the predicate run) one ``next()`` at a time, so
+    filtering an unbounded source (``filter(p, itertools.count())``)
+    terminates and predicate side effects interleave with consumption
+    exactly as in CPython.
+    """
+
+    __slots__ = ("_func", "_it")
+
+    def __init__(self, func, iterable):
+        self._func = func
+        self._it = iter(iterable)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        func = self._func
+        it = self._it
+        while True:
+            item = next(it)
+            if func is None or func is bool:
+                if item:
+                    return item
+            elif func(item):
+                return item
+
+    def __reduce__(self):
+        return (filter, (self._func, self._it))
+
+
+class _MapIter:
+    """Lazy ``map(func, *iterables)`` — CPython's ``mapobject``.
+
+    ``func`` is applied on demand; iteration stops at the shortest
+    iterable. Lazy evaluation means mapping over unbounded sources works
+    and exceptions from ``func`` surface mid-stream, as in CPython.
+    """
+
+    __slots__ = ("_func", "_iters")
+
+    def __init__(self, func, *iterables):
+        self._func = func
+        self._iters = tuple(iter(it) for it in iterables)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        args = []
+        for it in self._iters:
+            args.append(next(it))
+        return self._func(*args)
+
+    def __reduce__(self):
+        return (map, (self._func,) + self._iters)
+
+
+def _zip_arg_range(count):
+    """`argument 1` / `arguments 1-N` phrasing of zip-strict errors."""
+    return "argument 1" if count == 1 else f"arguments 1-{count}"
+
+
+class _ZipIter:
+    """Lazy ``zip(*iterables, strict=...)`` — CPython's ``zipobject``.
+
+    Stops at the shortest iterable without pre-materialising any of
+    them, so zipping unbounded iterators works. With ``strict=True``,
+    raises ``ValueError`` on length mismatch with CPython's wording.
+    """
+
+    __slots__ = ("_iters", "_strict")
+
+    def __init__(self, strict, *iterables):
+        self._iters = tuple(iter(it) for it in iterables)
+        self._strict = strict
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        iters = self._iters
+        if iters is None or not iters:
+            raise StopIteration
+        result = []
+        for i, it in enumerate(iters):
+            try:
+                result.append(next(it))
+            except StopIteration:
+                if not self._strict:
+                    self._iters = None
+                    raise
+                if i > 0:
+                    self._iters = None
+                    raise ValueError(
+                        f"zip() argument {i+1} is shorter than {_zip_arg_range(i)}"
+                    ) from None
+                # First iterator exhausted: with strict the rest must be
+                # exhausted too.
+                for j, jt in enumerate(iters[1:], 1):
+                    try:
+                        next(jt)
+                    except StopIteration:
+                        continue
+                    self._iters = None
+                    raise ValueError(
+                        f"zip() argument {j+1} is longer than {_zip_arg_range(j)}"
+                    ) from None
+                self._iters = None
+                raise
+        return tuple(result)
+
+    def __reduce__(self):
+        return (zip, self._iters if self._iters is not None else ((),))

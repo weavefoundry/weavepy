@@ -324,6 +324,7 @@ pub fn id_of(obj: &Object) -> ObjectId {
         Object::Generator(g) => Rc::as_ptr(g) as usize as u64,
         Object::Coroutine(g) => Rc::as_ptr(g) as usize as u64,
         Object::AsyncGenerator(g) => Rc::as_ptr(g) as usize as u64,
+        Object::AsyncGenAwait(a) => Rc::as_ptr(a) as usize as u64,
         Object::Iter(i) => Rc::as_ptr(i) as usize as u64,
         Object::Range(r) => Rc::as_ptr(r) as usize as u64,
         Object::Cell(c) => Rc::as_ptr(c) as usize as u64,
