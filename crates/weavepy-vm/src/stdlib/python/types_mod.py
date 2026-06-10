@@ -80,13 +80,11 @@ async def _ag():
 
 
 _a = _ag()
-try:
-    AsyncGeneratorType = type(_a)
-finally:
-    try:
-        _a.aclose()
-    except Exception:
-        pass
+AsyncGeneratorType = type(_a)
+# The never-started bootstrap agen needs no aclose() — calling it would
+# create (and discard) an aclose awaitable, tripping the gh-113753
+# "was never awaited" RuntimeWarning during interpreter startup.
+del _a, _ag
 
 
 class _C:

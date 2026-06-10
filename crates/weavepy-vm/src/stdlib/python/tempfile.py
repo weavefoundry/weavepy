@@ -32,6 +32,23 @@ def mkdtemp(suffix=None, prefix=None, dir=None):
     return _tempfile.mkdtemp(suffix, prefix, dir)
 
 
+def mktemp(suffix="", prefix=None, dir=None):
+    """Return a unique pathname that did not exist at call time
+    (deprecated in CPython, but still exercised by tests)."""
+    if dir is None:
+        dir = gettempdir()
+    if prefix is None:
+        prefix = gettempprefix()
+    import random
+    letters = "abcdefghijklmnopqrstuvwxyz0123456789_"
+    for _ in range(10000):
+        name = "".join(random.choice(letters) for _ in range(8))
+        path = os.path.join(dir, prefix + name + suffix)
+        if not os.path.exists(path):
+            return path
+    raise FileExistsError("No usable temporary filename found")
+
+
 class _NamedTempFile:
     """Wraps an `open()`ed file with a `name` attribute and (optional)
     delete-on-close semantics. Returned by `NamedTemporaryFile`."""
@@ -102,6 +119,6 @@ class TemporaryDirectory:
 
 
 __all__ = [
-    "gettempdir", "gettempprefix", "mkstemp", "mkdtemp",
+    "gettempdir", "gettempprefix", "mkstemp", "mkdtemp", "mktemp",
     "NamedTemporaryFile", "TemporaryDirectory",
 ]

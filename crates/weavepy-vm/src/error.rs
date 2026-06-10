@@ -36,6 +36,11 @@ pub struct PyException {
     /// re-raises preserve the original traceback — the re-raise
     /// location is not recorded).
     pub suppress_tb_once: bool,
+    /// True once implicit-context chaining has been decided for this
+    /// exception (CPython chains exactly once, in `_PyErr_SetObject` at
+    /// the raise site). Propagation through Rust boundaries must not
+    /// re-chain — user code may have set `__context__ = None` since.
+    pub context_settled: bool,
 }
 
 impl PyException {
@@ -46,6 +51,7 @@ impl PyException {
             context: None,
             cause: None,
             suppress_tb_once: false,
+            context_settled: false,
         }
     }
 

@@ -196,13 +196,21 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/_seqtools.py"),
             is_package: false,
         },
-        // `collections` is a package so `collections.abc` resolves; the
-        // verbatim CPython `_collections_abc` carries the ABC definitions
-        // and `collections.abc` re-exports them (RFC 0037 WS8).
+        // `collections` is the verbatim CPython package init; the
+        // `_collections` accelerator below supplies `deque`/`defaultdict`
+        // (which have no pure-Python fallback in the real module), while
+        // `OrderedDict`/`namedtuple` run the reference pure-Python paths.
+        // The verbatim CPython `_collections_abc` carries the ABC
+        // definitions and `collections.abc` re-exports them (RFC 0037 WS8).
         FrozenSource {
             name: "collections",
             source: include_str!("python/collections.py"),
             is_package: true,
+        },
+        FrozenSource {
+            name: "_collections",
+            source: include_str!("python/_collections.py"),
+            is_package: false,
         },
         FrozenSource {
             name: "_collections_abc",

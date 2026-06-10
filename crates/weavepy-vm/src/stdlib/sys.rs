@@ -302,6 +302,31 @@ pub fn build_with_state(
             DictKey(Object::from_static("getrefcount")),
             builtin("getrefcount", sys_getrefcount),
         );
+        d.insert(
+            DictKey(Object::from_static("get_coroutine_origin_tracking_depth")),
+            builtin("get_coroutine_origin_tracking_depth", |_| {
+                Ok(Object::Int(coroutine_origin_tracking_depth()))
+            }),
+        );
+        d.insert(
+            DictKey(Object::from_static("set_coroutine_origin_tracking_depth")),
+            builtin(
+                "set_coroutine_origin_tracking_depth",
+                sys_set_coroutine_origin_tracking_depth,
+            ),
+        );
+        d.insert(
+            DictKey(Object::from_static("get_asyncgen_hooks")),
+            builtin("get_asyncgen_hooks", sys_get_asyncgen_hooks),
+        );
+        d.insert(
+            DictKey(Object::from_static("set_asyncgen_hooks")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "set_asyncgen_hooks",
+                call: Box::new(|args| sys_set_asyncgen_hooks(args, &[])),
+                call_kw: Some(Box::new(sys_set_asyncgen_hooks)),
+            })),
+        );
         // `displayhook` — invoked by the REPL after every
         // evaluated expression. Default writes `repr(value)` to
         // stdout and stashes the value in `builtins._`. The hook
@@ -1377,6 +1402,107 @@ fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
     // "+1 for the argument reference" — no extra increment needed.
     let visible = strong.saturating_sub(registry).saturating_sub(weak_clones);
     Ok(Object::Int(visible.max(1) as i64))
+}
+
+thread_local! {
+    /// PEP 565-era coroutine origin tracking depth
+    /// (`sys.set_coroutine_origin_tracking_depth`). Per-thread in
+    /// CPython (a `PyThreadState` field).
+    static CORO_ORIGIN_DEPTH: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Current `sys.get_coroutine_origin_tracking_depth()` value; read by
+/// the interpreter when constructing coroutine objects.
+pub fn coroutine_origin_tracking_depth() -> i64 {
+    CORO_ORIGIN_DEPTH.with(std::cell::Cell::get)
+}
+
+fn sys_set_coroutine_origin_tracking_depth(args: &[Object]) -> Result<Object, RuntimeError> {
+    let depth = match args.first() {
+        Some(Object::Int(i)) => *i,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => {
+            return Err(type_error(
+                "set_coroutine_origin_tracking_depth() takes an integer",
+            ))
+        }
+    };
+    if depth < 0 {
+        return Err(crate::error::value_error("depth must be >= 0"));
+    }
+    CORO_ORIGIN_DEPTH.with(|c| c.set(depth));
+    Ok(Object::None)
+}
+
+thread_local! {
+    /// PEP 525 `sys.set_asyncgen_hooks` — `(firstiter, finalizer)`.
+    /// Per-thread in CPython (a `PyThreadState` field).
+    static ASYNCGEN_HOOKS: std::cell::RefCell<(Object, Object)> =
+        std::cell::RefCell::new((Object::None, Object::None));
+}
+
+/// The currently-installed `(firstiter, finalizer)` asyncgen hooks.
+pub fn asyncgen_hooks() -> (Object, Object) {
+    ASYNCGEN_HOOKS.with(|h| h.borrow().clone())
+}
+
+fn check_asyncgen_hook(v: &Object, which: &str) -> Result<(), RuntimeError> {
+    let callable = matches!(
+        v,
+        Object::Function(_)
+            | Object::Builtin(_)
+            | Object::BoundMethod(_)
+            | Object::Type(_)
+            | Object::StaticMethod(_)
+    ) || matches!(v, Object::Instance(inst) if inst.cls().lookup("__call__").is_some());
+    if matches!(v, Object::None) || callable {
+        Ok(())
+    } else {
+        Err(type_error(format!(
+            "callable {which} expected, got {}",
+            v.type_name()
+        )))
+    }
+}
+
+fn sys_set_asyncgen_hooks(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let mut firstiter = args.first().cloned();
+    let mut finalizer = args.get(1).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "firstiter" => firstiter = Some(v.clone()),
+            "finalizer" => finalizer = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "set_asyncgen_hooks() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    if let Some(f) = &firstiter {
+        check_asyncgen_hook(f, "firstiter")?;
+    }
+    if let Some(f) = &finalizer {
+        check_asyncgen_hook(f, "finalizer")?;
+    }
+    ASYNCGEN_HOOKS.with(|h| {
+        let mut h = h.borrow_mut();
+        if let Some(f) = firstiter {
+            h.0 = f;
+        }
+        if let Some(f) = finalizer {
+            h.1 = f;
+        }
+    });
+    Ok(Object::None)
+}
+
+fn sys_get_asyncgen_hooks(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let (firstiter, finalizer) = asyncgen_hooks();
+    Ok(Object::new_tuple(vec![firstiter, finalizer]))
 }
 
 /// Default `sys.displayhook`: if the value is None do nothing,

@@ -63,6 +63,13 @@ pub(crate) fn builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
                 call_kw: None,
             }))
         };
+        ($n:literal, $body:expr, $kw:expr) => {
+            Some(Rc::new(BuiltinFn {
+                name: $n,
+                call: Box::new($body),
+                call_kw: Some(Box::new($kw)),
+            }))
+        };
     }
     match name {
         "str" => ctor!("str", b_str),
@@ -75,8 +82,8 @@ pub(crate) fn builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
         "dict" => ctor!("dict", b_dict),
         "set" => ctor!("set", b_set),
         "frozenset" => ctor!("frozenset", b_frozenset),
-        "bytes" => ctor!("bytes", b_bytes),
-        "bytearray" => ctor!("bytearray", b_bytearray),
+        "bytes" => ctor!("bytes", b_bytes, b_bytes_kw),
+        "bytearray" => ctor!("bytearray", b_bytearray, b_bytearray_kw),
         "object" => ctor!("object", b_object),
         "type" => ctor!("type", b_type),
         "range" => ctor!("range", b_range),
@@ -407,7 +414,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "join" => Some(method("join", str_join)),
             "startswith" => Some(method("startswith", str_startswith)),
             "endswith" => Some(method("endswith", str_endswith)),
-            "replace" => Some(method("replace", str_replace)),
+            "replace" => Some(method_kw("replace", str_replace_kw)),
             "find" => Some(method("find", str_find)),
             "rfind" => Some(method("rfind", str_rfind)),
             "index" => Some(method("index", str_index)),
@@ -533,29 +540,47 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         },
         Object::Bytes(_) | Object::ByteArray(_) => match name {
             "decode" => Some(method("decode", bytes_decode)),
-            "hex" => Some(method("hex", bytes_hex)),
+            "hex" => Some(method_kw("hex", bytes_hex_kw)),
             "fromhex" => Some(method("fromhex", bytes_fromhex)),
             "startswith" => Some(method("startswith", bytes_startswith)),
             "endswith" => Some(method("endswith", bytes_endswith)),
             "find" => Some(method("find", bytes_find)),
             "rfind" => Some(method("rfind", bytes_rfind)),
             "index" => Some(method("index", bytes_index)),
+            "rindex" => Some(method("rindex", bytes_rindex)),
             "count" => Some(method("count", bytes_count)),
             "lower" => Some(method("lower", bytes_lower)),
             "upper" => Some(method("upper", bytes_upper)),
             "strip" => Some(method("strip", bytes_strip)),
             "lstrip" => Some(method("lstrip", bytes_lstrip)),
             "rstrip" => Some(method("rstrip", bytes_rstrip)),
-            "split" => Some(method("split", bytes_split)),
-            "splitlines" => Some(method("splitlines", bytes_splitlines)),
+            "split" => Some(method_kw("split", bytes_split_kw)),
+            "rsplit" => Some(method_kw("rsplit", bytes_rsplit_kw)),
+            "splitlines" => Some(method_kw("splitlines", bytes_splitlines_kw)),
             "join" => Some(method("join", bytes_join)),
-            "replace" => Some(method("replace", bytes_replace)),
-            "translate" => Some(method("translate", bytes_translate)),
+            "replace" => Some(method_kw("replace", bytes_replace_kw)),
+            "translate" => Some(method_kw("translate", bytes_translate_kw)),
             "maketrans" => Some(method("maketrans", bytes_maketrans)),
+            "partition" => Some(method("partition", bytes_partition)),
+            "rpartition" => Some(method("rpartition", bytes_rpartition)),
+            "removeprefix" => Some(method("removeprefix", bytes_removeprefix)),
+            "removesuffix" => Some(method("removesuffix", bytes_removesuffix)),
+            "expandtabs" => Some(method_kw("expandtabs", bytes_expandtabs)),
+            "center" => Some(method("center", bytes_center)),
+            "ljust" => Some(method("ljust", bytes_ljust)),
+            "rjust" => Some(method("rjust", bytes_rjust)),
+            "zfill" => Some(method("zfill", bytes_zfill)),
+            "capitalize" => Some(method("capitalize", bytes_capitalize)),
+            "title" => Some(method("title", bytes_title)),
+            "swapcase" => Some(method("swapcase", bytes_swapcase)),
             "isalnum" => Some(method("isalnum", bytes_isalnum)),
             "isalpha" => Some(method("isalpha", bytes_isalpha)),
             "isdigit" => Some(method("isdigit", bytes_isdigit)),
             "isspace" => Some(method("isspace", bytes_isspace)),
+            "islower" => Some(method("islower", bytes_islower)),
+            "isupper" => Some(method("isupper", bytes_isupper)),
+            "istitle" => Some(method("istitle", bytes_istitle)),
+            "isascii" => Some(method("isascii", bytes_isascii)),
             // bytearray-only mutators
             "append" if matches!(obj, Object::ByteArray(_)) => {
                 Some(method("append", bytearray_append))
@@ -570,10 +595,32 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "reverse" if matches!(obj, Object::ByteArray(_)) => {
                 Some(method("reverse", bytearray_reverse))
             }
+            "insert" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("insert", bytearray_insert))
+            }
+            "remove" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("remove", bytearray_remove))
+            }
+            "copy" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("copy", bytearray_copy))
+            }
             // Sequence dunders so direct calls / `hasattr` parity hold.
             "__contains__" => Some(method("__contains__", obj_contains)),
             "__len__" => Some(method("__len__", obj_len)),
             "__getitem__" => Some(method("__getitem__", seq_getitem)),
+            // PEP 461 `%`-formatting exposed as the number-protocol
+            // dunders (`bytes_mod` fills CPython's `nb_remainder` slot,
+            // so both wrappers exist).
+            "__mod__" => Some(method("__mod__", bytes_dunder_mod)),
+            "__rmod__" => Some(method("__rmod__", bytes_dunder_rmod)),
+            "__bytes__" if matches!(obj, Object::Bytes(_)) => {
+                Some(method("__bytes__", |args| {
+                    match args.first() {
+                        Some(Object::Bytes(b)) => Ok(Object::Bytes(b.clone())),
+                        _ => Err(type_error("__bytes__ requires a bytes receiver")),
+                    }
+                }))
+            }
             _ => None,
         },
         Object::File(_) => match name {
@@ -3470,24 +3517,51 @@ pub(crate) fn b_int_from_bytes_cls(args: &[Object]) -> Result<Object, RuntimeErr
     int_from_bytes_method(args)
 }
 
+fn fromhex_string_arg(arg: Option<&Object>) -> Result<String, RuntimeError> {
+    match arg {
+        Some(Object::Str(s)) => Ok(s.to_string()),
+        Some(other) => Err(type_error(format!(
+            "fromhex() argument must be str, not {}",
+            other.type_name()
+        ))),
+        None => Err(type_error(
+            "descriptor 'fromhex' of 'bytes' object needs an argument",
+        )),
+    }
+}
+
+/// CPython's `bytes.fromhex` on a subclass calls the subclass with the
+/// parsed result (`PyObject_CallOneArg(type, result)`), so the returned
+/// object is an instance of `cls`.
+fn fromhex_wrap_subclass(
+    cls: Option<&Object>,
+    base_name: &str,
+    result: Object,
+) -> Result<Object, RuntimeError> {
+    if let Some(cls_obj @ Object::Type(t)) = cls {
+        if t.name != base_name {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame still live on
+                // this thread; the GIL keeps the access exclusive.
+                let interp = unsafe { &mut *ptr };
+                let globals = interp.builtins_dict();
+                return interp.call_object_with_globals(cls_obj, &[result], &[], &globals);
+            }
+        }
+    }
+    Ok(result)
+}
+
 pub(crate) fn b_bytes_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _cls = args.first();
-    let s = match args.get(1) {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("fromhex() argument must be str")),
-    };
+    let s = fromhex_string_arg(args.get(1))?;
     let bytes = parse_hex_bytes(&s)?;
-    Ok(Object::new_bytes(bytes))
+    fromhex_wrap_subclass(args.first(), "bytes", Object::new_bytes(bytes))
 }
 
 pub(crate) fn b_bytearray_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _cls = args.first();
-    let s = match args.get(1) {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("fromhex() argument must be str")),
-    };
+    let s = fromhex_string_arg(args.get(1))?;
     let bytes = parse_hex_bytes(&s)?;
-    Ok(Object::new_bytearray(bytes))
+    fromhex_wrap_subclass(args.first(), "bytearray", Object::new_bytearray(bytes))
 }
 
 pub(crate) fn b_float_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3501,28 +3575,30 @@ pub(crate) fn b_float_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeErro
 }
 
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RuntimeError> {
-    let mut bytes = Vec::new();
-    let mut last_high: Option<u8> = None;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if last_high.is_some() {
-                return Err(value_error("non-hexadecimal number"));
-            }
+    // CPython's `_PyBytes_FromHex`: pairs of hex digits, with *ASCII*
+    // whitespace permitted only between pairs. Error positions are
+    // character offsets into the original string.
+    let hex_err = |pos: usize| {
+        value_error(format!(
+            "non-hexadecimal number found in fromhex() arg at position {pos}"
+        ))
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let mut bytes = Vec::with_capacity(chars.len() / 2);
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') {
+            i += 1;
             continue;
         }
-        let v = c
-            .to_digit(16)
-            .ok_or_else(|| value_error("non-hexadecimal number"))? as u8;
-        match last_high {
-            Some(hi) => {
-                bytes.push((hi << 4) | v);
-                last_high = None;
-            }
-            None => last_high = Some(v),
-        }
-    }
-    if last_high.is_some() {
-        return Err(value_error("non-hexadecimal number"));
+        let hi = if c.is_ascii() { c.to_digit(16) } else { None }.ok_or_else(|| hex_err(i))?;
+        let lo = match chars.get(i + 1) {
+            Some(c2) if c2.is_ascii() => c2.to_digit(16).ok_or_else(|| hex_err(i + 1))?,
+            _ => return Err(hex_err(i + 1)),
+        };
+        bytes.push(((hi << 4) | lo) as u8);
+        i += 2;
     }
     Ok(bytes)
 }
@@ -4035,77 +4111,302 @@ fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_frozenset_from(out))
 }
 
-fn b_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::new_bytes(Vec::new()));
-    }
-    match &args[0] {
-        Object::Int(n) => {
-            if *n < 0 {
-                return Err(value_error("negative count"));
+/// One item of a `bytes(iterable)` source: an integer in
+/// `range(0, 256)` via the `__index__` protocol.
+fn byte_item_value(o: &Object) -> Result<u8, RuntimeError> {
+    let native = o.native_value();
+    match native.as_ref().unwrap_or(o) {
+        Object::Bool(b) => Ok(u8::from(*b)),
+        Object::Int(i) if (0..=255).contains(i) => Ok(*i as u8),
+        Object::Int(_) | Object::Long(_) => {
+            Err(value_error("bytes must be in range(0, 256)"))
+        }
+        inst @ Object::Instance(_) => {
+            let v = coerce_index_i64(inst)?;
+            if (0..=255).contains(&v) {
+                Ok(v as u8)
+            } else {
+                Err(value_error("bytes must be in range(0, 256)"))
             }
-            Ok(Object::new_bytes(vec![0u8; *n as usize]))
         }
-        Object::Str(s) => {
-            let encoding = args
-                .get(1)
-                .and_then(|x| match x {
-                    Object::Str(e) => Some(e.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "utf-8".to_owned());
-            let errors = args
-                .get(2)
-                .and_then(|x| match x {
-                    Object::Str(e) => Some(e.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "strict".to_owned());
-            let bytes = crate::stdlib::codecs_mod::encode_str(s, &encoding, &errors)?;
-            Ok(Object::new_bytes(bytes))
+        other => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            other.type_name()
+        ))),
+    }
+}
+
+/// The non-string source conversion shared by `bytes(x)` and
+/// `bytearray(x)` — CPython's `PyBytes_FromObject` /
+/// `bytearray_init` tail: index-sized count, buffer copy, or
+/// iterable of byte values.
+fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, RuntimeError> {
+    let zero_fill = |n: i64| -> Result<Vec<u8>, RuntimeError> {
+        if n < 0 {
+            return Err(value_error("negative count"));
         }
-        Object::Bytes(b) => Ok(Object::Bytes(b.clone())),
-        Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
-        other => {
-            let mut it = other.make_iter()?;
+        let mut v = Vec::new();
+        v.try_reserve_exact(n as usize).map_err(|_| {
+            RuntimeError::PyException(crate::error::PyException::from_builtin(
+                "MemoryError",
+                String::new(),
+            ))
+        })?;
+        v.resize(n as usize, 0);
+        Ok(v)
+    };
+    match src {
+        Object::Bytes(b) => Ok(b.to_vec()),
+        Object::ByteArray(b) => Ok(b.borrow().clone()),
+        Object::MemoryView(mv) => Ok(mv.to_bytes()),
+        Object::Bool(b) => zero_fill(i64::from(*b)),
+        Object::Int(n) => zero_fill(*n),
+        Object::Long(_) => Err(crate::error::overflow_error(
+            "cannot fit 'int' into an index-sized integer",
+        )),
+        Object::List(items) => {
+            // CPython re-checks the list length every iteration
+            // (gh-34973): an item's `__index__` may mutate the list.
+            let cell = items.clone();
             let mut out = Vec::new();
-            while let Some(v) = it.next_value() {
-                match v {
-                    Object::Int(i) if (0..=255).contains(&i) => out.push(i as u8),
-                    _ => return Err(value_error("bytes must be in range(0, 256)")),
+            let mut i = 0usize;
+            loop {
+                let item = {
+                    let l = cell.borrow();
+                    if i >= l.len() {
+                        break;
+                    }
+                    l[i].clone()
+                };
+                out.push(byte_item_value(&item)?);
+                i += 1;
+            }
+            Ok(out)
+        }
+        Object::Tuple(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                out.push(byte_item_value(item)?);
+            }
+            Ok(out)
+        }
+        Object::Instance(inst) => {
+            // `__bytes__` is consulted by `bytes()` only — CPython's
+            // bytearray skips straight to the count/buffer/iterable
+            // protocol.
+            if type_name == "bytes" {
+                if let Some(method) = crate::instance_method(src, "__bytes__") {
+                    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                        // SAFETY: published by an enclosing VM frame still
+                        // live on this thread; the GIL keeps it exclusive.
+                        let interp = unsafe { &mut *ptr };
+                        let globals = interp.builtins_dict();
+                        let r =
+                            interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                        return bytes_argview(&r).map_err(|_| {
+                            type_error(format!(
+                                "__bytes__ returned non-bytes (type {})",
+                                r.type_name()
+                            ))
+                        });
+                    }
                 }
             }
-            Ok(Object::new_bytes(out))
+            // The `__index__` protocol: a TypeError raised *by* the
+            // hook falls through to the buffer/iterable path
+            // (gh-29159); any other exception propagates (gh-34974).
+            let indexable = inst.native.as_ref().map(|n| n.as_i64().is_some()).unwrap_or(false)
+                || crate::instance_method(src, "__index__").is_some();
+            if indexable {
+                match coerce_index_i64(src) {
+                    Ok(n) => return zero_fill(n),
+                    Err(RuntimeError::PyException(e)) if e.type_name() == "TypeError" => {}
+                    Err(other) => return Err(other),
+                }
+            }
+            // Buffer protocol: a bytes/bytearray subclass instance
+            // carries its payload natively.
+            if let Some(native) = &inst.native {
+                if matches!(
+                    native,
+                    Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+                ) {
+                    return bytes_from_source_obj(&native.clone(), type_name);
+                }
+            }
+            // Iterable (including legacy `__getitem__` sequences) via
+            // interpreter reentry; `__iter__` exceptions propagate.
+            let iterable = crate::instance_method(src, "__iter__").is_some()
+                || crate::instance_method(src, "__getitem__").is_some()
+                || inst.native.is_some();
+            if !iterable {
+                return Err(type_error(format!(
+                    "cannot convert '{}' object to {}",
+                    src.type_name(),
+                    type_name
+                )));
+            }
+            bytes_from_iterable_reentrant(src, type_name)
+        }
+        other => {
+            if other.make_iter().is_err() && !matches!(other, Object::Generator(_)) {
+                return Err(type_error(format!(
+                    "cannot convert '{}' object to {}",
+                    other.type_name(),
+                    type_name
+                )));
+            }
+            bytes_from_iterable_reentrant(other, type_name)
         }
     }
 }
 
+/// Iterate any object through the running interpreter (generators,
+/// sets, user iterables) collecting byte values.
+fn bytes_from_iterable_reentrant(
+    src: &Object,
+    type_name: &str,
+) -> Result<Vec<u8>, RuntimeError> {
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame still live on this
+        // thread; the GIL keeps the access exclusive.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        let items = interp.collect_iterable(src, &globals)?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in &items {
+            out.push(byte_item_value(item)?);
+        }
+        Ok(out)
+    } else {
+        let mut it = src.make_iter().map_err(|_| {
+            type_error(format!(
+                "cannot convert '{}' object to {}",
+                src.type_name(),
+                type_name
+            ))
+        })?;
+        let mut out = Vec::new();
+        while let Some(v) = it.next_value() {
+            out.push(byte_item_value(&v)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Shared `bytes(...)` / `bytearray(...)` construction — CPython's
+/// `bytes_new_impl` / `bytearray_init` argument handling, including
+/// the `encoding` / `errors` keyword rules.
+fn bytes_construct(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    type_name: &str,
+) -> Result<Vec<u8>, RuntimeError> {
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "{type_name}() takes at most 3 arguments ({} given)",
+            args.len()
+        )));
+    }
+    let mut source_obj = args.first().cloned();
+    let mut encoding_obj = args.get(1).cloned();
+    let mut errors_obj = args.get(2).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "source" => source_obj = Some(v.clone()),
+            "encoding" => encoding_obj = Some(v.clone()),
+            "errors" => errors_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "{type_name}() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let encoding = match &encoding_obj {
+        None => None,
+        Some(Object::Str(s)) => Some(s.to_string()),
+        Some(o) => {
+            return Err(type_error(format!(
+                "{type_name}() argument 'encoding' must be str, not {}",
+                o.type_name()
+            )))
+        }
+    };
+    let errors = match &errors_obj {
+        None => None,
+        Some(Object::Str(s)) => Some(s.to_string()),
+        Some(o) => {
+            return Err(type_error(format!(
+                "{type_name}() argument 'errors' must be str, not {}",
+                o.type_name()
+            )))
+        }
+    };
+    let Some(src) = source_obj.as_ref() else {
+        if encoding.is_some() {
+            return Err(type_error("encoding without a string argument"));
+        }
+        if errors.is_some() {
+            return Err(type_error("errors without a string argument"));
+        }
+        return Ok(Vec::new());
+    };
+    // String sources require an encoding; non-string sources reject one.
+    let as_str: Option<Rc<str>> = match src {
+        Object::Str(s) => Some(s.clone()),
+        Object::Instance(inst) => match &inst.native {
+            Some(Object::Str(s)) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(s) = as_str {
+        let Some(enc) = encoding else {
+            return Err(type_error("string argument without an encoding"));
+        };
+        return crate::stdlib::codecs_mod::encode_str(
+            &s,
+            &enc,
+            errors.as_deref().unwrap_or("strict"),
+        );
+    }
+    if encoding.is_some() {
+        return Err(type_error("encoding without a string argument"));
+    }
+    if errors.is_some() {
+        return Err(type_error("errors without a string argument"));
+    }
+    bytes_from_source_obj(src, type_name)
+}
+
+fn b_bytes_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // `bytes(b'…')` with the exact type returns the argument unchanged
+    // (immutable, so identity is shareable — `test_repeat_id_preserving`
+    // relies on `bytes(x) is x` style sharing).
+    if args.len() == 1 && kwargs.is_empty() {
+        if let Object::Bytes(b) = &args[0] {
+            return Ok(Object::Bytes(b.clone()));
+        }
+    }
+    Ok(Object::new_bytes(bytes_construct(args, kwargs, "bytes")?))
+}
+
+fn b_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
+    b_bytes_kw(args, &[])
+}
+
+fn b_bytearray_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    Ok(Object::new_bytearray(bytes_construct(
+        args, kwargs, "bytearray",
+    )?))
+}
+
 fn b_bytearray(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::new_bytearray(Vec::new()));
-    }
-    match &args[0] {
-        Object::Int(n) => {
-            if *n < 0 {
-                return Err(value_error("negative count"));
-            }
-            Ok(Object::new_bytearray(vec![0u8; *n as usize]))
-        }
-        Object::Str(s) => Ok(Object::new_bytearray(s.as_bytes().to_vec())),
-        Object::Bytes(b) => Ok(Object::new_bytearray(b.to_vec())),
-        Object::ByteArray(b) => Ok(Object::new_bytearray(b.borrow().clone())),
-        other => {
-            let mut it = other.make_iter()?;
-            let mut out = Vec::new();
-            while let Some(v) = it.next_value() {
-                match v {
-                    Object::Int(i) if (0..=255).contains(&i) => out.push(i as u8),
-                    _ => return Err(value_error("bytes must be in range(0, 256)")),
-                }
-            }
-            Ok(Object::new_bytearray(out))
-        }
-    }
+    b_bytearray_kw(args, &[])
 }
 
 /// Keyword-argument-aware wrapper for `open`. CPython's signature is
@@ -4997,20 +5298,42 @@ fn b_chr(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_ord(args: &[Object]) -> Result<Object, RuntimeError> {
-    match one(args, "ord")? {
+    let arg = one(args, "ord")?;
+    let native = arg.native_value();
+    match native.as_ref().unwrap_or(arg) {
         Object::Str(s) => {
             let mut chars = s.chars();
             let c = chars
                 .next()
-                .ok_or_else(|| type_error("ord() expected a character, but empty string given"))?;
+                .ok_or_else(|| type_error("ord() expected a character, but string of length 0 found"))?;
             if chars.next().is_some() {
-                return Err(type_error(
-                    "ord() expected a character, but multi-character string given",
-                ));
+                return Err(type_error(format!(
+                    "ord() expected a character, but string of length {} found",
+                    s.chars().count()
+                )));
             }
             Ok(Object::Int(i64::from(u32::from(c))))
         }
-        _ => Err(type_error("ord() expected string")),
+        Object::Bytes(b) if b.len() == 1 => Ok(Object::Int(i64::from(b[0]))),
+        Object::Bytes(b) => Err(type_error(format!(
+            "ord() expected a character, but string of length {} found",
+            b.len()
+        ))),
+        Object::ByteArray(b) => {
+            let data = b.borrow();
+            if data.len() == 1 {
+                Ok(Object::Int(i64::from(data[0])))
+            } else {
+                Err(type_error(format!(
+                    "ord() expected a character, but string of length {} found",
+                    data.len()
+                )))
+            }
+        }
+        other => Err(type_error(format!(
+            "ord() expected string of length 1, but {} found",
+            other.type_name()
+        ))),
     }
 }
 
@@ -5690,6 +6013,10 @@ fn str_match_prefix_suffix(
 }
 
 fn str_replace(args: &[Object]) -> Result<Object, RuntimeError> {
+    str_replace_kw(args, &[])
+}
+
+fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let from = match args.get(1) {
         Some(Object::Str(p)) => p,
@@ -5699,7 +6026,75 @@ fn str_replace(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(p)) => p,
         _ => return Err(type_error("replace() expected str")),
     };
-    Ok(Object::from_str(s.replace(&**from, to)))
+    let mut count_obj = args.get(3).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "count" => count_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "replace() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let count = match count_obj {
+        None | Some(Object::None) => -1i64,
+        Some(o) => coerce_index_i64(&o)?,
+    };
+    if count == 0 {
+        return Ok(Object::from_str(s.to_string()));
+    }
+    let out = if count < 0 {
+        s.replace(&**from, to)
+    } else if from.is_empty() {
+        // `str::replacen` with an empty pattern matches between every
+        // char and at both ends, same as CPython.
+        let mut out = String::new();
+        let mut done = 0i64;
+        for (i, ch) in s.chars().enumerate() {
+            let _ = i;
+            if done < count {
+                out.push_str(to);
+                done += 1;
+            }
+            out.push(ch);
+        }
+        if done < count {
+            out.push_str(to);
+        }
+        out
+    } else {
+        s.replacen(&**from, to, count as usize)
+    };
+    Ok(Object::from_str(out))
+}
+
+/// `ADJUST_INDICES`: negative indices offset by length and floored at
+/// 0; `end` clamped to length; `start` left unclamped so a start past
+/// the end yields an invalid window (`'abc'.find('', 4) == -1`).
+fn str_search_window(args: &[Object], total_chars: i64) -> Option<(i64, i64)> {
+    let resolve = |arg: Option<&Object>, default: i64| -> i64 {
+        match arg {
+            None | Some(Object::None) => default,
+            Some(o) => match o.as_i64() {
+                Some(x) => {
+                    if x < 0 {
+                        (x + total_chars).max(0)
+                    } else {
+                        x
+                    }
+                }
+                None => default,
+            },
+        }
+    };
+    let start = resolve(args.get(2), 0);
+    let end = resolve(args.get(3), total_chars).clamp(0, total_chars);
+    if start > end {
+        None
+    } else {
+        Some((start, end))
+    }
 }
 
 fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5709,11 +6104,9 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("find() expected str")),
     };
     let total_chars = s.chars().count() as i64;
-    let start = clamp_str_index(args.get(2), 0, total_chars);
-    let end = clamp_str_index(args.get(3), total_chars, total_chars);
-    if start > end || start > total_chars {
+    let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
-    }
+    };
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
@@ -5723,20 +6116,6 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
             Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
         }
         None => Ok(Object::Int(-1)),
-    }
-}
-
-fn clamp_str_index(arg: Option<&Object>, default: i64, len: i64) -> i64 {
-    match arg {
-        Some(Object::Int(n)) => {
-            if *n < 0 {
-                (len + n).max(0)
-            } else {
-                (*n).min(len)
-            }
-        }
-        Some(Object::None) | None => default,
-        _ => default,
     }
 }
 
@@ -5920,11 +6299,9 @@ fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("rfind() expected str")),
     };
     let total_chars = s.chars().count() as i64;
-    let start = clamp_str_index(args.get(2), 0, total_chars);
-    let end = clamp_str_index(args.get(3), total_chars, total_chars);
-    if start > end {
+    let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
-    }
+    };
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
@@ -5952,11 +6329,9 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("count() expected str")),
     };
     let total_chars = s.chars().count() as i64;
-    let start = clamp_str_index(args.get(2), 0, total_chars);
-    let end = clamp_str_index(args.get(3), total_chars, total_chars);
-    if start > end {
+    let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(0));
-    }
+    };
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     Ok(Object::Int(
@@ -6773,8 +7148,13 @@ fn dict_fromkeys(args: &[Object]) -> Result<Object, RuntimeError> {
     // shape: the bound version receives the dict as ``args[0]``;
     // the unbound version omits it. Sniff the receiver shape so a
     // single body handles both.
-    let (it_idx, value_idx) = match args.first() {
-        Some(Object::Dict(_)) | Some(Object::Type(_)) => (1usize, 2usize),
+    // A lone dict argument is the *iterable* of an unbound call
+    // (`map(dict.fromkeys, list_of_dicts)` — ChainMap.__iter__ does
+    // this); a dict in slot 0 only marks the bound receiver when more
+    // arguments follow.
+    let (it_idx, value_idx) = match (args.first(), args.len()) {
+        (Some(Object::Type(_)), _) => (1usize, 2usize),
+        (Some(Object::Dict(_)), n) if n >= 2 => (1usize, 2usize),
         _ => (0usize, 1usize),
     };
     let it = args
@@ -7083,10 +7463,105 @@ fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
     match arg {
         Object::Bytes(b) => Ok(b.to_vec()),
         Object::ByteArray(b) => Ok(b.borrow().clone()),
-        Object::Str(s) => Ok(s.as_bytes().to_vec()),
-        Object::Int(i) if (0..=255).contains(i) => Ok(vec![*i as u8]),
-        _ => Err(type_error("a bytes-like object is required")),
+        Object::MemoryView(mv) => Ok(mv.to_bytes()),
+        Object::Instance(inst) => {
+            // bytes/bytearray subclasses carry their payload natively.
+            if let Some(native) = &inst.native {
+                let native = native.clone();
+                if matches!(
+                    native,
+                    Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+                ) {
+                    return bytes_argview(&native);
+                }
+            }
+            // PEP 688: an object exposing `__buffer__` works anywhere a
+            // bytes-like object is accepted. Reenter the interpreter to
+            // call it (CPython's PyObject_GetBuffer slot dispatch).
+            if let Some(method) = crate::instance_method(arg, "__buffer__") {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still live
+                    // on this thread; the GIL keeps the access exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    let globals = interp.builtins_dict();
+                    let r = interp.call_object_with_globals(
+                        &method,
+                        &[Object::Int(0)],
+                        &[],
+                        &globals,
+                    )?;
+                    return match &r {
+                        Object::MemoryView(mv) => Ok(mv.to_bytes()),
+                        Object::Bytes(b) => Ok(b.to_vec()),
+                        Object::ByteArray(b) => Ok(b.borrow().clone()),
+                        _ => Err(type_error(format!(
+                            "__buffer__ returned non-buffer of type '{}'",
+                            r.type_name()
+                        ))),
+                    };
+                }
+            }
+            Err(type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                arg.type_name()
+            )))
+        }
+        _ => Err(type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            arg.type_name()
+        ))),
     }
+}
+
+/// Needle argument of `bytes.find` / `rfind` / `index` / `rindex` /
+/// `count` / `in`: a bytes-like object, or an integer naming a single
+/// byte (range-checked like CPython's `_getbytevalue`). Objects with a
+/// user `__index__` go through interpreter reentry like CPython's
+/// `PyNumber_Index` path.
+fn bytes_find_needle(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
+    let native = arg.native_value();
+    match native.as_ref().unwrap_or(arg) {
+        Object::Bytes(b) => Ok(b.to_vec()),
+        Object::ByteArray(b) => Ok(b.borrow().clone()),
+        Object::MemoryView(mv) => Ok(mv.to_bytes()),
+        Object::Bool(v) => Ok(vec![u8::from(*v)]),
+        Object::Int(i) => {
+            if (0..=255).contains(i) {
+                Ok(vec![*i as u8])
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        Object::Long(_) => Err(value_error("byte must be in range(0, 256)")),
+        inst @ Object::Instance(_)
+            if crate::instance_method(inst, "__index__").is_some() =>
+        {
+            let v = coerce_index_i64(inst)?;
+            if (0..=255).contains(&v) {
+                Ok(vec![v as u8])
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        _ => Err(type_error(format!(
+            "argument should be integer or bytes-like object, not '{}'",
+            arg.type_name()
+        ))),
+    }
+}
+
+/// Build a transform result that follows the receiver's type
+/// (`bytes.lower() -> bytes`, `bytearray.lower() -> bytearray`).
+fn bytes_like_result(args: &[Object], out: Vec<u8>) -> Object {
+    if matches!(args.first(), Some(Object::ByteArray(_))) {
+        Object::new_bytearray(out)
+    } else {
+        Object::new_bytes(out)
+    }
+}
+
+fn byte_is_pyspace(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
 }
 
 fn bytes_decode(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7106,24 +7581,72 @@ fn bytes_decode(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_hex(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
-    let sep: Option<u8> = match args.get(1) {
+    bytes_hex_kw(args, &[])
+}
+
+fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let data = match args.first() {
+        Some(Object::MemoryView(mv)) => mv.to_bytes(),
+        _ => bytes_data(args)?,
+    };
+    let mut sep_obj = args.get(1).cloned();
+    let mut bps_obj = args.get(2).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "sep" => sep_obj = Some(v.clone()),
+            "bytes_per_sep" => bps_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "hex() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let sep: Option<u8> = match &sep_obj {
+        None => None,
         Some(Object::Str(s)) => {
-            let bytes = s.as_bytes();
-            if bytes.len() != 1 {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => {
+                    if (c as u32) > 0x7f {
+                        return Err(value_error("sep must be ASCII."));
+                    }
+                    Some(c as u8)
+                }
+                _ => return Err(value_error("sep must be length 1.")),
+            }
+        }
+        Some(Object::Bytes(b)) => {
+            if b.len() != 1 {
                 return Err(value_error("sep must be length 1."));
             }
-            Some(bytes[0])
+            if b[0] > 0x7f {
+                return Err(value_error("sep must be ASCII."));
+            }
+            Some(b[0])
         }
-        Some(Object::Bytes(b)) if b.len() == 1 => Some(b[0]),
-        Some(Object::None) | None => None,
-        _ => return Err(type_error("sep must be a 1-byte string")),
+        Some(other) => {
+            return Err(type_error(format!(
+                "sep must be str or bytes, not {}",
+                other.type_name()
+            )))
+        }
     };
-    let bytes_per_sep = match args.get(2) {
+    let bytes_per_sep = match &bps_obj {
         Some(Object::Int(i)) => *i,
         Some(Object::Bool(b)) => i64::from(*b),
+        Some(Object::Long(_)) => {
+            return Err(crate::error::overflow_error(
+                "Python int too large to convert to C int",
+            ))
+        }
         None => 1,
-        _ => return Err(type_error("bytes_per_sep must be int")),
+        Some(other) => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                other.type_name()
+            )))
+        }
     };
     let mut out = String::with_capacity(data.len() * 2);
     let step = bytes_per_sep.unsigned_abs() as usize;
@@ -7160,36 +7683,8 @@ fn bytes_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         args.first()
     };
-    let s = match s_obj {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("fromhex() argument must be str")),
-    };
-    let mut bytes = Vec::new();
-    let mut last_high: Option<u8> = None;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if last_high.is_some() {
-                return Err(value_error("non-hexadecimal number"));
-            }
-            continue;
-        }
-        let v = c.to_digit(16).ok_or_else(|| {
-            value_error(format!(
-                "non-hexadecimal number found in fromhex() arg at position {}",
-                c.len_utf8()
-            ))
-        })? as u8;
-        match last_high {
-            Some(hi) => {
-                bytes.push((hi << 4) | v);
-                last_high = None;
-            }
-            None => last_high = Some(v),
-        }
-    }
-    if last_high.is_some() {
-        return Err(value_error("non-hexadecimal number"));
-    }
+    let s = fromhex_string_arg(s_obj)?;
+    let bytes = parse_hex_bytes(&s)?;
     // Decide return type based on receiver: bytearray.fromhex returns bytearray;
     // bytes.fromhex returns bytes.
     if matches!(args.first(), Some(Object::ByteArray(_))) {
@@ -7204,8 +7699,14 @@ fn bytes_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
     let target = args
         .get(1)
         .ok_or_else(|| type_error("startswith() expected 1 arg"))?;
+    let (start, end, invalid) = bytes_search_range(args, data.len());
+    if invalid {
+        return Ok(Object::Bool(false));
+    }
     Ok(Object::Bool(bytes_match_prefix_suffix(
-        &data, target, true,
+        &data[start..end],
+        target,
+        true,
     )?))
 }
 
@@ -7214,8 +7715,14 @@ fn bytes_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
     let target = args
         .get(1)
         .ok_or_else(|| type_error("endswith() expected 1 arg"))?;
+    let (start, end, invalid) = bytes_search_range(args, data.len());
+    if invalid {
+        return Ok(Object::Bool(false));
+    }
     Ok(Object::Bool(bytes_match_prefix_suffix(
-        &data, target, false,
+        &data[start..end],
+        target,
+        false,
     )?))
 }
 
@@ -7224,6 +7731,7 @@ fn bytes_match_prefix_suffix(
     target: &Object,
     prefix: bool,
 ) -> Result<bool, RuntimeError> {
+    let name = if prefix { "startswith" } else { "endswith" };
     let test = |needle: &[u8]| {
         if prefix {
             data.starts_with(needle)
@@ -7234,7 +7742,13 @@ fn bytes_match_prefix_suffix(
     match target {
         Object::Tuple(parts) => {
             for item in parts.iter() {
-                let needle = bytes_argview(item)?;
+                let needle = bytes_argview(item).map_err(|_| {
+                    type_error(format!(
+                        "tuple for {name} must only contain bytes-like objects, \
+                         not '{}'",
+                        item.type_name()
+                    ))
+                })?;
                 if test(&needle) {
                     return Ok(true);
                 }
@@ -7242,38 +7756,51 @@ fn bytes_match_prefix_suffix(
             Ok(false)
         }
         _ => {
-            let needle = bytes_argview(target)?;
+            let needle = bytes_argview(target).map_err(|_| {
+                type_error(format!(
+                    "{name} first arg must be bytes or a tuple of bytes, not {}",
+                    target.type_name()
+                ))
+            })?;
             Ok(test(&needle))
         }
     }
 }
 
 /// Resolve the optional `start`/`end` arguments of `bytes.find` and
-/// friends (positions 2 and 3) into a clamped `[start, end]` byte
-/// window, applying CPython's slice-style negative-index handling.
-fn bytes_search_range(args: &[Object], len: usize) -> (usize, usize) {
+/// friends (positions 2 and 3) the way CPython's `ADJUST_INDICES`
+/// does: negative indices are offset by the length and floored at 0,
+/// `end` is clamped to the length but `start` is **not** — a start
+/// past the end makes the window invalid (third tuple slot), which
+/// matters for empty needles (`b'abc'.find(b'', 4) == -1`).
+fn bytes_search_range(args: &[Object], len: usize) -> (usize, usize, bool) {
     let n = len as i64;
     let resolve = |o: Option<&Object>, default: i64| -> i64 {
         match o {
             None | Some(Object::None) => default,
             Some(obj) => match obj.as_i64() {
-                Some(mut x) => {
+                Some(x) => {
                     if x < 0 {
-                        x += n;
+                        (x + n).max(0)
+                    } else {
+                        x
                     }
-                    x.clamp(0, n)
                 }
                 None => default,
             },
         }
     };
-    let start = resolve(args.get(2), 0).clamp(0, n) as usize;
-    let end = resolve(args.get(3), n).clamp(0, n) as usize;
-    (start, end.max(start))
+    let raw_start = resolve(args.get(2), 0);
+    let end = resolve(args.get(3), n).clamp(0, n);
+    let invalid = raw_start > end;
+    let start = raw_start.clamp(0, end.max(0));
+    (start as usize, end as usize, invalid)
 }
 
 /// Find `sub` within `data[start..end]`, returning the *absolute*
 /// position (or -1). Mirrors `bytes.find`'s empty-needle behaviour.
+/// `memmem` is O(n + m) like CPython's stringlib fastsearch — the
+/// suite checks this (`test_adaptive_find` with megabyte needles).
 fn bytes_find_in(data: &[u8], sub: &[u8], start: usize, end: usize) -> i64 {
     if start > end || end > data.len() {
         return -1;
@@ -7282,45 +7809,61 @@ fn bytes_find_in(data: &[u8], sub: &[u8], start: usize, end: usize) -> i64 {
     if sub.is_empty() {
         return start as i64;
     }
-    if sub.len() > hay.len() {
-        return -1;
+    memchr::memmem::find(hay, sub).map_or(-1, |i| (start + i) as i64)
+}
+
+/// gh-142560: converting a search argument can run Python code (a user
+/// `__index__`) that mutates the receiving bytearray while the search
+/// "holds its buffer". CPython raises `BufferError`; we emulate by
+/// snapshotting the length around the conversion.
+fn bytes_needle_guarded(args: &[Object], arg: &Object) -> Result<Vec<u8>, RuntimeError> {
+    if let Some(Object::ByteArray(cell)) = args.first() {
+        let before = cell.borrow().len();
+        let sub = bytes_find_needle(arg)?;
+        if cell.borrow().len() != before {
+            return Err(RuntimeError::PyException(
+                crate::error::PyException::from_builtin(
+                    "BufferError",
+                    "Existing exports of data: object cannot be re-sized",
+                ),
+            ));
+        }
+        Ok(sub)
+    } else {
+        bytes_find_needle(arg)
     }
-    hay.windows(sub.len())
-        .position(|w| w == sub)
-        .map_or(-1, |i| (start + i) as i64)
 }
 
 fn bytes_find(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
-    let sub = bytes_argview(
+    let sub = bytes_needle_guarded(
+        args,
         args.get(1)
             .ok_or_else(|| type_error("find() expected 1 arg"))?,
     )?;
-    let (start, end) = bytes_search_range(args, data.len());
+    let data = bytes_data(args)?;
+    let (start, end, invalid) = bytes_search_range(args, data.len());
+    if invalid {
+        return Ok(Object::Int(-1));
+    }
     Ok(Object::Int(bytes_find_in(&data, &sub, start, end)))
 }
 
 fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
-    let sub = bytes_argview(
+    let sub = bytes_needle_guarded(
+        args,
         args.get(1)
             .ok_or_else(|| type_error("rfind() expected 1 arg"))?,
     )?;
-    let (start, end) = bytes_search_range(args, data.len());
-    if start > end || end > data.len() {
+    let data = bytes_data(args)?;
+    let (start, end, invalid) = bytes_search_range(args, data.len());
+    if invalid || end > data.len() {
         return Ok(Object::Int(-1));
     }
     if sub.is_empty() {
         return Ok(Object::Int(end as i64));
     }
-    let mut last = -1i64;
-    if sub.len() <= end - start {
-        for i in start..=end - sub.len() {
-            if data[i..i + sub.len()] == sub[..] {
-                last = i as i64;
-            }
-        }
-    }
+    let last = memchr::memmem::rfind(&data[start..end], &sub)
+        .map_or(-1, |i| (start + i) as i64);
     Ok(Object::Int(last))
 }
 
@@ -7331,54 +7874,53 @@ fn bytes_index(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+fn bytes_rindex(args: &[Object]) -> Result<Object, RuntimeError> {
+    match bytes_rfind(args)? {
+        Object::Int(i) if i >= 0 => Ok(Object::Int(i)),
+        _ => Err(value_error("subsection not found")),
+    }
+}
+
 fn bytes_count(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
-    let sub = bytes_argview(
+    let sub = bytes_needle_guarded(
+        args,
         args.get(1)
             .ok_or_else(|| type_error("count() expected 1 arg"))?,
     )?;
-    let (start, end) = bytes_search_range(args, data.len());
+    let data = bytes_data(args)?;
+    let (start, end, invalid) = bytes_search_range(args, data.len());
+    if invalid {
+        return Ok(Object::Int(0));
+    }
     if sub.is_empty() {
         return Ok(Object::Int((end - start) as i64 + 1));
     }
-    let mut n = 0i64;
-    let mut i = start;
-    while i + sub.len() <= end {
-        if data[i..i + sub.len()] == sub[..] {
-            n += 1;
-            i += sub.len();
-        } else {
-            i += 1;
-        }
-    }
+    // Non-overlapping occurrences, like CPython's `stringlib_count`.
+    let n = memchr::memmem::find_iter(&data[start..end], &sub).count() as i64;
     Ok(Object::Int(n))
 }
 
 fn bytes_lower(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::new_bytes(
-        bytes_data(args)?
-            .iter()
-            .map(|b| b.to_ascii_lowercase())
-            .collect::<Vec<_>>(),
-    ))
+    let out: Vec<u8> = bytes_data(args)?
+        .iter()
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    Ok(bytes_like_result(args, out))
 }
 
 fn bytes_upper(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::new_bytes(
-        bytes_data(args)?
-            .iter()
-            .map(|b| b.to_ascii_uppercase())
-            .collect::<Vec<_>>(),
-    ))
+    let out: Vec<u8> = bytes_data(args)?
+        .iter()
+        .map(|b| b.to_ascii_uppercase())
+        .collect();
+    Ok(bytes_like_result(args, out))
 }
 
 fn bytes_strip(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let trim_set: Vec<u8> = match args.get(1) {
-        Some(Object::Bytes(b)) => b.to_vec(),
-        Some(Object::ByteArray(b)) => b.borrow().clone(),
         None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
-        _ => return Err(type_error("strip() expected bytes")),
+        Some(other) => bytes_argview(other)?,
     };
     let start = data
         .iter()
@@ -7388,79 +7930,248 @@ fn bytes_strip(args: &[Object]) -> Result<Object, RuntimeError> {
         .iter()
         .rposition(|b| !trim_set.contains(b))
         .map_or(start, |i| i + 1);
-    Ok(Object::new_bytes(data[start..end].to_vec()))
+    Ok(bytes_like_result(args, data[start..end].to_vec()))
 }
 
 fn bytes_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let trim_set: Vec<u8> = match args.get(1) {
-        Some(Object::Bytes(b)) => b.to_vec(),
-        Some(Object::ByteArray(b)) => b.borrow().clone(),
         None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
-        _ => return Err(type_error("lstrip() expected bytes")),
+        Some(other) => bytes_argview(other)?,
     };
     let start = data
         .iter()
         .position(|b| !trim_set.contains(b))
         .unwrap_or(data.len());
-    Ok(Object::new_bytes(data[start..].to_vec()))
+    Ok(bytes_like_result(args, data[start..].to_vec()))
 }
 
 fn bytes_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let trim_set: Vec<u8> = match args.get(1) {
-        Some(Object::Bytes(b)) => b.to_vec(),
-        Some(Object::ByteArray(b)) => b.borrow().clone(),
         None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
-        _ => return Err(type_error("rstrip() expected bytes")),
+        Some(other) => bytes_argview(other)?,
     };
     let end = data
         .iter()
         .rposition(|b| !trim_set.contains(b))
         .map_or(0, |i| i + 1);
-    Ok(Object::new_bytes(data[..end].to_vec()))
+    Ok(bytes_like_result(args, data[..end].to_vec()))
 }
 
-fn bytes_split(args: &[Object]) -> Result<Object, RuntimeError> {
+/// Shared argument parsing for `bytes.split` / `rsplit`:
+/// `(sep=None, maxsplit=-1)`, both passable as keywords.
+fn bytes_split_args(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    name: &str,
+) -> Result<(Vec<u8>, Option<Vec<u8>>, i64), RuntimeError> {
     let data = bytes_data(args)?;
-    let sep: Option<Vec<u8>> = match args.get(1) {
+    let mut sep_obj = args.get(1).cloned();
+    let mut maxsplit_obj = args.get(2).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "sep" => sep_obj = Some(v.clone()),
+            "maxsplit" => maxsplit_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "{name}() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let sep = match sep_obj {
         None | Some(Object::None) => None,
-        Some(Object::Bytes(b)) => Some(b.to_vec()),
-        Some(Object::ByteArray(b)) => Some(b.borrow().clone()),
-        _ => return Err(type_error("split() expected bytes")),
+        Some(other) => {
+            // Same reentrancy hazard as the find family (gh-142560):
+            // converting `sep` can run user code that resizes the
+            // receiving bytearray.
+            if let Some(Object::ByteArray(cell)) = args.first() {
+                let before = cell.borrow().len();
+                let sep = bytes_argview(&other)?;
+                if cell.borrow().len() != before {
+                    return Err(RuntimeError::PyException(
+                        crate::error::PyException::from_builtin(
+                            "BufferError",
+                            "Existing exports of data: object cannot be re-sized",
+                        ),
+                    ));
+                }
+                Some(sep)
+            } else {
+                Some(bytes_argview(&other)?)
+            }
+        }
     };
-    let parts: Vec<Vec<u8>> = match sep {
-        None => data
-            .split(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c'))
-            .filter(|s| !s.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect(),
-        Some(sep) if !sep.is_empty() => {
-            let mut out: Vec<Vec<u8>> = Vec::new();
-            let mut start = 0;
+    if let Some(s) = &sep {
+        if s.is_empty() {
+            return Err(value_error("empty separator"));
+        }
+    }
+    let maxsplit = match maxsplit_obj {
+        None => -1,
+        Some(o) => o
+            .as_i64()
+            .ok_or_else(|| type_error("integer argument expected"))?,
+    };
+    Ok((data, sep, maxsplit))
+}
+
+fn bytes_split_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let (data, sep, maxsplit) = bytes_split_args(args, kwargs, "split")?;
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    match sep {
+        None => {
             let mut i = 0;
-            while i + sep.len() <= data.len() {
-                if data[i..i + sep.len()] == sep[..] {
-                    out.push(data[start..i].to_vec());
-                    i += sep.len();
-                    start = i;
-                } else {
+            let mut nsplit = 0i64;
+            while i < data.len() {
+                while i < data.len() && byte_is_pyspace(data[i]) {
                     i += 1;
                 }
+                if i >= data.len() {
+                    break;
+                }
+                if maxsplit >= 0 && nsplit >= maxsplit {
+                    parts.push(data[i..].to_vec());
+                    break;
+                }
+                let start = i;
+                while i < data.len() && !byte_is_pyspace(data[i]) {
+                    i += 1;
+                }
+                parts.push(data[start..i].to_vec());
+                nsplit += 1;
             }
-            out.push(data[start..].to_vec());
-            out
         }
-        _ => vec![data],
-    };
+        Some(sep) => {
+            let mut start = 0;
+            let mut nsplit = 0i64;
+            while maxsplit < 0 || nsplit < maxsplit {
+                match memchr::memmem::find(&data[start..], &sep) {
+                    Some(rel) => {
+                        parts.push(data[start..start + rel].to_vec());
+                        start += rel + sep.len();
+                        nsplit += 1;
+                    }
+                    None => break,
+                }
+            }
+            parts.push(data[start..].to_vec());
+        }
+    }
+    let is_ba = matches!(args.first(), Some(Object::ByteArray(_)));
     Ok(Object::new_list(
-        parts.into_iter().map(Object::new_bytes).collect(),
+        parts
+            .into_iter()
+            .map(|p| {
+                if is_ba {
+                    Object::new_bytearray(p)
+                } else {
+                    Object::new_bytes(p)
+                }
+            })
+            .collect(),
+    ))
+}
+
+fn bytes_rsplit_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let (data, sep, maxsplit) = bytes_split_args(args, kwargs, "rsplit")?;
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    match sep {
+        None => {
+            let mut i = data.len();
+            let mut nsplit = 0i64;
+            while i > 0 {
+                while i > 0 && byte_is_pyspace(data[i - 1]) {
+                    i -= 1;
+                }
+                if i == 0 {
+                    break;
+                }
+                if maxsplit >= 0 && nsplit >= maxsplit {
+                    parts.push(data[..i].to_vec());
+                    break;
+                }
+                let end = i;
+                while i > 0 && !byte_is_pyspace(data[i - 1]) {
+                    i -= 1;
+                }
+                parts.push(data[i..end].to_vec());
+                nsplit += 1;
+            }
+            parts.reverse();
+        }
+        Some(sep) => {
+            let mut end = data.len();
+            let mut nsplit = 0i64;
+            while maxsplit < 0 || nsplit < maxsplit {
+                match memchr::memmem::rfind(&data[..end], &sep) {
+                    Some(pos) => {
+                        parts.push(data[pos + sep.len()..end].to_vec());
+                        end = pos;
+                        nsplit += 1;
+                    }
+                    None => break,
+                }
+            }
+            parts.push(data[..end].to_vec());
+            parts.reverse();
+        }
+    }
+    let is_ba = matches!(args.first(), Some(Object::ByteArray(_)));
+    Ok(Object::new_list(
+        parts
+            .into_iter()
+            .map(|p| {
+                if is_ba {
+                    Object::new_bytearray(p)
+                } else {
+                    Object::new_bytes(p)
+                }
+            })
+            .collect(),
     ))
 }
 
 fn bytes_splitlines(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_splitlines_kw(args, &[])
+}
+
+fn bytes_splitlines_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let keepends = matches!(args.get(1), Some(Object::Bool(true)));
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "splitlines() takes at most 1 argument ({} given)",
+            args.len() - 1
+        )));
+    }
+    let mut keepends_obj = args.get(1).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "keepends" => keepends_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "splitlines() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let keepends = match &keepends_obj {
+        None => false,
+        Some(o) => o
+            .as_i64()
+            .map(|v| v != 0)
+            .ok_or_else(|| type_error("an integer is required"))?,
+    };
     let mut out: Vec<Object> = Vec::new();
     let mut start = 0;
     let mut i = 0;
@@ -7476,7 +8187,7 @@ fn bytes_splitlines(args: &[Object]) -> Result<Object, RuntimeError> {
             } else {
                 &data[start..no_eol]
             };
-            out.push(Object::new_bytes(slice.to_vec()));
+            out.push(bytes_like_result(args, slice.to_vec()));
             start = end;
             i = end;
         } else {
@@ -7484,9 +8195,46 @@ fn bytes_splitlines(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     if start < data.len() {
-        out.push(Object::new_bytes(data[start..].to_vec()));
+        out.push(bytes_like_result(args, data[start..].to_vec()));
     }
     Ok(Object::new_list(out))
+}
+
+/// `bytes.__mod__` / `bytearray.__mod__` — PEP 461 formatting through
+/// the running interpreter (instances may need `__bytes__`/`__repr__`).
+fn bytes_dunder_mod(args: &[Object]) -> Result<Object, RuntimeError> {
+    let receiver = args
+        .first()
+        .ok_or_else(|| type_error("__mod__ requires a receiver"))?;
+    let other = args
+        .get(1)
+        .ok_or_else(|| type_error("__mod__ expected 1 argument"))?;
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame still live on this
+        // thread; the GIL keeps the access exclusive.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        interp.bytes_percent_format(receiver, other, &globals)
+    } else {
+        Err(type_error("bytes %-formatting requires the interpreter"))
+    }
+}
+
+/// `bytes.__rmod__`: only formats when the *left* operand is bytes-like
+/// (then it's really that operand's format), otherwise `NotImplemented`.
+fn bytes_dunder_rmod(args: &[Object]) -> Result<Object, RuntimeError> {
+    let receiver = args
+        .first()
+        .ok_or_else(|| type_error("__rmod__ requires a receiver"))?;
+    let other = args
+        .get(1)
+        .ok_or_else(|| type_error("__rmod__ expected 1 argument"))?;
+    if matches!(other, Object::Bytes(_) | Object::ByteArray(_)) {
+        let swapped = [other.clone(), receiver.clone()];
+        bytes_dunder_mod(&swapped)
+    } else {
+        Ok(crate::vm_singletons::not_implemented())
+    }
 }
 
 fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7494,14 +8242,38 @@ fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
     let it = args
         .get(1)
         .ok_or_else(|| type_error("join() expected iterable"))?;
-    let mut parts: Vec<Vec<u8>> = Vec::new();
-    let mut iter = it.make_iter()?;
-    while let Some(v) = iter.next_value() {
-        match v {
-            Object::Bytes(b) => parts.push(b.to_vec()),
-            Object::ByteArray(b) => parts.push(b.borrow().clone()),
-            _ => return Err(type_error("sequence item: expected bytes")),
+    // Iterate through the interpreter so user iterables / generators
+    // work, not just native containers.
+    let items: Vec<Object> = match it {
+        Object::List(l) => l.borrow().clone(),
+        Object::Tuple(t) => t.to_vec(),
+        other => {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame still live on
+                // this thread; the GIL keeps the access exclusive.
+                let interp = unsafe { &mut *ptr };
+                let globals = interp.builtins_dict();
+                interp.collect_iterable(other, &globals)?
+            } else {
+                let mut iter = other.make_iter()?;
+                let mut out = Vec::new();
+                while let Some(v) = iter.next_value() {
+                    out.push(v);
+                }
+                out
+            }
         }
+    };
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+    for v in &items {
+        let part = bytes_argview(v).map_err(|_| {
+            type_error(format!(
+                "sequence item {}: expected a bytes-like object, {} found",
+                parts.len(),
+                v.type_name()
+            ))
+        })?;
+        parts.push(part);
     }
     let mut out = Vec::new();
     for (i, p) in parts.iter().enumerate() {
@@ -7510,10 +8282,17 @@ fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         out.extend_from_slice(p);
     }
-    Ok(Object::new_bytes(out))
+    Ok(bytes_like_result(args, out))
 }
 
 fn bytes_replace(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_replace_kw(args, &[])
+}
+
+fn bytes_replace_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let from = bytes_argview(
         args.get(1)
@@ -7523,11 +8302,31 @@ fn bytes_replace(args: &[Object]) -> Result<Object, RuntimeError> {
         args.get(2)
             .ok_or_else(|| type_error("replace() expected 2 args"))?,
     )?;
+    let mut max_obj = args.get(3).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "count" => max_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "replace() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let max = match max_obj {
+        None | Some(Object::None) => -1i64,
+        Some(o) => o
+            .as_i64()
+            .ok_or_else(|| type_error("integer argument expected"))?,
+    };
     let mut out = Vec::new();
+    let mut done = 0i64;
     let mut i = 0;
     while i < data.len() {
-        if i + from.len() <= data.len() && data[i..i + from.len()] == from[..] {
+        let within_budget = max < 0 || done < max;
+        if within_budget && i + from.len() <= data.len() && data[i..i + from.len()] == from[..] {
             out.extend_from_slice(&to);
+            done += 1;
             i += from.len().max(1);
             if from.is_empty() {
                 out.push(data[i - 1]);
@@ -7537,7 +8336,12 @@ fn bytes_replace(args: &[Object]) -> Result<Object, RuntimeError> {
             i += 1;
         }
     }
-    Ok(Object::new_bytes(out))
+    // An empty needle also matches at end-of-string (CPython appends a
+    // final replacement: `b"ab".replace(b"", b"-") == b"-a-b-"`).
+    if from.is_empty() && (max < 0 || done < max) {
+        out.extend_from_slice(&to);
+    }
+    Ok(bytes_like_result(args, out))
 }
 
 /// `bytes.translate(table, /, delete=b'')` and the `bytearray`
@@ -7545,9 +8349,32 @@ fn bytes_replace(args: &[Object]) -> Result<Object, RuntimeError> {
 /// 256; bytes present in `delete` are dropped first. The receiver's
 /// type (bytes vs bytearray) is preserved.
 fn bytes_translate(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_translate_kw(args, &[])
+}
+
+fn bytes_translate_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
+    let mut delete_obj = args.get(2).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "delete" => delete_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "translate() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
     let table = match args.get(1) {
-        None | Some(Object::None) => None,
+        None => {
+            return Err(type_error(
+                "translate() takes at least 1 argument (0 given)",
+            ))
+        }
+        Some(Object::None) => None,
         Some(o) => {
             let t = bytes_argview(o)?;
             if t.len() != 256 {
@@ -7556,9 +8383,9 @@ fn bytes_translate(args: &[Object]) -> Result<Object, RuntimeError> {
             Some(t)
         }
     };
-    let delete = match args.get(2) {
-        None | Some(Object::None) => Vec::new(),
-        Some(o) => bytes_argview(o)?,
+    let delete = match delete_obj {
+        None => Vec::new(),
+        Some(o) => bytes_argview(&o)?,
     };
     let mut out = Vec::with_capacity(data.len());
     for &b in &data {
@@ -7596,6 +8423,385 @@ fn bytes_maketrans(args: &[Object]) -> Result<Object, RuntimeError> {
         table[*f as usize] = *t;
     }
     Ok(Object::new_bytes(table))
+}
+
+fn bytes_partition(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let sep = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("partition() expected 1 arg"))?,
+    )?;
+    if sep.is_empty() {
+        return Err(value_error("empty separator"));
+    }
+    let (head, mid, tail) = match memchr::memmem::find(&data, &sep) {
+        Some(i) => (
+            data[..i].to_vec(),
+            sep.clone(),
+            data[i + sep.len()..].to_vec(),
+        ),
+        None => (data, Vec::new(), Vec::new()),
+    };
+    Ok(Object::new_tuple(vec![
+        bytes_like_result(args, head),
+        bytes_like_result(args, mid),
+        bytes_like_result(args, tail),
+    ]))
+}
+
+fn bytes_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let sep = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("rpartition() expected 1 arg"))?,
+    )?;
+    if sep.is_empty() {
+        return Err(value_error("empty separator"));
+    }
+    let (head, mid, tail) = match memchr::memmem::rfind(&data, &sep) {
+        Some(i) => (
+            data[..i].to_vec(),
+            sep.clone(),
+            data[i + sep.len()..].to_vec(),
+        ),
+        None => (Vec::new(), Vec::new(), data),
+    };
+    Ok(Object::new_tuple(vec![
+        bytes_like_result(args, head),
+        bytes_like_result(args, mid),
+        bytes_like_result(args, tail),
+    ]))
+}
+
+fn bytes_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let prefix = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("removeprefix() expected 1 arg"))?,
+    )?;
+    let out = if data.starts_with(&prefix) {
+        data[prefix.len()..].to_vec()
+    } else {
+        data
+    };
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let suffix = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("removesuffix() expected 1 arg"))?,
+    )?;
+    let out = if !suffix.is_empty() && data.ends_with(&suffix) {
+        data[..data.len() - suffix.len()].to_vec()
+    } else {
+        data
+    };
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_expandtabs(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let mut tabsize_obj = args.get(1).cloned();
+    for (k, v) in kwargs {
+        if k == "tabsize" {
+            tabsize_obj = Some(v.clone());
+        } else {
+            return Err(type_error(format!(
+                "expandtabs() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    let tabsize = match tabsize_obj {
+        None => 8,
+        Some(o) => o
+            .as_i64()
+            .ok_or_else(|| type_error("integer argument expected"))?,
+    };
+    let mut out = Vec::with_capacity(data.len());
+    let mut col: i64 = 0;
+    for &b in &data {
+        match b {
+            b'\t' => {
+                if tabsize > 0 {
+                    let pad = tabsize - (col % tabsize);
+                    out.extend(std::iter::repeat_n(b' ', pad as usize));
+                    col += pad;
+                }
+            }
+            b'\n' | b'\r' => {
+                out.push(b);
+                col = 0;
+            }
+            _ => {
+                out.push(b);
+                col += 1;
+            }
+        }
+    }
+    Ok(bytes_like_result(args, out))
+}
+
+/// Shared `center`/`ljust`/`rjust` plumbing: parse `(width,
+/// fillchar=b' ')` where fillchar must be a single byte.
+fn bytes_pad_args(args: &[Object], name: &str) -> Result<(Vec<u8>, i64, u8), RuntimeError> {
+    let data = bytes_data(args)?;
+    let width = args
+        .get(1)
+        .and_then(|o| o.as_i64())
+        .ok_or_else(|| type_error(format!("{name}() expected integer width")))?;
+    let fill = match args.get(2) {
+        None => b' ',
+        Some(o) => {
+            let v = bytes_argview(o).ok().filter(|v| v.len() == 1);
+            match v {
+                Some(v) => v[0],
+                None => {
+                    return Err(type_error(format!(
+                        "{name}() argument 2 must be a byte string of length 1, \
+                         not '{}'",
+                        o.type_name()
+                    )))
+                }
+            }
+        }
+    };
+    Ok((data, width, fill))
+}
+
+fn bytes_center(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (data, width, fill) = bytes_pad_args(args, "center")?;
+    let len = data.len() as i64;
+    if width <= len {
+        return Ok(bytes_like_result(args, data));
+    }
+    // CPython biases the extra fill to the right except when `width`
+    // is odd (`bytes_center` marg computation).
+    let marg = width - len;
+    let left = marg / 2 + (marg & width & 1);
+    let mut out = Vec::with_capacity(width as usize);
+    out.extend(std::iter::repeat_n(fill, left as usize));
+    out.extend_from_slice(&data);
+    out.extend(std::iter::repeat_n(fill, (marg - left) as usize));
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_ljust(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (data, width, fill) = bytes_pad_args(args, "ljust")?;
+    let mut out = data;
+    while (out.len() as i64) < width {
+        out.push(fill);
+    }
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_rjust(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (data, width, fill) = bytes_pad_args(args, "rjust")?;
+    let len = data.len() as i64;
+    let mut out = Vec::with_capacity(width.max(len) as usize);
+    out.extend(std::iter::repeat_n(fill, (width - len).max(0) as usize));
+    out.extend_from_slice(&data);
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let width = args
+        .get(1)
+        .and_then(|o| o.as_i64())
+        .ok_or_else(|| type_error("zfill() expected integer width"))?;
+    let len = data.len() as i64;
+    if width <= len {
+        return Ok(bytes_like_result(args, data));
+    }
+    let pad = (width - len) as usize;
+    let mut out = Vec::with_capacity(width as usize);
+    let body = if !data.is_empty() && (data[0] == b'+' || data[0] == b'-') {
+        out.push(data[0]);
+        &data[1..]
+    } else {
+        &data[..]
+    };
+    out.extend(std::iter::repeat_n(b'0', pad));
+    out.extend_from_slice(body);
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let mut out = Vec::with_capacity(data.len());
+    for (i, &b) in data.iter().enumerate() {
+        out.push(if i == 0 {
+            b.to_ascii_uppercase()
+        } else {
+            b.to_ascii_lowercase()
+        });
+    }
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_title(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let mut out = Vec::with_capacity(data.len());
+    let mut prev_alpha = false;
+    for &b in &data {
+        if b.is_ascii_alphabetic() {
+            out.push(if prev_alpha {
+                b.to_ascii_lowercase()
+            } else {
+                b.to_ascii_uppercase()
+            });
+            prev_alpha = true;
+        } else {
+            out.push(b);
+            prev_alpha = false;
+        }
+    }
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let out: Vec<u8> = data
+        .iter()
+        .map(|b| {
+            if b.is_ascii_uppercase() {
+                b.to_ascii_lowercase()
+            } else if b.is_ascii_lowercase() {
+                b.to_ascii_uppercase()
+            } else {
+                *b
+            }
+        })
+        .collect();
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_islower(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let has_cased = data.iter().any(u8::is_ascii_lowercase);
+    let no_upper = !data.iter().any(u8::is_ascii_uppercase);
+    Ok(Object::Bool(has_cased && no_upper))
+}
+
+fn bytes_isupper(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let has_cased = data.iter().any(u8::is_ascii_uppercase);
+    let no_lower = !data.iter().any(u8::is_ascii_lowercase);
+    Ok(Object::Bool(has_cased && no_lower))
+}
+
+fn bytes_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let mut cased = false;
+    let mut prev_cased = false;
+    for &b in &data {
+        if b.is_ascii_uppercase() {
+            if prev_cased {
+                return Ok(Object::Bool(false));
+            }
+            cased = true;
+            prev_cased = true;
+        } else if b.is_ascii_lowercase() {
+            if !prev_cased {
+                return Ok(Object::Bool(false));
+            }
+            cased = true;
+            prev_cased = true;
+        } else {
+            prev_cased = false;
+        }
+    }
+    Ok(Object::Bool(cased))
+}
+
+fn bytes_isascii(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    Ok(Object::Bool(data.iter().all(u8::is_ascii)))
+}
+
+// ---- bytearray-only mutators beyond append/extend/pop/clear ------
+
+fn bytearray_only(args: &[Object], name: &str) -> Result<Rc<RefCell<Vec<u8>>>, RuntimeError> {
+    match args.first() {
+        Some(Object::ByteArray(b)) => Ok(b.clone()),
+        _ => Err(type_error(format!("{name}() requires a bytearray receiver"))),
+    }
+}
+
+/// `_getbytevalue`: an int in `range(0, 256)` via the full
+/// `__index__` protocol (native unwrap or interpreter reentry).
+/// Used by `insert`/`remove`/`append` and bytearray item assignment.
+pub(crate) fn bytearray_byte_arg(arg: &Object) -> Result<u8, RuntimeError> {
+    let native = arg.native_value();
+    match native.as_ref().unwrap_or(arg) {
+        Object::Bool(v) => Ok(u8::from(*v)),
+        Object::Int(v) if (0..=255).contains(v) => Ok(*v as u8),
+        Object::Int(_) | Object::Long(_) => {
+            Err(value_error("byte must be in range(0, 256)"))
+        }
+        inst @ Object::Instance(_)
+            if crate::instance_method(inst, "__index__").is_some() =>
+        {
+            let v = coerce_index_i64(inst)?;
+            if (0..=255).contains(&v) {
+                Ok(v as u8)
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        other => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            other.type_name()
+        ))),
+    }
+}
+
+fn bytearray_insert(args: &[Object]) -> Result<Object, RuntimeError> {
+    let cell = bytearray_only(args, "insert")?;
+    let pos = args
+        .get(1)
+        .and_then(|o| o.as_i64())
+        .ok_or_else(|| type_error("insert() expected integer index"))?;
+    let byte = bytearray_byte_arg(
+        args.get(2)
+            .ok_or_else(|| type_error("insert() expected 2 args"))?,
+    )?;
+    let mut data = cell.borrow_mut();
+    let len = data.len() as i64;
+    let idx = if pos < 0 {
+        (len + pos).max(0)
+    } else {
+        pos.min(len)
+    } as usize;
+    data.insert(idx, byte);
+    Ok(Object::None)
+}
+
+fn bytearray_remove(args: &[Object]) -> Result<Object, RuntimeError> {
+    let cell = bytearray_only(args, "remove")?;
+    let byte = bytearray_byte_arg(
+        args.get(1)
+            .ok_or_else(|| type_error("remove() expected 1 arg"))?,
+    )?;
+    let mut data = cell.borrow_mut();
+    match data.iter().position(|b| *b == byte) {
+        Some(i) => {
+            data.remove(i);
+            Ok(Object::None)
+        }
+        None => Err(value_error("value not found in bytearray")),
+    }
+}
+
+fn bytearray_copy(args: &[Object]) -> Result<Object, RuntimeError> {
+    let cell = bytearray_only(args, "copy")?;
+    let data = cell.borrow().clone();
+    Ok(Object::new_bytearray(data))
 }
 
 fn bytes_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {

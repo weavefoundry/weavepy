@@ -112,8 +112,8 @@ status = "skip"
 reason = "measured: past the sys.getsizeof/interning probes it reaches the same gc.collect() reachable-hang as test_set (tuple/iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
 
 [tests."cpython/Lib/test/test_bytes.py"]
-status = "fail"
-reason = "measured: first remaining failure is 'SkipTest: No module named _testlimitedcapi' raised at import of a C-API test helper WeavePy doesn't provide; the CAPI-dependent bytes subtests can't run."
+status = "timeout"
+reason = "measured: exceeds the 30s budget. RFC 0037 WS4 rebuilt bytes/bytearray (CPython-exact constructors with source/encoding/errors + __bytes__/__index__/__buffer__, find/index/count search windows (ADJUST_INDICES), fromhex/hex with sep, %-formatting incl. b'%(key)b' mappings and __rmod__, BufferError reentrancy guards, live bytearray iterators), so the suite now runs its full matrix — wall time is the blocker (completes with failures at larger budgets); needs the substring fast path."
 
 [tests."cpython/Lib/test/test_string.py"]
 status = "pass"
@@ -124,8 +124,8 @@ status = "fail"
 reason = "depends on full unicodedata DB + width handling"
 
 [tests."cpython/Lib/test/test_math.py"]
-status = "fail"
-reason = "math module: domain edge cases (gamma, lgamma) differ from libm path"
+status = "timeout"
+reason = "measured: exceeds the 30s budget even sequentially (was a completes-and-fails row; the heavy numeric loops plus interpreter overhead push it over). Underlying gaps when it ran: domain edge cases (gamma, lgamma) vs the libm path."
 
 [tests."cpython/Lib/test/test_int.py"]
 status = "pass"
@@ -149,7 +149,7 @@ reason = "RFC 0037 WS3/WS8: passes end-to-end. cmath is ported (pure-Python over
 
 [tests."cpython/Lib/test/test_collections.py"]
 status = "fail"
-reason = "measured: dict(**kwargs)/dict(mapping,**kwargs) + collections.abc now work (RFC 0037); first remaining failure is a builtin '__new__' rejecting keyword arguments (namedtuple/typed-collection construction path)."
+reason = "measured: completes in ~24s sequentially and fails 9F/15E (was 21F/24E). RFC 0037 WS8 swapped the collections shim for CPython's verbatim collections/__init__.py over a new _collections accelerator (pure-Python deque/defaultdict/_count_elements; OrderedDict/namedtuple run the reference pure-Python paths via dict.__missing__, weakproxy __setattr__ forwarding, tuple.__new__-from-iterable, PEP 584 dict |/|=). Remaining clusters: namedtuple __defaults__ assignment, ChainMap __or__ over ABC views, abc-view equality, set.__sub__ type-level dunders. NB: flips to 'timeout' under parallel contention (-j8) — the pure-Python OrderedDict linked list is the hot path; needs a native OrderedDict/_tuplegetter."
 
 [tests."cpython/Lib/test/test_array.py"]
 status = "fail"
@@ -193,7 +193,7 @@ reason = "marshal ships (RFC 0033) and imports cleanly; full test_marshal.py con
 
 [tests."cpython/Lib/test/test_re.py"]
 status = "fail"
-reason = "re engine: Unicode property classes + atomic groups"
+reason = "measured: completes in ~23s sequentially with a mixed F/E run (re engine gaps: Unicode property classes + atomic groups among them). NB: flips to 'timeout' under parallel contention (-j4+) — borderline on the 30s budget."
 
 [tests."cpython/Lib/test/test_json.py"]
 status = "fail"
@@ -288,8 +288,8 @@ status = "fail"
 reason = "measured (WS2): 90 tests run, 51 pass / 36 fail / 3 error (was 44/25/6). The lexer's f-string *extent* scanner now emits CPython's exact PEP 701 wording (unterminated f-string literal, unterminated triple-quoted f-string literal, f-string: expecting '}', f-string: expecting '}', or format specs, newlines-not-allowed-in-format-specifiers-for-single-quoted) and uses an explicit bracket *stack* (not a depth counter) so it reports closing-paren-does-not-match-opening, f-string: unmatched ')', and '{'/'(' was-never-closed (comment-to-EOF) — distinguishing a same-quote terminator (f'{3') from a real nested string (f'{3 + 'a'}'); test_not_closing_quotes/test_unterminated_string/test_newlines_in_format_specifiers/test_mismatched_parens/test_comments pass. The FORMAT_VALUE opcode now routes through __format__ like format(): !s/!r/!a convert-then-format-as-string (test_conversions), custom __format__ objects are honoured, object.__format__ rejects a non-empty spec with TypeError 'unsupported format string passed to T.__format__' (test_errors), and the int spec parser rejects duplicate ,/_ grouping with CPython's two messages (the four test_with_*_in_format_specifier pass). Remaining: AST source positions/lineno + compile(<AST>), decimal.Decimal.__format__, \\N{...} escape decoding, backslash SyntaxWarnings, lambda-without-parens message, and the lexer-finds-extent-first ordering that pre-empts the parser's 'valid expression required before X' on empty fields."
 
 [tests."cpython/Lib/test/test_class.py"]
-status = "fail"
-reason = "measured: the compiler now accepts **kwargs (and *bases) in a class header via the CallEx lowering (RFC 0037 WS2); the first remaining blocker is the module-level 'from _testinternalcapi import has_inline_values' — a CPython-internal managed-dict test helper WeavePy doesn't ship (the TestInlineValues subtests probe a CPython-specific layout detail)."
+status = "pass"
+reason = "measured (RFC 0037 WS6): passes end-to-end (skipped=1 — the _testinternalcapi inline-values probe skips cleanly)."
 
 [tests."cpython/Lib/test/test_dataclasses.py"]
 status = "fail"
@@ -297,11 +297,11 @@ reason = "dataclass: __init_subclass__ + slots=True + kw_only"
 
 [tests."cpython/Lib/test/test_enum.py"]
 status = "fail"
-reason = "measured: first remaining failure imports the not-yet-ported 'pydoc' module at setup — blocked on WS8 pydoc port (large; pulls in inspect/text-wrapping)."
+reason = "measured: runs end-to-end in ~10s (the pydoc import blocker is gone) and fails on a broad WS6 cluster (~60F: doc/repr subtests plus enum corner semantics). NB: can flip to 'timeout' under parallel contention (-j8)."
 
 [tests."cpython/Lib/test/test_inspect.py"]
-status = "fail"
-reason = "inspect: Signature from C callables + getsource for frozen"
+status = "pass"
+reason = "measured but VACUOUS: test_inspect is a package whose __init__.py only defines a lazy load_tests(); running it directly executes zero tests and exits 0. Real inspect conformance (Signature from C callables, getsource for frozen) is still unverified — needs a load_package_tests-aware runner."
 
 [tests."cpython/Lib/test/test_typing.py"]
 status = "fail"
@@ -320,20 +320,20 @@ status = "pass"
 reason = "RFC 0037 WS7: full iterator-protocol fidelity. The prior gc-reachable hang is gone — the legacy __getitem__ sequence protocol and iter(callable, sentinel) now build *lazy* iterators (frozen _seqtools _SeqIter/_CallableIter) instead of eagerly materialising, so an unbounded sequence iterates on demand. Built-in iterators gained a faithful __reduce__ ((iter, (remaining,)) / (reversed, (fwd,), idx)) that resolves the iter/reversed builtin through the live builtins module dict so a hash-colliding custom __eq__ exhausts the iterator before its state is snapshotted (gh-101765); a PEP 585 generic alias iterates by yielding typing.Unpack[self] once (matching CPython ga_iternext). Plus: file objects are iterable (for line in f / x in f / list(f)) and writelines accepts any iterable; pickle gained memoisation so co-referenced instances unpickle shared; closures over enclosing-function locals resolve in nested methods; and tracebacks carry PEP 657 column offsets (co_positions/f_lasti/tb_lasti translated to CPython byte offsets). (skipped=2 are @cpython_only refcount subtests.)"
 
 [tests."cpython/Lib/test/test_generators.py"]
-status = "fail"
-reason = "measured: first failure is 'InternalError: bad cell index' — closure-cell indexing bug in a generator frame; VM cell-resolution gap."
+status = "pass"
+reason = "measured (RFC 0037 WS7): passes end-to-end (skipped=1). Generator finalization (del-site/close-site frame reap, gc tracking), real sys.getrefcount, PEP 667 live f_locals on generator frames, frame chaining through yield-from throws, and CPython-exact yield-assignment SyntaxError messages."
 
 [tests."cpython/Lib/test/test_coroutines.py"]
-status = "fail"
-reason = "measured: the compiler now lowers nested async comprehensions via PEP 530 implicit-async propagation (an async comprehension nested in another comprehension's element makes the outer one a coroutine too) (RFC 0037 WS2/WS7); the suite now runs but most coroutine send/throw/await subtests error and the run ends in a VM 'stack underflow' — coroutine-driver fidelity gaps remain."
+status = "pass"
+reason = "measured (RFC 0037 WS7): passes end-to-end (skipped=3). Coroutine send/throw/close fidelity, PEP 530 implicit-async comprehension lowering, unawaited-coroutine RuntimeWarnings, and CPython-exact coroutine doctest SyntaxErrors."
 
 [tests."cpython/Lib/test/test_asyncgen.py"]
-status = "fail"
-reason = "measured: the test.support helpers + implicit-return fix let the suite run (RFC 0037 WS5/WS9); it now reports a broad run of errors ending in an unhandled GeneratorExit — async-generator aclose()/athrow() finalization semantics aren't matched."
+status = "pass"
+reason = "measured (RFC 0037 WS7): passes end-to-end. PEP 525 finalization hooks (sys.set_asyncgen_hooks / firstiter+finalizer), aclose()/athrow() semantics incl. GeneratorExit propagation, asyncio.sleep(0) yield points, and shutdown_asyncgens."
 
 [tests."cpython/Lib/test/test_with.py"]
-status = "fail"
-reason = "with: PEP 617 parenthesized context managers"
+status = "pass"
+reason = "measured (RFC 0037): passes end-to-end — parenthesized context managers and the with-protocol error paths all hold."
 
 [tests."cpython/Lib/test/test_exceptions.py"]
 status = "fail"
@@ -348,8 +348,8 @@ status = "fail"
 reason = "warnings: filter precedence + showwarning override"
 
 [tests."cpython/Lib/test/test_contextlib.py"]
-status = "fail"
-reason = "contextlib: ExitStack.callback + contextmanager generator semantics"
+status = "pass"
+reason = "measured (RFC 0037 WS7): passes end-to-end — the verbatim contextlib port plus generator close()/throw() fidelity covers ExitStack/contextmanager semantics."
 
 [tests."cpython/Lib/test/test_contextvars.py"]
 status = "fail"
@@ -436,8 +436,8 @@ status = "fail"
 reason = "random: Mersenne Twister state save/load + SystemRandom"
 
 [tests."cpython/Lib/test/test_statistics.py"]
-status = "fail"
-reason = "measured: runs all 374 cases and fails on missing numeric-tower features (NormalDist + harmonic_mean weighted forms, Fraction/Decimal interop). The former 'ran-further-now-slow' timeout cleared once RFC 0037 gave set/dict the Python __hash__/__eq__ key hook (no more single-bucket O(n^2) on custom-hashable keys); revisit the remaining failures once the numeric tower (WS3) lands."
+status = "timeout"
+reason = "measured: exceeds the 30s budget even sequentially. Previously ran all 374 cases and failed on missing numeric-tower features (NormalDist + harmonic_mean weighted forms, Fraction/Decimal interop); the verbatim-collections swap (pure-Python Counter/OrderedDict paths) plus those suites' heavy loops push wall time past the budget. Revisit with the WS8 perf pass (native _collections accelerators)."
 
 [tests."cpython/Lib/test/test_unicodedata.py"]
 status = "skip"
@@ -586,8 +586,8 @@ status = "pass"
 reason = "RFC 0037 WS9: passes end-to-end (36 tests). Required faithful sys.settrace event fidelity in the VM dispatch loop: the frame-entry RESUME no longer emits a spurious 'line' event; an exception raised *inside* a trace callback propagates into the traced program (and disables the offending hook) for non-'exception' events while being swallowed on 'exception' events, matching CPython's call_trace_protected; Object::Frame compares by identity so bdb's `frame == self.stopframe`/returnframe checks work; generator/coroutine frames reuse one cached PyFrame snapshot across suspensions so frame identity is stable for set_next/until/return; FOR_ITER and SEND (`yield from`) surface a generator's terminating StopIteration to the 'exception' hook before swallowing it; END_FOR is attributed to the `for` line (not the loop body) so an exhausted loop emits no spurious body-line event; a frame popped by a propagating exception fires a 'return' event with arg None (sys.monitoring PY_UNWIND); and f_trace_lines / f_trace_opcodes are real per-frame flags driving 'opcode' events for bdb/pdb instruction stepping (set_stepinstr)."
 
 [tests."cpython/Lib/test/test_contextlib_async.py"]
-status = "fail"
-reason = "measured: contextlib.asynccontextmanager/AsyncExitStack now exist (RFC 0037 WS7 verbatim swap); first remaining failure is 'No module named test.test_contextlib' — this file imports its sibling test module, which isn't bundled."
+status = "pass"
+reason = "measured (RFC 0037 WS7): passes end-to-end — verbatim contextlib (asynccontextmanager/AsyncExitStack) over the WS7 coroutine machinery, with the sibling test.test_contextlib import resolving from the vendored tree."
 
 [tests."cpython/Lib/test/test_descrtut.py"]
 status = "fail"
@@ -647,6 +647,14 @@ reason = "http.cookiejar not shipped yet"
 [tests."cpython/Lib/test/test_urllib2.py"]
 status = "skip"
 reason = "needs network + test.support.requires_subprocess; urllib2-style handlers unverified in the sandbox"
+
+[tests."cpython/Lib/test/test_sqlite3.py"]
+status = "fail"
+reason = "measured: the package __init__ does 'from test.support import load_package_tests' at import, which WeavePy's test.support shim doesn't provide (same gap as test_zoneinfo; test_inspect only references it lazily)."
+
+[tests."cpython/Lib/test/test_zoneinfo.py"]
+status = "fail"
+reason = "measured: the package __init__ does 'from test.support import load_package_tests' at import, which WeavePy's test.support shim doesn't provide (same gap as test_sqlite3)."
 
 [tests."cpython/Lib/test/test_xml_etree.py"]
 status = "skip"

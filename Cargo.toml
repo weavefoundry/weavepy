@@ -106,6 +106,7 @@ unicode-normalization = "0.1"
 unicode-properties    = "0.1"
 unicode_names2        = "2.0"
 memmap2               = "0.9"
+memchr                = "2.8"
 libc                  = "0.2"
 rustls                = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types      = "1.7"

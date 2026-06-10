@@ -156,6 +156,29 @@ def warn(message, category=UserWarning, stacklevel=1, source=None):
                   registry=registry, module_globals=globals_, source=source)
 
 
+def _warn_unawaited_coroutine(coro):
+    """Called by the VM when a coroutine is finalized without ever
+    being awaited (CPython's identically-named hook in Lib/warnings.py).
+    Appends the cr_origin creation traceback when origin tracking is on.
+    """
+    msg_lines = [
+        f"coroutine '{coro.__qualname__}' was never awaited\n"
+    ]
+    if getattr(coro, "cr_origin", None) is not None:
+        import linecache
+        import traceback
+
+        def extract():
+            for filename, lineno, funcname in reversed(coro.cr_origin):
+                line = linecache.getline(filename, lineno).strip()
+                yield (filename, lineno, funcname, line)
+
+        msg_lines.append("Coroutine created at (most recent call last)\n")
+        msg_lines += traceback.format_list(list(extract()))
+    msg = "".join(msg_lines).rstrip("\n")
+    warn(msg, category=RuntimeWarning, stacklevel=2, source=coro)
+
+
 def warn_explicit(message, category, filename, lineno, module=None,
                   registry=None, module_globals=None, source=None):
     if registry is None:

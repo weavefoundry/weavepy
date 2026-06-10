@@ -52,6 +52,7 @@ unicode-normalization = { workspace = true }
 unicode-properties    = { workspace = true }
 unicode_names2        = { workspace = true }
 memmap2               = { workspace = true }
+memchr                = { workspace = true }
 libc                  = { workspace = true }
 rustls                = { workspace = true }
 rustls-pki-types      = { workspace = true }

@@ -363,7 +363,7 @@ pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("realpath")),
-            builtin("realpath", path_abspath),
+            builtin("realpath", path_realpath),
         );
         d.insert(
             DictKey(Object::from_static("relpath")),
@@ -1437,6 +1437,40 @@ fn path_abspath(args: &[Object]) -> Result<Object, RuntimeError> {
             .join(p)
     };
     Ok(Object::from_str(abs.to_string_lossy().into_owned()))
+}
+
+/// `os.path.realpath` — resolve symlinks via `fs::canonicalize`
+/// (CPython's non-strict mode: a nonexistent tail rides lexically on
+/// the longest resolvable prefix).
+fn path_realpath(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "realpath")?;
+    let p = PathBuf::from(&s);
+    let abs = if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir()
+            .map_err(|e| os_error(format!("realpath: {e}")))?
+            .join(p)
+    };
+    if let Ok(c) = std::fs::canonicalize(&abs) {
+        return Ok(Object::from_str(c.to_string_lossy().into_owned()));
+    }
+    let mut prefix = abs.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while prefix.file_name().is_some() {
+        if let Ok(c) = std::fs::canonicalize(&prefix) {
+            let mut out = c;
+            for t in tail.iter().rev() {
+                out.push(t);
+            }
+            return Ok(Object::from_str(normpath_lexical(
+                &out.to_string_lossy(),
+            )));
+        }
+        tail.push(prefix.file_name().expect("checked above").to_owned());
+        prefix.pop();
+    }
+    Ok(Object::from_str(normpath_lexical(&abs.to_string_lossy())))
 }
 
 fn path_normpath(args: &[Object]) -> Result<Object, RuntimeError> {

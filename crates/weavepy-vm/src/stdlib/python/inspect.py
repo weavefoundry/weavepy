@@ -296,6 +296,20 @@ def isasyncgen(obj):
     return type(obj).__name__ == "async_generator"
 
 
+def isawaitable(obj):
+    """True for coroutines, iterable-coroutine generators, and objects
+    with a `__await__` method (CPython `inspect.isawaitable`)."""
+    if iscoroutine(obj):
+        return True
+    tn = type(obj).__name__
+    if tn == "generator":
+        code = getattr(obj, "gi_code", None)
+        return bool(getattr(code, "co_flags", 0) & CO_ITERABLE_COROUTINE)
+    # CPython also accepts any object implementing __await__ (including
+    # its own async_generator_asend/athrow awaitables, which expose it).
+    return hasattr(type(obj), "__await__") or hasattr(obj, "__await__")
+
+
 def isasyncgenfunction(obj):
     code = getattr(obj, "__code__", None)
     if code is None:

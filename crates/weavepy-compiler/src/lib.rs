@@ -563,6 +563,15 @@ struct Compiler {
     /// emitted. Drives PEP-657 column tracking in [`Self::emit`]. Updated
     /// at statement and expression granularity as the compiler descends.
     current_span: (u32, u32),
+    /// Number of *live exception values* sitting on the operand stack at
+    /// the current compile point: a `finally` body (or the unmatched
+    /// re-raise path of a `try/except`) runs with the propagating
+    /// exception on the stack until the trailing `RERAISE` pops it.
+    /// Exception-table entries registered for code nested inside such
+    /// regions must include these slots in their `depth`, or the
+    /// dispatch loop would truncate the live exception away and the
+    /// `RERAISE` would underflow.
+    exc_on_stack: u32,
     /// `True` for methods compiled inside a class body. Such methods
     /// implicitly capture the class's `__class__` cell so `super()`
     /// works without arguments.
@@ -671,6 +680,7 @@ impl Compiler {
             line_index,
             current_line: 0,
             current_span: (0, 0),
+            exc_on_stack: 0,
             inside_class_body: false,
             annotations_initialized: false,
             code_kind: kind,
@@ -1179,6 +1189,13 @@ impl Compiler {
             StmtKind::Return(value) => {
                 if self.kind != CodeKind::Function {
                     return Err(CompileError::ReturnOutsideFunction);
+                }
+                // PEP 525: async generators cannot return a value (the
+                // flag is set before the body compiles, so this sees it).
+                if self.co.is_async_generator && value.is_some() {
+                    return Err(CompileError::SyntaxExact(
+                        "'return' with value in async generator".to_owned(),
+                    ));
                 }
                 match value {
                     Some(v) => self.compile_expr(v)?,
@@ -2208,10 +2225,11 @@ impl Compiler {
         // Approximate stack depth at handler entry. The dispatch
         // loop truncates everything above `depth`, so we need to
         // preserve any state the surrounding control-flow stitched
-        // into the stack — most importantly, iterators kept live
-        // across `for` loop iterations. Without full stack-effect
-        // tracking we simply count active `for` frames.
-        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32;
+        // into the stack — iterators kept live across `for` loop
+        // iterations, and any propagating exception a surrounding
+        // `finally` keeps on the stack for its trailing RERAISE.
+        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32
+            + self.exc_on_stack;
         // Make the finally body visible to any `return`/`break`/
         // `continue` nested inside `body`/`orelse`/handlers. We pop it
         // before emitting the *direct* normal-/exception-exit copies
@@ -2455,15 +2473,18 @@ impl Compiler {
                 let cur = self.next_offset();
                 self.patch_jump(site, cur);
             }
-            // Run finally on the re-raise path before propagating.
+            // Run finally on the re-raise path before propagating. The
+            // unmatched exception stays on the stack until RERAISE.
             let saved = if pushed_finally {
                 self.finally_stack.pop()
             } else {
                 None
             };
+            self.exc_on_stack += 1;
             for s in finalbody {
                 self.compile_stmt(s)?;
             }
+            self.exc_on_stack -= 1;
             if let Some(f) = saved {
                 self.finally_stack.push(f);
             }
@@ -2476,9 +2497,12 @@ impl Compiler {
                 let cleanup_start = self.next_offset();
                 let cleanup_push = self.emit(OpCode::PushExcInfo, 0);
                 let saved = self.finally_stack.pop();
+                // The escaping exception is on the stack until RERAISE.
+                self.exc_on_stack += 1;
                 for s in finalbody {
                     self.compile_stmt(s)?;
                 }
+                self.exc_on_stack -= 1;
                 if let Some(f) = saved {
                     self.finally_stack.push(f);
                 }
@@ -2530,9 +2554,14 @@ impl Compiler {
             // exception stays put for the trailing `RERAISE 0`.
             let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
             let saved = self.finally_stack.pop();
+            // The propagating exception is on the stack until RERAISE;
+            // nested handlers registered inside the finally body must
+            // preserve that slot.
+            self.exc_on_stack += 1;
             for s in finalbody {
                 self.compile_stmt(s)?;
             }
+            self.exc_on_stack -= 1;
             if let Some(f) = saved {
                 self.finally_stack.push(f);
             }
@@ -2565,22 +2594,16 @@ impl Compiler {
             }
             return Ok(());
         }
-        // Recurse on multi-item: `with a, b: body` ≡ `with a: with b: body`.
-        if items.len() > 1 {
-            let inner = vec![Stmt {
-                kind: StmtKind::With {
-                    items: items[1..].to_vec(),
-                    body: body.to_vec(),
-                },
-                span: weavepy_lexer::Span::new(0, 0),
-            }];
-            return self.compile_with(&items[..1], &inner);
-        }
-        let item = &items[0];
-        // The `with` statement's own line — the cleanup/`__exit__`
-        // sequences below are attributed to it (CPython does the same:
-        // a traceback through `__exit__` shows the `with` line, not the
-        // last body statement).
+        // Multi-item recursion happens at the body site below:
+        // `with a, b: body` ≡ `with a: with b: body`.
+        let (item, rest) = items.split_first().expect("nonempty");
+        // PEP 657: the whole setup/`__exit__` dance for this item is
+        // attributed to the context-manager *expression* itself, so a
+        // traceback through `__init__`/`__enter__`/`__exit__` pinpoints
+        // the precise manager in `with A(), B(), C():` (CPython
+        // `testExceptionLocation`).
+        self.set_line_from(item.context_expr.span.start.0);
+        self.set_span(item.context_expr.span);
         let with_line = self.current_line;
         let with_span = self.current_span;
         let cm_name = format!(".with_cm{}", self.with_counter);
@@ -2589,6 +2612,8 @@ impl Compiler {
 
         // Evaluate cm and stash it for later __exit__ access.
         self.compile_expr(&item.context_expr)?;
+        self.current_line = with_line;
+        self.current_span = with_span;
         self.emit(OpCode::StoreFast, cm_idx);
 
         // Call __enter__ and bind (or discard).
@@ -2616,8 +2641,12 @@ impl Compiler {
         });
 
         let body_start = self.next_offset();
-        for s in body {
-            self.compile_stmt(s)?;
+        if rest.is_empty() {
+            for s in body {
+                self.compile_stmt(s)?;
+            }
+        } else {
+            self.compile_with(rest, body)?;
         }
         let body_end = self.next_offset();
 
@@ -2625,7 +2654,7 @@ impl Compiler {
         // below emits the same call inline.
         self.finally_stack.pop();
 
-        // Attribute the whole exit path to the `with` line.
+        // Attribute the whole exit path to this item's expression.
         self.current_line = with_line;
         self.current_span = with_span;
 
@@ -2650,7 +2679,8 @@ impl Compiler {
         // *suppressed* an exception inside a `for` lost the iterator and
         // the next `FOR_ITER` found an empty stack. This matches the
         // `body_depth` convention used by `try`/`except` handlers above.
-        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32;
+        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32
+            + self.exc_on_stack;
         self.co.exception_table.push(ExcHandler {
             start: body_start,
             end: body_end,
@@ -3553,7 +3583,7 @@ impl Compiler {
             start: loop_top,
             end: dance_end,
             handler: cleanup_target,
-            depth: 1,
+            depth: 1 + self.exc_on_stack,
         });
         // Cleanup: pop aiter + exception, then run the `else` clause.
         self.emit(OpCode::EndAsyncFor, 0);
@@ -3576,11 +3606,15 @@ impl Compiler {
             return Ok(());
         }
         let (head, rest) = items.split_first().expect("nonempty");
-        // See `compile_with`: the exit paths are attributed to the
-        // `async with` statement's own line.
+        // See `compile_with`: the whole setup/exit dance is attributed
+        // to this item's context-manager expression (PEP 657).
+        self.set_line_from(head.context_expr.span.start.0);
+        self.set_span(head.context_expr.span);
         let with_line = self.current_line;
         let with_span = self.current_span;
         self.compile_expr(&head.context_expr)?;
+        self.current_line = with_line;
+        self.current_span = with_span;
         // BEFORE_ASYNC_WITH leaves [aexit, awaitable(aenter)].
         self.emit(OpCode::BeforeAsyncWith, 0);
         self.compile_await_dance(2);
@@ -3650,7 +3684,8 @@ impl Compiler {
         let handler_start = self.next_offset();
         // Preserve enclosing for-loop iterators on the operand stack, the
         // same depth convention used by `try`/`except` and `compile_with`.
-        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32;
+        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32
+            + self.exc_on_stack;
         self.co.exception_table.push(ExcHandler {
             start: body_start,
             end: body_end,
@@ -5349,6 +5384,11 @@ fn collect_reads_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
         StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
             for it in items {
                 collect_reads_expr(&it.context_expr, out);
+                // `with cm as obj.attr:` / `as obj[i]:` reads the
+                // target's container.
+                if let Some(t) = &it.optional_vars {
+                    collect_reads_assign_target(t, out);
+                }
             }
             for s in body {
                 collect_reads_stmt(s, out);
@@ -5612,6 +5652,16 @@ fn collect_reads_expr(expr: &Expr, out: &mut HashSet<String>) {
             for g in generators.iter().skip(1) {
                 collect_reads_expr(&g.iter, out);
             }
+            // Names free in the comprehension body propagate to the
+            // enclosing scope (CPython symtable). A non-name target
+            // (`for tgt[0] in …`) reads its container; filters read
+            // their condition.
+            for g in generators {
+                collect_reads_assign_target(&g.target, out);
+                for i in &g.ifs {
+                    collect_reads_expr(i, out);
+                }
+            }
             collect_reads_expr(elt, out);
         }
         ExprKind::DictComp {
@@ -5624,6 +5674,12 @@ fn collect_reads_expr(expr: &Expr, out: &mut HashSet<String>) {
             }
             for g in generators.iter().skip(1) {
                 collect_reads_expr(&g.iter, out);
+            }
+            for g in generators {
+                collect_reads_assign_target(&g.target, out);
+                for i in &g.ifs {
+                    collect_reads_expr(i, out);
+                }
             }
             collect_reads_expr(key, out);
             collect_reads_expr(value, out);

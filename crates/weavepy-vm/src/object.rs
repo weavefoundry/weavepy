@@ -793,6 +793,23 @@ pub struct PyGenerator {
     /// finishes and the frame is dropped.
     pub code: Object,
     pub state: RefCell<GeneratorState>,
+    /// `cr_origin` — for coroutines created while
+    /// `sys.set_coroutine_origin_tracking_depth(n)` is active: a tuple
+    /// of `(filename, lineno, funcname)` triples for the creation call
+    /// stack (most recent first). `None` when tracking is off.
+    pub origin: RefCell<Object>,
+    /// PEP 525 `sys.set_asyncgen_hooks` bookkeeping (async generators
+    /// only). `hooks_inited` flips on the first `__anext__`/`asend`/
+    /// `athrow`/`aclose`, at which point the thread's *finalizer* hook
+    /// is captured here so finalization can route through the event
+    /// loop that first iterated the generator.
+    pub hooks_inited: crate::sync::Cell<bool>,
+    pub finalizer: RefCell<Object>,
+    /// CPython's "tp_finalize already ran" GC bit: `invoke_finalizer`
+    /// sets it before finalizing so a generator left suspended by its
+    /// finalizer (e.g. a PEP 525 hook that declined to close it) is
+    /// not resurrected and re-finalized forever on the next drop.
+    pub finalize_ran: crate::sync::Cell<bool>,
 }
 
 impl PyGenerator {
@@ -809,6 +826,10 @@ impl PyGenerator {
             kind,
             code,
             state: RefCell::new(GeneratorState::Created(frame)),
+            origin: RefCell::new(Object::None),
+            hooks_inited: crate::sync::Cell::new(false),
+            finalizer: RefCell::new(Object::None),
+            finalize_ran: crate::sync::Cell::new(false),
         }
     }
 
@@ -839,12 +860,22 @@ impl Drop for PyGenerator {
         let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
         drop(state);
         if let GeneratorState::Suspended(frame) = prev {
+            // Finalized once already (CPython's `_PyGC_FINALIZED` bit):
+            // drop the frame for real instead of looping forever
+            // through resurrection → finalize → drop.
+            if self.finalize_ran.get() {
+                return;
+            }
             let resurrected = Rc::new(PyGenerator {
                 name: RefCell::new(self.name.borrow().clone()),
                 qualname: RefCell::new(self.qualname.borrow().clone()),
                 kind: self.kind,
                 code: self.code.clone(),
                 state: RefCell::new(GeneratorState::Suspended(frame)),
+                origin: RefCell::new(self.origin.borrow().clone()),
+                hooks_inited: crate::sync::Cell::new(self.hooks_inited.get()),
+                finalizer: RefCell::new(self.finalizer.borrow().clone()),
+                finalize_ran: crate::sync::Cell::new(self.finalize_ran.get()),
             });
             let obj = match self.kind {
                 CoroutineKind::Generator => Object::Generator(resurrected),
@@ -1298,6 +1329,13 @@ pub enum PyIterator {
         data: Rc<[u8]>,
         index: usize,
     },
+    /// Live view over a bytearray (CPython's `bytearray_iterator`
+    /// tracks the buffer, so clearing the bytearray exhausts a
+    /// half-consumed iterator — issue 27443).
+    ByteArray {
+        data: Rc<RefCell<Vec<u8>>>,
+        index: usize,
+    },
     /// Lazy `enumerate(...)`. Holds a *shared* handle to the wrapped
     /// iterator so consuming the enumerate also advances the original
     /// (CPython: `enumerate(it)` yields from the same `it`, leaving it
@@ -1384,6 +1422,11 @@ impl PyIterator {
                 *index += 1;
                 Some(Object::Int(i64::from(v)))
             }
+            PyIterator::ByteArray { data, index } => {
+                let v = data.borrow().get(*index).copied()?;
+                *index += 1;
+                Some(Object::Int(i64::from(v)))
+            }
             PyIterator::Enumerate { inner, count } => {
                 let v = inner.borrow_mut().next_value()?;
                 let i = *count;
@@ -1425,6 +1468,9 @@ impl PyIterator {
             PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
             PyIterator::DictKeys { keys, index } => Some(keys.len().saturating_sub(*index)),
             PyIterator::Bytes { data, index } => Some(data.len().saturating_sub(*index)),
+            PyIterator::ByteArray { data, index } => {
+                Some(data.borrow().len().saturating_sub(*index))
+            }
             PyIterator::Enumerate { inner, .. } => inner.borrow().remaining(),
             PyIterator::Reversed { index, .. } => Some((*index + 1).max(0) as usize),
             PyIterator::Range {
@@ -1472,6 +1518,11 @@ impl PyIterator {
                 .map(|rest| rest.iter().map(|k| k.0.clone()).collect())
                 .unwrap_or_default(),
             PyIterator::Bytes { data, index } => data
+                .get(*index..)
+                .map(|rest| rest.iter().map(|b| Object::Int(i64::from(*b))).collect())
+                .unwrap_or_default(),
+            PyIterator::ByteArray { data, index } => data
+                .borrow()
                 .get(*index..)
                 .map(|rest| rest.iter().map(|b| Object::Int(i64::from(*b))).collect())
                 .unwrap_or_default(),
@@ -1546,9 +1597,9 @@ impl PyIterator {
     /// elements.
     pub fn reduce_remaining(&self) -> Object {
         match self {
-            PyIterator::Tuple { .. } | PyIterator::Bytes { .. } => {
-                Object::new_tuple(self.remaining_items())
-            }
+            PyIterator::Tuple { .. }
+            | PyIterator::Bytes { .. }
+            | PyIterator::ByteArray { .. } => Object::new_tuple(self.remaining_items()),
             PyIterator::Str { s, index } => {
                 let start = (*index).min(s.len());
                 Object::from_str(&s[start..])
@@ -1855,6 +1906,16 @@ impl Object {
                 .partial_cmp(&(i64::from(*b) as f64))
                 .ok_or_else(|| value_error("cannot order with NaN"))?),
             (O::Str(a), O::Str(b)) => Ok(a.cmp(b)),
+            // bytes/bytearray order lexicographically by byte value;
+            // the four mixed combinations all compare (CPython's
+            // shared `bytes_richcompare` buffer path).
+            (O::Bytes(a), O::Bytes(b)) => Ok(a.as_ref().cmp(b.as_ref())),
+            (O::Bytes(a), O::ByteArray(b)) => Ok(a.as_ref()[..].cmp(&b.borrow()[..])),
+            (O::ByteArray(a), O::Bytes(b)) => Ok(a.borrow()[..].cmp(&b.as_ref()[..])),
+            (O::ByteArray(a), O::ByteArray(b)) => {
+                let bv = b.borrow().clone();
+                Ok(a.borrow()[..].cmp(&bv[..]))
+            }
             (O::Tuple(a), O::Tuple(b)) => seq_cmp(a, b),
             (O::List(a), O::List(b)) => {
                 let a = a.borrow();
@@ -1888,26 +1949,27 @@ impl Object {
             Object::Dict(d) => Ok(d.borrow().contains_key(&DictKey(item.clone()))),
             Object::Set(s) => Ok(s.borrow().contains(&DictKey(item.clone()))),
             Object::FrozenSet(s) => Ok(s.contains(&DictKey(item.clone()))),
-            Object::Bytes(haystack) => match item {
-                Object::Int(i) => Ok(*i >= 0 && *i <= 255 && haystack.contains(&(*i as u8))),
-                Object::Bytes(needle) => Ok(bytes_contains(haystack, needle)),
-                Object::ByteArray(needle) => Ok(bytes_contains(haystack, &needle.borrow())),
-                _ => Err(type_error(
-                    "a bytes-like object is required, not '".to_owned() + item.type_name() + "'",
-                )),
-            },
-            Object::ByteArray(haystack) => match item {
-                Object::Int(i) => {
-                    Ok(*i >= 0 && *i <= 255 && haystack.borrow().contains(&(*i as u8)))
+            Object::Bytes(haystack) => {
+                bytes_membership(haystack, item)
+            }
+            Object::ByteArray(haystack) => {
+                // Clone out: converting `item` can reenter Python (a user
+                // `__index__`) that mutates this bytearray. CPython holds
+                // the buffer during conversion and raises BufferError if
+                // it is resized (gh-142560).
+                let before = haystack.borrow().len();
+                let hay: Vec<u8> = haystack.borrow().clone();
+                let result = bytes_membership(&hay, item);
+                if haystack.borrow().len() != before {
+                    return Err(RuntimeError::PyException(
+                        crate::error::PyException::from_builtin(
+                            "BufferError",
+                            "Existing exports of data: object cannot be re-sized",
+                        ),
+                    ));
                 }
-                Object::Bytes(needle) => Ok(bytes_contains(&haystack.borrow(), needle)),
-                Object::ByteArray(needle) => {
-                    Ok(bytes_contains(&haystack.borrow(), &needle.borrow()))
-                }
-                _ => Err(type_error(
-                    "a bytes-like object is required, not '".to_owned() + item.type_name() + "'",
-                )),
-            },
+                result
+            }
             Object::Range(r) => {
                 if let Object::Int(i) = item {
                     if r.step > 0 {
@@ -1995,13 +2057,10 @@ impl Object {
                 data: b.clone(),
                 index: 0,
             }),
-            Object::ByteArray(b) => {
-                let snapshot: Rc<[u8]> = Rc::from(b.borrow().as_slice());
-                Ok(PyIterator::Bytes {
-                    data: snapshot,
-                    index: 0,
-                })
-            }
+            Object::ByteArray(b) => Ok(PyIterator::ByteArray {
+                data: b.clone(),
+                index: 0,
+            }),
             Object::MemoryView(mv) => {
                 if mv.released.get() {
                     return Err(value_error("memoryview: released"));
@@ -2926,10 +2985,39 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
     }
-    if needle.len() > haystack.len() {
-        return false;
+    memchr::memmem::find(haystack, needle).is_some()
+}
+
+/// `x in bytes` / `x in bytearray`: a byte value (int in
+/// `range(0, 256)`, out-of-range is `ValueError`) or a bytes-like
+/// needle. Anything else is the CPython `TypeError`.
+fn bytes_membership(haystack: &[u8], item: &Object) -> Result<bool, RuntimeError> {
+    let native = item.native_value();
+    match native.as_ref().unwrap_or(item) {
+        Object::Bool(v) => Ok(haystack.contains(&u8::from(*v))),
+        Object::Int(i) => {
+            if (0..=255).contains(i) {
+                Ok(haystack.contains(&(*i as u8)))
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        Object::Long(_) => Err(value_error("byte must be in range(0, 256)")),
+        Object::Bytes(needle) => Ok(bytes_contains(haystack, needle)),
+        Object::ByteArray(needle) => Ok(bytes_contains(haystack, &needle.borrow())),
+        Object::MemoryView(mv) => Ok(bytes_contains(haystack, &mv.to_bytes())),
+        inst @ Object::Instance(_) if crate::instance_method(inst, "__index__").is_some() => {
+            let v = crate::builtins::coerce_index_i64(inst)?;
+            if (0..=255).contains(&v) {
+                Ok(haystack.contains(&(v as u8)))
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        _ => Err(type_error(
+            "a bytes-like object is required, not '".to_owned() + item.type_name() + "'",
+        )),
     }
-    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// CPython's `Py_UNICODE_ISPRINTABLE`: every character is printable
@@ -2955,13 +3043,23 @@ pub(crate) fn char_is_printable(c: char) -> bool {
 }
 
 fn bytes_repr(b: &[u8]) -> String {
+    // CPython prefers single quotes, switching to double quotes when
+    // the data contains a single quote but no double quote.
+    let quote = if b.contains(&b'\'') && !b.contains(&b'"') {
+        b'"'
+    } else {
+        b'\''
+    };
     let mut out = String::with_capacity(b.len() + 3);
     out.push('b');
-    out.push('\'');
+    out.push(quote as char);
     for &c in b {
         match c {
             b'\\' => out.push_str("\\\\"),
-            b'\'' => out.push_str("\\'"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c as char);
+            }
             b'\n' => out.push_str("\\n"),
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
@@ -2969,7 +3067,7 @@ fn bytes_repr(b: &[u8]) -> String {
             _ => out.push_str(&format!("\\x{c:02x}")),
         }
     }
-    out.push('\'');
+    out.push(quote as char);
     out
 }
 

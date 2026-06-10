@@ -771,6 +771,23 @@ fn concrete_elements(obj: &Object) -> Option<Vec<Object>> {
     }
 }
 
+/// Drain any other iterable (map/filter/generator/range/…) through the
+/// running interpreter — the general-protocol fallback for the seeding
+/// conversions below (CPython's `PySequence_Tuple` reach).
+fn elements_via_interp(obj: &Object) -> Option<Vec<Object>> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: published by an enclosing VM frame still live on this
+    // thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    interp.collect_iterable(obj, &globals).ok()
+}
+
+/// `concrete_elements` plus the interpreter-driven fallback.
+fn any_elements(obj: &Object) -> Option<Vec<Object>> {
+    concrete_elements(obj).or_else(|| elements_via_interp(obj))
+}
+
 /// Build the native payload `object.__new__(cls, value?)` should stash
 /// on an instance of a value/container built-in subclass, or `None` for
 /// an ordinary `object` subclass. Mutable containers (`list`/`dict`/
@@ -811,24 +828,24 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
     }
     if is_strict(&bt.bytearray_) {
         let bytes = value
-            .and_then(concrete_elements)
+            .and_then(any_elements)
             .map(|els| els.iter().filter_map(|o| o.as_i64()).map(|i| i as u8).collect())
             .unwrap_or_default();
         return Some(Object::ByteArray(Rc::new(RefCell::new(bytes))));
     }
     if is_strict(&bt.bytes_) {
         let bytes: Vec<u8> = value
-            .and_then(concrete_elements)
+            .and_then(any_elements)
             .map(|els| els.iter().filter_map(|o| o.as_i64()).map(|i| i as u8).collect())
             .unwrap_or_default();
         return Some(Object::Bytes(Rc::from(bytes.as_slice())));
     }
     if is_strict(&bt.tuple_) {
-        let els = value.and_then(concrete_elements).unwrap_or_default();
+        let els = value.and_then(any_elements).unwrap_or_default();
         return Some(Object::new_tuple(els));
     }
     if is_strict(&bt.frozenset_) {
-        let els = value.and_then(concrete_elements).unwrap_or_default();
+        let els = value.and_then(any_elements).unwrap_or_default();
         return Some(Object::new_frozenset_from(els));
     }
     if is_strict(&bt.list_) {
@@ -858,6 +875,18 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
+    // `tuple.__new__(tuple, it)` / `int.__new__(int, x)` … on the *built-in
+    // class itself* must produce the native value, not a PyInstance shell
+    // (CPython's per-type `tp_new`). Subclasses keep falling through to the
+    // payload-seeding path below.
+    if cls.flags.is_builtin && !Rc::ptr_eq(&cls, &builtin_types().object_) {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame still live on this
+            // thread; the GIL keeps the access exclusive.
+            let interp = unsafe { &mut *ptr };
+            return interp.type_call_default(&cls, &args[1..], &[]);
+        }
+    }
     // CPython `object_new` arity policy (bpo-31506): excess arguments
     // are an error unless exactly one of `__new__`/`__init__` is
     // overridden (the overriding side owns the signature).

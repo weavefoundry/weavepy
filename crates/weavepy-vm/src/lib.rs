@@ -764,6 +764,27 @@ impl Interpreter {
     /// (containers, caches, other bindings) skips the reap and leaves
     /// the object to the cycle collector.
     fn prompt_reap_dropped(&mut self, dropped: Object) {
+        // A discarded never-driven `asend`/`athrow`/`aclose` awaitable
+        // warns at finalization (gh-113753; CPython's
+        // `async_gen_asend_finalize` family).
+        if let Object::AsyncGenAwait(a) = &dropped {
+            if !a.started.get() && !a.consumed.get() && Rc::strong_count(a) <= 1 {
+                a.consumed.set(true);
+                let method = match a.kind {
+                    crate::object::AgenAwaitKind::Send => "asend",
+                    crate::object::AgenAwaitKind::Throw => "athrow",
+                    crate::object::AgenAwaitKind::Close => "aclose",
+                };
+                let qualname = match &a.agen {
+                    Object::AsyncGenerator(g) => g.qualname.borrow().clone(),
+                    other => other.type_name_owned(),
+                };
+                let _ = self.emit_runtime_warning(format!(
+                    "coroutine method '{method}' of '{qualname}' was never awaited"
+                ));
+            }
+            return;
+        }
         let finalizable = match &dropped {
             Object::Instance(i) => i.cls().lookup("__del__").is_some(),
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
@@ -846,6 +867,35 @@ impl Interpreter {
     /// Call `obj.__del__()` if present, routing any raised exception
     /// through the unraisable hook. Used by both the cycle-GC drain and
     /// the shutdown pass.
+    /// CPython `_PyErr_WarnUnawaitedCoroutine`: prefer the Python hook
+    /// `warnings._warn_unawaited_coroutine` (it appends the `cr_origin`
+    /// creation traceback); a failing hook reports through
+    /// `sys.unraisablehook` with the coroutine as the object, and the
+    /// plain RuntimeWarning is still issued as a fallback.
+    fn warn_unawaited_coroutine(&mut self, obj: &Object, qualname: &str) {
+        let mut warned = false;
+        if let Some(hook) = self.module_attr("warnings", "_warn_unawaited_coroutine") {
+            let globals = self.builtins.clone();
+            match self.call(&hook, &[obj.clone()], &[], &globals) {
+                Ok(_) => warned = true,
+                Err(err) => {
+                    let outer = Rc::new(RefCell::new(DictData::new()));
+                    let context_repr =
+                        self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
+                    self.write_unraisable(&err, obj, &context_repr);
+                }
+            }
+        }
+        if !warned {
+            let message = format!("coroutine '{qualname}' was never awaited");
+            if let Err(err) = self.emit_runtime_warning(message) {
+                let outer = Rc::new(RefCell::new(DictData::new()));
+                let context_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
+                self.write_unraisable(&err, obj, &context_repr);
+            }
+        }
+    }
+
     fn invoke_finalizer(&mut self, obj: &Object) {
         // A coroutine that was created but never driven: CPython's
         // `_PyGen_Finalize` emits the "was never awaited"
@@ -855,13 +905,30 @@ impl Interpreter {
         if let Object::Coroutine(g) = obj {
             if matches!(&*g.state.borrow(), GeneratorState::Created(_)) {
                 *g.state.borrow_mut() = GeneratorState::Finished;
-                let message =
-                    format!("coroutine '{}' was never awaited", g.qualname.borrow());
-                if let Err(err) = self.emit_runtime_warning(message) {
+                let qualname = g.qualname.borrow().clone();
+                self.warn_unawaited_coroutine(obj, &qualname);
+                return;
+            }
+        }
+        // Mark "finalize ran" first (CPython sets the GC FINALIZED bit
+        // before tp_finalize): whatever happens below runs at most
+        // once; a generator left suspended by its finalizer will not
+        // be resurrected and re-finalized on its next drop.
+        if let Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) = obj {
+            g.finalize_ran.set(true);
+        }
+        // PEP 525: an async generator whose firstiter hook captured a
+        // finalizer routes finalization through that hook (CPython
+        // `_PyGen_Finalize`); asyncio's hook schedules `aclose()` on
+        // the owning loop instead of closing synchronously here.
+        if let Object::AsyncGenerator(g) = obj {
+            let finalizer = g.finalizer.borrow().clone();
+            if !matches!(finalizer, Object::None) && !g.is_finished() {
+                let globals = self.builtins.clone();
+                if let Err(err) = self.call(&finalizer, &[obj.clone()], &[], &globals) {
                     let outer = Rc::new(RefCell::new(DictData::new()));
-                    let context_repr = self
-                        .repr_of(obj, &outer)
-                        .unwrap_or_else(|_| obj.repr());
+                    let context_repr =
+                        self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
                     self.write_unraisable(&err, obj, &context_repr);
                 }
                 return;
@@ -1351,12 +1418,11 @@ impl Interpreter {
                         // fresh exception — including ones raised from C
                         // (here: Rust opcodes and builtins) — to the
                         // currently handled exception. `RAISE_VARARGS`
-                        // already did this at the raise site; a fresh
-                        // Rust-raised error is recognisable by its empty
-                        // traceback and unset context/cause. Re-raises
-                        // carry `suppress_tb_once` or an existing dict
-                        // `__context__` and are left alone.
-                        if exc.context.is_none()
+                        // already did this at the raise site
+                        // (`context_settled`); a fresh Rust-raised error
+                        // has empty traceback and unset context/cause.
+                        if !exc.context_settled
+                            && exc.context.is_none()
                             && exc.cause.is_none()
                             && exc.traceback.is_empty()
                             && !exc.suppress_tb_once
@@ -1584,6 +1650,14 @@ impl Interpreter {
                     ))
                 }
                 2 => {
+                    // Clearing the frame of a never-awaited coroutine
+                    // finalizes it — CPython's `_PyGen_Finalize` emits
+                    // the "was never awaited" RuntimeWarning (bpo-45813).
+                    if matches!(g.kind, crate::object::CoroutineKind::Coroutine) {
+                        let obj = Object::Coroutine(g.clone());
+                        let qualname = g.qualname.borrow().clone();
+                        self.warn_unawaited_coroutine(&obj, &qualname);
+                    }
                     // Tear down the never-started generator: its frame
                     // locals (bound arguments) die now, like CPython's
                     // refcount-driven dealloc. Drop the snapshot's own
@@ -2268,8 +2342,22 @@ impl Interpreter {
                 frame.push(Object::Cell(cell));
             }
             OpCode::LoadAttr => {
+                // `f().cr_frame`: the receiver temporary dies when the
+                // attribute load pops it — finalize promptly so a
+                // never-awaited coroutine warns here (bpo-45813).
+                let reap = match frame.stack.last() {
+                    Some(
+                        o @ (Object::Generator(_)
+                        | Object::Coroutine(_)
+                        | Object::AsyncGenerator(_)),
+                    ) => Some(o.clone()),
+                    _ => None,
+                };
                 let v = self.specialized_load_attr(frame, cache_pc, ins.arg)?;
                 frame.push(v);
+                if let Some(r) = reap {
+                    self.prompt_reap_dropped(r);
+                }
             }
             OpCode::StoreAttr => {
                 self.specialized_store_attr(frame, cache_pc, ins.arg)?;
@@ -2291,7 +2379,28 @@ impl Interpreter {
                             &frame.globals.clone(),
                         )?
                     } else {
-                        self.binary_subscr(&v, &i)?
+                        // `dict.__getitem__` on a subclass dispatches a
+                        // user-defined `__missing__(key)` instead of raising
+                        // (CPython `dict_subscript`).
+                        match self.binary_subscr(&v, &i) {
+                            Err(RuntimeError::PyException(exc))
+                                if exc.type_name() == "KeyError"
+                                    && matches!(v.native_value(), Some(Object::Dict(_))) =>
+                            {
+                                match instance_method(&v, "__missing__") {
+                                    Some(miss) => self.call(
+                                        &miss,
+                                        std::slice::from_ref(&i),
+                                        &[],
+                                        &frame.globals.clone(),
+                                    )?,
+                                    None => {
+                                        return Err(RuntimeError::PyException(exc))
+                                    }
+                                }
+                            }
+                            r => r?,
+                        }
                     }
                 } else if let Object::Type(ty) = &v {
                     // `Foo[args]` — CPython looks up `__getitem__`
@@ -2483,7 +2592,20 @@ impl Interpreter {
                 frame.push(Object::Bool(result));
             }
             OpCode::PopTop => {
-                frame.pop()?;
+                let v = frame.pop()?;
+                // Discarding the last reference to a temporary mirrors
+                // CPython's refcount-driven finalization (`f()` as a
+                // statement finalizes the result immediately).
+                if matches!(
+                    v,
+                    Object::Generator(_)
+                        | Object::Coroutine(_)
+                        | Object::AsyncGenerator(_)
+                        | Object::Instance(_)
+                        | Object::AsyncGenAwait(_)
+                ) {
+                    self.prompt_reap_dropped(v);
+                }
             }
             OpCode::CopyTop => {
                 let v = frame.top()?.clone();
@@ -3106,15 +3228,24 @@ impl Interpreter {
                 let mut exc = match ins.arg {
                     0 => {
                         // Re-raise the currently-handled exception. A bare
-                        // `raise` preserves the original traceback: the
-                        // re-raise site is *not* recorded (CPython RERAISE).
-                        let mut top = frame
-                            .exc_handlers
+                        // `raise` preserves the original traceback (the
+                        // re-raise site is *not* recorded) and — unlike a
+                        // fresh `raise e` — never re-chains `__context__`
+                        // (CPython RERAISE; an explicit
+                        // `e.__context__ = None` must survive). The active
+                        // exception is thread-state-wide in CPython
+                        // (`sys.exc_info()`), not frame-local: a helper
+                        // called from inside an `except:` block can
+                        // re-raise the caller's exception.
+                        let mut top = self
+                            .exc_info_stack
+                            .borrow()
                             .last()
-                            .map(|(_, pe)| pe.clone())
+                            .cloned()
                             .ok_or_else(|| runtime_error("No active exception to re-raise"))?;
                         top.suppress_tb_once = true;
-                        top
+                        top.context_settled = true;
+                        return Err(RuntimeError::PyException(top));
                     }
                     1 => {
                         let arg = frame.pop()?;
@@ -3212,15 +3343,41 @@ impl Interpreter {
                 };
                 let mut pe = Self::normalize_exception(exc, None)?;
                 // Re-raises keep the original traceback; the RERAISE
-                // site itself is not recorded (matches CPython).
+                // site itself is not recorded, and `__context__` is not
+                // re-chained (matches CPython).
                 pe.suppress_tb_once = true;
+                pe.context_settled = true;
                 Self::sync_exc_attrs(&pe);
                 return Err(RuntimeError::PyException(pe));
             }
             OpCode::BeforeWith => {
                 let cm = frame.pop()?;
-                let exit_method = self.load_attr(&cm, "__exit__")?;
-                let enter_method = self.load_attr(&cm, "__enter__")?;
+                // CPython `BEFORE_WITH`: a missing protocol method is a
+                // TypeError naming the protocol, not an AttributeError
+                // (`__enter__` checked first, then `__exit__`).
+                let enter_method = self.load_attr(&cm, "__enter__").map_err(|err| {
+                    if matches!(&err, RuntimeError::PyException(e) if e.type_name() == "AttributeError")
+                    {
+                        type_error(format!(
+                            "'{}' object does not support the context manager protocol",
+                            cm.type_name()
+                        ))
+                    } else {
+                        err
+                    }
+                })?;
+                let exit_method = self.load_attr(&cm, "__exit__").map_err(|err| {
+                    if matches!(&err, RuntimeError::PyException(e) if e.type_name() == "AttributeError")
+                    {
+                        type_error(format!(
+                            "'{}' object does not support the context manager protocol \
+                             (missed __exit__ method)",
+                            cm.type_name()
+                        ))
+                    } else {
+                        err
+                    }
+                })?;
                 let entered = self.call(&enter_method, &[], &[], &frame.globals)?;
                 // Stack on exit: [exit_method, entered_value]
                 frame.push(exit_method);
@@ -3717,6 +3874,9 @@ impl Interpreter {
     /// `__suppress_context__` (handled in `sync_exc_attrs`), which
     /// governs *display*, not whether `__context__` exists.
     fn attach_implicit_context(&self, exc: &mut PyException) {
+        // Chaining is decided exactly once per raise; later propagation
+        // through Rust boundaries must leave the result alone.
+        exc.context_settled = true;
         let stack = self.exc_info_stack.borrow();
         let Some(ctx) = stack.last() else {
             return;
@@ -3748,6 +3908,7 @@ impl Interpreter {
     /// The suspended generator's active handled exception is the top of
     /// the entries we detached on suspend (`frame.saved_exc_info`).
     fn chain_thrown_context(exc: &mut PyException, frame: &Frame) {
+        exc.context_settled = true;
         let Some(active) = frame.saved_exc_info.last() else {
             return;
         };
@@ -4064,6 +4225,11 @@ impl Interpreter {
                         }
                         "await" if prefix == "cr_" || prefix == "ag_" => {
                             return Ok(self.gen_yieldfrom(g))
+                        }
+                        // PEP-style origin tracking
+                        // (`sys.set_coroutine_origin_tracking_depth`).
+                        "origin" if prefix == "cr_" => {
+                            return Ok(g.origin.borrow().clone())
                         }
                         _ => {}
                     }
@@ -4824,10 +4990,13 @@ impl Interpreter {
         // (`type('D', (A,), {})`, enum's functional API) would inherit
         // its base's or metaclass's `__name__`.
         if name == "__name__" || name == "__qualname__" {
-            if let Some(v) = ty.dict.borrow().get(&DictKey(Object::from_str(name))) {
-                return Ok(v.clone());
+            match ty.dict.borrow().get(&DictKey(Object::from_str(name))) {
+                // A getset under `__name__` (generator/coroutine types)
+                // describes *instances*; the type's own name comes from
+                // the synthetic, as with CPython's `type.__name__`.
+                Some(v) if !matches!(v, Object::Property(_)) => return Ok(v.clone()),
+                _ => return Ok(Object::from_str(&ty.name)),
             }
-            return Ok(Object::from_str(&ty.name));
         }
 
         let meta = ty.metaclass_or_type();
@@ -4844,19 +5013,10 @@ impl Interpreter {
 
         // (2) Look up the name in `ty` itself (and its MRO).
         if let Some(attr) = ty.lookup(name) {
-            // A `__name__`/`__qualname__` *getset* in a class dict
-            // describes instances (e.g. `coroutine.__name__`); for the
-            // class itself CPython's metaclass getset (`type.__name__`)
-            // takes precedence and reports the type's own name. Fall
-            // through to the synthetic below.
-            let meta_owned = matches!(name, "__name__" | "__qualname__")
-                && matches!(attr, Object::Property(_));
-            if !meta_owned {
-                // Apply the descriptor protocol with no instance: classmethods
-                // bind to the class, plain functions stay as functions,
-                // staticmethods unwrap, properties remain themselves.
-                return self.descriptor_get(&attr, &Object::None, &owner);
-            }
+            // Apply the descriptor protocol with no instance: classmethods
+            // bind to the class, plain functions stay as functions,
+            // staticmethods unwrap, properties remain themselves.
+            return self.descriptor_get(&attr, &Object::None, &owner);
         }
 
         // (3) Fall-through to (possibly non-data) metaclass attribute.
@@ -7406,6 +7566,25 @@ impl Interpreter {
         self.load_attr(obj, name)
     }
 
+    /// Crate-visible attribute store (weakproxy `__setattr__` forwarding).
+    pub(crate) fn store_attr_public(
+        &mut self,
+        obj: &Object,
+        name: &str,
+        value: Object,
+    ) -> Result<(), RuntimeError> {
+        self.store_attr(obj, name, value)
+    }
+
+    /// Crate-visible attribute delete (weakproxy `__delattr__` forwarding).
+    pub(crate) fn delete_attr_public(
+        &mut self,
+        obj: &Object,
+        name: &str,
+    ) -> Result<(), RuntimeError> {
+        self.delete_attr(obj, name)
+    }
+
     /// Crate-visible `str()` for builtins that need full dispatch
     /// (e.g. `BaseException.__str__` rendering a nested exception arg).
     pub(crate) fn stringify_public(
@@ -7427,12 +7606,24 @@ impl Interpreter {
                 return Self::require_str_result(r, "__str__");
             }
             // A subclass of a built-in (`class S(str)`, `class F(float)`, …)
-            // with no custom `__str__` inherits the base type's `__str__`,
-            // i.e. it stringifies its native payload rather than falling back
-            // to `object.__str__` (the `<S object at 0x…>` repr).
+            // with no custom `__str__` inherits the base type's `__str__` —
+            // but only the value types actually *have* a `tp_str` in CPython.
+            // Container bases (tuple/list/dict/…) don't, so `str(x)` falls
+            // through `object.__str__` to `repr(x)`, which dispatches a user
+            // `__repr__` when defined (namedtuple relies on this).
             if let Some(native) = &inst.native {
-                let native = native.clone();
-                return self.stringify(&native, globals);
+                if matches!(
+                    native,
+                    Object::Int(_)
+                        | Object::Bool(_)
+                        | Object::Long(_)
+                        | Object::Float(_)
+                        | Object::Complex(_)
+                        | Object::Str(_)
+                ) {
+                    let native = native.clone();
+                    return self.stringify(&native, globals);
+                }
             }
             return self.repr_of(v, globals);
         }
@@ -7728,15 +7919,10 @@ impl Interpreter {
                     Err(not_awaitable(&value))
                 }
             }
-            // An async generator that surfaced through `__anext__` is
-            // already drivable via SEND; `await agen()` itself is an error.
-            Object::AsyncGenerator(_) => {
-                if ctx == 1 {
-                    Ok(value)
-                } else {
-                    Err(not_awaitable(&value))
-                }
-            }
+            // Async generators implement no `__await__`; `anext()` wraps
+            // them in an `AsyncGenAwait` before any GET_AWAITABLE sees
+            // them, so a bare agen here is always an error.
+            Object::AsyncGenerator(_) => Err(not_awaitable(&value)),
             // The deferred `asend`/`athrow`/`aclose` awaitable is already a
             // drivable awaitable (SEND applies the op via `step_agen_await`).
             Object::AsyncGenAwait(_) => Ok(value),
@@ -7828,12 +8014,16 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         match aiter {
             Object::AsyncGenerator(_) => {
-                // The async generator is itself the awaitable for the
-                // next yield (cooperative model — we don't allocate a
-                // fresh `async_generator_asend` like CPython does).
-                // `SEND` knows how to translate `StopIteration` into
-                // `StopAsyncIteration` for async generators.
-                Ok(aiter.clone())
+                // A deferred `async_generator_asend` awaitable, like
+                // CPython's. Returning the agen itself would make
+                // `await anext(agen)` indistinguishable from the illegal
+                // `await agen` (which must raise TypeError).
+                self.agen_init_hooks(aiter)?;
+                Ok(make_agen_await(
+                    aiter,
+                    crate::object::AgenAwaitKind::Send,
+                    vec![Object::None],
+                ))
             }
             Object::Instance(_) if instance_method(aiter, "__anext__").is_some() => {
                 let method = instance_method(aiter, "__anext__").expect("checked");
@@ -8047,6 +8237,29 @@ impl Interpreter {
         }
     }
 
+    /// PEP 525 `async_gen_init_hooks`: the first time any of
+    /// `__anext__`/`asend`/`athrow`/`aclose` produces an awaitable for
+    /// this agen, capture the thread's *finalizer* hook on the
+    /// generator and invoke the *firstiter* hook with it. CPython does
+    /// this at awaitable-creation time (not first drive), and an
+    /// exception from the hook propagates to the caller.
+    fn agen_init_hooks(&mut self, agen: &Object) -> Result<(), RuntimeError> {
+        let Object::AsyncGenerator(g) = agen else {
+            return Ok(());
+        };
+        if g.hooks_inited.get() {
+            return Ok(());
+        }
+        g.hooks_inited.set(true);
+        let (firstiter, finalizer) = crate::stdlib::sys::asyncgen_hooks();
+        *g.finalizer.borrow_mut() = finalizer;
+        if !matches!(firstiter, Object::None) {
+            let globals = self.builtins.clone();
+            self.call(&firstiter, &[agen.clone()], &[], &globals)?;
+        }
+        Ok(())
+    }
+
     /// CPython's `AWAITABLE_STATE_CLOSED` error: driving (or throwing into)
     /// an awaitable that already completed.
     fn agen_await_reuse_error(kind: crate::object::AgenAwaitKind) -> RuntimeError {
@@ -8067,11 +8280,14 @@ impl Interpreter {
         let Object::AsyncGenerator(g) = &a.agen else {
             return None;
         };
+        // Mid-await suspension *or* the agen's own body executing right
+        // now (e.g. `await anext(me)` from inside the body) both count
+        // as "already running" in CPython's `ag_running_async` sense.
         let mid_await = matches!(
             &*g.state.borrow(),
             GeneratorState::Suspended(boxed)
                 if boxed.downcast_ref::<Frame>().is_some_and(|f| !f.agen_yielded_value)
-        );
+        ) || matches!(&*g.state.borrow(), GeneratorState::Running);
         if !mid_await {
             return None;
         }
@@ -8106,15 +8322,42 @@ impl Interpreter {
         let outcome = if first {
             match a.kind {
                 AgenAwaitKind::Send => {
-                    let value = a.args.first().cloned().unwrap_or(Object::None);
+                    // CPython `async_gen_asend_send`: a non-None value
+                    // passed to the awaitable's own `send` replaces the
+                    // stored payload — and a just-started agen then
+                    // raises the usual non-None TypeError.
+                    let value = if matches!(send_value, Object::None) {
+                        a.args.first().cloned().unwrap_or(Object::None)
+                    } else {
+                        send_value.clone()
+                    };
                     self.gen_method_send(&a.agen, value)
                 }
                 AgenAwaitKind::Throw => self.gen_method_throw(&a.agen, &a.args),
-                AgenAwaitKind::Close => self.gen_method_close(&a.agen),
+                AgenAwaitKind::Close => {
+                    // Deliver GeneratorExit as a throw (not a one-shot
+                    // close): the agen's cleanup may legitimately
+                    // suspend on inner awaits (`finally: await sleep()`),
+                    // which pass through below and keep us drivable.
+                    if matches!(
+                        &a.agen,
+                        Object::AsyncGenerator(g) if g.is_finished()
+                    ) {
+                        a.consumed.set(true);
+                        return Err(stop_iteration());
+                    }
+                    let bt = crate::builtin_types::builtin_types();
+                    let exc_inst = crate::builtin_types::make_exception_with_class(
+                        bt.generator_exit.clone(),
+                        "",
+                    );
+                    self.gen_method_throw(&a.agen, &[exc_inst])
+                }
             }
         } else {
             self.gen_method_send(&a.agen, send_value)
         };
+        let is_close = matches!(a.kind, AgenAwaitKind::Close);
         match outcome {
             Ok(value) => {
                 // Did the agen suspend on an inner `await` (passing `value`
@@ -8127,16 +8370,35 @@ impl Interpreter {
                         return Ok(value);
                     }
                 }
+                a.consumed.set(true);
+                if is_close {
+                    // A real `yield` while GeneratorExit is pending —
+                    // the agen refused to exit.
+                    return Err(crate::error::runtime_error(
+                        "async generator ignored GeneratorExit",
+                    ));
+                }
                 // The agen yielded a consumer value / the op completed:
                 // express completion as `StopIteration(value)` so the SEND
                 // handler short-circuits.
-                a.consumed.set(true);
                 Err(stop_iteration_with(value))
             }
             // `StopAsyncIteration` (agen finished) and genuine exceptions
             // raised in the agen body propagate out of the await.
             Err(e) => {
                 a.consumed.set(true);
+                if is_close
+                    && matches!(
+                        &e,
+                        RuntimeError::PyException(pe) if matches!(
+                            pe.type_name().as_str(),
+                            "GeneratorExit" | "StopAsyncIteration"
+                        )
+                    )
+                {
+                    // Clean exit: awaiting `aclose()` completes with None.
+                    return Err(stop_iteration());
+                }
                 Err(e)
             }
         }
@@ -8515,8 +8777,11 @@ impl Interpreter {
             let exc_inst =
                 crate::builtin_types::make_exception_with_class(bt.generator_exit.clone(), "");
             return match self.gen_method_throw(&a.agen, &[exc_inst]) {
+                // CPython `gen_close` on the asend/athrow awaitable
+                // reports it as a *coroutine* ignoring the exit (the
+                // agen-level `aclose` path says "async generator").
                 Ok(_yielded) => Err(crate::error::runtime_error(
-                    "async generator ignored GeneratorExit",
+                    "coroutine ignored GeneratorExit",
                 )),
                 Err(RuntimeError::PyException(exc))
                     if matches!(
@@ -8615,10 +8880,25 @@ impl Interpreter {
                 self.generator_throw(g, exc)
             }
             _ => {
-                // Non-generator iterators don't have `.throw()`;
-                // CPython just re-raises the exception out of the
-                // delegation.
-                Err(RuntimeError::PyException(exc))
+                let globals = self.builtins.clone();
+                if exc.type_name() == "GeneratorExit" {
+                    // CPython `gen_close_iter`: ask the sub-iterator to
+                    // close itself, then deliver the GeneratorExit to
+                    // the delegating frame (its finally blocks run).
+                    if let Ok(close_m) = self.load_attr(sub_iter, "close") {
+                        self.call(&close_m, &[], &[], &globals)?;
+                    }
+                    return Err(RuntimeError::PyException(exc));
+                }
+                // A custom awaitable/iterator with its own `throw`
+                // (e.g. the `coroutine_wrapper` from `__await__`, or
+                // types.coroutine's _GeneratorWrapper) handles the
+                // exception itself; without one, the exception is
+                // raised at the delegating frame's yield-from point.
+                match self.load_attr(sub_iter, "throw") {
+                    Ok(throw_m) => self.call(&throw_m, &[exc.instance.clone()], &[], &globals),
+                    Err(_) => Err(RuntimeError::PyException(exc)),
+                }
             }
         }
     }
@@ -8962,6 +9242,67 @@ impl Interpreter {
                 items.borrow_mut().extend(extra);
                 return Ok(a.clone());
             }
+            // PEP 584 `dict |= other` updates in place; unlike the binary
+            // `|` it accepts anything `dict.update` does (a mapping or an
+            // iterable of key/value pairs).
+            (Object::Dict(dst), BinOpKind::BitOr) => {
+                let src: Vec<(DictKey, Object)> = match b {
+                    Object::Dict(s) => {
+                        s.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
+                    Object::Instance(_) => match b.native_value() {
+                        Some(Object::Dict(s)) => {
+                            s.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                        }
+                        _ => {
+                            let pairs = self.collect_iterable(b, globals)?;
+                            let mut out = Vec::with_capacity(pairs.len());
+                            for p in pairs {
+                                let kv = self.collect_iterable(&p, globals)?;
+                                match <[Object; 2]>::try_from(kv) {
+                                    Ok([k, v]) => out.push((DictKey(k), v)),
+                                    Err(_) => {
+                                        return Err(type_error(
+                                            "cannot convert dictionary update sequence \
+                                             element to a key/value pair",
+                                        ))
+                                    }
+                                }
+                            }
+                            out
+                        }
+                    },
+                    Object::List(_) | Object::Tuple(_) => {
+                        let pairs = self.collect_iterable(b, globals)?;
+                        let mut out = Vec::with_capacity(pairs.len());
+                        for p in pairs {
+                            let kv = self.collect_iterable(&p, globals)?;
+                            match <[Object; 2]>::try_from(kv) {
+                                Ok([k, v]) => out.push((DictKey(k), v)),
+                                Err(_) => {
+                                    return Err(type_error(
+                                        "cannot convert dictionary update sequence \
+                                         element to a key/value pair",
+                                    ))
+                                }
+                            }
+                        }
+                        out
+                    }
+                    _ => {
+                        return Err(type_error(format!(
+                            "unsupported operand type(s) for |=: 'dict' and '{}'",
+                            b.type_name_owned()
+                        )))
+                    }
+                };
+                let mut d = dst.borrow_mut();
+                for (k, v) in src {
+                    d.insert(k, v);
+                }
+                drop(d);
+                return Ok(a.clone());
+            }
             // `set`/`frozenset` in-place set algebra. `frozenset` is
             // immutable, so it falls through to the binary path which
             // returns a fresh object; only mutable `set` mutates here.
@@ -8986,8 +9327,64 @@ impl Interpreter {
                     buf.borrow_mut().extend_from_slice(&extra);
                     return Ok(a.clone());
                 }
+                Object::MemoryView(mv) => {
+                    let extra = mv.to_bytes();
+                    buf.borrow_mut().extend_from_slice(&extra);
+                    return Ok(a.clone());
+                }
                 _ => {}
             },
+            // `bytearray *= n` repeats in place, preserving identity
+            // (CPython's `bytearray_irepeat`).
+            (Object::ByteArray(buf), BinOpKind::Mult) => {
+                let n = match b {
+                    Object::Int(n) => Some(*n),
+                    Object::Bool(v) => Some(i64::from(*v)),
+                    inst @ Object::Instance(_)
+                        if instance_method(inst, "__index__").is_some()
+                            || inst.native_value().is_some() =>
+                    {
+                        Some(crate::builtins::coerce_index_i64(inst)?)
+                    }
+                    _ => None,
+                };
+                if let Some(n) = n {
+                    let mut data = buf.borrow_mut();
+                    if n <= 0 {
+                        data.clear();
+                    } else {
+                        let unit = data.len();
+                        checked_repeat_count(unit, n, "bytes")?;
+                        let original = data.clone();
+                        for _ in 1..n {
+                            data.extend_from_slice(&original);
+                        }
+                    }
+                    drop(data);
+                    return Ok(a.clone());
+                }
+            }
+            // `list *= n` likewise repeats in place.
+            (Object::List(items), BinOpKind::Mult) => {
+                if let Some(n) = match b {
+                    Object::Int(n) => Some(*n),
+                    Object::Bool(v) => Some(i64::from(*v)),
+                    _ => None,
+                } {
+                    let mut data = items.borrow_mut();
+                    if n <= 0 {
+                        data.clear();
+                    } else {
+                        checked_repeat_count(data.len(), n, "list")?;
+                        let original = data.clone();
+                        for _ in 1..n {
+                            data.extend_from_slice(&original);
+                        }
+                    }
+                    drop(data);
+                    return Ok(a.clone());
+                }
+            }
             _ => {}
         }
         self.dispatch_binary_op(a, b, op, globals)
@@ -9079,7 +9476,7 @@ impl Interpreter {
     /// latin-1 so it can share the text `%`-engine, then re-encoded; the
     /// result type follows the left operand. `%s`/`%b` dispatch `__bytes__`
     /// (and `%a`/`%r` `__repr__`) on user instances via the VM.
-    fn bytes_percent_format(
+    pub(crate) fn bytes_percent_format(
         &mut self,
         a: &Object,
         b: &Object,
@@ -9112,6 +9509,18 @@ impl Interpreter {
             }
         };
         let rendered = percent_format_with(&template, b, PercentMode::Bytes, &mut resolve)?;
+        // gh-142557: a `%a`/`%r`/`%s` callback may have mutated a bytearray
+        // template while we were formatting from it.
+        if let Object::ByteArray(t) = a {
+            if t.borrow().len() != template.len() {
+                return Err(RuntimeError::PyException(
+                    crate::error::PyException::from_builtin(
+                        "BufferError",
+                        "Existing exports of data: object cannot be re-sized",
+                    ),
+                ));
+            }
+        }
         let out: Vec<u8> = rendered.chars().map(|c| c as u8).collect();
         Ok(match a {
             Object::ByteArray(_) => Object::new_bytearray(out),
@@ -10389,7 +10798,10 @@ impl Interpreter {
         if let Some(setattr) = inst.cls().lookup("__setattr__") {
             if matches!(
                 setattr,
-                Object::Function(_) | Object::BoundMethod(_) | Object::Instance(_)
+                Object::Function(_)
+                    | Object::BoundMethod(_)
+                    | Object::Instance(_)
+                    | Object::Builtin(_)
             ) {
                 self.call(
                     &setattr,
@@ -10529,7 +10941,10 @@ impl Interpreter {
                 if let Some(delattr) = inst.cls().lookup("__delattr__") {
                     if matches!(
                         delattr,
-                        Object::Function(_) | Object::BoundMethod(_) | Object::Instance(_)
+                        Object::Function(_)
+                            | Object::BoundMethod(_)
+                            | Object::Instance(_)
+                            | Object::Builtin(_)
                     ) {
                         self.call(
                             &delattr,
@@ -10575,6 +10990,23 @@ impl Interpreter {
                     ty.invalidate_getattribute_cache();
                 }
                 Ok(())
+            }
+            // `del module.attr` removes the name from the module dict
+            // (CPython `module_setattro` with a NULL value).
+            Object::Module(m) => {
+                let removed = m
+                    .dict
+                    .borrow_mut()
+                    .shift_remove(&DictKey(Object::from_str(name)))
+                    .is_some();
+                if removed {
+                    Ok(())
+                } else {
+                    Err(attribute_error(format!(
+                        "module '{}' has no attribute '{}'",
+                        m.name, name
+                    )))
+                }
             }
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
@@ -10743,6 +11175,38 @@ impl Interpreter {
             },
             _ => container,
         };
+        let is_sequence = matches!(
+            container,
+            Object::List(_)
+                | Object::Tuple(_)
+                | Object::Str(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
+                | Object::Range(_)
+                | Object::MemoryView(_)
+        );
+        // Sequence indices honour the full `__index__` protocol; slices
+        // are pre-resolved so the container is not borrowed while user
+        // `__index__` code runs.
+        let coerced_index;
+        let index = match index {
+            Object::Slice(s) if is_sequence && slice_needs_resolution(s) => {
+                coerced_index = Object::Slice(Rc::new(resolve_slice_ints(s)?));
+                &coerced_index
+            }
+            inst @ Object::Instance(_)
+                if is_sequence && instance_method(inst, "__index__").is_some() =>
+            {
+                coerced_index = Object::Int(crate::builtins::coerce_index_i64(inst)?);
+                &coerced_index
+            }
+            Object::Long(_) if is_sequence => {
+                return Err(index_error(
+                    "cannot fit 'int' into an index-sized integer",
+                ))
+            }
+            _ => index,
+        };
         match (container, index) {
             (Object::List(items), Object::Int(i)) => {
                 let items = items.borrow();
@@ -10862,6 +11326,14 @@ impl Interpreter {
                     .cloned()
                     .ok_or_else(|| key_error(key.repr()))
             }
+            (Object::Bytes(_), other) => Err(type_error(format!(
+                "byte indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
+            (Object::ByteArray(_), other) => Err(type_error(format!(
+                "bytearray indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
             (_, _) => Err(type_error(format!(
                 "'{}' object is not subscriptable with '{}'",
                 container.type_name(),
@@ -10903,6 +11375,32 @@ impl Interpreter {
             },
             _ => container,
         };
+        let is_sequence = matches!(
+            container,
+            Object::List(_) | Object::ByteArray(_) | Object::MemoryView(_)
+        );
+        // Sequence indices honour the full `__index__` protocol; slices
+        // are pre-resolved so the container is not borrowed while user
+        // `__index__` code runs (gh-91153).
+        let coerced_index;
+        let index = match index {
+            Object::Slice(s) if is_sequence && slice_needs_resolution(s) => {
+                coerced_index = Object::Slice(Rc::new(resolve_slice_ints(s)?));
+                &coerced_index
+            }
+            inst @ Object::Instance(_)
+                if is_sequence && instance_method(inst, "__index__").is_some() =>
+            {
+                coerced_index = Object::Int(crate::builtins::coerce_index_i64(inst)?);
+                &coerced_index
+            }
+            Object::Long(_) if is_sequence => {
+                return Err(index_error(
+                    "cannot fit 'int' into an index-sized integer",
+                ))
+            }
+            _ => index,
+        };
         match (container, index) {
             (Object::List(items), Object::Int(i)) => {
                 let mut items = items.borrow_mut();
@@ -10936,15 +11434,54 @@ impl Interpreter {
                 Ok(())
             }
             (Object::ByteArray(b), Object::Int(i)) => {
-                let mut b = b.borrow_mut();
-                let idx = normalize_index(*i, b.len())?;
-                let byte = match value {
-                    Object::Int(v) if (0..=255).contains(&v) => v as u8,
-                    _ => return Err(value_error("byte must be in 0..256")),
-                };
-                b[idx] = byte;
+                // Convert the value *before* touching the buffer: a user
+                // `__index__` can run Python that resizes this bytearray
+                // (gh-91153), so the bounds check happens afterwards
+                // against the current length.
+                let i = *i;
+                let byte = crate::builtins::bytearray_byte_arg(&value)?;
+                let mut data = b.borrow_mut();
+                let idx = normalize_index(i, data.len())?;
+                data[idx] = byte;
                 Ok(())
             }
+            (Object::ByteArray(b), Object::Slice(s)) => {
+                // `ba[i:j:k] = bytes-like / iterable of ints` — collect
+                // the RHS into raw bytes via the buffer fast paths or
+                // the full iteration protocol, then splice like a list.
+                let replacement: Vec<u8> = match &value {
+                    Object::Bytes(src) => src.to_vec(),
+                    Object::ByteArray(src) => src.borrow().clone(),
+                    _ => {
+                        let items = self.collect_iterable(&value, globals)?;
+                        let mut out = Vec::with_capacity(items.len());
+                        for item in items {
+                            out.push(crate::builtins::bytearray_byte_arg(&item)?);
+                        }
+                        out
+                    }
+                };
+                let mut data = b.borrow_mut();
+                let mut objs: Vec<Object> =
+                    data.iter().map(|byte| Object::Int(i64::from(*byte))).collect();
+                let repl_objs: Vec<Object> = replacement
+                    .iter()
+                    .map(|byte| Object::Int(i64::from(*byte)))
+                    .collect();
+                apply_slice_assignment(&mut objs, s, repl_objs)?;
+                *data = objs
+                    .into_iter()
+                    .map(|o| match o {
+                        Object::Int(v) => v as u8,
+                        _ => unreachable!("bytearray slice splice produced non-int"),
+                    })
+                    .collect();
+                Ok(())
+            }
+            (Object::ByteArray(_), other) => Err(type_error(format!(
+                "bytearray indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
             _ => Err(type_error(format!(
                 "'{}' object does not support item assignment",
                 container.type_name()
@@ -10965,6 +11502,21 @@ impl Interpreter {
             _ => None,
         };
         let index = unwrapped.as_ref().unwrap_or(index);
+        let is_sequence = matches!(container, Object::List(_) | Object::ByteArray(_));
+        let coerced_index;
+        let index = match index {
+            Object::Slice(s) if is_sequence && slice_needs_resolution(s) => {
+                coerced_index = Object::Slice(Rc::new(resolve_slice_ints(s)?));
+                &coerced_index
+            }
+            inst @ Object::Instance(_)
+                if is_sequence && instance_method(inst, "__index__").is_some() =>
+            {
+                coerced_index = Object::Int(crate::builtins::coerce_index_i64(inst)?);
+                &coerced_index
+            }
+            _ => index,
+        };
         match (container, index) {
             (Object::List(items), Object::Int(i)) => {
                 let mut items = items.borrow_mut();
@@ -11044,31 +11596,52 @@ impl Interpreter {
                         }
                         ".u.agen_aiter" => Ok(receiver.clone()),
                         ".u.agen_anext" => match &receiver {
-                            Object::AsyncGenerator(_) => Ok(make_agen_await(
-                                &receiver,
-                                crate::object::AgenAwaitKind::Send,
-                                vec![Object::None],
-                            )),
+                            Object::AsyncGenerator(_) => {
+                                self.agen_init_hooks(&receiver)?;
+                                Ok(make_agen_await(
+                                    &receiver,
+                                    crate::object::AgenAwaitKind::Send,
+                                    vec![Object::None],
+                                ))
+                            }
                             other => Err(type_error(format!(
                                 "__anext__ requires an async_generator, got '{}'",
                                 other.type_name()
                             ))),
                         },
-                        ".u.agen_send" => Ok(make_agen_await(
-                            &receiver,
-                            crate::object::AgenAwaitKind::Send,
-                            vec![rest.first().cloned().unwrap_or(Object::None)],
-                        )),
-                        ".u.agen_throw" => Ok(make_agen_await(
-                            &receiver,
-                            crate::object::AgenAwaitKind::Throw,
-                            rest.to_vec(),
-                        )),
-                        ".u.agen_close" => Ok(make_agen_await(
-                            &receiver,
-                            crate::object::AgenAwaitKind::Close,
-                            Vec::new(),
-                        )),
+                        ".u.agen_send" => {
+                            self.agen_init_hooks(&receiver)?;
+                            Ok(make_agen_await(
+                                &receiver,
+                                crate::object::AgenAwaitKind::Send,
+                                vec![rest.first().cloned().unwrap_or(Object::None)],
+                            ))
+                        }
+                        ".u.agen_throw" => {
+                            // CPython warns at the `athrow(...)` call
+                            // itself, before the awaitable is driven.
+                            if rest.len() > 1 {
+                                self.emit_deprecation_warning(
+                                    "the (type, exc, tb) signature of athrow() is deprecated, \
+                                     use the single-arg signature instead."
+                                        .to_owned(),
+                                )?;
+                            }
+                            self.agen_init_hooks(&receiver)?;
+                            Ok(make_agen_await(
+                                &receiver,
+                                crate::object::AgenAwaitKind::Throw,
+                                rest.to_vec(),
+                            ))
+                        }
+                        ".u.agen_close" => {
+                            self.agen_init_hooks(&receiver)?;
+                            Ok(make_agen_await(
+                                &receiver,
+                                crate::object::AgenAwaitKind::Close,
+                                Vec::new(),
+                            ))
+                        }
                         _ => Err(RuntimeError::Internal(format!(
                             "unknown unbound gen sentinel {}",
                             b.name
@@ -11627,11 +12200,13 @@ impl Interpreter {
                         // path, so they are unaffected.)
                         ".agen_anext" => match &bm.receiver {
                             Object::AsyncGenerator(_) => {
+                                let receiver = bm.receiver.clone();
+                                self.agen_init_hooks(&receiver)?;
                                 return Ok(make_agen_await(
-                                    &bm.receiver,
+                                    &receiver,
                                     crate::object::AgenAwaitKind::Send,
                                     vec![Object::None],
-                                ))
+                                ));
                             }
                             other => {
                                 return Err(type_error(format!(
@@ -11648,23 +12223,38 @@ impl Interpreter {
                         // eagerly and returned the result, yielding `await
                         // None`). See [`Self::step_agen_await`].
                         ".agen_send" => {
+                            let receiver = bm.receiver.clone();
                             let value = args.first().cloned().unwrap_or(Object::None);
+                            self.agen_init_hooks(&receiver)?;
                             return Ok(make_agen_await(
-                                &bm.receiver,
+                                &receiver,
                                 crate::object::AgenAwaitKind::Send,
                                 vec![value],
                             ));
                         }
                         ".agen_throw" => {
+                            // CPython warns at the `athrow(...)` call
+                            // itself, before the awaitable is driven.
+                            if args.len() > 1 {
+                                self.emit_deprecation_warning(
+                                    "the (type, exc, tb) signature of athrow() is deprecated, \
+                                     use the single-arg signature instead."
+                                        .to_owned(),
+                                )?;
+                            }
+                            let receiver = bm.receiver.clone();
+                            self.agen_init_hooks(&receiver)?;
                             return Ok(make_agen_await(
-                                &bm.receiver,
+                                &receiver,
                                 crate::object::AgenAwaitKind::Throw,
                                 args.to_vec(),
                             ));
                         }
                         ".agen_close" => {
+                            let receiver = bm.receiver.clone();
+                            self.agen_init_hooks(&receiver)?;
                             return Ok(make_agen_await(
-                                &bm.receiver,
+                                &receiver,
                                 crate::object::AgenAwaitKind::Close,
                                 Vec::new(),
                             ));
@@ -13208,6 +13798,9 @@ impl Interpreter {
             }
             if let Some(builtin) = self.builtin_constructor_for(&cls) {
                 if !kwargs.is_empty() {
+                    if let Some(call_kw) = &builtin.call_kw {
+                        return call_kw(args, kwargs);
+                    }
                     return Err(type_error(format!(
                         "{}() does not accept keyword arguments",
                         cls.name
@@ -13581,9 +14174,11 @@ impl Interpreter {
                 ""
             };
             let given_verb = if provided == 1 { "was" } else { "were" };
+            // CPython renders these with `co_qualname` (`Class.meth()` /
+            // `outer.<locals>.f()`), not the bare name.
             return Err(type_error(format!(
                 "{}() takes {} positional argument{} but {} {} given",
-                f.name, sig, plural, provided, given_verb
+                code.qualname, sig, plural, provided, given_verb
             )));
         }
         // Keyword args: match by name. Unmatched ones go into the
@@ -13752,6 +14347,33 @@ impl Interpreter {
             false,
         );
         if code.is_generator || code.is_coroutine || code.is_async_generator {
+            // `cr_origin`: when origin tracking is on, snapshot the
+            // creation call stack (caller-outwards, like CPython's
+            // `compute_cr_origin`) before the bootstrap touches the
+            // frame stack.
+            let cr_origin = if code.is_coroutine {
+                let depth = crate::stdlib::sys::coroutine_origin_tracking_depth();
+                if depth > 0 {
+                    let stack = self.frame_stack.borrow();
+                    let frames: Vec<Object> = stack
+                        .iter()
+                        .rev()
+                        .take(depth as usize)
+                        .map(|py| {
+                            Object::new_tuple(vec![
+                                Object::from_str(py.code.filename.clone()),
+                                Object::Int(i64::from(py.current_lineno())),
+                                Object::from_str(py.code.name.clone()),
+                            ])
+                        })
+                        .collect();
+                    Some(Object::new_tuple(frames))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             // Run the bootstrap so the frame is past
             // `RETURN_GENERATOR; POP_TOP; RESUME`. We then wrap the
             // frame in a PyGenerator and hand it back to the caller.
@@ -13785,6 +14407,9 @@ impl Interpreter {
                         gen_code,
                         Box::new(frame),
                     ));
+                    if let Some(origin) = cr_origin {
+                        *gen.origin.borrow_mut() = origin;
+                    }
                     let obj = if code.is_coroutine {
                         Object::Coroutine(gen)
                     } else if code.is_async_generator {
@@ -15087,29 +15712,76 @@ fn current_package(globals: &Rc<RefCell<DictData>>) -> Option<String> {
     None
 }
 
+/// Resolve one slice bound to an `i64` the way `PySlice_Unpack` does:
+/// `None` → `Ok(None)`, ints/bools directly, big ints clamped to the
+/// extremes, and `__index__`-able objects through interpreter reentry.
+pub(crate) fn slice_bound_index(o: &Object) -> Result<Option<i64>, RuntimeError> {
+    match o {
+        Object::None => Ok(None),
+        Object::Int(i) => Ok(Some(*i)),
+        Object::Bool(b) => Ok(Some(i64::from(*b))),
+        Object::Long(l) => {
+            use num_traits::{Signed, ToPrimitive};
+            Ok(Some(l.to_i64().unwrap_or(if l.is_negative() {
+                i64::MIN
+            } else {
+                i64::MAX
+            })))
+        }
+        Object::Instance(_) => Ok(Some(crate::builtins::coerce_index_i64(o).map_err(
+            |_| {
+                type_error(
+                    "slice indices must be integers or None or have an __index__ method",
+                )
+            },
+        )?)),
+        _ => Err(type_error(
+            "slice indices must be integers or None or have an __index__ method",
+        )),
+    }
+}
+
+/// True when a slice has a bound that needs active resolution (a big
+/// int, bool, or `__index__`-able object rather than `None`/`Int`).
+fn slice_needs_resolution(s: &PySlice) -> bool {
+    [&s.start, &s.stop, &s.step]
+        .iter()
+        .any(|o| !matches!(o, Object::None | Object::Int(_)))
+}
+
+/// Pre-resolve every bound of a slice to `None`/`Int`. Run *before*
+/// borrowing the target container: `__index__` reentry can execute
+/// arbitrary Python (including code that mutates the container).
+fn resolve_slice_ints(s: &PySlice) -> Result<PySlice, RuntimeError> {
+    let resolve = |o: &Object| -> Result<Object, RuntimeError> {
+        Ok(match slice_bound_index(o)? {
+            None => Object::None,
+            Some(v) => Object::Int(v),
+        })
+    };
+    Ok(PySlice {
+        start: resolve(&s.start)?,
+        stop: resolve(&s.stop)?,
+        step: resolve(&s.step)?,
+    })
+}
+
 fn apply_slice_assignment(
     data: &mut Vec<Object>,
     s: &PySlice,
     replacement: Vec<Object>,
 ) -> Result<(), RuntimeError> {
     let len = data.len() as i64;
-    let step = match &s.step {
-        Object::None => 1i64,
-        Object::Int(i) => *i,
-        _ => return Err(type_error("slice indices must be integers or None")),
+    let step = match slice_bound_index(&s.step)? {
+        None => 1i64,
+        Some(v) => v,
     };
     if step == 0 {
         return Err(value_error("slice step cannot be zero"));
     }
-    let extract = |o: &Object, default: i64| -> Result<i64, RuntimeError> {
-        match o {
-            Object::None => Ok(default),
-            Object::Int(i) => Ok(*i),
-            _ => Err(type_error("slice indices must be integers or None")),
-        }
-    };
-    let start_raw = extract(&s.start, if step > 0 { 0 } else { len - 1 })?;
-    let stop_raw = extract(&s.stop, if step > 0 { len } else { -1 })?;
+    let start_raw =
+        slice_bound_index(&s.start)?.unwrap_or(if step > 0 { 0 } else { len - 1 });
+    let stop_raw = slice_bound_index(&s.stop)?.unwrap_or(if step > 0 { len } else { -1 });
     let norm = |x: i64| -> i64 {
         if x < 0 {
             ((x + len).max(0)).min(len)
@@ -16463,6 +17135,16 @@ pub(crate) fn percent_format_with(
     let positional: Vec<Object> = match value {
         Object::Tuple(items) => items.to_vec(),
         Object::Dict(_) => Vec::new(),
+        // A *tuple subclass* spreads as the argument pack too (CPython
+        // PyTuple_Check) — namedtuple's `repr_fmt % self` depends on it.
+        Object::Instance(_)
+            if matches!(value.native_value(), Some(Object::Tuple(_))) =>
+        {
+            match value.native_value() {
+                Some(Object::Tuple(items)) => items.to_vec(),
+                _ => unreachable!(),
+            }
+        }
         other => vec![other.clone()],
     };
     while i < bytes.len() {
@@ -16576,13 +17258,35 @@ pub(crate) fn percent_format_with(
                 continue;
             }
             let item = if let Some(k) = mapping_key {
-                match value {
-                    Object::Dict(d) => d
+                // In bytes mode the mapping is keyed by *bytes* (the raw
+                // template slice, latin-1); in str mode by text.
+                let key_obj = match mode {
+                    PercentMode::Bytes => {
+                        Object::new_bytes(k.chars().map(|c| c as u8).collect::<Vec<u8>>())
+                    }
+                    PercentMode::Str => Object::from_str(&k),
+                };
+                // Unwrap dict subclasses to their payload (CPython only
+                // needs `mp_subscript` here).
+                let native;
+                let mapping = match value {
+                    Object::Dict(d) => Some(d),
+                    Object::Instance(_) => match value.native_value() {
+                        Some(Object::Dict(d)) => {
+                            native = d;
+                            Some(&native)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match mapping {
+                    Some(d) => d
                         .borrow()
-                        .get(&DictKey(Object::from_str(&k)))
+                        .get(&DictKey(key_obj.clone()))
                         .cloned()
-                        .ok_or_else(|| key_error(format!("'{k}'")))?,
-                    _ => return Err(type_error("format requires a mapping")),
+                        .ok_or_else(|| key_error(key_obj.repr()))?,
+                    None => return Err(type_error("format requires a mapping")),
                 }
             } else {
                 let v = positional
@@ -16695,9 +17399,11 @@ pub(crate) fn percent_format_with(
                         },
                         _ if percent_is_real(&item) => item.clone(),
                         _ => {
+                            // gh-130928: `%i` reports as `%d` in the error.
+                            let kind_msg = if kind == 'i' { 'd' } else { kind };
                             return Err(type_error(format!(
-                                "%{kind} format: a real number is required, not {}",
-                                item.type_name()
+                                "%{kind_msg} format: a real number is required, not {}",
+                                item.type_name_owned()
                             )))
                         }
                     };
@@ -16709,7 +17415,7 @@ pub(crate) fn percent_format_with(
                     if !percent_is_int(&item) {
                         return Err(type_error(format!(
                             "%{kind} format: an integer is required, not {}",
-                            item.type_name()
+                            item.type_name_owned()
                         )));
                     }
                     format_via_spec_percent(&item, &spec)?
@@ -16719,10 +17425,10 @@ pub(crate) fn percent_format_with(
                         return Err(type_error(match mode {
                             PercentMode::Bytes => format!(
                                 "float argument required, not {}",
-                                item.type_name()
+                                item.type_name_owned()
                             ),
                             PercentMode::Str => {
-                                format!("must be real number, not {}", item.type_name())
+                                format!("must be real number, not {}", item.type_name_owned())
                             }
                         }));
                     }
@@ -17952,7 +18658,12 @@ fn detect_yield_from_subiter(frame: &Frame) -> Option<Object> {
         Object::Generator(_)
         | Object::Coroutine(_)
         | Object::AsyncGenerator(_)
+        | Object::AsyncGenAwait(_)
         | Object::Iter(_) => Some(top.clone()),
+        // A custom awaitable (`__await__` returning its own iterator,
+        // e.g. coroutine_wrapper or types.coroutine's wrapper): SEND
+        // delegates to it, so throw/close delegate too.
+        Object::Instance(_) => Some(top.clone()),
         _ => None,
     }
 }
@@ -18131,7 +18842,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::from_str(out))
         }
         (O::Str(x), O::Int(n), B::Mult) | (O::Int(n), O::Str(x), B::Mult) => {
-            let times = if *n < 0 { 0 } else { *n as usize };
+            let times = checked_repeat_count(x.len(), *n, "string")?;
             let mut out = String::with_capacity(x.len() * times);
             for _ in 0..times {
                 out.push_str(x);
@@ -18185,7 +18896,12 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::new_bytes(out))
         }
         (O::Bytes(x), O::Int(n), B::Mult) | (O::Int(n), O::Bytes(x), B::Mult) => {
-            let times = if *n < 0 { 0 } else { *n as usize };
+            // `b * 1` returns the operand itself — bytes are immutable, so
+            // CPython shares the object (`test_repeat_id_preserving`).
+            if *n == 1 {
+                return Ok(Object::Bytes(x.clone()));
+            }
+            let times = checked_repeat_count(x.len(), *n, "bytes")?;
             let mut out = Vec::with_capacity(x.len() * times);
             for _ in 0..times {
                 out.extend_from_slice(x);
@@ -18193,8 +18909,8 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::new_bytes(out))
         }
         (O::ByteArray(x), O::Int(n), B::Mult) | (O::Int(n), O::ByteArray(x), B::Mult) => {
-            let times = if *n < 0 { 0 } else { *n as usize };
             let body = x.borrow().clone();
+            let times = checked_repeat_count(body.len(), *n, "bytes")?;
             let mut out = Vec::with_capacity(body.len() * times);
             for _ in 0..times {
                 out.extend_from_slice(&body);
@@ -18205,6 +18921,15 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         (O::Set(a), O::Set(b), B::BitAnd) => Ok(intersect_sets(&a.borrow(), &b.borrow())),
         (O::Set(a), O::Set(b), B::Sub) => Ok(difference_sets(&a.borrow(), &b.borrow())),
         (O::Set(a), O::Set(b), B::BitXor) => Ok(symmetric_diff_sets(&a.borrow(), &b.borrow())),
+
+        // PEP 584 — `dict | dict` merges left-to-right into a new dict.
+        (O::Dict(x), O::Dict(y), B::BitOr) => {
+            let mut out = x.borrow().clone();
+            for (k, v) in y.borrow().iter() {
+                out.insert(k.clone(), v.clone());
+            }
+            Ok(Object::Dict(Rc::new(RefCell::new(out))))
+        }
         (O::FrozenSet(a), O::FrozenSet(b), B::BitOr) => Ok(union_sets(a, b)),
         (O::FrozenSet(a), O::FrozenSet(b), B::BitAnd) => Ok(intersect_sets(a, b)),
         (O::FrozenSet(a), O::FrozenSet(b), B::Sub) => Ok(difference_sets(a, b)),
@@ -18216,8 +18941,8 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::new_list(out))
         }
         (O::List(x), O::Int(n), B::Mult) | (O::Int(n), O::List(x), B::Mult) => {
-            let times = if *n < 0 { 0 } else { *n as usize };
             let body = x.borrow().clone();
+            let times = checked_repeat_count(body.len(), *n, "list")?;
             let mut out = Vec::with_capacity(body.len() * times);
             for _ in 0..times {
                 out.extend(body.iter().cloned());
@@ -18227,6 +18952,14 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         (O::Tuple(x), O::Tuple(y), B::Add) => {
             let mut out: Vec<Object> = x.iter().cloned().collect();
             out.extend(y.iter().cloned());
+            Ok(Object::new_tuple(out))
+        }
+        (O::Tuple(x), O::Int(n), B::Mult) | (O::Int(n), O::Tuple(x), B::Mult) => {
+            let times = checked_repeat_count(x.len(), *n, "tuple")?;
+            let mut out: Vec<Object> = Vec::with_capacity(x.len() * times);
+            for _ in 0..times {
+                out.extend(x.iter().cloned());
+            }
             Ok(Object::new_tuple(out))
         }
 
@@ -18250,6 +18983,23 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             op.as_str(),
             a.type_name_owned(),
             b.type_name_owned()
+        ))),
+    }
+}
+
+/// Validate a sequence-repeat count before allocating: CPython raises
+/// `OverflowError` when `len * n` exceeds `PY_SSIZE_T_MAX` (e.g.
+/// `b"abc" * sys.maxsize`) — without this, `Vec::with_capacity` aborts
+/// the whole process on allocation failure.
+fn checked_repeat_count(item_len: usize, n: i64, what: &str) -> Result<usize, RuntimeError> {
+    let times = if n < 0 { 0 } else { n as usize };
+    if item_len == 0 {
+        return Ok(times.min(1));
+    }
+    match item_len.checked_mul(times) {
+        Some(total) if total <= isize::MAX as usize => Ok(times),
+        _ => Err(crate::error::overflow_error(format!(
+            "repeated {what} is too long"
         ))),
     }
 }

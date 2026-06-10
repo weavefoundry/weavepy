@@ -241,11 +241,43 @@ fn install_proxy_forwarding(td: &mut DictData) {
         let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
         proxy_forward_via_builtin("str", &target)
     }
+    fn fwd_setattr(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        let name = match args.get(1) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => return Err(type_error("attribute name must be string")),
+        };
+        let value = args
+            .get(2)
+            .cloned()
+            .ok_or_else(|| type_error("__setattr__ expected 2 arguments"))?;
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| type_error("no running interpreter"))?;
+        // SAFETY: published by an enclosing VM frame on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.store_attr_public(&target, &name, value)?;
+        Ok(Object::None)
+    }
+    fn fwd_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        let name = match args.get(1) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => return Err(type_error("attribute name must be string")),
+        };
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| type_error("no running interpreter"))?;
+        // SAFETY: published by an enclosing VM frame on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.delete_attr_public(&target, &name)?;
+        Ok(Object::None)
+    }
     for (name, f) in [
         (
             "__getattr__",
             fwd_getattr as fn(&[Object]) -> Result<Object, RuntimeError>,
         ),
+        ("__setattr__", fwd_setattr),
+        ("__delattr__", fwd_delattr),
         ("__iter__", fwd_iter),
         ("__next__", fwd_next),
         ("__len__", fwd_len),
