@@ -34,6 +34,7 @@ const CO_VARARGS: u32 = 0x0004;
 const CO_VARKEYWORDS: u32 = 0x0008;
 const CO_GENERATOR: u32 = 0x0020;
 const CO_COROUTINE: u32 = 0x0080;
+const CO_ITERABLE_COROUTINE: u32 = 0x0100;
 const CO_ASYNC_GENERATOR: u32 = 0x0200;
 
 #[allow(dead_code)]
@@ -369,6 +370,9 @@ fn code_flags(co: &CodeObject) -> u32 {
     if co.is_coroutine {
         f |= CO_COROUTINE;
     }
+    if co.is_iterable_coroutine {
+        f |= CO_ITERABLE_COROUTINE;
+    }
     if co.is_async_generator {
         f |= CO_ASYNC_GENERATOR;
     }
@@ -477,7 +481,7 @@ impl<'a> MarshalReader<'a> {
             TYPE_NONE => Ok(Object::None),
             TYPE_TRUE => Ok(Object::Bool(true)),
             TYPE_FALSE => Ok(Object::Bool(false)),
-            TYPE_ELLIPSIS => Ok(Object::None), // Ellipsis singleton not modelled separately yet.
+            TYPE_ELLIPSIS => Ok(crate::vm_singletons::ellipsis()),
             TYPE_INT => {
                 let v = self.read_int()?;
                 Ok(Object::Int(i64::from(v)))
@@ -675,6 +679,7 @@ impl<'a> MarshalReader<'a> {
             is_generator: flags & CO_GENERATOR != 0,
             is_coroutine: flags & CO_COROUTINE != 0,
             is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
+            is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
         };
         Ok(Object::Code(Rc::new(co)))
     }

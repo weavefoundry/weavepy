@@ -78,7 +78,8 @@ __all__ = [
 ]
 
 
-# Code-object flags. Keep in sync with weavepy-compiler/src/code.rs.
+# Code-object flags — CPython's values (keep in sync with
+# `code_flags` in weavepy-vm/src/builtins.rs).
 CO_OPTIMIZED = 0x0001
 CO_NEWLOCALS = 0x0002
 CO_VARARGS = 0x0004
@@ -86,9 +87,9 @@ CO_VARKEYWORDS = 0x0008
 CO_NESTED = 0x0010
 CO_GENERATOR = 0x0020
 CO_NOFREE = 0x0040
-CO_COROUTINE = 0x0100
-CO_ITERABLE_COROUTINE = 0x0200
-CO_ASYNC_GENERATOR = 0x0400
+CO_COROUTINE = 0x0080
+CO_ITERABLE_COROUTINE = 0x0100
+CO_ASYNC_GENERATOR = 0x0200
 
 
 def _safe_type_name(t):
@@ -304,6 +305,86 @@ def isasyncgenfunction(obj):
 
 def istraceback(obj):
     return type(obj).__name__ == "traceback"
+
+
+GEN_CREATED = 'GEN_CREATED'
+GEN_RUNNING = 'GEN_RUNNING'
+GEN_SUSPENDED = 'GEN_SUSPENDED'
+GEN_CLOSED = 'GEN_CLOSED'
+
+
+def getgeneratorstate(generator):
+    """Get current state of a generator-iterator."""
+    if generator.gi_running:
+        return GEN_RUNNING
+    if generator.gi_suspended:
+        return GEN_SUSPENDED
+    if generator.gi_frame is None:
+        return GEN_CLOSED
+    return GEN_CREATED
+
+
+CORO_CREATED = 'CORO_CREATED'
+CORO_RUNNING = 'CORO_RUNNING'
+CORO_SUSPENDED = 'CORO_SUSPENDED'
+CORO_CLOSED = 'CORO_CLOSED'
+
+
+def getcoroutinestate(coroutine):
+    """Get current state of a coroutine."""
+    if coroutine.cr_running:
+        return CORO_RUNNING
+    if coroutine.cr_suspended:
+        return CORO_SUSPENDED
+    if coroutine.cr_frame is None:
+        return CORO_CLOSED
+    return CORO_CREATED
+
+
+AGEN_CREATED = 'AGEN_CREATED'
+AGEN_RUNNING = 'AGEN_RUNNING'
+AGEN_SUSPENDED = 'AGEN_SUSPENDED'
+AGEN_CLOSED = 'AGEN_CLOSED'
+
+
+def getasyncgenstate(agen):
+    """Get current state of an asynchronous generator."""
+    if agen.ag_running:
+        return AGEN_RUNNING
+    if agen.ag_suspended:
+        return AGEN_SUSPENDED
+    if agen.ag_frame is None:
+        return AGEN_CLOSED
+    return AGEN_CREATED
+
+
+def getgeneratorlocals(generator):
+    """Get the mapping of generator local variables to their current values."""
+    if not isgenerator(generator):
+        raise TypeError("{!r} is not a Python generator".format(generator))
+    frame = getattr(generator, "gi_frame", None)
+    if frame is not None:
+        return generator.gi_frame.f_locals
+    return {}
+
+
+def getcoroutinelocals(coroutine):
+    """Get the mapping of coroutine local variables to their current values."""
+    frame = getattr(coroutine, "cr_frame", None)
+    if frame is not None:
+        return frame.f_locals
+    return {}
+
+
+def getasyncgenlocals(agen):
+    """Get the mapping of asynchronous generator local variables to their
+    current values."""
+    if not isasyncgen(agen):
+        raise TypeError(f"{agen!r} is not a Python async generator")
+    frame = getattr(agen, "ag_frame", None)
+    if frame is not None:
+        return agen.ag_frame.f_locals
+    return {}
 
 
 def isframe(obj):

@@ -298,7 +298,7 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
         O::Slice(_) => PySlice_Type.as_ptr(),
         O::Type(t) => find_type_ptr(t).unwrap_or_else(|| PyType_Type.as_ptr()),
         O::Instance(inst) => {
-            find_type_ptr(&inst.class).unwrap_or_else(|| PyBaseObject_Type.as_ptr())
+            find_type_ptr(&inst.cls()).unwrap_or_else(|| PyBaseObject_Type.as_ptr())
         }
         _ => PyBaseObject_Type.as_ptr(),
     }

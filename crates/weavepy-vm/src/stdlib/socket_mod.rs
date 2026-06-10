@@ -420,7 +420,7 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
 
 fn extract_self(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
     match args.first() {
-        Some(Object::Instance(inst)) if inst.class.name == "socket" => Ok(inst.clone()),
+        Some(Object::Instance(inst)) if inst.cls().name == "socket" => Ok(inst.clone()),
         _ => Err(type_error("socket method requires socket self")),
     }
 }

@@ -165,15 +165,107 @@ fn ref_type() -> Rc<TypeObject> {
     })
 }
 
+/// Dereference a proxy instance, raising `ReferenceError` once the
+/// referent has been collected — CPython's `proxy_checkref`.
+fn proxy_target(me: &Object) -> Result<Object, RuntimeError> {
+    if let Object::Instance(inst) = me {
+        let getter = inst
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__weakref_get__")))
+            .cloned();
+        if let Some(Object::Builtin(b)) = getter {
+            let t = (b.call)(&[])?;
+            if !matches!(t, Object::None) {
+                return Ok(t);
+            }
+            let bt = crate::builtin_types::builtin_types();
+            let inst = crate::builtin_types::make_exception_with_class(
+                bt.reference_error.clone(),
+                "weakly-referenced object no longer exists",
+            );
+            return Err(RuntimeError::PyException(crate::error::PyException::new(
+                inst,
+            )));
+        }
+    }
+    Err(type_error("expected a weak proxy"))
+}
+
+/// Forward an operation to the referent by calling the named builtin
+/// (`iter`, `next`, `len`, …) on it through the live interpreter.
+fn proxy_forward_via_builtin(
+    builtin: &'static str,
+    target: &Object,
+) -> Result<Object, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| type_error("no running interpreter"))?;
+    // SAFETY: published by an enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    let f = globals
+        .borrow()
+        .get(&DictKey(Object::from_static(builtin)))
+        .cloned()
+        .ok_or_else(|| type_error(format!("builtin {builtin} unavailable")))?;
+    interp.call_object_with_globals(&f, std::slice::from_ref(target), &[], &globals)
+}
+
+/// The shared forwarding dunders for both proxy flavours.
+fn install_proxy_forwarding(td: &mut DictData) {
+    fn fwd_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        let name = match args.get(1) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => return Err(type_error("attribute name must be string")),
+        };
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| type_error("no running interpreter"))?;
+        // SAFETY: published by an enclosing VM frame on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.load_attr_public(&target, &name)
+    }
+    fn fwd_iter(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        proxy_forward_via_builtin("iter", &target)
+    }
+    fn fwd_next(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        proxy_forward_via_builtin("next", &target)
+    }
+    fn fwd_len(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        proxy_forward_via_builtin("len", &target)
+    }
+    fn fwd_str(args: &[Object]) -> Result<Object, RuntimeError> {
+        let target = proxy_target(args.first().ok_or_else(|| type_error("missing self"))?)?;
+        proxy_forward_via_builtin("str", &target)
+    }
+    for (name, f) in [
+        (
+            "__getattr__",
+            fwd_getattr as fn(&[Object]) -> Result<Object, RuntimeError>,
+        ),
+        ("__iter__", fwd_iter),
+        ("__next__", fwd_next),
+        ("__len__", fwd_len),
+        ("__str__", fwd_str),
+    ] {
+        td.insert(DictKey(Object::from_static(name)), b(name, f));
+    }
+}
+
 fn proxy_type() -> Rc<TypeObject> {
     PROXY_TYPE.with(|cell| {
         if let Some(t) = cell.borrow().clone() {
             return t;
         }
+        let mut td = DictData::new();
+        install_proxy_forwarding(&mut td);
         let t = TypeObject::new_with_flags(
             "weakproxy",
             vec![crate::builtin_types::builtin_types().object_.clone()],
-            DictData::new(),
+            td,
             TypeFlags {
                 is_exception: false,
                 is_builtin: true,
@@ -190,10 +282,12 @@ fn callable_proxy_type() -> Rc<TypeObject> {
         if let Some(t) = cell.borrow().clone() {
             return t;
         }
+        let mut td = DictData::new();
+        install_proxy_forwarding(&mut td);
         let t = TypeObject::new_with_flags(
             "weakcallableproxy",
             vec![crate::builtin_types::builtin_types().object_.clone()],
-            DictData::new(),
+            td,
             TypeFlags {
                 is_exception: false,
                 is_builtin: true,
@@ -335,7 +429,7 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
     }
 
     Object::Instance(Rc::new(PyInstance {
-        class,
+        class: crate::sync::RefCell::new(class),
         dict,
         native: None,
         inline_values: crate::sync::Cell::new(true),

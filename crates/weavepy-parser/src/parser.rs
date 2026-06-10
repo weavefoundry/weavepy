@@ -2261,6 +2261,15 @@ impl<'src> Parser<'src> {
         // matching CPython.
         if self.at_keyword(Keyword::Await) {
             let kw = self.bump();
+            // CPython grammar: `await_primary: AWAIT primary` — a
+            // directly chained `await await x` is invalid syntax
+            // (`await (await x)` is fine: the parens make a primary).
+            if self.at_keyword(Keyword::Await) {
+                return Err(ParseError::Unexpected {
+                    span: kw.span,
+                    message: "invalid syntax".to_owned(),
+                });
+            }
             let operand = self.parse_unary()?;
             let span = kw.span.merge(operand.span);
             return Ok(Expr {

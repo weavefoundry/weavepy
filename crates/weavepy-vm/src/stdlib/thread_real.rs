@@ -275,7 +275,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         );
     }
     let inst = Rc::new(PyInstance {
-        class: lock_type(),
+        class: crate::sync::RefCell::new(lock_type()),
         dict,
         native: None,
         inline_values: crate::sync::Cell::new(true),
@@ -376,7 +376,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         );
     }
     let inst = Rc::new(PyInstance {
-        class: rlock_type(),
+        class: crate::sync::RefCell::new(rlock_type()),
         dict,
         native: None,
         inline_values: crate::sync::Cell::new(true),
@@ -577,7 +577,7 @@ fn is_system_exit(err: &RuntimeError) -> bool {
     let RuntimeError::PyException(exc) = err else {
         return false;
     };
-    matches!(&exc.instance, Object::Instance(inst) if inst.class.name == "SystemExit")
+    matches!(&exc.instance, Object::Instance(inst) if inst.cls().name == "SystemExit")
 }
 
 /// Run `threading.excepthook` (if installed) with the worker's
@@ -614,7 +614,7 @@ fn invoke_threading_excepthook(
     // `threading.py` accepts a simple tuple-with-attribute shim,
     // which we materialise here as a `SimpleNamespace`.
     let exc_type = match &exc.instance {
-        Object::Instance(inst) => Object::Type(inst.class.clone()),
+        Object::Instance(inst) => Object::Type(inst.cls()),
         _ => Object::None,
     };
     let mut ns = DictData::new();
@@ -663,7 +663,7 @@ mod tests {
         let l = allocate_lock(&[]).unwrap();
         match l {
             Object::Instance(inst) => {
-                assert_eq!(inst.class.name, "lock");
+                assert_eq!(inst.cls().name, "lock");
             }
             _ => panic!("expected Object::Instance"),
         }

@@ -294,9 +294,21 @@ class OrderedDict(_MappingMixin):
 class defaultdict(_MappingMixin):
     """Dict that creates missing values via a ``default_factory``."""
 
-    def __init__(self, default_factory=None):
+    def __init__(self, default_factory=None, *args, **kwargs):
+        if default_factory is not None and not callable(default_factory):
+            raise TypeError("first argument must be callable or None")
         _MappingMixin.__init__(self)
         self.default_factory = default_factory
+        if args:
+            src = args[0]
+            if hasattr(src, "keys"):
+                for k in src.keys():
+                    self[k] = src[k]
+            else:
+                for k, v in src:
+                    self[k] = v
+        for k, v in kwargs.items():
+            self[k] = v
 
     def __getitem__(self, key):
         if key in self._data:

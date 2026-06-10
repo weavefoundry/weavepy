@@ -497,7 +497,7 @@ pub unsafe extern "C" fn _WeavePy_Format_Set(ty: *mut PyObject, msg: *const c_ch
     } else {
         match unsafe { crate::object::clone_object(ty) } {
             Object::Type(t) => Some(t),
-            Object::Instance(inst) => Some(inst.class.clone()),
+            Object::Instance(inst) => Some(inst.cls()),
             _ => None,
         }
     };

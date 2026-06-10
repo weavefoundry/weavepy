@@ -448,6 +448,15 @@ impl GcState {
             handle.color.store(color::White, Ordering::Release);
         }
 
+        // Index the candidate set by id so the per-child lookups in
+        // phases 3 and 4 are O(1) — a linear `find` here makes the
+        // whole collection quadratic, which generator-heavy programs
+        // (itertools pipelines) hit hard.
+        let by_id: std::collections::HashMap<ObjectId, Arc<TrackedHandle>> = candidate_set
+            .iter()
+            .map(|h| (h.id, h.clone()))
+            .collect();
+
         // Phase 3: subtract internal refs by walking each
         // tracked object's children. Self-references count too —
         // a `self.self = self` instance has one internal ref to
@@ -455,7 +464,7 @@ impl GcState {
         // collapses to gc_refs == 0.
         for handle in &candidate_set {
             traverse_object(&handle.object, &mut |child| {
-                if let Some(target) = candidate_set.iter().find(|h| h.id == id_of(child)) {
+                if let Some(target) = by_id.get(&id_of(child)) {
                     target.gc_refs.fetch_sub(1, Ordering::AcqRel);
                 }
             });
@@ -473,7 +482,7 @@ impl GcState {
         while let Some(h) = grey.pop() {
             h.color.store(color::Black, Ordering::Release);
             traverse_object(&h.object, &mut |child| {
-                if let Some(target) = candidate_set.iter().find(|t| t.id == id_of(child)) {
+                if let Some(target) = by_id.get(&id_of(child)) {
                     if target.color.load(Ordering::Acquire) == color::White {
                         target.color.store(color::Grey, Ordering::Release);
                         grey.push(target.clone());
@@ -779,6 +788,14 @@ pub fn clear_object_fields(obj: &Object) {
         Object::Cell(c) => {
             *c.borrow_mut() = Object::None;
         }
+        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+            // Dropping the suspended frame box breaks the cycle
+            // (the finalizer — close() — has already run by the
+            // time clear is reached; see collect phase 5c).
+            if let Ok(mut st) = g.state.try_borrow_mut() {
+                *st = crate::object::GeneratorState::Finished;
+            }
+        }
         _ => {}
     }
 }
@@ -794,12 +811,17 @@ fn run_finalizer(obj: &Object) {
     }
 }
 
-/// True iff `obj`'s class defines `__del__`.
+/// True iff `obj` needs finalization when it becomes garbage:
+/// instances whose class defines `__del__`, and generator-family
+/// objects that haven't finished (closing them runs `finally`
+/// blocks — CPython's `gen_dealloc` behavior).
 fn has_finalizer(obj: &Object) -> bool {
-    if let Object::Instance(inst) = obj {
-        inst.class.lookup("__del__").is_some()
-    } else {
-        false
+    match obj {
+        Object::Instance(inst) => inst.cls().lookup("__del__").is_some(),
+        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+            !g.is_finished()
+        }
+        _ => false,
     }
 }
 
@@ -817,6 +839,39 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 /// Convenience: track `obj` in the current thread's GC.
 pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
+}
+
+/// Convenience: find a tracked handle by object id (scans all
+/// generations plus the frozen set).
+pub fn find_handle(id: ObjectId) -> Option<Arc<TrackedHandle>> {
+    with_state(|s| {
+        {
+            let gens = s.generations.borrow();
+            for g in gens.iter() {
+                if let Some(h) = g.handles.iter().find(|h| h.id == id) {
+                    return Some(h.clone());
+                }
+            }
+        }
+        s.frozen.borrow().iter().find(|h| h.id == id).cloned()
+    })
+}
+
+/// Convenience: is `id` currently tracked by the cycle GC? Used
+/// by refcount-emulation paths to discount the registry's own
+/// strong handle.
+pub fn is_tracked(id: ObjectId) -> bool {
+    find_handle(id).is_some()
+}
+
+/// Convenience: claim `id`'s finalizer (so a later collection
+/// won't double-run `__del__`). Returns false if it was already
+/// claimed or the object isn't tracked.
+pub fn mark_finalized(id: ObjectId) -> bool {
+    match find_handle(id) {
+        Some(h) => !h.finalized.swap(true, Ordering::AcqRel),
+        None => false,
+    }
 }
 
 /// Convenience: snapshot all tracked objects with an unrun `__del__`

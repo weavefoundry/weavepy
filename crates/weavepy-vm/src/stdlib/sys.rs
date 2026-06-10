@@ -789,7 +789,7 @@ fn sys_exc_info(
     if let Some(top) = stack.last() {
         let inst = top.instance.clone();
         let type_obj = match &inst {
-            Object::Instance(i) => Object::Type(i.class.clone()),
+            Object::Instance(i) => Object::Type(i.cls()),
             _ => Object::None,
         };
         let tb = match &inst {
@@ -820,7 +820,7 @@ fn sys_default_excepthook(args: &[Object]) -> Result<Object, RuntimeError> {
     // from inside `except:` and the user hook is `None`.
     let value = args.get(1).cloned().unwrap_or(Object::None);
     let kind = match &value {
-        Object::Instance(i) => i.class.name.clone(),
+        Object::Instance(i) => i.cls().name.clone(),
         _ => "Exception".to_owned(),
     };
     let msg = crate::builtin_types::exception_message(&value).unwrap_or_default();
@@ -1359,17 +1359,24 @@ fn stdlib_module_names_value() -> Object {
     Object::FrozenSet(Rc::new(set))
 }
 
-/// `sys.getrefcount(obj)` — best-effort. Always returns a
-/// non-zero value to satisfy `assert sys.getrefcount(x) > 0`-
-/// style sanity checks. The exact number is implementation-
-/// specific even in CPython.
+/// `sys.getrefcount(obj)` — best-effort, derived from the real
+/// `Rc::strong_count` of the payload. Infrastructure references
+/// (the cycle-GC registry's handle, weakref slots' strong clones)
+/// are discounted so the number tracks *program-visible* bindings;
+/// `+1` accounts for the argument reference, like CPython. The
+/// exact number is implementation-specific even in CPython.
 fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
+    let Some(obj) = args.first() else {
         return Err(type_error("getrefcount() takes exactly 1 argument"));
-    }
-    // Two is what CPython returns for a freshly-bound name: the
-    // local + the argument.
-    Ok(Object::Int(2))
+    };
+    let strong = crate::gc_trace::strong_count_for(obj);
+    let id = crate::weakref_registry::id_of(obj);
+    let registry = usize::from(crate::gc_trace::is_tracked(id));
+    let weak_clones = crate::weakref_registry::strong_clone_count(id);
+    // The clone in our `args` slice plays the role of CPython's
+    // "+1 for the argument reference" — no extra increment needed.
+    let visible = strong.saturating_sub(registry).saturating_sub(weak_clones);
+    Ok(Object::Int(visible.max(1) as i64))
 }
 
 /// Default `sys.displayhook`: if the value is None do nothing,

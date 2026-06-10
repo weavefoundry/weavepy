@@ -155,17 +155,57 @@ class StackSummary:
     def append(self, frame):
         self._frames.append(frame)
 
+    def extend(self, frames):
+        self._frames.extend(frames)
+
+    def insert(self, index, frame):
+        self._frames.insert(index, frame)
+
+    def pop(self, index=-1):
+        return self._frames.pop(index)
+
+    def remove(self, frame):
+        self._frames.remove(frame)
+
+    def reverse(self):
+        self._frames.reverse()
+
+    def count(self, frame):
+        return self._frames.count(frame)
+
+    def index(self, frame, *args):
+        return self._frames.index(frame, *args)
+
     def __len__(self):
         return len(self._frames)
 
     def __iter__(self):
         return iter(self._frames)
 
+    def __reversed__(self):
+        return reversed(self._frames)
+
+    def __contains__(self, frame):
+        return frame in self._frames
+
     def __getitem__(self, index):
         return self._frames[index]
 
+    def __setitem__(self, index, value):
+        self._frames[index] = value
+
+    def __delitem__(self, index):
+        del self._frames[index]
+
     def __bool__(self):
         return bool(self._frames)
+
+    def __eq__(self, other):
+        if isinstance(other, StackSummary):
+            return self._frames == other._frames
+        if isinstance(other, list):
+            return self._frames == other
+        return NotImplemented
 
     @classmethod
     def extract(cls, frame_gen, *, limit=None, lookup_lines=True, capture_locals=False):

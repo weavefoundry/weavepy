@@ -31,6 +31,11 @@ pub struct PyException {
     pub context: Option<Box<PyException>>,
     /// Explicit chaining via `raise X from Y`.
     pub cause: Option<Box<PyException>>,
+    /// One-shot marker set by a bare `raise` / `RERAISE`: the *next*
+    /// frame-level unwind must not add a traceback entry (CPython
+    /// re-raises preserve the original traceback — the re-raise
+    /// location is not recorded).
+    pub suppress_tb_once: bool,
 }
 
 impl PyException {
@@ -40,6 +45,7 @@ impl PyException {
             traceback: Vec::new(),
             context: None,
             cause: None,
+            suppress_tb_once: false,
         }
     }
 
@@ -54,7 +60,7 @@ impl PyException {
     /// The class name of the wrapped instance.
     pub fn type_name(&self) -> String {
         match &self.instance {
-            Object::Instance(inst) => inst.class.name.clone(),
+            Object::Instance(inst) => inst.cls().name.clone(),
             _ => "BaseException".to_owned(),
         }
     }
@@ -104,7 +110,7 @@ impl PyException {
             return None;
         };
         if !inst
-            .class
+            .cls()
             .is_subclass_of(&crate::builtin_types::builtin_types().system_exit)
         {
             return None;

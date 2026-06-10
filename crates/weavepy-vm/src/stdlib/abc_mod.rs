@@ -113,7 +113,7 @@ fn abc_instancecheck(args: &[Object]) -> Result<Object, RuntimeError> {
     let cls = args.first().cloned().unwrap_or(Object::None);
     let inst = args.get(1).cloned().unwrap_or(Object::None);
     if let (Object::Type(t), Object::Instance(i)) = (&cls, &inst) {
-        if i.class.is_subclass_of(t) {
+        if i.cls().is_subclass_of(t) {
             return Ok(Object::Bool(true));
         }
         if let Some(Object::Set(reg)) = t
@@ -124,7 +124,7 @@ fn abc_instancecheck(args: &[Object]) -> Result<Object, RuntimeError> {
         {
             for entry in reg.borrow().iter() {
                 if let Object::Type(et) = &entry.0 {
-                    if i.class.is_subclass_of(et) {
+                    if i.cls().is_subclass_of(et) {
                         return Ok(Object::Bool(true));
                     }
                 }

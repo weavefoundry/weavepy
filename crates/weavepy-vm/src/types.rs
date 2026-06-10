@@ -107,9 +107,17 @@ impl TypeObject {
     pub fn new_user(
         name: &str,
         bases: Vec<Rc<TypeObject>>,
-        dict: DictData,
+        mut dict: DictData,
     ) -> Result<Rc<Self>, RuntimeError> {
         let is_exception = bases.iter().any(|b| b.flags.is_exception);
+        // CPython `type_new`: a class that defines `__eq__` without
+        // defining `__hash__` is unhashable (`__hash__` is set to None
+        // in the new class's dict).
+        if dict.contains_key(&DictKey(Object::from_static("__eq__")))
+            && !dict.contains_key(&DictKey(Object::from_static("__hash__")))
+        {
+            dict.insert(DictKey(Object::from_static("__hash__")), Object::None);
+        }
         Self::new_with_flags(
             name,
             bases,
@@ -164,6 +172,18 @@ impl TypeObject {
             t.flags.is_builtin
                 && matches!(t.name.as_str(), "int" | "tuple" | "str" | "bytes" | "type")
         })
+    }
+
+    /// The first built-in class in the MRO other than `object` — the
+    /// moral equivalent of CPython's `solid_base`, which determines
+    /// instance memory layout for `__class__` assignment checks.
+    /// `None` for plain `object`-rooted classes.
+    pub fn solid_base_name(&self) -> Option<String> {
+        self.mro
+            .borrow()
+            .iter()
+            .find(|t| t.flags.is_builtin && t.name != "object")
+            .map(|t| t.name.clone())
     }
 
     /// CPython `type.__flags__` (`tp_flags`), computed from this type's
@@ -369,7 +389,10 @@ fn compute_c3(
 /// descriptors yet; see RFC 0010).
 #[derive(Debug, Clone)]
 pub struct PyInstance {
-    pub class: Rc<TypeObject>,
+    /// The instance's type. Interior-mutable because Python permits
+    /// `obj.__class__ = OtherClass` for layout-compatible heap types;
+    /// read through [`PyInstance::cls`].
+    pub class: RefCell<Rc<TypeObject>>,
     pub dict: Rc<RefCell<DictData>>,
     /// For instances of a subclass of an immutable built-in
     /// (`int`, `str`, `float`, `bytes`, `tuple`, …) this holds the
@@ -392,7 +415,7 @@ pub struct PyInstance {
 impl PyInstance {
     pub fn new(class: Rc<TypeObject>) -> Self {
         Self {
-            class,
+            class: RefCell::new(class),
             dict: Rc::new(RefCell::new(DictData::new())),
             native: None,
             inline_values: Cell::new(true),
@@ -403,10 +426,21 @@ impl PyInstance {
     /// (subclass of `int`/`str`/…).
     pub fn with_native(class: Rc<TypeObject>, native: Object) -> Self {
         Self {
-            class,
+            class: RefCell::new(class),
             dict: Rc::new(RefCell::new(DictData::new())),
             native: Some(native),
             inline_values: Cell::new(true),
         }
+    }
+
+    /// The instance's current class (honours `__class__` assignment).
+    #[inline]
+    pub fn cls(&self) -> Rc<TypeObject> {
+        self.class.borrow().clone()
+    }
+
+    /// Re-point the instance at a new class (`obj.__class__ = C`).
+    pub fn set_cls(&self, class: Rc<TypeObject>) {
+        *self.class.borrow_mut() = class;
     }
 }

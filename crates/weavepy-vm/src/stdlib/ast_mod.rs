@@ -903,8 +903,6 @@ fn constant(c: &past::Constant) -> Object {
         C::Str(s) => Object::from_str(s.clone()),
         C::Bytes(b) => Object::new_bytes(b.clone()),
         C::Tuple(items) => Object::new_tuple(items.iter().map(constant).collect()),
-        // WeavePy models the `...` singleton as `None` (parity with the
-        // compiler's `Constant::Ellipsis` lowering).
-        C::Ellipsis => Object::None,
+        C::Ellipsis => crate::vm_singletons::ellipsis(),
     }
 }

@@ -159,7 +159,7 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
             // Walk the MRO and invoke descriptor protocol if the
             // resolved attribute is a property, classmethod, or
             // staticmethod. Mirror the VM's `LOAD_ATTR` dispatcher.
-            let raw = inst.class.lookup(key)?;
+            let raw = inst.cls().lookup(key)?;
             match &raw {
                 Object::Property(p) => {
                     let getter = p.fget.clone();
@@ -177,7 +177,7 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
                 }
                 Object::StaticMethod(inner) => Some((**inner).clone()),
                 Object::ClassMethod(inner) => {
-                    let class = Object::Type(inst.class.clone());
+                    let class = Object::Type(inst.cls());
                     Some(Object::BoundMethod(weavepy_vm::sync::Rc::new(
                         weavepy_vm::object::BoundMethod {
                             receiver: class,
@@ -495,7 +495,7 @@ fn install_runtime_error(err: RuntimeError) {
     match err {
         RuntimeError::PyException(pe) => {
             let cls = match &pe.instance {
-                Object::Instance(inst) => Some(inst.class.clone()),
+                Object::Instance(inst) => Some(inst.cls()),
                 _ => None,
             };
             crate::errors::set_pending(cls, Object::from_str(pe.message()));
@@ -644,7 +644,7 @@ pub unsafe extern "C" fn PyObject_IsInstance(o: *mut PyObject, cls: *mut PyObjec
         _ => return 0,
     };
     let actual = match &ob {
-        Object::Instance(inst) => Some(inst.class.clone()),
+        Object::Instance(inst) => Some(inst.cls()),
         Object::Type(_) => Some(weavepy_vm::builtin_types::builtin_types().type_.clone()),
         _ => weavepy_vm::builtin_types::builtin_types()
             .by_name(type_name(&ob))

@@ -28,8 +28,8 @@ const INLINE_CAPACITY: usize = 30;
 fn has_inline_values(args: &[Object]) -> Result<Object, RuntimeError> {
     let inline = match args.first() {
         Some(Object::Instance(inst)) => {
-            inst.class.has_managed_dict()
-                && !inst.class.has_var_sized_base()
+            inst.cls().has_managed_dict()
+                && !inst.cls().has_var_sized_base()
                 && inst.inline_values.get()
                 && inst.dict.borrow().len() <= INLINE_CAPACITY
         }

@@ -631,7 +631,7 @@ fn install_runtime_error(err: RuntimeError) {
     match err {
         RuntimeError::PyException(pe) => {
             let cls = match &pe.instance {
-                Object::Instance(inst) => Some(inst.class.clone()),
+                Object::Instance(inst) => Some(inst.cls()),
                 _ => None,
             };
             crate::errors::set_pending(cls, Object::from_str(pe.message()));

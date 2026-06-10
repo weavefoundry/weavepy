@@ -277,11 +277,88 @@ class DynamicClassAttribute:
 def coroutine(func):
     """Mark a generator function so it can be used with `await`.
 
-    CPython's full implementation rewires the function's flags; here we
-    simply return the function unchanged. Most generator-based
-    coroutines in modern code use ``async def`` directly.
+    Mirrors CPython's implementation: a generator function gets
+    `CO_ITERABLE_COROUTINE` set on its code (done natively); other
+    callables are wrapped so generator results are awaitable.
     """
-    return func
+    if not callable(func):
+        raise TypeError('types.coroutine() expects a callable')
+
+    co = getattr(func, '__code__', None)
+    flags = getattr(co, 'co_flags', None)
+    if flags is not None:
+        # Already a coroutine function or already marked: no-op.
+        if flags & 0x180:  # CO_COROUTINE | CO_ITERABLE_COROUTINE
+            return func
+        if flags & 0x20:  # CO_GENERATOR
+            return _weavepy_mark_iterable_coroutine(func)
+
+    import functools as _functools
+
+    @_functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        coro = func(*args, **kwargs)
+        cls_name = type(coro).__name__
+        if cls_name == 'coroutine' or (
+            getattr(coro, 'gi_code', None) is not None
+            and coro.gi_code.co_flags & 0x180
+        ):
+            return coro
+        if cls_name == 'generator':
+            return _GeneratorWrapper(coro)
+        return coro
+
+    return wrapped
+
+
+class _GeneratorWrapper:
+    """Adapt a plain generator into an awaitable (CPython types.py)."""
+
+    def __init__(self, gen):
+        self.__wrapped = gen
+        self.__isgen = type(gen).__name__ == 'generator'
+        self.__name__ = getattr(gen, '__name__', None)
+        self.__qualname__ = getattr(gen, '__qualname__', None)
+
+    def send(self, val):
+        return self.__wrapped.send(val)
+
+    def throw(self, tp, *rest):
+        return self.__wrapped.throw(tp, *rest)
+
+    def close(self):
+        return self.__wrapped.close()
+
+    @property
+    def gi_code(self):
+        return self.__wrapped.gi_code
+
+    @property
+    def gi_frame(self):
+        return self.__wrapped.gi_frame
+
+    @property
+    def gi_running(self):
+        return self.__wrapped.gi_running
+
+    @property
+    def gi_yieldfrom(self):
+        return self.__wrapped.gi_yieldfrom
+
+    cr_code = gi_code
+    cr_frame = gi_frame
+    cr_running = gi_running
+    cr_await = gi_yieldfrom
+
+    def __next__(self):
+        return next(self.__wrapped)
+
+    def __iter__(self):
+        if self.__isgen:
+            return self.__wrapped
+        return self
+
+    __await__ = __iter__
 
 
 def resolve_bases(bases):

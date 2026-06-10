@@ -46,6 +46,10 @@ pub use cpython_code::{CpythonCode, Position};
 pub enum CompileError {
     #[error("`{0}` is not a valid assignment target")]
     BadAssignmentTarget(String),
+    /// A syntax error whose message must match CPython verbatim
+    /// (doctests assert on these strings).
+    #[error("{0}")]
+    SyntaxExact(String),
     #[error("`break` outside loop")]
     BreakOutsideLoop,
     #[error("`continue` outside loop")]
@@ -128,6 +132,12 @@ pub struct CodeObject {
     /// that *also* contains `yield`. Calling such a function returns
     /// an `Object::AsyncGenerator`.
     pub is_async_generator: bool,
+    /// `True` when a generator code object was marked with
+    /// `types.coroutine` (CPython's `CO_ITERABLE_COROUTINE`). Such a
+    /// generator is accepted by `await` and may `yield from` a
+    /// coroutine. Never set by the compiler — only by the runtime
+    /// marking helper and marshal round-trips.
+    pub is_iterable_coroutine: bool,
 }
 
 /// A per-instruction source-column span (PEP-657). `col`/`end_col` are
@@ -936,8 +946,22 @@ impl Compiler {
                 self.patch_jump(skip, end);
             }
             StmtKind::Assign { targets, value } => {
-                self.compile_expr(value)?;
                 let n = targets.len();
+                for t in targets.iter() {
+                    if matches!(t.kind, ExprKind::Yield(_) | ExprKind::YieldFrom(_)) {
+                        // CPython distinguishes a bare `yield` in a chained
+                        // assignment (`x = yield = y`) from a parenthesised
+                        // sole target (`(yield x) = y`).
+                        return Err(CompileError::SyntaxExact(if n > 1 {
+                            "assignment to yield expression not possible".to_owned()
+                        } else {
+                            "cannot assign to yield expression here. Maybe you meant '==' \
+                             instead of '='?"
+                                .to_owned()
+                        }));
+                    }
+                }
+                self.compile_expr(value)?;
                 for (i, t) in targets.iter().enumerate() {
                     if i + 1 < n {
                         self.emit(OpCode::CopyTop, 0);
@@ -946,6 +970,12 @@ impl Compiler {
                 }
             }
             StmtKind::AugAssign { target, op, value } => {
+                if matches!(target.kind, ExprKind::Yield(_) | ExprKind::YieldFrom(_)) {
+                    return Err(CompileError::SyntaxExact(
+                        "'yield expression' is an illegal expression for augmented assignment"
+                            .to_owned(),
+                    ));
+                }
                 self.compile_load_target(target)?;
                 self.compile_expr(value)?;
                 self.emit(
@@ -2153,7 +2183,7 @@ impl Compiler {
                 self.emit(OpCode::LoadConst, none_idx);
                 self.emit(OpCode::LoadConst, none_idx);
                 self.emit(OpCode::Call, 3);
-                self.compile_await_dance(2);
+                self.compile_await_dance(3);
                 self.emit(OpCode::PopTop, 0);
                 Ok(())
             }
@@ -2197,11 +2227,17 @@ impl Compiler {
         for s in body {
             self.compile_stmt(s)?;
         }
-        // Else clause runs only on normal body completion.
+        let body_end = self.next_offset();
+        // Else clause runs only on normal body completion. It sits
+        // *outside* the handled range: an exception raised in `else`
+        // does not reach this statement's own `except` clauses (it
+        // still passes through `finally` via the cleanup entries
+        // registered below).
+        let orelse_start = self.next_offset();
         for s in orelse {
             self.compile_stmt(s)?;
         }
-        let body_end = self.next_offset();
+        let orelse_end = self.next_offset();
 
         // Normal-exit finally + jump to end. Falls through to the
         // finally body, then skips past the exception handlers.
@@ -2346,6 +2382,13 @@ impl Compiler {
             // Stack on entry: [exc] (pushed by dispatch loop).
             let mut next_handler_sites: Vec<u32> = Vec::new();
             let mut handler_exit_jumps: Vec<u32> = Vec::new();
+            // With a `finally`, an exception raised *inside* an except
+            // clause (match check, bind, or body — e.g. a bare
+            // `raise`) must still run the finally before propagating.
+            // We record each clause's covered range (excluding the
+            // inline finally copies) and point them at a shared
+            // cleanup block emitted after the re-raise path.
+            let mut cleanup_ranges: Vec<(u32, u32)> = Vec::new();
             // Each except clause's body lives between the body and the
             // catch-all `RERAISE` at the bottom. If a clause's `type_`
             // doesn't match we fall through to the next clause via the
@@ -2360,6 +2403,7 @@ impl Compiler {
                         self.patch_jump(site, cur);
                     }
                 }
+                let clause_start = self.next_offset();
                 match &h.type_ {
                     Some(t) => {
                         // Stack: [exc] → [exc, type] → [exc, bool]
@@ -2388,6 +2432,9 @@ impl Compiler {
                     self.compile_stmt(s)?;
                 }
                 self.emit(OpCode::PopExcept, 0);
+                if has_finally {
+                    cleanup_ranges.push((clause_start, self.next_offset()));
+                }
                 // Run finally on the matched path.
                 let saved = if pushed_finally {
                     self.finally_stack.pop()
@@ -2421,6 +2468,38 @@ impl Compiler {
                 self.finally_stack.push(f);
             }
             self.emit(OpCode::Reraise, 0);
+            // Shared finally-cleanup block for exceptions escaping an
+            // except clause or the `else` body. Reached only through
+            // the exception-table entries registered below; normal
+            // flow jumps past it (handler exits patch to `end`).
+            if has_finally {
+                let cleanup_start = self.next_offset();
+                let cleanup_push = self.emit(OpCode::PushExcInfo, 0);
+                let saved = self.finally_stack.pop();
+                for s in finalbody {
+                    self.compile_stmt(s)?;
+                }
+                if let Some(f) = saved {
+                    self.finally_stack.push(f);
+                }
+                self.emit(OpCode::Reraise, 0);
+                let cleanup_end = self.next_offset();
+                self.co.instructions[cleanup_push as usize].arg = cleanup_end;
+                if orelse_end > orelse_start {
+                    cleanup_ranges.push((orelse_start, orelse_end));
+                }
+                // Appended after any entries pushed while compiling
+                // nested statements, so the forward "innermost-first"
+                // scan in the VM still prefers those.
+                for (s, e) in cleanup_ranges {
+                    self.co.exception_table.push(ExcHandler {
+                        start: s,
+                        end: e,
+                        handler: cleanup_start,
+                        depth: body_depth,
+                    });
+                }
+            }
             // Patch handler-exit jumps to end.
             let end = self.next_offset();
             for site in handler_exit_jumps {
@@ -2498,6 +2577,12 @@ impl Compiler {
             return self.compile_with(&items[..1], &inner);
         }
         let item = &items[0];
+        // The `with` statement's own line — the cleanup/`__exit__`
+        // sequences below are attributed to it (CPython does the same:
+        // a traceback through `__exit__` shows the `with` line, not the
+        // last body statement).
+        let with_line = self.current_line;
+        let with_span = self.current_span;
         let cm_name = format!(".with_cm{}", self.with_counter);
         self.with_counter += 1;
         let cm_idx = self.var_index_or_add(&cm_name);
@@ -2539,6 +2624,10 @@ impl Compiler {
         // Pop the synthetic frame; the explicit normal-exit path
         // below emits the same call inline.
         self.finally_stack.pop();
+
+        // Attribute the whole exit path to the `with` line.
+        self.current_line = with_line;
+        self.current_span = with_span;
 
         // Normal exit: cm.__exit__(None, None, None).
         self.emit(OpCode::LoadFast, cm_idx);
@@ -2585,10 +2674,12 @@ impl Compiler {
         self.emit(OpCode::WithExceptStart, 0);
         // Stack: [__exit__, exc, result]
         let swallow = self.emit(OpCode::PopJumpIfTrue, 0);
-        // Falsy: re-raise. Stack: [__exit__, exc]
+        // Falsy: re-raise. Stack: [__exit__, exc]. CPython uses RERAISE
+        // here: the original traceback is preserved and no entry is
+        // recorded for the re-raise site.
         self.emit(OpCode::Swap, 2);
         self.emit(OpCode::PopTop, 0);
-        self.emit(OpCode::RaiseVarargs, 1);
+        self.emit(OpCode::Reraise, 0);
         let swallow_target = self.next_offset();
         self.patch_jump(swallow, swallow_target);
         // Swallowed: Stack: [__exit__, exc]. Drop the active handled-exc
@@ -3342,6 +3433,13 @@ impl Compiler {
                 if self.kind != CodeKind::Function {
                     return Err(CompileError::YieldOutsideFunction("yield from"));
                 }
+                // PEP 525: `yield from` is forbidden in `async def`
+                // (only plain `yield` makes an async generator).
+                if self.in_async_context() {
+                    return Err(CompileError::SyntaxExact(
+                        "'yield from' inside async function".to_owned(),
+                    ));
+                }
                 // CPython 3.13 pattern:
                 //   <iter>
                 //   GET_YIELD_FROM_ITER
@@ -3382,7 +3480,9 @@ impl Compiler {
     /// Emit the "drive awaitable to completion" instruction sequence
     /// CPython 3.13 uses for `await`. Stack on entry: `[awaitable]`;
     /// stack on exit: `[result]`. `awaitable_arg` is passed to
-    /// `GET_AWAITABLE` (0 = plain, 1 = aiter, 2 = aenter).
+    /// `GET_AWAITABLE` and selects the error message: 0 = plain
+    /// `await`, 1 = `async for`'s `__anext__` result, 2 = `async
+    /// with`'s `__aenter__` result, 3 = its `__aexit__` result.
     fn compile_await_dance(&mut self, awaitable_arg: u32) {
         self.emit(OpCode::GetAwaitable, awaitable_arg);
         let none_idx = self.co.intern_constant(Constant::None);
@@ -3425,6 +3525,11 @@ impl Compiler {
         let anext_site = self.emit(OpCode::GetAnext, 0);
         let _ = anext_site;
         self.compile_await_dance(1);
+        // The StopAsyncIteration window closes here: only the
+        // `__anext__` await may end the loop. An exception raised by
+        // the assignment target or the body — even a
+        // StopAsyncIteration — propagates (bpo-44895).
+        let dance_end = self.next_offset();
         // Stack: [aiter, value]. Move the value into the target.
         self.compile_assign(target)?;
         self.loop_stack.push(LoopFrame {
@@ -3438,14 +3543,15 @@ impl Compiler {
         let back = self.emit(OpCode::JumpBackward, 0);
         self.patch_jump(back, loop_top);
         let frame = self.loop_stack.pop().expect("loop frame");
-        // Register an exception-table handler covering the loop body
-        // so `StopAsyncIteration` lands at the cleanup label. The
+        // Register an exception-table handler covering only the
+        // `__anext__` await (loop header) so its `StopAsyncIteration`
+        // lands at the cleanup label; body exceptions propagate. The
         // aiter stays at stack depth 1 across the whole loop body —
         // every per-iteration push lives above it.
         let cleanup_target = self.next_offset();
         self.co.exception_table.push(ExcHandler {
             start: loop_top,
-            end: back,
+            end: dance_end,
             handler: cleanup_target,
             depth: 1,
         });
@@ -3470,6 +3576,10 @@ impl Compiler {
             return Ok(());
         }
         let (head, rest) = items.split_first().expect("nonempty");
+        // See `compile_with`: the exit paths are attributed to the
+        // `async with` statement's own line.
+        let with_line = self.current_line;
+        let with_span = self.current_span;
         self.compile_expr(&head.context_expr)?;
         // BEFORE_ASYNC_WITH leaves [aexit, awaitable(aenter)].
         self.emit(OpCode::BeforeAsyncWith, 0);
@@ -3515,6 +3625,10 @@ impl Compiler {
         // exception-cleanup paths below emit their own `__aexit__` call.
         self.finally_stack.pop();
 
+        // Attribute the whole exit path to the `async with` line.
+        self.current_line = with_line;
+        self.current_span = with_span;
+
         // Normal exit: `await aexit(None, None, None)`.
         self.emit(OpCode::LoadFast, slot_idx);
         let none_idx = self.co.intern_constant(Constant::None);
@@ -3522,7 +3636,7 @@ impl Compiler {
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::Call, 3);
-        self.compile_await_dance(2);
+        self.compile_await_dance(3);
         self.emit(OpCode::PopTop, 0);
         let end_jump = self.emit(OpCode::JumpForward, 0);
 
@@ -3559,13 +3673,14 @@ impl Compiler {
         // Stack: [aexit, exc]
         self.emit(OpCode::WithExceptStart, 0);
         // Stack: [aexit, exc, awaitable] — await the `__aexit__` coroutine.
-        self.compile_await_dance(2);
+        self.compile_await_dance(3);
         // Stack: [aexit, exc, result]
         let swallow = self.emit(OpCode::PopJumpIfTrue, 0);
-        // Falsy: re-raise. Stack: [aexit, exc]
+        // Falsy: re-raise. Stack: [aexit, exc]. RERAISE preserves the
+        // original traceback (no entry for the re-raise site).
         self.emit(OpCode::Swap, 2);
         self.emit(OpCode::PopTop, 0);
-        self.emit(OpCode::RaiseVarargs, 1);
+        self.emit(OpCode::Reraise, 0);
         let swallow_target = self.next_offset();
         self.patch_jump(swallow, swallow_target);
         // Swallowed: Stack: [aexit, exc]. Drop the active handled-exc
@@ -3977,6 +4092,9 @@ fn compile_comp_body(
         let loop_top = inner.next_offset();
         inner.emit(OpCode::GetAnext, 0);
         inner.compile_await_dance(1);
+        // As in `compile_async_for`: only the `__anext__` await may end
+        // the loop via StopAsyncIteration (bpo-44895).
+        let dance_end = inner.next_offset();
         inner.compile_assign(&gen.target)?;
         let mut filter_jumps = Vec::new();
         for cond in &gen.ifs {
@@ -3994,7 +4112,7 @@ fn compile_comp_body(
         let cleanup_target = inner.next_offset();
         inner.co.exception_table.push(ExcHandler {
             start: loop_top,
-            end: back,
+            end: dance_end,
             handler: cleanup_target,
             depth: cleanup_depth,
         });

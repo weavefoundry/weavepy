@@ -186,6 +186,10 @@ pub fn default_builtins() -> DictData {
     reg!("iter", b_iter);
     reg!("aiter", b_aiter);
     reg!("anext", b_anext);
+    reg!(
+        "_weavepy_mark_iterable_coroutine",
+        b_mark_iterable_coroutine
+    );
     reg!("divmod", b_divmod);
     reg!("round", b_round);
     reg!("format", b_format);
@@ -1248,6 +1252,18 @@ fn slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     let o = args
         .first()
         .ok_or_else(|| type_error("__repr__() takes exactly one argument (0 given)"))?;
+    // CPython guards `PyObject_Repr` with `Py_EnterRecursiveCall`; the
+    // native repr can re-enter the VM (user `__repr__`), and rebinding
+    // `__repr__ = __str__` (test_descr.test_repr_as_str) creates a
+    // native-only cycle that must raise instead of overflowing.
+    let _guard = match crate::recursion::enter() {
+        crate::recursion::Enter::Ok(g) => g,
+        crate::recursion::Enter::Overflow => {
+            return Err(crate::error::recursion_error(
+                "maximum recursion depth exceeded while getting the repr of an object",
+            ))
+        }
+    };
     let native = o.native_value();
     Ok(Object::from_str(native.as_ref().unwrap_or(o).repr()))
 }
@@ -1259,8 +1275,44 @@ fn slot_str(args: &[Object]) -> Result<Object, RuntimeError> {
     let o = args
         .first()
         .ok_or_else(|| type_error("__str__() takes exactly one argument (0 given)"))?;
+    // See `slot_repr`: participate in the recursion limit so
+    // `__repr__`/`__str__` rebinding cycles raise `RecursionError`.
+    let _guard = match crate::recursion::enter() {
+        crate::recursion::Enter::Ok(g) => g,
+        crate::recursion::Enter::Overflow => {
+            return Err(crate::error::recursion_error(
+                "maximum recursion depth exceeded while getting the str of an object",
+            ))
+        }
+    };
     let native = o.native_value();
-    Ok(Object::from_str(native.as_ref().unwrap_or(o).to_str()))
+    let target = native.as_ref().unwrap_or(o);
+    // CPython `object.__str__` is `PyObject_Repr(self)`: a user-defined
+    // `__repr__` is dispatched through the VM so its exceptions (and
+    // RecursionError from `__repr__ = __str__` cycles) *propagate*,
+    // rather than being swallowed by the native fallback rendering.
+    if let Object::Instance(inst) = target {
+        let key = crate::object::DictKey(Object::from_static("__repr__"));
+        let has_user_repr = inst
+            .cls()
+            .mro
+            .borrow()
+            .iter()
+            .any(|t| t.dict.borrow().contains_key(&key));
+        if has_user_repr {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame still live
+                // on this thread; the GIL keeps it exclusive.
+                let interp = unsafe { &mut *ptr };
+                if let Some(method) = crate::instance_method(target, "__repr__") {
+                    let globals = interp.builtins_dict();
+                    let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                    return Ok(Object::from_str(r.to_str()));
+                }
+            }
+        }
+    }
+    Ok(Object::from_str(target.to_str()))
 }
 
 /// `object.__format__(self, spec)` / `str.__format__(self, spec)` — format
@@ -1295,6 +1347,12 @@ fn slot_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     // SAFETY: published by an enclosing VM frame still live on this
     // thread; the GIL keeps the access exclusive.
     let interp = unsafe { &mut *ptr };
+    // `type.__call__(cls, …)` is the *default* class call: it must not
+    // re-dispatch through `type(cls).__call__`, or a metaclass
+    // `__call__` that delegates to `type.__call__` recurses forever.
+    if let Object::Type(ty) = callee {
+        return interp.type_call_default(ty, &args[1..], kwargs);
+    }
     let globals = interp.builtins_dict();
     interp.call_object_with_globals(callee, &args[1..], kwargs, &globals)
 }
@@ -1324,23 +1382,95 @@ pub fn builtin_type_dunder(base_name: &str, name: &str) -> Option<Object> {
     {
         return Some(Object::Builtin(Rc::new(method_kw("__call__", slot_call))));
     }
-    let f: fn(&[Object]) -> Result<Object, RuntimeError> = match name {
-        "__repr__" => slot_repr,
-        "__format__" => slot_format,
-        // Every built-in value type has its own `tp_str` in CPython
-        // (`int.__str__ is not object.__str__` — enum's ReprEnum wiring
-        // tests that identity), and `slot_str` already stringifies the
-        // receiver's native payload per type.
-        "__str__" => slot_str,
-        _ => return None,
-    };
-    let static_name = match name {
-        "__repr__" => "__repr__",
-        "__str__" => "__str__",
-        "__format__" => "__format__",
-        _ => return None,
-    };
+    let (static_name, f): (&'static str, fn(&[Object]) -> Result<Object, RuntimeError>) =
+        match name {
+            "__repr__" => ("__repr__", slot_repr),
+            "__format__" => ("__format__", slot_format),
+            // Every built-in value type has its own `tp_str` in CPython
+            // (`int.__str__ is not object.__str__` — enum's ReprEnum wiring
+            // tests that identity), and `slot_str` already stringifies the
+            // receiver's native payload per type.
+            "__str__" => ("__str__", slot_str),
+            // `object`'s default rich comparisons: `==`/`!=` compare by
+            // identity (value identity for primitives) and return
+            // `NotImplemented` otherwise; the orderings are always
+            // `NotImplemented` at the `object` level.
+            "__eq__" => ("__eq__", slot_obj_eq),
+            "__ne__" => ("__ne__", slot_obj_ne),
+            "__lt__" => ("__lt__", slot_obj_ordering),
+            "__le__" => ("__le__", slot_obj_ordering),
+            "__gt__" => ("__gt__", slot_obj_ordering),
+            "__ge__" => ("__ge__", slot_obj_ordering),
+            "__dir__" => ("__dir__", b_dir),
+            "__sizeof__" => ("__sizeof__", slot_sizeof),
+            "__getstate__" => ("__getstate__", slot_getstate),
+            _ => return None,
+        };
     Some(Object::Builtin(Rc::new(method(static_name, f))))
+}
+
+/// `object.__eq__(self, other)` — identity (payload equality for the
+/// primitive value types), `NotImplemented` otherwise.
+fn slot_obj_eq(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (a, b) = match args {
+        [a, b] => (a, b),
+        _ => return Err(type_error("expected 2 arguments")),
+    };
+    if object_identity(a) == object_identity(b) {
+        Ok(Object::Bool(true))
+    } else {
+        Ok(crate::vm_singletons::not_implemented())
+    }
+}
+
+/// `object.__ne__(self, other)` — the negation of `__eq__`, staying
+/// `NotImplemented` when equality is undecided.
+fn slot_obj_ne(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (a, b) = match args {
+        [a, b] => (a, b),
+        _ => return Err(type_error("expected 2 arguments")),
+    };
+    if object_identity(a) == object_identity(b) {
+        Ok(Object::Bool(false))
+    } else {
+        Ok(crate::vm_singletons::not_implemented())
+    }
+}
+
+/// `object.__lt__` / `__le__` / `__gt__` / `__ge__` — `object` defines
+/// no ordering: always `NotImplemented`.
+fn slot_obj_ordering(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(crate::vm_singletons::not_implemented())
+}
+
+/// `object.__sizeof__(self)` — a coarse byte size. WeavePy objects
+/// don't share CPython's memory layout; report the CPython-typical
+/// fixed header size so the protocol surface exists and returns a
+/// plausible positive int.
+fn slot_sizeof(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = one(args, "__sizeof__")?;
+    let size: i64 = match o {
+        Object::Instance(inst) => 16 + 8 * inst.dict.borrow().len() as i64,
+        Object::Str(s) => 49 + s.len() as i64,
+        Object::Bytes(b) => 33 + b.len() as i64,
+        Object::List(items) => 56 + 8 * items.borrow().len() as i64,
+        Object::Tuple(items) => 40 + 8 * items.len() as i64,
+        Object::Dict(d) => 64 + 24 * d.borrow().len() as i64,
+        _ => 16,
+    };
+    Ok(Object::Int(size))
+}
+
+/// `object.__getstate__(self)` — PEP 307 default pickling state: the
+/// instance `__dict__` when non-empty, else `None`.
+fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = one(args, "__getstate__")?;
+    if let Object::Instance(inst) = o {
+        if !inst.dict.borrow().is_empty() {
+            return Ok(Object::Dict(inst.dict.clone()));
+        }
+    }
+    Ok(Object::None)
 }
 
 // ---------- free builtins ----------
@@ -1694,7 +1824,19 @@ fn property_deleter(args: &[Object]) -> Result<Object, RuntimeError> {
 /// builtin context. Shared by the explicit descriptor-protocol slots
 /// (`property.__get__` / `__set__` / `__delete__`), whose accessors are
 /// ordinary Python functions.
-fn reentrant_call(callable: &Object, args: &[Object]) -> Result<Object, RuntimeError> {
+/// `str(obj)` through the running interpreter (so user `__str__` /
+/// nested-exception rendering dispatches). `None` when no interpreter
+/// is live on this thread.
+pub(crate) fn str_reentrant(obj: &Object) -> Option<String> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    interp.stringify_public(obj, &globals).ok()
+}
+
+pub(crate) fn reentrant_call(callable: &Object, args: &[Object]) -> Result<Object, RuntimeError> {
     let ptr = crate::vm_singletons::current_interpreter_ptr()
         .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
     // SAFETY: the pointer was published by an enclosing VM frame still
@@ -1765,9 +1907,9 @@ fn b_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 {
         return Err(type_error("getattr() requires at least 2 arguments"));
     }
-    let name = match &args[1] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("attribute name must be string")),
+    let name = match crate::attr_name_of(&args[1]) {
+        Some(n) => n,
+        None => return Err(type_error("attribute name must be string")),
     };
     let default = args.get(2).cloned();
     match attr_get(&args[0], &name) {
@@ -1787,9 +1929,9 @@ fn b_setattr(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 3 {
         return Err(type_error("setattr() takes exactly 3 arguments"));
     }
-    let name = match &args[1] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("attribute name must be string")),
+    let name = match crate::attr_name_of(&args[1]) {
+        Some(n) => n,
+        None => return Err(type_error("attribute name must be string")),
     };
     attr_set(&args[0], &name, args[2].clone())?;
     Ok(Object::None)
@@ -1799,9 +1941,9 @@ fn b_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("delattr() takes exactly 2 arguments"));
     }
-    let name = match &args[1] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("attribute name must be string")),
+    let name = match crate::attr_name_of(&args[1]) {
+        Some(n) => n,
+        None => return Err(type_error("attribute name must be string")),
     };
     attr_delete(&args[0], &name)?;
     Ok(Object::None)
@@ -1811,9 +1953,9 @@ fn b_hasattr(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("hasattr() takes exactly 2 arguments"));
     }
-    let name = match &args[1] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("attribute name must be string")),
+    let name = match crate::attr_name_of(&args[1]) {
+        Some(n) => n,
+        None => return Err(type_error("attribute name must be string")),
     };
     Ok(Object::Bool(attr_get(&args[0], &name).is_some()))
 }
@@ -1869,7 +2011,7 @@ fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     // Instances are callable when their class exposes `__call__`.
     if let Object::Instance(inst) = v {
-        return Ok(Object::Bool(inst.class.lookup("__call__").is_some()));
+        return Ok(Object::Bool(inst.cls().lookup("__call__").is_some()));
     }
     Ok(Object::Bool(false))
 }
@@ -1909,7 +2051,7 @@ fn bind_descriptor(value: &Object, receiver: &Object) -> Object {
         Object::StaticMethod(inner) => (**inner).clone(),
         Object::ClassMethod(inner) => {
             let cls = match receiver {
-                Object::Instance(inst) => Object::Type(inst.class.clone()),
+                Object::Instance(inst) => Object::Type(inst.cls()),
                 Object::Type(_) => receiver.clone(),
                 _ => receiver.clone(),
             };
@@ -1933,7 +2075,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             {
                 return Some(v);
             }
-            if let Some(v) = inst.class.lookup(name) {
+            if let Some(v) = inst.cls().lookup(name) {
                 // Bind functions to the receiver so `getattr(inst, 'm')()`
                 // works the same as `inst.m()`. Other descriptors are
                 // left to the VM's full `descriptor_get` path.
@@ -1941,7 +2083,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             }
             match name {
                 "__dict__" => Some(Object::Dict(inst.dict.clone())),
-                "__class__" => Some(Object::Type(inst.class.clone())),
+                "__class__" => Some(Object::Type(inst.cls())),
                 _ => None,
             }
         }
@@ -2371,7 +2513,10 @@ pub(crate) fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
         f |= CO_GENERATOR;
     }
     if c.is_coroutine {
-        f |= CO_COROUTINE | CO_ITERABLE_COROUTINE;
+        f |= CO_COROUTINE;
+    }
+    if c.is_iterable_coroutine {
+        f |= CO_ITERABLE_COROUTINE;
     }
     if c.is_async_generator {
         f |= CO_ASYNC_GENERATOR;
@@ -4289,7 +4434,7 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
     // always `C`'s MRO) breaks either diamond `__init_subclass__` or
     // `super().__init__()` inside a metaclass, respectively.
     let receiver_class = match &receiver {
-        Object::Instance(inst) => inst.class.clone(),
+        Object::Instance(inst) => inst.cls(),
         Object::Type(t) if t.is_subclass_of(&class) => t.clone(),
         Object::Type(t) => t.metaclass_or_type(),
         _ => class.clone(),
@@ -4314,7 +4459,7 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
         getattribute_kind: crate::sync::Cell::new(0),
     });
     let inst = crate::types::PyInstance {
-        class: proxy,
+        class: RefCell::new(proxy),
         dict: Rc::new(RefCell::new({
             let mut d = DictData::new();
             d.insert(DictKey(Object::from_static("__self__")), receiver);
@@ -4345,7 +4490,11 @@ fn b_issubclass(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("issubclass() arg 1 must be a class")),
     };
     let info = &args[1];
-    Ok(Object::Bool(class_matches_classinfo(&cls, info)?))
+    Ok(Object::Bool(class_matches_classinfo_named(
+        &cls,
+        info,
+        "issubclass",
+    )?))
 }
 
 /// Walk `cls`'s MRO against a single type or tuple of types.
@@ -4353,10 +4502,30 @@ pub fn class_matches_classinfo(
     cls: &crate::types::TypeObject,
     info: &Object,
 ) -> Result<bool, RuntimeError> {
+    class_matches_classinfo_named(cls, info, "isinstance")
+}
+
+/// As [`class_matches_classinfo`], with the caller's function name
+/// (`isinstance`/`issubclass`) threaded through for CPython-exact
+/// error messages.
+pub fn class_matches_classinfo_named(
+    cls: &crate::types::TypeObject,
+    info: &Object,
+    func: &str,
+) -> Result<bool, RuntimeError> {
     // PEP 604 union (`int | str`) — succeed if any union arm matches.
+    // A *parameterized* arm (`list[int] | int`) is not runtime-
+    // checkable: CPython's `union_instancecheck` raises TypeError.
     if let Some(args) = crate::is_pep604_union(info) {
         for arg in &args {
-            if class_matches_classinfo(cls, arg)? {
+            if generic_alias_origin(arg).is_some() {
+                return Err(type_error(format!(
+                    "{func}() argument 2 cannot contain a parameterized generic"
+                )));
+            }
+        }
+        for arg in &args {
+            if class_matches_classinfo_named(cls, arg, func)? {
                 return Ok(true);
             }
         }
@@ -4421,7 +4590,7 @@ fn generic_alias_origin(info: &Object) -> Option<Object> {
 pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
     let bt = builtin_types();
     match obj {
-        Object::Instance(inst) => inst.class.clone(),
+        Object::Instance(inst) => inst.cls(),
         Object::None => bt.none_type.clone(),
         Object::Bool(_) => bt.bool_.clone(),
         Object::Int(_) => bt.int_.clone(),
@@ -4485,7 +4654,8 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Code(_) | Object::Cell(_) | Object::SlotDescriptor(_) | Object::File(_) => {
             bt.object_.clone()
         }
-        Object::Frame(_) | Object::Traceback(_) => bt.object_.clone(),
+        Object::Frame(_) => bt.frame_.clone(),
+        Object::Traceback(_) => bt.traceback_.clone(),
     }
 }
 
@@ -4652,7 +4822,7 @@ pub(crate) fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                     names.insert(s.to_string());
                 }
             }
-            for t in inst.class.mro.borrow().iter() {
+            for t in inst.cls().mro.borrow().iter() {
                 for k in t.dict.borrow().keys() {
                     if let Object::Str(s) = &k.0 {
                         names.insert(s.to_string());
@@ -4676,7 +4846,70 @@ pub(crate) fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                 }
             }
         }
-        _ => {}
+        other => {
+            // Generic objects: `object.__dir__` ≈ the type's attributes.
+            for t in class_of(other).mro.borrow().iter() {
+                for k in t.dict.borrow().keys() {
+                    if let Object::Str(s) = &k.0 {
+                        names.insert(s.to_string());
+                    }
+                }
+            }
+            // The generator family's methods and introspection attrs are
+            // synthesized in `load_attr` rather than stored in type
+            // dicts; surface the same names CPython's type dicts hold.
+            let extra: &[&str] = match other {
+                Object::Generator(_) => &[
+                    "close",
+                    "send",
+                    "throw",
+                    "gi_code",
+                    "gi_frame",
+                    "gi_running",
+                    "gi_suspended",
+                    "gi_yieldfrom",
+                    "__next__",
+                    "__iter__",
+                    "__name__",
+                    "__qualname__",
+                    "__del__",
+                ],
+                Object::Coroutine(_) => &[
+                    "close",
+                    "send",
+                    "throw",
+                    "cr_await",
+                    "cr_code",
+                    "cr_frame",
+                    "cr_origin",
+                    "cr_running",
+                    "cr_suspended",
+                    "__await__",
+                    "__name__",
+                    "__qualname__",
+                    "__del__",
+                ],
+                Object::AsyncGenerator(_) => &[
+                    "aclose",
+                    "asend",
+                    "athrow",
+                    "ag_await",
+                    "ag_code",
+                    "ag_frame",
+                    "ag_running",
+                    "ag_suspended",
+                    "__aiter__",
+                    "__anext__",
+                    "__name__",
+                    "__qualname__",
+                    "__del__",
+                ],
+                _ => &[],
+            };
+            for n in extra {
+                names.insert((*n).to_string());
+            }
+        }
     }
     Ok(Object::new_list(
         names.into_iter().map(Object::from_str).collect(),
@@ -4701,10 +4934,8 @@ fn b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Bool(b) => Ok(Object::from_str(format!("0x{}", i64::from(*b)))),
-        other => Err(type_error(format!(
-            "'{}' object cannot be interpreted as an integer",
-            other.type_name()
-        ))),
+        // The `__index__` protocol (CPython `PyNumber_Index`).
+        other => b_hex(&[Object::Int(coerce_index_i64(other)?)]),
     }
 }
 
@@ -4726,7 +4957,8 @@ fn b_oct(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Bool(b) => Ok(Object::from_str(format!("0o{}", i64::from(*b)))),
-        _ => Err(type_error("expected int")),
+        // The `__index__` protocol (CPython `PyNumber_Index`).
+        other => b_oct(&[Object::Int(coerce_index_i64(other)?)]),
     }
 }
 
@@ -4748,7 +4980,8 @@ fn b_bin(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Bool(b) => Ok(Object::from_str(format!("0b{}", i64::from(*b)))),
-        _ => Err(type_error("expected int")),
+        // The `__index__` protocol (CPython `PyNumber_Index`).
+        other => b_bin(&[Object::Int(coerce_index_i64(other)?)]),
     }
 }
 
@@ -5071,6 +5304,33 @@ fn b_iter(args: &[Object]) -> Result<Object, RuntimeError> {
 /// dispatch runs; this fallback only fires if invoked outside the VM.
 fn b_aiter(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(type_error("aiter() must be called through the VM"))
+}
+
+/// Runtime support for `types.coroutine`: return a copy of a generator
+/// function whose code carries `CO_ITERABLE_COROUTINE` (CPython sets
+/// the flag by replacing `func.__code__`). Generators created by the
+/// returned function are accepted by `await` and may `yield from` a
+/// coroutine.
+fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(Object::Function(f)) = args.first() else {
+        return Err(type_error(
+            "_weavepy_mark_iterable_coroutine() expects a function",
+        ));
+    };
+    let mut code = (*f.code).clone();
+    code.is_iterable_coroutine = true;
+    let marked = crate::object::PyFunction {
+        name: f.name.clone(),
+        code: Rc::new(code),
+        globals: f.globals.clone(),
+        defaults: f.defaults.clone(),
+        kw_defaults: f.kw_defaults.clone(),
+        closure: f.closure.clone(),
+        // Shared, not copied: `func.__dict__` mutations stay visible on
+        // both, matching CPython where the function object is the same.
+        attrs: f.attrs.clone(),
+    };
+    Ok(Object::Function(Rc::new(marked)))
 }
 
 /// `anext(async_iterator[, default])` — return the awaitable from
@@ -7395,7 +7655,16 @@ fn bytearray_extend(args: &[Object]) -> Result<Object, RuntimeError> {
         .ok_or_else(|| type_error("extend() requires iterable"))?;
     match other {
         Object::Bytes(buf) => b.borrow_mut().extend_from_slice(buf),
-        Object::ByteArray(buf) => b.borrow_mut().extend_from_slice(&buf.borrow()),
+        Object::ByteArray(buf) => {
+            // `b.extend(b)` — self-extension must not double-borrow.
+            if Rc::ptr_eq(&b, buf) {
+                let mut t = b.borrow_mut();
+                let copy = t.clone();
+                t.extend_from_slice(&copy);
+            } else {
+                b.borrow_mut().extend_from_slice(&buf.borrow());
+            }
+        }
         Object::List(items) => {
             let items = items.borrow();
             for o in items.iter() {

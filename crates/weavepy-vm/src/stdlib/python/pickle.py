@@ -243,7 +243,10 @@ class _Pickler:
         except Exception:
             is_callable_like = False
         try:
-            is_type = type(obj).__name__ == "type"
+            # Name-based (not `isinstance`) for the same threading reason
+            # as above; walk the metaclass MRO so classes with a custom
+            # metaclass (`EnumType`, `ABCMeta`, …) count as types too.
+            is_type = any(t.__name__ == "type" for t in type(obj).__mro__)
         except Exception:
             is_type = False
         if is_callable_like or is_type:
@@ -261,6 +264,17 @@ class _Pickler:
             if qualname and _resolves_to_self(module, qualname, obj):
                 self._save_global(module, qualname)
                 return
+            # Classes and plain/builtin functions are *only* picklable by
+            # reference. CPython's `save_global` raises PicklingError for
+            # anything that doesn't resolve (e.g. a class defined inside a
+            # function: `<locals>` in its qualname); falling through to
+            # `__reduce_ex__` here would mis-pickle the class as an
+            # instance of its metaclass.
+            if is_type or tname in ("function", "builtin_function_or_method"):
+                raise PicklingError(
+                    "Can't pickle %r: it's not found as %s.%s"
+                    % (obj, module, qualname)
+                )
         # Arbitrary instances — try __reduce_ex__ / __reduce__ (the
         # canonical CPython pickle protocol). Falls back to the
         # PicklingError below if neither is provided.

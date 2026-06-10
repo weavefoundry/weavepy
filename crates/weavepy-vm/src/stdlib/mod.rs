@@ -23,6 +23,7 @@ pub mod codecs_mod;
 pub mod csv_mod;
 pub mod datetime_mod;
 pub mod errno_mod;
+pub mod testinternalcapi_mod;
 pub mod fcntl_mod;
 pub mod fnmatch_mod;
 pub mod gc_mod;
@@ -38,7 +39,6 @@ pub mod lzma_mod;
 pub mod marshal_mod;
 pub mod math;
 pub mod os;
-pub mod random;
 pub mod resource_mod;
 pub mod secrets_mod;
 pub mod select_mod;
@@ -90,7 +90,6 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("os.path", os::build_path);
     cache.register_builtin("io", io::build);
     cache.register_builtin("json", json::build);
-    cache.register_builtin("random", random::build);
     cache.register_builtin("time", time::build);
     cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
@@ -178,6 +177,14 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "keyword",
             source: include_str!("python/keyword.py"),
+            is_package: false,
+        },
+        // `random` — verbatim CPython distribution layer over the
+        // Rust `_random` MT19937 core (RFC 0037: `random.Random(42)`
+        // is stream-identical to CPython).
+        FrozenSource {
+            name: "random",
+            source: include_str!("python/random_mod.py"),
             is_package: false,
         },
         // Internal: `_SeqIter`, the lazy legacy-`__getitem__` iterator

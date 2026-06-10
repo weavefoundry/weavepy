@@ -172,7 +172,7 @@ impl fmt::Debug for Object {
             Object::Iter(_) => write!(f, "<iterator>"),
             Object::Slice(s) => write!(f, "slice({:?}, {:?}, {:?})", s.start, s.stop, s.step),
             Object::Type(t) => write!(f, "<class '{}'>", t.name),
-            Object::Instance(i) => write!(f, "<{} object>", i.class.name),
+            Object::Instance(i) => write!(f, "<{} object>", i.cls().name),
             Object::Module(m) => write!(f, "<module {:?}>", m.name),
             Object::Generator(g) => write!(f, "<generator object {}>", g.name.borrow()),
             Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name.borrow()),
@@ -248,6 +248,12 @@ pub struct PyFrame {
     /// subsequent `'line'` / `'return'` / `'exception'` events on
     /// the frame. `Object::None` disables tracing for the frame.
     pub trace: RefCell<Object>,
+    /// Backlink to the generator/coroutine that owns this frame
+    /// (weak — the frame must not keep its generator alive). Set by
+    /// the VM when the snapshot is cached on a generator frame; lets
+    /// `frame.clear()` tear down the suspended generator like
+    /// CPython's `frame_clear`.
+    pub gen_owner: RefCell<Option<crate::sync::Weak<PyGenerator>>>,
     /// Per-frame `f_lineno` override. CPython lets debuggers set
     /// `f_lineno` to jump to a different line; we keep storage so
     /// reads round-trip, even though writes don't actually move the
@@ -292,8 +298,11 @@ impl PyFrame {
     /// calls return the same dict object so `id(frame.f_locals)` is
     /// stable.
     pub fn locals(&self) -> Object {
-        if let Some(v) = self.locals_cache.borrow().as_ref() {
-            return v.clone();
+        if self.locals_cache.borrow().is_some() {
+            self.refresh_locals();
+            if let Some(v) = self.locals_cache.borrow().as_ref() {
+                return v.clone();
+            }
         }
         let provider = self.locals_provider.borrow().clone();
         let dict = provider
@@ -303,11 +312,53 @@ impl PyFrame {
         dict
     }
 
-    /// Force re-materialisation on the next `locals()` call. Used by
-    /// the VM after the frame has executed enough to make the cached
-    /// snapshot stale (function entry, generator resume).
+    /// Refresh the materialised `f_locals` dict *in place*, keeping
+    /// its identity stable (PEP 667: a handle obtained earlier
+    /// observes later execution of the frame). Frame names are
+    /// rewritten from the live state; user-added extra keys are
+    /// preserved.
+    pub fn refresh_locals(&self) {
+        let cached = self.locals_cache.borrow().clone();
+        let Some(Object::Dict(cached_rc)) = cached else {
+            return;
+        };
+        let provider = self.locals_provider.borrow().clone();
+        let Some(provider) = provider else { return };
+        let Object::Dict(fresh_rc) = provider() else {
+            return;
+        };
+        // Module/class scopes hand back the namespace dict itself —
+        // already live, nothing to merge.
+        if Rc::ptr_eq(&cached_rc, &fresh_rc) {
+            return;
+        }
+        let mut out = fresh_rc.borrow().clone();
+        {
+            let old = cached_rc.borrow();
+            for (k, v) in old.iter() {
+                let is_frame_name = match &k.0 {
+                    Object::Str(s) => {
+                        let name = s.as_ref();
+                        self.code.varnames.iter().any(|n| n == name)
+                            || self.code.cellvars.iter().any(|n| n == name)
+                            || self.code.freevars.iter().any(|n| n == name)
+                    }
+                    _ => false,
+                };
+                if !is_frame_name && !out.contains_key(k) {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        *cached_rc.borrow_mut() = out;
+    }
+
+    /// Bring the materialised snapshot (if any) up to date with the
+    /// frame's live state. Used by the VM after the frame has executed
+    /// enough to make the cached contents stale (function entry,
+    /// generator resume). The dict's identity is preserved.
     pub fn invalidate_locals(&self) {
-        self.locals_cache.borrow_mut().take();
+        self.refresh_locals();
     }
 }
 
@@ -566,7 +617,7 @@ fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
         obj,
         Object::Instance(inst)
             if matches!(
-                inst.class.lookup(name),
+                inst.cls().lookup(name),
                 Some(Object::Function(_) | Object::BoundMethod(_))
             )
     )
@@ -737,6 +788,10 @@ pub struct PyGenerator {
     /// PEP 479 (a `StopIteration` escaping the *body* becomes a
     /// `RuntimeError`) with the right wording per flavour.
     pub kind: CoroutineKind,
+    /// `gi_code` — held on the generator itself (CPython keeps a
+    /// strong reference) so it stays readable after the generator
+    /// finishes and the frame is dropped.
+    pub code: Object,
     pub state: RefCell<GeneratorState>,
 }
 
@@ -745,12 +800,14 @@ impl PyGenerator {
         name: impl Into<String>,
         qualname: impl Into<String>,
         kind: CoroutineKind,
+        code: Object,
         frame: Box<dyn std::any::Any + Send + Sync>,
     ) -> Self {
         Self {
             name: RefCell::new(name.into()),
             qualname: RefCell::new(qualname.into()),
             kind,
+            code,
             state: RefCell::new(GeneratorState::Created(frame)),
         }
     }
@@ -766,6 +823,39 @@ impl fmt::Debug for PyGenerator {
     }
 }
 
+impl Drop for PyGenerator {
+    fn drop(&mut self) {
+        // CPython finalizes a generator the moment its refcount dies:
+        // a *suspended* frame gets `GeneratorExit` thrown in so
+        // `finally:`/`with` cleanup runs. We can't run Python from
+        // `Drop`, so resurrect the live frame into the VM's
+        // pending-finalizer queue; `gc.collect()` and the module-exit
+        // path drain it. Created-but-never-started frames have run no
+        // user code, so (like CPython's `gen_close`) they are simply
+        // marked completed.
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return;
+        };
+        let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
+        drop(state);
+        if let GeneratorState::Suspended(frame) = prev {
+            let resurrected = Rc::new(PyGenerator {
+                name: RefCell::new(self.name.borrow().clone()),
+                qualname: RefCell::new(self.qualname.borrow().clone()),
+                kind: self.kind,
+                code: self.code.clone(),
+                state: RefCell::new(GeneratorState::Suspended(frame)),
+            });
+            let obj = match self.kind {
+                CoroutineKind::Generator => Object::Generator(resurrected),
+                CoroutineKind::Coroutine => Object::Coroutine(resurrected),
+                CoroutineKind::AsyncGenerator => Object::AsyncGenerator(resurrected),
+            };
+            crate::vm_singletons::try_push_pending_finalizer(obj);
+        }
+    }
+}
+
 /// Flavour of a `PyGenerator`. Stored alongside the suspended frame
 /// so the same suspension machinery serves all three async-shaped
 /// objects.
@@ -774,6 +864,19 @@ pub enum CoroutineKind {
     Generator,
     Coroutine,
     AsyncGenerator,
+}
+
+impl CoroutineKind {
+    /// The flavour word CPython uses in error messages
+    /// ("generator already executing", "coroutine ignored
+    /// GeneratorExit", "async generator ...").
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Generator => "generator",
+            Self::Coroutine => "coroutine",
+            Self::AsyncGenerator => "async generator",
+        }
+    }
 }
 
 /// State machine for an active or exhausted generator. The frame is
@@ -1513,20 +1616,20 @@ impl Object {
             Object::Instance(inst) => {
                 // int/str/… subclass instances are truthy per their
                 // wrapped value unless the class overrides __bool__/__len__.
-                if inst.class.lookup("__bool__").is_none() && inst.class.lookup("__len__").is_none()
+                if inst.cls().lookup("__bool__").is_none() && inst.cls().lookup("__len__").is_none()
                 {
                     if let Some(native) = &inst.native {
                         return native.is_truthy();
                     }
                 }
                 // Honour __bool__ then __len__ before defaulting to True.
-                if let Some(m) = inst.class.lookup("__bool__") {
+                if let Some(m) = inst.cls().lookup("__bool__") {
                     // Caller dispatches; we cannot run Python here.
                     // Default to True; the dispatch site handles the
                     // dunder dispatch when it has interpreter access.
                     let _ = m;
                     true
-                } else if let Some(m) = inst.class.lookup("__len__") {
+                } else if let Some(m) = inst.cls().lookup("__len__") {
                     let _ = m;
                     true
                 } else {
@@ -2024,7 +2127,7 @@ impl Object {
     /// `Object::Instance` instead of the static placeholder.
     pub fn type_name_owned(&self) -> String {
         match self {
-            Object::Instance(inst) => inst.class.name.clone(),
+            Object::Instance(inst) => inst.cls().name.clone(),
             Object::Type(t) => format!("type[{}]", t.name),
             other => other.type_name().to_owned(),
         }
@@ -2190,7 +2293,7 @@ impl Object {
                 // `<Color object>` instead of `<Color.RED: 1>`.
                 let key = DictKey(Object::from_static("__repr__"));
                 let has_user_repr = inst
-                    .class
+                    .cls()
                     .mro
                     .borrow()
                     .iter()
@@ -2209,11 +2312,11 @@ impl Object {
                             }
                         }
                     }
-                    format!("<{} object>", inst.class.name)
+                    format!("<{} object>", inst.cls().name)
                 } else {
                     format!(
                         "<{} object at 0x{:x}>",
-                        inst.class.name,
+                        inst.cls().name,
                         Rc::as_ptr(inst) as usize
                     )
                 }

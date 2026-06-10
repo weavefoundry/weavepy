@@ -38,6 +38,17 @@ pub fn push_pending_finalizer(obj: Object) {
     });
 }
 
+/// Like [`push_pending_finalizer`], but callable from `Drop` impls:
+/// tolerates thread-teardown (destroyed TLS) and re-entrant borrows
+/// by silently dropping the request.
+pub fn try_push_pending_finalizer(obj: Object) {
+    let _ = PENDING_FINALIZERS.try_with(|cell| {
+        if let Ok(mut queue) = cell.try_borrow_mut() {
+            queue.push(obj);
+        }
+    });
+}
+
 /// Drain the pending-finalizer queue. The eval loop calls this
 /// at every eval-breaker tick that has the GC flag set.
 pub fn drain_pending_finalizers() -> Vec<Object> {
@@ -45,10 +56,31 @@ pub fn drain_pending_finalizers() -> Vec<Object> {
 }
 
 fn make_singleton(name: &'static str) -> Object {
+    let mut dict = DictData::new();
+    // `repr(NotImplemented)` is "NotImplemented", `repr(...)` is
+    // "Ellipsis" — install a `__repr__` carrying the canonical text so
+    // every repr path renders the singleton the way CPython does.
+    let repr_text: &'static str = match name {
+        "NotImplementedType" => "NotImplemented",
+        "ellipsis" => "Ellipsis",
+        other => other,
+    };
+    fn make_repr(text: &'static str) -> Object {
+        use crate::object::BuiltinFn;
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__repr__",
+            call: Box::new(move |_args| Ok(Object::from_static(text))),
+            call_kw: None,
+        }))
+    }
+    dict.insert(
+        crate::object::DictKey(Object::from_static("__repr__")),
+        make_repr(repr_text),
+    );
     let cls = TypeObject::new_with_flags(
         name,
         vec![],
-        DictData::new(),
+        dict,
         TypeFlags {
             is_exception: false,
             is_builtin: true,

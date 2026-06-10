@@ -22,3 +22,11 @@ def sequence_setitem(obj, i, value):
 def sequence_delitem(obj, i):
     # PySequence_DelItem(obj, i)
     del obj[i]
+
+
+def object_hasattrstring(obj, name):
+    # PyObject_HasAttrString(obj, name) — `name` arrives as bytes
+    # (a C `char*`); returns 1/0.
+    if isinstance(name, (bytes, bytearray)):
+        name = name.decode("utf-8")
+    return 1 if hasattr(obj, name) else 0

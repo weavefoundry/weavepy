@@ -87,6 +87,22 @@ def updatecache(filename, module_globals=None):
                 lines = lines.splitlines(keepends=True)
             _cache[filename] = (len(lines), None, lines, filename)
             return lines
+    # WeavePy frozen stdlib modules carry `<frozen NAME>` filenames;
+    # their source is recoverable through `_imp.find_frozen`.
+    if filename.startswith("<frozen ") and filename.endswith(">"):
+        modname = filename[8:-1]
+        try:
+            import _imp
+            found = _imp.find_frozen(modname)
+        except Exception:
+            found = None
+        if found is not None:
+            src = found[0]
+            if isinstance(src, bytes):
+                src = src.decode("utf-8", "replace")
+            lines = src.splitlines(keepends=True)
+            _cache[filename] = (len(lines), None, lines, filename)
+            return lines
     name = filename
     # Try direct file system access.
     try:

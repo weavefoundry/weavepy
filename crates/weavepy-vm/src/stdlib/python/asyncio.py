@@ -198,6 +198,14 @@ class Task(Future):
             self._schedule_callbacks()
             return
         except BaseException as e:
+            # CPython's C `_asyncio` Task drives the coroutine without
+            # a Python frame, so the Task machinery never appears in
+            # the exception's traceback. Strip our own `_step` frame
+            # (the head entry, where the exception was caught) to give
+            # the same observable traceback.
+            tb = e.__traceback__
+            if tb is not None and tb.tb_frame.f_code.co_name == "_step":
+                e.__traceback__ = tb.tb_next
             self.set_exception(e)
             return
 
