@@ -1,6 +1,6 @@
 3 4
 10 4
-slot reject: 'Point' object has no attribute 'z'
+slot reject: 'Point' object has no attribute 'z' and no __dict__ for setting new attributes
 1 2 3
-nested slot reject: 'Vec3' object has no attribute 'w'
+nested slot reject: 'Vec3' object has no attribute 'w' and no __dict__ for setting new attributes
 7 8 fine

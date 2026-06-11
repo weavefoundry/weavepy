@@ -472,7 +472,10 @@ pub struct PyProperty {
     pub fget: Object,
     pub fset: Object,
     pub fdel: Object,
-    pub doc: Object,
+    /// Interior-mutable: CPython's `property.__doc__` is a writable
+    /// member (`namedtuple` field docs are patched in place:
+    /// `Point.x.__doc__ = …`).
+    pub doc: RefCell<Object>,
 }
 
 impl PyProperty {
@@ -481,8 +484,13 @@ impl PyProperty {
             fget,
             fset,
             fdel,
-            doc,
+            doc: RefCell::new(doc),
         }
+    }
+
+    /// Current `__doc__` value.
+    pub fn doc(&self) -> Object {
+        self.doc.borrow().clone()
     }
 
     /// Return a clone of `self` with the given attribute replaced. Used
@@ -494,7 +502,7 @@ impl PyProperty {
             fget: self.fget.clone(),
             fset: self.fset.clone(),
             fdel: self.fdel.clone(),
-            doc: self.doc.clone(),
+            doc: RefCell::new(self.doc()),
         };
         match which {
             PropertyAttr::Get => next.fget = fn_,
@@ -687,6 +695,48 @@ pub struct PyFunction {
     /// `__isabstractmethod__`, or any decorator that stashes
     /// per-callable metadata.
     pub attrs: Rc<RefCell<DictData>>,
+    /// CPython function *getset/member slots* (`__name__`,
+    /// `__qualname__`, `__doc__`, `__module__`, `__annotations__`,
+    /// `__type_params__`, …). These live outside `__dict__`: they're
+    /// data descriptors on the `function` type, so `f.__name__ = x`
+    /// must never appear in `f.__dict__` (functools.update_wrapper
+    /// copies `__dict__` and asserts the wrapper's annotations are
+    /// untouched by the wrapped function's slots).
+    pub slots: RefCell<DictData>,
+}
+
+/// Attribute names backed by function slots rather than `__dict__`.
+pub fn is_function_slot(name: &str) -> bool {
+    matches!(
+        name,
+        "__name__"
+            | "__qualname__"
+            | "__doc__"
+            | "__module__"
+            | "__annotations__"
+            | "__type_params__"
+            | "__defaults__"
+            | "__kwdefaults__"
+            | "__code__"
+    )
+}
+
+impl PyFunction {
+    /// Read a slot value if one has been stored (explicitly assigned or
+    /// stamped at definition time). Computed fallbacks live at the
+    /// attribute-access sites.
+    pub fn slot(&self, name: &str) -> Option<Object> {
+        self.slots
+            .borrow()
+            .get(&DictKey(Object::from_str(name)))
+            .cloned()
+    }
+
+    pub fn set_slot(&self, name: &str, value: Object) {
+        self.slots
+            .borrow_mut()
+            .insert(DictKey(Object::from_str(name)), value);
+    }
 }
 
 impl fmt::Debug for PyFunction {
@@ -2007,6 +2057,16 @@ impl Object {
                     "a bytes-like object is required for memoryview membership",
                 )),
             },
+            // A built-in-subclass instance (`class C(dict)`, …) contains
+            // through its wrapped native payload — the receiver-side
+            // analogue of CPython dispatching `sq_contains` on the base.
+            Object::Instance(inst) => match &inst.native {
+                Some(native) => native.contains(item),
+                None => Err(type_error(format!(
+                    "argument of type '{}' is not iterable",
+                    self.type_name()
+                ))),
+            },
             _ => Err(type_error(format!(
                 "argument of type '{}' is not iterable",
                 self.type_name()
@@ -2289,7 +2349,14 @@ impl Object {
                 }
             }
             Object::Function(f) => {
-                format!("<function {} at 0x{:x}>", f.name, Rc::as_ptr(f) as usize)
+                // CPython shows the *qualname* (with any user override
+                // via `f.__qualname__ = …` taking priority).
+                let qual = f
+                    .slot("__qualname__")
+                    .as_ref()
+                    .map(Object::to_str)
+                    .unwrap_or_else(|| f.code.qualname.clone());
+                format!("<function {} at 0x{:x}>", qual, Rc::as_ptr(f) as usize)
             }
             Object::Builtin(b) => format!("<built-in function {}>", b.name),
             Object::BoundMethod(_) => "<bound method>".to_owned(),
@@ -2302,7 +2369,7 @@ impl Object {
                 s.step.repr()
             ),
             Object::Cell(inner) => format!("<cell: {}>", inner.borrow().repr()),
-            Object::Type(t) => format!("<class '{}'>", t.name),
+            Object::Type(t) => format!("<class '{}'>", t.qualified_display_name()),
             Object::Module(m) => match &m.filename {
                 Some(path) => format!("<module '{}' from '{}'>", m.name, path),
                 None => format!("<module '{}' (built-in)>", m.name),
@@ -2409,8 +2476,35 @@ impl Object {
                 format!("{}([{}])", v.kind.type_name(), body.join(", "))
             }
             Object::SimpleNamespace(d) => {
-                let d = d.borrow();
-                let parts: Vec<String> = d
+                let dict = d.borrow();
+                // PEP 585/604 runtime forms repr as type expressions
+                // (CPython: `repr(list[int])` is "list[int]", `repr(int |
+                // str)` is "int | str"), not as namespace literals.
+                let type_param_repr = |o: &Object| -> String {
+                    match o {
+                        Object::Type(t) => t.qualified_display_name(),
+                        Object::None => "None".to_owned(),
+                        other => other.repr(),
+                    }
+                };
+                let args = dict.get(&DictKey(Object::from_static("__args__"))).cloned();
+                if dict
+                    .get(&DictKey(Object::from_static("__is_pep604_union__")))
+                    .is_some()
+                {
+                    if let Some(Object::Tuple(items)) = &args {
+                        let parts: Vec<String> = items.iter().map(type_param_repr).collect();
+                        return parts.join(" | ");
+                    }
+                }
+                if let (Some(origin), Some(Object::Tuple(items))) = (
+                    dict.get(&DictKey(Object::from_static("__origin__"))),
+                    &args,
+                ) {
+                    let parts: Vec<String> = items.iter().map(type_param_repr).collect();
+                    return format!("{}[{}]", type_param_repr(origin), parts.join(", "));
+                }
+                let parts: Vec<String> = dict
                     .iter()
                     .map(|(k, v)| format!("{}={}", k.0.to_str(), v.repr()))
                     .collect();
@@ -2839,6 +2933,12 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             Some(if v == -1 { -2 } else { v })
         }
         Object::Instance(inst) => {
+            // A user-defined `__hash__` outranks the wrapped value's hash —
+            // e.g. functools' `_HashedSeq(list)` caches its hash precisely so
+            // the (unhashable) list payload is never consulted.
+            if instance_has_custom_dunder(obj, "__hash__") {
+                return current_interp_hash(obj);
+            }
             if let Some(native) = &inst.native {
                 // int/str/… subclass instance hashes as the wrapped value.
                 return py_hash_value(native);
@@ -3121,6 +3221,15 @@ impl Object {
     }
 
     pub fn new_tuple(items: Vec<Object>) -> Self {
+        if items.is_empty() {
+            // CPython interns the empty tuple (`() is ()`);
+            // `functools.update_wrapper` asserts identity on copied
+            // `__type_params__` and similar empty-tuple attributes.
+            thread_local! {
+                static EMPTY_TUPLE: Rc<[Object]> = Rc::from(Vec::new().into_boxed_slice());
+            }
+            return Object::Tuple(EMPTY_TUPLE.with(Clone::clone));
+        }
         Object::Tuple(Rc::from(items.into_boxed_slice()))
     }
 

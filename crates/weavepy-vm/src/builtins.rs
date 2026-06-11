@@ -658,9 +658,23 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__exit__" => Some(method("__exit__", memoryview_exit)),
             _ => None,
         },
-        Object::DictView(_) | Object::MappingProxy(_) => match name {
+        Object::DictView(_) => match name {
             "isdisjoint" => Some(method("isdisjoint", view_isdisjoint)),
             "mapping" => None,
+            _ => None,
+        },
+        // `mappingproxy` (read-only `type.__dict__` view) forwards the
+        // read-side mapping API to the wrapped dict.
+        Object::MappingProxy(_) => match name {
+            "isdisjoint" => Some(method("isdisjoint", view_isdisjoint)),
+            "get" => Some(method("get", mappingproxy_get)),
+            "keys" => Some(method("keys", mappingproxy_keys)),
+            "values" => Some(method("values", mappingproxy_values)),
+            "items" => Some(method("items", mappingproxy_items)),
+            "copy" => Some(method("copy", mappingproxy_copy)),
+            "__getitem__" => Some(method("__getitem__", mappingproxy_getitem)),
+            "__len__" => Some(method("__len__", obj_len)),
+            "__contains__" => Some(method("__contains__", obj_contains)),
             _ => None,
         },
         Object::SimpleNamespace(_) => match name {
@@ -1429,15 +1443,23 @@ pub fn builtin_type_dunder(base_name: &str, name: &str) -> Option<Object> {
     {
         return Some(Object::Builtin(Rc::new(method_kw("__call__", slot_call))));
     }
+    // `tp_str` is defined only by `object` and `str` among the value types
+    // (CPython: `'__str__' in vars(int)` is False, hence
+    // `int.__str__ is object.__str__` — identity the enum bootstrap's
+    // `found_method in (data_type_method, object_method)` check relies
+    // on). Other types fall through here so the caller's MRO walk
+    // resolves `__str__` at `object`; exceptions get their own `__str__`
+    // via type-dict entries installed at startup.
+    if name == "__str__" {
+        if matches!(base_name, "object" | "str") {
+            return Some(Object::Builtin(Rc::new(method("__str__", slot_str))));
+        }
+        return None;
+    }
     let (static_name, f): (&'static str, fn(&[Object]) -> Result<Object, RuntimeError>) =
         match name {
             "__repr__" => ("__repr__", slot_repr),
             "__format__" => ("__format__", slot_format),
-            // Every built-in value type has its own `tp_str` in CPython
-            // (`int.__str__ is not object.__str__` — enum's ReprEnum wiring
-            // tests that identity), and `slot_str` already stringifies the
-            // receiver's native payload per type.
-            "__str__" => ("__str__", slot_str),
             // `object`'s default rich comparisons: `==`/`!=` compare by
             // identity (value identity for primitives) and return
             // `NotImplemented` otherwise; the orderings are always
@@ -1509,13 +1531,29 @@ fn slot_sizeof(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 /// `object.__getstate__(self)` — PEP 307 default pickling state: the
-/// instance `__dict__` when non-empty, else `None`.
+/// instance `__dict__` when non-empty, else `None`. When `__slots__`
+/// values are populated, CPython returns the 2-tuple
+/// `(dict_or_None, {slot: value, …})` instead.
 fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     let o = one(args, "__getstate__")?;
     if let Object::Instance(inst) = o {
-        if !inst.dict.borrow().is_empty() {
-            return Ok(Object::Dict(inst.dict.clone()));
+        let slots = inst.slots_snapshot();
+        let dict_state = if inst.dict.borrow().is_empty() {
+            Object::None
+        } else {
+            Object::Dict(inst.dict.clone())
+        };
+        if !slots.is_empty() {
+            let mut slot_dict = crate::object::DictData::new();
+            for (name, value) in slots {
+                slot_dict.insert(DictKey(Object::from_str(name)), value);
+            }
+            return Ok(Object::new_tuple(vec![
+                dict_state,
+                Object::Dict(Rc::new(RefCell::new(slot_dict))),
+            ]));
         }
+        return Ok(dict_state);
     }
     Ok(Object::None)
 }
@@ -2179,7 +2217,11 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             }
         }
         Object::Function(f) => {
-            if let Some(v) = f
+            if crate::object::is_function_slot(name) {
+                if let Some(v) = f.slot(name) {
+                    return Some(v);
+                }
+            } else if let Some(v) = f
                 .attrs
                 .borrow()
                 .get(&crate::object::DictKey(Object::from_str(name)))
@@ -2527,9 +2569,24 @@ fn code_varname_from_oparg(args: &[Object]) -> Result<Object, RuntimeError> {
 /// The compiler keeps the leading bare string expression as
 /// ``constants[0]``; functions / modules / classes pick it up at
 /// runtime via this helper.
+thread_local! {
+    /// Docstring objects keyed by the constant's string-data address, so
+    /// repeated `f.__doc__` reads return the *same* `str` object (CPython
+    /// stores the docstring once on the function; `update_wrapper` tests
+    /// `assertIs(wrapper.__doc__, wrapped.__doc__)`).
+    static DOCSTRING_CACHE: std::cell::RefCell<std::collections::HashMap<usize, Object>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 pub(crate) fn code_docstring(c: &weavepy_compiler::CodeObject) -> Option<Object> {
     match c.constants.first() {
-        Some(weavepy_compiler::Constant::Str(s)) => Some(Object::from_str(s.as_str())),
+        Some(weavepy_compiler::Constant::Str(s)) => Some(DOCSTRING_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .entry(s.as_ptr() as usize)
+                .or_insert_with(|| Object::from_str(s.as_str()))
+                .clone()
+        })),
         _ => None,
     }
 }
@@ -2595,9 +2652,13 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
             Ok(())
         }
         Object::Function(f) => {
-            f.attrs
-                .borrow_mut()
-                .insert(crate::object::DictKey(Object::from_str(name)), value);
+            if crate::object::is_function_slot(name) {
+                f.set_slot(name, value);
+            } else {
+                f.attrs
+                    .borrow_mut()
+                    .insert(crate::object::DictKey(Object::from_str(name)), value);
+            }
             Ok(())
         }
         _ => Err(type_error(format!(
@@ -2623,9 +2684,15 @@ fn attr_delete(obj: &Object, name: &str) -> Result<(), RuntimeError> {
             Ok(())
         }
         Object::Function(f) => {
-            f.attrs
-                .borrow_mut()
-                .shift_remove(&crate::object::DictKey(Object::from_str(name)));
+            if crate::object::is_function_slot(name) {
+                f.slots
+                    .borrow_mut()
+                    .shift_remove(&crate::object::DictKey(Object::from_str(name)));
+            } else {
+                f.attrs
+                    .borrow_mut()
+                    .shift_remove(&crate::object::DictKey(Object::from_str(name)));
+            }
             Ok(())
         }
         _ => Err(type_error(format!("cannot delete attribute '{}'", name))),
@@ -4028,6 +4095,12 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::new_tuple(Vec::new()));
     }
+    // `tuple(t)` on an exact tuple returns `t` itself (CPython reuses the
+    // immutable object; `copy.copy(partial).args is partial.args` relies
+    // on the identity).
+    if let Object::Tuple(_) = &args[0] {
+        return Ok(args[0].clone());
+    }
     let mut it = args[0].make_iter()?;
     let mut out = Vec::new();
     while let Some(v) = it.next_value() {
@@ -4778,6 +4851,7 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
         })),
         native: None,
         inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -4911,7 +4985,28 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
             crate::object::DictViewKind::Values => bt.dict_values_.clone(),
             crate::object::DictViewKind::Items => bt.dict_items_.clone(),
         },
-        Object::SimpleNamespace(_) => bt.simple_namespace_.clone(),
+        // Namespace-shaped objects double as the PEP 585/604 runtime
+        // forms; their *class* must report `types.GenericAlias` /
+        // `types.UnionType` (CPython: `type(list[int])`, `type(int|str)`).
+        Object::SimpleNamespace(d) => {
+            let dict = d.borrow();
+            if dict
+                .get(&DictKey(Object::from_static("__is_pep604_union__")))
+                .is_some()
+            {
+                bt.union_type_.clone()
+            } else if dict
+                .get(&DictKey(Object::from_static("__origin__")))
+                .is_some()
+                && dict
+                    .get(&DictKey(Object::from_static("__args__")))
+                    .is_some()
+            {
+                bt.generic_alias_.clone()
+            } else {
+                bt.simple_namespace_.clone()
+            }
+        }
         Object::Type(t) => t.metaclass_or_type(),
         Object::Function(_) => bt.function_.clone(),
         // Rust-implemented callables are `builtin_function_or_method`,
@@ -5652,6 +5747,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         // Shared, not copied: `func.__dict__` mutations stay visible on
         // both, matching CPython where the function object is the same.
         attrs: f.attrs.clone(),
+        slots: RefCell::new(f.slots.borrow().clone()),
     };
     Ok(Object::Function(Rc::new(marked)))
 }
@@ -6733,8 +6829,10 @@ fn list_append(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // List dunders exposed on the type so `list.__setitem__` /
 // `super().__getitem__` resolve for `list` subclasses (`class C(list)`).
-// Integer indices only — slice subscription routes through the VM's
-// dedicated subscript opcodes, not this unbound-method path.
+// These mirror CPython's `mp_subscript`/`mp_ass_subscript` slots fully:
+// both integer and slice keys work (`_HashedSeq.__init__` does
+// `self[:] = tup` on a `list` subclass, which dispatches here now that
+// the materialized `__setitem__` is in the type dict).
 fn list_index_arg(l_len: usize, idx: &Object, what: &str) -> Result<usize, RuntimeError> {
     match idx {
         Object::Int(i) => {
@@ -6759,6 +6857,10 @@ fn list_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = args
         .get(1)
         .ok_or_else(|| type_error("__getitem__ expected 1 argument"))?;
+    if let Object::Slice(s) = key {
+        let seq = l.borrow().clone();
+        return Ok(Object::new_list(crate::slice_seq(&seq, s)?));
+    }
     let l = l.borrow();
     let n = list_index_arg(l.len(), key, "__getitem__")?;
     Ok(l[n].clone())
@@ -6772,6 +6874,17 @@ fn list_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let val = args
         .get(2)
         .ok_or_else(|| type_error("__setitem__ expected 2 arguments"))?;
+    if let Object::Slice(s) = key {
+        // Materialize the replacement *before* the mutable borrow so
+        // self-assignment (`l[:] = l`) can't alias the live borrow.
+        let mut replacement = Vec::new();
+        let mut it = val.make_iter()?;
+        while let Some(v) = it.next_value() {
+            replacement.push(v);
+        }
+        crate::apply_slice_assignment(&mut l.borrow_mut(), s, replacement)?;
+        return Ok(Object::None);
+    }
     let mut l = l.borrow_mut();
     let n = list_index_arg(l.len(), key, "__setitem__")?;
     l[n] = val.clone();
@@ -6783,6 +6896,15 @@ fn list_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = args
         .get(1)
         .ok_or_else(|| type_error("__delitem__ expected 1 argument"))?;
+    if let Object::Slice(s) = key {
+        let mut l = l.borrow_mut();
+        let mut indices = crate::slice_indices(l.len(), s)?;
+        indices.sort_unstable();
+        for i in indices.into_iter().rev() {
+            l.remove(i);
+        }
+        return Ok(Object::None);
+    }
     let mut l = l.borrow_mut();
     let n = list_index_arg(l.len(), key, "__delitem__")?;
     l.remove(n);
@@ -6870,11 +6992,33 @@ fn list_index(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let l = list_self(args)?;
     let l = l.borrow();
-    let pos = l
-        .iter()
-        .position(|x| x.eq_value(&args[1]))
-        .ok_or_else(|| value_error("x not in list"))?;
-    Ok(Object::Int(pos as i64))
+    // CPython `list.index(value, start=0, stop=maxsize)`: negative
+    // bounds count from the end and clamp to 0 (`PySlice_AdjustIndices`
+    // semantics), and the comparison is identity-first
+    // (`PyObject_RichCompareBool`).
+    let len = l.len() as i64;
+    let adjust = |v: i64| -> i64 {
+        if v < 0 {
+            (v + len).max(0)
+        } else {
+            v.min(len)
+        }
+    };
+    let start = match args.get(2) {
+        Some(o) => adjust(coerce_index_i64(o)?),
+        None => 0,
+    };
+    let stop = match args.get(3) {
+        Some(o) => adjust(coerce_index_i64(o)?),
+        None => len,
+    };
+    for i in start..stop {
+        let x = &l[i as usize];
+        if x.is_same(&args[1]) || x.eq_value(&args[1]) {
+            return Ok(Object::Int(i));
+        }
+    }
+    Err(value_error(format!("{} is not in list", args[1].repr())))
 }
 
 fn list_count(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7111,11 +7255,31 @@ fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Tuple(t)) => t.clone(),
         _ => return Err(type_error("expected tuple")),
     };
-    let pos = t
-        .iter()
-        .position(|x| x.eq_value(&args[1]))
-        .ok_or_else(|| value_error("x not in tuple"))?;
-    Ok(Object::Int(pos as i64))
+    // Same `(value, start=0, stop=maxsize)` window + identity-first
+    // comparison semantics as `list.index`.
+    let len = t.len() as i64;
+    let adjust = |v: i64| -> i64 {
+        if v < 0 {
+            (v + len).max(0)
+        } else {
+            v.min(len)
+        }
+    };
+    let start = match args.get(2) {
+        Some(o) => adjust(coerce_index_i64(o)?),
+        None => 0,
+    };
+    let stop = match args.get(3) {
+        Some(o) => adjust(coerce_index_i64(o)?),
+        None => len,
+    };
+    for i in start..stop {
+        let x = &t[i as usize];
+        if x.is_same(&args[1]) || x.eq_value(&args[1]) {
+            return Ok(Object::Int(i));
+        }
+    }
+    Err(value_error("tuple.index(x): x not in tuple"))
 }
 
 // ---------- dict extras ----------
@@ -9154,6 +9318,41 @@ fn memoryview_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 // ----- dict view + mappingproxy methods (RFC 0023) -----
+
+/// Re-key a `mappingproxy` receiver as the wrapped dict so the dict
+/// method implementations can be reused verbatim (the proxy is a
+/// read-only *view*, so the share is intentional).
+fn mappingproxy_args(args: &[Object]) -> Vec<Object> {
+    let mut v = args.to_vec();
+    if let Some(Object::MappingProxy(d)) = v.first() {
+        v[0] = Object::Dict(d.clone());
+    }
+    v
+}
+
+fn mappingproxy_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_get(&mappingproxy_args(args))
+}
+
+fn mappingproxy_keys(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_keys(&mappingproxy_args(args))
+}
+
+fn mappingproxy_values(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_values(&mappingproxy_args(args))
+}
+
+fn mappingproxy_items(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_items(&mappingproxy_args(args))
+}
+
+fn mappingproxy_copy(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_copy(&mappingproxy_args(args))
+}
+
+fn mappingproxy_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_getitem(&mappingproxy_args(args))
+}
 
 fn view_isdisjoint(args: &[Object]) -> Result<Object, RuntimeError> {
     let other = args

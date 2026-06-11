@@ -266,8 +266,14 @@ def cpython_only(test):
 # docstrings, so this is False.
 MISSING_C_DOCSTRINGS = False
 
-# True when the build keeps docstrings (it does).
-HAVE_DOCSTRINGS = True
+
+def _check_docstrings():
+    """Just used to check if docstrings are enabled"""
+
+
+# Probe-derived, exactly as CPython's test.support computes them.
+HAVE_PY_DOCSTRINGS = _check_docstrings.__doc__ is not None
+HAVE_DOCSTRINGS = (HAVE_PY_DOCSTRINGS and not MISSING_C_DOCSTRINGS)
 
 
 def requires_docstrings(func):
@@ -484,6 +490,14 @@ def check__all__(test_case, module, name_of_module=None, extra=(),
             expected.add(name)
 
     test_case.assertCountEqual(module.__all__, expected)
+
+
+def setswitchinterval(interval):
+    """Set the bytecode switch interval, clamped to a sane minimum
+    (CPython clamps harder on Android; we keep the plain floor)."""
+    minimum_interval = 1e-9
+    interval = max(interval, minimum_interval)
+    sys.setswitchinterval(interval)
 
 
 # ---------------------------------------------------------------------------

@@ -1132,16 +1132,30 @@ impl Compiler {
                 args,
                 body,
                 decorator_list,
+                type_params,
+                returns,
             } => {
-                self.compile_function_def(name, args, body, decorator_list)?;
+                self.compile_pep695_prologue(type_params, stmt.span)?;
+                self.compile_function_def(name, args, body, decorator_list, returns.as_deref())?;
+                self.compile_pep695_epilogue(name, type_params, stmt.span)?;
             }
             StmtKind::AsyncFunctionDef {
                 name,
                 args,
                 body,
                 decorator_list,
+                type_params,
+                returns,
             } => {
-                self.compile_async_function_def(name, args, body, decorator_list)?;
+                self.compile_pep695_prologue(type_params, stmt.span)?;
+                self.compile_async_function_def(
+                    name,
+                    args,
+                    body,
+                    decorator_list,
+                    returns.as_deref(),
+                )?;
+                self.compile_pep695_epilogue(name, type_params, stmt.span)?;
             }
             StmtKind::ClassDef {
                 name,
@@ -1149,8 +1163,11 @@ impl Compiler {
                 keywords,
                 body,
                 decorator_list,
+                type_params,
             } => {
+                self.compile_pep695_prologue(type_params, stmt.span)?;
                 self.compile_class_def(name, bases, keywords, body, decorator_list)?;
+                self.compile_pep695_epilogue(name, type_params, stmt.span)?;
             }
             StmtKind::Try {
                 body,
@@ -1711,14 +1728,108 @@ impl Compiler {
     /// Compile a function definition statement: builds the function
     /// object, threads it through any decorators, and binds the result
     /// to `name` in the enclosing scope.
+    /// PEP 695 lowering, part 1: bind each type parameter as a
+    /// `TypeVar` *before* the `def`/`class` compiles, so parameter and
+    /// return annotations referencing `T` resolve at definition time:
+    ///
+    /// ```text
+    /// T = __weavepy_typevar__('T')
+    /// def f(a: T): ...
+    /// f.__type_params__ = (T,)
+    /// f.__annotations__['return'] = R
+    /// del T
+    /// ```
+    ///
+    /// CPython gives the parameters a dedicated lexical scope; the
+    /// flat-block approximation is observably equivalent here because
+    /// nothing reads the names after the epilogue's `del`.
+    fn compile_pep695_prologue(
+        &mut self,
+        type_params: &[String],
+        span: weavepy_lexer::Span,
+    ) -> Result<(), CompileError> {
+        if type_params.is_empty() {
+            return Ok(());
+        }
+        let name_expr = |n: &str| Expr {
+            kind: ExprKind::Name(n.to_owned()),
+            span,
+        };
+        for tp in type_params {
+            let assign = Stmt {
+                kind: StmtKind::Assign {
+                    targets: vec![name_expr(tp)],
+                    value: Expr {
+                        kind: ExprKind::Call {
+                            func: Box::new(name_expr("__weavepy_typevar__")),
+                            args: vec![Expr {
+                                kind: ExprKind::Constant(AstConstant::Str(tp.clone())),
+                                span,
+                            }],
+                            keywords: Vec::new(),
+                        },
+                        span,
+                    },
+                },
+                span,
+            };
+            self.compile_stmt(&assign)?;
+        }
+        Ok(())
+    }
+
+    /// PEP 695 lowering, part 2: after the `def`/`class` statement has
+    /// bound its name, stamp `__type_params__`, then drop the temporary
+    /// bindings. (The return annotation is *not* handled here — it goes
+    /// into the annotations dict at MakeFunction time, before
+    /// decorators wrap the function, exactly like CPython.)
+    fn compile_pep695_epilogue(
+        &mut self,
+        name: &str,
+        type_params: &[String],
+        span: weavepy_lexer::Span,
+    ) -> Result<(), CompileError> {
+        if type_params.is_empty() {
+            return Ok(());
+        }
+        let name_expr = |n: &str| Expr {
+            kind: ExprKind::Name(n.to_owned()),
+            span,
+        };
+        let set_params = Stmt {
+            kind: StmtKind::Assign {
+                targets: vec![Expr {
+                    kind: ExprKind::Attribute {
+                        value: Box::new(name_expr(name)),
+                        attr: "__type_params__".to_owned(),
+                    },
+                    span,
+                }],
+                value: Expr {
+                    kind: ExprKind::Tuple(type_params.iter().map(|t| name_expr(t)).collect()),
+                    span,
+                },
+            },
+            span,
+        };
+        self.compile_stmt(&set_params)?;
+        let del = Stmt {
+            kind: StmtKind::Delete(type_params.iter().map(|t| name_expr(t)).collect()),
+            span,
+        };
+        self.compile_stmt(&del)?;
+        Ok(())
+    }
+
     fn compile_function_def(
         &mut self,
         name: &str,
         args: &AstArguments,
         body: &[Stmt],
         decorator_list: &[Expr],
+        returns: Option<&Expr>,
     ) -> Result<(), CompileError> {
-        self.compile_function_def_inner(name, args, body, decorator_list, false)
+        self.compile_function_def_inner(name, args, body, decorator_list, returns, false)
     }
 
     fn compile_async_function_def(
@@ -1727,8 +1838,9 @@ impl Compiler {
         args: &AstArguments,
         body: &[Stmt],
         decorator_list: &[Expr],
+        returns: Option<&Expr>,
     ) -> Result<(), CompileError> {
-        self.compile_function_def_inner(name, args, body, decorator_list, true)
+        self.compile_function_def_inner(name, args, body, decorator_list, returns, true)
     }
 
     fn compile_function_def_inner(
@@ -1737,12 +1849,13 @@ impl Compiler {
         args: &AstArguments,
         body: &[Stmt],
         decorator_list: &[Expr],
+        returns: Option<&Expr>,
         is_async: bool,
     ) -> Result<(), CompileError> {
         for d in decorator_list {
             self.compile_expr(d)?;
         }
-        self.build_function_object_inner(name, args, body, is_async)?;
+        self.build_function_object_inner(name, args, body, returns, is_async)?;
         for _ in decorator_list {
             self.emit(OpCode::Call, 1);
         }
@@ -1761,7 +1874,7 @@ impl Compiler {
         args: &AstArguments,
         body: &[Stmt],
     ) -> Result<(), CompileError> {
-        self.build_function_object_inner(name, args, body, false)
+        self.build_function_object_inner(name, args, body, None, false)
     }
 
     fn build_function_object_inner(
@@ -1769,6 +1882,7 @@ impl Compiler {
         name: &str,
         args: &AstArguments,
         body: &[Stmt],
+        returns: Option<&Expr>,
         is_async: bool,
     ) -> Result<(), CompileError> {
         // Fast-local slots follow CPython's order exactly:
@@ -1914,6 +2028,12 @@ impl Compiler {
             if let Some(ann) = kw.annotation.as_ref() {
                 annotated_params.push((kw.name.clone(), ann));
             }
+        }
+        // `-> R` joins the same dict under the `'return'` key — at
+        // MakeFunction time, *before* decorators see the function
+        // (CPython compiles all annotations into one dict).
+        if let Some(ret) = returns {
+            annotated_params.push(("return".to_owned(), ret));
         }
         if !annotated_params.is_empty() {
             for (pname, ann) in &annotated_params {

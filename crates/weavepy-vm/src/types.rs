@@ -338,6 +338,23 @@ impl TypeObject {
     pub fn class_name(&self) -> &str {
         &self.name
     }
+
+    /// CPython `type_repr` name: `__module__.__qualname__`, with the
+    /// module prefix omitted for `builtins` (so `<class 'int'>` but
+    /// `<class 'collections.abc.Iterable'>` / `<class '__main__.Foo'>`).
+    pub fn qualified_display_name(&self) -> String {
+        let dict = self.dict.borrow();
+        let module = dict
+            .get(&DictKey(Object::from_static("__module__")))
+            .map(Object::to_str);
+        let qual = dict
+            .get(&DictKey(Object::from_static("__qualname__")))
+            .map_or_else(|| self.name.clone(), Object::to_str);
+        match module.as_deref() {
+            None | Some("builtins") | Some("") => qual,
+            Some(m) => format!("{m}.{qual}"),
+        }
+    }
 }
 
 fn compute_c3(
@@ -410,6 +427,12 @@ pub struct PyInstance {
     /// The capacity-overflow half of the state (too many attributes)
     /// is computed at query time from the dict size.
     pub inline_values: Cell<bool>,
+    /// `__slots__` storage. CPython lays slot values out as C struct
+    /// members *outside* the instance `__dict__`; we mirror that
+    /// separation with a side table so `vars(obj)` never exposes slot
+    /// values and `object.__getstate__` can report them separately.
+    /// `None` until the first slot write (most instances have none).
+    pub slots: RefCell<Option<DictData>>,
 }
 
 impl PyInstance {
@@ -419,6 +442,7 @@ impl PyInstance {
             dict: Rc::new(RefCell::new(DictData::new())),
             native: None,
             inline_values: Cell::new(true),
+            slots: RefCell::new(None),
         }
     }
 
@@ -430,6 +454,7 @@ impl PyInstance {
             dict: Rc::new(RefCell::new(DictData::new())),
             native: Some(native),
             inline_values: Cell::new(true),
+            slots: RefCell::new(None),
         }
     }
 
@@ -442,5 +467,47 @@ impl PyInstance {
     /// Re-point the instance at a new class (`obj.__class__ = C`).
     pub fn set_cls(&self, class: Rc<TypeObject>) {
         *self.class.borrow_mut() = class;
+    }
+
+    /// Read slot `name` from the side table (a `__slots__` member).
+    pub fn slot_get(&self, name: &str) -> Option<Object> {
+        self.slots
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.get(&DictKey(Object::from_str(name))).cloned())
+    }
+
+    /// Write slot `name` into the side table.
+    pub fn slot_set(&self, name: &str, value: Object) {
+        self.slots
+            .borrow_mut()
+            .get_or_insert_with(DictData::new)
+            .insert(DictKey(Object::from_str(name)), value);
+    }
+
+    /// Delete slot `name` from the side table; `false` when unset.
+    pub fn slot_del(&self, name: &str) -> bool {
+        self.slots
+            .borrow_mut()
+            .as_mut()
+            .map(|s| s.shift_remove(&DictKey(Object::from_str(name))).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Snapshot of the populated slot values (for `__getstate__`,
+    /// `copy`, and GC tracing).
+    pub fn slots_snapshot(&self) -> Vec<(String, Object)> {
+        self.slots
+            .borrow()
+            .as_ref()
+            .map(|s| {
+                s.iter()
+                    .filter_map(|(k, v)| match &k.0 {
+                        Object::Str(name) => Some((name.to_string(), v.clone())),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }

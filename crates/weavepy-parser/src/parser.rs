@@ -586,30 +586,33 @@ impl<'src> Parser<'src> {
         let def_tok = self.bump(); // `def`
         let name_tok = self.expect(&TokenKind::Name, "function name")?;
         let name = self.ident(name_tok.span);
-        // PEP 695: optional `[T, *Ts, **P]` type-parameter list.
-        // Consumed-and-discarded for now — the names are real `TypeVar`-shaped
-        // objects in CPython, but the parser tolerates the syntax so generic
-        // libraries that target 3.12+ load. The compiler's downstream
-        // dataflow analysis doesn't see them today; pretty-printer round-trip
-        // loses them.
-        self.skip_pep695_type_params()?;
+        // PEP 695: optional `[T, *Ts, **P]` type-parameter list. The
+        // captured names desugar into `TypeVar` bindings around the def
+        // (see `desugar_pep695_def`) so annotations referencing them
+        // resolve and `f.__type_params__` is populated.
+        let type_params = self.collect_pep695_type_params()?;
         self.expect(&TokenKind::LPar, "`(`")?;
         let args = self.parse_function_arguments()?;
         self.expect(&TokenKind::RPar, "`)`")?;
-        if self.eat(&TokenKind::RArrow) {
-            let _ = self.parse_expression(false)?;
-        }
+        let returns = if self.eat(&TokenKind::RArrow) {
+            Some(self.parse_expression(false)?)
+        } else {
+            None
+        };
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block()?;
         let span_end = body.last().map_or(def_tok.span, |s| s.span);
+        let span = def_tok.span.merge(span_end);
         Ok(Stmt {
             kind: StmtKind::FunctionDef {
                 name,
                 args,
                 body,
                 decorator_list,
+                type_params,
+                returns: returns.map(Box::new),
             },
-            span: def_tok.span.merge(span_end),
+            span,
         })
     }
 
@@ -627,12 +630,16 @@ impl<'src> Parser<'src> {
                         args,
                         body,
                         decorator_list,
+                        type_params,
+                        returns,
                     } => Ok(Stmt {
                         kind: StmtKind::AsyncFunctionDef {
                             name,
                             args,
                             body,
                             decorator_list,
+                            type_params,
+                            returns,
                         },
                         span: async_tok.span.merge(stmt.span),
                     }),
@@ -693,9 +700,9 @@ impl<'src> Parser<'src> {
         let class_tok = self.bump(); // `class`
         let name_tok = self.expect(&TokenKind::Name, "class name")?;
         let name = self.ident(name_tok.span);
-        // PEP 695: optional `[T, *Ts, **P]` type-parameter list (same as
-        // function form).
-        self.skip_pep695_type_params()?;
+        // PEP 695: optional `[T, *Ts, **P]` type-parameter list — same
+        // desugar as the function form (TypeVar bindings around the def).
+        let type_params = self.collect_pep695_type_params()?;
         let (bases, keywords) = if self.eat(&TokenKind::LPar) {
             let (a, kw) = self.parse_call_args()?;
             self.expect(&TokenKind::RPar, "`)`")?;
@@ -706,6 +713,7 @@ impl<'src> Parser<'src> {
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_block()?;
         let span_end = body.last().map_or(class_tok.span, |s| s.span);
+        let span = class_tok.span.merge(span_end);
         Ok(Stmt {
             kind: StmtKind::ClassDef {
                 name,
@@ -713,8 +721,9 @@ impl<'src> Parser<'src> {
                 keywords,
                 body,
                 decorator_list,
+                type_params,
             },
-            span: class_tok.span.merge(span_end),
+            span,
         })
     }
 

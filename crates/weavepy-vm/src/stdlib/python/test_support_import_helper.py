@@ -88,12 +88,13 @@ def import_fresh_module(name, fresh=(), blocked=(), *, deprecated=False):
         if blocker is not None:
             sys.meta_path.insert(0, blocker)
         try:
-            for modname in fresh:
-                try:
-                    importlib.import_module(modname)
-                except ImportError:
-                    pass
+            # CPython contract: if any *fresh* module can't be imported the
+            # whole call answers None — `import_fresh_module('functools',
+            # fresh=['_functools'])` is how test files probe for a missing
+            # C accelerator (the C-variant test classes then skip).
             try:
+                for modname in fresh:
+                    importlib.import_module(modname)
                 mod = importlib.import_module(name)
             except ImportError:
                 return None

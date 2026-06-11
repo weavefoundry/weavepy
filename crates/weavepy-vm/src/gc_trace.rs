@@ -658,6 +658,13 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                 visit(&k.0);
                 visit(v);
             }
+            drop(m);
+            if let Some(slots) = i.slots.borrow().as_ref() {
+                for (k, v) in slots.iter() {
+                    visit(&k.0);
+                    visit(v);
+                }
+            }
         }
         Object::Module(m) => {
             let dict = m.dict.borrow();
@@ -682,7 +689,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             visit(&p.fget);
             visit(&p.fset);
             visit(&p.fdel);
-            visit(&p.doc);
+            visit(&p.doc.borrow());
         }
         Object::StaticMethod(o) | Object::ClassMethod(o) => {
             visit(o);
@@ -781,6 +788,7 @@ pub fn clear_object_fields(obj: &Object) {
         }
         Object::Instance(i) => {
             i.dict.borrow_mut().clear();
+            *i.slots.borrow_mut() = None;
         }
         Object::ByteArray(b) => {
             b.borrow_mut().clear();

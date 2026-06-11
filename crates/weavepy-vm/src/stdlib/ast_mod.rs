@@ -202,6 +202,8 @@ impl Builder<'_> {
                 args,
                 body,
                 decorator_list,
+                returns,
+                ..
             } => node(
                 "FunctionDef",
                 vec![
@@ -209,7 +211,10 @@ impl Builder<'_> {
                     ("args", self.arguments(args)),
                     ("body", list_of(body, |x| self.stmt(x))),
                     ("decorator_list", list_of(decorator_list, |x| self.expr(x))),
-                    ("returns", Object::None),
+                    (
+                        "returns",
+                        returns.as_deref().map_or(Object::None, |r| self.expr(r)),
+                    ),
                     ("type_comment", Object::None),
                     ("type_params", Object::new_list(vec![])),
                 ],
@@ -221,6 +226,8 @@ impl Builder<'_> {
                 args,
                 body,
                 decorator_list,
+                returns,
+                ..
             } => node(
                 "AsyncFunctionDef",
                 vec![
@@ -228,7 +235,10 @@ impl Builder<'_> {
                     ("args", self.arguments(args)),
                     ("body", list_of(body, |x| self.stmt(x))),
                     ("decorator_list", list_of(decorator_list, |x| self.expr(x))),
-                    ("returns", Object::None),
+                    (
+                        "returns",
+                        returns.as_deref().map_or(Object::None, |r| self.expr(r)),
+                    ),
                     ("type_comment", Object::None),
                     ("type_params", Object::new_list(vec![])),
                 ],
@@ -241,6 +251,7 @@ impl Builder<'_> {
                 keywords,
                 body,
                 decorator_list,
+                ..
             } => node(
                 "ClassDef",
                 vec![

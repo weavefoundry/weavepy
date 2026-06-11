@@ -279,6 +279,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         dict,
         native: None,
         inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
     });
     Object::Instance(inst)
 }
@@ -380,6 +381,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         dict,
         native: None,
         inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
     });
     Object::Instance(inst)
 }

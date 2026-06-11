@@ -322,15 +322,22 @@ impl Builder {
                 args,
                 body,
                 decorator_list,
+                returns,
+                ..
             }
             | S::AsyncFunctionDef {
                 name,
                 args,
                 body,
                 decorator_list,
+                returns,
+                ..
             } => {
                 self.add_def(name, DEF_LOCAL);
                 self.visit_defaults_and_annotations(args, true);
+                if let Some(r) = returns {
+                    self.visit_expr(r);
+                }
                 for d in decorator_list {
                     self.visit_expr(d);
                 }
@@ -347,6 +354,7 @@ impl Builder {
                 keywords,
                 body,
                 decorator_list,
+                ..
             } => {
                 self.add_def(name, DEF_LOCAL);
                 for b in bases {

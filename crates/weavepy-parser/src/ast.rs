@@ -35,12 +35,16 @@ pub struct Stmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
-    /// `def name(args): body`
+    /// `def name[T](args) -> returns: body`
     FunctionDef {
         name: String,
         args: Arguments,
         body: Vec<Stmt>,
         decorator_list: Vec<Expr>,
+        /// PEP 695 type-parameter names (`def f[T, U](…)`).
+        type_params: Vec<String>,
+        /// `-> annotation`, evaluated at definition time.
+        returns: Option<Box<Expr>>,
     },
     /// `async def name(args): body` (PEP 492, RFC 0016). Same shape
     /// as [`StmtKind::FunctionDef`]; the compiler routes the body
@@ -50,6 +54,10 @@ pub enum StmtKind {
         args: Arguments,
         body: Vec<Stmt>,
         decorator_list: Vec<Expr>,
+        /// PEP 695 type-parameter names.
+        type_params: Vec<String>,
+        /// `-> annotation`, evaluated at definition time.
+        returns: Option<Box<Expr>>,
     },
     /// `class name(bases, **keywords): body`
     ClassDef {
@@ -58,6 +66,8 @@ pub enum StmtKind {
         keywords: Vec<Keyword>,
         body: Vec<Stmt>,
         decorator_list: Vec<Expr>,
+        /// PEP 695 type-parameter names (`class C[T](…)`).
+        type_params: Vec<String>,
     },
     /// `return value`
     Return(Option<Expr>),
@@ -555,6 +565,8 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             args,
             body,
             decorator_list,
+            returns,
+            ..
         } => {
             out.push_str("FunctionDef(name='");
             out.push_str(name);
@@ -569,13 +581,20 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
                 }
                 dump_expr(out, d, depth);
             }
-            out.push_str("], returns=None, type_comment=None)");
+            out.push_str("], returns=");
+            match returns {
+                Some(r) => dump_expr(out, r, depth),
+                None => out.push_str("None"),
+            }
+            out.push_str(", type_comment=None)");
         }
         S::AsyncFunctionDef {
             name,
             args,
             body,
             decorator_list,
+            returns,
+            ..
         } => {
             out.push_str("AsyncFunctionDef(name='");
             out.push_str(name);
@@ -590,7 +609,12 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
                 }
                 dump_expr(out, d, depth);
             }
-            out.push_str("], returns=None, type_comment=None)");
+            out.push_str("], returns=");
+            match returns {
+                Some(r) => dump_expr(out, r, depth),
+                None => out.push_str("None"),
+            }
+            out.push_str(", type_comment=None)");
         }
         S::ClassDef {
             name,
@@ -598,6 +622,7 @@ fn dump_stmt(out: &mut String, s: &Stmt, depth: usize) {
             keywords,
             body,
             decorator_list,
+            ..
         } => {
             out.push_str("ClassDef(name='");
             out.push_str(name);

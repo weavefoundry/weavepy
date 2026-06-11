@@ -42,6 +42,26 @@ class _SpecialForm:
     def __getitem__(self, params):
         if not isinstance(params, tuple):
             params = (params,)
+        if self._name == "Union":
+            # CPython normalizes at construction: `None` becomes
+            # `type(None)`, nested unions flatten, duplicates collapse
+            # (`Union[str, None]` == `Union[str, NoneType]`; singledispatch
+            # requires every arg to be a real class).
+            flat = []
+            for p in params:
+                if p is None:
+                    p = type(None)
+                if getattr(p, "__origin__", None) is Union:
+                    flat.extend(p.__args__)
+                else:
+                    flat.append(p)
+            deduped = []
+            for p in flat:
+                if not any(p is q for q in deduped):
+                    deduped.append(p)
+            if len(deduped) == 1:
+                return deduped[0]
+            params = tuple(deduped)
         return _GenericAlias(self, params)
 
     def __call__(self, *args, **kwargs):
@@ -563,6 +583,14 @@ def get_origin(tp):
     """Return the unsubscripted version of a generic alias."""
     if isinstance(tp, _GenericAlias):
         return tp.__origin__
+    # PEP 604 unions (`int | str`) — CPython answers `types.UnionType`.
+    if getattr(tp, "__is_pep604_union__", False):
+        import types
+        return types.UnionType
+    # PEP 585 aliases (`list[int]`) carry a real `__origin__`.
+    origin = getattr(tp, "__origin__", None)
+    if origin is not None and getattr(tp, "__args__", None) is not None:
+        return origin
     return None
 
 
@@ -570,6 +598,12 @@ def get_args(tp):
     """Return the type arguments of a generic alias."""
     if isinstance(tp, _GenericAlias):
         return tp.__args__
+    if getattr(tp, "__is_pep604_union__", False):
+        return tuple(tp.__args__)
+    if getattr(tp, "__origin__", None) is not None:
+        args = getattr(tp, "__args__", None)
+        if args is not None:
+            return tuple(args)
     return ()
 
 
@@ -772,6 +806,35 @@ _LAZY_COLLECTION_ALIASES = {
     "ChainMap": "ChainMap",
 }
 
+# Aliases backed by ``collections.abc`` (``typing.Iterable[str]`` and
+# friends). Same lazy PEP 562 treatment as the container aliases above.
+_LAZY_ABC_ALIASES = {
+    "AbstractSet": "Set",
+    "AsyncGenerator": "AsyncGenerator",
+    "AsyncIterable": "AsyncIterable",
+    "AsyncIterator": "AsyncIterator",
+    "Awaitable": "Awaitable",
+    "ByteString": "ByteString",
+    "Collection": "Collection",
+    "Container": "Container",
+    "Coroutine": "Coroutine",
+    "Generator": "Generator",
+    "Hashable": "Hashable",
+    "ItemsView": "ItemsView",
+    "Iterable": "Iterable",
+    "Iterator": "Iterator",
+    "KeysView": "KeysView",
+    "Mapping": "Mapping",
+    "MappingView": "MappingView",
+    "MutableMapping": "MutableMapping",
+    "MutableSequence": "MutableSequence",
+    "MutableSet": "MutableSet",
+    "Reversible": "Reversible",
+    "Sequence": "Sequence",
+    "Sized": "Sized",
+    "ValuesView": "ValuesView",
+}
+
 
 def __getattr__(name):
     target = _LAZY_COLLECTION_ALIASES.get(name)
@@ -779,6 +842,13 @@ def __getattr__(name):
         import collections
 
         alias = _OriginAlias(name, getattr(collections, target))
+        globals()[name] = alias
+        return alias
+    target = _LAZY_ABC_ALIASES.get(name)
+    if target is not None:
+        import collections.abc
+
+        alias = _OriginAlias(name, getattr(collections.abc, target))
         globals()[name] = alias
         return alias
     raise AttributeError(f"module 'typing' has no attribute {name!r}")

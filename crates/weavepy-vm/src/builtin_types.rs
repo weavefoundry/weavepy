@@ -51,6 +51,10 @@ pub struct BuiltinTypes {
     pub ellipsis_: Rc<TypeObject>,
     pub not_implemented_type_: Rc<TypeObject>,
     pub simple_namespace_: Rc<TypeObject>,
+    /// `types.GenericAlias` — the type of PEP 585 aliases (`list[int]`).
+    pub generic_alias_: Rc<TypeObject>,
+    /// `types.UnionType` — the type of PEP 604 unions (`int | str`).
+    pub union_type_: Rc<TypeObject>,
     pub function_: Rc<TypeObject>,
     pub method_: Rc<TypeObject>,
     /// `builtin_function_or_method` — the type of Rust-implemented
@@ -191,6 +195,25 @@ impl BuiltinTypes {
         let ellipsis_ = mk("ellipsis", vec![object_.clone()]);
         let not_implemented_type_ = mk("NotImplementedType", vec![object_.clone()]);
         let simple_namespace_ = mk("SimpleNamespace", vec![object_.clone()]);
+        // PEP 585 / PEP 604 runtime types. The *instances* are
+        // namespace-shaped (`Object::SimpleNamespace` carrying
+        // `__origin__` / `__args__`), but their reported class must be
+        // `types.GenericAlias` / `types.UnionType` as in CPython —
+        // `functools` does `GenericAlias = type(list[int])` and then both
+        // `isinstance(typ, GenericAlias)` and
+        // `__class_getitem__ = classmethod(GenericAlias)`.
+        let generic_alias_ = mk("GenericAlias", vec![object_.clone()]);
+        let union_type_ = mk("UnionType", vec![object_.clone()]);
+        for ty in [&generic_alias_, &union_type_] {
+            // Not in `as_globals` (they live in `types`, not `builtins`),
+            // so the bulk metaclass pass below won't reach them.
+            ty.set_metaclass(type_.clone());
+            let mut d = ty.dict.borrow_mut();
+            d.insert(
+                crate::object::DictKey(Object::from_static("__module__")),
+                Object::from_static("types"),
+            );
+        }
         let function_ = mk("function", vec![object_.clone()]);
         // `types.MethodType` — the bound-method type. Distinct from
         // `function` so `type(obj.meth)` is `method` (as in CPython) and
@@ -366,6 +389,8 @@ impl BuiltinTypes {
             ellipsis_,
             not_implemented_type_,
             simple_namespace_,
+            generic_alias_,
+            union_type_,
             function_,
             method_,
             builtin_function_,
@@ -455,6 +480,10 @@ impl BuiltinTypes {
         // int.__dict__` is True — `enum._find_data_type_` uses exactly this to
         // recognise `int`/`str`/… as the mix-in data type.
         install_value_type_new(&bt);
+        // RFC 0037 — materialize the full method/dunder surface into the
+        // type dicts (CPython's `tp_dict` parity: `vars(list)`,
+        // `bytearray.__hash__ is None`, `_check_methods`-style ABC hooks).
+        crate::type_surface::install(&bt);
         bt
     }
 

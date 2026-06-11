@@ -45,6 +45,7 @@ pub mod thread_registry;
 #[cfg(feature = "jit")]
 mod tier2;
 pub mod trace;
+pub mod type_surface;
 pub mod types;
 pub mod vm_singletons;
 pub mod weakref_registry;
@@ -3134,7 +3135,10 @@ impl Interpreter {
                     }
                 }
                 let name = code.name.clone();
-                let attrs = Rc::new(RefCell::new(DictData::new()));
+                // Function getset slots live *outside* `__dict__`
+                // (`f.__dict__` starts empty in CPython; only genuine
+                // user attributes land there).
+                let slots = RefCell::new(DictData::new());
                 // Stamp __module__ from globals['__name__'] (mirrors CPython's
                 // function dispatch). Pickle relies on this to serialise the
                 // function by qualified name.
@@ -3144,7 +3148,7 @@ impl Interpreter {
                     .get(&DictKey(Object::from_static("__name__")))
                     .cloned()
                 {
-                    attrs
+                    slots
                         .borrow_mut()
                         .insert(DictKey(Object::from_static("__module__")), name_obj);
                 }
@@ -3155,19 +3159,18 @@ impl Interpreter {
                 // stable identity, which `assertIs(wrapper.__name__,
                 // func.__name__)` in test_decorators relies on.
                 let name_obj = Object::from_str(name.clone());
-                attrs.borrow_mut().insert(
-                    DictKey(Object::from_static("__name__")),
-                    name_obj.clone(),
-                );
+                slots
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_static("__name__")), name_obj.clone());
                 // `__qualname__` is the code object's PEP 3155 dotted name
                 // (computed at compile time from lexical nesting), not the
                 // bare `__name__`. Pinned as a stable object like `__name__`.
-                attrs.borrow_mut().insert(
+                slots.borrow_mut().insert(
                     DictKey(Object::from_static("__qualname__")),
                     Object::from_str(code.qualname.clone()),
                 );
                 if let Some(ann) = annotations_obj {
-                    attrs
+                    slots
                         .borrow_mut()
                         .insert(DictKey(Object::from_static("__annotations__")), ann);
                 }
@@ -3178,7 +3181,8 @@ impl Interpreter {
                     defaults,
                     kw_defaults,
                     closure,
-                    attrs,
+                    attrs: Rc::new(RefCell::new(DictData::new())),
+                    slots,
                 };
                 frame.push(Object::Function(Rc::new(f)));
             }
@@ -4282,7 +4286,7 @@ impl Interpreter {
                 "fget" => Ok(p.fget.clone()),
                 "fset" => Ok(p.fset.clone()),
                 "fdel" => Ok(p.fdel.clone()),
-                "__doc__" => Ok(p.doc.clone()),
+                "__doc__" => Ok(p.doc()),
                 // CPython computes `property.__isabstractmethod__` as the
                 // OR of the wrapped accessors' flags, so the modern
                 // `@property` / `@abstractmethod` stacking marks the
@@ -4411,6 +4415,15 @@ impl Interpreter {
                 if name == "__dict__" {
                     return Ok(Object::Dict(d.clone()));
                 }
+                // Read-side mapping API (`get`/`keys`/`items`/…) comes from
+                // the method table (enum's `__setattr__` does
+                // `cls.__dict__.get(name)` on exactly this proxy type).
+                if let Some(m) = self.lookup_method(obj, name) {
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: obj.clone(),
+                        function: m,
+                    })));
+                }
                 Err(attribute_error(format!(
                     "'mappingproxy' object has no attribute '{name}'"
                 )))
@@ -4440,7 +4453,13 @@ impl Interpreter {
                 }
             },
             Object::Function(f) => {
-                if let Some(v) = f.attrs.borrow().get(&DictKey(Object::from_str(name))) {
+                // Slot dunders are data descriptors in CPython — they
+                // resolve *before* (and never through) `__dict__`.
+                if crate::object::is_function_slot(name) {
+                    if let Some(v) = f.slot(name) {
+                        return Ok(v);
+                    }
+                } else if let Some(v) = f.attrs.borrow().get(&DictKey(Object::from_str(name))) {
                     return Ok(v.clone());
                 }
                 match name {
@@ -4448,7 +4467,7 @@ impl Interpreter {
                     // PEP 3155 qualname comes from the code object (computed
                     // at compile time from lexical nesting), unless user code
                     // has overridden it via `f.__qualname__ = …` (handled by
-                    // the `f.attrs` lookup above).
+                    // the slot lookup above).
                     "__qualname__" => return Ok(Object::from_str(&f.code.qualname)),
                     "__doc__" => {
                         // CPython convention: the first statement of
@@ -4459,7 +4478,7 @@ impl Interpreter {
                     }
                     "__module__" => {
                         // Fall back to globals['__name__'] if the function's
-                        // attrs dict didn't already pin a value (e.g. for
+                        // slots didn't already pin a value (e.g. for
                         // synthesised functions in tests / REPL).
                         if let Some(name_obj) = f
                             .globals
@@ -4474,6 +4493,19 @@ impl Interpreter {
                     "__dict__" => return Ok(Object::Dict(f.attrs.clone())),
                     "__code__" => return Ok(Object::Code(f.code.clone())),
                     "__globals__" => return Ok(Object::Dict(f.globals.clone())),
+                    // CPython `function.__builtins__`: the builtins mapping
+                    // the function executes against — `__globals__['__builtins__']`
+                    // when present, else the interpreter's builtins dict.
+                    "__builtins__" => {
+                        if let Some(b) = f
+                            .globals
+                            .borrow()
+                            .get(&DictKey(Object::from_static("__builtins__")))
+                        {
+                            return Ok(b.clone());
+                        }
+                        return Ok(Object::Dict(self.builtins.clone()));
+                    }
                     "__defaults__" => {
                         if f.defaults.is_empty() {
                             return Ok(Object::None);
@@ -4501,14 +4533,10 @@ impl Interpreter {
                         // function was defined without annotations,
                         // so reads of ``__annotations__`` never raise
                         // ``AttributeError``. Stash it on the
-                        // function's attrs so subsequent writes mutate
-                        // the same dict.
-                        let key = DictKey(Object::from_static("__annotations__"));
-                        if let Some(v) = f.attrs.borrow().get(&key) {
-                            return Ok(v.clone());
-                        }
+                        // function's slots so subsequent writes mutate
+                        // the same dict (the slot lookup above missed).
                         let d = Object::Dict(Rc::new(RefCell::new(DictData::new())));
-                        f.attrs.borrow_mut().insert(key, d.clone());
+                        f.set_slot("__annotations__", d.clone());
                         return Ok(d);
                     }
                     // PEP 695: every function carries `__type_params__`
@@ -4609,15 +4637,17 @@ impl Interpreter {
             Object::BoundMethod(bm) => match name {
                 "__func__" => Ok(bm.function.clone()),
                 "__self__" => Ok(bm.receiver.clone()),
-                "__name__" => match &bm.function {
-                    Object::Function(f) => Ok(Object::from_str(f.name.clone())),
+                // `method.__name__`/`__doc__` delegate to `__func__` so a
+                // `functools.wraps`-patched attribute (stored in the
+                // function's attrs dict) wins over the compile-time name —
+                // `classmethod(contextmanager(f))` relies on this.
+                "__name__" | "__qualname__" => match &bm.function {
+                    Object::Function(_) => self.load_attr(&bm.function, name),
                     Object::Builtin(b) => Ok(Object::from_static(builtin_display_name(b.name))),
                     _ => Ok(Object::from_static("?")),
                 },
                 "__doc__" => match &bm.function {
-                    Object::Function(f) => {
-                        Ok(crate::builtins::code_docstring(&f.code).unwrap_or(Object::None))
-                    }
+                    Object::Function(_) => self.load_attr(&bm.function, name),
                     Object::Builtin(b) => Ok(builtin_doc(b.name)
                         .map(Object::from_static)
                         .unwrap_or(Object::None)),
@@ -4825,11 +4855,22 @@ impl Interpreter {
         // `super.__getattribute__` passes `su.__obj_type__` — the
         // class that originally triggered super — as the `owner`
         // argument to the descriptor protocol; we mirror that here.
-        let super_receiver = inst
+        // A proxy is identified by the `__obj_type__` key, which *only*
+        // `make_super` writes — a plain object that merely carries a
+        // `__self__` attribute (`partialmethod.__get__` writes one onto
+        // its bound `partial`) must stay on the normal path.
+        let super_receiver = if inst
             .dict
             .borrow()
-            .get(&DictKey(Object::from_static("__self__")))
-            .cloned();
+            .contains_key(&DictKey(Object::from_static("__obj_type__")))
+        {
+            inst.dict
+                .borrow()
+                .get(&DictKey(Object::from_static("__self__")))
+                .cloned()
+        } else {
+            None
+        };
         if name != "__self__" {
             if let Some(receiver) = super_receiver {
                 if let Some(v) = inst.cls().lookup(name) {
@@ -4907,7 +4948,18 @@ impl Interpreter {
         // user's instance dict but Python code (e.g.
         // `functools.cached_property`) reaches for them anyway.
         match name {
-            "__dict__" => return Ok(Object::Dict(inst.dict.clone())),
+            "__dict__" => {
+                // A pure-`__slots__` class has no instance `__dict__` at
+                // all (CPython raises AttributeError; `cached_property`
+                // keys its slots-unsupported diagnostic off this).
+                if inst.cls().forbids_dict {
+                    return Err(attribute_error(format!(
+                        "'{}' object has no attribute '__dict__'",
+                        inst.cls().name
+                    )));
+                }
+                return Ok(Object::Dict(inst.dict.clone()));
+            }
             "__class__" => return Ok(Object::Type(inst.cls())),
             _ => {}
         }
@@ -5042,7 +5094,11 @@ impl Interpreter {
                 return Ok(Object::new_tuple(mro));
             }
             "__class__" => return Ok(Object::Type(meta)),
-            "__dict__" => return Ok(Object::Dict(ty.dict.clone())),
+            // CPython: `type.__dict__` is a read-only `mappingproxy`
+            // (direct `cls.__dict__[k] = v` raises TypeError; mutation
+            // must go through `setattr`). The proxy *shares* the dict, so
+            // reads stay live.
+            "__dict__" => return Ok(Object::MappingProxy(ty.dict.clone())),
             "__flags__" => return Ok(Object::Int(ty.flags_bits())),
             "__subclasses__" => {
                 // `type.__subclasses__` is a bound method; the actual
@@ -5200,16 +5256,13 @@ impl Interpreter {
             }))),
             Object::SlotDescriptor(slot) => match instance {
                 Object::None => Ok(attr.clone()),
-                Object::Instance(inst) => {
-                    let key = DictKey(Object::from_str(&slot.name));
-                    match inst.dict.borrow().get(&key) {
-                        Some(v) => Ok(v.clone()),
-                        None => Err(attribute_error(format!(
-                            "'{}' object has no attribute '{}'",
-                            inst.cls().name, slot.name
-                        ))),
-                    }
-                }
+                Object::Instance(inst) => match inst.slot_get(&slot.name) {
+                    Some(v) => Ok(v),
+                    None => Err(attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.cls().name, slot.name
+                    ))),
+                },
                 _ => Err(type_error("slot descriptor requires an instance")),
             },
             Object::Function(_) | Object::Builtin(_) => {
@@ -6491,6 +6544,14 @@ impl Interpreter {
         v: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // `tuple(t)` on an exact tuple returns `t` itself (CPython reuses
+        // the immutable object — `copy.copy(partial).args is partial.args`
+        // depends on it).
+        if name == "tuple" {
+            if let Object::Tuple(_) = v {
+                return Ok(v.clone());
+            }
+        }
         let collected = self.collect_iterable(v, globals)?;
         if name == "list" {
             Ok(Object::new_list(collected))
@@ -7519,19 +7580,43 @@ impl Interpreter {
         reverse: bool,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<(), RuntimeError> {
+        // CPython's `reverse=True` is *tie-stable*: equal elements keep
+        // their original relative order (list.sort reverses the slice
+        // before and after sorting). A post-sort `.reverse()` alone would
+        // flip ties — observable in `heapq.nlargest`/`Counter.most_common`.
         if let Some(f) = key_fn {
             let mut decorated: Vec<(Object, Object)> = Vec::with_capacity(items.len());
             for item in items.iter() {
                 let k = self.call(f, std::slice::from_ref(item), &[], globals)?;
                 decorated.push((k, item.clone()));
             }
-            decorated.sort_by(|a, b| a.0.cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if reverse {
+                decorated.reverse();
+            }
+            if decorated.iter().any(|(k, _)| sort_key_needs_dunder_lt(k)) {
+                decorated = merge_sort_by_pylt(self, decorated, &|p: &(Object, Object)| &p.0, globals)?;
+            } else {
+                decorated.sort_by(|a, b| a.0.cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            }
             if reverse {
                 decorated.reverse();
             }
             *items = decorated.into_iter().map(|(_, v)| v).collect();
         } else {
-            items.sort_by(|a, b| a.cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if reverse {
+                items.reverse();
+            }
+            if items.iter().any(sort_key_needs_dunder_lt) {
+                let sorted = merge_sort_by_pylt(
+                    self,
+                    std::mem::take(items),
+                    &|o: &Object| o,
+                    globals,
+                )?;
+                *items = sorted;
+            } else {
+                items.sort_by(|a, b| a.cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            }
             if reverse {
                 items.reverse();
             }
@@ -9540,6 +9625,20 @@ impl Interpreter {
         name: &str,
         globals: &Rc<RefCell<DictData>>,
     ) -> Option<Object> {
+        // Comparing *classes* dispatches through the metaclass's rich
+        // comparisons (CPython: `A < B` with `Meta.__lt__` — e.g. a
+        // `@total_ordering`-decorated metaclass). Only a real user
+        // metaclass method counts; `type` itself supplies none.
+        if let Object::Type(ty) = obj {
+            let meta = ty.metaclass_or_type();
+            if let Some(m @ (Object::Function(_) | Object::BoundMethod(_))) = meta.lookup(name) {
+                return Some(Object::BoundMethod(Rc::new(BoundMethod {
+                    receiver: obj.clone(),
+                    function: m,
+                })));
+            }
+            return None;
+        }
         let inst = match obj {
             Object::Instance(i) => i.clone(),
             _ => return None,
@@ -10604,6 +10703,13 @@ impl Interpreter {
     fn store_attr(&mut self, obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
         match obj {
             Object::Instance(inst) => self.store_attr_instance(inst, obj, name, value),
+            // `property.__doc__` is a writable member in CPython
+            // (`prop.__doc__ = "…"`); the accessor triple stays
+            // immutable (replaced via `.getter/.setter/.deleter`).
+            Object::Property(p) if name == "__doc__" => {
+                *p.doc.borrow_mut() = value;
+                Ok(())
+            }
             Object::Type(ty) => {
                 if ty.flags.is_builtin {
                     return Err(type_error(format!(
@@ -10646,9 +10752,49 @@ impl Interpreter {
                 Ok(())
             }
             Object::Function(f) => {
-                f.attrs
-                    .borrow_mut()
-                    .insert(DictKey(Object::from_str(name)), value);
+                // CPython's function getsets validate the assigned shape
+                // before accepting it.
+                match name {
+                    "__defaults__"
+                        if !matches!(value, Object::Tuple(_) | Object::None) =>
+                    {
+                        return Err(type_error("__defaults__ must be set to a tuple object"));
+                    }
+                    "__kwdefaults__"
+                        if !matches!(value, Object::Dict(_) | Object::None) =>
+                    {
+                        return Err(type_error(
+                            "__kwdefaults__ must be set to a dict object",
+                        ));
+                    }
+                    "__name__" | "__qualname__" if !matches!(value, Object::Str(_)) => {
+                        return Err(type_error(format!(
+                            "{name} must be set to a string object"
+                        )));
+                    }
+                    "__annotations__"
+                        if !matches!(value, Object::Dict(_) | Object::None) =>
+                    {
+                        return Err(type_error(
+                            "__annotations__ must be set to a dict object",
+                        ));
+                    }
+                    "__type_params__" if !matches!(value, Object::Tuple(_)) => {
+                        return Err(type_error(
+                            "__type_params__ must be set to a tuple object",
+                        ));
+                    }
+                    _ => {}
+                }
+                // Slot dunders are data descriptors: assignment lands in
+                // the slot store, never `__dict__`.
+                if crate::object::is_function_slot(name) {
+                    f.set_slot(name, value);
+                } else {
+                    f.attrs
+                        .borrow_mut()
+                        .insert(DictKey(Object::from_str(name)), value);
+                }
                 Ok(())
             }
             Object::SimpleNamespace(d) => {
@@ -10891,9 +11037,7 @@ impl Interpreter {
                     return Ok(());
                 }
                 Object::SlotDescriptor(_) => {
-                    inst.dict
-                        .borrow_mut()
-                        .insert(DictKey(Object::from_str(name)), value);
+                    inst.slot_set(name, value);
                     return Ok(());
                 }
                 Object::Instance(descriptor_inst) => {
@@ -11008,6 +11152,33 @@ impl Interpreter {
                     )))
                 }
             }
+            // `del f.attr` removes a function attribute from `__dict__`
+            // (CPython raises AttributeError — not TypeError — when
+            // absent; `functools.update_wrapper` probes with delete).
+            Object::Function(f) => {
+                if crate::object::is_function_slot(name) {
+                    // CPython allows deleting the nullable slots
+                    // (`__doc__`, `__annotations__`, …): the value
+                    // resets so the computed default resurfaces.
+                    f.slots
+                        .borrow_mut()
+                        .shift_remove(&DictKey(Object::from_str(name)));
+                    return Ok(());
+                }
+                let removed = f
+                    .attrs
+                    .borrow_mut()
+                    .shift_remove(&DictKey(Object::from_str(name)))
+                    .is_some();
+                if removed {
+                    Ok(())
+                } else {
+                    Err(attribute_error(format!(
+                        "'function' object has no attribute '{}'",
+                        name
+                    )))
+                }
+            }
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),
@@ -11053,6 +11224,16 @@ impl Interpreter {
                         &self.builtins.clone(),
                     )?;
                     return Ok(());
+                }
+                Object::SlotDescriptor(slot) => {
+                    if inst.slot_del(&slot.name) {
+                        return Ok(());
+                    }
+                    return Err(attribute_error(format!(
+                        "'{}' object has no attribute '{}'",
+                        inst.cls().name,
+                        slot.name
+                    )));
                 }
                 Object::Instance(descriptor_inst) => {
                     if let Some(deleter) = descriptor_inst.cls().lookup("__delete__") {
@@ -12537,6 +12718,7 @@ impl Interpreter {
             kw_defaults: vec![],
             closure,
             attrs: Rc::new(RefCell::new(DictData::new())),
+            slots: RefCell::new(DictData::new()),
         })))
     }
 
@@ -13665,6 +13847,23 @@ impl Interpreter {
                 "classmethod" => {
                     return builtins::construct_classmethod(args);
                 }
+                // `types.GenericAlias(origin, args)` — also reachable as
+                // `__class_getitem__ = classmethod(GenericAlias)` in pure-
+                // Python classes following CPython's own idiom (functools).
+                "GenericAlias" => {
+                    if args.len() != 2 {
+                        return Err(type_error(format!(
+                            "GenericAlias expected 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    return Ok(make_generic_alias(args[0].clone(), args[1].clone()));
+                }
+                "UnionType" => {
+                    return Err(type_error(
+                        "cannot create 'types.UnionType' instances".to_owned(),
+                    ));
+                }
                 // `types.MethodType(func, obj)` — bind `func` to `obj`,
                 // producing a callable bound method (CPython `method`).
                 "method" => {
@@ -14249,10 +14448,23 @@ impl Interpreter {
         // Defaults plug remaining holes among positional args. CPython
         // attaches positional defaults right-aligned to the param
         // list (so `def f(a, b=1, c=2)` has `defaults = (1, 2)`).
+        // A user-assigned `__defaults__` (stored on the function's slot
+        // store — `namedtuple` relies on `__new__.__defaults__ = …`)
+        // replaces the compiled tuple wholesale; `None` clears it.
         if filled.iter().take(total_args).any(|x| !x) {
+            let def_override = f.slot("__defaults__");
+            let overridden: Option<Vec<Object>> = match def_override {
+                Some(Object::Tuple(t)) => Some(t.iter().cloned().collect()),
+                Some(Object::None) => Some(Vec::new()),
+                _ => None,
+            };
+            let defaults: &[Object] = match &overridden {
+                Some(v) => v,
+                None => &f.defaults,
+            };
             let needed = total_args;
-            let first_default = needed.saturating_sub(f.defaults.len());
-            for (i, d) in f.defaults.iter().enumerate() {
+            let first_default = needed.saturating_sub(defaults.len());
+            for (i, d) in defaults.iter().enumerate() {
                 let slot = first_default + i;
                 if slot < needed && !filled[slot] {
                     positional[slot] = d.clone();
@@ -14262,18 +14474,14 @@ impl Interpreter {
         }
         // Then plug kwonly defaults by name. Guarded on `kwonly_count`
         // so the overwhelmingly common no-keyword-only call skips this
-        // entirely (no per-call attrs probe). A user-assigned
-        // `__kwdefaults__` (stored on the function's attrs dict) replaces
+        // entirely (no per-call slot probe). A user-assigned
+        // `__kwdefaults__` (stored on the function's slot store) replaces
         // the compiled set wholesale — CPython's `func.__kwdefaults__ =
         // {...}` makes any keyword-only name absent from the new mapping
         // required again. Only the override path allocates; otherwise we
         // borrow the compiled `kw_defaults` directly.
         if kwonly_count > 0 {
-            let kwd_override = f
-                .attrs
-                .borrow()
-                .get(&DictKey(Object::from_static("__kwdefaults__")))
-                .cloned();
+            let kwd_override = f.slot("__kwdefaults__");
             let overridden: Option<Vec<(String, Object)>> = match kwd_override {
                 Some(Object::Dict(d)) => Some(
                     d.borrow()
@@ -14388,10 +14596,10 @@ impl Interpreter {
                     };
                     // CPython snapshots the *function's* current
                     // `__name__`/`__qualname__` (which user code may have
-                    // reassigned; overrides live in `f.attrs`) into
+                    // reassigned; overrides live in `f.slots`) into
                     // `gi_name`/`gi_qualname` at call time.
                     let attr_str = |attr: &'static str| -> Option<String> {
-                        match f.attrs.borrow().get(&DictKey(Object::from_static(attr))) {
+                        match f.slot(attr) {
                             Some(Object::Str(s)) => Some(s.to_string()),
                             _ => None,
                         }
@@ -15766,7 +15974,7 @@ fn resolve_slice_ints(s: &PySlice) -> Result<PySlice, RuntimeError> {
     })
 }
 
-fn apply_slice_assignment(
+pub(crate) fn apply_slice_assignment(
     data: &mut Vec<Object>,
     s: &PySlice,
     replacement: Vec<Object>,
@@ -15836,7 +16044,7 @@ fn apply_slice_assignment(
 /// Compute the concrete indices covered by `s` over a sequence of
 /// length `len` (CPython's `PySlice_Unpack` + `PySlice_AdjustIndices`),
 /// returned in iteration order.
-fn slice_indices(len: usize, s: &PySlice) -> Result<Vec<usize>, RuntimeError> {
+pub(crate) fn slice_indices(len: usize, s: &PySlice) -> Result<Vec<usize>, RuntimeError> {
     let len = len as i64;
     let step = match &s.step {
         Object::None => 1i64,
@@ -16517,6 +16725,77 @@ fn exception_value(instance: &Object) -> Object {
         }
     }
     Object::None
+}
+
+/// True when sorting must dispatch `__lt__` through the interpreter:
+/// the sort key is a user instance whose class defines a real Python
+/// `__lt__` (`functools.cmp_to_key`'s `K`, rich-comparable dataclasses,
+/// …). Everything else keeps the native `Object::cmp` fast path.
+fn sort_key_needs_dunder_lt(o: &Object) -> bool {
+    matches!(
+        o,
+        Object::Instance(inst)
+            if matches!(
+                inst.cls().lookup("__lt__"),
+                Some(Object::Function(_) | Object::BoundMethod(_))
+            )
+    )
+}
+
+/// Stable merge sort that orders by Python `<` (full rich-comparison
+/// dispatch, reflected operands included). `key` projects the comparison
+/// object out of each element (the decorated sort key, or the element
+/// itself). Comparison errors (unorderable types, raising `__lt__`)
+/// propagate exactly as CPython's `list.sort` does.
+fn merge_sort_by_pylt<T: Clone>(
+    interp: &mut Interpreter,
+    mut v: Vec<T>,
+    key: &impl Fn(&T) -> &Object,
+    globals: &Rc<RefCell<DictData>>,
+) -> Result<Vec<T>, RuntimeError> {
+    if v.len() <= 1 {
+        return Ok(v);
+    }
+    let right = v.split_off(v.len() / 2);
+    let left = merge_sort_by_pylt(interp, v, key, globals)?;
+    let right = merge_sort_by_pylt(interp, right, key, globals)?;
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    let (mut li, mut ri) = (0, 0);
+    while li < left.len() && ri < right.len() {
+        // Stability: take from the right run only when strictly smaller
+        // (timsort's `b < a` merge test).
+        if interp.dispatch_compare_op(
+            key(&right[ri]),
+            key(&left[li]),
+            CompareKind::Lt,
+            globals,
+        )? {
+            out.push(right[ri].clone());
+            ri += 1;
+        } else {
+            out.push(left[li].clone());
+            li += 1;
+        }
+    }
+    out.extend_from_slice(&left[li..]);
+    out.extend_from_slice(&right[ri..]);
+    Ok(out)
+}
+
+/// Convert a freshly built `set` result into a `frozenset` — used when
+/// the left operand of a set operator is frozen (result kind follows the
+/// left operand in CPython).
+fn freeze_set_result(o: Object) -> Object {
+    match o {
+        Object::Set(s) => {
+            let data = match Rc::try_unwrap(s) {
+                Ok(cell) => cell.into_inner(),
+                Err(rc) => rc.borrow().clone(),
+            };
+            Object::FrozenSet(Rc::new(data))
+        }
+        other => other,
+    }
 }
 
 fn union_sets(a: &crate::object::SetData, b: &crate::object::SetData) -> Object {
@@ -17624,6 +17903,14 @@ fn builtin_doc(name: &str) -> Option<&'static str> {
             "throw(typ[,val[,tb]]) -> raise exception in coroutine,\nreturn next iterated value or raise StopIteration.",
         ),
         ".cor_close" => Some("close() -> raise GeneratorExit inside coroutine."),
+        // CPython's signature-style docstrings (`functools.wraps(max)`
+        // copies one; test_functools asserts the `max(` prefix).
+        "max" => Some(
+            "max(iterable, *[, default=obj, key=func]) -> value\nmax(arg1, arg2, *args, *[, key=func]) -> value\n\nWith a single iterable argument, return its biggest item. The\ndefault keyword-only argument specifies an object to return if\nthe provided iterable is empty.\nWith two or more positional arguments, return the largest argument.",
+        ),
+        "min" => Some(
+            "min(iterable, *[, default=obj, key=func]) -> value\nmin(arg1, arg2, *args, *[, key=func]) -> value\n\nWith a single iterable argument, return its smallest item. The\ndefault keyword-only argument specifies an object to return if\nthe provided iterable is empty.\nWith two or more positional arguments, return the smallest argument.",
+        ),
         _ => None,
     }
 }
@@ -18917,10 +19204,34 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             Ok(Object::new_bytearray(out))
         }
-        (O::Set(a), O::Set(b), B::BitOr) => Ok(union_sets(&a.borrow(), &b.borrow())),
-        (O::Set(a), O::Set(b), B::BitAnd) => Ok(intersect_sets(&a.borrow(), &b.borrow())),
-        (O::Set(a), O::Set(b), B::Sub) => Ok(difference_sets(&a.borrow(), &b.borrow())),
-        (O::Set(a), O::Set(b), B::BitXor) => Ok(symmetric_diff_sets(&a.borrow(), &b.borrow())),
+        // Set operators accept any mix of `set`/`frozenset` operands; the
+        // result kind follows the *left* operand (CPython's `set_and` &
+        // co. use `PyAnySet_Check` on the other operand and build a result
+        // of `Py_TYPE(self)`).
+        (O::Set(x), O::Set(y), B::BitOr) => Ok(union_sets(&x.borrow(), &y.borrow())),
+        (O::Set(x), O::FrozenSet(y), B::BitOr) => Ok(union_sets(&x.borrow(), y)),
+        (O::FrozenSet(x), O::Set(y), B::BitOr) => Ok(freeze_set_result(union_sets(x, &y.borrow()))),
+        (O::FrozenSet(x), O::FrozenSet(y), B::BitOr) => Ok(freeze_set_result(union_sets(x, y))),
+        (O::Set(x), O::Set(y), B::BitAnd) => Ok(intersect_sets(&x.borrow(), &y.borrow())),
+        (O::Set(x), O::FrozenSet(y), B::BitAnd) => Ok(intersect_sets(&x.borrow(), y)),
+        (O::FrozenSet(x), O::Set(y), B::BitAnd) => {
+            Ok(freeze_set_result(intersect_sets(x, &y.borrow())))
+        }
+        (O::FrozenSet(x), O::FrozenSet(y), B::BitAnd) => Ok(freeze_set_result(intersect_sets(x, y))),
+        (O::Set(x), O::Set(y), B::Sub) => Ok(difference_sets(&x.borrow(), &y.borrow())),
+        (O::Set(x), O::FrozenSet(y), B::Sub) => Ok(difference_sets(&x.borrow(), y)),
+        (O::FrozenSet(x), O::Set(y), B::Sub) => {
+            Ok(freeze_set_result(difference_sets(x, &y.borrow())))
+        }
+        (O::FrozenSet(x), O::FrozenSet(y), B::Sub) => Ok(freeze_set_result(difference_sets(x, y))),
+        (O::Set(x), O::Set(y), B::BitXor) => Ok(symmetric_diff_sets(&x.borrow(), &y.borrow())),
+        (O::Set(x), O::FrozenSet(y), B::BitXor) => Ok(symmetric_diff_sets(&x.borrow(), y)),
+        (O::FrozenSet(x), O::Set(y), B::BitXor) => {
+            Ok(freeze_set_result(symmetric_diff_sets(x, &y.borrow())))
+        }
+        (O::FrozenSet(x), O::FrozenSet(y), B::BitXor) => {
+            Ok(freeze_set_result(symmetric_diff_sets(x, y)))
+        }
 
         // PEP 584 — `dict | dict` merges left-to-right into a new dict.
         (O::Dict(x), O::Dict(y), B::BitOr) => {
@@ -18930,10 +19241,6 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             Ok(Object::Dict(Rc::new(RefCell::new(out))))
         }
-        (O::FrozenSet(a), O::FrozenSet(b), B::BitOr) => Ok(union_sets(a, b)),
-        (O::FrozenSet(a), O::FrozenSet(b), B::BitAnd) => Ok(intersect_sets(a, b)),
-        (O::FrozenSet(a), O::FrozenSet(b), B::Sub) => Ok(difference_sets(a, b)),
-        (O::FrozenSet(a), O::FrozenSet(b), B::BitXor) => Ok(symmetric_diff_sets(a, b)),
 
         (O::List(x), O::List(y), B::Add) => {
             let mut out = x.borrow().clone();
@@ -19115,7 +19422,13 @@ pub fn make_pep604_union(a: &Object, b: &Object) -> Object {
 /// keep types as types; keep `None` as `None` (downstream
 /// `isinstance` recognises both).
 fn normalize_union_arg(x: Object) -> Object {
-    x
+    // `int | None` stores `type(None)` (CPython's `_Py_union_args` never
+    // contains the bare `None` object; singledispatch's "all arguments
+    // are classes" check depends on it).
+    match x {
+        Object::None => Object::Type(crate::builtin_types::builtin_types().none_type.clone()),
+        other => other,
+    }
 }
 
 /// Python `float % float`. Unlike Rust's `%` (C `fmod`, sign of the
@@ -19448,14 +19761,35 @@ fn i64_op(x: i64, y: i64, op: BinOpKind) -> Result<Option<Object>, RuntimeError>
 /// `__class_getitem__`. The result is a `SimpleNamespace`-shaped
 /// object with `__origin__` and `__args__` attributes; `isinstance`
 /// unwraps it via `__origin__` before walking the MRO.
+/// Crate-visible alias builder for [`type_surface`]'s materialized
+/// `__class_getitem__` entries.
+pub(crate) fn make_generic_alias_public(origin: Object, params: Object) -> Object {
+    make_generic_alias(origin, params)
+}
+
 fn make_generic_alias(origin: Object, params: Object) -> Object {
     let mut d = DictData::new();
     let args_tuple = match &params {
         Object::Tuple(_) => params.clone(),
         other => Object::new_tuple(vec![other.clone()]),
     };
+    // `__parameters__` collects the TypeVar-ish entries of `__args__`
+    // (objects exposing `__typing_subst__`/named-TypeVar shape). Plain
+    // classes yield the empty tuple CPython reports for `list[int]`.
+    let params_tuple = match &args_tuple {
+        Object::Tuple(items) => {
+            let vars: Vec<Object> = items
+                .iter()
+                .filter(|o| matches!(o, Object::Instance(inst) if inst.cls().name == "TypeVar"))
+                .cloned()
+                .collect();
+            Object::new_tuple(vars)
+        }
+        _ => Object::new_tuple(Vec::new()),
+    };
     d.insert(DictKey(Object::from_static("__origin__")), origin);
     d.insert(DictKey(Object::from_static("__args__")), args_tuple);
+    d.insert(DictKey(Object::from_static("__parameters__")), params_tuple);
     Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
@@ -19593,7 +19927,7 @@ fn complex_arith(
     }
 }
 
-fn compare_op(a: &Object, b: &Object, op: CompareKind) -> Result<bool, RuntimeError> {
+pub(crate) fn compare_op(a: &Object, b: &Object, op: CompareKind) -> Result<bool, RuntimeError> {
     // CPython lifts ``<``, ``<=``, ``>``, ``>=`` to subset/superset
     // tests on the set family. They are *not* total orderings, so we
     // intercept this before falling through to ``Object::cmp``.

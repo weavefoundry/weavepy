@@ -93,6 +93,10 @@ class UnpicklingError(PickleError):
 def dumps(obj, protocol=None, *, fix_imports=True, buffer_callback=None):
     if protocol is None:
         protocol = DEFAULT_PROTOCOL
+    # CPython `Pickler.__init__`: a negative protocol selects
+    # HIGHEST_PROTOCOL.
+    if protocol < 0:
+        protocol = HIGHEST_PROTOCOL
     if not 0 <= protocol <= HIGHEST_PROTOCOL:
         raise ValueError("unsupported pickle protocol: %d" % protocol)
     pickler = _Pickler(io.BytesIO(), protocol)
@@ -137,6 +141,10 @@ def _resolves_to_self(module, qualname, obj):
 class _Pickler:
     def __init__(self, buf, protocol):
         self._buf = buf
+        if protocol is None:
+            protocol = DEFAULT_PROTOCOL
+        elif protocol < 0:
+            protocol = HIGHEST_PROTOCOL
         self.protocol = protocol
         self.bin = protocol >= 1
         self.fast = False
@@ -745,8 +753,17 @@ def _build(u):
     setstate = getattr(obj, "__setstate__", None)
     if setstate is not None:
         setstate(state)
-    elif isinstance(state, dict):
+        return
+    # CPython `load_build`: a 2-tuple state is (__dict__ state, slot
+    # state); apply the dict half directly and the slots via setattr.
+    slotstate = None
+    if isinstance(state, tuple) and len(state) == 2:
+        state, slotstate = state
+    if state:
         for k, v in state.items():
+            setattr(obj, k, v)
+    if slotstate:
+        for k, v in slotstate.items():
             setattr(obj, k, v)
 
 
