@@ -760,8 +760,12 @@ def _build(u):
     if isinstance(state, tuple) and len(state) == 2:
         state, slotstate = state
     if state:
+        # Write the dict half straight into the instance dict, bypassing
+        # `__setattr__` (CPython `load_build` does `inst.__dict__[k] = v`)
+        # — this is what lets frozen dataclasses unpickle.
+        d = obj.__dict__
         for k, v in state.items():
-            setattr(obj, k, v)
+            d[k] = v
     if slotstate:
         for k, v in slotstate.items():
             setattr(obj, k, v)

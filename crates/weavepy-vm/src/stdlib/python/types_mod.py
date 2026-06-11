@@ -119,10 +119,26 @@ MethodWrapperType = _safe_type(lambda: object().__str__)
 MethodDescriptorType = _safe_type(lambda: str.join)
 ClassMethodDescriptorType = _safe_type(lambda: dict.__dict__.get("fromkeys", classmethod(lambda *a: None)))
 ModuleType = type(_sys)
-TracebackType = _safe_type(lambda: getattr(getattr(_sys, "exc_info", lambda: (None, None, None))()[2], "__class__", type(None)))
+# CPython's own idiom (Lib/types.py): raise and catch to obtain a live
+# traceback object whose class is the real `traceback` type.
+try:
+    raise TypeError
+except TypeError as _exc:
+    _tb = _exc.__traceback__
+    TracebackType = type(_tb) if _tb is not None else type(None)
+    del _tb
 FrameType = _safe_type(lambda: _sys._getframe()) if hasattr(_sys, "_getframe") else type(None)
 GetSetDescriptorType = _safe_type(lambda: type.__dict__.get("__dict__", object))
-MemberDescriptorType = GetSetDescriptorType
+
+
+class _SlotSample:
+    __slots__ = ("_member",)
+
+
+# The type of a `__slots__` storage descriptor (CPython samples
+# `FunctionType.__globals__`; a slots class is equivalent and simpler here).
+MemberDescriptorType = type(_SlotSample.__dict__["_member"])
+del _SlotSample
 CellType = _safe_type(lambda: (lambda x: (lambda: x))(1).__closure__[0])
 
 NoneType = type(None)
@@ -139,16 +155,16 @@ class MappingProxyType:
     __slots__ = ("_mapping",)
 
     def __init__(self, mapping):
-        # CPython checks for the mapping protocol via slot lookups; we
-        # accept anything that's a dict or that supplies the basics.
+        # CPython's check is `PyMapping_Check`: the *type* must supply
+        # `__getitem__` (no `keys` requirement — a custom mapping with
+        # just `__getitem__`/`__len__` is accepted).
         if isinstance(mapping, dict):
             self._mapping = mapping
             return
-        try:
-            mapping.keys
-            mapping.__getitem__
-        except AttributeError as exc:
-            raise TypeError("mappingproxy() argument must support the mapping protocol") from exc
+        if not hasattr(type(mapping), "__getitem__"):
+            raise TypeError(
+                "mappingproxy() argument must support the mapping protocol"
+            )
         self._mapping = mapping
 
     def __getitem__(self, key):

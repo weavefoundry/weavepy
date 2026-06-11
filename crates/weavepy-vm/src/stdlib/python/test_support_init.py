@@ -658,9 +658,14 @@ def catch_unraisable_exception():
 
 
 @contextlib.contextmanager
-def infinite_recursion(max_depth=100):
-    """Lower the recursion limit so a runaway recursion trips fast."""
-    if max_depth < 3:
+def infinite_recursion(max_depth=None):
+    """Raise the recursion limit so tests can recurse (nearly) without
+    bound — CPython's helper sets 20 000 by default and relies on the
+    C-stack guard underneath; callers pass a small ``max_depth`` when
+    they *want* a quick ``RecursionError``."""
+    if max_depth is None:
+        max_depth = 20_000
+    elif max_depth < 3:
         raise ValueError("max_depth must be at least 3")
     get_limit = getattr(sys, 'getrecursionlimit', None)
     set_limit = getattr(sys, 'setrecursionlimit', None)

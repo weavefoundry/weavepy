@@ -550,6 +550,12 @@ _NODE_TYPES = {
     if isinstance(obj, type) and issubclass(obj, AST)
 }
 
+# PEP 634: AST nodes are matchable by position (`case ast.Expr(value)`).
+# CPython generates `__match_args__ = _fields` on every node type.
+for _node in _NODE_TYPES.values():
+    _node.__match_args__ = _node._fields
+del _node
+
 
 def _build(spec):
     """Rebuild a node tree from the value-based spec produced by ``_ast``."""

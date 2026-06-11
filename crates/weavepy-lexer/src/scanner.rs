@@ -67,6 +67,9 @@ struct Scanner<'src> {
     /// Bracket depth — when > 0, NEWLINE is suppressed and DEDENT
     /// tracking pauses (CPython's "implicit line continuation").
     paren_depth: u32,
+    /// Byte offsets of currently-open brackets, innermost last.
+    /// Drives CPython's `'(' was never closed` error at EOF.
+    open_brackets: Vec<(u8, usize)>,
     /// Indent stack: column counts of each open block. Always
     /// starts with 0.
     indents: Vec<u32>,
@@ -76,8 +79,10 @@ struct Scanner<'src> {
     /// Set when the next call must emit pending DEDENTs before any
     /// real token.
     pending_dedents: u32,
-    /// Set when the next call must emit a pending INDENT.
-    pending_indent: bool,
+    /// Set when the next call must emit a pending INDENT; holds the
+    /// byte offset of the line start so the token's span covers the
+    /// whitespace run (CPython anchors "unexpected indent" at col 1).
+    pending_indent: Option<usize>,
     /// True after we emitted ENDMARKER; further calls return None.
     finished: bool,
     /// True when the most recently emitted token leaves a logical line
@@ -97,10 +102,11 @@ impl<'src> Scanner<'src> {
             src: source.as_bytes(),
             pos: 0,
             paren_depth: 0,
+            open_brackets: Vec::new(),
             indents: vec![0],
             at_line_start: true,
             pending_dedents: 0,
-            pending_indent: false,
+            pending_indent: None,
             finished: false,
             last_was_content: false,
             escape_warnings: Vec::new(),
@@ -190,9 +196,8 @@ impl<'src> Scanner<'src> {
 
         // Drain any indent/dedent tokens queued from the previous
         // newline-handling pass before doing anything else.
-        if self.pending_indent {
-            self.pending_indent = false;
-            return Ok(Some(self.token(TokenKind::Indent, self.pos, self.pos)));
+        if let Some(ws_start) = self.pending_indent.take() {
+            return Ok(Some(self.token(TokenKind::Indent, ws_start, self.pos)));
         }
         if self.pending_dedents > 0 {
             self.pending_dedents -= 1;
@@ -206,14 +211,15 @@ impl<'src> Scanner<'src> {
             // drain one before consuming any real source content. The
             // recursion is bounded because the queued flags are set
             // synchronously and consumed on the next call.
-            if self.pending_indent || self.pending_dedents > 0 {
+            if self.pending_indent.is_some() || self.pending_dedents > 0 {
                 return self.next_token();
             }
         }
 
-        // Skip non-newline horizontal whitespace.
+        // Skip non-newline horizontal whitespace (incl. form feed,
+        // which CPython tolerates anywhere it allows a space).
         while let Some(b) = self.peek() {
-            if b == b' ' || b == b'\t' {
+            if b == b' ' || b == b'\t' || b == 0x0C {
                 self.pos += 1;
             } else {
                 break;
@@ -235,6 +241,15 @@ impl<'src> Scanner<'src> {
             if self.paren_depth == 0 && self.last_was_content {
                 self.last_was_content = false;
                 return Ok(Some(self.token(TokenKind::Newline, self.pos, self.pos)));
+            }
+            // EOF with an unclosed bracket: CPython's tokenizer reports
+            // the *outermost* unclosed bracket (`parenstack[0]`),
+            // anchored at its opening position (`'(' was never closed`).
+            if let Some(&(bracket, pos)) = self.open_brackets.first() {
+                return Err(LexError::BracketNeverClosed {
+                    open: bracket as char,
+                    pos: pos as u32,
+                });
             }
             return Ok(Some(self.emit_endmarker()));
         };
@@ -338,6 +353,16 @@ impl<'src> Scanner<'src> {
                     saw_tab = true;
                     self.pos += 1;
                 }
+                // Form feed at line start: CPython's tokenizer resets
+                // the column to 0 and keeps scanning — it neither
+                // contributes to indentation nor counts as tab/space
+                // mixing.
+                0x0C => {
+                    indent = 0;
+                    saw_space = false;
+                    saw_tab = false;
+                    self.pos += 1;
+                }
                 _ => break,
             }
         }
@@ -367,7 +392,7 @@ impl<'src> Scanner<'src> {
         let current = *self.indents.last().expect("indent stack non-empty");
         if indent > current {
             self.indents.push(indent);
-            self.pending_indent = true;
+            self.pending_indent = Some(line_start);
             self.at_line_start = false;
             return Ok(());
         }
@@ -378,8 +403,16 @@ impl<'src> Scanner<'src> {
                 dedents += 1;
             }
             if *self.indents.last().expect("indent stack non-empty") != indent {
+                // CPython's tokenizer reports this error with the
+                // column past the end of the offending line (its
+                // buffer cursor sits at line end), so the traceback
+                // caret lands after the last character.
+                let mut line_end = self.pos;
+                while line_end < self.src.len() && self.src[line_end] != b'\n' {
+                    line_end += 1;
+                }
                 return Err(LexError::UnknownDedent {
-                    pos: line_start as u32,
+                    pos: line_end as u32,
                 });
             }
             self.pending_dedents = dedents;
@@ -1056,26 +1089,32 @@ impl<'src> Scanner<'src> {
         let kind = match b {
             b'(' => {
                 self.paren_depth += 1;
+                self.open_brackets.push((b'(', start));
                 TokenKind::LPar
             }
             b')' => {
                 self.paren_depth = self.paren_depth.saturating_sub(1);
+                self.open_brackets.pop();
                 TokenKind::RPar
             }
             b'[' => {
                 self.paren_depth += 1;
+                self.open_brackets.push((b'[', start));
                 TokenKind::LSqb
             }
             b']' => {
                 self.paren_depth = self.paren_depth.saturating_sub(1);
+                self.open_brackets.pop();
                 TokenKind::RSqb
             }
             b'{' => {
                 self.paren_depth += 1;
+                self.open_brackets.push((b'{', start));
                 TokenKind::LBrace
             }
             b'}' => {
                 self.paren_depth = self.paren_depth.saturating_sub(1);
+                self.open_brackets.pop();
                 TokenKind::RBrace
             }
             b',' => TokenKind::Comma,
@@ -1102,6 +1141,12 @@ impl<'src> Scanner<'src> {
                 let ch = decode_utf8(&self.src[self.pos..])
                     .map(|(c, _)| c)
                     .unwrap_or('\u{FFFD}');
+                // CPython wording: ASCII junk (`$`, `?`, `` ` ``) is a
+                // plain "invalid syntax"; only non-ASCII gets the
+                // `invalid character '€' (U+20AC)` message.
+                if ch.is_ascii() {
+                    return Err(LexError::InvalidToken { pos });
+                }
                 return Err(LexError::InvalidChar { ch, pos });
             }
         };

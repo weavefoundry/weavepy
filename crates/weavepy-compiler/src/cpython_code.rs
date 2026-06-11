@@ -75,6 +75,8 @@ pub mod op {
     pub const CALL: u8 = 53;
     pub const CALL_FUNCTION_EX: u8 = 54;
     pub const CALL_INTRINSIC_1: u8 = 55;
+    pub const CALL_INTRINSIC_2: u8 = 56;
+    pub const LOAD_ASSERTION_ERROR: u8 = 23;
     pub const CALL_KW: u8 = 57;
     pub const COMPARE_OP: u8 = 58;
     pub const CONTAINS_OP: u8 = 59;
@@ -133,6 +135,8 @@ pub const MAGIC_NUMBER: [u8; 4] = [0xf3, 0x0d, 0x0d, 0x0a];
 const INTRINSIC_IMPORT_STAR: u32 = 2;
 /// CALL_INTRINSIC_1 sub-op: `INTRINSIC_UNARY_POSITIVE`.
 const INTRINSIC_UNARY_POSITIVE: u32 = 5;
+/// CALL_INTRINSIC_2 sub-op: `INTRINSIC_PREP_RERAISE_STAR`.
+const INTRINSIC_PREP_RERAISE_STAR: u32 = 1;
 
 /// Number of inline-`CACHE` code units that follow `cp_op` in CPython
 /// 3.13 (`_PyOpcode_Caches`). Everything not listed has none.
@@ -315,6 +319,8 @@ fn map_to_cpython(ins: Instruction, nlocals: u32) -> MappedOp {
         O::ImportName => (op::IMPORT_NAME, ins.arg),
         O::ImportFrom => (op::IMPORT_FROM, ins.arg),
         O::ImportStar => (op::CALL_INTRINSIC_1, INTRINSIC_IMPORT_STAR),
+        O::PrepReraiseStar => (op::CALL_INTRINSIC_2, INTRINSIC_PREP_RERAISE_STAR),
+        O::LoadAssertionError => (op::LOAD_ASSERTION_ERROR, 0),
         O::FormatValue => {
             if ins.arg & 0x04 != 0 {
                 (op::FORMAT_WITH_SPEC, ins.arg)
@@ -1041,6 +1047,8 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
                 (O::ImportStar, 0)
             }
         }
+        op::CALL_INTRINSIC_2 => (O::PrepReraiseStar, 0),
+        op::LOAD_ASSERTION_ERROR => (O::LoadAssertionError, 0),
         op::COMPARE_OP => (O::CompareOp, CompareKind::from_arg(arg >> 5)?.as_arg()),
         op::IS_OP => (O::IsOp, arg),
         op::CONTAINS_OP => (O::ContainsOp, arg),

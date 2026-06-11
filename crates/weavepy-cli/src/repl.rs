@@ -283,6 +283,10 @@ fn needs_continuation(source: &str) -> bool {
         Err(parser::ParseError::Lex(lexer::LexError::UnterminatedFstring { .. })) => true,
         Err(parser::ParseError::Lex(lexer::LexError::UnterminatedTripleFstring { .. })) => true,
         Err(parser::ParseError::Lex(lexer::LexError::UnexpectedEof { .. })) => true,
+        // An open bracket at EOF is the canonical "keep typing" state
+        // (`(1,` ⏎). The batch compiler reports it as a hard
+        // SyntaxError; the REPL reads it as continuation.
+        Err(parser::ParseError::Lex(lexer::LexError::BracketNeverClosed { .. })) => true,
         Err(_) => false,
     }
 }

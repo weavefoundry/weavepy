@@ -494,7 +494,9 @@ class TestCase:
         return "%s (%s)" % (self._testMethodName, type(self).__name__)
 
     def __repr__(self):
-        return "<%s testMethod=%s>" % (type(self).__name__, self._testMethodName)
+        cls = type(self)
+        return "<%s.%s testMethod=%s>" % (
+            cls.__module__, cls.__qualname__, self._testMethodName)
 
     def countTestCases(self):
         return 1

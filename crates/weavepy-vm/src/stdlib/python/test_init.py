@@ -33,13 +33,22 @@ except NameError:
     __path__ = []
 for _p in _sys.path:
     try:
+        if not _p or not _os.path.isdir(_p):
+            continue
+        _norm = _os.path.normpath(_p)
+        if _os.path.basename(_norm) == "test" and _norm not in __path__:
+            __path__.append(_norm)
+            continue
+        # Running a file inside a *subpackage* of `test/` (e.g.
+        # `Lib/test/test_dataclasses/__init__.py`) puts that subpackage
+        # directory on `sys.path` — its parent is the on-disk `test/`.
+        _parent = _os.path.dirname(_norm)
         if (
-            _p
-            and _os.path.basename(_os.path.normpath(_p)) == "test"
-            and _os.path.isdir(_p)
-            and _p not in __path__
+            _os.path.basename(_parent) == "test"
+            and _os.path.isdir(_parent)
+            and _parent not in __path__
         ):
-            __path__.append(_p)
+            __path__.append(_parent)
     except (TypeError, ValueError):
         pass
 del _os, _sys

@@ -27,6 +27,7 @@ pub mod testinternalcapi_mod;
 pub mod fcntl_mod;
 pub mod fnmatch_mod;
 pub mod gc_mod;
+pub mod functools_mod;
 pub mod glob_mod;
 pub mod gzip_mod;
 pub mod hashlib_mod;
@@ -34,6 +35,7 @@ pub mod hmac_mod;
 pub mod imp_mod;
 pub mod interpreters_mod;
 pub mod io;
+pub mod itertools_mod;
 pub mod json;
 pub mod lzma_mod;
 pub mod marshal_mod;
@@ -108,6 +110,8 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("fnmatch", fnmatch_mod::build);
     cache.register_builtin("glob", glob_mod::build);
     cache.register_builtin("_shutil", shutil_mod::build);
+    cache.register_builtin("_functools", functools_mod::build);
+    cache.register_builtin("_itertools", itertools_mod::build);
     cache.register_builtin("ssl", ssl_mod::build);
     cache.register_builtin("zlib", zlib_mod::build);
     cache.register_builtin("_struct", struct_mod::build);
@@ -1299,6 +1303,14 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_testlimitedcapi",
             source: include_str!("python/_testlimitedcapi.py"),
+            is_package: false,
+        },
+        // Pure-Python stand-in for `_testcapi`, covering the traceback
+        // hooks (`exception_print` -> PyErr_Display via the traceback
+        // module, `traceback_print` -> PyTraceBack_Print).
+        FrozenSource {
+            name: "_testcapi",
+            source: include_str!("python/_testcapi.py"),
             is_package: false,
         },
     ]

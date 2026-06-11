@@ -28,6 +28,11 @@ thread_local! {
     /// GC. Drained at the next eval-loop tick by the interpreter.
     /// See [`crate::gc_trace::run_finalizer`] for the producer side.
     pub(crate) static PENDING_FINALIZERS: RefCell<Vec<Object>> = const { RefCell::new(Vec::new()) };
+    /// Pending weakref-callback invocations `(callback, weakref_obj)`
+    /// queued when a referent dies (cycle GC, refcount reap, registry
+    /// sweep). Drained alongside the finalizer queue.
+    pub(crate) static PENDING_WEAKREF_CALLBACKS: RefCell<Vec<(Object, Object)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Push an instance whose `__del__` should run at the next safe
@@ -53,6 +58,21 @@ pub fn try_push_pending_finalizer(obj: Object) {
 /// at every eval-breaker tick that has the GC flag set.
 pub fn drain_pending_finalizers() -> Vec<Object> {
     PENDING_FINALIZERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+/// Queue a weakref callback `(callback, weakref_obj)` for invocation at
+/// the next safe point. Teardown-safe (callable from sweep paths).
+pub fn push_pending_weakref_callback(callback: Object, weakref_obj: Object) {
+    let _ = PENDING_WEAKREF_CALLBACKS.try_with(|cell| {
+        if let Ok(mut queue) = cell.try_borrow_mut() {
+            queue.push((callback, weakref_obj));
+        }
+    });
+}
+
+/// Drain the pending weakref-callback queue.
+pub fn drain_pending_weakref_callbacks() -> Vec<(Object, Object)> {
+    PENDING_WEAKREF_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 fn make_singleton(name: &'static str) -> Object {
@@ -160,9 +180,19 @@ pub fn interactive_printer(name: &'static str, body: &'static str) -> Object {
 
 static INTERPRETER_SEED: OnceLock<Mutex<Option<crate::Interpreter>>> = OnceLock::new();
 static WORKER_THREAD_ID: OnceLock<Mutex<std::collections::HashMap<u64, u64>>> = OnceLock::new();
+/// The seed thread's built-in type registry. Workers adopt it (see
+/// [`snapshot_interpreter`]) so `type`/`object`/… compare pointer-equal
+/// across threads — class statements check metaclasses by identity.
+static SEED_BUILTIN_TYPES: OnceLock<Mutex<Option<crate::sync::Rc<crate::builtin_types::BuiltinTypes>>>> =
+    OnceLock::new();
 
 fn seed_slot() -> &'static Mutex<Option<crate::Interpreter>> {
     INTERPRETER_SEED.get_or_init(|| Mutex::new(None))
+}
+
+fn seed_types_slot(
+) -> &'static Mutex<Option<crate::sync::Rc<crate::builtin_types::BuiltinTypes>>> {
+    SEED_BUILTIN_TYPES.get_or_init(|| Mutex::new(None))
 }
 
 fn worker_map() -> &'static Mutex<std::collections::HashMap<u64, u64>> {
@@ -176,12 +206,21 @@ fn worker_map() -> &'static Mutex<std::collections::HashMap<u64, u64>> {
 pub fn publish_interpreter_seed(interp: &crate::Interpreter) {
     let mut slot = seed_slot().lock();
     *slot = Some(interp.fork_for_thread());
+    drop(slot);
+    *seed_types_slot().lock() = Some(crate::builtin_types::builtin_types());
 }
 
 /// Hand out a fresh worker [`crate::Interpreter`] cloned from the
 /// last-published seed. Returns `None` if no seed has been published
 /// yet (callers fall back to `Interpreter::new()`).
+///
+/// Also installs the seed's built-in type registry on the calling
+/// thread (no-op if this thread already built one) — class statements
+/// executed by the worker must see the same `TypeObject`s as the seed.
 pub fn snapshot_interpreter() -> Option<crate::Interpreter> {
+    if let Some(bt) = seed_types_slot().lock().clone() {
+        crate::builtin_types::install_shared(bt);
+    }
     let slot = seed_slot().lock();
     slot.as_ref().map(|i| i.fork_for_thread())
 }
@@ -321,6 +360,33 @@ impl Drop for InterpreterGuard {
             let _ = cell.borrow_mut().pop();
         });
     }
+}
+
+/// `True` once interpreter shutdown (finalizer sweep) has begun —
+/// CPython's `_Py_IsFinalizing()`. Fresh imports are refused while
+/// set (already-imported modules keep working), and
+/// `sys.is_finalizing()` reads it.
+static FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_finalizing(value: bool) {
+    FINALIZING.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn is_finalizing() -> bool {
+    FINALIZING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// PEP 657 column info enabled? Cleared by `-X no_debug_ranges` /
+/// `PYTHONNODEBUGRANGES`; `co_positions()` then reports `None`
+/// columns and traceback carets disappear, like CPython.
+static DEBUG_RANGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_debug_ranges(value: bool) {
+    DEBUG_RANGES.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn debug_ranges() -> bool {
+    DEBUG_RANGES.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Publish `interp` as the live VM pointer for the duration of

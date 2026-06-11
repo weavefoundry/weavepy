@@ -211,6 +211,30 @@ impl Default for GcState {
     }
 }
 
+impl Drop for GcState {
+    fn drop(&mut self) {
+        // Thread teardown: the tracked set can hold long generator /
+        // container chains whose recursive field-drops overflow the
+        // native stack (each `Arc` link is one `drop_in_place` frame).
+        // Clear every tracked object's container fields *iteratively*
+        // first so the chains are already severed when the handle
+        // vectors drop. Safe at this point: the thread is exiting, no
+        // Python code will observe the cleared objects.
+        let mut handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        if let Ok(gens) = self.generations.try_borrow() {
+            for g in gens.iter() {
+                handles.extend(g.handles.iter().cloned());
+            }
+        }
+        if let Ok(frozen) = self.frozen.try_borrow() {
+            handles.extend(frozen.iter().cloned());
+        }
+        for h in &handles {
+            clear_object_fields(&h.object);
+        }
+    }
+}
+
 impl GcState {
     pub fn new() -> Self {
         Self {
@@ -536,9 +560,21 @@ impl GcState {
             clear_object_fields(&h.object);
         }
 
-        // 5d: invoke weakref callbacks now (after finalisers
-        // and cyclic clears, matching CPython's order).
-        let _ = weakref_callbacks;
+        // 5d: queue weakref callbacks (after finalisers and cyclic
+        // clears, matching CPython's order). The interpreter drains
+        // the queue at its next safe point — the GC layer can't call
+        // Python itself.
+        for (slot, cb) in weakref_callbacks {
+            let wr = slot
+                .py_ref
+                .borrow()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .map(crate::object::Object::Instance);
+            if let Some(wr) = wr {
+                crate::vm_singletons::push_pending_weakref_callback(cb, wr);
+            }
+        }
 
         // Phase 6: rebuild the generation lists. Survivors of
         // generation `g` (color != White) move to generation
@@ -716,6 +752,16 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             for base in &t.bases {
                 visit(&Object::Type(base.clone()));
             }
+            // The MRO holds strong refs — including one to the class
+            // itself (every class self-cycles through `mro[0]`). The
+            // collector must subtract these internal edges or a class
+            // can never collapse to gc_refs == 0.
+            for entry in t.mro.borrow().iter() {
+                visit(&Object::Type(entry.clone()));
+            }
+            if let Some(meta) = t.metaclass.borrow().as_ref() {
+                visit(&Object::Type(meta.clone()));
+            }
         }
         Object::Function(_)
         | Object::Builtin(_)
@@ -804,6 +850,16 @@ pub fn clear_object_fields(obj: &Object) {
                 *st = crate::object::GeneratorState::Finished;
             }
         }
+        Object::Type(t) => {
+            // An unreachable class: drop the dict entries and the MRO
+            // (which holds the self-`Rc` every class is born with).
+            // `bases` is an immutable Vec, but base edges point up to
+            // parents that hold children only weakly, so they never
+            // form a cycle on their own.
+            t.dict.borrow_mut().clear();
+            t.mro.borrow_mut().clear();
+            *t.metaclass.borrow_mut() = None;
+        }
         _ => {}
     }
 }
@@ -891,13 +947,45 @@ pub fn finalization_candidates() -> Vec<Arc<TrackedHandle>> {
 /// Convenience: run a full collection on the current thread's
 /// GC. Returns the number of objects collected.
 pub fn collect_all() -> usize {
-    with_state(|s| s.collect(N_GENERATIONS - 1))
+    let n = with_state(|s| s.collect(N_GENERATIONS - 1));
+    sweep_weakref_only_targets();
+    n
 }
 
 /// Convenience: run a partial collection of generations
 /// `0..=upto`.
 pub fn collect_upto(upto: usize) -> usize {
-    with_state(|s| s.collect(upto))
+    let n = with_state(|s| s.collect(upto));
+    sweep_weakref_only_targets();
+    n
+}
+
+/// Clear weakrefs whose referent isn't in the tracked set and whose
+/// only remaining strong references are the weakref slots' own
+/// clones. Covers weakref-able objects the cycle collector never
+/// sees — plain functions, bound methods, types — so
+/// `del f; gc.collect()` flips `weakref.ref(f)()` to `None` exactly
+/// like CPython's refcount-driven `tp_dealloc` would.
+pub fn sweep_weakref_only_targets() -> usize {
+    let targets = crate::weakref_registry::with_registry(|r| r.targets());
+    let mut cleared = 0;
+    for (id, target) in targets {
+        if is_tracked(id) {
+            // Tracked objects belong to the cycle pass (their handle
+            // holds an extra strong ref this arithmetic doesn't model).
+            continue;
+        }
+        let clones = crate::weakref_registry::strong_clone_count(id);
+        // `target` itself is one clone we hold for the probe.
+        if strong_count_for(&target) <= clones + 1 {
+            crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(id));
+            cleared += 1;
+        }
+    }
+    if cleared > 0 {
+        crate::weakref_registry::with_registry(|r| r.shrink());
+    }
+    cleared
 }
 
 #[cfg(test)]

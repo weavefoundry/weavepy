@@ -93,6 +93,13 @@ impl<'src> Parser<'src> {
         t
     }
 
+    /// Span of the most recently consumed token. Used to extend a
+    /// statement's span to its last token (CPython statement positions
+    /// cover the whole statement, not just the keyword).
+    fn prev_token_span(&self) -> weavepy_lexer::Span {
+        self.tokens[self.pos.saturating_sub(1)].span
+    }
+
     fn check(&self, k: &TokenKind) -> bool {
         self.peek() == k
     }
@@ -154,6 +161,15 @@ impl<'src> Parser<'src> {
 
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
         self.skip_trivia();
+        // An INDENT token where a statement should start means the line
+        // is indented deeper than its block — CPython's tokenizer
+        // raises IndentationError("unexpected indent").
+        if matches!(self.peek(), TokenKind::Indent) {
+            return Err(ParseError::Indentation {
+                span: self.peek_token().span,
+                message: "unexpected indent".to_owned(),
+            });
+        }
         // Decorators apply to the next `def` or `class`.
         if matches!(self.peek(), TokenKind::At) {
             let decorators = self.parse_decorators()?;
@@ -493,15 +509,15 @@ impl<'src> Parser<'src> {
         // Augmented assignment.
         if let Some(op) = self.try_aug_op() {
             let value = self.parse_expression_list(true)?;
+            let end = self.prev_token_span();
             self.consume_stmt_end()?;
-            let span = start_span.merge(value.span);
             return Ok(Stmt {
                 kind: StmtKind::AugAssign {
                     target: first,
                     op,
                     value,
                 },
-                span,
+                span: start_span.merge(end),
             });
         }
 
@@ -514,15 +530,15 @@ impl<'src> Parser<'src> {
             } else {
                 None
             };
+            let end = self.prev_token_span();
             self.consume_stmt_end()?;
-            let end_span = value.as_ref().map_or(annotation.span, |v| v.span);
             return Ok(Stmt {
                 kind: StmtKind::AnnAssign {
                     target: first,
                     annotation,
                     value,
                 },
-                span: start_span.merge(end_span),
+                span: start_span.merge(end),
             });
         }
 
@@ -536,14 +552,14 @@ impl<'src> Parser<'src> {
                 if self.check(&TokenKind::Equal) {
                     targets.push(next);
                 } else {
+                    let end = self.prev_token_span();
                     self.consume_stmt_end()?;
-                    let span = start_span.merge(next.span);
                     return Ok(Stmt {
                         kind: StmtKind::Assign {
                             targets,
                             value: next,
                         },
-                        span,
+                        span: start_span.merge(end),
                     });
                 }
             }
@@ -553,11 +569,11 @@ impl<'src> Parser<'src> {
         }
 
         // Plain expression statement.
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
-        let span = first.span;
         Ok(Stmt {
             kind: StmtKind::Expr(first),
-            span,
+            span: start_span.merge(end),
         })
     }
 
@@ -834,10 +850,11 @@ impl<'src> Parser<'src> {
             };
             (Some(e), c)
         };
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Raise { exc, cause },
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
@@ -1158,8 +1175,8 @@ impl<'src> Parser<'src> {
         } else {
             Some(self.parse_expression_list(true)?)
         };
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
-        let end = value.as_ref().map_or(kw.span, |e| e.span);
         Ok(Stmt {
             kind: StmtKind::Return(value),
             span: kw.span.merge(end),
@@ -1186,10 +1203,11 @@ impl<'src> Parser<'src> {
                 break;
             }
         }
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Import(names),
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
@@ -1255,6 +1273,7 @@ impl<'src> Parser<'src> {
             }
             names
         };
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::ImportFrom {
@@ -1262,27 +1281,29 @@ impl<'src> Parser<'src> {
                 names,
                 level,
             },
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
     fn parse_global(&mut self) -> Result<Stmt, ParseError> {
         let kw = self.bump();
         let names = self.parse_name_list()?;
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Global(names),
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
     fn parse_nonlocal(&mut self) -> Result<Stmt, ParseError> {
         let kw = self.bump();
         let names = self.parse_name_list()?;
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Nonlocal(names),
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
@@ -1301,10 +1322,11 @@ impl<'src> Parser<'src> {
             }
             targets.push(self.parse_ternary()?);
         }
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Delete(targets),
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
@@ -1321,8 +1343,8 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
-        let end = msg.as_ref().map(|m| m.span).unwrap_or(test.span);
         Ok(Stmt {
             kind: StmtKind::Assert { test, msg },
             span: kw.span.merge(end),
@@ -1352,7 +1374,13 @@ impl<'src> Parser<'src> {
         self.expect(&TokenKind::Colon, "`:`")?;
         self.expect(&TokenKind::Newline, "newline after `match ... :`")?;
         self.skip_trivia_and_newlines();
-        self.expect(&TokenKind::Indent, "indented block")?;
+        if !self.check(&TokenKind::Indent) {
+            return Err(ParseError::Indentation {
+                span: self.peek_token().span,
+                message: "expected an indented block".to_owned(),
+            });
+        }
+        self.bump();
 
         let mut cases = Vec::new();
         loop {
@@ -1776,7 +1804,13 @@ impl<'src> Parser<'src> {
         if matches!(self.peek(), TokenKind::Newline) {
             self.bump();
             self.skip_trivia_and_newlines();
-            self.expect(&TokenKind::Indent, "indented block")?;
+            if !self.check(&TokenKind::Indent) {
+                return Err(ParseError::Indentation {
+                    span: self.peek_token().span,
+                    message: "expected an indented block".to_owned(),
+                });
+            }
+            self.bump();
             let mut body = Vec::new();
             loop {
                 self.skip_trivia_and_newlines();
@@ -1891,7 +1925,10 @@ impl<'src> Parser<'src> {
             let star_tok = self.peek_token().clone();
             self.bump();
             let inner = self.parse_ternary()?;
-            let span = star_tok.span.merge(inner.span);
+            // Token-range span (CPython's EXTRA): a parenthesized
+            // operand's node span excludes its parens, so merge with
+            // the last *consumed token* instead of the child span.
+            let span = star_tok.span.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::Starred(Box::new(inner)),
                 span,
@@ -1922,7 +1959,7 @@ impl<'src> Parser<'src> {
                     self.bump(); // name
                     self.bump(); // :=
                     let value = self.parse_ternary()?;
-                    let span = name_tok.span.merge(value.span);
+                    let span = name_tok.span.merge(self.prev_token_span());
                     return Ok(Expr {
                         kind: ExprKind::NamedExpr {
                             target: Box::new(Expr {
@@ -1936,6 +1973,7 @@ impl<'src> Parser<'src> {
                 }
             }
         }
+        let start = self.peek_token().span;
         let body = self.parse_or()?;
         if self.at_keyword(Keyword::If) {
             self.bump();
@@ -1948,7 +1986,7 @@ impl<'src> Parser<'src> {
             }
             self.bump();
             let orelse = self.parse_ternary()?;
-            let span = body.span.merge(orelse.span);
+            let span = start.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::IfExp {
                     test: Box::new(test),
@@ -1966,7 +2004,7 @@ impl<'src> Parser<'src> {
         if self.at_keyword(Keyword::From) {
             self.bump();
             let value = self.parse_ternary()?;
-            let span = kw.span.merge(value.span);
+            let span = kw.span.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::YieldFrom(Box::new(value)),
                 span,
@@ -1993,7 +2031,7 @@ impl<'src> Parser<'src> {
             });
         }
         let value = self.parse_expression_list(true)?;
-        let span = kw.span.merge(value.span);
+        let span = kw.span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Yield(Some(Box::new(value))),
             span,
@@ -2009,7 +2047,7 @@ impl<'src> Parser<'src> {
         };
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_ternary()?;
-        let span = kw.span.merge(body.span);
+        let span = kw.span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Lambda {
                 args,
@@ -2020,6 +2058,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let first = self.parse_and()?;
         if !self.at_keyword(Keyword::Or) {
             return Ok(first);
@@ -2029,11 +2068,7 @@ impl<'src> Parser<'src> {
             self.bump();
             values.push(self.parse_and()?);
         }
-        let span = values
-            .first()
-            .unwrap()
-            .span
-            .merge(values.last().unwrap().span);
+        let span = start.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::BoolOp {
                 op: BoolOp::Or,
@@ -2044,6 +2079,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let first = self.parse_not()?;
         if !self.at_keyword(Keyword::And) {
             return Ok(first);
@@ -2053,11 +2089,7 @@ impl<'src> Parser<'src> {
             self.bump();
             values.push(self.parse_not()?);
         }
-        let span = values
-            .first()
-            .unwrap()
-            .span
-            .merge(values.last().unwrap().span);
+        let span = start.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::BoolOp {
                 op: BoolOp::And,
@@ -2071,7 +2103,7 @@ impl<'src> Parser<'src> {
         if self.at_keyword(Keyword::Not) {
             let kw = self.bump();
             let operand = self.parse_not()?;
-            let span = kw.span.merge(operand.span);
+            let span = kw.span.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::UnaryOp {
                     op: UnaryOp::Not,
@@ -2084,6 +2116,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let left = self.parse_bit_or()?;
         let mut ops = Vec::new();
         let mut comparators = Vec::new();
@@ -2094,7 +2127,7 @@ impl<'src> Parser<'src> {
         if ops.is_empty() {
             return Ok(left);
         }
-        let span = left.span.merge(comparators.last().unwrap().span);
+        let span = start.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Compare {
                 left: Box::new(left),
@@ -2139,11 +2172,17 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_bit_or(&mut self) -> Result<Expr, ParseError> {
+        // All the binop ladders use token-range spans (`start` is the
+        // first token of the rule, the end is the last consumed token)
+        // so a parenthesized operand — whose node span excludes the
+        // parens, as in CPython — still yields `(a) + b` spanning from
+        // the `(`. PEP-657 caret anchors depend on this.
+        let start = self.peek_token().span;
         let mut left = self.parse_bit_xor()?;
         while self.check(&TokenKind::Vbar) {
             self.bump();
             let right = self.parse_bit_xor()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2157,11 +2196,12 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_bit_xor(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_bit_and()?;
         while self.check(&TokenKind::Caret) {
             self.bump();
             let right = self.parse_bit_and()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2175,11 +2215,12 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_bit_and(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_shift()?;
         while self.check(&TokenKind::Amper) {
             self.bump();
             let right = self.parse_shift()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2193,6 +2234,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_shift(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_addsub()?;
         loop {
             let op = match self.peek() {
@@ -2202,7 +2244,7 @@ impl<'src> Parser<'src> {
             };
             self.bump();
             let right = self.parse_addsub()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2216,6 +2258,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_addsub(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_muldiv()?;
         loop {
             let op = match self.peek() {
@@ -2225,7 +2268,7 @@ impl<'src> Parser<'src> {
             };
             self.bump();
             let right = self.parse_muldiv()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2239,6 +2282,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_muldiv(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek() {
@@ -2251,7 +2295,7 @@ impl<'src> Parser<'src> {
             };
             self.bump();
             let right = self.parse_unary()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2280,7 +2324,7 @@ impl<'src> Parser<'src> {
                 });
             }
             let operand = self.parse_unary()?;
-            let span = kw.span.merge(operand.span);
+            let span = kw.span.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::Await(Box::new(operand)),
                 span,
@@ -2294,7 +2338,7 @@ impl<'src> Parser<'src> {
         };
         let kw = self.bump();
         let operand = self.parse_unary()?;
-        let span = kw.span.merge(operand.span);
+        let span = kw.span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::UnaryOp {
                 op,
@@ -2305,6 +2349,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_power(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let base = self.parse_trailer_chain()?;
         if !self.check(&TokenKind::DoubleStar) {
             return Ok(base);
@@ -2314,7 +2359,7 @@ impl<'src> Parser<'src> {
         // the right side. Python's grammar: `power: await? primary ('**' factor)?`
         // where `factor` includes unary.
         let exponent = self.parse_unary()?;
-        let span = base.span.merge(exponent.span);
+        let span = start.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::BinOp {
                 left: Box::new(base),
@@ -2326,6 +2371,9 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_trailer_chain(&mut self) -> Result<Expr, ParseError> {
+        // Token-range spans: `( a ).m()[0]` chains span from the `(`
+        // even though the parenthesized base node itself starts at `a`.
+        let start = self.peek_token().span;
         let mut base = self.parse_atom()?;
         loop {
             match self.peek() {
@@ -2333,7 +2381,7 @@ impl<'src> Parser<'src> {
                     self.bump();
                     let (args, keywords) = self.parse_call_args()?;
                     let rp = self.expect(&TokenKind::RPar, "`)`")?;
-                    let span = base.span.merge(rp.span);
+                    let span = start.merge(rp.span);
                     base = Expr {
                         kind: ExprKind::Call {
                             func: Box::new(base),
@@ -2347,7 +2395,7 @@ impl<'src> Parser<'src> {
                     self.bump();
                     let slice = self.parse_subscript()?;
                     let rb = self.expect(&TokenKind::RSqb, "`]`")?;
-                    let span = base.span.merge(rb.span);
+                    let span = start.merge(rb.span);
                     base = Expr {
                         kind: ExprKind::Subscript {
                             value: Box::new(base),
@@ -2360,7 +2408,7 @@ impl<'src> Parser<'src> {
                     self.bump();
                     let n = self.expect(&TokenKind::Name, "attribute name")?;
                     let attr = self.ident(n.span);
-                    let span = base.span.merge(n.span);
+                    let span = start.merge(n.span);
                     base = Expr {
                         kind: ExprKind::Attribute {
                             value: Box::new(base),
@@ -2387,7 +2435,12 @@ impl<'src> Parser<'src> {
         // "keyword argument repeated: <name>").
         let mut seen_keyword = false;
         let mut kw_names: Vec<String> = Vec::new();
+        // Span of the most recent argument — CPython's "Perhaps you
+        // forgot a comma?" underlines the *previous* element when two
+        // expressions abut.
+        let mut last_arg_span: Option<weavepy_lexer::Span> = None;
         loop {
+            let arg_start = self.peek_token().span;
             if self.eat(&TokenKind::DoubleStar) {
                 let val = self.parse_ternary()?;
                 seen_keyword = true;
@@ -2432,13 +2485,21 @@ impl<'src> Parser<'src> {
                     }
                     let e = self.parse_ternary()?;
                     // Generator expression as single argument: `f(x for x in xs)`.
-                    if (self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async))
-                        && args.is_empty()
-                        && keywords.is_empty()
-                    {
+                    if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
                         let elt = e;
                         let generators = self.parse_comp_for()?;
-                        let span = elt.span;
+                        // CPython's genexp node (and the
+                        // must-be-parenthesized error) spans the whole
+                        // `elt for … in …`, not just the element.
+                        let span = elt.span.merge(self.prev_token_span());
+                        // A bare genexp must be the *only* argument.
+                        if !(args.is_empty() && keywords.is_empty()) {
+                            return Err(ParseError::Unexpected {
+                                span,
+                                message: "Generator expression must be parenthesized"
+                                    .to_owned(),
+                            });
+                        }
                         args.push(Expr {
                             kind: ExprKind::GeneratorExp {
                                 elt: Box::new(elt),
@@ -2446,12 +2507,31 @@ impl<'src> Parser<'src> {
                             },
                             span,
                         });
+                        if self.check(&TokenKind::Comma) {
+                            return Err(ParseError::Unexpected {
+                                span,
+                                message: "Generator expression must be parenthesized"
+                                    .to_owned(),
+                            });
+                        }
                     } else {
                         args.push(e);
                     }
                 }
             }
+            last_arg_span = Some(arg_start.merge(self.prev_token_span()));
             if !self.eat(&TokenKind::Comma) {
+                // Two adjacent expressions with no comma — CPython's
+                // `invalid_expression` rule anchors the error at the
+                // *previous* element and suggests the missing comma.
+                if !self.check(&TokenKind::RPar) && self.at_expression_start() {
+                    if let Some(prev) = last_arg_span {
+                        return Err(ParseError::Unexpected {
+                            span: prev,
+                            message: "invalid syntax. Perhaps you forgot a comma?".to_owned(),
+                        });
+                    }
+                }
                 break;
             }
             if self.check(&TokenKind::RPar) {
@@ -2459,6 +2539,33 @@ impl<'src> Parser<'src> {
             }
         }
         Ok((args, keywords))
+    }
+
+    /// Could the current token begin an expression? Drives the
+    /// "Perhaps you forgot a comma?" heuristic.
+    fn at_expression_start(&self) -> bool {
+        match self.peek() {
+            TokenKind::Name
+            | TokenKind::Number
+            | TokenKind::String
+            | TokenKind::LPar
+            | TokenKind::LSqb
+            | TokenKind::LBrace
+            | TokenKind::Minus
+            | TokenKind::Plus
+            | TokenKind::Tilde
+            | TokenKind::Ellipsis => true,
+            TokenKind::Keyword(k) => matches!(
+                k,
+                Keyword::Lambda
+                    | Keyword::Not
+                    | Keyword::Await
+                    | Keyword::None
+                    | Keyword::True
+                    | Keyword::False
+            ),
+            _ => false,
+        }
     }
 
     fn parse_subscript(&mut self) -> Result<Expr, ParseError> {
@@ -2616,11 +2723,12 @@ impl<'src> Parser<'src> {
 
     fn parse_paren_or_tuple(&mut self) -> Result<Expr, ParseError> {
         let lp = self.bump();
-        if self.eat(&TokenKind::RPar) {
-            // Empty tuple
+        if self.check(&TokenKind::RPar) {
+            // Empty tuple — spans both parens.
+            let rp = self.bump();
             return Ok(Expr {
                 kind: ExprKind::Tuple(Vec::new()),
-                span: lp.span,
+                span: lp.span.merge(rp.span),
             });
         }
         let first = self.parse_ternary_or_starred()?;
@@ -2661,12 +2769,13 @@ impl<'src> Parser<'src> {
                 message: "can't use starred expression here".to_owned(),
             });
         }
-        // Plain parenthesized expression — keep its span but no wrapper node.
-        let rp = self.expect(&TokenKind::RPar, "`)`")?;
-        Ok(Expr {
-            kind: first.kind,
-            span: lp.span.merge(rp.span),
-        })
+        // Plain parenthesized expression: no wrapper node, and — exactly
+        // like CPython's grammar actions — the node keeps the *inner*
+        // span, excluding the parentheses. `traceback`'s caret-anchor
+        // probe (`ast.parse(f"(\n{segment}\n)")`) depends on this:
+        // positions must point into `segment`, not at the added parens.
+        self.expect(&TokenKind::RPar, "`)`")?;
+        Ok(first)
     }
 
     fn parse_list_or_listcomp(&mut self) -> Result<Expr, ParseError> {

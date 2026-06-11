@@ -59,6 +59,8 @@ __all__ = [
     "getargspec",
     "getfullargspec",
     "signature",
+    "formatannotation",
+    "unwrap",
     "Signature",
     "Parameter",
     "BoundArguments",
@@ -1036,6 +1038,44 @@ class _empty:
     pass
 
 
+def formatannotation(annotation, base_module=None):
+    if getattr(annotation, '__module__', None) == 'typing':
+        import re
+        def repl(match):
+            text = match.group()
+            return text.removeprefix('typing.')
+        return re.sub(r'[\w\.]+', repl, repr(annotation))
+    if isinstance(annotation, type):
+        if annotation.__module__ in ('builtins', base_module):
+            return annotation.__qualname__
+        return annotation.__module__ + '.' + annotation.__qualname__
+    return repr(annotation)
+
+
+def unwrap(func, *, stop=None):
+    """Walk the `__wrapped__` chain of *func*, returning the innermost
+    callable (CPython `inspect.unwrap`, including the cycle guard)."""
+    if stop is None:
+        def _is_wrapper(f):
+            return hasattr(f, '__wrapped__')
+    else:
+        def _is_wrapper(f):
+            return hasattr(f, '__wrapped__') and not stop(f)
+    f = func  # remember the original func for error reporting
+    # Memoise by id to tolerate non-hashable objects, but store objects
+    # to ensure they aren't destroyed, which would allow their IDs to be
+    # reused.
+    memo = {id(f): f}
+    recursion_limit = sys.getrecursionlimit()
+    while _is_wrapper(func):
+        func = func.__wrapped__
+        id_func = id(func)
+        if (id_func in memo) or (len(memo) >= recursion_limit):
+            raise ValueError(f'wrapper loop when unwrapping {f!r}')
+        memo[id_func] = func
+    return func
+
+
 class Parameter:
     POSITIONAL_ONLY = 0
     POSITIONAL_OR_KEYWORD = 1
@@ -1096,7 +1136,7 @@ class Parameter:
         elif self._kind == Parameter.VAR_KEYWORD:
             out = "**" + out
         if self._annotation is not _empty:
-            out += f": {self._annotation}"
+            out += f": {formatannotation(self._annotation)}"
         if self._default is not _empty:
             sep = " = " if self._annotation is not _empty else "="
             out += sep + repr(self._default)
@@ -1271,7 +1311,7 @@ class Signature:
         if max_width is not None and len(rendered) > max_width:
             rendered = "(\n    " + ",\n    ".join(result) + "\n)"
         if self._return_annotation is not _empty:
-            rendered += f" -> {self._return_annotation!r}"
+            rendered += f" -> {formatannotation(self._return_annotation)}"
         return rendered
 
     def __str__(self):
@@ -1282,29 +1322,118 @@ class Signature:
         return signature(func)
 
 
-def signature(callable_):
-    if isclass(callable_):
+def _signature_drop_first(sig):
+    """Remove the leading (bound) parameter — CPython drops it by
+    position, not by name."""
+    params = list(sig.parameters.values())[1:]
+    return Signature(params, return_annotation=sig.return_annotation)
+
+
+def _signature_get_partial(wrapped_sig, part, extra_args=()):
+    """Signature of a `functools.partial` given its target's signature
+    (mirrors CPython `_signature_get_partial`)."""
+    old_params = wrapped_sig.parameters
+    new_params = dict(old_params.items())
+    partial_args = part.args or ()
+    partial_keywords = part.keywords or {}
+    if extra_args:
+        partial_args = extra_args + partial_args
+    try:
+        ba = wrapped_sig.bind_partial(*partial_args, **partial_keywords)
+    except TypeError as ex:
+        raise ValueError(ex.args[0] if ex.args else str(ex)) from None
+
+    transform_to_kwonly = False
+    for param_name, param in old_params.items():
+        try:
+            arg_value = ba.arguments[param_name]
+        except KeyError:
+            pass
+        else:
+            if param.kind == Parameter.POSITIONAL_ONLY:
+                # Bound by partial.func: disappears from the signature.
+                new_params.pop(param_name)
+                continue
+            if param.kind == Parameter.POSITIONAL_OR_KEYWORD:
+                if param_name in partial_keywords:
+                    # This parameter (and everything after it) becomes
+                    # keyword-only: `partial(foo, 1, b=2)` of
+                    # `foo(a, b, *args, c)` is `(*, b=2, c)`.
+                    transform_to_kwonly = True
+                    new_params[param_name] = param.replace(default=arg_value)
+                else:
+                    new_params.pop(param_name)
+                    continue
+            if param.kind == Parameter.KEYWORD_ONLY:
+                new_params[param_name] = param.replace(default=arg_value)
+
+        if transform_to_kwonly:
+            if param.kind == Parameter.VAR_POSITIONAL:
+                new_params.pop(param.name, None)
+            elif param.kind == Parameter.POSITIONAL_OR_KEYWORD:
+                new_params[param_name] = new_params[param_name].replace(
+                    kind=Parameter.KEYWORD_ONLY)
+
+    return Signature(list(new_params.values()),
+                     return_annotation=wrapped_sig.return_annotation)
+
+
+def signature(callable_, *, follow_wrapped=True):
+    if not callable(callable_):
+        raise TypeError(f"{callable_!r} is not a callable object")
+    obj = callable_
+    if ismethod(obj):
+        # Bound method: signature of the underlying function minus the
+        # bound argument.
+        return _signature_drop_first(signature(obj.__func__))
+    # Was this function wrapped by a decorator? An explicit
+    # `__signature__` anywhere on the chain stops the walk.
+    if follow_wrapped:
+        obj = unwrap(obj, stop=lambda f: hasattr(f, "__signature__"))
+        if ismethod(obj):
+            return _signature_drop_first(signature(obj.__func__))
+    explicit = getattr(obj, "__signature__", None)
+    if explicit is not None:
+        return explicit
+    if isinstance(obj, functools.partial):
+        return _signature_get_partial(signature(obj.func), obj)
+    if isclass(obj):
+        # A metaclass with a custom `__call__` takes over construction
+        # entirely (CPython `_signature_from_callable`): derive the
+        # signature from it, or fail with ValueError when it isn't
+        # introspectable (e.g. `__call__ = dict`).
+        meta = type(obj)
+        if meta is not type:
+            meta_call = None
+            for k in getattr(meta, "__mro__", ()):
+                if k is type:
+                    break
+                if "__call__" in getattr(k, "__dict__", {}):
+                    meta_call = k.__dict__["__call__"]
+                    break
+            if meta_call is not None:
+                if isfunction(meta_call):
+                    sig = signature(meta_call)
+                    params = list(sig.parameters.values())[1:]
+                    return Signature(params, return_annotation=sig.return_annotation)
+                raise ValueError(f"no signature found for {obj!r}")
         # Prefer __new__ when it is overridden (e.g. functools.partial), then
         # fall back to __init__. A class signature carries no return annotation.
-        new = getattr(callable_, "__new__", None)
+        new = getattr(obj, "__new__", None)
         if new is not None and new is not object.__new__:
             sig = signature(new)
             params = [p for name, p in sig.parameters.items() if name != "cls"]
             return Signature(params)
-        init = getattr(callable_, "__init__", None)
+        init = getattr(obj, "__init__", None)
         if init is not None and init is not object.__init__:
             sig = signature(init)
             params = [p for name, p in sig.parameters.items() if name != "self"]
             return Signature(params)
         return Signature([])
-    if ismethod(callable_):
-        sig = signature(callable_.__func__)
-        params = [p for name, p in sig.parameters.items() if name != "self"]
-        return Signature(params, return_annotation=sig.return_annotation)
-    if not isfunction(callable_):
+    if not isfunction(obj):
         # A callable instance (defines __call__ on its type): derive the
         # signature from the type's __call__, dropping the bound `self`.
-        call = getattr(type(callable_), "__call__", None)
+        call = getattr(type(obj), "__call__", None)
         if call is not None and (isfunction(call) or ismethod(call)):
             sig = signature(call)
             params = [p for name, p in sig.parameters.items() if name != "self"]
@@ -1312,6 +1441,7 @@ def signature(callable_):
         # Best effort: return an "unknown" signature.
         return Signature([Parameter("args", Parameter.VAR_POSITIONAL),
                           Parameter("kwargs", Parameter.VAR_KEYWORD)])
+    callable_ = obj
     spec = getfullargspec(callable_)
     params = []
     defaults = spec.defaults or ()

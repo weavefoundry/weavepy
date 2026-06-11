@@ -65,6 +65,11 @@ pub enum Error {
     Compile(#[from] compiler::CompileError),
     #[error("runtime error: {0}")]
     Runtime(#[from] vm::RuntimeError),
+    /// As [`Error::Runtime`], but the traceback was already written
+    /// to stderr by the interpreter (CPython-style, via the
+    /// `traceback` module). Callers must not print it again.
+    #[error("runtime error: {0}")]
+    RuntimePrinted(vm::RuntimeError),
 }
 
 impl Error {
@@ -72,7 +77,8 @@ impl Error {
     pub fn format(&self, source: &str, filename: &str) -> String {
         match self {
             Error::Parse(parser::ParseError::Lex(lex)) => format_lex_error(source, filename, lex),
-            Error::Parse(parser::ParseError::Unexpected { span, message }) => {
+            Error::Parse(parser::ParseError::Unexpected { span, message })
+            | Error::Parse(parser::ParseError::Indentation { span, message }) => {
                 format_syntax_error(source, filename, span.start.0, message)
             }
             Error::Parse(parser::ParseError::NotImplemented { span, feature, rfc }) => {
@@ -108,7 +114,16 @@ impl Error {
                     "Traceback (most recent call last):\n  File \"{filename}\", line ?, in <module>\nInternalError: {msg}\n"
                 )
             }
+            // Already on stderr — render nothing.
+            Error::RuntimePrinted(_) => String::new(),
         }
+    }
+
+    /// `true` when the traceback was already written to stderr by the
+    /// interpreter and the caller must not print [`Error::format`]'s
+    /// output again.
+    pub fn already_printed(&self) -> bool {
+        matches!(self, Error::RuntimePrinted(_))
     }
 
     /// When this error is a `SystemExit` (or subclass) propagating out
@@ -117,7 +132,10 @@ impl Error {
     /// Returns `None` for every other error.
     pub fn system_exit_code(&self) -> Option<vm::object::Object> {
         match self {
-            Error::Runtime(vm::RuntimeError::PyException(exc)) => exc.system_exit_code(),
+            Error::Runtime(vm::RuntimeError::PyException(exc))
+            | Error::RuntimePrinted(vm::RuntimeError::PyException(exc)) => {
+                exc.system_exit_code()
+            }
             _ => None,
         }
     }
@@ -165,6 +183,14 @@ pub struct RunOptions {
     /// these on `sys.flags`, `sys.dont_write_bytecode`,
     /// `sys._xoptions`, and `sys.warnoptions`.
     pub flags: InterpreterFlags,
+    /// CLI behaviour: print an uncaught exception to stderr through
+    /// the interpreter's own machinery (`sys.excepthook` → `traceback`
+    /// module, with carets and chained exceptions) before returning
+    /// it. The returned [`Error`] then reports
+    /// [`Error::already_printed`] so the caller doesn't double-print.
+    /// Library embedders keep the default (`false`) and render via
+    /// [`Error::format`].
+    pub print_uncaught: bool,
 }
 
 pub use vm::InterpreterFlags;
@@ -177,7 +203,15 @@ impl RunOptions {
             extra_path: Vec::new(),
             script_dir: None,
             flags: InterpreterFlags::default(),
+            print_uncaught: false,
         }
+    }
+
+    /// See [`RunOptions::print_uncaught`].
+    #[must_use]
+    pub fn with_print_uncaught(mut self, value: bool) -> Self {
+        self.print_uncaught = value;
+        self
     }
 
     #[must_use]
@@ -262,15 +296,39 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
     } else {
         Some(opts.filename.as_str())
     };
+    // `python -c CMD` keeps the command text reachable for tracebacks
+    // even though `<string>` has no file: CPython registers it with
+    // `linecache._register_code` (gh-103987). Mirror that for our
+    // CLI-driven `<string>` runs.
+    if opts.print_uncaught && opts.filename == "<string>" {
+        let code_rc = vm::sync::Rc::new(code.clone());
+        interpreter.register_source_with_linecache(&code_rc, source_ref, "<string>");
+    }
     let result = interpreter.run_module_as(&code, "__main__", file_for_main);
+    // CPython prints the uncaught exception (via `sys.excepthook` /
+    // the traceback module) *before* `Py_FinalizeEx` runs shutdown
+    // finalizers — `__del__` output interleaves after the traceback.
+    let result = match result {
+        Err(vm::RuntimeError::PyException(exc))
+            if opts.print_uncaught && exc.system_exit_code().is_none() =>
+        {
+            if interpreter.print_uncaught_exception(&exc) {
+                Err(Error::RuntimePrinted(vm::RuntimeError::PyException(exc)))
+            } else {
+                // Rendering machinery unavailable — let the caller's
+                // plain formatter handle it.
+                Err(Error::Runtime(vm::RuntimeError::PyException(exc)))
+            }
+        }
+        other => other.map_err(Error::from),
+    };
     // CPython runs finalizers for everything still alive during
     // interpreter shutdown — including a module-global object whose
     // `__del__` raises (which is reported via `sys.unraisablehook`).
     // Do this whether the module returned normally or via `SystemExit`,
     // before the caller turns a `SystemExit` into a process exit.
     interpreter.run_shutdown_finalizers();
-    result?;
-    Ok(())
+    result.map(|_| ())
 }
 
 fn script_dir_of(filename: &str) -> PathBuf {

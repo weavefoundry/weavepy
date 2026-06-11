@@ -42,6 +42,12 @@ const _: () = {
 #[derive(Clone)]
 pub enum Object {
     None,
+    /// The "no value" marker for local-variable slots — CPython's NULL
+    /// fast-local. Never a Python-visible value: `LOAD_FAST` raises
+    /// `UnboundLocalError` on it, and the `f_locals` provider skips it
+    /// (which is what lets a local explicitly bound to `None` remain
+    /// visible — the two states must be distinguishable).
+    Unbound,
     Bool(bool),
     Int(i64),
     /// Arbitrary-precision integer (RFC 0019). Created on i64 overflow,
@@ -141,12 +147,22 @@ pub enum Object {
     /// `sys.implementation`, `argparse.Namespace`-shaped fixtures, and
     /// the conformance harness.
     SimpleNamespace(Rc<RefCell<DictData>>),
+    /// Native lazy iterator adapter (RFC 0037) — an `itertools` object
+    /// CPython implements in C. Wraps an arbitrary VM iterable, so it
+    /// is stepped by the *interpreter* (`Interpreter::iter_next`),
+    /// never by `PyIterator::next_value`: advancing the source may
+    /// resume a generator or call a user-defined `__next__`. Being
+    /// native matters beyond speed — stepping adds no Python frame,
+    /// which `traceback.walk_stack`'s hardcoded `f_back` hop count
+    /// relies on.
+    LazyIter(Rc<PyLazyIter>),
 }
 
 impl fmt::Debug for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Object::None => write!(f, "None"),
+            Object::Unbound => write!(f, "<unbound>"),
             Object::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),
             Object::Int(i) => write!(f, "{i}"),
             Object::Long(b) => write!(f, "{b}"),
@@ -209,6 +225,7 @@ impl fmt::Debug for Object {
                 }
                 m.finish()
             }
+            Object::LazyIter(l) => write!(f, "<{} object>", l.type_name()),
         }
     }
 }
@@ -621,14 +638,18 @@ fn current_interp_eq(a: &Object, b: &Object) -> Option<bool> {
 /// Used to gate the reentrant `__eq__` dispatch so plain instances keep the
 /// native identity fast path.
 fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
-    matches!(
-        obj,
-        Object::Instance(inst)
-            if matches!(
-                inst.cls().lookup(name),
-                Some(Object::Function(_) | Object::BoundMethod(_))
-            )
-    )
+    let Object::Instance(inst) = obj else {
+        return false;
+    };
+    match inst.cls().lookup_with_owner(name) {
+        Some((Object::Function(_) | Object::BoundMethod(_), _)) => true,
+        Some((Object::None, _)) | None => false,
+        // Non-function dunder supplied by a user class — e.g.
+        // `unittest.mock` installs `Mock` instances as `__hash__` /
+        // `__eq__` on per-instance subclasses. Built-in owners keep
+        // the native identity fast path.
+        Some((_, owner)) => !owner.flags.is_builtin,
+    }
 }
 
 impl PartialEq for DictKey {
@@ -909,30 +930,40 @@ impl Drop for PyGenerator {
         };
         let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
         drop(state);
-        if let GeneratorState::Suspended(frame) = prev {
-            // Finalized once already (CPython's `_PyGC_FINALIZED` bit):
-            // drop the frame for real instead of looping forever
-            // through resurrection → finalize → drop.
-            if self.finalize_ran.get() {
-                return;
+        match prev {
+            GeneratorState::Suspended(frame) => {
+                // Finalized once already (CPython's `_PyGC_FINALIZED` bit):
+                // drop the frame for real instead of looping forever
+                // through resurrection → finalize → drop.
+                if self.finalize_ran.get() {
+                    defer_generator_state_drop(GeneratorState::Suspended(frame));
+                    return;
+                }
+                let resurrected = Rc::new(PyGenerator {
+                    name: RefCell::new(self.name.borrow().clone()),
+                    qualname: RefCell::new(self.qualname.borrow().clone()),
+                    kind: self.kind,
+                    code: self.code.clone(),
+                    state: RefCell::new(GeneratorState::Suspended(frame)),
+                    origin: RefCell::new(self.origin.borrow().clone()),
+                    hooks_inited: crate::sync::Cell::new(self.hooks_inited.get()),
+                    finalizer: RefCell::new(self.finalizer.borrow().clone()),
+                    finalize_ran: crate::sync::Cell::new(self.finalize_ran.get()),
+                });
+                let obj = match self.kind {
+                    CoroutineKind::Generator => Object::Generator(resurrected),
+                    CoroutineKind::Coroutine => Object::Coroutine(resurrected),
+                    CoroutineKind::AsyncGenerator => Object::AsyncGenerator(resurrected),
+                };
+                crate::vm_singletons::try_push_pending_finalizer(obj);
             }
-            let resurrected = Rc::new(PyGenerator {
-                name: RefCell::new(self.name.borrow().clone()),
-                qualname: RefCell::new(self.qualname.borrow().clone()),
-                kind: self.kind,
-                code: self.code.clone(),
-                state: RefCell::new(GeneratorState::Suspended(frame)),
-                origin: RefCell::new(self.origin.borrow().clone()),
-                hooks_inited: crate::sync::Cell::new(self.hooks_inited.get()),
-                finalizer: RefCell::new(self.finalizer.borrow().clone()),
-                finalize_ran: crate::sync::Cell::new(self.finalize_ran.get()),
-            });
-            let obj = match self.kind {
-                CoroutineKind::Generator => Object::Generator(resurrected),
-                CoroutineKind::Coroutine => Object::Coroutine(resurrected),
-                CoroutineKind::AsyncGenerator => Object::AsyncGenerator(resurrected),
-            };
-            crate::vm_singletons::try_push_pending_finalizer(obj);
+            // A never-started frame still owns locals that can hold the
+            // *next* generator of a pipeline (`chain(chain(chain(…)))`).
+            // Dropping it inline recurses one native stack frame per
+            // link and overflows on long chains, so route it through
+            // the iterative trampoline below.
+            state @ GeneratorState::Created(_) => defer_generator_state_drop(state),
+            GeneratorState::Finished | GeneratorState::Running => {}
         }
     }
 }
@@ -974,6 +1005,46 @@ pub enum GeneratorState {
     Finished,
     /// Currently executing — re-entry would be illegal.
     Running,
+}
+
+thread_local! {
+    /// Worklist for [`defer_generator_state_drop`].
+    static GEN_DROP_QUEUE: std::cell::RefCell<Vec<GeneratorState>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// True while the outermost deferred drop is draining the queue.
+    static GEN_DROP_DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Drop a generator's frame payload *iteratively*. A generator pipeline
+/// (`a = gen(); b = wrap(a); c = wrap(b); …`) dies as a linked chain:
+/// dropping the head frame drops the next `Arc<PyGenerator>`, whose
+/// `Drop` would drop *its* frame, one native stack frame per link —
+/// thousands of links overflow the stack. Instead every generator drop
+/// pushes its frame here and only the outermost call drains, so chain
+/// teardown runs in constant stack space.
+fn defer_generator_state_drop(state: GeneratorState) {
+    // `try_with`: during thread teardown our own TLS may already be
+    // destroyed; fall back to the inline (recursive) drop then — by
+    // that point GcState::drop has already flattened tracked chains.
+    let queued = GEN_DROP_QUEUE.try_with(|q| q.borrow_mut().push(state));
+    let Ok(()) = queued else {
+        return;
+    };
+    let _ = GEN_DROP_DRAINING.try_with(|flag| {
+        if flag.get() {
+            // An outer drop is draining; it will pick up our entry.
+            return;
+        }
+        flag.set(true);
+        loop {
+            let next = GEN_DROP_QUEUE.with(|q| q.borrow_mut().pop());
+            match next {
+                Some(s) => drop(s),
+                None => break,
+            }
+        }
+        flag.set(false);
+    });
 }
 
 impl fmt::Debug for GeneratorState {
@@ -1349,6 +1420,41 @@ impl fmt::Debug for FileBackend {
     }
 }
 
+/// State of an [`Object::LazyIter`]. A separate struct (rather than
+/// `PyIterator` variants) because stepping needs the interpreter, and
+/// `PyIterator::next_value`'s 30+ call sites step without one — a lazy
+/// adapter reaching them would silently read as exhausted.
+#[derive(Debug)]
+pub struct PyLazyIter {
+    pub state: RefCell<LazyIterKind>,
+}
+
+impl PyLazyIter {
+    /// Python-visible type name (`type(islice(...)).__name__`).
+    pub fn type_name(&self) -> &'static str {
+        match &*self.state.borrow() {
+            LazyIterKind::Islice { .. } => "islice",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum LazyIterKind {
+    /// `itertools.islice(source, start, stop, step)` mid-iteration.
+    /// `next_idx` is the source index of the next element to emit and
+    /// `pos` the source index the underlying iterator will yield next;
+    /// the gap between them is skipped on demand (CPython consumes
+    /// skipped elements lazily, not at construction).
+    Islice {
+        source: Object,
+        next_idx: u64,
+        pos: u64,
+        stop: Option<u64>,
+        step: u64,
+        done: bool,
+    },
+}
+
 /// State of an active iterator. Slim by design — every iterable
 /// type implements its own iteration here (no Python-level iterator
 /// protocol yet).
@@ -1668,6 +1774,7 @@ impl Object {
     pub fn is_truthy(&self) -> bool {
         match self {
             Object::None => false,
+            Object::Unbound => false,
             Object::Bool(b) => *b,
             Object::Int(i) => *i != 0,
             Object::Long(b) => !b.is_zero(),
@@ -1709,6 +1816,7 @@ impl Object {
             Object::MappingProxy(d) => !d.borrow().is_empty(),
             Object::DictView(v) => !v.dict.borrow().is_empty(),
             Object::SimpleNamespace(_) => true,
+            Object::LazyIter(_) => true,
             Object::Bytes(b) => !b.is_empty(),
             Object::ByteArray(b) => !b.borrow().is_empty(),
             Object::Set(s) => !s.borrow().is_empty(),
@@ -1793,6 +1901,8 @@ impl Object {
             (Object::MappingProxy(a), Object::MappingProxy(b)) => Rc::ptr_eq(a, b),
             (Object::DictView(a), Object::DictView(b)) => Rc::ptr_eq(a, b),
             (Object::SimpleNamespace(a), Object::SimpleNamespace(b)) => Rc::ptr_eq(a, b),
+            (Object::LazyIter(a), Object::LazyIter(b)) => Rc::ptr_eq(a, b),
+            (Object::Unbound, Object::Unbound) => true,
             _ => false,
         }
     }
@@ -2197,6 +2307,7 @@ impl Object {
     pub fn type_name(&self) -> &'static str {
         match self {
             Object::None => "NoneType",
+            Object::Unbound => "NoneType",
             Object::Bool(_) => "bool",
             Object::Int(_) => "int",
             Object::Long(_) => "int",
@@ -2239,6 +2350,7 @@ impl Object {
             Object::MappingProxy(_) => "mappingproxy",
             Object::DictView(v) => v.kind.type_name(),
             Object::SimpleNamespace(_) => "SimpleNamespace",
+            Object::LazyIter(l) => l.type_name(),
         }
     }
 
@@ -2257,6 +2369,7 @@ impl Object {
     pub fn repr(&self) -> String {
         match self {
             Object::None => "None".to_owned(),
+            Object::Unbound => "<unbound>".to_owned(),
             Object::Bool(b) => if *b { "True" } else { "False" }.to_owned(),
             Object::Int(i) => i.to_string(),
             Object::Long(b) => b.to_string(),
@@ -2440,9 +2553,11 @@ impl Object {
                     }
                     format!("<{} object>", inst.cls().name)
                 } else {
+                    // CPython's `object.__repr__`: `<module.qualname object
+                    // at 0x…>` (module omitted for builtins).
                     format!(
                         "<{} object at 0x{:x}>",
-                        inst.cls().name,
+                        inst.cls().qualified_display_name(),
                         Rc::as_ptr(inst) as usize
                     )
                 }
@@ -2474,6 +2589,13 @@ impl Object {
                         .collect(),
                 };
                 format!("{}([{}])", v.kind.type_name(), body.join(", "))
+            }
+            Object::LazyIter(l) => {
+                format!(
+                    "<itertools.{} object at {:#x}>",
+                    l.type_name(),
+                    Rc::as_ptr(l) as usize
+                )
             }
             Object::SimpleNamespace(d) => {
                 let dict = d.borrow();
@@ -2884,6 +3006,7 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
         Object::Traceback(r) => rot(Rc::as_ptr(r).cast()),
         Object::MemoryView(r) => rot(Rc::as_ptr(r).cast()),
         Object::SimpleNamespace(r) => rot(Rc::as_ptr(r).cast()),
+        Object::LazyIter(r) => rot(Rc::as_ptr(r).cast()),
         // Value-hashable variants never reach here (handled by
         // `py_hash_value`); anything else gets a stable constant.
         _ => 0,

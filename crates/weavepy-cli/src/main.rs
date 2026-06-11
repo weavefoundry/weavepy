@@ -374,6 +374,15 @@ fn split_argv(raw: Vec<String>) -> (Vec<String>, Option<(&'static str, String)>,
             let rest: Vec<String> = iter.collect();
             return (wp, Some(("-", String::new())), rest);
         }
+        // Value-taking flags: consume the following arg too, so it
+        // isn't mistaken for the positional script (`-X opt script.py`).
+        if arg == "-X" || arg == "-W" || arg == "--check-hash-based-pycs" {
+            wp.push(arg);
+            if let Some(value) = iter.next() {
+                wp.push(value);
+            }
+            continue;
+        }
         if !arg.starts_with('-') {
             // Positional script.
             let rest: Vec<String> = iter.collect();
@@ -708,7 +717,11 @@ fn run_stdin(extra: Vec<String>, flags: &InterpreterFlags, extra_path: &[PathBuf
 }
 
 fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
-    match weavepy::run_source_with_options(source, opts) {
+    // CLI runs print uncaught exceptions CPython-style, through the
+    // interpreter's `sys.excepthook` / `traceback` machinery (source
+    // lines, carets, exception chains) while it is still alive.
+    let opts = opts.clone().with_print_uncaught(true);
+    match weavepy::run_source_with_options(source, &opts) {
         Ok(()) => Ok(()),
         Err(err) => {
             // A `SystemExit` reaching the top level terminates the
@@ -718,9 +731,11 @@ fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
             if let Some(code) = err.system_exit_code() {
                 exit_with_system_exit(code);
             }
-            let mut stderr = io::stderr().lock();
-            let diag = err.format(source, &opts.filename);
-            let _ = stderr.write_all(diag.as_bytes());
+            if !err.already_printed() {
+                let mut stderr = io::stderr().lock();
+                let diag = err.format(source, &opts.filename);
+                let _ = stderr.write_all(diag.as_bytes());
+            }
             anyhow::bail!(DIAGNOSTIC_SENTINEL);
         }
     }

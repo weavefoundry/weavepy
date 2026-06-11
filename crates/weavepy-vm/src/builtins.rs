@@ -539,7 +539,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             _ => None,
         },
         Object::Bytes(_) | Object::ByteArray(_) => match name {
-            "decode" => Some(method("decode", bytes_decode)),
+            "decode" => Some(method_kw("decode", bytes_decode_kw)),
             "hex" => Some(method_kw("hex", bytes_hex_kw)),
             "fromhex" => Some(method("fromhex", bytes_fromhex)),
             "startswith" => Some(method("startswith", bytes_startswith)),
@@ -2337,8 +2337,11 @@ pub(crate) fn code_synthetic_attr(
         "co_names" => Some(Object::new_tuple(
             c.names.iter().map(Object::from_str).collect(),
         )),
+        // First *tracked* line — synthetic preamble instructions carry
+        // line 0, but CPython's co_firstlineno is 1-based (a module
+        // compiled from one line reports 1, not 0).
         "co_firstlineno" => Some(Object::Int(i64::from(
-            c.linetable.first().copied().unwrap_or(0),
+            c.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1),
         ))),
         "co_consts" => Some(Object::new_tuple(
             c.constants
@@ -2496,7 +2499,11 @@ fn code_self(args: &[Object]) -> Result<Rc<weavepy_compiler::CodeObject>, Runtim
 fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
     let c = code_self(args)?;
     let cp = c.to_cpython();
-    let col = |v: Option<u32>| v.map_or(Object::None, |x| Object::Int(i64::from(x)));
+    let debug_ranges = crate::vm_singletons::debug_ranges();
+    let col = |v: Option<u32>| {
+        v.filter(|_| debug_ranges)
+            .map_or(Object::None, |x| Object::Int(i64::from(x)))
+    };
     let items = cp
         .positions
         .iter()
@@ -4967,6 +4974,8 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
     match obj {
         Object::Instance(inst) => inst.cls(),
         Object::None => bt.none_type.clone(),
+        // Unbound never escapes to Python; map it like None defensively.
+        Object::Unbound => bt.none_type.clone(),
         Object::Bool(_) => bt.bool_.clone(),
         Object::Int(_) => bt.int_.clone(),
         Object::Long(_) => bt.int_.clone(),
@@ -5038,6 +5047,10 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Set(_) => bt.set_.clone(),
         Object::FrozenSet(_) => bt.frozenset_.clone(),
         Object::Iter(_) => bt.iterator_.clone(),
+        // Native itertools adapters share the generic iterator type for
+        // now; `type(x).__name__` is "iterator" rather than CPython's
+        // "islice" until they get dedicated TypeObjects.
+        Object::LazyIter(_) => bt.iterator_.clone(),
         Object::Generator(_) => bt.generator_.clone(),
         Object::Coroutine(_) => bt.coroutine_.clone(),
         Object::AsyncGenerator(_) => bt.async_generator_.clone(),
@@ -5047,9 +5060,9 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         // `repr`/error messages via `Object::type_name`).
         Object::AsyncGenAwait(_) => bt.object_.clone(),
         Object::Module(_) => bt.module_.clone(),
-        Object::Code(_) | Object::Cell(_) | Object::SlotDescriptor(_) | Object::File(_) => {
-            bt.object_.clone()
-        }
+        Object::SlotDescriptor(_) => bt.member_descriptor_.clone(),
+        Object::Code(_) => bt.code_.clone(),
+        Object::Cell(_) | Object::File(_) => bt.object_.clone(),
         Object::Frame(_) => bt.frame_.clone(),
         Object::Traceback(_) => bt.traceback_.clone(),
     }
@@ -5142,6 +5155,7 @@ fn object_identity(obj: &Object) -> i64 {
         Object::Code(c) => Rc::as_ptr(c) as usize as i64,
         Object::Cell(c) => Rc::as_ptr(c) as usize as i64,
         Object::Iter(i) => Rc::as_ptr(i) as usize as i64,
+        Object::LazyIter(l) => Rc::as_ptr(l) as usize as i64,
         Object::Int(i) => i.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64),
         Object::Float(f) => (f.to_bits() as i64) ^ 0x0123_4567_89AB_CDEFu64 as i64,
         Object::Bool(b) => {
@@ -5152,6 +5166,7 @@ fn object_identity(obj: &Object) -> i64 {
             }
         }
         Object::None => 0x4E6F_6E65, // 'None' as bytes — stable sentinel.
+        Object::Unbound => 0x4E6F_6E66,
     }
 }
 
@@ -7729,15 +7744,18 @@ fn byte_is_pyspace(c: u8) -> bool {
 }
 
 fn bytes_decode(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_decode_kw(args, &[])
+}
+
+fn bytes_decode_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let encoding = match args.get(1) {
+    let encoding = match arg_or_kw(args, 1, kwargs, "encoding") {
         Some(Object::Str(e)) => e.to_string(),
         None => "utf-8".to_owned(),
         _ => return Err(type_error("decode() expected str")),
     };
-    let errors = match args.get(2) {
+    let errors = match arg_or_kw(args, 2, kwargs, "errors") {
         Some(Object::Str(e)) => e.to_string(),
-        None => "strict".to_owned(),
         _ => "strict".to_owned(),
     };
     let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;

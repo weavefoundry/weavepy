@@ -73,6 +73,11 @@ pub struct WeakRefSlot {
     /// Type tag used for `isinstance(w, weakref.ProxyType)`
     /// distinction: 0 = ref, 1 = proxy, 2 = callable proxy.
     pub kind: u8,
+    /// Back-pointer to the user-visible weakref object built around
+    /// this slot. Weak so the slot doesn't keep the Python wrapper
+    /// alive; lets `obj.__weakref__` / `weakref.getweakrefs` return
+    /// the *same* object the user holds.
+    pub py_ref: RefCell<Option<crate::sync::Weak<crate::types::PyInstance>>>,
 }
 
 /// Weakref kinds as exposed to Python. Numeric so the field
@@ -92,6 +97,7 @@ impl WeakRefSlot {
             identity_hash: target_id as i64,
             dead: AtomicBool::new(false),
             kind,
+            py_ref: RefCell::new(None),
         }
     }
 
@@ -241,6 +247,24 @@ impl WeakRefRegistry {
         });
     }
 
+    /// Snapshot one live target `Object` per watched id. Feeds the
+    /// collector's weakref-only sweep for referents that aren't in the
+    /// tracked set (functions, methods, …): if the only remaining
+    /// strong references to a target are the slots' own clones, the
+    /// object is unreachable from Python and its weakrefs must clear.
+    pub fn targets(&self) -> Vec<(ObjectId, Object)> {
+        let g = self.inner.borrow();
+        g.slots
+            .iter()
+            .filter_map(|(id, v)| {
+                v.iter()
+                    .filter_map(Weak::upgrade)
+                    .find_map(|s| s.target.borrow().clone())
+                    .map(|t| (*id, t))
+            })
+            .collect()
+    }
+
     pub fn version(&self) -> u64 {
         self.inner.borrow().version
     }
@@ -266,6 +290,27 @@ pub fn register(slot: Arc<WeakRefSlot>) {
 /// has died.
 pub fn notify_clear(id: ObjectId) -> Vec<(Arc<WeakRefSlot>, Option<Object>)> {
     with_registry(|r| r.notify_clear(id))
+}
+
+/// Queue every callback from a `notify_clear` result for invocation at
+/// the next interpreter safe point. The callback argument is the
+/// user-visible weakref object (recovered through the slot's `py_ref`
+/// back-pointer; `None` if the wrapper itself is already gone — in that
+/// case the callback is dropped, matching CPython, which clears a dead
+/// ref's callback without calling it).
+pub fn queue_callbacks(cleared: Vec<(Arc<WeakRefSlot>, Option<Object>)>) {
+    for (slot, cb) in cleared {
+        let Some(cb) = cb else { continue };
+        let wr = slot
+            .py_ref
+            .borrow()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(Object::Instance);
+        if let Some(wr) = wr {
+            crate::vm_singletons::push_pending_weakref_callback(cb, wr);
+        }
+    }
 }
 
 /// Convenience: weakref count for `id` in the current thread.
@@ -302,6 +347,7 @@ pub fn id_of(obj: &Object) -> ObjectId {
     use crate::sync::Rc;
     match obj {
         Object::None => 1,
+        Object::Unbound => 1,
         Object::Bool(false) => 2,
         Object::Bool(true) => 3,
         Object::Int(n) => 0x1000_0000_0000_0000u64 ^ (*n as u64),
@@ -340,6 +386,7 @@ pub fn id_of(obj: &Object) -> ObjectId {
         Object::MappingProxy(d) => Rc::as_ptr(d) as usize as u64,
         Object::DictView(v) => Rc::as_ptr(v) as usize as u64,
         Object::SimpleNamespace(d) => Rc::as_ptr(d) as usize as u64,
+        Object::LazyIter(l) => Rc::as_ptr(l) as usize as u64,
         Object::Long(b) => Rc::as_ptr(b) as usize as u64,
         Object::Complex(c) => Rc::as_ptr(c) as usize as u64,
     }

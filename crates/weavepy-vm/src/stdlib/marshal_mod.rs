@@ -428,7 +428,14 @@ impl<'a> MarshalReader<'a> {
 
     fn read_byte(&mut self) -> Result<u8, RuntimeError> {
         if self.pos >= self.bytes.len() {
-            return Err(value_error("bad marshal data: short"));
+            // CPython `r_object`: EOF at an object boundary is
+            // EOFError, not ValueError (test_exceptions.testRaising).
+            return Err(RuntimeError::PyException(
+                crate::error::PyException::from_builtin(
+                    "EOFError",
+                    "EOF read where object expected",
+                ),
+            ));
         }
         let b = self.bytes[self.pos];
         self.pos += 1;

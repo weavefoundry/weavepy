@@ -68,12 +68,19 @@ pub fn parse(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
         _ => return Err(value_error("ast.parse() requires a str or bytes source")),
     };
+    let filename = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => "<unknown>".to_owned(),
+    };
     let mode = match args.get(2) {
         Some(Object::Str(s)) => s.to_string(),
         _ => "exec".to_owned(),
     };
+    // CPython raises `SyntaxError` (never `ValueError`) from
+    // `ast.parse` — callers like `traceback`'s caret-anchor probe rely
+    // on `except SyntaxError` swallowing bad segments.
     let module = weavepy_parser::parse_module(&source)
-        .map_err(|e| value_error(format!("invalid syntax: {e}")))?;
+        .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
     let lm = LineMap::new(&source);
     let b = Builder { lm: &lm };
     Ok(b.module(&module, &mode))

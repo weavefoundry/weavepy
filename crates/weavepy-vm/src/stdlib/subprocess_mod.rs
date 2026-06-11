@@ -218,26 +218,56 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         Stdio::inherit()
     });
-    cmd.stdout(if stdout_pipe {
-        Stdio::piped()
+    // `stderr=STDOUT`: both child streams must share one fd so writes
+    // interleave in order. When stdout is a pipe we hand the child two
+    // clones of the same pipe's write end and keep the read end.
+    let mut merged_reader: Option<std::io::PipeReader> = None;
+    if stderr_to_stdout && stdout_pipe {
+        let (reader, writer) = std::io::pipe().map_err(|e| io_error_to_py(&e))?;
+        let writer2 = writer.try_clone().map_err(|e| io_error_to_py(&e))?;
+        cmd.stdout(Stdio::from(writer));
+        cmd.stderr(Stdio::from(writer2));
+        merged_reader = Some(reader);
     } else {
-        Stdio::inherit()
-    });
-    if stderr_to_stdout {
-        // CPython STDOUT sentinel — merge stderr into stdout.
-        cmd.stderr(Stdio::piped());
-    } else {
-        cmd.stderr(if stderr_pipe {
+        cmd.stdout(if stdout_pipe {
             Stdio::piped()
         } else {
             Stdio::inherit()
         });
+        if stderr_to_stdout {
+            // stdout is inherited; send child stderr to *our* stdout.
+            #[cfg(unix)]
+            {
+                use std::os::fd::FromRawFd;
+                let dup = unsafe { libc::dup(1) };
+                if dup >= 0 {
+                    cmd.stderr(unsafe { Stdio::from_raw_fd(dup) });
+                } else {
+                    cmd.stderr(Stdio::inherit());
+                }
+            }
+            #[cfg(not(unix))]
+            cmd.stderr(Stdio::inherit());
+        } else {
+            cmd.stderr(if stderr_pipe {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            });
+        }
     }
     let mut child = cmd.spawn().map_err(|e| io_error_to_py(&e))?;
+    // `Command` keeps its configured `Stdio` handles (our pipe write
+    // ends) alive until dropped — reading the merged pipe to EOF
+    // would deadlock with them still open in this process.
+    drop(cmd);
     let pid = i64::from(child.id());
 
     let stdin_obj = child.stdin.take().map_or(Object::None, pipe_writer);
-    let stdout_obj = child.stdout.take().map_or(Object::None, pipe_reader);
+    let stdout_obj = match merged_reader {
+        Some(reader) => pipe_reader(reader),
+        None => child.stdout.take().map_or(Object::None, pipe_reader),
+    };
     let stderr_obj = child.stderr.take().map_or(Object::None, pipe_reader);
 
     let child_rc: Rc<RefCell<Option<std::process::Child>>> = Rc::new(RefCell::new(Some(child)));

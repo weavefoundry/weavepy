@@ -154,6 +154,14 @@ impl TypeObject {
         for base in &bases {
             base.subclasses.borrow_mut().push(Rc::downgrade(&ty));
         }
+        // RFC 0024: user classes join the cycle collector. Every class
+        // is born in a self-cycle (its own `mro` holds an `Rc` to
+        // itself), so without tracking, `del SomeClass` could never
+        // free it — and weakrefs to it (or to methods in its dict)
+        // would never clear. Built-ins are immortal; skip them.
+        if !ty.flags.is_builtin {
+            crate::gc_trace::track(Object::Type(ty.clone()));
+        }
         Ok(ty)
     }
 
@@ -335,6 +343,20 @@ impl TypeObject {
         None
     }
 
+    /// Like [`Self::lookup`], but also report the MRO entry that owns
+    /// the attribute. Lets callers distinguish a dunder *supplied by a
+    /// user class* from one inherited off a built-in (e.g. `object`'s
+    /// identity `__hash__`).
+    pub fn lookup_with_owner(&self, name: &str) -> Option<(Object, Rc<TypeObject>)> {
+        let key = DictKey(Object::from_str(name));
+        for ty in self.mro.borrow().iter() {
+            if let Some(v) = ty.dict.borrow().get(&key).cloned() {
+                return Some((v, ty.clone()));
+            }
+        }
+        None
+    }
+
     pub fn class_name(&self) -> &str {
         &self.name
     }
@@ -344,12 +366,16 @@ impl TypeObject {
     /// `<class 'collections.abc.Iterable'>` / `<class '__main__.Foo'>`).
     pub fn qualified_display_name(&self) -> String {
         let dict = self.dict.borrow();
-        let module = dict
-            .get(&DictKey(Object::from_static("__module__")))
-            .map(Object::to_str);
-        let qual = dict
-            .get(&DictKey(Object::from_static("__qualname__")))
-            .map_or_else(|| self.name.clone(), Object::to_str);
+        // Only honour *string* entries — some built-in types carry a
+        // `__qualname__`/`__module__` *property descriptor* (for their
+        // instances) in the dict, which must not leak into the class
+        // repr (`type(gen)` printing `<class '<property object>'>`).
+        let as_str = |name: &'static str| match dict.get(&DictKey(Object::from_static(name))) {
+            Some(Object::Str(s)) => Some(s.as_ref().to_owned()),
+            _ => None,
+        };
+        let module = as_str("__module__");
+        let qual = as_str("__qualname__").unwrap_or_else(|| self.name.clone());
         match module.as_deref() {
             None | Some("builtins") | Some("") => qual,
             Some(m) => format!("{m}.{qual}"),

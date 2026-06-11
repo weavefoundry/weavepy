@@ -545,10 +545,23 @@ fn start_new_thread(args: &[Object]) -> Result<Object, RuntimeError> {
             // section, then re-acquire on return.
             let gil = crate::gil::global_gil();
             crate::gil::push_gil_guard(gil.acquire());
-            let call_result = worker_interp.call_object(worker_func, &positional, &kwargs_pairs);
-            if let Err(err) = call_result {
-                if !is_system_exit(&err) {
-                    invoke_threading_excepthook(&mut worker_interp, &entry_name, &err);
+            let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_interp.call_object(worker_func, &positional, &kwargs_pairs)
+            }));
+            match call_result {
+                Ok(Err(err)) => {
+                    if !is_system_exit(&err) {
+                        invoke_threading_excepthook(&mut worker_interp, &entry_name, &err);
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("<non-string panic payload>");
+                    eprintln!("FATAL: panic in thread {entry_name}: {msg}");
                 }
             }
             // Drop the guard before marking finished so the
@@ -592,6 +605,10 @@ fn invoke_threading_excepthook(
     err: &RuntimeError,
 ) {
     let RuntimeError::PyException(exc) = err else {
+        // Internal (non-Python) errors would otherwise vanish with the
+        // worker thread; CPython prints *something* for every dying
+        // thread, so route the message to stderr.
+        eprintln!("Exception in thread {thread_name}: {err:?}");
         return;
     };
     let mods = interp.module_cache().modules.borrow();

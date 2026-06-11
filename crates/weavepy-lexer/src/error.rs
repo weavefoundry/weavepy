@@ -33,9 +33,13 @@ pub enum LexError {
     // the `SyntaxError`'s `lineno`/`offset`, not in the message text.
     #[error("invalid character {ch:?} (U+{codepoint:04X})", codepoint = u32::from(*ch))]
     InvalidChar { ch: char, pos: u32 },
-    #[error("inconsistent indentation at byte {pos}")]
+    /// ASCII junk the tokenizer can't start a token with (`$`, `?`,
+    /// `` ` ``) — CPython reports these as a bare "invalid syntax".
+    #[error("invalid syntax")]
+    InvalidToken { pos: u32 },
+    #[error("inconsistent use of tabs and spaces in indentation")]
     InconsistentIndent { pos: u32 },
-    #[error("indentation does not match any outer level at byte {pos}")]
+    #[error("unindent does not match any outer indentation level")]
     UnknownDedent { pos: u32 },
     #[error("invalid numeric literal at byte {pos}: {message}")]
     InvalidNumber { pos: u32, message: String },
@@ -62,6 +66,7 @@ impl LexError {
             | LexError::BracketNeverClosed { pos, .. }
             | LexError::FstringNewlineInSpec { pos }
             | LexError::InvalidChar { pos, .. }
+            | LexError::InvalidToken { pos }
             | LexError::InconsistentIndent { pos }
             | LexError::UnknownDedent { pos }
             | LexError::InvalidNumber { pos, .. }

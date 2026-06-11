@@ -112,6 +112,29 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
                 if !family(&a) || !family(&b) {
                     return Ok(crate::vm_singletons::not_implemented());
                 }
+                // Containers recurse *through the interpreter* so element
+                // `__eq__`/`__lt__` is honoured — `list_richcompare` in
+                // CPython calls `PyObject_RichCompare` per item. The
+                // native fallback only runs with no ambient interpreter
+                // (early startup) or for scalar families.
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame on this thread.
+                    let interp = unsafe { &mut *ptr };
+                    let globals = interp.builtins_dict();
+                    match op {
+                        CompareKind::Eq | CompareKind::NotEq => {
+                            if let Some(rv) = interp.deep_equal_collection(&a, &b, &globals)? {
+                                let rv = if matches!(op, CompareKind::Eq) { rv } else { !rv };
+                                return Ok(Object::Bool(rv));
+                            }
+                        }
+                        _ => {
+                            if let Some(rv) = interp.deep_order_collection(&a, &b, op, &globals)? {
+                                return Ok(Object::Bool(rv));
+                            }
+                        }
+                    }
+                }
                 match op {
                     CompareKind::Eq => Ok(Object::Bool(a.eq_value(&b))),
                     CompareKind::NotEq => Ok(Object::Bool(!a.eq_value(&b))),

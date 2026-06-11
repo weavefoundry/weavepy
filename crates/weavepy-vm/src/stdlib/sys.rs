@@ -87,10 +87,13 @@ pub fn build_with_state(
                 call_kw: None,
             })),
         );
-        let eh_get = excepthook.clone();
         d.insert(
             DictKey(Object::from_static("__excepthook__")),
-            eh_get.borrow().clone(),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "excepthook",
+                call: Box::new(sys_default_excepthook),
+                call_kw: None,
+            })),
         );
         let eh = excepthook.clone();
         d.insert(
@@ -541,6 +544,12 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("intern", sys_intern),
         );
         d.insert(
+            DictKey(Object::from_static("is_finalizing")),
+            builtin("is_finalizing", |_args| {
+                Ok(Object::Bool(crate::vm_singletons::is_finalizing()))
+            }),
+        );
+        d.insert(
             DictKey(Object::from_static("getdefaultencoding")),
             builtin("getdefaultencoding", sys_getdefaultencoding),
         );
@@ -839,11 +848,21 @@ fn sys_exc_info(
 }
 
 fn sys_default_excepthook(args: &[Object]) -> Result<Object, RuntimeError> {
-    // type, value, tb — we render a short summary directly to stderr.
-    // The VM-level CLI does the full traceback. This default is what
-    // a user gets when they call `sys.excepthook(*sys.exc_info())`
-    // from inside `except:` and the user hook is `None`.
+    // `sys.__excepthook__(type, value, tb)` — CPython's pristine hook
+    // renders the full traceback (source lines, carets, chained
+    // causes/contexts) to `sys.stderr`. Route through the Python
+    // `traceback` module when an interpreter is on the stack; fall
+    // back to a bare "Type: msg" line otherwise.
     let value = args.get(1).cloned().unwrap_or(Object::None);
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by `publish_interpreter_ptr` from a
+        // `&mut Interpreter` still on the call stack above us; the
+        // GIL makes this thread's access exclusive.
+        let interp = unsafe { &mut *ptr };
+        if interp.print_exception_via_traceback(&value) {
+            return Ok(Object::None);
+        }
+    }
     let kind = match &value {
         Object::Instance(i) => i.cls().name.clone(),
         _ => "Exception".to_owned(),

@@ -165,6 +165,15 @@ def islice(iterable, *args):
         i += 1
 
 
+# Prefer the native islice: like CPython's C implementation, stepping
+# it adds no Python frame — `traceback.walk_stack`'s hardcoded `f_back`
+# hop count through `StackSummary.extract` depends on that.
+try:
+    from _itertools import islice
+except ImportError:
+    pass
+
+
 def starmap(func, iterable):
     for args in iterable:
         yield func(*args)

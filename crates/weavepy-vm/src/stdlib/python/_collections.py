@@ -24,6 +24,14 @@ def _count_elements(mapping, iterable):
 class defaultdict(dict):
     """dict subclass that calls a factory function to supply missing values."""
 
+    # The C type reports `collections`, not `_collections`.
+    __module__ = "collections"
+
+    # Class-level default mirrors the C type's member descriptor; code like
+    # `dataclasses._asdict_inner` probes `hasattr(type(obj),
+    # 'default_factory')` to recognize defaultdict-shaped mappings.
+    default_factory = None
+
     def __init__(self, default_factory=None, /, *args, **kwds):
         if default_factory is not None and not callable(default_factory):
             raise TypeError("first argument must be callable or None")
@@ -75,6 +83,10 @@ class deque:
     keeps the public API (append/appendleft, pop/popleft, maxlen
     discipline, rotate, +, *, comparison, …) over a plain list.
     """
+
+    # The C type reports `collections`, not `_collections` (annotation
+    # formatting and pickling both key off this).
+    __module__ = "collections"
 
     def __init__(self, iterable=(), maxlen=None):
         if maxlen is not None:

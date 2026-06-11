@@ -308,9 +308,15 @@ class partial:
         cls = type(self)
         qualname = cls.__qualname__
         module = cls.__module__
-        args = [repr(self.func)]
-        args.extend(repr(x) for x in self.args)
-        args.extend(f"{k}={v!r}" for (k, v) in self.keywords.items())
+        # GH-144475: snapshot the state up front so a reentrant
+        # `__setstate__` (triggered from a member's repr) can't swap
+        # func/args/keywords mid-format.
+        func = self.func
+        f_args = self.args
+        keywords = self.keywords
+        args = [repr(func)]
+        args.extend(repr(x) for x in f_args)
+        args.extend(f"{k}={v!r}" for (k, v) in keywords.items())
         return f"{module}.{qualname}({', '.join(args)})"
 
     def __get__(self, obj, objtype=None):
@@ -356,6 +362,17 @@ class partial:
 
 try:
     from _functools import partial
+except ImportError:
+    pass
+
+# WeavePy: CPython's `partial` is a C type, so calling one adds no
+# Python frame to tracebacks. Splice in the native `__call__` to match
+# (the pure-Python definition above stays as documentation/fallback).
+try:
+    from _functools import _partial_call
+
+    partial.__call__ = _partial_call
+    del _partial_call
 except ImportError:
     pass
 

@@ -18,7 +18,8 @@ def on_die(_):
 
 b2 = Box("two")
 r2 = weakref.ref(b2, on_die)
-r2._release()
+del b2
+gc.collect()
 print("after release:", r2())
 print("callback fired:", released)
 

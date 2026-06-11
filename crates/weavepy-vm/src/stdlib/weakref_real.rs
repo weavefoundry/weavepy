@@ -62,7 +62,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                  part of the clear phase.",
             ),
         );
-        d.insert(DictKey(Object::from_static("ref")), b("ref", new_ref));
+        // `ref` IS the ReferenceType type object, exactly as in CPython
+        // (`_weakref.ref is _weakref.ReferenceType`); instantiation routes
+        // through `construct_ref` via the VM's builtin-type special-case.
+        d.insert(DictKey(Object::from_static("ref")), Object::Type(ref_type()));
         d.insert(DictKey(Object::from_static("proxy")), b("proxy", new_proxy));
         d.insert(
             DictKey(Object::from_static("getweakrefcount")),
@@ -140,6 +143,83 @@ fn ref_type_call(args: &[Object]) -> Result<Object, RuntimeError> {
     Err(type_error("__call__() requires a weakref instance"))
 }
 
+/// Referent of a ref/proxy wrapper through its per-instance deref
+/// closure. `Some(Some(target))` while live, `Some(None)` once dead,
+/// `None` when `obj` isn't a weakref wrapper at all.
+fn wrapper_referent(obj: &Object) -> Option<Option<Object>> {
+    let Object::Instance(inst) = obj else {
+        return None;
+    };
+    let getter = inst
+        .dict
+        .borrow()
+        .get(&DictKey(Object::from_static("__weakref_get__")))
+        .cloned();
+    match getter {
+        Some(Object::Builtin(b)) => {
+            let t = (b.call)(&[]).ok()?;
+            Some(if matches!(t, Object::None) { None } else { Some(t) })
+        }
+        _ => None,
+    }
+}
+
+/// Type-level `weakref.__eq__` — CPython's `weakref_richcompare`:
+/// while both referents are alive compare them with `==`; once either
+/// side is dead, fall back to identity of the *refs* themselves. A
+/// non-weakref operand declines with `NotImplemented`.
+fn ref_type_eq(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = args
+        .first()
+        .ok_or_else(|| type_error("__eq__() missing self"))?;
+    let other = args.get(1).cloned().unwrap_or(Object::None);
+    let (Some(a), Some(b)) = (wrapper_referent(me), wrapper_referent(&other)) else {
+        return Ok(crate::vm_singletons::not_implemented());
+    };
+    let result = match (a, b) {
+        (Some(ta), Some(tb)) => {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame on this thread.
+                let interp = unsafe { &mut *ptr };
+                interp.reentrant_py_eq(&ta, &tb).unwrap_or(false)
+            } else {
+                ta.is_same(&tb)
+            }
+        }
+        _ => me.is_same(&other),
+    };
+    Ok(Object::Bool(result))
+}
+
+/// Type-level `weakref.__hash__` — hash of the referent, cached on
+/// first use; once the referent is gone an uncached hash raises
+/// `TypeError` exactly as CPython's `weakref_hash` does.
+fn ref_type_hash(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = args
+        .first()
+        .ok_or_else(|| type_error("__hash__() missing self"))?;
+    let Object::Instance(inst) = me else {
+        return Err(type_error("descriptor '__hash__' requires a 'weakref' object"));
+    };
+    let cache_key = DictKey(Object::from_static("__hash_cache__"));
+    if let Some(h) = inst.dict.borrow().get(&cache_key).cloned() {
+        return Ok(h);
+    }
+    let target = wrapper_referent(me)
+        .flatten()
+        .ok_or_else(|| type_error("weak object has gone away"))?;
+    let h = if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame on this thread.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        interp.do_hash_call(&target, &globals)?
+    } else {
+        crate::builtins::hash_object(&target)?
+    };
+    inst.dict.borrow_mut().insert(cache_key, h.clone());
+    Ok(h)
+}
+
 fn ref_type() -> Rc<TypeObject> {
     REF_TYPE.with(|cell| {
         if let Some(t) = cell.borrow().clone() {
@@ -149,6 +229,14 @@ fn ref_type() -> Rc<TypeObject> {
         type_dict.insert(
             DictKey(Object::from_static("__call__")),
             b("__call__", ref_type_call),
+        );
+        type_dict.insert(
+            DictKey(Object::from_static("__eq__")),
+            b("__eq__", ref_type_eq),
+        );
+        type_dict.insert(
+            DictKey(Object::from_static("__hash__")),
+            b("__hash__", ref_type_hash),
         );
         let t = TypeObject::new_with_flags(
             "weakref",
@@ -347,8 +435,33 @@ fn new_ref(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .cloned()
         .ok_or_else(|| type_error("ref() requires at least 1 argument"))?;
+    if !supports_weakref(&target) {
+        return Err(type_error(format!(
+            "cannot create weak reference to '{}' object",
+            target.type_name()
+        )));
+    }
     let callback = extract_callback(args.get(1));
     Ok(make_ref_object(target, callback, kind::REF))
+}
+
+/// Entry point for `weakref.ref(target, callback=None)` when invoked by
+/// calling the `ReferenceType` type object (the only spelling CPython
+/// has). Wired from the VM's `instantiate` builtin-type dispatch.
+pub(crate) fn construct_ref(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    if !kwargs.is_empty() {
+        return Err(type_error("ref() does not take keyword arguments"));
+    }
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "__new__ expected at most 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    new_ref(args)
 }
 
 /// `_weakref.proxy(obj, callback=None)` — returns a delegating
@@ -359,6 +472,12 @@ fn new_proxy(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .cloned()
         .ok_or_else(|| type_error("proxy() requires at least 1 argument"))?;
+    if !supports_weakref(&target) {
+        return Err(type_error(format!(
+            "cannot create weak reference to '{}' object",
+            target.type_name()
+        )));
+    }
     let callback = extract_callback(args.get(1));
     let is_callable = matches!(
         target,
@@ -403,16 +522,13 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
     let target_id_for_clear = target_id;
     let clear = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         let _ = slot_for_clear.clear();
-        let _ = reg::notify_clear(target_id_for_clear);
+        reg::queue_callbacks(reg::notify_clear(target_id_for_clear));
         Ok(Object::None)
     };
     let slot_for_alive = slot.clone();
     let alive = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         Ok(Object::Bool(!slot_for_alive.is_dead()))
     };
-    let hash_value = slot.identity_hash;
-    let hash =
-        move |_args: &[Object]| -> Result<Object, RuntimeError> { Ok(Object::Int(hash_value)) };
     let slot_for_repr = slot.clone();
     let repr = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         let txt = if slot_for_repr.is_dead() {
@@ -442,10 +558,6 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
             b_dyn("__alive__", alive),
         );
         d.insert(
-            DictKey(Object::from_static("__hash__")),
-            b_dyn("__hash__", hash),
-        );
-        d.insert(
             DictKey(Object::from_static("__repr__")),
             b_dyn("__repr__", repr),
         );
@@ -460,13 +572,65 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
         );
     }
 
-    Object::Instance(Rc::new(PyInstance {
+    let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(class),
         dict,
         native: None,
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
-    }))
+    });
+    // Back-pointer so `obj.__weakref__` / `getweakrefs(obj)` can return
+    // this same wrapper object.
+    *slot.py_ref.borrow_mut() = Some(Rc::downgrade(&inst));
+    Object::Instance(inst)
+}
+
+/// Can a weak reference be created to `target`? Mirrors CPython's
+/// `tp_weaklistoffset != 0` check for the cases we model: instances of
+/// pure-`__slots__` classes are only weakref-able when `__weakref__`
+/// appears in the slots of some class on the MRO (or a dict-bearing
+/// user class contributes its implicit weakref support). Everything
+/// else in our heap remains permissively weakref-able.
+pub(crate) fn supports_weakref(target: &Object) -> bool {
+    let Object::Instance(inst) = target else {
+        return true;
+    };
+    let cls = inst.cls();
+    if !cls.forbids_dict {
+        return true;
+    }
+    let mro = cls.mro.borrow().clone();
+    for ty in mro {
+        if ty.flags.is_builtin {
+            continue;
+        }
+        if !ty.forbids_dict {
+            return true;
+        }
+        if ty.slot_names.borrow().iter().any(|s| s == "__weakref__") {
+            return true;
+        }
+    }
+    false
+}
+
+/// The first live user-visible weakref object (kind `REF`, no callback
+/// preferred) targeting `obj`, if any — CPython's "basic ref" served by
+/// the `__weakref__` getset.
+pub(crate) fn basic_ref_for(obj: &Object) -> Option<Object> {
+    let id = id_of(obj);
+    let slots = reg::collect_for(id);
+    for slot in slots {
+        if slot.kind != kind::REF || slot.is_dead() {
+            continue;
+        }
+        if let Some(w) = slot.py_ref.borrow().as_ref() {
+            if let Some(inst) = w.upgrade() {
+                return Some(Object::Instance(inst));
+            }
+        }
+    }
+    None
 }
 
 /// `_weakref.getweakrefcount(obj)` — number of live weakrefs
@@ -489,13 +653,18 @@ fn get_weakrefs(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("getweakrefs() requires 1 argument"))?;
     let id = id_of(target);
-    let _slots = reg::collect_for(id);
-    // We can't reconstruct the weakref object without the
-    // original wrapper; CPython does this through a separate
-    // tp_weaklistoffset chain. For now return an empty list
-    // — code that needs the precise CPython behaviour pivots
-    // on `weakref.ref(obj)` directly.
-    Ok(Object::new_list(Vec::new()))
+    let mut out = Vec::new();
+    for slot in reg::collect_for(id) {
+        if slot.is_dead() {
+            continue;
+        }
+        if let Some(w) = slot.py_ref.borrow().as_ref() {
+            if let Some(inst) = w.upgrade() {
+                out.push(Object::Instance(inst));
+            }
+        }
+    }
+    Ok(Object::new_list(out))
 }
 
 fn remove_dead_weakref(_args: &[Object]) -> Result<Object, RuntimeError> {

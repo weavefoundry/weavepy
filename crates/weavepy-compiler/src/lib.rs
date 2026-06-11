@@ -536,6 +536,11 @@ struct Compiler {
     kind: CodeKind,
     /// Name → binding for the current scope.
     bindings: IndexMap<String, Binding>,
+    /// Names declared `global` by an explicit `global` statement in this
+    /// scope. A nested `def`/`class` whose name is in this set gets a bare
+    /// `__qualname__` (CPython's `compiler_set_qualname` GLOBAL_EXPLICIT
+    /// rule), which is what makes `global P; class P: ...` pickleable.
+    explicit_globals: HashSet<String>,
     /// Free variables (in declaration order) — populated by inner
     /// scopes looking up to their lexical parents.
     free_order: Vec<String>,
@@ -671,6 +676,7 @@ impl Compiler {
             co,
             kind,
             bindings: IndexMap::new(),
+            explicit_globals: HashSet::new(),
             free_order: Vec::new(),
             loop_stack: Vec::new(),
             finally_stack: Vec::new(),
@@ -703,6 +709,11 @@ impl Compiler {
     ///   `C.method`). The child name is then dotted onto that base.
     fn compute_child_qualname(&self, name: &str) -> String {
         if matches!(self.kind, CodeKind::Module) {
+            return name.to_owned();
+        }
+        // CPython's GLOBAL_EXPLICIT rule: `global P` in the enclosing scope
+        // resets the nested def/class qualname to the bare name.
+        if self.explicit_globals.contains(name) {
             return name.to_owned();
         }
         let mut base = self.co.qualname.clone();
@@ -744,7 +755,22 @@ impl Compiler {
     fn emit(&mut self, op: OpCode, arg: u32) -> u32 {
         let offset = self.co.instructions.len() as u32;
         self.co.instructions.push(Instruction { op, arg });
-        self.co.linetable.push(self.current_line);
+        // An instruction's line is its *own* location's start line
+        // (CPython 3.11+ locations), not the enclosing statement's —
+        // a traceback through a multiline expression points at the
+        // sub-expression that raised.
+        let line = match self.current_span {
+            (0, 0) => self.current_line,
+            (start, _) => {
+                let l = self.line_index.line_for(start);
+                if l == 0 {
+                    self.current_line
+                } else {
+                    l
+                }
+            }
+        };
+        self.co.linetable.push(line);
         self.co.coltable.push(self.resolve_colspan());
         offset
     }
@@ -754,6 +780,73 @@ impl Compiler {
         if line != 0 {
             self.current_line = line;
         }
+    }
+
+    /// PEP 654: `break`/`continue`/`return` may not leave an `except*`
+    /// clause body. `break`/`continue` are fine when their target loop
+    /// began inside the clause; `return` never is (nested `def`s are
+    /// their own code unit and aren't descended into).
+    fn validate_star_clause_jumps(stmts: &[Stmt], in_loop: bool) -> Result<(), CompileError> {
+        const MSG: &str = "'break', 'continue' and 'return' cannot appear in an except* block";
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Break | StmtKind::Continue => {
+                    if !in_loop {
+                        return Err(CompileError::SyntaxExact(MSG.to_owned()));
+                    }
+                }
+                StmtKind::Return(_) => {
+                    return Err(CompileError::SyntaxExact(MSG.to_owned()));
+                }
+                StmtKind::If { body, orelse, .. } => {
+                    Self::validate_star_clause_jumps(body, in_loop)?;
+                    Self::validate_star_clause_jumps(orelse, in_loop)?;
+                }
+                StmtKind::While { body, orelse, .. }
+                | StmtKind::For { body, orelse, .. }
+                | StmtKind::AsyncFor { body, orelse, .. } => {
+                    Self::validate_star_clause_jumps(body, true)?;
+                    // A loop `else` belongs to the *outer* context.
+                    Self::validate_star_clause_jumps(orelse, in_loop)?;
+                }
+                StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
+                    Self::validate_star_clause_jumps(body, in_loop)?;
+                }
+                StmtKind::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    Self::validate_star_clause_jumps(body, in_loop)?;
+                    for h in handlers {
+                        Self::validate_star_clause_jumps(&h.body, in_loop)?;
+                    }
+                    Self::validate_star_clause_jumps(orelse, in_loop)?;
+                    Self::validate_star_clause_jumps(finalbody, in_loop)?;
+                }
+                StmtKind::Match { cases, .. } => {
+                    for case in cases {
+                        Self::validate_star_clause_jumps(&case.body, in_loop)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit the entry `Resume` for a function/class/comprehension body.
+    /// CPython 3.11+ places `RESUME` at the header line with a zero-width
+    /// `0..0` column span (GH-93249), so synthesized tracebacks pointing
+    /// at `tb_lasti == 0` render an (empty) caret row rather than none.
+    fn emit_entry_resume(&mut self) {
+        let idx = self.emit(OpCode::Resume, 0) as usize;
+        self.co.coltable[idx] = ColSpan {
+            end_lineno: self.co.linetable[idx],
+            col: 0,
+            end_col: 0,
+        };
     }
 
     /// Resolve [`Self::current_span`] into a PEP-657 [`ColSpan`] for the
@@ -778,6 +871,30 @@ impl Compiler {
     #[inline]
     fn set_span(&mut self, span: weavepy_lexer::Span) {
         self.current_span = (span.start.0, span.end.0);
+    }
+
+    /// CPython's `update_start_location_to_match_attr`: when an
+    /// attribute access (or method call) spans multiple lines, the
+    /// `LOAD/STORE/DELETE_ATTR` — and the `CALL` on a method — report
+    /// the *attribute name* as their start location, so tracebacks
+    /// point at `.method`, not at the start of a multiline receiver.
+    /// Runs `f` with the adjusted location, then restores it.
+    fn with_attr_location<F: FnOnce(&mut Self)>(&mut self, attr_end: u32, attr_len: u32, f: F) {
+        let saved_span = self.current_span;
+        let saved_line = self.current_line;
+        let (start, end) = self.current_span;
+        if !(start == 0 && end == 0) {
+            let start_line = self.line_index.line_for(start);
+            let attr_line = self.line_index.line_for(attr_end);
+            if start_line != attr_line {
+                let new_start = attr_end.saturating_sub(attr_len);
+                self.current_span = (new_start, end.max(attr_end));
+                self.set_line_from(new_start);
+            }
+        }
+        f(self);
+        self.current_span = saved_span;
+        self.current_line = saved_line;
     }
 
     fn next_offset(&self) -> u32 {
@@ -842,6 +959,7 @@ impl Compiler {
         for s in body {
             collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
         }
+        self.explicit_globals = globals.clone();
         for n in globals {
             self.bindings.insert(n, Binding::Global);
         }
@@ -946,7 +1064,9 @@ impl Compiler {
                 // to elide the AssertionError raise.
                 self.compile_expr(test)?;
                 let skip = self.emit(OpCode::PopJumpIfTrue, 0);
-                self.emit_load_name("AssertionError");
+                // The *builtin* AssertionError, immune to shadowing
+                // (CPython LOAD_ASSERTION_ERROR, bpo-34880).
+                self.emit(OpCode::LoadAssertionError, 0);
                 if let Some(m) = msg {
                     self.compile_expr(m)?;
                     self.emit(OpCode::Call, 1);
@@ -1856,8 +1976,14 @@ impl Compiler {
             self.compile_expr(d)?;
         }
         self.build_function_object_inner(name, args, body, returns, is_async)?;
-        for _ in decorator_list {
+        // Decorators apply innermost-first; each application CALL carries
+        // the *decorator expression's* location (CPython points the
+        // traceback at `@dec`, not at the `def` line).
+        for d in decorator_list.iter().rev() {
+            let saved = self.current_span;
+            self.set_span(d.span);
             self.emit(OpCode::Call, 1);
+            self.current_span = saved;
         }
         let name_expr = Expr {
             kind: ExprKind::Name(name.to_owned()),
@@ -1956,7 +2082,7 @@ impl Compiler {
                 inner.emit(OpCode::ReturnGenerator, 0);
             }
         }
-        inner.emit(OpCode::Resume, 0);
+        inner.emit_entry_resume();
         // CPython reserves `co_consts[0]` for the function docstring (or
         // `None`). Mirror that here so `__doc__` is *only* the leading
         // bare string-literal statement — never an unrelated string
@@ -2118,8 +2244,11 @@ impl Compiler {
                 self.emit(OpCode::CallKw, (bases.len() + 2) as u32);
             }
         }
-        for _ in decorator_list {
+        for d in decorator_list.iter().rev() {
+            let saved = self.current_span;
+            self.set_span(d.span);
             self.emit(OpCode::Call, 1);
+            self.current_span = saved;
         }
         let name_expr = Expr {
             kind: ExprKind::Name(name.to_owned()),
@@ -2152,6 +2281,18 @@ impl Compiler {
         }
         for n in assigned {
             inner.bindings.insert(n, Binding::Global);
+        }
+        // Track explicit `global X` declarations in the class body so a
+        // nested `def X`/`class X` gets a bare qualname (see
+        // `compute_child_qualname`).
+        {
+            let mut globals = HashSet::new();
+            let mut nonlocals = HashSet::new();
+            let mut decl_assigned = HashSet::new();
+            for s in body {
+                collect_decls(s, &mut globals, &mut nonlocals, &mut decl_assigned);
+            }
+            inner.explicit_globals = globals;
         }
 
         let outer_inside_class = inner.inside_class_body;
@@ -2186,7 +2327,7 @@ impl Compiler {
             }
         }
 
-        inner.emit(OpCode::Resume, 0);
+        inner.emit_entry_resume();
         // `__module__ = __name__` and `__qualname__ = <computed>`
         // boilerplate. The class body stores its full PEP 3155 qualname
         // (e.g. `Outer.method.<locals>.C`), not the bare name, so
@@ -2327,6 +2468,35 @@ impl Compiler {
         }
     }
 
+    /// The implicit `e = None; del e` CPython runs when an
+    /// `except E as e:` block exits by *any* path — fallthrough,
+    /// `return`/`break`/`continue`, or a propagating exception. The
+    /// assignment-first shape means the delete can never raise (the
+    /// body may itself have `del e`'d), and synthesizing AST keeps
+    /// name-scoping decisions (fast/global/cell) in one place.
+    fn except_unbind_stmts(name: &str, span: weavepy_lexer::Span) -> Vec<Stmt> {
+        let name_expr = |kind_span| Expr {
+            kind: ExprKind::Name(name.to_owned()),
+            span: kind_span,
+        };
+        vec![
+            Stmt {
+                kind: StmtKind::Assign {
+                    targets: vec![name_expr(span)],
+                    value: Expr {
+                        kind: ExprKind::Constant(AstConstant::None),
+                        span,
+                    },
+                },
+                span,
+            },
+            Stmt {
+                kind: StmtKind::Delete(vec![name_expr(span)]),
+                span,
+            },
+        ]
+    }
+
     fn compile_try(
         &mut self,
         body: &[Stmt],
@@ -2341,6 +2511,14 @@ impl Compiler {
                 self.compile_stmt(s)?;
             }
             return Ok(());
+        }
+        // PEP 654 static check, before anything else compiles so the
+        // `except*` jump error wins over e.g. a `return` in a module-
+        // level `finally` (matching CPython's reporting order).
+        if handlers.iter().any(|h| h.is_star) {
+            for h in handlers {
+                Self::validate_star_clause_jumps(&h.body, false)?;
+            }
         }
         // Approximate stack depth at handler entry. The dispatch
         // loop truncates everything above `depth`, so we need to
@@ -2403,9 +2581,17 @@ impl Compiler {
         let handlers_start = self.next_offset();
         let is_star_try = handlers.iter().any(|h| h.is_star);
         if has_handlers && is_star_try {
-            // PEP 654 / RFC 0018: `except*` lowering. The handlers
-            // each consume a sub-group of the caught exception; any
-            // unmatched remainder propagates as an `ExceptionGroup`.
+            // PEP 654 / RFC 0018: `except*` lowering, mirroring
+            // CPython's `compiler_try_star_except`:
+            // - each clause consumes a sub-group of the caught exception;
+            // - exceptions raised by clause *bodies* don't propagate
+            //   immediately — they're collected, and after all clauses
+            //   ran they are combined with the unmatched remainder via
+            //   `PREP_RERAISE_STAR` (so `raise X` inside one clause
+            //   still lets the other clauses run, and the final
+            //   exception groups everything that's still alive);
+            // - inside a clause body the *matched* sub-group is the
+            //   active exception (`sys.exc_info()`, bare `raise`).
             self.co.exception_table.push(ExcHandler {
                 start: body_start,
                 end: body_end,
@@ -2415,14 +2601,20 @@ impl Compiler {
             // Back-patched to the pc past the handler region (see the
             // non-`except*` branch for the rationale).
             let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
-            // Stack on entry: [exc]. Stash the remainder in a
-            // synthetic local so each handler can update it.
-            let rem_name = format!(".eg_remaining{}", self.with_counter);
+            // Stack on entry: [exc]. Stash the original (for
+            // PREP_RERAISE_STAR), the running remainder, and the
+            // raised-collection list in synthetic locals.
+            let uid = self.with_counter;
             self.with_counter += 1;
-            let rem_idx = self.var_index_or_add(&rem_name);
+            let orig_idx = self.var_index_or_add(&format!(".eg_orig{uid}"));
+            let rem_idx = self.var_index_or_add(&format!(".eg_remaining{uid}"));
+            let raised_idx = self.var_index_or_add(&format!(".eg_raised{uid}"));
+            self.emit(OpCode::CopyTop, 0);
+            self.emit(OpCode::StoreFast, orig_idx);
             self.emit(OpCode::StoreFast, rem_idx);
+            self.emit(OpCode::BuildList, 0);
+            self.emit(OpCode::StoreFast, raised_idx);
 
-            let mut handler_exit_jumps: Vec<u32> = Vec::new();
             let none_idx = self.co.intern_constant(Constant::None);
             for h in handlers {
                 // [.remaining]
@@ -2432,7 +2624,11 @@ impl Compiler {
                     .as_ref()
                     .expect("except* requires a type expression — parser must reject bare except*");
                 self.compile_expr(ty)?;
-                // [.remaining, type]
+                // [.remaining, type]. CPython locates CHECK_EG_MATCH on
+                // the whole clause; the implicit wrapper around a naked
+                // exception gets its traceback entry here (gh-128799).
+                self.set_span(h.span);
+                self.set_line_from(h.span.start.0);
                 self.emit(OpCode::CheckEGMatch, 0);
                 // [rest, matched]
                 self.emit(OpCode::Swap, 2);
@@ -2446,7 +2642,10 @@ impl Compiler {
                 self.emit(OpCode::IsOp, 0);
                 // [matched, is_none]
                 let skip_body = self.emit(OpCode::PopJumpIfTrue, 0);
-                // matched is on stack and is not None.
+                // matched is on stack and is not None. It becomes the
+                // active exception while the clause body runs —
+                // back-patched below to tag the body's extent.
+                let push_match_site = self.emit(OpCode::PushExcInfo, 0);
                 if let Some(n) = &h.name {
                     let name_expr = Expr {
                         kind: ExprKind::Name(n.clone()),
@@ -2456,34 +2655,87 @@ impl Compiler {
                 } else {
                     self.emit(OpCode::PopTop, 0);
                 }
+                let clause_body_start = self.next_offset();
+                // `e` is unbound on every exit from the block (CPython
+                // behaviour); `break`/`continue`/`return` cannot leave
+                // an `except*` block at all (PEP 654), enforced via the
+                // loop-mark pushed here.
+                let unbind_stmts = h.name.as_deref().map(|n| Self::except_unbind_stmts(n, h.span));
+                if let Some(stmts) = &unbind_stmts {
+                    self.finally_stack.push(FinallyFrame {
+                        kind: FinallyKind::Stmts(stmts.clone()),
+                        loop_depth_at_push: self.loop_stack.len(),
+                    });
+                }
                 for s in &h.body {
                     self.compile_stmt(s)?;
                 }
-                if let Some(n) = &h.name {
-                    // `e` is unbound at end of block (CPython behaviour).
-                    let nidx = self.var_index_or_add(n);
-                    self.emit(OpCode::DeleteFast, nidx);
+                if let Some(stmts) = &unbind_stmts {
+                    self.finally_stack.pop();
+                    for s in stmts {
+                        self.compile_stmt(s)?;
+                    }
                 }
+                let clause_body_end = self.next_offset();
+                self.co.instructions[push_match_site as usize].arg = clause_body_end;
+                self.emit(OpCode::PopExcept, 0);
                 let after_body = self.emit(OpCode::JumpForward, 0);
+
+                // Collector: an exception raised by the clause body
+                // lands here with `[raised_exc]` on the stack (its
+                // `__context__` already chained to the matched group by
+                // the raise itself). Stash it and run the next clause.
+                let collector = self.next_offset();
+                self.co.exception_table.push(ExcHandler {
+                    start: clause_body_start,
+                    end: clause_body_end,
+                    handler: collector,
+                    depth: body_depth,
+                });
+                self.emit(OpCode::LoadFast, raised_idx);
+                // [exc, list]
+                self.emit(OpCode::Swap, 2);
+                // [list, exc]
+                self.emit(OpCode::ListAppend, 1);
+                // [list]
+                self.emit(OpCode::PopTop, 0);
+                if let Some(stmts) = &unbind_stmts {
+                    for s in stmts {
+                        self.compile_stmt(s)?;
+                    }
+                }
+                let after_collect = self.emit(OpCode::JumpForward, 0);
+
                 let skip_target = self.next_offset();
                 self.patch_jump(skip_body, skip_target);
                 // matched is on stack still (was a None) — discard.
                 self.emit(OpCode::PopTop, 0);
                 let after_skip = self.next_offset();
                 self.patch_jump(after_body, after_skip);
+                self.patch_jump(after_collect, after_skip);
             }
-            // After all handlers, check whether anything is left.
-            // If `.remaining` is None — everything matched; just pop
-            // the active exception and continue.
+            // After all clauses: excs = raised + [remainder]; compute
+            // the exception to propagate (None when fully handled).
+            self.emit(OpCode::LoadFast, raised_idx);
             self.emit(OpCode::LoadFast, rem_idx);
+            // [list, rem]
+            self.emit(OpCode::ListAppend, 1);
+            // [list]
+            self.emit(OpCode::LoadFast, orig_idx);
+            // [list, orig]
+            self.emit(OpCode::PrepReraiseStar, 0);
+            // [result]
+            self.emit(OpCode::CopyTop, 0);
             self.emit(OpCode::LoadConst, none_idx);
             self.emit(OpCode::IsOp, 0);
             let all_handled = self.emit(OpCode::PopJumpIfTrue, 0);
-            // Otherwise re-raise the remainder.
-            self.emit(OpCode::LoadFast, rem_idx);
-            self.emit(OpCode::RaiseVarargs, 1);
+            // Re-raise without recording the re-raise site and without
+            // re-chaining `__context__` (CPython RERAISE).
+            self.emit(OpCode::Reraise, 0);
             let after_raise = self.next_offset();
             self.patch_jump(all_handled, after_raise);
+            // [None] — discard, drop the original from exc_info.
+            self.emit(OpCode::PopTop, 0);
             self.emit(OpCode::PopExcept, 0);
             let saved = if pushed_finally {
                 self.finally_stack.pop()
@@ -2497,11 +2749,45 @@ impl Compiler {
                 self.finally_stack.push(f);
             }
             let exit = self.emit(OpCode::JumpForward, 0);
-            handler_exit_jumps.push(exit);
-            let end = self.next_offset();
-            for site in handler_exit_jumps {
-                self.patch_jump(site, end);
+            // Shared finally-cleanup for exceptions escaping the
+            // `except*` machinery — clause-internal raises are collected
+            // (above), so this covers match evaluation and the final
+            // re-raise. Reached only via the exception-table entry;
+            // normal flow jumps past.
+            if has_finally {
+                let cleanup_start = self.next_offset();
+                let cleanup_push = self.emit(OpCode::PushExcInfo, 0);
+                let saved = self.finally_stack.pop();
+                self.exc_on_stack += 1;
+                for s in finalbody {
+                    self.compile_stmt(s)?;
+                }
+                self.exc_on_stack -= 1;
+                if let Some(f) = saved {
+                    self.finally_stack.push(f);
+                }
+                self.emit(OpCode::Reraise, 0);
+                let cleanup_end = self.next_offset();
+                self.co.instructions[cleanup_push as usize].arg = cleanup_end;
+                // Registered after the per-clause collector entries so
+                // the forward innermost-first scan prefers those.
+                self.co.exception_table.push(ExcHandler {
+                    start: handlers_start,
+                    end: after_raise,
+                    handler: cleanup_start,
+                    depth: body_depth,
+                });
+                if orelse_end > orelse_start {
+                    self.co.exception_table.push(ExcHandler {
+                        start: orelse_start,
+                        end: orelse_end,
+                        handler: cleanup_start,
+                        depth: body_depth,
+                    });
+                }
             }
+            let end = self.next_offset();
+            self.patch_jump(exit, end);
             // Record the handler-body end on PUSH_EXC_INFO (see below).
             self.co.instructions[push_exc_site as usize].arg = end;
         } else if has_handlers {
@@ -2566,11 +2852,59 @@ impl Compiler {
                         self.emit(OpCode::PopTop, 0);
                     }
                 }
+                // `except E as e:` unbinds `e` on every exit from the
+                // clause body (CPython wraps the body in
+                // `try: … finally: e = None; del e`). The finally-stack
+                // frame covers `return`/`break`/`continue`; the inline
+                // copy below covers fallthrough; the exception-table
+                // entry further below covers a propagating exception.
+                let unbind_stmts = h.name.as_deref().map(|n| Self::except_unbind_stmts(n, h.span));
+                if let Some(stmts) = &unbind_stmts {
+                    self.finally_stack.push(FinallyFrame {
+                        kind: FinallyKind::Stmts(stmts.clone()),
+                        loop_depth_at_push: self.loop_stack.len(),
+                    });
+                }
+                let hbody_start = self.next_offset();
                 for s in &h.body {
                     self.compile_stmt(s)?;
                 }
+                let hbody_end = self.next_offset();
+                if let Some(stmts) = &unbind_stmts {
+                    self.finally_stack.pop();
+                    for s in stmts {
+                        self.compile_stmt(s)?;
+                    }
+                }
                 self.emit(OpCode::PopExcept, 0);
+                if let Some(stmts) = &unbind_stmts {
+                    if hbody_end > hbody_start {
+                        // Exception escaping the clause body: unbind the
+                        // name, then keep propagating. Normal flow jumps
+                        // over this block.
+                        let over = self.emit(OpCode::JumpForward, 0);
+                        let cleanup_start = self.next_offset();
+                        let cleanup_push = self.emit(OpCode::PushExcInfo, 0);
+                        self.exc_on_stack += 1;
+                        for s in stmts {
+                            self.compile_stmt(s)?;
+                        }
+                        self.exc_on_stack -= 1;
+                        self.emit(OpCode::Reraise, 0);
+                        let cleanup_end = self.next_offset();
+                        self.co.instructions[cleanup_push as usize].arg = cleanup_end;
+                        self.patch_jump(over, cleanup_end);
+                        self.co.exception_table.push(ExcHandler {
+                            start: hbody_start,
+                            end: hbody_end,
+                            handler: cleanup_start,
+                            depth: body_depth,
+                        });
+                    }
+                }
                 if has_finally {
+                    // Includes the unbind-cleanup RERAISE so the escaping
+                    // exception still runs this statement's finally.
                     cleanup_ranges.push((clause_start, self.next_offset()));
                 }
                 // Run finally on the matched path.
@@ -2962,7 +3296,12 @@ impl Compiler {
             ExprKind::Attribute { value, attr } => {
                 self.compile_expr(value)?;
                 let idx = self.co.intern_name(attr);
-                self.emit(OpCode::StoreAttr, idx);
+                let saved = self.current_span;
+                self.set_span(target.span);
+                self.with_attr_location(target.span.end.0, attr.len() as u32, |c| {
+                    c.emit(OpCode::StoreAttr, idx);
+                });
+                self.current_span = saved;
                 Ok(())
             }
             ExprKind::Subscript { value, slice } => {
@@ -3150,7 +3489,12 @@ impl Compiler {
             ExprKind::Attribute { value, attr } => {
                 self.compile_expr(value)?;
                 let idx = self.co.intern_name(attr);
-                self.emit(OpCode::DeleteAttr, idx);
+                let saved = self.current_span;
+                self.set_span(target.span);
+                self.with_attr_location(target.span.end.0, attr.len() as u32, |c| {
+                    c.emit(OpCode::DeleteAttr, idx);
+                });
+                self.current_span = saved;
                 Ok(())
             }
             ExprKind::Subscript { value, slice } => {
@@ -3385,6 +3729,25 @@ impl Compiler {
             } => {
                 let has_starred = args.iter().any(|a| matches!(a.kind, ExprKind::Starred(_)));
                 let has_kw_splat = keywords.iter().any(|k| k.arg.is_none());
+                // Method calls report the method name as the CALL's
+                // start location (CPython adjusts via
+                // `update_start_location_to_match_attr`).
+                let meth = match &func.kind {
+                    ExprKind::Attribute { attr, .. } => {
+                        Some((func.span.end.0, attr.len() as u32))
+                    }
+                    _ => None,
+                };
+                let emit_call = |c: &mut Self, op: OpCode, arg: u32| match meth {
+                    Some((attr_end, attr_len)) => {
+                        c.with_attr_location(attr_end, attr_len, |c| {
+                            c.emit(op, arg);
+                        });
+                    }
+                    None => {
+                        c.emit(op, arg);
+                    }
+                };
                 self.compile_expr(func)?;
                 if has_starred || has_kw_splat {
                     // Build a single args tuple by concatenating
@@ -3393,15 +3756,15 @@ impl Compiler {
                     self.compile_starred_args_tuple(args)?;
                     if !keywords.is_empty() || has_kw_splat {
                         self.compile_kwargs_dict(keywords)?;
-                        self.emit(OpCode::CallEx, 1);
+                        emit_call(self, OpCode::CallEx, 1);
                     } else {
-                        self.emit(OpCode::CallEx, 0);
+                        emit_call(self, OpCode::CallEx, 0);
                     }
                 } else if keywords.is_empty() {
                     for a in args {
                         self.compile_expr(a)?;
                     }
-                    self.emit(OpCode::Call, args.len() as u32);
+                    emit_call(self, OpCode::Call, args.len() as u32);
                 } else {
                     for a in args {
                         self.compile_expr(a)?;
@@ -3414,13 +3777,15 @@ impl Compiler {
                     }
                     let tup_idx = self.co.intern_constant(Constant::Tuple(names));
                     self.emit(OpCode::LoadConst, tup_idx);
-                    self.emit(OpCode::CallKw, args.len() as u32);
+                    emit_call(self, OpCode::CallKw, args.len() as u32);
                 }
             }
             ExprKind::Attribute { value, attr } => {
                 self.compile_expr(value)?;
                 let idx = self.co.intern_name(attr);
-                self.emit(OpCode::LoadAttr, idx);
+                self.with_attr_location(e.span.end.0, attr.len() as u32, |c| {
+                    c.emit(OpCode::LoadAttr, idx);
+                });
             }
             ExprKind::Subscript { value, slice } => {
                 self.compile_expr(value)?;
@@ -4107,7 +4472,7 @@ impl Compiler {
             // comps use the suspended-frame infrastructure.
             inner.emit(OpCode::ReturnGenerator, 0);
         }
-        inner.emit(OpCode::Resume, 0);
+        inner.emit_entry_resume();
         if let Some(op) = collector_op {
             inner.emit(op, 0);
         }

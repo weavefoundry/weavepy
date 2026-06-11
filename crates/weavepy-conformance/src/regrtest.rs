@@ -703,7 +703,7 @@ fn run_inprocess(
                             let msg = err.format(&source, &opts.filename);
                             (TestStatus::Error, Some(truncate_detail(&msg)))
                         }
-                        weavepy::Error::Runtime(_) => {
+                        weavepy::Error::Runtime(_) | weavepy::Error::RuntimePrinted(_) => {
                             let msg = err.format(&source, &opts.filename);
                             (TestStatus::Fail, Some(truncate_detail(&msg)))
                         }

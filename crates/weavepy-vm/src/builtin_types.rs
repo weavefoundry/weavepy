@@ -63,11 +63,15 @@ pub struct BuiltinTypes {
     /// `method-wrapper` — the type of a slot wrapper bound to an
     /// instance (`type(object().__str__)`).
     pub method_wrapper_: Rc<TypeObject>,
+    /// `member_descriptor` — the type of `__slots__` storage descriptors
+    /// (`types.MemberDescriptorType`).
+    pub member_descriptor_: Rc<TypeObject>,
     pub generator_: Rc<TypeObject>,
     pub coroutine_: Rc<TypeObject>,
     pub async_generator_: Rc<TypeObject>,
     /// `types.FrameType` / `types.TracebackType`.
     pub frame_: Rc<TypeObject>,
+    pub code_: Rc<TypeObject>,
     pub traceback_: Rc<TypeObject>,
 
     pub module_: Rc<TypeObject>,
@@ -90,6 +94,8 @@ pub struct BuiltinTypes {
     pub stop_iteration: Rc<TypeObject>,
     pub stop_async_iteration: Rc<TypeObject>,
     pub syntax_error: Rc<TypeObject>,
+    pub indentation_error: Rc<TypeObject>,
+    pub tab_error: Rc<TypeObject>,
     pub timeout_error: Rc<TypeObject>,
     pub type_error: Rc<TypeObject>,
     pub unbound_local_error: Rc<TypeObject>,
@@ -127,6 +133,7 @@ pub struct BuiltinTypes {
     /// Raised on access through a dead weak proxy.
     pub reference_error: Rc<TypeObject>,
     pub memory_error: Rc<TypeObject>,
+    pub system_error: Rc<TypeObject>,
     /// PEP 654 / RFC 0018 — exception group hierarchy.
     pub base_exception_group: Rc<TypeObject>,
     pub exception_group: Rc<TypeObject>,
@@ -227,6 +234,11 @@ impl BuiltinTypes {
         // `types.MethodWrapperType` — a slot-wrapper dunder bound to an
         // instance (`object().__str__`).
         let method_wrapper_ = mk("method-wrapper", vec![object_.clone()]);
+        // `types.MemberDescriptorType` — `__slots__` storage descriptors
+        // (`type(A.x)` for `class A: __slots__ = ('x',)`). `dataclasses`
+        // uses an isinstance check against this to recognize slot-shadowed
+        // defaults.
+        let member_descriptor_ = mk("member_descriptor", vec![object_.clone()]);
         let generator_ = mk("generator", vec![object_.clone()]);
         let coroutine_ = mk("coroutine", vec![object_.clone()]);
         let async_generator_ = mk("async_generator", vec![object_.clone()]);
@@ -234,6 +246,7 @@ impl BuiltinTypes {
         install_gen_name_getsets(&coroutine_, "coroutine");
         install_gen_name_getsets(&async_generator_, "async generator");
         let frame_ = mk("frame", vec![object_.clone()]);
+        let code_ = mk("code", vec![object_.clone()]);
         let traceback_ = mk("traceback", vec![object_.clone()]);
         let module_ = mk("module", vec![object_.clone()]);
         install_module_init(&module_);
@@ -246,6 +259,24 @@ impl BuiltinTypes {
         // CPython-familiar message rather than the generic
         // "<X object at 0x...>" instance repr.
         install_exception_str_repr(&base_exception);
+        // CPython's `BaseException` getsets default to None/False/() —
+        // an instance that was never raised still answers
+        // `e.__traceback__` etc. Instance dicts shadow these when the
+        // raise machinery (or user code) sets real values.
+        {
+            let mut d = base_exception.dict.borrow_mut();
+            for key in ["__traceback__", "__context__", "__cause__"] {
+                d.insert(crate::object::DictKey(Object::from_static(key)), Object::None);
+            }
+            d.insert(
+                crate::object::DictKey(Object::from_static("__suppress_context__")),
+                Object::Bool(false),
+            );
+            d.insert(
+                crate::object::DictKey(Object::from_static("args")),
+                Object::new_tuple(Vec::new()),
+            );
+        }
 
         let arithmetic_error = exc("ArithmeticError", exception.clone());
         let assertion_error = exc("AssertionError", exception.clone());
@@ -257,6 +288,18 @@ impl BuiltinTypes {
         let key_error = exc("KeyError", lookup_error.clone());
         let name_error = exc("NameError", exception.clone());
         let unbound_local_error = exc("UnboundLocalError", name_error.clone());
+        // Structured-field defaults mirroring CPython's getset members:
+        // raise sites / keyword constructors override per instance, and
+        // unenriched instances read `None` (`AttributeError("m").name`).
+        fn install_field_defaults(ty: &Rc<TypeObject>, fields: &[&'static str]) {
+            let mut d = ty.dict.borrow_mut();
+            for f in fields {
+                d.insert(crate::object::DictKey(Object::from_static(f)), Object::None);
+            }
+        }
+        install_field_defaults(&attribute_error, &["name", "obj"]);
+        install_field_defaults(&name_error, &["name"]);
+        install_field_defaults(&import_error, &["name", "path", "name_from"]);
         let os_error = exc("OSError", exception.clone());
         install_os_error_init(&os_error);
         let runtime_error = exc("RuntimeError", exception.clone());
@@ -275,6 +318,8 @@ impl BuiltinTypes {
         // `" (<basename>, line N)"`. Install both so the type behaves as a
         // drop-in whether constructed from Python or raised from Rust.
         install_syntax_error_dunders(&syntax_error);
+        let indentation_error = exc("IndentationError", syntax_error.clone());
+        let tab_error = exc("TabError", indentation_error.clone());
         // `TimeoutError` lands here so `asyncio.wait_for` raises a
         // public, importable type rather than a synthetic shim.
         let timeout_error = exc("TimeoutError", os_error.clone());
@@ -322,6 +367,7 @@ impl BuiltinTypes {
         let buffer_error = exc("BufferError", exception.clone());
         let reference_error = exc("ReferenceError", exception.clone());
         let memory_error = exc("MemoryError", exception.clone());
+        let system_error = exc("SystemError", exception.clone());
 
         // RFC 0018 — Warning hierarchy.
         let warning = exc("Warning", exception.clone());
@@ -395,10 +441,12 @@ impl BuiltinTypes {
             method_,
             builtin_function_,
             method_wrapper_,
+            member_descriptor_,
             generator_,
             coroutine_,
             async_generator_,
             frame_,
+            code_,
             traceback_,
             module_,
             base_exception,
@@ -419,6 +467,8 @@ impl BuiltinTypes {
             stop_iteration,
             stop_async_iteration,
             syntax_error,
+            indentation_error,
+            tab_error,
             timeout_error,
             type_error,
             unbound_local_error,
@@ -450,6 +500,7 @@ impl BuiltinTypes {
             buffer_error,
             reference_error,
             memory_error,
+            system_error,
             base_exception_group,
             exception_group,
             warning,
@@ -534,6 +585,8 @@ impl BuiltinTypes {
             pair!(stop_iteration, "StopIteration"),
             pair!(stop_async_iteration, "StopAsyncIteration"),
             pair!(syntax_error, "SyntaxError"),
+            pair!(indentation_error, "IndentationError"),
+            pair!(tab_error, "TabError"),
             pair!(timeout_error, "TimeoutError"),
             pair!(type_error, "TypeError"),
             pair!(unbound_local_error, "UnboundLocalError"),
@@ -565,6 +618,7 @@ impl BuiltinTypes {
             pair!(buffer_error, "BufferError"),
             pair!(reference_error, "ReferenceError"),
             pair!(memory_error, "MemoryError"),
+            pair!(system_error, "SystemError"),
             pair!(base_exception_group, "BaseExceptionGroup"),
             pair!(exception_group, "ExceptionGroup"),
             pair!(warning, "Warning"),
@@ -609,6 +663,7 @@ impl BuiltinTypes {
             "dict_values" => Some(self.dict_values_.clone()),
             "dict_items" => Some(self.dict_items_.clone()),
             "frame" => Some(self.frame_.clone()),
+            "code" => Some(self.code_.clone()),
             "traceback" => Some(self.traceback_.clone()),
             "BaseException" => Some(self.base_exception.clone()),
             "Exception" => Some(self.exception.clone()),
@@ -628,6 +683,8 @@ impl BuiltinTypes {
             "StopIteration" => Some(self.stop_iteration.clone()),
             "StopAsyncIteration" => Some(self.stop_async_iteration.clone()),
             "SyntaxError" => Some(self.syntax_error.clone()),
+            "IndentationError" => Some(self.indentation_error.clone()),
+            "TabError" => Some(self.tab_error.clone()),
             "TimeoutError" => Some(self.timeout_error.clone()),
             "TypeError" => Some(self.type_error.clone()),
             "UnboundLocalError" => Some(self.unbound_local_error.clone()),
@@ -659,6 +716,7 @@ impl BuiltinTypes {
             "BufferError" => Some(self.buffer_error.clone()),
             "ReferenceError" => Some(self.reference_error.clone()),
             "MemoryError" => Some(self.memory_error.clone()),
+            "SystemError" => Some(self.system_error.clone()),
             "BaseExceptionGroup" => Some(self.base_exception_group.clone()),
             "ExceptionGroup" => Some(self.exception_group.clone()),
             "Warning" => Some(self.warning.clone()),
@@ -708,6 +766,22 @@ pub fn builtin_types() -> Rc<BuiltinTypes> {
         }
         cell.borrow().as_ref().unwrap().clone()
     })
+}
+
+/// RFC 0025: adopt an existing registry on this thread. Worker threads
+/// forked from the interpreter seed must see the *same* `type`,
+/// `object`, … `TypeObject`s as the seed thread — class statements
+/// compare metaclasses by pointer, so a worker that lazily built its
+/// own registry would hit "metaclass conflict" on any class whose
+/// bases came from the seed thread (e.g. importing a frozen module
+/// inside a `threading.Thread`).
+pub fn install_shared(bt: Rc<BuiltinTypes>) {
+    BUILTIN_TYPES.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(bt);
+        }
+    });
 }
 
 /// Construct an exception instance of `class_name` with `message` as
@@ -904,6 +978,32 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
+    // Exception classes: `BaseException.__new__` allocates and seeds
+    // `.args` but never runs `__init__` (CPython `BaseException_new`).
+    // `UnicodeDecodeError.__new__(UnicodeDecodeError)` must succeed
+    // with zero constructor arguments.
+    if cls
+        .mro
+        .borrow()
+        .iter()
+        .any(|t| t.name == "BaseException")
+    {
+        let new_args = if args.len() > 1 { &args[1..] } else { &[][..] };
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame still live on
+            // this thread; the GIL keeps the access exclusive.
+            let interp = unsafe { &mut *ptr };
+            return Ok(interp.build_exception_instance(cls, new_args));
+        }
+        let inst = Rc::new(PyInstance::new(cls));
+        inst.dict.borrow_mut().insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(new_args.to_vec()),
+        );
+        let obj = Object::Instance(inst);
+        crate::gc_trace::track(obj.clone());
+        return Ok(obj);
+    }
     // `tuple.__new__(tuple, it)` / `int.__new__(int, x)` … on the *built-in
     // class itself* must produce the native value, not a PyInstance shell
     // (CPython's per-type `tp_new`). Subclasses keep falling through to the
@@ -941,9 +1041,17 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // immutable subclasses); mutable containers start empty and are filled by
     // `__init__` / `__setstate__` / the `_reconstruct` append-and-update loop.
     if let Some(native) = native_seed_for_new(&cls, args.get(1)) {
-        return Ok(Object::Instance(Rc::new(PyInstance::with_native(cls, native))));
+        let inst = Object::Instance(Rc::new(PyInstance::with_native(cls, native)));
+        crate::gc_trace::track(inst.clone());
+        return Ok(inst);
     }
-    Ok(Object::Instance(Rc::new(PyInstance::new(cls))))
+    // RFC 0024: explicit `object.__new__(cls)` / `super().__new__(cls)`
+    // allocations join the cycle collector exactly like instances born
+    // through the default `instantiate` path — otherwise they're
+    // invisible to `gc.collect()` and their weakrefs never clear.
+    let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
+    crate::gc_trace::track(inst.clone());
+    Ok(inst)
 }
 
 /// Does `cls` inherit `__new__` from somewhere other than `object`?
@@ -1421,11 +1529,24 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         if let Object::Instance(inst_rc) = inst {
             let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
             let mut dict = inst_rc.dict.borrow_mut();
-            dict.insert(
-                DictKey(Object::from_static("args")),
-                Object::new_tuple(rest.to_vec()),
-            );
-            let pick = |i: usize| rest.get(i).cloned().unwrap_or(Object::None);
+            // CPython `oserror_init`: the named fields populate only
+            // for the 2..5-positional forms, and `.args` keeps just
+            // `(errno, strerror)` in those forms; otherwise the full
+            // tuple is stored and the fields stay None.
+            let populated = (2..=5).contains(&rest.len());
+            let args_tuple = if populated {
+                Object::new_tuple(rest[..2].to_vec())
+            } else {
+                Object::new_tuple(rest.to_vec())
+            };
+            dict.insert(DictKey(Object::from_static("args")), args_tuple);
+            let pick = |i: usize| {
+                if populated {
+                    rest.get(i).cloned().unwrap_or(Object::None)
+                } else {
+                    Object::None
+                }
+            };
             dict.insert(DictKey(Object::from_static("errno")), pick(0));
             dict.insert(DictKey(Object::from_static("strerror")), pick(1));
             dict.insert(DictKey(Object::from_static("filename")), pick(2));
@@ -1498,7 +1619,16 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
             set(&mut dict, "encoding", rest[i].clone());
             i += 1;
         }
-        set(&mut dict, "object", rest[i].clone());
+        // Decode errors normalize a bytes-like payload to `bytes`
+        // (CPython `UnicodeDecodeError_init` via PyObject_GetBuffer).
+        let object = match (&kind, &rest[i]) {
+            (UnicodeErrorKind::Decode, Object::ByteArray(b)) => {
+                let bytes: Vec<u8> = b.borrow().clone();
+                Object::new_bytes(bytes)
+            }
+            _ => rest[i].clone(),
+        };
+        set(&mut dict, "object", object);
         set(&mut dict, "start", rest[i + 1].clone());
         set(&mut dict, "end", rest[i + 2].clone());
         set(&mut dict, "reason", rest[i + 3].clone());
@@ -1518,16 +1648,27 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
                 _ => 0,
             }
         };
-        let encoding = match get("encoding") {
-            Some(Object::Str(s)) => s.to_string(),
-            _ => String::new(),
-        };
-        let reason = match get("reason") {
-            Some(Object::Str(s)) => s.to_string(),
-            _ => String::new(),
-        };
+        // `encoding` / `reason` render via str() whatever their type —
+        // attributes are reassignable after construction (issue 7309).
+        let encoding = get("encoding").map(|o| o.to_str()).unwrap_or_default();
+        let reason = get("reason").map(|o| o.to_str()).unwrap_or_default();
         let start = get("start").as_ref().map(as_i).unwrap_or(0);
         let end = get("end").as_ref().map(as_i).unwrap_or(0);
+
+        // CPython: a half-built instance (`__new__` without `__init__`)
+        // falls back to `BaseException.__str__` — "" for empty args,
+        // str(arg) for one, repr(args) otherwise.
+        if get("object").is_none() || get("reason").is_none() {
+            let args = get("args");
+            return Ok(match args {
+                Some(Object::Tuple(t)) => match t.as_ref() {
+                    [] => Object::from_static(""),
+                    [single] => Object::from_str(single.to_str()),
+                    _ => Object::from_str(Object::Tuple(t.clone()).repr()),
+                },
+                _ => Object::from_static(""),
+            });
+        }
         let obj = get("object").unwrap_or(Object::None);
 
         // Escape a single offending scalar exactly as CPython does.
@@ -1876,17 +2017,31 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
             crate::error::type_error("add_note() expects one argument".to_owned())
         })?;
         if !matches!(note, Object::Str(_)) {
-            return Err(crate::error::type_error("note must be a str".to_owned()));
+            return Err(crate::error::type_error(format!(
+                "note must be a str, not '{}'",
+                note.type_name_owned()
+            )));
         }
         if let Object::Instance(inst_rc) = inst {
             let key = DictKey(Object::from_static("__notes__"));
             let mut dict = inst_rc.dict.borrow_mut();
-            let mut notes = match dict.get(&key) {
-                Some(Object::List(l)) => l.borrow().clone(),
-                _ => Vec::new(),
-            };
-            notes.push(note.clone());
-            dict.insert(key, Object::List(Rc::new(crate::sync::GilCell::new(notes))));
+            match dict.get(&key) {
+                // Append in place so `e.__notes__` keeps its identity.
+                Some(Object::List(l)) => l.borrow_mut().push(note.clone()),
+                Some(other) => {
+                    let msg = format!(
+                        "Cannot add note: __notes__ is not a list, it is '{}' instead",
+                        other.type_name_owned()
+                    );
+                    return Err(crate::error::type_error(msg));
+                }
+                None => {
+                    dict.insert(
+                        key,
+                        Object::List(Rc::new(crate::sync::GilCell::new(vec![note.clone()]))),
+                    );
+                }
+            }
         }
         Ok(Object::None)
     }
@@ -1905,12 +2060,56 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         }
         Ok(inst.clone())
     }
+    // `BaseException.__setstate__(state)` — pickle protocol support:
+    // apply each dict entry as an attribute (CPython
+    // `BaseException_setstate`); `None` is a no-op; anything else is
+    // a TypeError.
+    fn exc_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        let state = args.get(1).cloned().unwrap_or(Object::None);
+        if matches!(state, Object::None) {
+            return Ok(Object::None);
+        }
+        let Object::Dict(d) = &state else {
+            return Err(crate::error::type_error(
+                "state is not a dictionary".to_owned(),
+            ));
+        };
+        if let Object::Instance(inst_rc) = inst {
+            let entries: Vec<(Object, Object)> = d
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.0.clone(), v.clone()))
+                .collect();
+            let mut dict = inst_rc.dict.borrow_mut();
+            for (k, v) in entries {
+                if !matches!(k, Object::Str(_)) {
+                    return Err(crate::error::type_error(format!(
+                        "attribute name must be string, not '{}'",
+                        k.type_name_owned()
+                    )));
+                }
+                dict.insert(DictKey(k), v);
+            }
+        }
+        Ok(Object::None)
+    }
     let mut dict = base_exception.dict.borrow_mut();
     dict.insert(
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
             call: Box::new(exc_init),
+            call_kw: None,
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__setstate__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__setstate__",
+            call: Box::new(exc_setstate),
             call_kw: None,
         })),
     );
@@ -2020,8 +2219,8 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         // `exceptions` must be a sequence of BaseException instances;
         // CPython raises ValueError on empty. We're lenient here —
         // the caller may construct empty groups for split/subgroup.
-        let excs_tuple = match excs {
-            Object::Tuple(items) => items,
+        let excs_tuple = match &excs {
+            Object::Tuple(items) => items.clone(),
             Object::List(items) => Rc::from(items.borrow().clone().into_boxed_slice()),
             other => {
                 return Err(crate::error::type_error(format!(
@@ -2032,9 +2231,12 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         };
         if let Object::Instance(inst_rc) = inst {
             let mut dict = inst_rc.dict.borrow_mut();
+            // `args` keeps the *original* second argument (a list stays
+            // a list — `repr(eg)` shows it); only the `.exceptions`
+            // accessor is normalized to a tuple, like CPython.
             dict.insert(
                 DictKey(Object::from_static("args")),
-                Object::new_tuple(vec![msg.clone(), Object::Tuple(excs_tuple.clone())]),
+                Object::new_tuple(vec![msg.clone(), excs]),
             );
             dict.insert(DictKey(Object::from_static("message")), msg);
             dict.insert(
@@ -2124,6 +2326,58 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         let (m, r) = split_exception_group(inst, &pred)?;
         Ok(Object::new_tuple(vec![m, r]))
     }
+    fn eg_new(args: &[Object]) -> Result<Object, RuntimeError> {
+        // `BaseExceptionGroup.__new__(cls, message, exceptions)` —
+        // reached from user subclasses' `super().__new__(...)` and
+        // from the generic instantiation path for EG subclasses.
+        let Some(Object::Type(cls)) = args.first() else {
+            return Err(crate::error::type_error(
+                "BaseExceptionGroup.__new__ requires a class argument",
+            ));
+        };
+        let ctor_args = &args[1..];
+        let excs = ctor_args
+            .get(1)
+            .cloned()
+            .ok_or_else(|| crate::error::type_error("expected 2 arguments, got 1"))?;
+        let items: Vec<Object> = match &excs {
+            Object::Tuple(t) => t.to_vec(),
+            Object::List(l) => l.borrow().clone(),
+            _ => {
+                return Err(crate::error::type_error(
+                    "second argument (exceptions) must be a sequence",
+                ))
+            }
+        };
+        if items.is_empty() {
+            return Err(crate::error::value_error(
+                "second argument (exceptions) must be a non-empty sequence".to_owned(),
+            ));
+        }
+        for (i, item) in items.iter().enumerate() {
+            if !instance_is_subclass(item, &builtin_types().base_exception) {
+                return Err(crate::error::value_error(format!(
+                    "Item {i} of second argument (exceptions) is not an exception"
+                )));
+            }
+        }
+        let cls = resolve_exception_group_class(cls.clone(), ctor_args)?;
+        let msg = ctor_args.first().cloned().unwrap_or(Object::from_static(""));
+        let inst = make_exception_with_class(cls, "");
+        if let Object::Instance(inst_rc) = &inst {
+            let mut dict = inst_rc.dict.borrow_mut();
+            dict.insert(
+                DictKey(Object::from_static("args")),
+                Object::new_tuple(vec![msg.clone(), excs]),
+            );
+            dict.insert(DictKey(Object::from_static("message")), msg);
+            dict.insert(
+                DictKey(Object::from_static("exceptions")),
+                Object::new_tuple(items),
+            );
+        }
+        Ok(inst)
+    }
     fn eg_subgroup(args: &[Object]) -> Result<Object, RuntimeError> {
         let inst = args
             .first()
@@ -2173,6 +2427,18 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "subgroup",
             call: Box::new(eg_subgroup),
+            call_kw: None,
+        })),
+    );
+    // A *plain* Builtin (not StaticMethod-wrapped like the default
+    // allocator) so the instantiation path treats it as a real user
+    // `__new__` and EG subclasses' `super().__new__(cls, msg, excs)`
+    // reaches PEP 654 construction instead of `object.__new__`.
+    dict.insert(
+        DictKey(Object::from_static("__new__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__new__",
+            call: Box::new(eg_new),
             call_kw: None,
         })),
     );
@@ -2230,12 +2496,23 @@ pub fn resolve_exception_group_class(
 /// `True` if `class` overrides `derive` somewhere below the builtin
 /// `BaseExceptionGroup` implementation in its MRO.
 fn overrides_eg_derive(class: &Rc<TypeObject>) -> bool {
+    overrides_eg_method(class, "derive")
+}
+
+/// `True` if `class` overrides `split` below the builtin
+/// `BaseExceptionGroup` implementation — the VM's `CheckEGMatch` must
+/// then dispatch the override (gh-128049) instead of the native split.
+pub fn overrides_eg_split(class: &Rc<TypeObject>) -> bool {
+    overrides_eg_method(class, "split")
+}
+
+fn overrides_eg_method(class: &Rc<TypeObject>, name: &'static str) -> bool {
     let bt = builtin_types();
     for t in class.mro.borrow().iter() {
         if Rc::ptr_eq(t, &bt.base_exception_group) {
             return false;
         }
-        if t.dict.borrow().contains_key(&DictKey(Object::from_static("derive"))) {
+        if t.dict.borrow().contains_key(&DictKey(Object::from_static(name))) {
             return true;
         }
     }
@@ -2260,6 +2537,16 @@ fn overrides_eg_derive(class: &Rc<TypeObject>) -> bool {
 pub fn split_exception_group(
     group: &Object,
     type_pred: &Object,
+) -> Result<(Object, Object), RuntimeError> {
+    split_exception_group_by(group, &|exc| exception_matches_type(exc, type_pred))
+}
+
+/// Predicate-based core of [`split_exception_group`]. Also used for
+/// CPython's `exception_group_projection` (leaf-identity matching) in
+/// the `except*` re-raise machinery.
+pub fn split_exception_group_by(
+    group: &Object,
+    leaf_matches: &dyn Fn(&Object) -> bool,
 ) -> Result<(Object, Object), RuntimeError> {
     let (cls, message, excs) = match group {
         Object::Instance(inst) => {
@@ -2288,15 +2575,15 @@ pub fn split_exception_group(
             Object::Instance(i) => is_subclass_by_name(&i.cls(), "BaseExceptionGroup"),
             _ => false,
         };
-        if is_group {
-            let (m, r) = split_exception_group(&exc, type_pred)?;
+        if is_group && !leaf_matches(&exc) {
+            let (m, r) = split_exception_group_by(&exc, leaf_matches)?;
             if !matches!(m, Object::None) {
                 matched.push(m);
             }
             if !matches!(r, Object::None) {
                 rest.push(r);
             }
-        } else if exception_matches_type(&exc, type_pred) {
+        } else if leaf_matches(&exc) {
             matched.push(exc);
         } else {
             rest.push(exc);
@@ -2342,6 +2629,169 @@ pub fn split_exception_group(
         Ok(new_inst)
     };
     Ok((mk(matched)?, mk(rest)?))
+}
+
+/// Wrap a naked (non-group) exception caught by an `except*` clause in
+/// an implicit `ExceptionGroup("", (exc,))` — CPython's
+/// `exception_group_match` does this inside `CHECK_EG_MATCH`. The
+/// caller attaches the current frame's traceback entry (gh-128799).
+pub fn make_naked_eg_wrapper(exc: &Object) -> Object {
+    let items = vec![exc.clone()];
+    let cls = exception_group_class_for(&items);
+    let items_t = Object::new_tuple(items);
+    let wrapper = make_exception_with_class(cls, "");
+    if let Object::Instance(inst) = &wrapper {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![Object::from_static(""), items_t.clone()]),
+        );
+        d.insert(
+            DictKey(Object::from_static("message")),
+            Object::from_static(""),
+        );
+        d.insert(DictKey(Object::from_static("exceptions")), items_t);
+    }
+    wrapper
+}
+
+/// CPython's `is_same_exception_metadata`: two exceptions are "the
+/// same raise" when their `__notes__`, `__traceback__`, `__cause__`
+/// and `__context__` are identical *objects*. Used by
+/// `prep_reraise_star` to tell re-raised parts of the original group
+/// from newly raised exceptions.
+fn is_same_exception_metadata(a: &Object, b: &Object) -> bool {
+    let (Object::Instance(ia), Object::Instance(ib)) = (a, b) else {
+        return false;
+    };
+    let da = ia.dict.borrow();
+    let db = ib.dict.borrow();
+    for key in ["__notes__", "__traceback__", "__cause__", "__context__"] {
+        let va = da.get(&DictKey(Object::from_static(key)));
+        let vb = db.get(&DictKey(Object::from_static(key)));
+        let same = match (va, vb) {
+            (Some(Object::None) | None, Some(Object::None) | None) => true,
+            (Some(x), Some(y)) => x.is_same(y),
+            _ => false,
+        };
+        if !same {
+            return false;
+        }
+    }
+    true
+}
+
+/// Collect the identities (`Rc` pointers) of an exception tree's leaf
+/// exceptions, recursing through nested groups.
+fn collect_eg_leaf_ids(exc: &Object, ids: &mut std::collections::HashSet<usize>) {
+    let is_group = matches!(
+        exc,
+        Object::Instance(i) if is_subclass_by_name(&i.cls(), "BaseExceptionGroup")
+    );
+    if is_group {
+        if let Object::Instance(inst) = exc {
+            let excs = inst
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("exceptions")))
+                .cloned();
+            if let Some(Object::Tuple(t)) = excs {
+                for e in t.iter() {
+                    collect_eg_leaf_ids(e, ids);
+                }
+                return;
+            }
+        }
+    }
+    if let Object::Instance(inst) = exc {
+        ids.insert(Rc::as_ptr(inst) as usize);
+    }
+}
+
+/// CPython's `exception_group_projection`: the subgroup of `orig`
+/// containing exactly the leaves that appear (by identity) under any
+/// exception in `keep`. Preserves `orig`'s nesting structure and
+/// metadata on the derived groups. Returns `None` when nothing is kept.
+fn exception_group_projection(orig: &Object, keep: &[Object]) -> Result<Object, RuntimeError> {
+    let mut ids = std::collections::HashSet::new();
+    for e in keep {
+        collect_eg_leaf_ids(e, &mut ids);
+    }
+    let (matched, _rest) = split_exception_group_by(orig, &|exc| match exc {
+        Object::Instance(i) => ids.contains(&(Rc::as_ptr(i) as usize)),
+        _ => false,
+    })?;
+    Ok(matched)
+}
+
+/// CPython's `_PyExc_PrepReraiseStar` intrinsic: combine the exceptions
+/// raised/re-raised by `except*` handler bodies (`excs`, with the
+/// unmatched remainder — possibly `None` — as its last element) into
+/// the single exception to propagate, or `None` when fully handled.
+pub fn prep_reraise_star(orig: &Object, excs: &[Object]) -> Result<Object, RuntimeError> {
+    if excs.is_empty() {
+        return Ok(Object::None);
+    }
+    let bt = builtin_types();
+    let orig_is_group = matches!(
+        orig,
+        Object::Instance(i) if i.cls().is_subclass_of(&bt.base_exception_group)
+    );
+    if !orig_is_group {
+        // A naked exception was caught and wrapped; at most one
+        // `except*` clause ran, so there is at most one exception to
+        // raise (plus the always-appended `None` remainder).
+        return Ok(excs
+            .iter()
+            .find(|e| !matches!(e, Object::None))
+            .cloned()
+            .unwrap_or(Object::None));
+    }
+    let mut raised: Vec<Object> = Vec::new();
+    let mut reraised: Vec<Object> = Vec::new();
+    for e in excs {
+        if matches!(e, Object::None) {
+            continue;
+        }
+        if is_same_exception_metadata(e, orig) {
+            reraised.push(e.clone());
+        } else {
+            raised.push(e.clone());
+        }
+    }
+    let reraised_eg = if reraised.is_empty() {
+        Object::None
+    } else {
+        exception_group_projection(orig, &reraised)?
+    };
+    if raised.is_empty() {
+        return Ok(reraised_eg);
+    }
+    if !matches!(reraised_eg, Object::None) {
+        raised.push(reraised_eg);
+    }
+    if raised.len() == 1 {
+        return Ok(raised.pop().expect("len checked"));
+    }
+    // Multiple exceptions — combine them as siblings in a fresh group
+    // with an empty message (no metadata is copied; the re-raise builds
+    // the traceback from the `except*` frame outward).
+    let cls = exception_group_class_for(&raised);
+    let items_t = Object::new_tuple(raised);
+    let combined = make_exception_with_class(cls, "");
+    if let Object::Instance(inst) = &combined {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![Object::from_static(""), items_t.clone()]),
+        );
+        d.insert(
+            DictKey(Object::from_static("message")),
+            Object::from_static(""),
+        );
+        d.insert(DictKey(Object::from_static("exceptions")), items_t);
+    }
+    Ok(combined)
 }
 
 fn exception_matches_type(exc: &Object, type_pred: &Object) -> bool {

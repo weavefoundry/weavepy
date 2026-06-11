@@ -575,6 +575,9 @@ def get_type_hints(obj, globalns=None, localns=None, include_extras=False):
                 # Leave unresolved strings as-is; CPython would raise,
                 # but loose behavior keeps simple tests passing.
                 pass
+        # CPython `_type_check`: a bare `None` annotation means NoneType.
+        if ann is None:
+            ann = type(None)
         resolved[name] = ann
     return resolved
 

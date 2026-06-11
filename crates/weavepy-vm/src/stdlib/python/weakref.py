@@ -45,44 +45,10 @@ def getweakrefs(obj):
     return _weakref.getweakrefs(obj)
 
 
-class ref:
-    """A weak reference to `target`.
-
-    Wraps a real `_weakref.ref` Rust core. Calling the ref
-    returns the target while it is reachable; once the cycle GC
-    has cleared the referent, the call returns `None`. The
-    optional `callback` runs at clear time.
-    """
-
-    __slots__ = ("_real", "_callback", "__weakref__")
-
-    def __init__(self, target, callback=None):
-        self._real = _weakref.ref(target, callback)
-        self._callback = callback
-
-    def __call__(self):
-        return self._real.__weakref_get__()
-
-    def __hash__(self):
-        return self._real.__hash__()
-
-    def __eq__(self, other):
-        if isinstance(other, ref):
-            return self() is other()
-        return NotImplemented
-
-    def __repr__(self):
-        return self._real.__repr__()
-
-    def _release(self):
-        self._real.__clear__()
-        cb = self._callback
-        if cb is not None:
-            try:
-                cb(self)
-            except Exception:
-                pass
-        self._callback = None
+# `ref` IS the native ReferenceType, exactly as in CPython. Calling it
+# builds a real weakref; `obj.__weakref__` and `getweakrefs(obj)` hand
+# back the same object.
+ref = _weakref.ref
 
 
 def proxy(target, callback=None):

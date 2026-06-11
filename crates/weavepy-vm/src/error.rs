@@ -180,6 +180,23 @@ impl PartialEq for RuntimeError {
 
 impl Eq for RuntimeError {}
 
+/// Set an attribute in a wrapped exception instance's `__dict__` unless
+/// already present. Used by raise sites that enrich exceptions with
+/// structured fields the way CPython's C raisers do (`AttributeError.name`
+/// / `.obj`, `NameError.name`, `ImportError.name_from`, …).
+pub fn set_exception_attr(err: &RuntimeError, key: &'static str, value: Object) {
+    use crate::object::DictKey;
+    if let RuntimeError::PyException(pe) = err {
+        if let Object::Instance(inst) = &pe.instance {
+            let k = DictKey(Object::from_static(key));
+            let mut dict = inst.dict.borrow_mut();
+            if !dict.contains_key(&k) {
+                dict.insert(k, value);
+            }
+        }
+    }
+}
+
 pub fn type_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("TypeError", message))
 }
@@ -194,6 +211,29 @@ pub fn name_error(message: impl Into<String>) -> RuntimeError {
 
 pub fn attribute_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("AttributeError", message))
+}
+
+/// `AttributeError` carrying the structured `.name`/`.obj` fields
+/// CPython's C raise sites populate (PEP 3134-adjacent; used by
+/// suggestion machinery and asserted on by `test_exceptions`).
+pub fn attribute_error_named(obj: &Object, name: &str) -> RuntimeError {
+    use crate::object::DictKey;
+    let err = attribute_error(format!(
+        "'{}' object has no attribute '{}'",
+        obj.type_name_owned(),
+        name
+    ));
+    if let RuntimeError::PyException(pe) = &err {
+        if let Object::Instance(inst) = &pe.instance {
+            let mut dict = inst.dict.borrow_mut();
+            dict.insert(
+                DictKey(Object::from_static("name")),
+                Object::from_str(name),
+            );
+            dict.insert(DictKey(Object::from_static("obj")), obj.clone());
+        }
+    }
+    err
 }
 
 pub fn key_error(message: impl Into<String>) -> RuntimeError {
@@ -310,9 +350,22 @@ pub fn syntax_error_located(
     offset: Option<u32>,
     text: Option<&str>,
 ) -> RuntimeError {
+    syntax_error_located_as("SyntaxError", message, filename, lineno, offset, text)
+}
+
+/// [`syntax_error_located`] with an explicit exception class —
+/// `IndentationError` / `TabError` share SyntaxError's location payload.
+pub fn syntax_error_located_as(
+    class: &'static str,
+    message: impl Into<String>,
+    filename: Option<&str>,
+    lineno: Option<u32>,
+    offset: Option<u32>,
+    text: Option<&str>,
+) -> RuntimeError {
     use crate::object::DictKey;
     let message = message.into();
-    let pe = PyException::from_builtin("SyntaxError", message.clone());
+    let pe = PyException::from_builtin(class, message.clone());
     if let Object::Instance(inst) = &pe.instance {
         let msg_obj = Object::from_str(message);
         let file_obj = filename.map_or(Object::None, |s| Object::from_str(s));

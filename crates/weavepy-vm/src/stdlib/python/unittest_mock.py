@@ -165,8 +165,51 @@ class _Call:
 call = _Call()
 
 
+# Magic methods that, when assigned on a mock instance, are installed on
+# the mock's per-instance *class* so the interpreter's type-based dunder
+# dispatch finds them (CPython mock's `_all_magics`, trimmed to the
+# protocols WeavePy dispatches).
+_numerics = "add sub mul matmul truediv floordiv mod lshift rshift and xor or pow divmod"
+_all_magics = {
+    f"__{name}__"
+    for name in (
+        " ".join(
+            [
+                _numerics,
+                " ".join("r" + n for n in _numerics.split()),
+                " ".join("i" + n for n in _numerics.split() if n != "divmod"),
+                "lt gt le ge eq ne",
+                "int float complex bool index round ceil floor trunc",
+                "neg pos abs invert",
+                "hash str repr sizeof fspath",
+                "len contains iter next reversed",
+                "getitem setitem delitem missing",
+                "enter exit aenter aexit aiter anext",
+                "call",
+            ]
+        )
+    ).split()
+}
+
+
+def _get_method(name, func):
+    """Turn a callable (like a mock) into a real function so it behaves
+    as a method when installed on the per-instance class."""
+    def method(self, /, *args, **kw):
+        return func(self, *args, **kw)
+    method.__name__ = name
+    return method
+
+
 class NonCallableMock:
     """A non-callable mock object (parent of Mock)."""
+
+    def __new__(cls, /, *args, **kw):
+        # Every mock instance gets its own class, so magic methods can
+        # be configured per-instance without stomping on other mocks
+        # (mirrors CPython mock's `NonCallableMock.__new__`).
+        new = type(cls.__name__, (cls,), {"__doc__": cls.__doc__})
+        return object.__new__(new)
 
     def __init__(self, spec=None, wraps=None, name=None, spec_set=None,
                  side_effect=None, return_value=DEFAULT, unsafe=False, **kwargs):
@@ -207,6 +250,18 @@ class NonCallableMock:
     def __setattr__(self, name, value):
         if self._mock_spec_set is not None and name not in self._mock_methods and not name.startswith("_"):
             raise AttributeError(f"Mock object has no attribute {name!r}")
+        if name in _all_magics:
+            # Dunders dispatch through the type, so install them on the
+            # per-instance class (created in `__new__`). A mock value is
+            # installed as-is (the binary-op protocol passes `self`
+            # explicitly); any other callable is wrapped as a method.
+            if isinstance(value, NonCallableMock):
+                self._mock_children[name] = value
+                setattr(type(self), name, value)
+            else:
+                setattr(type(self), name, _get_method(name, value))
+                original = value
+                value = lambda *args, **kw: original(self, *args, **kw)
         object.__setattr__(self, name, value)
 
     # ----- introspection helpers ----- #
@@ -364,6 +419,10 @@ class Mock(NonCallableMock):
             else:
                 raise effect
         if self._mock_return_value is DEFAULT:
+            # No configured return value: delegate to the wrapped callable
+            # when one was supplied (``wraps=``), like CPython's mock.
+            if self._mock_wraps is not None:
+                return self._mock_wraps(*args, **kwargs)
             return self.return_value
         return self._mock_return_value
 
@@ -459,9 +518,11 @@ class _patch:
         self._had = False
 
     def _resolve_target(self):
+        # `self.target` is already the parent path (the attribute was
+        # split off in `patch()`); resolve the whole dotted path —
+        # importing the leading module and getattr-ing the rest.
         if isinstance(self.target, str):
-            mod_name, _, _ = self.target.rpartition(".")
-            return _import_target(mod_name)
+            return _import_target(self.target)
         return self.target
 
     def __enter__(self):
@@ -519,8 +580,17 @@ def _import_target(dotted):
     mod = sys.modules.get(name)
     if mod is None:
         mod = __import__(name)
+    # CPython's `_dot_lookup`: getattr each component, importing the
+    # partial path when the attribute isn't there yet (submodules of
+    # packages that haven't been imported).
+    import_path = name
     for p in parts[1:]:
-        mod = getattr(mod, p)
+        import_path += "." + p
+        try:
+            mod = getattr(mod, p)
+        except AttributeError:
+            __import__(import_path)
+            mod = getattr(mod, p)
     return mod
 
 

@@ -357,6 +357,17 @@ pub enum OpCode {
     PopExcept,
     /// Pop and re-raise the top of the `exception_handlers` stack.
     Reraise,
+    /// PEP 654: CPython's `CALL_INTRINSIC_2(PREP_RERAISE_STAR)`. Stack
+    /// on entry: `[..., excs_list, orig]`; pops both and pushes the
+    /// exception to re-raise after the `except*` clauses ran (or `None`
+    /// when everything was handled). `excs_list` holds the exceptions
+    /// raised/re-raised by the handler bodies plus the unmatched
+    /// remainder (possibly `None`) as its last element.
+    PrepReraiseStar,
+
+    /// Push the builtin `AssertionError` type, ignoring any shadowing
+    /// binding of that name (CPython `LOAD_ASSERTION_ERROR`, bpo-34880).
+    LoadAssertionError,
 
     // Context managers
     /// `with` enter: pop cm, push `__exit__` bound to cm, then push
@@ -532,6 +543,8 @@ impl OpCode {
             OpCode::RaiseVarargs => "RAISE_VARARGS",
             OpCode::CheckExcMatch => "CHECK_EXC_MATCH",
             OpCode::CheckEGMatch => "CHECK_EG_MATCH",
+            OpCode::PrepReraiseStar => "PREP_RERAISE_STAR",
+            OpCode::LoadAssertionError => "LOAD_ASSERTION_ERROR",
             OpCode::PushExcInfo => "PUSH_EXC_INFO",
             OpCode::PopExcept => "POP_EXCEPT",
             OpCode::Reraise => "RERAISE",
