@@ -849,6 +849,55 @@ pub fn make_unicode_encode_error(
     Object::Instance(Rc::new(inst))
 }
 
+/// `UnicodeDecodeError` instance with the canonical `(encoding, object,
+/// start, end, reason)` payload — `object` is the *bytes* input, per
+/// CPython (`PyUnicodeDecodeError_Create`).
+pub fn make_unicode_decode_error(
+    encoding: &str,
+    object: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> Object {
+    use crate::types::PyInstance;
+    let bt = builtin_types();
+    let class = bt
+        .by_name("UnicodeDecodeError")
+        .unwrap_or_else(|| bt.value_error.clone());
+    let inst = PyInstance::new(class);
+    let enc = Object::from_str(encoding);
+    let obj = Object::new_bytes(object.to_vec());
+    let start_o = Object::Int(start as i64);
+    let end_o = Object::Int(end as i64);
+    let reason_o = Object::from_str(reason);
+    {
+        let mut dict = inst.dict.borrow_mut();
+        dict.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![
+                enc.clone(),
+                obj.clone(),
+                start_o.clone(),
+                end_o.clone(),
+                reason_o.clone(),
+            ]),
+        );
+        dict.insert(DictKey(Object::from_static("encoding")), enc);
+        dict.insert(DictKey(Object::from_static("object")), obj);
+        dict.insert(DictKey(Object::from_static("start")), start_o);
+        dict.insert(DictKey(Object::from_static("end")), end_o);
+        dict.insert(DictKey(Object::from_static("reason")), reason_o);
+        dict.insert(DictKey(Object::from_static("__context__")), Object::None);
+        dict.insert(DictKey(Object::from_static("__cause__")), Object::None);
+        dict.insert(
+            DictKey(Object::from_static("__suppress_context__")),
+            Object::Bool(false),
+        );
+        dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
+    }
+    Object::Instance(Rc::new(inst))
+}
+
 /// Extract the elements of a *concrete* iterable (one that doesn't need
 /// the interpreter to drive). Used by `object.__new__` to seed the
 /// native payload of an immutable-container subclass from a

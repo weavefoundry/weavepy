@@ -441,20 +441,39 @@ fn encode_utf8(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
 }
 
 fn decode_utf8(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
+    // Strict (and unknown-handler) failures raise a real
+    // `UnicodeDecodeError` with CPython's payload and message shape:
+    // `'utf-8' codec can't decode byte 0x80 in position 12: invalid
+    // start byte`.
+    let strict_err = |e: &std::str::Utf8Error| {
+        let pos = e.valid_up_to();
+        let end = pos + e.error_len().unwrap_or(1);
+        let reason = if e.error_len().is_none() {
+            "unexpected end of data"
+        } else if bytes.get(pos).is_some_and(|b| (0x80..0xC2).contains(b)) {
+            "invalid start byte"
+        } else {
+            "invalid continuation byte"
+        };
+        crate::error::unicode_decode_error(
+            "utf-8",
+            bytes,
+            pos,
+            end.min(bytes.len()),
+            reason,
+        )
+    };
     match errors {
-        "strict" => std::str::from_utf8(bytes).map(str::to_owned).map_err(|e| {
-            value_error(format!(
-                "'utf-8' codec can't decode byte at position {}",
-                e.valid_up_to()
-            ))
-        }),
+        "strict" => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|e| strict_err(&e)),
         "ignore" => Ok(String::from_utf8_lossy_lenient(bytes, false)),
         "replace" => Ok(String::from_utf8_lossy(bytes).into_owned()),
         "surrogateescape" => Ok(decode_utf8_surrogateescape(bytes)),
         "backslashreplace" => Ok(decode_utf8_backslashreplace(bytes)),
         _ => std::str::from_utf8(bytes)
             .map(str::to_owned)
-            .map_err(|e| value_error(format!("utf-8 decode error at byte {}", e.valid_up_to()))),
+            .map_err(|e| strict_err(&e)),
     }
 }
 
@@ -564,11 +583,11 @@ fn encode_ascii(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
 
 fn decode_ascii(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
     let mut out = String::with_capacity(bytes.len());
-    for &b in bytes {
+    for (pos, &b) in bytes.iter().enumerate() {
         if b < 0x80 {
             out.push(b as char);
         } else {
-            handle_decode_error(&mut out, b, errors, "ascii")?;
+            handle_decode_error(&mut out, bytes, pos, errors, "ascii")?;
         }
     }
     Ok(out)
@@ -647,14 +666,20 @@ fn handle_encode_error(
 
 fn handle_decode_error(
     out: &mut String,
-    byte: u8,
+    input: &[u8],
+    pos: usize,
     errors: &str,
     encoding: &str,
 ) -> Result<(), RuntimeError> {
+    let byte = input[pos];
     match errors {
-        "strict" => Err(value_error(format!(
-            "'{encoding}' codec can't decode byte 0x{byte:02x}"
-        ))),
+        "strict" => Err(crate::error::unicode_decode_error(
+            encoding,
+            input,
+            pos,
+            pos + 1,
+            "ordinal not in range(128)",
+        )),
         "ignore" => Ok(()),
         "replace" => {
             out.push('\u{FFFD}');

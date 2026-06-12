@@ -268,6 +268,22 @@ pub fn unicode_encode_error(
     ))
 }
 
+/// `UnicodeDecodeError` carrying the canonical `(encoding, object, start,
+/// end, reason)` payload — the strict-mode decode counterpart of
+/// [`unicode_encode_error`], so `bytes.decode()` failures are catchable
+/// as `UnicodeDecodeError` (not just `ValueError`).
+pub fn unicode_decode_error(
+    encoding: &str,
+    object: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> RuntimeError {
+    RuntimeError::PyException(PyException::new(
+        crate::builtin_types::make_unicode_decode_error(encoding, object, start, end, reason),
+    ))
+}
+
 /// `RecursionError` — raised when the per-thread Python call depth /
 /// native-recursion guard (RFC 0037 WS1) is exceeded. CPython raises
 /// this from `Py_EnterRecursiveCall`, including on the C-level recursion

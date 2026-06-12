@@ -614,6 +614,17 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "copy" if matches!(obj, Object::ByteArray(_)) => {
                 Some(method("copy", bytearray_copy))
             }
+            // CPython exposes the allocation size (`ob_alloc`, which
+            // includes the trailing NUL). We don't track capacity
+            // separately, so report `len + 1` — satisfies the documented
+            // `__alloc__() > len()` invariant.
+            "__alloc__" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("__alloc__", |args| {
+                    let b = bytearray_self(args)?;
+                    let n = b.borrow().len();
+                    Ok(Object::Int(n as i64 + 1))
+                }))
+            }
             // Sequence dunders so direct calls / `hasattr` parity hold.
             "__contains__" => Some(method("__contains__", obj_contains)),
             "__len__" => Some(method("__len__", obj_len)),
@@ -8271,7 +8282,21 @@ fn bytes_count(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(n))
 }
 
+/// CPython parity: the no-argument bytes/bytearray methods
+/// (`upper`, `islower`, …) are `METH_NOARGS` and raise `TypeError`
+/// when called with anything beyond the receiver.
+fn bytes_no_args(name: &str, args: &[Object]) -> Result<(), RuntimeError> {
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "{name}() takes no arguments ({} given)",
+            args.len() - 1
+        )));
+    }
+    Ok(())
+}
+
 fn bytes_lower(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("lower", args)?;
     let out: Vec<u8> = bytes_data(args)?
         .iter()
         .map(|b| b.to_ascii_lowercase())
@@ -8280,6 +8305,7 @@ fn bytes_lower(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_upper(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("upper", args)?;
     let out: Vec<u8> = bytes_data(args)?
         .iter()
         .map(|b| b.to_ascii_uppercase())
@@ -9003,6 +9029,7 @@ fn bytes_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("capitalize", args)?;
     let data = bytes_data(args)?;
     let mut out = Vec::with_capacity(data.len());
     for (i, &b) in data.iter().enumerate() {
@@ -9016,6 +9043,7 @@ fn bytes_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_title(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("title", args)?;
     let data = bytes_data(args)?;
     let mut out = Vec::with_capacity(data.len());
     let mut prev_alpha = false;
@@ -9036,6 +9064,7 @@ fn bytes_title(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("swapcase", args)?;
     let data = bytes_data(args)?;
     let out: Vec<u8> = data
         .iter()
@@ -9053,6 +9082,7 @@ fn bytes_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_islower(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("islower", args)?;
     let data = bytes_data(args)?;
     let has_cased = data.iter().any(u8::is_ascii_lowercase);
     let no_upper = !data.iter().any(u8::is_ascii_uppercase);
@@ -9060,6 +9090,7 @@ fn bytes_islower(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_isupper(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isupper", args)?;
     let data = bytes_data(args)?;
     let has_cased = data.iter().any(u8::is_ascii_uppercase);
     let no_lower = !data.iter().any(u8::is_ascii_lowercase);
@@ -9067,6 +9098,7 @@ fn bytes_isupper(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("istitle", args)?;
     let data = bytes_data(args)?;
     let mut cased = false;
     let mut prev_cased = false;
@@ -9091,6 +9123,7 @@ fn bytes_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_isascii(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isascii", args)?;
     let data = bytes_data(args)?;
     Ok(Object::Bool(data.iter().all(u8::is_ascii)))
 }
@@ -9176,6 +9209,7 @@ fn bytearray_copy(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isalnum", args)?;
     let data = bytes_data(args)?;
     Ok(Object::Bool(
         !data.is_empty() && data.iter().all(u8::is_ascii_alphanumeric),
@@ -9183,6 +9217,7 @@ fn bytes_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_isalpha(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isalpha", args)?;
     let data = bytes_data(args)?;
     Ok(Object::Bool(
         !data.is_empty() && data.iter().all(u8::is_ascii_alphabetic),
@@ -9190,6 +9225,7 @@ fn bytes_isalpha(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_isdigit(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isdigit", args)?;
     let data = bytes_data(args)?;
     Ok(Object::Bool(
         !data.is_empty() && data.iter().all(u8::is_ascii_digit),
@@ -9197,6 +9233,7 @@ fn bytes_isdigit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isspace", args)?;
     let data = bytes_data(args)?;
     Ok(Object::Bool(
         !data.is_empty() && data.iter().all(u8::is_ascii_whitespace),
@@ -9216,11 +9253,8 @@ fn bytearray_append(args: &[Object]) -> Result<Object, RuntimeError> {
     let b = bytearray_self(args)?;
     let value = args
         .get(1)
-        .ok_or_else(|| type_error("append() requires int"))?;
-    let byte = match value {
-        Object::Int(i) if (0..=255).contains(i) => *i as u8,
-        _ => return Err(value_error("byte must be 0..256")),
-    };
+        .ok_or_else(|| type_error("append() takes exactly one argument (0 given)"))?;
+    let byte = bytearray_byte_arg(value)?;
     b.borrow_mut().push(byte);
     Ok(Object::None)
 }
@@ -9229,11 +9263,14 @@ fn bytearray_extend(args: &[Object]) -> Result<Object, RuntimeError> {
     let b = bytearray_self(args)?;
     let other = args
         .get(1)
-        .ok_or_else(|| type_error("extend() requires iterable"))?;
+        .ok_or_else(|| type_error("extend() takes exactly 1 argument (0 given)"))?;
+    // Bytes-like fast paths (with `b.extend(b)` alias safety).
     match other {
-        Object::Bytes(buf) => b.borrow_mut().extend_from_slice(buf),
+        Object::Bytes(buf) => {
+            b.borrow_mut().extend_from_slice(buf);
+            return Ok(Object::None);
+        }
         Object::ByteArray(buf) => {
-            // `b.extend(b)` — self-extension must not double-borrow.
             if Rc::ptr_eq(&b, buf) {
                 let mut t = b.borrow_mut();
                 let copy = t.clone();
@@ -9241,22 +9278,27 @@ fn bytearray_extend(args: &[Object]) -> Result<Object, RuntimeError> {
             } else {
                 b.borrow_mut().extend_from_slice(&buf.borrow());
             }
+            return Ok(Object::None);
         }
-        Object::List(items) => {
-            let items = items.borrow();
-            for o in items.iter() {
-                if let Object::Int(i) = o {
-                    if !(0..=255).contains(i) {
-                        return Err(value_error("byte must be 0..256"));
-                    }
-                    b.borrow_mut().push(*i as u8);
-                } else {
-                    return Err(type_error("bytearray extend with non-int"));
-                }
-            }
-        }
-        _ => return Err(type_error("bytearray.extend() expects an iterable of ints")),
+        _ => {}
     }
+    // General protocol: any iterable of ints (each through `__index__`,
+    // as CPython's `bytearray_extend` does via `_getbytevalue`).
+    // Generators and user-`__iter__` objects were materialised by the
+    // interpreter's dispatch shim before reaching this builtin.
+    let mut it = other.make_iter().map_err(|_| {
+        type_error(format!(
+            "can't extend bytearray with {}",
+            other.type_name()
+        ))
+    })?;
+    // Collect first so a mid-iteration error leaves the target
+    // unchanged (CPython builds into a fresh buffer too).
+    let mut tmp: Vec<u8> = Vec::new();
+    while let Some(item) = it.next_value() {
+        tmp.push(bytearray_byte_arg(&item)?);
+    }
+    b.borrow_mut().extend_from_slice(&tmp);
     Ok(Object::None)
 }
 

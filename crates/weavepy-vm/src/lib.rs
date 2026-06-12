@@ -12945,6 +12945,17 @@ impl Interpreter {
                     new_args[0] = Object::new_list(collected);
                     return (b.call)(&new_args);
                 }
+                // Method-style consumers (receiver in `args[0]`, iterable in
+                // `args[1]`): `bytearray.extend` walks its argument with
+                // `Object::make_iter`, which can't drive generator frames or
+                // a user `__iter__` — materialise those eagerly, like the
+                // free-function consumers above.
+                if b.name == "extend" && args.get(1).is_some_and(needs_vm_iter) {
+                    let collected = self.collect_iterable(&args[1], outer_globals)?;
+                    let mut new_args = args.to_vec();
+                    new_args[1] = Object::new_list(collected);
+                    return (b.call)(&new_args);
+                }
                 // `zip` must NOT pre-materialise — it stops at the shortest
                 // iterable, so a paired unbounded iterator (`itertools.count`)
                 // would hang. Drive it lazily through the interpreter instead.
@@ -15076,6 +15087,13 @@ impl Interpreter {
                 // type whose `tp_traverse` is non-NULL — for us that's
                 // every Python-defined class (they all carry a dict).
                 gc_trace::track(inst.clone());
+                // CPython's allocator runs a threshold-driven young
+                // collection right here; without it the tracked set
+                // (which holds strong handles) grows without bound and
+                // long test runs degrade superlinearly.
+                if gc_trace::maybe_auto_collect() > 0 {
+                    self.run_pending_finalizers();
+                }
                 inst
             }
         };
@@ -15703,6 +15721,11 @@ impl Interpreter {
                     // reference cycles (a local that holds the generator
                     // itself), so track them like instances.
                     gc_trace::track(obj.clone());
+                    // Threshold-driven young collection at the
+                    // allocation site, as in the instance path.
+                    if gc_trace::maybe_auto_collect() > 0 {
+                        self.run_pending_finalizers();
+                    }
                     Ok(obj)
                 }
                 FrameOutcome::Returned(_) | FrameOutcome::Yielded(_) => {
@@ -17536,6 +17559,16 @@ thread_local! {
 /// path); instance attribute access keeps using `repr_of` / `stringify` /
 /// `instance_method`, so the hot per-object dispatch is unchanged.
 fn builtin_slot_wrapper(ty: &Rc<TypeObject>, name: &str) -> Option<Object> {
+    // `__doc__` resolves on the type *itself*, never through the MRO —
+    // CPython's `type.__doc__` getset returns the type's own docstring
+    // or `None` (a user class without one must not inherit
+    // `object.__doc__`).
+    if name == "__doc__" {
+        return Some(match builtin_type_doc(&ty.name) {
+            Some(doc) if ty.flags.is_builtin => Object::from_static(doc),
+            _ => Object::None,
+        });
+    }
     let mro: Vec<Rc<TypeObject>> = ty.mro.borrow().iter().cloned().collect();
     for base in mro {
         if !base.flags.is_builtin {
@@ -17561,6 +17594,62 @@ fn builtin_slot_wrapper(ty: &Rc<TypeObject>, name: &str) -> Option<Object> {
 /// dispatched method itself carries its own `__globals__`.
 fn fallback_globals() -> Rc<RefCell<DictData>> {
     Rc::new(RefCell::new(DictData::new()))
+}
+
+/// First-line docstrings for the built-in types (CPython's
+/// `tp_doc`). Tests assert on the leading `"<type>("` shape; the
+/// bodies are abbreviated.
+fn builtin_type_doc(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "bytes" => {
+            "bytes(iterable_of_ints) -> bytes\n\
+             bytes(string, encoding[, errors]) -> bytes\n\
+             bytes(bytes_or_buffer) -> immutable copy of bytes_or_buffer\n\
+             bytes(int) -> bytes object of size given by the parameter initialized with null bytes\n\
+             bytes() -> empty bytes object"
+        }
+        "bytearray" => {
+            "bytearray(iterable_of_ints) -> bytearray\n\
+             bytearray(string, encoding[, errors]) -> bytearray\n\
+             bytearray(bytes_or_buffer) -> mutable copy of bytes_or_buffer\n\
+             bytearray(int) -> bytes array of size given by the parameter initialized with null bytes\n\
+             bytearray() -> empty bytes array"
+        }
+        "list" => "Built-in mutable sequence.",
+        "tuple" => "Built-in immutable sequence.",
+        "dict" => {
+            "dict() -> new empty dictionary"
+        }
+        "set" => "set() -> new empty set object\nset(iterable) -> new set object",
+        "frozenset" => {
+            "frozenset() -> empty frozenset object\nfrozenset(iterable) -> frozenset object"
+        }
+        "str" => {
+            "str(object='') -> str\nstr(bytes_or_buffer[, encoding[, errors]]) -> str"
+        }
+        "int" => {
+            "int([x]) -> integer\nint(x, base=10) -> integer"
+        }
+        "float" => "Convert a string or number to a floating-point number, if possible.",
+        "complex" => "Create a complex number from a string or numbers.",
+        "bool" => "Returns True when the argument is true, False otherwise.",
+        "object" => {
+            "The base class of the class hierarchy.\n\n\
+             When called, it accepts no arguments and returns a new featureless\n\
+             instance that has no instance attributes and cannot be given any.\n"
+        }
+        "type" => {
+            "type(object) -> the object's type\ntype(name, bases, dict, **kwds) -> a new type"
+        }
+        "range" => {
+            "range(stop) -> range object\nrange(start, stop[, step]) -> range object"
+        }
+        "slice" => {
+            "slice(stop)\nslice(start, stop[, step])"
+        }
+        "memoryview" => "Create a new memoryview object which references the given object.",
+        _ => return None,
+    })
 }
 
 /// Extract an attribute name from a `getattr`/`hasattr`/`setattr`-style

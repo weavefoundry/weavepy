@@ -261,7 +261,18 @@ class _AssertRaisesContext:
             raise AssertionError("%s not raised" % self._exc_name())
         if not issubclass(exc_type, self.expected):
             return False
-        self.exception = exc_value
+        # CPython detaches the traceback before storing the exception
+        # (case.py does `traceback.clear_frames(tb)` plus
+        # `with_traceback(None)`): the traceback chain pins every frame
+        # between the raise and the handler, and a test that calls
+        # `assertRaises` in a loop would otherwise accumulate all of
+        # them until the cycle collector runs.
+        try:
+            import traceback
+            traceback.clear_frames(tb)
+        except Exception:
+            pass
+        self.exception = exc_value.with_traceback(None)
         if self.expected_regex is not None:
             import re
             text = str(exc_value)
