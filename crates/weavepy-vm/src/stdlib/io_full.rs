@@ -83,6 +83,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("open")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open",
+                binds_instance: false,
                 call: Box::new(io_open),
                 call_kw: None,
             })),
@@ -91,6 +92,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("open_code")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open_code",
+                binds_instance: false,
                 call: Box::new(io_open),
                 call_kw: None,
             })),
@@ -131,6 +133,7 @@ fn make_protocol(name: &'static str, bases: Vec<Rc<TypeObject>>) -> Rc<TypeObjec
             DictKey(Object::from_static(stub_name)),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: stub_name,
+                binds_instance: true,
                 call: Box::new(stub_method),
                 call_kw: None,
             })),

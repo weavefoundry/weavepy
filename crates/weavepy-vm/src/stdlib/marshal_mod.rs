@@ -108,6 +108,7 @@ fn register(
 ) {
     let bf = BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     };

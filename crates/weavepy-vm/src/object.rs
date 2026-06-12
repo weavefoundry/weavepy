@@ -578,11 +578,25 @@ impl PyComplex {
     }
 }
 
+/// `range(...)` bounds. `i128` so ranges straddling the `i64` boundary
+/// (`range(sys.maxsize - 5, sys.maxsize + 5)`) still work; elements that
+/// don't fit `i64` materialise as `Object::Long`. (CPython supports
+/// arbitrary ints here; i128 covers every realistic bound while keeping
+/// the in-range iteration fast path allocation-free.)
 #[derive(Debug, Clone)]
 pub struct Range {
-    pub start: i64,
-    pub stop: i64,
-    pub step: i64,
+    pub start: i128,
+    pub stop: i128,
+    pub step: i128,
+}
+
+/// An int object from an `i128`: machine `Int` when it fits, `Long`
+/// otherwise.
+pub fn int_from_i128(v: i128) -> Object {
+    match i64::try_from(v) {
+        Ok(x) => Object::Int(x),
+        Err(_) => Object::Long(Rc::new(num_bigint::BigInt::from(v))),
+    }
 }
 
 /// A loaded Python module: a name, an optional source filename, and
@@ -795,6 +809,11 @@ impl fmt::Debug for BoundMethod {
 /// audit checks at construction time.
 pub struct BuiltinFn {
     pub name: &'static str,
+    /// CPython's type split: type-dict *method descriptors* (and slot
+    /// wrappers) bind `self` on instance attribute access; module-level
+    /// `builtin_function_or_method`s are **not** descriptors and are
+    /// returned as-is (`class C: f = len` leaves `c.f` unbound).
+    pub binds_instance: bool,
     pub call: Box<dyn Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync>,
     /// Kwargs-aware entry point. When `Some`, the VM dispatch loop
     /// calls this with both positional and keyword arguments instead
@@ -814,6 +833,7 @@ impl BuiltinFn {
     {
         Self {
             name,
+            binds_instance: false,
             call: Box::new(body),
             call_kw: None,
         }
@@ -833,6 +853,7 @@ impl BuiltinFn {
         let body_pos = body.clone();
         Self {
             name,
+            binds_instance: false,
             call: Box::new(move |args| body_pos(args, &[])),
             call_kw: Some(Box::new(move |args, kwargs| body(args, kwargs))),
         }
@@ -1486,6 +1507,14 @@ pub enum PyIterator {
         stop: i64,
         step: i64,
     },
+    /// Range whose bounds don't all fit `i64` — the slow sibling of
+    /// `Range` (which stays `i64` so the FOR_ITER inline cache pushes
+    /// machine ints without conversion checks).
+    RangeHuge {
+        current: i128,
+        stop: i128,
+        step: i128,
+    },
     DictKeys {
         keys: Vec<DictKey>,
         index: usize,
@@ -1518,6 +1547,12 @@ pub enum PyIterator {
         items: Rc<RefCell<Vec<Object>>>,
         index: i64,
     },
+    /// Shared handle onto an existing `Object::Iter`'s cursor: `iter(it)
+    /// is it` in Python, so any consumer draining the handle must advance
+    /// the original object too (`heapq.nlargest` zips a prefix off `it`
+    /// and then scans the tail with `for elem in it`). Cloning the cursor
+    /// instead would silently fork the position.
+    Shared(Rc<RefCell<PyIterator>>),
 }
 
 impl PyIterator {
@@ -1577,6 +1612,25 @@ impl PyIterator {
                 *current += *step;
                 Some(Object::Int(v))
             }
+            PyIterator::RangeHuge {
+                current,
+                stop,
+                step,
+            } => {
+                let exhausted = if *step > 0 {
+                    *current >= *stop
+                } else if *step < 0 {
+                    *current <= *stop
+                } else {
+                    true
+                };
+                if exhausted {
+                    return None;
+                }
+                let v = *current;
+                *current += *step;
+                Some(int_from_i128(v))
+            }
             PyIterator::DictKeys { keys, index } => {
                 let k = keys.get(*index)?.clone();
                 *index += 1;
@@ -1598,6 +1652,7 @@ impl PyIterator {
                 *count += 1;
                 Some(Object::new_tuple(vec![Object::Int(i), v]))
             }
+            PyIterator::Shared(inner) => inner.borrow_mut().next_value(),
             PyIterator::Reversed { items, index } => {
                 if *index < 0 {
                     *items = Rc::new(RefCell::new(Vec::new()));
@@ -1637,6 +1692,7 @@ impl PyIterator {
                 Some(data.borrow().len().saturating_sub(*index))
             }
             PyIterator::Enumerate { inner, .. } => inner.borrow().remaining(),
+            PyIterator::Shared(inner) => inner.borrow().remaining(),
             PyIterator::Reversed { index, .. } => Some((*index + 1).max(0) as usize),
             PyIterator::Range {
                 current,
@@ -1649,6 +1705,19 @@ impl PyIterator {
                 } else if *step < 0 && *current > *stop {
                     Some((((*current - *stop) as i128 + i128::from(-*step) - 1)
                         / i128::from(-*step)) as usize)
+                } else {
+                    Some(0)
+                }
+            }
+            PyIterator::RangeHuge {
+                current,
+                stop,
+                step,
+            } => {
+                if *step > 0 && *current < *stop {
+                    usize::try_from((*stop - *current + *step - 1) / *step).ok()
+                } else if *step < 0 && *current > *stop {
+                    usize::try_from((*current - *stop + (-*step) - 1) / (-*step)).ok()
                 } else {
                     Some(0)
                 }
@@ -1711,6 +1780,26 @@ impl PyIterator {
                 }
                 out
             }
+            PyIterator::RangeHuge {
+                current,
+                stop,
+                step,
+            } => {
+                let mut out = Vec::new();
+                let (mut c, st, sp) = (*current, *stop, *step);
+                if sp > 0 {
+                    while c < st {
+                        out.push(int_from_i128(c));
+                        c += sp;
+                    }
+                } else if sp < 0 {
+                    while c > st {
+                        out.push(int_from_i128(c));
+                        c += sp;
+                    }
+                }
+                out
+            }
             PyIterator::Enumerate { inner, count } => {
                 let rest = inner.borrow().remaining_items();
                 let mut out = Vec::with_capacity(rest.len());
@@ -1721,6 +1810,7 @@ impl PyIterator {
                 }
                 out
             }
+            PyIterator::Shared(inner) => inner.borrow().remaining_items(),
             PyIterator::Reversed { items, index } => {
                 // Not-yet-yielded values, in yield order: items[index]..items[0].
                 let items = items.borrow();
@@ -2012,6 +2102,20 @@ impl Object {
                     && (a.stop.is_same(&b.stop) || a.stop.eq_value(&b.stop))
                     && (a.step.is_same(&b.step) || a.step.eq_value(&b.step))
             }
+            // Namespace-shaped values: `types.SimpleNamespace` compares
+            // `vars(a) == vars(b)`, and PEP 585 generic aliases (also
+            // carried in this representation, keyed by `__origin__` /
+            // `__args__` / `__parameters__`) compare those fields — both
+            // reduce to dict-content equality (`list[int] == list[int]`).
+            (Object::SimpleNamespace(a), Object::SimpleNamespace(b)) => {
+                Rc::ptr_eq(a, b) || {
+                    let (a, b) = (a.borrow(), b.borrow());
+                    a.len() == b.len()
+                        && a.iter().all(|(k, v)| {
+                            b.get(k).is_some_and(|w| v.is_same(w) || v.eq_value(w))
+                        })
+                }
+            }
             // Reference-identity equality for class / module / function
             // / builtin / method values. CPython falls back to identity
             // here, and our `in` / dict-key checks rely on it.
@@ -2140,11 +2244,18 @@ impl Object {
                 result
             }
             Object::Range(r) => {
-                if let Object::Int(i) = item {
+                use num_traits::ToPrimitive;
+                let i: Option<i128> = match item {
+                    Object::Bool(b) => Some(i128::from(*b)),
+                    Object::Int(i) => Some(i128::from(*i)),
+                    Object::Long(b) => b.to_i128(),
+                    _ => None,
+                };
+                if let Some(i) = i {
                     if r.step > 0 {
-                        Ok(*i >= r.start && *i < r.stop && (*i - r.start) % r.step == 0)
+                        Ok(i >= r.start && i < r.stop && (i - r.start) % r.step == 0)
                     } else if r.step < 0 {
-                        Ok(*i <= r.start && *i > r.stop && (r.start - *i) % (-r.step) == 0)
+                        Ok(i <= r.start && i > r.stop && (r.start - i) % (-r.step) == 0)
                     } else {
                         Ok(false)
                     }
@@ -2209,11 +2320,32 @@ impl Object {
                 s: s.clone(),
                 index: 0,
             }),
-            Object::Range(r) => Ok(PyIterator::Range {
-                current: r.start,
-                stop: r.stop,
-                step: r.step,
-            }),
+            Object::Range(r) => Ok(
+                match (
+                    i64::try_from(r.start),
+                    i64::try_from(r.stop),
+                    i64::try_from(r.step),
+                ) {
+                    // `current += step` must not overflow after the last
+                    // yielded element (current peaks at stop-1+step for
+                    // positive step, bottoms at stop+1+step for negative),
+                    // so boundary-hugging ranges take the i128 variant too.
+                    (Ok(current), Ok(stop), Ok(step))
+                        if stop.checked_add(step).is_some() =>
+                    {
+                        PyIterator::Range {
+                            current,
+                            stop,
+                            step,
+                        }
+                    }
+                    _ => PyIterator::RangeHuge {
+                        current: r.start,
+                        stop: r.stop,
+                        step: r.step,
+                    },
+                },
+            ),
             Object::Dict(d) => {
                 let keys: Vec<DictKey> = d.borrow().keys().cloned().collect();
                 Ok(PyIterator::DictKeys { keys, index: 0 })
@@ -2301,11 +2433,11 @@ impl Object {
                 })
             }
             // A native iterator is its own iterable: `iter(it) is it` in
-            // Python, and passing one to a plain builtin (`dict.fromkeys`,
-            // `set`, …) must drain it rather than raise. We hand back a
-            // clone of the underlying cursor, which yields the remaining
-            // elements (the shared source `Rc` is preserved).
-            Object::Iter(it) => Ok(it.borrow().clone()),
+            // Python, and passing one to a plain builtin (`zip`,
+            // `dict.fromkeys`, `set`, …) must drain *the same cursor* —
+            // partial consumption (`zip(range(n), it)`) must leave `it`
+            // positioned at the first unconsumed element.
+            Object::Iter(it) => Ok(PyIterator::Shared(it.clone())),
             _ => Err(type_error(format!(
                 "'{}' object is not iterable",
                 self.type_name()
@@ -2477,7 +2609,7 @@ impl Object {
                     .slot("__qualname__")
                     .as_ref()
                     .map(Object::to_str)
-                    .unwrap_or_else(|| f.code.qualname.clone());
+                    .unwrap_or_else(|| f.code().qualname.clone());
                 format!("<function {} at 0x{:x}>", qual, Rc::as_ptr(f) as usize)
             }
             Object::Builtin(b) => format!("<built-in function {}>", b.name),
@@ -2668,7 +2800,7 @@ impl Object {
                 } else {
                     return Err(value_error("range step cannot be zero"));
                 };
-                let step = r.step.unsigned_abs() as i64;
+                let step = r.step.unsigned_abs() as i128;
                 Ok(((span + step - 1) / step).max(0) as usize)
             }
             Object::Bytes(b) => Ok(b.len()),
@@ -3052,17 +3184,19 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             Some(if v == -1 { -2 } else { v })
         }
         Object::FrozenSet(s) => {
-            // Order-independent: xor scrambled element hashes (mirrors the
-            // key property of CPython's `frozenset_hash`).
+            // CPython's `frozenset_hash` (Objects/setobject.c), bit-exact:
+            // `collections.abc.Set._hash` reimplements the same algorithm
+            // in Python and the two must agree (`hash(fs) == Set._hash(fs)`).
             let mut acc: u64 = 0;
             for k in s.iter() {
                 let eh = py_hash_value(&k.0).unwrap_or_else(|| identity_hash(&k.0)) as u64;
-                acc ^= eh
-                    .wrapping_mul(89_869_747)
-                    .wrapping_add(0x2545_F491_4F6C_DD1D);
+                acc ^= (eh ^ (eh << 16) ^ 89_869_747).wrapping_mul(3_644_798_167);
             }
+            acc ^= (s.len() as u64).wrapping_add(1).wrapping_mul(1_927_868_237);
+            acc ^= (acc >> 11) ^ (acc >> 25);
+            acc = acc.wrapping_mul(69_069).wrapping_add(907_133_923);
             let v = acc as i64;
-            Some(if v == -1 { -2 } else { v })
+            Some(if v == -1 { 590_923_713 } else { v })
         }
         Object::Instance(inst) => {
             // A user-defined `__hash__` outranks the wrapped value's hash —

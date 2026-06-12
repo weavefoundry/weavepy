@@ -46,6 +46,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         let bf = BuiltinFn {
             name: "parse",
+            binds_instance: false,
             call: Box::new(parse),
             call_kw: None,
         };

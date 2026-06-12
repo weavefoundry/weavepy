@@ -20,6 +20,12 @@ INT_MAX = 2**31 - 1
 INT_MIN = -(2**31)
 PY_SSIZE_T_MAX = sys.maxsize
 PY_SSIZE_T_MIN = -sys.maxsize - 1
+# <float.h> limits (IEEE 754 binary32 / binary64, the only layouts we
+# support): test_float's rounding tests read these off _testcapi.
+FLT_MAX = 3.4028234663852886e38
+FLT_MIN = 1.1754943508222875e-38
+DBL_MAX = sys.float_info.max
+DBL_MIN = sys.float_info.min
 
 
 def exception_print(exc):

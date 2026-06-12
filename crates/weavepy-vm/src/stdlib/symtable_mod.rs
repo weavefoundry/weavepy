@@ -138,6 +138,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         }
         let bf = BuiltinFn {
             name: "symtable",
+            binds_instance: false,
             call: Box::new(symtable),
             call_kw: None,
         };

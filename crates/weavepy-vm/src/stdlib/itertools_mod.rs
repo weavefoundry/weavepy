@@ -33,6 +33,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("islice")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "islice",
+                binds_instance: false,
                 call: Box::new(islice),
                 call_kw: None,
             })),

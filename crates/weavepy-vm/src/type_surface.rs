@@ -99,6 +99,7 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
     ) -> Object {
         Object::Builtin(Rc::new(BuiltinFn {
             name,
+            binds_instance: true,
             call: Box::new(move |args: &[Object]| {
                 let (a, b) = match args {
                     [a, b] => (as_native(a), as_native(b)),
@@ -266,6 +267,7 @@ fn unwrap_shim(inner: Rc<BuiltinFn>) -> Object {
     let has_kw = inner.call_kw.is_some();
     let mut shim = BuiltinFn {
         name: inner.name,
+        binds_instance: inner.binds_instance,
         call: Box::new(move |args| {
             if let Some(first) = args.first() {
                 let unwrapped = as_native(first);
@@ -303,6 +305,7 @@ fn unwrap_shim(inner: Rc<BuiltinFn>) -> Object {
 fn builtin(name: &'static str, f: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: true,
         call: Box::new(f),
         call_kw: None,
     }))
@@ -423,6 +426,34 @@ fn dict_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     }))))
 }
 
+/// `dict_keys.__reversed__` / `dict_values` / `dict_items` — CPython's
+/// dict views are reversible (their C types carry `__reversed__`, which
+/// is also what `collections.abc.Reversible`'s subclasshook probes for).
+fn dict_view_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
+    let recv = args
+        .first()
+        .ok_or_else(|| type_error("__reversed__() missing self"))?;
+    let Object::DictView(v) = recv else {
+        return Err(type_error(
+            "descriptor '__reversed__' requires a dict view object",
+        ));
+    };
+    let d = v.dict.borrow();
+    let items: Vec<Object> = match v.kind {
+        crate::object::DictViewKind::Keys => d.keys().rev().map(|k| k.0.clone()).collect(),
+        crate::object::DictViewKind::Values => d.values().rev().cloned().collect(),
+        crate::object::DictViewKind::Items => d
+            .iter()
+            .rev()
+            .map(|(k, val)| Object::new_tuple(vec![k.0.clone(), val.clone()]))
+            .collect(),
+    };
+    Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
+        items: Rc::from(items.as_slice()),
+        index: 0,
+    }))))
+}
+
 fn iter_next_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
     let recv = args
         .first()
@@ -472,6 +503,11 @@ fn install_container_protocols(bt: &BuiltinTypes) {
             ty,
             "__contains__",
             builtin("__contains__", obj_contains_builtin),
+        );
+        insert_if_absent(
+            ty,
+            "__reversed__",
+            builtin("__reversed__", dict_view_reversed_builtin),
         );
     }
     insert_if_absent(&bt.list_, "__reversed__", builtin("__reversed__", list_reversed_builtin));

@@ -44,6 +44,22 @@ class ABCMeta(type):
                 if getattr(value, "__isabstractmethod__", False):
                     abstracts.add(name)
         cls.__abstractmethods__ = frozenset(abstracts)
+        # CPython's C `_abc_init` consumes `__abc_tpflags__` here: reject
+        # a class claiming both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING,
+        # fold the collection bits into the type's flags (stored under a
+        # private name the VM's `__flags__` getter folds in), and delete
+        # the public attribute.
+        tpflags = namespace.get("__abc_tpflags__")
+        if isinstance(tpflags, int):
+            COLLECTION_FLAGS = (1 << 5) | (1 << 6)
+            if tpflags & COLLECTION_FLAGS == COLLECTION_FLAGS:
+                raise TypeError(
+                    "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE"
+                    " and Py_TPFLAGS_MAPPING"
+                )
+            cls._abc_collection_flags = tpflags & COLLECTION_FLAGS
+        if "__abc_tpflags__" in namespace:
+            del cls.__abc_tpflags__
         # Set up inheritance registry
         cls._abc_registry = WeakSet()
         cls._abc_cache = WeakSet()

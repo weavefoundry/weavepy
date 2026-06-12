@@ -1095,6 +1095,7 @@ fn make_default_new() -> Object {
     use crate::object::BuiltinFn;
     Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
         name: "__new__",
+        binds_instance: true,
         call: Box::new(object_new),
         call_kw: None,
     }))))
@@ -1139,6 +1140,7 @@ fn install_gen_name_getsets(ty: &Rc<TypeObject>, kind: &'static str) {
             Object::Property(Rc::new(PyProperty::new(
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: attr,
+                    binds_instance: true,
                     call: Box::new(f),
                     call_kw: None,
                 })),
@@ -1193,6 +1195,7 @@ fn install_module_init(module_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(module_init),
             call_kw: None,
         })),
@@ -1364,6 +1367,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__hash__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__hash__",
+            binds_instance: true,
             call: Box::new(object_hash),
             call_kw: None,
         })),
@@ -1376,6 +1380,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(object_init),
             call_kw: None,
         })),
@@ -1384,6 +1389,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__setattr__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__setattr__",
+            binds_instance: true,
             call: Box::new(object_setattr),
             call_kw: None,
         })),
@@ -1392,6 +1398,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__delattr__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__delattr__",
+            binds_instance: true,
             call: Box::new(object_delattr),
             call_kw: None,
         })),
@@ -1406,6 +1413,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__init_subclass__")),
         Object::ClassMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
             name: "__init_subclass__",
+            binds_instance: true,
             call: Box::new(object_no_op),
             call_kw: None,
         })))),
@@ -1421,6 +1429,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__subclasshook__")),
         Object::ClassMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
             name: "__subclasshook__",
+            binds_instance: true,
             call: Box::new(object_subclasshook),
             call_kw: None,
         })))),
@@ -1445,6 +1454,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__reduce_ex__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: ".object_reduce_ex",
+            binds_instance: true,
             call: Box::new(object_reduce_ex_sentinel),
             call_kw: None,
         })),
@@ -1453,6 +1463,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__reduce__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: ".object_reduce",
+            binds_instance: true,
             call: Box::new(object_reduce_sentinel),
             call_kw: None,
         })),
@@ -1475,6 +1486,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__getattribute__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: ".object_getattribute",
+            binds_instance: true,
             call: Box::new(object_getattribute_sentinel),
             call_kw: None,
         })),
@@ -1505,6 +1517,7 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__new__")),
         Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
             name: "__new__",
+            binds_instance: true,
             call: Box::new(type_new_sentinel),
             call_kw: None,
         })))),
@@ -1513,6 +1526,7 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(type_init),
             call_kw: None,
         })),
@@ -1573,6 +1587,7 @@ fn install_import_error_init(import_error: &Rc<TypeObject>) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(|args| import_error_init_impl(args, &[])),
             call_kw: Some(Box::new(|args, kwargs| {
                 import_error_init_impl(args, kwargs)
@@ -1623,6 +1638,7 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(oserror_init),
             call_kw: None,
         })),
@@ -1808,6 +1824,7 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(init),
             call_kw: None,
         })),
@@ -1816,6 +1833,7 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
         DictKey(Object::from_static("__str__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__str__",
+            binds_instance: true,
             call: Box::new(str_fn),
             call_kw: None,
         })),
@@ -1945,6 +1963,7 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
         "__init__",
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(syntaxerror_init),
             call_kw: None,
         })),
@@ -1954,6 +1973,7 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
         "__str__",
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__str__",
+            binds_instance: true,
             call: Box::new(syntaxerror_str),
             call_kw: None,
         })),
@@ -2230,6 +2250,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(exc_init),
             call_kw: None,
         })),
@@ -2238,6 +2259,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         DictKey(Object::from_static("__setstate__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__setstate__",
+            binds_instance: true,
             call: Box::new(exc_setstate),
             call_kw: None,
         })),
@@ -2246,6 +2268,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         DictKey(Object::from_static("__reduce__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__reduce__",
+            binds_instance: true,
             call: Box::new(exc_reduce),
             call_kw: None,
         })),
@@ -2254,6 +2277,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         DictKey(Object::from_static("__str__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__str__",
+            binds_instance: true,
             call: Box::new(exc_str),
             call_kw: None,
         })),
@@ -2262,6 +2286,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         DictKey(Object::from_static("__repr__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__repr__",
+            binds_instance: true,
             call: Box::new(exc_repr),
             call_kw: None,
         })),
@@ -2270,6 +2295,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         DictKey(Object::from_static("add_note")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "add_note",
+            binds_instance: true,
             call: Box::new(exc_add_note),
             call_kw: None,
         })),
@@ -2278,6 +2304,7 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         DictKey(Object::from_static("with_traceback")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "with_traceback",
+            binds_instance: true,
             call: Box::new(exc_with_traceback),
             call_kw: None,
         })),
@@ -2531,6 +2558,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(eg_init),
             call_kw: None,
         })),
@@ -2539,6 +2567,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         DictKey(Object::from_static("__str__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__str__",
+            binds_instance: true,
             call: Box::new(eg_str),
             call_kw: None,
         })),
@@ -2547,6 +2576,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         DictKey(Object::from_static("derive")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "derive",
+            binds_instance: true,
             call: Box::new(eg_derive),
             call_kw: None,
         })),
@@ -2555,6 +2585,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         DictKey(Object::from_static("split")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "split",
+            binds_instance: true,
             call: Box::new(eg_split),
             call_kw: None,
         })),
@@ -2563,6 +2594,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         DictKey(Object::from_static("subgroup")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "subgroup",
+            binds_instance: true,
             call: Box::new(eg_subgroup),
             call_kw: None,
         })),
@@ -2575,6 +2607,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
         DictKey(Object::from_static("__new__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__new__",
+            binds_instance: true,
             call: Box::new(eg_new),
             call_kw: None,
         })),
@@ -3152,6 +3185,7 @@ fn install_mutable_container_init(bt: &BuiltinTypes) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(dict_init),
             call_kw: Some(Box::new(dict_init_kw)),
         })),
@@ -3160,6 +3194,7 @@ fn install_mutable_container_init(bt: &BuiltinTypes) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(list_init),
             call_kw: None,
         })),
@@ -3168,6 +3203,7 @@ fn install_mutable_container_init(bt: &BuiltinTypes) {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(set_init),
             call_kw: None,
         })),
@@ -3188,6 +3224,7 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
     ) {
         let builtin = Object::Builtin(Rc::new(BuiltinFn {
             name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         }));
@@ -3226,6 +3263,7 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
             DictKey(Object::from_static("__hash__")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "__hash__",
+                binds_instance: true,
                 call: Box::new(value_hash),
                 call_kw: None,
             })),
@@ -3257,6 +3295,7 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
             DictKey(Object::from_static(name)),
             Object::Builtin(Rc::new(BuiltinFn {
                 name,
+                binds_instance: true,
                 call: Box::new(f),
                 call_kw: None,
             })),

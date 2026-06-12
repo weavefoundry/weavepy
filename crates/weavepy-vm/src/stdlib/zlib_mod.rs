@@ -96,6 +96,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -205,6 +206,7 @@ fn zlib_compressobj(args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("compress")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "compress",
+                binds_instance: false,
                 call: Box::new(compress),
                 call_kw: None,
             })),
@@ -213,6 +215,7 @@ fn zlib_compressobj(args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("flush")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "flush",
+                binds_instance: false,
                 call: Box::new(flush),
                 call_kw: None,
             })),
@@ -247,6 +250,7 @@ fn zlib_decompressobj(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("decompress")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "decompress",
+                binds_instance: false,
                 call: Box::new(decompress),
                 call_kw: None,
             })),
@@ -255,6 +259,7 @@ fn zlib_decompressobj(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("flush")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "flush",
+                binds_instance: false,
                 call: Box::new(flush),
                 call_kw: None,
             })),

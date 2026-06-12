@@ -266,18 +266,34 @@ impl TypeObject {
             Some(Object::FrozenSet(s)) if !s.is_empty() => bits |= IS_ABSTRACT,
             _ => {}
         }
+        const SEQUENCE: i64 = 1 << 5;
+        const MAPPING: i64 = 1 << 6;
         for t in self.mro.borrow().iter() {
             if t.flags.is_builtin {
                 match t.name.as_str() {
                     "int" => bits |= LONG_SUBCLASS,
-                    "list" => bits |= LIST_SUBCLASS,
-                    "tuple" => bits |= TUPLE_SUBCLASS,
+                    "list" => bits |= LIST_SUBCLASS | SEQUENCE,
+                    "tuple" => bits |= TUPLE_SUBCLASS | SEQUENCE,
                     "bytes" => bits |= BYTES_SUBCLASS,
                     "str" => bits |= UNICODE_SUBCLASS,
-                    "dict" => bits |= DICT_SUBCLASS,
+                    "dict" => bits |= DICT_SUBCLASS | MAPPING,
+                    "range" | "memoryview" | "bytearray" => bits |= SEQUENCE,
+                    "mappingproxy" => bits |= MAPPING,
                     "type" => bits |= TYPE_SUBCLASS,
                     _ => {}
                 }
+            }
+            // ABCs that declared `__abc_tpflags__` (Sequence / Mapping):
+            // `_abc_init` stowed the collection bits here, and CPython
+            // propagates them to subclasses through tp_flags inheritance —
+            // the MRO walk reproduces that.
+            if let Some(v) = t
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("_abc_collection_flags")))
+                .and_then(Object::as_i64)
+            {
+                bits |= v & (SEQUENCE | MAPPING);
             }
         }
         if self.flags.is_exception {

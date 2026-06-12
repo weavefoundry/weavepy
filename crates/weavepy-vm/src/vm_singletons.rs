@@ -89,6 +89,7 @@ fn make_singleton(name: &'static str) -> Object {
         use crate::object::BuiltinFn;
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__repr__",
+            binds_instance: true,
             call: Box::new(move |_args| Ok(Object::from_static(text))),
             call_kw: None,
         }))
@@ -149,6 +150,7 @@ pub fn interactive_printer(name: &'static str, body: &'static str) -> Object {
     let body_for_call = body.to_owned();
     let f = BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(move |_args: &[Object]| {
             // We can't reach the interpreter's stdout from a static
             // builtin; route through Rust's stdout for the
@@ -408,6 +410,7 @@ pub fn quitter(name: &'static str) -> Object {
     use crate::object::BuiltinFn;
     let f = BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(|args: &[Object]| {
             let code = args.first().cloned().unwrap_or(Object::None);
             let bt = crate::builtin_types::builtin_types();

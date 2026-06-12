@@ -39,6 +39,7 @@ pub const BUILD_CLASS_NAME: &str = "__build_class__";
 pub fn build_class_builtin() -> BuiltinFn {
     BuiltinFn {
         name: BUILD_CLASS_NAME,
+        binds_instance: false,
         call: Box::new(|_args: &[Object]| {
             Err(runtime_error("internal: __build_class__ called outside VM"))
         }),
@@ -59,6 +60,7 @@ pub(crate) fn builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
         ($n:literal, $body:expr) => {
             Some(Rc::new(BuiltinFn {
                 name: $n,
+                binds_instance: false,
                 call: Box::new($body),
                 call_kw: None,
             }))
@@ -66,6 +68,7 @@ pub(crate) fn builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
         ($n:literal, $body:expr, $kw:expr) => {
             Some(Rc::new(BuiltinFn {
                 name: $n,
+                binds_instance: false,
                 call: Box::new($body),
                 call_kw: Some(Box::new($kw)),
             }))
@@ -123,6 +126,7 @@ pub fn default_builtins() -> DictData {
         ($name:literal, $body:expr) => {{
             let f = BuiltinFn {
                 name: $name,
+                binds_instance: false,
                 call: Box::new($body),
                 call_kw: None,
             };
@@ -156,6 +160,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "open",
+            binds_instance: false,
             call: Box::new(b_open),
             call_kw: Some(Box::new(b_open_kw)),
         };
@@ -225,6 +230,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:input",
+            binds_instance: false,
             call: Box::new(b_input_unsupported),
             call_kw: None,
         };
@@ -281,6 +287,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:__import__",
+            binds_instance: false,
             call: Box::new(b_import_placeholder),
             call_kw: None,
         };
@@ -292,6 +299,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:compile",
+            binds_instance: false,
             call: Box::new(b_vm_intrinsic),
             call_kw: None,
         };
@@ -303,6 +311,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:exec",
+            binds_instance: false,
             call: Box::new(b_vm_intrinsic),
             call_kw: None,
         };
@@ -314,6 +323,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:eval",
+            binds_instance: false,
             call: Box::new(b_vm_intrinsic),
             call_kw: None,
         };
@@ -946,6 +956,7 @@ fn method(
 ) -> BuiltinFn {
     BuiltinFn {
         name,
+        binds_instance: true,
         call: Box::new(body),
         call_kw: None,
     }
@@ -1135,10 +1146,6 @@ fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn> {
         }),
         "__format__" => method("__format__", |args| {
             let value = args.first().cloned().unwrap_or(Object::None);
-            // A subclass instance (e.g. an `IntEnum` member) formats its
-            // native payload — `int.__format__(member, '')` is `'3'`,
-            // never the instance repr.
-            let value = value.native_value().unwrap_or(value);
             let spec = match args.get(1) {
                 Some(Object::Str(s)) => s.to_string(),
                 Some(other) => {
@@ -1149,6 +1156,15 @@ fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn> {
                 }
                 None => String::new(),
             };
+            // CPython: an empty spec is `PyObject_Str(self)` — a *virtual*
+            // call, so an `IntEnum` member with an overridden `__str__`
+            // formats through that override, not its int payload.
+            if spec.is_empty() {
+                return virtual_format_str(&value);
+            }
+            // A non-empty spec formats the native payload — e.g.
+            // `int.__format__(member, 'd')` is `'3'`, never the repr.
+            let value = value.native_value().unwrap_or(value);
             crate::format_via_spec(&value, &spec).map(Object::from_str)
         }),
         // Exposing the numeric `__hash__` puts it in the type's MRO so a
@@ -1213,6 +1229,7 @@ fn method_kw(
     let positional = body.clone();
     BuiltinFn {
         name,
+        binds_instance: true,
         call: Box::new(move |args| positional(args, &[])),
         call_kw: Some(Box::new(move |args, kwargs| body(args, kwargs))),
     }
@@ -1346,13 +1363,15 @@ fn slot_str(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
-    let native = o.native_value();
-    let target = native.as_ref().unwrap_or(o);
     // CPython `object.__str__` is `PyObject_Repr(self)`: a user-defined
     // `__repr__` is dispatched through the VM so its exceptions (and
     // RecursionError from `__repr__ = __str__` cycles) *propagate*,
     // rather than being swallowed by the native fallback rendering.
-    if let Object::Instance(inst) = target {
+    // The check runs on the instance itself — *before* unwrapping any
+    // native payload — so `__str__ = object.__str__` on an `IntEnum`
+    // still routes through the member's `__repr__` rather than the
+    // wrapped int's rendering.
+    if let Object::Instance(inst) = o {
         let key = crate::object::DictKey(Object::from_static("__repr__"));
         let has_user_repr = inst
             .cls()
@@ -1365,7 +1384,7 @@ fn slot_str(args: &[Object]) -> Result<Object, RuntimeError> {
                 // SAFETY: published by an enclosing VM frame still live
                 // on this thread; the GIL keeps it exclusive.
                 let interp = unsafe { &mut *ptr };
-                if let Some(method) = crate::instance_method(target, "__repr__") {
+                if let Some(method) = crate::instance_method(o, "__repr__") {
                     let globals = interp.builtins_dict();
                     let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
                     return Ok(Object::from_str(r.to_str()));
@@ -1373,6 +1392,8 @@ fn slot_str(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
     }
+    let native = o.native_value();
+    let target = native.as_ref().unwrap_or(o);
     Ok(Object::from_str(target.to_str()))
 }
 
@@ -1393,8 +1414,32 @@ fn slot_format(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
     };
+    // Empty spec ≡ `str(self)` — dispatched virtually so user `__str__`
+    // overrides on built-in subclasses are honoured (CPython behaviour).
+    if spec.is_empty() {
+        return virtual_format_str(o);
+    }
     let native = o.native_value();
     crate::format_via_spec(native.as_ref().unwrap_or(o), &spec).map(Object::from_str)
+}
+
+/// `format(x, '')` semantics shared by the built-in `__format__` slot
+/// wrappers: CPython's `<type>.__format__(self, '')` short-circuits to
+/// `PyObject_Str(self)`, a *virtual* str() that dispatches a user
+/// `__str__`/`__repr__` override before falling back to the native
+/// payload's rendering.
+fn virtual_format_str(o: &Object) -> Result<Object, RuntimeError> {
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame still live on this
+        // thread; the GIL keeps the access exclusive.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        return interp
+            .stringify_public(o, &globals)
+            .map(Object::from_str);
+    }
+    let native = o.native_value();
+    Ok(Object::from_str(native.as_ref().unwrap_or(o).to_str()))
 }
 
 /// `type.__call__` / `function.__call__` / … — invoke `args[0]` with the
@@ -1430,6 +1475,29 @@ fn slot_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
 /// `int.__str__ is object.__str__` holds and `IntEnum` correctly falls back to
 /// `int.__repr__` for member stringification.
 pub fn builtin_type_dunder(base_name: &str, name: &str) -> Option<Object> {
+    // Memoised: repeated lookups must return the *same* object so
+    // identity-based deduplication holds — enum's bootstrap compares
+    // `getattr(cls, '__format__') in (member_type.__format__,
+    // object.__format__)` to decide whether to substitute
+    // `Enum.__format__`, which only works when `int.__format__` is one
+    // stable object rather than a fresh wrapper per access.
+    thread_local! {
+        static DUNDER_CACHE: std::cell::RefCell<
+            std::collections::HashMap<String, Option<Object>>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = format!("{base_name}.{name}");
+    if let Some(hit) = DUNDER_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let computed = builtin_type_dunder_uncached(base_name, name);
+    DUNDER_CACHE.with(|c| {
+        c.borrow_mut().insert(key, computed.clone());
+    });
+    computed
+}
+
+fn builtin_type_dunder_uncached(base_name: &str, name: &str) -> Option<Object> {
     if let Some(o) = unbound_method(base_name, name) {
         return Some(o);
     }
@@ -1575,6 +1643,26 @@ fn b_len(args: &[Object]) -> Result<Object, RuntimeError> {
 /// (e.g. `IntEnum` members), and otherwise invoke a Python-level `__index__`
 /// via reentry into the running interpreter. Shared by the integer-position
 /// builtins (`range`, slicing helpers, …) so they all honour `__index__`.
+/// `coerce_index_i64` widened to `i128` for consumers (like `range`)
+/// that must accept bounds beyond the machine-int span. Ints past i128
+/// get the CPython-style overflow complaint rather than silent clamping.
+pub(crate) fn coerce_index_i128(o: &Object) -> Result<i128, RuntimeError> {
+    use num_traits::ToPrimitive;
+    match o {
+        Object::Bool(b) => return Ok(i128::from(*b)),
+        Object::Int(i) => return Ok(i128::from(*i)),
+        Object::Long(b) => {
+            return b.to_i128().ok_or_else(|| {
+                crate::error::overflow_error(
+                    "Python int too large to convert to C ssize_t",
+                )
+            })
+        }
+        _ => {}
+    }
+    coerce_index_i64(o).map(i128::from)
+}
+
 pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
     if let Some(v) = o.as_i64() {
         return Ok(v);
@@ -1641,7 +1729,7 @@ pub(crate) fn coerce_f64_opt(o: &Object) -> Result<Option<f64>, RuntimeError> {
 }
 
 fn b_range(args: &[Object]) -> Result<Object, RuntimeError> {
-    let to_int = |o: &Object| -> Result<i64, RuntimeError> { coerce_index_i64(o) };
+    let to_int = |o: &Object| -> Result<i128, RuntimeError> { coerce_index_i128(o) };
     let (start, stop, step) = match args.len() {
         1 => (0, to_int(&args[0])?, 1),
         2 => (to_int(&args[0])?, to_int(&args[1])?, 1),
@@ -2235,9 +2323,9 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             // attribute access.
             match name {
                 "__name__" | "__qualname__" => Some(Object::from_str(&f.name)),
-                "__doc__" => Some(code_docstring(&f.code).unwrap_or(Object::None)),
+                "__doc__" => Some(code_docstring(&f.code()).unwrap_or(Object::None)),
                 "__dict__" => Some(Object::Dict(f.attrs.clone())),
-                "__code__" => Some(Object::Code(f.code.clone())),
+                "__code__" => Some(Object::Code(f.code())),
                 "__globals__" => Some(Object::Dict(f.globals.clone())),
                 "__defaults__" => {
                     if f.defaults.is_empty() {
@@ -2284,7 +2372,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 _ => None,
             },
             "__code__" => match &bm.function {
-                Object::Function(f) => Some(Object::Code(f.code.clone())),
+                Object::Function(f) => Some(Object::Code(f.code())),
                 _ => None,
             },
             "__doc__" => Some(Object::None),
@@ -2386,6 +2474,7 @@ fn code_method_kw(
         receiver: Object::Code(c.clone()),
         function: Object::Builtin(Rc::new(BuiltinFn {
             name,
+            binds_instance: false,
             call: Box::new(move |args| body(args, &[])),
             call_kw: Some(Box::new(body)),
         })),
@@ -2746,7 +2835,20 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
             Ok(())
         }
         Object::Function(f) => {
-            if crate::object::is_function_slot(name) {
+            if name == "__code__" {
+                let Object::Code(c) = value else {
+                    return Err(type_error("__code__ must be set to a code object"));
+                };
+                if f.closure.len() != c.freevars.len() {
+                    return Err(crate::error::value_error(format!(
+                        "{}() requires a code object with {} free vars, not {}",
+                        f.name,
+                        f.closure.len(),
+                        c.freevars.len()
+                    )));
+                }
+                *f.code.borrow_mut() = c;
+            } else if crate::object::is_function_slot(name) {
                 f.set_slot(name, value);
             } else {
                 f.attrs
@@ -5837,11 +5939,11 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
             "_weavepy_mark_iterable_coroutine() expects a function",
         ));
     };
-    let mut code = (*f.code).clone();
+    let mut code = (*f.code()).clone();
     code.is_iterable_coroutine = true;
     let marked = crate::object::PyFunction {
         name: f.name.clone(),
-        code: Rc::new(code),
+        code: RefCell::new(Rc::new(code)),
         globals: f.globals.clone(),
         defaults: f.defaults.clone(),
         kw_defaults: f.kw_defaults.clone(),

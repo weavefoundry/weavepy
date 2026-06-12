@@ -278,7 +278,7 @@ pub fn attempt_specialize_unpack_sequence(seq: &Object, n: usize) -> InlineCache
 pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
     match callable {
         Object::Function(f) => {
-            let code = &f.code;
+            let code = f.code();
             if code.is_generator || code.is_coroutine || code.is_async_generator {
                 return InlineCache::Cooldown(COOLDOWN);
             }

@@ -156,6 +156,7 @@ fn make_getter(
     };
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -186,6 +187,7 @@ fn make_setter(
     };
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -233,6 +235,7 @@ pub unsafe fn collect_members(mut defs: *mut PyMemberDef) -> Vec<(String, Object
             name,
             Object::Builtin(Rc::new(BuiltinFn {
                 name: static_name,
+                binds_instance: false,
                 call: Box::new(f),
                 call_kw: None,
             })),

@@ -102,6 +102,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -113,6 +114,18 @@ fn b_dyn(
 ) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
+        call: Box::new(body),
+        call_kw: None,
+    }))
+}
+
+/// Type-dict method variant of [`b`]: looked up through the class MRO,
+/// so it must bind the receiver like CPython's method descriptors.
+fn m(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: true,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -228,15 +241,15 @@ fn ref_type() -> Rc<TypeObject> {
         let mut type_dict = DictData::new();
         type_dict.insert(
             DictKey(Object::from_static("__call__")),
-            b("__call__", ref_type_call),
+            m("__call__", ref_type_call),
         );
         type_dict.insert(
             DictKey(Object::from_static("__eq__")),
-            b("__eq__", ref_type_eq),
+            m("__eq__", ref_type_eq),
         );
         type_dict.insert(
             DictKey(Object::from_static("__hash__")),
-            b("__hash__", ref_type_hash),
+            m("__hash__", ref_type_hash),
         );
         let t = TypeObject::new_with_flags(
             "weakref",
@@ -371,7 +384,7 @@ fn install_proxy_forwarding(td: &mut DictData) {
         ("__len__", fwd_len),
         ("__str__", fwd_str),
     ] {
-        td.insert(DictKey(Object::from_static(name)), b(name, f));
+        td.insert(DictKey(Object::from_static(name)), m(name, f));
     }
 }
 

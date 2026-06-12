@@ -57,6 +57,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static(name)),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name,
+                    binds_instance: false,
                     call: Box::new(body),
                     call_kw: None,
                 })),

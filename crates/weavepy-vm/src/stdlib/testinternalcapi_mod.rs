@@ -54,6 +54,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("has_inline_values")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "has_inline_values",
+                binds_instance: false,
                 call: Box::new(has_inline_values),
                 call_kw: None,
             })),

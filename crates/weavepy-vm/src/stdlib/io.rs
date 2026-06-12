@@ -100,6 +100,7 @@ fn make_io_protocol(name: &'static str) -> Rc<crate::types::TypeObject> {
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -157,7 +158,15 @@ fn make_text_io_wrapper() -> Rc<crate::types::TypeObject> {
     let bt = builtin_types();
     let mut dict = DictData::new();
     let mut method = |name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
-        dict.insert(DictKey(Object::from_static(name)), builtin(name, body));
+        dict.insert(
+            DictKey(Object::from_static(name)),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name,
+                binds_instance: true,
+                call: Box::new(body),
+                call_kw: None,
+            })),
+        );
     };
     method("write", tw_write);
     method("read", tw_read);
@@ -183,6 +192,7 @@ fn make_text_io_wrapper() -> Rc<crate::types::TypeObject> {
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__init__",
+            binds_instance: true,
             call: Box::new(|args| tw_init(args, &[])),
             call_kw: Some(Box::new(tw_init)),
         })),

@@ -345,6 +345,7 @@ impl Default for Interpreter {
             DictKey(Object::from_static("print")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "print",
+                binds_instance: false,
                 call: Box::new(|_args| Err(runtime_error("internal: print called outside VM"))),
                 call_kw: None,
             })),
@@ -601,6 +602,7 @@ impl Interpreter {
     fn install_print_into(&self, dict: &mut DictData) {
         let f = BuiltinFn {
             name: "print",
+            binds_instance: false,
             call: Box::new(move |_args: &[Object]| {
                 Err(runtime_error("internal: print called outside VM"))
             }),
@@ -3149,7 +3151,7 @@ impl Interpreter {
                         let mut out = Vec::new();
                         let mut cur = r.start;
                         while (r.step > 0 && cur < r.stop) || (r.step < 0 && cur > r.stop) {
-                            out.push(Object::Int(cur));
+                            out.push(crate::object::int_from_i128(cur));
                             cur += r.step;
                         }
                         out
@@ -3253,7 +3255,7 @@ impl Interpreter {
                         let mut out = Vec::new();
                         let mut cur = r.start;
                         while (r.step > 0 && cur < r.stop) || (r.step < 0 && cur > r.stop) {
-                            out.push(Object::Int(cur));
+                            out.push(crate::object::int_from_i128(cur));
                             cur += r.step;
                         }
                         out
@@ -3429,7 +3431,7 @@ impl Interpreter {
                 }
                 let f = PyFunction {
                     name,
-                    code,
+                    code: RefCell::new(code),
                     globals: frame.globals.clone(),
                     defaults,
                     kw_defaults,
@@ -4701,6 +4703,7 @@ impl Interpreter {
                     let type_name = obj.type_name().to_owned();
                     return Ok(Object::Builtin(Rc::new(BuiltinFn {
                         name: "__reduce_ex__",
+                        binds_instance: false,
                         call: Box::new(move |_args| {
                             Err(type_error(format!(
                                 "cannot pickle '{type_name}' object"
@@ -4922,13 +4925,13 @@ impl Interpreter {
                     // at compile time from lexical nesting), unless user code
                     // has overridden it via `f.__qualname__ = …` (handled by
                     // the slot lookup above).
-                    "__qualname__" => return Ok(Object::from_str(&f.code.qualname)),
+                    "__qualname__" => return Ok(Object::from_str(&f.code().qualname)),
                     "__doc__" => {
                         // CPython convention: the first statement of
                         // the function body, if it is a string
                         // literal, is stored as ``co_consts[0]`` and
                         // surfaces as ``__doc__``.
-                        return Ok(crate::builtins::code_docstring(&f.code).unwrap_or(Object::None));
+                        return Ok(crate::builtins::code_docstring(&f.code()).unwrap_or(Object::None));
                     }
                     "__module__" => {
                         // Fall back to globals['__name__'] if the function's
@@ -4945,7 +4948,7 @@ impl Interpreter {
                         return Ok(Object::None);
                     }
                     "__dict__" => return Ok(Object::Dict(f.attrs.clone())),
-                    "__code__" => return Ok(Object::Code(f.code.clone())),
+                    "__code__" => return Ok(Object::Code(f.code())),
                     "__globals__" => return Ok(Object::Dict(f.globals.clone())),
                     // CPython `function.__builtins__`: the builtins mapping
                     // the function executes against — `__globals__['__builtins__']`
@@ -5051,6 +5054,7 @@ impl Interpreter {
                     let fr = fr.clone();
                     Ok(Object::Builtin(Rc::new(BuiltinFn {
                         name: "frame.clear",
+                        binds_instance: false,
                         call: Box::new(move |_args| {
                             let ptr = crate::vm_singletons::current_interpreter_ptr()
                                 .ok_or_else(|| {
@@ -5092,6 +5096,11 @@ impl Interpreter {
                     .map(Object::from_static)
                     .unwrap_or(Object::None)),
                 "__self__" => Ok(Object::None),
+                // Argument-Clinic style introspection string; `None`
+                // when the builtin doesn't publish one (CPython).
+                "__text_signature__" => Ok(builtin_text_signature(b.name)
+                    .map(Object::from_static)
+                    .unwrap_or(Object::None)),
                 _ => Err(attribute_error(format!(
                     "'builtin_function_or_method' object has no attribute '{}'",
                     name
@@ -5117,7 +5126,7 @@ impl Interpreter {
                     _ => Ok(Object::None),
                 },
                 "__code__" => match &bm.function {
-                    Object::Function(f) => Ok(Object::Code(f.code.clone())),
+                    Object::Function(f) => Ok(Object::Code(f.code())),
                     _ => Err(attribute_error(format!(
                         "'method' object has no attribute '{}'",
                         name
@@ -5193,27 +5202,39 @@ impl Interpreter {
                 }
                 // Plain iterators expose the iterator protocol as real
                 // attributes (`hasattr(it, '__next__')` gates e.g.
-                // `dataclasses._get_slots`' iterator rejection).
+                // `dataclasses._get_slots`' iterator rejection). Wrapped in
+                // a BoundMethod so `it.__next__.__self__` recovers the
+                // iterator (CPython method-wrapper semantics; `heapq.merge`
+                // does `yield from next.__self__`). The closures ignore the
+                // prepended receiver argument.
                 if let Object::Iter(it) = obj {
                     match name {
                         "__next__" => {
                             let it = it.clone();
-                            return Ok(Object::Builtin(Rc::new(BuiltinFn {
-                                name: "__next__",
-                                call: Box::new(move |_args| {
-                                    it.borrow_mut()
-                                        .next_value()
-                                        .ok_or_else(crate::error::stop_iteration)
-                                }),
-                                call_kw: None,
+                            return Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                                receiver: obj.clone(),
+                                function: Object::Builtin(Rc::new(BuiltinFn {
+                                    name: "__next__",
+                                    binds_instance: true,
+                                    call: Box::new(move |_args| {
+                                        it.borrow_mut()
+                                            .next_value()
+                                            .ok_or_else(crate::error::stop_iteration)
+                                    }),
+                                    call_kw: None,
+                                })),
                             })));
                         }
                         "__iter__" => {
                             let me = obj.clone();
-                            return Ok(Object::Builtin(Rc::new(BuiltinFn {
-                                name: "__iter__",
-                                call: Box::new(move |_args| Ok(me.clone())),
-                                call_kw: None,
+                            return Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                                receiver: obj.clone(),
+                                function: Object::Builtin(Rc::new(BuiltinFn {
+                                    name: "__iter__",
+                                    binds_instance: true,
+                                    call: Box::new(move |_args| Ok(me.clone())),
+                                    call_kw: None,
+                                })),
                             })));
                         }
                         _ => {}
@@ -5609,6 +5630,7 @@ impl Interpreter {
                 // a plain `BuiltinFn` closure).
                 let builtin = Object::Builtin(Rc::new(BuiltinFn {
                     name: ".type_subclasses",
+                    binds_instance: false,
                     call: Box::new(|_args| {
                         Err(RuntimeError::Internal(
                             "type.__subclasses__ must be dispatched via Interpreter::call"
@@ -5646,6 +5668,7 @@ impl Interpreter {
         if let Some(internal) = unbound_gen_method_sentinel(ty, name) {
             return Ok(Object::Builtin(Rc::new(BuiltinFn {
                 name: internal,
+                binds_instance: false,
                 call: Box::new(|_args| {
                     Err(RuntimeError::Internal(
                         "unbound generator method must be dispatched via Interpreter::call"
@@ -5687,6 +5710,7 @@ impl Interpreter {
         if name == "__dir__" {
             return Ok(Object::Builtin(Rc::new(BuiltinFn {
                 name: "__dir__",
+                binds_instance: true,
                 call: Box::new(crate::builtins::b_dir),
                 call_kw: None,
             })));
@@ -5698,6 +5722,7 @@ impl Interpreter {
             let t = ty.clone();
             return Ok(Object::Builtin(Rc::new(BuiltinFn {
                 name: "mro",
+                binds_instance: false,
                 call: Box::new(move |_args| {
                     Ok(Object::new_list(
                         t.mro.borrow().iter().cloned().map(Object::Type).collect(),
@@ -5774,8 +5799,21 @@ impl Interpreter {
                 }
                 _ => Err(type_error("slot descriptor requires an instance")),
             },
-            Object::Function(_) | Object::Builtin(_) => {
+            Object::Function(_) => {
                 if matches!(instance, Object::None) {
+                    Ok(attr.clone())
+                } else {
+                    Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: instance.clone(),
+                        function: attr.clone(),
+                    })))
+                }
+            }
+            Object::Builtin(b) => {
+                // CPython type split: method descriptors / slot wrappers
+                // bind; module-level builtin functions are not
+                // descriptors (`class C: f = len` leaves `c.f` as `len`).
+                if matches!(instance, Object::None) || !b.binds_instance {
                     Ok(attr.clone())
                 } else {
                     Ok(Object::BoundMethod(Rc::new(BoundMethod {
@@ -5828,6 +5866,7 @@ impl Interpreter {
 
     fn maybe_bind(&self, receiver: &Object, attr: Object) -> Object {
         match &attr {
+            Object::Builtin(b) if !b.binds_instance => attr,
             Object::Function(_) | Object::Builtin(_) => Object::BoundMethod(Rc::new(BoundMethod {
                 receiver: receiver.clone(),
                 function: attr,
@@ -6215,9 +6254,15 @@ impl Interpreter {
             }
             // No user `__format__`: a built-in subclass (and `IntEnum`/`StrEnum`
             // members, whose payload is an `int`/`str`) inherits the base type's
-            // `__format__`, so honour the spec against the native value.
+            // `__format__`, so honour the spec against the native value. An
+            // empty spec is `str(self)` — virtual, so a `__str__` override
+            // still wins (CPython's `<type>.__format__(self, '')`).
             if let Some(native) = &inst.native {
-                return format_via_spec(native, spec);
+                if spec.is_empty() {
+                    return self.stringify(value, globals);
+                }
+                let native = native.clone();
+                return format_via_spec(&native, spec);
             }
             // Otherwise `object.__format__` returns str(self) for an empty spec
             // and rejects any non-empty spec with a TypeError (it does *not*
@@ -7896,9 +7941,16 @@ impl Interpreter {
         kwargs: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        let receiver = args.first().cloned();
-        let Some(receiver @ Object::Dict(_)) = receiver else {
-            return Err(type_error("update() requires a 'dict' receiver"));
+        // A dict-subclass instance stores its mapping in the native
+        // payload; CPython's `dict.update` writes into that concrete
+        // storage directly (no `__setitem__` dispatch), so unwrap it.
+        let receiver = match args.first() {
+            Some(d @ Object::Dict(_)) => d.clone(),
+            Some(Object::Instance(i)) => match i.native.as_ref() {
+                Some(d @ Object::Dict(_)) => d.clone(),
+                _ => return Err(type_error("update() requires a 'dict' receiver")),
+            },
+            _ => return Err(type_error("update() requires a 'dict' receiver")),
         };
         if args.len() > 2 {
             return Err(type_error(format!(
@@ -10087,6 +10139,32 @@ impl Interpreter {
         let not_impl = crate::vm_singletons::not_implemented();
         let mut a_declined = false;
         let mut b_declined = false;
+        // CPython's subclass-priority rule (`binary_op1`): when the right
+        // operand's type is a proper subclass of the left's *and* it
+        // overrides the reflected method, the reflected method runs first
+        // (`ChainMap() | SubclassWithRor()` must hit `__ror__`).
+        let mut reflected_tried = false;
+        if let (Object::Instance(ai), Object::Instance(bi)) = (a, b) {
+            let (at, bt) = (ai.cls(), bi.cls());
+            if !Rc::ptr_eq(&at, &bt) && bt.is_subclass_of(&at) {
+                let overridden = match (at.lookup(rdunder), bt.lookup(rdunder)) {
+                    (Some(x), Some(y)) => !x.is_same(&y),
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if overridden {
+                    if let Some(method) = instance_method(b, rdunder) {
+                        reflected_tried = true;
+                        let r =
+                            self.call(&method, std::slice::from_ref(a), &[], globals)?;
+                        if !r.is_same(&not_impl) {
+                            return Ok(r);
+                        }
+                        b_declined = true;
+                    }
+                }
+            }
+        }
         if let Some(method) = instance_method(a, dunder) {
             let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
             if !r.is_same(&not_impl) {
@@ -10094,12 +10172,14 @@ impl Interpreter {
             }
             a_declined = true;
         }
-        if let Some(method) = instance_method(b, rdunder) {
-            let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
-            if !r.is_same(&not_impl) {
-                return Ok(r);
+        if !reflected_tried {
+            if let Some(method) = instance_method(b, rdunder) {
+                let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
+                if !r.is_same(&not_impl) {
+                    return Ok(r);
+                }
+                b_declined = true;
             }
-            b_declined = true;
         }
         // Both operands defined the operator and *declined* via
         // `NotImplemented`. CPython raises `TypeError` here; we must NOT fall
@@ -11366,6 +11446,24 @@ impl Interpreter {
                 // CPython's function getsets validate the assigned shape
                 // before accepting it.
                 match name {
+                    // `func_set_code`: rebind the executed code object.
+                    // The closure shape must keep matching the new code's
+                    // free variables.
+                    "__code__" => {
+                        let Object::Code(c) = value else {
+                            return Err(type_error("__code__ must be set to a code object"));
+                        };
+                        if f.closure.len() != c.freevars.len() {
+                            return Err(crate::error::value_error(format!(
+                                "{}() requires a code object with {} free vars, not {}",
+                                f.name,
+                                f.closure.len(),
+                                c.freevars.len()
+                            )));
+                        }
+                        *f.code.borrow_mut() = c;
+                        return Ok(());
+                    }
                     "__defaults__"
                         if !matches!(value, Object::Tuple(_) | Object::None) =>
                     {
@@ -12112,7 +12210,9 @@ impl Interpreter {
                 if idx < 0 || idx >= len {
                     return Err(index_error("range object index out of range"));
                 }
-                Ok(Object::Int(r.start + idx * r.step))
+                Ok(crate::object::int_from_i128(
+                    r.start + i128::from(idx) * r.step,
+                ))
             }
             (Object::Range(r), Object::Slice(slc)) => {
                 let len = container.len()? as i64;
@@ -12834,7 +12934,7 @@ impl Interpreter {
                 // interpreter can iterate. Single-iterable builtins take it
                 // in `args[0]`; `zip` takes one per argument.
                 let needs_vm_iter = object_needs_vm_iter;
-                if matches!(b.name, "enumerate" | "sum" | "all" | "any")
+                if matches!(b.name, "enumerate" | "sum" | "all" | "any" | "prod")
                     && args.first().is_some_and(needs_vm_iter)
                 {
                     // These consume their iterable in full (or short-circuit
@@ -12870,8 +12970,16 @@ impl Interpreter {
                 // pairs, and keyword arguments — the latter three need the
                 // interpreter (user `keys`/`__getitem__`/`__iter__`), so
                 // route dict receivers here instead of the native builtin.
+                // A dict-*subclass* receiver (`super().update(...)` inside
+                // `Counter.update`) carries its storage in the instance's
+                // native payload; route it the same way.
                 if b.name == "update"
-                    && matches!(args.first(), Some(Object::Dict(_)))
+                    && (matches!(args.first(), Some(Object::Dict(_)))
+                        || matches!(
+                            args.first(),
+                            Some(Object::Instance(i))
+                                if matches!(i.native.as_ref(), Some(Object::Dict(_)))
+                        ))
                 {
                     return self.do_dict_update_call(args, kwargs, outer_globals);
                 }
@@ -13227,6 +13335,19 @@ impl Interpreter {
                     )))
                 }
             }
+            // PEP 585 generic alias: `list[int](...)` / `Group[int, str](...)`
+            // instantiates the origin class (CPython `ga_call`).
+            Object::SimpleNamespace(d)
+                if d.borrow()
+                    .contains_key(&DictKey(Object::from_static("__origin__"))) =>
+            {
+                let origin = d
+                    .borrow()
+                    .get(&DictKey(Object::from_static("__origin__")))
+                    .cloned()
+                    .expect("checked above");
+                self.call(&origin, args, kwargs, outer_globals)
+            }
             _ => Err(type_error(format!(
                 "'{}' object is not callable",
                 callable.type_name()
@@ -13388,7 +13509,7 @@ impl Interpreter {
         // builtins even with a bare `{}` globals dict.
         Ok(Object::Function(Rc::new(crate::object::PyFunction {
             name,
-            code,
+            code: RefCell::new(code),
             globals,
             defaults,
             kw_defaults: vec![],
@@ -13732,7 +13853,7 @@ impl Interpreter {
         // Build a frame for the class body. Locals are unused; names
         // store and load through `class_ns`. The body's `__class__`
         // cell is captured so methods can reference it.
-        let code = body_fn.code.clone();
+        let code = body_fn.code();
         let mut frame = self.make_frame(
             code,
             Vec::new(),
@@ -13755,7 +13876,7 @@ impl Interpreter {
         // so zero-arg `super()` works inside hooks fired during class
         // creation (e.g. enum member `__new__` via `_proto_member`).
         let class_cell: Option<Rc<RefCell<Object>>> = body_fn
-            .code
+            .code()
             .cellvars
             .iter()
             .position(|c| c == "__class__")
@@ -13879,7 +14000,7 @@ impl Interpreter {
                 // `__init_subclass__` already ran inside the real
                 // `type.__new__` via `dynamic_type_call_with_meta`.)
                 other => {
-                    for (i, cell_name) in body_fn.code.cellvars.iter().enumerate() {
+                    for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
                         if cell_name == "__class__" {
                             if let Some(cell) = frame.cells.get(i) {
                                 *cell.borrow_mut() = other.clone();
@@ -13924,7 +14045,7 @@ impl Interpreter {
 
         // If the body produced a `__class__` cell (because a method
         // references super or __class__), point it at the new type.
-        for (i, cell_name) in body_fn.code.cellvars.iter().enumerate() {
+        for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
             if cell_name == "__class__" {
                 if let Some(cell) = frame.cells.get(i) {
                     *cell.borrow_mut() = Object::Type(ty.clone());
@@ -13968,7 +14089,7 @@ impl Interpreter {
                 ns.insert(DictKey(Object::from_static("__module__")), m);
             }
         }
-        let code = body_fn.code.clone();
+        let code = body_fn.code();
         let mut frame = self.make_frame(
             code,
             Vec::new(),
@@ -13987,7 +14108,7 @@ impl Interpreter {
         let result = self.call(&meta, &call_args, subclass_kwargs, &body_fn.globals)?;
         // PEP 3135: point any `__class__` cell at whatever the meta
         // returned, so zero-arg `super()` in methods doesn't dangle.
-        for (i, cell_name) in body_fn.code.cellvars.iter().enumerate() {
+        for (i, cell_name) in body_fn.code().cellvars.iter().enumerate() {
             if cell_name == "__class__" {
                 if let Some(cell) = frame.cells.get(i) {
                     *cell.borrow_mut() = result.clone();
@@ -15260,7 +15381,7 @@ impl Interpreter {
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
-        let code = f.code.clone();
+        let code = f.code();
         let total_args = code.arg_count as usize;
         let has_varargs = code.has_varargs;
         let has_varkeywords = code.has_varkeywords;
@@ -15635,7 +15756,7 @@ impl Interpreter {
                         // arity, no cells/closure — so a recycled address
                         // can never run an incompatible function through
                         // the no-free path (which skips defaults & cells).
-                        let code = &f.code;
+                        let code = f.code();
                         if specialize::rc_id(f) == func_id
                             && args.len() == argc
                             && code.arg_count as usize == argc
@@ -15662,7 +15783,7 @@ impl Interpreter {
                         // Same ABA guard as above: confirm exact arity
                         // before taking the binding-free path (cells are
                         // rebuilt from `f.code`, so they stay correct).
-                        let code = &f.code;
+                        let code = f.code();
                         if specialize::rc_id(f) == func_id
                             && args.len() == argc
                             && code.arg_count as usize == argc
@@ -15739,7 +15860,7 @@ impl Interpreter {
         f: &Rc<PyFunction>,
         args: Vec<Object>,
     ) -> Result<Object, RuntimeError> {
-        let code = f.code.clone();
+        let code = f.code();
         let mut locals = vec![Object::Unbound; code.varnames.len()];
         for (slot, v) in args.into_iter().enumerate() {
             locals[slot] = v;
@@ -15771,7 +15892,7 @@ impl Interpreter {
         args: Vec<Object>,
     ) -> Result<Object, RuntimeError> {
         let mut frame = self.make_frame(
-            f.code.clone(),
+            f.code(),
             args,
             f.closure.clone(),
             f.globals.clone(),
@@ -17157,9 +17278,9 @@ fn adjust_slice(len: i64, s: &PySlice) -> Result<(i64, i64, i64, i64), RuntimeEr
 /// `range(...)[slice]` → a new range, mirroring CPython `compute_slice`.
 fn range_slice(r: &crate::object::Range, len: i64, s: &PySlice) -> Result<Object, RuntimeError> {
     let (start, _stop, step, slicelen) = adjust_slice(len, s)?;
-    let new_start = r.start + start * r.step;
-    let new_step = r.step * step;
-    let new_stop = new_start + slicelen * new_step;
+    let new_start = r.start + i128::from(start) * r.step;
+    let new_step = r.step * i128::from(step);
+    let new_stop = new_start + i128::from(slicelen) * new_step;
     Ok(Object::Range(Rc::new(crate::object::Range {
         start: new_start,
         stop: new_stop,
@@ -17551,6 +17672,7 @@ fn make_gen_method(name: &str, receiver: &Object) -> Object {
     };
     let builtin = Object::Builtin(Rc::new(BuiltinFn {
         name: internal_name,
+        binds_instance: false,
         call: Box::new(unreachable_call),
         call_kw: None,
     }));
@@ -17638,6 +17760,7 @@ fn make_coroutine_wrapper(coro: &Object) -> Object {
                 DictKey(Object::from_static(name)),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name,
+                    binds_instance: true,
                     call: Box::new(f),
                     call_kw: None,
                 })),
@@ -18903,6 +19026,15 @@ fn builtin_display_name(name: &'static str) -> &'static str {
 
 /// Docstrings for builtin methods, matching CPython's C-level method
 /// tables where tests inspect them (`gen.__next__.__doc__` etc.).
+/// `__text_signature__` strings for native builtins (CPython generates
+/// these with Argument Clinic; `inspect.signature` parses them).
+fn builtin_text_signature(name: &str) -> Option<&'static str> {
+    match name {
+        "cmp_to_key" => Some("($module, /, mycmp)"),
+        _ => None,
+    }
+}
+
 fn builtin_doc(name: &str) -> Option<&'static str> {
     // Bound methods use ".gen_send"; unbound descriptors ".u.gen_send".
     match name.strip_prefix(".u").unwrap_or(name) {

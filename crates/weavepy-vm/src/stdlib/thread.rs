@@ -82,6 +82,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -111,16 +112,19 @@ fn allocate_lock(_args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let acquire_obj = Object::Builtin(Rc::new(BuiltinFn {
         name: "acquire",
+        binds_instance: false,
         call: Box::new(acquire),
         call_kw: None,
     }));
     let release_obj = Object::Builtin(Rc::new(BuiltinFn {
         name: "release",
+        binds_instance: false,
         call: Box::new(release),
         call_kw: None,
     }));
     let locked_obj = Object::Builtin(Rc::new(BuiltinFn {
         name: "locked",
+        binds_instance: false,
         call: Box::new(locked),
         call_kw: None,
     }));
@@ -135,6 +139,7 @@ fn allocate_lock(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("__exit__")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "__exit__",
+                binds_instance: false,
                 call: Box::new({
                     let s = state.clone();
                     move |_a: &[Object]| -> Result<Object, RuntimeError> {

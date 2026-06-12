@@ -343,6 +343,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -377,6 +378,7 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
                 $name,
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: $name,
+                    binds_instance: true,
                     call: Box::new($body),
                     call_kw: None,
                 })),
@@ -1019,6 +1021,7 @@ fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("read")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "read",
+                binds_instance: false,
                 call: Box::new(read),
                 call_kw: None,
             })),
@@ -1027,6 +1030,7 @@ fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("write")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "write",
+                binds_instance: false,
                 call: Box::new(write),
                 call_kw: None,
             })),
@@ -1035,6 +1039,7 @@ fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("close")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "close",
+                binds_instance: false,
                 call: Box::new(close),
                 call_kw: None,
             })),

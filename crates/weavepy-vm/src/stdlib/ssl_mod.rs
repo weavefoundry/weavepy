@@ -117,6 +117,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -156,6 +157,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("wrap_socket")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "wrap_socket",
+                binds_instance: false,
                 call: Box::new(wrap_socket_stub),
                 call_kw: None,
             })),
@@ -164,6 +166,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("load_default_certs")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "load_default_certs",
+                binds_instance: false,
                 call: Box::new(noop),
                 call_kw: None,
             })),
@@ -172,6 +175,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("load_cert_chain")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "load_cert_chain",
+                binds_instance: false,
                 call: Box::new(noop),
                 call_kw: None,
             })),
@@ -180,6 +184,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("load_verify_locations")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "load_verify_locations",
+                binds_instance: false,
                 call: Box::new(noop),
                 call_kw: None,
             })),
@@ -188,6 +193,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("set_alpn_protocols")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "set_alpn_protocols",
+                binds_instance: false,
                 call: Box::new(noop),
                 call_kw: None,
             })),
@@ -196,6 +202,7 @@ fn create_default_context(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("set_ciphers")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "set_ciphers",
+                binds_instance: false,
                 call: Box::new(noop),
                 call_kw: None,
             })),

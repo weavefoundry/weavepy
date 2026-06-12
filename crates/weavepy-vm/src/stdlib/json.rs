@@ -90,6 +90,7 @@ fn b_kw(
 ) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(move |args| body(args, &[])),
         call_kw: Some(Box::new(body)),
     }))

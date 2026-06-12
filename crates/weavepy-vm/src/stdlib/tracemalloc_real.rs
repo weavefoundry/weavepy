@@ -151,6 +151,7 @@ pub fn build(_cache: &crate::import::ModuleCache) -> Rc<PyModule> {
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -263,6 +264,7 @@ fn t_take_snapshot(_args: &[Object]) -> Result<Object, RuntimeError> {
     let stats_for_closure = stats_list.clone();
     let stats_fn = Object::Builtin(Rc::new(BuiltinFn {
         name: "statistics",
+        binds_instance: false,
         call: Box::new(move |_args| Ok(stats_for_closure.clone())),
         call_kw: None,
     }));
@@ -273,6 +275,7 @@ fn t_take_snapshot(_args: &[Object]) -> Result<Object, RuntimeError> {
             "filter_traces",
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "filter_traces",
+                binds_instance: false,
                 call: Box::new(|_args| Ok(Object::None)),
                 call_kw: None,
             })),

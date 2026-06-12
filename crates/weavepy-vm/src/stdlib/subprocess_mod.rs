@@ -65,6 +65,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -290,6 +291,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                 DictKey(Object::from_static("poll")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "poll",
+                    binds_instance: false,
                     call: Box::new(move |_a: &[Object]| {
                         if let Some(code) = *rc.borrow() {
                             return Ok(Object::Int(code));
@@ -317,6 +319,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                 DictKey(Object::from_static("wait")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "wait",
+                    binds_instance: false,
                     call: Box::new(move |a: &[Object]| {
                         if let Some(code) = *rc.borrow() {
                             return Ok(Object::Int(code));
@@ -347,6 +350,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                 DictKey(Object::from_static("kill")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "kill",
+                    binds_instance: false,
                     call: Box::new(move |_a: &[Object]| {
                         let mut slot = c.borrow_mut();
                         if let Some(ch) = slot.as_mut() {
@@ -366,6 +370,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                 DictKey(Object::from_static("terminate")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "terminate",
+                    binds_instance: false,
                     call: Box::new(move |_a: &[Object]| {
                         let mut slot = c.borrow_mut();
                         if let Some(ch) = slot.as_mut() {
@@ -394,6 +399,7 @@ fn spawn_call(args: &[Object]) -> Result<Object, RuntimeError> {
                 DictKey(Object::from_static("send_signal")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "send_signal",
+                    binds_instance: false,
                     call: Box::new(move |a: &[Object]| {
                         let sig = match a.first() {
                             Some(Object::Int(n)) => *n,

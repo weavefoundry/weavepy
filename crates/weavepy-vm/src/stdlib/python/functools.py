@@ -204,7 +204,7 @@ def total_ordering(cls):
 ### cmp_to_key() function converter
 ################################################################################
 
-def cmp_to_key(mycmp):
+def _cmp_to_key_py(mycmp):
     """Convert a cmp= function into a key= function"""
     class K(object):
         __slots__ = ['obj']
@@ -223,7 +223,11 @@ def cmp_to_key(mycmp):
         __hash__ = None
     return K
 
+cmp_to_key = _cmp_to_key_py
+
 try:
+    # The native version is a non-binding builtin (CPython's is a C
+    # function); it calls back into `_cmp_to_key_py` for the K class.
     from _functools import cmp_to_key
 except ImportError:
     pass
@@ -281,7 +285,9 @@ class partial:
     and keywords.
     """
 
-    __slots__ = "func", "args", "keywords", "__dict__", "__weakref__"
+    # CPython's partial is a C type whose `func`/`args`/`keywords`
+    # members are read-only; store privately and expose properties.
+    __slots__ = "_func", "_args", "_keywords", "__dict__", "__weakref__"
 
     def __new__(cls, func, /, *args, **keywords):
         if not callable(func):
@@ -294,10 +300,28 @@ class partial:
 
         self = super(partial, cls).__new__(cls)
 
-        self.func = func
-        self.args = args
-        self.keywords = keywords
+        self._func = func
+        self._args = args
+        self._keywords = keywords
         return self
+
+    @property
+    def func(self):
+        return self._func
+
+    @property
+    def args(self):
+        return self._args
+
+    @property
+    def keywords(self):
+        return self._keywords
+
+    def __delattr__(self, name):
+        # CPython's C partial has no deleter on its `__dict__` getset.
+        if name == "__dict__":
+            raise TypeError("cannot delete __dict__")
+        super().__delattr__(name)
 
     def __call__(self, /, *args, **keywords):
         keywords = {**self.keywords, **keywords}
@@ -353,9 +377,9 @@ class partial:
             namespace = {}
 
         self.__dict__ = namespace
-        self.func = func
-        self.args = args
-        self.keywords = kwds
+        self._func = func
+        self._args = args
+        self._keywords = kwds
 
     __class_getitem__ = classmethod(GenericAlias)
 

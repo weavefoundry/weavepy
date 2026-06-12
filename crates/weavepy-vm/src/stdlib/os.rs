@@ -437,6 +437,7 @@ pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -451,6 +452,7 @@ fn builtin_kw(
 ) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(move |args| body(args, &[])),
         call_kw: Some(Box::new(body)),
     }))
@@ -883,6 +885,7 @@ fn build_dir_entry(
             DictKey(Object::from_static("is_dir")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "is_dir",
+                binds_instance: false,
                 call: Box::new(move |_args| Ok(Object::Bool(is_dir_v))),
                 call_kw: None,
             })),
@@ -892,6 +895,7 @@ fn build_dir_entry(
             DictKey(Object::from_static("is_file")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "is_file",
+                binds_instance: false,
                 call: Box::new(move |_args| Ok(Object::Bool(is_file_v))),
                 call_kw: None,
             })),
@@ -901,6 +905,7 @@ fn build_dir_entry(
             DictKey(Object::from_static("is_symlink")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "is_symlink",
+                binds_instance: false,
                 call: Box::new(move |_args| Ok(Object::Bool(is_symlink_v))),
                 call_kw: None,
             })),
@@ -910,6 +915,7 @@ fn build_dir_entry(
             DictKey(Object::from_static("stat")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "stat",
+                binds_instance: false,
                 call: Box::new(move |_args| {
                     let meta = std::fs::metadata(&path_for_stat)
                         .map_err(|e| crate::error::io_error_to_py(&e))?;

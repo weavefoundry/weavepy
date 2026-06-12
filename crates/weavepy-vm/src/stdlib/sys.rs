@@ -47,6 +47,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("_getframe")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "_getframe",
+                binds_instance: false,
                 call: Box::new(move |args| {
                     if let Some(h) = crate::vm_singletons::current_thread_handles() {
                         sys_getframe(args, &h.frame_stack)
@@ -62,6 +63,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("exc_info")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "exc_info",
+                binds_instance: false,
                 call: Box::new(move |_| {
                     if let Some(h) = crate::vm_singletons::current_thread_handles() {
                         sys_exc_info(&h.exc_info_stack)
@@ -77,6 +79,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("exception")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "exception",
+                binds_instance: false,
                 call: Box::new(move |_| {
                     if let Some(h) = crate::vm_singletons::current_thread_handles() {
                         sys_exception(&h.exc_info_stack)
@@ -91,6 +94,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("__excepthook__")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "excepthook",
+                binds_instance: false,
                 call: Box::new(sys_default_excepthook),
                 call_kw: None,
             })),
@@ -100,6 +104,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("excepthook")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "excepthook",
+                binds_instance: false,
                 call: Box::new(move |args| {
                     let hook = eh.borrow().clone();
                     // If a user hook is installed, the *call* path
@@ -119,6 +124,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("unraisablehook")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "unraisablehook",
+                binds_instance: false,
                 call: Box::new(move |_args| {
                     let _ = uh.borrow().clone();
                     Ok(Object::None)
@@ -272,6 +278,7 @@ pub fn build_with_state(
                 DictKey(Object::from_static("_current_frames")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "_current_frames",
+                    binds_instance: false,
                     call: Box::new(move |_args| {
                         let frame = if let Some(h) = crate::vm_singletons::current_thread_handles()
                         {
@@ -326,6 +333,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("set_asyncgen_hooks")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "set_asyncgen_hooks",
+                binds_instance: false,
                 call: Box::new(|args| sys_set_asyncgen_hooks(args, &[])),
                 call_kw: Some(Box::new(sys_set_asyncgen_hooks)),
             })),
@@ -490,6 +498,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static("_get_frozen_source")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "_get_frozen_source",
+                    binds_instance: false,
                     call: Box::new(move |args| {
                         let name = match args.first() {
                             Some(Object::Str(s)) => s.to_string(),
@@ -511,6 +520,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static("_is_frozen")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "_is_frozen",
+                    binds_instance: false,
                     call: Box::new(move |args| {
                         let name = match args.first() {
                             Some(Object::Str(s)) => s.to_string(),
@@ -649,6 +659,7 @@ fn implementation_value() -> Object {
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))

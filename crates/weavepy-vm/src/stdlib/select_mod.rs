@@ -82,6 +82,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -309,6 +310,7 @@ fn select_poll(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("register")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "register",
+                binds_instance: false,
                 call: Box::new(register),
                 call_kw: None,
             })),
@@ -317,6 +319,7 @@ fn select_poll(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("modify")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "modify",
+                binds_instance: false,
                 call: Box::new(modify),
                 call_kw: None,
             })),
@@ -325,6 +328,7 @@ fn select_poll(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("unregister")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "unregister",
+                binds_instance: false,
                 call: Box::new(unregister),
                 call_kw: None,
             })),
@@ -333,6 +337,7 @@ fn select_poll(_args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("poll")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "poll",
+                binds_instance: false,
                 call: Box::new(poll_fn),
                 call_kw: None,
             })),

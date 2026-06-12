@@ -202,3 +202,13 @@ class array:
 
 
 ArrayType = array
+
+# CPython's C module registers itself on import (array_modexec):
+# `issubclass(array.array, collections.abc.MutableSequence)` is True.
+try:
+    from collections.abc import MutableSequence as _MutableSequence
+
+    _MutableSequence.register(array)
+    del _MutableSequence
+except ImportError:
+    pass

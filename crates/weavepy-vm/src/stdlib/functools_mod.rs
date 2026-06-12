@@ -29,8 +29,27 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("_partial_call")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "__call__",
+                binds_instance: false,
                 call: Box::new(|args| partial_call(args, &[])),
                 call_kw: Some(Box::new(partial_call)),
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("cmp_to_key")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "cmp_to_key",
+                binds_instance: false,
+                call: Box::new(|args| cmp_to_key(args, &[])),
+                call_kw: Some(Box::new(cmp_to_key)),
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("reduce")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "reduce",
+                binds_instance: false,
+                call: Box::new(reduce),
+                call_kw: None,
             })),
         );
     }
@@ -68,6 +87,10 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         for (k, v) in d.borrow().iter() {
             if let Object::Str(s) = &k.0 {
                 call_kwargs.push((s.to_string(), v.clone()));
+            } else {
+                // CPython rejects non-string keys at call time
+                // (`PyObject_Call` kwargs validation).
+                return Err(type_error("keywords must be strings"));
             }
         }
     }
@@ -82,4 +105,71 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
 
     let globals = interp.builtins_dict();
     interp.call(&func, &call_args, &call_kwargs, &globals)
+}
+
+/// `cmp_to_key(mycmp)` — CPython implements this in C so the module
+/// attribute is a non-binding builtin (a test class stores it as a
+/// class attribute and calls it through `self.`). The K-class factory
+/// itself stays in the frozen `functools.py` (`_cmp_to_key_py`).
+fn cmp_to_key(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let mycmp = match (args, kwargs) {
+        ([m], []) => m.clone(),
+        ([], [(name, m)]) if name == "mycmp" => m.clone(),
+        ([], []) => {
+            return Err(type_error(
+                "cmp_to_key() missing required argument: 'mycmp' (pos 1)",
+            ))
+        }
+        _ => {
+            return Err(type_error(format!(
+                "cmp_to_key() takes at most 1 argument ({} given)",
+                args.len() + kwargs.len()
+            )))
+        }
+    };
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Err(type_error("cmp_to_key() requires a running interpreter"));
+    };
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let Some(functools) = interp.module_cache().get("functools") else {
+        return Err(type_error("cmp_to_key() requires functools to be imported"));
+    };
+    let factory = interp.load_attr_public(&functools, "_cmp_to_key_py")?;
+    let globals = interp.builtins_dict();
+    interp.call(&factory, &[mycmp], &[], &globals)
+}
+
+/// `reduce(function, iterable[, initial])` — native loop, no Python
+/// frame per step (CPython's `_functools.reduce`).
+fn reduce(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(type_error(format!(
+            "reduce expected at most 3 arguments, got {}",
+            args.len()
+        )));
+    }
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Err(type_error("reduce() requires a running interpreter"));
+    };
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let function = args[0].clone();
+    let it = interp.iter_object(args[1].clone())?;
+    let mut acc = match args.get(2) {
+        Some(initial) => initial.clone(),
+        None => match interp.iter_next_object(it.clone())? {
+            Some(first) => first,
+            None => {
+                return Err(type_error(
+                    "reduce() of empty iterable with no initial value",
+                ))
+            }
+        },
+    };
+    let globals = interp.builtins_dict();
+    while let Some(x) = interp.iter_next_object(it.clone())? {
+        acc = interp.call(&function, &[acc, x], &[], &globals)?;
+    }
+    Ok(acc)
 }

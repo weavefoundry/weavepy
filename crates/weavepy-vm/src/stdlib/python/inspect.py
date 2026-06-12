@@ -1378,6 +1378,77 @@ def _signature_get_partial(wrapped_sig, part, extra_args=()):
                      return_annotation=wrapped_sig.return_annotation)
 
 
+def _signature_from_text(text):
+    """Build a Signature from a `__text_signature__` string (a trimmed
+    version of CPython's `_signature_fromstr`): handles `$module`/`$self`
+    elision, `/` and `*` markers, `*args`/`**kwargs`, and literal
+    defaults."""
+    import ast
+
+    inner = text.strip()
+    if inner.startswith("("):
+        inner = inner[1:]
+    if inner.endswith(")"):
+        inner = inner[:-1]
+    params = []
+    # Split on top-level commas (defaults can contain commas in
+    # tuples/lists — rare in clinic strings, but be careful).
+    parts = []
+    depth = 0
+    current = ""
+    for ch in inner:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        parts.append(current)
+
+    kind = Parameter.POSITIONAL_OR_KEYWORD
+    seen_slash = False
+    pending = []
+    for raw in parts:
+        item = raw.strip()
+        if not item:
+            continue
+        if item == "/":
+            seen_slash = True
+            # Everything before the slash is positional-only.
+            pending = [p.replace(kind=Parameter.POSITIONAL_ONLY) for p in pending]
+            continue
+        if item == "*":
+            kind = Parameter.KEYWORD_ONLY
+            continue
+        if item.startswith("**"):
+            pending.append(Parameter(item[2:], Parameter.VAR_KEYWORD))
+            continue
+        if item.startswith("*"):
+            pending.append(Parameter(item[1:], Parameter.VAR_POSITIONAL))
+            kind = Parameter.KEYWORD_ONLY
+            continue
+        default = _empty
+        name = item
+        if "=" in item:
+            name, _, default_text = item.partition("=")
+            name = name.strip()
+            default_text = default_text.strip()
+            try:
+                default = ast.literal_eval(default_text)
+            except Exception:
+                default = default_text
+        if name.startswith("$"):
+            # `$module` / `$self` bind implicitly; they never appear in
+            # the public signature.
+            continue
+        pending.append(Parameter(name, kind, default=default))
+    return Signature(pending)
+
+
 def signature(callable_, *, follow_wrapped=True):
     if not callable(callable_):
         raise TypeError(f"{callable_!r} is not a callable object")
@@ -1430,6 +1501,12 @@ def signature(callable_, *, follow_wrapped=True):
             params = [p for name, p in sig.parameters.items() if name != "self"]
             return Signature(params)
         return Signature([])
+    if isbuiltin(obj):
+        # Builtins publish Argument-Clinic text signatures (when they
+        # do at all); parse those before any generic fallback.
+        text = getattr(obj, "__text_signature__", None)
+        if text:
+            return _signature_from_text(text)
     if not isfunction(obj):
         # A callable instance (defines __call__ on its type): derive the
         # signature from the type's __call__, dropping the bound `self`.

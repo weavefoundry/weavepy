@@ -65,6 +65,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -270,6 +271,7 @@ fn writer_call(args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("writerow")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "writerow",
+                binds_instance: false,
                 call: Box::new(writerow),
                 call_kw: None,
             })),
@@ -278,6 +280,7 @@ fn writer_call(args: &[Object]) -> Result<Object, RuntimeError> {
             DictKey(Object::from_static("writerows")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "writerows",
+                binds_instance: false,
                 call: Box::new(writerows),
                 call_kw: None,
             })),
