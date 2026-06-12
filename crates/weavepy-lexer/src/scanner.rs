@@ -102,6 +102,11 @@ struct Scanner<'src> {
     /// Current lexical f-string nesting depth (CPython caps this at
     /// MAXFSTRINGLEVEL = 150 with "too many nested f-strings").
     fstring_level: u32,
+    /// Start (just past the `{`) of the outermost replacement field of
+    /// the outermost f-string currently being scanned. Lets a deeply
+    /// nested "too many nested f-strings" carry enough context for the
+    /// parser to prefer an error from the tokens already seen.
+    outer_field_start: Option<u32>,
 }
 
 impl<'src> Scanner<'src> {
@@ -120,6 +125,7 @@ impl<'src> Scanner<'src> {
             last_was_content: false,
             escape_warnings: Vec::new(),
             fstring_level: 0,
+            outer_field_start: None,
         }
     }
 
@@ -795,6 +801,7 @@ impl<'src> Scanner<'src> {
             self.fstring_level -= 1;
             return Err(LexError::FstringTooManyNested {
                 pos: start as u32,
+                field_start: self.outer_field_start.unwrap_or(start as u32),
             });
         }
         let r = self.scan_fstring_extent_inner(start, quote, triple, raw, warned);
@@ -964,6 +971,13 @@ impl<'src> Scanner<'src> {
         // Field expression text begins right here (just past the `{`);
         // recorded so the parser can re-parse a partial field.
         let field_start = self.pos as u32;
+        // Remember the *outermost* open replacement field: a deeply
+        // nested "too many nested f-strings" defers to any parse error
+        // pegen would have found in the tokens already seen (CPython
+        // reports `f"{1 1:{f"…`'s comma hint, not the nesting limit).
+        if depth == 1 && self.fstring_level == 1 {
+            self.outer_field_start = Some(field_start);
+        }
         loop {
             let Some(b) = self.peek() else {
                 if in_comment {

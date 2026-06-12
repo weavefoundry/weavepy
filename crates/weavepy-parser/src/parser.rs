@@ -3371,10 +3371,17 @@ impl<'src> Parser<'src> {
     ) -> Result<Vec<Expr>, ParseError> {
         let mut parts = Vec::new();
         let mut literal = String::new();
+        // Byte index in `body` where the current literal run began, for
+        // the Constant part's source span (CPython anchors each literal
+        // part at its own text, not at the whole string token).
+        let mut lit_start = 0usize;
         let bytes = body.as_bytes();
         let mut i = 0usize;
         while i < bytes.len() {
             let b = bytes[i];
+            if literal.is_empty() {
+                lit_start = i;
+            }
             // Non-raw backslash escapes are copied into the literal as a
             // unit so the decoder interprets them — and, crucially, so an
             // escaped backslash (`\\`) can't have its second byte misread
@@ -3425,7 +3432,7 @@ impl<'src> Parser<'src> {
                         })?;
                     parts.push(Expr {
                         kind: ExprKind::Constant(Constant::Str(decoded)),
-                        span: anchor,
+                        span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
                     });
                     literal.clear();
                 }
@@ -3484,7 +3491,7 @@ impl<'src> Parser<'src> {
             })?;
             parts.push(Expr {
                 kind: ExprKind::Constant(Constant::Str(decoded)),
-                span: anchor,
+                span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
             });
         }
         Ok(parts)
@@ -3851,6 +3858,11 @@ impl<'src> Parser<'src> {
                 &map_back,
             )
         })?;
+        // Re-anchor the sub-parsed tree from `wrapped` coordinates onto
+        // the real source so `ast` positions (lineno/col_offset) and
+        // runtime tracebacks point into the actual f-string text.
+        let mut value = value;
+        remap_expr_spans(&mut value, &map_back);
         // A bare starred expression can't be formatted (`f'{*a}'`); the
         // tuple form `f'{*a,}'` is fine and parses as a tuple instead.
         if !partial {
@@ -3899,13 +3911,20 @@ impl<'src> Parser<'src> {
             _ => None,
         };
 
+        // CPython spans the FormattedValue from its `{` through the
+        // matching `}` (the field text sits at `field_abs`, just past
+        // the opening brace).
+        let fv_span = Span::new(
+            field_abs.saturating_sub(1),
+            field_abs + field.len() as u32 + 1,
+        );
         let fv = Expr {
             kind: ExprKind::FormattedValue {
                 value: Box::new(value),
                 conversion,
                 format_spec,
             },
-            span: anchor,
+            span: fv_span,
         };
         if let Some(lit) = debug_lit {
             // Wrap in a tiny JoinedStr-equivalent: emit a literal
@@ -3925,6 +3944,155 @@ impl<'src> Parser<'src> {
             });
         }
         Ok(fv)
+    }
+}
+
+/// Rewrite every span in an expression tree through `map` (a byte-offset
+/// translation). Used to re-anchor an f-string replacement field's
+/// sub-parsed expression from its synthetic `( … \n)` wrapper onto the
+/// real source, so `ast` positions and runtime tracebacks point at the
+/// actual f-string text (CPython parses fields in-place and gets this
+/// for free).
+fn remap_expr_spans(e: &mut Expr, map: &dyn Fn(u32) -> u32) {
+    e.span = Span::new(map(e.span.start.0), map(e.span.end.0));
+    let remap_opt = |o: &mut Option<Box<Expr>>, map: &dyn Fn(u32) -> u32| {
+        if let Some(inner) = o {
+            remap_expr_spans(inner, map);
+        }
+    };
+    let remap_args = |a: &mut crate::ast::Arguments, map: &dyn Fn(u32) -> u32| {
+        for arg in a
+            .posonlyargs
+            .iter_mut()
+            .chain(a.args.iter_mut())
+            .chain(a.kwonlyargs.iter_mut())
+            .chain(a.vararg.iter_mut())
+            .chain(a.kwarg.iter_mut())
+        {
+            arg.span = Span::new(map(arg.span.start.0), map(arg.span.end.0));
+            if let Some(ann) = &mut arg.annotation {
+                remap_expr_spans(ann, map);
+            }
+        }
+        for d in &mut a.defaults {
+            remap_expr_spans(d, map);
+        }
+        for d in a.kw_defaults.iter_mut().flatten() {
+            remap_expr_spans(d, map);
+        }
+    };
+    let remap_comps = |gens: &mut Vec<crate::ast::Comprehension>, map: &dyn Fn(u32) -> u32| {
+        for g in gens {
+            remap_expr_spans(&mut g.target, map);
+            remap_expr_spans(&mut g.iter, map);
+            for i in &mut g.ifs {
+                remap_expr_spans(i, map);
+            }
+        }
+    };
+    match &mut e.kind {
+        ExprKind::Constant(_) | ExprKind::Name(_) => {}
+        ExprKind::Attribute { value, .. } => remap_expr_spans(value, map),
+        ExprKind::Subscript { value, slice } => {
+            remap_expr_spans(value, map);
+            remap_expr_spans(slice, map);
+        }
+        ExprKind::Slice { lower, upper, step } => {
+            remap_opt(lower, map);
+            remap_opt(upper, map);
+            remap_opt(step, map);
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            remap_expr_spans(left, map);
+            remap_expr_spans(right, map);
+        }
+        ExprKind::BoolOp { values, .. } => {
+            for v in values {
+                remap_expr_spans(v, map);
+            }
+        }
+        ExprKind::UnaryOp { operand, .. } => remap_expr_spans(operand, map),
+        ExprKind::Compare {
+            left, comparators, ..
+        } => {
+            remap_expr_spans(left, map);
+            for c in comparators {
+                remap_expr_spans(c, map);
+            }
+        }
+        ExprKind::IfExp { test, body, orelse } => {
+            remap_expr_spans(test, map);
+            remap_expr_spans(body, map);
+            remap_expr_spans(orelse, map);
+        }
+        ExprKind::NamedExpr { target, value } => {
+            remap_expr_spans(target, map);
+            remap_expr_spans(value, map);
+        }
+        ExprKind::Lambda { args, body } => {
+            remap_args(args, map);
+            remap_expr_spans(body, map);
+        }
+        ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            remap_expr_spans(func, map);
+            for a in args {
+                remap_expr_spans(a, map);
+            }
+            for k in keywords {
+                remap_expr_spans(&mut k.value, map);
+            }
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+            for i in items {
+                remap_expr_spans(i, map);
+            }
+        }
+        ExprKind::Dict { keys, values } => {
+            for k in keys.iter_mut().flatten() {
+                remap_expr_spans(k, map);
+            }
+            for v in values {
+                remap_expr_spans(v, map);
+            }
+        }
+        ExprKind::ListComp { elt, generators }
+        | ExprKind::SetComp { elt, generators }
+        | ExprKind::GeneratorExp { elt, generators } => {
+            remap_expr_spans(elt, map);
+            remap_comps(generators, map);
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            generators,
+        } => {
+            remap_expr_spans(key, map);
+            remap_expr_spans(value, map);
+            remap_comps(generators, map);
+        }
+        ExprKind::Starred(inner)
+        | ExprKind::YieldFrom(inner)
+        | ExprKind::Await(inner) => remap_expr_spans(inner, map),
+        ExprKind::Yield(inner) => {
+            if let Some(i) = inner {
+                remap_expr_spans(i, map);
+            }
+        }
+        ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                remap_expr_spans(p, map);
+            }
+        }
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            remap_expr_spans(value, map);
+            remap_opt(format_spec, map);
+        }
     }
 }
 
@@ -4286,6 +4454,10 @@ fn join_str_into_parts(parts: &mut Vec<Expr>, s: String, span: Span) {
     if let Some(last) = parts.last_mut() {
         if let ExprKind::Constant(Constant::Str(existing)) = &mut last.kind {
             existing.push_str(&s);
+            // The merged literal spans from the first fragment's start
+            // to the last fragment's end (CPython's implicit-concat AST
+            // positions cross the token boundary).
+            last.span = Span::new(last.span.start.0, span.end.0);
             return;
         }
     }

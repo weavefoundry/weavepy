@@ -60,7 +60,8 @@ pub use crate::error::{PyException, RuntimeError};
 pub use crate::import::ModuleCache;
 use crate::import::{package_search_path, resolve_relative};
 use crate::object::{
-    BoundMethod, BuiltinFn, DictData, DictKey, FileBackend, GeneratorState, Object, PyFrame,
+    BoundMethod, BuiltinFn, DictData, DictKey, FileBackend, GeneratorState, MethodWrapper, Object,
+    PyFrame,
     PyFunction, PyGenerator, PyModule, PySlice, PyTraceback,
 };
 use crate::types::{PyInstance, TypeObject};
@@ -2714,8 +2715,8 @@ impl Interpreter {
                         )?
                     } else if let Some(method) = ty.lookup("__class_getitem__") {
                         let callable = match method {
-                            Object::ClassMethod(inner) => (*inner).clone(),
-                            Object::StaticMethod(inner) => (*inner).clone(),
+                            Object::ClassMethod(inner) => inner.func.clone(),
+                            Object::StaticMethod(inner) => inner.func.clone(),
                             other => other,
                         };
                         self.call(
@@ -3987,7 +3988,7 @@ impl Interpreter {
                     // fixed payload; the popped `value` is forwarded so a
                     // re-drive (after an inner-await passthrough) resumes it.
                     Object::AsyncGenAwait(a) => self.step_agen_await(a, value),
-                    Object::Iter(_) => {
+                    Object::Iter(_) | Object::LazyIter(_) => {
                         if !matches!(value, Object::None) {
                             return Err(type_error(
                                 "can't send non-None value to a just-started iterator",
@@ -4653,12 +4654,31 @@ impl Interpreter {
         // raised *from within* a successful lookup (we only rescue
         // genuine AttributeErrors for `name` itself).
         if let Err(err) = &result {
-            if !matches!(obj, Object::Type(_)) && self.is_attribute_error(err) {
+            // Instances whose class overrides `__getattribute__` already
+            // had the final word — rescuing through the slot table would
+            // resurrect attributes the override deliberately hid
+            // (copy.copy probes `__reduce_ex__` exactly this way).
+            let override_owns_lookup = match obj {
+                Object::Instance(i) => self.user_getattribute(&i.cls()).is_some(),
+                _ => false,
+            };
+            if !matches!(obj, Object::Type(_))
+                && !override_owns_lookup
+                && self.is_attribute_error(err)
+            {
                 if let Some(f) = builtin_slot_wrapper(&crate::builtins::class_of(obj), name) {
-                    return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: obj.clone(),
-                        function: f,
-                    })));
+                    // Only callables bind; plain values (`__doc__`
+                    // strings, sentinels stored in a base's dict) are
+                    // returned as-is, like CPython's generic getattr.
+                    return Ok(match f {
+                        Object::Function(_) | Object::Builtin(_) => {
+                            Object::BoundMethod(Rc::new(BoundMethod {
+                                receiver: obj.clone(),
+                                function: f,
+                            }))
+                        }
+                        other => other,
+                    });
                 }
             }
             // CPython's `PyObject_GetAttr` augments *any* propagating
@@ -4862,7 +4882,14 @@ impl Interpreter {
             },
             Object::StaticMethod(inner) => match name {
                 // `__func__`/`__wrapped__` expose the wrapped callable.
-                "__func__" | "__wrapped__" => Ok((**inner).clone()),
+                "__func__" | "__wrapped__" => Ok(inner.func.clone()),
+                // The wrapper's own instance dict — seeded with the
+                // functools-wrapper attributes at construction and open
+                // to arbitrary writes (bpo-43682).
+                "__dict__" => Ok(Object::Dict(inner.dict.clone())),
+                _ if inner.dict.borrow().contains_key(&DictKey(Object::from_str(name))) => {
+                    Ok(inner.dict.borrow()[&DictKey(Object::from_str(name))].clone())
+                }
                 // The descriptor hook. `staticmethod` is a non-data
                 // descriptor; `sm.__get__(obj, cls)` returns the wrapped
                 // function. Descriptor-aware library code (e.g.
@@ -4876,13 +4903,14 @@ impl Interpreter {
                     // *under* `@staticmethod` (`@staticmethod
                     // @abstractmethod def f(): ...`).
                     Ok(self
-                        .load_attr(inner.as_ref(), "__isabstractmethod__")
+                        .load_attr(&inner.func, "__isabstractmethod__")
                         .unwrap_or(Object::Bool(false)))
                 }
-                // Metadata transparently mirrors the wrapped function so
-                // `getattr(staticmethod(f), attr) is getattr(f, attr)`.
-                "__module__" | "__qualname__" | "__name__" | "__doc__"
-                | "__annotations__" | "__dict__" => self.load_attr(inner.as_ref(), name),
+                // Metadata falls back to the wrapped callable when the
+                // seeded dict lacks it (non-function callables).
+                "__module__" | "__qualname__" | "__name__" | "__doc__" | "__annotations__" => {
+                    self.load_attr(&inner.func, name)
+                }
                 _ => Err(attribute_error(format!(
                     "'staticmethod' object has no attribute '{}'",
                     name
@@ -4891,7 +4919,12 @@ impl Interpreter {
             Object::ClassMethod(inner) => match name {
                 // `__func__` and `__wrapped__` both expose the underlying
                 // callable; `functools.wraps`/inspect walk `__wrapped__`.
-                "__func__" | "__wrapped__" => Ok((**inner).clone()),
+                "__func__" | "__wrapped__" => Ok(inner.func.clone()),
+                // Instance dict, as for `staticmethod` above.
+                "__dict__" => Ok(Object::Dict(inner.dict.clone())),
+                _ if inner.dict.borrow().contains_key(&DictKey(Object::from_str(name))) => {
+                    Ok(inner.dict.borrow()[&DictKey(Object::from_str(name))].clone())
+                }
                 // The descriptor hook. `cm.__get__(obj, cls)` returns the
                 // wrapped callable bound to the owning class. Library code
                 // such as `functools.partialmethod` invokes it directly.
@@ -4900,10 +4933,11 @@ impl Interpreter {
                     function: crate::builtins::descriptor_get_builtin(false),
                 }))),
                 "__isabstractmethod__" => Ok(self
-                    .load_attr(inner.as_ref(), "__isabstractmethod__")
+                    .load_attr(&inner.func, "__isabstractmethod__")
                     .unwrap_or(Object::Bool(false))),
-                "__module__" | "__qualname__" | "__name__" | "__doc__"
-                | "__annotations__" | "__dict__" => self.load_attr(inner.as_ref(), name),
+                "__module__" | "__qualname__" | "__name__" | "__doc__" | "__annotations__" => {
+                    self.load_attr(&inner.func, name)
+                }
                 _ => Err(attribute_error(format!(
                     "'classmethod' object has no attribute '{}'",
                     name
@@ -5004,18 +5038,33 @@ impl Interpreter {
                     return Ok(v.clone());
                 }
                 match name {
-                    "__name__" => return Ok(Object::from_str(&f.name)),
+                    // Stash the computed value on the slot so repeated
+                    // reads return the *same* object — CPython hands out
+                    // the one stored string and `assertIs(f.__name__, …)`
+                    // style identity checks rely on it.
+                    "__name__" => {
+                        let v = Object::from_str(&f.name);
+                        f.set_slot("__name__", v.clone());
+                        return Ok(v);
+                    }
                     // PEP 3155 qualname comes from the code object (computed
                     // at compile time from lexical nesting), unless user code
                     // has overridden it via `f.__qualname__ = …` (handled by
                     // the slot lookup above).
-                    "__qualname__" => return Ok(Object::from_str(&f.code().qualname)),
+                    "__qualname__" => {
+                        let v = Object::from_str(&f.code().qualname);
+                        f.set_slot("__qualname__", v.clone());
+                        return Ok(v);
+                    }
                     "__doc__" => {
                         // CPython convention: the first statement of
                         // the function body, if it is a string
                         // literal, is stored as ``co_consts[0]`` and
                         // surfaces as ``__doc__``.
-                        return Ok(crate::builtins::code_docstring(&f.code()).unwrap_or(Object::None));
+                        let v =
+                            crate::builtins::code_docstring(&f.code()).unwrap_or(Object::None);
+                        f.set_slot("__doc__", v.clone());
+                        return Ok(v);
                     }
                     "__module__" => {
                         // Fall back to globals['__name__'] if the function's
@@ -5535,10 +5584,19 @@ impl Interpreter {
         let meta_attr = inst.cls().lookup(name);
         let owner = Object::Type(inst.cls());
 
-        // (1) Data descriptor on class wins over instance dict.
+        // (1) Data descriptor on class wins over instance dict — but only
+        // when it actually implements `__get__` (CPython checks
+        // `tp_descr_get`: a `__set__`-only descriptor doesn't intercept
+        // reads, so the instance dict is consulted first).
         if let Some(ref attr) = meta_attr {
             if self.is_data_descriptor(attr) {
-                return self.descriptor_get(attr, instance_obj, &owner);
+                let has_get = match attr {
+                    Object::Instance(d) => d.cls().lookup("__get__").is_some(),
+                    _ => true,
+                };
+                if has_get {
+                    return self.descriptor_get(attr, instance_obj, &owner);
+                }
             }
         }
 
@@ -5684,11 +5742,19 @@ impl Interpreter {
         let owner = Object::Type(ty.clone());
         let self_as_obj = Object::Type(ty.clone());
 
-        // (1) Metaclass-level data descriptor wins.
+        // (1) Metaclass-level data descriptor wins — when it implements
+        // `__get__` (a `__set__`-only descriptor doesn't intercept reads;
+        // see the instance path above / CPython `type_getattro`).
         let meta_attr = meta.lookup(name);
         if let Some(ref attr) = meta_attr {
             if self.is_data_descriptor(attr) {
-                return self.descriptor_get(attr, &self_as_obj, &Object::Type(meta.clone()));
+                let has_get = match attr {
+                    Object::Instance(d) => d.cls().lookup("__get__").is_some(),
+                    _ => true,
+                };
+                if has_get {
+                    return self.descriptor_get(attr, &self_as_obj, &Object::Type(meta.clone()));
+                }
             }
         }
 
@@ -5898,10 +5964,10 @@ impl Interpreter {
                     &self.builtins.clone(),
                 )
             }
-            Object::StaticMethod(inner) => Ok((**inner).clone()),
+            Object::StaticMethod(inner) => Ok(inner.func.clone()),
             Object::ClassMethod(inner) => Ok(Object::BoundMethod(Rc::new(BoundMethod {
                 receiver: owner.clone(),
-                function: (**inner).clone(),
+                function: inner.func.clone(),
             }))),
             Object::SlotDescriptor(slot) => match instance {
                 Object::None => Ok(attr.clone()),
@@ -5999,9 +6065,9 @@ impl Interpreter {
                     Object::Instance(inst) => Object::Type(inst.cls()),
                     other => other.clone(),
                 },
-                function: (**inner).clone(),
+                function: inner.func.clone(),
             })),
-            Object::StaticMethod(inner) => (**inner).clone(),
+            Object::StaticMethod(inner) => inner.func.clone(),
             _ => attr,
         }
     }
@@ -7505,9 +7571,12 @@ impl Interpreter {
         args: &[Object],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
-        let items = self.collect_iterable(&args[0], globals)?;
+        // Stream instead of collecting: `any(tee(repeat(None, 20_000_000)))`
+        // must short-circuit per element without materialising a 20M-item
+        // Vec (and must terminate on infinite-but-eventually-truthy input).
         let want_any = name == "any";
-        for x in items {
+        let it = self.make_iter(&args[0], globals)?;
+        while let Some(x) = self.iter_next(&it, globals)? {
             if x.is_truthy() {
                 if want_any {
                     return Ok(Object::Bool(true));
@@ -8951,59 +9020,819 @@ impl Interpreter {
         l: &Rc<crate::object::PyLazyIter>,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
-        // Copy the scalar state out so no borrow is held while we
-        // re-enter the interpreter (the source may observe this object),
-        // then write the advanced cursor back before returning.
-        let (source, mut next_idx, mut pos, stop, step, done) = match &*l.state.borrow() {
-            crate::object::LazyIterKind::Islice {
+        use crate::object::LazyIterKind;
+        // Pure state machines first: their stepping never re-enters the
+        // interpreter, so the whole transition runs under one borrow.
+        {
+            let mut st = l.state.borrow_mut();
+            match &mut *st {
+                LazyIterKind::Repeat { obj, times } => {
+                    return match times {
+                        None => Ok(Some(obj.clone())),
+                        Some(t) if *t <= 0 => Ok(None),
+                        Some(t) => {
+                            *t -= 1;
+                            Ok(Some(obj.clone()))
+                        }
+                    }
+                }
+                LazyIterKind::Product {
+                    pools,
+                    indices,
+                    started,
+                    stopped,
+                } => {
+                    if *stopped {
+                        return Ok(None);
+                    }
+                    if !*started {
+                        if pools.iter().any(|p| p.is_empty()) {
+                            *stopped = true;
+                            return Ok(None);
+                        }
+                        *started = true;
+                        indices.clear();
+                        indices.resize(pools.len(), 0);
+                        let t: Vec<Object> = pools.iter().map(|p| p[0].clone()).collect();
+                        return Ok(Some(Object::Tuple(t.into())));
+                    }
+                    let n = pools.len();
+                    let mut i = n as i64 - 1;
+                    while i >= 0 {
+                        let k = i as usize;
+                        indices[k] += 1;
+                        if indices[k] < pools[k].len() {
+                            break;
+                        }
+                        indices[k] = 0;
+                        i -= 1;
+                    }
+                    if i < 0 {
+                        *stopped = true;
+                        return Ok(None);
+                    }
+                    let t: Vec<Object> = pools
+                        .iter()
+                        .zip(indices.iter())
+                        .map(|(p, &ix)| p[ix].clone())
+                        .collect();
+                    return Ok(Some(Object::Tuple(t.into())));
+                }
+                LazyIterKind::Permutations {
+                    pool,
+                    r,
+                    indices,
+                    cycles,
+                    started,
+                    stopped,
+                } => {
+                    if *stopped {
+                        return Ok(None);
+                    }
+                    let n = pool.len();
+                    let r = *r;
+                    if !*started {
+                        *started = true;
+                        let t: Vec<Object> =
+                            indices[..r].iter().map(|&ix| pool[ix].clone()).collect();
+                        return Ok(Some(Object::Tuple(t.into())));
+                    }
+                    if n == 0 {
+                        *stopped = true;
+                        return Ok(None);
+                    }
+                    let mut i = r as i64 - 1;
+                    while i >= 0 {
+                        let k = i as usize;
+                        cycles[k] -= 1;
+                        if cycles[k] == 0 {
+                            indices[k..].rotate_left(1);
+                            cycles[k] = n - k;
+                        } else {
+                            let j = n - cycles[k];
+                            indices.swap(k, j);
+                            let t: Vec<Object> =
+                                indices[..r].iter().map(|&ix| pool[ix].clone()).collect();
+                            return Ok(Some(Object::Tuple(t.into())));
+                        }
+                        i -= 1;
+                    }
+                    *stopped = true;
+                    return Ok(None);
+                }
+                LazyIterKind::Combinations {
+                    pool,
+                    r,
+                    indices,
+                    started,
+                    stopped,
+                } => {
+                    if *stopped {
+                        return Ok(None);
+                    }
+                    let n = pool.len();
+                    let r = *r;
+                    if !*started {
+                        *started = true;
+                        let t: Vec<Object> =
+                            indices.iter().map(|&ix| pool[ix].clone()).collect();
+                        return Ok(Some(Object::Tuple(t.into())));
+                    }
+                    let mut i = r as i64 - 1;
+                    while i >= 0 && indices[i as usize] == i as usize + n - r {
+                        i -= 1;
+                    }
+                    if i < 0 {
+                        *stopped = true;
+                        return Ok(None);
+                    }
+                    let k = i as usize;
+                    indices[k] += 1;
+                    for j in k + 1..r {
+                        indices[j] = indices[j - 1] + 1;
+                    }
+                    let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
+                    return Ok(Some(Object::Tuple(t.into())));
+                }
+                LazyIterKind::Cwr {
+                    pool,
+                    r,
+                    indices,
+                    started,
+                    stopped,
+                } => {
+                    if *stopped {
+                        return Ok(None);
+                    }
+                    let n = pool.len();
+                    let r = *r;
+                    if !*started {
+                        *started = true;
+                        let t: Vec<Object> =
+                            indices.iter().map(|&ix| pool[ix].clone()).collect();
+                        return Ok(Some(Object::Tuple(t.into())));
+                    }
+                    let mut i = r as i64 - 1;
+                    while i >= 0 && indices[i as usize] == n - 1 {
+                        i -= 1;
+                    }
+                    if i < 0 {
+                        *stopped = true;
+                        return Ok(None);
+                    }
+                    let k = i as usize;
+                    let v = indices[k] + 1;
+                    for slot in indices[k..].iter_mut() {
+                        *slot = v;
+                    }
+                    let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
+                    return Ok(Some(Object::Tuple(t.into())));
+                }
+                _ => {}
+            }
+        }
+        // Reentrant kinds: copy the state out so no borrow is held while
+        // we re-enter the interpreter (the source may observe this
+        // object), then write the advanced cursor back before returning.
+        enum Snap {
+            Islice {
+                source: Object,
+                next_idx: u64,
+                pos: u64,
+                stop: Option<u64>,
+                step: u64,
+                done: bool,
+            },
+            Tee {
+                shared: Rc<RefCell<crate::object::TeeShared>>,
+                data: Object,
+                index: usize,
+            },
+            Count {
+                current: Object,
+                step: Object,
+            },
+            Cycle {
+                source: Option<Object>,
+                saved: Rc<RefCell<Vec<Object>>>,
+                index: usize,
+                firstpass: bool,
+            },
+            Chain {
+                source: Option<Object>,
+                active: Option<Object>,
+            },
+            Compress {
+                data: Object,
+                selectors: Object,
+            },
+            DropWhile {
+                func: Object,
+                source: Object,
+                started: bool,
+            },
+            TakeWhile {
+                func: Object,
+                source: Object,
+                stopped: bool,
+            },
+            FilterFalse {
+                func: Object,
+                source: Object,
+            },
+            StarMap {
+                func: Object,
+                source: Object,
+            },
+            Pairwise {
+                source: Option<Object>,
+                old: Option<Object>,
+            },
+            ZipLongest {
+                iters: Vec<Option<Object>>,
+                fillvalue: Object,
+                numactive: usize,
+            },
+            Accumulate {
+                source: Object,
+                func: Option<Object>,
+                total: Option<Object>,
+                initial: Option<Object>,
+            },
+            Batched {
+                source: Option<Object>,
+                n: usize,
+                strict: bool,
+            },
+        }
+        let snap = match &*l.state.borrow() {
+            LazyIterKind::Islice {
                 source,
                 next_idx,
                 pos,
                 stop,
                 step,
                 done,
-            } => (source.clone(), *next_idx, *pos, *stop, *step, *done),
+            } => Snap::Islice {
+                source: source.clone(),
+                next_idx: *next_idx,
+                pos: *pos,
+                stop: *stop,
+                step: *step,
+                done: *done,
+            },
+            LazyIterKind::TeeBranch {
+                shared,
+                data,
+                index,
+            } => Snap::Tee {
+                shared: shared.clone(),
+                data: data.clone(),
+                index: *index,
+            },
+            LazyIterKind::Count { current, step } => Snap::Count {
+                current: current.clone(),
+                step: step.clone(),
+            },
+            LazyIterKind::Cycle {
+                source,
+                saved,
+                index,
+                firstpass,
+            } => Snap::Cycle {
+                source: source.clone(),
+                saved: saved.clone(),
+                index: *index,
+                firstpass: *firstpass,
+            },
+            LazyIterKind::Chain { source, active } => Snap::Chain {
+                source: source.clone(),
+                active: active.clone(),
+            },
+            LazyIterKind::Compress { data, selectors } => Snap::Compress {
+                data: data.clone(),
+                selectors: selectors.clone(),
+            },
+            LazyIterKind::DropWhile {
+                func,
+                source,
+                started,
+            } => Snap::DropWhile {
+                func: func.clone(),
+                source: source.clone(),
+                started: *started,
+            },
+            LazyIterKind::TakeWhile {
+                func,
+                source,
+                stopped,
+            } => Snap::TakeWhile {
+                func: func.clone(),
+                source: source.clone(),
+                stopped: *stopped,
+            },
+            LazyIterKind::FilterFalse { func, source } => Snap::FilterFalse {
+                func: func.clone(),
+                source: source.clone(),
+            },
+            LazyIterKind::StarMap { func, source } => Snap::StarMap {
+                func: func.clone(),
+                source: source.clone(),
+            },
+            LazyIterKind::Pairwise { source, old } => Snap::Pairwise {
+                source: source.clone(),
+                old: old.clone(),
+            },
+            LazyIterKind::ZipLongest {
+                iters,
+                fillvalue,
+                numactive,
+            } => Snap::ZipLongest {
+                iters: iters.clone(),
+                fillvalue: fillvalue.clone(),
+                numactive: *numactive,
+            },
+            LazyIterKind::Accumulate {
+                source,
+                func,
+                total,
+                initial,
+            } => Snap::Accumulate {
+                source: source.clone(),
+                func: func.clone(),
+                total: total.clone(),
+                initial: initial.clone(),
+            },
+            LazyIterKind::Batched { source, n, strict } => Snap::Batched {
+                source: source.clone(),
+                n: *n,
+                strict: *strict,
+            },
+            LazyIterKind::Repeat { .. }
+            | LazyIterKind::Product { .. }
+            | LazyIterKind::Permutations { .. }
+            | LazyIterKind::Combinations { .. }
+            | LazyIterKind::Cwr { .. } => unreachable!("handled above"),
         };
-        if done {
-            return Ok(None);
-        }
-        let write_back = |next_idx: u64, pos: u64, done: bool| {
-            if let crate::object::LazyIterKind::Islice {
-                next_idx: ni,
-                pos: p,
-                done: d,
-                ..
-            } = &mut *l.state.borrow_mut()
-            {
-                *ni = next_idx;
-                *p = pos;
-                *d = done;
+        match snap {
+            Snap::Count { current, step } => {
+                // Int fast path; anything else (float, Decimal,
+                // Fraction, bool subclasses) goes through `+` dispatch.
+                let new = match (&current, &step) {
+                    (Object::Int(a), Object::Int(b)) => match a.checked_add(*b) {
+                        Some(s) => Object::Int(s),
+                        None => binary_op(&current, &step, BinOpKind::Add)?,
+                    },
+                    _ => self.dispatch_binary_op(&current, &step, BinOpKind::Add, globals)?,
+                };
+                if let LazyIterKind::Count { current: c, .. } = &mut *l.state.borrow_mut() {
+                    *c = new;
+                }
+                Ok(Some(current))
             }
-        };
-        // Skipped elements are consumed lazily, on the step that needs
-        // to jump over them (CPython's islice_next does the same).
-        loop {
-            if stop.is_some_and(|s| next_idx >= s) {
-                write_back(next_idx, pos, true);
-                return Ok(None);
+            Snap::Cycle {
+                source,
+                saved,
+                index,
+                firstpass,
+            } => {
+                if let Some(src) = &source {
+                    match self.iter_next(src, globals)? {
+                        Some(item) => {
+                            if !firstpass {
+                                saved.borrow_mut().push(item.clone());
+                            }
+                            return Ok(Some(item));
+                        }
+                        None => {
+                            if let LazyIterKind::Cycle { source: s, .. } =
+                                &mut *l.state.borrow_mut()
+                            {
+                                *s = None;
+                            }
+                        }
+                    }
+                }
+                let (item, new_index) = {
+                    let buf = saved.borrow();
+                    if buf.is_empty() {
+                        return Ok(None);
+                    }
+                    let item = buf[index.min(buf.len() - 1)].clone();
+                    let mut ni = index + 1;
+                    if ni >= buf.len() {
+                        ni = 0;
+                    }
+                    (item, ni)
+                };
+                if let LazyIterKind::Cycle { index: ix, .. } = &mut *l.state.borrow_mut() {
+                    *ix = new_index;
+                }
+                Ok(Some(item))
             }
-            let item = match self.iter_next(&source, globals) {
-                Ok(Some(item)) => item,
-                Ok(None) => {
+            Snap::Chain {
+                mut source,
+                mut active,
+            } => {
+                let write_back =
+                    |source: &Option<Object>, active: &Option<Object>| {
+                        if let LazyIterKind::Chain { source: s, active: a } =
+                            &mut *l.state.borrow_mut()
+                        {
+                            *s = source.clone();
+                            *a = active.clone();
+                        }
+                    };
+                loop {
+                    let Some(src) = &source else {
+                        write_back(&None, &None);
+                        return Ok(None);
+                    };
+                    if active.is_none() {
+                        match self.iter_next(src, globals) {
+                            Ok(Some(iterable)) => match self.make_iter(&iterable, globals) {
+                                Ok(it) => active = Some(it),
+                                Err(e) => {
+                                    write_back(&None, &None);
+                                    return Err(e);
+                                }
+                            },
+                            Ok(None) => {
+                                write_back(&None, &None);
+                                return Ok(None);
+                            }
+                            Err(e) => {
+                                write_back(&None, &None);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    match self.iter_next(active.as_ref().expect("set above"), globals) {
+                        Ok(Some(v)) => {
+                            write_back(&source, &active);
+                            return Ok(Some(v));
+                        }
+                        Ok(None) => {
+                            active = None;
+                        }
+                        Err(e) => {
+                            write_back(&None, &None);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            Snap::Compress { data, selectors } => loop {
+                let Some(item) = self.iter_next(&data, globals)? else {
+                    return Ok(None);
+                };
+                let Some(keep) = self.iter_next(&selectors, globals)? else {
+                    return Ok(None);
+                };
+                if self.obj_truthy(&keep, globals)? {
+                    return Ok(Some(item));
+                }
+            },
+            Snap::DropWhile {
+                func,
+                source,
+                started,
+            } => {
+                if started {
+                    return self.iter_next(&source, globals);
+                }
+                loop {
+                    let Some(item) = self.iter_next(&source, globals)? else {
+                        return Ok(None);
+                    };
+                    let verdict = self.call(&func, std::slice::from_ref(&item), &[], globals)?;
+                    if !self.obj_truthy(&verdict, globals)? {
+                        if let LazyIterKind::DropWhile { started: s, .. } =
+                            &mut *l.state.borrow_mut()
+                        {
+                            *s = true;
+                        }
+                        return Ok(Some(item));
+                    }
+                }
+            }
+            Snap::TakeWhile {
+                func,
+                source,
+                stopped,
+            } => {
+                if stopped {
+                    return Ok(None);
+                }
+                let Some(item) = self.iter_next(&source, globals)? else {
+                    return Ok(None);
+                };
+                let verdict = self.call(&func, std::slice::from_ref(&item), &[], globals)?;
+                if self.obj_truthy(&verdict, globals)? {
+                    Ok(Some(item))
+                } else {
+                    if let LazyIterKind::TakeWhile { stopped: s, .. } =
+                        &mut *l.state.borrow_mut()
+                    {
+                        *s = true;
+                    }
+                    Ok(None)
+                }
+            }
+            Snap::FilterFalse { func, source } => loop {
+                let Some(item) = self.iter_next(&source, globals)? else {
+                    return Ok(None);
+                };
+                let truthy = match &func {
+                    Object::None => self.obj_truthy(&item, globals)?,
+                    f => {
+                        let verdict = self.call(f, std::slice::from_ref(&item), &[], globals)?;
+                        self.obj_truthy(&verdict, globals)?
+                    }
+                };
+                if !truthy {
+                    return Ok(Some(item));
+                }
+            },
+            Snap::StarMap { func, source } => {
+                let Some(item) = self.iter_next(&source, globals)? else {
+                    return Ok(None);
+                };
+                let call_args: Vec<Object> = match &item {
+                    Object::Tuple(items) => items.to_vec(),
+                    other => self.collect_iterable(other, globals)?,
+                };
+                Ok(Some(self.call(&func, &call_args, &[], globals)?))
+            }
+            Snap::Pairwise { source, old } => {
+                let Some(src) = source else {
+                    return Ok(None);
+                };
+                let clear = || {
+                    if let LazyIterKind::Pairwise { source: s, old: o } =
+                        &mut *l.state.borrow_mut()
+                    {
+                        *s = None;
+                        *o = None;
+                    }
+                };
+                let old = match old {
+                    Some(o) => o,
+                    None => match self.iter_next(&src, globals)? {
+                        Some(first) => first,
+                        None => {
+                            clear();
+                            return Ok(None);
+                        }
+                    },
+                };
+                let new = match self.iter_next(&src, globals)? {
+                    Some(v) => v,
+                    None => {
+                        clear();
+                        return Ok(None);
+                    }
+                };
+                if let LazyIterKind::Pairwise { old: o, .. } = &mut *l.state.borrow_mut() {
+                    *o = Some(new.clone());
+                }
+                Ok(Some(Object::Tuple(vec![old, new].into())))
+            }
+            Snap::ZipLongest {
+                mut iters,
+                fillvalue,
+                mut numactive,
+            } => {
+                if iters.is_empty() || numactive == 0 {
+                    return Ok(None);
+                }
+                let mut result = Vec::with_capacity(iters.len());
+                for slot in iters.iter_mut() {
+                    let value = match slot {
+                        None => fillvalue.clone(),
+                        Some(it) => match self.iter_next(it, globals)? {
+                            Some(v) => v,
+                            None => {
+                                numactive -= 1;
+                                if numactive == 0 {
+                                    if let LazyIterKind::ZipLongest {
+                                        numactive: na, ..
+                                    } = &mut *l.state.borrow_mut()
+                                    {
+                                        *na = 0;
+                                    }
+                                    return Ok(None);
+                                }
+                                *slot = None;
+                                fillvalue.clone()
+                            }
+                        },
+                    };
+                    result.push(value);
+                }
+                if let LazyIterKind::ZipLongest {
+                    iters: i,
+                    numactive: na,
+                    ..
+                } = &mut *l.state.borrow_mut()
+                {
+                    *i = iters;
+                    *na = numactive;
+                }
+                Ok(Some(Object::Tuple(result.into())))
+            }
+            Snap::Accumulate {
+                source,
+                func,
+                total,
+                initial,
+            } => {
+                if let Some(init) = initial {
+                    if let LazyIterKind::Accumulate {
+                        total: t,
+                        initial: i,
+                        ..
+                    } = &mut *l.state.borrow_mut()
+                    {
+                        *t = Some(init.clone());
+                        *i = None;
+                    }
+                    return Ok(Some(init));
+                }
+                let Some(item) = self.iter_next(&source, globals)? else {
+                    return Ok(None);
+                };
+                let new_total = match total {
+                    None => item,
+                    Some(total) => match &func {
+                        None => {
+                            self.dispatch_binary_op(&total, &item, BinOpKind::Add, globals)?
+                        }
+                        Some(f) => self.call(f, &[total, item], &[], globals)?,
+                    },
+                };
+                if let LazyIterKind::Accumulate { total: t, .. } = &mut *l.state.borrow_mut() {
+                    *t = Some(new_total.clone());
+                }
+                Ok(Some(new_total))
+            }
+            Snap::Batched { source, n, strict } => {
+                let Some(src) = source else {
+                    return Ok(None);
+                };
+                let mut batch = Vec::with_capacity(n);
+                while batch.len() < n {
+                    match self.iter_next(&src, globals)? {
+                        Some(v) => batch.push(v),
+                        None => {
+                            if let LazyIterKind::Batched { source: s, .. } =
+                                &mut *l.state.borrow_mut()
+                            {
+                                *s = None;
+                            }
+                            if batch.is_empty() {
+                                return Ok(None);
+                            }
+                            if strict {
+                                return Err(value_error("batched(): incomplete batch"));
+                            }
+                            return Ok(Some(Object::Tuple(batch.into())));
+                        }
+                    }
+                }
+                Ok(Some(Object::Tuple(batch.into())))
+            }
+            Snap::Tee {
+                shared,
+                data,
+                index,
+            } => {
+                let value = {
+                    let sh = shared.borrow();
+                    let buf = sh.buffer.borrow();
+                    buf.get(index).cloned()
+                };
+                let value = match value {
+                    Some(v) => v,
+                    None => {
+                        // Need to pull a fresh element from the source.
+                        let source = {
+                            let mut sh = shared.borrow_mut();
+                            let src = match sh.source.clone() {
+                                None => return Ok(None),
+                                Some(_) if sh.busy => {
+                                    return Err(crate::error::runtime_error(
+                                        "cannot re-enter the tee iterator",
+                                    ))
+                                }
+                                Some(src) => src,
+                            };
+                            sh.busy = true;
+                            src
+                        };
+                        let pulled = self.iter_next(&source, globals);
+                        let mut sh = shared.borrow_mut();
+                        sh.busy = false;
+                        match pulled {
+                            Ok(Some(v)) => {
+                                sh.buffer.borrow_mut().push(v.clone());
+                                v
+                            }
+                            Ok(None) => {
+                                sh.source = None;
+                                drop(sh);
+                                // Mirror the exhaustion onto the Python
+                                // `_tee_dataobject` so its `__reduce__`
+                                // (and other branches created from it)
+                                // observe `source is None`.
+                                if let Object::Instance(inst) = &data {
+                                    inst.dict.borrow_mut().insert(
+                                        crate::object::DictKey(Object::from_static("source")),
+                                        Object::None,
+                                    );
+                                }
+                                return Ok(None);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                };
+                if let LazyIterKind::TeeBranch { index: i, .. } = &mut *l.state.borrow_mut() {
+                    *i = index + 1;
+                }
+                Ok(Some(value))
+            }
+            Snap::Islice {
+                source,
+                mut next_idx,
+                mut pos,
+                stop,
+                step,
+                done,
+            } => {
+                if done {
+                    return Ok(None);
+                }
+                let write_back = |next_idx: u64, pos: u64, done: bool| {
+                    if let LazyIterKind::Islice {
+                        next_idx: ni,
+                        pos: p,
+                        done: d,
+                        source: src,
+                        ..
+                    } = &mut *l.state.borrow_mut()
+                    {
+                        *ni = next_idx;
+                        *p = pos;
+                        *d = done;
+                        if done {
+                            // Release the source so weakrefs to it can
+                            // die with it (CPython clears lz->it).
+                            *src = Object::None;
+                        }
+                    }
+                };
+                // CPython's islice_next order: consume the skipped
+                // elements first, *then* check the stop bound —
+                // `islice(it, 3, 3)` advances `it` by three even though
+                // it yields nothing.
+                while pos < next_idx {
+                    match self.iter_next(&source, globals) {
+                        Ok(Some(_)) => pos += 1,
+                        Ok(None) => {
+                            write_back(next_idx, pos, true);
+                            return Ok(None);
+                        }
+                        Err(e) => {
+                            write_back(next_idx, pos, true);
+                            return Err(e);
+                        }
+                    }
+                }
+                if stop.is_some_and(|s| pos >= s) {
                     write_back(next_idx, pos, true);
                     return Ok(None);
                 }
-                Err(e) => {
-                    write_back(next_idx, pos, true);
-                    return Err(e);
-                }
-            };
-            let cur = pos;
-            pos += 1;
-            if cur == next_idx {
+                let item = match self.iter_next(&source, globals) {
+                    Ok(Some(item)) => item,
+                    Ok(None) => {
+                        write_back(next_idx, pos, true);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        write_back(next_idx, pos, true);
+                        return Err(e);
+                    }
+                };
+                pos += 1;
                 next_idx = next_idx.saturating_add(step);
+                if let Some(s) = stop {
+                    if next_idx > s {
+                        next_idx = s;
+                    }
+                }
                 write_back(next_idx, pos, false);
-                return Ok(Some(item));
+                Ok(Some(item))
             }
         }
     }
@@ -11623,6 +12452,14 @@ impl Interpreter {
                 *p.doc.borrow_mut() = value;
                 Ok(())
             }
+            // `classmethod`/`staticmethod` wrappers carry a writable
+            // instance dict (bpo-43682): `cm.x = 42` just works.
+            Object::StaticMethod(w) | Object::ClassMethod(w) => {
+                w.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_str(name)), value);
+                Ok(())
+            }
             Object::Type(ty) => {
                 if ty.flags.is_builtin {
                     return Err(type_error(format!(
@@ -12101,6 +12938,21 @@ impl Interpreter {
                     }
                 }
                 self.generic_delattr_instance(inst, obj, name)
+            }
+            Object::StaticMethod(w) | Object::ClassMethod(w) => {
+                let removed = w
+                    .dict
+                    .borrow_mut()
+                    .shift_remove(&DictKey(Object::from_str(name)))
+                    .is_some();
+                if removed {
+                    return Ok(());
+                }
+                Err(attribute_error(format!(
+                    "'{}' object has no attribute '{}'",
+                    obj.type_name(),
+                    name
+                )))
             }
             Object::Type(ty) => {
                 // A user metaclass `__delattr__` intercepts class-attribute
@@ -13384,7 +14236,7 @@ impl Interpreter {
             // Since Python 3.10 (bpo-43682) `staticmethod` objects are
             // themselves callable and simply forward to the wrapped
             // function with the arguments unchanged.
-            Object::StaticMethod(inner) => self.call(inner, args, kwargs, outer_globals),
+            Object::StaticMethod(inner) => self.call(&inner.func, args, kwargs, outer_globals),
             Object::BoundMethod(bm) => {
                 // Generator / coroutine / async-generator methods are
                 // wired through internal builtin names so the
@@ -13889,9 +14741,9 @@ impl Interpreter {
         // as the implicit first argument when needed.
         let (callable, prefix): (Object, Vec<Object>) = match &prep {
             Object::ClassMethod(inner) => {
-                ((**inner).clone(), vec![Object::Type(metaclass.clone())])
+                (inner.func.clone(), vec![Object::Type(metaclass.clone())])
             }
-            Object::StaticMethod(inner) => ((**inner).clone(), Vec::new()),
+            Object::StaticMethod(inner) => (inner.func.clone(), Vec::new()),
             other => (other.clone(), vec![Object::Type(metaclass.clone())]),
         };
         let bases_tuple =
@@ -14237,15 +15089,15 @@ impl Interpreter {
             let is_type_new_sentinel = matches!(
                 new_method.as_ref(),
                 Some(Object::StaticMethod(inner)) if matches!(
-                    inner.as_ref(),
+                    &inner.func,
                     Object::Builtin(b) if b.name == "__new__"
                 )
             );
             let class_obj = match &new_method {
                 Some(_) if !is_type_new_sentinel => {
                     let callable = match new_method.as_ref().unwrap() {
-                        Object::StaticMethod(inner) => (**inner).clone(),
-                        Object::ClassMethod(inner) => (**inner).clone(),
+                        Object::StaticMethod(inner) => inner.func.clone(),
+                        Object::ClassMethod(inner) => inner.func.clone(),
                         other => other.clone(),
                     };
                     let mut new_args = Vec::with_capacity(call_args.len() + 1);
@@ -14419,14 +15271,14 @@ impl Interpreter {
         let is_type_new_sentinel = matches!(
             new_method.as_ref(),
             Some(Object::StaticMethod(inner)) if matches!(
-                inner.as_ref(),
+                &inner.func,
                 Object::Builtin(b) if b.name == "__new__"
             )
         );
         if let Some(new_method) = new_method {
             if !is_type_new_sentinel {
                 let callable = match &new_method {
-                    Object::StaticMethod(inner) | Object::ClassMethod(inner) => (**inner).clone(),
+                    Object::StaticMethod(inner) | Object::ClassMethod(inner) => inner.func.clone(),
                     other => other.clone(),
                 };
                 let mut new_args = Vec::with_capacity(args.len() + 1);
@@ -14601,7 +15453,7 @@ impl Interpreter {
             if let Some(Object::Function(f)) = current {
                 ty.dict
                     .borrow_mut()
-                    .insert(key, Object::ClassMethod(Rc::new(Object::Function(f))));
+                    .insert(key, Object::ClassMethod(MethodWrapper::new(Object::Function(f))));
             }
         }
 
@@ -14620,7 +15472,7 @@ impl Interpreter {
             if let Some(Object::Function(f)) = current {
                 ty.dict
                     .borrow_mut()
-                    .insert(key, Object::StaticMethod(Rc::new(Object::Function(f))));
+                    .insert(key, Object::StaticMethod(MethodWrapper::new(Object::Function(f))));
             }
         }
 
@@ -14654,6 +15506,21 @@ impl Interpreter {
                     out
                 }
             };
+            // Private slot names are mangled exactly like attribute
+            // references in the class body (`__slots__ = ['__s']` in
+            // class `MySet` stores `_MySet__s` — CPython `type_new`).
+            let cls_short = ty.name.rsplit('.').next().unwrap_or(&ty.name);
+            let stripped = cls_short.trim_start_matches('_');
+            let names: Vec<String> = names
+                .into_iter()
+                .map(|n| {
+                    if n.starts_with("__") && !n.ends_with("__") && !stripped.is_empty() {
+                        format!("_{stripped}{n}")
+                    } else {
+                        n
+                    }
+                })
+                .collect();
             let allows_dict_in_slots = names.iter().any(|s| s == "__dict__");
             *ty.slot_names.borrow_mut() = names.clone();
             // Install slot descriptors for each name. `__dict__` stays a
@@ -14784,7 +15651,7 @@ impl Interpreter {
         // CPython treats __init_subclass__ as an implicit classmethod
         // regardless of how it was defined.
         let callable = match hook {
-            Object::ClassMethod(inner) => (*inner).clone(),
+            Object::ClassMethod(inner) => inner.func.clone(),
             other => other,
         };
         let bound = Object::BoundMethod(Rc::new(BoundMethod {
@@ -14935,9 +15802,15 @@ impl Interpreter {
                     return builtins::construct_property(&bound);
                 }
                 "staticmethod" => {
+                    if !kwargs.is_empty() {
+                        return Err(type_error("staticmethod() takes no keyword arguments"));
+                    }
                     return builtins::construct_staticmethod(args);
                 }
                 "classmethod" => {
+                    if !kwargs.is_empty() {
+                        return Err(type_error("classmethod() takes no keyword arguments"));
+                    }
                     return builtins::construct_classmethod(args);
                 }
                 // `types.GenericAlias(origin, args)` — also reachable as
@@ -15264,7 +16137,7 @@ impl Interpreter {
             &new_fn,
             Some(Object::StaticMethod(inner))
                 if matches!(
-                    inner.as_ref(),
+                    &inner.func,
                     Object::Builtin(b) if b.name == "__new__"
                 )
         );
@@ -15272,8 +16145,15 @@ impl Interpreter {
             Some(_) if !is_object_new => {
                 // User-defined `__new__` — pass cls + args + kwargs.
                 let callable = match new_fn.unwrap() {
-                    Object::StaticMethod(inner) => (*inner).clone(),
-                    Object::ClassMethod(inner) => (*inner).clone(),
+                    Object::StaticMethod(inner) => inner.func.clone(),
+                    // A `classmethod`-wrapped `__new__` binds `cls` like any
+                    // attribute access would, and `type.__call__` still
+                    // passes `cls` explicitly — the target sees it twice
+                    // (CPython: `C(1, 2)` → `f(C, C, 1, 2)`).
+                    Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod {
+                        receiver: Object::Type(cls.clone()),
+                        function: inner.func.clone(),
+                    })),
                     other => other,
                 };
                 let mut new_args: Vec<Object> = Vec::with_capacity(args.len() + 1);
@@ -16298,7 +17178,7 @@ impl Interpreter {
     /// warning is raised; we convert it into a located `SyntaxError`
     /// (carrying the backslash's `offset`), exactly as CPython's compiler
     /// does. A no-op when there are no diagnostics or no `warnings` module.
-    fn emit_escape_warnings(
+    pub fn emit_escape_warnings(
         &mut self,
         source: &str,
         filename: &str,
@@ -16480,6 +17360,15 @@ impl Interpreter {
         // shared buffer and post-unpickle mutations are visible through
         // the iterator (CPython `bytearrayiter_reduce`).
         if let crate::object::PyIterator::ByteArray { data, index } = &*it.borrow() {
+            // A detached (exhausted) iterator reduces to `(iter, ((),))` —
+            // no buffer, no index (CPython `bytearrayiter_reduce` with
+            // `it_seq == NULL`).
+            if *index == usize::MAX {
+                return Ok(Object::new_tuple(vec![
+                    builtin,
+                    Object::new_tuple(vec![Object::new_tuple(vec![])]),
+                ]));
+            }
             return Ok(Object::new_tuple(vec![
                 builtin,
                 Object::new_tuple(vec![Object::ByteArray(data.clone())]),
@@ -16522,7 +17411,7 @@ impl Interpreter {
         while let Some(line) = self.iter_next(&it, globals)? {
             match line {
                 Object::Str(s) => {
-                    file.write_bytes(s.as_bytes())?;
+                    file.write_bytes(&file.encode_text(&s)?)?;
                 }
                 Object::Bytes(b) => {
                     file.write_bytes(&b)?;
@@ -16552,6 +17441,25 @@ impl Interpreter {
             // Bytes sources go through PEP 263 detection (BOM + coding
             // cookie), like CPython's `compile()`.
             Some(Object::Bytes(b)) => decode_compile_source_bytes(b, &filename)?,
+            // An `ast.parse` result: `ast.parse` stashes the original
+            // text on the tree (`_weavepy_source`), which we recompile —
+            // CPython lowers the AST directly; we only support the
+            // unmodified round-trip.
+            Some(Object::Instance(inst)) => {
+                let src = inst
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("_weavepy_source")))
+                    .cloned();
+                match src {
+                    Some(Object::Str(s)) => s.to_string(),
+                    _ => {
+                        return Err(type_error(
+                            "compile() argument 1 must be a string or bytes-like",
+                        ))
+                    }
+                }
+            }
             _ => {
                 return Err(type_error(
                     "compile() argument 1 must be a string or bytes-like",
@@ -16663,7 +17571,27 @@ impl Interpreter {
         // (e.g. `dataclasses` building `__init__`) this way.
         let exec_locals: Option<Rc<RefCell<DictData>>> = match args.get(2) {
             Some(Object::Dict(d)) if !Rc::ptr_eq(d, &globals_dict) => Some(d.clone()),
-            Some(Object::Dict(_)) | Some(Object::None) | None => None,
+            Some(Object::Dict(_)) => None,
+            // Defaulted: like `eval`, CPython falls back to the *calling
+            // frame's* live locals (so `exec(c)` inside a function sees
+            // that function's locals). At module level locals *are*
+            // globals, so no distinct mapping is installed.
+            Some(Object::None) | None => {
+                if matches!(args.get(1), Some(Object::Dict(_))) {
+                    // Explicit globals without locals: locals default to
+                    // the same dict (CPython), i.e. no distinct mapping.
+                    None
+                } else {
+                    let caller = self.frame_stack.borrow().last().cloned();
+                    caller.and_then(|f| {
+                        f.invalidate_locals();
+                        match f.locals() {
+                            Object::Dict(d) if !Rc::ptr_eq(&d, &globals_dict) => Some(d),
+                            _ => None,
+                        }
+                    })
+                }
+            }
             _ => return Err(type_error("exec() locals must be a mapping")),
         };
         let code_rc = match source {
@@ -17378,11 +18306,19 @@ fn decode_source_bytes_inner(
             .iter()
             .position(|&b| b == b'\n')
             .map_or(payload.len(), |off| line_start + off);
-        if let Some(c) = cookie_of_line(&payload[line_start..line_end]) {
+        let line = &payload[line_start..line_end];
+        if let Some(c) = cookie_of_line(line) {
             cookie = Some(c);
             break;
         }
-        if line_end >= payload.len() {
+        // A cookie on line 2 only counts when line 1 is blank or a
+        // comment (PEP 263 — the tokenizer stops looking once it sees
+        // real code on the first line).
+        let blank_or_comment = line
+            .iter()
+            .find(|b| !matches!(b, b' ' | b'\t' | 0x0C | b'\r'))
+            .is_none_or(|b| *b == b'#');
+        if !blank_or_comment || line_end >= payload.len() {
             break;
         }
         line_start = line_end + 1;
@@ -17526,7 +18462,17 @@ fn parse_error_to_syntax_error(
     source: &str,
     filename: &str,
 ) -> RuntimeError {
-    let (lineno, offset, text) = line_col_text(source, err.byte_offset());
+    let (lineno, offset, mut text) = line_col_text(source, err.byte_offset());
+    // Tokenizer errors detected at EOF/EOL but *reported* at the opening
+    // quote/bracket (unterminated literals, "'(' was never closed") get
+    // their `.text` from CPython's tokenizer line buffer, which doesn't
+    // include the trailing newline; ordinary parser errors do.
+    let msg = err.syntax_message();
+    if msg.starts_with("unterminated ") || msg.contains("was never closed") {
+        if text.ends_with('\n') {
+            text.pop();
+        }
+    }
     let e = crate::error::syntax_error_located_as(
         err.exception_class(),
         err.syntax_message(),
@@ -18225,6 +19171,9 @@ fn builtin_type_doc(name: &str) -> Option<&'static str> {
             "slice(stop)\nslice(start, stop[, step])"
         }
         "memoryview" => "Create a new memoryview object which references the given object.",
+        "NoneType" => "The type of the None singleton.",
+        "NotImplementedType" => "The type of the NotImplemented singleton.",
+        "ellipsis" => "The type of the Ellipsis singleton.",
         _ => return None,
     })
 }

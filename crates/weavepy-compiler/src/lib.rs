@@ -492,6 +492,39 @@ pub fn compile_eval_with_source(
     source: &str,
     filename: &str,
 ) -> Result<CodeObject, CompileError> {
+    // CPython's `eval` grammar only admits a single expression; any
+    // statement syntax (`del x`, `x = 1`, a second statement, …) is a
+    // bare "invalid syntax" pointing at the first token the expression
+    // grammar can't accept — *before* any statement-level diagnostics
+    // like "cannot delete f-string expression" can fire.
+    if let Some(bad) = eval_mode_invalid_stmt(module) {
+        let span = match &bad.kind {
+            // The expression grammar chokes on the `=`: locate it
+            // between the last target and the value.
+            StmtKind::Assign { targets, value } => {
+                let from = targets
+                    .last()
+                    .map(|t| t.span.end.0 as usize)
+                    .unwrap_or(bad.span.start.0 as usize);
+                let to = value.span.start.0 as usize;
+                let eq = source
+                    .get(from..to)
+                    .and_then(|s| s.find('='))
+                    .map(|i| (from + i) as u32)
+                    .unwrap_or(bad.span.start.0);
+                weavepy_lexer::Span::new(eq, eq + 1)
+            }
+            // Statement keywords (`del`, `pass`, …) span the keyword.
+            StmtKind::Delete(_) => {
+                weavepy_lexer::Span::new(bad.span.start.0, bad.span.start.0 + 3)
+            }
+            _ => weavepy_lexer::Span::new(bad.span.start.0, bad.span.start.0 + 1),
+        };
+        return Err(CompileError::parser_spanned(
+            "invalid syntax".to_owned(),
+            span,
+        ));
+    }
     validate::validate_module(module, source)?;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
@@ -505,6 +538,17 @@ pub fn compile_eval_with_source(
     top.eval_mode = true;
     top.compile_module_body(module)?;
     Ok(top.finish())
+}
+
+/// The first statement that breaks `eval` mode's single-expression
+/// shape: any non-`Expr` statement, or any statement after the first.
+fn eval_mode_invalid_stmt(module: &Module) -> Option<&Stmt> {
+    for (i, stmt) in module.body.iter().enumerate() {
+        if i > 0 || !matches!(stmt.kind, StmtKind::Expr(_)) {
+            return Some(stmt);
+        }
+    }
+    None
 }
 
 /// Lookup table that maps a byte offset back to a 1-based line number.

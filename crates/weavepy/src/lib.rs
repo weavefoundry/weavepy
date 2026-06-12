@@ -263,7 +263,11 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
         source
     };
     install_capi_loader();
-    let module = parser::parse_module(source_ref)?;
+    // Tokenizer-collected invalid-escape diagnostics (CPython's
+    // `SyntaxWarning`s) are replayed through the `warnings` machinery
+    // once the interpreter is up, just before the module body runs.
+    let (module_res, escape_warnings) = parser::parse_module_with_warnings(source_ref);
+    let module = module_res?;
     let code = compiler::compile_module_with_source(&module, source_ref, &opts.filename)?;
     let mut interpreter = vm::Interpreter::default();
     interpreter.apply_run_options(&opts.flags);
@@ -300,7 +304,9 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
         let code_rc = vm::sync::Rc::new(code.clone());
         interpreter.register_source_with_linecache(&code_rc, source_ref, "<string>");
     }
-    let result = interpreter.run_module_as(&code, "__main__", file_for_main);
+    let result = interpreter
+        .emit_escape_warnings(source_ref, &opts.filename, &escape_warnings)
+        .and_then(|()| interpreter.run_module_as(&code, "__main__", file_for_main));
     // CPython prints the uncaught exception (via `sys.excepthook` /
     // the traceback module) *before* `Py_FinalizeEx` runs shutdown
     // finalizers — `__del__` output interleaves after the traceback.

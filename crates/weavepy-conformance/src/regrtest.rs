@@ -647,22 +647,64 @@ pub fn run_one_with(
     }
 }
 
+/// For vendored CPython tests, build a libregrtest-style bootstrap:
+/// import the file as `test.<name>` (so `__name__`/`__module__` match
+/// what CPython's test runner produces — `global_enum` reprs, pickling
+/// of test-defined classes, …) and run its unittest suite explicitly,
+/// since the `if __name__ == '__main__'` guard never fires on import.
+///
+/// Returns `None` for bundled tests, which keep script semantics.
+fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
+    let name = file
+        .label
+        .strip_prefix("cpython/Lib/test/")?
+        .trim_end_matches(".py")
+        .to_owned();
+    // `Lib` is the ancestor whose child is the `test` directory the
+    // file (or its package) lives in.
+    let mut lib_dir = file.path.parent()?;
+    while lib_dir.file_name().and_then(|n| n.to_str()) != Some("test") {
+        lib_dir = lib_dir.parent()?;
+    }
+    let lib_dir = lib_dir.parent()?.display().to_string();
+    let path = file.path.display().to_string();
+    Some(format!(
+        r#"
+import sys
+sys.path.insert(0, {lib_dir:?})
+sys.argv = [{path:?}]
+import unittest
+try:
+    mod = __import__("test.{name}", fromlist=["__spec__"])
+except unittest.SkipTest as e:
+    print("skipped:", e)
+    sys.exit(0)
+suite = unittest.TestLoader().loadTestsFromModule(mod)
+result = unittest.TextTestRunner(verbosity=1).run(suite)
+sys.exit(0 if result.wasSuccessful() else 1)
+"#
+    ))
+}
+
 fn run_inprocess(
     file: &RegrtestFile,
     expected: Option<TestStatus>,
     timeout: Duration,
 ) -> TestReport {
-    let source = match fs::read_to_string(&file.path) {
-        Ok(s) => s,
-        Err(e) => {
-            return TestReport {
-                label: file.label.clone(),
-                status: TestStatus::Error,
-                duration_ms: Some(0),
-                detail: Some(format!("read failed: {e}")),
-                expected,
-            };
-        }
+    let source = match libregrtest_bootstrap(file) {
+        Some(bootstrap) => bootstrap,
+        None => match fs::read_to_string(&file.path) {
+            Ok(s) => s,
+            Err(e) => {
+                return TestReport {
+                    label: file.label.clone(),
+                    status: TestStatus::Error,
+                    duration_ms: Some(0),
+                    detail: Some(format!("read failed: {e}")),
+                    expected,
+                };
+            }
+        },
     };
 
     let opts = RunOptions::new(file.path.display().to_string())
@@ -734,7 +776,14 @@ fn run_subprocess(
         .unwrap_or_else(|| PathBuf::from("weavepy"));
     let start = Instant::now();
     let mut cmd = std::process::Command::new(&weavepy_bin);
-    cmd.arg(&file.path);
+    match libregrtest_bootstrap(file) {
+        Some(bootstrap) => {
+            cmd.arg("-c").arg(bootstrap);
+        }
+        None => {
+            cmd.arg(&file.path);
+        }
+    }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());

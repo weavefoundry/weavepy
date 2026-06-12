@@ -36,9 +36,11 @@ pub enum LexError {
     #[error("f-string: expressions nested too deeply")]
     FstringNestedTooDeeply { pos: u32 },
     /// More than 150 lexically nested f-strings (CPython's
-    /// `MAXFSTRINGLEVEL`).
+    /// `MAXFSTRINGLEVEL`). `field_start` is the outermost replacement
+    /// field's start so the parser can prefer an error pegen would have
+    /// reported from the tokens already seen.
     #[error("too many nested f-strings")]
-    FstringTooManyNested { pos: u32 },
+    FstringTooManyNested { pos: u32, field_start: u32 },
     /// `\N` not followed by a complete `{NAME}` group in an f-string
     /// literal part. CPython detects this in the tokenizer (names are
     /// parsed differently inside f-strings), so it wins over an
@@ -104,7 +106,7 @@ impl LexError {
             | LexError::FstringExpectingBrace { pos, .. }
             | LexError::FstringExpectingBraceOrSpec { pos, .. }
             | LexError::FstringNestedTooDeeply { pos }
-            | LexError::FstringTooManyNested { pos }
+            | LexError::FstringTooManyNested { pos, .. }
             | LexError::FstringMalformedNamedEscape { pos, .. }
             | LexError::FstringParenMismatch { pos, .. }
             | LexError::FstringUnmatchedParen { pos, .. }

@@ -295,6 +295,8 @@ class _AssertWarnsContext:
         import warnings
         self._cm = warnings.catch_warnings(record=True)
         self._records = self._cm.__enter__()
+        # CPython exposes the recorded-warnings list as `.warnings`.
+        self.warnings = self._records
         warnings.simplefilter("always")
         return self
 

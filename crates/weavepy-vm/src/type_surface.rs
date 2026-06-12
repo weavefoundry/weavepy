@@ -31,7 +31,7 @@ use crate::sync::RefCell;
 
 use crate::builtin_types::BuiltinTypes;
 use crate::error::{type_error, value_error, RuntimeError};
-use crate::object::{BuiltinFn, DictData, DictKey, Object, PyIterator, PyMemoryView};
+use crate::object::{BuiltinFn, DictData, DictKey, MethodWrapper, Object, PyIterator, PyMemoryView};
 use crate::types::TypeObject;
 
 /// Entry point: called once per thread when [`BuiltinTypes`] is built.
@@ -48,6 +48,33 @@ pub fn install(bt: &BuiltinTypes) {
     install_value_richcmp(bt);
     install_numeric_getsets(bt);
     install_value_reprs(bt);
+    install_numeric_dunders(bt);
+}
+
+/// Materialize the numeric operator slots in the value types' dicts
+/// (`'__add__' in vars(int)` is True in CPython; test_descr's
+/// OperatorsTest walks `t.__dict__` looking for them). The synthesized
+/// builtins are the same ones `lookup_method` resolves on instances.
+fn install_numeric_dunders(bt: &BuiltinTypes) {
+    const NAMES: &[&str] = &[
+        "__add__", "__radd__", "__sub__", "__rsub__", "__mul__", "__rmul__", "__truediv__",
+        "__rtruediv__", "__floordiv__", "__rfloordiv__", "__mod__", "__rmod__", "__pow__",
+        "__rpow__", "__divmod__", "__rdivmod__", "__lshift__", "__rlshift__", "__rshift__",
+        "__rrshift__", "__and__", "__rand__", "__or__", "__ror__", "__xor__", "__rxor__",
+        "__neg__", "__pos__", "__invert__", "__abs__", "__bool__", "__eq__", "__ne__", "__lt__",
+        "__le__", "__gt__", "__ge__", "__hash__", "__format__", "__getnewargs__",
+    ];
+    for (ty, rep) in [
+        (&bt.int_, Object::Int(0)),
+        (&bt.float_, Object::Float(0.0)),
+        (&bt.complex_, Object::new_complex(0.0, 0.0)),
+    ] {
+        for name in NAMES {
+            if let Some(b) = crate::builtins::numeric_dunder(&rep, name) {
+                insert_if_absent(ty, name, Object::Builtin(Rc::new(b)));
+            }
+        }
+    }
 }
 
 /// Materialize `tp_repr` for the value types (`'__repr__' in vars(int)`
@@ -1008,7 +1035,7 @@ fn install_class_getitem(bt: &BuiltinTypes) {
         insert_if_absent(
             ty,
             "__class_getitem__",
-            Object::ClassMethod(Rc::new(builtin(
+            Object::ClassMethod(MethodWrapper::new(builtin(
                 "__class_getitem__",
                 class_getitem_builtin,
             ))),
@@ -1094,6 +1121,8 @@ fn install_method_tables(bt: &BuiltinTypes) {
             "__add__",
             "__mul__",
             "__rmul__",
+            "__iadd__",
+            "__imul__",
             "__len__",
             "__contains__",
         ],

@@ -614,7 +614,15 @@ def parse(source, filename="<unknown>", mode="exec",
     if isinstance(source, (bytes, bytearray)):
         source = bytes(source).decode("utf-8")
     spec = _ast.parse(source, filename, mode)
-    return _fix_contexts(_build(spec))
+    tree = _fix_contexts(_build(spec))
+    # Remember the original text so `compile(tree, ...)` can recompile it
+    # (WeavePy compiles from source; an unmodified `ast.parse` round-trip
+    # is by far the common case).
+    try:
+        tree._weavepy_source = source
+    except Exception:
+        pass
+    return tree
 
 
 # ---------------------------------------------------------------------------

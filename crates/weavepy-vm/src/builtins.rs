@@ -25,7 +25,7 @@ use crate::builtin_types::{builtin_types, instance_is_subclass};
 use crate::error::{
     index_error, key_error, runtime_error, stop_iteration, type_error, value_error, RuntimeError,
 };
-use crate::object::{BuiltinFn, DictData, DictKey, Object, PyIterator, Range};
+use crate::object::{BuiltinFn, DictData, DictKey, MethodWrapper, Object, PyIterator, Range};
 
 /// Marker name on the `BuiltinFn` returned by [`build_class_builtin`].
 /// The VM looks for this when dispatching `Call` so the call can be
@@ -517,6 +517,8 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                 weavepy_compiler::BinOpKind::Mult,
                 true,
             )),
+            "__iadd__" => Some(method("__iadd__", list_iadd)),
+            "__imul__" => Some(method("__imul__", list_imul)),
             _ => None,
         },
         Object::Dict(_) => match name {
@@ -1239,6 +1241,9 @@ fn num_unary_method(nm: &'static str, op: weavepy_compiler::UnaryKind) -> Builti
             .first()
             .cloned()
             .ok_or_else(|| type_error(format!("unbound method {nm}() needs an argument")))?;
+        // Subclass instances apply the base type's op to their native
+        // payload (CPython's inherited slot ignores the subclass).
+        let s = s.native_value().unwrap_or(s);
         crate::unary_op(&s, op)
     })
 }
@@ -1259,7 +1264,7 @@ fn num_getnewargs(self_o: &Object) -> Object {
 /// Resolve a numeric slot-wrapper dunder by name for receiver `self_repr`.
 /// Returns `None` for anything that isn't a numeric dunder so the caller
 /// falls through to its other attribute paths.
-fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn> {
+pub(crate) fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn> {
     use weavepy_compiler::BinOpKind as B;
     use weavepy_compiler::UnaryKind as U;
     let kind = num_self_of(self_repr)?;
@@ -1336,6 +1341,14 @@ fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn> {
         "__invert__" if matches!(kind, NumSelf::Int) => {
             num_unary_method("__invert__", U::Invert)
         }
+        "__bool__" => method("__bool__", |args| {
+            let v = args.first().cloned().unwrap_or(Object::None);
+            let v = v.native_value().unwrap_or(v);
+            Ok(Object::Bool(v.is_truthy()))
+        }),
+        "__abs__" => method("__abs__", |args| {
+            b_abs(std::slice::from_ref(args.first().unwrap_or(&Object::None)))
+        }),
         "__eq__" => num_cmp_method("__eq__", kind, CmpDun::Eq),
         "__ne__" => num_cmp_method("__ne__", kind, CmpDun::Ne),
         "__lt__" => num_cmp_method("__lt__", kind, CmpDun::Lt),
@@ -1509,8 +1522,8 @@ pub fn unbound_method(type_name: &str, name: &str) -> Option<Object> {
             Object::None,
             Object::None,
         ))),
-        "staticmethod" => Object::StaticMethod(Rc::new(Object::None)),
-        "classmethod" => Object::ClassMethod(Rc::new(Object::None)),
+        "staticmethod" => Object::StaticMethod(MethodWrapper::new(Object::None)),
+        "classmethod" => Object::ClassMethod(MethodWrapper::new(Object::None)),
         _ => return None,
     };
     lookup_method(&rep, name)
@@ -2158,14 +2171,14 @@ pub fn construct_property(args: &[Object]) -> Result<Object, RuntimeError> {
 /// callable unchanged on access.
 pub fn construct_staticmethod(args: &[Object]) -> Result<Object, RuntimeError> {
     let inner = args.first().cloned().unwrap_or(Object::None);
-    Ok(Object::StaticMethod(Rc::new(inner)))
+    Ok(Object::StaticMethod(MethodWrapper::new(inner)))
 }
 
 /// `classmethod(f)` — non-data descriptor that binds the wrapped
 /// callable to the *class* (not the instance) on access.
 pub fn construct_classmethod(args: &[Object]) -> Result<Object, RuntimeError> {
     let inner = args.first().cloned().unwrap_or(Object::None);
-    Ok(Object::ClassMethod(Rc::new(inner)))
+    Ok(Object::ClassMethod(MethodWrapper::new(inner)))
 }
 
 /// `staticmethod.__get__(self, obj, objtype=None)` — the descriptor hook.
@@ -2177,7 +2190,7 @@ pub fn construct_classmethod(args: &[Object]) -> Result<Object, RuntimeError> {
 /// itself (the bound receiver).
 pub(crate) fn staticmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
     match args.first() {
-        Some(Object::StaticMethod(inner)) => Ok((**inner).clone()),
+        Some(Object::StaticMethod(inner)) => Ok(inner.func.clone()),
         // Tolerate an already-unwrapped callable (defensive).
         Some(other) => Ok(other.clone()),
         None => Err(type_error("staticmethod.__get__() missing self")),
@@ -2190,7 +2203,7 @@ pub(crate) fn staticmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeE
 /// otherwise `type(obj)`.
 pub(crate) fn classmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
     let inner = match args.first() {
-        Some(Object::ClassMethod(i)) => (**i).clone(),
+        Some(Object::ClassMethod(i)) => i.func.clone(),
         _ => return Err(type_error("classmethod.__get__() missing self")),
     };
     let owner = match args.get(2) {
@@ -2501,7 +2514,7 @@ fn bind_descriptor(value: &Object, receiver: &Object) -> Object {
             receiver: receiver.clone(),
             function: value.clone(),
         })),
-        Object::StaticMethod(inner) => (**inner).clone(),
+        Object::StaticMethod(inner) => inner.func.clone(),
         Object::ClassMethod(inner) => {
             let cls = match receiver {
                 Object::Instance(inst) => Object::Type(inst.cls()),
@@ -2510,7 +2523,7 @@ fn bind_descriptor(value: &Object, receiver: &Object) -> Object {
             };
             Object::BoundMethod(Rc::new(crate::object::BoundMethod {
                 receiver: cls,
-                function: (**inner).clone(),
+                function: inner.func.clone(),
             }))
         }
         _ => value.clone(),
@@ -2558,10 +2571,10 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                     Object::ClassMethod(inner) => {
                         Object::BoundMethod(Rc::new(crate::object::BoundMethod {
                             receiver: Object::Type(t.clone()),
-                            function: (*inner).clone(),
+                            function: inner.func.clone(),
                         }))
                     }
-                    Object::StaticMethod(inner) => (*inner).clone(),
+                    Object::StaticMethod(inner) => inner.func.clone(),
                     other => other,
                 });
             }
@@ -4592,6 +4605,12 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::new_dict());
     }
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "dict expected at most 1 argument, got {}",
+            args.len()
+        )));
+    }
     // Fast path: another built-in dict copies entry-for-entry. Avoids
     // re-iterating as a sequence of pairs (which would fail, since
     // iter(dict) yields keys, not items).
@@ -4607,27 +4626,54 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     // `Vm::do_dict_call`. Anything left over is an iterable of pairs.
     let mut it = args[0].make_iter()?;
     let mut d = DictData::new();
+    let mut i = 0usize;
     while let Some(pair) = it.next_value() {
-        match pair {
-            Object::Tuple(items) if items.len() == 2 => {
-                d.insert(DictKey(items[0].clone()), items[1].clone());
-            }
-            Object::List(items) => {
-                let items = items.borrow();
-                if items.len() == 2 {
-                    d.insert(DictKey(items[0].clone()), items[1].clone());
+        // CPython `PyDict_MergeFromSeq2`: each element must itself be a
+        // sequence of exactly two items (a 2-char string works too).
+        // User instances iterate through the live interpreter (their
+        // `__iter__`/`__getitem__` is Python code).
+        let kv: Vec<Object> = if matches!(pair, Object::Instance(_)) {
+            let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+                return Err(type_error(format!(
+                    "cannot convert dictionary update sequence element #{i} to a sequence"
+                )));
+            };
+            // SAFETY: published by an enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let globals = interp.builtins_dict();
+            interp.collect_iterable(&pair, &globals).map_err(|e| {
+                if crate::is_type_error(&e) {
+                    type_error(format!(
+                        "cannot convert dictionary update sequence element #{i} to a sequence"
+                    ))
                 } else {
-                    return Err(value_error(
-                        "dictionary update sequence element is not a 2-element sequence",
-                    ));
+                    e
+                }
+            })?
+        } else {
+            let mut inner = pair.make_iter().map_err(|_| {
+                type_error(format!(
+                    "cannot convert dictionary update sequence element #{i} to a sequence"
+                ))
+            })?;
+            let mut kv = Vec::with_capacity(2);
+            while let Some(v) = inner.next_value() {
+                kv.push(v);
+                if kv.len() > 2 {
+                    break;
                 }
             }
-            _ => {
-                return Err(value_error(
-                    "dictionary update sequence element is not a 2-tuple",
-                ))
-            }
+            kv
+        };
+        if kv.len() != 2 {
+            return Err(value_error(format!(
+                "dictionary update sequence element #{i} has length {}; 2 is required",
+                kv.len()
+            )));
         }
+        let mut kv = kv.into_iter();
+        d.insert(DictKey(kv.next().unwrap()), kv.next().unwrap());
+        i += 1;
     }
     Ok(Object::Dict(Rc::new(RefCell::new(d))))
 }
@@ -5011,11 +5057,13 @@ fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     // slots and accept (but ignore) the rest.
     let mut combined: Vec<Object> = args.to_vec();
     let mut mode = combined.get(1).cloned();
+    let mut encoding = combined.get(3).cloned();
     for (k, v) in kwargs {
         match k.as_str() {
             "mode" => mode = Some(v.clone()),
-            "buffering" | "encoding" | "errors" | "newline" | "closefd" | "opener" => {
-                // Accept but don't fail: encoding is implicitly utf-8.
+            "encoding" => encoding = Some(v.clone()),
+            "buffering" | "errors" | "newline" | "closefd" | "opener" => {
+                // Accepted but not plumbed further yet.
             }
             other => {
                 return Err(type_error(format!(
@@ -5031,7 +5079,13 @@ fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
             combined[1] = m;
         }
     }
-    b_open(&combined)
+    let file = b_open(&combined)?;
+    if let (Object::File(f), Some(Object::Str(enc))) = (&file, &encoding) {
+        if !f.binary {
+            f.set_encoding(enc);
+        }
+    }
+    Ok(file)
 }
 
 fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5098,11 +5152,14 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = opts
         .open(&path)
         .map_err(|e| crate::error::os_error(format!("{path}: {e}")))?;
-    Ok(Object::File(Rc::new(PyFile::new(
-        path,
-        mode,
-        FileBackend::Disk(f),
-    ))))
+    let file = PyFile::new(path, mode, FileBackend::Disk(f));
+    // Positional `open(file, mode, buffering, encoding, …)`.
+    if let Some(Object::Str(enc)) = args.get(3) {
+        if !file.binary {
+            file.set_encoding(enc);
+        }
+    }
+    Ok(Object::File(Rc::new(file)))
 }
 
 pub(crate) fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5311,7 +5368,7 @@ fn b_super(args: &[Object]) -> Result<Object, RuntimeError> {
     // `super(C, self)` returns a proxy instance whose class is the
     // synthesized proxy type. Zero-arg form is handled by the VM's
     // call path (it materialises `__class__` and `self` first).
-    if args.len() != 2 {
+    if !matches!(args.len(), 1 | 2) {
         return Err(type_error(
             "super(): expected 2 arguments (zero-arg form must be called from inside a method)",
         ));
@@ -5320,8 +5377,70 @@ fn b_super(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Type(t) => t.clone(),
         _ => return Err(type_error("super() arg 1 must be a class")),
     };
+    if args.len() == 1 {
+        return Ok(make_unbound_super(class));
+    }
     let receiver = args[1].clone();
     Ok(make_super(class, receiver))
+}
+
+/// The one-argument form `super(C)`: an *unbound* super object. It does
+/// no MRO walking itself; it is a non-data descriptor whose `__get__`
+/// re-binds to `super(C, obj)` (the classic pre-PEP 3135
+/// `C._C__super = super(C); self.__super.meth()` idiom).
+fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object {
+    use crate::types::TypeObject;
+    let getter = {
+        let class = class.clone();
+        method("__get__", move |args: &[Object]| {
+            // Called as `desc.__get__(obj[, owner])` — bound, so args are
+            // `[desc, obj, owner?]`.
+            let obj = args.get(1).cloned().unwrap_or(Object::None);
+            if matches!(obj, Object::None) {
+                return Ok(args.first().cloned().unwrap_or(Object::None));
+            }
+            Ok(make_super(class.clone(), obj))
+        })
+    };
+    let proxy = Rc::new(TypeObject {
+        name: "super".to_owned(),
+        qualname: RefCell::new(None),
+        bases: vec![],
+        mro: RefCell::new(vec![]),
+        dict: Rc::new(RefCell::new({
+            let mut d = DictData::new();
+            d.insert(
+                DictKey(Object::from_static("__get__")),
+                Object::Builtin(Rc::new(getter)),
+            );
+            d
+        })),
+        flags: crate::types::TypeFlags::default(),
+        metaclass: RefCell::new(None),
+        slot_names: RefCell::new(Vec::new()),
+        forbids_dict: false,
+        subclasses: RefCell::new(Vec::new()),
+        getattribute_kind: crate::sync::Cell::new(0),
+    });
+    // `lookup` walks the MRO only — it must contain the type itself for
+    // the `__get__` above to be found.
+    *proxy.mro.borrow_mut() = vec![proxy.clone()];
+    let inst = crate::types::PyInstance {
+        class: RefCell::new(proxy),
+        dict: Rc::new(RefCell::new({
+            let mut d = DictData::new();
+            d.insert(DictKey(Object::from_static("__self__")), Object::None);
+            d.insert(
+                DictKey(Object::from_static("__thisclass__")),
+                Object::Type(class),
+            );
+            d
+        })),
+        native: None,
+        inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
+    };
+    Object::Instance(Rc::new(inst))
 }
 
 /// Construct a super proxy. Exposed publicly so the VM can build
@@ -7499,6 +7618,42 @@ fn list_extend(args: &[Object]) -> Result<Object, RuntimeError> {
         l.borrow_mut().push(v);
     }
     Ok(Object::None)
+}
+
+/// `list.__iadd__(self, other)` — extend in place, return self
+/// (CPython `list_inplace_concat`; accepts any iterable).
+fn list_iadd(args: &[Object]) -> Result<Object, RuntimeError> {
+    list_extend(args)?;
+    Ok(args[0].clone())
+}
+
+/// `list.__imul__(self, n)` — repeat in place, return self.
+fn list_imul(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error("list.__imul__() expected 1 argument"));
+    }
+    let n = match &args[1] {
+        Object::Int(i) => *i,
+        Object::Bool(b) => i64::from(*b),
+        other => {
+            return Err(type_error(format!(
+                "can't multiply sequence by non-int of type '{}'",
+                other.type_name()
+            )))
+        }
+    };
+    let l = list_self(args)?;
+    let mut data = l.borrow_mut();
+    if n <= 0 {
+        data.clear();
+    } else {
+        let original = data.clone();
+        for _ in 1..n {
+            data.extend_from_slice(&original);
+        }
+    }
+    drop(data);
+    Ok(args[0].clone())
 }
 
 fn list_insert(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -9827,8 +9982,7 @@ fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
     if f.binary {
         Ok(Object::new_bytes(bytes))
     } else {
-        let s = String::from_utf8(bytes).map_err(|e| value_error(e.to_string()))?;
-        Ok(Object::from_str(s))
+        Ok(Object::from_str(f.decode_text(bytes)?))
     }
 }
 
@@ -9878,8 +10032,7 @@ fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     if f.binary {
         Ok(Object::new_bytes(out))
     } else {
-        let s = String::from_utf8(out).map_err(|e| value_error(e.to_string()))?;
-        Ok(Object::from_str(s))
+        Ok(Object::from_str(f.decode_text(out)?))
     }
 }
 
@@ -9923,7 +10076,7 @@ fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .ok_or_else(|| type_error("write() expected 1 arg"))?;
     let n = match data {
-        Object::Str(s) => f.write_bytes(s.as_bytes())?,
+        Object::Str(s) => f.write_bytes(&f.encode_text(s)?)?,
         Object::Bytes(b) => f.write_bytes(b)?,
         Object::ByteArray(b) => f.write_bytes(&b.borrow())?,
         _ => return Err(type_error("write() argument must be str or bytes")),
@@ -9940,7 +10093,7 @@ fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
     while let Some(v) = iter.next_value() {
         match v {
             Object::Str(s) => {
-                f.write_bytes(s.as_bytes())?;
+                f.write_bytes(&f.encode_text(&s)?)?;
             }
             Object::Bytes(b) => {
                 f.write_bytes(&b)?;

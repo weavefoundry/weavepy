@@ -196,7 +196,15 @@ def warn_explicit(message, category, filename, lineno, module=None,
             category = UserWarning
         message = category(text)
     key = (text, category, lineno)
-    if registry.get(key):
+    # CPython versions each module's __warningregistry__: whenever the
+    # filter list mutates, stale "already shown" entries are discarded.
+    # Without this, a warning suppressed once under the default filter
+    # could never be re-promoted by `simplefilter('error')` or recorded
+    # by `assertWarns` (both mutate the filters first).
+    if registry.get("version", 0) != _filters_version:
+        registry.clear()
+        registry["version"] = _filters_version
+    elif registry.get(key):
         return
     action = defaultaction
     matched_filter = None

@@ -111,10 +111,10 @@ pub enum Object {
     Property(Rc<PyProperty>),
     /// `@staticmethod` descriptor (RFC 0015). Returns the wrapped
     /// callable unchanged when accessed via instance or class.
-    StaticMethod(Rc<Object>),
+    StaticMethod(Rc<MethodWrapper>),
     /// `@classmethod` descriptor (RFC 0015). Returns a method bound
     /// to the class (not the instance) on access.
-    ClassMethod(Rc<Object>),
+    ClassMethod(Rc<MethodWrapper>),
     /// Slot descriptor created by `__slots__` (RFC 0015). Stores a
     /// per-instance value under the slot's name in `__dict__`,
     /// enforcing the slot-list at the class level.
@@ -202,8 +202,8 @@ impl fmt::Debug for Object {
             Object::FrozenSet(s) => f.debug_set().entries(s.iter()).finish(),
             Object::File(file) => write!(f, "<file {:?}>", file.name),
             Object::Property(_) => write!(f, "<property>"),
-            Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", inner.as_ref()),
-            Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", inner.as_ref()),
+            Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", &inner.func),
+            Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", &inner.func),
             Object::SlotDescriptor(sd) => write!(f, "<slot {:?} of {:?}>", sd.name, sd.class_name),
             Object::Frame(fr) => write!(f, "<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
             Object::Traceback(tb) => write!(f, "<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
@@ -630,6 +630,91 @@ impl DictViewKind {
 pub struct PyDictView {
     pub dict: Rc<RefCell<DictData>>,
     pub kind: DictViewKind,
+}
+
+/// Internal payload for [`Object::StaticMethod`] / [`Object::ClassMethod`].
+///
+/// Besides the wrapped callable, CPython's `classmethod` and
+/// `staticmethod` objects carry a real instance `__dict__` which the
+/// constructor seeds with the functools-wrapper attributes copied from
+/// the wrapped function (bpo-43682). Arbitrary attributes can be set on
+/// the wrapper afterwards (`cm.x = 42`).
+#[derive(Debug)]
+pub struct MethodWrapper {
+    pub func: Object,
+    pub dict: Rc<RefCell<DictData>>,
+}
+
+impl MethodWrapper {
+    pub fn new(func: Object) -> Rc<Self> {
+        let dict: DictData = match &func {
+            // Copy `functools.WRAPPER_ASSIGNMENTS` from a plain function
+            // (CPython skips attributes the callable doesn't have, and
+            // only functions are guaranteed to carry all five).
+            Object::Function(f) => {
+                let code = f.code();
+                // Computed lazily, then pinned to the function's slots so
+                // `wrapper.__name__ is func.__name__` style identity
+                // checks hold (CPython stores one object per attribute).
+                let mut pinned = |name: &'static str, compute: &dyn Fn() -> Object| {
+                    f.slot(name).unwrap_or_else(|| {
+                        let v = compute();
+                        f.set_slot(name, v.clone());
+                        v
+                    })
+                };
+                let name = pinned("__name__", &|| Object::from_str(f.name.clone()));
+                let qualname =
+                    pinned("__qualname__", &|| Object::from_str(code.qualname.clone()));
+                let module = pinned("__module__", &|| {
+                    f.globals
+                        .borrow()
+                        .get(&DictKey(Object::from_static("__name__")))
+                        .cloned()
+                        .unwrap_or(Object::None)
+                });
+                let doc = pinned("__doc__", &|| {
+                    crate::builtins::code_docstring(&code).unwrap_or(Object::None)
+                });
+                let annotations = pinned("__annotations__", &|| {
+                    Object::Dict(Rc::new(RefCell::new(DictData::new())))
+                });
+                [
+                    ("__module__", module),
+                    ("__name__", name),
+                    ("__qualname__", qualname),
+                    ("__annotations__", annotations),
+                    ("__doc__", doc),
+                ]
+                .into_iter()
+                .map(|(k, v)| (DictKey(Object::from_static(k)), v))
+                .collect()
+            }
+            // Builtin callables: no seeding. (Also load-bearing: these
+            // wrappers are built *during* `builtin_types()` init, so
+            // this arm must not call back into the type registry.)
+            Object::Builtin(_) => DictData::new(),
+            // Non-function callables only carry the attributes they
+            // actually have; for builtin singletons/values that is just
+            // the type docstring (`staticmethod(None).__dict__` ==
+            // `{'__doc__': None.__doc__}`).
+            other => {
+                let cls = crate::builtins::class_of(other);
+                match crate::builtin_type_doc(&cls.name) {
+                    Some(doc) if cls.flags.is_builtin => {
+                        [(DictKey(Object::from_static("__doc__")), Object::from_static(doc))]
+                            .into_iter()
+                            .collect()
+                    }
+                    _ => DictData::new(),
+                }
+            }
+        };
+        Rc::new(Self {
+            func,
+            dict: Rc::new(RefCell::new(dict)),
+        })
+    }
 }
 
 /// Internal payload for [`Object::Property`].
@@ -1304,6 +1389,9 @@ pub struct PyFile {
     pub binary: bool,
     pub backend: RefCell<FileBackend>,
     pub closed: RefCell<bool>,
+    /// Text-mode codec (`open(..., encoding=...)`); `None` means the
+    /// UTF-8 default.
+    pub encoding: RefCell<Option<String>>,
 }
 
 impl PyFile {
@@ -1316,6 +1404,34 @@ impl PyFile {
             binary,
             backend: RefCell::new(backend),
             closed: RefCell::new(false),
+            encoding: RefCell::new(None),
+        }
+    }
+
+    /// Set the text-mode codec. UTF-8 spellings collapse to the
+    /// `None` fast path.
+    pub fn set_encoding(&self, enc: &str) {
+        let norm = enc.to_ascii_lowercase().replace(['-', '_'], "");
+        *self.encoding.borrow_mut() = if norm == "utf8" {
+            None
+        } else {
+            Some(enc.to_owned())
+        };
+    }
+
+    /// Encode a text-mode write through the file's codec.
+    pub fn encode_text(&self, s: &str) -> Result<Vec<u8>, RuntimeError> {
+        match &*self.encoding.borrow() {
+            Some(enc) => crate::stdlib::codecs_mod::encode_str(s, enc, "strict"),
+            None => Ok(s.as_bytes().to_vec()),
+        }
+    }
+
+    /// Decode a text-mode read through the file's codec.
+    pub fn decode_text(&self, bytes: Vec<u8>) -> Result<String, RuntimeError> {
+        match &*self.encoding.borrow() {
+            Some(enc) => crate::stdlib::codecs_mod::decode_bytes(&bytes, enc, "strict"),
+            None => String::from_utf8(bytes).map_err(|e| value_error(e.to_string())),
         }
     }
 
@@ -1420,7 +1536,7 @@ impl PyFile {
                 "binary mode files are not iterable in text mode".to_owned(),
             ));
         }
-        String::from_utf8(out).map_err(|e| value_error(e.to_string()))
+        self.decode_text(out)
     }
 
     pub fn write_bytes(&self, data: &[u8]) -> Result<usize, RuntimeError> {
@@ -1613,8 +1729,42 @@ impl PyLazyIter {
     pub fn type_name(&self) -> &'static str {
         match &*self.state.borrow() {
             LazyIterKind::Islice { .. } => "islice",
+            LazyIterKind::Repeat { .. } => "repeat",
+            LazyIterKind::TeeBranch { .. } => "_tee",
+            LazyIterKind::Count { .. } => "count",
+            LazyIterKind::Cycle { .. } => "cycle",
+            LazyIterKind::Chain { .. } => "chain",
+            LazyIterKind::Compress { .. } => "compress",
+            LazyIterKind::DropWhile { .. } => "dropwhile",
+            LazyIterKind::TakeWhile { .. } => "takewhile",
+            LazyIterKind::FilterFalse { .. } => "filterfalse",
+            LazyIterKind::StarMap { .. } => "starmap",
+            LazyIterKind::Pairwise { .. } => "pairwise",
+            LazyIterKind::ZipLongest { .. } => "zip_longest",
+            LazyIterKind::Accumulate { .. } => "accumulate",
+            LazyIterKind::Product { .. } => "product",
+            LazyIterKind::Permutations { .. } => "permutations",
+            LazyIterKind::Combinations { .. } => "combinations",
+            LazyIterKind::Cwr { .. } => "combinations_with_replacement",
+            LazyIterKind::Batched { .. } => "batched",
         }
     }
+}
+
+/// Buffer shared by the branches of one `tee()` call. `buffer` aliases
+/// the storage of the Python-level `_tee_dataobject.buffer` list, so
+/// items appended natively stay visible to `__reduce__` on the Python
+/// side. Dropping a multi-million-cell buffer is a plain `Vec` drop —
+/// iterative, never recursing down a linked chain.
+#[derive(Debug)]
+pub struct TeeShared {
+    /// `None` once the source is exhausted.
+    pub source: Option<Object>,
+    pub buffer: Rc<RefCell<Vec<Object>>>,
+    /// Guards the source pull: CPython's tee raises RuntimeError when
+    /// one branch re-enters the shared source while another branch is
+    /// already inside it.
+    pub busy: bool,
 }
 
 #[derive(Debug)]
@@ -1631,6 +1781,113 @@ pub enum LazyIterKind {
         stop: Option<u64>,
         step: u64,
         done: bool,
+    },
+    /// Core of `itertools.repeat`: yield `obj` forever (`times` None)
+    /// or `times` more times.
+    Repeat { obj: Object, times: Option<i64> },
+    /// One branch of `itertools.tee`. `data` is the Python
+    /// `_tee_dataobject` the branch reports through `lazy_state` (for
+    /// pickling); the hot path reads `shared` directly.
+    TeeBranch {
+        shared: Rc<RefCell<TeeShared>>,
+        data: Object,
+        index: usize,
+    },
+    /// `itertools.count(current, step)` — values can be any numeric
+    /// type (float, Decimal, Fraction), stepping goes through the
+    /// interpreter's `+`.
+    Count { current: Object, step: Object },
+    /// `itertools.cycle`. `saved` aliases the Python wrapper's saved
+    /// list storage; `firstpass` set means elements are already saved
+    /// (don't re-append while draining `source`).
+    Cycle {
+        source: Option<Object>,
+        saved: Rc<RefCell<Vec<Object>>>,
+        index: usize,
+        firstpass: bool,
+    },
+    /// `itertools.chain`: `source` iterates the iterables, `active`
+    /// the current one. `source` None means fully exhausted.
+    Chain {
+        source: Option<Object>,
+        active: Option<Object>,
+    },
+    /// `itertools.compress(data, selectors)`.
+    Compress { data: Object, selectors: Object },
+    /// `itertools.dropwhile(func, source)`; `started` once the
+    /// predicate has failed.
+    DropWhile {
+        func: Object,
+        source: Object,
+        started: bool,
+    },
+    /// `itertools.takewhile(func, source)`.
+    TakeWhile {
+        func: Object,
+        source: Object,
+        stopped: bool,
+    },
+    /// `itertools.filterfalse(func_or_None, source)`.
+    FilterFalse { func: Object, source: Object },
+    /// `itertools.starmap(func, source)`.
+    StarMap { func: Object, source: Object },
+    /// `itertools.pairwise(source)`.
+    Pairwise {
+        source: Option<Object>,
+        old: Option<Object>,
+    },
+    /// `itertools.zip_longest(*iters, fillvalue=...)`; exhausted slots
+    /// become `None`.
+    ZipLongest {
+        iters: Vec<Option<Object>>,
+        fillvalue: Object,
+        numactive: usize,
+    },
+    /// `itertools.accumulate(source, func, initial=...)`.
+    Accumulate {
+        source: Object,
+        func: Option<Object>,
+        total: Option<Object>,
+        initial: Option<Object>,
+    },
+    /// `itertools.product` over materialised pools.
+    Product {
+        pools: Vec<Rc<[Object]>>,
+        indices: Vec<usize>,
+        started: bool,
+        stopped: bool,
+    },
+    /// `itertools.permutations(pool, r)` (Sedgewick's cycles algorithm,
+    /// like CPython).
+    Permutations {
+        pool: Rc<[Object]>,
+        r: usize,
+        indices: Vec<usize>,
+        cycles: Vec<usize>,
+        started: bool,
+        stopped: bool,
+    },
+    /// `itertools.combinations(pool, r)`.
+    Combinations {
+        pool: Rc<[Object]>,
+        r: usize,
+        indices: Vec<usize>,
+        started: bool,
+        stopped: bool,
+    },
+    /// `itertools.combinations_with_replacement(pool, r)`.
+    Cwr {
+        pool: Rc<[Object]>,
+        r: usize,
+        indices: Vec<usize>,
+        started: bool,
+        stopped: bool,
+    },
+    /// `itertools.batched(source, n, strict)`.
+    Batched {
+        source: Option<Object>,
+        n: usize,
+        strict: bool,
     },
 }
 
@@ -1801,8 +2058,10 @@ impl PyIterator {
                         // Exhausted. Detach from the buffer so a later
                         // `append` can't resurrect the iterator —
                         // CPython clears `it_seq` on first StopIteration.
+                        // `usize::MAX` marks the detached state so
+                        // `__reduce__` emits the exhausted form.
                         *data = Rc::new(RefCell::new(Vec::new()));
-                        *index = 0;
+                        *index = usize::MAX;
                         None
                     }
                 }
@@ -2873,8 +3132,8 @@ impl Object {
             // CPython 3.10+: `<staticmethod(<function f at 0x..>)>` — the
             // wrapped callable's repr is embedded so the address matches
             // `'{!r}'.format(func)`.
-            Object::StaticMethod(inner) => format!("<staticmethod({})>", inner.repr()),
-            Object::ClassMethod(inner) => format!("<classmethod({})>", inner.repr()),
+            Object::StaticMethod(inner) => format!("<staticmethod({})>", inner.func.repr()),
+            Object::ClassMethod(inner) => format!("<classmethod({})>", inner.func.repr()),
             Object::SlotDescriptor(sd) => {
                 format!("<member '{}' of '{}' objects>", sd.name, sd.class_name)
             }

@@ -14,7 +14,7 @@ use crate::sync::Rc;
 use crate::sync::RefCell;
 
 use crate::error::RuntimeError;
-use crate::object::{DictData, DictKey, Object};
+use crate::object::{DictData, DictKey, MethodWrapper, Object};
 use crate::types::TypeObject;
 
 /// All built-in classes, kept in one place so calls like
@@ -166,6 +166,15 @@ impl BuiltinTypes {
             TypeObject::new_exception(name, base).expect("built-in exception must linearise")
         };
         let object_ = mk("object", vec![]);
+        // `object()` instances carry no `__dict__` (tp_dictoffset 0 in
+        // CPython): attribute writes on a plain object raise
+        // AttributeError, and weak references to one are refused.
+        {
+            // SAFETY: this is the only reference; nothing observes the
+            // flag before the registry is published.
+            let raw = Rc::as_ptr(&object_).cast_mut();
+            unsafe { (*raw).forbids_dict = true };
+        }
         let type_ = mk("type", vec![object_.clone()]);
         let property_ = mk("property", vec![object_.clone()]);
         let staticmethod_ = mk("staticmethod", vec![object_.clone()]);
@@ -1166,7 +1175,7 @@ pub(crate) fn overrides_dunder_init(cls: &Rc<TypeObject>) -> bool {
 /// as the default allocator (it keys on the builtin's `"__new__"` name).
 fn make_default_new() -> Object {
     use crate::object::BuiltinFn;
-    Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
+    Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
         name: "__new__",
         binds_instance: true,
         call: Box::new(object_new),
@@ -1484,7 +1493,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
     }
     dict.insert(
         DictKey(Object::from_static("__init_subclass__")),
-        Object::ClassMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
+        Object::ClassMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
             name: "__init_subclass__",
             binds_instance: true,
             call: Box::new(object_no_op),
@@ -1500,7 +1509,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
     }
     dict.insert(
         DictKey(Object::from_static("__subclasshook__")),
-        Object::ClassMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
+        Object::ClassMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
             name: "__subclasshook__",
             binds_instance: true,
             call: Box::new(object_subclasshook),
@@ -1588,7 +1597,7 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
     let mut dict = type_.dict.borrow_mut();
     dict.insert(
         DictKey(Object::from_static("__new__")),
-        Object::StaticMethod(Rc::new(Object::Builtin(Rc::new(BuiltinFn {
+        Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
             name: "__new__",
             binds_instance: true,
             call: Box::new(type_new_sentinel),
@@ -1961,11 +1970,21 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
             let items: Vec<Object> = match &rest[1] {
                 Object::Tuple(items) => items.to_vec(),
                 Object::List(items) => items.borrow().clone(),
+                // Any other sequence goes through `tuple()` like
+                // CPython's `PySequence_Tuple` — including strings
+                // (`SyntaxError('error', 'abcd')` unpacks to 4 chars).
                 other => {
-                    return Err(crate::error::type_error(format!(
-                        "'{}' object is not iterable",
-                        other.type_name()
-                    )));
+                    let mut it = other.make_iter().map_err(|_| {
+                        crate::error::type_error(format!(
+                            "'{}' object is not iterable",
+                            other.type_name()
+                        ))
+                    })?;
+                    let mut out = Vec::new();
+                    while let Some(v) = it.next_value() {
+                        out.push(v);
+                    }
+                    out
                 }
             };
             if items.len() < 4 {
@@ -3321,7 +3340,7 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
         }));
         // Wrap as `classmethod` so descriptor binding skips the
         // instance and routes through the class.
-        let cm = Object::ClassMethod(Rc::new(builtin));
+        let cm = Object::ClassMethod(MethodWrapper::new(builtin));
         ty.dict
             .borrow_mut()
             .insert(DictKey(Object::from_static(name)), cm);

@@ -65,6 +65,19 @@ pub fn parse_module_with_warnings(source: &str) -> (Result<Module, ParseError>, 
                 )),
             }
         }
+        // "too many nested f-strings": an error pegen would have found in
+        // the tokens before the limit was hit (e.g. `f"{1 1:{f"…`'s comma
+        // hint) wins over the nesting diagnostic.
+        Err(weavepy_lexer::LexError::FstringTooManyNested { pos, field_start })
+            if pos > field_start =>
+        {
+            match parser::partial_fstring_field_error(source, field_start, pos) {
+                Some(inner) => Err(inner),
+                None => Err(ParseError::from(
+                    weavepy_lexer::LexError::FstringTooManyNested { pos, field_start },
+                )),
+            }
+        }
         Err(e) => Err(ParseError::from(e)),
     };
     (module, warnings)

@@ -819,7 +819,13 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             }
         }
         Object::StaticMethod(o) | Object::ClassMethod(o) => {
-            visit(o);
+            visit(&o.func);
+            if let Ok(d) = o.dict.try_borrow() {
+                for (k, v) in d.iter() {
+                    visit(&k.0);
+                    visit(v);
+                }
+            }
         }
         Object::DictView(v) => {
             // Dict views borrow the underlying dict — visit its
