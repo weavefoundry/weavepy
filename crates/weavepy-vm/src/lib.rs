@@ -117,6 +117,13 @@ struct Frame {
     /// pc *before* the current instruction — used to look up the
     /// exception handler when an opcode raises.
     pc: u32,
+    /// pc of the instruction whose exception is being handled by a
+    /// *cleanup* handler (`push_lasti` exception-table entries: `with`
+    /// exits, except-variable unbind blocks). CPython pushes this on
+    /// the value stack and `RERAISE k>0` restores `f_lasti` from it so
+    /// `frame.f_lineno` reports the original raise site after the
+    /// cleanup re-raises (PEP 626).
+    cleanup_lasti: Option<u32>,
     /// Persistent Python-visible frame snapshot for generator /
     /// coroutine / async-generator frames. A generator is re-entered
     /// on every `next()`/`send()`; CPython keeps a single `gi_frame`
@@ -1375,6 +1382,7 @@ impl Interpreter {
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
+            cleanup_lasti: None,
         }
     }
 
@@ -3696,6 +3704,19 @@ impl Interpreter {
                 pe.suppress_tb_once = true;
                 pe.context_settled = true;
                 Self::sync_exc_attrs(&pe);
+                // CPython RERAISE with the lasti flag set on the cleanup
+                // handler restores `frame->instr_ptr` to the original
+                // raise site so `f_lineno` reports the line that raised,
+                // not the cleanup block (PEP 626). Only the *display*
+                // offset is restored — the handler lookup still uses the
+                // RERAISE site (ceval.c: "We can't use frame->instr_ptr
+                // here, as RERAISE may have set it"); redirecting the pc
+                // would re-enter the same cleanup handler forever.
+                if let Some(orig) = frame.cleanup_lasti.take() {
+                    if let Some(py_frame) = self.frame_stack.borrow().last() {
+                        py_frame.lasti.set(orig);
+                    }
+                }
                 return Err(RuntimeError::PyException(pe));
             }
             OpCode::BeforeWith => {
@@ -4142,6 +4163,16 @@ impl Interpreter {
                 frame.exc_handlers.pop();
                 self.exc_info_stack.borrow_mut().pop();
             }
+            // CPython's `lasti` exception-table flag: a cleanup handler
+            // (with-exit, except-unbind) re-raises via RERAISE, which
+            // must restore `f_lasti` to the *original* raise site so
+            // `frame.f_lineno` keeps reporting the line that raised
+            // (PEP 626). Record it; the RERAISE arm consumes it.
+            frame.cleanup_lasti = if handler.push_lasti {
+                Some(raise_pc)
+            } else {
+                None
+            };
             // Push the exception instance for the handler to bind /
             // CHECK_EXC_MATCH to inspect.
             frame.stack.push(exc.instance.clone());
@@ -4455,9 +4486,26 @@ impl Interpreter {
     }
 
     fn exception_matches(&self, exc: &Object, ty: &Object) -> Result<bool, RuntimeError> {
+        // Every entry must be a BaseException subclass *before* any
+        // matching happens — `except (ValueError, 42):` is a TypeError
+        // even when the raised exception would match ValueError
+        // (CPython `check_except_type` over the whole tuple).
+        let check = |t: &Object| -> Result<(), RuntimeError> {
+            let ok = matches!(t, Object::Type(c)
+                if c.mro.borrow().iter().any(|m| m.name == "BaseException"));
+            if ok {
+                Ok(())
+            } else {
+                Err(type_error(
+                    "catching classes that do not inherit from BaseException is not allowed",
+                ))
+            }
+        };
         match ty {
-            Object::Type(t) => Ok(instance_is_subclass(exc, t)),
             Object::Tuple(items) => {
+                for t in items.iter() {
+                    check(t)?;
+                }
                 for t in items.iter() {
                     if let Object::Type(t) = t {
                         if instance_is_subclass(exc, t) {
@@ -4467,9 +4515,11 @@ impl Interpreter {
                 }
                 Ok(false)
             }
-            _ => Err(type_error(
-                "catching classes that do not inherit from BaseException is not allowed",
-            )),
+            _ => {
+                check(ty)?;
+                let Object::Type(t) = ty else { unreachable!() };
+                Ok(instance_is_subclass(exc, t))
+            }
         }
     }
 
@@ -4977,7 +5027,16 @@ impl Interpreter {
                 "f_globals" => Ok(Object::Dict(fr.globals.clone())),
                 "f_builtins" => Ok(Object::Dict(fr.builtins.clone())),
                 "f_locals" => Ok(fr.locals()),
-                "f_lineno" => Ok(Object::Int(i64::from(fr.current_lineno()))),
+                "f_lineno" => {
+                    // 0 is the "no line" sentinel (PEP 626 NO_LOCATION
+                    // entries) — CPython reports None.
+                    let line = fr.current_lineno();
+                    if line == 0 {
+                        Ok(Object::None)
+                    } else {
+                        Ok(Object::Int(i64::from(line)))
+                    }
+                }
                 "f_lasti" => Ok(Object::Int(i64::from(
                     fr.code.cpython_lasti(fr.lasti.get()),
                 ))),
@@ -14879,6 +14938,18 @@ impl Interpreter {
                     }
                     None => Object::Instance(Rc::new(PyInstance::new(cls.clone()))),
                 };
+                // CPython `BaseException_new` seeds `.args` from the
+                // constructor positionals even when a subclass
+                // `__init__` never calls `super().__init__`
+                // (test_exceptions NaiveException).
+                if let Object::Instance(i) = &inst {
+                    if i.cls().mro.borrow().iter().any(|t| t.name == "BaseException") {
+                        i.dict.borrow_mut().insert(
+                            DictKey(Object::from_static("args")),
+                            Object::new_tuple(args.to_vec()),
+                        );
+                    }
+                }
                 // RFC 0024: auto-track every fresh user instance with
                 // the cycle collector. CPython does the same for any
                 // type whose `tp_traverse` is non-NULL — for us that's
@@ -15686,6 +15757,7 @@ impl Interpreter {
             agen_yielded_value: true,
             pc: 0,
             py_frame: None,
+            cleanup_lasti: None,
         };
         self.run_frame(&mut frame)
     }

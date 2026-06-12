@@ -2400,6 +2400,74 @@ fn code_method_kw(
 /// stream (`co_code`, `co_linetable`, `co_stacksize`, `co_flags`, …)
 /// are accepted for drop-in compatibility but carried through from the
 /// original; an unknown keyword raises `TypeError`, as in CPython.
+/// Decode a CPython compact location table (PEP 626 / `co_linetable`)
+/// into per-unit lines; `None` marks the NO_LOCATION entries (`f_lineno`
+/// shows them as None).
+fn decode_compact_linetable(table: &[u8], firstlineno: u32) -> Vec<Option<u32>> {
+    fn varint(table: &[u8], pos: &mut usize) -> i32 {
+        let mut val: i32 = 0;
+        let mut shift = 0;
+        while *pos < table.len() {
+            let b = table[*pos];
+            *pos += 1;
+            val |= i32::from(b & 0x3F) << shift;
+            if b & 0x40 == 0 {
+                break;
+            }
+            shift += 6;
+        }
+        val
+    }
+    fn svarint(table: &[u8], pos: &mut usize) -> i32 {
+        let v = varint(table, pos);
+        if v & 1 != 0 {
+            -(v >> 1)
+        } else {
+            v >> 1
+        }
+    }
+    let mut out: Vec<Option<u32>> = Vec::new();
+    let mut pos = 0usize;
+    let mut line = firstlineno as i32;
+    while pos < table.len() {
+        let first = table[pos];
+        pos += 1;
+        if first & 0x80 == 0 {
+            break;
+        }
+        let code = (first >> 3) & 0x0F;
+        let length = ((first & 0x07) as usize) + 1;
+        let entry_line = match code {
+            15 => None,
+            13 => {
+                line += svarint(table, &mut pos);
+                Some(line)
+            }
+            14 => {
+                line += svarint(table, &mut pos);
+                let _ = varint(table, &mut pos);
+                let _ = varint(table, &mut pos);
+                let _ = varint(table, &mut pos);
+                Some(line)
+            }
+            10..=12 => {
+                line += i32::from(code) - 10;
+                let _ = varint(table, &mut pos);
+                let _ = varint(table, &mut pos);
+                Some(line)
+            }
+            _ => {
+                pos += 1;
+                Some(line)
+            }
+        };
+        for _ in 0..length {
+            out.push(entry_line.map(|l| l.max(0) as u32));
+        }
+    }
+    out
+}
+
 fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let c = code_self(args)?;
     let mut nc: weavepy_compiler::CodeObject = (*c).clone();
@@ -2455,11 +2523,30 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
                     }
                 }
             }
+            "co_linetable" => {
+                // Re-derive per-instruction lines from a CPython compact
+                // location table (PEP 626). Entries with the NO_LOCATION
+                // code map to the 0 sentinel, which `f_lineno` reports
+                // as None (test_missing_lineno_shows_as_none).
+                let bytes: Vec<u8> = match v {
+                    Object::Bytes(b) => b.to_vec(),
+                    _ => {
+                        return Err(type_error(
+                            "code.replace(): co_linetable must be bytes".to_owned(),
+                        ))
+                    }
+                };
+                let firstlineno = nc.linetable.first().copied().unwrap_or(1);
+                let unit_lines = decode_compact_linetable(&bytes, firstlineno);
+                for (i, slot) in nc.linetable.iter_mut().enumerate() {
+                    *slot = unit_lines.get(i).copied().flatten().unwrap_or(0);
+                }
+            }
             // Recognised CPython fields WeavePy derives on demand rather
             // than storing independently. Accepted (carried through) so
             // `replace()` callers don't break, but not independently set.
             "co_qualname" | "co_flags" | "co_stacksize" | "co_code" | "co_consts"
-            | "co_linetable" | "co_exceptiontable" | "co_nlocals" | "co_lnotab" => {}
+            | "co_exceptiontable" | "co_nlocals" | "co_lnotab" => {}
             other => {
                 return Err(type_error(format!(
                     "replace() got an unexpected keyword argument '{other}'"

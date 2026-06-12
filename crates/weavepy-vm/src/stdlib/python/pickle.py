@@ -220,8 +220,13 @@ class _Pickler:
         if tname == "float":
             self._save_float(obj)
             return
-        if tname in ("bytes", "bytearray"):
-            self._save_bytes(bytes(obj))
+        if tname == "bytes":
+            self._save_bytes(obj)
+            return
+        if tname == "bytearray":
+            # CPython reduces bytearray to `bytearray(bytes(obj))` so the
+            # round-trip preserves the type (protocol < 5 form).
+            self._save_reduce((bytearray, (bytes(obj),)), obj)
             return
         if tname == "str":
             self._save_str(obj)

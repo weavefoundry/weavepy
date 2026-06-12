@@ -704,7 +704,10 @@ pub type DictData = indexmap::IndexMap<DictKey, Object>;
 #[derive(Clone)]
 pub struct PyFunction {
     pub name: String,
-    pub code: Rc<CodeObject>,
+    /// The code object executed on call. Interior-mutable because
+    /// `f.__code__ = other.__code__` rebinds it at runtime (CPython's
+    /// `func_set_code`); every call reads the *current* value.
+    pub code: RefCell<Rc<CodeObject>>,
     /// Module-level globals shared with the defining module.
     pub globals: Rc<RefCell<DictData>>,
     pub defaults: Vec<Object>,
@@ -727,6 +730,8 @@ pub struct PyFunction {
 }
 
 /// Attribute names backed by function slots rather than `__dict__`.
+/// `__code__` is *not* here: it rebinds `PyFunction::code` directly so
+/// calls observe the swap (see the function setattr path).
 pub fn is_function_slot(name: &str) -> bool {
     matches!(
         name,
@@ -738,11 +743,15 @@ pub fn is_function_slot(name: &str) -> bool {
             | "__type_params__"
             | "__defaults__"
             | "__kwdefaults__"
-            | "__code__"
     )
 }
 
 impl PyFunction {
+    /// The current code object (honours `f.__code__ = …` rebinding).
+    pub fn code(&self) -> Rc<CodeObject> {
+        self.code.borrow().clone()
+    }
+
     /// Read a slot value if one has been stored (explicitly assigned or
     /// stamped at definition time). Computed fallbacks live at the
     /// attribute-access sites.

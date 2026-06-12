@@ -175,6 +175,11 @@ pub struct ExcHandler {
     /// Stack depth to restore before pushing the exception value and
     /// jumping into the handler.
     pub depth: u32,
+    /// CPython's `lasti` exception-table flag: the handler is a
+    /// *cleanup* block (with-exit, except-variable unbind) whose
+    /// trailing `RERAISE` restores `f_lasti` to the original raise
+    /// site so `frame.f_lineno` stays accurate (PEP 626).
+    pub push_lasti: bool,
 }
 
 impl CodeObject {
@@ -577,6 +582,11 @@ struct Compiler {
     /// dispatch loop would truncate the live exception away and the
     /// `RERAISE` would underflow.
     exc_on_stack: u32,
+    /// Number of `except` handler bodies (each with a live
+    /// `PUSH_EXC_INFO` entry) enclosing the current compile point.
+    /// `break`/`continue` jumping out of a handler must POP_EXCEPT
+    /// the levels they exit.
+    handler_depth: u32,
     /// `True` for methods compiled inside a class body. Such methods
     /// implicitly capture the class's `__class__` cell so `super()`
     /// works without arguments.
@@ -625,6 +635,12 @@ struct LoopFrame {
     /// `for` loops keep the iterator on the stack between iterations.
     /// `break` therefore needs to drop it.
     is_for_loop: bool,
+    /// `handler_depth` when the loop was entered. `break`/`continue`
+    /// from inside an `except` handler body must POP_EXCEPT each
+    /// handler level they exit (CPython unwinds the exception-handler
+    /// blocks; without this the handled exception leaks until frame
+    /// exit — test_exceptions.testExceptionCleanupState).
+    handler_depth_at_entry: u32,
 }
 
 /// One pending `finally` clause. We hold the AST so `return`,
@@ -687,6 +703,7 @@ impl Compiler {
             current_line: 0,
             current_span: (0, 0),
             exc_on_stack: 0,
+            handler_depth: 0,
             inside_class_body: false,
             annotations_initialized: false,
             code_kind: kind,
@@ -1163,6 +1180,7 @@ impl Compiler {
                     continue_target: loop_start,
                     break_sites: Vec::new(),
                     is_for_loop: false,
+                    handler_depth_at_entry: self.handler_depth,
                 });
                 for s in body {
                     self.compile_stmt(s)?;
@@ -1209,6 +1227,7 @@ impl Compiler {
                     continue_target: loop_top,
                     break_sites: Vec::new(),
                     is_for_loop: true,
+                    handler_depth_at_entry: self.handler_depth,
                 });
                 for s in body {
                     self.compile_stmt(s)?;
@@ -1375,11 +1394,18 @@ impl Compiler {
                 self.emit(OpCode::ReturnValue, 0);
             }
             StmtKind::Break => {
-                let is_for = self
+                let frame_top = self
                     .loop_stack
                     .last()
-                    .ok_or(CompileError::BreakOutsideLoop)?
-                    .is_for_loop;
+                    .ok_or(CompileError::BreakOutsideLoop)?;
+                let is_for = frame_top.is_for_loop;
+                let exc_to_pop = self.handler_depth.saturating_sub(frame_top.handler_depth_at_entry);
+                // Leaving `except` handler bodies on the way out: discard
+                // their handled-exception state (CPython POP_EXCEPT
+                // during block unwind).
+                for _ in 0..exc_to_pop {
+                    self.emit(OpCode::PopExcept, 0);
+                }
                 // Run any `finally` clauses that lie between us and
                 // the enclosing loop, in innermost-out order.
                 self.inline_finally_for_loop_exit()?;
@@ -1396,11 +1422,15 @@ impl Compiler {
                     .push(site);
             }
             StmtKind::Continue => {
-                let target = self
+                let frame_top = self
                     .loop_stack
                     .last()
-                    .ok_or(CompileError::ContinueOutsideLoop)?
-                    .continue_target;
+                    .ok_or(CompileError::ContinueOutsideLoop)?;
+                let target = frame_top.continue_target;
+                let exc_to_pop = self.handler_depth.saturating_sub(frame_top.handler_depth_at_entry);
+                for _ in 0..exc_to_pop {
+                    self.emit(OpCode::PopExcept, 0);
+                }
                 self.inline_finally_for_loop_exit()?;
                 let site = self.emit(OpCode::JumpBackward, 0);
                 self.patch_jump(site, target);
@@ -2597,6 +2627,7 @@ impl Compiler {
                 end: body_end,
                 handler: handlers_start,
                 depth: body_depth,
+                push_lasti: false,
             });
             // Back-patched to the pc past the handler region (see the
             // non-`except*` branch for the rationale).
@@ -2691,6 +2722,7 @@ impl Compiler {
                     end: clause_body_end,
                     handler: collector,
                     depth: body_depth,
+                    push_lasti: false,
                 });
                 self.emit(OpCode::LoadFast, raised_idx);
                 // [exc, list]
@@ -2776,6 +2808,7 @@ impl Compiler {
                     end: after_raise,
                     handler: cleanup_start,
                     depth: body_depth,
+                    push_lasti: false,
                 });
                 if orelse_end > orelse_start {
                     self.co.exception_table.push(ExcHandler {
@@ -2783,6 +2816,7 @@ impl Compiler {
                         end: orelse_end,
                         handler: cleanup_start,
                         depth: body_depth,
+                        push_lasti: false,
                     });
                 }
             }
@@ -2796,6 +2830,7 @@ impl Compiler {
                 end: body_end,
                 handler: handlers_start,
                 depth: body_depth,
+                push_lasti: false,
             });
             // The arg is back-patched below to the pc just past this
             // handler region; the VM tags the active-handler entry with
@@ -2866,9 +2901,11 @@ impl Compiler {
                     });
                 }
                 let hbody_start = self.next_offset();
+                self.handler_depth += 1;
                 for s in &h.body {
                     self.compile_stmt(s)?;
                 }
+                self.handler_depth -= 1;
                 let hbody_end = self.next_offset();
                 if let Some(stmts) = &unbind_stmts {
                     self.finally_stack.pop();
@@ -2899,6 +2936,10 @@ impl Compiler {
                             end: hbody_end,
                             handler: cleanup_start,
                             depth: body_depth,
+                            // CPython marks the unbind-cleanup with the
+                            // lasti flag: its RERAISE restores f_lasti to
+                            // the raise site inside the except body.
+                            push_lasti: true,
                         });
                     }
                 }
@@ -2975,6 +3016,7 @@ impl Compiler {
                         end: e,
                         handler: cleanup_start,
                         depth: body_depth,
+                        push_lasti: false,
                     });
                 }
             }
@@ -2998,6 +3040,7 @@ impl Compiler {
                 end: body_end,
                 handler: handlers_start,
                 depth: body_depth,
+                push_lasti: false,
             });
             // Record the propagating exception as the active handled
             // exception for the duration of the finally body. Without
@@ -3140,6 +3183,10 @@ impl Compiler {
             end: body_end,
             handler: handler_start,
             depth: body_depth,
+            // CPython's SETUP_WITH cleanup carries the lasti flag: when
+            // __exit__ doesn't suppress, RERAISE restores f_lasti to the
+            // raising instruction inside the body (PEP 626).
+            push_lasti: true,
         });
         // Stack: [exc]. Record the propagating exception as the active
         // handled exception for the duration of the `__exit__` call so a
@@ -4051,6 +4098,7 @@ impl Compiler {
             continue_target: loop_top,
             break_sites: Vec::new(),
             is_for_loop: true,
+            handler_depth_at_entry: self.handler_depth,
         });
         for s in body {
             self.compile_stmt(s)?;
@@ -4069,6 +4117,7 @@ impl Compiler {
             end: dance_end,
             handler: cleanup_target,
             depth: 1 + self.exc_on_stack,
+            push_lasti: false,
         });
         // Cleanup: pop aiter + exception, then run the `else` clause.
         self.emit(OpCode::EndAsyncFor, 0);
@@ -4176,6 +4225,8 @@ impl Compiler {
             end: body_end,
             handler: handler_start,
             depth: body_depth,
+            // Same lasti semantics as the sync `with` cleanup.
+            push_lasti: true,
         });
         // Stack: [exc]. Record the propagating exception as the active
         // handled exception for the duration of the awaited `__aexit__`,
@@ -4635,6 +4686,7 @@ fn compile_comp_body(
             end: dance_end,
             handler: cleanup_target,
             depth: cleanup_depth,
+            push_lasti: false,
         });
         inner.emit(OpCode::EndAsyncFor, 0);
         return Ok(());

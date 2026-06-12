@@ -661,8 +661,8 @@ fn encode_exception_table(code: &CodeObject, starts: &[usize]) -> Vec<u8> {
         push_exc_varint(&mut out, start as u32, 0x80);
         push_exc_varint(&mut out, length as u32, 0);
         push_exc_varint(&mut out, target as u32, 0);
-        // depth_and_lasti = (depth << 1) | lasti; WeavePy has no lasti bit.
-        push_exc_varint(&mut out, h.depth << 1, 0);
+        // depth_and_lasti = (depth << 1) | lasti.
+        push_exc_varint(&mut out, (h.depth << 1) | u32::from(h.push_lasti), 0);
     }
     out
 }
@@ -997,6 +997,8 @@ fn decode_exception_table(table: &[u8], raws: &[DecodedRaw]) -> Vec<ExcHandler> 
             end: map_unit(start_unit + length),
             handler: map_unit(target_unit),
             depth: dl >> 1,
+            // Low bit of the depth/lasti word is CPython's lasti flag.
+            push_lasti: dl & 1 != 0,
         });
     }
     out
@@ -1316,6 +1318,7 @@ mod tests {
             end: 3,
             handler: 3,
             depth: 2,
+            push_lasti: false,
         });
         let cp = encode(&code);
         let mut i = 0;
@@ -1357,6 +1360,7 @@ mod tests {
             end: 4,
             handler: 5,
             depth: 2,
+            push_lasti: false,
         });
 
         let cp = encode(&code);

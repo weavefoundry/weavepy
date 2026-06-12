@@ -300,6 +300,7 @@ impl BuiltinTypes {
         install_field_defaults(&attribute_error, &["name", "obj"]);
         install_field_defaults(&name_error, &["name"]);
         install_field_defaults(&import_error, &["name", "path", "name_from"]);
+        install_import_error_init(&import_error);
         let os_error = exc("OSError", exception.clone());
         install_os_error_init(&os_error);
         let runtime_error = exc("RuntimeError", exception.clone());
@@ -1518,6 +1519,68 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
     );
 }
 
+fn install_import_error_init(import_error: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    // `ImportError.__init__(self, *args, name=None, path=None,
+    // name_from=None)` — CPython `ImportError_init`: every named field
+    // resets on each call (gh test_reset_attributes), `msg` is the sole
+    // positional when there is exactly one.
+    fn import_error_init_impl(
+        args: &[Object],
+        kwargs: &[(String, Object)],
+    ) -> Result<Object, RuntimeError> {
+        let inst = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        if let Object::Instance(inst_rc) = inst {
+            let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
+            let mut name = Object::None;
+            let mut path = Object::None;
+            let mut name_from = Object::None;
+            for (k, v) in kwargs {
+                match k.as_str() {
+                    "name" => name = v.clone(),
+                    "path" => path = v.clone(),
+                    "name_from" => name_from = v.clone(),
+                    other => {
+                        return Err(crate::error::type_error(format!(
+                            "ImportError.__init__() got an unexpected keyword argument '{other}'"
+                        )))
+                    }
+                }
+            }
+            let mut dict = inst_rc.dict.borrow_mut();
+            dict.insert(
+                DictKey(Object::from_static("args")),
+                Object::new_tuple(rest.to_vec()),
+            );
+            dict.insert(
+                DictKey(Object::from_static("msg")),
+                if rest.len() == 1 {
+                    rest[0].clone()
+                } else {
+                    Object::None
+                },
+            );
+            dict.insert(DictKey(Object::from_static("name")), name);
+            dict.insert(DictKey(Object::from_static("path")), path);
+            dict.insert(DictKey(Object::from_static("name_from")), name_from);
+        }
+        Ok(Object::None)
+    }
+    let mut dict = import_error.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            call: Box::new(|args| import_error_init_impl(args, &[])),
+            call_kw: Some(Box::new(|args, kwargs| {
+                import_error_init_impl(args, kwargs)
+            })),
+        })),
+    );
+}
+
 fn install_os_error_init(os_error: &Rc<TypeObject>) {
     use crate::object::BuiltinFn;
     fn oserror_init(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2096,6 +2159,72 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         }
         Ok(Object::None)
     }
+    // `BaseException.__reduce__` — `(cls, self.args)` plus the instance
+    // dict (minus the runtime exception metadata we model as dict
+    // entries but CPython keeps in C slots) when it is non-empty.
+    // OSError appends `filename`/`filename2` to the reconstruction args
+    // (CPython `OSError_reduce`).
+    fn exc_reduce(args: &[Object]) -> Result<Object, RuntimeError> {
+        let inst_obj = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+        let Object::Instance(inst) = inst_obj else {
+            return Err(crate::error::type_error(
+                "__reduce__ requires an exception instance".to_owned(),
+            ));
+        };
+        let cls = inst.cls();
+        let dict = inst.dict.borrow();
+        let get = |name: &'static str| dict.get(&DictKey(Object::from_static(name))).cloned();
+        let mut ctor_args: Vec<Object> = match get("args") {
+            Some(Object::Tuple(t)) => t.to_vec(),
+            _ => Vec::new(),
+        };
+        if is_subclass_by_name(&cls, "OSError") && ctor_args.len() == 2 {
+            let filename = get("filename").filter(|v| !matches!(v, Object::None));
+            let filename2 = get("filename2").filter(|v| !matches!(v, Object::None));
+            if let Some(f) = filename {
+                ctor_args.push(f);
+                if let Some(f2) = filename2 {
+                    ctor_args.push(Object::None);
+                    ctor_args.push(f2);
+                }
+            }
+        }
+        // Exception state CPython keeps out of `__dict__` (C slots /
+        // interpreter metadata); everything else round-trips.
+        const SKIP: &[&str] = &[
+            "args",
+            "message",
+            "__traceback__",
+            "__context__",
+            "__cause__",
+            "__suppress_context__",
+        ];
+        // GH-103352: AttributeError deliberately drops `obj` from its
+        // pickled state (it may be huge or unpicklable).
+        let skip_obj = is_subclass_by_name(&cls, "AttributeError");
+        let mut state = crate::object::DictData::new();
+        for (k, v) in dict.iter() {
+            if let Object::Str(s) = &k.0 {
+                if SKIP.contains(&s.as_ref()) || (skip_obj && s.as_ref() == "obj") {
+                    continue;
+                }
+            }
+            state.insert(k.clone(), v.clone());
+        }
+        let cls_obj = Object::Type(cls);
+        let args_obj = Object::new_tuple(ctor_args);
+        Ok(if state.is_empty() {
+            Object::new_tuple(vec![cls_obj, args_obj])
+        } else {
+            Object::new_tuple(vec![
+                cls_obj,
+                args_obj,
+                Object::Dict(Rc::new(RefCell::new(state))),
+            ])
+        })
+    }
     let mut dict = base_exception.dict.borrow_mut();
     dict.insert(
         DictKey(Object::from_static("__init__")),
@@ -2110,6 +2239,14 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
         Object::Builtin(Rc::new(BuiltinFn {
             name: "__setstate__",
             call: Box::new(exc_setstate),
+            call_kw: None,
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__reduce__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__reduce__",
+            call: Box::new(exc_reduce),
             call_kw: None,
         })),
     );
