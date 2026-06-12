@@ -46,6 +46,126 @@ pub fn install(bt: &BuiltinTypes) {
     install_method_tables(bt);
     install_object_compare(bt);
     install_value_richcmp(bt);
+    install_numeric_getsets(bt);
+    install_value_reprs(bt);
+}
+
+/// Materialize `tp_repr` for the value types (`'__repr__' in vars(int)`
+/// is True in CPython). The slot renders the *native payload* without
+/// re-dispatching `type(self).__repr__` — `int.__repr__(IntFlagMember)`
+/// must yield the plain digits.
+fn install_value_reprs(bt: &BuiltinTypes) {
+    fn install(ty: &Rc<TypeObject>) {
+        let key = DictKey(Object::from_static("__repr__"));
+        let mut d = ty.dict.borrow_mut();
+        if !d.contains_key(&key) {
+            d.insert(
+                key,
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name: "__repr__",
+                    binds_instance: true,
+                    call: Box::new(crate::builtins::value_slot_repr),
+                    call_kw: None,
+                })),
+            );
+        }
+    }
+    for ty in [
+        &bt.int_, &bt.bool_, &bt.float_, &bt.complex_, &bt.str_, &bt.bytes_, &bt.bytearray_,
+        &bt.tuple_,
+    ] {
+        install(ty);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Numeric getset descriptors
+// ---------------------------------------------------------------------------
+
+/// CPython stores `int.numerator`/`denominator`/`real`/`imag` (and the
+/// float pair) as getset descriptors in the type dict. Materialize them
+/// as properties so `int.__dict__['numerator']` exists and is a
+/// descriptor — `enum.EnumType._add_member_` keys its shadowed-attribute
+/// redirect on exactly this.
+fn install_numeric_getsets(bt: &BuiltinTypes) {
+    fn int_value(o: &Object) -> Result<Object, RuntimeError> {
+        match o {
+            Object::Bool(b) => Ok(Object::Int(i64::from(*b))),
+            Object::Int(_) | Object::Long(_) => Ok(o.clone()),
+            Object::Instance(_) => match o.native_value() {
+                Some(n) => int_value(&n),
+                None => Err(type_error("descriptor requires an 'int' object")),
+            },
+            _ => Err(type_error("descriptor requires an 'int' object")),
+        }
+    }
+    fn float_value(o: &Object) -> Result<Object, RuntimeError> {
+        match o {
+            Object::Float(_) => Ok(o.clone()),
+            Object::Instance(_) => match o.native_value() {
+                Some(n) => float_value(&n),
+                None => Err(type_error("descriptor requires a 'float' object")),
+            },
+            _ => Err(type_error("descriptor requires a 'float' object")),
+        }
+    }
+    fn getset(
+        ty: &Rc<TypeObject>,
+        name: &'static str,
+        f: fn(&[Object]) -> Result<Object, RuntimeError>,
+    ) {
+        let fget = Object::Builtin(Rc::new(BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        }));
+        let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
+            fget,
+            Object::None,
+            Object::None,
+            Object::None,
+        )));
+        let key = DictKey(Object::from_static(name));
+        let mut d = ty.dict.borrow_mut();
+        if !d.contains_key(&key) {
+            d.insert(key, prop);
+        }
+    }
+    getset(&bt.int_, "numerator", |args| {
+        int_value(args.first().unwrap_or(&Object::None))
+    });
+    getset(&bt.int_, "denominator", |args| {
+        int_value(args.first().unwrap_or(&Object::None)).map(|_| Object::Int(1))
+    });
+    getset(&bt.int_, "real", |args| {
+        int_value(args.first().unwrap_or(&Object::None))
+    });
+    getset(&bt.int_, "imag", |args| {
+        int_value(args.first().unwrap_or(&Object::None)).map(|_| Object::Int(0))
+    });
+    getset(&bt.float_, "real", |args| {
+        float_value(args.first().unwrap_or(&Object::None))
+    });
+    getset(&bt.float_, "imag", |args| {
+        float_value(args.first().unwrap_or(&Object::None)).map(|_| Object::Float(0.0))
+    });
+    fn complex_value(o: &Object) -> Result<(f64, f64), RuntimeError> {
+        match o {
+            Object::Complex(c) => Ok((c.real, c.imag)),
+            Object::Instance(_) => match o.native_value() {
+                Some(n) => complex_value(&n),
+                None => Err(type_error("descriptor requires a 'complex' object")),
+            },
+            _ => Err(type_error("descriptor requires a 'complex' object")),
+        }
+    }
+    getset(&bt.complex_, "real", |args| {
+        complex_value(args.first().unwrap_or(&Object::None)).map(|(r, _)| Object::Float(r))
+    });
+    getset(&bt.complex_, "imag", |args| {
+        complex_value(args.first().unwrap_or(&Object::None)).map(|(_, i)| Object::Float(i))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -949,7 +1069,8 @@ fn install_method_tables(bt: &BuiltinTypes) {
             "isdigit", "isalpha", "isalnum", "isspace", "isupper", "islower", "isascii",
             "isnumeric", "isdecimal", "isidentifier", "isprintable", "istitle", "zfill",
             "ljust", "rjust", "center", "expandtabs", "encode", "removeprefix", "removesuffix",
-            "translate", "maketrans", "__getitem__",
+            "translate", "maketrans", "__getitem__", "__add__", "__mul__", "__rmul__",
+            "__mod__", "__len__", "__contains__",
         ],
     );
     install_named_methods(
@@ -970,6 +1091,11 @@ fn install_method_tables(bt: &BuiltinTypes) {
             "__getitem__",
             "__setitem__",
             "__delitem__",
+            "__add__",
+            "__mul__",
+            "__rmul__",
+            "__len__",
+            "__contains__",
         ],
     );
     install_named_methods(
@@ -992,7 +1118,20 @@ fn install_method_tables(bt: &BuiltinTypes) {
             "__delitem__",
         ],
     );
-    install_named_methods(&bt.tuple_, "tuple", &["count", "index", "__getitem__"]);
+    install_named_methods(
+        &bt.tuple_,
+        "tuple",
+        &[
+            "count",
+            "index",
+            "__getitem__",
+            "__add__",
+            "__mul__",
+            "__rmul__",
+            "__len__",
+            "__contains__",
+        ],
+    );
     install_named_methods(
         &bt.set_,
         "set",
@@ -1077,6 +1216,12 @@ fn install_method_tables(bt: &BuiltinTypes) {
                 "isupper",
                 "istitle",
                 "isascii",
+                "__getitem__",
+                "__add__",
+                "__mul__",
+                "__rmul__",
+                "__len__",
+                "__contains__",
             ],
         );
     }

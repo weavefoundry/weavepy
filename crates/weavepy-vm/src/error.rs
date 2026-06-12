@@ -248,6 +248,23 @@ pub fn zero_division_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("ZeroDivisionError", message))
 }
 
+/// `LookupError` — CPython raises this (not `ValueError`) for unknown
+/// codec names and error handlers (`codecs.lookup`, `bytes(s, encoding=…)`).
+pub fn lookup_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("LookupError", message))
+}
+
+/// `BufferError` — raised when a length-changing operation hits a
+/// `bytearray` with live buffer exports (`memoryview`, or a search
+/// method's internal export held across re-entrant argument coercion).
+pub fn buffer_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("BufferError", message))
+}
+
+pub fn memory_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::PyException(PyException::from_builtin("MemoryError", message))
+}
+
 pub fn overflow_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("OverflowError", message))
 }

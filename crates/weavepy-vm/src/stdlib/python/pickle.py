@@ -291,21 +291,18 @@ class _Pickler:
         # Arbitrary instances — try __reduce_ex__ / __reduce__ (the
         # canonical CPython pickle protocol). Falls back to the
         # PicklingError below if neither is provided.
+        # Exceptions raised by a user `__reduce_ex__` / `__reduce__`
+        # propagate, as in CPython — `enum._make_class_unpicklable`
+        # relies on its injected TypeError reaching the caller.
         reduce_ex = getattr(obj, "__reduce_ex__", None)
         if reduce_ex is not None:
-            try:
-                rv = reduce_ex(self.protocol)
-            except TypeError:
-                rv = None
+            rv = reduce_ex(self.protocol)
             if rv is not None and rv is not NotImplemented:
                 self._save_reduce(rv, obj)
                 return
         reduce = getattr(obj, "__reduce__", None)
         if reduce is not None:
-            try:
-                rv = reduce()
-            except TypeError:
-                rv = None
+            rv = reduce()
             if rv is not None and rv is not NotImplemented:
                 self._save_reduce(rv, obj)
                 return
@@ -857,3 +854,10 @@ class Pickler(_Pickler):
 
 class Unpickler(_Unpickler):
     pass
+
+
+# CPython keeps the pure-Python implementations reachable under
+# underscore names after the C-accelerator import (`pickle._dumps` is
+# probed by test_descr's reduce checks). There is no separate C
+# implementation here, so they alias the public functions.
+_dump, _dumps, _load, _loads = dump, dumps, load, loads

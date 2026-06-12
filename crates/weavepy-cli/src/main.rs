@@ -642,9 +642,10 @@ fn run_module(
         init.is_file().then_some((init, true))
     });
     if let Some((source_path, _)) = on_disk {
-        let source = fs::read_to_string(&source_path)
+        let bytes = fs::read(&source_path)
             .with_context(|| format!("failed to read {}", source_path.display()))?;
         let filename = source_path.display().to_string();
+        let source = decode_script_source(&bytes, &filename);
         let opts = RunOptions::new(filename.clone())
             .with_argv(argv)
             .with_extra_path(extra_path.to_vec())
@@ -678,15 +679,33 @@ fn run_module(
     run_source_with_options(&bootstrap, &opts)
 }
 
+/// Decode a script file's bytes per PEP 263 (BOM + coding cookie,
+/// default strict UTF-8). On failure, print CPython's tokenizer-style
+/// `SyntaxError` to stderr and exit 1 — like `python bad.py` does.
+fn decode_script_source(bytes: &[u8], filename: &str) -> String {
+    match weavepy::vm::decode_source_bytes(bytes, filename) {
+        Ok(s) => s,
+        Err(err) => {
+            let msg = match &err {
+                weavepy::vm::RuntimeError::PyException(pe) => pe.message(),
+                other => other.to_string(),
+            };
+            eprintln!("  File \"{filename}\", line 1");
+            eprintln!("SyntaxError: {msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_path(
     path: &Path,
     extra: Vec<String>,
     flags: &InterpreterFlags,
     extra_path: &[PathBuf],
 ) -> Result<()> {
-    let source =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let filename = path.display().to_string();
+    let source = decode_script_source(&bytes, &filename);
     let mut argv = vec![filename.clone()];
     argv.extend(extra);
     let script_dir = path

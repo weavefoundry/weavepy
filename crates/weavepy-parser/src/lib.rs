@@ -38,6 +38,33 @@ pub fn parse_module_with_warnings(source: &str) -> (Result<Module, ParseError>, 
     let (tok_result, warnings) = weavepy_lexer::tokenize_with_escapes(source);
     let module = match tok_result {
         Ok(tokens) => parser::parse(source, tokens),
+        // An f-string field left open at the literal's own terminator:
+        // CPython's pegen parses the partial field expression first, so
+        // a specialized *inner* error ("Perhaps you forgot a comma?")
+        // wins over the generic "f-string: expecting '}'".
+        Err(weavepy_lexer::LexError::FstringExpectingBrace { pos, field_start })
+            if pos > field_start =>
+        {
+            match parser::partial_fstring_field_error(source, field_start, pos) {
+                Some(inner) => Err(inner),
+                None => Err(ParseError::from(
+                    weavepy_lexer::LexError::FstringExpectingBrace { pos, field_start },
+                )),
+            }
+        }
+        // Same for a field whose *format spec* never closed (`f'{!s:'`):
+        // an error pegen would have reported from the already-seen field
+        // tokens (e.g. "valid expression required before '!'") wins.
+        Err(weavepy_lexer::LexError::FstringExpectingBraceOrSpec { pos, field_start })
+            if pos > field_start =>
+        {
+            match parser::partial_fstring_field_error(source, field_start, pos) {
+                Some(inner) => Err(inner),
+                None => Err(ParseError::from(
+                    weavepy_lexer::LexError::FstringExpectingBraceOrSpec { pos, field_start },
+                )),
+            }
+        }
         Err(e) => Err(ParseError::from(e)),
     };
     (module, warnings)

@@ -491,6 +491,11 @@ impl Interpreter {
         crate::vm_singletons::set_debug_ranges(
             !flags.xoptions.iter().any(|x| x == "no_debug_ranges"),
         );
+        let dev_mode = flags
+            .xoptions
+            .iter()
+            .any(|x| x == "dev" || x.starts_with("dev="));
+        crate::vm_singletons::set_dev_mode(dev_mode);
         if let Some(Object::Module(m)) = self
             .cache
             .modules
@@ -536,7 +541,11 @@ impl Interpreter {
                     flags.hash_seed.map_or(1, |_| 0),
                 );
                 set(&mut fld, "utf8_mode", 1);
-                set(&mut fld, "dev_mode", 0);
+                // The lone bool field on CPython's `sys.flags`.
+                fld.insert(
+                    crate::object::DictKey(Object::from_static("dev_mode")),
+                    Object::Bool(dev_mode),
+                );
                 set(&mut fld, "int_max_str_digits", 4300);
                 set(&mut fld, "warn_default_encoding", 0);
             }
@@ -1409,7 +1418,29 @@ impl Interpreter {
     /// Run the frame until it yields, returns, or starts a generator.
     /// When `sent` is `Some`, push it onto the stack first — this is
     /// how `gen.send(v)` resumes from `YIELD_VALUE`.
+    ///
+    /// Every Python activation maps onto a native Rust stack frame, and
+    /// the native stack available varies wildly by thread (8 MiB main
+    /// thread vs 2 MiB Rust test / user threads). Growing the stack
+    /// on demand (`stacker`) decouples `sys.setrecursionlimit` from
+    /// the platform stack size: the Python-level guard in
+    /// [`Self::run_until_yield_or_return_impl`] is the only limiter.
     fn run_until_yield_or_return(
+        &mut self,
+        frame: &mut Frame,
+        sent: Option<Object>,
+    ) -> Result<FrameOutcome, RuntimeError> {
+        // 512 KiB red zone — debug-build activations have large native
+        // frames (the dispatch loop plus un-inlined helpers), and the
+        // next growth check only happens at the *next* Python call.
+        // Growing in 8 MiB segments keeps segment churn low for deep
+        // recursion near `sys.getrecursionlimit()`.
+        stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+            self.run_until_yield_or_return_impl(frame, sent)
+        })
+    }
+
+    fn run_until_yield_or_return_impl(
         &mut self,
         frame: &mut Frame,
         sent: Option<Object>,
@@ -1711,6 +1742,7 @@ impl Interpreter {
         let cells_snapshot: Vec<Rc<RefCell<Object>>> = frame.cells.clone();
         let globals = frame.globals.clone();
         let class_ns = frame.class_namespace.clone();
+        let class_ns_obj = frame.class_namespace_obj.clone();
         let snapshot_for_provider = locals_snapshot.clone();
         // At module / exec scope CPython makes `locals() is globals()`.
         // We detect the module body by its conventional code name so a
@@ -1723,6 +1755,12 @@ impl Interpreter {
             // For module / class bodies the user-visible locals are
             // the corresponding namespace dict (class_ns when set,
             // otherwise globals).
+            // PEP 3115 custom class namespace (e.g. `enum.EnumDict`):
+            // `locals()`/`vars()` in the class body hand back the live
+            // mapping object itself, exactly as CPython does.
+            if let Some(ns_obj) = class_ns_obj.as_ref() {
+                return ns_obj.clone();
+            }
             if let Some(ns) = class_ns.as_ref() {
                 return Object::Dict(ns.clone());
             }
@@ -2385,7 +2423,12 @@ impl Interpreter {
                 frame.push(constant_to_object(c));
             }
             OpCode::LoadName => {
-                let name = self.name_at(&frame.code, ins.arg)?;
+                let mut name = self.name_at(&frame.code, ins.arg)?;
+                if frame.class_namespace_obj.is_some() || frame.class_namespace.is_some() {
+                    if let Some(m) = mangle_class_private(&frame.code.name, &name) {
+                        name = m;
+                    }
+                }
                 let from_ns = match &frame.class_namespace_obj {
                     // PEP 3115 custom namespace: read it before globals.
                     Some(ns_obj) => self.class_ns_load(ns_obj, &name),
@@ -2449,7 +2492,15 @@ impl Interpreter {
             }
             OpCode::StoreName => {
                 let v = frame.pop()?;
-                let name = self.name_at(&frame.code, ins.arg)?;
+                let mut name = self.name_at(&frame.code, ins.arg)?;
+                if frame.class_namespace_obj.is_some() || frame.class_namespace.is_some() {
+                    // Private name mangling: `__x` bound in a class body
+                    // is stored as `_ClassName__x` (CPython mangles at
+                    // compile time throughout the class scope).
+                    if let Some(m) = mangle_class_private(&frame.code.name, &name) {
+                        name = m;
+                    }
+                }
                 if let Some(ns_obj) = frame.class_namespace_obj.clone() {
                     // PEP 3115: a custom class namespace observes the binding
                     // through its `__setitem__` (e.g. `enum._EnumDict`).
@@ -2473,7 +2524,12 @@ impl Interpreter {
                     .insert(DictKey(Object::from_str(name)), v);
             }
             OpCode::DeleteName => {
-                let name = self.name_at(&frame.code, ins.arg)?;
+                let mut name = self.name_at(&frame.code, ins.arg)?;
+                if frame.class_namespace_obj.is_some() || frame.class_namespace.is_some() {
+                    if let Some(m) = mangle_class_private(&frame.code.name, &name) {
+                        name = m;
+                    }
+                }
                 if let Some(ns_obj) = frame.class_namespace_obj.clone() {
                     let g = frame.globals.clone();
                     self.class_ns_delete(&ns_obj, &name, &g)?;
@@ -2816,7 +2872,21 @@ impl Interpreter {
                     // membership by iterating its lines (`line in f`).
                     self.contains_via_iter(&container, &item, &frame.globals.clone())?
                 } else {
-                    container.contains(&item)?
+                    match &container {
+                        // `PySequence_Contains` compares each element with a
+                        // *rich* `==` — a user `__eq__` (e.g. `datetime.date`
+                        // values inside an enum's `_hashable_values_` list)
+                        // must be dispatched, not just the native eq.
+                        Object::List(items) => {
+                            let snapshot: Vec<Object> = items.borrow().clone();
+                            self.seq_contains_rich(&snapshot, &item, &frame.globals.clone())?
+                        }
+                        Object::Tuple(items) => {
+                            let snapshot: Vec<Object> = items.to_vec();
+                            self.seq_contains_rich(&snapshot, &item, &frame.globals.clone())?
+                        }
+                        _ => container.contains(&item)?,
+                    }
                 };
                 let result = if ins.arg == 1 { !found } else { found };
                 frame.push(Object::Bool(result));
@@ -3058,6 +3128,11 @@ impl Interpreter {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
+                // Set insertion hashes each element; unhashable elements
+                // raise (`{ {} }` is a set holding a dict).
+                for it in &items {
+                    builtins::ensure_hashable(it)?;
+                }
                 self.record_alloc(frame, 216 + (n as u64) * 16);
                 frame.push(Object::new_set_from(items));
             }
@@ -3119,6 +3194,7 @@ impl Interpreter {
                         RuntimeError::Internal("SET_ADD depth out of range".to_owned())
                     })?;
                 if let Object::Set(s) = s {
+                    builtins::ensure_hashable(&v)?;
                     s.borrow_mut().insert(DictKey(v));
                 }
             }
@@ -4743,7 +4819,15 @@ impl Interpreter {
                 "fget" => Ok(p.fget.clone()),
                 "fset" => Ok(p.fset.clone()),
                 "fdel" => Ok(p.fdel.clone()),
-                "__doc__" => Ok(p.doc()),
+                "__doc__" => {
+                    // CPython `property.__init__`: a missing explicit doc
+                    // falls back to the getter's docstring.
+                    let doc = p.doc();
+                    if matches!(doc, Object::None) && !matches!(p.fget, Object::None) {
+                        return Ok(self.load_attr(&p.fget, "__doc__").unwrap_or(Object::None));
+                    }
+                    Ok(doc)
+                }
                 // CPython computes `property.__isabstractmethod__` as the
                 // OR of the wrapped accessors' flags, so the modern
                 // `@property` / `@abstractmethod` stacking marks the
@@ -5101,6 +5185,19 @@ impl Interpreter {
                 "__text_signature__" => Ok(builtin_text_signature(b.name)
                     .map(Object::from_static)
                     .unwrap_or(Object::None)),
+                // Method-descriptor protocol: CPython's built-in methods
+                // (`str.__dict__['title']`, …) have a `__get__` that binds
+                // the receiver. `enum._is_descriptor` and similar
+                // introspection key on its presence.
+                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod {
+                    receiver: obj.clone(),
+                    function: Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                        name: "__get__",
+                        binds_instance: true,
+                        call: Box::new(crate::builtins::builtin_descriptor_get),
+                        call_kw: None,
+                    })),
+                }))),
                 _ => Err(attribute_error(format!(
                     "'builtin_function_or_method' object has no attribute '{}'",
                     name
@@ -5569,7 +5666,17 @@ impl Interpreter {
                 // describes *instances*; the type's own name comes from
                 // the synthetic, as with CPython's `type.__name__`.
                 Some(v) if !matches!(v, Object::Property(_)) => return Ok(v.clone()),
-                _ => return Ok(Object::from_str(&ty.name)),
+                _ => {
+                    // Interned so repeated reads return the *same* str
+                    // object (CPython getattr(cls, '__name__') identity;
+                    // inspect.classify_class_attrs compares with `is`).
+                    if name == "__qualname__" {
+                        if let Some(q) = ty.qualname.borrow().as_ref() {
+                            return Ok(Object::interned_str(q));
+                        }
+                    }
+                    return Ok(Object::interned_str(&ty.name));
+                }
             }
         }
 
@@ -5605,6 +5712,22 @@ impl Interpreter {
             "__bases__" => {
                 let bases = ty.bases.iter().map(|b| Object::Type(b.clone())).collect();
                 return Ok(Object::new_tuple(bases));
+            }
+            // CPython `type.__base__` is `tp_base` — the solid base the
+            // layout is inherited from. With single inheritance that is
+            // `bases[0]`; with multiple bases, prefer the first base whose
+            // layout extends `object` (a non-object base), falling back to
+            // `bases[0]`. `object.__base__` is None.
+            "__base__" => {
+                if ty.bases.is_empty() {
+                    return Ok(Object::None);
+                }
+                let best = ty
+                    .bases
+                    .iter()
+                    .find(|b| b.name != "object")
+                    .unwrap_or(&ty.bases[0]);
+                return Ok(Object::Type(best.clone()));
             }
             "__mro__" => {
                 let mro = ty
@@ -8175,7 +8298,21 @@ impl Interpreter {
             if decorated.iter().any(|(k, _)| sort_key_needs_dunder_lt(k)) {
                 decorated = merge_sort_by_pylt(self, decorated, &|p: &(Object, Object)| &p.0, globals)?;
             } else {
-                decorated.sort_by(|a, b| a.0.cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                // Uncomparable keys must surface the `TypeError` (CPython
+                // propagates the failed `<`), not silently compare equal.
+                let mut err: Option<RuntimeError> = None;
+                decorated.sort_by(|a, b| match a.0.cmp(&b.0) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        if err.is_none() {
+                            err = Some(e);
+                        }
+                        std::cmp::Ordering::Equal
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
             }
             if reverse {
                 decorated.reverse();
@@ -8194,7 +8331,19 @@ impl Interpreter {
                 )?;
                 *items = sorted;
             } else {
-                items.sort_by(|a, b| a.cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mut err: Option<RuntimeError> = None;
+                items.sort_by(|a, b| match a.cmp(b) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        if err.is_none() {
+                            err = Some(e);
+                        }
+                        std::cmp::Ordering::Equal
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
             }
             if reverse {
                 items.reverse();
@@ -8320,6 +8469,19 @@ impl Interpreter {
             // is `'2.5'`, not `<F object at 0x…>`).
             if let Some(native) = &inst.native {
                 let native = native.clone();
+                // `bytearray_repr` spells the *subclass* name
+                // (`ByteArraySubclass(b'abc')`); CPython uses
+                // `_PyType_Name`, the segment after the last dot.
+                if let Object::ByteArray(_) = &native {
+                    let name = inst.cls().name.clone();
+                    let short = name.rsplit('.').next().unwrap_or(&name).to_owned();
+                    let inner = self.repr_of(&native, globals)?;
+                    let body = inner
+                        .strip_prefix("bytearray(")
+                        .and_then(|s| s.strip_suffix(')'))
+                        .unwrap_or(&inner);
+                    return Ok(format!("{short}({body})"));
+                }
                 return self.repr_of(&native, globals);
             }
         }
@@ -8371,6 +8533,34 @@ impl Interpreter {
             if item.is_same(&x)
                 || self.dispatch_compare_op(&x, item, CompareKind::Eq, globals)?
             {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// `item in <list/tuple>` with CPython `PySequence_Contains`
+    /// semantics: identity first, then rich `==` per element. The fast
+    /// native equality is used unless a user-defined `__eq__` could be
+    /// involved (either side wraps an `Instance`), keeping the common
+    /// primitive case cheap.
+    fn seq_contains_rich(
+        &mut self,
+        items: &[Object],
+        item: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<bool, RuntimeError> {
+        for x in items {
+            if x.is_same(item) {
+                return Ok(true);
+            }
+            let needs_dispatch =
+                matches!(x, Object::Instance(_)) || matches!(item, Object::Instance(_));
+            if needs_dispatch {
+                if self.dispatch_compare_op(x, item, CompareKind::Eq, globals)? {
+                    return Ok(true);
+                }
+            } else if x.eq_value(item) {
                 return Ok(true);
             }
         }
@@ -8849,17 +9039,27 @@ impl Interpreter {
         };
         match (spec, converted) {
             (None, Some(s)) => Ok(s),
-            (None, None) => self.stringify(value, globals),
+            // No conversion and no spec: CPython's FORMAT_SIMPLE is
+            // `format(value, '')` — i.e. `type(value).__format__(value, '')`
+            // — with a fast path only for exact `str`. A custom
+            // `__format__` must be honoured (and called once per field:
+            // `f'{x} {x}'` with a stateful `__format__` counts twice).
+            (None, None) => match value {
+                Object::Str(s) => Ok(s.to_string()),
+                _ => self.format_obj_str(value, "", globals),
+            },
             (Some(Object::Str(spec_str)), conv) => {
-                let empty = spec_str.is_empty();
                 match conv {
                     // Converted: the target is the resulting string.
-                    Some(s) if empty => Ok(s),
+                    Some(s) if spec_str.is_empty() => Ok(s),
                     Some(s) => self.format_obj_str(&Object::from_str(s), spec_str, globals),
-                    // Unconverted: keep the original value (single stringify
-                    // for the empty-spec case; `__format__` otherwise).
-                    None if empty => self.stringify(value, globals),
-                    None => self.format_obj_str(value, spec_str, globals),
+                    // Unconverted: the value's own `__format__` drives the
+                    // spec — including the empty spec (`f'{x:}'` still
+                    // calls `__format__('')`).
+                    None => match value {
+                        Object::Str(s) if spec_str.is_empty() => Ok(s.to_string()),
+                        _ => self.format_obj_str(value, spec_str, globals),
+                    },
                 }
             }
             (Some(_), _) => Err(type_error("format spec must be a string")),
@@ -10118,7 +10318,26 @@ impl Interpreter {
             }
             _ => {}
         }
-        self.dispatch_binary_op(a, b, op, globals)
+        // CPython's `binary_iop1` reports the *augmented* operator in the
+        // failure message ("unsupported operand type(s) for **=: …").
+        match self.dispatch_binary_op(a, b, op, globals) {
+            Err(e) if is_type_error(&e) => {
+                let plain = format!("unsupported operand type(s) for {}:", op.as_str());
+                let msg = match &e {
+                    RuntimeError::PyException(pe) => pe.message(),
+                    RuntimeError::Internal(s) => s.clone(),
+                };
+                if let Some(rest) = msg.strip_prefix(&plain) {
+                    return Err(type_error(format!(
+                        "unsupported operand type(s) for {}=:{}",
+                        op.as_str(),
+                        rest
+                    )));
+                }
+                Err(e)
+            }
+            other => other,
+        }
     }
 
     fn dispatch_binary_op(
@@ -10206,7 +10425,10 @@ impl Interpreter {
                 let template = template.clone();
                 let mut resolve =
                     |obj: &Object, kind: char| -> Result<Option<String>, RuntimeError> {
-                        if let Object::Instance(_) = obj {
+                        // Classes also need dispatch: a metaclass `__repr__`
+                        // / `__str__` (e.g. `EnumType.__repr__` rendering
+                        // `<enum 'Color'>`) must be honoured by `%s`/`%r`.
+                        if matches!(obj, Object::Instance(_) | Object::Type(_)) {
                             let s = match kind {
                                 's' => self.stringify(obj, globals)?,
                                 'r' => self.repr_of(obj, globals)?,
@@ -11426,6 +11648,19 @@ impl Interpreter {
                         return Ok(());
                     }
                 }
+                // `cls.__qualname__ = …` goes through the `type` getset in
+                // CPython: it updates the slot without touching `__dict__`.
+                if name == "__qualname__" {
+                    let Object::Str(s) = &value else {
+                        return Err(type_error(format!(
+                            "can only assign string to {}.__qualname__, not '{}'",
+                            ty.name,
+                            value.type_name()
+                        )));
+                    };
+                    *ty.qualname.borrow_mut() = Some(s.to_string());
+                    return Ok(());
+                }
                 ty.dict
                     .borrow_mut()
                     .insert(DictKey(Object::from_str(name)), value);
@@ -12206,7 +12441,7 @@ impl Interpreter {
             }
             (Object::Range(r), Object::Int(i)) => {
                 let len = container.len()? as i64;
-                let idx = if *i < 0 { *i + len } else { *i };
+                let idx = if *i < 0 { i.saturating_add(len) } else { *i };
                 if idx < 0 || idx >= len {
                     return Err(index_error("range object index out of range"));
                 }
@@ -12419,6 +12654,24 @@ impl Interpreter {
                     }
                 };
                 let mut data = b.borrow_mut();
+                // CPython (`bytearray_ass_subscript`): assigning an *empty*
+                // buffer to an extended slice is a deletion — and the
+                // resizability check runs before the no-op early-out, so an
+                // exported bytearray raises BufferError even for zero-width
+                // slices.
+                let step = match &s.step {
+                    Object::Int(k) => *k,
+                    _ => 1,
+                };
+                if replacement.is_empty() && step != 1 {
+                    crate::object::bytearray_check_resizable(b)?;
+                    let mut indices = slice_indices(data.len(), s)?;
+                    indices.sort_unstable();
+                    for idx in indices.into_iter().rev() {
+                        data.remove(idx);
+                    }
+                    return Ok(());
+                }
                 let mut objs: Vec<Object> =
                     data.iter().map(|byte| Object::Int(i64::from(*byte))).collect();
                 let repl_objs: Vec<Object> = replacement
@@ -12426,6 +12679,9 @@ impl Interpreter {
                     .map(|byte| Object::Int(i64::from(*byte)))
                     .collect();
                 apply_slice_assignment(&mut objs, s, repl_objs)?;
+                if objs.len() != data.len() {
+                    crate::object::bytearray_check_resizable(b)?;
+                }
                 *data = objs
                     .into_iter()
                     .map(|o| match o {
@@ -12492,18 +12748,26 @@ impl Interpreter {
                 Ok(())
             }
             (Object::ByteArray(b), Object::Int(i)) => {
-                let mut b = b.borrow_mut();
-                let idx = normalize_index(*i, b.len())?;
-                b.remove(idx);
+                let mut data = b.borrow_mut();
+                let idx = normalize_index(*i, data.len())?;
+                crate::object::bytearray_check_resizable(b)?;
+                data.remove(idx);
                 Ok(())
             }
             (Object::ByteArray(b), Object::Slice(s)) => {
-                let mut b = b.borrow_mut();
-                let mut indices = slice_indices(b.len(), s)?;
+                let mut data = b.borrow_mut();
+                let mut indices = slice_indices(data.len(), s)?;
                 indices.sort_unstable();
                 indices.dedup();
+                // CPython checks resizability before the zero-width early-out
+                // on the extended-slice path, so `del exported[1:1:2]` raises
+                // BufferError even though nothing would be removed.
+                let extended = !matches!(&s.step, Object::None | Object::Int(1));
+                if extended || !indices.is_empty() {
+                    crate::object::bytearray_check_resizable(b)?;
+                }
                 for idx in indices.into_iter().rev() {
-                    b.remove(idx);
+                    data.remove(idx);
                 }
                 Ok(())
             }
@@ -12803,9 +13067,13 @@ impl Interpreter {
                     // exactly `outer_globals`.
                     return Ok(Object::Dict(outer_globals.clone()));
                 }
-                if b.name == "locals" && args.is_empty() && kwargs.is_empty() {
+                if (b.name == "locals" || b.name == "vars")
+                    && args.is_empty()
+                    && kwargs.is_empty()
+                {
                     // CPython returns a dict of the locals visible
-                    // in the calling frame. At module / class /
+                    // in the calling frame (`vars()` with no argument
+                    // is an alias for `locals()`). At module / class /
                     // exec scope this *is* the module dict; in
                     // function scope it's a fresh dict snapshot of
                     // the locals.
@@ -13832,12 +14100,15 @@ impl Interpreter {
         } else {
             None
         };
+        // CPython injects only `__module__` here; `__qualname__` is a
+        // compiler-emitted STORE at the top of the class body (with its
+        // full PEP 3155 dotted path), and `__name__` is *never* placed in
+        // the class namespace — reading `__name__` inside a class body
+        // resolves to the module's global.
         if let Some(obj) = &ns_obj {
             // Route the implicit names through the custom mapping so it sees
             // them exactly as CPython does.
             let g = body_fn.globals.clone();
-            self.class_ns_store(obj, "__name__", Object::from_str(&name), &g)?;
-            self.class_ns_store(obj, "__qualname__", Object::from_str(&name), &g)?;
             if let Some(m) = module_name {
                 self.class_ns_store(obj, "__module__", m, &g)?;
             }
@@ -13846,14 +14117,6 @@ impl Interpreter {
             }
         } else {
             let mut ns = class_ns.borrow_mut();
-            ns.insert(
-                DictKey(Object::from_static("__name__")),
-                Object::from_str(&name),
-            );
-            ns.insert(
-                DictKey(Object::from_static("__qualname__")),
-                Object::from_str(&name),
-            );
             if let Some(m) = module_name {
                 ns.insert(DictKey(Object::from_static("__module__")), m);
             }
@@ -14082,15 +14345,9 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         let class_ns = Rc::new(RefCell::new(DictData::new()));
         {
+            // Only `__module__` is injected (see the main build path);
+            // `__qualname__` is stored by the compiled class body itself.
             let mut ns = class_ns.borrow_mut();
-            ns.insert(
-                DictKey(Object::from_static("__name__")),
-                Object::from_str(name),
-            );
-            ns.insert(
-                DictKey(Object::from_static("__qualname__")),
-                Object::from_str(name),
-            );
             if let Some(m) = body_fn
                 .globals
                 .borrow()
@@ -14877,6 +15134,12 @@ impl Interpreter {
                 if !kwargs.is_empty() {
                     if let Some(call_kw) = &builtin.call_kw {
                         return call_kw(args, kwargs);
+                    }
+                    // `str(object=…, encoding=…, errors=…)` accepts its
+                    // arguments by keyword (CPython argument clinic).
+                    if cls.name == "str" {
+                        let bound = bind_str_args(args, kwargs)?;
+                        return (builtin.call)(&bound);
                     }
                     return Err(type_error(format!(
                         "{}() does not accept keyword arguments",
@@ -16129,6 +16392,29 @@ impl Interpreter {
                 return self.call(&bound, &[], &[], globals);
             }
         }
+        // `bytearray` (and subclasses) define their own `__reduce_ex__`
+        // in CPython: the buffer content must ride in the constructor
+        // args — the default newobj reduction would rebuild an *empty*
+        // payload. Delegated to `copyreg._bytearray_reduce`.
+        let is_bytearray = match recv {
+            Object::ByteArray(_) => true,
+            Object::Instance(inst) => {
+                matches!(&inst.native, Some(Object::ByteArray(_)))
+            }
+            _ => false,
+        };
+        if is_bytearray {
+            let helper = self
+                .module_attr("copyreg", "_bytearray_reduce")
+                .ok_or_else(|| runtime_error("copyreg._bytearray_reduce unavailable"))?;
+            return self.call(&helper, &[recv.clone(), Object::Int(proto)], &[], globals);
+        }
+        // Built-in iterators define `__reduce__` at the C level in CPython;
+        // their `__reduce_ex__` must reach it rather than the class-based
+        // default (which would try to pickle the unexposed iterator type).
+        if matches!(recv, Object::Iter(_)) {
+            return self.iter_reduce(recv, globals);
+        }
         self.object_default_reduce(recv, proto, globals)
     }
 
@@ -16189,6 +16475,17 @@ impl Interpreter {
             .and_then(|d| d.borrow().get(&key).cloned())
             .or_else(|| self.builtins.borrow().get(&key).cloned())
             .ok_or_else(|| runtime_error(format!("builtin '{builtin_name}' unavailable")))?;
+        // A bytearray iterator reduces to `(iter, (live_bytearray,), index)`
+        // — the *same* object, so co-pickling `(iter(b), b)` memoizes to a
+        // shared buffer and post-unpickle mutations are visible through
+        // the iterator (CPython `bytearrayiter_reduce`).
+        if let crate::object::PyIterator::ByteArray { data, index } = &*it.borrow() {
+            return Ok(Object::new_tuple(vec![
+                builtin,
+                Object::new_tuple(vec![Object::ByteArray(data.clone())]),
+                Object::Int(*index as i64),
+            ]));
+        }
         // Snapshot remaining *after* the lookup, mirroring CPython reading
         // `it_seq`/index post-`_PyEval_GetBuiltin`.
         let remaining = {
@@ -16246,18 +16543,20 @@ impl Interpreter {
         args: &[Object],
         _outer_globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        let filename = match args.get(1) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => "<string>".to_owned(),
+        };
         let source = match args.first() {
             Some(Object::Str(s)) => s.to_string(),
-            Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+            // Bytes sources go through PEP 263 detection (BOM + coding
+            // cookie), like CPython's `compile()`.
+            Some(Object::Bytes(b)) => decode_compile_source_bytes(b, &filename)?,
             _ => {
                 return Err(type_error(
                     "compile() argument 1 must be a string or bytes-like",
                 ))
             }
-        };
-        let filename = match args.get(1) {
-            Some(Object::Str(s)) => s.to_string(),
-            _ => "<string>".to_owned(),
         };
         let mode = match args.get(2) {
             Some(Object::Str(s)) => s.to_string(),
@@ -16277,13 +16576,13 @@ impl Interpreter {
                 let module = self.parse_source_emitting_warnings(&source, &filename)?;
                 let code =
                     weavepy_compiler::compile_module_with_source(&module, &source, &filename)
-                        .map_err(|e| crate::error::syntax_error(e.to_string()))?;
+                        .map_err(|e| compile_error_to_syntax_error(&e, &source, &filename))?;
                 Ok(Object::Code(Rc::new(code)))
             }
             "eval" => {
                 let module = self.parse_source_emitting_warnings(&source, &filename)?;
                 let code = weavepy_compiler::compile_eval_with_source(&module, &source, &filename)
-                    .map_err(|e| crate::error::syntax_error(e.to_string()))?;
+                    .map_err(|e| compile_error_to_syntax_error(&e, &source, &filename))?;
                 Ok(Object::Code(Rc::new(code)))
             }
             // Interactive mode: top-level expression statements echo
@@ -16293,7 +16592,7 @@ impl Interpreter {
                 let module = self.parse_source_emitting_warnings(&source, &filename)?;
                 let code =
                     weavepy_compiler::compile_interactive_with_source(&module, &source, &filename)
-                        .map_err(|e| crate::error::syntax_error(e.to_string()))?;
+                        .map_err(|e| compile_error_to_syntax_error(&e, &source, &filename))?;
                 Ok(Object::Code(Rc::new(code)))
             }
             other => Err(crate::error::value_error(format!(
@@ -16377,7 +16676,7 @@ impl Interpreter {
                 let module = self.parse_source_emitting_warnings(&src, "<string>")?;
                 let compiled =
                     weavepy_compiler::compile_module_with_source(&module, &src, "<string>")
-                        .map_err(|e| crate::error::syntax_error(e.to_string()))?;
+                        .map_err(|e| compile_error_to_syntax_error(&e, &src, "<string>"))?;
                 Rc::new(compiled)
             }
             other => {
@@ -16499,7 +16798,7 @@ impl Interpreter {
         let trimmed = src.trim_start_matches([' ', '\t', '\n', '\r', '\x0c']);
         let module = self.parse_source_emitting_warnings(trimmed, "<string>")?;
         let code = weavepy_compiler::compile_eval_with_source(&module, trimmed, "<string>")
-            .map_err(|e| crate::error::syntax_error(e.to_string()))?;
+            .map_err(|e| compile_error_to_syntax_error(&e, trimmed, "<string>"))?;
         let mut frame = self.make_frame(Rc::new(code), Vec::new(), Vec::new(), ns.clone(), true);
         self.run_frame(&mut frame)
     }
@@ -16735,7 +17034,7 @@ impl Interpreter {
             parse_error_to_syntax_error(&e, source, &diag)
         })?;
         let code = weavepy_compiler::compile_module_with_source(&module, source, filename)
-            .map_err(|e| crate::error::syntax_error(e.to_string()))?;
+            .map_err(|e| compile_error_to_syntax_error(&e, source, filename))?;
         // RFC 0021 — populate the process-global frozen cache so the
         // *next* interpreter in this process skips parse + compile.
         // We cache only the compiled code, never the running module
@@ -16820,7 +17119,7 @@ impl Interpreter {
             let module = weavepy_parser::parse_module(&source)
                 .map_err(|e| parse_error_to_syntax_error(&e, &source, &filename))?;
             let code = weavepy_compiler::compile_module_with_source(&module, &source, &filename)
-                .map_err(|e| crate::error::syntax_error(e.to_string()))?;
+                .map_err(|e| compile_error_to_syntax_error(&e, &source, &filename))?;
             if !self.bytecode_writes_disabled() {
                 crate::pycache::try_write(path, &code);
             }
@@ -17013,7 +17312,208 @@ fn line_col_text(source: &str, byte: u32) -> (u32, u32, String) {
         .find('\n')
         .map_or(source.len(), |off| line_start + off);
     let col = source[line_start..byte].chars().count() as u32 + 1;
-    (line, col, source[line_start..line_end].to_owned())
+    // CPython's tokenizer normalizes input to end with a newline, so
+    // `SyntaxError.text` always carries a trailing `\n`.
+    let mut text = source[line_start..line_end].to_owned();
+    text.push('\n');
+    (line, col, text)
+}
+
+/// Decode a Python source buffer per PEP 263: an optional UTF-8 BOM,
+/// then an optional `# -*- coding: NAME -*-` cookie on line 1 or 2,
+/// defaulting to strict UTF-8. Mirrors CPython's tokenizer setup —
+/// undecodable input is a `SyntaxError`, not a `UnicodeDecodeError`.
+pub fn decode_source_bytes(bytes: &[u8], filename: &str) -> Result<String, RuntimeError> {
+    decode_source_bytes_inner(bytes, filename, true)
+}
+
+/// [`decode_source_bytes`] for `compile()`-style string sources: decode
+/// failures surface as CPython's `(unicode error) …` SyntaxError (with
+/// line/offset/text) instead of the file tokenizer's `Non-UTF-8 code…`.
+pub fn decode_compile_source_bytes(bytes: &[u8], filename: &str) -> Result<String, RuntimeError> {
+    decode_source_bytes_inner(bytes, filename, false)
+}
+
+fn decode_source_bytes_inner(
+    bytes: &[u8],
+    filename: &str,
+    from_file: bool,
+) -> Result<String, RuntimeError> {
+    let had_bom = bytes.starts_with(b"\xEF\xBB\xBF");
+    let payload = if had_bom { &bytes[3..] } else { bytes };
+
+    // PEP 263 cookie: `^[ \t\f]*#.*?coding[:=][ \t]*([-_.a-zA-Z0-9]+)`
+    // on one of the first two lines.
+    fn cookie_of_line(line: &[u8]) -> Option<String> {
+        let mut i = 0;
+        while i < line.len() && matches!(line[i], b' ' | b'\t' | 0x0C) {
+            i += 1;
+        }
+        if line.get(i) != Some(&b'#') {
+            return None;
+        }
+        let rest = &line[i..];
+        let pos = rest.windows(6).position(|w| w == b"coding")?;
+        let mut j = pos + 6;
+        if !matches!(rest.get(j), Some(b':' | b'=')) {
+            return None;
+        }
+        j += 1;
+        while matches!(rest.get(j), Some(b' ' | b'\t')) {
+            j += 1;
+        }
+        let start = j;
+        while rest
+            .get(j)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            j += 1;
+        }
+        (j > start).then(|| String::from_utf8_lossy(&rest[start..j]).into_owned())
+    }
+    let mut cookie = None;
+    let mut line_start = 0usize;
+    for _ in 0..2 {
+        let line_end = payload[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(payload.len(), |off| line_start + off);
+        if let Some(c) = cookie_of_line(&payload[line_start..line_end]) {
+            cookie = Some(c);
+            break;
+        }
+        if line_end >= payload.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+
+    if let Some(enc) = cookie {
+        // With a BOM present, CPython only accepts cookies that
+        // *literally* start with "utf-8" — even "utf8" is rejected
+        // ("encoding problem: utf8 with BOM", lineno 0, offset -1).
+        if had_bom && !enc.to_ascii_lowercase().starts_with("utf-8") {
+            let e = crate::error::syntax_error_located(
+                format!("encoding problem: {enc} with BOM"),
+                Some(filename),
+                None,
+                None,
+                None,
+            );
+            if let RuntimeError::PyException(pe) = &e {
+                if let Object::Instance(inst) = &pe.instance {
+                    let mut d = inst.dict.borrow_mut();
+                    d.insert(DictKey(Object::from_static("lineno")), Object::Int(0));
+                    d.insert(DictKey(Object::from_static("offset")), Object::Int(-1));
+                }
+            }
+            return Err(e);
+        }
+        return crate::stdlib::codecs_mod::decode_bytes(payload, &enc, "strict").map_err(|_| {
+            crate::error::syntax_error(format!("encoding problem for '{filename}': {enc}"))
+        });
+    }
+
+    match std::str::from_utf8(payload) {
+        Ok(s) => Ok(s.to_owned()),
+        Err(e) => {
+            let bad_at = e.valid_up_to();
+            let bad_byte = payload.get(bad_at).copied().unwrap_or(0);
+            let line = payload[..bad_at].iter().filter(|&&b| b == b'\n').count() + 1;
+            if from_file {
+                // CPython's file tokenizer message (`python bad.py`).
+                return Err(crate::error::syntax_error(format!(
+                    "Non-UTF-8 code starting with '\\x{bad_byte:02x}' in file {filename} on \
+                     line {line}, but no encoding declared; see \
+                     https://peps.python.org/pep-0263/ for details"
+                )));
+            }
+            // `compile()` bytes source: CPython reports the failure as
+            // a "(unicode error)" SyntaxError. `position` is the bad
+            // byte's index within its contiguous run of non-ASCII
+            // bytes; `offset` is the character column where that run
+            // starts; `end_offset` is `offset + position + 1`.
+            let line_start = payload[..bad_at]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            let line_end = payload[bad_at..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(payload.len(), |off| bad_at + off);
+            let mut run_start = bad_at;
+            while run_start > line_start && payload[run_start - 1] >= 0x80 {
+                run_start -= 1;
+            }
+            let position = bad_at - run_start;
+            let reason = if e.error_len().is_none() {
+                "unexpected end of data"
+            } else if matches!(bad_byte, 0xC2..=0xF4) {
+                "invalid continuation byte"
+            } else {
+                "invalid start byte"
+            };
+            let text: String = decode_utf8_replace(&payload[line_start..line_end]);
+            // Bytes before the run are valid UTF-8, so the decoded
+            // text's byte offsets line up with the source's there.
+            let offset = text
+                .char_indices()
+                .take_while(|(i, _)| *i < run_start - line_start)
+                .count()
+                .max(1);
+            let text = format!("{text}\n");
+            let e = crate::error::syntax_error_located(
+                format!(
+                    "(unicode error) 'utf-8' codec can't decode byte 0x{bad_byte:02x} in \
+                     position {position}: {reason}"
+                ),
+                Some(filename),
+                Some(line as u32),
+                Some(offset as u32),
+                Some(&text),
+            );
+            if let RuntimeError::PyException(pe) = &e {
+                if let Object::Instance(inst) = &pe.instance {
+                    let mut d = inst.dict.borrow_mut();
+                    d.insert(
+                        DictKey(Object::from_static("end_lineno")),
+                        Object::Int(line as i64),
+                    );
+                    d.insert(
+                        DictKey(Object::from_static("end_offset")),
+                        Object::Int((offset + position + 1) as i64),
+                    );
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Decode bytes as UTF-8 with one U+FFFD per undecodable byte, like
+/// Python's `errors='replace'` (std's `from_utf8_lossy` can merge a
+/// multi-byte invalid sequence into a single replacement char).
+fn decode_utf8_replace(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                return out;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                out.push_str(std::str::from_utf8(&rest[..valid]).unwrap_or(""));
+                out.push('\u{FFFD}');
+                let skip = valid + e.error_len().unwrap_or(rest.len() - valid).max(1);
+                rest = &rest[skip.min(rest.len())..];
+                if rest.is_empty() {
+                    return out;
+                }
+            }
+        }
+    }
 }
 
 /// Map a [`weavepy_parser::ParseError`] to a CPython-shaped `SyntaxError`,
@@ -17064,6 +17564,81 @@ fn parse_error_to_syntax_error(
     e
 }
 
+/// Map a [`weavepy_compiler::CompileError`] to a CPython-shaped
+/// `SyntaxError`. Compile/symtable-stage errors in CPython carry the AST
+/// node's location with **byte**-based columns (`col_offset + 1`, no
+/// character conversion — unlike parser errors). `.text` is the source
+/// line, newline-terminated, same as parser errors.
+pub fn compile_error_to_syntax_error(
+    err: &weavepy_compiler::CompileError,
+    source: &str,
+    filename: &str,
+) -> RuntimeError {
+    let Some(span) = err.span else {
+        return crate::error::syntax_error(err.message.clone());
+    };
+    // Parser-stage errors (pegen `invalid_*` rules) use *character*
+    // columns; compile/symtable-stage errors use raw *byte* columns
+    // (`col_offset + 1`).
+    let line_col = |byte: u32| -> (u32, u32, usize) {
+        let byte = (byte as usize).min(source.len());
+        let mut line = 1u32;
+        let mut line_start = 0usize;
+        for (i, ch) in source.char_indices() {
+            if i >= byte {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                line_start = i + 1;
+            }
+        }
+        let col = if err.parser_stage {
+            source[line_start..byte].chars().count() as u32 + 1
+        } else {
+            (byte - line_start) as u32 + 1
+        };
+        (line, col, line_start)
+    };
+    let (lineno, offset, line_start) = line_col(span.start.0);
+    let (end_lineno, end_offset, _) = line_col(span.end.0);
+    // Parser-stage errors always carry `.text` (the tokenizer's current,
+    // newline-terminated line). Compile-stage errors get it only when
+    // CPython can *re-read the file* (`PyErr_ProgramTextObject`) —
+    // string sources (`<string>`, `<fragment>`, …) get `.text = None`.
+    let text = if !err.parser_stage && filename.starts_with('<') {
+        None
+    } else {
+        let line_end = source[line_start..]
+            .find('\n')
+            .map_or(source.len(), |off| line_start + off);
+        let mut t = source[line_start..line_end].to_owned();
+        t.push('\n');
+        Some(t)
+    };
+    let e = crate::error::syntax_error_located(
+        err.message.clone(),
+        Some(filename),
+        Some(lineno),
+        Some(offset),
+        text.as_deref(),
+    );
+    if let RuntimeError::PyException(pe) = &e {
+        if let Object::Instance(inst) = &pe.instance {
+            let mut d = inst.dict.borrow_mut();
+            d.insert(
+                DictKey(Object::from_static("end_lineno")),
+                Object::Int(i64::from(end_lineno)),
+            );
+            d.insert(
+                DictKey(Object::from_static("end_offset")),
+                Object::Int(i64::from(end_offset)),
+            );
+        }
+    }
+    e
+}
+
 /// Read the current module's `__package__` (or fall back to
 /// `__name__`'s parent) so relative imports can resolve.
 fn current_package(globals: &Rc<RefCell<DictData>>) -> Option<String> {
@@ -17086,6 +17661,10 @@ fn current_package(globals: &Rc<RefCell<DictData>>) -> Option<String> {
 /// Resolve one slice bound to an `i64` the way `PySlice_Unpack` does:
 /// `None` → `Ok(None)`, ints/bools directly, big ints clamped to the
 /// extremes, and `__index__`-able objects through interpreter reentry.
+fn start_raw_to_obj(v: Option<i64>) -> Object {
+    v.map_or(Object::None, Object::Int)
+}
+
 pub(crate) fn slice_bound_index(o: &Object) -> Result<Option<i64>, RuntimeError> {
     match o {
         Object::None => Ok(None),
@@ -17155,7 +17734,7 @@ pub(crate) fn apply_slice_assignment(
     let stop_raw = slice_bound_index(&s.stop)?.unwrap_or(if step > 0 { len } else { -1 });
     let norm = |x: i64| -> i64 {
         if x < 0 {
-            ((x + len).max(0)).min(len)
+            (x.saturating_add(len).max(0)).min(len)
         } else {
             x.min(len)
         }
@@ -17166,31 +17745,18 @@ pub(crate) fn apply_slice_assignment(
         data.splice(start..stop, replacement);
         return Ok(());
     }
-    // Strided assignment: build the list of indices first, then
-    // verify the lengths match before applying.
-    let mut indices: Vec<usize> = Vec::new();
-    let mut i = if step > 0 {
-        norm(start_raw)
-    } else {
-        if start_raw < 0 {
-            (start_raw + len).max(-1)
-        } else {
-            start_raw.min(len - 1)
-        }
+    // Strided assignment: compute the covered indices with the *same*
+    // clamping as the read path (`slice_indices`), then verify the
+    // lengths match before applying — `L[s] = reversed(L[s])` must
+    // always agree on the slice width. Bounds were already coerced to
+    // ints by `slice_bound_index` above, so re-wrap them for the
+    // shared helper.
+    let resolved = PySlice {
+        start: start_raw_to_obj(slice_bound_index(&s.start)?),
+        stop: start_raw_to_obj(slice_bound_index(&s.stop)?),
+        step: Object::Int(step),
     };
-    let stop = if step > 0 {
-        norm(stop_raw)
-    } else if stop_raw < 0 {
-        (stop_raw + len).max(-1)
-    } else {
-        stop_raw.min(len)
-    };
-    while (step > 0 && i < stop) || (step < 0 && i > stop) {
-        if i >= 0 && (i as usize) < data.len() {
-            indices.push(i as usize);
-        }
-        i += step;
-    }
+    let indices = slice_indices(data.len(), &resolved)?;
     if indices.len() != replacement.len() {
         return Err(value_error(format!(
             "attempt to assign sequence of size {} to extended slice of size {}",
@@ -17229,7 +17795,7 @@ pub(crate) fn slice_indices(len: usize, s: &PySlice) -> Result<Vec<usize>, Runti
         match o {
             Object::None => Ok(default),
             Object::Int(i) => {
-                let v = if *i < 0 { *i + len } else { *i };
+                let v = if *i < 0 { i.saturating_add(len) } else { *i };
                 Ok(v.clamp(lower, upper))
             }
             _ => Err(type_error("slice indices must be integers or None")),
@@ -17242,7 +17808,7 @@ pub(crate) fn slice_indices(len: usize, s: &PySlice) -> Result<Vec<usize>, Runti
         if i >= 0 && (i as usize) < len as usize {
             out.push(i as usize);
         }
-        i += step;
+        i = i.saturating_add(step);
     }
     Ok(out)
 }
@@ -17270,7 +17836,7 @@ fn adjust_slice(len: i64, s: &PySlice) -> Result<(i64, i64, i64, i64), RuntimeEr
             Object::Int(i) => {
                 let mut x = *i;
                 if x < 0 {
-                    x += len;
+                    x = x.saturating_add(len);
                     if x < lower {
                         x = lower;
                     }
@@ -17344,7 +17910,7 @@ pub(crate) fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, Runt
     // the start of the sequence), whereas a positive step floors at 0.
     let adjust = |x: i64| -> i64 {
         if x < 0 {
-            let v = x + len;
+            let v = x.saturating_add(len);
             if v < 0 {
                 if step < 0 {
                     -1
@@ -17404,14 +17970,14 @@ pub(crate) fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, Runt
             if (0..len).contains(&i) {
                 out.push(seq[i as usize].clone());
             }
-            i += step;
+            i = i.saturating_add(step);
         }
     } else {
         while i > stop {
             if (0..len).contains(&i) {
                 out.push(seq[i as usize].clone());
             }
-            i += step;
+            i = i.saturating_add(step);
         }
     }
     Ok(out)
@@ -17583,6 +18149,17 @@ fn builtin_slot_wrapper(ty: &Rc<TypeObject>, name: &str) -> Option<Object> {
             SLOT_WRAPPER_CACHE.with(|c| {
                 c.borrow_mut().insert((ptr, name.to_owned()), o.clone());
             });
+            return Some(o);
+        }
+        // The base's own type dict — where `object.__reduce_ex__` /
+        // `__reduce__` / `__getattribute__` sentinels live. Already
+        // identity-stable, so no caching needed.
+        if let Some(o) = base
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_str(name)))
+            .cloned()
+        {
             return Some(o);
         }
     }
@@ -18191,6 +18768,72 @@ fn bind_int_args(
     Ok(out)
 }
 
+/// Bind `str(object=…, encoding=…, errors=…)` keywords to positional
+/// order, mirroring CPython's `str.__new__` argument clinic.
+fn bind_str_args(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Vec<Object>, RuntimeError> {
+    let mut object_kw: Option<Object> = None;
+    let mut encoding_kw: Option<Object> = None;
+    let mut errors_kw: Option<Object> = None;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "object" => object_kw = Some(v.clone()),
+            "encoding" => encoding_kw = Some(v.clone()),
+            "errors" => errors_kw = Some(v.clone()),
+            _ => {
+                return Err(type_error(format!(
+                    "'{k}' is an invalid keyword argument for str()"
+                )))
+            }
+        }
+    }
+    let mut slots: [Option<Object>; 3] = [None, None, None];
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "str expected at most 3 arguments, got {}",
+            args.len()
+        )));
+    }
+    for (i, a) in args.iter().enumerate() {
+        slots[i] = Some(a.clone());
+    }
+    for (i, (kw, name)) in [
+        (object_kw, "object"),
+        (encoding_kw, "encoding"),
+        (errors_kw, "errors"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(v) = kw {
+            if slots[i].is_some() {
+                return Err(type_error(format!(
+                    "argument for str() given by name ('{name}') and position ({})",
+                    i + 1
+                )));
+            }
+            slots[i] = Some(v);
+        }
+    }
+    // Trailing unset slots are simply omitted; a hole before a later
+    // argument keeps CPython's default in place ('' / 'utf-8').
+    let mut out = Vec::new();
+    let [object, encoding, errors] = slots;
+    out.push(object.unwrap_or_else(|| Object::from_static("")));
+    if let Some(e) = encoding {
+        out.push(e);
+        if let Some(er) = errors {
+            out.push(er);
+        }
+    } else if let Some(er) = errors {
+        out.push(Object::from_static("utf-8"));
+        out.push(er);
+    }
+    Ok(out)
+}
+
 /// Public entry point shared with the `format` builtin: drive the
 /// format-spec mini-language without going through `FORMAT_VALUE`.
 pub(crate) fn format_via_spec(value: &Object, spec: &str) -> Result<String, RuntimeError> {
@@ -18520,7 +19163,7 @@ fn apply_trailer(value: Object, trailer: &str) -> Result<Object, RuntimeError> {
                         let len = l.borrow().len() as i64;
 
                         if i < 0 {
-                            i + len
+                            i.saturating_add(len)
                         } else {
                             i
                         }
@@ -18538,7 +19181,7 @@ fn apply_trailer(value: Object, trailer: &str) -> Result<Object, RuntimeError> {
                         let len = t.len() as i64;
 
                         if i < 0 {
-                            i + len
+                            i.saturating_add(len)
                         } else {
                             i
                         }
@@ -18701,14 +19344,25 @@ pub(crate) fn percent_format_with(
                     .cloned()
                     .ok_or_else(|| type_error("not enough arguments for format string"))?;
                 idx += 1;
+                // CPython parses `*` width as Py_ssize_t (`"n;* wants int"`),
+                // so any i64 is accepted — an infeasibly large width then
+                // fails at buffer allocation with MemoryError (gh-140939).
                 let n = star_arg_int(&v)?;
-                if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&n) {
-                    return Err(overflow_error("Python int too large to convert to C int"));
+                let magnitude = n.unsigned_abs();
+                if usize::try_from(magnitude)
+                    .ok()
+                    .and_then(|m| {
+                        let mut probe: Vec<u8> = Vec::new();
+                        probe.try_reserve_exact(m).ok()
+                    })
+                    .is_none()
+                {
+                    return Err(crate::error::memory_error(String::new()));
                 }
                 // A negative `*` width left-justifies in abs(width), like `-`.
                 if n < 0 {
                     flags.push('-');
-                    width = (-n).to_string();
+                    width = magnitude.to_string();
                 } else {
                     width = n.to_string();
                 }
@@ -21184,6 +21838,21 @@ fn complex_arith(
             op.as_str()
         ))),
     }
+}
+
+/// CPython private name mangling (`_Py_Mangle`): inside a class scope,
+/// `__spam` (two leading underscores, at most one trailing underscore)
+/// becomes `_ClassName__spam`, with the class name stripped of leading
+/// underscores. Returns `None` when no mangling applies.
+fn mangle_class_private(class_name: &str, name: &str) -> Option<String> {
+    if !name.starts_with("__") || name.ends_with("__") || name.contains('.') {
+        return None;
+    }
+    let stripped = class_name.trim_start_matches('_');
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(format!("_{stripped}{name}"))
 }
 
 pub(crate) fn compare_op(a: &Object, b: &Object, op: CompareKind) -> Result<bool, RuntimeError> {

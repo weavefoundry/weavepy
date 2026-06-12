@@ -77,17 +77,45 @@ def source_from_cache(path):
     return os.path.join(parent, base + '.py')
 
 
-def decode_source(source_bytes):
-    """Decode a UTF-8 source-byte blob to text.
+def _coding_cookie(line):
+    """PEP 263 cookie in a comment line (bytes), or None."""
+    i = 0
+    while i < len(line) and line[i : i + 1] in (b' ', b'\t', b'\x0c'):
+        i += 1
+    if line[i : i + 1] != b'#':
+        return None
+    pos = line.find(b'coding', i)
+    if pos < 0:
+        return None
+    j = pos + 6
+    if line[j : j + 1] not in (b':', b'='):
+        return None
+    j += 1
+    while line[j : j + 1] in (b' ', b'\t'):
+        j += 1
+    start = j
+    while j < len(line) and chr(line[j]) in (
+        'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.'
+    ):
+        j += 1
+    if j == start:
+        return None
+    return line[start:j].decode('ascii')
 
-    Honours BOM stripping the same way CPython does. The
-    encoding-cookie parse (PEP 263) is approximated; we trust the
-    BOM and otherwise assume UTF-8.
+
+def decode_source(source_bytes):
+    """Decode a source-byte blob to text, per PEP 263: a UTF-8 BOM
+    wins, then a coding cookie on line 1 or 2, defaulting to UTF-8
+    (CPython routes this through `tokenize.detect_encoding`).
     """
     if isinstance(source_bytes, str):
         return source_bytes
     if source_bytes.startswith(b'\xef\xbb\xbf'):
         return source_bytes[3:].decode('utf-8')
+    for line in source_bytes.split(b'\n', 2)[:2]:
+        encoding = _coding_cookie(line)
+        if encoding is not None:
+            return source_bytes.decode(encoding)
     return source_bytes.decode('utf-8')
 
 

@@ -26,5 +26,9 @@ unicode_names2 = { workspace = true }
 # and `μ` (U+03BC) name the same binding and `𝔘𝔫𝔦𝔠𝔬𝔡𝔢` folds to `Unicode`.
 unicode-normalization = { workspace = true }
 
+# F-string conversion clauses (`!s`/`!r`/`!a`) are NAME tokens; validating
+# them needs the same XID tables the lexer uses.
+unicode-ident = { workspace = true }
+
 [lints]
 workspace = true

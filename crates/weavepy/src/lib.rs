@@ -79,17 +79,13 @@ impl Error {
             Error::Parse(parser::ParseError::Lex(lex)) => format_lex_error(source, filename, lex),
             Error::Parse(parser::ParseError::Unexpected { span, message })
             | Error::Parse(parser::ParseError::Indentation { span, message }) => {
-                format_syntax_error(source, filename, span.start.0, message)
+                format_syntax_error_span(source, filename, span.start.0, span.end.0, message)
             }
             Error::Parse(parser::ParseError::NotImplemented { span, feature, rfc }) => {
                 let message = format!("`{feature}` is not implemented in the slice ({rfc})");
-                format_syntax_error(source, filename, span.start.0, &message)
+                format_syntax_error_span(source, filename, span.start.0, span.end.0, &message)
             }
-            Error::Compile(compile_err) => {
-                // Compiler errors don't carry spans yet — surface as a
-                // SyntaxError-shaped diagnostic without line info.
-                format!("  File \"{filename}\", line ?\nSyntaxError: {compile_err}\n")
-            }
+            Error::Compile(compile_err) => format_compile_error(source, filename, compile_err),
             Error::Runtime(vm::RuntimeError::PyException(exc)) => {
                 let mut s = String::new();
                 let _ = writeln!(s, "Traceback (most recent call last):");
@@ -340,19 +336,133 @@ fn script_dir_of(filename: &str) -> PathBuf {
 
 /// Render a CPython-style `SyntaxError`-shape diagnostic, with the
 /// offending source line and a caret under the column.
-fn format_syntax_error(source: &str, filename: &str, byte: u32, message: &str) -> String {
-    let loc = SourceLocation::from_byte(source, byte);
+/// Render the `File … / source line / caret run / SyntaxError: …` block
+/// for a syntax error, replicating CPython's
+/// `traceback.TracebackException.format_exception_only` clamp logic.
+/// `offset`/`end_offset` are the 1-based columns stored on the
+/// exception (character-based for parser errors, byte-based for
+/// compile/symtable errors — CPython renders both as if they indexed
+/// characters, so we do too).
+fn render_caret_block(
+    filename: &str,
+    lineno: usize,
+    line_text: &str,
+    offset: usize,
+    end_offset: usize,
+    message: &str,
+) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "  File \"{filename}\", line {}", loc.line);
-    let _ = writeln!(out, "    {}", loc.line_text);
-    let pad: String = " ".repeat(4 + loc.col.saturating_sub(1));
-    let _ = writeln!(out, "{pad}^");
+    let _ = writeln!(out, "  File \"{filename}\", line {lineno}");
+    let rtext = line_text.trim_end_matches('\n');
+    let ltext = rtext.trim_start_matches([' ', '\n', '\x0c']);
+    let rtext_chars = rtext.chars().count();
+    let ltext_chars = ltext.chars().count();
+    let spaces = rtext_chars - ltext_chars;
+    // `.text` is the newline-terminated line; CPython clamps offsets
+    // that fall past it back to just-after-end-of-line.
+    let text_chars = rtext_chars + 1;
+    let mut offset = offset;
+    let mut end_offset = end_offset;
+    if offset > text_chars {
+        offset = rtext_chars + 1;
+    }
+    if end_offset > text_chars {
+        end_offset = rtext_chars + 1;
+    }
+    if offset >= end_offset {
+        end_offset = offset + 1;
+    }
+    let colno = offset as i64 - 1 - spaces as i64;
+    let end_colno = end_offset as i64 - 1 - spaces as i64;
+    let _ = writeln!(out, "    {ltext}");
+    if colno >= 0 {
+        // Non-space whitespace (tabs) is kept so the carets align.
+        let caretspace: String = ltext
+            .chars()
+            .take(colno as usize)
+            .map(|c| if c.is_whitespace() { c } else { ' ' })
+            .collect();
+        let _ = writeln!(
+            out,
+            "    {caretspace}{}",
+            "^".repeat((end_colno - colno) as usize)
+        );
+    }
     let _ = writeln!(out, "SyntaxError: {message}");
     out
 }
 
+/// Render a compile/symtable-stage error CPython-style. Byte columns
+/// for compile-stage spans, character columns for parser-stage ones —
+/// matching what the VM stores on the `SyntaxError` object.
+fn format_compile_error(source: &str, filename: &str, err: &compiler::CompileError) -> String {
+    let Some(span) = err.span else {
+        return format!(
+            "  File \"{filename}\", line ?\nSyntaxError: {}\n",
+            err.message
+        );
+    };
+    let start = SourceLocation::from_byte(source, span.start.0);
+    let end = SourceLocation::from_byte(source, span.end.0);
+    let line_start_byte = {
+        let byte = (span.start.0 as usize).min(source.len());
+        source[..byte].rfind('\n').map_or(0, |i| i + 1)
+    };
+    let byte_col = |byte: u32| (byte as usize).min(source.len()) - line_start_byte + 1;
+    let (offset, end_offset) = if err.parser_stage {
+        let end_col = if end.line == start.line {
+            end.col
+        } else {
+            start.line_text.chars().count() + 1
+        };
+        (start.col, end_col)
+    } else {
+        let end_col = if end.line == start.line {
+            byte_col(span.end.0)
+        } else {
+            start.line_text.len() + 1
+        };
+        (byte_col(span.start.0), end_col)
+    };
+    render_caret_block(
+        filename,
+        start.line,
+        start.line_text,
+        offset,
+        end_offset,
+        &err.message,
+    )
+}
+
 fn format_lex_error(source: &str, filename: &str, err: &lexer::LexError) -> String {
-    format_syntax_error(source, filename, err.byte_offset(), &err.to_string())
+    let byte = err.byte_offset();
+    format_syntax_error_span(source, filename, byte, byte, &err.to_string())
+}
+
+/// Render a parser-stage error with character-based columns derived
+/// from the byte span.
+fn format_syntax_error_span(
+    source: &str,
+    filename: &str,
+    start_byte: u32,
+    end_byte: u32,
+    message: &str,
+) -> String {
+    let start = SourceLocation::from_byte(source, start_byte);
+    let end = SourceLocation::from_byte(source, end_byte);
+    let end_col = if end.line == start.line {
+        end.col
+    } else {
+        start.line_text.chars().count() + 1
+    };
+    render_caret_block(
+        filename,
+        start.line,
+        start.line_text,
+        start.col,
+        end_col,
+        message,
+    )
 }
 
 /// `(line, column, line_text)` derived from a byte offset.

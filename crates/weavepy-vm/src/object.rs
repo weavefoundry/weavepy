@@ -389,6 +389,112 @@ pub struct PyTraceback {
     pub next: RefCell<Option<Rc<PyTraceback>>>,
 }
 
+// ---- bytearray buffer-export accounting ----
+//
+// CPython forbids resizing a `bytearray` while its buffer is exported
+// (`ob_exports > 0`): a live `memoryview`, or a native method holding
+// the buffer across a re-entrant callback (gh-142560). We track live
+// exports per backing buffer in a side table. The hot-path cost for
+// non-exporting programs is a single relaxed atomic load.
+
+static BYTEARRAY_EXPORT_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+type ExportMap = std::collections::HashMap<usize, (crate::sync::Weak<RefCell<Vec<u8>>>, usize)>;
+
+fn bytearray_export_map() -> &'static std::sync::Mutex<ExportMap> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<ExportMap>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(ExportMap::new()))
+}
+
+/// Register a live export of `buf`. Pair with
+/// [`bytearray_export_release`] (or use [`ByteArrayExportGuard`]).
+pub fn bytearray_export_acquire(buf: &Rc<RefCell<Vec<u8>>>) {
+    let key = Rc::as_ptr(buf) as usize;
+    let mut map = bytearray_export_map().lock().unwrap();
+    let entry = map.entry(key);
+    match entry {
+        std::collections::hash_map::Entry::Occupied(mut o) => {
+            // A recycled allocation address must not inherit the stale
+            // count from a dead buffer.
+            let stale = o.get().0.upgrade().map_or(true, |live| !Rc::ptr_eq(&live, buf));
+            if stale {
+                let removed = o.get().1;
+                BYTEARRAY_EXPORT_TOTAL
+                    .fetch_sub(removed, std::sync::atomic::Ordering::AcqRel);
+                *o.get_mut() = (Rc::downgrade(buf), 1);
+            } else {
+                o.get_mut().1 += 1;
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert((Rc::downgrade(buf), 1));
+        }
+    }
+    BYTEARRAY_EXPORT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Drop one live export of `buf`.
+pub fn bytearray_export_release(buf: &Rc<RefCell<Vec<u8>>>) {
+    let key = Rc::as_ptr(buf) as usize;
+    let mut map = bytearray_export_map().lock().unwrap();
+    if let Some((weak, count)) = map.get_mut(&key) {
+        let live = weak.upgrade().is_some_and(|live| Rc::ptr_eq(&live, buf));
+        if live {
+            *count -= 1;
+            BYTEARRAY_EXPORT_TOTAL.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            if *count == 0 {
+                map.remove(&key);
+            }
+        }
+    }
+}
+
+/// Does `buf` have any live exports?
+pub fn bytearray_is_exported(buf: &Rc<RefCell<Vec<u8>>>) -> bool {
+    if BYTEARRAY_EXPORT_TOTAL.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    let key = Rc::as_ptr(buf) as usize;
+    let map = bytearray_export_map().lock().unwrap();
+    map.get(&key).is_some_and(|(weak, count)| {
+        *count > 0 && weak.upgrade().is_some_and(|live| Rc::ptr_eq(&live, buf))
+    })
+}
+
+/// Gate for length-changing `bytearray` operations — CPython's
+/// `_canresize`. Same-length writes are always fine; the callers only
+/// invoke this when the operation would change `len`.
+pub fn bytearray_check_resizable(buf: &Rc<RefCell<Vec<u8>>>) -> Result<(), RuntimeError> {
+    if bytearray_is_exported(buf) {
+        return Err(RuntimeError::PyException(crate::error::PyException::from_builtin(
+            "BufferError",
+            "Existing exports of data: object cannot be re-sized",
+        )));
+    }
+    Ok(())
+}
+
+/// RAII export of a bytearray buffer — what a CPython C method holds
+/// (via `PyObject_GetBuffer` on `self`) while it converts arguments
+/// that may call back into Python.
+pub struct ByteArrayExportGuard {
+    buf: Rc<RefCell<Vec<u8>>>,
+}
+
+impl ByteArrayExportGuard {
+    pub fn new(buf: Rc<RefCell<Vec<u8>>>) -> Self {
+        bytearray_export_acquire(&buf);
+        Self { buf }
+    }
+}
+
+impl Drop for ByteArrayExportGuard {
+    fn drop(&mut self) {
+        bytearray_export_release(&self.buf);
+    }
+}
+
 /// Backing buffer for a [`PyMemoryView`].
 #[derive(Debug)]
 pub enum MemoryViewBuffer {
@@ -435,6 +541,10 @@ impl PyMemoryView {
 
     pub fn from_bytearray(b: Rc<RefCell<Vec<u8>>>) -> Self {
         let len = b.borrow().len();
+        // The view is a live buffer export: the bytearray cannot be
+        // resized until this view is released/dropped (CPython
+        // `ob_exports`).
+        bytearray_export_acquire(&b);
         Self {
             buffer: MemoryViewBuffer::ByteArray(b),
             start: Cell::new(0),
@@ -446,6 +556,39 @@ impl PyMemoryView {
         }
     }
 
+    /// Same backing buffer, same window — `memoryview(mv)`. Takes its
+    /// own buffer export, like CPython.
+    pub fn shallow_clone(&self) -> Self {
+        let buffer = match &self.buffer {
+            MemoryViewBuffer::Bytes(b) => MemoryViewBuffer::Bytes(b.clone()),
+            MemoryViewBuffer::ByteArray(b) => {
+                if !self.released.get() {
+                    bytearray_export_acquire(b);
+                }
+                MemoryViewBuffer::ByteArray(b.clone())
+            }
+        };
+        Self {
+            buffer,
+            start: Cell::new(self.start.get()),
+            len: Cell::new(self.len.get()),
+            readonly: Cell::new(self.readonly.get()),
+            released: Cell::new(self.released.get()),
+            format: RefCell::new(self.format.borrow().clone()),
+            itemsize: Cell::new(self.itemsize.get()),
+        }
+    }
+
+    /// `memoryview.release()` — drop the buffer export and mark the
+    /// view unusable. Idempotent.
+    pub fn release(&self) {
+        if !self.released.replace(true) {
+            if let MemoryViewBuffer::ByteArray(b) = &self.buffer {
+                bytearray_export_release(b);
+            }
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let start = self.start.get();
         let end = start + self.len.get();
@@ -453,6 +596,12 @@ impl PyMemoryView {
             MemoryViewBuffer::Bytes(b) => b[start..end].to_vec(),
             MemoryViewBuffer::ByteArray(b) => b.borrow()[start..end].to_vec(),
         }
+    }
+}
+
+impl Drop for PyMemoryView {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -1642,9 +1791,21 @@ impl PyIterator {
                 Some(Object::Int(i64::from(v)))
             }
             PyIterator::ByteArray { data, index } => {
-                let v = data.borrow().get(*index).copied()?;
-                *index += 1;
-                Some(Object::Int(i64::from(v)))
+                let v = data.borrow().get(*index).copied();
+                match v {
+                    Some(v) => {
+                        *index += 1;
+                        Some(Object::Int(i64::from(v)))
+                    }
+                    None => {
+                        // Exhausted. Detach from the buffer so a later
+                        // `append` can't resurrect the iterator —
+                        // CPython clears `it_seq` on first StopIteration.
+                        *data = Rc::new(RefCell::new(Vec::new()));
+                        *index = 0;
+                        None
+                    }
+                }
             }
             PyIterator::Enumerate { inner, count } => {
                 let v = inner.borrow_mut().next_value()?;
@@ -2226,22 +2387,13 @@ impl Object {
                 bytes_membership(haystack, item)
             }
             Object::ByteArray(haystack) => {
-                // Clone out: converting `item` can reenter Python (a user
-                // `__index__`) that mutates this bytearray. CPython holds
-                // the buffer during conversion and raises BufferError if
-                // it is resized (gh-142560).
-                let before = haystack.borrow().len();
+                // Hold a buffer export: converting `item` can reenter
+                // Python (a user `__index__`/`__buffer__`) that tries to
+                // resize this bytearray; the resize then raises
+                // BufferError at the mutation site (gh-142560).
+                let _guard = ByteArrayExportGuard::new(haystack.clone());
                 let hay: Vec<u8> = haystack.borrow().clone();
-                let result = bytes_membership(&hay, item);
-                if haystack.borrow().len() != before {
-                    return Err(RuntimeError::PyException(
-                        crate::error::PyException::from_builtin(
-                            "BufferError",
-                            "Existing exports of data: object cannot be re-sized",
-                        ),
-                    ));
-                }
-                result
+                bytes_membership(&hay, item)
             }
             Object::Range(r) => {
                 use num_traits::ToPrimitive;
@@ -2613,7 +2765,19 @@ impl Object {
                 format!("<function {} at 0x{:x}>", qual, Rc::as_ptr(f) as usize)
             }
             Object::Builtin(b) => format!("<built-in function {}>", b.name),
-            Object::BoundMethod(_) => "<bound method>".to_owned(),
+            // CPython `method_repr`: `<bound method qualname of repr(self)>`.
+            Object::BoundMethod(bm) => {
+                let qual = match &bm.function {
+                    Object::Function(f) => f
+                        .slot("__qualname__")
+                        .as_ref()
+                        .map(Object::to_str)
+                        .unwrap_or_else(|| f.code().qualname.clone()),
+                    Object::Builtin(b) => b.name.to_owned(),
+                    other => other.repr(),
+                };
+                format!("<bound method {} of {}>", qual, bm.receiver.repr())
+            }
             Object::Code(c) => format!("<code object {}>", c.name),
             Object::Iter(_) => "<iterator>".to_owned(),
             Object::Slice(s) => format!(
@@ -2650,7 +2814,9 @@ impl Object {
                 Rc::as_ptr(a) as usize
             ),
             Object::Bytes(b) => bytes_repr(b),
-            Object::ByteArray(b) => format!("bytearray({})", bytes_repr(&b.borrow())),
+            Object::ByteArray(b) => {
+                format!("bytearray({})", bytes_repr_inner(&b.borrow(), false))
+            }
             Object::Set(s) => set_repr(&s.borrow(), "set"),
             Object::FrozenSet(s) => set_repr(s, "frozenset"),
             Object::File(file) => format!(
@@ -3409,6 +3575,15 @@ pub(crate) fn char_is_printable(c: char) -> bool {
 }
 
 fn bytes_repr(b: &[u8]) -> String {
+    bytes_repr_inner(b, true)
+}
+
+/// `smartquotes`: `bytes` repr only escapes the active quote character
+/// (PyBytes_Repr with smartquotes=1); `bytearray`'s body always
+/// backslash-escapes single quotes regardless of the chosen delimiter
+/// (Objects/bytearrayobject.c `bytearray_repr`) — so
+/// `repr(bytearray(b"'"))` is `bytearray(b"\'")`.
+fn bytes_repr_inner(b: &[u8], smartquotes: bool) -> String {
     // CPython prefers single quotes, switching to double quotes when
     // the data contains a single quote but no double quote.
     let quote = if b.contains(&b'\'') && !b.contains(&b'"') {
@@ -3422,7 +3597,7 @@ fn bytes_repr(b: &[u8]) -> String {
     for &c in b {
         match c {
             b'\\' => out.push_str("\\\\"),
-            c if c == quote => {
+            c if c == quote || (!smartquotes && c == b'\'') => {
                 out.push('\\');
                 out.push(c as char);
             }
@@ -3476,6 +3651,24 @@ fn seq_cmp(a: &[Object], b: &[Object]) -> Result<Ordering, RuntimeError> {
 impl Object {
     pub fn from_str(s: impl Into<String>) -> Self {
         Object::Str(Rc::from(s.into().as_str()))
+    }
+
+    /// Identity-stable string: repeated calls with the same text return
+    /// the *same* `Rc<str>` allocation. Used where CPython exposes a
+    /// stored string with stable identity — e.g. `cls.__name__`, which
+    /// `inspect.classify_class_attrs` compares with `is`.
+    pub fn interned_str(s: &str) -> Self {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static TABLE: OnceLock<Mutex<HashMap<String, Rc<str>>>> = OnceLock::new();
+        let table = TABLE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut t = table.lock().unwrap();
+        if let Some(rc) = t.get(s) {
+            return Object::Str(rc.clone());
+        }
+        let rc: Rc<str> = Rc::from(s);
+        t.insert(s.to_owned(), rc.clone());
+        Object::Str(rc)
     }
 
     pub fn from_static(s: &'static str) -> Self {

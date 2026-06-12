@@ -599,6 +599,17 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("stdin")),
             Object::File(Rc::new(PyFile::new("<stdin>", "r", FileBackend::Stdin))),
         );
+        // `sys.__stdout__` et al. record the *original* streams so code
+        // that rebinds `sys.stdout` can restore them. They alias the same
+        // objects at startup.
+        for name in ["stdout", "stderr", "stdin"] {
+            let dunder = format!("__{name}__");
+            let v = d
+                .get(&DictKey(Object::from_str(name)))
+                .cloned()
+                .expect("stream just inserted");
+            d.insert(DictKey(Object::from_str(dunder)), v);
+        }
     }
     Rc::new(PyModule {
         name: "sys".to_owned(),

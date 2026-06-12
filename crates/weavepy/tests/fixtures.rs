@@ -135,13 +135,26 @@ fn run_fixture(py_path: &Path) {
 
 #[test]
 fn all_run_fixtures_match() {
-    let fixtures = list_fixtures();
-    assert!(
-        !fixtures.is_empty(),
-        "expected at least one .py fixture in {}",
-        fixtures_dir().display()
-    );
-    for f in fixtures {
-        run_fixture(&f);
-    }
+    // Rust test threads get a 2 MiB stack (vs 8 MiB for a process main
+    // thread). The interpreter grows its stack on demand for Python
+    // call activations, but deep native work outside that path (object
+    // graph drops, compiler recursion) still wants main-thread-sized
+    // headroom — give the harness an explicit 16 MiB thread, the same
+    // way CPython's own test runner configures thread stack size.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let fixtures = list_fixtures();
+            assert!(
+                !fixtures.is_empty(),
+                "expected at least one .py fixture in {}",
+                fixtures_dir().display()
+            );
+            for f in fixtures {
+                run_fixture(&f);
+            }
+        })
+        .expect("spawn fixture thread")
+        .join()
+        .expect("fixture thread panicked");
 }

@@ -1083,6 +1083,30 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
             )));
         }
     }
+    // `str.__new__(cls, value[, encoding[, errors]])` on a subclass
+    // converts exactly like `str(value, …)` (CPython `unicode_new` calls
+    // `unicode_new_impl` then re-wraps in the subclass) — a non-str seed
+    // (`str.__new__(IntSeeded, 1)` from a mixed-in enum's
+    // `_new_member_`) must yield `'1'`, and bad `encoding`/`errors`
+    // arguments must raise str()'s own TypeError.
+    {
+        let bt = builtin_types();
+        if cls.is_subclass_of(&bt.str_) && !Rc::ptr_eq(&cls, &bt.str_) && args.len() > 1 {
+            let needs_convert = args.len() > 2 || !matches!(args[1], Object::Str(_));
+            if needs_convert {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still live
+                    // on this thread; the GIL keeps the access exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    let s = interp.type_call_default(&bt.str_, &args[1..], &[])?;
+                    let inst =
+                        Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), s)));
+                    crate::gc_trace::track(inst.clone());
+                    return Ok(inst);
+                }
+            }
+        }
+    }
     // When `cls` derives from a value/container built-in (`int`, `float`,
     // `str`, `tuple`, `list`, `dict`, …) capture the native payload the
     // instance wraps so the inherited protocols keep firing through the
@@ -1607,7 +1631,7 @@ fn install_import_error_init(import_error: &Rc<TypeObject>) {
                     "name_from" => name_from = v.clone(),
                     other => {
                         return Err(crate::error::type_error(format!(
-                            "ImportError.__init__() got an unexpected keyword argument '{other}'"
+                            "ImportError() got an unexpected keyword argument '{other}'"
                         )))
                     }
                 }
@@ -1929,40 +1953,46 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
         if let Some(msg) = rest.first() {
             set(&mut dict, "msg", msg.clone());
         }
-        // `SyntaxError(msg, detail)` — `detail` is a 2-to-6 element
-        // sequence `(filename, lineno, offset, text[, end_lineno,
-        // end_offset])`.
+        // `SyntaxError(msg, detail)` — `detail` is a `(filename, lineno,
+        // offset, text[, end_lineno, end_offset])` sequence. CPython runs
+        // it through `PySequence_Tuple` and requires exactly 4 or 6
+        // items (5 gets a dedicated message).
         if rest.len() == 2 {
-            let info: Option<&[Object]> = match &rest[1] {
-                Object::Tuple(items) => Some(items.as_ref()),
-                Object::List(items) => {
-                    // Borrow can't outlive the match arm; handle inline.
-                    let v = items.borrow();
-                    let pick = |i: usize| v.get(i).cloned().unwrap_or(Object::None);
-                    set(&mut dict, "filename", pick(0));
-                    set(&mut dict, "lineno", pick(1));
-                    set(&mut dict, "offset", pick(2));
-                    set(&mut dict, "text", pick(3));
-                    if v.len() > 4 {
-                        set(&mut dict, "end_lineno", pick(4));
-                        set(&mut dict, "end_offset", pick(5));
-                    }
-                    None
+            let items: Vec<Object> = match &rest[1] {
+                Object::Tuple(items) => items.to_vec(),
+                Object::List(items) => items.borrow().clone(),
+                other => {
+                    return Err(crate::error::type_error(format!(
+                        "'{}' object is not iterable",
+                        other.type_name()
+                    )));
                 }
-                // Non-sequence second arg: CPython leaves the location
-                // attributes at their `None` defaults.
-                _ => None,
             };
-            if let Some(items) = info {
-                let pick = |i: usize| items.get(i).cloned().unwrap_or(Object::None);
-                set(&mut dict, "filename", pick(0));
-                set(&mut dict, "lineno", pick(1));
-                set(&mut dict, "offset", pick(2));
-                set(&mut dict, "text", pick(3));
-                if items.len() > 4 {
-                    set(&mut dict, "end_lineno", pick(4));
-                    set(&mut dict, "end_offset", pick(5));
-                }
+            if items.len() < 4 {
+                return Err(crate::error::type_error(format!(
+                    "function takes at least 4 arguments ({} given)",
+                    items.len()
+                )));
+            }
+            if items.len() > 6 {
+                return Err(crate::error::type_error(format!(
+                    "function takes at most 6 arguments ({} given)",
+                    items.len()
+                )));
+            }
+            if items.len() == 5 {
+                return Err(crate::error::type_error(
+                    "end_offset must be provided when end_lineno is provided".to_owned(),
+                ));
+            }
+            let pick = |i: usize| items.get(i).cloned().unwrap_or(Object::None);
+            set(&mut dict, "filename", pick(0));
+            set(&mut dict, "lineno", pick(1));
+            set(&mut dict, "offset", pick(2));
+            set(&mut dict, "text", pick(3));
+            if items.len() == 6 {
+                set(&mut dict, "end_lineno", pick(4));
+                set(&mut dict, "end_offset", pick(5));
             }
         }
         Ok(Object::None)
@@ -3255,6 +3285,18 @@ fn install_mutable_container_init(bt: &BuiltinTypes) {
             binds_instance: true,
             call: Box::new(set_init),
             call_kw: None,
+        })),
+    );
+    // bytearray owns a real `tp_init` too: it (re)seeds the buffer from
+    // `source`/`encoding`/`errors` keywords — `bytearray(source=b'abc')`
+    // and subclass `__init__` chains both rely on it.
+    bt.bytearray_.dict.borrow_mut().insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            binds_instance: true,
+            call: Box::new(crate::builtins::bytearray_init),
+            call_kw: Some(Box::new(crate::builtins::bytearray_init_kw)),
         })),
     );
 }

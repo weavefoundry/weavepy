@@ -387,6 +387,42 @@ pub enum ExprKind {
     },
 }
 
+/// CPython's `_PyPegen_get_expr_name`: how an expression is described in
+/// "cannot assign to X" / "cannot delete X" syntax errors.
+pub fn expr_name(expr: &Expr) -> &'static str {
+    match &expr.kind {
+        ExprKind::Constant(c) => match c {
+            Constant::None => "None",
+            Constant::Bool(true) => "True",
+            Constant::Bool(false) => "False",
+            Constant::Ellipsis => "ellipsis",
+            _ => "literal",
+        },
+        ExprKind::Name(_) => "name",
+        ExprKind::Attribute { .. } => "attribute",
+        ExprKind::Subscript { .. } => "subscript",
+        ExprKind::Starred(_) => "starred expression",
+        ExprKind::Tuple(_) => "tuple",
+        ExprKind::List(_) => "list",
+        ExprKind::Dict { .. } => "dict literal",
+        ExprKind::Set(_) => "set display",
+        ExprKind::Lambda { .. } => "lambda",
+        ExprKind::Call { .. } => "function call",
+        ExprKind::BoolOp { .. } | ExprKind::BinOp { .. } | ExprKind::UnaryOp { .. } => "expression",
+        ExprKind::GeneratorExp { .. } => "generator expression",
+        ExprKind::Yield(_) | ExprKind::YieldFrom(_) => "yield expression",
+        ExprKind::Await(_) => "await expression",
+        ExprKind::ListComp { .. } => "list comprehension",
+        ExprKind::SetComp { .. } => "set comprehension",
+        ExprKind::DictComp { .. } => "dict comprehension",
+        ExprKind::JoinedStr(_) | ExprKind::FormattedValue { .. } => "f-string expression",
+        ExprKind::Compare { .. } => "comparison",
+        ExprKind::IfExp { .. } => "conditional expression",
+        ExprKind::NamedExpr { .. } => "named expression",
+        ExprKind::Slice { .. } => "slice",
+    }
+}
+
 /// `**kw=value` keyword argument in a call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Keyword {

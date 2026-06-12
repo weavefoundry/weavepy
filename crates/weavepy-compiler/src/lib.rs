@@ -33,6 +33,8 @@ use weavepy_parser::ast::{
 
 pub mod bytecode;
 pub mod cpython_code;
+mod mangle;
+mod validate;
 
 pub use bytecode::{
     BinOpKind, CacheTable, CompareKind, InlineCache, Instruction, OpCode, UnaryKind,
@@ -42,30 +44,65 @@ pub use cpython_code::{CpythonCode, Position};
 
 // ---------- error type ----------
 
+/// A compile-phase `SyntaxError`. The message matches CPython verbatim
+/// (tests assert on these strings) and, when known, `span` carries the
+/// byte range of the offending construct so the raise site can populate
+/// `SyntaxError.lineno`/`.offset`/`.end_lineno`/`.end_offset`. CPython's
+/// compile/symtable-stage errors report *byte*-based columns (the raw
+/// AST `col_offset + 1`), unlike parser errors which are
+/// character-based — converters must honour that.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
-pub enum CompileError {
-    #[error("`{0}` is not a valid assignment target")]
-    BadAssignmentTarget(String),
-    /// A syntax error whose message must match CPython verbatim
-    /// (doctests assert on these strings).
-    #[error("{0}")]
-    SyntaxExact(String),
-    #[error("`break` outside loop")]
-    BreakOutsideLoop,
-    #[error("`continue` outside loop")]
-    ContinueOutsideLoop,
-    #[error("`return` outside function")]
-    ReturnOutsideFunction,
-    /// A `yield` / `yield from` expression outside a function body.
-    /// `{0}` is the keyword (`yield` or `yield from`) so the message
-    /// matches CPython's `SyntaxError: 'yield' outside function`.
-    #[error("'{0}' outside function")]
-    YieldOutsideFunction(&'static str),
-    #[error("`{0}` is not yet supported by the compiler ({1})")]
-    NotImplemented(&'static str, &'static str),
-    #[error("internal compiler error: {0}")]
-    Internal(String),
+#[error("{message}")]
+pub struct CompileError {
+    pub message: String,
+    pub span: Option<weavepy_lexer::Span>,
+    /// Whether CPython raises this error in the PEG *parser* (its
+    /// `invalid_*` grammar rules — e.g. "cannot assign to literal")
+    /// rather than in symtable/compile. Parser-stage errors report
+    /// character-based columns and always populate `SyntaxError.text`;
+    /// compile-stage errors report byte-based columns and leave `.text`
+    /// as `None` for non-file sources.
+    pub parser_stage: bool,
 }
+
+impl CompileError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            span: None,
+            parser_stage: false,
+        }
+    }
+
+    pub fn spanned(message: impl Into<String>, span: weavepy_lexer::Span) -> Self {
+        Self {
+            message: message.into(),
+            span: Some(span),
+            parser_stage: false,
+        }
+    }
+
+    /// An error CPython raises from its PEG parser's `invalid_*` rules.
+    pub fn parser_spanned(message: impl Into<String>, span: weavepy_lexer::Span) -> Self {
+        Self {
+            message: message.into(),
+            span: Some(span),
+            parser_stage: true,
+        }
+    }
+
+    pub fn not_implemented(feature: &str, hint: &str) -> Self {
+        Self::new(format!(
+            "`{feature}` is not yet supported by the compiler ({hint})"
+        ))
+    }
+
+    pub fn internal(message: impl std::fmt::Display) -> Self {
+        Self::new(format!("internal compiler error: {message}"))
+    }
+}
+
+pub use weavepy_parser::ast::expr_name;
 
 // ---------- code object ----------
 
@@ -407,6 +444,7 @@ pub fn compile_module_with_source(
     source: &str,
     filename: &str,
 ) -> Result<CodeObject, CompileError> {
+    validate::validate_module(module, source)?;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -430,6 +468,7 @@ pub fn compile_interactive_with_source(
     source: &str,
     filename: &str,
 ) -> Result<CodeObject, CompileError> {
+    validate::validate_module(module, source)?;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -453,6 +492,7 @@ pub fn compile_eval_with_source(
     source: &str,
     filename: &str,
 ) -> Result<CodeObject, CompileError> {
+    validate::validate_module(module, source)?;
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -539,6 +579,10 @@ enum Binding {
 struct Compiler {
     co: CodeObject,
     kind: CodeKind,
+    /// Which comprehension form this scope lowers (`None` outside
+    /// comprehensions). Drives CPython's "'yield' inside list
+    /// comprehension"-style messages.
+    comp_kind: Option<CompKind>,
     /// Name → binding for the current scope.
     bindings: IndexMap<String, Binding>,
     /// Names declared `global` by an explicit `global` statement in this
@@ -623,6 +667,11 @@ struct Compiler {
     /// strings rather than being evaluated at definition time. Propagated
     /// to every nested function/class scope.
     future_annotations: bool,
+    /// CPython `ste_private`: the name of the innermost enclosing class,
+    /// inherited by every scope textually inside it. Used to *demangle*
+    /// def/class binding names back to their source spelling for
+    /// `__name__`/`__qualname__` (the AST pass mangles the bindings).
+    private: Option<Rc<str>>,
 }
 
 struct LoopFrame {
@@ -691,6 +740,7 @@ impl Compiler {
         Self {
             co,
             kind,
+            comp_kind: None,
             bindings: IndexMap::new(),
             explicit_globals: HashSet::new(),
             free_order: Vec::new(),
@@ -711,6 +761,18 @@ impl Compiler {
             eval_mode: false,
             source,
             future_annotations,
+            private: None,
+        }
+    }
+
+    /// The source spelling of a (possibly mangled) binding name, for
+    /// `__name__`/`__qualname__` display. CPython mangles the *binding*
+    /// of `def __m`/`class __C` inside a class but keeps display names
+    /// unmangled.
+    fn display_name<'a>(&self, name: &'a str) -> &'a str {
+        match &self.private {
+            Some(class_name) => crate::mangle::demangle_name(class_name, name),
+            None => name,
         }
     }
 
@@ -809,11 +871,11 @@ impl Compiler {
             match &s.kind {
                 StmtKind::Break | StmtKind::Continue => {
                     if !in_loop {
-                        return Err(CompileError::SyntaxExact(MSG.to_owned()));
+                        return Err(CompileError::spanned(MSG, s.span));
                     }
                 }
                 StmtKind::Return(_) => {
-                    return Err(CompileError::SyntaxExact(MSG.to_owned()));
+                    return Err(CompileError::spanned(MSG, s.span));
                 }
                 StmtKind::If { body, orelse, .. } => {
                     Self::validate_star_clause_jumps(body, in_loop)?;
@@ -1080,15 +1142,23 @@ impl Compiler {
                 // checks `sys.flags.optimize` at runtime if it wants
                 // to elide the AssertionError raise.
                 self.compile_expr(test)?;
+                // The raise sequence carries the *test expression's*
+                // location (CPython compiler_assert): the traceback's
+                // PEP-657 carets underline the failed condition, not
+                // the whole `assert …, msg` statement.
+                let saved = self.current_span;
+                self.set_span(test.span);
                 let skip = self.emit(OpCode::PopJumpIfTrue, 0);
                 // The *builtin* AssertionError, immune to shadowing
                 // (CPython LOAD_ASSERTION_ERROR, bpo-34880).
                 self.emit(OpCode::LoadAssertionError, 0);
                 if let Some(m) = msg {
                     self.compile_expr(m)?;
+                    self.set_span(test.span);
                     self.emit(OpCode::Call, 1);
                 }
                 self.emit(OpCode::RaiseVarargs, 1);
+                self.current_span = saved;
                 let end = self.next_offset();
                 self.patch_jump(skip, end);
             }
@@ -1099,13 +1169,15 @@ impl Compiler {
                         // CPython distinguishes a bare `yield` in a chained
                         // assignment (`x = yield = y`) from a parenthesised
                         // sole target (`(yield x) = y`).
-                        return Err(CompileError::SyntaxExact(if n > 1 {
-                            "assignment to yield expression not possible".to_owned()
-                        } else {
-                            "cannot assign to yield expression here. Maybe you meant '==' \
-                             instead of '='?"
-                                .to_owned()
-                        }));
+                        return Err(CompileError::parser_spanned(
+                            if n > 1 {
+                                "assignment to yield expression not possible"
+                            } else {
+                                "cannot assign to yield expression here. Maybe you meant '==' \
+                                 instead of '='?"
+                            },
+                            t.span,
+                        ));
                     }
                 }
                 self.compile_expr(value)?;
@@ -1118,9 +1190,9 @@ impl Compiler {
             }
             StmtKind::AugAssign { target, op, value } => {
                 if matches!(target.kind, ExprKind::Yield(_) | ExprKind::YieldFrom(_)) {
-                    return Err(CompileError::SyntaxExact(
-                        "'yield expression' is an illegal expression for augmented assignment"
-                            .to_owned(),
+                    return Err(CompileError::parser_spanned(
+                        "'yield expression' is an illegal expression for augmented assignment",
+                        target.span,
                     ));
                 }
                 self.compile_load_target(target)?;
@@ -1259,9 +1331,9 @@ impl Compiler {
                 orelse,
             } => {
                 if !self.in_async_context() {
-                    return Err(CompileError::NotImplemented(
-                        "`async for` outside `async def`",
-                        "wrap the loop in an `async def` function",
+                    return Err(CompileError::spanned(
+                        "'async for' outside async function",
+                        stmt.span,
                     ));
                 }
                 self.compile_async_for(target, iter, body, orelse)?;
@@ -1335,22 +1407,23 @@ impl Compiler {
             }
             StmtKind::AsyncWith { items, body } => {
                 if !self.in_async_context() {
-                    return Err(CompileError::NotImplemented(
-                        "`async with` outside `async def`",
-                        "wrap the block in an `async def` function",
+                    return Err(CompileError::spanned(
+                        "'async with' outside async function",
+                        stmt.span,
                     ));
                 }
                 self.compile_async_with(items, body)?;
             }
             StmtKind::Return(value) => {
                 if self.kind != CodeKind::Function {
-                    return Err(CompileError::ReturnOutsideFunction);
+                    return Err(CompileError::spanned("'return' outside function", stmt.span));
                 }
                 // PEP 525: async generators cannot return a value (the
                 // flag is set before the body compiles, so this sees it).
                 if self.co.is_async_generator && value.is_some() {
-                    return Err(CompileError::SyntaxExact(
-                        "'return' with value in async generator".to_owned(),
+                    return Err(CompileError::spanned(
+                        "'return' with value in async generator",
+                        stmt.span,
                     ));
                 }
                 match value {
@@ -1397,7 +1470,7 @@ impl Compiler {
                 let frame_top = self
                     .loop_stack
                     .last()
-                    .ok_or(CompileError::BreakOutsideLoop)?;
+                    .ok_or_else(|| CompileError::spanned("'break' outside loop", stmt.span))?;
                 let is_for = frame_top.is_for_loop;
                 let exc_to_pop = self.handler_depth.saturating_sub(frame_top.handler_depth_at_entry);
                 // Leaving `except` handler bodies on the way out: discard
@@ -1422,10 +1495,9 @@ impl Compiler {
                     .push(site);
             }
             StmtKind::Continue => {
-                let frame_top = self
-                    .loop_stack
-                    .last()
-                    .ok_or(CompileError::ContinueOutsideLoop)?;
+                let frame_top = self.loop_stack.last().ok_or_else(|| {
+                    CompileError::spanned("'continue' not properly in loop", stmt.span)
+                })?;
                 let target = frame_top.continue_target;
                 let exc_to_pop = self.handler_depth.saturating_sub(frame_top.handler_depth_at_entry);
                 for _ in 0..exc_to_pop {
@@ -1619,8 +1691,8 @@ impl Compiler {
                 self.compile_sequence_pattern(items, fail_sites)?;
             }
             Pattern::Star(_) => {
-                return Err(CompileError::Internal(
-                    "`*name` patterns may only appear inside a sequence".to_owned(),
+                return Err(CompileError::internal(
+                    "`*name` patterns may only appear inside a sequence",
                 ));
             }
             Pattern::Mapping {
@@ -2066,15 +2138,19 @@ impl Compiler {
         let arg_count = (args.posonlyargs.len() + args.args.len()) as u32;
         let kwonly_count = args.kwonlyargs.len() as u32;
 
+        // `def __m` inside a class binds `_C__m` but keeps `__m` as its
+        // `__name__`/`__qualname__`.
+        let display = self.display_name(name);
         let mut inner = Compiler::new(
-            name.to_owned(),
+            display.to_owned(),
             self.co.filename.clone(),
             CodeKind::Function,
             self.line_index.clone(),
             self.source.clone(),
             self.future_annotations,
         );
-        inner.co.qualname = self.compute_child_qualname(name);
+        inner.private = self.private.clone();
+        inner.co.qualname = self.compute_child_qualname(display);
         inner.co.arg_count = arg_count;
         inner.co.posonly_count = posonly_count;
         inner.co.kwonly_count = kwonly_count;
@@ -2240,9 +2316,12 @@ impl Compiler {
         let has_kw_splat = keywords.iter().any(|k| k.arg.is_none());
         let has_starred_base = bases.iter().any(|b| matches!(b.kind, ExprKind::Starred(_)));
 
+        // `__build_class__` receives the *source* name (binding may be
+        // mangled for a private nested class).
+        let display = self.display_name(name).to_owned();
         if has_kw_splat || has_starred_base {
             self.build_class_body(name, body)?;
-            let name_idx = self.co.intern_constant(Constant::Str(name.to_owned()));
+            let name_idx = self.co.intern_constant(Constant::Str(display.clone()));
             self.emit(OpCode::LoadConst, name_idx);
             self.emit(OpCode::BuildTuple, 2);
             self.compile_starred_args_tuple(bases)?;
@@ -2255,7 +2334,7 @@ impl Compiler {
             }
         } else {
             self.build_class_body(name, body)?;
-            let name_idx = self.co.intern_constant(Constant::Str(name.to_owned()));
+            let name_idx = self.co.intern_constant(Constant::Str(display));
             self.emit(OpCode::LoadConst, name_idx);
             for b in bases {
                 self.compile_expr(b)?;
@@ -2289,6 +2368,23 @@ impl Compiler {
 
     /// Build the class-body function object and leave it on the stack.
     fn build_class_body(&mut self, name: &str, body: &[Stmt]) -> Result<(), CompileError> {
+        // `name` is the (possibly mangled) binding; the class's
+        // *source* name drives `__name__`, `__qualname__`, and its own
+        // mangling context.
+        let name = self.display_name(name).to_owned();
+        let name = name.as_str();
+        // Private name mangling (CPython `_Py_Mangle`): rewrite `__spam`
+        // identifiers throughout the class's textual scope before
+        // compiling. Done on a clone so the caller's AST is untouched.
+        let mangled_body;
+        let body: &[Stmt] = if name.trim_start_matches('_').is_empty() {
+            body
+        } else {
+            let mut b = body.to_vec();
+            crate::mangle::mangle_class_body(name, &mut b);
+            mangled_body = b;
+            &mangled_body
+        };
         let mut inner = Compiler::new(
             name.to_owned(),
             self.co.filename.clone(),
@@ -2297,6 +2393,7 @@ impl Compiler {
             self.source.clone(),
             self.future_annotations,
         );
+        inner.private = Some(Rc::from(name));
         inner.co.qualname = self.compute_child_qualname(name);
         inner.current_line = self.current_line;
         // Every class body carries a `__class__` cell so methods can
@@ -3369,7 +3466,7 @@ impl Compiler {
                     let before = idx as u32;
                     let after = (items.len() - idx - 1) as u32;
                     if before > 0xFF || after > 0xFF {
-                        return Err(CompileError::NotImplemented(
+                        return Err(CompileError::not_implemented(
                             "starred unpack with more than 255 leading or trailing names",
                             "too many names on either side of the star",
                         ));
@@ -3398,10 +3495,10 @@ impl Compiler {
                 // emitting the UNPACK_EX.
                 self.compile_assign(inner)
             }
-            _ => Err(CompileError::BadAssignmentTarget(format!(
-                "{:?}",
-                target.kind
-            ))),
+            _ => Err(CompileError::parser_spanned(
+                format!("cannot assign to {}", expr_name(target)),
+                target.span,
+            )),
         }
     }
 
@@ -3556,10 +3653,10 @@ impl Compiler {
                 }
                 Ok(())
             }
-            _ => Err(CompileError::BadAssignmentTarget(format!(
-                "delete target: {:?}",
-                target.kind
-            ))),
+            _ => Err(CompileError::parser_spanned(
+                format!("cannot delete {}", expr_name(target)),
+                target.span,
+            )),
         }
     }
 
@@ -3951,9 +4048,9 @@ impl Compiler {
                 self.compile_comprehension(CompKind::Dict, key, Some(value), generators)?;
             }
             ExprKind::Starred(_) => {
-                return Err(CompileError::NotImplemented(
-                    "starred expression",
-                    "the slice doesn't support `*x` in this position",
+                return Err(CompileError::spanned(
+                    "can't use starred expression here",
+                    e.span,
                 ));
             }
             ExprKind::JoinedStr(parts) => {
@@ -3969,11 +4066,12 @@ impl Compiler {
             ExprKind::Yield(value) => {
                 // `yield` is only legal in a function body. At module or
                 // class scope (or inside a comprehension's own frame) it is
-                // a SyntaxError — CPython reports "'yield' outside function".
-                // Catching it here also prevents a non-generator frame from
-                // ever executing `YIELD_VALUE` at runtime.
+                // a SyntaxError — CPython reports "'yield' outside function"
+                // (or "'yield' inside list comprehension" etc.). Catching it
+                // here also prevents a non-generator frame from ever
+                // executing `YIELD_VALUE` at runtime.
                 if self.kind != CodeKind::Function {
-                    return Err(CompileError::YieldOutsideFunction("yield"));
+                    return Err(self.yield_placement_error("yield", e.span));
                 }
                 if let Some(v) = value {
                     self.compile_expr(v)?;
@@ -3993,13 +4091,14 @@ impl Compiler {
             }
             ExprKind::YieldFrom(iter) => {
                 if self.kind != CodeKind::Function {
-                    return Err(CompileError::YieldOutsideFunction("yield from"));
+                    return Err(self.yield_placement_error("yield from", e.span));
                 }
                 // PEP 525: `yield from` is forbidden in `async def`
                 // (only plain `yield` makes an async generator).
                 if self.in_async_context() {
-                    return Err(CompileError::SyntaxExact(
-                        "'yield from' inside async function".to_owned(),
+                    return Err(CompileError::spanned(
+                        "'yield from' inside async function",
+                        e.span,
                     ));
                 }
                 // CPython 3.13 pattern:
@@ -4027,9 +4126,13 @@ impl Compiler {
             }
             ExprKind::Await(value) => {
                 if !self.in_async_context() {
-                    return Err(CompileError::NotImplemented(
-                        "`await` outside `async def`",
-                        "wrap the expression in an `async def` function",
+                    return Err(CompileError::spanned(
+                        if self.kind == CodeKind::Function {
+                            "'await' outside async function"
+                        } else {
+                            "'await' outside function"
+                        },
+                        e.span,
                     ));
                 }
                 self.compile_expr(value)?;
@@ -4037,6 +4140,20 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// CPython's symtable wording for a misplaced `yield` / `yield from`:
+    /// inside a comprehension scope the message names the comprehension
+    /// form, otherwise it's "outside function".
+    fn yield_placement_error(&self, kw: &str, span: weavepy_lexer::Span) -> CompileError {
+        let msg = match self.comp_kind {
+            Some(CompKind::List) => format!("'{kw}' inside list comprehension"),
+            Some(CompKind::Set) => format!("'{kw}' inside set comprehension"),
+            Some(CompKind::Dict) => format!("'{kw}' inside dict comprehension"),
+            Some(CompKind::Generator) => format!("'{kw}' inside generator expression"),
+            None => format!("'{kw}' outside function"),
+        };
+        CompileError::spanned(msg, span)
     }
 
     /// Emit the "drive awaitable to completion" instruction sequence
@@ -4303,7 +4420,7 @@ impl Compiler {
             114 => 2, // 'r'
             97 => 3,  // 'a'
             other => {
-                return Err(CompileError::Internal(format!(
+                return Err(CompileError::internal(format!(
                     "unknown f-string conversion {other}"
                 )));
             }
@@ -4408,6 +4525,8 @@ impl Compiler {
             self.future_annotations,
         );
         inner.current_line = self.current_line;
+        inner.comp_kind = Some(kind);
+        inner.private = self.private.clone();
         // PEP 3155: a comprehension scope gets a dotted qualname like any
         // other nested scope (`C.m.<locals>.<genexpr>`); CPython's
         // `compiler_set_qualname` doesn't special-case comprehensions.
@@ -4581,9 +4700,8 @@ impl Compiler {
         // final value (list/set/dict) ends up on the stack.
         if is_async_comp && !matches!(kind, CompKind::Generator) {
             if !self.in_async_context() {
-                return Err(CompileError::NotImplemented(
-                    "async comprehension outside `async def`",
-                    "wrap in an `async def` function",
+                return Err(CompileError::new(
+                    "asynchronous comprehension outside of an asynchronous function",
                 ));
             }
             self.compile_await_dance(0);

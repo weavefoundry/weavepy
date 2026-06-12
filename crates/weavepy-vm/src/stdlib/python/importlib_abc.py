@@ -95,7 +95,8 @@ class FileLoader(ResourceLoader, ExecutionLoader):
 
 class SourceLoader(FileLoader):
     def get_source(self, fullname=None):
-        return self.get_data(self.path).decode('utf-8')
+        from importlib.util import decode_source
+        return decode_source(self.get_data(self.path))
 
 
 class Traversable(abc.ABC):

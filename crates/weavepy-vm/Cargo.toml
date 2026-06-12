@@ -67,6 +67,7 @@ crossbeam-utils       = { workspace = true }
 
 # RFC 0032 — tier-2 Cranelift JIT, behind the (default-off) `jit` feature.
 weavepy-jit           = { workspace = true, optional = true }
+stacker = "0.1.24"
 
 [features]
 default = []

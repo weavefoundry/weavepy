@@ -189,6 +189,17 @@ class _GenericAlias:
             params = (params,)
         return _GenericAlias(self.__origin__, self.__args__ + params)
 
+    def __eq__(self, other):
+        # CPython typing._GenericAlias.__eq__: aliases compare by
+        # origin + args (`List[int] == List[int]`).
+        if not isinstance(other, _GenericAlias):
+            return NotImplemented
+        return (self.__origin__ == other.__origin__
+                and self.__args__ == other.__args__)
+
+    def __hash__(self):
+        return hash((self.__origin__, self.__args__))
+
     def __call__(self, *args, **kwargs):
         # ``List[int](...)`` constructs the *origin* class.
         return self.__origin__(*args, **kwargs)

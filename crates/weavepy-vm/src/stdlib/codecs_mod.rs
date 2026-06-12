@@ -217,17 +217,46 @@ pub fn b_decode(args: &[Object]) -> Result<Object, RuntimeError> {
 fn b_lookup(args: &[Object]) -> Result<Object, RuntimeError> {
     let name = arg_str(args, 0, "lookup")?;
     let enc =
-        lookup_encoding(&name).ok_or_else(|| value_error(format!("unknown encoding: {name}")))?;
+        lookup_encoding(&name)
+        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {name}")))?;
     let normalised = enc.name().to_lowercase();
     Ok(Object::from_str(normalised))
 }
 
+/// Known built-in error handler names. Custom handlers registered via
+/// `codecs.register_error` live in the frozen `codecs.py` registry and
+/// are resolved there before reaching the native engine.
+const KNOWN_ERROR_HANDLERS: &[&str] = &[
+    "strict",
+    "ignore",
+    "replace",
+    "backslashreplace",
+    "xmlcharrefreplace",
+    "namereplace",
+    "surrogateescape",
+    "surrogatepass",
+];
+
+/// `-X dev`: validate the error-handler name eagerly, like CPython's
+/// bpo-37388 check in `bytes(s, encoding, errors=…)` / `bytes.decode`.
+/// Outside dev mode unknown handlers only fail if an error actually
+/// occurs (matching CPython's lazy lookup).
+fn check_error_handler(errors: &str) -> Result<(), RuntimeError> {
+    if crate::vm_singletons::dev_mode() && !KNOWN_ERROR_HANDLERS.contains(&errors) {
+        return Err(crate::error::lookup_error(format!(
+            "unknown error handler name '{errors}'"
+        )));
+    }
+    Ok(())
+}
+
 pub fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
+    check_error_handler(errors)?;
     if let Some(out) = encode_special(s, encoding, errors)? {
         return Ok(out);
     }
     let enc = lookup_encoding(encoding)
-        .ok_or_else(|| value_error(format!("unknown encoding: {encoding}")))?;
+        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {encoding}")))?;
     let (bytes, _, has_replacements) = enc.encode(s);
     if has_replacements && errors == "strict" {
         return Err(value_error(format!(
@@ -238,11 +267,12 @@ pub fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, Runt
 }
 
 pub fn decode_bytes(bytes: &[u8], encoding: &str, errors: &str) -> Result<String, RuntimeError> {
+    check_error_handler(errors)?;
     if let Some(out) = decode_special(bytes, encoding, errors)? {
         return Ok(out);
     }
     let enc = lookup_encoding(encoding)
-        .ok_or_else(|| value_error(format!("unknown encoding: {encoding}")))?;
+        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {encoding}")))?;
     let (text, _, had_errors) = enc.decode(bytes);
     if had_errors && errors == "strict" {
         return Err(value_error(format!(
@@ -269,6 +299,7 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
         "utf32be" => Some(encode_utf32(s, true, false)),
         "rawunicodeescape" => Some(encode_raw_unicode_escape(s)),
         "unicodeescape" => Some(encode_unicode_escape(s)),
+        "cp437" | "437" | "ibm437" => Some(encode_cp437(s, errors)?),
         _ => None,
     })
 }
@@ -291,8 +322,71 @@ fn decode_special(
         "utf32be" => Some(decode_utf32(bytes, Some(true))?),
         "rawunicodeescape" => Some(decode_raw_unicode_escape(bytes)?),
         "unicodeescape" => Some(decode_unicode_escape(bytes)?),
+        "cp437" | "437" | "ibm437" => Some(decode_cp437(bytes)),
         _ => None,
     })
+}
+
+// ---------- cp437 (IBM PC / DOS codepage, not in encoding_rs) ----------
+
+/// Upper half (0x80..=0xFF) of code page 437, from CPython's
+/// `Lib/encodings/cp437.py` decoding table.
+const CP437_HIGH: [char; 128] = [
+    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
+    '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
+    '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}',
+    '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00a2}', '\u{00a3}', '\u{00a5}', '\u{20a7}', '\u{0192}',
+    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}',
+    '\u{00bf}', '\u{2310}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{255c}', '\u{255b}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{255e}', '\u{255f}',
+    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256b}',
+    '\u{256a}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{258c}', '\u{2590}', '\u{2580}',
+    '\u{03b1}', '\u{00df}', '\u{0393}', '\u{03c0}', '\u{03a3}', '\u{03c3}', '\u{00b5}', '\u{03c4}',
+    '\u{03a6}', '\u{0398}', '\u{03a9}', '\u{03b4}', '\u{221e}', '\u{03c6}', '\u{03b5}', '\u{2229}',
+    '\u{2261}', '\u{00b1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00f7}', '\u{2248}',
+    '\u{00b0}', '\u{2219}', '\u{00b7}', '\u{221a}', '\u{207f}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
+];
+
+fn decode_cp437(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b < 0x80 {
+                b as char
+            } else {
+                CP437_HIGH[(b - 0x80) as usize]
+            }
+        })
+        .collect()
+}
+
+fn encode_cp437(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
+    let mut out = Vec::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if (c as u32) < 0x80 {
+            out.push(c as u8);
+        } else if let Some(pos) = CP437_HIGH.iter().position(|&h| h == c) {
+            out.push(0x80 + pos as u8);
+        } else {
+            match errors {
+                "ignore" => {}
+                "replace" => out.push(b'?'),
+                _ => {
+                    return Err(crate::error::unicode_encode_error(
+                        "charmap",
+                        s,
+                        i,
+                        i + 1,
+                        "character maps to <undefined>",
+                    ))
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn encode_utf16(s: &str, big: bool, with_bom: bool) -> Vec<u8> {

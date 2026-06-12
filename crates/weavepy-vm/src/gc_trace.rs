@@ -240,8 +240,29 @@ impl Drop for GcState {
         if let Ok(frozen) = self.frozen.try_borrow() {
             handles.extend(frozen.iter().cloned());
         }
-        for h in &handles {
-            clear_object_fields(&h.object);
+        // Only clear objects whose sole remaining strong reference is the
+        // registry handle itself. Anything with extra references escaped
+        // into shared state that outlives this thread — e.g. Flag
+        // pseudo-members a worker published into the enum class's
+        // `_value2member_map_` — and other threads *will* observe it, so
+        // wiping its fields would corrupt live objects. Iterate to a
+        // fixpoint: each cleared object releases its referents, which can
+        // drop a chained object's count to 1 and make it clearable on the
+        // next pass — severing long chains without recursive drops.
+        loop {
+            let mut progress = false;
+            handles.retain(|h| {
+                if strong_count_for(&h.object) <= 1 {
+                    clear_object_fields(&h.object);
+                    progress = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            if !progress {
+                break;
+            }
         }
     }
 }

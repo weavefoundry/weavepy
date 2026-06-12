@@ -623,6 +623,49 @@ fn os_close_fd(_fd: i64) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `os.open(path, flags, mode=0o777)` → raw fd. The flag bits are the
+/// module's own `O_*` constants (translated to `OpenOptions` here, so
+/// the values never reach the host libc, whose constants may differ).
+#[cfg(unix)]
+fn os_open_stub(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::os::unix::io::IntoRawFd;
+    let p = first_path(args, "open")?;
+    let flags = args
+        .get(1)
+        .and_then(crate::object::Object::as_i64)
+        .ok_or_else(|| {
+            crate::error::type_error("open() flags must be an int".to_owned())
+        })?;
+    const O_WRONLY: i64 = 1;
+    const O_RDWR: i64 = 2;
+    const O_CREAT: i64 = 64;
+    const O_EXCL: i64 = 128;
+    const O_TRUNC: i64 = 512;
+    const O_APPEND: i64 = 1024;
+    let mut oo = std::fs::OpenOptions::new();
+    match flags & 0x3 {
+        O_WRONLY => oo.write(true),
+        O_RDWR => oo.read(true).write(true),
+        _ => oo.read(true),
+    };
+    if flags & O_APPEND != 0 {
+        oo.append(true);
+    }
+    if flags & O_TRUNC != 0 {
+        oo.write(true).truncate(true);
+    }
+    if flags & O_CREAT != 0 {
+        if flags & O_EXCL != 0 {
+            oo.create_new(true);
+        } else {
+            oo.create(true);
+        }
+    }
+    let f = oo.open(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    Ok(Object::Int(i64::from(f.into_raw_fd())))
+}
+
+#[cfg(not(unix))]
 fn os_open_stub(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.open(): raw fd interface is not implemented in WeavePy yet",

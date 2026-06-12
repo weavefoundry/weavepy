@@ -193,8 +193,9 @@ class _LoaderBase:
         if not self.path:
             return None
         try:
+            from importlib.util import decode_source
             with open(self.path, 'rb') as f:
-                return f.read().decode('utf-8')
+                return decode_source(f.read())
         except OSError:
             return None
 
@@ -232,7 +233,8 @@ class SourceFileLoader(_LoaderBase):
     def source_to_code(self, data, path, *, _optimize=-1):
         """Compile a chunk of source bytes."""
         if isinstance(data, (bytes, bytearray)):
-            data = data.decode('utf-8')
+            from importlib.util import decode_source
+            data = decode_source(bytes(data))
         return compile(data, path, 'exec')
 
     def path_stats(self, path):

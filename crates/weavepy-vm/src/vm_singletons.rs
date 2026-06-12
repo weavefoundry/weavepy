@@ -391,6 +391,19 @@ pub fn debug_ranges() -> bool {
     DEBUG_RANGES.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// `-X dev` / `PYTHONDEVMODE`. Dev mode turns on eager validation
+/// that CPython otherwise defers (e.g. `bytes(s, encoding, errors=…)`
+/// looks up the error handler immediately; bpo-37388).
+static DEV_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_dev_mode(value: bool) {
+    DEV_MODE.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn dev_mode() -> bool {
+    DEV_MODE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Publish `interp` as the live VM pointer for the duration of
 /// the returned guard. Re-entrant calls produce a stack so the
 /// most recent guard wins on `current_interpreter_ptr` lookups.

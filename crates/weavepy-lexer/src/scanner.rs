@@ -73,6 +73,11 @@ struct Scanner<'src> {
     /// Indent stack: column counts of each open block. Always
     /// starts with 0.
     indents: Vec<u32>,
+    /// CPython's "altindent": indentation widths computed with tab size 1
+    /// instead of 8. A new line's indentation must compare the same way
+    /// against the stack under *both* tab sizes, otherwise the mix of
+    /// tabs and spaces is ambiguous and the tokenizer raises `TabError`.
+    alt_indents: Vec<u32>,
     /// True when at start of a logical line; controls indentation
     /// emission. Reset whenever we emit a non-trivia token on a line.
     at_line_start: bool,
@@ -94,6 +99,9 @@ struct Scanner<'src> {
     /// bytes literals, in source order (the first invalid escape *per
     /// literal*, matching CPython's `first_invalid_escape` tracking).
     escape_warnings: Vec<EscapeWarning>,
+    /// Current lexical f-string nesting depth (CPython caps this at
+    /// MAXFSTRINGLEVEL = 150 with "too many nested f-strings").
+    fstring_level: u32,
 }
 
 impl<'src> Scanner<'src> {
@@ -104,12 +112,14 @@ impl<'src> Scanner<'src> {
             paren_depth: 0,
             open_brackets: Vec::new(),
             indents: vec![0],
+            alt_indents: vec![0],
             at_line_start: true,
             pending_dedents: 0,
             pending_indent: None,
             finished: false,
             last_was_content: false,
             escape_warnings: Vec::new(),
+            fstring_level: 0,
         }
     }
 
@@ -293,7 +303,26 @@ impl<'src> Scanner<'src> {
                 // Skip the newline; do not start a new logical line.
                 return Ok(None);
             }
-            return Err(LexError::StrayBackslash { pos: bs_pos as u32 });
+            // A `\` at EOF inside an open bracket: CPython reports the
+            // unclosed bracket (anchored at its opener), not the stray
+            // backslash.
+            if self.peek().is_none() {
+                if let Some(&(bracket, pos)) = self.open_brackets.first() {
+                    return Err(LexError::BracketNeverClosed {
+                        open: bracket as char,
+                        pos: pos as u32,
+                    });
+                }
+                // CPython anchors the error at the backslash itself when
+                // nothing follows, and at the offending character when
+                // one does.
+                return Err(LexError::StrayBackslash {
+                    pos: bs_pos as u32,
+                });
+            }
+            return Err(LexError::StrayBackslash {
+                pos: (bs_pos + 1) as u32,
+            });
         }
 
         // Strings (possibly prefixed: r, b, rb, br, f, u, with case variants).
@@ -337,20 +366,22 @@ impl<'src> Scanner<'src> {
 
     fn handle_line_start(&mut self) -> Result<(), LexError> {
         let mut indent = 0u32;
+        // CPython's "altindent" — same width computed with tab size 1.
+        // Both measures must order a line the same way against the
+        // indent stack, or the tab/space mix is ambiguous (TabError).
+        let mut alt = 0u32;
         let line_start = self.pos;
-        let mut saw_tab = false;
-        let mut saw_space = false;
         while let Some(b) = self.peek() {
             match b {
                 b' ' => {
                     indent += 1;
-                    saw_space = true;
+                    alt += 1;
                     self.pos += 1;
                 }
                 b'\t' => {
                     // CPython aligns tabs to the next multiple of 8.
                     indent = (indent / 8 + 1) * 8;
-                    saw_tab = true;
+                    alt += 1;
                     self.pos += 1;
                 }
                 // Form feed at line start: CPython's tokenizer resets
@@ -359,8 +390,7 @@ impl<'src> Scanner<'src> {
                 // mixing.
                 0x0C => {
                     indent = 0;
-                    saw_space = false;
-                    saw_tab = false;
+                    alt = 0;
                     self.pos += 1;
                 }
                 _ => break,
@@ -380,18 +410,17 @@ impl<'src> Scanner<'src> {
             return Ok(());
         }
 
-        if saw_tab && saw_space {
-            // CPython treats mixed tab/space at the same level as
-            // an error in `python -tt` mode. We follow that strict
-            // interpretation.
-            return Err(LexError::InconsistentIndent {
-                pos: line_start as u32,
-            });
-        }
-
+        let tab_error = || LexError::InconsistentIndent {
+            pos: line_start as u32,
+        };
         let current = *self.indents.last().expect("indent stack non-empty");
+        let alt_current = *self.alt_indents.last().expect("indent stack non-empty");
         if indent > current {
+            if alt <= alt_current {
+                return Err(tab_error());
+            }
             self.indents.push(indent);
+            self.alt_indents.push(alt);
             self.pending_indent = Some(line_start);
             self.at_line_start = false;
             return Ok(());
@@ -400,6 +429,7 @@ impl<'src> Scanner<'src> {
             let mut dedents = 0u32;
             while *self.indents.last().expect("indent stack non-empty") > indent {
                 self.indents.pop();
+                self.alt_indents.pop();
                 dedents += 1;
             }
             if *self.indents.last().expect("indent stack non-empty") != indent {
@@ -415,11 +445,17 @@ impl<'src> Scanner<'src> {
                     pos: line_end as u32,
                 });
             }
+            if *self.alt_indents.last().expect("indent stack non-empty") != alt {
+                return Err(tab_error());
+            }
             self.pending_dedents = dedents;
             self.at_line_start = false;
             return Ok(());
         }
 
+        if alt != alt_current {
+            return Err(tab_error());
+        }
         self.at_line_start = false;
         Ok(())
     }
@@ -446,6 +482,7 @@ impl<'src> Scanner<'src> {
         if self.indents.len() > 1 {
             self.pending_dedents = (self.indents.len() - 1) as u32;
             self.indents.truncate(1);
+            self.alt_indents.truncate(1);
             self.pending_dedents -= 1; // we'll emit one now and let the rest drain
             self.at_line_start = false;
             return self.token(TokenKind::Dedent, self.pos, self.pos);
@@ -517,92 +554,195 @@ impl<'src> Scanner<'src> {
             )
         {
             let radix_char = self.peek_at(1).expect("checked above");
-            self.pos += 2;
-            let valid: fn(u8) -> bool = match radix_char {
-                b'x' | b'X' => |b: u8| b.is_ascii_hexdigit(),
-                b'o' | b'O' => |b: u8| (b'0'..=b'7').contains(&b),
-                _ => |b: u8| b == b'0' || b == b'1',
+            let (valid, literal_msg, radix_name): (fn(u8) -> bool, &str, &str) = match radix_char {
+                b'x' | b'X' => (
+                    |b: u8| b.is_ascii_hexdigit(),
+                    "invalid hexadecimal literal",
+                    "hexadecimal",
+                ),
+                b'o' | b'O' => (
+                    |b: u8| (b'0'..=b'7').contains(&b),
+                    "invalid octal literal",
+                    "octal",
+                ),
+                _ => (
+                    |b: u8| b == b'0' || b == b'1',
+                    "invalid binary literal",
+                    "binary",
+                ),
             };
-            let body_start = self.pos;
-            while let Some(b) = self.peek() {
-                if valid(b) || b == b'_' {
-                    self.pos += 1;
-                } else {
-                    break;
+            self.pos += 2;
+            // Digit run with CPython's underscore rule: `_` must be
+            // *followed* by a digit of the radix (`0x_1f` is legal,
+            // `0x1_` is not). Error positions point at the last
+            // consumed byte (`pos`), matching the tokenizer's cursor.
+            let mut any = false;
+            loop {
+                match self.peek() {
+                    Some(b'_') => {
+                        self.pos += 1;
+                        match self.peek() {
+                            Some(b) if valid(b) => {}
+                            _ => {
+                                return Err(LexError::InvalidNumber {
+                                    pos: (self.pos - 1) as u32,
+                                    message: literal_msg.to_owned(),
+                                });
+                            }
+                        }
+                    }
+                    Some(b) if valid(b) => {
+                        any = true;
+                        self.pos += 1;
+                    }
+                    _ => break,
                 }
             }
-            if self.pos == body_start {
+            // A decimal digit that isn't valid for the radix:
+            // "invalid digit '9' in octal literal", anchored at the digit.
+            if radix_name != "hexadecimal" {
+                if let Some(b) = self.peek() {
+                    if b.is_ascii_digit() {
+                        self.pos += 1;
+                        return Err(LexError::InvalidNumber {
+                            pos: (self.pos - 1) as u32,
+                            message: format!(
+                                "invalid digit '{}' in {radix_name} literal",
+                                b as char
+                            ),
+                        });
+                    }
+                }
+            }
+            if !any {
+                // Empty body: error anchored at the radix character.
                 return Err(LexError::InvalidNumber {
-                    pos: start as u32,
-                    message: "missing digits".to_owned(),
+                    pos: (start + 1) as u32,
+                    message: literal_msg.to_owned(),
                 });
             }
+            self.verify_end_of_number(literal_msg)?;
             return Ok(self.token(TokenKind::Number, start, self.pos));
         }
 
-        // Decimal integer or float — consume digits.
-        let mut saw_digit_before_dot = false;
-        while let Some(b) = self.peek() {
-            if b.is_ascii_digit() || b == b'_' {
-                if b.is_ascii_digit() {
-                    saw_digit_before_dot = true;
+        // Decimal integer or float — consume digits (underscores only
+        // *between* digits, per CPython).
+        let mut consume_digit_run = |slf: &mut Self| -> Result<bool, LexError> {
+            let mut any = false;
+            loop {
+                match slf.peek() {
+                    Some(b) if b.is_ascii_digit() => {
+                        any = true;
+                        slf.pos += 1;
+                    }
+                    Some(b'_') if any => {
+                        slf.pos += 1;
+                        match slf.peek() {
+                            Some(b) if b.is_ascii_digit() => {}
+                            _ => {
+                                return Err(LexError::InvalidNumber {
+                                    pos: (slf.pos - 1) as u32,
+                                    message: "invalid decimal literal".to_owned(),
+                                });
+                            }
+                        }
+                    }
+                    _ => break,
                 }
-                self.pos += 1;
-            } else {
-                break;
             }
-        }
+            Ok(any)
+        };
+
+        consume_digit_run(self)?;
+        let int_end = self.pos;
 
         let mut is_float = false;
         if matches!(self.peek(), Some(b'.')) {
             // A `.` immediately after the integer part is always part of
             // the float in Python: `1.`, `2.+3.`, `[1.]`, `1.e3` are all
             // valid. The dot binds to the number, never to attribute
-            // access — `1.real` tokenizes as `1.` then `real` and is a
-            // `SyntaxError` (you must write `(1).real` or `1 .real`),
-            // exactly as in CPython's tokenizer.
+            // access — `1.real` is a `SyntaxError` (you must write
+            // `(1).real` or `1 .real`), exactly as in CPython.
             is_float = true;
             self.pos += 1;
-            while let Some(b) = self.peek() {
-                if b.is_ascii_digit() || b == b'_' {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            }
+            consume_digit_run(self)?;
         }
 
         if matches!(self.peek(), Some(b'e' | b'E')) {
+            // Only a real exponent: `1e3`, `1e+3`. A bare `1e` or `1e+`
+            // is "invalid decimal literal" at the last consumed byte.
             is_float = true;
             self.pos += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.pos += 1;
             }
-            let exp_start = self.pos;
-            while let Some(b) = self.peek() {
-                if b.is_ascii_digit() || b == b'_' {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            }
-            if self.pos == exp_start {
+            let got = consume_digit_run(self)?;
+            if !got {
                 return Err(LexError::InvalidNumber {
-                    pos: start as u32,
-                    message: "exponent has no digits".to_owned(),
+                    pos: (self.pos - 1) as u32,
+                    message: "invalid decimal literal".to_owned(),
                 });
             }
         }
 
         // Allow the imaginary suffix `j`/`J`; we tokenize it as
         // part of a number (semantics handled later).
+        let mut is_imaginary = false;
         if matches!(self.peek(), Some(b'j' | b'J')) {
-            is_float = true;
+            is_imaginary = true;
             self.pos += 1;
         }
 
-        let _ = (is_float, saw_digit_before_dot);
+        // Plain integers may not have leading zeros ("0010"); all-zero
+        // ("000") and float/imaginary forms are fine.
+        if !is_float && !is_imaginary {
+            let lexeme = &self.src[start..int_end];
+            if lexeme.first() == Some(&b'0')
+                && lexeme.iter().any(|b| (b'1'..=b'9').contains(b))
+            {
+                return Err(LexError::InvalidNumber {
+                    pos: start as u32,
+                    message: "leading zeros in decimal integer literals are not permitted; \
+                              use an 0o prefix for octal integers"
+                        .to_owned(),
+                });
+            }
+        }
+
+        self.verify_end_of_number("invalid decimal literal")?;
         Ok(self.token(TokenKind::Number, start, self.pos))
+    }
+
+    /// CPython's `verify_end_of_number`: a number immediately followed
+    /// by an identifier character is a syntax error ("invalid decimal
+    /// literal" at the number's last byte) — except when the trailing
+    /// identifier is a keyword that may legally follow a number
+    /// (`1if x else y`, `0in xs`, …).
+    fn verify_end_of_number(&mut self, message: &str) -> Result<(), LexError> {
+        const ALLOWED: &[&str] = &[
+            "and", "else", "for", "if", "in", "is", "not", "or", "while",
+        ];
+        let next = match self.peek() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let is_ident_byte =
+            |b: u8| b == b'_' || b.is_ascii_alphabetic() || b.is_ascii_digit() || b >= 0x80;
+        if !(next == b'_' || next.is_ascii_alphabetic() || next >= 0x80) {
+            return Ok(());
+        }
+        let mut end = self.pos;
+        while end < self.src.len() && is_ident_byte(self.src[end]) {
+            end += 1;
+        }
+        let word = std::str::from_utf8(&self.src[self.pos..end]).unwrap_or("");
+        if ALLOWED.contains(&word) {
+            return Ok(());
+        }
+        Err(LexError::InvalidNumber {
+            pos: (self.pos - 1) as u32,
+            message: message.to_owned(),
+        })
     }
 
     // ---------- strings ----------
@@ -623,7 +763,8 @@ impl<'src> Scanner<'src> {
             } else {
                 self.pos += 1;
             }
-            self.scan_fstring_extent(start, quote, triple, prefix.raw)?;
+            let mut warned = false;
+            self.scan_fstring_extent(start, quote, triple, prefix.raw, &mut warned)?;
             return Ok(self.token(TokenKind::String, start, self.pos));
         }
         if triple {
@@ -644,8 +785,35 @@ impl<'src> Scanner<'src> {
         start: usize,
         quote: u8,
         triple: bool,
-        _raw: bool,
+        raw: bool,
+        warned: &mut bool,
     ) -> Result<(), LexError> {
+        // CPython's tokenizer caps lexically nested f-strings at
+        // MAXFSTRINGLEVEL (150).
+        self.fstring_level += 1;
+        if self.fstring_level > 150 {
+            self.fstring_level -= 1;
+            return Err(LexError::FstringTooManyNested {
+                pos: start as u32,
+            });
+        }
+        let r = self.scan_fstring_extent_inner(start, quote, triple, raw, warned);
+        self.fstring_level -= 1;
+        r
+    }
+
+    fn scan_fstring_extent_inner(
+        &mut self,
+        start: usize,
+        quote: u8,
+        triple: bool,
+        raw: bool,
+        warned: &mut bool,
+    ) -> Result<(), LexError> {
+        // Start of the literal body (just past the opening quotes) —
+        // used to report `\N` escape errors with CPython's
+        // segment-relative byte positions.
+        let body_start = self.pos;
         loop {
             let Some(b) = self.peek() else {
                 // Ran off the end with the literal still open: CPython
@@ -687,6 +855,62 @@ impl<'src> Scanner<'src> {
                 // them — `fr'\{{'` is a literal backslash followed by the
                 // brace escape.
                 b'\\' => {
+                    let bs = self.pos;
+                    // `\N{NAME}` named-character escape (non-raw): the brace
+                    // group belongs to the escape, not a replacement field.
+                    // CPython's tokenizer validates this eagerly, so a `\N`
+                    // missing its `{NAME}` is malformed *here* — even when
+                    // the literal is otherwise unterminated.
+                    if !raw
+                        && self.peek_at(1) == Some(b'N')
+                        && self.peek_at(2) == Some(b'{')
+                    {
+                        self.pos += 3;
+                        loop {
+                            match self.peek() {
+                                Some(b'}') => {
+                                    self.pos += 1;
+                                    break;
+                                }
+                                Some(b'\n') | Some(b'\r') if !triple => {
+                                    return Err(LexError::FstringMalformedNamedEscape {
+                                        pos: self.pos as u32,
+                                        seg_start: (bs - body_start) as u32,
+                                        seg_end: (self.pos - body_start - 1) as u32,
+                                    });
+                                }
+                                Some(q) if q == quote => {
+                                    // Possible literal terminator: for a
+                                    // single-quoted f-string the name can't
+                                    // contain the quote; for triple quotes
+                                    // only the full closer ends it.
+                                    if !triple
+                                        || (self.peek_at(1) == Some(quote)
+                                            && self.peek_at(2) == Some(quote))
+                                    {
+                                        return Err(LexError::FstringMalformedNamedEscape {
+                                            pos: self.pos as u32,
+                                            seg_start: (bs - body_start) as u32,
+                                            seg_end: (self.pos - body_start - 1) as u32,
+                                        });
+                                    }
+                                    self.pos += 1;
+                                }
+                                Some(_) => self.pos += 1,
+                                None => {
+                                    return Err(LexError::FstringMalformedNamedEscape {
+                                        pos: self.pos as u32,
+                                        seg_start: (bs - body_start) as u32,
+                                        seg_end: (self.pos - body_start - 1) as u32,
+                                    });
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if !raw && !*warned && self.note_invalid_escape(bs, false) {
+                        *warned = true;
+                    }
                     self.pos += 1;
                     if matches!(self.peek(), Some(n) if n != b'{' && n != b'}') {
                         self.pos += 1;
@@ -697,7 +921,7 @@ impl<'src> Scanner<'src> {
                         self.pos += 2; // `{{` literal-brace escape
                     } else {
                         self.pos += 1;
-                        self.scan_fstring_field_extent(start, quote, triple)?;
+                        self.scan_fstring_field_extent(start, quote, triple, raw, 1, warned)?;
                     }
                 }
                 b'}' => {
@@ -725,6 +949,9 @@ impl<'src> Scanner<'src> {
         start: usize,
         outer_quote: u8,
         outer_triple: bool,
+        outer_raw: bool,
+        depth: u32,
+        warned: &mut bool,
     ) -> Result<(), LexError> {
         // Explicit bracket stack (mirroring the parser) so we reproduce
         // CPython's precise PEP 701 diagnostics rather than masking a
@@ -734,6 +961,9 @@ impl<'src> Scanner<'src> {
         // unterminated field).
         let mut stack: Vec<u8> = Vec::new();
         let mut in_comment = false;
+        // Field expression text begins right here (just past the `{`);
+        // recorded so the parser can re-parse a partial field.
+        let field_start = self.pos as u32;
         loop {
             let Some(b) = self.peek() else {
                 if in_comment {
@@ -743,7 +973,12 @@ impl<'src> Scanner<'src> {
                         pos: start as u32,
                     });
                 }
-                return Err(LexError::FstringExpectingBrace { pos: start as u32 });
+                // Field ran to EOF: CPython reports the unclosed `{`
+                // itself ("'{' was never closed"), anchored at the brace.
+                return Err(LexError::BracketNeverClosed {
+                    open: '{',
+                    pos: field_start.saturating_sub(1),
+                });
             };
             match b {
                 b'}' if stack.is_empty() => {
@@ -754,8 +989,48 @@ impl<'src> Scanner<'src> {
                 // and `:` are literal and only `{ }` nest replacement
                 // fields (e.g. `{x:#06x}`, `{x:.{prec}f}`).
                 b':' if stack.is_empty() => {
+                    // CPython's tokenizer allows replacement fields in
+                    // format specs only two levels deep; a third-level
+                    // spec errors at its `:`.
+                    if depth >= 3 {
+                        return Err(LexError::FstringNestedTooDeeply {
+                            pos: self.pos as u32,
+                        });
+                    }
                     self.pos += 1;
-                    return self.scan_fstring_format_spec_extent(start, outer_quote, outer_triple);
+                    return self.scan_fstring_format_spec_extent(
+                        start,
+                        outer_quote,
+                        outer_triple,
+                        outer_raw,
+                        depth,
+                        field_start,
+                        warned,
+                    );
+                }
+                // A backslash in the expression part is only legal as a
+                // line continuation (PEP 701 re-tokenizes the field like
+                // ordinary source).
+                b'\\' => {
+                    match self.peek_at(1) {
+                        Some(b'\n') => self.pos += 2,
+                        Some(b'\r') => {
+                            self.pos += 2;
+                            if self.peek() == Some(b'\n') {
+                                self.pos += 1;
+                            }
+                        }
+                        Some(_) => {
+                            return Err(LexError::StrayBackslash {
+                                pos: (self.pos + 1) as u32,
+                            })
+                        }
+                        None => {
+                            return Err(LexError::StrayBackslash {
+                                pos: self.pos as u32,
+                            })
+                        }
+                    }
                 }
                 b'(' | b'[' | b'{' => {
                     stack.push(b);
@@ -793,7 +1068,7 @@ impl<'src> Scanner<'src> {
                         }
                     }
                 }
-                b'"' | b'\'' => self.scan_fstring_nested_string(outer_quote)?,
+                b'"' | b'\'' => self.scan_fstring_nested_string(outer_quote, field_start)?,
                 // In the *expression* part, `#` starts a comment to end
                 // of line (only meaningful in multiline fields). A comment
                 // terminated by a newline resumes normal scanning; one that
@@ -822,13 +1097,20 @@ impl<'src> Scanner<'src> {
         start: usize,
         outer_quote: u8,
         outer_triple: bool,
+        outer_raw: bool,
+        depth: u32,
+        field_start: u32,
+        warned: &mut bool,
     ) -> Result<(), LexError> {
         loop {
             let Some(b) = self.peek() else {
                 // Spec ran to EOF with the field still open. CPython's spec
                 // diagnostic names the spec too: "expecting '}', or format
                 // specs" (vs the plain "expecting '}'" for the expr part).
-                return Err(LexError::FstringExpectingBraceOrSpec { pos: start as u32 });
+                return Err(LexError::FstringExpectingBraceOrSpec {
+                    pos: start as u32,
+                    field_start,
+                });
             };
             match b {
                 b'}' => {
@@ -837,14 +1119,42 @@ impl<'src> Scanner<'src> {
                 }
                 b'{' => {
                     self.pos += 1;
-                    self.scan_fstring_field_extent(start, outer_quote, outer_triple)?;
+                    self.scan_fstring_field_extent(
+                        start,
+                        outer_quote,
+                        outer_triple,
+                        outer_raw,
+                        depth + 1,
+                        warned,
+                    )?;
+                }
+                // Escape in the spec's literal text: consume the pair (the
+                // backslash never swallows a structural brace) and record
+                // an invalid-escape SyntaxWarning like any literal part.
+                b'\\' => {
+                    if !outer_raw && !*warned && self.note_invalid_escape(self.pos, false) {
+                        *warned = true;
+                    }
+                    self.pos += 1;
+                    if matches!(self.peek(), Some(n) if n != b'{' && n != b'}') {
+                        if matches!(self.peek(), Some(b'\n') | Some(b'\r')) && !outer_triple {
+                            // Backslash-newline in a single-quoted spec is
+                            // still a newline-in-spec error downstream;
+                            // leave the newline for the arm below.
+                        } else {
+                            self.pos += 1;
+                        }
+                    }
                 }
                 // The spec is literal text, so the *outer* quote here is the
                 // f-string's own terminator (a quote-as-fill must use the
                 // other quote, e.g. `f"{x:'>10}"`). Reaching it means the
                 // field never closed: "expecting '}', or format specs".
                 _ if b == outer_quote => {
-                    return Err(LexError::FstringExpectingBraceOrSpec { pos: self.pos as u32 });
+                    return Err(LexError::FstringExpectingBraceOrSpec {
+                        pos: self.pos as u32,
+                        field_start,
+                    });
                 }
                 // A literal newline in the spec is only legal inside a
                 // triple-quoted f-string; in a single-line one CPython
@@ -862,7 +1172,11 @@ impl<'src> Scanner<'src> {
     /// Skip a nested string literal that appears inside a replacement
     /// field. Detects an immediately-preceding string prefix so a nested
     /// f-string recurses (its own fields may reuse the outer quote).
-    fn scan_fstring_nested_string(&mut self, outer_quote: u8) -> Result<(), LexError> {
+    fn scan_fstring_nested_string(
+        &mut self,
+        outer_quote: u8,
+        field_start: u32,
+    ) -> Result<(), LexError> {
         let quote = self.peek().expect("nested string at quote");
         let triple = self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote);
         // When a lone quote *matching the enclosing f-string's* quote can't
@@ -871,9 +1185,16 @@ impl<'src> Scanner<'src> {
         // is what's unterminated. CPython surfaces "f-string: expecting '}'",
         // not "unterminated string literal". (`f'{3'` vs the valid `f'{3''}'`
         // empty string, or `f'{3 + 'a'}'` which finds its pair.)
+        // The boundary the parser cares about (and CPython anchors its
+        // "expecting '}'" at) is the *opening* quote — the field's
+        // expression text ends just before it.
+        let quote_pos = self.pos as u32;
         let unterminated = |pos: u32| {
             if quote == outer_quote {
-                LexError::FstringExpectingBrace { pos }
+                LexError::FstringExpectingBrace {
+                    pos: quote_pos,
+                    field_start,
+                }
             } else {
                 LexError::UnterminatedString { pos }
             }
@@ -901,7 +1222,8 @@ impl<'src> Scanner<'src> {
             self.pos += 1;
         }
         if prefix.fstring {
-            return self.scan_fstring_extent(self.pos, quote, triple, prefix.raw);
+            let mut warned = false;
+            return self.scan_fstring_extent(self.pos, quote, triple, prefix.raw, &mut warned);
         }
         let _ = prefix.raw;
         loop {
@@ -1146,6 +1468,21 @@ impl<'src> Scanner<'src> {
                 // `invalid character '€' (U+20AC)` message.
                 if ch.is_ascii() {
                     return Err(LexError::InvalidToken { pos });
+                }
+                // CPython distinguishes printable junk (`invalid character
+                // '€' (U+20AC)`) from non-printable junk (`invalid
+                // non-printable character U+00A0`). Approximate
+                // `str.isprintable`: controls, non-space whitespace, and
+                // common Cf format characters are non-printable.
+                let non_printable = ch.is_control()
+                    || (ch.is_whitespace() && ch != ' ')
+                    || matches!(ch,
+                        '\u{200b}'..='\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2060}'..='\u{2064}'
+                            | '\u{feff}');
+                if non_printable {
+                    return Err(LexError::InvalidNonPrintable { ch, pos });
                 }
                 return Err(LexError::InvalidChar { ch, pos });
             }

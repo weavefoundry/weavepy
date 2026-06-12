@@ -23,6 +23,11 @@ use crate::object::{DictData, DictKey, Object};
 /// time so attribute lookups are linear in the depth of inheritance.
 pub struct TypeObject {
     pub name: String,
+    /// PEP 3155 `__qualname__`. CPython's `type_new` *pops* the
+    /// compiler-stored `__qualname__` out of the class namespace into
+    /// `tp_qualname` (it is not visible in `cls.__dict__`); mirrored
+    /// here. `None` falls back to `name` (dynamic `type(...)` classes).
+    pub qualname: RefCell<Option<String>>,
     pub bases: Vec<Rc<TypeObject>>,
     pub mro: RefCell<Vec<Rc<TypeObject>>>,
     pub dict: Rc<RefCell<DictData>>,
@@ -132,11 +137,24 @@ impl TypeObject {
     pub fn new_with_flags(
         name: &str,
         bases: Vec<Rc<TypeObject>>,
-        dict: DictData,
+        mut dict: DictData,
         flags: TypeFlags,
     ) -> Result<Rc<Self>, RuntimeError> {
+        // CPython `type_new`: `__qualname__` is removed from the class
+        // namespace and stored on the type itself.
+        let qualname = match dict.shift_remove(&DictKey(Object::from_static("__qualname__"))) {
+            Some(Object::Str(s)) => Some(s.to_string()),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "type __qualname__ must be a str, not {}",
+                    other.type_name()
+                )))
+            }
+            None => None,
+        };
         let ty = Rc::new(TypeObject {
             name: name.to_owned(),
+            qualname: RefCell::new(qualname),
             bases: bases.clone(),
             mro: RefCell::new(Vec::new()),
             dict: Rc::new(RefCell::new(dict)),

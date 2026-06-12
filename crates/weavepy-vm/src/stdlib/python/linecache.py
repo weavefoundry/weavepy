@@ -156,15 +156,59 @@ def updatecache(filename, module_globals=None):
             return updatecache(filename, module_globals)
         return []
     try:
-        with open(name, encoding="utf-8") as f:
-            data = f.read()
-    except (OSError, UnicodeDecodeError):
+        with open(name, "rb") as f:
+            raw = f.read()
+        data = _decode_source(raw)
+    except (OSError, UnicodeDecodeError, LookupError):
         return []
     lines = data.splitlines(keepends=True)
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
     cache[filename] = (stat.st_size, stat.st_mtime, lines, name)
     return lines
+
+
+def _coding_cookie(line):
+    """PEP 263 cookie in a comment line (bytes), or None.
+
+    Hand-rolled equivalent of tokenize's
+    `^[ \\t\\f]*#.*?coding[:=][ \\t]*([-_.a-zA-Z0-9]+)` so linecache
+    doesn't have to import `re` mid-traceback.
+    """
+    i = 0
+    while i < len(line) and line[i : i + 1] in (b" ", b"\t", b"\x0c"):
+        i += 1
+    if line[i : i + 1] != b"#":
+        return None
+    pos = line.find(b"coding", i)
+    if pos < 0:
+        return None
+    j = pos + 6
+    if line[j : j + 1] not in (b":", b"="):
+        return None
+    j += 1
+    while line[j : j + 1] in (b" ", b"\t"):
+        j += 1
+    start = j
+    while j < len(line) and chr(line[j]) in (
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+    ):
+        j += 1
+    if j == start:
+        return None
+    return line[start:j].decode("ascii")
+
+
+def _decode_source(raw):
+    """Decode source bytes the way `tokenize.open` would: UTF-8 BOM,
+    then a PEP 263 coding cookie on line 1 or 2, defaulting to UTF-8."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8")
+    for line in raw.split(b"\n", 2)[:2]:
+        encoding = _coding_cookie(line)
+        if encoding is not None:
+            return raw.decode(encoding)
+    return raw.decode("utf-8")
 
 
 def lazycache(filename, module_globals):

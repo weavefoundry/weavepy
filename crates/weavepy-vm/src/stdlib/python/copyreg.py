@@ -76,6 +76,22 @@ def _default_getstate(obj):
     return dict_state
 
 
+def _bytearray_reduce(obj, protocol):
+    """CPython ``bytearray.__reduce_ex__`` (``_common_reduce`` in
+    Objects/bytearrayobject.c): the buffer content rides as a
+    constructor argument so ``cls(content)`` rebuilds the payload, and
+    the instance state (``__dict__`` / slots) follows separately."""
+    getstate = getattr(obj, "__getstate__", None)
+    if getstate is not None:
+        state = getstate()
+    else:
+        state = _default_getstate(obj)
+    if protocol < 3:
+        # str-based reduction (Python 2.x compatible), like CPython.
+        return (type(obj), (bytes(obj).decode('latin-1'), 'latin-1'), state)
+    return (type(obj), (bytes(obj),), state)
+
+
 def _reduce_newobj(obj, protocol):
     """Port of CPython's ``object.__reduce_ex__`` protocol-2+ path
     (``Objects/typeobject.c:reduce_newobj``).

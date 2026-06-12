@@ -428,6 +428,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "find" => Some(method("find", str_find)),
             "rfind" => Some(method("rfind", str_rfind)),
             "index" => Some(method("index", str_index)),
+            "rindex" => Some(method("rindex", str_rindex)),
             "count" => Some(method("count", str_count)),
             "partition" => Some(method("partition", str_partition)),
             "rpartition" => Some(method("rpartition", str_rpartition)),
@@ -460,6 +461,26 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__getitem__" => Some(method("__getitem__", seq_getitem)),
             "__len__" => Some(method("__len__", obj_len)),
             "__contains__" => Some(method("__contains__", obj_contains)),
+            "__add__" => Some(seq_dunder_binop(
+                "__add__",
+                weavepy_compiler::BinOpKind::Add,
+                false,
+            )),
+            "__mul__" => Some(seq_dunder_binop(
+                "__mul__",
+                weavepy_compiler::BinOpKind::Mult,
+                false,
+            )),
+            "__rmul__" => Some(seq_dunder_binop(
+                "__rmul__",
+                weavepy_compiler::BinOpKind::Mult,
+                true,
+            )),
+            "__mod__" => Some(seq_dunder_binop(
+                "__mod__",
+                weavepy_compiler::BinOpKind::Mod,
+                false,
+            )),
             _ => None,
         },
         Object::List(_) => match name {
@@ -481,6 +502,21 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__delitem__" => Some(method("__delitem__", list_delitem)),
             "__len__" => Some(method("__len__", obj_len)),
             "__contains__" => Some(method("__contains__", obj_contains)),
+            "__add__" => Some(seq_dunder_binop(
+                "__add__",
+                weavepy_compiler::BinOpKind::Add,
+                false,
+            )),
+            "__mul__" => Some(seq_dunder_binop(
+                "__mul__",
+                weavepy_compiler::BinOpKind::Mult,
+                false,
+            )),
+            "__rmul__" => Some(seq_dunder_binop(
+                "__rmul__",
+                weavepy_compiler::BinOpKind::Mult,
+                true,
+            )),
             _ => None,
         },
         Object::Dict(_) => match name {
@@ -516,6 +552,21 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__getitem__" => Some(method("__getitem__", seq_getitem)),
             "__len__" => Some(method("__len__", obj_len)),
             "__contains__" => Some(method("__contains__", obj_contains)),
+            "__add__" => Some(seq_dunder_binop(
+                "__add__",
+                weavepy_compiler::BinOpKind::Add,
+                false,
+            )),
+            "__mul__" => Some(seq_dunder_binop(
+                "__mul__",
+                weavepy_compiler::BinOpKind::Mult,
+                false,
+            )),
+            "__rmul__" => Some(seq_dunder_binop(
+                "__rmul__",
+                weavepy_compiler::BinOpKind::Mult,
+                true,
+            )),
             _ => None,
         },
         Object::Set(_) | Object::FrozenSet(_) => match name {
@@ -625,10 +676,31 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                     Ok(Object::Int(n as i64 + 1))
                 }))
             }
+            // In-place (re)initialisation — `b.__init__(it)` resets the
+            // content; subclass `__init__` chains
+            // (`bytearray.__init__(me, *args, **kwargs)`) land here too.
+            "__init__" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method_kw("__init__", bytearray_init_kw))
+            }
             // Sequence dunders so direct calls / `hasattr` parity hold.
             "__contains__" => Some(method("__contains__", obj_contains)),
             "__len__" => Some(method("__len__", obj_len)),
             "__getitem__" => Some(method("__getitem__", seq_getitem)),
+            "__add__" => Some(seq_dunder_binop(
+                "__add__",
+                weavepy_compiler::BinOpKind::Add,
+                false,
+            )),
+            "__mul__" => Some(seq_dunder_binop(
+                "__mul__",
+                weavepy_compiler::BinOpKind::Mult,
+                false,
+            )),
+            "__rmul__" => Some(seq_dunder_binop(
+                "__rmul__",
+                weavepy_compiler::BinOpKind::Mult,
+                true,
+            )),
             // PEP 461 `%`-formatting exposed as the number-protocol
             // dunders (`bytes_mod` fills CPython's `nb_remainder` slot,
             // so both wrappers exist).
@@ -644,8 +716,11 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             }
             _ => None,
         },
-        Object::File(_) => match name {
+        Object::File(f) => match name {
             "read" => Some(method("read", file_read)),
+            // Binary streams only — CPython text files genuinely lack the
+            // attribute (it lives on RawIOBase/BufferedIOBase).
+            "readinto" if f.binary => Some(method("readinto", file_readinto)),
             "readline" => Some(method("readline", file_readline)),
             "readlines" => Some(method("readlines", file_readlines)),
             "write" => Some(method("write", file_write)),
@@ -802,11 +877,43 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__reduce__" => Some(method(".iter_reduce", |_| {
                 Err(type_error("iterator.__reduce__ requires the interpreter"))
             })),
+            "__setstate__" => Some(method("__setstate__", iter_setstate)),
             _ => None,
         },
         _ => None,
     };
     f.map(|f| Object::Builtin(Rc::new(f)))
+}
+
+/// `<iterator>.__setstate__(index)` — reposition the cursor after an
+/// unpickle (CPython's `*iter_setstate`). The index clamps to
+/// `[0, len]`; out-of-range states unpickle as an exhausted iterator.
+fn iter_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let it = match args.first() {
+        Some(Object::Iter(it)) => it.clone(),
+        _ => return Err(type_error("__setstate__() requires an iterator")),
+    };
+    let state = args
+        .get(1)
+        .and_then(|o| o.as_i64())
+        .ok_or_else(|| type_error("an integer is required"))?;
+    let clamp = |len: usize| -> usize { state.max(0).min(len as i64) as usize };
+    use crate::object::PyIterator;
+    match &mut *it.borrow_mut() {
+        PyIterator::List { items, index } => {
+            *index = clamp(items.borrow().len());
+        }
+        PyIterator::Tuple { items, index } => *index = clamp(items.len()),
+        PyIterator::Str { s, index } => *index = clamp(s.len()),
+        PyIterator::Bytes { data, index } => *index = clamp(data.len()),
+        PyIterator::ByteArray { data, index } => {
+            *index = clamp(data.borrow().len());
+        }
+        PyIterator::DictKeys { keys, index } => *index = clamp(keys.len()),
+        PyIterator::Reversed { index, .. } => *index = state.max(-1),
+        _ => {}
+    }
+    Ok(Object::None)
 }
 
 /// `<iterator>.__length_hint__()` — the number of items the iterator
@@ -971,6 +1078,37 @@ fn method(
         call: Box::new(body),
         call_kw: None,
     }
+}
+
+// ---- sequence slot-wrapper dunders (`str.__add__`, `list.__mul__`, …) ----
+//
+// CPython exposes the sequence protocol's binary slots as wrapper
+// descriptors on each concrete type (`str.__add__`, `list.__mul__`,
+// `tuple.__rmul__`, …). Like the C wrappers, they delegate straight to
+// the native operation — its TypeErrors ("can only concatenate str …")
+// surface unchanged. Reached only via attribute access; the `a + b`
+// operator path never routes primitives through here.
+fn seq_dunder_binop(
+    name: &'static str,
+    op: weavepy_compiler::BinOpKind,
+    reflected: bool,
+) -> BuiltinFn {
+    method(name, move |args: &[Object]| {
+        let (a, b) = match args {
+            [a, b] => (a, b),
+            _ => {
+                return Err(type_error(format!(
+                    "{name} expected 2 arguments, got {}",
+                    args.len().saturating_sub(1)
+                )))
+            }
+        };
+        if reflected {
+            crate::binary_op(b, a, op)
+        } else {
+            crate::binary_op(a, b, op)
+        }
+    })
 }
 
 // ---- numeric slot-wrapper dunders (`int.__add__`, `complex.__eq__`, …) ----
@@ -1144,6 +1282,60 @@ fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn> {
         }
         "__mod__" if not_complex => num_binop_method("__mod__", kind, B::Mod, false),
         "__rmod__" if not_complex => num_binop_method("__rmod__", kind, B::Mod, true),
+        // Bitwise / shift ops are int-only (CPython `long_*` slots).
+        "__lshift__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__lshift__", kind, B::LShift, false)
+        }
+        "__rlshift__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rlshift__", kind, B::LShift, true)
+        }
+        "__rshift__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rshift__", kind, B::RShift, false)
+        }
+        "__rrshift__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rrshift__", kind, B::RShift, true)
+        }
+        "__and__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__and__", kind, B::BitAnd, false)
+        }
+        "__rand__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rand__", kind, B::BitAnd, true)
+        }
+        "__or__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__or__", kind, B::BitOr, false)
+        }
+        "__ror__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__ror__", kind, B::BitOr, true)
+        }
+        "__xor__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__xor__", kind, B::BitXor, false)
+        }
+        "__rxor__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rxor__", kind, B::BitXor, true)
+        }
+        "__divmod__" if not_complex => method("__divmod__", move |args| {
+            let (a, b) = match args {
+                [a, b] => (a.clone(), b.clone()),
+                _ => return Err(type_error("__divmod__ expected 2 arguments")),
+            };
+            if !num_accepts(kind, &b) {
+                return Ok(crate::vm_singletons::not_implemented());
+            }
+            b_divmod(&[a, b])
+        }),
+        "__rdivmod__" if not_complex => method("__rdivmod__", move |args| {
+            let (a, b) = match args {
+                [a, b] => (a.clone(), b.clone()),
+                _ => return Err(type_error("__rdivmod__ expected 2 arguments")),
+            };
+            if !num_accepts(kind, &b) {
+                return Ok(crate::vm_singletons::not_implemented());
+            }
+            b_divmod(&[b, a])
+        }),
+        "__invert__" if matches!(kind, NumSelf::Int) => {
+            num_unary_method("__invert__", U::Invert)
+        }
         "__eq__" => num_cmp_method("__eq__", kind, CmpDun::Eq),
         "__ne__" => num_cmp_method("__ne__", kind, CmpDun::Ne),
         "__lt__" => num_cmp_method("__lt__", kind, CmpDun::Lt),
@@ -1354,6 +1546,19 @@ fn slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let native = o.native_value();
+    // CPython's `bytearray_repr` spells the *receiver's* type name
+    // (`_PyType_Name(Py_TYPE(self))`), so a bytearray subclass renders
+    // as `ByteArraySubclass(b'…')` even without a custom `__repr__`.
+    if let (Object::Instance(inst), Some(payload @ Object::ByteArray(_))) = (o, &native) {
+        let name = inst.cls().name.clone();
+        let short = name.rsplit('.').next().unwrap_or(&name);
+        let inner = payload.repr();
+        let body = inner
+            .strip_prefix("bytearray(")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(&inner);
+        return Ok(Object::from_str(format!("{short}({body})")));
+    }
     Ok(Object::from_str(native.as_ref().unwrap_or(o).repr()))
 }
 
@@ -1530,8 +1735,16 @@ fn builtin_type_dunder_uncached(base_name: &str, name: &str) -> Option<Object> {
     // resolves `__str__` at `object`; exceptions get their own `__str__`
     // via type-dict entries installed at startup.
     if name == "__str__" {
-        if matches!(base_name, "object" | "str") {
+        if base_name == "object" {
             return Some(Object::Builtin(Rc::new(method("__str__", slot_str))));
+        }
+        if base_name == "str" {
+            // `str.__str__` is its own slot (`unicode_str`), distinct from
+            // `object.__str__`: it returns the plain-`str` value of the
+            // receiver *without* re-dispatching through `type(self).__str__`
+            // or `__repr__`. StrEnum's `__str__ = str.__str__` relies on
+            // this to yield the member's string payload.
+            return Some(Object::Builtin(Rc::new(method("__str__", str_slot_str))));
         }
         return None;
     }
@@ -1555,6 +1768,52 @@ fn builtin_type_dunder_uncached(base_name: &str, name: &str) -> Option<Object> {
             _ => return None,
         };
     Some(Object::Builtin(Rc::new(method(static_name, f))))
+}
+
+/// Crate-visible handle on the native (non-dispatching) `__repr__` slot
+/// so `type_surface` can materialize `int.__repr__`/`str.__repr__`/…
+/// entries in the value-type dicts (CPython stores a `tp_repr` wrapper
+/// per type; `enum._find_data_repr_` keys on `'__repr__' in
+/// base.__dict__`).
+pub(crate) fn value_slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    slot_repr(args)
+}
+
+/// `<builtin method>.__get__(obj, owner)` — bind a built-in method
+/// descriptor to `obj` (CPython `method_get`). `args[0]` is the builtin
+/// itself (the receiver of the bound `__get__`).
+pub(crate) fn builtin_descriptor_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let func = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("__get__() missing descriptor"))?;
+    let instance = args.get(1).cloned().unwrap_or(Object::None);
+    if matches!(instance, Object::None) {
+        return Ok(func);
+    }
+    Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod {
+        receiver: instance,
+        function: func,
+    })))
+}
+
+/// `str.__str__(self)` — CPython's `unicode_str`: return the receiver
+/// itself when it is exactly `str`, or a plain-`str` copy of the native
+/// payload for `str` subclasses. No virtual re-dispatch.
+fn str_slot_str(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__str__() takes exactly one argument (0 given)"))?;
+    match o {
+        Object::Str(_) => Ok(o.clone()),
+        _ => match o.native_value() {
+            Some(n @ Object::Str(_)) => Ok(n),
+            _ => Err(type_error(format!(
+                "descriptor '__str__' requires a 'str' object but received a '{}'",
+                o.type_name()
+            ))),
+        },
+    }
 }
 
 /// `object.__eq__(self, other)` — identity (payload equality for the
@@ -1824,12 +2083,22 @@ fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
         let encoding = match &args[1] {
             Object::Str(e) => e.to_string(),
             Object::None => "utf-8".to_owned(),
-            _ => return Err(type_error("str() argument 'encoding' must be str")),
+            other => {
+                return Err(type_error(format!(
+                    "str() argument 'encoding' must be str, not {}",
+                    other.type_name()
+                )))
+            }
         };
         let errors = match args.get(2) {
             Some(Object::Str(e)) => e.to_string(),
             Some(Object::None) | None => "strict".to_owned(),
-            _ => return Err(type_error("str() argument 'errors' must be str")),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "str() argument 'errors' must be str, not {}",
+                    other.type_name()
+                )))
+            }
         };
         let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;
         return Ok(Object::from_str(s));
@@ -3788,7 +4057,10 @@ fn finish_hex_tail(s: &[u8], mut i: usize, val: f64) -> Result<f64, RuntimeError
 // routes the rest through the underlying body.
 
 pub(crate) fn b_int_from_bytes_cls(args: &[Object]) -> Result<Object, RuntimeError> {
-    int_from_bytes_method(args)
+    // CPython's `int.from_bytes` calls `cls(result)` for subclasses so
+    // e.g. `IntEnum.from_bytes(...)` resolves to the matching member.
+    let result = int_from_bytes_method(args)?;
+    fromhex_wrap_subclass(args.first(), "int", result)
 }
 
 fn fromhex_string_arg(arg: Option<&Object>) -> Result<String, RuntimeError> {
@@ -4669,6 +4941,44 @@ fn b_bytes_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
             return Ok(Object::Bytes(b.clone()));
         }
     }
+    // CPython `bytes_new_impl`: with no encoding/errors, `__bytes__` is
+    // consulted *before* the str complaint — so a str subclass defining
+    // `__bytes__` converts through it (issue #25766) — and a bytes-subclass
+    // result is returned as-is (issue #24731).
+    let mut source_obj = args.first().cloned();
+    let mut has_encoding = args.len() > 1;
+    let mut has_errors = args.len() > 2;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "source" => source_obj = Some(v.clone()),
+            "encoding" => has_encoding = true,
+            "errors" => has_errors = true,
+            _ => {}
+        }
+    }
+    if !has_encoding && !has_errors {
+        if let Some(src @ Object::Instance(_)) = &source_obj {
+            if let Some(method) = crate::instance_method(src, "__bytes__") {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still live
+                    // on this thread; the GIL keeps the access exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    let globals = interp.builtins_dict();
+                    let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                    let is_bytes = matches!(&r, Object::Bytes(_))
+                        || matches!(&r, Object::Instance(inst)
+                            if matches!(&inst.native, Some(Object::Bytes(_))));
+                    if !is_bytes {
+                        return Err(type_error(format!(
+                            "__bytes__ returned non-bytes (type {})",
+                            r.type_name()
+                        )));
+                    }
+                    return Ok(r);
+                }
+            }
+        }
+    }
     Ok(Object::new_bytes(bytes_construct(args, kwargs, "bytes")?))
 }
 
@@ -4730,14 +5040,31 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Err(type_error("open() missing required argument: 'file'"));
     }
-    let path = match &args[0] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("open() argument 'file' must be str".to_owned())),
-    };
     let mode = match args.get(1) {
         Some(Object::Str(m)) => m.to_string(),
         Some(_) => return Err(type_error("open() mode must be str")),
         None => "r".to_owned(),
+    };
+    // `open(fd, …)` adopts an already-open raw file descriptor
+    // (produced by `os.open`); the file's `name` is the fd itself.
+    #[cfg(unix)]
+    if let Object::Int(fd) = &args[0] {
+        use std::os::unix::io::FromRawFd;
+        let fd = i32::try_from(*fd)
+            .map_err(|_| crate::error::value_error("file descriptor out of range"))?;
+        // SAFETY: ownership of the fd transfers to the new File; it was
+        // handed out by os.open (or dup) and is closed exactly once when
+        // the PyFile drops.
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        return Ok(Object::File(Rc::new(PyFile::new(
+            fd.to_string(),
+            mode,
+            FileBackend::Disk(f),
+        ))));
+    }
+    let path = match &args[0] {
+        Object::Str(s) => s.to_string(),
+        _ => return Err(type_error("open() argument 'file' must be str".to_owned())),
     };
     let mut opts = OpenOptions::new();
     let mut writing = false;
@@ -5029,6 +5356,7 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
     drop(mro);
     let proxy = Rc::new(TypeObject {
         name: format!("super<{}>", class.name),
+        qualname: RefCell::new(None),
         bases: after.clone(),
         mro: RefCell::new(after),
         dict: Rc::new(RefCell::new(DictData::new())),
@@ -5872,25 +6200,7 @@ pub fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
     let mv = match arg {
         Object::Bytes(b) => crate::object::PyMemoryView::from_bytes(b.clone()),
         Object::ByteArray(b) => crate::object::PyMemoryView::from_bytearray(b.clone()),
-        Object::MemoryView(mv) => {
-            // Shallow clone — same backing buffer, same window.
-            crate::object::PyMemoryView {
-                buffer: match &mv.buffer {
-                    crate::object::MemoryViewBuffer::Bytes(b) => {
-                        crate::object::MemoryViewBuffer::Bytes(b.clone())
-                    }
-                    crate::object::MemoryViewBuffer::ByteArray(b) => {
-                        crate::object::MemoryViewBuffer::ByteArray(b.clone())
-                    }
-                },
-                start: crate::sync::Cell::new(mv.start.get()),
-                len: crate::sync::Cell::new(mv.len.get()),
-                readonly: crate::sync::Cell::new(mv.readonly.get()),
-                released: crate::sync::Cell::new(mv.released.get()),
-                format: crate::sync::RefCell::new(mv.format.borrow().clone()),
-                itemsize: crate::sync::Cell::new(mv.itemsize.get()),
-            }
-        }
+        Object::MemoryView(mv) => mv.shallow_clone(),
         other => {
             return Err(type_error(format!(
                 "memoryview: a bytes-like object is required, not '{}'",
@@ -6633,6 +6943,14 @@ fn str_index(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+fn str_rindex(args: &[Object]) -> Result<Object, RuntimeError> {
+    let pos = str_rfind(args)?;
+    match pos {
+        Object::Int(-1) => Err(value_error("substring not found")),
+        other => Ok(other),
+    }
+}
+
 fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let sub = match args.get(1) {
@@ -6859,6 +7177,12 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "expandtabs() takes at most 1 argument ({} given)",
+            args.len() - 1
+        )));
+    }
     let s = str_self(args)?;
     let tabsize = match args.get(1) {
         Some(Object::Int(i)) => *i as usize,
@@ -6910,6 +7234,12 @@ fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "removeprefix() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let s = str_self(args)?;
     let prefix = match args.get(1) {
         Some(Object::Str(p)) => p.to_string(),
@@ -6920,6 +7250,12 @@ fn str_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "removesuffix() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let s = str_self(args)?;
     let suffix = match args.get(1) {
         Some(Object::Str(p)) => p.to_string(),
@@ -7984,34 +8320,78 @@ fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
             }
         }
     }
+    // CPython sizes `sep` with `PyObject_Length`, which dispatches an
+    // overridden `__len__` — user code that may try to resize the
+    // receiving bytearray. Hold an export so that resize raises
+    // BufferError instead of leaving the hex loop reading freed
+    // memory (gh-143195).
+    let _guard = bytearray_receiver_guard(args);
     let sep: Option<u8> = match &sep_obj {
         None => None,
-        Some(Object::Str(s)) => {
-            let mut chars = s.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) => {
+        Some(sep_arg) => {
+            // Virtual length first (an overridden `__len__` runs here);
+            // then validate against the native payload.
+            let native = sep_arg.native_value();
+            let unwrapped = native.as_ref().unwrap_or(sep_arg);
+            let reported_len: Option<i64> =
+                if let (Object::Instance(_), Some(m)) =
+                    (sep_arg, crate::instance_method(sep_arg, "__len__"))
+                {
+                    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                        // SAFETY: published by an enclosing VM frame still
+                        // live on this thread; the GIL keeps it exclusive.
+                        let interp = unsafe { &mut *ptr };
+                        let globals = interp.builtins_dict();
+                        let r = interp.call_object_with_globals(&m, &[], &[], &globals)?;
+                        r.as_i64()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            match unwrapped {
+                Object::Str(s) => {
+                    let n = reported_len.unwrap_or_else(|| s.chars().count() as i64);
+                    if n != 1 {
+                        return Err(value_error("sep must be length 1."));
+                    }
+                    let c = s.chars().next().ok_or_else(|| {
+                        value_error("sep must be length 1.")
+                    })?;
                     if (c as u32) > 0x7f {
                         return Err(value_error("sep must be ASCII."));
                     }
                     Some(c as u8)
                 }
-                _ => return Err(value_error("sep must be length 1.")),
+                Object::Bytes(b) => {
+                    let n = reported_len.unwrap_or(b.len() as i64);
+                    if n != 1 || b.is_empty() {
+                        return Err(value_error("sep must be length 1."));
+                    }
+                    if b[0] > 0x7f {
+                        return Err(value_error("sep must be ASCII."));
+                    }
+                    Some(b[0])
+                }
+                Object::ByteArray(b) => {
+                    let b = b.borrow();
+                    let n = reported_len.unwrap_or(b.len() as i64);
+                    if n != 1 || b.is_empty() {
+                        return Err(value_error("sep must be length 1."));
+                    }
+                    if b[0] > 0x7f {
+                        return Err(value_error("sep must be ASCII."));
+                    }
+                    Some(b[0])
+                }
+                other => {
+                    return Err(type_error(format!(
+                        "sep must be str or bytes, not {}",
+                        other.type_name()
+                    )))
+                }
             }
-        }
-        Some(Object::Bytes(b)) => {
-            if b.len() != 1 {
-                return Err(value_error("sep must be length 1."));
-            }
-            if b[0] > 0x7f {
-                return Err(value_error("sep must be ASCII."));
-            }
-            Some(b[0])
-        }
-        Some(other) => {
-            return Err(type_error(format!(
-                "sep must be str or bytes, not {}",
-                other.type_name()
-            )))
         }
     };
     let bytes_per_sep = match &bps_obj {
@@ -8077,6 +8457,7 @@ fn bytes_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_search_arity("startswith", args)?;
     let data = bytes_data(args)?;
     let target = args
         .get(1)
@@ -8093,6 +8474,7 @@ fn bytes_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_search_arity("endswith", args)?;
     let data = bytes_data(args)?;
     let target = args
         .get(1)
@@ -8195,28 +8577,51 @@ fn bytes_find_in(data: &[u8], sub: &[u8], start: usize, end: usize) -> i64 {
 }
 
 /// gh-142560: converting a search argument can run Python code (a user
-/// `__index__`) that mutates the receiving bytearray while the search
-/// "holds its buffer". CPython raises `BufferError`; we emulate by
-/// snapshotting the length around the conversion.
+/// `__index__` / `__buffer__`) that tries to resize the receiving
+/// bytearray while the search holds its buffer. Holding a real export
+/// for the duration makes the offending resize raise `BufferError`
+/// at the mutation site, exactly like CPython.
 fn bytes_needle_guarded(args: &[Object], arg: &Object) -> Result<Vec<u8>, RuntimeError> {
-    if let Some(Object::ByteArray(cell)) = args.first() {
-        let before = cell.borrow().len();
-        let sub = bytes_find_needle(arg)?;
-        if cell.borrow().len() != before {
-            return Err(RuntimeError::PyException(
-                crate::error::PyException::from_builtin(
-                    "BufferError",
-                    "Existing exports of data: object cannot be re-sized",
-                ),
-            ));
+    let _guard = bytearray_receiver_guard(args);
+    bytes_find_needle(arg)
+}
+
+/// Export the receiver's buffer (when it is a bytearray) for the
+/// lifetime of the returned guard.
+fn bytearray_receiver_guard(args: &[Object]) -> Option<crate::object::ByteArrayExportGuard> {
+    match args.first() {
+        Some(Object::ByteArray(cell)) => {
+            Some(crate::object::ByteArrayExportGuard::new(cell.clone()))
         }
-        Ok(sub)
-    } else {
-        bytes_find_needle(arg)
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::ByteArray(cell)) => {
+                Some(crate::object::ByteArrayExportGuard::new(cell.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
+/// `_PyArg_CheckPositional("find", nargs, 1, 3)` — the search family
+/// takes `sub[, start[, end]]`.
+fn bytes_search_arity(name: &str, args: &[Object]) -> Result<(), RuntimeError> {
+    let nargs = args.len().saturating_sub(1);
+    if nargs > 3 {
+        return Err(type_error(format!(
+            "{name} expected at most 3 arguments, got {nargs}"
+        )));
+    }
+    if nargs < 1 {
+        return Err(type_error(format!(
+            "{name} expected at least 1 argument, got {nargs}"
+        )));
+    }
+    Ok(())
+}
+
 fn bytes_find(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_search_arity("find", args)?;
     let sub = bytes_needle_guarded(
         args,
         args.get(1)
@@ -8231,6 +8636,7 @@ fn bytes_find(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_search_arity("rfind", args)?;
     let sub = bytes_needle_guarded(
         args,
         args.get(1)
@@ -8250,6 +8656,7 @@ fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_index(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_search_arity("index", args)?;
     match bytes_find(args)? {
         Object::Int(i) if i >= 0 => Ok(Object::Int(i)),
         _ => Err(value_error("subsection not found")),
@@ -8257,6 +8664,7 @@ fn bytes_index(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_rindex(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_search_arity("rindex", args)?;
     match bytes_rfind(args)? {
         Object::Int(i) if i >= 0 => Ok(Object::Int(i)),
         _ => Err(value_error("subsection not found")),
@@ -8264,6 +8672,7 @@ fn bytes_rindex(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_search_arity("count", args)?;
     let sub = bytes_needle_guarded(
         args,
         args.get(1)
@@ -8381,23 +8790,10 @@ fn bytes_split_args(
         None | Some(Object::None) => None,
         Some(other) => {
             // Same reentrancy hazard as the find family (gh-142560):
-            // converting `sep` can run user code that resizes the
-            // receiving bytearray.
-            if let Some(Object::ByteArray(cell)) = args.first() {
-                let before = cell.borrow().len();
-                let sep = bytes_argview(&other)?;
-                if cell.borrow().len() != before {
-                    return Err(RuntimeError::PyException(
-                        crate::error::PyException::from_builtin(
-                            "BufferError",
-                            "Existing exports of data: object cannot be re-sized",
-                        ),
-                    ));
-                }
-                Some(sep)
-            } else {
-                Some(bytes_argview(&other)?)
-            }
+            // converting `sep` can run user code (`__buffer__`) that
+            // tries to resize the receiving bytearray.
+            let _guard = bytearray_receiver_guard(args);
+            Some(bytes_argview(&other)?)
         }
     };
     if let Some(s) = &sep {
@@ -8871,6 +9267,12 @@ fn bytes_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "removeprefix() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let data = bytes_data(args)?;
     let prefix = bytes_argview(
         args.get(1)
@@ -8885,6 +9287,12 @@ fn bytes_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "removesuffix() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let data = bytes_data(args)?;
     let suffix = bytes_argview(
         args.get(1)
@@ -8902,6 +9310,12 @@ fn bytes_expandtabs(
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "expandtabs() takes at most 1 argument ({} given)",
+            args.len() - 1
+        )));
+    }
     let data = bytes_data(args)?;
     let mut tabsize_obj = args.get(1).cloned();
     for (k, v) in kwargs {
@@ -9133,6 +9547,12 @@ fn bytes_isascii(args: &[Object]) -> Result<Object, RuntimeError> {
 fn bytearray_only(args: &[Object], name: &str) -> Result<Rc<RefCell<Vec<u8>>>, RuntimeError> {
     match args.first() {
         Some(Object::ByteArray(b)) => Ok(b.clone()),
+        // Unbound calls on subclass instances (`bytearray.append(me, …)`)
+        // reach the native payload.
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::ByteArray(b)) => Ok(b.clone()),
+            _ => Err(type_error(format!("{name}() requires a bytearray receiver"))),
+        },
         _ => Err(type_error(format!("{name}() requires a bytearray receiver"))),
     }
 }
@@ -9175,6 +9595,7 @@ fn bytearray_insert(args: &[Object]) -> Result<Object, RuntimeError> {
         args.get(2)
             .ok_or_else(|| type_error("insert() expected 2 args"))?,
     )?;
+    crate::object::bytearray_check_resizable(&cell)?;
     let mut data = cell.borrow_mut();
     let len = data.len() as i64;
     let idx = if pos < 0 {
@@ -9195,6 +9616,7 @@ fn bytearray_remove(args: &[Object]) -> Result<Object, RuntimeError> {
     let mut data = cell.borrow_mut();
     match data.iter().position(|b| *b == byte) {
         Some(i) => {
+            crate::object::bytearray_check_resizable(&cell)?;
             data.remove(i);
             Ok(Object::None)
         }
@@ -9245,8 +9667,33 @@ fn bytes_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
 fn bytearray_self(args: &[Object]) -> Result<Rc<crate::sync::RefCell<Vec<u8>>>, RuntimeError> {
     match args.first() {
         Some(Object::ByteArray(b)) => Ok(b.clone()),
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::ByteArray(b)) => Ok(b.clone()),
+            _ => Err(type_error("expected bytearray receiver")),
+        },
         _ => Err(type_error("expected bytearray receiver")),
     }
+}
+
+/// `bytearray.__init__(self, source=None, encoding=None, errors=None)` —
+/// (re)initialise the buffer *in place*. CPython's `bytearray___init___`:
+/// the content is rebuilt from the constructor arguments; a re-init that
+/// changes the length while the buffer is exported is forbidden.
+pub(crate) fn bytearray_init_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let b = bytearray_self(args)?;
+    let new = bytes_construct(&args[1..], kwargs, "bytearray")?;
+    if new.len() != b.borrow().len() {
+        crate::object::bytearray_check_resizable(&b)?;
+    }
+    *b.borrow_mut() = new;
+    Ok(Object::None)
+}
+
+pub(crate) fn bytearray_init(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytearray_init_kw(args, &[])
 }
 
 fn bytearray_append(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -9255,6 +9702,7 @@ fn bytearray_append(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .ok_or_else(|| type_error("append() takes exactly one argument (0 given)"))?;
     let byte = bytearray_byte_arg(value)?;
+    crate::object::bytearray_check_resizable(&b)?;
     b.borrow_mut().push(byte);
     Ok(Object::None)
 }
@@ -9264,13 +9712,27 @@ fn bytearray_extend(args: &[Object]) -> Result<Object, RuntimeError> {
     let other = args
         .get(1)
         .ok_or_else(|| type_error("extend() takes exactly 1 argument (0 given)"))?;
+    // CPython rejects `str` up front with a dedicated message —
+    // strings are iterable but never an "iterable of ints".
+    if matches!(
+        other.native_value().as_ref().unwrap_or(other),
+        Object::Str(_)
+    ) {
+        return Err(type_error("expected iterable of integers; got: 'str'"));
+    }
     // Bytes-like fast paths (with `b.extend(b)` alias safety).
     match other {
         Object::Bytes(buf) => {
+            if !buf.is_empty() {
+                crate::object::bytearray_check_resizable(&b)?;
+            }
             b.borrow_mut().extend_from_slice(buf);
             return Ok(Object::None);
         }
         Object::ByteArray(buf) => {
+            if !buf.borrow().is_empty() {
+                crate::object::bytearray_check_resizable(&b)?;
+            }
             if Rc::ptr_eq(&b, buf) {
                 let mut t = b.borrow_mut();
                 let copy = t.clone();
@@ -9298,12 +9760,20 @@ fn bytearray_extend(args: &[Object]) -> Result<Object, RuntimeError> {
     while let Some(item) = it.next_value() {
         tmp.push(bytearray_byte_arg(&item)?);
     }
+    if !tmp.is_empty() {
+        crate::object::bytearray_check_resizable(&b)?;
+    }
     b.borrow_mut().extend_from_slice(&tmp);
     Ok(Object::None)
 }
 
 fn bytearray_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     let b = bytearray_self(args)?;
+    // Resize-to-zero is a no-op on an empty buffer (CPython's
+    // `PyByteArray_Resize` short-circuits before `_canresize`).
+    if !b.borrow().is_empty() {
+        crate::object::bytearray_check_resizable(&b)?;
+    }
     b.borrow_mut().clear();
     Ok(Object::None)
 }
@@ -9320,12 +9790,13 @@ fn bytearray_pop(args: &[Object]) -> Result<Object, RuntimeError> {
             let len = buf.len() as i64;
             let n = if i < 0 { i + len } else { i };
             if n < 0 || n >= len {
-                return Err(crate::error::index_error("bytearray index out of range"));
+                return Err(crate::error::index_error("pop index out of range"));
             }
             n as usize
         }
         _ => return Err(type_error("pop() index must be int")),
     };
+    crate::object::bytearray_check_resizable(&b)?;
     let v = buf.remove(idx);
     Ok(Object::Int(i64::from(v)))
 }
@@ -9359,6 +9830,36 @@ fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
         let s = String::from_utf8(bytes).map_err(|e| value_error(e.to_string()))?;
         Ok(Object::from_str(s))
     }
+}
+
+/// `f.readinto(b)` — read up to `len(b)` bytes into a writable
+/// bytes-like object, returning the count actually read. Only reachable
+/// on binary-mode files (the method table gates on `f.binary`).
+fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let target = match args.get(1) {
+        Some(Object::ByteArray(b)) => b.clone(),
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::ByteArray(b)) => b.clone(),
+            _ => {
+                return Err(type_error(format!(
+                    "readinto() argument must be read-write bytes-like object, not {}",
+                    inst.cls().name
+                )))
+            }
+        },
+        other => {
+            return Err(type_error(format!(
+                "readinto() argument must be read-write bytes-like object, not {}",
+                other.map_or("nothing", |o| o.type_name())
+            )))
+        }
+    };
+    let capacity = target.borrow().len();
+    let bytes = f.read_bytes(Some(capacity))?;
+    let n = bytes.len();
+    target.borrow_mut()[..n].copy_from_slice(&bytes);
+    Ok(Object::Int(n as i64))
 }
 
 fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -9526,7 +10027,7 @@ fn memoryview_tolist(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn memoryview_release(args: &[Object]) -> Result<Object, RuntimeError> {
     let mv = memoryview_self(args)?;
-    mv.released.set(true);
+    mv.release();
     Ok(Object::None)
 }
 

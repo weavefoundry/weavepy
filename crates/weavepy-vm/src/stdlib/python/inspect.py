@@ -744,36 +744,43 @@ def getmro(cls):
 
 
 def getmembers(obj, predicate=None):
-    out = []
-    seen = set()
-    mro = ()
+    # CPython `inspect._getmembers`: names come from `dir(obj)` (plus
+    # DynamicClassAttributes from base dicts when `obj` is a class) —
+    # *not* from walking every MRO `__dict__`, so a metaclass `__dir__`
+    # (e.g. `EnumType.__dir__`) controls what is reported.
+    results = []
+    processed = set()
+    names = dir(obj)
     if isclass(obj):
+        mro = getmro(obj)
         try:
-            mro = (obj,) + tuple(obj.__mro__[1:])
-        except Exception:
-            mro = (obj,)
-    for klass in mro:
-        try:
-            for k, v in vars(klass).items():
-                if k in seen:
-                    continue
-                seen.add(k)
-                if predicate is None or predicate(v):
-                    out.append((k, v))
-        except Exception:
-            pass
-    for name in dir(obj):
-        if name in seen:
-            continue
-        try:
-            value = getattr(obj, name)
+            for base in obj.__bases__:
+                for k, v in base.__dict__.items():
+                    if isinstance(v, types.DynamicClassAttribute):
+                        names.append(k)
         except AttributeError:
-            continue
-        seen.add(name)
+            pass
+    else:
+        mro = ()
+    for key in names:
+        try:
+            value = getattr(obj, key)
+            if key in processed:
+                raise AttributeError
+        except AttributeError:
+            for base in mro:
+                if key in base.__dict__:
+                    value = base.__dict__[key]
+                    break
+            else:
+                # could be a (currently) missing slot member, or a buggy
+                # __dir__; discard and move on
+                continue
         if predicate is None or predicate(value):
-            out.append((name, value))
-    out.sort(key=lambda kv: kv[0])
-    return out
+            results.append((key, value))
+        processed.add(key)
+    results.sort(key=lambda pair: pair[0])
+    return results
 
 
 try:
@@ -848,6 +855,12 @@ def classify_class_attrs(cls):
                 if homecls not in metamro:
                     homecls = base
                 break
+        if name == '__class__' and dict_obj is None and homecls not in metamro:
+            # CPython stores a `__class__` getset in `object.__dict__`;
+            # WeavePy synthesizes the attribute instead of materializing
+            # a dict entry, so the walk above can't find it — credit
+            # `object`, as CPython does.
+            homecls = object
         if homecls is None:
             # unable to locate the attribute anywhere, most likely due to
             # buggy custom __dir__; discard and move on
@@ -1142,6 +1155,23 @@ class Parameter:
             out += sep + repr(self._default)
         return out
 
+    def __eq__(self, other):
+        # CPython Parameter.__eq__: compare the (name, kind, annotation,
+        # default) basis.
+        if self is other:
+            return True
+        if not isinstance(other, Parameter):
+            return NotImplemented
+        return (self._name == other._name
+                and self._kind == other._kind
+                and self._default == other._default
+                and self._annotation == other._annotation)
+
+    def __hash__(self):
+        return hash((self._name, self._kind,
+                     self._default if self._default is not _empty else _empty,
+                     self._annotation if self._annotation is not _empty else _empty))
+
 
 class BoundArguments:
     def __init__(self, signature, arguments):
@@ -1218,6 +1248,26 @@ class Signature:
         params = list(self._parameters.values()) if parameters is _empty else list(parameters)
         ret = self._return_annotation if return_annotation is _empty else return_annotation
         return Signature(params, return_annotation=ret)
+
+    def _hash_basis(self):
+        # CPython: keyword-only parameters compare order-insensitively.
+        params = tuple(p for p in self._parameters.values()
+                       if p.kind != Parameter.KEYWORD_ONLY)
+        kwo_params = {p.name: p for p in self._parameters.values()
+                      if p.kind == Parameter.KEYWORD_ONLY}
+        return params, kwo_params, self._return_annotation
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if not isinstance(other, Signature):
+            return NotImplemented
+        return self._hash_basis() == other._hash_basis()
+
+    def __hash__(self):
+        params, kwo_params, return_annotation = self._hash_basis()
+        kwo_params = frozenset(kwo_params.values())
+        return hash((params, kwo_params, return_annotation))
 
     def bind(self, *args, **kwargs):
         return self._bind(args, kwargs, partial=False)
@@ -1465,7 +1515,18 @@ def signature(callable_, *, follow_wrapped=True):
             return _signature_drop_first(signature(obj.__func__))
     explicit = getattr(obj, "__signature__", None)
     if explicit is not None:
-        return explicit
+        # CPython: `__signature__` may be a string, or a callable
+        # returning one (e.g. `Enum.__signature__` is a classmethod) —
+        # convert before handing it back.
+        sig = explicit
+        if not isinstance(sig, (Signature, str)) and callable(sig):
+            sig = sig()
+        if isinstance(sig, str):
+            sig = _signature_from_text(sig)
+        if not isinstance(sig, Signature):
+            raise TypeError(
+                "unexpected object {!r} in __signature__ attribute".format(explicit))
+        return sig
     if isinstance(obj, functools.partial):
         return _signature_get_partial(signature(obj.func), obj)
     if isclass(obj):
