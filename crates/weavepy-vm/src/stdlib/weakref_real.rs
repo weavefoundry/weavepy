@@ -266,6 +266,20 @@ fn ref_type() -> Rc<TypeObject> {
     })
 }
 
+/// If `obj` is a weakproxy (either flavour), dereference it: CPython's
+/// proxy forwards `tp_getattro` wholesale, so attribute reads such as
+/// `proxy.__class__` must report the *referent*, never the proxy type.
+/// `Some(Err(..))` is a dead referent (ReferenceError).
+pub fn proxy_referent(obj: &Object) -> Option<Result<Object, RuntimeError>> {
+    if let Object::Instance(inst) = obj {
+        let cls = inst.cls();
+        if Rc::ptr_eq(&cls, &proxy_type()) || Rc::ptr_eq(&cls, &callable_proxy_type()) {
+            return Some(proxy_target(obj));
+        }
+    }
+    None
+}
+
 /// Dereference a proxy instance, raising `ReferenceError` once the
 /// referent has been collected — CPython's `proxy_checkref`.
 fn proxy_target(me: &Object) -> Result<Object, RuntimeError> {
@@ -608,16 +622,17 @@ pub(crate) fn supports_weakref(target: &Object) -> bool {
     let Object::Instance(inst) = target else {
         return true;
     };
+    // CPython: a heap class contributes weakref support unless it
+    // declares `__slots__` without listing `"__weakref__"`. Any single
+    // slots-free (or weakref-slotted) class on the MRO is enough —
+    // `__slots__ = ["__dict__"]` grants a dict but *not* weakrefs.
     let cls = inst.cls();
-    if !cls.forbids_dict {
-        return true;
-    }
     let mro = cls.mro.borrow().clone();
     for ty in mro {
         if ty.flags.is_builtin {
             continue;
         }
-        if !ty.forbids_dict {
+        if !ty.declares_slots.get() {
             return true;
         }
         if ty.slot_names.borrow().iter().any(|s| s == "__weakref__") {

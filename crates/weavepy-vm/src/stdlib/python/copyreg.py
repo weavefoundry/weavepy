@@ -31,13 +31,58 @@ def _reconstructor(cls, base, state):
         obj = object.__new__(cls)
     else:
         obj = base.__new__(cls, state)
-    if base.__init__ != object.__init__:
-        base.__init__(obj, state)
+        if base.__init__ != object.__init__:
+            base.__init__(obj, state)
     return obj
 
 
 _HEAPTYPE = 1 << 9
-_new_type = type(int)
+
+
+def _reduce_ex(self, proto):
+    """``object.__reduce_ex__`` for protocols 0 and 1 (CPython's
+    ``Lib/copyreg.py:_reduce_ex``, invoked from ``common_reduce``)."""
+    assert proto < 2
+    cls = self.__class__
+    for base in cls.__mro__:
+        if hasattr(base, '__flags__') and not base.__flags__ & _HEAPTYPE:
+            break
+        # CPython also stops at a base whose `__new__` is a C-level
+        # static method bound to that base (an extension type).
+        new = base.__new__
+        if getattr(new, '__self__', None) is base:
+            break
+    else:
+        base = object  # not really reachable
+    if base is object:
+        state = None
+    else:
+        if base is cls:
+            raise TypeError(f"cannot pickle {cls.__name__!r} object")
+        state = base(self)
+    args = (cls, base, state)
+    try:
+        getstate = self.__getstate__
+    except AttributeError:
+        if getattr(self, "__slots__", None):
+            raise TypeError(f"cannot pickle {cls.__name__!r} object: "
+                            f"a class that defines __slots__ without "
+                            f"defining __getstate__ cannot be pickled "
+                            f"with protocol {proto}") from None
+        try:
+            dict = self.__dict__
+        except AttributeError:
+            dict = None
+    else:
+        if (type(self).__getstate__ is object.__getstate__ and
+                getattr(self, "__slots__", None)):
+            raise TypeError("a class that defines __slots__ without "
+                            "defining __getstate__ cannot be pickled")
+        dict = getstate()
+    if dict:
+        return _reconstructor, args, dict
+    else:
+        return _reconstructor, args
 
 
 def __newobj__(cls, *args):
@@ -92,6 +137,27 @@ def _bytearray_reduce(obj, protocol):
     return (type(obj), (bytes(obj),), state)
 
 
+def _lookup_special(obj, name):
+    """CPython's ``_PyObject_LookupSpecial``: a *type-only* attribute
+    lookup (instance ``__dict__`` and ``__getattr__`` are never
+    consulted) with the descriptor protocol applied against ``obj``."""
+    cls = type(obj)
+    for klass in cls.__mro__:
+        if name in klass.__dict__:
+            d = klass.__dict__[name]
+            get = getattr(type(d), "__get__", None)
+            if get is not None:
+                return get(d, obj, cls)
+            if callable(d):
+                # Engine divergence: plain functions/builtins don't expose
+                # `__get__`; bind the receiver manually instead.
+                def _bound(*args, _d=d, **kwargs):
+                    return _d(obj, *args, **kwargs)
+                return _bound
+            return d
+    return None
+
+
 def _reduce_newobj(obj, protocol):
     """Port of CPython's ``object.__reduce_ex__`` protocol-2+ path
     (``Objects/typeobject.c:reduce_newobj``).
@@ -99,15 +165,37 @@ def _reduce_newobj(obj, protocol):
     Produces the ``(callable, args, state, listitems, dictitems)`` tuple
     that ``copy``/``pickle`` feed to ``copyreg._reconstruct`` to rebuild
     the instance, honouring the ``__getnewargs_ex__`` / ``__getnewargs__``
-    and ``__getstate__`` hooks.
+    and ``__getstate__`` hooks (looked up on the *type*, as CPython's
+    ``_PyObject_GetNewArguments`` does).
     """
     cls = type(obj)
-    getnewargs_ex = getattr(obj, "__getnewargs_ex__", None)
+    getnewargs_ex = _lookup_special(obj, "__getnewargs_ex__")
     if getnewargs_ex is not None:
-        args, kwargs = getnewargs_ex()
+        newargs_pair = getnewargs_ex()
+        if not isinstance(newargs_pair, tuple):
+            raise TypeError("__getnewargs_ex__ should return a tuple, "
+                            "not '%s'" % type(newargs_pair).__name__)
+        if len(newargs_pair) != 2:
+            raise ValueError("__getnewargs_ex__ should return a tuple of "
+                             "length 2, not %d" % len(newargs_pair))
+        args, kwargs = newargs_pair
+        if not isinstance(args, tuple):
+            raise TypeError("first item of the tuple returned by "
+                            "__getnewargs_ex__ must be a tuple, not '%s'"
+                            % type(args).__name__)
+        if not isinstance(kwargs, dict):
+            raise TypeError("second item of the tuple returned by "
+                            "__getnewargs_ex__ must be a dict, not '%s'"
+                            % type(kwargs).__name__)
     else:
-        getnewargs = getattr(obj, "__getnewargs__", None)
-        args = getnewargs() if getnewargs is not None else ()
+        getnewargs = _lookup_special(obj, "__getnewargs__")
+        if getnewargs is not None:
+            args = getnewargs()
+            if not isinstance(args, tuple):
+                raise TypeError("__getnewargs__ should return a tuple, "
+                                "not '%s'" % type(args).__name__)
+        else:
+            args = ()
         kwargs = {}
 
     if kwargs:
@@ -117,11 +205,14 @@ def _reduce_newobj(obj, protocol):
         newobj = __newobj__
         newargs = (cls,) + tuple(args)
 
-    getstate = getattr(obj, "__getstate__", None)
-    if getstate is not None:
-        state = getstate()
-    else:
+    getstate = _lookup_special(obj, "__getstate__")
+    if getstate is None or getattr(type(obj), "__getstate__", None) is object.__getstate__:
+        # The default `object.__getstate__` — implemented here so the
+        # `__slotnames__` cache (and its getattr-based slot reads) are
+        # honoured exactly like CPython's `_PyObject_GetState`.
         state = _default_getstate(obj)
+    else:
+        state = getstate()
 
     listitems = iter(obj) if isinstance(obj, list) else None
     dictitems = iter(obj.items()) if isinstance(obj, dict) else None

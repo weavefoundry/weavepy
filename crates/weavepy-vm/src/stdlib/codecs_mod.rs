@@ -174,6 +174,15 @@ fn lookup_encoding(name: &str) -> Option<&'static Encoding> {
         "latin1" | "latin" | "iso88591" | "88591" | "cp819" | "l1" => {
             Encoding::for_label(b"iso-8859-1")
         }
+        // CPython `Lib/encodings/aliases.py` latin-N aliases.
+        "latin2" | "l2" => Encoding::for_label(b"iso-8859-2"),
+        "latin3" | "l3" => Encoding::for_label(b"iso-8859-3"),
+        "latin4" | "l4" => Encoding::for_label(b"iso-8859-4"),
+        "latin5" | "l5" => Encoding::for_label(b"iso-8859-9"),
+        "latin6" | "l6" => Encoding::for_label(b"iso-8859-10"),
+        "latin8" | "l8" => Encoding::for_label(b"iso-8859-14"),
+        "latin9" | "l9" => Encoding::for_label(b"iso-8859-15"),
+        "latin10" | "l10" => Encoding::for_label(b"iso-8859-16"),
         "utf8" | "u8" | "utf" => Encoding::for_label(b"utf-8"),
         "utf16" | "u16" => Encoding::for_label(b"utf-16"),
         "utf16le" => Encoding::for_label(b"utf-16le"),

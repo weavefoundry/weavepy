@@ -248,6 +248,7 @@ impl BuiltinTypes {
         // uses an isinstance check against this to recognize slot-shadowed
         // defaults.
         let member_descriptor_ = mk("member_descriptor", vec![object_.clone()]);
+        install_member_descriptor_methods(&member_descriptor_);
         let generator_ = mk("generator", vec![object_.clone()]);
         let coroutine_ = mk("coroutine", vec![object_.clone()]);
         let async_generator_ = mk("async_generator", vec![object_.clone()]);
@@ -1067,6 +1068,14 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // class itself* must produce the native value, not a PyInstance shell
     // (CPython's per-type `tp_new`). Subclasses keep falling through to the
     // payload-seeding path below.
+    // `module.__new__(module)` allocates an *uninitialized* module —
+    // empty dict, no `__name__` — exactly CPython's `module_new` (the
+    // name/doc seeding lives in `module.__init__` only).
+    if cls.is_subclass_of(&builtin_types().module_) {
+        let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
+        crate::gc_trace::track(inst.clone());
+        return Ok(inst);
+    }
     if cls.flags.is_builtin && !Rc::ptr_eq(&cls, &builtin_types().object_) {
         if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
             // SAFETY: published by an enclosing VM frame still live on this
@@ -1230,6 +1239,107 @@ fn install_gen_name_getsets(ty: &Rc<TypeObject>, kind: &'static str) {
                 Object::None,
                 Object::from_str(doc),
             ))),
+        );
+    }
+}
+
+/// Explicit-protocol methods on `member_descriptor` (`__slots__` storage
+/// descriptors): `A.x.__set__(obj, v)` / `.__get__(obj)` / `.__delete__(obj)`
+/// — CPython's `member_get`/`member_set`/`member_delete`, including the
+/// receiver type check that rejects virtual (ABC-registered) instances.
+fn install_member_descriptor_methods(member_: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    fn slot_and_receiver<'a>(
+        args: &'a [Object],
+        op: &str,
+    ) -> Result<(&'a Rc<crate::object::SlotDescriptor>, &'a Object), RuntimeError> {
+        let slot = match args.first() {
+            Some(Object::SlotDescriptor(s)) => s,
+            _ => {
+                return Err(crate::error::type_error(format!(
+                    "descriptor '{op}' requires a 'member_descriptor' object"
+                )))
+            }
+        };
+        let obj = args.get(1).ok_or_else(|| {
+            crate::error::type_error(format!("descriptor '{}' of object needs an argument", slot.name))
+        })?;
+        Ok((slot, obj))
+    }
+    /// CPython `descr_check`: the receiver must be a *real* instance of
+    /// the declaring class (virtual/ABC registration doesn't count).
+    fn check_receiver(
+        slot: &crate::object::SlotDescriptor,
+        obj: &Object,
+    ) -> Result<crate::sync::Rc<crate::types::PyInstance>, RuntimeError> {
+        if let Object::Instance(inst) = obj {
+            let owns = inst
+                .cls()
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| t.name == slot.class_name && t.slot_names.borrow().iter().any(|n| *n == slot.name));
+            if owns {
+                return Ok(inst.clone());
+            }
+        }
+        Err(crate::error::type_error(format!(
+            "descriptor '{}' for '{}' objects doesn't apply to a '{}' object",
+            slot.name,
+            slot.class_name,
+            obj.type_name()
+        )))
+    }
+    fn member_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (slot, obj) = slot_and_receiver(args, "__get__")?;
+        if matches!(obj, Object::None) {
+            return Ok(args[0].clone());
+        }
+        let inst = check_receiver(slot, obj)?;
+        inst.slot_get(&slot.name).ok_or_else(|| {
+            crate::error::attribute_error(format!(
+                "'{}' object has no attribute '{}'",
+                inst.cls().name,
+                slot.name
+            ))
+        })
+    }
+    fn member_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (slot, obj) = slot_and_receiver(args, "__set__")?;
+        let inst = check_receiver(slot, obj)?;
+        let value = args
+            .get(2)
+            .cloned()
+            .ok_or_else(|| crate::error::type_error("__set__ expected 2 arguments"))?;
+        inst.slot_set(&slot.name, value);
+        Ok(Object::None)
+    }
+    fn member_delete(args: &[Object]) -> Result<Object, RuntimeError> {
+        let (slot, obj) = slot_and_receiver(args, "__delete__")?;
+        let inst = check_receiver(slot, obj)?;
+        if !inst.slot_del(&slot.name) {
+            return Err(crate::error::attribute_error(format!(
+                "'{}' object has no attribute '{}'",
+                inst.cls().name,
+                slot.name
+            )));
+        }
+        Ok(Object::None)
+    }
+    let mut td = member_.dict.borrow_mut();
+    for (name, f) in [
+        ("__get__", member_get as fn(&[Object]) -> Result<Object, RuntimeError>),
+        ("__set__", member_set),
+        ("__delete__", member_delete),
+    ] {
+        td.insert(
+            DictKey(Object::from_static(name)),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name,
+                binds_instance: true,
+                call: Box::new(f),
+                call_kw: None,
+            })),
         );
     }
 }

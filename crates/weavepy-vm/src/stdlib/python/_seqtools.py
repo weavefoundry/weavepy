@@ -142,6 +142,34 @@ class _CallableIter:
         return (_iter, (self._callable, self._sentinel))
 
 
+def _hold_iter(obj):
+    """The iterator to *store* for a lazy builtin (map/zip/filter/...).
+
+    CPython stores ``PyObject_GetIter(obj)``, which is ``obj`` itself for
+    any self-iterating type. WeavePy's itertools classes return their
+    native core from ``__iter__`` as a speed path, so calling ``iter()``
+    here would erase the type — breaking ``__reduce__``-based pickling
+    and ``copy.deepcopy`` of e.g. ``map(f, 'abc', count())``. Keep
+    proper iterators (both ``__iter__`` and ``__next__``, like CPython's
+    ``PyIter_Check`` after ``GetIter``) as-is; everything else goes
+    through ``iter()`` so non-iterables raise TypeError at construction.
+    """
+    tp = type(obj)
+    if hasattr(tp, "__next__") and hasattr(tp, "__iter__"):
+        return obj
+    return iter(obj)
+
+
+def _reject_subclass_kwargs(cls, base, name, kwargs):
+    """CPython's builtin-iterator constructor rule (bpo-43413): keyword
+    arguments are rejected when constructing the exact builtin type, or a
+    subclass that did not override ``__init__`` (so nothing would consume
+    them). A subclass with its own ``__init__`` receives and handles them.
+    """
+    if kwargs and (cls is base or cls.__init__ is object.__init__):
+        raise TypeError(f"{name}() takes no keyword arguments")
+
+
 class _FilterIter:
     """Lazy ``filter(func, iterable)`` — CPython's ``filterobject``.
 
@@ -149,13 +177,20 @@ class _FilterIter:
     filtering an unbounded source (``filter(p, itertools.count())``)
     terminates and predicate side effects interleave with consumption
     exactly as in CPython.
+
+    Setup happens in ``__new__`` (CPython's ``tp_new``) so subclasses may
+    override ``__new__``/``__init__`` independently, exactly like
+    subclassing the real ``filter`` type.
     """
 
     __slots__ = ("_func", "_it")
 
-    def __init__(self, func, iterable):
+    def __new__(cls, func, iterable, **kwargs):
+        _reject_subclass_kwargs(cls, _FilterIter, "filter", kwargs)
+        self = object.__new__(cls)
         self._func = func
-        self._it = iter(iterable)
+        self._it = _hold_iter(iterable)
+        return self
 
     def __iter__(self):
         return self
@@ -185,9 +220,12 @@ class _MapIter:
 
     __slots__ = ("_func", "_iters")
 
-    def __init__(self, func, *iterables):
+    def __new__(cls, func, *iterables, **kwargs):
+        _reject_subclass_kwargs(cls, _MapIter, "map", kwargs)
+        self = object.__new__(cls)
         self._func = func
-        self._iters = tuple(iter(it) for it in iterables)
+        self._iters = tuple(_hold_iter(it) for it in iterables)
+        return self
 
     def __iter__(self):
         return self
@@ -200,6 +238,32 @@ class _MapIter:
 
     def __reduce__(self):
         return (map, (self._func,) + self._iters)
+
+
+class _EnumerateIter:
+    """Lazy ``enumerate(iterable, start=0)`` — CPython's ``enumobject``.
+
+    Pulls one element per ``__next__`` so enumerating unbounded sources
+    (``enumerate(itertools.count())``) works, matching CPython.
+    """
+
+    __slots__ = ("_it", "_index")
+
+    def __init__(self, iterable, start=0):
+        self._it = _hold_iter(iterable)
+        self._index = start
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        value = next(self._it)
+        index = self._index
+        self._index = index + 1
+        return (index, value)
+
+    def __reduce__(self):
+        return (enumerate, (self._it, self._index))
 
 
 def _zip_arg_range(count):
@@ -217,9 +281,11 @@ class _ZipIter:
 
     __slots__ = ("_iters", "_strict")
 
-    def __init__(self, strict, *iterables):
-        self._iters = tuple(iter(it) for it in iterables)
+    def __new__(cls, *iterables, strict=False):
+        self = object.__new__(cls)
+        self._iters = tuple(_hold_iter(it) for it in iterables)
         self._strict = strict
+        return self
 
     def __iter__(self):
         return self

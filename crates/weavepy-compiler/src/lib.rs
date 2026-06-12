@@ -2509,6 +2509,41 @@ impl Compiler {
         inner.emit(OpCode::LoadConst, qualname_const);
         inner.emit(OpCode::StoreName, qualname_idx);
 
+        // CPython 3.13 compiler extras: `__firstlineno__` (the line of
+        // the `class` statement) and `__static_attributes__` (sorted
+        // names assigned through `self.X` in any method body).
+        {
+            let line_const = inner
+                .co
+                .intern_constant(Constant::Int(self.current_line as i64));
+            let line_name = inner.co.intern_name("__firstlineno__");
+            inner.emit(OpCode::LoadConst, line_const);
+            inner.emit(OpCode::StoreName, line_name);
+
+            let mut attrs: HashSet<String> = HashSet::new();
+            for s in body {
+                if let StmtKind::FunctionDef { args, body: fbody, .. }
+                | StmtKind::AsyncFunctionDef { args, body: fbody, .. } = &s.kind
+                {
+                    let self_name = args
+                        .posonlyargs
+                        .first()
+                        .or_else(|| args.args.first())
+                        .map(|a| a.name.clone());
+                    if let Some(self_name) = self_name {
+                        collect_self_attr_stores(fbody, &self_name, &mut attrs);
+                    }
+                }
+            }
+            let mut attrs: Vec<String> = attrs.into_iter().collect();
+            attrs.sort();
+            let tup = Constant::Tuple(attrs.into_iter().map(Constant::Str).collect());
+            let tup_const = inner.co.intern_constant(tup);
+            let tup_name = inner.co.intern_name("__static_attributes__");
+            inner.emit(OpCode::LoadConst, tup_const);
+            inner.emit(OpCode::StoreName, tup_name);
+        }
+
         // CPython stores a class body's leading string literal as
         // `__doc__` via a `STORE_NAME` at the top of the body. Mirror
         // that so `Cls.__doc__` is faithful (classes without a docstring
@@ -5676,6 +5711,83 @@ fn collect_inner_free_expr(
             collect_inner_free_expr(value, outer_bindings, out);
         }
         ExprKind::Name(_) | ExprKind::Constant(_) => {}
+    }
+}
+
+/// Collect attribute names assigned through the method's first
+/// parameter (`self.x = …`, including tuple unpacking, `for self.x in`,
+/// `with … as self.x`, augmented and annotated assignment) — the
+/// contents of CPython 3.13's `__static_attributes__` class tuple.
+fn collect_self_attr_stores(stmts: &[Stmt], self_name: &str, out: &mut HashSet<String>) {
+    fn target(e: &Expr, self_name: &str, out: &mut HashSet<String>) {
+        match &e.kind {
+            ExprKind::Attribute { value, attr } => {
+                if matches!(&value.kind, ExprKind::Name(n) if n == self_name) {
+                    out.insert(attr.clone());
+                }
+            }
+            ExprKind::Tuple(elts) | ExprKind::List(elts) => {
+                for el in elts {
+                    target(el, self_name, out);
+                }
+            }
+            ExprKind::Starred(inner) => target(inner, self_name, out),
+            _ => {}
+        }
+    }
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Assign { targets, .. } => {
+                for t in targets {
+                    target(t, self_name, out);
+                }
+            }
+            StmtKind::AugAssign { target: t, .. } | StmtKind::AnnAssign { target: t, .. } => {
+                target(t, self_name, out);
+            }
+            StmtKind::For {
+                target: t,
+                body,
+                orelse,
+                ..
+            }
+            | StmtKind::AsyncFor {
+                target: t,
+                body,
+                orelse,
+                ..
+            } => {
+                target(t, self_name, out);
+                collect_self_attr_stores(body, self_name, out);
+                collect_self_attr_stores(orelse, self_name, out);
+            }
+            StmtKind::While { body, orelse, .. } | StmtKind::If { body, orelse, .. } => {
+                collect_self_attr_stores(body, self_name, out);
+                collect_self_attr_stores(orelse, self_name, out);
+            }
+            StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
+                for it in items {
+                    if let Some(v) = &it.optional_vars {
+                        target(v, self_name, out);
+                    }
+                }
+                collect_self_attr_stores(body, self_name, out);
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                collect_self_attr_stores(body, self_name, out);
+                for h in handlers {
+                    collect_self_attr_stores(&h.body, self_name, out);
+                }
+                collect_self_attr_stores(orelse, self_name, out);
+                collect_self_attr_stores(finalbody, self_name, out);
+            }
+            _ => {}
+        }
     }
 }
 

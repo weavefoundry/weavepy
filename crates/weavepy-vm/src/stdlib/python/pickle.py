@@ -71,6 +71,19 @@ REDUCE = b"R"
 BUILD = b"b"
 NEWOBJ = b"\x81"
 NEWOBJ_EX = b"\x92"
+# Protocol-0 text opcodes — never *emitted* here (we write protocol 2+
+# framing), but historical pickles (e.g. CPython's cross-version
+# compatibility blobs in Lib/test) still carry them on the read side.
+INT = b"I"
+LONG = b"L"
+FLOAT = b"F"
+STRING = b"S"
+UNICODE = b"V"
+LIST = b"l"
+DICT = b"d"
+APPEND = b"a"
+SETITEM = b"s"
+DUP = b"2"
 
 # --- exceptions -----------------------------------------------------------
 
@@ -341,14 +354,26 @@ class _Pickler:
         # items, so a self-referential object can back-reference itself.
         if obj is not None:
             self._memoize(obj)
+        # CPython `Pickler._batch_appends` / `_batch_setitems`: drain the
+        # iterators in MARK…APPENDS / MARK…SETITEMS batches so the loader
+        # folds the items back into the object on the stack.
         if listitems is not None:
-            for item in listitems:
-                self._save(item)
-                self._buf.write(APPENDS[:0])  # no-op; preserves stack
+            items = list(listitems)
+            for start in range(0, len(items), 1000):
+                batch = items[start : start + 1000]
+                self._buf.write(MARK)
+                for item in batch:
+                    self._save(item)
+                self._buf.write(APPENDS)
         if dictitems is not None:
-            for k, v in dictitems:
-                self._save(k)
-                self._save(v)
+            items = list(dictitems)
+            for start in range(0, len(items), 1000):
+                batch = items[start : start + 1000]
+                self._buf.write(MARK)
+                for k, v in batch:
+                    self._save(k)
+                    self._save(v)
+                self._buf.write(SETITEMS)
         if state is not None:
             self._save(state)
             self._buf.write(BUILD)
@@ -779,6 +804,69 @@ def _newobj(u):
     u.stack.append(cls.__new__(cls, *args))
 
 
+def _int_op(u):
+    # Protocol-0 INT covers booleans too: `I00`/`I01` are False/True.
+    data = _read_line(u)
+    if data == b"00":
+        u.stack.append(False)
+    elif data == b"01":
+        u.stack.append(True)
+    else:
+        u.stack.append(int(data))
+
+
+def _long_op(u):
+    data = _read_line(u)
+    if data.endswith(b"L"):
+        data = data[:-1]
+    u.stack.append(int(data))
+
+
+def _float_op(u):
+    u.stack.append(float(_read_line(u)))
+
+
+def _string_op(u):
+    data = _read_line(u).decode("latin-1")
+    # Repr-quoted: strip the matching quotes and unescape.
+    if len(data) >= 2 and data[0] == data[-1] and data[0] in "\"'":
+        data = data[1:-1]
+    else:
+        raise UnpicklingError("the STRING opcode argument must be quoted")
+    u.stack.append(data.encode("latin-1").decode("unicode_escape"))
+
+
+def _unicode_op(u):
+    u.stack.append(_read_line(u).decode("raw-unicode-escape"))
+
+
+def _list_op(u):
+    u.stack.append(u._pop_to_mark())
+
+
+def _dict_op(u):
+    items = u._pop_to_mark()
+    d = {}
+    for i in range(0, len(items), 2):
+        d[items[i]] = items[i + 1]
+    u.stack.append(d)
+
+
+def _append(u):
+    value = u.stack.pop()
+    u.stack[-1].append(value)
+
+
+def _setitem(u):
+    value = u.stack.pop()
+    key = u.stack.pop()
+    u.stack[-1][key] = value
+
+
+def _dup(u):
+    u.stack.append(u.stack[-1])
+
+
 def _newobj_ex(u):
     kwargs = u.stack.pop()
     args = u.stack.pop()
@@ -836,6 +924,16 @@ _OPCODES = {
     BUILD: _build,
     NEWOBJ: _newobj,
     NEWOBJ_EX: _newobj_ex,
+    INT: _int_op,
+    LONG: _long_op,
+    FLOAT: _float_op,
+    STRING: _string_op,
+    UNICODE: _unicode_op,
+    LIST: _list_op,
+    DICT: _dict_op,
+    APPEND: _append,
+    SETITEM: _setitem,
+    DUP: _dup,
 }
 
 

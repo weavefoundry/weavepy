@@ -1347,7 +1347,11 @@ pub(crate) fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn
             Ok(Object::Bool(v.is_truthy()))
         }),
         "__abs__" => method("__abs__", |args| {
-            b_abs(std::slice::from_ref(args.first().unwrap_or(&Object::None)))
+            let v = args.first().cloned().unwrap_or(Object::None);
+            // Unwrap a builtin-subclass receiver to its native payload
+            // (`abs(IntSubclass(0))` routes here via the type-dict slot).
+            let v = v.native_value().unwrap_or(v);
+            b_abs(std::slice::from_ref(&v))
         }),
         "__eq__" => num_cmp_method("__eq__", kind, CmpDun::Eq),
         "__ne__" => num_cmp_method("__ne__", kind, CmpDun::Ne),
@@ -2584,7 +2588,11 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             match name {
                 "__name__" | "__qualname__" => Some(Object::from_str(&t.name)),
                 "__bases__" => Some(Object::new_tuple(
-                    t.bases.iter().map(|b| Object::Type(b.clone())).collect(),
+                    t.bases
+                        .borrow()
+                        .iter()
+                        .map(|b| Object::Type(b.clone()))
+                        .collect(),
                 )),
                 "__mro__" => Some(Object::new_tuple(
                     t.mro
@@ -5405,7 +5413,7 @@ fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object {
     let proxy = Rc::new(TypeObject {
         name: "super".to_owned(),
         qualname: RefCell::new(None),
-        bases: vec![],
+        bases: RefCell::new(vec![]),
         mro: RefCell::new(vec![]),
         dict: Rc::new(RefCell::new({
             let mut d = DictData::new();
@@ -5418,6 +5426,7 @@ fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object {
         flags: crate::types::TypeFlags::default(),
         metaclass: RefCell::new(None),
         slot_names: RefCell::new(Vec::new()),
+        declares_slots: crate::sync::Cell::new(false),
         forbids_dict: false,
         subclasses: RefCell::new(Vec::new()),
         getattribute_kind: crate::sync::Cell::new(0),
@@ -5476,12 +5485,13 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
     let proxy = Rc::new(TypeObject {
         name: format!("super<{}>", class.name),
         qualname: RefCell::new(None),
-        bases: after.clone(),
+        bases: RefCell::new(after.clone()),
         mro: RefCell::new(after),
         dict: Rc::new(RefCell::new(DictData::new())),
         flags: crate::types::TypeFlags::default(),
         metaclass: RefCell::new(None),
         slot_names: RefCell::new(Vec::new()),
+        declares_slots: crate::sync::Cell::new(false),
         forbids_dict: false,
         subclasses: RefCell::new(Vec::new()),
         getattribute_kind: crate::sync::Cell::new(0),
@@ -8329,6 +8339,25 @@ fn bytes_data(args: &[Object]) -> Result<Vec<u8>, RuntimeError> {
     }
 }
 
+/// Run `f` over the receiver's bytes *without* copying them. The search
+/// family (`find`/`rfind`/`count`/`index`/`rindex`) is called in tight
+/// loops over megabyte haystacks (test_bytes' fastsearch suite); a
+/// per-call `to_vec` of the haystack turns the O(n+m) search into an
+/// O(n) copy per call and blows the suite's time budget.
+fn with_bytes_data<R>(
+    args: &[Object],
+    f: impl FnOnce(&[u8]) -> Result<R, RuntimeError>,
+) -> Result<R, RuntimeError> {
+    match args.first() {
+        Some(Object::Bytes(b)) => f(b),
+        Some(Object::ByteArray(b)) => {
+            let guard = b.borrow();
+            f(&guard)
+        }
+        _ => Err(type_error("expected bytes-like receiver")),
+    }
+}
+
 fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
     match arg {
         Object::Bytes(b) => Ok(b.to_vec()),
@@ -8613,36 +8642,38 @@ fn bytes_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bytes_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
     bytes_search_arity("startswith", args)?;
-    let data = bytes_data(args)?;
     let target = args
         .get(1)
         .ok_or_else(|| type_error("startswith() expected 1 arg"))?;
-    let (start, end, invalid) = bytes_search_range(args, data.len());
-    if invalid {
-        return Ok(Object::Bool(false));
-    }
-    Ok(Object::Bool(bytes_match_prefix_suffix(
-        &data[start..end],
-        target,
-        true,
-    )?))
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid {
+            return Ok(Object::Bool(false));
+        }
+        Ok(Object::Bool(bytes_match_prefix_suffix(
+            &data[start..end],
+            target,
+            true,
+        )?))
+    })
 }
 
 fn bytes_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
     bytes_search_arity("endswith", args)?;
-    let data = bytes_data(args)?;
     let target = args
         .get(1)
         .ok_or_else(|| type_error("endswith() expected 1 arg"))?;
-    let (start, end, invalid) = bytes_search_range(args, data.len());
-    if invalid {
-        return Ok(Object::Bool(false));
-    }
-    Ok(Object::Bool(bytes_match_prefix_suffix(
-        &data[start..end],
-        target,
-        false,
-    )?))
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid {
+            return Ok(Object::Bool(false));
+        }
+        Ok(Object::Bool(bytes_match_prefix_suffix(
+            &data[start..end],
+            target,
+            false,
+        )?))
+    })
 }
 
 fn bytes_match_prefix_suffix(
@@ -8782,12 +8813,13 @@ fn bytes_find(args: &[Object]) -> Result<Object, RuntimeError> {
         args.get(1)
             .ok_or_else(|| type_error("find() expected 1 arg"))?,
     )?;
-    let data = bytes_data(args)?;
-    let (start, end, invalid) = bytes_search_range(args, data.len());
-    if invalid {
-        return Ok(Object::Int(-1));
-    }
-    Ok(Object::Int(bytes_find_in(&data, &sub, start, end)))
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid {
+            return Ok(Object::Int(-1));
+        }
+        Ok(Object::Int(bytes_find_in(data, &sub, start, end)))
+    })
 }
 
 fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8797,17 +8829,18 @@ fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
         args.get(1)
             .ok_or_else(|| type_error("rfind() expected 1 arg"))?,
     )?;
-    let data = bytes_data(args)?;
-    let (start, end, invalid) = bytes_search_range(args, data.len());
-    if invalid || end > data.len() {
-        return Ok(Object::Int(-1));
-    }
-    if sub.is_empty() {
-        return Ok(Object::Int(end as i64));
-    }
-    let last = memchr::memmem::rfind(&data[start..end], &sub)
-        .map_or(-1, |i| (start + i) as i64);
-    Ok(Object::Int(last))
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid || end > data.len() {
+            return Ok(Object::Int(-1));
+        }
+        if sub.is_empty() {
+            return Ok(Object::Int(end as i64));
+        }
+        let last = memchr::memmem::rfind(&data[start..end], &sub)
+            .map_or(-1, |i| (start + i) as i64);
+        Ok(Object::Int(last))
+    })
 }
 
 fn bytes_index(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8833,17 +8866,18 @@ fn bytes_count(args: &[Object]) -> Result<Object, RuntimeError> {
         args.get(1)
             .ok_or_else(|| type_error("count() expected 1 arg"))?,
     )?;
-    let data = bytes_data(args)?;
-    let (start, end, invalid) = bytes_search_range(args, data.len());
-    if invalid {
-        return Ok(Object::Int(0));
-    }
-    if sub.is_empty() {
-        return Ok(Object::Int((end - start) as i64 + 1));
-    }
-    // Non-overlapping occurrences, like CPython's `stringlib_count`.
-    let n = memchr::memmem::find_iter(&data[start..end], &sub).count() as i64;
-    Ok(Object::Int(n))
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid {
+            return Ok(Object::Int(0));
+        }
+        if sub.is_empty() {
+            return Ok(Object::Int((end - start) as i64 + 1));
+        }
+        // Non-overlapping occurrences, like CPython's `stringlib_count`.
+        let n = memchr::memmem::find_iter(&data[start..end], &sub).count() as i64;
+        Ok(Object::Int(n))
+    })
 }
 
 /// CPython parity: the no-argument bytes/bytearray methods

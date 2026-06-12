@@ -847,7 +847,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                     visit(v);
                 }
             }
-            for base in &t.bases {
+            for base in t.bases.borrow().iter() {
                 visit(&Object::Type(base.clone()));
             }
             // The MRO holds strong refs — including one to the class

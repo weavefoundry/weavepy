@@ -46,6 +46,13 @@ def traceback_print(tb, file):
     file.write("\n".join(kept) + "\n")
 
 
+def bad_get(self, obj, cls):
+    # C helper used as a `__get__` replacement (bpo-25750): it calls the
+    # owning class mid-dispatch, which clobbers the descriptor out of
+    # the class dict — the regression test just checks we don't crash.
+    return cls()
+
+
 def run_in_subinterp(code):
     # Py_NewInterpreter + PyRun_SimpleString: execute `code` in a fresh
     # interpreter namespace; uncaught exceptions are printed to stderr

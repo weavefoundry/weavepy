@@ -208,6 +208,10 @@ def _decode_source(raw):
         encoding = _coding_cookie(line)
         if encoding is not None:
             return raw.decode(encoding)
+        # A cookie on line 2 only counts if line 1 is blank or a comment.
+        stripped = line.strip(b" \t\x0c\r")
+        if stripped and not stripped.startswith(b"#"):
+            break
     return raw.decode("utf-8")
 
 

@@ -1,16 +1,17 @@
 """WeavePy's ``itertools`` module.
 
-Unlike the previous generator-based implementation, every tool here is
-a *class* whose instances mirror CPython's C iterator objects: the
-constructor signatures (positional/keyword acceptance), ``__reduce__``
-/ ``__setstate__`` pickling protocol, ``__repr__`` (count / repeat),
-subclassing behaviour and lazy argument-error timing all match
-CPython 3.13.
+Every tool here is a *class* whose instances mirror CPython's C
+iterator objects: the constructor signatures (positional/keyword
+acceptance), ``__reduce__`` / ``__setstate__`` pickling protocol,
+``__repr__`` (count / repeat), subclassing behaviour and lazy
+argument-error timing all match CPython 3.13.
 
-Hot inner loops (``islice``, ``repeat``, ``tee``) delegate to native
-cores from ``_itertools`` when available so stepping them adds no
-Python frame; pure-Python core classes provide identical semantics as
-a fallback.
+The data plane is split out into *cores*: when the native
+``_itertools`` module is available (always, under WeavePy) each class
+delegates iteration to a native core whose stepping adds no Python
+frame; otherwise a pure-Python core class with an identical state
+layout takes its place (which is how this module is validated against
+CPython's test suite under real CPython).
 """
 
 import sys as _sys
@@ -102,26 +103,26 @@ def _is_iterator(obj):
 
 
 # ---------------------------------------------------------------------------
-# Native cores (optional). Each has a pure-Python twin with the same
-# protocol: the wrapper classes below only ever talk to a "core".
+# Cores. Native versions come from `_itertools`; the pure-Python twins
+# below expose the exact same constructor arguments and `state()`
+# layout so the wrapper classes never care which one they hold.
 # ---------------------------------------------------------------------------
 
 try:
-    from _itertools import (
-        islice_core as _native_islice_core,
-        lazy_state as _native_lazy_state,
-        islice_set_cnt as _native_islice_set_cnt,
-        repeat_core as _native_repeat_core,
-        tee_core as _native_tee_core,
-    )
+    import _itertools as _n
 
     _HAVE_NATIVE = True
 except ImportError:
     _HAVE_NATIVE = False
 
 
-class _PyIsliceCore:
-    __slots__ = ("source", "next_idx", "pos", "stop", "step")
+class _PyCoreBase:
+    def __iter__(self):
+        return self
+
+
+class _PyIsliceCore(_PyCoreBase):
+    __slots__ = ("source", "next_idx", "pos", "stop", "step", "done")
 
     def __init__(self, source, start, stop, step):
         self.source = source
@@ -129,27 +130,27 @@ class _PyIsliceCore:
         self.pos = 0
         self.stop = stop
         self.step = step
-
-    def __iter__(self):
-        return self
+        self.done = False
 
     def __next__(self):
         # CPython's islice_next order: consume the skipped elements
         # first, *then* check the stop bound — `islice(it, 3, 3)`
         # advances `it` by three even though it yields nothing.
-        src = self.source
-        if src is None:
+        if self.done:
             raise StopIteration
+        src = self.source
         try:
             while self.pos < self.next_idx:
                 next(src)
                 self.pos += 1
             stop = self.stop
             if stop is not None and self.pos >= stop:
+                self.done = True
                 self.source = None
                 raise StopIteration
             item = next(src)
         except StopIteration:
+            self.done = True
             self.source = None
             raise
         self.pos += 1
@@ -161,21 +162,15 @@ class _PyIsliceCore:
 
     def state(self):
         return (self.source, self.next_idx, self.pos, self.stop, self.step,
-                self.source is None)
-
-    def set_cnt(self, cnt):
-        self.pos = cnt
+                self.done)
 
 
-class _PyRepeatCore:
+class _PyRepeatCore(_PyCoreBase):
     __slots__ = ("obj", "times")
 
     def __init__(self, obj, times):
         self.obj = obj
         self.times = times
-
-    def __iter__(self):
-        return self
 
     def __next__(self):
         t = self.times
@@ -189,44 +184,13 @@ class _PyRepeatCore:
     def state(self):
         return (self.obj, self.times)
 
-    def set_times(self, times):
-        self.times = times
 
-
-class _tee_dataobject:
-    """Data container shared by the branches of one ``tee()`` call.
-
-    Pickling two branches of the same tee in one dump must reconnect
-    them to a single shared buffer on load — sharing happens through
-    this object (pickle's memo deduplicates it), like CPython's
-    ``itertools._tee_dataobject``.
-    """
-
-    def __init__(self, source):
-        self.source = source
-        self.buffer = []
-        self.busy = False
-
-    def __reduce__(self):
-        _pickle_deprecated()
-        return (_tee_dataobject_reconstruct, (self.source, self.buffer))
-
-
-def _tee_dataobject_reconstruct(source, buffer):
-    data = _tee_dataobject(source)
-    data.buffer = buffer
-    return data
-
-
-class _PyTeeCore:
+class _PyTeeCore(_PyCoreBase):
     __slots__ = ("data", "index")
 
     def __init__(self, data, index):
         self.data = data
         self.index = index
-
-    def __iter__(self):
-        return self
 
     def __next__(self):
         sh = self.data
@@ -252,50 +216,538 @@ class _PyTeeCore:
         self.index = i + 1
         return value
 
+    def state(self):
+        return (self.data, self.index)
+
+
+class _PyCountCore(_PyCoreBase):
+    __slots__ = ("current", "step")
+
+    def __init__(self, current, step):
+        self.current = current
+        self.step = step
+
+    def __next__(self):
+        v = self.current
+        self.current = v + self.step
+        return v
+
+    def state(self):
+        return (self.current, self.step)
+
+
+class _PyCycleCore(_PyCoreBase):
+    __slots__ = ("source", "saved", "index", "firstpass")
+
+    def __init__(self, source, saved, index, firstpass):
+        self.source = source
+        self.saved = saved
+        self.index = index
+        self.firstpass = firstpass
+
+    def __next__(self):
+        src = self.source
+        if src is not None:
+            try:
+                item = next(src)
+            except StopIteration:
+                self.source = None
+            else:
+                if not self.firstpass:
+                    self.saved.append(item)
+                return item
+        saved = self.saved
+        if not saved:
+            raise StopIteration
+        i = self.index
+        item = saved[i]
+        i += 1
+        if i >= len(saved):
+            i = 0
+        self.index = i
+        return item
+
+    def state(self):
+        return (self.source, self.saved, self.index, self.firstpass)
+
+
+class _PyChainCore(_PyCoreBase):
+    __slots__ = ("source", "active")
+
+    def __init__(self, source, active):
+        self.source = source
+        self.active = active
+
+    def __next__(self):
+        while True:
+            source = self.source
+            if source is None:
+                raise StopIteration
+            active = self.active
+            if active is None:
+                try:
+                    iterable = next(source)
+                except StopIteration:
+                    self.source = None
+                    raise
+                except BaseException:
+                    self.source = None
+                    raise
+                try:
+                    active = iter(iterable)
+                except BaseException:
+                    self.source = None
+                    raise
+                self.active = active
+            try:
+                return next(active)
+            except StopIteration:
+                self.active = None
+            except BaseException:
+                self.source = None
+                self.active = None
+                raise
+
+    def state(self):
+        return (self.source, self.active)
+
+
+class _PyCompressCore(_PyCoreBase):
+    __slots__ = ("data", "selectors")
+
+    def __init__(self, data, selectors):
+        self.data = data
+        self.selectors = selectors
+
+    def __next__(self):
+        data = self.data
+        selectors = self.selectors
+        while True:
+            item = next(data)
+            keep = next(selectors)
+            if keep:
+                return item
+
+    def state(self):
+        return (self.data, self.selectors)
+
+
+class _PyDropWhileCore(_PyCoreBase):
+    __slots__ = ("func", "source", "started")
+
+    def __init__(self, func, source, started):
+        self.func = func
+        self.source = source
+        self.started = started
+
+    def __next__(self):
+        it = self.source
+        func = self.func
+        while True:
+            item = next(it)
+            if self.started:
+                return item
+            if not func(item):
+                self.started = True
+                return item
+
+    def state(self):
+        return (self.func, self.source, self.started)
+
+
+class _PyTakeWhileCore(_PyCoreBase):
+    __slots__ = ("func", "source", "stopped")
+
+    def __init__(self, func, source, stopped):
+        self.func = func
+        self.source = source
+        self.stopped = stopped
+
+    def __next__(self):
+        if self.stopped:
+            raise StopIteration
+        item = next(self.source)
+        if self.func(item):
+            return item
+        self.stopped = True
+        raise StopIteration
+
+    def state(self):
+        return (self.func, self.source, self.stopped)
+
+
+class _PyFilterFalseCore(_PyCoreBase):
+    __slots__ = ("func", "source")
+
+    def __init__(self, func, source):
+        self.func = func
+        self.source = source
+
+    def __next__(self):
+        func = self.func
+        it = self.source
+        while True:
+            item = next(it)
+            if func is None or func is bool:
+                if not item:
+                    return item
+            elif not func(item):
+                return item
+
+    def state(self):
+        return (self.func, self.source)
+
+
+class _PyStarMapCore(_PyCoreBase):
+    __slots__ = ("func", "source")
+
+    def __init__(self, func, source):
+        self.func = func
+        self.source = source
+
+    def __next__(self):
+        args = next(self.source)
+        if not isinstance(args, tuple):
+            args = tuple(args)
+        return self.func(*args)
+
+    def state(self):
+        return (self.func, self.source)
+
+
+class _PyPairwiseCore(_PyCoreBase):
+    __slots__ = ("source", "old")
+
+    def __init__(self, source):
+        self.source = source
+        self.old = None
+
+    def __next__(self):
+        it = self.source
+        if it is None:
+            raise StopIteration
+        old = self.old
+        if old is None:
+            try:
+                old = next(it)
+            except StopIteration:
+                self.source = None
+                self.old = None
+                raise
+        try:
+            new = next(it)
+        except StopIteration:
+            self.source = None
+            self.old = None
+            raise
+        self.old = new
+        return (old, new)
+
+    def state(self):
+        return (self.source, self.old)
+
+
+class _PyZipLongestCore(_PyCoreBase):
+    __slots__ = ("iters", "fillvalue", "numactive")
+
+    def __init__(self, fillvalue, iters):
+        self.iters = list(iters)
+        self.fillvalue = fillvalue
+        self.numactive = sum(1 for it in self.iters if it is not None)
+
+    def __next__(self):
+        iters = self.iters
+        if not iters or self.numactive <= 0:
+            raise StopIteration
+        fillvalue = self.fillvalue
+        result = []
+        for i, it in enumerate(iters):
+            if it is None:
+                result.append(fillvalue)
+                continue
+            try:
+                value = next(it)
+            except StopIteration:
+                self.numactive -= 1
+                if self.numactive <= 0:
+                    raise
+                iters[i] = None
+                result.append(fillvalue)
+            else:
+                result.append(value)
+        return tuple(result)
+
+    def state(self):
+        return (self.fillvalue, self.numactive, tuple(self.iters))
+
+
+class _PyAccumulateCore(_PyCoreBase):
+    __slots__ = ("source", "func", "has_total", "total", "initial")
+
+    def __init__(self, source, func, has_total, total, initial):
+        self.source = source
+        self.func = func
+        self.has_total = bool(has_total)
+        self.total = total
+        self.initial = initial
+
+    def __next__(self):
+        initial = self.initial
+        if initial is not None:
+            self.initial = None
+            self.has_total = True
+            self.total = initial
+            return initial
+        if not self.has_total:
+            total = next(self.source)
+            self.has_total = True
+            self.total = total
+            return total
+        item = next(self.source)
+        func = self.func
+        if func is None:
+            total = self.total + item
+        else:
+            total = func(self.total, item)
+        self.total = total
+        return total
+
+    def state(self):
+        return (self.source, self.func, self.has_total, self.total,
+                self.initial)
+
+
+class _PyProductCore(_PyCoreBase):
+    __slots__ = ("pools", "indices", "started", "stopped")
+
+    def __init__(self, pools, indices, started, stopped):
+        self.pools = pools
+        self.indices = list(indices) if indices is not None else [0] * len(pools)
+        self.started = started
+        self.stopped = stopped
+
+    def __next__(self):
+        if self.stopped:
+            raise StopIteration
+        pools = self.pools
+        n = len(pools)
+        indices = self.indices
+        if not self.started:
+            for pool in pools:
+                if not pool:
+                    self.stopped = True
+                    raise StopIteration
+            self.started = True
+            return tuple(pool[0] for pool in pools)
+        i = n - 1
+        while i >= 0:
+            indices[i] += 1
+            if indices[i] < len(pools[i]):
+                break
+            indices[i] = 0
+            i -= 1
+        else:
+            self.stopped = True
+            raise StopIteration
+        return tuple(pool[idx] for pool, idx in zip(pools, indices))
+
+    def state(self):
+        return (self.pools, tuple(self.indices), self.started, self.stopped)
+
+
+class _PyPermutationsCore(_PyCoreBase):
+    __slots__ = ("pool", "r", "indices", "cycles", "started", "stopped")
+
+    def __init__(self, pool, r, indices, cycles, started, stopped):
+        n = len(pool)
+        self.pool = pool
+        self.r = r
+        self.indices = list(indices) if indices is not None else list(range(n))
+        self.cycles = list(cycles) if cycles is not None else list(range(n, n - r, -1))
+        self.started = started
+        self.stopped = stopped
+
+    def __next__(self):
+        if self.stopped:
+            raise StopIteration
+        pool = self.pool
+        indices = self.indices
+        cycles = self.cycles
+        r = self.r
+        n = len(pool)
+        if not self.started:
+            self.started = True
+            return tuple(pool[indices[i]] for i in range(r))
+        if not n:
+            self.stopped = True
+            raise StopIteration
+        i = r - 1
+        while i >= 0:
+            cycles[i] -= 1
+            if cycles[i] == 0:
+                indices[i:] = indices[i + 1:] + indices[i:i + 1]
+                cycles[i] = n - i
+            else:
+                j = cycles[i]
+                indices[i], indices[-j] = indices[-j], indices[i]
+                return tuple(pool[indices[k]] for k in range(r))
+            i -= 1
+        self.stopped = True
+        raise StopIteration
+
+    def state(self):
+        return (self.pool, self.r, tuple(self.indices), tuple(self.cycles),
+                self.started, self.stopped)
+
+
+class _PyCombinationsCore(_PyCoreBase):
+    __slots__ = ("pool", "r", "indices", "started", "stopped")
+
+    def __init__(self, pool, r, indices, started, stopped):
+        self.pool = pool
+        self.r = r
+        self.indices = list(indices) if indices is not None else list(range(r))
+        self.started = started
+        self.stopped = stopped
+
+    def __next__(self):
+        if self.stopped:
+            raise StopIteration
+        pool = self.pool
+        indices = self.indices
+        r = self.r
+        n = len(pool)
+        if not self.started:
+            self.started = True
+            return tuple(pool[i] for i in indices)
+        i = r - 1
+        while i >= 0 and indices[i] == i + n - r:
+            i -= 1
+        if i < 0:
+            self.stopped = True
+            raise StopIteration
+        indices[i] += 1
+        for j in range(i + 1, r):
+            indices[j] = indices[j - 1] + 1
+        return tuple(pool[i] for i in indices)
+
+    def state(self):
+        return (self.pool, self.r, tuple(self.indices), self.started,
+                self.stopped)
+
+
+class _PyCwrCore(_PyCoreBase):
+    __slots__ = ("pool", "r", "indices", "started", "stopped")
+
+    def __init__(self, pool, r, indices, started, stopped):
+        self.pool = pool
+        self.r = r
+        self.indices = list(indices) if indices is not None else [0] * r
+        self.started = started
+        self.stopped = stopped
+
+    def __next__(self):
+        if self.stopped:
+            raise StopIteration
+        pool = self.pool
+        indices = self.indices
+        r = self.r
+        n = len(pool)
+        if not self.started:
+            self.started = True
+            return tuple(pool[i] for i in indices)
+        i = r - 1
+        while i >= 0 and indices[i] == n - 1:
+            i -= 1
+        if i < 0:
+            self.stopped = True
+            raise StopIteration
+        indices[i:] = [indices[i] + 1] * (r - i)
+        return tuple(pool[i] for i in indices)
+
+    def state(self):
+        return (self.pool, self.r, tuple(self.indices), self.started,
+                self.stopped)
+
+
+class _PyBatchedCore(_PyCoreBase):
+    __slots__ = ("source", "n", "strict")
+
+    def __init__(self, source, n, strict):
+        self.source = source
+        self.n = n
+        self.strict = strict
+
+    def __next__(self):
+        it = self.source
+        if it is None:
+            raise StopIteration
+        batch = []
+        try:
+            for _ in range(self.n):
+                batch.append(next(it))
+        except StopIteration:
+            self.source = None
+            if not batch:
+                raise
+            if self.strict:
+                raise ValueError("batched(): incomplete batch") from None
+        return tuple(batch)
+
+    def state(self):
+        return (self.source, self.n, self.strict)
+
 
 if _HAVE_NATIVE:
-    def _make_islice_core(source, start, stop, step):
-        return _native_islice_core(source, start, stop, step)
+    _islice_core = _n.islice_core
+    _repeat_core = _n.repeat_core
+    _tee_core = _n.tee_core
+    _count_core = _n.count_core
+    _cycle_core = _n.cycle_core
+    _chain_core = _n.chain_core
+    _compress_core = _n.compress_core
+    _dropwhile_core = _n.dropwhile_core
+    _takewhile_core = _n.takewhile_core
+    _filterfalse_core = _n.filterfalse_core
+    _starmap_core = _n.starmap_core
+    _pairwise_core = _n.pairwise_core
+    _zip_longest_core = _n.zip_longest_core
+    _accumulate_core = _n.accumulate_core
+    _product_core = _n.product_core
+    _permutations_core = _n.permutations_core
+    _combinations_core = _n.combinations_core
+    _cwr_core = _n.cwr_core
+    _batched_core = _n.batched_core
+    _core_state = _n.lazy_state
 
-    def _islice_core_state(core):
-        return _native_lazy_state(core)
-
-    def _islice_core_set_cnt(core, cnt):
-        _native_islice_set_cnt(core, cnt)
-
-    def _make_repeat_core(obj, times):
-        return _native_repeat_core(obj, times)
-
-    def _repeat_core_state(core):
-        return _native_lazy_state(core)
-
-    def _make_tee_core(data, index):
-        return _native_tee_core(data, index)
-
-    def _tee_core_state(core):
-        """(data, index) for the branch."""
-        return _native_lazy_state(core)
+    def _islice_set_cnt(core, cnt):
+        _n.islice_set_cnt(core, cnt)
 else:
-    def _make_islice_core(source, start, stop, step):
-        return _PyIsliceCore(source, start, stop, step)
+    _islice_core = _PyIsliceCore
+    _repeat_core = _PyRepeatCore
+    _tee_core = _PyTeeCore
+    _count_core = _PyCountCore
+    _cycle_core = _PyCycleCore
+    _chain_core = _PyChainCore
+    _compress_core = _PyCompressCore
+    _dropwhile_core = _PyDropWhileCore
+    _takewhile_core = _PyTakeWhileCore
+    _filterfalse_core = _PyFilterFalseCore
+    _starmap_core = _PyStarMapCore
+    _pairwise_core = _PyPairwiseCore
+    _zip_longest_core = _PyZipLongestCore
+    _accumulate_core = _PyAccumulateCore
+    _product_core = _PyProductCore
+    _permutations_core = _PyPermutationsCore
+    _combinations_core = _PyCombinationsCore
+    _cwr_core = _PyCwrCore
+    _batched_core = _PyBatchedCore
 
-    def _islice_core_state(core):
+    def _core_state(core):
         return core.state()
 
-    def _islice_core_set_cnt(core, cnt):
-        core.set_cnt(cnt)
-
-    def _make_repeat_core(obj, times):
-        return _PyRepeatCore(obj, times)
-
-    def _repeat_core_state(core):
-        return core.state()
-
-    def _make_tee_core(data, index):
-        return _PyTeeCore(data, index)
-
-    def _tee_core_state(core):
-        return (core.data, core.index)
+    def _islice_set_cnt(core, cnt):
+        core.pos = cnt
 
 
 # ---------------------------------------------------------------------------
@@ -313,32 +765,27 @@ class count:
         if not _is_number(start) or not _is_number(step):
             raise TypeError("a number is required")
         self = object.__new__(cls)
-        self._cnt = start
-        self._step = step
+        self._core = _count_core(start, step)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        v = self._cnt
-        self._cnt = v + self._step
-        return v
-
-    def _step_is_one(self):
-        step = self._step
-        return type(step) is int and step == 1
+        return next(self._core)
 
     def __repr__(self):
-        if self._step_is_one():
-            return f"count({self._cnt!r})"
-        return f"count({self._cnt!r}, {self._step!r})"
+        cnt, step = _core_state(self._core)
+        if type(step) is int and step == 1:
+            return f"count({cnt!r})"
+        return f"count({cnt!r}, {step!r})"
 
     def __reduce__(self):
         _pickle_deprecated()
-        if self._step_is_one():
-            return (type(self), (self._cnt,))
-        return (type(self), (self._cnt, self._step))
+        cnt, step = _core_state(self._core)
+        if type(step) is int and step == 1:
+            return (type(self), (cnt,))
+        return (type(self), (cnt, step))
 
 
 # ---------------------------------------------------------------------------
@@ -359,45 +806,24 @@ class cycle:
                 f"cycle expected 1 argument, got {len(args)}"
             )
         self = object.__new__(cls)
-        self._it = iter(args[0])
-        self._saved = []
-        self._index = 0
-        self._firstpass = False
+        self._core = _cycle_core(iter(args[0]), [], 0, False)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        it = self._it
-        if it is not None:
-            try:
-                item = next(it)
-            except StopIteration:
-                self._it = None
-            else:
-                if not self._firstpass:
-                    self._saved.append(item)
-                return item
-        saved = self._saved
-        if not saved:
-            raise StopIteration
-        i = self._index
-        item = saved[i]
-        i += 1
-        if i >= len(saved):
-            i = 0
-        self._index = i
-        return item
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        if self._it is None:
-            it = iter(self._saved)
-            if self._index:
-                it.__setstate__(self._index)
-            return (type(self), (it,), (self._saved, True))
-        return (type(self), (self._it,), (self._saved, self._firstpass))
+        source, saved, index, firstpass = _core_state(self._core)
+        if source is None:
+            it = iter(saved)
+            if index:
+                it.__setstate__(index)
+            return (type(self), (it,), (saved, True))
+        return (type(self), (source,), (saved, bool(firstpass)))
 
     def __setstate__(self, state):
         _pickle_deprecated()
@@ -414,9 +840,8 @@ class cycle:
             raise TypeError(
                 f"'{type(firstpass).__name__}' object cannot be interpreted as an integer"
             )
-        self._saved = saved
-        self._firstpass = bool(firstpass)
-        self._index = 0
+        source, _, _, _ = _core_state(self._core)
+        self._core = _cycle_core(source, saved, 0, bool(firstpass))
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +886,7 @@ class repeat:
             if times < 0:
                 times = 0
         self = object.__new__(cls)
-        self._core = _make_repeat_core(obj, times)
+        self._core = _repeat_core(obj, times)
         return self
 
     def __iter__(self):
@@ -471,20 +896,20 @@ class repeat:
         return next(self._core)
 
     def __length_hint__(self):
-        obj, times = _repeat_core_state(self._core)
+        obj, times = _core_state(self._core)
         if times is None:
             raise TypeError("len() of unsized object")
         return times
 
     def __repr__(self):
-        obj, times = _repeat_core_state(self._core)
+        obj, times = _core_state(self._core)
         if times is None:
             return f"repeat({obj!r})"
         return f"repeat({obj!r}, {times})"
 
     def __reduce__(self):
         _pickle_deprecated()
-        obj, times = _repeat_core_state(self._core)
+        obj, times = _core_state(self._core)
         if times is None:
             return (type(self), (obj,))
         return (type(self), (obj, times))
@@ -534,54 +959,35 @@ class accumulate:
         if iterable is _NULL:
             raise TypeError("accumulate() missing required argument 'iterable' (pos 1)")
         self = object.__new__(cls)
-        self._it = iter(iterable)
-        self._func = func
-        self._total = _NULL
-        self._initial = initial
+        self._core = _accumulate_core(iter(iterable), func, False, None, initial)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        initial = self._initial
-        if initial is not None:
-            self._initial = None
-            self._total = initial
-            return initial
-        total = self._total
-        if total is _NULL:
-            # First call: emit the first element unchanged.
-            total = next(self._it)
-            self._total = total
-            return total
-        item = next(self._it)
-        func = self._func
-        if func is None:
-            total = total + item
-        else:
-            total = func(total, item)
-        self._total = total
-        return total
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        has_total = self._total is not _NULL
+        source, func, has_total, total, initial = _core_state(self._core)
         return (
             type(self),
-            (self._it, self._func),
-            (has_total, self._total if has_total else None, self._initial),
+            (source, func),
+            (bool(has_total), total if has_total else None, initial),
         )
 
     def __setstate__(self, state):
         _pickle_deprecated()
+        source, func, _, _, _ = _core_state(self._core)
         if isinstance(state, tuple) and len(state) == 3:
             has_total, total, initial = state
-            self._total = total if has_total else _NULL
-            self._initial = initial
+            self._core = _accumulate_core(
+                source, func, bool(has_total), total, initial
+            )
         else:
             # CPython-style state: the running total.
-            self._total = state
+            self._core = _accumulate_core(source, func, True, state, None)
 
 
 # ---------------------------------------------------------------------------
@@ -599,57 +1005,29 @@ class chain:
     def __new__(cls, *args, **kwargs):
         _no_kwargs(cls, kwargs, "chain")
         self = object.__new__(cls)
-        self._source = iter(args)
-        self._active = _NULL
+        self._core = _chain_core(iter(args), None)
         return self
 
     @classmethod
     def from_iterable(cls, iterable):
         self = object.__new__(cls)
-        self._source = iter(iterable)
-        self._active = _NULL
+        self._core = _chain_core(iter(iterable), None)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        while True:
-            source = self._source
-            if source is _NULL:
-                raise StopIteration
-            active = self._active
-            if active is _NULL:
-                try:
-                    iterable = next(source)
-                except StopIteration:
-                    self._source = _NULL
-                    raise
-                except BaseException:
-                    self._source = _NULL
-                    raise
-                try:
-                    active = iter(iterable)
-                except BaseException:
-                    self._source = _NULL
-                    raise
-                self._active = active
-            try:
-                return next(active)
-            except StopIteration:
-                self._active = _NULL
-            except BaseException:
-                self._source = _NULL
-                self._active = _NULL
-                raise
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        if self._source is _NULL:
+        source, active = _core_state(self._core)
+        if source is None:
             return (type(self), ())
-        if self._active is _NULL:
-            return (type(self), (), (self._source,))
-        return (type(self), (), (self._source, self._active))
+        if active is None:
+            return (type(self), (), (source,))
+        return (type(self), (), (source, active))
 
     def __setstate__(self, state):
         _pickle_deprecated()
@@ -661,8 +1039,9 @@ class chain:
             raise TypeError("Arguments must be iterators.")
         if len(state) == 2 and not _is_iterator(state[1]):
             raise TypeError("Arguments must be iterators.")
-        self._source = state[0]
-        self._active = state[1] if len(state) == 2 else _NULL
+        self._core = _chain_core(
+            state[0], state[1] if len(state) == 2 else None
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -708,25 +1087,19 @@ class compress:
         if selectors is _NULL:
             raise TypeError("compress() missing required argument 'selectors' (pos 2)")
         self = object.__new__(cls)
-        self._data = iter(data)
-        self._selectors = iter(selectors)
+        self._core = _compress_core(iter(data), iter(selectors))
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        data = self._data
-        selectors = self._selectors
-        while True:
-            item = next(data)
-            keep = next(selectors)
-            if keep:
-                return item
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        return (type(self), (self._data, self._selectors))
+        data, selectors = _core_state(self._core)
+        return (type(self), (data, selectors))
 
 
 # ---------------------------------------------------------------------------
@@ -745,32 +1118,24 @@ class dropwhile:
         if len(args) != 2:
             raise TypeError(f"dropwhile expected 2 arguments, got {len(args)}")
         self = object.__new__(cls)
-        self._func = args[0]
-        self._it = iter(args[1])
-        self._start = False
+        self._core = _dropwhile_core(args[0], iter(args[1]), False)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        it = self._it
-        func = self._func
-        while True:
-            item = next(it)
-            if self._start:
-                return item
-            if not func(item):
-                self._start = True
-                return item
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        return (type(self), (self._func, self._it), int(self._start))
+        func, source, started = _core_state(self._core)
+        return (type(self), (func, source), int(started))
 
     def __setstate__(self, state):
         _pickle_deprecated()
-        self._start = bool(state)
+        func, source, _ = _core_state(self._core)
+        self._core = _dropwhile_core(func, source, bool(state))
 
 
 class takewhile:
@@ -785,30 +1150,24 @@ class takewhile:
         if len(args) != 2:
             raise TypeError(f"takewhile expected 2 arguments, got {len(args)}")
         self = object.__new__(cls)
-        self._func = args[0]
-        self._it = iter(args[1])
-        self._stop = False
+        self._core = _takewhile_core(args[0], iter(args[1]), False)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        if self._stop:
-            raise StopIteration
-        item = next(self._it)
-        if self._func(item):
-            return item
-        self._stop = True
-        raise StopIteration
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        return (type(self), (self._func, self._it), int(self._stop))
+        func, source, stopped = _core_state(self._core)
+        return (type(self), (func, source), int(stopped))
 
     def __setstate__(self, state):
         _pickle_deprecated()
-        self._stop = bool(state)
+        func, source, _ = _core_state(self._core)
+        self._core = _takewhile_core(func, source, bool(state))
 
 
 class filterfalse:
@@ -823,27 +1182,19 @@ class filterfalse:
         if len(args) != 2:
             raise TypeError(f"filterfalse expected 2 arguments, got {len(args)}")
         self = object.__new__(cls)
-        self._func = args[0]
-        self._it = iter(args[1])
+        self._core = _filterfalse_core(args[0], iter(args[1]))
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        func = self._func
-        it = self._it
-        while True:
-            item = next(it)
-            if func is None or func is bool:
-                if not item:
-                    return item
-            elif not func(item):
-                return item
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        return (type(self), (self._func, self._it))
+        func, source = _core_state(self._core)
+        return (type(self), (func, source))
 
 
 class starmap:
@@ -858,22 +1209,19 @@ class starmap:
         if len(args) != 2:
             raise TypeError(f"starmap expected 2 arguments, got {len(args)}")
         self = object.__new__(cls)
-        self._func = args[0]
-        self._it = iter(args[1])
+        self._core = _starmap_core(args[0], iter(args[1]))
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        args = next(self._it)
-        if not isinstance(args, tuple):
-            args = tuple(args)
-        return self._func(*args)
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        return (type(self), (self._func, self._it))
+        func, source = _core_state(self._core)
+        return (type(self), (func, source))
 
 
 # ---------------------------------------------------------------------------
@@ -1065,7 +1413,7 @@ class islice:
             else:
                 step = 1
         self = object.__new__(cls)
-        self._core = _make_islice_core(iter(iterable), start, stop, step)
+        self._core = _islice_core(iter(iterable), start, stop, step)
         return self
 
     def __iter__(self):
@@ -1076,14 +1424,14 @@ class islice:
 
     def __reduce__(self):
         _pickle_deprecated()
-        source, next_idx, pos, stop, step, done = _islice_core_state(self._core)
+        source, next_idx, pos, stop, step, done = _core_state(self._core)
         if source is None or done:
             return (type(self), (iter(()), 0), 0)
         return (type(self), (source, next_idx, stop, step), pos)
 
     def __setstate__(self, state):
         _pickle_deprecated()
-        _islice_core_set_cnt(self._core, _as_int(state))
+        _islice_set_cnt(self._core, _as_int(state))
 
 
 # ---------------------------------------------------------------------------
@@ -1101,36 +1449,14 @@ class pairwise:
         if len(args) != 1:
             raise TypeError(f"pairwise expected 1 argument, got {len(args)}")
         self = object.__new__(cls)
-        self._it = iter(args[0])
-        self._old = _NULL
+        self._core = _pairwise_core(iter(args[0]))
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        it = self._it
-        if it is None:
-            raise StopIteration
-        old = self._old
-        if old is _NULL:
-            old = next(it)
-            self._old = old
-            # The pull above can re-enter and exhaust us (CPython
-            # pairwise_next handles the same reentrancy).
-            it = self._it
-            if it is None:
-                self._old = _NULL
-                raise StopIteration
-        try:
-            new = next(it)
-        except StopIteration:
-            self._it = None
-            self._old = _NULL
-            raise
-        result = (old, new)
-        self._old = new
-        return result
+        return next(self._core)
 
 
 # ---------------------------------------------------------------------------
@@ -1155,44 +1481,27 @@ class zip_longest:
                     f"zip_longest() got an unexpected keyword argument '{k}'"
                 )
         self = object.__new__(cls)
-        self._iters = [iter(it) for it in args]
-        self._numactive = len(self._iters)
-        self._fillvalue = fillvalue
+        self._core = _zip_longest_core(
+            fillvalue, tuple(iter(it) for it in args)
+        )
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        iters = self._iters
-        if not iters or self._numactive <= 0:
-            raise StopIteration
-        fillvalue = self._fillvalue
-        result = []
-        for i, it in enumerate(iters):
-            if it is None:
-                result.append(fillvalue)
-                continue
-            try:
-                value = next(it)
-            except StopIteration:
-                self._numactive -= 1
-                if self._numactive <= 0:
-                    raise
-                iters[i] = None
-                result.append(fillvalue)
-            else:
-                result.append(value)
-        return tuple(result)
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        iters = tuple(iter(()) if it is None else it for it in self._iters)
-        return (type(self), iters, self._fillvalue)
+        fillvalue, numactive, slots = _core_state(self._core)
+        iters = tuple(iter(()) if it is None else it for it in slots)
+        return (type(self), iters, fillvalue)
 
     def __setstate__(self, state):
         _pickle_deprecated()
-        self._fillvalue = state
+        _, _, slots = _core_state(self._core)
+        self._core = _zip_longest_core(state, slots)
 
 
 # ---------------------------------------------------------------------------
@@ -1219,59 +1528,36 @@ class product:
         if nrepeat < 0:
             raise ValueError("repeat argument cannot be negative")
         self = object.__new__(cls)
-        pools = [tuple(it) for it in args] * nrepeat
-        self._pools = tuple(pools)
-        self._indices = None
-        self._stopped = False
+        pools = tuple([tuple(it) for it in args] * nrepeat)
+        self._core = _product_core(pools, None, False, False)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        if self._stopped:
-            raise StopIteration
-        pools = self._pools
-        n = len(pools)
-        indices = self._indices
-        if indices is None:
-            # First call.
-            for pool in pools:
-                if not pool:
-                    self._stopped = True
-                    raise StopIteration
-            self._indices = [0] * n
-            return tuple(pool[0] for pool in pools)
-        i = n - 1
-        while i >= 0:
-            indices[i] += 1
-            if indices[i] < len(pools[i]):
-                break
-            indices[i] = 0
-            i -= 1
-        else:
-            self._stopped = True
-            raise StopIteration
-        return tuple(pool[idx] for pool, idx in zip(pools, indices))
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        if self._stopped:
+        pools, indices, started, stopped = _core_state(self._core)
+        if stopped:
             return (type(self), ((),))
-        if self._indices is None:
-            return (type(self), self._pools)
-        return (type(self), self._pools, tuple(self._indices))
+        if not started:
+            return (type(self), tuple(pools))
+        return (type(self), tuple(pools), tuple(indices))
 
     def __setstate__(self, state):
         _pickle_deprecated()
-        if not isinstance(state, tuple) or len(state) != len(self._pools):
+        pools, _, _, stopped = _core_state(self._core)
+        if not isinstance(state, tuple) or len(state) != len(pools):
             raise TypeError("invalid arguments")
         indices = []
-        for index, pool in zip(state, self._pools):
+        for index, pool in zip(state, pools):
             index = _as_int(index)
             poolsize = len(pool)
             if poolsize == 0:
-                self._stopped = True
+                self._core = _product_core(tuple(pools), None, True, True)
                 return
             if index < 0:
                 index = 0
@@ -1279,7 +1565,9 @@ class product:
                 index = poolsize - 1
             indices.append(index)
         # Mark as started: the next __next__ advances past `indices`.
-        self._indices = indices
+        self._core = _product_core(
+            tuple(pools), tuple(indices), True, bool(stopped)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1336,71 +1624,38 @@ class permutations:
             if r < 0:
                 raise ValueError("r must be non-negative")
         self = object.__new__(cls)
-        self._pool = pool
-        self._r = r
-        self._indices = list(range(n))
-        self._cycles = list(range(n, n - r, -1))
-        self._started = False
-        self._stopped = r > n
+        self._core = _permutations_core(pool, r, None, None, False, r > n)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        if self._stopped:
-            raise StopIteration
-        pool = self._pool
-        indices = self._indices
-        cycles = self._cycles
-        r = self._r
-        n = len(pool)
-        if not self._started:
-            self._started = True
-            return tuple(pool[indices[i]] for i in range(r))
-        if not n:
-            self._stopped = True
-            raise StopIteration
-        i = r - 1
-        while i >= 0:
-            cycles[i] -= 1
-            if cycles[i] == 0:
-                indices[i:] = indices[i + 1:] + indices[i:i + 1]
-                cycles[i] = n - i
-            else:
-                j = cycles[i]
-                indices[i], indices[-j] = indices[-j], indices[i]
-                return tuple(pool[indices[k]] for k in range(r))
-            i -= 1
-        self._stopped = True
-        raise StopIteration
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        if self._stopped:
-            return (type(self), ((), self._r))
-        if not self._started:
-            return (type(self), (self._pool, self._r))
-        return (
-            type(self),
-            (self._pool, self._r),
-            (tuple(self._indices), tuple(self._cycles)),
-        )
+        pool, r, indices, cycles, started, stopped = _core_state(self._core)
+        if stopped:
+            return (type(self), ((), r))
+        if not started:
+            return (type(self), (pool, r))
+        return (type(self), (pool, r), (tuple(indices), tuple(cycles)))
 
     def __setstate__(self, state):
         _pickle_deprecated()
         if not (isinstance(state, tuple) and len(state) == 2):
             raise TypeError("invalid arguments")
         indices, cycles = state
-        n = len(self._pool)
-        r = self._r
+        pool, r, _, _, _, stopped = _core_state(self._core)
+        n = len(pool)
         if len(indices) != n or len(cycles) != r:
             raise ValueError("invalid arguments")
         indices = [min(max(_as_int(i), 0), n - 1) for i in indices]
         cycles = [min(max(_as_int(c), 1), n - i) for i, c in enumerate(cycles)]
-        self._indices = indices
-        self._cycles = cycles
-        self._started = True
+        self._core = _permutations_core(
+            pool, r, tuple(indices), tuple(cycles), True, bool(stopped)
+        )
 
 
 class combinations:
@@ -1447,61 +1702,42 @@ class combinations:
         if r < 0:
             raise ValueError("r must be non-negative")
         self = object.__new__(cls)
-        self._pool = pool
-        self._r = r
-        self._indices = list(range(r))
-        self._started = False
-        self._stopped = r > len(pool)
+        self._core = _combinations_core(pool, r, None, False, r > len(pool))
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        if self._stopped:
-            raise StopIteration
-        pool = self._pool
-        indices = self._indices
-        r = self._r
-        n = len(pool)
-        if not self._started:
-            self._started = True
-            return tuple(pool[i] for i in indices)
-        i = r - 1
-        while i >= 0 and indices[i] == i + n - r:
-            i -= 1
-        if i < 0:
-            self._stopped = True
-            raise StopIteration
-        indices[i] += 1
-        for j in range(i + 1, r):
-            indices[j] = indices[j - 1] + 1
-        return tuple(pool[i] for i in indices)
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        if self._stopped:
-            return (type(self), ((), self._r))
-        if not self._started:
-            return (type(self), (self._pool, self._r))
-        return (type(self), (self._pool, self._r), tuple(self._indices))
+        pool, r, indices, started, stopped = _core_state(self._core)
+        if stopped:
+            return (type(self), ((), r))
+        if not started:
+            return (type(self), (pool, r))
+        return (type(self), (pool, r), tuple(indices))
 
     def __setstate__(self, state):
         _pickle_deprecated()
-        if not isinstance(state, tuple) or len(state) != self._r:
+        pool, r, _, _, stopped = _core_state(self._core)
+        if not isinstance(state, tuple) or len(state) != r:
             raise TypeError("invalid arguments")
-        n = len(self._pool)
+        n = len(pool)
         indices = []
         for i, index in enumerate(state):
             index = _as_int(index)
-            maxval = i + n - self._r
+            maxval = i + n - r
             if index < 0:
                 index = 0
             elif index > maxval:
                 index = maxval
             indices.append(index)
-        self._indices = indices
-        self._started = True
+        self._core = _combinations_core(
+            pool, r, tuple(indices), True, bool(stopped)
+        )
 
 
 class combinations_with_replacement:
@@ -1557,48 +1793,30 @@ class combinations_with_replacement:
         if r < 0:
             raise ValueError("r must be non-negative")
         self = object.__new__(cls)
-        self._pool = pool
-        self._r = r
-        self._indices = [0] * r
-        self._started = False
-        self._stopped = not pool and r > 0
+        self._core = _cwr_core(pool, r, None, False, not pool and r > 0)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        if self._stopped:
-            raise StopIteration
-        pool = self._pool
-        indices = self._indices
-        r = self._r
-        n = len(pool)
-        if not self._started:
-            self._started = True
-            return tuple(pool[i] for i in indices)
-        i = r - 1
-        while i >= 0 and indices[i] == n - 1:
-            i -= 1
-        if i < 0:
-            self._stopped = True
-            raise StopIteration
-        indices[i:] = [indices[i] + 1] * (r - i)
-        return tuple(pool[i] for i in indices)
+        return next(self._core)
 
     def __reduce__(self):
         _pickle_deprecated()
-        if self._stopped:
-            return (type(self), ((), self._r))
-        if not self._started:
-            return (type(self), (self._pool, self._r))
-        return (type(self), (self._pool, self._r), tuple(self._indices))
+        pool, r, indices, started, stopped = _core_state(self._core)
+        if stopped:
+            return (type(self), ((), r))
+        if not started:
+            return (type(self), (pool, r))
+        return (type(self), (pool, r), tuple(indices))
 
     def __setstate__(self, state):
         _pickle_deprecated()
-        if not isinstance(state, tuple) or len(state) != self._r:
+        pool, r, _, _, stopped = _core_state(self._core)
+        if not isinstance(state, tuple) or len(state) != r:
             raise TypeError("invalid arguments")
-        n = len(self._pool)
+        n = len(pool)
         indices = []
         for index in state:
             index = _as_int(index)
@@ -1607,8 +1825,7 @@ class combinations_with_replacement:
             elif index > n - 1:
                 index = n - 1
             indices.append(index)
-        self._indices = indices
-        self._started = True
+        self._core = _cwr_core(pool, r, tuple(indices), True, bool(stopped))
 
 
 # ---------------------------------------------------------------------------
@@ -1660,35 +1877,44 @@ class batched:
         if n < 1:
             raise ValueError("n must be at least one")
         self = object.__new__(cls)
-        self._it = iter(iterable)
-        self._n = n
-        self._strict = strict
+        self._core = _batched_core(iter(iterable), n, strict)
         return self
 
     def __iter__(self):
-        return self
+        return self._core
 
     def __next__(self):
-        it = self._it
-        if it is None:
-            raise StopIteration
-        n = self._n
-        batch = []
-        try:
-            for _ in range(n):
-                batch.append(next(it))
-        except StopIteration:
-            self._it = None
-            if not batch:
-                raise
-            if self._strict:
-                raise ValueError("batched(): incomplete batch") from None
-        return tuple(batch)
+        return next(self._core)
 
 
 # ---------------------------------------------------------------------------
 # tee
 # ---------------------------------------------------------------------------
+
+class _tee_dataobject:
+    """Data container shared by the branches of one ``tee()`` call.
+
+    Pickling two branches of the same tee in one dump must reconnect
+    them to a single shared buffer on load — sharing happens through
+    this object (pickle's memo deduplicates it), like CPython's
+    ``itertools._tee_dataobject``.
+    """
+
+    def __init__(self, source):
+        self.source = source
+        self.buffer = []
+        self.busy = False
+
+    def __reduce__(self):
+        _pickle_deprecated()
+        return (_tee_dataobject_reconstruct, (self.source, self.buffer))
+
+
+def _tee_dataobject_reconstruct(source, buffer):
+    data = _tee_dataobject(source)
+    data.buffer = buffer
+    return data
+
 
 class _tee:
     """Iterator wrapped to make it copyable."""
@@ -1698,14 +1924,14 @@ class _tee:
             return iterable.__copy__()
         self = object.__new__(cls)
         self._data = _tee_dataobject(iter(iterable))
-        self._core = _make_tee_core(self._data, 0)
+        self._core = _tee_core(self._data, 0)
         return self
 
     @classmethod
     def _from_data(cls, data, index):
         self = object.__new__(cls)
         self._data = data
-        self._core = _make_tee_core(data, index)
+        self._core = _tee_core(data, index)
         return self
 
     def __iter__(self):
@@ -1715,12 +1941,12 @@ class _tee:
         return next(self._core)
 
     def __copy__(self):
-        data, index = _tee_core_state(self._core)
+        data, index = _core_state(self._core)
         return type(self)._from_data(data, index)
 
     def __reduce__(self):
         _pickle_deprecated()
-        data, index = _tee_core_state(self._core)
+        data, index = _core_state(self._core)
         return (type(self), ((),), (data, index))
 
     def __setstate__(self, state):
@@ -1731,7 +1957,7 @@ class _tee:
         if not isinstance(data, _tee_dataobject):
             raise TypeError("state is not a _tee_dataobject")
         self._data = data
-        self._core = _make_tee_core(data, _as_int(index))
+        self._core = _tee_core(data, _as_int(index))
 
 
 def tee(iterable, n=2):

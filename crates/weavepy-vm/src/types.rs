@@ -28,7 +28,9 @@ pub struct TypeObject {
     /// `tp_qualname` (it is not visible in `cls.__dict__`); mirrored
     /// here. `None` falls back to `name` (dynamic `type(...)` classes).
     pub qualname: RefCell<Option<String>>,
-    pub bases: Vec<Rc<TypeObject>>,
+    /// Direct bases. Mutable because CPython supports `cls.__bases__ = …`
+    /// assignment (with layout/MRO validation and subclass re-resolution).
+    pub bases: RefCell<Vec<Rc<TypeObject>>>,
     pub mro: RefCell<Vec<Rc<TypeObject>>>,
     pub dict: Rc<RefCell<DictData>>,
     pub flags: TypeFlags,
@@ -46,6 +48,12 @@ pub struct TypeObject {
     /// attribute-set time to enforce slot-only access on classes
     /// whose entire MRO declares slots.
     pub slot_names: RefCell<Vec<String>>,
+    /// `True` when the class body *declared* `__slots__` (even an empty
+    /// one). Distinguishes `__slots__ = []` (no `__weakref__` support
+    /// contributed) from a plain class (which contributes both
+    /// `__dict__` and `__weakref__`), mirroring CPython's tp_weaklistoffset
+    /// computation.
+    pub declares_slots: Cell<bool>,
     /// `True` for slot-using classes whose MRO carries `__slots__`
     /// every step of the way (so the instance has no implicit
     /// `__dict__`). Set when the user neither omits `__slots__` from
@@ -108,12 +116,118 @@ impl TypeObject {
         )
     }
 
+    /// Is this built-in type one whose instances "own" a distinct memory
+    /// layout (CPython: `tp_basicsize`/`tp_itemsize` extended past the
+    /// base)? Determines the `solid_base` used for multiple-inheritance
+    /// layout-conflict checks. Plain exceptions all share
+    /// `BaseException`'s layout; the listed ones add fields.
+    fn owns_layout(&self) -> bool {
+        if !self.flags.is_builtin || self.name == "object" {
+            return false;
+        }
+        if self.flags.is_exception {
+            return matches!(
+                self.name.as_str(),
+                "BaseException"
+                    | "OSError"
+                    | "SyntaxError"
+                    | "SystemExit"
+                    | "StopIteration"
+                    | "ImportError"
+                    | "NameError"
+                    | "AttributeError"
+                    | "UnicodeDecodeError"
+                    | "UnicodeEncodeError"
+                    | "UnicodeTranslateError"
+                    | "BaseExceptionGroup"
+            );
+        }
+        true
+    }
+
+    /// CPython's `solid_base`: the most-derived class on the MRO whose
+    /// instance layout this type shares. `None` means plain `object`.
+    pub fn solid_base(&self) -> Option<Rc<TypeObject>> {
+        self.mro.borrow().iter().find(|t| t.owns_layout()).cloned()
+    }
+
+    /// Recompute this type's C3 linearisation from its *current* bases
+    /// (used by `type.mro()` and `__bases__` assignment).
+    pub fn recompute_c3(ty: &Rc<TypeObject>) -> Result<Vec<Rc<TypeObject>>, RuntimeError> {
+        let bases = ty.bases.borrow().clone();
+        compute_c3(ty, &bases, &ty.name)
+    }
+
+    /// CPython `type_new` base validation (`best_base`): every base must
+    /// be subclassable, and the solid bases of all bases must form a
+    /// single inheritance chain (no instance lay-out conflict).
+    pub fn validate_bases(name: &str, bases: &[Rc<TypeObject>]) -> Result<(), RuntimeError> {
+        let _ = name;
+        for b in bases {
+            if b.flags.is_builtin
+                && matches!(
+                    b.name.as_str(),
+                    "bool"
+                        | "NoneType"
+                        | "NotImplementedType"
+                        | "ellipsis"
+                        | "range"
+                        | "slice"
+                        | "memoryview"
+                        | "function"
+                        | "builtin_function_or_method"
+                        | "method"
+                        | "generator"
+                        | "coroutine"
+                        | "async_generator"
+                        | "frame"
+                        | "traceback"
+                        | "code"
+                        | "cell"
+                        | "mappingproxy"
+                        | "weakproxy"
+                        | "weakcallableproxy"
+                        | "member_descriptor"
+                        | "method_descriptor"
+                        | "getset_descriptor"
+                        | "wrapper_descriptor"
+                        | "method-wrapper"
+                )
+            {
+                return Err(type_error(format!(
+                    "type '{}' is not an acceptable base type",
+                    b.name
+                )));
+            }
+        }
+        let mut winner: Option<Rc<TypeObject>> = None;
+        for b in bases {
+            let Some(sb) = b.solid_base() else { continue };
+            match &winner {
+                None => winner = Some(sb),
+                Some(w) => {
+                    if w.is_subclass_of(&sb) {
+                        // current winner already extends sb — keep it
+                    } else if sb.is_subclass_of(w) {
+                        winner = Some(sb);
+                    } else {
+                        return Err(type_error(
+                            "multiple bases have instance lay-out conflict",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Construct a user-defined class from a class statement.
     pub fn new_user(
         name: &str,
         bases: Vec<Rc<TypeObject>>,
         mut dict: DictData,
     ) -> Result<Rc<Self>, RuntimeError> {
+        Self::validate_bases(name, &bases)?;
         let is_exception = bases.iter().any(|b| b.flags.is_exception);
         // CPython `type_new`: a class that defines `__eq__` without
         // defining `__hash__` is unhashable (`__hash__` is set to None
@@ -155,12 +269,13 @@ impl TypeObject {
         let ty = Rc::new(TypeObject {
             name: name.to_owned(),
             qualname: RefCell::new(qualname),
-            bases: bases.clone(),
+            bases: RefCell::new(bases.clone()),
             mro: RefCell::new(Vec::new()),
             dict: Rc::new(RefCell::new(dict)),
             flags,
             metaclass: RefCell::new(None),
             slot_names: RefCell::new(Vec::new()),
+            declares_slots: Cell::new(false),
             forbids_dict: false,
             subclasses: RefCell::new(Vec::new()),
             getattribute_kind: Cell::new(0),
@@ -369,7 +484,13 @@ impl TypeObject {
     /// Look up `name` in this type's MRO.
     pub fn lookup(&self, name: &str) -> Option<Object> {
         let key = DictKey(Object::from_str(name));
-        for ty in self.mro.borrow().iter() {
+        // Snapshot the MRO before walking it (CPython `_PyType_Lookup`
+        // holds a strong reference for the same reason): a dict probe
+        // can re-enter Python (`__eq__` on a non-string class-dict key)
+        // and reassign `__bases__` mid-lookup. The in-flight lookup
+        // must keep resolving against the *old* linearisation.
+        let mro: Vec<Rc<TypeObject>> = self.mro.borrow().clone();
+        for ty in mro.iter() {
             if let Some(v) = ty.dict.borrow().get(&key).cloned() {
                 return Some(v);
             }
@@ -383,7 +504,9 @@ impl TypeObject {
     /// identity `__hash__`).
     pub fn lookup_with_owner(&self, name: &str) -> Option<(Object, Rc<TypeObject>)> {
         let key = DictKey(Object::from_str(name));
-        for ty in self.mro.borrow().iter() {
+        // Snapshot for reentrancy — see `lookup`.
+        let mro: Vec<Rc<TypeObject>> = self.mro.borrow().clone();
+        for ty in mro.iter() {
             if let Some(v) = ty.dict.borrow().get(&key).cloned() {
                 return Some((v, ty.clone()));
             }
@@ -409,7 +532,9 @@ impl TypeObject {
             _ => None,
         };
         let module = as_str("__module__");
-        let qual = as_str("__qualname__").unwrap_or_else(|| self.name.clone());
+        let qual = as_str("__qualname__")
+            .or_else(|| self.qualname.borrow().clone())
+            .unwrap_or_else(|| self.name.clone());
         match module.as_deref() {
             None | Some("builtins") | Some("") => qual,
             Some(m) => format!("{m}.{qual}"),
