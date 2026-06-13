@@ -57,6 +57,37 @@ assert math.isnan(float.fromhex("nan"))
 assert (0.5).as_integer_ratio() == (1, 2)
 assert (-0.25).as_integer_ratio() == (-1, 4)
 
+# float repr — shortest round-trip + CPython's exponential thresholds
+# (exponential when decpt <= -4 or decpt > 16).
+assert repr(0.0) == "0.0"
+assert repr(-0.0) == "-0.0"
+assert repr(1.0) == "1.0"
+assert repr(0.1) == "0.1"
+assert repr(1234.5678) == "1234.5678"
+assert repr(1e15) == "1000000000000000.0"
+assert repr(1e16) == "1e+16"
+assert repr(1e17) == "1e+17"
+assert repr(1e100) == "1e+100"
+assert repr(0.0001) == "0.0001"
+assert repr(0.00001) == "1e-05"
+assert repr(1e-100) == "1e-100"
+assert repr(1234567890123456.0) == "1234567890123456.0"
+assert repr(12345678901234567.0) == "1.2345678901234568e+16"
+assert repr(5e-324) == "5e-324"             # smallest subnormal
+assert repr(1.7976931348623157e308) == "1.7976931348623157e+308"  # max
+assert repr(float("inf")) == "inf"
+assert repr(float("-inf")) == "-inf"
+assert repr(float("nan")) == "nan"
+# str(float) == repr(float) in Python 3
+assert str(1e16) == "1e+16"
+assert str(0.1) == "0.1"
+# complex parts reuse the float rules but drop a trailing ``.0``
+assert repr(complex(4, 5)) == "(4+5j)"
+assert repr(complex(1.5, 2)) == "(1.5+2j)"
+assert repr(complex(1e100, 0)) == "(1e+100+0j)"
+assert repr(complex(0, 1)) == "1j"
+assert repr(2.0 + 0j) == "(2+0j)"
+
 
 # ---------- complex ----------
 assert complex(1, 2) == 1 + 2j

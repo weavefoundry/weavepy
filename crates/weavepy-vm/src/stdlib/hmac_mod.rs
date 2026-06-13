@@ -193,6 +193,7 @@ fn hmac_class() -> Rc<TypeObject> {
                     DictKey(Object::from_static($name)),
                     Object::Builtin(Rc::new(BuiltinFn {
                         name: $name,
+                        binds_instance: true,
                         call: Box::new($body),
                         call_kw: None,
                     })),
@@ -284,6 +285,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))

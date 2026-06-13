@@ -173,6 +173,17 @@ pub struct GcStats {
 #[allow(missing_debug_implementations)]
 pub struct GcState {
     generations: RefCell<[Generation; N_GENERATIONS]>,
+    /// Id → handle index over every tracked object (all generations
+    /// plus the frozen set). Keeps `track` dedupe, `find_handle`, and
+    /// `is_tracked` O(1) — the linear scans they replace made
+    /// allocation-heavy workloads quadratic once the tracked
+    /// population grew past a few thousand.
+    index: RefCell<std::collections::HashMap<ObjectId, Arc<TrackedHandle>>>,
+    /// Re-entrancy guard: a collection can indirectly allocate (e.g.
+    /// queued finalizers running Python at the next safe point may
+    /// re-enter `track`), and a nested collection would see torn
+    /// generation lists.
+    collecting: std::cell::Cell<bool>,
     /// Per-generation thresholds. Gen 0's threshold is
     /// "allocations since last gen 0 collection"; gens 1 and 2
     /// are "collections of the previous gen since last
@@ -211,10 +222,57 @@ impl Default for GcState {
     }
 }
 
+impl Drop for GcState {
+    fn drop(&mut self) {
+        // Thread teardown: the tracked set can hold long generator /
+        // container chains whose recursive field-drops overflow the
+        // native stack (each `Arc` link is one `drop_in_place` frame).
+        // Clear every tracked object's container fields *iteratively*
+        // first so the chains are already severed when the handle
+        // vectors drop. Safe at this point: the thread is exiting, no
+        // Python code will observe the cleared objects.
+        let mut handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        if let Ok(gens) = self.generations.try_borrow() {
+            for g in gens.iter() {
+                handles.extend(g.handles.iter().cloned());
+            }
+        }
+        if let Ok(frozen) = self.frozen.try_borrow() {
+            handles.extend(frozen.iter().cloned());
+        }
+        // Only clear objects whose sole remaining strong reference is the
+        // registry handle itself. Anything with extra references escaped
+        // into shared state that outlives this thread — e.g. Flag
+        // pseudo-members a worker published into the enum class's
+        // `_value2member_map_` — and other threads *will* observe it, so
+        // wiping its fields would corrupt live objects. Iterate to a
+        // fixpoint: each cleared object releases its referents, which can
+        // drop a chained object's count to 1 and make it clearable on the
+        // next pass — severing long chains without recursive drops.
+        loop {
+            let mut progress = false;
+            handles.retain(|h| {
+                if strong_count_for(&h.object) <= 1 {
+                    clear_object_fields(&h.object);
+                    progress = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            if !progress {
+                break;
+            }
+        }
+    }
+}
+
 impl GcState {
     pub fn new() -> Self {
         Self {
             generations: RefCell::new(Default::default()),
+            index: RefCell::new(std::collections::HashMap::new()),
+            collecting: std::cell::Cell::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
             counts: RefCell::new([0; N_GENERATIONS]),
             frozen: RefCell::new(Vec::new()),
@@ -232,17 +290,15 @@ impl GcState {
     /// is already tracked, this is a no-op.
     pub fn track(&self, obj: Object) {
         let new_id = id_of(&obj);
-        let mut gens = self.generations.borrow_mut();
-        // Avoid double-tracking. Linear scan of generation 0 is
-        // fine since most allocations are short-lived.
-        for h in &gens[0].handles {
-            if h.id == new_id {
+        {
+            let mut index = self.index.borrow_mut();
+            if index.contains_key(&new_id) {
                 return;
             }
+            let handle = Arc::new(TrackedHandle::new(obj, 0));
+            index.insert(new_id, handle.clone());
+            self.generations.borrow_mut()[0].handles.push(handle);
         }
-        let handle = Arc::new(TrackedHandle::new(obj, 0));
-        gens[0].handles.push(handle);
-        drop(gens);
         self.tracked_count.fetch_add(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
         self.bump_count(0);
@@ -252,22 +308,52 @@ impl GcState {
     /// after an object is reclaimed, and by the explicit
     /// `gc._untrack(obj)` extension.
     pub fn untrack_id(&self, id: ObjectId) {
+        if self.index.borrow_mut().remove(&id).is_none() {
+            return;
+        }
         let mut gens = self.generations.borrow_mut();
         for gen in gens.iter_mut() {
-            let before = gen.handles.len();
             gen.handles.retain(|h| h.id != id);
-            let removed = before - gen.handles.len();
-            if removed > 0 {
-                self.tracked_count.fetch_sub(removed, Ordering::AcqRel);
-            }
         }
+        drop(gens);
+        self.frozen.borrow_mut().retain(|h| h.id != id);
+        // The index is the dedupe authority, so exactly one handle
+        // existed for `id`.
+        self.tracked_count.fetch_sub(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn is_tracked(&self, id: ObjectId) -> bool {
+        self.index.borrow().contains_key(&id)
+    }
+
+    /// O(1) handle lookup by object id (any generation or frozen).
+    pub fn handle_for(&self, id: ObjectId) -> Option<Arc<TrackedHandle>> {
+        self.index.borrow().get(&id).cloned()
+    }
+
+    /// Snapshot every tracked object that still carries an unrun
+    /// `__del__`. The interpreter's shutdown pass walks this list to
+    /// finalize objects that are still alive at exit — CPython runs
+    /// finalizers for everything during interpreter teardown, not just
+    /// for cyclic garbage. The per-handle `finalized` flag (shared with
+    /// the cycle collector) guarantees each `__del__` runs at most once.
+    pub fn finalization_candidates(&self) -> Vec<Arc<TrackedHandle>> {
+        let mut out = Vec::new();
         let gens = self.generations.borrow();
-        gens.iter().any(|g| g.handles.iter().any(|h| h.id == id))
-            || self.frozen.borrow().iter().any(|h| h.id == id)
+        for gen in gens.iter() {
+            for h in &gen.handles {
+                if !h.finalized.load(Ordering::Acquire) && has_finalizer(&h.object) {
+                    out.push(h.clone());
+                }
+            }
+        }
+        for h in self.frozen.borrow().iter() {
+            if !h.finalized.load(Ordering::Acquire) && has_finalizer(&h.object) {
+                out.push(h.clone());
+            }
+        }
+        out
     }
 
     /// Number of tracked objects in each generation.
@@ -298,13 +384,38 @@ impl GcState {
     pub fn bump_count(&self, gen: usize) {
         let mut counts = self.counts.borrow_mut();
         counts[gen] = counts[gen].saturating_add(1);
-        let thresholds = *self.thresholds.borrow();
-        if counts[gen] >= thresholds[gen] && self.is_enabled() {
-            counts[gen] = 0;
-            for g in 0..gen {
-                counts[g] = 0;
-            }
+    }
+
+    /// Threshold-driven automatic collection (CPython's `gc_alloc`
+    /// path): when the gen-0 allocation counter passes `threshold0`,
+    /// collect the *oldest* generation whose own counter has also
+    /// passed its threshold. Returns the number of objects reclaimed.
+    /// Callers must be at a safe point (no outstanding container
+    /// borrows); the interpreter invokes this from its allocation
+    /// sites.
+    pub fn maybe_auto_collect(&self) -> usize {
+        if !self.is_enabled() || self.collecting.get() {
+            return 0;
         }
+        let (count0, eligible) = {
+            let counts = self.counts.borrow();
+            let thresholds = self.thresholds.borrow();
+            if thresholds[0] == 0 {
+                return 0;
+            }
+            let mut gen = 0;
+            if counts[1] + 1 >= thresholds[1] {
+                gen = 1;
+                if counts[2] + 1 >= thresholds[2] {
+                    gen = 2;
+                }
+            }
+            (counts[0] >= thresholds[0], gen)
+        };
+        if !count0 {
+            return 0;
+        }
+        self.collect(eligible)
     }
 
     /// Total population (across all generations + frozen).
@@ -378,19 +489,34 @@ impl GcState {
     /// Collect generations `0..=upto`. Returns the number of
     /// objects reclaimed.
     pub fn collect(&self, upto: usize) -> usize {
-        if !self.is_enabled() {
+        if !self.is_enabled() || self.collecting.get() {
             return 0;
         }
+        self.collecting.set(true);
         let gen = upto.min(N_GENERATIONS - 1);
-        let mut total_collected = 0;
-        for g in 0..=gen {
-            let collected = self.collect_generation(g);
-            total_collected += collected;
+        // One merged pass: `collect_generation(gen)` already takes
+        // every younger generation as part of its candidate set.
+        let collected = self.collect_generation(gen);
+        {
             let mut stats = self.stats.borrow_mut();
-            stats[g].collections = stats[g].collections.saturating_add(1);
-            stats[g].collected = stats[g].collected.saturating_add(collected as u64);
+            stats[gen].collections = stats[gen].collections.saturating_add(1);
+            stats[gen].collected = stats[gen].collected.saturating_add(collected as u64);
         }
-        total_collected
+        {
+            // CPython resets the counters of every collected
+            // generation and credits one "tick" to the next older
+            // one — that tick is what eventually promotes a gen-1 /
+            // gen-2 collection in `maybe_auto_collect`.
+            let mut counts = self.counts.borrow_mut();
+            for c in counts.iter_mut().take(gen + 1) {
+                *c = 0;
+            }
+            if gen + 1 < N_GENERATIONS {
+                counts[gen + 1] = counts[gen + 1].saturating_add(1);
+            }
+        }
+        self.collecting.set(false);
+        collected
     }
 
     /// Collect a specific generation. Used by [`Self::collect`].
@@ -409,10 +535,26 @@ impl GcState {
         // `Rc::strong_count - 1` (the candidate set holds one
         // reference itself, in `TrackedHandle::object`).
         for handle in &candidate_set {
-            let outer = strong_count_for(&handle.object).saturating_sub(1) as i64;
+            // A weak reference must not keep its referent reachable, but
+            // each live slot holds a strong `Object` clone of the target
+            // (the registry's drop-driven clear model). Discount those
+            // clones here so an object reachable *only* through weakrefs
+            // collapses to `gc_refs == 0` and is collected — which fires
+            // `notify_clear` and flips `weakref.ref(obj)()` to `None`.
+            let weak_clones = crate::weakref_registry::strong_clone_count(handle.id) as i64;
+            let outer = strong_count_for(&handle.object)
+                .saturating_sub(1)
+                .saturating_sub(weak_clones as usize) as i64;
             handle.gc_refs.store(outer, Ordering::Release);
             handle.color.store(color::White, Ordering::Release);
         }
+
+        // Index the candidate set by id so the per-child lookups in
+        // phases 3 and 4 are O(1) — a linear `find` here makes the
+        // whole collection quadratic, which generator-heavy programs
+        // (itertools pipelines) hit hard.
+        let by_id: std::collections::HashMap<ObjectId, Arc<TrackedHandle>> =
+            candidate_set.iter().map(|h| (h.id, h.clone())).collect();
 
         // Phase 3: subtract internal refs by walking each
         // tracked object's children. Self-references count too —
@@ -421,7 +563,7 @@ impl GcState {
         // collapses to gc_refs == 0.
         for handle in &candidate_set {
             traverse_object(&handle.object, &mut |child| {
-                if let Some(target) = candidate_set.iter().find(|h| h.id == id_of(child)) {
+                if let Some(target) = by_id.get(&id_of(child)) {
                     target.gc_refs.fetch_sub(1, Ordering::AcqRel);
                 }
             });
@@ -439,7 +581,7 @@ impl GcState {
         while let Some(h) = grey.pop() {
             h.color.store(color::Black, Ordering::Release);
             traverse_object(&h.object, &mut |child| {
-                if let Some(target) = candidate_set.iter().find(|t| t.id == id_of(child)) {
+                if let Some(target) = by_id.get(&id_of(child)) {
                     if target.color.load(Ordering::Acquire) == color::White {
                         target.color.store(color::Grey, Ordering::Release);
                         grey.push(target.clone());
@@ -493,9 +635,21 @@ impl GcState {
             clear_object_fields(&h.object);
         }
 
-        // 5d: invoke weakref callbacks now (after finalisers
-        // and cyclic clears, matching CPython's order).
-        let _ = weakref_callbacks;
+        // 5d: queue weakref callbacks (after finalisers and cyclic
+        // clears, matching CPython's order). The interpreter drains
+        // the queue at its next safe point — the GC layer can't call
+        // Python itself.
+        for (slot, cb) in weakref_callbacks {
+            let wr = slot
+                .py_ref
+                .borrow()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .map(crate::object::Object::Instance);
+            if let Some(wr) = wr {
+                crate::vm_singletons::push_pending_weakref_callback(cb, wr);
+            }
+        }
 
         // Phase 6: rebuild the generation lists. Survivors of
         // generation `g` (color != White) move to generation
@@ -525,12 +679,14 @@ impl GcState {
 
     fn rebuild_generations(&self, upto: usize, candidates: &[Arc<TrackedHandle>]) {
         let mut gens = self.generations.borrow_mut();
+        let mut index = self.index.borrow_mut();
         for g in 0..=upto.min(N_GENERATIONS - 1) {
             gens[g].handles.clear();
         }
         for h in candidates {
             let color = h.color.load(Ordering::Acquire);
             if color == color::White {
+                index.remove(&h.id);
                 continue;
             }
             let g = h.generation.load(Ordering::Acquire);
@@ -578,10 +734,16 @@ pub fn strong_count_for(obj: &Object) -> usize {
 
 /// Walk the immediate children of a container object, calling
 /// `visit(child)` for each. Containers without children no-op.
+///
+/// Uses `try_borrow` throughout: collections can now run from the
+/// interpreter's allocation sites, and a container that is mid-borrow
+/// at that instant is simply skipped. That is *conservative* under the
+/// refcount-seeded reachability model — an unvisited child keeps its
+/// external `gc_refs` and therefore survives the pass.
 pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     match obj {
         Object::List(l) => {
-            let v = l.borrow();
+            let Ok(v) = l.try_borrow() else { return };
             for item in v.iter() {
                 visit(item);
             }
@@ -592,14 +754,14 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             }
         }
         Object::Dict(d) | Object::MappingProxy(d) | Object::SimpleNamespace(d) => {
-            let m = d.borrow();
+            let Ok(m) = d.try_borrow() else { return };
             for (k, v) in m.iter() {
                 visit(&k.0);
                 visit(v);
             }
         }
         Object::Set(s) => {
-            let m = s.borrow();
+            let Ok(m) = s.try_borrow() else { return };
             for k in m.iter() {
                 visit(&k.0);
             }
@@ -610,21 +772,33 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             }
         }
         Object::Instance(i) => {
-            let m = i.dict.borrow();
-            for (k, v) in m.iter() {
-                visit(&k.0);
-                visit(v);
+            if let Ok(m) = i.dict.try_borrow() {
+                for (k, v) in m.iter() {
+                    visit(&k.0);
+                    visit(v);
+                }
+            }
+            if let Ok(slots) = i.slots.try_borrow() {
+                if let Some(slots) = slots.as_ref() {
+                    for (k, v) in slots.iter() {
+                        visit(&k.0);
+                        visit(v);
+                    }
+                }
             }
         }
         Object::Module(m) => {
-            let dict = m.dict.borrow();
+            let Ok(dict) = m.dict.try_borrow() else {
+                return;
+            };
             for (k, v) in dict.iter() {
                 visit(&k.0);
                 visit(v);
             }
         }
         Object::Cell(c) => {
-            visit(&c.borrow());
+            let Ok(v) = c.try_borrow() else { return };
+            visit(&v);
         }
         Object::BoundMethod(b) => {
             visit(&b.function);
@@ -639,16 +813,24 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             visit(&p.fget);
             visit(&p.fset);
             visit(&p.fdel);
-            visit(&p.doc);
+            if let Ok(doc) = p.doc.try_borrow() {
+                visit(&doc);
+            }
         }
         Object::StaticMethod(o) | Object::ClassMethod(o) => {
-            visit(o);
+            visit(&o.func());
+            if let Ok(d) = o.dict.try_borrow() {
+                for (k, v) in d.iter() {
+                    visit(&k.0);
+                    visit(v);
+                }
+            }
         }
         Object::DictView(v) => {
             // Dict views borrow the underlying dict — visit its
             // entries so cycles through `dict.items()` snapshots
             // are detectable.
-            let m = v.dict.borrow();
+            let Ok(m) = v.dict.try_borrow() else { return };
             for (k, val) in m.iter() {
                 visit(&k.0);
                 visit(val);
@@ -658,13 +840,28 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             // Class dict + base list. Without this, classes that
             // close over a method that closes over the class
             // (a very common pattern via decorators) leak.
-            let dict = t.dict.borrow();
-            for (k, v) in dict.iter() {
-                visit(&k.0);
-                visit(v);
+            if let Ok(dict) = t.dict.try_borrow() {
+                for (k, v) in dict.iter() {
+                    visit(&k.0);
+                    visit(v);
+                }
             }
-            for base in &t.bases {
+            for base in t.bases.borrow().iter() {
                 visit(&Object::Type(base.clone()));
+            }
+            // The MRO holds strong refs — including one to the class
+            // itself (every class self-cycles through `mro[0]`). The
+            // collector must subtract these internal edges or a class
+            // can never collapse to gc_refs == 0.
+            if let Ok(mro) = t.mro.try_borrow() {
+                for entry in mro.iter() {
+                    visit(&Object::Type(entry.clone()));
+                }
+            }
+            if let Ok(meta) = t.metaclass.try_borrow() {
+                if let Some(meta) = meta.as_ref() {
+                    visit(&Object::Type(meta.clone()));
+                }
             }
         }
         Object::Function(_)
@@ -726,24 +923,67 @@ pub fn register_traverse(
 /// Drain a container's child references in place. Used during
 /// the GC's clear phase to break cycles.
 pub fn clear_object_fields(obj: &Object) {
+    // `try_borrow_mut` throughout: clear targets are unreachable, but
+    // collections can run from allocation sites and the drop path —
+    // a momentarily-borrowed container is left for the next pass
+    // rather than panicking the interpreter.
     match obj {
         Object::List(l) => {
-            l.borrow_mut().clear();
+            if let Ok(mut v) = l.try_borrow_mut() {
+                v.clear();
+            }
         }
         Object::Dict(d) | Object::MappingProxy(d) | Object::SimpleNamespace(d) => {
-            d.borrow_mut().clear();
+            if let Ok(mut m) = d.try_borrow_mut() {
+                m.clear();
+            }
         }
         Object::Set(s) => {
-            s.borrow_mut().clear();
+            if let Ok(mut m) = s.try_borrow_mut() {
+                m.clear();
+            }
         }
         Object::Instance(i) => {
-            i.dict.borrow_mut().clear();
+            if let Ok(mut m) = i.dict.try_borrow_mut() {
+                m.clear();
+            }
+            if let Ok(mut slots) = i.slots.try_borrow_mut() {
+                *slots = None;
+            }
         }
         Object::ByteArray(b) => {
-            b.borrow_mut().clear();
+            if let Ok(mut v) = b.try_borrow_mut() {
+                v.clear();
+            }
         }
         Object::Cell(c) => {
-            *c.borrow_mut() = Object::None;
+            if let Ok(mut v) = c.try_borrow_mut() {
+                *v = Object::None;
+            }
+        }
+        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
+            // Dropping the suspended frame box breaks the cycle
+            // (the finalizer — close() — has already run by the
+            // time clear is reached; see collect phase 5c).
+            if let Ok(mut st) = g.state.try_borrow_mut() {
+                *st = crate::object::GeneratorState::Finished;
+            }
+        }
+        Object::Type(t) => {
+            // An unreachable class: drop the dict entries and the MRO
+            // (which holds the self-`Rc` every class is born with).
+            // `bases` is an immutable Vec, but base edges point up to
+            // parents that hold children only weakly, so they never
+            // form a cycle on their own.
+            if let Ok(mut dict) = t.dict.try_borrow_mut() {
+                dict.clear();
+            }
+            if let Ok(mut mro) = t.mro.try_borrow_mut() {
+                mro.clear();
+            }
+            if let Ok(mut meta) = t.metaclass.try_borrow_mut() {
+                *meta = None;
+            }
         }
         _ => {}
     }
@@ -760,12 +1000,15 @@ fn run_finalizer(obj: &Object) {
     }
 }
 
-/// True iff `obj`'s class defines `__del__`.
+/// True iff `obj` needs finalization when it becomes garbage:
+/// instances whose class defines `__del__`, and generator-family
+/// objects that haven't finished (closing them runs `finally`
+/// blocks — CPython's `gen_dealloc` behavior).
 fn has_finalizer(obj: &Object) -> bool {
-    if let Object::Instance(inst) = obj {
-        inst.class.lookup("__del__").is_some()
-    } else {
-        false
+    match obj {
+        Object::Instance(inst) => inst.cls().lookup("__del__").is_some(),
+        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => !g.is_finished(),
+        _ => false,
     }
 }
 
@@ -785,16 +1028,150 @@ pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
 }
 
+/// A value that can never (transitively) hold a reference back to a
+/// container, and therefore can never be part of a reference cycle.
+/// Mutable byte/scalar leaves qualify; everything else is treated as
+/// potentially-cyclic so the collector errs toward tracking.
+pub fn is_atomic(obj: &Object) -> bool {
+    matches!(
+        obj,
+        Object::None
+            | Object::Unbound
+            | Object::Bool(_)
+            | Object::Int(_)
+            | Object::Long(_)
+            | Object::Float(_)
+            | Object::Complex(_)
+            | Object::Str(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+            | Object::Range(_)
+    )
+}
+
+/// True if the freshly-built container `obj` holds at least one
+/// non-atomic element and could therefore participate in a reference
+/// cycle. A `list`/`dict`/`set` of only scalar leaves (ints, strs,
+/// floats, …) can never close a cycle, so the collector skips it —
+/// this is CPython's container-untracking optimization applied at
+/// construction time, and it keeps numeric/string-heavy workloads off
+/// the GC's books entirely.
+fn container_can_cycle(obj: &Object) -> bool {
+    match obj {
+        Object::List(l) => l
+            .try_borrow()
+            .map(|v| v.iter().any(|x| !is_atomic(x)))
+            .unwrap_or(true),
+        Object::Set(s) => s
+            .try_borrow()
+            .map(|m| m.iter().any(|k| !is_atomic(&k.0)))
+            .unwrap_or(true),
+        Object::Dict(d) => d
+            .try_borrow()
+            .map(|m| m.iter().any(|(k, v)| !is_atomic(&k.0) || !is_atomic(v)))
+            .unwrap_or(true),
+        // Any other container kind: be conservative and track.
+        _ => true,
+    }
+}
+
+/// Track a freshly-created mutable container (`list`/`dict`/`set`) with
+/// the cycle collector, but only when it can actually participate in a
+/// cycle (see [`container_can_cycle`]). Returns `true` when the object
+/// was added to the tracked set, so the caller can decide whether to
+/// run a threshold-driven young collection at the allocation site.
+pub fn track_if_cyclic(obj: &Object) -> bool {
+    if container_can_cycle(obj) {
+        track(obj.clone());
+        true
+    } else {
+        false
+    }
+}
+
+/// Convenience: threshold-driven automatic collection on the current
+/// thread's GC (see [`GcState::maybe_auto_collect`]). Returns the
+/// number of objects reclaimed; the caller should drain pending
+/// finalizers when this is non-zero.
+pub fn maybe_auto_collect() -> usize {
+    let n = with_state(GcState::maybe_auto_collect);
+    if n > 0 {
+        sweep_weakref_only_targets();
+    }
+    n
+}
+
+/// Convenience: find a tracked handle by object id (O(1) via the
+/// id index, which covers all generations plus the frozen set).
+pub fn find_handle(id: ObjectId) -> Option<Arc<TrackedHandle>> {
+    with_state(|s| s.handle_for(id))
+}
+
+/// Convenience: is `id` currently tracked by the cycle GC? Used
+/// by refcount-emulation paths to discount the registry's own
+/// strong handle.
+pub fn is_tracked(id: ObjectId) -> bool {
+    find_handle(id).is_some()
+}
+
+/// Convenience: claim `id`'s finalizer (so a later collection
+/// won't double-run `__del__`). Returns false if it was already
+/// claimed or the object isn't tracked.
+pub fn mark_finalized(id: ObjectId) -> bool {
+    match find_handle(id) {
+        Some(h) => !h.finalized.swap(true, Ordering::AcqRel),
+        None => false,
+    }
+}
+
+/// Convenience: snapshot all tracked objects with an unrun `__del__`
+/// on the current thread's GC (see [`GcState::finalization_candidates`]).
+pub fn finalization_candidates() -> Vec<Arc<TrackedHandle>> {
+    with_state(|s| s.finalization_candidates())
+}
+
 /// Convenience: run a full collection on the current thread's
 /// GC. Returns the number of objects collected.
 pub fn collect_all() -> usize {
-    with_state(|s| s.collect(N_GENERATIONS - 1))
+    let n = with_state(|s| s.collect(N_GENERATIONS - 1));
+    sweep_weakref_only_targets();
+    n
 }
 
 /// Convenience: run a partial collection of generations
 /// `0..=upto`.
 pub fn collect_upto(upto: usize) -> usize {
-    with_state(|s| s.collect(upto))
+    let n = with_state(|s| s.collect(upto));
+    sweep_weakref_only_targets();
+    n
+}
+
+/// Clear weakrefs whose referent isn't in the tracked set and whose
+/// only remaining strong references are the weakref slots' own
+/// clones. Covers weakref-able objects the cycle collector never
+/// sees — plain functions, bound methods, types — so
+/// `del f; gc.collect()` flips `weakref.ref(f)()` to `None` exactly
+/// like CPython's refcount-driven `tp_dealloc` would.
+pub fn sweep_weakref_only_targets() -> usize {
+    let targets = crate::weakref_registry::with_registry(|r| r.targets());
+    let mut cleared = 0;
+    for (id, target) in targets {
+        if is_tracked(id) {
+            // Tracked objects belong to the cycle pass (their handle
+            // holds an extra strong ref this arithmetic doesn't model).
+            continue;
+        }
+        let clones = crate::weakref_registry::strong_clone_count(id);
+        // `target` itself is one clone we hold for the probe.
+        if strong_count_for(&target) <= clones + 1 {
+            crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(id));
+            cleared += 1;
+        }
+    }
+    if cleared > 0 {
+        crate::weakref_registry::with_registry(|r| r.shrink());
+    }
+    cleared
 }
 
 #[cfg(test)]

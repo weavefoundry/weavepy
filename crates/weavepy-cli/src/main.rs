@@ -255,6 +255,35 @@ The following implementation-specific options are available:
 ";
 
 fn main() -> ExitCode {
+    run_on_large_stack(main_dispatch)
+}
+
+/// WeavePy evaluates Python by recursive descent, so Python call depth
+/// maps onto native (Rust) stack depth (see `crates/weavepy-vm/src/
+/// recursion.rs`). Run the whole interpreter on a thread with a large
+/// stack reserve so that `sys.setrecursionlimit` — enforced by the VM's
+/// recursion guard (RFC 0037) — is what bounds recursion, rather than
+/// the fixed OS main-thread stack (8 MiB on Linux/macOS). This makes the
+/// behaviour uniform across platforms *and* build profiles: debug builds
+/// have much larger per-activation stack frames than release, so without
+/// this a default `setrecursionlimit(1000)` would overflow the native
+/// stack in debug before the guard could fire. The reserve is committed
+/// lazily by the OS, so it costs address space, not memory.
+fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
+    const STACK_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB reserve
+    match std::thread::Builder::new()
+        .name("weavepy-main".to_owned())
+        .stack_size(STACK_BYTES)
+        .spawn(entry)
+    {
+        Ok(handle) => handle.join().unwrap_or(ExitCode::FAILURE),
+        // Extremely unlikely, but if the OS refuses the thread, fall
+        // back to running on the current (main) thread.
+        Err(_) => entry(),
+    }
+}
+
+fn main_dispatch() -> ExitCode {
     init_tracing();
 
     let raw: Vec<String> = env::args().collect();
@@ -344,6 +373,15 @@ fn split_argv(raw: Vec<String>) -> (Vec<String>, Option<(&'static str, String)>,
         if arg == "-" {
             let rest: Vec<String> = iter.collect();
             return (wp, Some(("-", String::new())), rest);
+        }
+        // Value-taking flags: consume the following arg too, so it
+        // isn't mistaken for the positional script (`-X opt script.py`).
+        if arg == "-X" || arg == "-W" || arg == "--check-hash-based-pycs" {
+            wp.push(arg);
+            if let Some(value) = iter.next() {
+                wp.push(value);
+            }
+            continue;
         }
         if !arg.starts_with('-') {
             // Positional script.
@@ -604,9 +642,10 @@ fn run_module(
         init.is_file().then_some((init, true))
     });
     if let Some((source_path, _)) = on_disk {
-        let source = fs::read_to_string(&source_path)
+        let bytes = fs::read(&source_path)
             .with_context(|| format!("failed to read {}", source_path.display()))?;
         let filename = source_path.display().to_string();
+        let source = decode_script_source(&bytes, &filename);
         let opts = RunOptions::new(filename.clone())
             .with_argv(argv)
             .with_extra_path(extra_path.to_vec())
@@ -640,15 +679,33 @@ fn run_module(
     run_source_with_options(&bootstrap, &opts)
 }
 
+/// Decode a script file's bytes per PEP 263 (BOM + coding cookie,
+/// default strict UTF-8). On failure, print CPython's tokenizer-style
+/// `SyntaxError` to stderr and exit 1 — like `python bad.py` does.
+fn decode_script_source(bytes: &[u8], filename: &str) -> String {
+    match weavepy::vm::decode_source_bytes(bytes, filename) {
+        Ok(s) => s,
+        Err(err) => {
+            let msg = match &err {
+                weavepy::vm::RuntimeError::PyException(pe) => pe.message(),
+                other => other.to_string(),
+            };
+            eprintln!("  File \"{filename}\", line 1");
+            eprintln!("SyntaxError: {msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_path(
     path: &Path,
     extra: Vec<String>,
     flags: &InterpreterFlags,
     extra_path: &[PathBuf],
 ) -> Result<()> {
-    let source =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let filename = path.display().to_string();
+    let source = decode_script_source(&bytes, &filename);
     let mut argv = vec![filename.clone()];
     argv.extend(extra);
     let script_dir = path
@@ -679,7 +736,11 @@ fn run_stdin(extra: Vec<String>, flags: &InterpreterFlags, extra_path: &[PathBuf
 }
 
 fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
-    match weavepy::run_source_with_options(source, opts) {
+    // CLI runs print uncaught exceptions CPython-style, through the
+    // interpreter's `sys.excepthook` / `traceback` machinery (source
+    // lines, carets, exception chains) while it is still alive.
+    let opts = opts.clone().with_print_uncaught(true);
+    match weavepy::run_source_with_options(source, &opts) {
         Ok(()) => Ok(()),
         Err(err) => {
             // A `SystemExit` reaching the top level terminates the
@@ -689,9 +750,11 @@ fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
             if let Some(code) = err.system_exit_code() {
                 exit_with_system_exit(code);
             }
-            let mut stderr = io::stderr().lock();
-            let diag = err.format(source, &opts.filename);
-            let _ = stderr.write_all(diag.as_bytes());
+            if !err.already_printed() {
+                let mut stderr = io::stderr().lock();
+                let diag = err.format(source, &opts.filename);
+                let _ = stderr.write_all(diag.as_bytes());
+            }
             anyhow::bail!(DIAGNOSTIC_SENTINEL);
         }
     }

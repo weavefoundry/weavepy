@@ -225,6 +225,7 @@ fn wrap_c_function(
     };
     Object::Builtin(Rc::new(BuiltinFn {
         name: static_name,
+        binds_instance: false,
         call: Box::new(f),
         call_kw: None,
     }))
@@ -323,6 +324,8 @@ fn wrap_c_method_function(
     };
     Object::Builtin(Rc::new(BuiltinFn {
         name: static_name,
+        // C-type method defs are method descriptors: they bind.
+        binds_instance: true,
         call: Box::new(f),
         call_kw: None,
     }))
@@ -631,7 +634,7 @@ fn install_runtime_error(err: RuntimeError) {
     match err {
         RuntimeError::PyException(pe) => {
             let cls = match &pe.instance {
-                Object::Instance(inst) => Some(inst.class.clone()),
+                Object::Instance(inst) => Some(inst.cls()),
                 _ => None,
             };
             crate::errors::set_pending(cls, Object::from_str(pe.message()));

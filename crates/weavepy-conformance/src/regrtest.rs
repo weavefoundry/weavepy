@@ -43,7 +43,6 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -264,6 +263,17 @@ pub fn discover_with(
             if p.is_file() {
                 out.push(RegrtestFile {
                     path: p,
+                    label: format!("cpython/Lib/test/{name}"),
+                });
+                continue;
+            }
+            // Some regression tests are *packages* (`test_dataclasses/`
+            // with an `__init__.py`); keep the `.py` label but run the
+            // package entry point.
+            let pkg_init = dir.join(name.trim_end_matches(".py")).join("__init__.py");
+            if pkg_init.is_file() {
+                out.push(RegrtestFile {
+                    path: pkg_init,
                     label: format!("cpython/Lib/test/{name}"),
                 });
             }
@@ -635,22 +645,64 @@ pub fn run_one_with(
     }
 }
 
+/// For vendored CPython tests, build a libregrtest-style bootstrap:
+/// import the file as `test.<name>` (so `__name__`/`__module__` match
+/// what CPython's test runner produces — `global_enum` reprs, pickling
+/// of test-defined classes, …) and run its unittest suite explicitly,
+/// since the `if __name__ == '__main__'` guard never fires on import.
+///
+/// Returns `None` for bundled tests, which keep script semantics.
+fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
+    let name = file
+        .label
+        .strip_prefix("cpython/Lib/test/")?
+        .trim_end_matches(".py")
+        .to_owned();
+    // `Lib` is the ancestor whose child is the `test` directory the
+    // file (or its package) lives in.
+    let mut lib_dir = file.path.parent()?;
+    while lib_dir.file_name().and_then(|n| n.to_str()) != Some("test") {
+        lib_dir = lib_dir.parent()?;
+    }
+    let lib_dir = lib_dir.parent()?.display().to_string();
+    let path = file.path.display().to_string();
+    Some(format!(
+        r#"
+import sys
+sys.path.insert(0, {lib_dir:?})
+sys.argv = [{path:?}]
+import unittest
+try:
+    mod = __import__("test.{name}", fromlist=["__spec__"])
+except unittest.SkipTest as e:
+    print("skipped:", e)
+    sys.exit(0)
+suite = unittest.TestLoader().loadTestsFromModule(mod)
+result = unittest.TextTestRunner(verbosity=1).run(suite)
+sys.exit(0 if result.wasSuccessful() else 1)
+"#
+    ))
+}
+
 fn run_inprocess(
     file: &RegrtestFile,
     expected: Option<TestStatus>,
     timeout: Duration,
 ) -> TestReport {
-    let source = match fs::read_to_string(&file.path) {
-        Ok(s) => s,
-        Err(e) => {
-            return TestReport {
-                label: file.label.clone(),
-                status: TestStatus::Error,
-                duration_ms: Some(0),
-                detail: Some(format!("read failed: {e}")),
-                expected,
-            };
-        }
+    let source = match libregrtest_bootstrap(file) {
+        Some(bootstrap) => bootstrap,
+        None => match fs::read_to_string(&file.path) {
+            Ok(s) => s,
+            Err(e) => {
+                return TestReport {
+                    label: file.label.clone(),
+                    status: TestStatus::Error,
+                    duration_ms: Some(0),
+                    detail: Some(format!("read failed: {e}")),
+                    expected,
+                };
+            }
+        },
     };
 
     let opts = RunOptions::new(file.path.display().to_string())
@@ -691,7 +743,7 @@ fn run_inprocess(
                             let msg = err.format(&source, &opts.filename);
                             (TestStatus::Error, Some(truncate_detail(&msg)))
                         }
-                        weavepy::Error::Runtime(_) => {
+                        weavepy::Error::Runtime(_) | weavepy::Error::RuntimePrinted(_) => {
                             let msg = err.format(&source, &opts.filename);
                             (TestStatus::Fail, Some(truncate_detail(&msg)))
                         }
@@ -722,7 +774,14 @@ fn run_subprocess(
         .unwrap_or_else(|| PathBuf::from("weavepy"));
     let start = Instant::now();
     let mut cmd = std::process::Command::new(&weavepy_bin);
-    cmd.arg(&file.path);
+    match libregrtest_bootstrap(file) {
+        Some(bootstrap) => {
+            cmd.arg("-c").arg(bootstrap);
+        }
+        None => {
+            cmd.arg(&file.path);
+        }
+    }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -798,25 +857,49 @@ enum ChildOutcome {
 
 /// Wait up to `timeout` for `child` to exit. If it doesn't, SIGKILL the
 /// child and return [`ChildOutcome::TimedOut`].
+///
+/// stdout/stderr are drained on dedicated threads from the moment the
+/// child starts. Reading only *after* the child exits (the obvious
+/// approach) deadlocks against any child that writes more than one pipe
+/// buffer's worth of output (~64 KiB): the child blocks in `write()`
+/// waiting for us to read, while we block in `wait()` waiting for it to
+/// exit. A `unittest` file with hundreds of failing assertions trips this
+/// instantly, so the reader threads are load-bearing for subprocess mode.
 fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> ChildOutcome {
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        pipe.map(|mut s| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf);
+                buf
+            })
+        })
+    }
+    fn collect(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> String {
+        handle
+            .and_then(|h| h.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    }
+
+    let out_handle = drain(child.stdout.take());
+    let err_handle = drain(child.stderr.take());
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    let _ = s.read_to_string(&mut stdout);
-                }
-                if let Some(mut s) = child.stderr.take() {
-                    let _ = s.read_to_string(&mut stderr);
-                }
-                return ChildOutcome::Exited(status, stdout, stderr);
+                return ChildOutcome::Exited(status, collect(out_handle), collect(err_handle));
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Join the readers so the threads don't outlive us;
+                    // the pipes close on kill, so they return promptly.
+                    let _ = collect(out_handle);
+                    let _ = collect(err_handle);
                     return ChildOutcome::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(50));

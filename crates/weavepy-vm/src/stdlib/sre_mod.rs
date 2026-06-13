@@ -1490,6 +1490,7 @@ fn sre_getlower(args: &[Object]) -> Result<Object, RuntimeError> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))

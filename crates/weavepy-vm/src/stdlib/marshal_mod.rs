@@ -34,6 +34,7 @@ const CO_VARARGS: u32 = 0x0004;
 const CO_VARKEYWORDS: u32 = 0x0008;
 const CO_GENERATOR: u32 = 0x0020;
 const CO_COROUTINE: u32 = 0x0080;
+const CO_ITERABLE_COROUTINE: u32 = 0x0100;
 const CO_ASYNC_GENERATOR: u32 = 0x0200;
 
 #[allow(dead_code)]
@@ -107,6 +108,7 @@ fn register(
 ) {
     let bf = BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     };
@@ -337,9 +339,10 @@ impl MarshalWriter {
         self.write_value(&Object::new_bytes(cp.localspluskinds))?;
         self.write_value(&Object::from_str(co.filename.clone()))?;
         self.write_value(&Object::from_str(co.name.clone()))?;
-        // We don't track a separate qualified name; the plain name is a
-        // faithful stand-in for top-level defs and is what `dis` prints.
-        self.write_value(&Object::from_str(co.name.clone()))?;
+        // PEP 3155 qualified name, computed at compile time from lexical
+        // nesting (`outer.<locals>.inner`, `C.method`). Round-trips so an
+        // unmarshalled function/class keeps a faithful `__qualname__`.
+        self.write_value(&Object::from_str(co.qualname.clone()))?;
         self.write_int(cp.firstlineno as i32);
         self.write_value(&Object::new_bytes(cp.co_linetable))?;
         self.write_value(&Object::new_bytes(cp.co_exceptiontable))?;
@@ -367,6 +370,9 @@ fn code_flags(co: &CodeObject) -> u32 {
     }
     if co.is_coroutine {
         f |= CO_COROUTINE;
+    }
+    if co.is_iterable_coroutine {
+        f |= CO_ITERABLE_COROUTINE;
     }
     if co.is_async_generator {
         f |= CO_ASYNC_GENERATOR;
@@ -423,7 +429,14 @@ impl<'a> MarshalReader<'a> {
 
     fn read_byte(&mut self) -> Result<u8, RuntimeError> {
         if self.pos >= self.bytes.len() {
-            return Err(value_error("bad marshal data: short"));
+            // CPython `r_object`: EOF at an object boundary is
+            // EOFError, not ValueError (test_exceptions.testRaising).
+            return Err(RuntimeError::PyException(
+                crate::error::PyException::from_builtin(
+                    "EOFError",
+                    "EOF read where object expected",
+                ),
+            ));
         }
         let b = self.bytes[self.pos];
         self.pos += 1;
@@ -476,7 +489,7 @@ impl<'a> MarshalReader<'a> {
             TYPE_NONE => Ok(Object::None),
             TYPE_TRUE => Ok(Object::Bool(true)),
             TYPE_FALSE => Ok(Object::Bool(false)),
-            TYPE_ELLIPSIS => Ok(Object::None), // Ellipsis singleton not modelled separately yet.
+            TYPE_ELLIPSIS => Ok(crate::vm_singletons::ellipsis()),
             TYPE_INT => {
                 let v = self.read_int()?;
                 Ok(Object::Int(i64::from(v)))
@@ -624,7 +637,7 @@ impl<'a> MarshalReader<'a> {
         let localspluskinds = self.read_value()?;
         let filename = self.read_value()?;
         let name = self.read_value()?;
-        let _qualname = self.read_value()?;
+        let qualname = self.read_value()?;
         let firstlineno = self.read_int()? as u32;
         let linetable = self.read_value()?;
         let exceptiontable = self.read_value()?;
@@ -645,8 +658,13 @@ impl<'a> MarshalReader<'a> {
         )
         .ok_or_else(|| value_error("marshal: code object uses an unsupported opcode"))?;
 
+        let co_name = string_of(&name, "co_name")?;
+        // Fall back to the bare name when the producer didn't record a
+        // qualname (e.g. older marshal payloads); CPython always writes one.
+        let co_qualname = string_of(&qualname, "co_qualname").unwrap_or_else(|_| co_name.clone());
         let co = CodeObject {
-            name: string_of(&name, "co_name")?,
+            name: co_name,
+            qualname: co_qualname,
             filename: string_of(&filename, "co_filename")?,
             caches: CacheTable::with_len(decoded.instructions.len()),
             instructions: decoded.instructions,
@@ -657,6 +675,9 @@ impl<'a> MarshalReader<'a> {
             cellvars: decoded.cellvars,
             exception_table: decoded.exception_table,
             linetable: decoded.linetable,
+            // Marshal doesn't round-trip PEP-657 columns yet; co_positions()
+            // on an unmarshalled code object reports lines only.
+            coltable: Vec::new(),
             arg_count,
             posonly_count,
             kwonly_count,
@@ -666,6 +687,7 @@ impl<'a> MarshalReader<'a> {
             is_generator: flags & CO_GENERATOR != 0,
             is_coroutine: flags & CO_COROUTINE != 0,
             is_async_generator: flags & CO_ASYNC_GENERATOR != 0,
+            is_iterable_coroutine: flags & CO_ITERABLE_COROUTINE != 0,
         };
         Ok(Object::Code(Rc::new(co)))
     }

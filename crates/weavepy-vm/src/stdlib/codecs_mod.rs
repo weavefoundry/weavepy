@@ -123,6 +123,7 @@ fn register(
 ) {
     let bf = BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     };
@@ -173,6 +174,15 @@ fn lookup_encoding(name: &str) -> Option<&'static Encoding> {
         "latin1" | "latin" | "iso88591" | "88591" | "cp819" | "l1" => {
             Encoding::for_label(b"iso-8859-1")
         }
+        // CPython `Lib/encodings/aliases.py` latin-N aliases.
+        "latin2" | "l2" => Encoding::for_label(b"iso-8859-2"),
+        "latin3" | "l3" => Encoding::for_label(b"iso-8859-3"),
+        "latin4" | "l4" => Encoding::for_label(b"iso-8859-4"),
+        "latin5" | "l5" => Encoding::for_label(b"iso-8859-9"),
+        "latin6" | "l6" => Encoding::for_label(b"iso-8859-10"),
+        "latin8" | "l8" => Encoding::for_label(b"iso-8859-14"),
+        "latin9" | "l9" => Encoding::for_label(b"iso-8859-15"),
+        "latin10" | "l10" => Encoding::for_label(b"iso-8859-16"),
         "utf8" | "u8" | "utf" => Encoding::for_label(b"utf-8"),
         "utf16" | "u16" => Encoding::for_label(b"utf-16"),
         "utf16le" => Encoding::for_label(b"utf-16le"),
@@ -215,18 +225,46 @@ pub fn b_decode(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_lookup(args: &[Object]) -> Result<Object, RuntimeError> {
     let name = arg_str(args, 0, "lookup")?;
-    let enc =
-        lookup_encoding(&name).ok_or_else(|| value_error(format!("unknown encoding: {name}")))?;
+    let enc = lookup_encoding(&name)
+        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {name}")))?;
     let normalised = enc.name().to_lowercase();
     Ok(Object::from_str(normalised))
 }
 
+/// Known built-in error handler names. Custom handlers registered via
+/// `codecs.register_error` live in the frozen `codecs.py` registry and
+/// are resolved there before reaching the native engine.
+const KNOWN_ERROR_HANDLERS: &[&str] = &[
+    "strict",
+    "ignore",
+    "replace",
+    "backslashreplace",
+    "xmlcharrefreplace",
+    "namereplace",
+    "surrogateescape",
+    "surrogatepass",
+];
+
+/// `-X dev`: validate the error-handler name eagerly, like CPython's
+/// bpo-37388 check in `bytes(s, encoding, errors=…)` / `bytes.decode`.
+/// Outside dev mode unknown handlers only fail if an error actually
+/// occurs (matching CPython's lazy lookup).
+fn check_error_handler(errors: &str) -> Result<(), RuntimeError> {
+    if crate::vm_singletons::dev_mode() && !KNOWN_ERROR_HANDLERS.contains(&errors) {
+        return Err(crate::error::lookup_error(format!(
+            "unknown error handler name '{errors}'"
+        )));
+    }
+    Ok(())
+}
+
 pub fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
+    check_error_handler(errors)?;
     if let Some(out) = encode_special(s, encoding, errors)? {
         return Ok(out);
     }
     let enc = lookup_encoding(encoding)
-        .ok_or_else(|| value_error(format!("unknown encoding: {encoding}")))?;
+        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {encoding}")))?;
     let (bytes, _, has_replacements) = enc.encode(s);
     if has_replacements && errors == "strict" {
         return Err(value_error(format!(
@@ -237,11 +275,12 @@ pub fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, Runt
 }
 
 pub fn decode_bytes(bytes: &[u8], encoding: &str, errors: &str) -> Result<String, RuntimeError> {
+    check_error_handler(errors)?;
     if let Some(out) = decode_special(bytes, encoding, errors)? {
         return Ok(out);
     }
     let enc = lookup_encoding(encoding)
-        .ok_or_else(|| value_error(format!("unknown encoding: {encoding}")))?;
+        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {encoding}")))?;
     let (text, _, had_errors) = enc.decode(bytes);
     if had_errors && errors == "strict" {
         return Err(value_error(format!(
@@ -268,6 +307,7 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
         "utf32be" => Some(encode_utf32(s, true, false)),
         "rawunicodeescape" => Some(encode_raw_unicode_escape(s)),
         "unicodeescape" => Some(encode_unicode_escape(s)),
+        "cp437" | "437" | "ibm437" => Some(encode_cp437(s, errors)?),
         _ => None,
     })
 }
@@ -290,8 +330,71 @@ fn decode_special(
         "utf32be" => Some(decode_utf32(bytes, Some(true))?),
         "rawunicodeescape" => Some(decode_raw_unicode_escape(bytes)?),
         "unicodeescape" => Some(decode_unicode_escape(bytes)?),
+        "cp437" | "437" | "ibm437" => Some(decode_cp437(bytes)),
         _ => None,
     })
+}
+
+// ---------- cp437 (IBM PC / DOS codepage, not in encoding_rs) ----------
+
+/// Upper half (0x80..=0xFF) of code page 437, from CPython's
+/// `Lib/encodings/cp437.py` decoding table.
+const CP437_HIGH: [char; 128] = [
+    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
+    '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
+    '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}',
+    '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00a2}', '\u{00a3}', '\u{00a5}', '\u{20a7}', '\u{0192}',
+    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}',
+    '\u{00bf}', '\u{2310}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{255c}', '\u{255b}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{255e}', '\u{255f}',
+    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256b}',
+    '\u{256a}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{258c}', '\u{2590}', '\u{2580}',
+    '\u{03b1}', '\u{00df}', '\u{0393}', '\u{03c0}', '\u{03a3}', '\u{03c3}', '\u{00b5}', '\u{03c4}',
+    '\u{03a6}', '\u{0398}', '\u{03a9}', '\u{03b4}', '\u{221e}', '\u{03c6}', '\u{03b5}', '\u{2229}',
+    '\u{2261}', '\u{00b1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00f7}', '\u{2248}',
+    '\u{00b0}', '\u{2219}', '\u{00b7}', '\u{221a}', '\u{207f}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
+];
+
+fn decode_cp437(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b < 0x80 {
+                b as char
+            } else {
+                CP437_HIGH[(b - 0x80) as usize]
+            }
+        })
+        .collect()
+}
+
+fn encode_cp437(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
+    let mut out = Vec::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if (c as u32) < 0x80 {
+            out.push(c as u8);
+        } else if let Some(pos) = CP437_HIGH.iter().position(|&h| h == c) {
+            out.push(0x80 + pos as u8);
+        } else {
+            match errors {
+                "ignore" => {}
+                "replace" => out.push(b'?'),
+                _ => {
+                    return Err(crate::error::unicode_encode_error(
+                        "charmap",
+                        s,
+                        i,
+                        i + 1,
+                        "character maps to <undefined>",
+                    ))
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn encode_utf16(s: &str, big: bool, with_bom: bool) -> Vec<u8> {
@@ -440,20 +543,33 @@ fn encode_utf8(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
 }
 
 fn decode_utf8(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
+    // Strict (and unknown-handler) failures raise a real
+    // `UnicodeDecodeError` with CPython's payload and message shape:
+    // `'utf-8' codec can't decode byte 0x80 in position 12: invalid
+    // start byte`.
+    let strict_err = |e: &std::str::Utf8Error| {
+        let pos = e.valid_up_to();
+        let end = pos + e.error_len().unwrap_or(1);
+        let reason = if e.error_len().is_none() {
+            "unexpected end of data"
+        } else if bytes.get(pos).is_some_and(|b| (0x80..0xC2).contains(b)) {
+            "invalid start byte"
+        } else {
+            "invalid continuation byte"
+        };
+        crate::error::unicode_decode_error("utf-8", bytes, pos, end.min(bytes.len()), reason)
+    };
     match errors {
-        "strict" => std::str::from_utf8(bytes).map(str::to_owned).map_err(|e| {
-            value_error(format!(
-                "'utf-8' codec can't decode byte at position {}",
-                e.valid_up_to()
-            ))
-        }),
+        "strict" => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|e| strict_err(&e)),
         "ignore" => Ok(String::from_utf8_lossy_lenient(bytes, false)),
         "replace" => Ok(String::from_utf8_lossy(bytes).into_owned()),
         "surrogateescape" => Ok(decode_utf8_surrogateescape(bytes)),
         "backslashreplace" => Ok(decode_utf8_backslashreplace(bytes)),
         _ => std::str::from_utf8(bytes)
             .map(str::to_owned)
-            .map_err(|e| value_error(format!("utf-8 decode error at byte {}", e.valid_up_to()))),
+            .map_err(|e| strict_err(&e)),
     }
 }
 
@@ -542,12 +658,20 @@ impl FromUtf8Lenient for String {
 
 fn encode_ascii(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
     let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
+    for (pos, c) in s.chars().enumerate() {
         let cp = c as u32;
         if cp < 0x80 {
             out.push(cp as u8);
         } else {
-            handle_encode_error(&mut out, c, errors, "ascii")?;
+            handle_encode_error(
+                &mut out,
+                s,
+                pos,
+                c,
+                errors,
+                "ascii",
+                "ordinal not in range(128)",
+            )?;
         }
     }
     Ok(out)
@@ -555,11 +679,11 @@ fn encode_ascii(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
 
 fn decode_ascii(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
     let mut out = String::with_capacity(bytes.len());
-    for &b in bytes {
+    for (pos, &b) in bytes.iter().enumerate() {
         if b < 0x80 {
             out.push(b as char);
         } else {
-            handle_decode_error(&mut out, b, errors, "ascii")?;
+            handle_decode_error(&mut out, bytes, pos, errors, "ascii")?;
         }
     }
     Ok(out)
@@ -567,12 +691,20 @@ fn decode_ascii(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
 
 fn encode_latin1(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
     let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
+    for (pos, c) in s.chars().enumerate() {
         let cp = c as u32;
         if cp < 0x100 {
             out.push(cp as u8);
         } else {
-            handle_encode_error(&mut out, c, errors, "latin-1")?;
+            handle_encode_error(
+                &mut out,
+                s,
+                pos,
+                c,
+                errors,
+                "latin-1",
+                "ordinal not in range(256)",
+            )?;
         }
     }
     Ok(out)
@@ -584,15 +716,24 @@ fn decode_latin1(bytes: &[u8]) -> String {
 
 fn handle_encode_error(
     out: &mut Vec<u8>,
+    source: &str,
+    pos: usize,
     c: char,
     errors: &str,
     encoding: &str,
+    reason: &str,
 ) -> Result<(), RuntimeError> {
     match errors {
-        "strict" => Err(value_error(format!(
-            "'{encoding}' codec can't encode character '\\u{{{:x}}}'",
-            c as u32
-        ))),
+        // Strict mode raises a real `UnicodeEncodeError` (a `ValueError`
+        // subclass) carrying the canonical `(encoding, object, start, end,
+        // reason)` payload, matching CPython — not a bare `ValueError`.
+        "strict" => Err(crate::error::unicode_encode_error(
+            encoding,
+            source,
+            pos,
+            pos + 1,
+            reason,
+        )),
         "ignore" => Ok(()),
         "replace" => {
             out.push(b'?');
@@ -621,14 +762,20 @@ fn handle_encode_error(
 
 fn handle_decode_error(
     out: &mut String,
-    byte: u8,
+    input: &[u8],
+    pos: usize,
     errors: &str,
     encoding: &str,
 ) -> Result<(), RuntimeError> {
+    let byte = input[pos];
     match errors {
-        "strict" => Err(value_error(format!(
-            "'{encoding}' codec can't decode byte 0x{byte:02x}"
-        ))),
+        "strict" => Err(crate::error::unicode_decode_error(
+            encoding,
+            input,
+            pos,
+            pos + 1,
+            "ordinal not in range(128)",
+        )),
         "ignore" => Ok(()),
         "replace" => {
             out.push('\u{FFFD}');

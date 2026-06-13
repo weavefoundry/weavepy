@@ -52,6 +52,7 @@ unicode-normalization = { workspace = true }
 unicode-properties    = { workspace = true }
 unicode_names2        = { workspace = true }
 memmap2               = { workspace = true }
+memchr                = { workspace = true }
 libc                  = { workspace = true }
 rustls                = { workspace = true }
 rustls-pki-types      = { workspace = true }
@@ -66,6 +67,7 @@ crossbeam-utils       = { workspace = true }
 
 # RFC 0032 — tier-2 Cranelift JIT, behind the (default-off) `jit` feature.
 weavepy-jit           = { workspace = true, optional = true }
+stacker = "0.1.24"
 
 [features]
 default = []

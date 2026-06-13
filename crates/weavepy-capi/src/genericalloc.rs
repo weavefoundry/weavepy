@@ -253,7 +253,7 @@ pub unsafe extern "C" fn PyObject_HashNotImplemented(o: *mut PyObject) -> isize 
     }
     let obj = unsafe { crate::object::clone_object(o) };
     let name = match &obj {
-        Object::Instance(inst) => inst.class.name.clone(),
+        Object::Instance(inst) => inst.cls().name.clone(),
         _ => "object".to_owned(),
     };
     crate::errors::set_type_error(format!("unhashable type: '{name}'"));

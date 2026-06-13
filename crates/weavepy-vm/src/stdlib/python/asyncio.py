@@ -36,9 +36,11 @@ The event loop is a single, lazily-created instance. Once
 spins up a fresh one.
 """
 
+import sys as _sys
 import time as _time
 import selectors as _selectors
 import socket as _socket
+import weakref as _weakref
 
 
 # ---- Exceptions ---------------------------------------------------
@@ -171,11 +173,31 @@ class Task(Future):
     def set_name(self, value):
         self._name = str(value)
 
+    def get_coro(self):
+        return self._coro
+
+    def get_stack(self, *, limit=None):
+        """Frames where the task's coroutine is currently suspended
+        (CPython walks `cr_await` chains; a single frame is the common
+        observable shape). Done tasks have no stack."""
+        if self.done():
+            return []
+        frame = getattr(self._coro, "cr_frame", None)
+        if frame is None:
+            frame = getattr(self._coro, "gi_frame", None)
+        return [frame] if frame is not None else []
+
     def cancel(self, msg=None):
         if self.done():
             return False
         self._must_cancel = True
         self._cancel_message = msg
+        # Wake a task parked on an inner future so the cancellation is
+        # delivered promptly (CPython cancels `_fut_waiter`, which
+        # reschedules the step with CancelledError).
+        waiting = self._waiting_on
+        if waiting is not None and not waiting.done():
+            waiting.cancel(msg)
         return True
 
     def _step(self, value, exc=None):
@@ -198,6 +220,14 @@ class Task(Future):
             self._schedule_callbacks()
             return
         except BaseException as e:
+            # CPython's C `_asyncio` Task drives the coroutine without
+            # a Python frame, so the Task machinery never appears in
+            # the exception's traceback. Strip our own `_step` frame
+            # (the head entry, where the exception was caught) to give
+            # the same observable traceback.
+            tb = e.__traceback__
+            if tb is not None and tb.tb_frame.f_code.co_name == "_step":
+                e.__traceback__ = tb.tb_next
             self.set_exception(e)
             return
 
@@ -262,6 +292,11 @@ class EventLoop:
         self._selector = _selectors.DefaultSelector()
         # fd -> (reader_cb, writer_cb)
         self._fd_callbacks = {}
+        # PEP 525: async generators first-iterated while this loop runs.
+        # Weak — the loop must not keep otherwise-dead agens alive (their
+        # finalization is exactly what routes through the hooks).
+        self._asyncgens = _weakref.WeakSet()
+        self._asyncgens_shutdown_called = False
 
     # ---- inspection -----------------------------------------------
 
@@ -320,9 +355,18 @@ class EventLoop:
     # ---- run loop -------------------------------------------------
 
     def run_forever(self):
+        global _running_loop
         if self._running:
             raise RuntimeError("event loop is already running")
+        if _running_loop is not None:
+            raise RuntimeError(
+                "Cannot run the event loop while another loop is running")
+        old_agen_hooks = _sys.get_asyncgen_hooks()
+        _sys.set_asyncgen_hooks(
+            firstiter=self._asyncgen_firstiter_hook,
+            finalizer=self._asyncgen_finalizer_hook)
         self._running = True
+        _running_loop = self
         try:
             while self._running:
                 if (not self._ready and not self._scheduled
@@ -331,6 +375,45 @@ class EventLoop:
                 self._run_once()
         finally:
             self._running = False
+            _running_loop = None
+            _sys.set_asyncgen_hooks(*old_agen_hooks)
+
+    # ---- PEP 525 async generator finalization ---------------------
+
+    def _asyncgen_firstiter_hook(self, agen):
+        if self._asyncgens_shutdown_called:
+            import warnings
+            warnings.warn(
+                "asynchronous generator {!r} was scheduled after "
+                "loop.shutdown_asyncgens() call".format(agen),
+                ResourceWarning)
+        self._asyncgens.add(agen)
+
+    def _asyncgen_finalizer_hook(self, agen):
+        self._asyncgens.discard(agen)
+        if not self.is_closed():
+            self.call_soon(self.create_task, agen.aclose())
+
+    async def shutdown_asyncgens(self):
+        """Shutdown all active asynchronous generators."""
+        self._asyncgens_shutdown_called = True
+        closing_agens = list(self._asyncgens)
+        self._asyncgens.clear()
+        if not closing_agens:
+            return
+        results = await gather(
+            *[ag.aclose() for ag in closing_agens],
+            return_exceptions=True)
+        for result, agen in zip(results, closing_agens):
+            if isinstance(result, CancelledError):
+                continue
+            if isinstance(result, BaseException):
+                self.call_exception_handler({
+                    "message": "an error occurred during closing of "
+                               "asynchronous generator {!r}".format(agen),
+                    "exception": result,
+                    "asyncgen": agen,
+                })
 
     def run_until_complete(self, future):
         if not isinstance(future, Future):
@@ -541,17 +624,36 @@ class EventLoop:
             self.remove_reader(sock.fileno())
 
     def _handle_exception(self, exc):
-        if self._exception_handler is not None:
-            self._exception_handler(self, {"exception": exc})
-        else:
-            try:
-                import sys
-                sys.stderr.write("asyncio task exception: {}\n".format(exc))
-            except Exception:
-                pass
+        self.call_exception_handler({
+            "message": "Exception in callback",
+            "exception": exc,
+        })
 
     def set_exception_handler(self, handler):
         self._exception_handler = handler
+
+    def get_exception_handler(self):
+        return self._exception_handler
+
+    def default_exception_handler(self, context):
+        message = context.get("message") or \
+            "Unhandled exception in event loop"
+        exc = context.get("exception")
+        try:
+            _sys.stderr.write("{}: {!r}\n".format(message, exc))
+        except Exception:
+            pass
+
+    def call_exception_handler(self, context):
+        if self._exception_handler is None:
+            self.default_exception_handler(context)
+        else:
+            try:
+                self._exception_handler(self, context)
+            except BaseException:
+                # A broken handler must not take the loop down
+                # (CPython falls back to the default handler).
+                self.default_exception_handler(context)
 
 
 class _Handle:
@@ -575,9 +677,18 @@ class _Handle:
 
 _current_loop = None
 
+# The loop currently inside `run_forever` (CPython tracks this in a
+# thread-local set by `events._set_running_loop`). `sleep`, `gather`,
+# `create_task` etc. must schedule on *this* loop — not the module-level
+# "current" loop, which can be a different object when user code drives
+# `new_event_loop().run_until_complete(...)` directly.
+_running_loop = None
+
 
 def get_event_loop():
     global _current_loop
+    if _running_loop is not None:
+        return _running_loop
     if _current_loop is None or _current_loop.is_closed():
         _current_loop = EventLoop()
     return _current_loop
@@ -593,9 +704,60 @@ def set_event_loop(loop):
 
 
 def get_running_loop():
-    if _current_loop is None or not _current_loop.is_running():
+    if _running_loop is None:
         raise RuntimeError("no running event loop")
-    return _current_loop
+    return _running_loop
+
+
+# ---- event loop policy --------------------------------------------
+#
+# The policy layer is deprecated in 3.12+ but the stdlib and its test
+# suite (e.g. ``IsolatedAsyncioTestCase`` helpers in test_contextlib_async)
+# still reach for ``get_event_loop_policy().get_event_loop()``. We ship a
+# faithful default policy that simply delegates to the module-level loop
+# accessors above.
+
+
+class AbstractEventLoopPolicy:
+    def get_event_loop(self):
+        raise NotImplementedError
+
+    def set_event_loop(self, loop):
+        raise NotImplementedError
+
+    def new_event_loop(self):
+        raise NotImplementedError
+
+
+class DefaultEventLoopPolicy(AbstractEventLoopPolicy):
+    def get_event_loop(self):
+        return get_event_loop()
+
+    def set_event_loop(self, loop):
+        set_event_loop(loop)
+
+    def new_event_loop(self):
+        return new_event_loop()
+
+
+_event_loop_policy = None
+
+
+def get_event_loop_policy():
+    global _event_loop_policy
+    if _event_loop_policy is None:
+        _event_loop_policy = DefaultEventLoopPolicy()
+    return _event_loop_policy
+
+
+def set_event_loop_policy(policy):
+    global _event_loop_policy
+    if policy is not None and not isinstance(policy, AbstractEventLoopPolicy):
+        raise TypeError(
+            f"policy must be an instance of AbstractEventLoopPolicy or None, "
+            f"not '{type(policy).__name__}'"
+        )
+    _event_loop_policy = policy
 
 
 # ---- run / ensure_future ------------------------------------------
@@ -607,8 +769,31 @@ def run(coro, *, debug=None):
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.close()
-        set_event_loop(None)
+        try:
+            _cancel_all_tasks(loop)
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
+            set_event_loop(None)
+
+
+def _cancel_all_tasks(loop):
+    to_cancel = [t for t in loop._tasks if not t.done()]
+    if not to_cancel:
+        return
+    for task in to_cancel:
+        task.cancel()
+    loop.run_until_complete(gather(*to_cancel, return_exceptions=True))
+    for task in to_cancel:
+        if task.cancelled():
+            continue
+        if task.exception() is not None:
+            loop.call_exception_handler({
+                "message": "unhandled exception during asyncio.run() "
+                           "shutdown",
+                "exception": task.exception(),
+                "task": task,
+            })
 
 
 def ensure_future(obj, *, loop=None):
@@ -641,8 +826,21 @@ def all_tasks(loop=None):
 # ---- sleep --------------------------------------------------------
 
 
+class _Sleep0:
+    """Awaitable that yields to the event loop exactly once (CPython's
+    `__sleep0`). `sleep(0)` must reschedule the task — code like
+    `finally: await sleep(0)` relies on other ready tasks (e.g. a
+    pending aclose) running before it resumes."""
+
+    def __await__(self):
+        yield
+
+    __iter__ = __await__
+
+
 async def sleep(delay, result=None):
     if delay <= 0:
+        await _Sleep0()
         return result
     loop = get_event_loop()
     fut = _SleepFuture(loop=loop)
@@ -1786,6 +1984,10 @@ __all__ = [
     "new_event_loop",
     "set_event_loop",
     "get_running_loop",
+    "get_event_loop_policy",
+    "set_event_loop_policy",
+    "AbstractEventLoopPolicy",
+    "DefaultEventLoopPolicy",
     "Lock",
     "Event",
     "Semaphore",

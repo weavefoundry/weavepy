@@ -645,7 +645,7 @@ fn is_class_named(o: *mut PyObject, name: &str) -> c_int {
     }
     match unsafe { crate::object::clone_object(o) } {
         Object::Instance(inst) => {
-            for cls in inst.class.mro.borrow().iter() {
+            for cls in inst.cls().mro.borrow().iter() {
                 if cls.name == name {
                     return 1;
                 }
@@ -662,7 +662,7 @@ fn is_class_named_exact(o: *mut PyObject, name: &str) -> c_int {
     }
     match unsafe { crate::object::clone_object(o) } {
         Object::Instance(inst) => {
-            if inst.class.name == name {
+            if inst.cls().name == name {
                 1
             } else {
                 0

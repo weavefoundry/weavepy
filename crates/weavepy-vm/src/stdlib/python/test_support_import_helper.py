@@ -88,15 +88,32 @@ def import_fresh_module(name, fresh=(), blocked=(), *, deprecated=False):
         if blocker is not None:
             sys.meta_path.insert(0, blocker)
         try:
-            for modname in fresh:
-                try:
-                    importlib.import_module(modname)
-                except ImportError:
-                    pass
+            # CPython contract: if any *fresh* module can't be imported the
+            # whole call answers None — `import_fresh_module('functools',
+            # fresh=['_functools'])` is how test files probe for a missing
+            # C accelerator (the C-variant test classes then skip).
             try:
-                return importlib.import_module(name)
+                for modname in fresh:
+                    importlib.import_module(modname)
+                mod = importlib.import_module(name)
             except ImportError:
                 return None
+            # A statically-embedded built-in (native) module is a process
+            # singleton: re-importing always returns the same object, so
+            # it can never be garbage collected. CPython re-creates
+            # extension modules on a fresh import; honour that contract
+            # (and let callers that drop the result observe its
+            # collection — see test_struct's reference-cycle test) by
+            # handing back an independent module object populated from the
+            # live namespace. Native modules are distinguished by having
+            # no source file, whereas frozen modules report '<frozen>'
+            # and on-disk modules report a path.
+            if getattr(mod, "__file__", None) is None:
+                import types
+                fresh_mod = types.ModuleType(getattr(mod, "__name__", name))
+                fresh_mod.__dict__.update(mod.__dict__)
+                return fresh_mod
+            return mod
         finally:
             if blocker is not None:
                 try:

@@ -261,7 +261,18 @@ class _AssertRaisesContext:
             raise AssertionError("%s not raised" % self._exc_name())
         if not issubclass(exc_type, self.expected):
             return False
-        self.exception = exc_value
+        # CPython detaches the traceback before storing the exception
+        # (case.py does `traceback.clear_frames(tb)` plus
+        # `with_traceback(None)`): the traceback chain pins every frame
+        # between the raise and the handler, and a test that calls
+        # `assertRaises` in a loop would otherwise accumulate all of
+        # them until the cycle collector runs.
+        try:
+            import traceback
+            traceback.clear_frames(tb)
+        except Exception:
+            pass
+        self.exception = exc_value.with_traceback(None)
         if self.expected_regex is not None:
             import re
             text = str(exc_value)
@@ -284,6 +295,8 @@ class _AssertWarnsContext:
         import warnings
         self._cm = warnings.catch_warnings(record=True)
         self._records = self._cm.__enter__()
+        # CPython exposes the recorded-warnings list as `.warnings`.
+        self.warnings = self._records
         warnings.simplefilter("always")
         return self
 
@@ -466,6 +479,12 @@ class TestCase:
     def skipTest(self, reason):
         raise SkipTest(reason)
 
+    def _callTestMethod(self, method):
+        # Indirection point CPython uses so ``IsolatedAsyncioTestCase``
+        # can drive an ``async def`` test through an event loop. The
+        # default just calls the (synchronous) method.
+        method()
+
     def shortDescription(self):
         doc = self._testMethodDoc
         return doc.strip().split("\n")[0].strip() if doc else None
@@ -488,7 +507,9 @@ class TestCase:
         return "%s (%s)" % (self._testMethodName, type(self).__name__)
 
     def __repr__(self):
-        return "<%s testMethod=%s>" % (type(self).__name__, self._testMethodName)
+        cls = type(self)
+        return "<%s.%s testMethod=%s>" % (
+            cls.__module__, cls.__qualname__, self._testMethodName)
 
     def countTestCases(self):
         return 1
@@ -610,7 +631,7 @@ class TestCase:
             n_err = len(result.errors)
             ok = False
             try:
-                testMethod()
+                self._callTestMethod(testMethod)
             except KeyboardInterrupt:
                 raise
             except SkipTest as e:
@@ -1730,3 +1751,10 @@ def main(module="__main__", defaultTest=None, argv=None, testRunner=None,
         verbosity=verbosity, failfast=failfast, catchbreak=catchbreak,
         buffer=buffer, warnings=warnings, tb_locals=tb_locals)
     return getattr(program, "result", None)
+
+
+# Re-export the async TestCase (CPython does this at the bottom of
+# ``unittest/__init__.py``). Done last so ``unittest.TestCase`` is fully
+# defined when ``async_case`` imports the package.
+from .async_case import IsolatedAsyncioTestCase  # noqa: E402
+__all__.append("IsolatedAsyncioTestCase")

@@ -65,6 +65,11 @@ pub enum Error {
     Compile(#[from] compiler::CompileError),
     #[error("runtime error: {0}")]
     Runtime(#[from] vm::RuntimeError),
+    /// As [`Error::Runtime`], but the traceback was already written
+    /// to stderr by the interpreter (CPython-style, via the
+    /// `traceback` module). Callers must not print it again.
+    #[error("runtime error: {0}")]
+    RuntimePrinted(vm::RuntimeError),
 }
 
 impl Error {
@@ -72,18 +77,15 @@ impl Error {
     pub fn format(&self, source: &str, filename: &str) -> String {
         match self {
             Error::Parse(parser::ParseError::Lex(lex)) => format_lex_error(source, filename, lex),
-            Error::Parse(parser::ParseError::Unexpected { span, message }) => {
-                format_syntax_error(source, filename, span.start.0, message)
+            Error::Parse(parser::ParseError::Unexpected { span, message })
+            | Error::Parse(parser::ParseError::Indentation { span, message }) => {
+                format_syntax_error_span(source, filename, span.start.0, span.end.0, message)
             }
             Error::Parse(parser::ParseError::NotImplemented { span, feature, rfc }) => {
                 let message = format!("`{feature}` is not implemented in the slice ({rfc})");
-                format_syntax_error(source, filename, span.start.0, &message)
+                format_syntax_error_span(source, filename, span.start.0, span.end.0, &message)
             }
-            Error::Compile(compile_err) => {
-                // Compiler errors don't carry spans yet — surface as a
-                // SyntaxError-shaped diagnostic without line info.
-                format!("  File \"{filename}\", line ?\nSyntaxError: {compile_err}\n")
-            }
+            Error::Compile(compile_err) => format_compile_error(source, filename, compile_err),
             Error::Runtime(vm::RuntimeError::PyException(exc)) => {
                 let mut s = String::new();
                 let _ = writeln!(s, "Traceback (most recent call last):");
@@ -108,7 +110,16 @@ impl Error {
                     "Traceback (most recent call last):\n  File \"{filename}\", line ?, in <module>\nInternalError: {msg}\n"
                 )
             }
+            // Already on stderr — render nothing.
+            Error::RuntimePrinted(_) => String::new(),
         }
+    }
+
+    /// `true` when the traceback was already written to stderr by the
+    /// interpreter and the caller must not print [`Error::format`]'s
+    /// output again.
+    pub fn already_printed(&self) -> bool {
+        matches!(self, Error::RuntimePrinted(_))
     }
 
     /// When this error is a `SystemExit` (or subclass) propagating out
@@ -117,7 +128,8 @@ impl Error {
     /// Returns `None` for every other error.
     pub fn system_exit_code(&self) -> Option<vm::object::Object> {
         match self {
-            Error::Runtime(vm::RuntimeError::PyException(exc)) => exc.system_exit_code(),
+            Error::Runtime(vm::RuntimeError::PyException(exc))
+            | Error::RuntimePrinted(vm::RuntimeError::PyException(exc)) => exc.system_exit_code(),
             _ => None,
         }
     }
@@ -165,6 +177,14 @@ pub struct RunOptions {
     /// these on `sys.flags`, `sys.dont_write_bytecode`,
     /// `sys._xoptions`, and `sys.warnoptions`.
     pub flags: InterpreterFlags,
+    /// CLI behaviour: print an uncaught exception to stderr through
+    /// the interpreter's own machinery (`sys.excepthook` → `traceback`
+    /// module, with carets and chained exceptions) before returning
+    /// it. The returned [`Error`] then reports
+    /// [`Error::already_printed`] so the caller doesn't double-print.
+    /// Library embedders keep the default (`false`) and render via
+    /// [`Error::format`].
+    pub print_uncaught: bool,
 }
 
 pub use vm::InterpreterFlags;
@@ -177,7 +197,15 @@ impl RunOptions {
             extra_path: Vec::new(),
             script_dir: None,
             flags: InterpreterFlags::default(),
+            print_uncaught: false,
         }
+    }
+
+    /// See [`RunOptions::print_uncaught`].
+    #[must_use]
+    pub fn with_print_uncaught(mut self, value: bool) -> Self {
+        self.print_uncaught = value;
+        self
     }
 
     #[must_use]
@@ -233,7 +261,11 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
         source
     };
     install_capi_loader();
-    let module = parser::parse_module(source_ref)?;
+    // Tokenizer-collected invalid-escape diagnostics (CPython's
+    // `SyntaxWarning`s) are replayed through the `warnings` machinery
+    // once the interpreter is up, just before the module body runs.
+    let (module_res, escape_warnings) = parser::parse_module_with_warnings(source_ref);
+    let module = module_res?;
     let code = compiler::compile_module_with_source(&module, source_ref, &opts.filename)?;
     let mut interpreter = vm::Interpreter::default();
     interpreter.apply_run_options(&opts.flags);
@@ -262,8 +294,41 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
     } else {
         Some(opts.filename.as_str())
     };
-    let _ = interpreter.run_module_as(&code, "__main__", file_for_main)?;
-    Ok(())
+    // `python -c CMD` keeps the command text reachable for tracebacks
+    // even though `<string>` has no file: CPython registers it with
+    // `linecache._register_code` (gh-103987). Mirror that for our
+    // CLI-driven `<string>` runs.
+    if opts.print_uncaught && opts.filename == "<string>" {
+        let code_rc = vm::sync::Rc::new(code.clone());
+        interpreter.register_source_with_linecache(&code_rc, source_ref, "<string>");
+    }
+    let result = interpreter
+        .emit_escape_warnings(source_ref, &opts.filename, &escape_warnings)
+        .and_then(|()| interpreter.run_module_as(&code, "__main__", file_for_main));
+    // CPython prints the uncaught exception (via `sys.excepthook` /
+    // the traceback module) *before* `Py_FinalizeEx` runs shutdown
+    // finalizers — `__del__` output interleaves after the traceback.
+    let result = match result {
+        Err(vm::RuntimeError::PyException(exc))
+            if opts.print_uncaught && exc.system_exit_code().is_none() =>
+        {
+            if interpreter.print_uncaught_exception(&exc) {
+                Err(Error::RuntimePrinted(vm::RuntimeError::PyException(exc)))
+            } else {
+                // Rendering machinery unavailable — let the caller's
+                // plain formatter handle it.
+                Err(Error::Runtime(vm::RuntimeError::PyException(exc)))
+            }
+        }
+        other => other.map_err(Error::from),
+    };
+    // CPython runs finalizers for everything still alive during
+    // interpreter shutdown — including a module-global object whose
+    // `__del__` raises (which is reported via `sys.unraisablehook`).
+    // Do this whether the module returned normally or via `SystemExit`,
+    // before the caller turns a `SystemExit` into a process exit.
+    interpreter.run_shutdown_finalizers();
+    result.map(|_| ())
 }
 
 fn script_dir_of(filename: &str) -> PathBuf {
@@ -275,29 +340,133 @@ fn script_dir_of(filename: &str) -> PathBuf {
 
 /// Render a CPython-style `SyntaxError`-shape diagnostic, with the
 /// offending source line and a caret under the column.
-fn format_syntax_error(source: &str, filename: &str, byte: u32, message: &str) -> String {
-    let loc = SourceLocation::from_byte(source, byte);
+/// Render the `File … / source line / caret run / SyntaxError: …` block
+/// for a syntax error, replicating CPython's
+/// `traceback.TracebackException.format_exception_only` clamp logic.
+/// `offset`/`end_offset` are the 1-based columns stored on the
+/// exception (character-based for parser errors, byte-based for
+/// compile/symtable errors — CPython renders both as if they indexed
+/// characters, so we do too).
+fn render_caret_block(
+    filename: &str,
+    lineno: usize,
+    line_text: &str,
+    offset: usize,
+    end_offset: usize,
+    message: &str,
+) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "  File \"{filename}\", line {}", loc.line);
-    let _ = writeln!(out, "    {}", loc.line_text);
-    let pad: String = " ".repeat(4 + loc.col.saturating_sub(1));
-    let _ = writeln!(out, "{pad}^");
+    let _ = writeln!(out, "  File \"{filename}\", line {lineno}");
+    let rtext = line_text.trim_end_matches('\n');
+    let ltext = rtext.trim_start_matches([' ', '\n', '\x0c']);
+    let rtext_chars = rtext.chars().count();
+    let ltext_chars = ltext.chars().count();
+    let spaces = rtext_chars - ltext_chars;
+    // `.text` is the newline-terminated line; CPython clamps offsets
+    // that fall past it back to just-after-end-of-line.
+    let text_chars = rtext_chars + 1;
+    let mut offset = offset;
+    let mut end_offset = end_offset;
+    if offset > text_chars {
+        offset = rtext_chars + 1;
+    }
+    if end_offset > text_chars {
+        end_offset = rtext_chars + 1;
+    }
+    if offset >= end_offset {
+        end_offset = offset + 1;
+    }
+    let colno = offset as i64 - 1 - spaces as i64;
+    let end_colno = end_offset as i64 - 1 - spaces as i64;
+    let _ = writeln!(out, "    {ltext}");
+    if colno >= 0 {
+        // Non-space whitespace (tabs) is kept so the carets align.
+        let caretspace: String = ltext
+            .chars()
+            .take(colno as usize)
+            .map(|c| if c.is_whitespace() { c } else { ' ' })
+            .collect();
+        let _ = writeln!(
+            out,
+            "    {caretspace}{}",
+            "^".repeat((end_colno - colno) as usize)
+        );
+    }
     let _ = writeln!(out, "SyntaxError: {message}");
     out
 }
 
-fn format_lex_error(source: &str, filename: &str, err: &lexer::LexError) -> String {
-    let byte = match err {
-        lexer::LexError::UnterminatedString { pos }
-        | lexer::LexError::InvalidChar { pos, .. }
-        | lexer::LexError::InconsistentIndent { pos }
-        | lexer::LexError::UnknownDedent { pos }
-        | lexer::LexError::InvalidNumber { pos, .. }
-        | lexer::LexError::InvalidStringPrefix { pos, .. }
-        | lexer::LexError::StrayBackslash { pos }
-        | lexer::LexError::UnexpectedEof { pos, .. } => *pos,
+/// Render a compile/symtable-stage error CPython-style. Byte columns
+/// for compile-stage spans, character columns for parser-stage ones —
+/// matching what the VM stores on the `SyntaxError` object.
+fn format_compile_error(source: &str, filename: &str, err: &compiler::CompileError) -> String {
+    let Some(span) = err.span else {
+        return format!(
+            "  File \"{filename}\", line ?\nSyntaxError: {}\n",
+            err.message
+        );
     };
-    format_syntax_error(source, filename, byte, &err.to_string())
+    let start = SourceLocation::from_byte(source, span.start.0);
+    let end = SourceLocation::from_byte(source, span.end.0);
+    let line_start_byte = {
+        let byte = (span.start.0 as usize).min(source.len());
+        source[..byte].rfind('\n').map_or(0, |i| i + 1)
+    };
+    let byte_col = |byte: u32| (byte as usize).min(source.len()) - line_start_byte + 1;
+    let (offset, end_offset) = if err.parser_stage {
+        let end_col = if end.line == start.line {
+            end.col
+        } else {
+            start.line_text.chars().count() + 1
+        };
+        (start.col, end_col)
+    } else {
+        let end_col = if end.line == start.line {
+            byte_col(span.end.0)
+        } else {
+            start.line_text.len() + 1
+        };
+        (byte_col(span.start.0), end_col)
+    };
+    render_caret_block(
+        filename,
+        start.line,
+        start.line_text,
+        offset,
+        end_offset,
+        &err.message,
+    )
+}
+
+fn format_lex_error(source: &str, filename: &str, err: &lexer::LexError) -> String {
+    let byte = err.byte_offset();
+    format_syntax_error_span(source, filename, byte, byte, &err.to_string())
+}
+
+/// Render a parser-stage error with character-based columns derived
+/// from the byte span.
+fn format_syntax_error_span(
+    source: &str,
+    filename: &str,
+    start_byte: u32,
+    end_byte: u32,
+    message: &str,
+) -> String {
+    let start = SourceLocation::from_byte(source, start_byte);
+    let end = SourceLocation::from_byte(source, end_byte);
+    let end_col = if end.line == start.line {
+        end.col
+    } else {
+        start.line_text.chars().count() + 1
+    };
+    render_caret_block(
+        filename,
+        start.line,
+        start.line_text,
+        start.col,
+        end_col,
+        message,
+    )
 }
 
 /// `(line, column, line_text)` derived from a byte offset.

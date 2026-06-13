@@ -46,6 +46,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         let bf = BuiltinFn {
             name: "parse",
+            binds_instance: false,
             call: Box::new(parse),
             call_kw: None,
         };
@@ -68,12 +69,19 @@ pub fn parse(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
         _ => return Err(value_error("ast.parse() requires a str or bytes source")),
     };
+    let filename = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => "<unknown>".to_owned(),
+    };
     let mode = match args.get(2) {
         Some(Object::Str(s)) => s.to_string(),
         _ => "exec".to_owned(),
     };
+    // CPython raises `SyntaxError` (never `ValueError`) from
+    // `ast.parse` — callers like `traceback`'s caret-anchor probe rely
+    // on `except SyntaxError` swallowing bad segments.
     let module = weavepy_parser::parse_module(&source)
-        .map_err(|e| value_error(format!("invalid syntax: {e}")))?;
+        .map_err(|e| crate::parse_error_to_syntax_error(&e, &source, &filename))?;
     let lm = LineMap::new(&source);
     let b = Builder { lm: &lm };
     Ok(b.module(&module, &mode))
@@ -202,6 +210,8 @@ impl Builder<'_> {
                 args,
                 body,
                 decorator_list,
+                returns,
+                ..
             } => node(
                 "FunctionDef",
                 vec![
@@ -209,7 +219,10 @@ impl Builder<'_> {
                     ("args", self.arguments(args)),
                     ("body", list_of(body, |x| self.stmt(x))),
                     ("decorator_list", list_of(decorator_list, |x| self.expr(x))),
-                    ("returns", Object::None),
+                    (
+                        "returns",
+                        returns.as_deref().map_or(Object::None, |r| self.expr(r)),
+                    ),
                     ("type_comment", Object::None),
                     ("type_params", Object::new_list(vec![])),
                 ],
@@ -221,6 +234,8 @@ impl Builder<'_> {
                 args,
                 body,
                 decorator_list,
+                returns,
+                ..
             } => node(
                 "AsyncFunctionDef",
                 vec![
@@ -228,7 +243,10 @@ impl Builder<'_> {
                     ("args", self.arguments(args)),
                     ("body", list_of(body, |x| self.stmt(x))),
                     ("decorator_list", list_of(decorator_list, |x| self.expr(x))),
-                    ("returns", Object::None),
+                    (
+                        "returns",
+                        returns.as_deref().map_or(Object::None, |r| self.expr(r)),
+                    ),
                     ("type_comment", Object::None),
                     ("type_params", Object::new_list(vec![])),
                 ],
@@ -241,6 +259,7 @@ impl Builder<'_> {
                 keywords,
                 body,
                 decorator_list,
+                ..
             } => node(
                 "ClassDef",
                 vec![
@@ -903,8 +922,6 @@ fn constant(c: &past::Constant) -> Object {
         C::Str(s) => Object::from_str(s.clone()),
         C::Bytes(b) => Object::new_bytes(b.clone()),
         C::Tuple(items) => Object::new_tuple(items.iter().map(constant).collect()),
-        // WeavePy models the `...` singleton as `None` (parity with the
-        // compiler's `Constant::Ellipsis` lowering).
-        C::Ellipsis => Object::None,
+        C::Ellipsis => crate::vm_singletons::ellipsis(),
     }
 }

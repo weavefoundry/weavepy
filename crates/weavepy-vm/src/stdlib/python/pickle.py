@@ -49,6 +49,19 @@ ADDITEMS = b"\x90"
 FROZENSET = b"\x91"
 MARK = b"("
 STOP = b"."
+POP = b"0"
+POP_MARK = b"1"
+# Memo opcodes — preserve object identity/sharing and enable cyclic
+# structures. PUT/GET use a textual index (protocol 0), BINPUT/BINGET a
+# 1-byte index, LONG_BINPUT/LONG_BINGET a 4-byte index, and MEMOIZE
+# (protocol 4+) appends the stack top to the memo with no explicit index.
+PUT = b"p"
+BINPUT = b"q"
+LONG_BINPUT = b"r"
+GET = b"g"
+BINGET = b"h"
+LONG_BINGET = b"j"
+MEMOIZE = b"\x94"
 # Global reference + reduce opcodes used to serialize functions and
 # classes by their qualified name. CPython uses these for everything
 # from `pickle.dumps(int)` to `pickle.dumps(my_module.my_func)`.
@@ -58,6 +71,19 @@ REDUCE = b"R"
 BUILD = b"b"
 NEWOBJ = b"\x81"
 NEWOBJ_EX = b"\x92"
+# Protocol-0 text opcodes — never *emitted* here (we write protocol 2+
+# framing), but historical pickles (e.g. CPython's cross-version
+# compatibility blobs in Lib/test) still carry them on the read side.
+INT = b"I"
+LONG = b"L"
+FLOAT = b"F"
+STRING = b"S"
+UNICODE = b"V"
+LIST = b"l"
+DICT = b"d"
+APPEND = b"a"
+SETITEM = b"s"
+DUP = b"2"
 
 # --- exceptions -----------------------------------------------------------
 
@@ -80,6 +106,10 @@ class UnpicklingError(PickleError):
 def dumps(obj, protocol=None, *, fix_imports=True, buffer_callback=None):
     if protocol is None:
         protocol = DEFAULT_PROTOCOL
+    # CPython `Pickler.__init__`: a negative protocol selects
+    # HIGHEST_PROTOCOL.
+    if protocol < 0:
+        protocol = HIGHEST_PROTOCOL
     if not 0 <= protocol <= HIGHEST_PROTOCOL:
         raise ValueError("unsupported pickle protocol: %d" % protocol)
     pickler = _Pickler(io.BytesIO(), protocol)
@@ -103,17 +133,68 @@ def load(file, *, fix_imports=True, encoding="ASCII", errors="strict"):
 # --- pickler --------------------------------------------------------------
 
 
+def _resolves_to_self(module, qualname, obj):
+    """True when ``module.qualname`` imports back to *obj* itself.
+
+    This is CPython's ``save_global`` self-consistency check: an object is
+    only safe to pickle by reference (functions, classes, module globals)
+    when the dotted name found in its declaring module *is* that object.
+    Callable instances inherit their class's ``__qualname__`` and would
+    otherwise be mistaken for the class.
+    """
+    try:
+        target = __import__(module, fromlist=["_"])
+        for part in qualname.split("."):
+            target = getattr(target, part)
+        return target is obj
+    except Exception:
+        return False
+
+
 class _Pickler:
     def __init__(self, buf, protocol):
         self._buf = buf
+        if protocol is None:
+            protocol = DEFAULT_PROTOCOL
+        elif protocol < 0:
+            protocol = HIGHEST_PROTOCOL
         self.protocol = protocol
         self.bin = protocol >= 1
         self.fast = False
+        # id(obj) -> (memo_index, obj). Keeping a reference to `obj`
+        # prevents its id from being reused mid-pickle.
+        self.memo = {}
 
     def dump(self, obj):
         self._buf.write(PROTO + bytes([self.protocol]))
         self._save(obj)
         self._buf.write(STOP)
+
+    def _memoize(self, obj):
+        """Record `obj` (already written / on the stack) in the memo and
+        emit the PUT opcode so a later occurrence can reference it."""
+        if self.fast or id(obj) in self.memo:
+            return
+        idx = len(self.memo)
+        if self.protocol >= 4:
+            self._buf.write(MEMOIZE)
+        elif self.bin:
+            if idx < 256:
+                self._buf.write(BINPUT + bytes([idx]))
+            else:
+                self._buf.write(LONG_BINPUT + struct.pack("<I", idx))
+        else:
+            self._buf.write(PUT + repr(idx).encode("ascii") + b"\n")
+        self.memo[id(obj)] = (idx, obj)
+
+    def _write_get(self, idx):
+        if self.bin:
+            if idx < 256:
+                self._buf.write(BINGET + bytes([idx]))
+            else:
+                self._buf.write(LONG_BINGET + struct.pack("<I", idx))
+        else:
+            self._buf.write(GET + repr(idx).encode("ascii") + b"\n")
 
     def _save(self, obj):
         # In the order CPython tries dispatch:
@@ -126,6 +207,14 @@ class _Pickler:
             return
         if obj is False:
             self._buf.write(NEWFALSE)
+            return
+
+        # Already pickled this exact object? Emit a back-reference so
+        # sharing (and cycles) are preserved on load. Atomic immutables
+        # (int/float) are never memoized, so they simply miss here.
+        x = self.memo.get(id(obj))
+        if x is not None:
+            self._write_get(x[0])
             return
 
         # Dispatch by `type(obj).__name__` rather than `type(obj) is X`
@@ -144,8 +233,13 @@ class _Pickler:
         if tname == "float":
             self._save_float(obj)
             return
-        if tname in ("bytes", "bytearray"):
-            self._save_bytes(bytes(obj))
+        if tname == "bytes":
+            self._save_bytes(obj)
+            return
+        if tname == "bytearray":
+            # CPython reduces bytearray to `bytearray(bytes(obj))` so the
+            # round-trip preserves the type (protocol < 5 form).
+            self._save_reduce((bytearray, (bytes(obj),)), obj)
             return
         if tname == "str":
             self._save_str(obj)
@@ -175,7 +269,10 @@ class _Pickler:
         except Exception:
             is_callable_like = False
         try:
-            is_type = type(obj).__name__ == "type"
+            # Name-based (not `isinstance`) for the same threading reason
+            # as above; walk the metaclass MRO so classes with a custom
+            # metaclass (`EnumType`, `ABCMeta`, …) count as types too.
+            is_type = any(t.__name__ == "type" for t in type(obj).__mro__)
         except Exception:
             is_type = False
         if is_callable_like or is_type:
@@ -184,29 +281,43 @@ class _Pickler:
                 getattr(obj, "__qualname__", None)
                 or getattr(obj, "__name__", None)
             )
-            if qualname:
+            # Only pickle by name when that name actually resolves back to
+            # *this* object (CPython's `save_global` self-check). A callable
+            # *instance* — e.g. `operator.attrgetter('x')` — inherits its
+            # class's `__qualname__`, so without this guard it would be
+            # saved as the bare class and unpickle to the class object
+            # rather than round-tripping through `__reduce__`.
+            if qualname and _resolves_to_self(module, qualname, obj):
                 self._save_global(module, qualname)
                 return
+            # Classes and plain/builtin functions are *only* picklable by
+            # reference. CPython's `save_global` raises PicklingError for
+            # anything that doesn't resolve (e.g. a class defined inside a
+            # function: `<locals>` in its qualname); falling through to
+            # `__reduce_ex__` here would mis-pickle the class as an
+            # instance of its metaclass.
+            if is_type or tname in ("function", "builtin_function_or_method"):
+                raise PicklingError(
+                    "Can't pickle %r: it's not found as %s.%s"
+                    % (obj, module, qualname)
+                )
         # Arbitrary instances — try __reduce_ex__ / __reduce__ (the
         # canonical CPython pickle protocol). Falls back to the
         # PicklingError below if neither is provided.
+        # Exceptions raised by a user `__reduce_ex__` / `__reduce__`
+        # propagate, as in CPython — `enum._make_class_unpicklable`
+        # relies on its injected TypeError reaching the caller.
         reduce_ex = getattr(obj, "__reduce_ex__", None)
         if reduce_ex is not None:
-            try:
-                rv = reduce_ex(self.protocol)
-            except TypeError:
-                rv = None
+            rv = reduce_ex(self.protocol)
             if rv is not None and rv is not NotImplemented:
-                self._save_reduce(rv)
+                self._save_reduce(rv, obj)
                 return
         reduce = getattr(obj, "__reduce__", None)
         if reduce is not None:
-            try:
-                rv = reduce()
-            except TypeError:
-                rv = None
+            rv = reduce()
             if rv is not None and rv is not NotImplemented:
-                self._save_reduce(rv)
+                self._save_reduce(rv, obj)
                 return
         raise PicklingError(
             "Can't pickle %r: pickle currently only supports primitive types"
@@ -225,7 +336,7 @@ class _Pickler:
         self._buf.write(encoded_name)
         self._buf.write(b"\n")
 
-    def _save_reduce(self, rv):
+    def _save_reduce(self, rv, obj=None):
         if isinstance(rv, str):
             self._save_global(rv.rsplit(".", 1)[0] if "." in rv else "builtins", rv)
             return
@@ -239,14 +350,30 @@ class _Pickler:
         self._save(func)
         self._save(tuple(args))
         self._buf.write(REDUCE)
+        # Memoize the just-constructed object *before* applying state /
+        # items, so a self-referential object can back-reference itself.
+        if obj is not None:
+            self._memoize(obj)
+        # CPython `Pickler._batch_appends` / `_batch_setitems`: drain the
+        # iterators in MARK…APPENDS / MARK…SETITEMS batches so the loader
+        # folds the items back into the object on the stack.
         if listitems is not None:
-            for item in listitems:
-                self._save(item)
-                self._buf.write(APPENDS[:0])  # no-op; preserves stack
+            items = list(listitems)
+            for start in range(0, len(items), 1000):
+                batch = items[start : start + 1000]
+                self._buf.write(MARK)
+                for item in batch:
+                    self._save(item)
+                self._buf.write(APPENDS)
         if dictitems is not None:
-            for k, v in dictitems:
-                self._save(k)
-                self._save(v)
+            items = list(dictitems)
+            for start in range(0, len(items), 1000):
+                batch = items[start : start + 1000]
+                self._buf.write(MARK)
+                for k, v in batch:
+                    self._save(k)
+                    self._save(v)
+                self._buf.write(SETITEMS)
         if state is not None:
             self._save(state)
             self._buf.write(BUILD)
@@ -284,6 +411,7 @@ class _Pickler:
             self._buf.write(BINBYTES + struct.pack("<I", n) + b)
         else:
             self._buf.write(BINBYTES8 + struct.pack("<Q", n) + b)
+        self._memoize(b)
 
     def _save_str(self, s):
         encoded = s.encode("utf-8", "surrogatepass")
@@ -294,33 +422,40 @@ class _Pickler:
             self._buf.write(BINUNICODE + struct.pack("<I", n) + encoded)
         else:
             self._buf.write(BINUNICODE8 + struct.pack("<Q", n) + encoded)
+        self._memoize(s)
 
     def _save_tuple(self, t):
         n = len(t)
         if n == 0:
             self._buf.write(EMPTY_TUPLE)
             return
-        if n == 1:
-            self._save(t[0])
-            self._buf.write(TUPLE1)
-            return
-        if n == 2:
-            self._save(t[0])
-            self._save(t[1])
-            self._buf.write(TUPLE2)
-            return
-        if n == 3:
+        if n <= 3:
             for item in t:
                 self._save(item)
-            self._buf.write(TUPLE3)
+            # A nested element may have memoized *this* tuple (a cycle via
+            # reduce); if so, drop what we wrote and emit the reference.
+            x = self.memo.get(id(t))
+            if x is not None:
+                self._buf.write(POP * n)
+                self._write_get(x[0])
+                return
+            self._buf.write((TUPLE1, TUPLE2, TUPLE3)[n - 1])
+            self._memoize(t)
             return
         self._buf.write(MARK)
         for item in t:
             self._save(item)
+        x = self.memo.get(id(t))
+        if x is not None:
+            self._buf.write(POP_MARK)
+            self._write_get(x[0])
+            return
         self._buf.write(TUPLE)
+        self._memoize(t)
 
     def _save_list(self, lst):
         self._buf.write(EMPTY_LIST)
+        self._memoize(lst)
         if lst:
             self._buf.write(MARK)
             for item in lst:
@@ -329,6 +464,7 @@ class _Pickler:
 
     def _save_dict(self, d):
         self._buf.write(EMPTY_DICT)
+        self._memoize(d)
         if d:
             self._buf.write(MARK)
             for k, v in d.items():
@@ -344,8 +480,10 @@ class _Pickler:
             for it in items:
                 self._save(it)
             self._buf.write(FROZENSET)
+            self._memoize(s)
         else:
             self._buf.write(EMPTY_SET)
+            self._memoize(s)
             if items:
                 self._buf.write(MARK)
                 for it in items:
@@ -543,6 +681,49 @@ def _stop(_u):
     return _STOP
 
 
+def _pop(u):
+    u.stack.pop()
+
+
+def _pop_mark(u):
+    idx = u.markers.pop()
+    del u.stack[idx:]
+
+
+def _put(u):
+    idx = int(_read_line(u))
+    u.memo[idx] = u.stack[-1]
+
+
+def _binput(u):
+    idx = u.file.read(1)[0]
+    u.memo[idx] = u.stack[-1]
+
+
+def _long_binput(u):
+    idx = struct.unpack("<I", u._read_short(4))[0]
+    u.memo[idx] = u.stack[-1]
+
+
+def _memoize(u):
+    u.memo[len(u.memo)] = u.stack[-1]
+
+
+def _get(u):
+    idx = int(_read_line(u))
+    u.stack.append(u.memo[idx])
+
+
+def _binget(u):
+    idx = u.file.read(1)[0]
+    u.stack.append(u.memo[idx])
+
+
+def _long_binget(u):
+    idx = struct.unpack("<I", u._read_short(4))[0]
+    u.stack.append(u.memo[idx])
+
+
 def _read_line(u):
     out = b""
     while True:
@@ -599,8 +780,21 @@ def _build(u):
     setstate = getattr(obj, "__setstate__", None)
     if setstate is not None:
         setstate(state)
-    elif isinstance(state, dict):
+        return
+    # CPython `load_build`: a 2-tuple state is (__dict__ state, slot
+    # state); apply the dict half directly and the slots via setattr.
+    slotstate = None
+    if isinstance(state, tuple) and len(state) == 2:
+        state, slotstate = state
+    if state:
+        # Write the dict half straight into the instance dict, bypassing
+        # `__setattr__` (CPython `load_build` does `inst.__dict__[k] = v`)
+        # — this is what lets frozen dataclasses unpickle.
+        d = obj.__dict__
         for k, v in state.items():
+            d[k] = v
+    if slotstate:
+        for k, v in slotstate.items():
             setattr(obj, k, v)
 
 
@@ -608,6 +802,69 @@ def _newobj(u):
     args = u.stack.pop()
     cls = u.stack.pop()
     u.stack.append(cls.__new__(cls, *args))
+
+
+def _int_op(u):
+    # Protocol-0 INT covers booleans too: `I00`/`I01` are False/True.
+    data = _read_line(u)
+    if data == b"00":
+        u.stack.append(False)
+    elif data == b"01":
+        u.stack.append(True)
+    else:
+        u.stack.append(int(data))
+
+
+def _long_op(u):
+    data = _read_line(u)
+    if data.endswith(b"L"):
+        data = data[:-1]
+    u.stack.append(int(data))
+
+
+def _float_op(u):
+    u.stack.append(float(_read_line(u)))
+
+
+def _string_op(u):
+    data = _read_line(u).decode("latin-1")
+    # Repr-quoted: strip the matching quotes and unescape.
+    if len(data) >= 2 and data[0] == data[-1] and data[0] in "\"'":
+        data = data[1:-1]
+    else:
+        raise UnpicklingError("the STRING opcode argument must be quoted")
+    u.stack.append(data.encode("latin-1").decode("unicode_escape"))
+
+
+def _unicode_op(u):
+    u.stack.append(_read_line(u).decode("raw-unicode-escape"))
+
+
+def _list_op(u):
+    u.stack.append(u._pop_to_mark())
+
+
+def _dict_op(u):
+    items = u._pop_to_mark()
+    d = {}
+    for i in range(0, len(items), 2):
+        d[items[i]] = items[i + 1]
+    u.stack.append(d)
+
+
+def _append(u):
+    value = u.stack.pop()
+    u.stack[-1].append(value)
+
+
+def _setitem(u):
+    value = u.stack.pop()
+    key = u.stack.pop()
+    u.stack[-1][key] = value
+
+
+def _dup(u):
+    u.stack.append(u.stack[-1])
 
 
 def _newobj_ex(u):
@@ -652,12 +909,31 @@ _OPCODES = {
     FROZENSET: _frozenset,
     MARK: _mark,
     STOP: _stop,
+    POP: _pop,
+    POP_MARK: _pop_mark,
+    PUT: _put,
+    BINPUT: _binput,
+    LONG_BINPUT: _long_binput,
+    MEMOIZE: _memoize,
+    GET: _get,
+    BINGET: _binget,
+    LONG_BINGET: _long_binget,
     GLOBAL: _global,
     STACK_GLOBAL: _stack_global,
     REDUCE: _reduce,
     BUILD: _build,
     NEWOBJ: _newobj,
     NEWOBJ_EX: _newobj_ex,
+    INT: _int_op,
+    LONG: _long_op,
+    FLOAT: _float_op,
+    STRING: _string_op,
+    UNICODE: _unicode_op,
+    LIST: _list_op,
+    DICT: _dict_op,
+    APPEND: _append,
+    SETITEM: _setitem,
+    DUP: _dup,
 }
 
 
@@ -676,3 +952,10 @@ class Pickler(_Pickler):
 
 class Unpickler(_Unpickler):
     pass
+
+
+# CPython keeps the pure-Python implementations reachable under
+# underscore names after the C-accelerator import (`pickle._dumps` is
+# probed by test_descr's reduce checks). There is no separate C
+# implementation here, so they alias the public functions.
+_dump, _dumps, _load, _loads = dump, dumps, load, loads

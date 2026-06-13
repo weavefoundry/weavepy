@@ -1032,6 +1032,7 @@ fn set_cloexec(fd: RawFd, on: bool) -> std::io::Result<()> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -1044,6 +1045,7 @@ fn b_dyn(
 ) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))

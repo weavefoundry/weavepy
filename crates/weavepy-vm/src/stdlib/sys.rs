@@ -47,6 +47,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("_getframe")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "_getframe",
+                binds_instance: false,
                 call: Box::new(move |args| {
                     if let Some(h) = crate::vm_singletons::current_thread_handles() {
                         sys_getframe(args, &h.frame_stack)
@@ -62,6 +63,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("exc_info")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "exc_info",
+                binds_instance: false,
                 call: Box::new(move |_| {
                     if let Some(h) = crate::vm_singletons::current_thread_handles() {
                         sys_exc_info(&h.exc_info_stack)
@@ -72,16 +74,37 @@ pub fn build_with_state(
                 call_kw: None,
             })),
         );
-        let eh_get = excepthook.clone();
+        let es_fallback_exc = exc_info_stack.clone();
+        d.insert(
+            DictKey(Object::from_static("exception")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "exception",
+                binds_instance: false,
+                call: Box::new(move |_| {
+                    if let Some(h) = crate::vm_singletons::current_thread_handles() {
+                        sys_exception(&h.exc_info_stack)
+                    } else {
+                        sys_exception(&es_fallback_exc)
+                    }
+                }),
+                call_kw: None,
+            })),
+        );
         d.insert(
             DictKey(Object::from_static("__excepthook__")),
-            eh_get.borrow().clone(),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "excepthook",
+                binds_instance: false,
+                call: Box::new(sys_default_excepthook),
+                call_kw: None,
+            })),
         );
         let eh = excepthook.clone();
         d.insert(
             DictKey(Object::from_static("excepthook")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "excepthook",
+                binds_instance: false,
                 call: Box::new(move |args| {
                     let hook = eh.borrow().clone();
                     // If a user hook is installed, the *call* path
@@ -101,6 +124,7 @@ pub fn build_with_state(
             DictKey(Object::from_static("unraisablehook")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "unraisablehook",
+                binds_instance: false,
                 call: Box::new(move |_args| {
                     let _ = uh.borrow().clone();
                     Ok(Object::None)
@@ -254,6 +278,7 @@ pub fn build_with_state(
                 DictKey(Object::from_static("_current_frames")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "_current_frames",
+                    binds_instance: false,
                     call: Box::new(move |_args| {
                         let frame = if let Some(h) = crate::vm_singletons::current_thread_handles()
                         {
@@ -286,6 +311,32 @@ pub fn build_with_state(
         d.insert(
             DictKey(Object::from_static("getrefcount")),
             builtin("getrefcount", sys_getrefcount),
+        );
+        d.insert(
+            DictKey(Object::from_static("get_coroutine_origin_tracking_depth")),
+            builtin("get_coroutine_origin_tracking_depth", |_| {
+                Ok(Object::Int(coroutine_origin_tracking_depth()))
+            }),
+        );
+        d.insert(
+            DictKey(Object::from_static("set_coroutine_origin_tracking_depth")),
+            builtin(
+                "set_coroutine_origin_tracking_depth",
+                sys_set_coroutine_origin_tracking_depth,
+            ),
+        );
+        d.insert(
+            DictKey(Object::from_static("get_asyncgen_hooks")),
+            builtin("get_asyncgen_hooks", sys_get_asyncgen_hooks),
+        );
+        d.insert(
+            DictKey(Object::from_static("set_asyncgen_hooks")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "set_asyncgen_hooks",
+                binds_instance: false,
+                call: Box::new(|args| sys_set_asyncgen_hooks(args, &[])),
+                call_kw: Some(Box::new(sys_set_asyncgen_hooks)),
+            })),
         );
         // `displayhook` — invoked by the REPL after every
         // evaluated expression. Default writes `repr(value)` to
@@ -400,6 +451,13 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("platform")),
             Object::from_static(host_platform()),
         );
+        // CPython-on-macOS build detail: the framework name when built
+        // as a macOS framework, `""` otherwise (the common case, and
+        // ours). `pydoc`/`platform`/`site` read it unconditionally.
+        d.insert(
+            DictKey(Object::from_static("_framework")),
+            Object::from_static(""),
+        );
         d.insert(
             DictKey(Object::from_static("byteorder")),
             Object::from_static(if cfg!(target_endian = "little") {
@@ -440,6 +498,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static("_get_frozen_source")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "_get_frozen_source",
+                    binds_instance: false,
                     call: Box::new(move |args| {
                         let name = match args.first() {
                             Some(Object::Str(s)) => s.to_string(),
@@ -461,6 +520,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static("_is_frozen")),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name: "_is_frozen",
+                    binds_instance: false,
                     call: Box::new(move |args| {
                         let name = match args.first() {
                             Some(Object::Str(s)) => s.to_string(),
@@ -482,8 +542,34 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("setrecursionlimit", sys_setrecursionlimit),
         );
         d.insert(
+            DictKey(Object::from_static("get_int_max_str_digits")),
+            builtin("get_int_max_str_digits", sys_get_int_max_str_digits),
+        );
+        d.insert(
+            DictKey(Object::from_static("set_int_max_str_digits")),
+            builtin("set_int_max_str_digits", sys_set_int_max_str_digits),
+        );
+        d.insert(
             DictKey(Object::from_static("intern")),
             builtin("intern", sys_intern),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_finalizing")),
+            builtin("is_finalizing", |_args| {
+                Ok(Object::Bool(crate::vm_singletons::is_finalizing()))
+            }),
+        );
+        d.insert(
+            DictKey(Object::from_static("getdefaultencoding")),
+            builtin("getdefaultencoding", sys_getdefaultencoding),
+        );
+        d.insert(
+            DictKey(Object::from_static("getfilesystemencoding")),
+            builtin("getfilesystemencoding", sys_getfilesystemencoding),
+        );
+        d.insert(
+            DictKey(Object::from_static("getfilesystemencodeerrors")),
+            builtin("getfilesystemencodeerrors", sys_getfilesystemencodeerrors),
         );
 
         // Standard I/O streams. We expose them as file-like objects
@@ -513,6 +599,17 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("stdin")),
             Object::File(Rc::new(PyFile::new("<stdin>", "r", FileBackend::Stdin))),
         );
+        // `sys.__stdout__` et al. record the *original* streams so code
+        // that rebinds `sys.stdout` can restore them. They alias the same
+        // objects at startup.
+        for name in ["stdout", "stderr", "stdin"] {
+            let dunder = format!("__{name}__");
+            let v = d
+                .get(&DictKey(Object::from_str(name)))
+                .cloned()
+                .expect("stream just inserted");
+            d.insert(DictKey(Object::from_str(dunder)), v);
+        }
     }
     Rc::new(PyModule {
         name: "sys".to_owned(),
@@ -573,6 +670,7 @@ fn implementation_value() -> Object {
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -607,13 +705,71 @@ fn sys_exit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sys_getrecursionlimit(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(1000))
+    Ok(Object::Int(crate::recursion::recursion_limit() as i64))
+}
+
+thread_local! {
+    // PEP 0467 int<->str conversion cap. WeavePy doesn't yet *enforce* the
+    // limit on conversion, but `sys.get/set_int_max_str_digits` must round-trip
+    // (test_int reads/sets it; many modules query it at import).
+    static INT_MAX_STR_DIGITS: std::cell::Cell<i64> = const { std::cell::Cell::new(4300) };
+}
+
+/// The current per-thread int↔str conversion digit cap (0 = unlimited).
+/// Read by the str→int / int→str conversion paths to enforce PEP 0467.
+pub fn int_max_str_digits() -> i64 {
+    INT_MAX_STR_DIGITS.with(|c| c.get())
+}
+
+fn sys_get_int_max_str_digits(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Int(INT_MAX_STR_DIGITS.with(|c| c.get())))
+}
+
+fn sys_set_int_max_str_digits(args: &[Object]) -> Result<Object, RuntimeError> {
+    let n = match args.first() {
+        Some(Object::Int(n)) => *n,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => return Err(type_error("'maxdigits' must be an integer")),
+    };
+    // CPython rejects values in (0, 640); 0 disables the limit.
+    if n != 0 && n < 640 {
+        return Err(value_error("maxdigits must be 0 or larger than 640"));
+    }
+    INT_MAX_STR_DIGITS.with(|c| c.set(n));
+    Ok(Object::None)
 }
 
 fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _ = args;
-    // No-op for now: the host stack does the bounding.
-    Ok(Object::None)
+    // RFC 0037 (WS1) — the limit is now enforced by the dispatch loop's
+    // recursion guard rather than left to the native stack.
+    let limit = match args.first() {
+        Some(Object::Int(n)) => *n,
+        Some(Object::Bool(b)) => i64::from(*b),
+        Some(Object::Long(n)) => {
+            // Absurdly large limits are accepted by CPython; clamp to a
+            // value the usize counter can represent.
+            use num_traits::ToPrimitive;
+            n.to_i64().unwrap_or(i64::MAX)
+        }
+        Some(_) => return Err(type_error("'limit' must be an integer")),
+        None => return Err(type_error("setrecursionlimit expected 1 argument, got 0")),
+    };
+    if limit < 1 {
+        return Err(value_error(
+            "recursion limit must be greater or equal than 1",
+        ));
+    }
+    match crate::recursion::set_limit(limit as usize) {
+        Ok(()) => Ok(Object::None),
+        Err(depth) => Err(RuntimeError::PyException(crate::error::PyException::new(
+            crate::builtin_types::make_exception(
+                "RecursionError",
+                format!(
+                    "cannot set the recursion limit to {limit} at the recursion depth {depth}: the limit is too low"
+                ),
+            ),
+        ))),
+    }
 }
 
 fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -621,6 +777,19 @@ fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(_)) => Ok(args[0].clone()),
         _ => Err(type_error("sys.intern() argument must be str")),
     }
+}
+
+fn sys_getdefaultencoding(_args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython 3 always returns "utf-8" here.
+    Ok(Object::from_static("utf-8"))
+}
+
+fn sys_getfilesystemencoding(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::from_static("utf-8"))
+}
+
+fn sys_getfilesystemencodeerrors(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::from_static("surrogatepass"))
 }
 
 fn sys_getframe(
@@ -646,6 +815,19 @@ fn sys_getframe(
     Ok(Object::Frame(stack[idx].clone()))
 }
 
+/// `sys.exception()` (PEP 3134 / 3.11+): the exception instance currently
+/// being handled, or `None` if not in an `except`. Equivalent to
+/// `sys.exc_info()[1]`. The verbatim CPython `contextlib` relies on this.
+fn sys_exception(
+    exc_info_stack: &Rc<RefCell<Vec<crate::error::PyException>>>,
+) -> Result<Object, RuntimeError> {
+    let stack = exc_info_stack.borrow();
+    Ok(stack
+        .last()
+        .map(|top| top.instance.clone())
+        .unwrap_or(Object::None))
+}
+
 fn sys_exc_info(
     exc_info_stack: &Rc<RefCell<Vec<crate::error::PyException>>>,
 ) -> Result<Object, RuntimeError> {
@@ -653,7 +835,7 @@ fn sys_exc_info(
     if let Some(top) = stack.last() {
         let inst = top.instance.clone();
         let type_obj = match &inst {
-            Object::Instance(i) => Object::Type(i.class.clone()),
+            Object::Instance(i) => Object::Type(i.cls()),
             _ => Object::None,
         };
         let tb = match &inst {
@@ -678,13 +860,23 @@ fn sys_exc_info(
 }
 
 fn sys_default_excepthook(args: &[Object]) -> Result<Object, RuntimeError> {
-    // type, value, tb — we render a short summary directly to stderr.
-    // The VM-level CLI does the full traceback. This default is what
-    // a user gets when they call `sys.excepthook(*sys.exc_info())`
-    // from inside `except:` and the user hook is `None`.
+    // `sys.__excepthook__(type, value, tb)` — CPython's pristine hook
+    // renders the full traceback (source lines, carets, chained
+    // causes/contexts) to `sys.stderr`. Route through the Python
+    // `traceback` module when an interpreter is on the stack; fall
+    // back to a bare "Type: msg" line otherwise.
     let value = args.get(1).cloned().unwrap_or(Object::None);
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by `publish_interpreter_ptr` from a
+        // `&mut Interpreter` still on the call stack above us; the
+        // GIL makes this thread's access exclusive.
+        let interp = unsafe { &mut *ptr };
+        if interp.print_exception_via_traceback(&value) {
+            return Ok(Object::None);
+        }
+    }
     let kind = match &value {
-        Object::Instance(i) => i.class.name.clone(),
+        Object::Instance(i) => i.cls().name.clone(),
         _ => "Exception".to_owned(),
     };
     let msg = crate::builtin_types::exception_message(&value).unwrap_or_default();
@@ -829,12 +1021,21 @@ fn sys_flags_value() -> Object {
         "dev_mode",
         "utf8_mode",
         "safe_path",
-        "int_max_str_digits",
         "warn_default_encoding",
     ] {
         d.insert(DictKey(Object::from_static(name)), Object::Int(0));
     }
-    Object::Dict(Rc::new(RefCell::new(d)))
+    // CPython's default cap on int<->str conversion size (PEP 0467 /
+    // `-X int_max_str_digits`). test_int reads this off `sys.flags`.
+    d.insert(
+        DictKey(Object::from_static("int_max_str_digits")),
+        Object::Int(4300),
+    );
+    // CPython exposes `sys.flags` as a struct-sequence answering attribute
+    // access (`sys.flags.optimize`, `sys.flags.bytes_warning`, …), used by
+    // test_descr / test_bytes / test_collections. A SimpleNamespace gives
+    // us that attribute surface (mirrors `sys.float_info` above).
+    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
 
 fn sys_float_info() -> Object {
@@ -886,9 +1087,13 @@ fn sys_int_info() -> Object {
 fn sys_hash_info() -> Object {
     let mut d = DictData::new();
     d.insert(DictKey(Object::from_static("width")), Object::Int(64));
+    // `_PyHASH_MODULUS` on a 64-bit build is the Mersenne prime 2**61-1,
+    // which is also the modulus `python_int_hash`/`py_hash_double` reduce
+    // through. test_numeric_tower derives `_PyHASH_MODULUS` from this field
+    // and checks exact Fraction hashes against it, so it must match.
     d.insert(
         DictKey(Object::from_static("modulus")),
-        Object::Int(i64::MAX),
+        Object::Int((1i64 << 61) - 1),
     );
     d.insert(DictKey(Object::from_static("inf")), Object::Int(314_159));
     d.insert(DictKey(Object::from_static("nan")), Object::Int(0));
@@ -1210,17 +1415,125 @@ fn stdlib_module_names_value() -> Object {
     Object::FrozenSet(Rc::new(set))
 }
 
-/// `sys.getrefcount(obj)` — best-effort. Always returns a
-/// non-zero value to satisfy `assert sys.getrefcount(x) > 0`-
-/// style sanity checks. The exact number is implementation-
-/// specific even in CPython.
+/// `sys.getrefcount(obj)` — best-effort, derived from the real
+/// `Rc::strong_count` of the payload. Infrastructure references
+/// (the cycle-GC registry's handle, weakref slots' strong clones)
+/// are discounted so the number tracks *program-visible* bindings;
+/// `+1` accounts for the argument reference, like CPython. The
+/// exact number is implementation-specific even in CPython.
 fn sys_getrefcount(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
+    let Some(obj) = args.first() else {
         return Err(type_error("getrefcount() takes exactly 1 argument"));
+    };
+    let strong = crate::gc_trace::strong_count_for(obj);
+    let id = crate::weakref_registry::id_of(obj);
+    let registry = usize::from(crate::gc_trace::is_tracked(id));
+    let weak_clones = crate::weakref_registry::strong_clone_count(id);
+    // The clone in our `args` slice plays the role of CPython's
+    // "+1 for the argument reference" — no extra increment needed.
+    let visible = strong.saturating_sub(registry).saturating_sub(weak_clones);
+    Ok(Object::Int(visible.max(1) as i64))
+}
+
+thread_local! {
+    /// PEP 565-era coroutine origin tracking depth
+    /// (`sys.set_coroutine_origin_tracking_depth`). Per-thread in
+    /// CPython (a `PyThreadState` field).
+    static CORO_ORIGIN_DEPTH: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Current `sys.get_coroutine_origin_tracking_depth()` value; read by
+/// the interpreter when constructing coroutine objects.
+pub fn coroutine_origin_tracking_depth() -> i64 {
+    CORO_ORIGIN_DEPTH.with(std::cell::Cell::get)
+}
+
+fn sys_set_coroutine_origin_tracking_depth(args: &[Object]) -> Result<Object, RuntimeError> {
+    let depth = match args.first() {
+        Some(Object::Int(i)) => *i,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => {
+            return Err(type_error(
+                "set_coroutine_origin_tracking_depth() takes an integer",
+            ))
+        }
+    };
+    if depth < 0 {
+        return Err(crate::error::value_error("depth must be >= 0"));
     }
-    // Two is what CPython returns for a freshly-bound name: the
-    // local + the argument.
-    Ok(Object::Int(2))
+    CORO_ORIGIN_DEPTH.with(|c| c.set(depth));
+    Ok(Object::None)
+}
+
+thread_local! {
+    /// PEP 525 `sys.set_asyncgen_hooks` — `(firstiter, finalizer)`.
+    /// Per-thread in CPython (a `PyThreadState` field).
+    static ASYNCGEN_HOOKS: std::cell::RefCell<(Object, Object)> =
+        const { std::cell::RefCell::new((Object::None, Object::None)) };
+}
+
+/// The currently-installed `(firstiter, finalizer)` asyncgen hooks.
+pub fn asyncgen_hooks() -> (Object, Object) {
+    ASYNCGEN_HOOKS.with(|h| h.borrow().clone())
+}
+
+fn check_asyncgen_hook(v: &Object, which: &str) -> Result<(), RuntimeError> {
+    let callable = matches!(
+        v,
+        Object::Function(_)
+            | Object::Builtin(_)
+            | Object::BoundMethod(_)
+            | Object::Type(_)
+            | Object::StaticMethod(_)
+    ) || matches!(v, Object::Instance(inst) if inst.cls().lookup("__call__").is_some());
+    if matches!(v, Object::None) || callable {
+        Ok(())
+    } else {
+        Err(type_error(format!(
+            "callable {which} expected, got {}",
+            v.type_name()
+        )))
+    }
+}
+
+fn sys_set_asyncgen_hooks(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let mut firstiter = args.first().cloned();
+    let mut finalizer = args.get(1).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "firstiter" => firstiter = Some(v.clone()),
+            "finalizer" => finalizer = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "set_asyncgen_hooks() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    if let Some(f) = &firstiter {
+        check_asyncgen_hook(f, "firstiter")?;
+    }
+    if let Some(f) = &finalizer {
+        check_asyncgen_hook(f, "finalizer")?;
+    }
+    ASYNCGEN_HOOKS.with(|h| {
+        let mut h = h.borrow_mut();
+        if let Some(f) = firstiter {
+            h.0 = f;
+        }
+        if let Some(f) = finalizer {
+            h.1 = f;
+        }
+    });
+    Ok(Object::None)
+}
+
+fn sys_get_asyncgen_hooks(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let (firstiter, finalizer) = asyncgen_hooks();
+    Ok(Object::new_tuple(vec![firstiter, finalizer]))
 }
 
 /// Default `sys.displayhook`: if the value is None do nothing,

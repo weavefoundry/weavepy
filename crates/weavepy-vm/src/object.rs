@@ -42,6 +42,12 @@ const _: () = {
 #[derive(Clone)]
 pub enum Object {
     None,
+    /// The "no value" marker for local-variable slots — CPython's NULL
+    /// fast-local. Never a Python-visible value: `LOAD_FAST` raises
+    /// `UnboundLocalError` on it, and the `f_locals` provider skips it
+    /// (which is what lets a local explicitly bound to `None` remain
+    /// visible — the two states must be distinguishable).
+    Unbound,
     Bool(bool),
     Int(i64),
     /// Arbitrary-precision integer (RFC 0019). Created on i64 overflow,
@@ -82,6 +88,10 @@ pub enum Object {
     /// returned from calling an `async def` that contains `yield`.
     /// Consumable via `async for`.
     AsyncGenerator(Rc<PyGenerator>),
+    /// Deferred awaitable produced by `agen.asend()` / `.athrow()` /
+    /// `.aclose()` (PEP 525). Awaiting it applies the operation to the
+    /// underlying async generator. See [`AsyncGenAwait`].
+    AsyncGenAwait(Rc<AsyncGenAwait>),
     /// Immutable byte string `b"..."`.
     Bytes(Rc<[u8]>),
     /// Mutable byte string `bytearray(...)`.
@@ -101,10 +111,10 @@ pub enum Object {
     Property(Rc<PyProperty>),
     /// `@staticmethod` descriptor (RFC 0015). Returns the wrapped
     /// callable unchanged when accessed via instance or class.
-    StaticMethod(Rc<Object>),
+    StaticMethod(Rc<MethodWrapper>),
     /// `@classmethod` descriptor (RFC 0015). Returns a method bound
     /// to the class (not the instance) on access.
-    ClassMethod(Rc<Object>),
+    ClassMethod(Rc<MethodWrapper>),
     /// Slot descriptor created by `__slots__` (RFC 0015). Stores a
     /// per-instance value under the slot's name in `__dict__`,
     /// enforcing the slot-list at the class level.
@@ -137,12 +147,22 @@ pub enum Object {
     /// `sys.implementation`, `argparse.Namespace`-shaped fixtures, and
     /// the conformance harness.
     SimpleNamespace(Rc<RefCell<DictData>>),
+    /// Native lazy iterator adapter (RFC 0037) — an `itertools` object
+    /// CPython implements in C. Wraps an arbitrary VM iterable, so it
+    /// is stepped by the *interpreter* (`Interpreter::iter_next`),
+    /// never by `PyIterator::next_value`: advancing the source may
+    /// resume a generator or call a user-defined `__next__`. Being
+    /// native matters beyond speed — stepping adds no Python frame,
+    /// which `traceback.walk_stack`'s hardcoded `f_back` hop count
+    /// relies on.
+    LazyIter(Rc<PyLazyIter>),
 }
 
 impl fmt::Debug for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Object::None => write!(f, "None"),
+            Object::Unbound => write!(f, "<unbound>"),
             Object::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),
             Object::Int(i) => write!(f, "{i}"),
             Object::Long(b) => write!(f, "{b}"),
@@ -168,19 +188,22 @@ impl fmt::Debug for Object {
             Object::Iter(_) => write!(f, "<iterator>"),
             Object::Slice(s) => write!(f, "slice({:?}, {:?}, {:?})", s.start, s.stop, s.step),
             Object::Type(t) => write!(f, "<class '{}'>", t.name),
-            Object::Instance(i) => write!(f, "<{} object>", i.class.name),
+            Object::Instance(i) => write!(f, "<{} object>", i.cls().name),
             Object::Module(m) => write!(f, "<module {:?}>", m.name),
-            Object::Generator(g) => write!(f, "<generator object {}>", g.name),
-            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name),
-            Object::AsyncGenerator(g) => write!(f, "<async_generator object {}>", g.name),
+            Object::Generator(g) => write!(f, "<generator object {}>", g.name.borrow()),
+            Object::Coroutine(g) => write!(f, "<coroutine object {}>", g.name.borrow()),
+            Object::AsyncGenerator(g) => {
+                write!(f, "<async_generator object {}>", g.name.borrow())
+            }
+            Object::AsyncGenAwait(a) => write!(f, "<{} object>", a.kind.type_name()),
             Object::Bytes(b) => write!(f, "Bytes({})", b.len()),
             Object::ByteArray(b) => write!(f, "ByteArray({})", b.borrow().len()),
             Object::Set(s) => f.debug_set().entries(s.borrow().iter()).finish(),
             Object::FrozenSet(s) => f.debug_set().entries(s.iter()).finish(),
             Object::File(file) => write!(f, "<file {:?}>", file.name),
             Object::Property(_) => write!(f, "<property>"),
-            Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", inner.as_ref()),
-            Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", inner.as_ref()),
+            Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", &inner.func()),
+            Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", &inner.func()),
             Object::SlotDescriptor(sd) => write!(f, "<slot {:?} of {:?}>", sd.name, sd.class_name),
             Object::Frame(fr) => write!(f, "<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
             Object::Traceback(tb) => write!(f, "<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
@@ -202,6 +225,7 @@ impl fmt::Debug for Object {
                 }
                 m.finish()
             }
+            Object::LazyIter(l) => write!(f, "<{} object>", l.type_name()),
         }
     }
 }
@@ -241,6 +265,12 @@ pub struct PyFrame {
     /// subsequent `'line'` / `'return'` / `'exception'` events on
     /// the frame. `Object::None` disables tracing for the frame.
     pub trace: RefCell<Object>,
+    /// Backlink to the generator/coroutine that owns this frame
+    /// (weak — the frame must not keep its generator alive). Set by
+    /// the VM when the snapshot is cached on a generator frame; lets
+    /// `frame.clear()` tear down the suspended generator like
+    /// CPython's `frame_clear`.
+    pub gen_owner: RefCell<Option<crate::sync::Weak<PyGenerator>>>,
     /// Per-frame `f_lineno` override. CPython lets debuggers set
     /// `f_lineno` to jump to a different line; we keep storage so
     /// reads round-trip, even though writes don't actually move the
@@ -251,6 +281,14 @@ pub struct PyFrame {
     /// means "no line event has fired on this frame yet" — the
     /// next `step` will fire one.
     pub last_line: Cell<Option<u32>>,
+    /// Mirrors CPython's `frame.f_trace_lines`. When `true` (the
+    /// default) the dispatcher fires `'line'` events; debuggers set it
+    /// `false` to suppress them.
+    pub trace_lines: Cell<bool>,
+    /// Mirrors CPython's `frame.f_trace_opcodes`. When `true` the
+    /// dispatcher fires an `'opcode'` event before every instruction
+    /// (used by `bdb`/`pdb` instruction stepping). Defaults to `false`.
+    pub trace_opcodes: Cell<bool>,
 }
 
 impl fmt::Debug for PyFrame {
@@ -277,8 +315,11 @@ impl PyFrame {
     /// calls return the same dict object so `id(frame.f_locals)` is
     /// stable.
     pub fn locals(&self) -> Object {
-        if let Some(v) = self.locals_cache.borrow().as_ref() {
-            return v.clone();
+        if self.locals_cache.borrow().is_some() {
+            self.refresh_locals();
+            if let Some(v) = self.locals_cache.borrow().as_ref() {
+                return v.clone();
+            }
         }
         let provider = self.locals_provider.borrow().clone();
         let dict = provider
@@ -288,11 +329,53 @@ impl PyFrame {
         dict
     }
 
-    /// Force re-materialisation on the next `locals()` call. Used by
-    /// the VM after the frame has executed enough to make the cached
-    /// snapshot stale (function entry, generator resume).
+    /// Refresh the materialised `f_locals` dict *in place*, keeping
+    /// its identity stable (PEP 667: a handle obtained earlier
+    /// observes later execution of the frame). Frame names are
+    /// rewritten from the live state; user-added extra keys are
+    /// preserved.
+    pub fn refresh_locals(&self) {
+        let cached = self.locals_cache.borrow().clone();
+        let Some(Object::Dict(cached_rc)) = cached else {
+            return;
+        };
+        let provider = self.locals_provider.borrow().clone();
+        let Some(provider) = provider else { return };
+        let Object::Dict(fresh_rc) = provider() else {
+            return;
+        };
+        // Module/class scopes hand back the namespace dict itself —
+        // already live, nothing to merge.
+        if Rc::ptr_eq(&cached_rc, &fresh_rc) {
+            return;
+        }
+        let mut out = fresh_rc.borrow().clone();
+        {
+            let old = cached_rc.borrow();
+            for (k, v) in old.iter() {
+                let is_frame_name = match &k.0 {
+                    Object::Str(s) => {
+                        let name = s.as_ref();
+                        self.code.varnames.iter().any(|n| n == name)
+                            || self.code.cellvars.iter().any(|n| n == name)
+                            || self.code.freevars.iter().any(|n| n == name)
+                    }
+                    _ => false,
+                };
+                if !is_frame_name && !out.contains_key(k) {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        *cached_rc.borrow_mut() = out;
+    }
+
+    /// Bring the materialised snapshot (if any) up to date with the
+    /// frame's live state. Used by the VM after the frame has executed
+    /// enough to make the cached contents stale (function entry,
+    /// generator resume). The dict's identity is preserved.
     pub fn invalidate_locals(&self) {
-        self.locals_cache.borrow_mut().take();
+        self.refresh_locals();
     }
 }
 
@@ -304,6 +387,118 @@ pub struct PyTraceback {
     pub lineno: u32,
     pub lasti: u32,
     pub next: RefCell<Option<Rc<PyTraceback>>>,
+}
+
+// ---- bytearray buffer-export accounting ----
+//
+// CPython forbids resizing a `bytearray` while its buffer is exported
+// (`ob_exports > 0`): a live `memoryview`, or a native method holding
+// the buffer across a re-entrant callback (gh-142560). We track live
+// exports per backing buffer in a side table. The hot-path cost for
+// non-exporting programs is a single relaxed atomic load.
+
+static BYTEARRAY_EXPORT_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+type ExportMap = std::collections::HashMap<usize, (crate::sync::Weak<RefCell<Vec<u8>>>, usize)>;
+
+fn bytearray_export_map() -> &'static std::sync::Mutex<ExportMap> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<ExportMap>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(ExportMap::new()))
+}
+
+/// Register a live export of `buf`. Pair with
+/// [`bytearray_export_release`] (or use [`ByteArrayExportGuard`]).
+pub fn bytearray_export_acquire(buf: &Rc<RefCell<Vec<u8>>>) {
+    let key = Rc::as_ptr(buf) as usize;
+    let mut map = bytearray_export_map().lock().unwrap();
+    let entry = map.entry(key);
+    match entry {
+        std::collections::hash_map::Entry::Occupied(mut o) => {
+            // A recycled allocation address must not inherit the stale
+            // count from a dead buffer.
+            let stale = o
+                .get()
+                .0
+                .upgrade()
+                .is_none_or(|live| !Rc::ptr_eq(&live, buf));
+            if stale {
+                let removed = o.get().1;
+                BYTEARRAY_EXPORT_TOTAL.fetch_sub(removed, std::sync::atomic::Ordering::AcqRel);
+                *o.get_mut() = (Rc::downgrade(buf), 1);
+            } else {
+                o.get_mut().1 += 1;
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert((Rc::downgrade(buf), 1));
+        }
+    }
+    BYTEARRAY_EXPORT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Drop one live export of `buf`.
+pub fn bytearray_export_release(buf: &Rc<RefCell<Vec<u8>>>) {
+    let key = Rc::as_ptr(buf) as usize;
+    let mut map = bytearray_export_map().lock().unwrap();
+    if let Some((weak, count)) = map.get_mut(&key) {
+        let live = weak.upgrade().is_some_and(|live| Rc::ptr_eq(&live, buf));
+        if live {
+            *count -= 1;
+            BYTEARRAY_EXPORT_TOTAL.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            if *count == 0 {
+                map.remove(&key);
+            }
+        }
+    }
+}
+
+/// Does `buf` have any live exports?
+pub fn bytearray_is_exported(buf: &Rc<RefCell<Vec<u8>>>) -> bool {
+    if BYTEARRAY_EXPORT_TOTAL.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    let key = Rc::as_ptr(buf) as usize;
+    let map = bytearray_export_map().lock().unwrap();
+    map.get(&key).is_some_and(|(weak, count)| {
+        *count > 0 && weak.upgrade().is_some_and(|live| Rc::ptr_eq(&live, buf))
+    })
+}
+
+/// Gate for length-changing `bytearray` operations — CPython's
+/// `_canresize`. Same-length writes are always fine; the callers only
+/// invoke this when the operation would change `len`.
+pub fn bytearray_check_resizable(buf: &Rc<RefCell<Vec<u8>>>) -> Result<(), RuntimeError> {
+    if bytearray_is_exported(buf) {
+        return Err(RuntimeError::PyException(
+            crate::error::PyException::from_builtin(
+                "BufferError",
+                "Existing exports of data: object cannot be re-sized",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// RAII export of a bytearray buffer — what a CPython C method holds
+/// (via `PyObject_GetBuffer` on `self`) while it converts arguments
+/// that may call back into Python.
+#[derive(Debug)]
+pub struct ByteArrayExportGuard {
+    buf: Rc<RefCell<Vec<u8>>>,
+}
+
+impl ByteArrayExportGuard {
+    pub fn new(buf: Rc<RefCell<Vec<u8>>>) -> Self {
+        bytearray_export_acquire(&buf);
+        Self { buf }
+    }
+}
+
+impl Drop for ByteArrayExportGuard {
+    fn drop(&mut self) {
+        bytearray_export_release(&self.buf);
+    }
 }
 
 /// Backing buffer for a [`PyMemoryView`].
@@ -352,6 +547,10 @@ impl PyMemoryView {
 
     pub fn from_bytearray(b: Rc<RefCell<Vec<u8>>>) -> Self {
         let len = b.borrow().len();
+        // The view is a live buffer export: the bytearray cannot be
+        // resized until this view is released/dropped (CPython
+        // `ob_exports`).
+        bytearray_export_acquire(&b);
         Self {
             buffer: MemoryViewBuffer::ByteArray(b),
             start: Cell::new(0),
@@ -363,6 +562,39 @@ impl PyMemoryView {
         }
     }
 
+    /// Same backing buffer, same window — `memoryview(mv)`. Takes its
+    /// own buffer export, like CPython.
+    pub fn shallow_clone(&self) -> Self {
+        let buffer = match &self.buffer {
+            MemoryViewBuffer::Bytes(b) => MemoryViewBuffer::Bytes(b.clone()),
+            MemoryViewBuffer::ByteArray(b) => {
+                if !self.released.get() {
+                    bytearray_export_acquire(b);
+                }
+                MemoryViewBuffer::ByteArray(b.clone())
+            }
+        };
+        Self {
+            buffer,
+            start: Cell::new(self.start.get()),
+            len: Cell::new(self.len.get()),
+            readonly: Cell::new(self.readonly.get()),
+            released: Cell::new(self.released.get()),
+            format: RefCell::new(self.format.borrow().clone()),
+            itemsize: Cell::new(self.itemsize.get()),
+        }
+    }
+
+    /// `memoryview.release()` — drop the buffer export and mark the
+    /// view unusable. Idempotent.
+    pub fn release(&self) {
+        if !self.released.replace(true) {
+            if let MemoryViewBuffer::ByteArray(b) = &self.buffer {
+                bytearray_export_release(b);
+            }
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let start = self.start.get();
         let end = start + self.len.get();
@@ -370,6 +602,12 @@ impl PyMemoryView {
             MemoryViewBuffer::Bytes(b) => b[start..end].to_vec(),
             MemoryViewBuffer::ByteArray(b) => b.borrow()[start..end].to_vec(),
         }
+    }
+}
+
+impl Drop for PyMemoryView {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -400,13 +638,128 @@ pub struct PyDictView {
     pub kind: DictViewKind,
 }
 
+/// Internal payload for [`Object::StaticMethod`] / [`Object::ClassMethod`].
+///
+/// Besides the wrapped callable, CPython's `classmethod` and
+/// `staticmethod` objects carry a real instance `__dict__` which the
+/// constructor seeds with the functools-wrapper attributes copied from
+/// the wrapped function (bpo-43682). Arbitrary attributes can be set on
+/// the wrapper afterwards (`cm.x = 42`).
+#[derive(Debug)]
+pub struct MethodWrapper {
+    /// The wrapped callable. Interior-mutable because CPython's
+    /// `classmethod`/`staticmethod` set `sm_callable`/`cm_callable` in
+    /// `__init__` (not `__new__`), so a subclass that overrides
+    /// `__init__` without chaining leaves `__func__` as `None`
+    /// (test_descr `test_classmethod_new` / `test_staticmethod_new`).
+    func: RefCell<Object>,
+    pub dict: Rc<RefCell<DictData>>,
+}
+
+impl MethodWrapper {
+    pub fn new(func: Object) -> Rc<Self> {
+        let dict = Self::wrapper_dict_for(&func);
+        Rc::new(Self {
+            func: RefCell::new(func),
+            dict: Rc::new(RefCell::new(dict)),
+        })
+    }
+
+    /// CPython's `functools.WRAPPER_ASSIGNMENTS` copy that `cm_init` /
+    /// `sm_init` perform: seed the wrapper's instance dict from the
+    /// wrapped callable.
+    fn wrapper_dict_for(func: &Object) -> DictData {
+        match func {
+            // Copy `functools.WRAPPER_ASSIGNMENTS` from a plain function
+            // (CPython skips attributes the callable doesn't have, and
+            // only functions are guaranteed to carry all five).
+            Object::Function(f) => {
+                let code = f.code();
+                // Computed lazily, then pinned to the function's slots so
+                // `wrapper.__name__ is func.__name__` style identity
+                // checks hold (CPython stores one object per attribute).
+                let pinned = |name: &'static str, compute: &dyn Fn() -> Object| {
+                    f.slot(name).unwrap_or_else(|| {
+                        let v = compute();
+                        f.set_slot(name, v.clone());
+                        v
+                    })
+                };
+                let name = pinned("__name__", &|| Object::from_str(f.name.clone()));
+                let qualname = pinned("__qualname__", &|| Object::from_str(code.qualname.clone()));
+                let module = pinned("__module__", &|| {
+                    f.globals
+                        .borrow()
+                        .get(&DictKey(Object::from_static("__name__")))
+                        .cloned()
+                        .unwrap_or(Object::None)
+                });
+                let doc = pinned("__doc__", &|| {
+                    crate::builtins::code_docstring(&code).unwrap_or(Object::None)
+                });
+                let annotations = pinned("__annotations__", &|| {
+                    Object::Dict(Rc::new(RefCell::new(DictData::new())))
+                });
+                [
+                    ("__module__", module),
+                    ("__name__", name),
+                    ("__qualname__", qualname),
+                    ("__annotations__", annotations),
+                    ("__doc__", doc),
+                ]
+                .into_iter()
+                .map(|(k, v)| (DictKey(Object::from_static(k)), v))
+                .collect()
+            }
+            // Builtin callables: no seeding. (Also load-bearing: these
+            // wrappers are built *during* `builtin_types()` init, so
+            // this arm must not call back into the type registry.)
+            Object::Builtin(_) => DictData::new(),
+            // Non-function callables only carry the attributes they
+            // actually have; for builtin singletons/values that is just
+            // the type docstring (`staticmethod(None).__dict__` ==
+            // `{'__doc__': None.__doc__}`).
+            other => {
+                let cls = crate::builtins::class_of(other);
+                match crate::builtin_type_doc(&cls.name) {
+                    Some(doc) if cls.flags.is_builtin => [(
+                        DictKey(Object::from_static("__doc__")),
+                        Object::from_static(doc),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    _ => DictData::new(),
+                }
+            }
+        }
+    }
+
+    /// The wrapped callable (a clone of the current value).
+    pub fn func(&self) -> Object {
+        self.func.borrow().clone()
+    }
+
+    /// Replace the wrapped callable and re-seed the wrapper dict from it,
+    /// matching CPython's `cm_init`/`sm_init` (which set the callable and
+    /// run the functools-wraps copy). A subclass that overrides
+    /// `__init__` without chaining never reaches here, so its `__func__`
+    /// stays `None`.
+    pub fn set_func(&self, func: Object) {
+        *self.dict.borrow_mut() = Self::wrapper_dict_for(&func);
+        *self.func.borrow_mut() = func;
+    }
+}
+
 /// Internal payload for [`Object::Property`].
 #[derive(Debug)]
 pub struct PyProperty {
     pub fget: Object,
     pub fset: Object,
     pub fdel: Object,
-    pub doc: Object,
+    /// Interior-mutable: CPython's `property.__doc__` is a writable
+    /// member (`namedtuple` field docs are patched in place:
+    /// `Point.x.__doc__ = …`).
+    pub doc: RefCell<Object>,
 }
 
 impl PyProperty {
@@ -415,8 +768,13 @@ impl PyProperty {
             fget,
             fset,
             fdel,
-            doc,
+            doc: RefCell::new(doc),
         }
+    }
+
+    /// Current `__doc__` value.
+    pub fn doc(&self) -> Object {
+        self.doc.borrow().clone()
     }
 
     /// Return a clone of `self` with the given attribute replaced. Used
@@ -428,7 +786,7 @@ impl PyProperty {
             fget: self.fget.clone(),
             fset: self.fset.clone(),
             fdel: self.fdel.clone(),
-            doc: self.doc.clone(),
+            doc: RefCell::new(self.doc()),
         };
         match which {
             PropertyAttr::Get => next.fget = fn_,
@@ -487,11 +845,25 @@ impl PyComplex {
     }
 }
 
+/// `range(...)` bounds. `i128` so ranges straddling the `i64` boundary
+/// (`range(sys.maxsize - 5, sys.maxsize + 5)`) still work; elements that
+/// don't fit `i64` materialise as `Object::Long`. (CPython supports
+/// arbitrary ints here; i128 covers every realistic bound while keeping
+/// the in-range iteration fast path allocation-free.)
 #[derive(Debug, Clone)]
 pub struct Range {
-    pub start: i64,
-    pub stop: i64,
-    pub step: i64,
+    pub start: i128,
+    pub stop: i128,
+    pub step: i128,
+}
+
+/// An int object from an `i128`: machine `Int` when it fits, `Long`
+/// otherwise.
+pub fn int_from_i128(v: i128) -> Object {
+    match i64::try_from(v) {
+        Ok(x) => Object::Int(x),
+        Err(_) => Object::Long(Rc::new(num_bigint::BigInt::from(v))),
+    }
 }
 
 /// A loaded Python module: a name, an optional source filename, and
@@ -519,9 +891,73 @@ impl fmt::Debug for PyModule {
 #[derive(Clone, Debug)]
 pub struct DictKey(pub Object);
 
+/// Reach for the running interpreter to compute a user instance's Python
+/// `__hash__`. `DictKey`'s `Hash`/`Eq` impls have no interpreter handle, so
+/// they borrow the thread's published interpreter pointer — the same bridge
+/// `_imp`/`_thread`/the C-API iterator use. Returns `None` when no
+/// interpreter is active (e.g. a dict built from pure-Rust setup), so the
+/// caller falls back to the native structural behaviour.
+fn current_interp_hash(obj: &Object) -> Option<i64> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: the pointer is published by the bytecode dispatch loop for the
+    // running thread and used only to re-enter the interpreter synchronously,
+    // mirroring the established reentrant-callback pattern in `_imp`/`_thread`.
+    let interp = unsafe { &mut *ptr };
+    interp.reentrant_py_hash(obj)
+}
+
+/// Companion to [`current_interp_hash`] for `a == b` via Python `__eq__`.
+fn current_interp_eq(a: &Object, b: &Object) -> Option<bool> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: see `current_interp_hash`.
+    let interp = unsafe { &mut *ptr };
+    interp.reentrant_py_eq(a, b)
+}
+
+/// True when `obj` is a user instance whose class supplies a *callable*
+/// `name` dunder (a real Python `def`, not the inherited identity default).
+/// Used to gate the reentrant `__eq__` dispatch so plain instances keep the
+/// native identity fast path.
+fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
+    let Object::Instance(inst) = obj else {
+        return false;
+    };
+    match inst.cls().lookup_with_owner(name) {
+        Some((Object::Function(_) | Object::BoundMethod(_), _)) => true,
+        Some((Object::None, _)) | None => false,
+        // Non-function dunder supplied by a user class — e.g.
+        // `unittest.mock` installs `Mock` instances as `__hash__` /
+        // `__eq__` on per-instance subclasses. Built-in owners keep
+        // the native identity fast path.
+        Some((_, owner)) => !owner.flags.is_builtin,
+    }
+}
+
 impl PartialEq for DictKey {
     fn eq(&self, other: &Self) -> bool {
-        self.0.eq_value(&other.0)
+        // CPython compares dict/set keys with `a is b or a == b`; the identity
+        // half makes a stored `nan` findable by itself (`{nan}` contains its
+        // own nan even though `nan != nan`).
+        if self.0.is_same(&other.0) {
+            return true;
+        }
+        // Native fast path also covers instance *identity* (`Rc::ptr_eq`),
+        // which is the `a is b` half of CPython's dict-key comparison.
+        if self.0.eq_value(&other.0) {
+            return true;
+        }
+        // Distinct user instances with a custom `__eq__` compare through it
+        // so a class defining `__eq__`/`__hash__` works as a `set`/`dict`
+        // key. Plain instances (no custom `__eq__`) keep identity semantics,
+        // already decided by the `eq_value` fast path above.
+        if instance_has_custom_dunder(&self.0, "__eq__")
+            || instance_has_custom_dunder(&other.0, "__eq__")
+        {
+            if let Some(eq) = current_interp_eq(&self.0, &other.0) {
+                return eq;
+            }
+        }
+        false
     }
 }
 
@@ -529,71 +965,18 @@ impl Eq for DictKey {}
 
 impl Hash for DictKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // An `int`/`str`/… subclass instance hashes identically to the
-        // value it wraps, so it can be used interchangeably with that
-        // value as a dict/set key (CPython invariant).
-        if let Some(native) = self.0.native_value() {
-            return DictKey(native).hash(state);
-        }
-        match &self.0 {
-            Object::None => 0u8.hash(state),
-            Object::Bool(b) => {
-                1u8.hash(state);
-                b.hash(state);
-            }
-            Object::Int(i) => {
-                // Hash compatibly with Long: route through the
-                // BigInt hash so `Int(0).hash() == Long(0).hash()`.
-                2u8.hash(state);
-                python_int_hash_i64(*i).hash(state);
-            }
-            Object::Long(b) => {
-                2u8.hash(state);
-                python_int_hash_bigint(b).hash(state);
-            }
-            Object::Float(f) => {
-                3u8.hash(state);
-                if f.fract() == 0.0 && f.is_finite() {
-                    // For values representable as integers, hash
-                    // through the int path so `1 == 1.0` implies
-                    // `hash(1) == hash(1.0)`.
-                    if let Some(as_int) = f64_to_i64_exact(*f) {
-                        2u8.hash(state);
-                        python_int_hash_i64(as_int).hash(state);
-                    } else {
-                        f.to_bits().hash(state);
-                    }
-                } else {
-                    f.to_bits().hash(state);
-                }
-            }
-            Object::Complex(c) => {
-                // Pure-real complex hashes as the underlying float;
-                // imaginary component contributes a separate
-                // factor (CPython: `hash(complex) = hash(real) ^
-                // (hash(imag) * IMAG)`). Constant good-enough.
-                3u8.hash(state);
-                c.real.to_bits().hash(state);
-                c.imag.to_bits().hash(state);
-            }
-            Object::Str(s) => {
-                4u8.hash(state);
-                s.hash(state);
-            }
-            Object::Tuple(items) => {
-                5u8.hash(state);
-                items.len().hash(state);
-                for x in items.iter() {
-                    DictKey(x.clone()).hash(state);
-                }
-            }
-            _ => {
-                // Unhashable types — hash to a constant. Python would
-                // raise TypeError; we keep it well-defined for now and
-                // let the runtime raise lazily when this key is used.
-                255u8.hash(state);
-            }
-        }
+        // Bucket every key by its single canonical Python hash value, so any
+        // two keys Python deems equal-and-hashable collide here regardless of
+        // their Rust representation: equal numeric types (`1 == 1.0 == True`),
+        // an `int`/`str`/… subclass and its wrapped value, and — crucially —
+        // a custom `__hash__` that returns a built-in value (e.g.
+        // `hash('halibut')`) and the string itself. `DictKey::eq` then decides
+        // actual equality within the bucket. Identity-hashable objects
+        // (functions, types, plain instances, …) fold in their allocation
+        // identity; truly unhashable keys share a constant bucket and the
+        // runtime raises lazily when used.
+        let h = py_hash_value(&self.0).unwrap_or_else(|| identity_hash(&self.0));
+        h.hash(state);
     }
 }
 
@@ -602,7 +985,10 @@ pub type DictData = indexmap::IndexMap<DictKey, Object>;
 #[derive(Clone)]
 pub struct PyFunction {
     pub name: String,
-    pub code: Rc<CodeObject>,
+    /// The code object executed on call. Interior-mutable because
+    /// `f.__code__ = other.__code__` rebinds it at runtime (CPython's
+    /// `func_set_code`); every call reads the *current* value.
+    pub code: RefCell<Rc<CodeObject>>,
     /// Module-level globals shared with the defining module.
     pub globals: Rc<RefCell<DictData>>,
     pub defaults: Vec<Object>,
@@ -614,6 +1000,54 @@ pub struct PyFunction {
     /// `__isabstractmethod__`, or any decorator that stashes
     /// per-callable metadata.
     pub attrs: Rc<RefCell<DictData>>,
+    /// CPython function *getset/member slots* (`__name__`,
+    /// `__qualname__`, `__doc__`, `__module__`, `__annotations__`,
+    /// `__type_params__`, …). These live outside `__dict__`: they're
+    /// data descriptors on the `function` type, so `f.__name__ = x`
+    /// must never appear in `f.__dict__` (functools.update_wrapper
+    /// copies `__dict__` and asserts the wrapper's annotations are
+    /// untouched by the wrapped function's slots).
+    pub slots: RefCell<DictData>,
+}
+
+/// Attribute names backed by function slots rather than `__dict__`.
+/// `__code__` is *not* here: it rebinds `PyFunction::code` directly so
+/// calls observe the swap (see the function setattr path).
+pub fn is_function_slot(name: &str) -> bool {
+    matches!(
+        name,
+        "__name__"
+            | "__qualname__"
+            | "__doc__"
+            | "__module__"
+            | "__annotations__"
+            | "__type_params__"
+            | "__defaults__"
+            | "__kwdefaults__"
+    )
+}
+
+impl PyFunction {
+    /// The current code object (honours `f.__code__ = …` rebinding).
+    pub fn code(&self) -> Rc<CodeObject> {
+        self.code.borrow().clone()
+    }
+
+    /// Read a slot value if one has been stored (explicitly assigned or
+    /// stamped at definition time). Computed fallbacks live at the
+    /// attribute-access sites.
+    pub fn slot(&self, name: &str) -> Option<Object> {
+        self.slots
+            .borrow()
+            .get(&DictKey(Object::from_str(name)))
+            .cloned()
+    }
+
+    pub fn set_slot(&self, name: &str, value: Object) {
+        self.slots
+            .borrow_mut()
+            .insert(DictKey(Object::from_str(name)), value);
+    }
 }
 
 impl fmt::Debug for PyFunction {
@@ -626,6 +1060,46 @@ impl fmt::Debug for PyFunction {
 pub struct BoundMethod {
     pub receiver: Object,
     pub function: Object,
+    /// When `true`, this is *not* a fully-bound CPython `method` but a
+    /// *deferred special-method dispatch* (`instance_method` /
+    /// `metaclass_method`): if `function` turns out to be a descriptor
+    /// instance (a class attribute with `__get__`, e.g.
+    /// `class X: __iter__ = SomeDescriptor()`), its `__get__(receiver,
+    /// type(receiver))` is invoked at call time and the result is
+    /// called — mirroring CPython's `_PyObject_LookupSpecial`.
+    ///
+    /// When `false` (the default for a real bound method), calling
+    /// prepends `receiver` and calls `function` directly, with **no**
+    /// further descriptor resolution. This is what `classmethod.__get__`
+    /// / `function.__get__` produce: CPython 3.13 removed chained
+    /// `classmethod` descriptors, so `classmethod(partial)` must call the
+    /// wrapped `partial` with the class prepended rather than re-invoking
+    /// `partial.__get__`.
+    pub redispatch_descriptor: bool,
+}
+
+impl BoundMethod {
+    /// A fully-bound method (CPython `method`): calling it prepends
+    /// `receiver` and calls `function` directly.
+    pub fn new(receiver: Object, function: Object) -> Self {
+        BoundMethod {
+            receiver,
+            function,
+            redispatch_descriptor: false,
+        }
+    }
+
+    /// A *deferred* special-method dispatch: if `function` is itself a
+    /// descriptor instance, its `__get__` is honoured at call time. Only
+    /// the implicit special-method lookup helpers (`instance_method` /
+    /// `metaclass_method`) build these.
+    pub fn dispatch(receiver: Object, function: Object) -> Self {
+        BoundMethod {
+            receiver,
+            function,
+            redispatch_descriptor: true,
+        }
+    }
 }
 
 impl fmt::Debug for BoundMethod {
@@ -642,6 +1116,11 @@ impl fmt::Debug for BoundMethod {
 /// audit checks at construction time.
 pub struct BuiltinFn {
     pub name: &'static str,
+    /// CPython's type split: type-dict *method descriptors* (and slot
+    /// wrappers) bind `self` on instance attribute access; module-level
+    /// `builtin_function_or_method`s are **not** descriptors and are
+    /// returned as-is (`class C: f = len` leaves `c.f` unbound).
+    pub binds_instance: bool,
     pub call: Box<dyn Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync>,
     /// Kwargs-aware entry point. When `Some`, the VM dispatch loop
     /// calls this with both positional and keyword arguments instead
@@ -661,6 +1140,7 @@ impl BuiltinFn {
     {
         Self {
             name,
+            binds_instance: false,
             call: Box::new(body),
             call_kw: None,
         }
@@ -680,6 +1160,7 @@ impl BuiltinFn {
         let body_pos = body.clone();
         Self {
             name,
+            binds_instance: false,
             call: Box::new(move |args| body_pos(args, &[])),
             call_kw: Some(Box::new(move |args, kwargs| body(args, kwargs))),
         }
@@ -704,15 +1185,59 @@ pub struct PySlice {
 /// itself is opaque to outside code — it's owned by the VM module via
 /// `state` and only legal to inspect via interpreter methods.
 pub struct PyGenerator {
-    pub name: String,
+    /// `gi_name`. Seeded from the function's `__name__` at call time;
+    /// user code may reassign it (`gen.__name__ = ...`).
+    pub name: RefCell<String>,
+    /// `gi_qualname` (PEP 3155). Seeded from the function's
+    /// `__qualname__` at call time; reassignable like `name`.
+    pub qualname: RefCell<String>,
+    /// Whether this is a plain generator, a coroutine, or an async
+    /// generator. Needed so the shared send/throw machinery can apply
+    /// PEP 479 (a `StopIteration` escaping the *body* becomes a
+    /// `RuntimeError`) with the right wording per flavour.
+    pub kind: CoroutineKind,
+    /// `gi_code` — held on the generator itself (CPython keeps a
+    /// strong reference) so it stays readable after the generator
+    /// finishes and the frame is dropped.
+    pub code: Object,
     pub state: RefCell<GeneratorState>,
+    /// `cr_origin` — for coroutines created while
+    /// `sys.set_coroutine_origin_tracking_depth(n)` is active: a tuple
+    /// of `(filename, lineno, funcname)` triples for the creation call
+    /// stack (most recent first). `None` when tracking is off.
+    pub origin: RefCell<Object>,
+    /// PEP 525 `sys.set_asyncgen_hooks` bookkeeping (async generators
+    /// only). `hooks_inited` flips on the first `__anext__`/`asend`/
+    /// `athrow`/`aclose`, at which point the thread's *finalizer* hook
+    /// is captured here so finalization can route through the event
+    /// loop that first iterated the generator.
+    pub hooks_inited: crate::sync::Cell<bool>,
+    pub finalizer: RefCell<Object>,
+    /// CPython's "tp_finalize already ran" GC bit: `invoke_finalizer`
+    /// sets it before finalizing so a generator left suspended by its
+    /// finalizer (e.g. a PEP 525 hook that declined to close it) is
+    /// not resurrected and re-finalized forever on the next drop.
+    pub finalize_ran: crate::sync::Cell<bool>,
 }
 
 impl PyGenerator {
-    pub fn new(name: impl Into<String>, frame: Box<dyn std::any::Any + Send + Sync>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        qualname: impl Into<String>,
+        kind: CoroutineKind,
+        code: Object,
+        frame: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
         Self {
-            name: name.into(),
+            name: RefCell::new(name.into()),
+            qualname: RefCell::new(qualname.into()),
+            kind,
+            code,
             state: RefCell::new(GeneratorState::Created(frame)),
+            origin: RefCell::new(Object::None),
+            hooks_inited: crate::sync::Cell::new(false),
+            finalizer: RefCell::new(Object::None),
+            finalize_ran: crate::sync::Cell::new(false),
         }
     }
 
@@ -723,7 +1248,60 @@ impl PyGenerator {
 
 impl fmt::Debug for PyGenerator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<generator {}>", self.name)
+        write!(f, "<generator {}>", self.name.borrow())
+    }
+}
+
+impl Drop for PyGenerator {
+    fn drop(&mut self) {
+        // CPython finalizes a generator the moment its refcount dies:
+        // a *suspended* frame gets `GeneratorExit` thrown in so
+        // `finally:`/`with` cleanup runs. We can't run Python from
+        // `Drop`, so resurrect the live frame into the VM's
+        // pending-finalizer queue; `gc.collect()` and the module-exit
+        // path drain it. Created-but-never-started frames have run no
+        // user code, so (like CPython's `gen_close`) they are simply
+        // marked completed.
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return;
+        };
+        let prev = std::mem::replace(&mut *state, GeneratorState::Finished);
+        drop(state);
+        match prev {
+            GeneratorState::Suspended(frame) => {
+                // Finalized once already (CPython's `_PyGC_FINALIZED` bit):
+                // drop the frame for real instead of looping forever
+                // through resurrection → finalize → drop.
+                if self.finalize_ran.get() {
+                    defer_generator_state_drop(GeneratorState::Suspended(frame));
+                    return;
+                }
+                let resurrected = Rc::new(PyGenerator {
+                    name: RefCell::new(self.name.borrow().clone()),
+                    qualname: RefCell::new(self.qualname.borrow().clone()),
+                    kind: self.kind,
+                    code: self.code.clone(),
+                    state: RefCell::new(GeneratorState::Suspended(frame)),
+                    origin: RefCell::new(self.origin.borrow().clone()),
+                    hooks_inited: crate::sync::Cell::new(self.hooks_inited.get()),
+                    finalizer: RefCell::new(self.finalizer.borrow().clone()),
+                    finalize_ran: crate::sync::Cell::new(self.finalize_ran.get()),
+                });
+                let obj = match self.kind {
+                    CoroutineKind::Generator => Object::Generator(resurrected),
+                    CoroutineKind::Coroutine => Object::Coroutine(resurrected),
+                    CoroutineKind::AsyncGenerator => Object::AsyncGenerator(resurrected),
+                };
+                crate::vm_singletons::try_push_pending_finalizer(obj);
+            }
+            // A never-started frame still owns locals that can hold the
+            // *next* generator of a pipeline (`chain(chain(chain(…)))`).
+            // Dropping it inline recurses one native stack frame per
+            // link and overflows on long chains, so route it through
+            // the iterative trampoline below.
+            state @ GeneratorState::Created(_) => defer_generator_state_drop(state),
+            GeneratorState::Finished | GeneratorState::Running => {}
+        }
     }
 }
 
@@ -735,6 +1313,19 @@ pub enum CoroutineKind {
     Generator,
     Coroutine,
     AsyncGenerator,
+}
+
+impl CoroutineKind {
+    /// The flavour word CPython uses in error messages
+    /// ("generator already executing", "coroutine ignored
+    /// GeneratorExit", "async generator ...").
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Generator => "generator",
+            Self::Coroutine => "coroutine",
+            Self::AsyncGenerator => "async generator",
+        }
+    }
 }
 
 /// State machine for an active or exhausted generator. The frame is
@@ -753,6 +1344,46 @@ pub enum GeneratorState {
     Running,
 }
 
+thread_local! {
+    /// Worklist for [`defer_generator_state_drop`].
+    static GEN_DROP_QUEUE: std::cell::RefCell<Vec<GeneratorState>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// True while the outermost deferred drop is draining the queue.
+    static GEN_DROP_DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Drop a generator's frame payload *iteratively*. A generator pipeline
+/// (`a = gen(); b = wrap(a); c = wrap(b); …`) dies as a linked chain:
+/// dropping the head frame drops the next `Arc<PyGenerator>`, whose
+/// `Drop` would drop *its* frame, one native stack frame per link —
+/// thousands of links overflow the stack. Instead every generator drop
+/// pushes its frame here and only the outermost call drains, so chain
+/// teardown runs in constant stack space.
+fn defer_generator_state_drop(state: GeneratorState) {
+    // `try_with`: during thread teardown our own TLS may already be
+    // destroyed; fall back to the inline (recursive) drop then — by
+    // that point GcState::drop has already flattened tracked chains.
+    let queued = GEN_DROP_QUEUE.try_with(|q| q.borrow_mut().push(state));
+    let Ok(()) = queued else {
+        return;
+    };
+    let _ = GEN_DROP_DRAINING.try_with(|flag| {
+        if flag.get() {
+            // An outer drop is draining; it will pick up our entry.
+            return;
+        }
+        flag.set(true);
+        loop {
+            let next = GEN_DROP_QUEUE.with(|q| q.borrow_mut().pop());
+            match next {
+                Some(s) => drop(s),
+                None => break,
+            }
+        }
+        flag.set(false);
+    });
+}
+
 impl fmt::Debug for GeneratorState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -761,6 +1392,63 @@ impl fmt::Debug for GeneratorState {
             Self::Finished => write!(f, "Finished"),
             Self::Running => write!(f, "Running"),
         }
+    }
+}
+
+/// The deferred operation carried by an [`AsyncGenAwait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgenAwaitKind {
+    /// `agen.asend(value)` — resume the agen, sending `value` in.
+    Send,
+    /// `agen.athrow(exc[, val[, tb]])` — throw into the agen.
+    Throw,
+    /// `agen.aclose()` — throw `GeneratorExit` into the agen.
+    Close,
+}
+
+impl AgenAwaitKind {
+    /// CPython type name of the awaitable this op produces: `asend`
+    /// yields `async_generator_asend`; `athrow`/`aclose` both yield
+    /// `async_generator_athrow`.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            AgenAwaitKind::Send => "async_generator_asend",
+            AgenAwaitKind::Throw | AgenAwaitKind::Close => "async_generator_athrow",
+        }
+    }
+}
+
+/// Deferred awaitable returned by `agen.asend(v)` / `agen.athrow(e)` /
+/// `agen.aclose()` (PEP 525). Mirrors CPython's `async_generator_asend`
+/// and `async_generator_athrow`: the operation on the underlying async
+/// generator is *deferred* until the awaitable is driven (`await`ed),
+/// rather than running eagerly at call time. WeavePy's cooperative async
+/// model has no real suspension inside the agen body, so a single drive
+/// applies the op and completes the await — but routing through an
+/// awaitable (instead of executing inside `asend`/`athrow`/`aclose`) is
+/// exactly what makes `await agen.aclose()` legal rather than the bug it
+/// replaces (`await None`).
+pub struct AsyncGenAwait {
+    /// The `Object::AsyncGenerator` this operation targets.
+    pub agen: Object,
+    pub kind: AgenAwaitKind,
+    /// Operation payload: `asend` -> `[value]`, `athrow` -> the throw
+    /// args (`[exc, val?, tb?]`), `aclose` -> empty.
+    pub args: Vec<Object>,
+    /// Set once the awaitable has been driven, so a second pull behaves
+    /// like an exhausted iterator (`StopIteration`) instead of replaying
+    /// the operation.
+    pub consumed: Cell<bool>,
+    /// Set on the first drive. The first drive applies the operation payload
+    /// (`args`); later drives — reached only when the agen suspended on an
+    /// inner `await` and we passed its value through — forward the caller's
+    /// sent value to resume that inner await.
+    pub started: Cell<bool>,
+}
+
+impl fmt::Debug for AsyncGenAwait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} object>", self.kind.type_name())
     }
 }
 
@@ -774,6 +1462,9 @@ pub struct PyFile {
     pub binary: bool,
     pub backend: RefCell<FileBackend>,
     pub closed: RefCell<bool>,
+    /// Text-mode codec (`open(..., encoding=...)`); `None` means the
+    /// UTF-8 default.
+    pub encoding: RefCell<Option<String>>,
 }
 
 impl PyFile {
@@ -786,6 +1477,34 @@ impl PyFile {
             binary,
             backend: RefCell::new(backend),
             closed: RefCell::new(false),
+            encoding: RefCell::new(None),
+        }
+    }
+
+    /// Set the text-mode codec. UTF-8 spellings collapse to the
+    /// `None` fast path.
+    pub fn set_encoding(&self, enc: &str) {
+        let norm = enc.to_ascii_lowercase().replace(['-', '_'], "");
+        *self.encoding.borrow_mut() = if norm == "utf8" {
+            None
+        } else {
+            Some(enc.to_owned())
+        };
+    }
+
+    /// Encode a text-mode write through the file's codec.
+    pub fn encode_text(&self, s: &str) -> Result<Vec<u8>, RuntimeError> {
+        match &*self.encoding.borrow() {
+            Some(enc) => crate::stdlib::codecs_mod::encode_str(s, enc, "strict"),
+            None => Ok(s.as_bytes().to_vec()),
+        }
+    }
+
+    /// Decode a text-mode read through the file's codec.
+    pub fn decode_text(&self, bytes: Vec<u8>) -> Result<String, RuntimeError> {
+        match &*self.encoding.borrow() {
+            Some(enc) => crate::stdlib::codecs_mod::decode_bytes(&bytes, enc, "strict"),
+            None => String::from_utf8(bytes).map_err(|e| value_error(e.to_string())),
         }
     }
 
@@ -890,7 +1609,7 @@ impl PyFile {
                 "binary mode files are not iterable in text mode".to_owned(),
             ));
         }
-        String::from_utf8(out).map_err(|e| value_error(e.to_string()))
+        self.decode_text(out)
     }
 
     pub fn write_bytes(&self, data: &[u8]) -> Result<usize, RuntimeError> {
@@ -1069,6 +1788,182 @@ impl fmt::Debug for FileBackend {
     }
 }
 
+/// State of an [`Object::LazyIter`]. A separate struct (rather than
+/// `PyIterator` variants) because stepping needs the interpreter, and
+/// `PyIterator::next_value`'s 30+ call sites step without one — a lazy
+/// adapter reaching them would silently read as exhausted.
+#[derive(Debug)]
+pub struct PyLazyIter {
+    pub state: RefCell<LazyIterKind>,
+}
+
+impl PyLazyIter {
+    /// Python-visible type name (`type(islice(...)).__name__`).
+    pub fn type_name(&self) -> &'static str {
+        match &*self.state.borrow() {
+            LazyIterKind::Islice { .. } => "islice",
+            LazyIterKind::Repeat { .. } => "repeat",
+            LazyIterKind::TeeBranch { .. } => "_tee",
+            LazyIterKind::Count { .. } => "count",
+            LazyIterKind::Cycle { .. } => "cycle",
+            LazyIterKind::Chain { .. } => "chain",
+            LazyIterKind::Compress { .. } => "compress",
+            LazyIterKind::DropWhile { .. } => "dropwhile",
+            LazyIterKind::TakeWhile { .. } => "takewhile",
+            LazyIterKind::FilterFalse { .. } => "filterfalse",
+            LazyIterKind::StarMap { .. } => "starmap",
+            LazyIterKind::Pairwise { .. } => "pairwise",
+            LazyIterKind::ZipLongest { .. } => "zip_longest",
+            LazyIterKind::Accumulate { .. } => "accumulate",
+            LazyIterKind::Product { .. } => "product",
+            LazyIterKind::Permutations { .. } => "permutations",
+            LazyIterKind::Combinations { .. } => "combinations",
+            LazyIterKind::Cwr { .. } => "combinations_with_replacement",
+            LazyIterKind::Batched { .. } => "batched",
+        }
+    }
+}
+
+/// Buffer shared by the branches of one `tee()` call. `buffer` aliases
+/// the storage of the Python-level `_tee_dataobject.buffer` list, so
+/// items appended natively stay visible to `__reduce__` on the Python
+/// side. Dropping a multi-million-cell buffer is a plain `Vec` drop —
+/// iterative, never recursing down a linked chain.
+#[derive(Debug)]
+pub struct TeeShared {
+    /// `None` once the source is exhausted.
+    pub source: Option<Object>,
+    pub buffer: Rc<RefCell<Vec<Object>>>,
+    /// Guards the source pull: CPython's tee raises RuntimeError when
+    /// one branch re-enters the shared source while another branch is
+    /// already inside it.
+    pub busy: bool,
+}
+
+#[derive(Debug)]
+pub enum LazyIterKind {
+    /// `itertools.islice(source, start, stop, step)` mid-iteration.
+    /// `next_idx` is the source index of the next element to emit and
+    /// `pos` the source index the underlying iterator will yield next;
+    /// the gap between them is skipped on demand (CPython consumes
+    /// skipped elements lazily, not at construction).
+    Islice {
+        source: Object,
+        next_idx: u64,
+        pos: u64,
+        stop: Option<u64>,
+        step: u64,
+        done: bool,
+    },
+    /// Core of `itertools.repeat`: yield `obj` forever (`times` None)
+    /// or `times` more times.
+    Repeat { obj: Object, times: Option<i64> },
+    /// One branch of `itertools.tee`. `data` is the Python
+    /// `_tee_dataobject` the branch reports through `lazy_state` (for
+    /// pickling); the hot path reads `shared` directly.
+    TeeBranch {
+        shared: Rc<RefCell<TeeShared>>,
+        data: Object,
+        index: usize,
+    },
+    /// `itertools.count(current, step)` — values can be any numeric
+    /// type (float, Decimal, Fraction), stepping goes through the
+    /// interpreter's `+`.
+    Count { current: Object, step: Object },
+    /// `itertools.cycle`. `saved` aliases the Python wrapper's saved
+    /// list storage; `firstpass` set means elements are already saved
+    /// (don't re-append while draining `source`).
+    Cycle {
+        source: Option<Object>,
+        saved: Rc<RefCell<Vec<Object>>>,
+        index: usize,
+        firstpass: bool,
+    },
+    /// `itertools.chain`: `source` iterates the iterables, `active`
+    /// the current one. `source` None means fully exhausted.
+    Chain {
+        source: Option<Object>,
+        active: Option<Object>,
+    },
+    /// `itertools.compress(data, selectors)`.
+    Compress { data: Object, selectors: Object },
+    /// `itertools.dropwhile(func, source)`; `started` once the
+    /// predicate has failed.
+    DropWhile {
+        func: Object,
+        source: Object,
+        started: bool,
+    },
+    /// `itertools.takewhile(func, source)`.
+    TakeWhile {
+        func: Object,
+        source: Object,
+        stopped: bool,
+    },
+    /// `itertools.filterfalse(func_or_None, source)`.
+    FilterFalse { func: Object, source: Object },
+    /// `itertools.starmap(func, source)`.
+    StarMap { func: Object, source: Object },
+    /// `itertools.pairwise(source)`.
+    Pairwise {
+        source: Option<Object>,
+        old: Option<Object>,
+    },
+    /// `itertools.zip_longest(*iters, fillvalue=...)`; exhausted slots
+    /// become `None`.
+    ZipLongest {
+        iters: Vec<Option<Object>>,
+        fillvalue: Object,
+        numactive: usize,
+    },
+    /// `itertools.accumulate(source, func, initial=...)`.
+    Accumulate {
+        source: Object,
+        func: Option<Object>,
+        total: Option<Object>,
+        initial: Option<Object>,
+    },
+    /// `itertools.product` over materialised pools.
+    Product {
+        pools: Vec<Rc<[Object]>>,
+        indices: Vec<usize>,
+        started: bool,
+        stopped: bool,
+    },
+    /// `itertools.permutations(pool, r)` (Sedgewick's cycles algorithm,
+    /// like CPython).
+    Permutations {
+        pool: Rc<[Object]>,
+        r: usize,
+        indices: Vec<usize>,
+        cycles: Vec<usize>,
+        started: bool,
+        stopped: bool,
+    },
+    /// `itertools.combinations(pool, r)`.
+    Combinations {
+        pool: Rc<[Object]>,
+        r: usize,
+        indices: Vec<usize>,
+        started: bool,
+        stopped: bool,
+    },
+    /// `itertools.combinations_with_replacement(pool, r)`.
+    Cwr {
+        pool: Rc<[Object]>,
+        r: usize,
+        indices: Vec<usize>,
+        started: bool,
+        stopped: bool,
+    },
+    /// `itertools.batched(source, n, strict)`.
+    Batched {
+        source: Option<Object>,
+        n: usize,
+        strict: bool,
+    },
+}
+
 /// State of an active iterator. Slim by design — every iterable
 /// type implements its own iteration here (no Python-level iterator
 /// protocol yet).
@@ -1091,6 +1986,14 @@ pub enum PyIterator {
         stop: i64,
         step: i64,
     },
+    /// Range whose bounds don't all fit `i64` — the slow sibling of
+    /// `Range` (which stays `i64` so the FOR_ITER inline cache pushes
+    /// machine ints without conversion checks).
+    RangeHuge {
+        current: i128,
+        stop: i128,
+        step: i128,
+    },
     DictKeys {
         keys: Vec<DictKey>,
         index: usize,
@@ -1099,6 +2002,36 @@ pub enum PyIterator {
         data: Rc<[u8]>,
         index: usize,
     },
+    /// Live view over a bytearray (CPython's `bytearray_iterator`
+    /// tracks the buffer, so clearing the bytearray exhausts a
+    /// half-consumed iterator — issue 27443).
+    ByteArray {
+        data: Rc<RefCell<Vec<u8>>>,
+        index: usize,
+    },
+    /// Lazy `enumerate(...)`. Holds a *shared* handle to the wrapped
+    /// iterator so consuming the enumerate also advances the original
+    /// (CPython: `enumerate(it)` yields from the same `it`, leaving it
+    /// positioned right after the last item produced).
+    Enumerate {
+        inner: Rc<RefCell<PyIterator>>,
+        count: i64,
+    },
+    /// `reversed(seq)` — yields `items[index]`, `items[index-1]`, … down
+    /// to `items[0]`. `items` is held in *forward* order (matching
+    /// CPython's `list_reverseiterator`, whose `__reduce__` is
+    /// `(reversed, (forward_seq,), index)`); `index` counts down and the
+    /// backing vector is detached on exhaustion.
+    Reversed {
+        items: Rc<RefCell<Vec<Object>>>,
+        index: i64,
+    },
+    /// Shared handle onto an existing `Object::Iter`'s cursor: `iter(it)
+    /// is it` in Python, so any consumer draining the handle must advance
+    /// the original object too (`heapq.nlargest` zips a prefix off `it`
+    /// and then scans the tail with `for elem in it`). Cloning the cursor
+    /// instead would silently fork the position.
+    Shared(Rc<RefCell<PyIterator>>),
 }
 
 impl PyIterator {
@@ -1106,9 +2039,21 @@ impl PyIterator {
     pub fn next_value(&mut self) -> Option<Object> {
         match self {
             PyIterator::List { items, index } => {
-                let v = items.borrow().get(*index).cloned()?;
-                *index += 1;
-                Some(v)
+                let next = items.borrow().get(*index).cloned();
+                match next {
+                    Some(v) => {
+                        *index += 1;
+                        Some(v)
+                    }
+                    None => {
+                        // Exhausted. Detach from the backing list so a
+                        // later `append`/`extend` can't resurrect the
+                        // iterator — CPython clears `it_seq` on the first
+                        // StopIteration and the iterator stays empty.
+                        *items = Rc::new(RefCell::new(Vec::new()));
+                        None
+                    }
+                }
             }
             PyIterator::Tuple { items, index } => {
                 let v = items.get(*index).cloned()?;
@@ -1146,6 +2091,25 @@ impl PyIterator {
                 *current += *step;
                 Some(Object::Int(v))
             }
+            PyIterator::RangeHuge {
+                current,
+                stop,
+                step,
+            } => {
+                let exhausted = if *step > 0 {
+                    *current >= *stop
+                } else if *step < 0 {
+                    *current <= *stop
+                } else {
+                    true
+                };
+                if exhausted {
+                    return None;
+                }
+                let v = *current;
+                *current += *step;
+                Some(int_from_i128(v))
+            }
             PyIterator::DictKeys { keys, index } => {
                 let k = keys.get(*index)?.clone();
                 *index += 1;
@@ -1156,6 +2120,243 @@ impl PyIterator {
                 *index += 1;
                 Some(Object::Int(i64::from(v)))
             }
+            PyIterator::ByteArray { data, index } => {
+                let v = data.borrow().get(*index).copied();
+                match v {
+                    Some(v) => {
+                        *index += 1;
+                        Some(Object::Int(i64::from(v)))
+                    }
+                    None => {
+                        // Exhausted. Detach from the buffer so a later
+                        // `append` can't resurrect the iterator —
+                        // CPython clears `it_seq` on first StopIteration.
+                        // `usize::MAX` marks the detached state so
+                        // `__reduce__` emits the exhausted form.
+                        *data = Rc::new(RefCell::new(Vec::new()));
+                        *index = usize::MAX;
+                        None
+                    }
+                }
+            }
+            PyIterator::Enumerate { inner, count } => {
+                let v = inner.borrow_mut().next_value()?;
+                let i = *count;
+                *count += 1;
+                Some(Object::new_tuple(vec![Object::Int(i), v]))
+            }
+            PyIterator::Shared(inner) => inner.borrow_mut().next_value(),
+            PyIterator::Reversed { items, index } => {
+                if *index < 0 {
+                    *items = Rc::new(RefCell::new(Vec::new()));
+                    return None;
+                }
+                let v = items.borrow().get(*index as usize).cloned();
+                match v {
+                    Some(val) => {
+                        *index -= 1;
+                        Some(val)
+                    }
+                    None => {
+                        // Index out of range (list shrank): exhaust + detach.
+                        *items = Rc::new(RefCell::new(Vec::new()));
+                        *index = -1;
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Number of items remaining, when cheaply known. Backs the
+    /// `__length_hint__` slot CPython's built-in iterators expose
+    /// (`operator.length_hint`, list pre-sizing, …). Returns `None`
+    /// for sources whose remaining length isn't known in O(1).
+    pub fn remaining(&self) -> Option<usize> {
+        match self {
+            PyIterator::List { items, index } => Some(items.borrow().len().saturating_sub(*index)),
+            PyIterator::Tuple { items, index } => Some(items.len().saturating_sub(*index)),
+            PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
+            PyIterator::DictKeys { keys, index } => Some(keys.len().saturating_sub(*index)),
+            PyIterator::Bytes { data, index } => Some(data.len().saturating_sub(*index)),
+            PyIterator::ByteArray { data, index } => {
+                Some(data.borrow().len().saturating_sub(*index))
+            }
+            PyIterator::Enumerate { inner, .. } => inner.borrow().remaining(),
+            PyIterator::Shared(inner) => inner.borrow().remaining(),
+            PyIterator::Reversed { index, .. } => Some((*index + 1).max(0) as usize),
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => {
+                if *step > 0 && *current < *stop {
+                    Some(
+                        ((i128::from(*stop - *current) + i128::from(*step) - 1) / i128::from(*step))
+                            as usize,
+                    )
+                } else if *step < 0 && *current > *stop {
+                    Some(
+                        ((i128::from(*current - *stop) + i128::from(-*step) - 1)
+                            / i128::from(-*step)) as usize,
+                    )
+                } else {
+                    Some(0)
+                }
+            }
+            PyIterator::RangeHuge {
+                current,
+                stop,
+                step,
+            } => {
+                if *step > 0 && *current < *stop {
+                    usize::try_from((*stop - *current + *step - 1) / *step).ok()
+                } else if *step < 0 && *current > *stop {
+                    usize::try_from((*current - *stop + (-*step) - 1) / (-*step)).ok()
+                } else {
+                    Some(0)
+                }
+            }
+        }
+    }
+
+    /// Snapshot the items the iterator would still yield, *without*
+    /// consuming it. Backs the built-in iterator's `__reduce__`
+    /// (pickling): CPython reduces e.g. a list-iterator to
+    /// `(iter, (remaining_list,))`, so a freshly-unpickled iterator
+    /// replays exactly the not-yet-seen elements. A shared
+    /// (`Enumerate`) inner is read through its `RefCell` borrow, never
+    /// advanced.
+    pub fn remaining_items(&self) -> Vec<Object> {
+        match self {
+            PyIterator::List { items, index } => items
+                .borrow()
+                .get(*index..)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default(),
+            PyIterator::Tuple { items, index } => {
+                items.get(*index..).map(<[_]>::to_vec).unwrap_or_default()
+            }
+            PyIterator::Str { s, index } => {
+                let start = (*index).min(s.len());
+                s[start..]
+                    .chars()
+                    .map(|c| Object::Str(Rc::from(c.to_string().as_str())))
+                    .collect()
+            }
+            PyIterator::DictKeys { keys, index } => keys
+                .get(*index..)
+                .map(|rest| rest.iter().map(|k| k.0.clone()).collect())
+                .unwrap_or_default(),
+            PyIterator::Bytes { data, index } => data
+                .get(*index..)
+                .map(|rest| rest.iter().map(|b| Object::Int(i64::from(*b))).collect())
+                .unwrap_or_default(),
+            PyIterator::ByteArray { data, index } => data
+                .borrow()
+                .get(*index..)
+                .map(|rest| rest.iter().map(|b| Object::Int(i64::from(*b))).collect())
+                .unwrap_or_default(),
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => {
+                let mut out = Vec::new();
+                let (mut c, st, sp) = (*current, *stop, *step);
+                if sp > 0 {
+                    while c < st {
+                        out.push(Object::Int(c));
+                        c += sp;
+                    }
+                } else if sp < 0 {
+                    while c > st {
+                        out.push(Object::Int(c));
+                        c += sp;
+                    }
+                }
+                out
+            }
+            PyIterator::RangeHuge {
+                current,
+                stop,
+                step,
+            } => {
+                let mut out = Vec::new();
+                let (mut c, st, sp) = (*current, *stop, *step);
+                if sp > 0 {
+                    while c < st {
+                        out.push(int_from_i128(c));
+                        c += sp;
+                    }
+                } else if sp < 0 {
+                    while c > st {
+                        out.push(int_from_i128(c));
+                        c += sp;
+                    }
+                }
+                out
+            }
+            PyIterator::Enumerate { inner, count } => {
+                let rest = inner.borrow().remaining_items();
+                let mut out = Vec::with_capacity(rest.len());
+                for (i, v) in (*count..).zip(rest) {
+                    out.push(Object::new_tuple(vec![Object::Int(i), v]));
+                }
+                out
+            }
+            PyIterator::Shared(inner) => inner.borrow().remaining_items(),
+            PyIterator::Reversed { items, index } => {
+                // Not-yet-yielded values, in yield order: items[index]..items[0].
+                let items = items.borrow();
+                let mut out = Vec::new();
+                let mut i = *index;
+                while i >= 0 {
+                    if let Some(v) = items.get(i as usize) {
+                        out.push(v.clone());
+                    }
+                    i -= 1;
+                }
+                out
+            }
+        }
+    }
+
+    /// The forward slice a `reversed`-iterator reduces with: re-applying
+    /// `reversed` to it reproduces the not-yet-yielded values in order.
+    /// Empty when exhausted, giving CPython's `(reversed, ([],))`.
+    pub fn reversed_reduce_arg(&self) -> Option<Object> {
+        match self {
+            PyIterator::Reversed { items, index } => {
+                let items = items.borrow();
+                let end = ((*index).max(-1) + 1) as usize;
+                let slice = items.get(..end.min(items.len())).unwrap_or(&[]);
+                Some(Object::new_list(slice.to_vec()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The remaining items packaged in the *native container type*
+    /// CPython uses for that iterator's `__reduce__` argument, so the
+    /// reduction tuple compares equal to CPython's: a string-iterator
+    /// reduces with a `str`, a tuple-iterator with a `tuple`, a
+    /// list-iterator with a `list`. (Bytes and the generic seqiter use a
+    /// `tuple`, so an exhausted one reduces to `(iter, ((),))`.)
+    /// Re-applying `iter` to this value replays exactly the not-yet-seen
+    /// elements.
+    pub fn reduce_remaining(&self) -> Object {
+        match self {
+            PyIterator::Tuple { .. } | PyIterator::Bytes { .. } | PyIterator::ByteArray { .. } => {
+                Object::new_tuple(self.remaining_items())
+            }
+            PyIterator::Str { s, index } => {
+                let start = (*index).min(s.len());
+                Object::from_str(&s[start..])
+            }
+            // list / dict / range / enumerate reduce through a plain list
+            // (dict iterators explicitly unpickle as list iterators).
+            _ => Object::new_list(self.remaining_items()),
         }
     }
 }
@@ -1167,6 +2368,7 @@ impl Object {
     pub fn is_truthy(&self) -> bool {
         match self {
             Object::None => false,
+            Object::Unbound => false,
             Object::Bool(b) => *b,
             Object::Int(i) => *i != 0,
             Object::Long(b) => !b.is_zero(),
@@ -1196,6 +2398,7 @@ impl Object {
             | Object::Generator(_)
             | Object::Coroutine(_)
             | Object::AsyncGenerator(_)
+            | Object::AsyncGenAwait(_)
             | Object::File(_)
             | Object::Property(_)
             | Object::StaticMethod(_)
@@ -1207,6 +2410,7 @@ impl Object {
             Object::MappingProxy(d) => !d.borrow().is_empty(),
             Object::DictView(v) => !v.dict.borrow().is_empty(),
             Object::SimpleNamespace(_) => true,
+            Object::LazyIter(_) => true,
             Object::Bytes(b) => !b.is_empty(),
             Object::ByteArray(b) => !b.borrow().is_empty(),
             Object::Set(s) => !s.borrow().is_empty(),
@@ -1215,20 +2419,20 @@ impl Object {
             Object::Instance(inst) => {
                 // int/str/… subclass instances are truthy per their
                 // wrapped value unless the class overrides __bool__/__len__.
-                if inst.class.lookup("__bool__").is_none() && inst.class.lookup("__len__").is_none()
+                if inst.cls().lookup("__bool__").is_none() && inst.cls().lookup("__len__").is_none()
                 {
                     if let Some(native) = &inst.native {
                         return native.is_truthy();
                     }
                 }
                 // Honour __bool__ then __len__ before defaulting to True.
-                if let Some(m) = inst.class.lookup("__bool__") {
+                if let Some(m) = inst.cls().lookup("__bool__") {
                     // Caller dispatches; we cannot run Python here.
                     // Default to True; the dispatch site handles the
                     // dunder dispatch when it has interpreter access.
                     let _ = m;
                     true
-                } else if let Some(m) = inst.class.lookup("__len__") {
+                } else if let Some(m) = inst.cls().lookup("__len__") {
                     let _ = m;
                     true
                 } else {
@@ -1275,6 +2479,7 @@ impl Object {
             (Object::Generator(a), Object::Generator(b)) => Rc::ptr_eq(a, b),
             (Object::Coroutine(a), Object::Coroutine(b)) => Rc::ptr_eq(a, b),
             (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
+            (Object::AsyncGenAwait(a), Object::AsyncGenAwait(b)) => Rc::ptr_eq(a, b),
             (Object::Bytes(a), Object::Bytes(b)) => Rc::ptr_eq(a, b),
             (Object::ByteArray(a), Object::ByteArray(b)) => Rc::ptr_eq(a, b),
             (Object::Set(a), Object::Set(b)) => Rc::ptr_eq(a, b),
@@ -1290,6 +2495,8 @@ impl Object {
             (Object::MappingProxy(a), Object::MappingProxy(b)) => Rc::ptr_eq(a, b),
             (Object::DictView(a), Object::DictView(b)) => Rc::ptr_eq(a, b),
             (Object::SimpleNamespace(a), Object::SimpleNamespace(b)) => Rc::ptr_eq(a, b),
+            (Object::LazyIter(a), Object::LazyIter(b)) => Rc::ptr_eq(a, b),
+            (Object::Unbound, Object::Unbound) => true,
             _ => false,
         }
     }
@@ -1323,7 +2530,7 @@ impl Object {
             }
             (Object::Float(a), Object::Float(b)) => a == b,
             (Object::Int(a), Object::Float(b)) | (Object::Float(b), Object::Int(a)) => {
-                (*a as f64) == *b
+                i64_eq_f64(*a, *b)
             }
             (Object::Long(a), Object::Float(b)) | (Object::Float(b), Object::Long(a)) => {
                 bigint_eq_f64(a, *b)
@@ -1333,7 +2540,7 @@ impl Object {
             }
             (Object::Complex(a), Object::Complex(b)) => a.real == b.real && a.imag == b.imag,
             (Object::Complex(c), Object::Int(i)) | (Object::Int(i), Object::Complex(c)) => {
-                c.imag == 0.0 && c.real == (*i as f64)
+                c.imag == 0.0 && i64_eq_f64(*i, c.real)
             }
             (Object::Complex(c), Object::Float(f)) | (Object::Float(f), Object::Complex(c)) => {
                 c.imag == 0.0 && c.real == *f
@@ -1342,13 +2549,21 @@ impl Object {
                 c.imag == 0.0 && bigint_eq_f64(b, c.real)
             }
             (Object::Str(a), Object::Str(b)) => a == b,
+            // Sequence comparison is element-wise `PyObject_RichCompareBool`,
+            // which is identity-first — so `[nan] == [nan]` (same nan) is true.
             (Object::Tuple(a), Object::Tuple(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_value(y))
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| x.is_same(y) || x.eq_value(y))
             }
             (Object::List(a), Object::List(b)) => {
                 let a = a.borrow();
                 let b = b.borrow();
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_value(y))
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| x.is_same(y) || x.eq_value(y))
             }
             (Object::Dict(a), Object::Dict(b)) => {
                 let a = a.borrow();
@@ -1374,6 +2589,27 @@ impl Object {
             (Object::Set(a), Object::FrozenSet(b)) | (Object::FrozenSet(b), Object::Set(a)) => {
                 sets_equal(&a.borrow(), b)
             }
+            // `slice` objects compare as the `(start, stop, step)` triple
+            // (CPython's `slice_richcompare`), identity-first per field so
+            // `slice(None)` fields (NaN-free here, but consistent) match.
+            (Object::Slice(a), Object::Slice(b)) => {
+                (a.start.is_same(&b.start) || a.start.eq_value(&b.start))
+                    && (a.stop.is_same(&b.stop) || a.stop.eq_value(&b.stop))
+                    && (a.step.is_same(&b.step) || a.step.eq_value(&b.step))
+            }
+            // Namespace-shaped values: `types.SimpleNamespace` compares
+            // `vars(a) == vars(b)`, and PEP 585 generic aliases (also
+            // carried in this representation, keyed by `__origin__` /
+            // `__args__` / `__parameters__`) compare those fields — both
+            // reduce to dict-content equality (`list[int] == list[int]`).
+            (Object::SimpleNamespace(a), Object::SimpleNamespace(b)) => {
+                Rc::ptr_eq(a, b) || {
+                    let (a, b) = (a.borrow(), b.borrow());
+                    a.len() == b.len()
+                        && a.iter()
+                            .all(|(k, v)| b.get(k).is_some_and(|w| v.is_same(w) || v.eq_value(w)))
+                }
+            }
             // Reference-identity equality for class / module / function
             // / builtin / method values. CPython falls back to identity
             // here, and our `in` / dict-key checks rely on it.
@@ -1382,7 +2618,31 @@ impl Object {
             (Object::Function(a), Object::Function(b)) => Rc::ptr_eq(a, b),
             (Object::Builtin(a), Object::Builtin(b)) => Rc::ptr_eq(a, b),
             (Object::Instance(a), Object::Instance(b)) => Rc::ptr_eq(a, b),
-            _ => false,
+            // Bound methods compare like CPython's `method_richcompare`:
+            // `__func__` by equality, `__self__` by identity. Two freshly
+            // bound references to the same method on the same object are
+            // therefore equal even though they're distinct allocations.
+            (Object::BoundMethod(a), Object::BoundMethod(b)) => {
+                let func_eq = match (&a.function, &b.function) {
+                    // Built-in methods are materialized fresh on each
+                    // attribute access; CPython's `meth_richcompare`
+                    // compares the C method def — same receiver + same
+                    // name resolves to the same def here.
+                    (Object::Builtin(x), Object::Builtin(y)) => {
+                        Rc::ptr_eq(x, y) || x.name == y.name
+                    }
+                    _ => a.function.eq_value(&b.function),
+                };
+                func_eq && a.receiver.is_same(&b.receiver)
+            }
+            // CPython's default `tp_richcompare` (no user `__eq__`) falls
+            // back to *identity*: `x == x` is True and `x == y` is False
+            // for distinct objects. This covers reference types without
+            // value semantics — frames, generators, tracebacks, cells,
+            // code objects, … — where `bdb`/`pdb` rely on `frame ==
+            // self.returnframe`. Returning a flat `false` here would make
+            // even `frame == frame` False.
+            _ => self.is_same(other),
         }
     }
 
@@ -1407,12 +2667,8 @@ impl Object {
             (O::Float(a), O::Float(b)) => Ok(a
                 .partial_cmp(b)
                 .ok_or_else(|| value_error(format!("cannot order {a} and {b} (NaN)")))?),
-            (O::Int(a), O::Float(b)) => Ok((*a as f64)
-                .partial_cmp(b)
-                .ok_or_else(|| value_error("cannot order with NaN"))?),
-            (O::Float(a), O::Int(b)) => Ok(a
-                .partial_cmp(&(*b as f64))
-                .ok_or_else(|| value_error("cannot order with NaN"))?),
+            (O::Int(a), O::Float(b)) => i64_cmp_f64(*a, *b),
+            (O::Float(a), O::Int(b)) => Ok(i64_cmp_f64(*b, *a)?.reverse()),
             (O::Long(a), O::Float(b)) => Ok(bigint_cmp_f64(a, *b)?),
             (O::Float(a), O::Long(b)) => Ok(bigint_cmp_f64(b, *a)?.reverse()),
             (O::Bool(a), O::Bool(b)) => Ok(a.cmp(b)),
@@ -1427,6 +2683,16 @@ impl Object {
                 .partial_cmp(&(i64::from(*b) as f64))
                 .ok_or_else(|| value_error("cannot order with NaN"))?),
             (O::Str(a), O::Str(b)) => Ok(a.cmp(b)),
+            // bytes/bytearray order lexicographically by byte value;
+            // the four mixed combinations all compare (CPython's
+            // shared `bytes_richcompare` buffer path).
+            (O::Bytes(a), O::Bytes(b)) => Ok(a.as_ref().cmp(b.as_ref())),
+            (O::Bytes(a), O::ByteArray(b)) => Ok(a.as_ref()[..].cmp(&b.borrow()[..])),
+            (O::ByteArray(a), O::Bytes(b)) => Ok(a.borrow()[..].cmp(b.as_ref())),
+            (O::ByteArray(a), O::ByteArray(b)) => {
+                let bv = b.borrow().clone();
+                Ok(a.borrow()[..].cmp(&bv[..]))
+            }
             (O::Tuple(a), O::Tuple(b)) => seq_cmp(a, b),
             (O::List(a), O::List(b)) => {
                 let a = a.borrow();
@@ -1435,8 +2701,8 @@ impl Object {
             }
             _ => Err(type_error(format!(
                 "'<' not supported between instances of '{}' and '{}'",
-                self.type_name(),
-                other.type_name()
+                self.type_name_owned(),
+                other.type_name_owned()
             ))),
         }
     }
@@ -1444,8 +2710,13 @@ impl Object {
     /// Membership: `x in container`.
     pub fn contains(&self, item: &Self) -> Result<bool, RuntimeError> {
         match self {
-            Object::Tuple(items) => Ok(items.iter().any(|x| x.eq_value(item))),
-            Object::List(items) => Ok(items.borrow().iter().any(|x| x.eq_value(item))),
+            // CPython's `PyObject_RichCompareBool` short-circuits on identity
+            // before `==`, so `nan in [nan]` (the *same* nan) is `True`.
+            Object::Tuple(items) => Ok(items.iter().any(|x| x.is_same(item) || x.eq_value(item))),
+            Object::List(items) => Ok(items
+                .borrow()
+                .iter()
+                .any(|x| x.is_same(item) || x.eq_value(item))),
             Object::Str(haystack) => match item {
                 Object::Str(needle) => Ok(haystack.contains(&**needle)),
                 _ => Err(type_error(
@@ -1455,32 +2726,29 @@ impl Object {
             Object::Dict(d) => Ok(d.borrow().contains_key(&DictKey(item.clone()))),
             Object::Set(s) => Ok(s.borrow().contains(&DictKey(item.clone()))),
             Object::FrozenSet(s) => Ok(s.contains(&DictKey(item.clone()))),
-            Object::Bytes(haystack) => match item {
-                Object::Int(i) => Ok(*i >= 0 && *i <= 255 && haystack.contains(&(*i as u8))),
-                Object::Bytes(needle) => Ok(bytes_contains(haystack, needle)),
-                Object::ByteArray(needle) => Ok(bytes_contains(haystack, &needle.borrow())),
-                _ => Err(type_error(
-                    "a bytes-like object is required, not '".to_owned() + item.type_name() + "'",
-                )),
-            },
-            Object::ByteArray(haystack) => match item {
-                Object::Int(i) => {
-                    Ok(*i >= 0 && *i <= 255 && haystack.borrow().contains(&(*i as u8)))
-                }
-                Object::Bytes(needle) => Ok(bytes_contains(&haystack.borrow(), needle)),
-                Object::ByteArray(needle) => {
-                    Ok(bytes_contains(&haystack.borrow(), &needle.borrow()))
-                }
-                _ => Err(type_error(
-                    "a bytes-like object is required, not '".to_owned() + item.type_name() + "'",
-                )),
-            },
+            Object::Bytes(haystack) => bytes_membership(haystack, item),
+            Object::ByteArray(haystack) => {
+                // Hold a buffer export: converting `item` can reenter
+                // Python (a user `__index__`/`__buffer__`) that tries to
+                // resize this bytearray; the resize then raises
+                // BufferError at the mutation site (gh-142560).
+                let _guard = ByteArrayExportGuard::new(haystack.clone());
+                let hay: Vec<u8> = haystack.borrow().clone();
+                bytes_membership(&hay, item)
+            }
             Object::Range(r) => {
-                if let Object::Int(i) = item {
+                use num_traits::ToPrimitive;
+                let i: Option<i128> = match item {
+                    Object::Bool(b) => Some(i128::from(*b)),
+                    Object::Int(i) => Some(i128::from(*i)),
+                    Object::Long(b) => b.to_i128(),
+                    _ => None,
+                };
+                if let Some(i) = i {
                     if r.step > 0 {
-                        Ok(*i >= r.start && *i < r.stop && (*i - r.start) % r.step == 0)
+                        Ok(i >= r.start && i < r.stop && (i - r.start) % r.step == 0)
                     } else if r.step < 0 {
-                        Ok(*i <= r.start && *i > r.stop && (r.start - *i) % (-r.step) == 0)
+                        Ok(i <= r.start && i > r.stop && (r.start - i) % (-r.step) == 0)
                     } else {
                         Ok(false)
                     }
@@ -1512,6 +2780,16 @@ impl Object {
                     "a bytes-like object is required for memoryview membership",
                 )),
             },
+            // A built-in-subclass instance (`class C(dict)`, …) contains
+            // through its wrapped native payload — the receiver-side
+            // analogue of CPython dispatching `sq_contains` on the base.
+            Object::Instance(inst) => match &inst.native {
+                Some(native) => native.contains(item),
+                None => Err(type_error(format!(
+                    "argument of type '{}' is not iterable",
+                    self.type_name()
+                ))),
+            },
             _ => Err(type_error(format!(
                 "argument of type '{}' is not iterable",
                 self.type_name()
@@ -1535,11 +2813,30 @@ impl Object {
                 s: s.clone(),
                 index: 0,
             }),
-            Object::Range(r) => Ok(PyIterator::Range {
-                current: r.start,
-                stop: r.stop,
-                step: r.step,
-            }),
+            Object::Range(r) => Ok(
+                match (
+                    i64::try_from(r.start),
+                    i64::try_from(r.stop),
+                    i64::try_from(r.step),
+                ) {
+                    // `current += step` must not overflow after the last
+                    // yielded element (current peaks at stop-1+step for
+                    // positive step, bottoms at stop+1+step for negative),
+                    // so boundary-hugging ranges take the i128 variant too.
+                    (Ok(current), Ok(stop), Ok(step)) if stop.checked_add(step).is_some() => {
+                        PyIterator::Range {
+                            current,
+                            stop,
+                            step,
+                        }
+                    }
+                    _ => PyIterator::RangeHuge {
+                        current: r.start,
+                        stop: r.stop,
+                        step: r.step,
+                    },
+                },
+            ),
             Object::Dict(d) => {
                 let keys: Vec<DictKey> = d.borrow().keys().cloned().collect();
                 Ok(PyIterator::DictKeys { keys, index: 0 })
@@ -1562,13 +2859,10 @@ impl Object {
                 data: b.clone(),
                 index: 0,
             }),
-            Object::ByteArray(b) => {
-                let snapshot: Rc<[u8]> = Rc::from(b.borrow().as_slice());
-                Ok(PyIterator::Bytes {
-                    data: snapshot,
-                    index: 0,
-                })
-            }
+            Object::ByteArray(b) => Ok(PyIterator::ByteArray {
+                data: b.clone(),
+                index: 0,
+            }),
             Object::MemoryView(mv) => {
                 if mv.released.get() {
                     return Err(value_error("memoryview: released"));
@@ -1630,11 +2924,11 @@ impl Object {
                 })
             }
             // A native iterator is its own iterable: `iter(it) is it` in
-            // Python, and passing one to a plain builtin (`dict.fromkeys`,
-            // `set`, …) must drain it rather than raise. We hand back a
-            // clone of the underlying cursor, which yields the remaining
-            // elements (the shared source `Rc` is preserved).
-            Object::Iter(it) => Ok(it.borrow().clone()),
+            // Python, and passing one to a plain builtin (`zip`,
+            // `dict.fromkeys`, `set`, …) must drain *the same cursor* —
+            // partial consumption (`zip(range(n), it)`) must leave `it`
+            // positioned at the first unconsumed element.
+            Object::Iter(it) => Ok(PyIterator::Shared(it.clone())),
             _ => Err(type_error(format!(
                 "'{}' object is not iterable",
                 self.type_name()
@@ -1645,6 +2939,7 @@ impl Object {
     pub fn type_name(&self) -> &'static str {
         match self {
             Object::None => "NoneType",
+            Object::Unbound => "NoneType",
             Object::Bool(_) => "bool",
             Object::Int(_) => "int",
             Object::Long(_) => "int",
@@ -1671,6 +2966,7 @@ impl Object {
             Object::Generator(_) => "generator",
             Object::Coroutine(_) => "coroutine",
             Object::AsyncGenerator(_) => "async_generator",
+            Object::AsyncGenAwait(a) => a.kind.type_name(),
             Object::Bytes(_) => "bytes",
             Object::ByteArray(_) => "bytearray",
             Object::Set(_) => "set",
@@ -1686,6 +2982,7 @@ impl Object {
             Object::MappingProxy(_) => "mappingproxy",
             Object::DictView(v) => v.kind.type_name(),
             Object::SimpleNamespace(_) => "SimpleNamespace",
+            Object::LazyIter(l) => l.type_name(),
         }
     }
 
@@ -1693,7 +2990,7 @@ impl Object {
     /// `Object::Instance` instead of the static placeholder.
     pub fn type_name_owned(&self) -> String {
         match self {
-            Object::Instance(inst) => inst.class.name.clone(),
+            Object::Instance(inst) => inst.cls().name.clone(),
             Object::Type(t) => format!("type[{}]", t.name),
             other => other.type_name().to_owned(),
         }
@@ -1704,17 +3001,12 @@ impl Object {
     pub fn repr(&self) -> String {
         match self {
             Object::None => "None".to_owned(),
+            Object::Unbound => "<unbound>".to_owned(),
             Object::Bool(b) => if *b { "True" } else { "False" }.to_owned(),
             Object::Int(i) => i.to_string(),
             Object::Long(b) => b.to_string(),
             Object::Complex(c) => complex_repr(c.real, c.imag),
-            Object::Float(f) => {
-                if f.fract() == 0.0 && f.is_finite() {
-                    format!("{f:.1}")
-                } else {
-                    f.to_string()
-                }
-            }
+            Object::Float(f) => float_repr(*f),
             Object::Str(s) => {
                 // CPython quote selection (Objects/unicodeobject.c
                 // `unicode_repr`): use '\'' unless the string contains a
@@ -1802,10 +3094,48 @@ impl Object {
                 }
             }
             Object::Function(f) => {
-                format!("<function {} at 0x{:x}>", f.name, Rc::as_ptr(f) as usize)
+                // CPython shows the *qualname* (with any user override
+                // via `f.__qualname__ = …` taking priority).
+                let qual = f
+                    .slot("__qualname__")
+                    .as_ref()
+                    .map(Object::to_str)
+                    .unwrap_or_else(|| f.code().qualname.clone());
+                format!("<function {} at 0x{:x}>", qual, Rc::as_ptr(f) as usize)
             }
             Object::Builtin(b) => format!("<built-in function {}>", b.name),
-            Object::BoundMethod(_) => "<bound method>".to_owned(),
+            // CPython `method_repr`: `<bound method qualname of repr(self)>`.
+            // The name is `func.__qualname__` then `func.__name__`, and
+            // finally `?` when the wrapped callable carries neither — e.g.
+            // a `types.MethodType` bound over an arbitrary callable object.
+            Object::BoundMethod(bm) => {
+                let qual = match &bm.function {
+                    Object::Function(f) => f
+                        .slot("__qualname__")
+                        .as_ref()
+                        .map(Object::to_str)
+                        .unwrap_or_else(|| f.code().qualname.clone()),
+                    Object::Builtin(b) => b.name.to_owned(),
+                    Object::Instance(i) => {
+                        let pick = |key: &str| -> Option<String> {
+                            if let Some(Object::Str(s)) =
+                                i.dict.borrow().get(&DictKey(Object::from_str(key)))
+                            {
+                                return Some(s.to_string());
+                            }
+                            match i.cls().lookup(key) {
+                                Some(Object::Str(s)) => Some(s.to_string()),
+                                _ => None,
+                            }
+                        };
+                        pick("__qualname__")
+                            .or_else(|| pick("__name__"))
+                            .unwrap_or_else(|| "?".to_owned())
+                    }
+                    other => other.repr(),
+                };
+                format!("<bound method {} of {}>", qual, bm.receiver.repr())
+            }
             Object::Code(c) => format!("<code object {}>", c.name),
             Object::Iter(_) => "<iterator>".to_owned(),
             Object::Slice(s) => format!(
@@ -1815,28 +3145,36 @@ impl Object {
                 s.step.repr()
             ),
             Object::Cell(inner) => format!("<cell: {}>", inner.borrow().repr()),
-            Object::Type(t) => format!("<class '{}'>", t.name),
+            Object::Type(t) => format!("<class '{}'>", t.qualified_display_name()),
             Object::Module(m) => match &m.filename {
                 Some(path) => format!("<module '{}' from '{}'>", m.name, path),
                 None => format!("<module '{}' (built-in)>", m.name),
             },
+            // CPython's repr shows the qualified name (PEP 3155).
             Object::Generator(g) => format!(
                 "<generator object {} at 0x{:x}>",
-                g.name,
+                g.qualname.borrow(),
                 Rc::as_ptr(g) as usize
             ),
             Object::Coroutine(g) => format!(
                 "<coroutine object {} at 0x{:x}>",
-                g.name,
+                g.qualname.borrow(),
                 Rc::as_ptr(g) as usize
             ),
             Object::AsyncGenerator(g) => format!(
                 "<async_generator object {} at 0x{:x}>",
-                g.name,
+                g.qualname.borrow(),
                 Rc::as_ptr(g) as usize
             ),
+            Object::AsyncGenAwait(a) => format!(
+                "<{} object at 0x{:x}>",
+                a.kind.type_name(),
+                Rc::as_ptr(a) as usize
+            ),
             Object::Bytes(b) => bytes_repr(b),
-            Object::ByteArray(b) => format!("bytearray({})", bytes_repr(&b.borrow())),
+            Object::ByteArray(b) => {
+                format!("bytearray({})", bytes_repr_inner(&b.borrow(), false))
+            }
             Object::Set(s) => set_repr(&s.borrow(), "set"),
             Object::FrozenSet(s) => set_repr(s, "frozenset"),
             Object::File(file) => format!(
@@ -1850,30 +3188,69 @@ impl Object {
                 file.mode
             ),
             Object::Instance(inst) => {
-                // Defer to __repr__ on the class if present; otherwise
-                // synthesize a default. The caller is expected to run
-                // __repr__ through the interpreter for user methods —
-                // here we only handle the default case.
+                // The `Ellipsis` / `NotImplemented` singletons render as
+                // fixed text — CPython's `ellipsis`/`NotImplementedType`
+                // `tp_repr`. We supply it here, keyed on the registry type
+                // identity, rather than via a `__repr__` dict entry that
+                // would otherwise leak into `dir()` (test_descr test_dir
+                // requires `dir(Ellipsis) == dir(object())`).
+                {
+                    let cls = inst.cls();
+                    if cls.name == "ellipsis" || cls.name == "NotImplementedType" {
+                        let bt = crate::builtin_types::builtin_types();
+                        if Rc::ptr_eq(&cls, &bt.ellipsis_) {
+                            return "Ellipsis".to_owned();
+                        }
+                        if Rc::ptr_eq(&cls, &bt.not_implemented_type_) {
+                            return "NotImplemented".to_owned();
+                        }
+                    }
+                }
+                // Defer to __repr__ on the class when present. This path
+                // is reached from *native* rendering (container reprs,
+                // error messages, the Debug impl), so the user `__repr__`
+                // must be run by re-entering the live interpreter — the
+                // same reentry the dunder coercions use. Without it,
+                // `repr([Color.RED])` would render the elements as
+                // `<Color object>` instead of `<Color.RED: 1>`.
                 let key = DictKey(Object::from_static("__repr__"));
                 let has_user_repr = inst
-                    .class
+                    .cls()
                     .mro
                     .borrow()
                     .iter()
                     .any(|t| t.dict.borrow().contains_key(&key));
                 if has_user_repr {
-                    format!("<{} object>", inst.class.name)
+                    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                        // SAFETY: published by an enclosing VM frame still
+                        // live on this thread; the GIL keeps it exclusive.
+                        let interp = unsafe { &mut *ptr };
+                        if let Some(method) = crate::instance_method(self, "__repr__") {
+                            let globals = interp.builtins_dict();
+                            if let Ok(r) =
+                                interp.call_object_with_globals(&method, &[], &[], &globals)
+                            {
+                                return r.to_str();
+                            }
+                        }
+                    }
+                    format!("<{} object>", inst.cls().name)
                 } else {
+                    // CPython's `object.__repr__`: `<module.qualname object
+                    // at 0x…>` (module omitted for builtins).
                     format!(
                         "<{} object at 0x{:x}>",
-                        inst.class.name,
+                        inst.cls().qualified_display_name(),
                         Rc::as_ptr(inst) as usize
                     )
                 }
             }
             Object::Property(_) => "<property object>".to_owned(),
-            Object::StaticMethod(_) => "<staticmethod object>".to_owned(),
-            Object::ClassMethod(_) => "<classmethod object>".to_owned(),
+            // CPython 3.10+: `<staticmethod(<function f at 0x..>)>` — the
+            // wrapped callable's repr is embedded so the address matches
+            // `'{!r}'.format(func)`.
+            Object::StaticMethod(inner) => format!("<staticmethod({})>", inner.func().repr()),
+            Object::ClassMethod(inner) => format!("<classmethod({})>", inner.func().repr()),
             Object::SlotDescriptor(sd) => {
                 format!("<member '{}' of '{}' objects>", sd.name, sd.class_name)
             }
@@ -1896,9 +3273,42 @@ impl Object {
                 };
                 format!("{}([{}])", v.kind.type_name(), body.join(", "))
             }
+            Object::LazyIter(l) => {
+                format!(
+                    "<itertools.{} object at {:#x}>",
+                    l.type_name(),
+                    Rc::as_ptr(l) as usize
+                )
+            }
             Object::SimpleNamespace(d) => {
-                let d = d.borrow();
-                let parts: Vec<String> = d
+                let dict = d.borrow();
+                // PEP 585/604 runtime forms repr as type expressions
+                // (CPython: `repr(list[int])` is "list[int]", `repr(int |
+                // str)` is "int | str"), not as namespace literals.
+                let type_param_repr = |o: &Object| -> String {
+                    match o {
+                        Object::Type(t) => t.qualified_display_name(),
+                        Object::None => "None".to_owned(),
+                        other => other.repr(),
+                    }
+                };
+                let args = dict.get(&DictKey(Object::from_static("__args__"))).cloned();
+                if dict
+                    .get(&DictKey(Object::from_static("__is_pep604_union__")))
+                    .is_some()
+                {
+                    if let Some(Object::Tuple(items)) = &args {
+                        let parts: Vec<String> = items.iter().map(type_param_repr).collect();
+                        return parts.join(" | ");
+                    }
+                }
+                if let (Some(origin), Some(Object::Tuple(items))) =
+                    (dict.get(&DictKey(Object::from_static("__origin__"))), &args)
+                {
+                    let parts: Vec<String> = items.iter().map(type_param_repr).collect();
+                    return format!("{}[{}]", type_param_repr(origin), parts.join(", "));
+                }
+                let parts: Vec<String> = dict
                     .iter()
                     .map(|(k, v)| format!("{}={}", k.0.to_str(), v.repr()))
                     .collect();
@@ -1931,7 +3341,7 @@ impl Object {
                 } else {
                     return Err(value_error("range step cannot be zero"));
                 };
-                let step = r.step.unsigned_abs() as i64;
+                let step = r.step.unsigned_abs() as i128;
                 Ok(((span + step - 1) / step).max(0) as usize)
             }
             Object::Bytes(b) => Ok(b.len()),
@@ -1941,6 +3351,15 @@ impl Object {
             Object::MemoryView(mv) => Ok(mv.len.get()),
             Object::MappingProxy(d) => Ok(d.borrow().len()),
             Object::DictView(v) => Ok(v.dict.borrow().len()),
+            // A subclass of a built-in container (`class C(list)`, …)
+            // measures the length of the native payload it wraps.
+            Object::Instance(inst) => match &inst.native {
+                Some(native) => native.len(),
+                None => Err(type_error(format!(
+                    "object of type '{}' has no len()",
+                    self.type_name()
+                ))),
+            },
             _ => Err(type_error(format!(
                 "object of type '{}' has no len()",
                 self.type_name()
@@ -1996,38 +3415,346 @@ pub(crate) fn bigint_eq_f64(a: &BigInt, b: f64) -> bool {
     *a == bi
 }
 
-/// CPython's hash for ints: `value mod (2**61 - 1)` for 64-bit
-/// platforms.  This keeps `hash(1) == hash(1.0) == hash(True)` and
-/// also `hash(big) == hash(int(big))` for any big int.
-pub(crate) const PYTHON_HASH_MODULUS: u64 = (1u64 << 61) - 1;
+/// Smallest power of two that is *not* exactly representable beyond the
+/// f64 integer-precision boundary; `2f64.powi(63)` as a literal so the
+/// i64-range checks below stay branch-cheap.
+const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 
-pub(crate) fn python_int_hash_i64(value: i64) -> i64 {
-    let modulus = i128::from(PYTHON_HASH_MODULUS);
-    let r = i128::from(value).rem_euclid(modulus) as i64;
-    // CPython returns -2 instead of -1 for hash collisions with the
-    // sentinel; we don't need the singularity handling at this level
-    // because the broader Rust hasher xors in additional bits.
-    r
+/// Exact `i64 == f64`. A plain `a as f64 == b` loses precision for
+/// `|a| > 2**53`, making e.g. `float(2**53 + 1) == 2**53 + 1` wrongly
+/// `True`. CPython compares an int and a float *exactly*; this mirrors
+/// that without allocating a `BigInt` for the common in-range case.
+pub(crate) fn i64_eq_f64(a: i64, b: f64) -> bool {
+    if !b.is_finite() || b.fract() != 0.0 {
+        return false;
+    }
+    // `b` is integral; it can equal an `i64` only inside `[-2**63, 2**63)`.
+    if (-TWO_POW_63..TWO_POW_63).contains(&b) {
+        (b as i64) == a
+    } else {
+        false
+    }
 }
 
-pub(crate) fn python_int_hash_bigint(value: &BigInt) -> i64 {
-    use num_integer::Integer;
-    let modulus = BigInt::from(PYTHON_HASH_MODULUS);
-    let (_, rem) = value.div_mod_floor(&modulus);
-    rem.to_i64().unwrap_or(0)
+/// Exact `i64` vs `f64` ordering (see [`i64_eq_f64`]).
+pub(crate) fn i64_cmp_f64(a: i64, b: f64) -> Result<Ordering, RuntimeError> {
+    if b.is_nan() {
+        return Err(value_error("cannot order with NaN"));
+    }
+    if b == f64::INFINITY {
+        return Ok(Ordering::Less);
+    }
+    if b == f64::NEG_INFINITY {
+        return Ok(Ordering::Greater);
+    }
+    let trunc = b.trunc();
+    if (-TWO_POW_63..TWO_POW_63).contains(&trunc) {
+        let ti = trunc as i64;
+        match a.cmp(&ti) {
+            Ordering::Equal => {
+                let frac = b - trunc;
+                if frac == 0.0 {
+                    Ok(Ordering::Equal)
+                } else if frac > 0.0 {
+                    Ok(Ordering::Less)
+                } else {
+                    Ok(Ordering::Greater)
+                }
+            }
+            other => Ok(other),
+        }
+    } else if trunc > 0.0 {
+        // |b| ≥ 2**63 is larger in magnitude than any i64.
+        Ok(Ordering::Less)
+    } else {
+        Ok(Ordering::Greater)
+    }
 }
 
-pub(crate) fn f64_to_i64_exact(f: f64) -> Option<i64> {
-    if !f.is_finite() {
-        return None;
+/// Width of the Python numeric hash reduction: `_PyHASH_BITS` (61 on
+/// 64-bit, so the modulus is the Mersenne prime `2**61 - 1`).
+const PY_HASH_BITS: u32 = 61;
+/// `sys.hash_info.inf` — the hash of `±inf` (CPython `_PyHASH_INF`).
+pub(crate) const PY_HASH_INF: i64 = 314_159;
+/// `sys.hash_info.imag` — the multiplier for a complex's imaginary part.
+const PY_HASH_IMAG: u64 = 1_000_003;
+
+/// C `frexp`: split `x` into `(m, e)` with `x == m * 2**e` and
+/// `0.5 <= |m| < 1` (or `m == 0`). Handles subnormals; callers guard
+/// against non-finite inputs.
+fn py_frexp(x: f64) -> (f64, i32) {
+    if x == 0.0 || !x.is_finite() {
+        return (x, 0);
     }
-    if f.fract() != 0.0 {
-        return None;
+    let bits = x.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
+    if raw_exp == 0 {
+        // Subnormal: scale into the normal range (× 2**54), then correct.
+        let (m, e) = py_frexp(x * 18_014_398_509_481_984.0_f64);
+        return (m, e - 54);
     }
-    if f < (i64::MIN as f64) || f > (i64::MAX as f64) {
-        return None;
+    // Normal value = ±(1.frac) * 2**(raw_exp-1023). Forcing the stored
+    // exponent field to 1022 (factor 2**-1) yields a mantissa in [0.5, 1);
+    // the true binary exponent is then `raw_exp - 1022`.
+    let e = raw_exp - 1022;
+    let m = f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | (1022u64 << 52));
+    (m, e)
+}
+
+/// CPython `_Py_HashDouble`: the canonical hash of a finite double via
+/// reduction modulo `2**61 - 1`, so an integer-valued float hashes equal
+/// to the corresponding `int` and a `Fraction`/`Decimal` of equal value.
+pub(crate) fn py_hash_double(v: f64) -> i64 {
+    const MOD: u64 = (1u64 << PY_HASH_BITS) - 1;
+    if !v.is_finite() {
+        if v.is_infinite() {
+            return if v > 0.0 { PY_HASH_INF } else { -PY_HASH_INF };
+        }
+        // NaN. CPython 3.10+ uses the object's identity; for value hashing
+        // 0 is a stable, collision-tolerant choice (matches sys.hash_info.nan).
+        return 0;
     }
-    Some(f as i64)
+    let (mut m, mut e) = py_frexp(v);
+    let sign: i64 = if m < 0.0 {
+        m = -m;
+        -1
+    } else {
+        1
+    };
+    // Accumulate 28 bits of mantissa at a time, rotating left within the
+    // 61-bit field (mirrors the C loop exactly).
+    let mut x: u64 = 0;
+    while m != 0.0 {
+        x = ((x << 28) & MOD) | (x >> (PY_HASH_BITS - 28));
+        m *= 268_435_456.0; // 2**28
+        e -= 28;
+        let y = m as u64;
+        m -= y as f64;
+        x += y;
+        if x >= MOD {
+            x -= MOD;
+        }
+    }
+    // Fold in the leftover power of two via a 61-bit rotate.
+    let mut e = e % (PY_HASH_BITS as i32);
+    if e < 0 {
+        e += PY_HASH_BITS as i32;
+    }
+    let e = e as u32;
+    x = ((x << e) & MOD) | (x >> (PY_HASH_BITS - e));
+    let mut res = (x as i64) * sign;
+    if res == -1 {
+        res = -2;
+    }
+    res
+}
+
+/// CPython `long_hash` for a machine int: `sign * (|n| mod (2**61-1))`,
+/// with the reserved `-1` remapped to `-2`.
+pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
+    const MOD: u128 = (1u128 << PY_HASH_BITS) - 1;
+    let mut x = (i128::from(n).unsigned_abs() % MOD) as i64;
+    if n < 0 {
+        x = -x;
+    }
+    if x == -1 {
+        x = -2;
+    }
+    x
+}
+
+/// CPython `long_hash` for a big int. `BigInt %` is truncating, so it
+/// already carries the dividend's sign with magnitude `|n| mod P`.
+pub(crate) fn py_hash_long_bigint(value: &BigInt) -> i64 {
+    let modulus = BigInt::from((1u64 << PY_HASH_BITS) - 1);
+    let rem = value % &modulus;
+    let mut x = rem.to_i64().unwrap_or(0);
+    if x == -1 {
+        x = -2;
+    }
+    x
+}
+
+/// CPython `complex_hash`: `hash(real) + _PyHASH_IMAG * hash(imag)` in
+/// wrapping (mod 2**64) arithmetic, with `-1` remapped to `-2`. A
+/// zero-imaginary complex therefore hashes equal to the bare float.
+pub(crate) fn py_hash_complex(re: f64, im: f64) -> i64 {
+    let hr = py_hash_double(re) as u64;
+    let hi = py_hash_double(im) as u64;
+    let combined = hr.wrapping_add(PY_HASH_IMAG.wrapping_mul(hi));
+    let res = combined as i64;
+    if res == -1 {
+        -2
+    } else {
+        res
+    }
+}
+
+/// Exact CPython `hash()` for the built-in numeric types, so that equal
+/// values across `bool`/`int`/`float`/`complex` (and the pure-Python
+/// `Fraction`/`Decimal`, which implement the same reduction) all agree.
+/// Returns `None` for non-numeric objects.
+pub(crate) fn numeric_hash(obj: &Object) -> Option<i64> {
+    match obj {
+        Object::Bool(b) => Some(py_hash_long_i64(i64::from(*b))),
+        Object::Int(i) => Some(py_hash_long_i64(*i)),
+        Object::Long(b) => Some(py_hash_long_bigint(b)),
+        Object::Float(f) => Some(py_hash_double(*f)),
+        Object::Complex(c) => Some(py_hash_complex(c.real, c.imag)),
+        _ => None,
+    }
+}
+
+/// `hash(None)` — CPython 3.12 returns this fixed constant rather than a
+/// pointer-derived value.
+const PY_HASH_NONE: i64 = 0xFCA8_6420;
+
+/// Deterministic structural hash for a byte slice (backs both `str` and
+/// `bytes`). CPython randomises string hashing per process via SipHash, so
+/// we don't need to reproduce its exact output — only to be stable within a
+/// run so equal strings bucket together. `hash("") == hash(b"") == 0`,
+/// matching CPython, and the reserved `-1` is remapped to `-2`.
+fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let v = h.finish() as i64;
+    if v == -1 {
+        -2
+    } else {
+        v
+    }
+}
+
+/// Identity-based hash for objects that hash by allocation identity in
+/// CPython (functions, types, modules, plain instances without a custom
+/// `__hash__`, …). Mirrors CPython's pointer hash: rotate so the low
+/// alignment zero-bits don't waste bucket entropy, remapping `-1` to `-2`.
+pub(crate) fn identity_hash(obj: &Object) -> i64 {
+    fn rot(p: *const ()) -> i64 {
+        let u = p as usize as u64;
+        let v = u.rotate_right(4) as i64;
+        if v == -1 {
+            -2
+        } else {
+            v
+        }
+    }
+    match obj {
+        Object::Function(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Builtin(r) => rot(Rc::as_ptr(r).cast()),
+        // CPython `method_hash`: combine `hash(__self__)` with
+        // `hash(__func__)` so two bindings of the same method on the
+        // same object hash (and compare) equal. Built-in functions are
+        // materialized fresh per access; hash their *name* so the hash
+        // agrees with `eq_value`.
+        Object::BoundMethod(r) => {
+            let self_h = py_hash_value(&r.receiver).unwrap_or_else(|| identity_hash(&r.receiver));
+            let func_h = match &r.function {
+                Object::Builtin(b) => py_hash_bytes_slice(b.name.as_bytes()),
+                f => py_hash_value(f).unwrap_or_else(|| identity_hash(f)),
+            };
+            let v = self_h ^ func_h.rotate_left(13);
+            if v == -1 {
+                -2
+            } else {
+                v
+            }
+        }
+        Object::Code(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Cell(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Iter(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Slice(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Type(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Instance(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Module(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Generator(r) | Object::Coroutine(r) | Object::AsyncGenerator(r) => {
+            rot(Rc::as_ptr(r).cast())
+        }
+        Object::AsyncGenAwait(r) => rot(Rc::as_ptr(r).cast()),
+        Object::File(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Property(r) => rot(Rc::as_ptr(r).cast()),
+        Object::StaticMethod(r) => rot(Rc::as_ptr(r).cast()),
+        Object::ClassMethod(r) => rot(Rc::as_ptr(r).cast()),
+        Object::SlotDescriptor(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Frame(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Traceback(r) => rot(Rc::as_ptr(r).cast()),
+        Object::MemoryView(r) => rot(Rc::as_ptr(r).cast()),
+        Object::SimpleNamespace(r) => rot(Rc::as_ptr(r).cast()),
+        Object::LazyIter(r) => rot(Rc::as_ptr(r).cast()),
+        // Value-hashable variants never reach here (handled by
+        // `py_hash_value`); anything else gets a stable constant.
+        _ => 0,
+    }
+}
+
+/// Canonical Python `hash(obj)` value, shared by the `hash()` builtin and
+/// the [`DictKey`] hasher. Bucketing every key by this single value (rather
+/// than a type-tagged structural hash) is what lets objects Python considers
+/// equal-and-hashable collide regardless of Rust representation — e.g. a
+/// custom `__hash__` returning `hash('halibut')` buckets with the actual
+/// string, so a `set`/`dict` can dedup them via [`DictKey::eq`].
+///
+/// Returns `None` for objects with no *value* hash (identity-hashable or
+/// unhashable); callers fall back to [`identity_hash`].
+pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
+    if let Some(h) = numeric_hash(obj) {
+        return Some(h);
+    }
+    match obj {
+        Object::None => Some(PY_HASH_NONE),
+        Object::Str(s) => Some(py_hash_bytes_slice(s.as_bytes())),
+        Object::Bytes(b) => Some(py_hash_bytes_slice(b)),
+        Object::Tuple(items) => {
+            // Order-sensitive mix (FNV-style) over element hashes so equal
+            // tuples bucket together; unhashable elements would raise at the
+            // `hash()` builtin, here they just fold their identity in.
+            let mut acc: u64 = 0x0034_5678;
+            for x in items.iter() {
+                let eh = py_hash_value(x).unwrap_or_else(|| identity_hash(x)) as u64;
+                acc = (acc ^ eh)
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(items.len() as u64);
+            }
+            let v = acc as i64;
+            Some(if v == -1 { -2 } else { v })
+        }
+        Object::FrozenSet(s) => {
+            // CPython's `frozenset_hash` (Objects/setobject.c), bit-exact:
+            // `collections.abc.Set._hash` reimplements the same algorithm
+            // in Python and the two must agree (`hash(fs) == Set._hash(fs)`).
+            let mut acc: u64 = 0;
+            for k in s.iter() {
+                let eh = py_hash_value(&k.0).unwrap_or_else(|| identity_hash(&k.0)) as u64;
+                acc ^= (eh ^ (eh << 16) ^ 89_869_747).wrapping_mul(3_644_798_167);
+            }
+            acc ^= (s.len() as u64).wrapping_add(1).wrapping_mul(1_927_868_237);
+            acc ^= (acc >> 11) ^ (acc >> 25);
+            acc = acc.wrapping_mul(69_069).wrapping_add(907_133_923);
+            let v = acc as i64;
+            Some(if v == -1 { 590_923_713 } else { v })
+        }
+        Object::Instance(inst) => {
+            // A user-defined `__hash__` outranks the wrapped value's hash —
+            // e.g. functools' `_HashedSeq(list)` caches its hash precisely so
+            // the (unhashable) list payload is never consulted.
+            if instance_has_custom_dunder(obj, "__hash__") {
+                return current_interp_hash(obj);
+            }
+            if let Some(native) = &inst.native {
+                // int/str/… subclass instance hashes as the wrapped value.
+                return py_hash_value(native);
+            }
+            // Custom `__hash__` via the interpreter; `None` (no active
+            // interpreter or only the inherited identity hash) falls through
+            // to `identity_hash` at the call site.
+            current_interp_hash(obj)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn bigint_from_f64_trunc(f: f64) -> BigInt {
@@ -2055,21 +3782,94 @@ pub(crate) fn bigint_from_f64_trunc(f: f64) -> BigInt {
 /// Render a `complex` the way CPython does: bare `Xj` if real is
 /// zero, `(R+Ij)` / `(R-Ij)` otherwise.  Special-cases `nan` and
 /// signed zeros to match CPython's `repr` exactly.
-pub(crate) fn complex_repr(real: f64, imag: f64) -> String {
-    fn fmt_part(p: f64) -> String {
-        // Unlike `float`, CPython renders integer-valued complex
-        // components without a trailing `.0` (e.g. `4j`, not `4.0j`).
-        if p.fract() == 0.0 && p.is_finite() {
-            format!("{p:.0}")
-        } else {
-            format!("{p}")
-        }
+/// CPython-compatible `repr(float)` — the shortest decimal string that
+/// round-trips, switching to exponential notation exactly when CPython
+/// does (`decpt <= -4 || decpt > 16`, i.e. magnitudes below 1e-4 or at
+/// or above 1e16). Mirrors `float_repr` /
+/// `PyOS_double_to_string(v, 'r', 0, Py_DTSF_ADD_DOT_0, ...)`.
+///
+/// Rust's `f64::to_string()` is *also* shortest-round-trip, but never
+/// uses exponential form, so `1e100` would otherwise print as a 101-digit
+/// integer. We recover the shortest digits + decimal exponent from
+/// `{:e}` (Ryū) and reassemble them under CPython's rules.
+pub(crate) fn float_repr(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_owned();
     }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf" } else { "inf" }.to_owned();
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_owned();
+    }
+    let neg = f.is_sign_negative();
+    let a = f.abs();
+    let sci = format!("{a:e}");
+    let (mant, exp_str) = sci.split_once('e').expect("scientific form has 'e'");
+    let exp: i32 = exp_str.parse().expect("valid exponent");
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let ndigits = digits.len() as i32;
+    let decpt = exp + 1; // count of digits left of the decimal point
+    let body = if decpt <= -4 || decpt > 16 {
+        let e = decpt - 1;
+        let mut s = digits[..1].to_owned();
+        if digits.len() > 1 {
+            s.push('.');
+            s.push_str(&digits[1..]);
+        }
+        s.push('e');
+        s.push(if e < 0 { '-' } else { '+' });
+        s.push_str(&format!("{:02}", e.unsigned_abs()));
+        s
+    } else if decpt <= 0 {
+        let mut s = String::from("0.");
+        for _ in 0..(-decpt) {
+            s.push('0');
+        }
+        s.push_str(&digits);
+        s
+    } else if decpt >= ndigits {
+        let mut s = digits.clone();
+        for _ in 0..(decpt - ndigits) {
+            s.push('0');
+        }
+        s.push_str(".0");
+        s
+    } else {
+        let d = decpt as usize;
+        format!("{}.{}", &digits[..d], &digits[d..])
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// `repr`-shortest rendering of a single complex component. Unlike
+/// `float`, CPython renders integer-valued complex components without a
+/// trailing `.0` (e.g. `4j`, not `4.0j`), but otherwise uses the same
+/// shortest/exponential rules.
+pub(crate) fn complex_component_repr(p: f64) -> String {
+    let r = float_repr(p);
+    match r.strip_suffix(".0") {
+        Some(stripped) => stripped.to_owned(),
+        None => r,
+    }
+}
+
+pub(crate) fn complex_repr(real: f64, imag: f64) -> String {
+    let fmt_part = complex_component_repr;
     if real == 0.0 && real.is_sign_positive() {
         format!("{}j", fmt_part(imag))
     } else {
-        let sep = if imag.is_sign_negative() { "" } else { "+" };
-        format!("({}{sep}{}j)", fmt_part(real), fmt_part(imag))
+        // Insert the joining sign based on the *rendered* imaginary part,
+        // not its raw sign bit: `-nan` keeps a set sign bit yet renders as
+        // "nan" (no leading '-'), so CPython prints `(nan+nanj)`, and a
+        // genuine negative like -2.0 renders "-2" and needs no extra '+'.
+        let im = fmt_part(imag);
+        let sep = if im.starts_with('-') { "" } else { "+" };
+        format!("({}{sep}{im}j)", fmt_part(real))
     }
 }
 
@@ -2077,10 +3877,39 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
     }
-    if needle.len() > haystack.len() {
-        return false;
+    memchr::memmem::find(haystack, needle).is_some()
+}
+
+/// `x in bytes` / `x in bytearray`: a byte value (int in
+/// `range(0, 256)`, out-of-range is `ValueError`) or a bytes-like
+/// needle. Anything else is the CPython `TypeError`.
+fn bytes_membership(haystack: &[u8], item: &Object) -> Result<bool, RuntimeError> {
+    let native = item.native_value();
+    match native.as_ref().unwrap_or(item) {
+        Object::Bool(v) => Ok(haystack.contains(&u8::from(*v))),
+        Object::Int(i) => {
+            if (0..=255).contains(i) {
+                Ok(haystack.contains(&(*i as u8)))
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        Object::Long(_) => Err(value_error("byte must be in range(0, 256)")),
+        Object::Bytes(needle) => Ok(bytes_contains(haystack, needle)),
+        Object::ByteArray(needle) => Ok(bytes_contains(haystack, &needle.borrow())),
+        Object::MemoryView(mv) => Ok(bytes_contains(haystack, &mv.to_bytes())),
+        inst @ Object::Instance(_) if crate::instance_method(inst, "__index__").is_some() => {
+            let v = crate::builtins::coerce_index_i64(inst)?;
+            if (0..=255).contains(&v) {
+                Ok(haystack.contains(&(v as u8)))
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        _ => Err(type_error(
+            "a bytes-like object is required, not '".to_owned() + item.type_name() + "'",
+        )),
     }
-    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// CPython's `Py_UNICODE_ISPRINTABLE`: every character is printable
@@ -2106,13 +3935,32 @@ pub(crate) fn char_is_printable(c: char) -> bool {
 }
 
 fn bytes_repr(b: &[u8]) -> String {
+    bytes_repr_inner(b, true)
+}
+
+/// `smartquotes`: `bytes` repr only escapes the active quote character
+/// (PyBytes_Repr with smartquotes=1); `bytearray`'s body always
+/// backslash-escapes single quotes regardless of the chosen delimiter
+/// (Objects/bytearrayobject.c `bytearray_repr`) — so
+/// `repr(bytearray(b"'"))` is `bytearray(b"\'")`.
+fn bytes_repr_inner(b: &[u8], smartquotes: bool) -> String {
+    // CPython prefers single quotes, switching to double quotes when
+    // the data contains a single quote but no double quote.
+    let quote = if b.contains(&b'\'') && !b.contains(&b'"') {
+        b'"'
+    } else {
+        b'\''
+    };
     let mut out = String::with_capacity(b.len() + 3);
     out.push('b');
-    out.push('\'');
+    out.push(quote as char);
     for &c in b {
         match c {
             b'\\' => out.push_str("\\\\"),
-            b'\'' => out.push_str("\\'"),
+            c if c == quote || (!smartquotes && c == b'\'') => {
+                out.push('\\');
+                out.push(c as char);
+            }
             b'\n' => out.push_str("\\n"),
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
@@ -2120,7 +3968,7 @@ fn bytes_repr(b: &[u8]) -> String {
             _ => out.push_str(&format!("\\x{c:02x}")),
         }
     }
-    out.push('\'');
+    out.push(quote as char);
     out
 }
 
@@ -2165,6 +4013,24 @@ impl Object {
         Object::Str(Rc::from(s.into().as_str()))
     }
 
+    /// Identity-stable string: repeated calls with the same text return
+    /// the *same* `Rc<str>` allocation. Used where CPython exposes a
+    /// stored string with stable identity — e.g. `cls.__name__`, which
+    /// `inspect.classify_class_attrs` compares with `is`.
+    pub fn interned_str(s: &str) -> Self {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static TABLE: OnceLock<Mutex<HashMap<String, Rc<str>>>> = OnceLock::new();
+        let table = TABLE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut t = table.lock().unwrap();
+        if let Some(rc) = t.get(s) {
+            return Object::Str(rc.clone());
+        }
+        let rc: Rc<str> = Rc::from(s);
+        t.insert(s.to_owned(), rc.clone());
+        Object::Str(rc)
+    }
+
     pub fn from_static(s: &'static str) -> Self {
         Object::Str(Rc::from(s))
     }
@@ -2174,6 +4040,15 @@ impl Object {
     }
 
     pub fn new_tuple(items: Vec<Object>) -> Self {
+        if items.is_empty() {
+            // CPython interns the empty tuple (`() is ()`);
+            // `functools.update_wrapper` asserts identity on copied
+            // `__type_params__` and similar empty-tuple attributes.
+            thread_local! {
+                static EMPTY_TUPLE: Rc<[Object]> = Rc::from(Vec::new().into_boxed_slice());
+            }
+            return Object::Tuple(EMPTY_TUPLE.with(Clone::clone));
+        }
         Object::Tuple(Rc::from(items.into_boxed_slice()))
     }
 
@@ -2320,12 +4195,13 @@ impl Object {
         }
     }
 
-    /// Try to view this value as bytes (works for both `bytes` and
-    /// `bytearray`). Returns `None` for any other type.
+    /// Try to view this value as bytes (works for `bytes`, `bytearray`,
+    /// and contiguous `memoryview`). Returns `None` for any other type.
     pub fn as_bytes_view(&self) -> Option<Vec<u8>> {
         match self {
             Object::Bytes(b) => Some(b.to_vec()),
             Object::ByteArray(b) => Some(b.borrow().clone()),
+            Object::MemoryView(mv) => Some(mv.to_bytes()),
             _ => None,
         }
     }

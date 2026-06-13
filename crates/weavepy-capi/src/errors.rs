@@ -97,7 +97,7 @@ fn message_for(o: &Object) -> String {
                     }
                 }
             }
-            format!("<{}>", inst.class.name)
+            format!("<{}>", inst.cls().name)
         }
         Object::None => String::new(),
         _ => format!("{o:?}"),
@@ -122,7 +122,7 @@ pub fn set_pending_from_runtime(err: RuntimeError) {
     match err {
         RuntimeError::PyException(pe) => {
             let cls = match &pe.instance {
-                Object::Instance(inst) => Some(inst.class.clone()),
+                Object::Instance(inst) => Some(inst.cls()),
                 _ => None,
             };
             set_pending(cls, Object::from_str(pe.message()));
@@ -554,7 +554,7 @@ pub unsafe extern "C" fn PyErr_GivenExceptionMatches(
     }
     let given_ty = match unsafe { crate::object::clone_object(given) } {
         Object::Type(t) => t,
-        Object::Instance(inst) => inst.class.clone(),
+        Object::Instance(inst) => inst.cls(),
         _ => return 0,
     };
     let exc_obj = unsafe { crate::object::clone_object(exc) };
@@ -684,7 +684,7 @@ fn type_object_for(p: *mut PyObject) -> Option<Rc<TypeObject>> {
     }
     match unsafe { crate::object::clone_object(p) } {
         Object::Type(t) => Some(t),
-        Object::Instance(inst) => Some(inst.class.clone()),
+        Object::Instance(inst) => Some(inst.cls()),
         _ => None,
     }
 }

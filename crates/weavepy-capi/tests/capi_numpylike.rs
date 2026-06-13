@@ -68,7 +68,7 @@ fn try_call(interp: &mut Interpreter, fn_obj: Object, args: &[Object]) -> Result
 
 fn call_method(interp: &mut Interpreter, instance: Object, name: &str, args: &[Object]) -> Object {
     let class = match &instance {
-        Object::Instance(inst) => inst.class.clone(),
+        Object::Instance(inst) => inst.cls(),
         other => panic!("expected instance, got {other:?}"),
     };
     let method = class

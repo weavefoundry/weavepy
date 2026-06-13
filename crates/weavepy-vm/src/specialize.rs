@@ -131,7 +131,7 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
             // Only cache when the type doesn't customize lookup.
             // If the class has __getattr__ / __getattribute__ /
             // descriptors, the slow path is mandatory.
-            if type_has_attr_override(&inst.class) {
+            if type_has_attr_override(&inst.cls()) {
                 return InlineCache::Cooldown(COOLDOWN);
             }
             // First check the instance dict — that's the
@@ -139,17 +139,18 @@ pub fn attempt_specialize_load_attr(obj: &Object, name: &str) -> InlineCache {
             let dict = inst.dict.borrow();
             if let Some(idx) = dict.index_of_key_str(name) {
                 return InlineCache::LoadAttrInstance {
-                    type_id: rc_id(&inst.class),
+                    type_id: rc_id(&inst.cls()),
                     key_idx: idx,
                 };
             }
             drop(dict);
             // Otherwise look in the type's dict — the
             // `LoadAttrType` shape (descriptor or class attribute).
-            let class_dict = inst.class.dict.borrow();
+            let cls = inst.cls();
+            let class_dict = cls.dict.borrow();
             if let Some(idx) = class_dict.index_of_key_str(name) {
                 return InlineCache::LoadAttrType {
-                    type_id: rc_id(&inst.class),
+                    type_id: rc_id(&cls),
                     key_idx: idx,
                 };
             }
@@ -210,13 +211,13 @@ pub fn attempt_specialize_load_global(
 pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
     match obj {
         Object::Instance(inst) => {
-            if type_has_attr_override(&inst.class) {
+            if type_has_attr_override(&inst.cls()) {
                 return InlineCache::Cooldown(COOLDOWN);
             }
             let dict = inst.dict.borrow();
             if let Some(idx) = dict.index_of_key_str(name) {
                 return InlineCache::StoreAttrInstance {
-                    type_id: rc_id(&inst.class),
+                    type_id: rc_id(&inst.cls()),
                     key_idx: idx,
                 };
             }
@@ -277,7 +278,7 @@ pub fn attempt_specialize_unpack_sequence(seq: &Object, n: usize) -> InlineCache
 pub fn attempt_specialize_call(callable: &Object, argc: usize) -> InlineCache {
     match callable {
         Object::Function(f) => {
-            let code = &f.code;
+            let code = f.code();
             if code.is_generator || code.is_coroutine || code.is_async_generator {
                 return InlineCache::Cooldown(COOLDOWN);
             }
@@ -319,8 +320,14 @@ fn type_has_attr_override(ty: &Rc<TypeObject>) -> bool {
     if ty.lookup("__getattr__").is_some() {
         return true;
     }
-    if ty.lookup("__getattribute__").is_some() {
-        return true;
+    // `object.__getattribute__` lives in `object`'s dict as a sentinel, so a
+    // bare `is_some()` would match *every* class. Only a genuine user override
+    // (anything other than that sentinel) should disable the dict-slot fast
+    // path — the default lookup is exactly what the fast path reproduces.
+    match ty.lookup("__getattribute__") {
+        Some(Object::Builtin(b)) if b.name == ".object_getattribute" => {}
+        Some(_) => return true,
+        None => {}
     }
     if ty.lookup("__setattr__").is_some() {
         return true;

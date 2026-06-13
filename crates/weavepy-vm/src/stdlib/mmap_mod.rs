@@ -88,6 +88,7 @@ fn mmap_type() -> Rc<TypeObject> {
             DictKey(Object::from_static(name)),
             Object::Builtin(Rc::new(BuiltinFn {
                 name,
+                binds_instance: true,
                 call: Box::new(fn_),
                 call_kw: None,
             })),

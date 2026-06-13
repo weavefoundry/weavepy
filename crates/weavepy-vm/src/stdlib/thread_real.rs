@@ -134,6 +134,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -145,6 +146,7 @@ fn b_dyn(
 ) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -275,9 +277,11 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         );
     }
     let inst = Rc::new(PyInstance {
-        class: lock_type(),
+        class: crate::sync::RefCell::new(lock_type()),
         dict,
         native: None,
+        inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
     });
     Object::Instance(inst)
 }
@@ -375,9 +379,11 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         );
     }
     let inst = Rc::new(PyInstance {
-        class: rlock_type(),
+        class: crate::sync::RefCell::new(rlock_type()),
         dict,
         native: None,
+        inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
     });
     Object::Instance(inst)
 }
@@ -506,8 +512,15 @@ fn start_new_thread(args: &[Object]) -> Result<Object, RuntimeError> {
     let worker_func = func.clone();
     let worker_lock = join_lock.clone();
     let entry_name = thread_name.clone();
+    // RFC 0037 (WS1): worker threads recurse through the same
+    // recursive-descent evaluator as the main thread, so they need the
+    // same generous stack reserve for `sys.setrecursionlimit` to bind
+    // before the native stack. (std's default thread stack is only
+    // ~2 MiB.) The reserve is committed lazily by the OS.
+    const WORKER_STACK_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
     let handle = std::thread::Builder::new()
         .name(format!("weavepy-worker-{}", synth_id))
+        .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
             crate::vm_singletons::install_worker_thread_id(synth_id);
             // The parent published this entry into the slot below
@@ -534,10 +547,23 @@ fn start_new_thread(args: &[Object]) -> Result<Object, RuntimeError> {
             // section, then re-acquire on return.
             let gil = crate::gil::global_gil();
             crate::gil::push_gil_guard(gil.acquire());
-            let call_result = worker_interp.call_object(worker_func, &positional, &kwargs_pairs);
-            if let Err(err) = call_result {
-                if !is_system_exit(&err) {
-                    invoke_threading_excepthook(&mut worker_interp, &entry_name, &err);
+            let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_interp.call_object(worker_func, &positional, &kwargs_pairs)
+            }));
+            match call_result {
+                Ok(Err(err)) => {
+                    if !is_system_exit(&err) {
+                        invoke_threading_excepthook(&mut worker_interp, &entry_name, &err);
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("<non-string panic payload>");
+                    eprintln!("FATAL: panic in thread {entry_name}: {msg}");
                 }
             }
             // Drop the guard before marking finished so the
@@ -568,7 +594,7 @@ fn is_system_exit(err: &RuntimeError) -> bool {
     let RuntimeError::PyException(exc) = err else {
         return false;
     };
-    matches!(&exc.instance, Object::Instance(inst) if inst.class.name == "SystemExit")
+    matches!(&exc.instance, Object::Instance(inst) if inst.cls().name == "SystemExit")
 }
 
 /// Run `threading.excepthook` (if installed) with the worker's
@@ -581,6 +607,10 @@ fn invoke_threading_excepthook(
     err: &RuntimeError,
 ) {
     let RuntimeError::PyException(exc) = err else {
+        // Internal (non-Python) errors would otherwise vanish with the
+        // worker thread; CPython prints *something* for every dying
+        // thread, so route the message to stderr.
+        eprintln!("Exception in thread {thread_name}: {err:?}");
         return;
     };
     let mods = interp.module_cache().modules.borrow();
@@ -605,7 +635,7 @@ fn invoke_threading_excepthook(
     // `threading.py` accepts a simple tuple-with-attribute shim,
     // which we materialise here as a `SimpleNamespace`.
     let exc_type = match &exc.instance {
-        Object::Instance(inst) => Object::Type(inst.class.clone()),
+        Object::Instance(inst) => Object::Type(inst.cls()),
         _ => Object::None,
     };
     let mut ns = DictData::new();
@@ -654,7 +684,7 @@ mod tests {
         let l = allocate_lock(&[]).unwrap();
         match l {
             Object::Instance(inst) => {
-                assert_eq!(inst.class.name, "lock");
+                assert_eq!(inst.cls().name, "lock");
             }
             _ => panic!("expected Object::Instance"),
         }

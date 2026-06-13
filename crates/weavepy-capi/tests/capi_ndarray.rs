@@ -82,7 +82,7 @@ fn call_method(
     args: &[Object],
 ) -> Result<Object, RuntimeError> {
     let class = match &instance {
-        Object::Instance(inst) => inst.class.clone(),
+        Object::Instance(inst) => inst.cls(),
         other => panic!("expected instance, got {other:?}"),
     };
     let method = class

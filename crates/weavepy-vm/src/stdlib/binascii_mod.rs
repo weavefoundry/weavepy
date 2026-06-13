@@ -57,6 +57,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static(name)),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name,
+                    binds_instance: false,
                     call: Box::new(body),
                     call_kw: None,
                 })),
@@ -71,10 +72,22 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 }
 
 fn input_bytes(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
-    match arg {
-        Some(Object::Bytes(b)) => Ok(b.to_vec()),
-        Some(Object::ByteArray(b)) => Ok(b.borrow().clone()),
-        Some(Object::Str(s)) => Ok(s.as_bytes().to_vec()),
+    let obj = match arg {
+        Some(o) => o,
+        None => return Err(type_error("expected bytes-like object")),
+    };
+    // A subclass of `bytes`/`bytearray` exposes the inherited buffer
+    // interface via its native payload (CPython's PyArg_ParseTuple `t#`),
+    // while a subclass of a non-buffer type (e.g. `int`) does not
+    // (test_buffer_inheritance).
+    let effective = match obj {
+        Object::Instance(_) => obj.native_value().unwrap_or_else(|| obj.clone()),
+        other => other.clone(),
+    };
+    match &effective {
+        Object::Bytes(b) => Ok(b.to_vec()),
+        Object::ByteArray(b) => Ok(b.borrow().clone()),
+        Object::Str(s) => Ok(s.as_bytes().to_vec()),
         _ => Err(type_error("expected bytes-like object")),
     }
 }

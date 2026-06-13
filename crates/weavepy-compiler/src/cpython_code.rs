@@ -75,6 +75,8 @@ pub mod op {
     pub const CALL: u8 = 53;
     pub const CALL_FUNCTION_EX: u8 = 54;
     pub const CALL_INTRINSIC_1: u8 = 55;
+    pub const CALL_INTRINSIC_2: u8 = 56;
+    pub const LOAD_ASSERTION_ERROR: u8 = 23;
     pub const CALL_KW: u8 = 57;
     pub const COMPARE_OP: u8 = 58;
     pub const CONTAINS_OP: u8 = 59;
@@ -133,6 +135,8 @@ pub const MAGIC_NUMBER: [u8; 4] = [0xf3, 0x0d, 0x0d, 0x0a];
 const INTRINSIC_IMPORT_STAR: u32 = 2;
 /// CALL_INTRINSIC_1 sub-op: `INTRINSIC_UNARY_POSITIVE`.
 const INTRINSIC_UNARY_POSITIVE: u32 = 5;
+/// CALL_INTRINSIC_2 sub-op: `INTRINSIC_PREP_RERAISE_STAR`.
+const INTRINSIC_PREP_RERAISE_STAR: u32 = 1;
 
 /// Number of inline-`CACHE` code units that follow `cp_op` in CPython
 /// 3.13 (`_PyOpcode_Caches`). Everything not listed has none.
@@ -248,6 +252,7 @@ fn map_to_cpython(ins: Instruction, nlocals: u32) -> MappedOp {
         O::DeleteName => (op::DELETE_NAME, ins.arg),
         O::LoadDeref => (op::LOAD_DEREF, ins.arg + nlocals),
         O::StoreDeref => (op::STORE_DEREF, ins.arg + nlocals),
+        O::DeleteDeref => (op::DELETE_DEREF, ins.arg + nlocals),
         O::MakeCell => (op::MAKE_CELL, ins.arg + nlocals),
         // 3.13 has no real LOAD_CLOSURE opcode; cells live in the fast
         // array and are loaded with LOAD_FAST.
@@ -314,6 +319,8 @@ fn map_to_cpython(ins: Instruction, nlocals: u32) -> MappedOp {
         O::ImportName => (op::IMPORT_NAME, ins.arg),
         O::ImportFrom => (op::IMPORT_FROM, ins.arg),
         O::ImportStar => (op::CALL_INTRINSIC_1, INTRINSIC_IMPORT_STAR),
+        O::PrepReraiseStar => (op::CALL_INTRINSIC_2, INTRINSIC_PREP_RERAISE_STAR),
+        O::LoadAssertionError => (op::LOAD_ASSERTION_ERROR, 0),
         O::FormatValue => {
             if ins.arg & 0x04 != 0 {
                 (op::FORMAT_WITH_SPEC, ins.arg)
@@ -383,6 +390,11 @@ pub struct CpythonCode {
     pub firstlineno: u32,
     /// One [`Position`] per code unit.
     pub positions: Vec<Position>,
+    /// Code-unit offset of each WeavePy instruction's *opcode* unit (i.e.
+    /// past any `EXTENDED_ARG` prefix), indexed by WeavePy instruction
+    /// index. Multiply by 2 for the `co_code` byte offset CPython's
+    /// `f_lasti`/`tb_lasti` expose. Length equals the instruction count.
+    pub inst_offsets: Vec<u32>,
 }
 
 const CO_FAST_LOCAL: u8 = 0x20;
@@ -480,14 +492,24 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
     // Emit code units + per-unit positions.
     let mut co_code: Vec<u8> = Vec::with_capacity(starts[n] * 2);
     let mut positions: Vec<Position> = Vec::with_capacity(starts[n]);
+    let mut inst_offsets: Vec<u32> = Vec::with_capacity(n);
     let firstlineno = code.linetable.first().copied().unwrap_or(1);
     for i in 0..n {
         let line = code.linetable.get(i).copied().unwrap_or(firstlineno) as i32;
+        // PEP-657 columns, when the compiler tracked them for this
+        // instruction. `col`/`end_col` are byte offsets (`-1` = unknown);
+        // `end_lineno` is `0` when unknown (fall back to the start line).
+        let cs = code.coltable.get(i).copied().unwrap_or_default();
+        let end_lineno = if cs.end_lineno != 0 {
+            cs.end_lineno as i32
+        } else {
+            line
+        };
         let pos = Position {
             lineno: line,
-            end_lineno: line,
-            col: None,
-            end_col: None,
+            end_lineno,
+            col: (cs.col >= 0).then_some(cs.col as u32),
+            end_col: (cs.end_col >= 0).then_some(cs.end_col as u32),
         };
         let arg = args[i];
         // EXTENDED_ARG units carry the high base-256 digits, MSB first.
@@ -497,6 +519,9 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
             co_code.push(byte);
             positions.push(pos);
         }
+        // The opcode unit lands here, past any EXTENDED_ARG prefix — this is
+        // the code-unit offset CPython's `f_lasti`/`tb_lasti` point at.
+        inst_offsets.push((co_code.len() / 2) as u32);
         co_code.push(mapped[i].cp_op);
         co_code.push((arg & 0xFF) as u8);
         positions.push(pos);
@@ -517,6 +542,7 @@ pub fn encode(code: &CodeObject) -> CpythonCode {
         stacksize: compute_stacksize(code),
         firstlineno,
         positions,
+        inst_offsets,
     }
 }
 
@@ -635,8 +661,8 @@ fn encode_exception_table(code: &CodeObject, starts: &[usize]) -> Vec<u8> {
         push_exc_varint(&mut out, start as u32, 0x80);
         push_exc_varint(&mut out, length as u32, 0);
         push_exc_varint(&mut out, target as u32, 0);
-        // depth_and_lasti = (depth << 1) | lasti; WeavePy has no lasti bit.
-        push_exc_varint(&mut out, h.depth << 1, 0);
+        // depth_and_lasti = (depth << 1) | lasti.
+        push_exc_varint(&mut out, (h.depth << 1) | u32::from(h.push_lasti), 0);
     }
     out
 }
@@ -971,6 +997,8 @@ fn decode_exception_table(table: &[u8], raws: &[DecodedRaw]) -> Vec<ExcHandler> 
             end: map_unit(start_unit + length),
             handler: map_unit(target_unit),
             depth: dl >> 1,
+            // Low bit of the depth/lasti word is CPython's lasti flag.
+            push_lasti: dl & 1 != 0,
         });
     }
     out
@@ -1002,6 +1030,7 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
         op::DELETE_NAME => (O::DeleteName, arg),
         op::LOAD_DEREF => (O::LoadDeref, arg.saturating_sub(nlocals)),
         op::STORE_DEREF => (O::StoreDeref, arg.saturating_sub(nlocals)),
+        op::DELETE_DEREF => (O::DeleteDeref, arg.saturating_sub(nlocals)),
         op::MAKE_CELL => (O::MakeCell, arg.saturating_sub(nlocals)),
         op::LOAD_ATTR => (O::LoadAttr, arg >> 1),
         op::STORE_ATTR => (O::StoreAttr, arg),
@@ -1020,6 +1049,8 @@ fn map_from_cpython(cp_op: u8, arg: u32, nlocals: u32) -> Option<(OpCode, u32)> 
                 (O::ImportStar, 0)
             }
         }
+        op::CALL_INTRINSIC_2 => (O::PrepReraiseStar, 0),
+        op::LOAD_ASSERTION_ERROR => (O::LoadAssertionError, 0),
         op::COMPARE_OP => (O::CompareOp, CompareKind::from_arg(arg >> 5)?.as_arg()),
         op::IS_OP => (O::IsOp, arg),
         op::CONTAINS_OP => (O::ContainsOp, arg),
@@ -1088,6 +1119,19 @@ impl CodeObject {
     #[must_use]
     pub fn to_cpython(&self) -> CpythonCode {
         encode(self)
+    }
+
+    /// Translate a WeavePy instruction index into the `co_code` byte offset
+    /// CPython's `f_lasti`/`tb_lasti` expose (2 bytes/code unit, opcode past
+    /// any `EXTENDED_ARG` prefix). Keeps `co_positions()` / `dis` anchoring
+    /// consistent across the cache- and extended-arg-inflated encoding.
+    #[must_use]
+    pub fn cpython_lasti(&self, weavepy_index: u32) -> u32 {
+        let cp = self.to_cpython();
+        cp.inst_offsets
+            .get(weavepy_index as usize)
+            .map(|&unit| unit * 2)
+            .unwrap_or(weavepy_index * 2)
     }
 }
 
@@ -1274,6 +1318,7 @@ mod tests {
             end: 3,
             handler: 3,
             depth: 2,
+            push_lasti: false,
         });
         let cp = encode(&code);
         let mut i = 0;
@@ -1315,6 +1360,7 @@ mod tests {
             end: 4,
             handler: 5,
             depth: 2,
+            push_lasti: false,
         });
 
         let cp = encode(&code);

@@ -18,8 +18,8 @@ use parking_lot::Mutex;
 
 use crate::sync::{Rc, RefCell};
 
-use crate::object::{DictData, Object};
-use crate::types::{PyInstance, TypeFlags, TypeObject};
+use crate::object::Object;
+use crate::types::{PyInstance, TypeObject};
 
 thread_local! {
     static NOT_IMPLEMENTED: RefCell<Option<Object>> = const { RefCell::new(None) };
@@ -28,6 +28,11 @@ thread_local! {
     /// GC. Drained at the next eval-loop tick by the interpreter.
     /// See [`crate::gc_trace::run_finalizer`] for the producer side.
     pub(crate) static PENDING_FINALIZERS: RefCell<Vec<Object>> = const { RefCell::new(Vec::new()) };
+    /// Pending weakref-callback invocations `(callback, weakref_obj)`
+    /// queued when a referent dies (cycle GC, refcount reap, registry
+    /// sweep). Drained alongside the finalizer queue.
+    pub(crate) static PENDING_WEAKREF_CALLBACKS: RefCell<Vec<(Object, Object)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Push an instance whose `__del__` should run at the next safe
@@ -38,50 +43,78 @@ pub fn push_pending_finalizer(obj: Object) {
     });
 }
 
+/// Like [`push_pending_finalizer`], but callable from `Drop` impls:
+/// tolerates thread-teardown (destroyed TLS) and re-entrant borrows
+/// by silently dropping the request.
+pub fn try_push_pending_finalizer(obj: Object) {
+    let _ = PENDING_FINALIZERS.try_with(|cell| {
+        if let Ok(mut queue) = cell.try_borrow_mut() {
+            queue.push(obj);
+        }
+    });
+}
+
 /// Drain the pending-finalizer queue. The eval loop calls this
 /// at every eval-breaker tick that has the GC flag set.
 pub fn drain_pending_finalizers() -> Vec<Object> {
     PENDING_FINALIZERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
-fn make_singleton(name: &'static str) -> Object {
-    let cls = TypeObject::new_with_flags(
-        name,
-        vec![],
-        DictData::new(),
-        TypeFlags {
-            is_exception: false,
-            is_builtin: true,
-        },
-    )
-    .expect("singleton MRO");
-    let instance = PyInstance::new(cls);
-    Object::Instance(Rc::new(instance))
+/// Queue a weakref callback `(callback, weakref_obj)` for invocation at
+/// the next safe point. Teardown-safe (callable from sweep paths).
+pub fn push_pending_weakref_callback(callback: Object, weakref_obj: Object) {
+    let _ = PENDING_WEAKREF_CALLBACKS.try_with(|cell| {
+        if let Ok(mut queue) = cell.try_borrow_mut() {
+            queue.push((callback, weakref_obj));
+        }
+    });
+}
+
+/// Drain the pending weakref-callback queue.
+pub fn drain_pending_weakref_callbacks() -> Vec<(Object, Object)> {
+    PENDING_WEAKREF_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+/// Build a singleton instance of the given built-in registry type.
+/// The instance carries an empty dict — the canonical repr text
+/// ("Ellipsis" / "NotImplemented") is supplied by `Object::repr`'s
+/// type-keyed special case rather than a `__repr__` dict entry, so the
+/// singleton's `dir()` stays identical to `object()`'s (test_descr
+/// test_dir: `dir(Ellipsis) == dir(object())`).
+fn make_singleton(cls: Rc<TypeObject>) -> Object {
+    Object::Instance(Rc::new(PyInstance::new(cls)))
 }
 
 /// Return the unique `NotImplemented` instance, allocating it on
 /// first access. Subsequent calls hand back the same `Rc`-shared
-/// object so `x is NotImplemented` works.
+/// object so `x is NotImplemented` works. Its class is the registry's
+/// `NotImplementedType` (an `object` subclass), so `type(NotImplemented)`
+/// and the MRO match CPython.
 pub fn not_implemented() -> Object {
     NOT_IMPLEMENTED.with(|slot| {
         let mut s = slot.borrow_mut();
         if let Some(v) = s.as_ref() {
             return v.clone();
         }
-        let v = make_singleton("NotImplementedType");
+        let cls = crate::builtin_types::builtin_types()
+            .not_implemented_type_
+            .clone();
+        let v = make_singleton(cls);
         *s = Some(v.clone());
         v
     })
 }
 
-/// Same idea for `Ellipsis` (the value of `...`).
+/// Same idea for `Ellipsis` (the value of `...`); its class is the
+/// registry's `ellipsis` type.
 pub fn ellipsis() -> Object {
     ELLIPSIS.with(|slot| {
         let mut s = slot.borrow_mut();
         if let Some(v) = s.as_ref() {
             return v.clone();
         }
-        let v = make_singleton("ellipsis");
+        let cls = crate::builtin_types::builtin_types().ellipsis_.clone();
+        let v = make_singleton(cls);
         *s = Some(v.clone());
         v
     })
@@ -97,6 +130,7 @@ pub fn interactive_printer(name: &'static str, body: &'static str) -> Object {
     let body_for_call = body.to_owned();
     let f = BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(move |_args: &[Object]| {
             // We can't reach the interpreter's stdout from a static
             // builtin; route through Rust's stdout for the
@@ -128,9 +162,20 @@ pub fn interactive_printer(name: &'static str, body: &'static str) -> Object {
 
 static INTERPRETER_SEED: OnceLock<Mutex<Option<crate::Interpreter>>> = OnceLock::new();
 static WORKER_THREAD_ID: OnceLock<Mutex<std::collections::HashMap<u64, u64>>> = OnceLock::new();
+/// The seed thread's built-in type registry. Workers adopt it (see
+/// [`snapshot_interpreter`]) so `type`/`object`/… compare pointer-equal
+/// across threads — class statements check metaclasses by identity.
+static SEED_BUILTIN_TYPES: OnceLock<
+    Mutex<Option<crate::sync::Rc<crate::builtin_types::BuiltinTypes>>>,
+> = OnceLock::new();
 
 fn seed_slot() -> &'static Mutex<Option<crate::Interpreter>> {
     INTERPRETER_SEED.get_or_init(|| Mutex::new(None))
+}
+
+fn seed_types_slot() -> &'static Mutex<Option<crate::sync::Rc<crate::builtin_types::BuiltinTypes>>>
+{
+    SEED_BUILTIN_TYPES.get_or_init(|| Mutex::new(None))
 }
 
 fn worker_map() -> &'static Mutex<std::collections::HashMap<u64, u64>> {
@@ -144,12 +189,21 @@ fn worker_map() -> &'static Mutex<std::collections::HashMap<u64, u64>> {
 pub fn publish_interpreter_seed(interp: &crate::Interpreter) {
     let mut slot = seed_slot().lock();
     *slot = Some(interp.fork_for_thread());
+    drop(slot);
+    *seed_types_slot().lock() = Some(crate::builtin_types::builtin_types());
 }
 
 /// Hand out a fresh worker [`crate::Interpreter`] cloned from the
 /// last-published seed. Returns `None` if no seed has been published
 /// yet (callers fall back to `Interpreter::new()`).
+///
+/// Also installs the seed's built-in type registry on the calling
+/// thread (no-op if this thread already built one) — class statements
+/// executed by the worker must see the same `TypeObject`s as the seed.
 pub fn snapshot_interpreter() -> Option<crate::Interpreter> {
+    if let Some(bt) = seed_types_slot().lock().clone() {
+        crate::builtin_types::install_shared(bt);
+    }
     let slot = seed_slot().lock();
     slot.as_ref().map(|i| i.fork_for_thread())
 }
@@ -291,6 +345,46 @@ impl Drop for InterpreterGuard {
     }
 }
 
+/// `True` once interpreter shutdown (finalizer sweep) has begun —
+/// CPython's `_Py_IsFinalizing()`. Fresh imports are refused while
+/// set (already-imported modules keep working), and
+/// `sys.is_finalizing()` reads it.
+static FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_finalizing(value: bool) {
+    FINALIZING.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn is_finalizing() -> bool {
+    FINALIZING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// PEP 657 column info enabled? Cleared by `-X no_debug_ranges` /
+/// `PYTHONNODEBUGRANGES`; `co_positions()` then reports `None`
+/// columns and traceback carets disappear, like CPython.
+static DEBUG_RANGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_debug_ranges(value: bool) {
+    DEBUG_RANGES.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn debug_ranges() -> bool {
+    DEBUG_RANGES.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// `-X dev` / `PYTHONDEVMODE`. Dev mode turns on eager validation
+/// that CPython otherwise defers (e.g. `bytes(s, encoding, errors=…)`
+/// looks up the error handler immediately; bpo-37388).
+static DEV_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_dev_mode(value: bool) {
+    DEV_MODE.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn dev_mode() -> bool {
+    DEV_MODE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Publish `interp` as the live VM pointer for the duration of
 /// the returned guard. Re-entrant calls produce a stack so the
 /// most recent guard wins on `current_interpreter_ptr` lookups.
@@ -310,6 +404,7 @@ pub fn quitter(name: &'static str) -> Object {
     use crate::object::BuiltinFn;
     let f = BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(|args: &[Object]| {
             let code = args.first().cloned().unwrap_or(Object::None);
             let bt = crate::builtin_types::builtin_types();

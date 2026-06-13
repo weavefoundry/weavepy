@@ -30,6 +30,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("request")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "request",
+                binds_instance: false,
                 call: Box::new(https_request),
                 call_kw: None,
             })),
@@ -38,6 +39,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("open")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open",
+                binds_instance: false,
                 call: Box::new(https_open),
                 call_kw: None,
             })),
@@ -46,6 +48,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("send")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "send",
+                binds_instance: false,
                 call: Box::new(https_send),
                 call_kw: None,
             })),
@@ -54,6 +57,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("recv")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "recv",
+                binds_instance: false,
                 call: Box::new(https_recv),
                 call_kw: None,
             })),
@@ -62,6 +66,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("close")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "close",
+                binds_instance: false,
                 call: Box::new(https_close),
                 call_kw: None,
             })),

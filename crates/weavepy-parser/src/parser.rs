@@ -55,6 +55,26 @@ impl<'src> Parser<'src> {
         &self.source[span.start.0 as usize..span.end.0 as usize]
     }
 
+    /// Identifier text for a NAME token, NFKC-normalized per PEP 3131.
+    ///
+    /// CPython normalizes every identifier to Normalization Form KC at
+    /// parse time (`unicodeobject.c: _PyUnicode_TransformDecimalAndSpaceToASCII`
+    /// → `compile.c`/`tokenizer` actually use `PyUnicode_FromString` +
+    /// `unicodedata.normalize('NFKC', …)`), so `µ` (U+00B5) and `μ`
+    /// (U+03BC) bind the same name, and the mathematical-alphabet
+    /// `𝔘𝔫𝔦𝔠𝔬𝔡𝔢` folds to plain `Unicode`. ASCII identifiers — the
+    /// overwhelmingly common case — are already in NFKC, so we return the
+    /// borrowed slice without touching the normalizer.
+    fn ident(&self, span: Span) -> String {
+        let raw = self.lexeme(span);
+        if raw.is_ascii() {
+            raw.to_owned()
+        } else {
+            use unicode_normalization::UnicodeNormalization;
+            raw.nfkc().collect()
+        }
+    }
+
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.pos].kind
     }
@@ -71,6 +91,13 @@ impl<'src> Parser<'src> {
         let t = self.tokens[self.pos].clone();
         self.pos += 1;
         t
+    }
+
+    /// Span of the most recently consumed token. Used to extend a
+    /// statement's span to its last token (CPython statement positions
+    /// cover the whole statement, not just the keyword).
+    fn prev_token_span(&self) -> weavepy_lexer::Span {
+        self.tokens[self.pos.saturating_sub(1)].span
     }
 
     fn check(&self, k: &TokenKind) -> bool {
@@ -99,6 +126,48 @@ impl<'src> Parser<'src> {
 
     fn at_keyword(&self, kw: Keyword) -> bool {
         matches!(self.peek(), TokenKind::Keyword(k) if *k == kw)
+    }
+
+    /// Expect the `:` between a dict key and value. A `=` here gets
+    /// CPython's "cannot assign to X here. Maybe you meant '==' instead
+    /// of '='?", anchored at the key.
+    fn expect_dict_colon(&mut self, key: &Expr) -> Result<(), ParseError> {
+        if self.check(&TokenKind::Equal) {
+            return Err(ParseError::Unexpected {
+                span: key.span,
+                message: format!(
+                    "cannot assign to {} here. Maybe you meant '==' instead of '='?",
+                    crate::ast::expr_name(key)
+                ),
+            });
+        }
+        self.expect(&TokenKind::Colon, "`:`")?;
+        Ok(())
+    }
+
+    /// Like [`Parser::expect`], but when the failure is two adjacent
+    /// expressions (e.g. `[a b]`), report CPython's
+    /// "invalid syntax. Perhaps you forgot a comma?" spanning from the
+    /// previous element through the stray expression.
+    fn expect_or_forgot_comma(
+        &mut self,
+        k: &TokenKind,
+        what: &str,
+        items: &[Expr],
+    ) -> Result<Token, ParseError> {
+        if !self.check(k) && self.at_expression_start() {
+            if let Some(prev) = items.last() {
+                let start = prev.span;
+                // Parse (and discard) the stray expression to find its
+                // extent; any nested parse error wins.
+                let stray = self.parse_ternary()?;
+                return Err(ParseError::Unexpected {
+                    span: start.merge(stray.span),
+                    message: "invalid syntax. Perhaps you forgot a comma?".to_owned(),
+                });
+            }
+        }
+        self.expect(k, what)
     }
 
     // Skip any trivia (NL, COMMENT) between meaningful tokens.
@@ -134,6 +203,15 @@ impl<'src> Parser<'src> {
 
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
         self.skip_trivia();
+        // An INDENT token where a statement should start means the line
+        // is indented deeper than its block — CPython's tokenizer
+        // raises IndentationError("unexpected indent").
+        if matches!(self.peek(), TokenKind::Indent) {
+            return Err(ParseError::Indentation {
+                span: self.peek_token().span,
+                message: "unexpected indent".to_owned(),
+            });
+        }
         // Decorators apply to the next `def` or `class`.
         if matches!(self.peek(), TokenKind::At) {
             let decorators = self.parse_decorators()?;
@@ -251,7 +329,7 @@ impl<'src> Parser<'src> {
     fn parse_type_alias_stmt(&mut self) -> Result<Stmt, ParseError> {
         let type_tok = self.bump(); // `type`
         let name_tok = self.expect(&TokenKind::Name, "type alias name")?;
-        let name = self.lexeme(name_tok.span).to_owned();
+        let name = self.ident(name_tok.span);
         let type_params = self.collect_pep695_type_params()?;
         self.expect(&TokenKind::Equal, "`=`")?;
         let value = self.parse_expression_list(true)?;
@@ -275,8 +353,8 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// Like [`Self::skip_pep695_type_params`] but returns the
-    /// captured parameter names.
+    /// Swallows a PEP 695 `[T, *Ts, **P]` type-parameter list after a
+    /// `def`/`class`/`type` name and returns the captured parameter names.
     fn collect_pep695_type_params(&mut self) -> Result<Vec<String>, ParseError> {
         if !matches!(self.peek(), TokenKind::LSqb) {
             return Ok(Vec::new());
@@ -293,7 +371,7 @@ impl<'src> Parser<'src> {
                 break;
             }
             let name_tok = self.expect(&TokenKind::Name, "type parameter name")?;
-            names.push(self.lexeme(name_tok.span).to_owned());
+            names.push(self.ident(name_tok.span));
             // Skip optional `: bound` and `= default`.
             if matches!(self.peek(), TokenKind::Colon) {
                 self.bump();
@@ -311,37 +389,6 @@ impl<'src> Parser<'src> {
         }
         self.expect(&TokenKind::RSqb, "`]`")?;
         Ok(names)
-    }
-
-    /// PEP 695 — `[T, *Ts, **P]` after `def`/`class`/`type` names.
-    /// We swallow the entire bracket-delimited list. This keeps
-    /// the parser permissive for any 3.12+ syntax surface; the
-    /// names are not actually bound in the function/class scope.
-    fn skip_pep695_type_params(&mut self) -> Result<(), ParseError> {
-        if !matches!(self.peek(), TokenKind::LSqb) {
-            return Ok(());
-        }
-        self.bump(); // `[`
-        let mut depth = 1i32;
-        while let Some(tok) = self.tokens.get(self.pos) {
-            match &tok.kind {
-                TokenKind::LSqb => depth += 1,
-                TokenKind::RSqb => {
-                    depth -= 1;
-                    if depth == 0 {
-                        self.bump();
-                        return Ok(());
-                    }
-                }
-                TokenKind::Endmarker => break,
-                _ => {}
-            }
-            self.bump();
-        }
-        Err(ParseError::Unexpected {
-            span: self.peek_token().span,
-            message: "unterminated type-parameter list".to_owned(),
-        })
     }
 
     /// `match` is a soft keyword. The disambiguating signal is
@@ -400,10 +447,12 @@ impl<'src> Parser<'src> {
                     ) {
                         j += 1;
                     }
-                    if !matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Indent)) {
-                        return false;
+                    // A missing INDENT is still a match statement when
+                    // `case` follows — parse_match then reports CPython's
+                    // "expected an indented block after 'match' statement".
+                    if matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Indent)) {
+                        j += 1;
                     }
-                    j += 1;
                     while matches!(
                         self.tokens.get(j).map(|t| &t.kind),
                         Some(TokenKind::Nl | TokenKind::Comment)
@@ -453,9 +502,12 @@ impl<'src> Parser<'src> {
                 }
                 Ok(())
             }
-            other => Err(ParseError::Unexpected {
+            // Leftover tokens after an otherwise-complete statement are
+            // CPython's catch-all "invalid syntax" (e.g. `1 2`, or a bad
+            // string prefix like `fu''` which tokenises as NAME + STRING).
+            _ => Err(ParseError::Unexpected {
                 span: self.peek_token().span,
-                message: format!("expected end of statement, got {other:?}"),
+                message: "invalid syntax".to_owned(),
             }),
         }
     }
@@ -470,15 +522,15 @@ impl<'src> Parser<'src> {
         // Augmented assignment.
         if let Some(op) = self.try_aug_op() {
             let value = self.parse_expression_list(true)?;
+            let end = self.prev_token_span();
             self.consume_stmt_end()?;
-            let span = start_span.merge(value.span);
             return Ok(Stmt {
                 kind: StmtKind::AugAssign {
                     target: first,
                     op,
                     value,
                 },
-                span,
+                span: start_span.merge(end),
             });
         }
 
@@ -491,15 +543,15 @@ impl<'src> Parser<'src> {
             } else {
                 None
             };
+            let end = self.prev_token_span();
             self.consume_stmt_end()?;
-            let end_span = value.as_ref().map_or(annotation.span, |v| v.span);
             return Ok(Stmt {
                 kind: StmtKind::AnnAssign {
                     target: first,
                     annotation,
                     value,
                 },
-                span: start_span.merge(end_span),
+                span: start_span.merge(end),
             });
         }
 
@@ -513,14 +565,14 @@ impl<'src> Parser<'src> {
                 if self.check(&TokenKind::Equal) {
                     targets.push(next);
                 } else {
+                    let end = self.prev_token_span();
                     self.consume_stmt_end()?;
-                    let span = start_span.merge(next.span);
                     return Ok(Stmt {
                         kind: StmtKind::Assign {
                             targets,
                             value: next,
                         },
-                        span,
+                        span: start_span.merge(end),
                     });
                 }
             }
@@ -529,12 +581,29 @@ impl<'src> Parser<'src> {
             unreachable!("assignment loop fell through");
         }
 
+        // Python-2-style `print foo` / `exec foo`: a bare `print`/`exec`
+        // name directly followed by another expression. CPython special-
+        // cases the diagnostic (`invalid_legacy_expression`).
+        if self.at_expression_start() {
+            if let ExprKind::Name(n) = &first.kind {
+                if n == "print" || n == "exec" {
+                    let stray = self.parse_expression_list(true)?;
+                    return Err(ParseError::Unexpected {
+                        span: first.span.merge(stray.span),
+                        message: format!(
+                            "Missing parentheses in call to '{n}'. Did you mean {n}(...)?"
+                        ),
+                    });
+                }
+            }
+        }
+
         // Plain expression statement.
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
-        let span = first.span;
         Ok(Stmt {
             kind: StmtKind::Expr(first),
-            span,
+            span: start_span.merge(end),
         })
     }
 
@@ -562,31 +631,34 @@ impl<'src> Parser<'src> {
     fn parse_function_def(&mut self, decorator_list: Vec<Expr>) -> Result<Stmt, ParseError> {
         let def_tok = self.bump(); // `def`
         let name_tok = self.expect(&TokenKind::Name, "function name")?;
-        let name = self.lexeme(name_tok.span).to_owned();
-        // PEP 695: optional `[T, *Ts, **P]` type-parameter list.
-        // Consumed-and-discarded for now — the names are real `TypeVar`-shaped
-        // objects in CPython, but the parser tolerates the syntax so generic
-        // libraries that target 3.12+ load. The compiler's downstream
-        // dataflow analysis doesn't see them today; pretty-printer round-trip
-        // loses them.
-        self.skip_pep695_type_params()?;
+        let name = self.ident(name_tok.span);
+        // PEP 695: optional `[T, *Ts, **P]` type-parameter list. The
+        // captured names desugar into `TypeVar` bindings around the def
+        // (see `desugar_pep695_def`) so annotations referencing them
+        // resolve and `f.__type_params__` is populated.
+        let type_params = self.collect_pep695_type_params()?;
         self.expect(&TokenKind::LPar, "`(`")?;
         let args = self.parse_function_arguments()?;
         self.expect(&TokenKind::RPar, "`)`")?;
-        if self.eat(&TokenKind::RArrow) {
-            let _ = self.parse_expression(false)?;
-        }
+        let returns = if self.eat(&TokenKind::RArrow) {
+            Some(self.parse_expression(false)?)
+        } else {
+            None
+        };
         self.expect(&TokenKind::Colon, "`:`")?;
-        let body = self.parse_block()?;
+        let body = self.parse_block("function definition", def_tok.span)?;
         let span_end = body.last().map_or(def_tok.span, |s| s.span);
+        let span = def_tok.span.merge(span_end);
         Ok(Stmt {
             kind: StmtKind::FunctionDef {
                 name,
                 args,
                 body,
                 decorator_list,
+                type_params,
+                returns: returns.map(Box::new),
             },
-            span: def_tok.span.merge(span_end),
+            span,
         })
     }
 
@@ -604,12 +676,16 @@ impl<'src> Parser<'src> {
                         args,
                         body,
                         decorator_list,
+                        type_params,
+                        returns,
                     } => Ok(Stmt {
                         kind: StmtKind::AsyncFunctionDef {
                             name,
                             args,
                             body,
                             decorator_list,
+                            type_params,
+                            returns,
                         },
                         span: async_tok.span.merge(stmt.span),
                     }),
@@ -669,10 +745,10 @@ impl<'src> Parser<'src> {
     fn parse_class_def(&mut self, decorator_list: Vec<Expr>) -> Result<Stmt, ParseError> {
         let class_tok = self.bump(); // `class`
         let name_tok = self.expect(&TokenKind::Name, "class name")?;
-        let name = self.lexeme(name_tok.span).to_owned();
-        // PEP 695: optional `[T, *Ts, **P]` type-parameter list (same as
-        // function form).
-        self.skip_pep695_type_params()?;
+        let name = self.ident(name_tok.span);
+        // PEP 695: optional `[T, *Ts, **P]` type-parameter list — same
+        // desugar as the function form (TypeVar bindings around the def).
+        let type_params = self.collect_pep695_type_params()?;
         let (bases, keywords) = if self.eat(&TokenKind::LPar) {
             let (a, kw) = self.parse_call_args()?;
             self.expect(&TokenKind::RPar, "`)`")?;
@@ -681,8 +757,9 @@ impl<'src> Parser<'src> {
             (Vec::new(), Vec::new())
         };
         self.expect(&TokenKind::Colon, "`:`")?;
-        let body = self.parse_block()?;
+        let body = self.parse_block("class definition", class_tok.span)?;
         let span_end = body.last().map_or(class_tok.span, |s| s.span);
+        let span = class_tok.span.merge(span_end);
         Ok(Stmt {
             kind: StmtKind::ClassDef {
                 name,
@@ -690,15 +767,16 @@ impl<'src> Parser<'src> {
                 keywords,
                 body,
                 decorator_list,
+                type_params,
             },
-            span: class_tok.span.merge(span_end),
+            span,
         })
     }
 
     fn parse_try(&mut self) -> Result<Stmt, ParseError> {
         let try_tok = self.bump(); // `try`
         self.expect(&TokenKind::Colon, "`:`")?;
-        let body = self.parse_block()?;
+        let body = self.parse_block("'try' statement", try_tok.span)?;
         self.skip_trivia_and_newlines();
         let mut handlers = Vec::new();
         let mut orelse: Vec<Stmt> = Vec::new();
@@ -722,9 +800,11 @@ impl<'src> Parser<'src> {
             }
             let (type_, name) = if self.check(&TokenKind::Colon) {
                 if is_star {
+                    // CPython anchors this at the token where the
+                    // exception type should have appeared (the `:`).
                     return Err(ParseError::Unexpected {
-                        span: exc_tok.span,
-                        message: "except* requires an exception type".to_owned(),
+                        span: self.peek_token().span,
+                        message: "expected one or more exception types".to_owned(),
                     });
                 }
                 (None, None)
@@ -733,14 +813,14 @@ impl<'src> Parser<'src> {
                 let n = if self.at_keyword(Keyword::As) {
                     self.bump();
                     let nt = self.expect(&TokenKind::Name, "name after `as`")?;
-                    Some(self.lexeme(nt.span).to_owned())
+                    Some(self.ident(nt.span))
                 } else {
                     None
                 };
                 (Some(t), n)
             };
             self.expect(&TokenKind::Colon, "`:`")?;
-            let handler_body = self.parse_block()?;
+            let handler_body = self.parse_block("'except' statement", exc_tok.span)?;
             let span_end = handler_body.last().map_or(exc_tok.span, |s| s.span);
             handlers.push(ExceptHandler {
                 type_,
@@ -752,15 +832,15 @@ impl<'src> Parser<'src> {
             self.skip_trivia_and_newlines();
         }
         if self.at_keyword(Keyword::Else) {
-            self.bump();
+            let else_tok = self.bump();
             self.expect(&TokenKind::Colon, "`:`")?;
-            orelse = self.parse_block()?;
+            orelse = self.parse_block("'else' statement", else_tok.span)?;
             self.skip_trivia_and_newlines();
         }
         if self.at_keyword(Keyword::Finally) {
-            self.bump();
+            let fin_tok = self.bump();
             self.expect(&TokenKind::Colon, "`:`")?;
-            finalbody = self.parse_block()?;
+            finalbody = self.parse_block("'finally' statement", fin_tok.span)?;
         }
         if handlers.is_empty() && finalbody.is_empty() {
             return Err(ParseError::Unexpected {
@@ -802,10 +882,11 @@ impl<'src> Parser<'src> {
             };
             (Some(e), c)
         };
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Raise { exc, cause },
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
@@ -836,7 +917,7 @@ impl<'src> Parser<'src> {
             }
         }
         self.expect(&TokenKind::Colon, "`:`")?;
-        let body = self.parse_block()?;
+        let body = self.parse_block("'with' statement", kw.span)?;
         let span_end = body.last().map_or(kw.span, |s| s.span);
         Ok(Stmt {
             kind: StmtKind::With { items, body },
@@ -904,19 +985,26 @@ impl<'src> Parser<'src> {
         // 2 = keyword-only (after `*`)
         let mut phase = 0u8;
         let mut had_default = false;
+        // A bare `*` separator (no `*args` name) requires at least one
+        // keyword-only argument to follow it; CPython rejects `def f(p, *)`
+        // and `def f(p, *, **kw)` with "named arguments must follow bare *".
+        let mut bare_star_span: Option<Span> = None;
         loop {
             if self.check(&TokenKind::RPar) || self.check(&TokenKind::Colon) {
                 break;
             }
             // `*args` or bare `*` separator.
-            if self.eat(&TokenKind::Star) {
+            if self.check(&TokenKind::Star) {
+                let star_tok = self.bump();
                 if matches!(self.peek(), TokenKind::Name) {
                     let n = self.bump();
                     args.vararg = Some(Arg {
-                        name: self.lexeme(n.span).to_owned(),
+                        name: self.ident(n.span),
                         annotation: self.try_arg_annotation(allow_annotation)?,
                         span: n.span,
                     });
+                } else {
+                    bare_star_span = Some(star_tok.span);
                 }
                 phase = 2;
                 if !self.eat(&TokenKind::Comma) {
@@ -928,7 +1016,7 @@ impl<'src> Parser<'src> {
             if self.eat(&TokenKind::DoubleStar) {
                 let n = self.expect(&TokenKind::Name, "kwarg name")?;
                 args.kwarg = Some(Arg {
-                    name: self.lexeme(n.span).to_owned(),
+                    name: self.ident(n.span),
                     annotation: self.try_arg_annotation(allow_annotation)?,
                     span: n.span,
                 });
@@ -948,7 +1036,7 @@ impl<'src> Parser<'src> {
             }
 
             let n = self.expect(&TokenKind::Name, "parameter name")?;
-            let name = self.lexeme(n.span).to_owned();
+            let name = self.ident(n.span);
             let annotation = self.try_arg_annotation(allow_annotation)?;
             let default = if self.eat(&TokenKind::Equal) {
                 Some(self.parse_expression(false)?)
@@ -980,6 +1068,38 @@ impl<'src> Parser<'src> {
                 break;
             }
         }
+        // A bare `*` must be followed by at least one keyword-only
+        // argument (CPython: "named arguments must follow bare *").
+        if let Some(span) = bare_star_span {
+            if args.kwonlyargs.is_empty() {
+                return Err(ParseError::Unexpected {
+                    span,
+                    message: "named arguments must follow bare *".to_owned(),
+                });
+            }
+        }
+        // No parameter name may repeat across any section
+        // (positional-only, positional-or-keyword, `*args`, keyword-only,
+        // `**kwargs`) — CPython raises "duplicate argument '<n>' in
+        // function definition".
+        let mut seen: Vec<&str> = Vec::new();
+        let dup_span = |span: Span, name: &str| ParseError::Unexpected {
+            span,
+            message: format!("duplicate argument '{name}' in function definition"),
+        };
+        for a in args
+            .posonlyargs
+            .iter()
+            .chain(args.args.iter())
+            .chain(args.vararg.iter())
+            .chain(args.kwonlyargs.iter())
+            .chain(args.kwarg.iter())
+        {
+            if seen.contains(&a.name.as_str()) {
+                return Err(dup_span(a.span, &a.name));
+            }
+            seen.push(a.name.as_str());
+        }
         Ok(args)
     }
 
@@ -992,18 +1112,23 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_if(&mut self) -> Result<Stmt, ParseError> {
-        let if_tok = self.bump(); // `if`
+        let if_tok = self.bump(); // `if` (or `elif` — see recursion below)
+        let if_what = if matches!(if_tok.kind, TokenKind::Keyword(Keyword::Elif)) {
+            "'elif' statement"
+        } else {
+            "'if' statement"
+        };
         let test = self.parse_expression(false)?;
         self.expect(&TokenKind::Colon, "`:`")?;
-        let body = self.parse_block()?;
+        let body = self.parse_block(if_what, if_tok.span)?;
         let orelse = if self.at_keyword(Keyword::Elif) {
             // Recurse: elif → nested `if`.
             let nested = self.parse_if()?;
             vec![nested]
         } else if self.at_keyword(Keyword::Else) {
-            self.bump();
+            let else_tok = self.bump();
             self.expect(&TokenKind::Colon, "`:`")?;
-            self.parse_block()?
+            self.parse_block("'else' statement", else_tok.span)?
         } else {
             Vec::new()
         };
@@ -1021,11 +1146,11 @@ impl<'src> Parser<'src> {
         let kw = self.bump();
         let test = self.parse_expression(false)?;
         self.expect(&TokenKind::Colon, "`:`")?;
-        let body = self.parse_block()?;
+        let body = self.parse_block("'while' statement", kw.span)?;
         let orelse = if self.at_keyword(Keyword::Else) {
-            self.bump();
+            let else_tok = self.bump();
             self.expect(&TokenKind::Colon, "`:`")?;
-            self.parse_block()?
+            self.parse_block("'else' statement", else_tok.span)?
         } else {
             Vec::new()
         };
@@ -1055,11 +1180,11 @@ impl<'src> Parser<'src> {
         self.bump();
         let iter = self.parse_expression_list(false)?;
         self.expect(&TokenKind::Colon, "`:`")?;
-        let body = self.parse_block()?;
+        let body = self.parse_block("'for' statement", kw.span)?;
         let orelse = if self.at_keyword(Keyword::Else) {
-            self.bump();
+            let else_tok = self.bump();
             self.expect(&TokenKind::Colon, "`:`")?;
-            self.parse_block()?
+            self.parse_block("'else' statement", else_tok.span)?
         } else {
             Vec::new()
         };
@@ -1088,8 +1213,8 @@ impl<'src> Parser<'src> {
         } else {
             Some(self.parse_expression_list(true)?)
         };
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
-        let end = value.as_ref().map_or(kw.span, |e| e.span);
         Ok(Stmt {
             kind: StmtKind::Return(value),
             span: kw.span.merge(end),
@@ -1104,7 +1229,7 @@ impl<'src> Parser<'src> {
             let asname = if self.at_keyword(Keyword::As) {
                 self.bump();
                 let n = self.expect(&TokenKind::Name, "name after `as`")?;
-                Some(self.lexeme(n.span).to_owned())
+                Some(self.ident(n.span))
             } else {
                 None
             };
@@ -1116,20 +1241,21 @@ impl<'src> Parser<'src> {
                 break;
             }
         }
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Import(names),
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
     fn parse_dotted_name(&mut self) -> Result<String, ParseError> {
         let first = self.expect(&TokenKind::Name, "module name")?;
-        let mut out = self.lexeme(first.span).to_owned();
+        let mut out = self.ident(first.span);
         while self.eat(&TokenKind::Dot) {
             let n = self.expect(&TokenKind::Name, "name after `.`")?;
             out.push('.');
-            out.push_str(self.lexeme(n.span));
+            out.push_str(&self.ident(n.span));
         }
         Ok(out)
     }
@@ -1167,11 +1293,11 @@ impl<'src> Parser<'src> {
                     break;
                 }
                 let n = self.expect(&TokenKind::Name, "imported name")?;
-                let name = self.lexeme(n.span).to_owned();
+                let name = self.ident(n.span);
                 let asname = if self.at_keyword(Keyword::As) {
                     self.bump();
                     let n2 = self.expect(&TokenKind::Name, "name after `as`")?;
-                    Some(self.lexeme(n2.span).to_owned())
+                    Some(self.ident(n2.span))
                 } else {
                     None
                 };
@@ -1185,6 +1311,7 @@ impl<'src> Parser<'src> {
             }
             names
         };
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::ImportFrom {
@@ -1192,27 +1319,29 @@ impl<'src> Parser<'src> {
                 names,
                 level,
             },
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
     fn parse_global(&mut self) -> Result<Stmt, ParseError> {
         let kw = self.bump();
         let names = self.parse_name_list()?;
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Global(names),
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
     fn parse_nonlocal(&mut self) -> Result<Stmt, ParseError> {
         let kw = self.bump();
         let names = self.parse_name_list()?;
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Nonlocal(names),
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
@@ -1231,10 +1360,11 @@ impl<'src> Parser<'src> {
             }
             targets.push(self.parse_ternary()?);
         }
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
         Ok(Stmt {
             kind: StmtKind::Delete(targets),
-            span: kw.span,
+            span: kw.span.merge(end),
         })
     }
 
@@ -1251,8 +1381,8 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
+        let end = self.prev_token_span();
         self.consume_stmt_end()?;
-        let end = msg.as_ref().map(|m| m.span).unwrap_or(test.span);
         Ok(Stmt {
             kind: StmtKind::Assert { test, msg },
             span: kw.span.merge(end),
@@ -1263,7 +1393,7 @@ impl<'src> Parser<'src> {
         let mut names = Vec::new();
         loop {
             let n = self.expect(&TokenKind::Name, "name")?;
-            names.push(self.lexeme(n.span).to_owned());
+            names.push(self.ident(n.span));
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -1282,7 +1412,16 @@ impl<'src> Parser<'src> {
         self.expect(&TokenKind::Colon, "`:`")?;
         self.expect(&TokenKind::Newline, "newline after `match ... :`")?;
         self.skip_trivia_and_newlines();
-        self.expect(&TokenKind::Indent, "indented block")?;
+        if !self.check(&TokenKind::Indent) {
+            return Err(ParseError::Indentation {
+                span: self.peek_token().span,
+                message: format!(
+                    "expected an indented block after 'match' statement on line {}",
+                    self.line_of(kw.span)
+                ),
+            });
+        }
+        self.bump();
 
         let mut cases = Vec::new();
         loop {
@@ -1346,7 +1485,7 @@ impl<'src> Parser<'src> {
             None
         };
         self.expect(&TokenKind::Colon, "`:`")?;
-        let body = self.parse_block()?;
+        let body = self.parse_block("'case' statement", case_tok.span)?;
         let span_end = body.last().map_or(case_tok.span, |s| s.span);
         Ok(MatchCase {
             pattern,
@@ -1362,7 +1501,7 @@ impl<'src> Parser<'src> {
         if self.at_keyword(Keyword::As) {
             self.bump();
             let n = self.expect(&TokenKind::Name, "name after `as`")?;
-            let name = self.lexeme(n.span).to_owned();
+            let name = self.ident(n.span);
             if name == "_" {
                 return Err(ParseError::Unexpected {
                     span: n.span,
@@ -1399,7 +1538,7 @@ impl<'src> Parser<'src> {
             let name = match self.peek() {
                 TokenKind::Name => {
                     let tok = self.bump();
-                    let s = self.lexeme(tok.span).to_owned();
+                    let s = self.ident(tok.span);
                     if s == "_" {
                         None
                     } else {
@@ -1500,7 +1639,7 @@ impl<'src> Parser<'src> {
     /// value pattern; `(` makes it a class pattern; otherwise capture.
     fn parse_name_pattern(&mut self) -> Result<Pattern, ParseError> {
         let first = self.bump();
-        let first_name = self.lexeme(first.span).to_owned();
+        let first_name = self.ident(first.span);
         // Dotted: value pattern.
         if self.check(&TokenKind::Dot) {
             let mut expr = Expr {
@@ -1509,7 +1648,7 @@ impl<'src> Parser<'src> {
             };
             while self.eat(&TokenKind::Dot) {
                 let n = self.expect(&TokenKind::Name, "attribute name in pattern")?;
-                let attr = self.lexeme(n.span).to_owned();
+                let attr = self.ident(n.span);
                 let span = expr.span.merge(n.span);
                 expr = Expr {
                     kind: ExprKind::Attribute {
@@ -1550,7 +1689,7 @@ impl<'src> Parser<'src> {
                 && matches!(self.peek_at(1), Some(TokenKind::Equal))
             {
                 let n = self.bump();
-                let name = self.lexeme(n.span).to_owned();
+                let name = self.ident(n.span);
                 self.bump(); // `=`
                 let p = self.parse_pattern()?;
                 keywords.push((name, p));
@@ -1625,10 +1764,19 @@ impl<'src> Parser<'src> {
         while !self.check(&TokenKind::RBrace) {
             if self.eat(&TokenKind::DoubleStar) {
                 let n = self.expect(&TokenKind::Name, "name after `**` in mapping pattern")?;
-                let name = self.lexeme(n.span).to_owned();
+                let name = self.ident(n.span);
                 rest = Some(if name == "_" { None } else { Some(name) });
                 if !self.eat(&TokenKind::Comma) {
                     break;
+                }
+                // PEP 634: `**rest` must be the last item in a mapping
+                // pattern. CPython reports a plain "invalid syntax"
+                // anchored at the trailing item.
+                if !self.check(&TokenKind::RBrace) {
+                    return Err(ParseError::Unexpected {
+                        span: self.peek_token().span,
+                        message: "invalid syntax".to_owned(),
+                    });
                 }
                 continue;
             }
@@ -1682,12 +1830,12 @@ impl<'src> Parser<'src> {
         // Dotted name as a value key.
         let n = self.expect(&TokenKind::Name, "key")?;
         let mut expr = Expr {
-            kind: ExprKind::Name(self.lexeme(n.span).to_owned()),
+            kind: ExprKind::Name(self.ident(n.span)),
             span: n.span,
         };
         while self.eat(&TokenKind::Dot) {
             let attr_tok = self.expect(&TokenKind::Name, "attribute name in key")?;
-            let attr = self.lexeme(attr_tok.span).to_owned();
+            let attr = self.ident(attr_tok.span);
             let span = expr.span.merge(attr_tok.span);
             expr = Expr {
                 kind: ExprKind::Attribute {
@@ -1700,13 +1848,36 @@ impl<'src> Parser<'src> {
         Ok(expr)
     }
 
-    fn parse_block(&mut self) -> Result<Vec<Stmt>, ParseError> {
+    /// 1-based source line containing the start of `span`.
+    fn line_of(&self, span: weavepy_lexer::Span) -> u32 {
+        let start = (span.start.0 as usize).min(self.source.len());
+        self.source[..start].bytes().filter(|&b| b == b'\n').count() as u32 + 1
+    }
+
+    /// Block suite after `:`. `after` names the introducing construct
+    /// for CPython's IndentationError message ("'if' statement",
+    /// "function definition", …); `intro_span` is the keyword's span,
+    /// whose line number the message cites.
+    fn parse_block(
+        &mut self,
+        after: &str,
+        intro_span: weavepy_lexer::Span,
+    ) -> Result<Vec<Stmt>, ParseError> {
         // After the `:`, either a single inline statement or a
         // NEWLINE INDENT block DEDENT.
         if matches!(self.peek(), TokenKind::Newline) {
             self.bump();
             self.skip_trivia_and_newlines();
-            self.expect(&TokenKind::Indent, "indented block")?;
+            if !self.check(&TokenKind::Indent) {
+                return Err(ParseError::Indentation {
+                    span: self.peek_token().span,
+                    message: format!(
+                        "expected an indented block after {after} on line {}",
+                        self.line_of(intro_span)
+                    ),
+                });
+            }
+            self.bump();
             let mut body = Vec::new();
             loop {
                 self.skip_trivia_and_newlines();
@@ -1725,9 +1896,39 @@ impl<'src> Parser<'src> {
             }
             Ok(body)
         } else {
-            // Inline single-statement block: `if x: y = 1`, `class A: pass`.
-            let s = self.parse_statement()?;
-            Ok(vec![s])
+            // Inline suite after `:` — Python's `simple_stmt`:
+            //   small_stmt (';' small_stmt)* [';'] NEWLINE
+            // e.g. `if x: y = 1`, `class A: pass`, and crucially the
+            // multi-statement form `def f(): a = 1; return a`. We used to
+            // parse only the first statement, leaving `; return a` to be
+            // re-parsed by the *enclosing* scope — which then rejected the
+            // `return` as "outside function". Each `parse_statement`
+            // consumes its own terminator (`;` or NEWLINE via
+            // `consume_stmt_end`), so we keep going while that terminator
+            // was a `;` and another small statement follows on the line.
+            let mut body = Vec::new();
+            loop {
+                body.push(self.parse_statement()?);
+                let ended_with_semi = matches!(
+                    self.tokens.get(self.pos.wrapping_sub(1)).map(|t| &t.kind),
+                    Some(TokenKind::Semi)
+                );
+                if !ended_with_semi {
+                    break;
+                }
+                // A trailing `;` right before the line break (`a = 1;`)
+                // ends the suite; consume the closing NEWLINE so the
+                // caller resumes from a clean statement boundary.
+                match self.peek() {
+                    TokenKind::Newline => {
+                        self.bump();
+                        break;
+                    }
+                    TokenKind::Endmarker | TokenKind::Dedent => break,
+                    _ => {}
+                }
+            }
+            Ok(body)
         }
     }
 
@@ -1791,7 +1992,10 @@ impl<'src> Parser<'src> {
             let star_tok = self.peek_token().clone();
             self.bump();
             let inner = self.parse_ternary()?;
-            let span = star_tok.span.merge(inner.span);
+            // Token-range span (CPython's EXTRA): a parenthesized
+            // operand's node span excludes its parens, so merge with
+            // the last *consumed token* instead of the child span.
+            let span = star_tok.span.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::Starred(Box::new(inner)),
                 span,
@@ -1818,11 +2022,11 @@ impl<'src> Parser<'src> {
             if let Some(next) = self.tokens.get(self.pos + 1) {
                 if matches!(next.kind, TokenKind::ColonEqual) {
                     let name_tok = self.peek_token().clone();
-                    let name = self.lexeme(name_tok.span).to_owned();
+                    let name = self.ident(name_tok.span);
                     self.bump(); // name
                     self.bump(); // :=
                     let value = self.parse_ternary()?;
-                    let span = name_tok.span.merge(value.span);
+                    let span = name_tok.span.merge(self.prev_token_span());
                     return Ok(Expr {
                         kind: ExprKind::NamedExpr {
                             target: Box::new(Expr {
@@ -1836,6 +2040,7 @@ impl<'src> Parser<'src> {
                 }
             }
         }
+        let start = self.peek_token().span;
         let body = self.parse_or()?;
         if self.at_keyword(Keyword::If) {
             self.bump();
@@ -1848,7 +2053,7 @@ impl<'src> Parser<'src> {
             }
             self.bump();
             let orelse = self.parse_ternary()?;
-            let span = body.span.merge(orelse.span);
+            let span = start.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::IfExp {
                     test: Box::new(test),
@@ -1866,7 +2071,7 @@ impl<'src> Parser<'src> {
         if self.at_keyword(Keyword::From) {
             self.bump();
             let value = self.parse_ternary()?;
-            let span = kw.span.merge(value.span);
+            let span = kw.span.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::YieldFrom(Box::new(value)),
                 span,
@@ -1893,7 +2098,7 @@ impl<'src> Parser<'src> {
             });
         }
         let value = self.parse_expression_list(true)?;
-        let span = kw.span.merge(value.span);
+        let span = kw.span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Yield(Some(Box::new(value))),
             span,
@@ -1909,7 +2114,7 @@ impl<'src> Parser<'src> {
         };
         self.expect(&TokenKind::Colon, "`:`")?;
         let body = self.parse_ternary()?;
-        let span = kw.span.merge(body.span);
+        let span = kw.span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Lambda {
                 args,
@@ -1920,6 +2125,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let first = self.parse_and()?;
         if !self.at_keyword(Keyword::Or) {
             return Ok(first);
@@ -1929,11 +2135,7 @@ impl<'src> Parser<'src> {
             self.bump();
             values.push(self.parse_and()?);
         }
-        let span = values
-            .first()
-            .unwrap()
-            .span
-            .merge(values.last().unwrap().span);
+        let span = start.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::BoolOp {
                 op: BoolOp::Or,
@@ -1944,6 +2146,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let first = self.parse_not()?;
         if !self.at_keyword(Keyword::And) {
             return Ok(first);
@@ -1953,11 +2156,7 @@ impl<'src> Parser<'src> {
             self.bump();
             values.push(self.parse_not()?);
         }
-        let span = values
-            .first()
-            .unwrap()
-            .span
-            .merge(values.last().unwrap().span);
+        let span = start.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::BoolOp {
                 op: BoolOp::And,
@@ -1971,7 +2170,7 @@ impl<'src> Parser<'src> {
         if self.at_keyword(Keyword::Not) {
             let kw = self.bump();
             let operand = self.parse_not()?;
-            let span = kw.span.merge(operand.span);
+            let span = kw.span.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::UnaryOp {
                     op: UnaryOp::Not,
@@ -1984,6 +2183,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let left = self.parse_bit_or()?;
         let mut ops = Vec::new();
         let mut comparators = Vec::new();
@@ -1994,7 +2194,7 @@ impl<'src> Parser<'src> {
         if ops.is_empty() {
             return Ok(left);
         }
-        let span = left.span.merge(comparators.last().unwrap().span);
+        let span = start.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::Compare {
                 left: Box::new(left),
@@ -2039,11 +2239,17 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_bit_or(&mut self) -> Result<Expr, ParseError> {
+        // All the binop ladders use token-range spans (`start` is the
+        // first token of the rule, the end is the last consumed token)
+        // so a parenthesized operand — whose node span excludes the
+        // parens, as in CPython — still yields `(a) + b` spanning from
+        // the `(`. PEP-657 caret anchors depend on this.
+        let start = self.peek_token().span;
         let mut left = self.parse_bit_xor()?;
         while self.check(&TokenKind::Vbar) {
             self.bump();
             let right = self.parse_bit_xor()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2057,11 +2263,12 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_bit_xor(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_bit_and()?;
         while self.check(&TokenKind::Caret) {
             self.bump();
             let right = self.parse_bit_and()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2075,11 +2282,12 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_bit_and(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_shift()?;
         while self.check(&TokenKind::Amper) {
             self.bump();
             let right = self.parse_shift()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2093,6 +2301,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_shift(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_addsub()?;
         loop {
             let op = match self.peek() {
@@ -2102,7 +2311,7 @@ impl<'src> Parser<'src> {
             };
             self.bump();
             let right = self.parse_addsub()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2116,6 +2325,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_addsub(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_muldiv()?;
         loop {
             let op = match self.peek() {
@@ -2125,7 +2335,7 @@ impl<'src> Parser<'src> {
             };
             self.bump();
             let right = self.parse_muldiv()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2139,6 +2349,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_muldiv(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek() {
@@ -2151,7 +2362,7 @@ impl<'src> Parser<'src> {
             };
             self.bump();
             let right = self.parse_unary()?;
-            let span = left.span.merge(right.span);
+            let span = start.merge(self.prev_token_span());
             left = Expr {
                 kind: ExprKind::BinOp {
                     left: Box::new(left),
@@ -2170,8 +2381,17 @@ impl<'src> Parser<'src> {
         // matching CPython.
         if self.at_keyword(Keyword::Await) {
             let kw = self.bump();
+            // CPython grammar: `await_primary: AWAIT primary` — a
+            // directly chained `await await x` is invalid syntax
+            // (`await (await x)` is fine: the parens make a primary).
+            if self.at_keyword(Keyword::Await) {
+                return Err(ParseError::Unexpected {
+                    span: kw.span,
+                    message: "invalid syntax".to_owned(),
+                });
+            }
             let operand = self.parse_unary()?;
-            let span = kw.span.merge(operand.span);
+            let span = kw.span.merge(self.prev_token_span());
             return Ok(Expr {
                 kind: ExprKind::Await(Box::new(operand)),
                 span,
@@ -2185,7 +2405,7 @@ impl<'src> Parser<'src> {
         };
         let kw = self.bump();
         let operand = self.parse_unary()?;
-        let span = kw.span.merge(operand.span);
+        let span = kw.span.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::UnaryOp {
                 op,
@@ -2196,6 +2416,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_power(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek_token().span;
         let base = self.parse_trailer_chain()?;
         if !self.check(&TokenKind::DoubleStar) {
             return Ok(base);
@@ -2205,7 +2426,7 @@ impl<'src> Parser<'src> {
         // the right side. Python's grammar: `power: await? primary ('**' factor)?`
         // where `factor` includes unary.
         let exponent = self.parse_unary()?;
-        let span = base.span.merge(exponent.span);
+        let span = start.merge(self.prev_token_span());
         Ok(Expr {
             kind: ExprKind::BinOp {
                 left: Box::new(base),
@@ -2217,6 +2438,9 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_trailer_chain(&mut self) -> Result<Expr, ParseError> {
+        // Token-range spans: `( a ).m()[0]` chains span from the `(`
+        // even though the parenthesized base node itself starts at `a`.
+        let start = self.peek_token().span;
         let mut base = self.parse_atom()?;
         loop {
             match self.peek() {
@@ -2224,7 +2448,7 @@ impl<'src> Parser<'src> {
                     self.bump();
                     let (args, keywords) = self.parse_call_args()?;
                     let rp = self.expect(&TokenKind::RPar, "`)`")?;
-                    let span = base.span.merge(rp.span);
+                    let span = start.merge(rp.span);
                     base = Expr {
                         kind: ExprKind::Call {
                             func: Box::new(base),
@@ -2238,7 +2462,7 @@ impl<'src> Parser<'src> {
                     self.bump();
                     let slice = self.parse_subscript()?;
                     let rb = self.expect(&TokenKind::RSqb, "`]`")?;
-                    let span = base.span.merge(rb.span);
+                    let span = start.merge(rb.span);
                     base = Expr {
                         kind: ExprKind::Subscript {
                             value: Box::new(base),
@@ -2250,8 +2474,8 @@ impl<'src> Parser<'src> {
                 TokenKind::Dot => {
                     self.bump();
                     let n = self.expect(&TokenKind::Name, "attribute name")?;
-                    let attr = self.lexeme(n.span).to_owned();
-                    let span = base.span.merge(n.span);
+                    let attr = self.ident(n.span);
+                    let span = start.merge(n.span);
                     base = Expr {
                         kind: ExprKind::Attribute {
                             value: Box::new(base),
@@ -2272,9 +2496,17 @@ impl<'src> Parser<'src> {
         if self.check(&TokenKind::RPar) {
             return Ok((args, keywords));
         }
+        // Track keyword state so we can reject a plain positional argument
+        // that follows a keyword (CPython: "positional argument follows
+        // keyword argument") and a repeated keyword name (CPython:
+        // "keyword argument repeated: <name>").
+        let mut seen_keyword = false;
+        let mut kw_names: Vec<String> = Vec::new();
         loop {
+            let arg_start = self.peek_token().span;
             if self.eat(&TokenKind::DoubleStar) {
                 let val = self.parse_ternary()?;
+                seen_keyword = true;
                 keywords.push(KwArg {
                     arg: None,
                     value: val,
@@ -2292,23 +2524,53 @@ impl<'src> Parser<'src> {
                     && matches!(self.peek_at(1), Some(TokenKind::Equal))
                 {
                     let nt = self.bump();
-                    let name = self.lexeme(nt.span).to_owned();
+                    let name = self.ident(nt.span);
+                    if kw_names.contains(&name) {
+                        return Err(ParseError::Unexpected {
+                            span: nt.span,
+                            message: format!("keyword argument repeated: {name}"),
+                        });
+                    }
                     self.bump(); // `=`
                     let val = self.parse_ternary()?;
+                    seen_keyword = true;
+                    kw_names.push(name.clone());
                     keywords.push(KwArg {
                         arg: Some(name),
                         value: val,
                     });
                 } else {
+                    if seen_keyword {
+                        return Err(ParseError::Unexpected {
+                            span: self.peek_token().span,
+                            message: "positional argument follows keyword argument".to_owned(),
+                        });
+                    }
                     let e = self.parse_ternary()?;
+                    // `f(1=2)` — a non-name expression followed by `=`.
+                    if self.check(&TokenKind::Equal) {
+                        return Err(ParseError::Unexpected {
+                            span: e.span,
+                            message: "expression cannot contain assignment, perhaps you meant \
+                                      \"==\"?"
+                                .to_owned(),
+                        });
+                    }
                     // Generator expression as single argument: `f(x for x in xs)`.
-                    if (self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async))
-                        && args.is_empty()
-                        && keywords.is_empty()
-                    {
+                    if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
                         let elt = e;
                         let generators = self.parse_comp_for()?;
-                        let span = elt.span;
+                        // CPython's genexp node (and the
+                        // must-be-parenthesized error) spans the whole
+                        // `elt for … in …`, not just the element.
+                        let span = elt.span.merge(self.prev_token_span());
+                        // A bare genexp must be the *only* argument.
+                        if !(args.is_empty() && keywords.is_empty()) {
+                            return Err(ParseError::Unexpected {
+                                span,
+                                message: "Generator expression must be parenthesized".to_owned(),
+                            });
+                        }
                         args.push(Expr {
                             kind: ExprKind::GeneratorExp {
                                 elt: Box::new(elt),
@@ -2316,12 +2578,33 @@ impl<'src> Parser<'src> {
                             },
                             span,
                         });
+                        if self.check(&TokenKind::Comma) {
+                            return Err(ParseError::Unexpected {
+                                span,
+                                message: "Generator expression must be parenthesized".to_owned(),
+                            });
+                        }
                     } else {
                         args.push(e);
                     }
                 }
             }
+            // Span of the most recent argument — CPython's "Perhaps you
+            // forgot a comma?" underlines the *previous* element when two
+            // expressions abut.
+            let last_arg_span = Some(arg_start.merge(self.prev_token_span()));
             if !self.eat(&TokenKind::Comma) {
+                // Two adjacent expressions with no comma — CPython's
+                // `invalid_expression` rule anchors the error at the
+                // *previous* element and suggests the missing comma.
+                if !self.check(&TokenKind::RPar) && self.at_expression_start() {
+                    if let Some(prev) = last_arg_span {
+                        return Err(ParseError::Unexpected {
+                            span: prev,
+                            message: "invalid syntax. Perhaps you forgot a comma?".to_owned(),
+                        });
+                    }
+                }
                 break;
             }
             if self.check(&TokenKind::RPar) {
@@ -2329,6 +2612,33 @@ impl<'src> Parser<'src> {
             }
         }
         Ok((args, keywords))
+    }
+
+    /// Could the current token begin an expression? Drives the
+    /// "Perhaps you forgot a comma?" heuristic.
+    fn at_expression_start(&self) -> bool {
+        match self.peek() {
+            TokenKind::Name
+            | TokenKind::Number
+            | TokenKind::String
+            | TokenKind::LPar
+            | TokenKind::LSqb
+            | TokenKind::LBrace
+            | TokenKind::Minus
+            | TokenKind::Plus
+            | TokenKind::Tilde
+            | TokenKind::Ellipsis => true,
+            TokenKind::Keyword(k) => matches!(
+                k,
+                Keyword::Lambda
+                    | Keyword::Not
+                    | Keyword::Await
+                    | Keyword::None
+                    | Keyword::True
+                    | Keyword::False
+            ),
+            _ => false,
+        }
     }
 
     fn parse_subscript(&mut self) -> Result<Expr, ParseError> {
@@ -2442,7 +2752,7 @@ impl<'src> Parser<'src> {
             TokenKind::Name => {
                 self.bump();
                 Ok(Expr {
-                    kind: ExprKind::Name(self.lexeme(tok.span).to_owned()),
+                    kind: ExprKind::Name(self.ident(tok.span)),
                     span: tok.span,
                 })
             }
@@ -2486,11 +2796,12 @@ impl<'src> Parser<'src> {
 
     fn parse_paren_or_tuple(&mut self) -> Result<Expr, ParseError> {
         let lp = self.bump();
-        if self.eat(&TokenKind::RPar) {
-            // Empty tuple
+        if self.check(&TokenKind::RPar) {
+            // Empty tuple — spans both parens.
+            let rp = self.bump();
             return Ok(Expr {
                 kind: ExprKind::Tuple(Vec::new()),
-                span: lp.span,
+                span: lp.span.merge(rp.span),
             });
         }
         let first = self.parse_ternary_or_starred()?;
@@ -2516,7 +2827,7 @@ impl<'src> Parser<'src> {
                 }
                 items.push(self.parse_ternary_or_starred()?);
             }
-            let rp = self.expect(&TokenKind::RPar, "`)`")?;
+            let rp = self.expect_or_forgot_comma(&TokenKind::RPar, "`)`", &items)?;
             return Ok(Expr {
                 kind: ExprKind::Tuple(items),
                 span: lp.span.merge(rp.span),
@@ -2531,12 +2842,13 @@ impl<'src> Parser<'src> {
                 message: "can't use starred expression here".to_owned(),
             });
         }
-        // Plain parenthesized expression — keep its span but no wrapper node.
-        let rp = self.expect(&TokenKind::RPar, "`)`")?;
-        Ok(Expr {
-            kind: first.kind,
-            span: lp.span.merge(rp.span),
-        })
+        // Plain parenthesized expression: no wrapper node, and — exactly
+        // like CPython's grammar actions — the node keeps the *inner*
+        // span, excluding the parentheses. `traceback`'s caret-anchor
+        // probe (`ast.parse(f"(\n{segment}\n)")`) depends on this:
+        // positions must point into `segment`, not at the added parens.
+        self.expect_or_forgot_comma(&TokenKind::RPar, "`)`", std::slice::from_ref(&first))?;
+        Ok(first)
     }
 
     fn parse_list_or_listcomp(&mut self) -> Result<Expr, ParseError> {
@@ -2549,7 +2861,13 @@ impl<'src> Parser<'src> {
         }
         let first = self.parse_ternary_or_starred()?;
         let first_starred = matches!(first.kind, ExprKind::Starred(_));
-        if !first_starred && (self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async)) {
+        if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
+            if first_starred {
+                return Err(ParseError::Unexpected {
+                    span: first.span,
+                    message: "iterable unpacking cannot be used in comprehension".to_owned(),
+                });
+            }
             let generators = self.parse_comp_for()?;
             let rb = self.expect(&TokenKind::RSqb, "`]`")?;
             return Ok(Expr {
@@ -2567,7 +2885,7 @@ impl<'src> Parser<'src> {
             }
             items.push(self.parse_ternary_or_starred()?);
         }
-        let rb = self.expect(&TokenKind::RSqb, "`]`")?;
+        let rb = self.expect_or_forgot_comma(&TokenKind::RSqb, "`]`", &items)?;
         Ok(Expr {
             kind: ExprKind::List(items),
             span: lb.span.merge(rb.span),
@@ -2601,13 +2919,13 @@ impl<'src> Parser<'src> {
                     values.push(self.parse_ternary()?);
                 } else {
                     let k = self.parse_ternary()?;
-                    self.expect(&TokenKind::Colon, "`:`")?;
+                    self.expect_dict_colon(&k)?;
                     let v = self.parse_ternary()?;
                     keys.push(Some(k));
                     values.push(v);
                 }
             }
-            let rb = self.expect(&TokenKind::RBrace, "`}`")?;
+            let rb = self.expect_or_forgot_comma(&TokenKind::RBrace, "`}`", &values)?;
             return Ok(Expr {
                 kind: ExprKind::Dict { keys, values },
                 span: lb.span.merge(rb.span),
@@ -2641,20 +2959,26 @@ impl<'src> Parser<'src> {
                     values.push(self.parse_ternary()?);
                 } else {
                     let k = self.parse_ternary()?;
-                    self.expect(&TokenKind::Colon, "`:`")?;
+                    self.expect_dict_colon(&k)?;
                     let vv = self.parse_ternary()?;
                     keys.push(Some(k));
                     values.push(vv);
                 }
             }
-            let rb = self.expect(&TokenKind::RBrace, "`}`")?;
+            let rb = self.expect_or_forgot_comma(&TokenKind::RBrace, "`}`", &values)?;
             return Ok(Expr {
                 kind: ExprKind::Dict { keys, values },
                 span: lb.span.merge(rb.span),
             });
         }
         // Otherwise: set literal or set comp.
-        if !first_starred && (self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async)) {
+        if self.at_keyword(Keyword::For) || self.at_keyword(Keyword::Async) {
+            if first_starred {
+                return Err(ParseError::Unexpected {
+                    span: first.span,
+                    message: "iterable unpacking cannot be used in comprehension".to_owned(),
+                });
+            }
             let generators = self.parse_comp_for()?;
             let rb = self.expect(&TokenKind::RBrace, "`}`")?;
             return Ok(Expr {
@@ -2665,14 +2989,36 @@ impl<'src> Parser<'src> {
                 span: lb.span.merge(rb.span),
             });
         }
+        // A `=` right after a would-be dict key: `{k=22}`. CPython:
+        // "cannot assign to <expr> here. Maybe you meant '==' instead
+        // of '='?", anchored at the key.
+        if self.check(&TokenKind::Equal) {
+            return Err(ParseError::Unexpected {
+                span: first.span,
+                message: format!(
+                    "cannot assign to {} here. Maybe you meant '==' instead of '='?",
+                    crate::ast::expr_name(&first)
+                ),
+            });
+        }
         let mut items = vec![first];
         while self.eat(&TokenKind::Comma) {
             if self.check(&TokenKind::RBrace) {
                 break;
             }
             items.push(self.parse_ternary_or_starred()?);
+            if self.check(&TokenKind::Equal) {
+                let last = items.last().expect("just pushed");
+                return Err(ParseError::Unexpected {
+                    span: last.span,
+                    message: format!(
+                        "cannot assign to {} here. Maybe you meant '==' instead of '='?",
+                        crate::ast::expr_name(last)
+                    ),
+                });
+            }
         }
-        let rb = self.expect(&TokenKind::RBrace, "`}`")?;
+        let rb = self.expect_or_forgot_comma(&TokenKind::RBrace, "`}`", &items)?;
         Ok(Expr {
             kind: ExprKind::Set(items),
             span: lb.span.merge(rb.span),
@@ -2805,13 +3151,13 @@ impl<'src> Parser<'src> {
                 (AccumString::Bytes(_), _, _) => {
                     return Err(ParseError::Unexpected {
                         span: next_tok.span,
-                        message: "cannot concatenate str and bytes literals".to_owned(),
+                        message: "cannot mix bytes and nonbytes literals".to_owned(),
                     });
                 }
                 (_, _, true) => {
                     return Err(ParseError::Unexpected {
                         span: next_tok.span,
-                        message: "cannot concatenate str and bytes literals".to_owned(),
+                        message: "cannot mix bytes and nonbytes literals".to_owned(),
                     });
                 }
                 (AccumString::Plain(mut a), false, false) => {
@@ -2865,20 +3211,13 @@ impl<'src> Parser<'src> {
                 kind: ExprKind::Constant(Constant::Bytes(b)),
                 span,
             }),
-            AccumString::Joined(parts) => {
-                if parts.len() == 1 {
-                    if matches!(parts[0].kind, ExprKind::Constant(_)) {
-                        return Ok(Expr {
-                            kind: parts[0].kind.clone(),
-                            span,
-                        });
-                    }
-                }
-                Ok(Expr {
-                    kind: ExprKind::JoinedStr(parts),
-                    span,
-                })
-            }
+            // Any f-string in the concatenation keeps the result a
+            // `JoinedStr`, even when it folds to a single literal part
+            // (CPython AST shape; not a docstring candidate).
+            AccumString::Joined(parts) => Ok(Expr {
+                kind: ExprKind::JoinedStr(parts),
+                span,
+            }),
         }
     }
 
@@ -2958,12 +3297,16 @@ impl<'src> Parser<'src> {
         let (_, rest) = split_string_prefix(lex);
         let raw = self.string_prefix(tok)?.raw;
         let body = strip_quotes(rest);
-        let parts = self.parse_fstring_body(body, raw, tok.span)?;
-        if parts.len() == 1 {
-            if let ExprKind::Constant(_) = &parts[0].kind {
-                return Ok(parts[0].clone());
-            }
-        }
+        // Absolute byte offset of `body` in the source — `body` is a
+        // subslice of the token's lexeme, so pointer arithmetic gives
+        // the prefix+quote length. Interior parse errors are reported
+        // at their real source location (PEP 701), not the f-string's.
+        let body_abs = tok.span.start.0 + (body.as_ptr() as usize - lex.as_ptr() as usize) as u32;
+        let parts = self.parse_fstring_body(body, raw, tok.span, body_abs)?;
+        // CPython keeps even a pure-literal f-string as a `JoinedStr`
+        // (`ast.parse("f'x'")` is JoinedStr([Constant])): it is *not* a
+        // docstring candidate and `ast.literal_eval` rejects it. Constant
+        // folding happens in the compiler, not here.
         Ok(Expr {
             kind: ExprKind::JoinedStr(parts),
             span: tok.span,
@@ -2975,15 +3318,74 @@ impl<'src> Parser<'src> {
         body: &str,
         raw: bool,
         anchor: Span,
+        body_abs: u32,
+    ) -> Result<Vec<Expr>, ParseError> {
+        self.parse_fstring_body_inner(body, raw, anchor, body_abs, false)
+    }
+
+    /// `spec_mode` parses a format spec, where `{{`/`}}` are *not*
+    /// doubled-brace escapes: in a spec every `{` opens a nested
+    /// replacement field (CPython rejects `f'{3:{{>10}'` with "expecting
+    /// a valid expression after '{'").
+    fn parse_fstring_body_inner(
+        &self,
+        body: &str,
+        raw: bool,
+        anchor: Span,
+        body_abs: u32,
+        spec_mode: bool,
     ) -> Result<Vec<Expr>, ParseError> {
         let mut parts = Vec::new();
         let mut literal = String::new();
+        // Byte index in `body` where the current literal run began, for
+        // the Constant part's source span (CPython anchors each literal
+        // part at its own text, not at the whole string token).
+        let mut lit_start = 0usize;
         let bytes = body.as_bytes();
         let mut i = 0usize;
         while i < bytes.len() {
             let b = bytes[i];
+            if literal.is_empty() {
+                lit_start = i;
+            }
+            // Non-raw backslash escapes are copied into the literal as a
+            // unit so the decoder interprets them — and, crucially, so an
+            // escaped backslash (`\\`) can't have its second byte misread
+            // as the start of a new escape (e.g. `f'\\N{AMPERSAND}'` is a
+            // literal `\` then the field `{AMPERSAND}`, not `\N{...}`).
+            if b == b'\\' && !raw {
+                // `\N{NAME}` named-character escape: the brace group is
+                // the Unicode character name, not a replacement field.
+                if bytes.get(i + 1) == Some(&b'N') && bytes.get(i + 2) == Some(&b'{') {
+                    let mut j = i + 3;
+                    while j < bytes.len() && bytes[j] != b'}' {
+                        j += 1;
+                    }
+                    if j < bytes.len() {
+                        j += 1; // include the closing `}`
+                    }
+                    literal.push_str(&body[i..j]);
+                    i = j;
+                    continue;
+                }
+                // Any other escape: copy the backslash, then its escaped
+                // character — except `{`/`}`, which stay structural (a
+                // lone `\` before a brace is a literal backslash followed
+                // by a replacement field / brace escape, e.g. `\{6*7}`).
+                literal.push('\\');
+                i += 1;
+                if let Some(&n) = bytes.get(i) {
+                    if n != b'{' && n != b'}' {
+                        let ch_len = utf8_char_len(n);
+                        let end = (i + ch_len).min(bytes.len());
+                        literal.push_str(&body[i..end]);
+                        i = end;
+                    }
+                }
+                continue;
+            }
             if b == b'{' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                if !spec_mode && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                     literal.push('{');
                     i += 2;
                     continue;
@@ -2996,25 +3398,52 @@ impl<'src> Parser<'src> {
                         })?;
                     parts.push(Expr {
                         kind: ExprKind::Constant(Constant::Str(decoded)),
-                        span: anchor,
+                        span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
                     });
                     literal.clear();
                 }
-                let (field, end) = self.scan_fstring_field(body, i + 1, anchor)?;
-                let parsed = self.parse_fstring_field(&field, anchor)?;
+                let (field, end) = match self.scan_fstring_field(body, i + 1, anchor) {
+                    Ok(ok) => ok,
+                    // Unterminated field ("f-string: expecting '}'"):
+                    // CPython's pegen parses the partial expression
+                    // first, so an *inner* error (e.g. "Perhaps you
+                    // forgot a comma?") wins over the missing brace.
+                    Err(scan_err) => {
+                        if matches!(&scan_err, ParseError::Unexpected { message, .. }
+                            if message == "f-string: expecting '}'")
+                        {
+                            let partial = &body[i + 1..];
+                            self.parse_fstring_field(
+                                partial,
+                                anchor,
+                                body_abs + (i as u32) + 1,
+                                raw,
+                                true,
+                            )?;
+                        }
+                        return Err(scan_err);
+                    }
+                };
+                let parsed = self.parse_fstring_field(
+                    &field,
+                    anchor,
+                    body_abs + (i as u32) + 1,
+                    raw,
+                    false,
+                )?;
                 parts.push(parsed);
                 i = end + 1; // skip past the closing `}`
                 continue;
             }
             if b == b'}' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                if !spec_mode && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
                     literal.push('}');
                     i += 2;
                     continue;
                 }
                 return Err(ParseError::Unexpected {
                     span: anchor,
-                    message: "single '}' is not allowed in f-string".to_owned(),
+                    message: "f-string: single '}' is not allowed".to_owned(),
                 });
             }
             // Append the next UTF-8 character (one or more bytes).
@@ -3023,21 +3452,32 @@ impl<'src> Parser<'src> {
             literal.push_str(&body[i..end]);
             i = end;
         }
-        if !literal.is_empty() || parts.is_empty() {
+        // A trailing literal run becomes a final part; an empty body
+        // yields an empty `JoinedStr` (CPython: `f''` and the empty
+        // format spec `f'{x:}'` both have `values=[]`).
+        if !literal.is_empty() {
             let decoded = decode_str_body(&literal, raw).map_err(|m| ParseError::Unexpected {
                 span: anchor,
                 message: m,
             })?;
             parts.push(Expr {
                 kind: ExprKind::Constant(Constant::Str(decoded)),
-                span: anchor,
+                span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
             });
         }
         Ok(parts)
     }
 
-    /// Scan from just past the opening `{` to the matching `}` at depth 0.
-    /// Returns the field text and the index of the closing `}`.
+    /// Scan from just past the opening `{` to the matching `}` at the
+    /// field's top level. Returns the field text and the index of that
+    /// closing `}`.
+    ///
+    /// Bracket nesting is tracked with an explicit stack so we can report
+    /// CPython's PEP 701 diagnostics: a `)`/`]`/`}` that doesn't match the
+    /// innermost opener yields "closing parenthesis 'X' does not match
+    /// opening parenthesis 'Y'", a `)`/`]` with nothing open yields
+    /// "f-string: unmatched ')'", and running off the end yields
+    /// "f-string: expecting '}'".
     fn scan_fstring_field(
         &self,
         body: &str,
@@ -3045,11 +3485,18 @@ impl<'src> Parser<'src> {
         anchor: Span,
     ) -> Result<(String, usize), ParseError> {
         let bytes = body.as_bytes();
-        let mut depth = 1i32;
+        // Openers seen *inside* the field (the field's own `{` is implicit
+        // and not pushed); a top-level `}` closes the field.
+        let mut stack: Vec<u8> = Vec::new();
         let mut i = start;
-        // String state machine for backtick-free quotes inside the field.
+        // String state machine for quotes inside the field.
         let mut in_str: Option<u8> = None;
         let mut triple = false;
+        // Once the top-level `:` is seen we're in the format spec, where
+        // `#` is literal (e.g. `{x:#06x}`); before it, in the expression
+        // part, `#` starts a comment to end of line (legal in multi-line
+        // f-strings, PEP 701).
+        let mut in_spec = false;
         while i < bytes.len() {
             let b = bytes[i];
             if let Some(q) = in_str {
@@ -3088,43 +3535,79 @@ impl<'src> Parser<'src> {
                     }
                 }
                 b'(' | b'[' | b'{' => {
-                    depth += 1;
+                    stack.push(b);
                     i += 1;
                 }
-                b')' | b']' => {
-                    depth -= 1;
-                    i += 1;
-                }
-                b'}' => {
-                    if depth == 1 {
-                        return Ok((body[start..i].to_owned(), i));
+                b')' => match stack.last() {
+                    Some(b'(') => {
+                        stack.pop();
+                        i += 1;
                     }
-                    depth -= 1;
+                    Some(&open) => return Err(fstring_paren_mismatch(')', open, anchor)),
+                    None => {
+                        return Err(ParseError::Unexpected {
+                            span: anchor,
+                            message: "f-string: unmatched ')'".to_owned(),
+                        })
+                    }
+                },
+                b']' => match stack.last() {
+                    Some(b'[') => {
+                        stack.pop();
+                        i += 1;
+                    }
+                    Some(&open) => return Err(fstring_paren_mismatch(']', open, anchor)),
+                    None => {
+                        return Err(ParseError::Unexpected {
+                            span: anchor,
+                            message: "f-string: unmatched ']'".to_owned(),
+                        })
+                    }
+                },
+                b'}' => match stack.last() {
+                    None => return Ok((body[start..i].to_owned(), i)),
+                    Some(b'{') => {
+                        stack.pop();
+                        i += 1;
+                    }
+                    Some(&open) => return Err(fstring_paren_mismatch('}', open, anchor)),
+                },
+                b':' if stack.is_empty() && !in_spec => {
+                    in_spec = true;
                     i += 1;
+                }
+                b'#' if !in_spec => {
+                    // Comment to end of line; the brackets/quotes it may
+                    // contain must not perturb depth or string tracking.
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
                 }
                 _ => i += 1,
             }
         }
         Err(ParseError::Unexpected {
             span: anchor,
-            message: "expected '}' to close f-string replacement field".to_owned(),
+            message: "f-string: expecting '}'".to_owned(),
         })
     }
 
     /// Parse one `expr[!conv][:spec]` field and return a
     /// `FormattedValue` (possibly preceded by a synthetic literal
     /// for `{x = }` debug form).
-    fn parse_fstring_field(&self, field: &str, anchor: Span) -> Result<Expr, ParseError> {
-        // Split into expr, conversion, format_spec. Backslashes inside
-        // an f-string field aren't allowed in CPython <3.12 — we
-        // surface that as a parse error for clarity.
-        if field.contains('\\') {
-            return Err(ParseError::NotImplemented {
-                span: anchor,
-                feature: "backslashes inside f-string replacement fields",
-                rfc: "RFC 0005-B",
-            });
-        }
+    fn parse_fstring_field(
+        &self,
+        field: &str,
+        anchor: Span,
+        field_abs: u32,
+        raw: bool,
+        partial: bool,
+    ) -> Result<Expr, ParseError> {
+        // PEP 701 (3.12+): backslashes *are* allowed inside replacement
+        // fields (e.g. `f"{d["a\tb"]}"`). The expression is re-tokenized
+        // below, so escapes inside nested string literals are handled by
+        // the sub-lexer; a stray backslash in the expression itself just
+        // surfaces as a normal sub-parse error.
         let bytes = field.as_bytes();
         // Find the `!conv` and `:spec` boundaries at top level (not
         // inside nested parens/brackets/braces or string literals).
@@ -3137,6 +3620,16 @@ impl<'src> Parser<'src> {
         let mut i = 0;
         while i < bytes.len() {
             let b = bytes[i];
+            // A `#` in the expression part (before any `!conv`/`:spec`,
+            // and not inside a string) is a comment to end of line. Skip
+            // it so quotes/`!`/`:` it contains can't be mistaken for
+            // string delimiters or conv/spec boundaries.
+            if in_str.is_none() && b == b'#' && conv_start.is_none() && spec_start.is_none() {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
             if let Some(q) = in_str {
                 if b == q {
                     if triple {
@@ -3175,12 +3668,16 @@ impl<'src> Parser<'src> {
             }
             if depth == 0 {
                 if b == b'!' && conv_start.is_none() && spec_start.is_none() {
-                    // `!=` and `!<` etc. are comparison; `!` followed
-                    // by `s` / `r` / `a` is conversion.
-                    if i + 1 < bytes.len() && matches!(bytes[i + 1], b's' | b'r' | b'a') {
+                    // `!=` is the only `!` that stays part of the
+                    // expression (comparison); any other `!` ends the
+                    // expression and opens the conversion clause. Catching
+                    // it here (rather than only before `s`/`r`/`a`) lets an
+                    // empty expression before `!` surface CPython's
+                    // "valid expression required before '!'".
+                    if bytes.get(i + 1) != Some(&b'=') {
                         expr_end = i;
                         conv_start = Some(i + 1);
-                        i += 2;
+                        i += 1;
                         continue;
                     }
                 } else if b == b':' && spec_start.is_none() {
@@ -3192,60 +3689,209 @@ impl<'src> Parser<'src> {
             }
             i += 1;
         }
-        let expr_text = &field[..expr_end];
-        // Debug form `{x = }`: literal "x = " prepended, conversion
-        // forced to `r` if no explicit conversion / spec.
-        let (expr_text, debug_lit) = if expr_text.trim_end().ends_with('=') {
-            let trimmed = expr_text.trim_end();
-            let without_eq = trimmed.trim_end_matches('=');
-            let literal = format!("{without_eq}=");
-            (without_eq.trim(), Some(literal))
+        let expr_slice = &field[..expr_end];
+        // Debug form `{expr=}`: CPython echoes the *verbatim* source of
+        // the expression part (preserving the author's whitespace, e.g.
+        // `{val = }` -> "val = 7") and then formats the value. A trailing
+        // single `=` triggers it, but `==`/`!=`/`<=`/`>=` must not.
+        //
+        // PEP 701 allows `#` comments inside (multi-line) replacement
+        // fields, e.g.
+        //   f"{1+2 = # my comment
+        //     }"   ==  '1+2 = \n  3'
+        // The comment is removed but the surrounding whitespace stays, and
+        // it must not hide the debug `=`. Strip comments first, then both
+        // the detection and the echoed literal work on the cleaned text.
+        let clean = strip_fstring_field_comments(expr_slice);
+        // Only ASCII whitespace is insignificant around the expression
+        // (space, tab, formfeed, CR/LF, VT). Notably *not* U+00A0 etc. —
+        // CPython rejects those as "invalid non-printable character".
+        let ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c');
+        let trimmed_end = clean.trim_end_matches(ws);
+        let is_debug = trimmed_end.ends_with('=')
+            && !trimmed_end.ends_with("==")
+            && !trimmed_end.ends_with("!=")
+            && !trimmed_end.ends_with("<=")
+            && !trimmed_end.ends_with(">=");
+        let (expr_text, debug_lit) = if is_debug {
+            let value_src = trimmed_end[..trimmed_end.len() - 1].trim_matches(ws);
+            // Verbatim expression-part slice (through the `=`, including
+            // any surrounding spaces, comments removed) is echoed.
+            (value_src, Some(clean.clone()))
         } else {
-            (expr_text.trim(), None)
+            (clean.trim_matches(ws), None)
         };
         if expr_text.is_empty() {
+            // Name the terminator that followed the (empty) expression,
+            // mirroring CPython: "f-string: valid expression required
+            // before '}'/'!'/':'/'='".
+            let before = if is_debug {
+                '='
+            } else if conv_start.is_some() {
+                '!'
+            } else if spec_start.is_some() {
+                ':'
+            } else {
+                '}'
+            };
+            // In a *partial* (unterminated) field there is no real `}`;
+            // an all-whitespace field defers to the lexer's own
+            // diagnostic ("expecting '}'" / "'{' was never closed").
+            if partial && before == '}' {
+                return Err(ParseError::Unexpected {
+                    span: anchor,
+                    message: "f-string: expecting '}'".to_owned(),
+                });
+            }
             return Err(ParseError::Unexpected {
                 span: anchor,
-                message: "empty expression in f-string replacement field".to_owned(),
+                message: format!("f-string: valid expression required before '{before}'"),
             });
         }
-        // Recursively tokenize+parse the expression.
-        let tokens = weavepy_lexer::tokenize(expr_text)?;
-        let mut sub = Parser::new(expr_text, tokens);
-        sub.skip_trivia_and_newlines();
-        let value = sub.parse_expression_list(false)?;
-        sub.skip_trivia_and_newlines();
-        if !matches!(sub.peek(), TokenKind::Endmarker) {
-            return Err(ParseError::Unexpected {
-                span: anchor,
-                message: "trailing tokens in f-string expression".to_owned(),
-            });
+        // Recursively tokenize+parse the expression. Inside an f-string
+        // replacement field, newlines, comments and indentation are
+        // insignificant (PEP 701: the field is parsed in the same
+        // implicit line-continuation context as the surrounding `{...}`),
+        // so a multi-line field like
+        //   f'''{
+        //   40  # forty
+        //   + 2 # two
+        //   }'''
+        // must read as `40 + 2`. Wrapping the expression in parentheses
+        // reproduces that joining exactly; the parens are transparent for
+        // a plain expression (and for a top-level comma the result is the
+        // same tuple `parse_expression_list` would have built). The
+        // closing paren goes on its own line so a trailing `# comment` in
+        // the field can't swallow it.
+        // A failure parsing the embedded expression keeps its own
+        // message and is re-anchored at the expression's *real* source
+        // location (CPython's pegen reports interior errors verbatim —
+        // e.g. "invalid decimal literal" inside `f'{(123_a)}'` points
+        // at line 3 of a multi-line f-string, not at the `f`).
+        // `expr_text` borrows `clean`; when no comments were stripped,
+        // offsets in `clean` equal offsets in `field`.
+        let expr_off_in_field = expr_text.as_ptr() as usize - clean.as_ptr() as usize;
+        let expr_abs = field_abs + expr_off_in_field as u32;
+        // Map a byte offset in `wrapped` (below) back to the source:
+        // subtract the synthetic `(`, clamp to the expression's extent.
+        let map_back = |byte: u32| -> u32 {
+            let rel = (byte.saturating_sub(1)).min(expr_text.len() as u32);
+            expr_abs + rel
+        };
+        // CPython's expression-start span: the first character of the
+        // expression text.
+        let expr_start_span = {
+            let first_len = expr_text.chars().next().map_or(1, |c| c.len_utf8()) as u32;
+            Span::new(expr_abs, expr_abs + first_len)
+        };
+        // CPython's invalid_replacement_field family of diagnostics:
+        // a field whose expression can't be parsed *at all* is
+        // "expecting a valid expression after '{'"; junk after a parsed
+        // expression is "expecting '=', or '!', or ':', or '}'" — unless
+        // the junk itself starts an expression, which pegen's
+        // invalid_expression rule turns into the comma hint.
+        let value = (|| -> Result<Expr, ParseError> {
+            let wrapped = format!("({expr_text}\n)");
+            let tokens = weavepy_lexer::tokenize(&wrapped)?;
+            let mut sub = Parser::new(&wrapped, tokens);
+            sub.skip_trivia_and_newlines();
+            let value = sub.parse_expression_list(false)?;
+            sub.skip_trivia_and_newlines();
+            if !matches!(sub.peek(), TokenKind::Endmarker) {
+                let sp = sub.peek_token().span;
+                // Junk after a parsed expression: junk that itself begins
+                // an expression gets pegen's comma hint (`f'{1 1}'`);
+                // other junk names the expected delimiters.
+                let junk_is_expr = sub.parse_expression_list(false).is_ok();
+                return Err(ParseError::Unexpected {
+                    span: sp,
+                    message: if junk_is_expr {
+                        "invalid syntax. Perhaps you forgot a comma?".to_owned()
+                    } else {
+                        "f-string: expecting '=', or '!', or ':', or '}'".to_owned()
+                    },
+                });
+            }
+            Ok(value)
+        })()
+        .map_err(|e| {
+            map_fstring_subparse_error(
+                e,
+                expr_text,
+                spec_start,
+                field_abs,
+                expr_abs,
+                expr_start_span,
+                &map_back,
+            )
+        })?;
+        // Re-anchor the sub-parsed tree from `wrapped` coordinates onto
+        // the real source so `ast` positions (lineno/col_offset) and
+        // runtime tracebacks point into the actual f-string text.
+        let mut value = value;
+        remap_expr_spans(&mut value, &map_back);
+        // A bare starred expression can't be formatted (`f'{*a}'`); the
+        // tuple form `f'{*a,}'` is fine and parses as a tuple instead.
+        if !partial {
+            if let ExprKind::Starred(_) = value.kind {
+                return Err(ParseError::Unexpected {
+                    span: Span::new(expr_abs, expr_abs + expr_text.len() as u32),
+                    message: "can't use starred expression here".to_owned(),
+                });
+            }
         }
 
         let conversion = match conv_start {
-            Some(idx) => i32::from(field.as_bytes()[idx]),
-            None if debug_lit.is_some() => i32::from(b'r'),
+            Some(idx) if !partial => {
+                let conv_end = spec_start.map(|s| s - 1).unwrap_or(field.len());
+                let text = &field[idx..conv_end];
+                validate_fstring_conversion(text, idx, field, field_abs)?
+            }
+            // Partial (unterminated) field whose conversion clause *was*
+            // terminated by a `:` — the clause is complete enough to
+            // validate (`f'{3!:'` is "missing conversion character", not
+            // an unterminated-literal error).
+            Some(idx) if spec_start.is_some() => {
+                let conv_end = spec_start.map(|s| s - 1).unwrap_or(field.len());
+                let text = &field[idx..conv_end];
+                validate_fstring_conversion(text, idx, field, field_abs)?
+            }
+            // Partial field with the conversion clause itself cut off:
+            // defer to the lexer's diagnostics.
+            Some(_) => -1,
+            // Debug form defaults to `!r`, but only when no explicit
+            // conversion *and* no format spec is given (`{x=:.2f}` uses
+            // the spec, not repr).
+            None if debug_lit.is_some() && spec_start.is_none() => i32::from(b'r'),
             None => -1,
         };
         let format_spec = match spec_start {
-            Some(s) => {
+            Some(s) if !partial => {
                 let spec = &field[s..];
-                let inner = self.parse_fstring_body(spec, false, anchor)?;
+                let inner =
+                    self.parse_fstring_body_inner(spec, raw, anchor, field_abs + s as u32, true)?;
                 Some(Box::new(Expr {
                     kind: ExprKind::JoinedStr(inner),
                     span: anchor,
                 }))
             }
-            None => None,
+            _ => None,
         };
 
+        // CPython spans the FormattedValue from its `{` through the
+        // matching `}` (the field text sits at `field_abs`, just past
+        // the opening brace).
+        let fv_span = Span::new(
+            field_abs.saturating_sub(1),
+            field_abs + field.len() as u32 + 1,
+        );
         let fv = Expr {
             kind: ExprKind::FormattedValue {
                 value: Box::new(value),
                 conversion,
                 format_spec,
             },
-            span: anchor,
+            span: fv_span,
         };
         if let Some(lit) = debug_lit {
             // Wrap in a tiny JoinedStr-equivalent: emit a literal
@@ -3268,6 +3914,155 @@ impl<'src> Parser<'src> {
     }
 }
 
+/// Rewrite every span in an expression tree through `map` (a byte-offset
+/// translation). Used to re-anchor an f-string replacement field's
+/// sub-parsed expression from its synthetic `( … \n)` wrapper onto the
+/// real source, so `ast` positions and runtime tracebacks point at the
+/// actual f-string text (CPython parses fields in-place and gets this
+/// for free).
+fn remap_expr_spans(e: &mut Expr, map: &dyn Fn(u32) -> u32) {
+    e.span = Span::new(map(e.span.start.0), map(e.span.end.0));
+    let remap_opt = |o: &mut Option<Box<Expr>>, map: &dyn Fn(u32) -> u32| {
+        if let Some(inner) = o {
+            remap_expr_spans(inner, map);
+        }
+    };
+    let remap_args = |a: &mut crate::ast::Arguments, map: &dyn Fn(u32) -> u32| {
+        for arg in a
+            .posonlyargs
+            .iter_mut()
+            .chain(a.args.iter_mut())
+            .chain(a.kwonlyargs.iter_mut())
+            .chain(a.vararg.iter_mut())
+            .chain(a.kwarg.iter_mut())
+        {
+            arg.span = Span::new(map(arg.span.start.0), map(arg.span.end.0));
+            if let Some(ann) = &mut arg.annotation {
+                remap_expr_spans(ann, map);
+            }
+        }
+        for d in &mut a.defaults {
+            remap_expr_spans(d, map);
+        }
+        for d in a.kw_defaults.iter_mut().flatten() {
+            remap_expr_spans(d, map);
+        }
+    };
+    let remap_comps = |gens: &mut Vec<crate::ast::Comprehension>, map: &dyn Fn(u32) -> u32| {
+        for g in gens {
+            remap_expr_spans(&mut g.target, map);
+            remap_expr_spans(&mut g.iter, map);
+            for i in &mut g.ifs {
+                remap_expr_spans(i, map);
+            }
+        }
+    };
+    match &mut e.kind {
+        ExprKind::Constant(_) | ExprKind::Name(_) => {}
+        ExprKind::Attribute { value, .. } => remap_expr_spans(value, map),
+        ExprKind::Subscript { value, slice } => {
+            remap_expr_spans(value, map);
+            remap_expr_spans(slice, map);
+        }
+        ExprKind::Slice { lower, upper, step } => {
+            remap_opt(lower, map);
+            remap_opt(upper, map);
+            remap_opt(step, map);
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            remap_expr_spans(left, map);
+            remap_expr_spans(right, map);
+        }
+        ExprKind::BoolOp { values, .. } => {
+            for v in values {
+                remap_expr_spans(v, map);
+            }
+        }
+        ExprKind::UnaryOp { operand, .. } => remap_expr_spans(operand, map),
+        ExprKind::Compare {
+            left, comparators, ..
+        } => {
+            remap_expr_spans(left, map);
+            for c in comparators {
+                remap_expr_spans(c, map);
+            }
+        }
+        ExprKind::IfExp { test, body, orelse } => {
+            remap_expr_spans(test, map);
+            remap_expr_spans(body, map);
+            remap_expr_spans(orelse, map);
+        }
+        ExprKind::NamedExpr { target, value } => {
+            remap_expr_spans(target, map);
+            remap_expr_spans(value, map);
+        }
+        ExprKind::Lambda { args, body } => {
+            remap_args(args, map);
+            remap_expr_spans(body, map);
+        }
+        ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            remap_expr_spans(func, map);
+            for a in args {
+                remap_expr_spans(a, map);
+            }
+            for k in keywords {
+                remap_expr_spans(&mut k.value, map);
+            }
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+            for i in items {
+                remap_expr_spans(i, map);
+            }
+        }
+        ExprKind::Dict { keys, values } => {
+            for k in keys.iter_mut().flatten() {
+                remap_expr_spans(k, map);
+            }
+            for v in values {
+                remap_expr_spans(v, map);
+            }
+        }
+        ExprKind::ListComp { elt, generators }
+        | ExprKind::SetComp { elt, generators }
+        | ExprKind::GeneratorExp { elt, generators } => {
+            remap_expr_spans(elt, map);
+            remap_comps(generators, map);
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            generators,
+        } => {
+            remap_expr_spans(key, map);
+            remap_expr_spans(value, map);
+            remap_comps(generators, map);
+        }
+        ExprKind::Starred(inner) | ExprKind::YieldFrom(inner) | ExprKind::Await(inner) => {
+            remap_expr_spans(inner, map)
+        }
+        ExprKind::Yield(inner) => {
+            if let Some(i) = inner {
+                remap_expr_spans(i, map);
+            }
+        }
+        ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                remap_expr_spans(p, map);
+            }
+        }
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            remap_expr_spans(value, map);
+            remap_opt(format_spec, map);
+        }
+    }
+}
+
 #[inline]
 fn utf8_char_len(b: u8) -> usize {
     if b < 0x80 {
@@ -3279,6 +4074,335 @@ fn utf8_char_len(b: u8) -> usize {
     } else {
         4
     }
+}
+
+/// Build CPython's "closing parenthesis 'X' does not match opening
+/// parenthesis 'Y'" diagnostic for a mismatched bracket inside an f-string
+/// replacement field.
+fn fstring_paren_mismatch(close: char, open: u8, anchor: Span) -> ParseError {
+    ParseError::Unexpected {
+        span: anchor,
+        message: format!(
+            "closing parenthesis '{close}' does not match opening parenthesis '{}'",
+            open as char
+        ),
+    }
+}
+
+/// Map a failure from the replacement-field sub-parse onto CPython's
+/// pegen diagnostics. Specialized messages (the comma hint, a nested
+/// f-string's own error, …) survive verbatim; internal phrasing is
+/// re-derived: if *some* leading expression parses the field has junk
+/// after it ("expecting '=', or '!', or ':', or '}'"), if a lambda lost
+/// its `:` to the format spec it gets the dedicated lambda message, and
+/// otherwise the expression never started ("expecting a valid expression
+/// after '{'").
+#[allow(clippy::too_many_arguments)]
+fn map_fstring_subparse_error(
+    e: ParseError,
+    expr_text: &str,
+    spec_start: Option<usize>,
+    field_abs: u32,
+    expr_abs: u32,
+    expr_start_span: Span,
+    map_back: &dyn Fn(u32) -> u32,
+) -> ParseError {
+    let valid_expr_err = || ParseError::Unexpected {
+        span: expr_start_span,
+        message: "f-string: expecting a valid expression after '{'".to_owned(),
+    };
+    // Does a non-empty leading slice of the expression parse as a complete
+    // expression list? Returns the junk position (in `wrapped`
+    // coordinates) when one does and junk follows.
+    let leading_parse = |text: &str| -> Option<(u32, bool)> {
+        let wrapped = format!("({text}\n)");
+        let tokens = weavepy_lexer::tokenize(&wrapped).ok()?;
+        let mut sub = Parser::new(&wrapped, tokens);
+        sub.skip_trivia_and_newlines();
+        // Consume the synthetic `(` so the parse isn't forced to reach
+        // the matching `)`.
+        sub.bump();
+        sub.skip_trivia_and_newlines();
+        sub.parse_expression_list(false).ok()?;
+        sub.skip_trivia_and_newlines();
+        let sp = sub.peek_token().span;
+        let junk_is_expr = sub.parse_expression_list(false).is_ok();
+        Some((sp.start.0, junk_is_expr))
+    };
+    match e {
+        ParseError::Lex(weavepy_lexer::LexError::InvalidToken { pos }) => {
+            // A byte the tokenizer can't start a token with (`$`, `?`,
+            // `` ` ``): pegen sees an error token where it expects
+            // `=`/`!`/`:`/`}` — provided some expression precedes it.
+            let prefix_end = (pos as usize).saturating_sub(1).min(expr_text.len());
+            let prefix = expr_text[..prefix_end].trim();
+            let at = map_back(pos);
+            if !prefix.is_empty() && leading_parse(prefix).is_some() {
+                ParseError::Unexpected {
+                    span: Span::new(at, at + 1),
+                    message: "f-string: expecting '=', or '!', or ':', or '}'".to_owned(),
+                }
+            } else {
+                valid_expr_err()
+            }
+        }
+        ParseError::Lex(lex) => {
+            let at = map_back(lex.byte_offset());
+            ParseError::Unexpected {
+                span: Span::new(at, at),
+                message: lex.to_string(),
+            }
+        }
+        ParseError::Unexpected { span, message } | ParseError::Indentation { span, message } => {
+            let internal = message.starts_with("expected ")
+                || message.starts_with("unexpected token")
+                || message == "trailing";
+            if !internal {
+                return ParseError::Unexpected {
+                    span: Span::new(map_back(span.start.0), map_back(span.end.0)),
+                    message,
+                };
+            }
+            match leading_parse(expr_text) {
+                // A leading expression parses; the failure is junk after
+                // it (the junk may itself be a `(`-less continuation the
+                // paren-wrapped parse choked on).
+                Some((junk_pos, junk_is_expr)) => {
+                    let at = map_back(junk_pos);
+                    ParseError::Unexpected {
+                        span: Span::new(at, at + 1),
+                        message: if junk_is_expr {
+                            "invalid syntax. Perhaps you forgot a comma?".to_owned()
+                        } else {
+                            "f-string: expecting '=', or '!', or ':', or '}'".to_owned()
+                        },
+                    }
+                }
+                None => fstring_lambda_error(expr_text, spec_start, field_abs, expr_abs)
+                    .unwrap_or_else(valid_expr_err),
+            }
+        }
+        ParseError::NotImplemented { .. } => valid_expr_err(),
+    }
+}
+
+/// CPython's pegen has a dedicated rule for a lambda whose body `:` was
+/// consumed as the format-spec separator: `f'{lambda x:x}'`. Detected by
+/// re-attaching a synthetic `: 0` body — if that parses, the original
+/// failure was exactly the missing colon.
+fn fstring_lambda_error(
+    expr_text: &str,
+    spec_start: Option<usize>,
+    field_abs: u32,
+    expr_abs: u32,
+) -> Option<ParseError> {
+    let spec_start = spec_start?;
+    if !expr_text.contains("lambda") {
+        return None;
+    }
+    let test = format!("({expr_text}: 0\n)");
+    let tokens = weavepy_lexer::tokenize(&test).ok()?;
+    let mut sub = Parser::new(&test, tokens);
+    sub.skip_trivia_and_newlines();
+    sub.parse_expression_list(false).ok()?;
+    sub.skip_trivia_and_newlines();
+    if !matches!(sub.peek(), TokenKind::Endmarker) {
+        return None;
+    }
+    let lam_off = find_last_toplevel_lambda(expr_text)?;
+    Some(ParseError::Unexpected {
+        // CPython spans from the `lambda` keyword through the spec colon.
+        span: Span::new(expr_abs + lam_off as u32, field_abs + spec_start as u32),
+        message: "f-string: lambda expressions are not allowed without parentheses".to_owned(),
+    })
+}
+
+/// Byte offset of the last top-level `lambda` keyword in `expr` (outside
+/// strings and brackets, with identifier boundaries).
+fn find_last_toplevel_lambda(expr: &str) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str: Option<u8> = None;
+    let mut found = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'l' if depth == 0 => {
+                let is_word = bytes[i..].starts_with(b"lambda")
+                    && (i == 0 || !is_ident_byte(bytes[i - 1]))
+                    && bytes.get(i + 6).is_none_or(|&n| !is_ident_byte(n));
+                if is_word {
+                    found = Some(i);
+                    i += 6;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    found
+}
+
+#[inline]
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Validate the conversion clause text (between `!` and the spec `:` /
+/// field end), returning the conversion code or CPython's exact
+/// diagnostic. `idx` is the clause's byte offset within `field`.
+fn validate_fstring_conversion(
+    text: &str,
+    idx: usize,
+    field: &str,
+    field_abs: u32,
+) -> Result<i32, ParseError> {
+    let abs = |off: usize| field_abs + (idx + off) as u32;
+    if text.is_empty() {
+        return Err(ParseError::Unexpected {
+            span: Span::new(abs(0), abs(0) + 1),
+            message: "f-string: missing conversion character".to_owned(),
+        });
+    }
+    let first = text.chars().next().expect("non-empty");
+    if first.is_whitespace() {
+        // CPython spans from the `!` through the end of the field.
+        return Err(ParseError::Unexpected {
+            span: Span::new(field_abs + (idx - 1) as u32, field_abs + field.len() as u32),
+            message: "f-string: conversion type must come right after the exclamation mark"
+                .to_owned(),
+        });
+    }
+    if !(unicode_ident::is_xid_start(first) || first == '_') {
+        return Err(ParseError::Unexpected {
+            span: Span::new(abs(0), abs(first.len_utf8())),
+            message: "f-string: invalid conversion character".to_owned(),
+        });
+    }
+    let ident_end = text
+        .char_indices()
+        .find(|(_, c)| !(unicode_ident::is_xid_continue(*c) || *c == '_'))
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let ident = &text[..ident_end];
+    // Trailing whitespace after the conversion is insignificant; anything
+    // else expects the spec or the closing brace.
+    let rest = &text[ident_end..];
+    if let Some((j, c)) = rest.char_indices().find(|(_, c)| !c.is_whitespace()) {
+        let at = ident_end + j;
+        return Err(ParseError::Unexpected {
+            span: Span::new(abs(at), abs(at + c.len_utf8())),
+            message: "f-string: expecting ':' or '}'".to_owned(),
+        });
+    }
+    if !matches!(ident, "s" | "r" | "a") {
+        return Err(ParseError::Unexpected {
+            span: Span::new(abs(0), abs(ident_end)),
+            message: format!(
+                "f-string: invalid conversion character '{ident}': expected 's', 'r', or 'a'"
+            ),
+        });
+    }
+    Ok(i32::from(ident.as_bytes()[0]))
+}
+
+/// Remove `#` comments from the expression part of an f-string replacement
+/// field while leaving everything else (including whitespace and newlines)
+/// byte-for-byte intact. PEP 701 permits comments inside multi-line fields;
+/// a `#` only starts a comment outside of string literals, so this tracks
+/// single/triple-quoted strings (and their backslash escapes) to avoid
+/// mangling a `#` that lives inside a string. A comment runs to the next
+/// newline (the newline itself is preserved).
+fn strip_fstring_field_comments(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    // `Some(quote)` while inside a string literal; `triple` tracks `"""`/`'''`.
+    let mut in_str: Option<u8> = None;
+    let mut triple = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                // Copy the backslash and its escaped char as a unit so an
+                // escaped quote can't be read as closing the string.
+                out.push('\\');
+                i += 1;
+                if i < bytes.len() {
+                    let cl = utf8_char_len(bytes[i]);
+                    let e = (i + cl).min(bytes.len());
+                    out.push_str(&s[i..e]);
+                    i = e;
+                }
+                continue;
+            }
+            if b == q {
+                if triple {
+                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                        out.push_str(&s[i..i + 3]);
+                        i += 3;
+                        in_str = None;
+                        triple = false;
+                        continue;
+                    }
+                } else {
+                    out.push(q as char);
+                    i += 1;
+                    in_str = None;
+                    continue;
+                }
+            }
+            let cl = utf8_char_len(b);
+            let e = (i + cl).min(bytes.len());
+            out.push_str(&s[i..e]);
+            i = e;
+            continue;
+        }
+        match b {
+            b'#' => {
+                // Drop the comment up to (but not including) the newline.
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' | b'\'' => {
+                if i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b {
+                    in_str = Some(b);
+                    triple = true;
+                    out.push_str(&s[i..i + 3]);
+                    i += 3;
+                } else {
+                    in_str = Some(b);
+                    triple = false;
+                    out.push(b as char);
+                    i += 1;
+                }
+            }
+            _ => {
+                let cl = utf8_char_len(b);
+                let e = (i + cl).min(bytes.len());
+                out.push_str(&s[i..e]);
+                i = e;
+            }
+        }
+    }
+    out
 }
 
 /// Working state while concatenating adjacent string tokens.
@@ -3294,6 +4418,10 @@ fn join_str_into_parts(parts: &mut Vec<Expr>, s: String, span: Span) {
     if let Some(last) = parts.last_mut() {
         if let ExprKind::Constant(Constant::Str(existing)) = &mut last.kind {
             existing.push_str(&s);
+            // The merged literal spans from the first fragment's start
+            // to the last fragment's end (CPython's implicit-concat AST
+            // positions cross the token boundary).
+            last.span = Span::new(last.span.start.0, span.end.0);
             return;
         }
     }
@@ -3301,6 +4429,49 @@ fn join_str_into_parts(parts: &mut Vec<Expr>, s: String, span: Span) {
         kind: ExprKind::Constant(Constant::Str(s)),
         span,
     });
+}
+
+/// Re-parse an unterminated f-string field (`source[field_start..limit]`)
+/// to surface a *specialized* interior diagnostic, if any. Returns
+/// `None` when the partial expression parses cleanly or only fails
+/// generically — the caller then keeps the original lexer error.
+pub(crate) fn partial_fstring_field_error(
+    source: &str,
+    field_start: u32,
+    limit: u32,
+) -> Option<ParseError> {
+    let end = (limit as usize).min(source.len());
+    let start = (field_start as usize).min(end);
+    if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+        return None;
+    }
+    let field = &source[start..end];
+    let tokens = weavepy_lexer::tokenize("").ok()?;
+    let p = Parser::new("", tokens);
+    let anchor = Span::new(field_start, limit);
+    match p.parse_fstring_field(field, anchor, field_start, false, true) {
+        Err(e) => {
+            // Errors CPython's pegen reports from the tokens it has
+            // already seen win over the tokenizer's unterminated-field
+            // diagnostic; anything else keeps the lexer error.
+            let wins = match &e {
+                ParseError::Unexpected { message, .. }
+                | ParseError::Indentation { message, .. } => message.starts_with("invalid syntax.")
+                    || message.starts_with("f-string: valid expression required before")
+                    || message == "f-string: expecting a valid expression after '{'"
+                    || message == "f-string: expecting '=', or '!', or ':', or '}'"
+                    || message == "f-string: missing conversion character"
+                    || message.starts_with("f-string: invalid conversion character")
+                    || message
+                        == "f-string: conversion type must come right after the exclamation mark"
+                    || message
+                        == "f-string: lambda expressions are not allowed without parentheses",
+                _ => false,
+            };
+            wins.then_some(e)
+        }
+        Ok(_) => None,
+    }
 }
 
 fn split_string_prefix(lex: &str) -> (&str, &str) {
@@ -3328,18 +4499,35 @@ fn strip_quotes(s: &str) -> &str {
     }
 }
 
+/// Decode a (non-f) string-literal body. Returns the decoded text plus
+/// any invalid-escape diagnostics CPython would surface as a
+/// `SyntaxWarning` (unrecognised escapes and octal escapes `> \377`).
+/// Each diagnostic carries the byte offset of its backslash *within the
+/// body* so the caller can map it back to an absolute source position.
 fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
     if raw {
         return Ok(s.to_owned());
     }
+    // CPython surfaces escape-decoding failures as the unicodeescape
+    // codec's error, with byte positions of the failed escape within the
+    // body: "(unicode error) 'unicodeescape' codec can't decode bytes in
+    // position {start}-{end}: {reason}". `end` is the last consumed byte.
+    let unicode_err = |start: usize, end: usize, reason: &str| -> String {
+        let last = end.saturating_sub(1);
+        format!(
+            "(unicode error) 'unicodeescape' codec can't decode bytes in \
+             position {start}-{last}: {reason}"
+        )
+    };
+    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
+    let mut chars = s.char_indices().peekable();
+    while let Some((bs, c)) = chars.next() {
         if c != '\\' {
             out.push(c);
             continue;
         }
-        let Some(esc) = chars.next() else {
+        let Some((_, esc)) = chars.next() else {
             out.push('\\');
             break;
         };
@@ -3350,65 +4538,103 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
             '\\' => out.push('\\'),
             '\'' => out.push('\''),
             '"' => out.push('"'),
-            '0' => out.push('\0'),
+            // Octal escape `\ooo`: 1–3 octal digits (CPython accepts up
+            // to `\777` = 511 in a str literal). `\0` is just the
+            // zero-length-tail case of this rule. Values above `\377`
+            // draw a `SyntaxWarning`, detected by the lexer.
+            '0'..='7' => {
+                let mut val = esc as u32 - '0' as u32;
+                for _ in 0..2 {
+                    match chars.peek().copied() {
+                        Some((_, d @ '0'..='7')) => {
+                            val = val * 8 + (d as u32 - '0' as u32);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(char::from_u32(val).unwrap_or('\u{FFFD}'));
+            }
             'a' => out.push('\x07'),
             'b' => out.push('\x08'),
             'f' => out.push('\x0c'),
             'v' => out.push('\x0b'),
-            '\n' => {} // line continuation inside string
-            'x' => {
-                let h1 = chars.next().ok_or("incomplete \\x escape")?;
-                let h2 = chars.next().ok_or("incomplete \\x escape")?;
-                let hex = format!("{h1}{h2}");
-                let n = u32::from_str_radix(&hex, 16).map_err(|e| e.to_string())?;
-                out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
-            }
-            'u' => {
-                let mut hex = String::new();
-                for _ in 0..4 {
-                    hex.push(chars.next().ok_or("incomplete \\u escape")?);
+            // Line continuation inside the string (`\` + newline). A
+            // `\<CR>` (optionally `\<CR><LF>`) continues too.
+            '\n' => {}
+            '\r' => {
+                if matches!(chars.peek(), Some((_, '\n'))) {
+                    chars.next();
                 }
-                let n = u32::from_str_radix(&hex, 16).map_err(|e| e.to_string())?;
-                out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
             }
-            'U' => {
-                // 8-hex code-point escape, e.g. `\U0001F600`. Required
-                // for non-BMP literals; CPython rejects out-of-range or
-                // surrogate values, so we surface a clear error.
+            'x' | 'u' | 'U' => {
+                let want = match esc {
+                    'x' => 2,
+                    'u' => 4,
+                    _ => 8,
+                };
                 let mut hex = String::new();
-                for _ in 0..8 {
-                    hex.push(chars.next().ok_or("incomplete \\U escape")?);
+                for _ in 0..want {
+                    match chars.peek().copied() {
+                        Some((_, h)) if h.is_ascii_hexdigit() => {
+                            hex.push(h);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
                 }
-                let n = u32::from_str_radix(&hex, 16).map_err(|e| e.to_string())?;
-                let ch = char::from_u32(n).ok_or_else(|| {
-                    format!("invalid \\U escape: {n:#x} is not a valid character")
-                })?;
-                out.push(ch);
+                let end = chars.peek().map_or(bytes.len(), |(i, _)| *i);
+                if hex.len() < want {
+                    let reason = match esc {
+                        'x' => "truncated \\xXX escape",
+                        'u' => "truncated \\uXXXX escape",
+                        _ => "truncated \\UXXXXXXXX escape",
+                    };
+                    return Err(unicode_err(bs, end, reason));
+                }
+                let n = u32::from_str_radix(&hex, 16).expect("hex digits");
+                // Out-of-range code points are CPython's "illegal Unicode
+                // character". Lone surrogates are *valid* in CPython str
+                // literals; Rust `char` can't hold them, so they degrade
+                // to U+FFFD (pre-existing representation limit).
+                if n > 0x0010_FFFF {
+                    return Err(unicode_err(bs, end, "illegal Unicode character"));
+                }
+                out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
             }
             'N' => {
                 // `\N{UNICODE CHARACTER NAME}` — resolve the name against
                 // the full UCD name table. CPython requires the brace form
                 // and raises a SyntaxError ("malformed \N character escape"
                 // / "unknown Unicode character name") otherwise.
-                if chars.next() != Some('{') {
-                    return Err("malformed \\N character escape".to_owned());
+                if !matches!(chars.peek(), Some((_, '{'))) {
+                    return Err(unicode_err(bs, bs + 2, "malformed \\N character escape"));
                 }
+                chars.next();
                 let mut name = String::new();
                 loop {
                     match chars.next() {
-                        Some('}') => break,
-                        Some(c) => name.push(c),
-                        None => return Err("malformed \\N character escape".to_owned()),
+                        Some((i, '}')) => {
+                            let ch = unicode_names2::character(&name).ok_or_else(|| {
+                                unicode_err(bs, i + 1, "unknown Unicode character name")
+                            })?;
+                            out.push(ch);
+                            break;
+                        }
+                        Some((_, c)) => name.push(c),
+                        None => {
+                            return Err(unicode_err(
+                                bs,
+                                bytes.len(),
+                                "malformed \\N character escape",
+                            ))
+                        }
                     }
                 }
-                let ch = unicode_names2::character(&name).ok_or_else(|| {
-                    format!("unknown Unicode character name in \\N escape: {name:?}")
-                })?;
-                out.push(ch);
             }
             other => {
-                // CPython issues a DeprecationWarning for unknown
-                // escapes but emits both characters literally.
+                // CPython issues a `SyntaxWarning` for unknown escapes (the
+                // lexer records it) but emits both characters literally.
                 out.push('\\');
                 out.push(other);
             }
@@ -3417,12 +4643,25 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
     Ok(out)
 }
 
+/// Decode a bytes-literal body. Like [`decode_str_body`] but bytes-valued
+/// and ASCII-only: a non-ASCII source character is a `SyntaxError` ("bytes
+/// can only contain ASCII literal characters") in both raw and cooked
+/// forms, and octal escapes wrap mod 256. Invalid-escape `SyntaxWarning`s
+/// are detected separately by the lexer (see
+/// [`weavepy_lexer::tokenize_with_escapes`]).
 fn decode_bytes_body(s: &str, raw: bool) -> Result<Vec<u8>, String> {
     if raw {
-        return Ok(s.as_bytes().to_vec());
+        let mut out = Vec::with_capacity(s.len());
+        for c in s.chars() {
+            if !c.is_ascii() {
+                return Err("bytes can only contain ASCII literal characters".to_owned());
+            }
+            out.push(c as u8);
+        }
+        return Ok(out);
     }
     let mut out = Vec::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c.is_ascii() {
             if c != '\\' {
@@ -3430,7 +4669,7 @@ fn decode_bytes_body(s: &str, raw: bool) -> Result<Vec<u8>, String> {
                 continue;
             }
         } else {
-            return Err("non-ascii character in bytes literal".to_owned());
+            return Err("bytes can only contain ASCII literal characters".to_owned());
         }
         let Some(esc) = chars.next() else {
             out.push(b'\\');
@@ -3443,7 +4682,22 @@ fn decode_bytes_body(s: &str, raw: bool) -> Result<Vec<u8>, String> {
             '\\' => out.push(b'\\'),
             '\'' => out.push(b'\''),
             '"' => out.push(b'"'),
-            '0' => out.push(0),
+            // Octal escape `\ooo` (1–3 digits). In a bytes literal the
+            // value is stored as a single byte, so CPython wraps it mod
+            // 256 (`b'\400'` -> 0x00, `b'\777'` -> 0xFF).
+            '0'..='7' => {
+                let mut val: u32 = esc as u32 - '0' as u32;
+                for _ in 0..2 {
+                    match chars.peek().copied() {
+                        Some(d @ '0'..='7') => {
+                            val = val * 8 + (d as u32 - '0' as u32);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push((val & 0xFF) as u8);
+            }
             'a' => out.push(0x07),
             'b' => out.push(0x08),
             'f' => out.push(0x0c),

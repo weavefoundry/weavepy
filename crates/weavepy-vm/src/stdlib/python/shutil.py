@@ -42,7 +42,7 @@ def copytree(src, dst, *, symlinks=False, ignore=None, copy_function=None,
 def rmtree(path, ignore_errors=False, onerror=None):
     """Recursively delete a directory tree."""
     try:
-        _shutil.rmtree(path)
+        _shutil.rmtree(os.fspath(path))
     except OSError:
         if not ignore_errors:
             raise

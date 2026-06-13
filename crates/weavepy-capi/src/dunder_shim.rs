@@ -251,6 +251,7 @@ fn install_unary(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -280,6 +281,7 @@ fn install_binary(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -329,6 +331,7 @@ fn install_ternary(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -363,6 +366,7 @@ fn install_inquiry(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -397,6 +401,7 @@ fn install_lenfunc(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -445,6 +450,7 @@ fn install_ssize_arg(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -500,6 +506,7 @@ fn install_ssize_obj_arg(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -537,6 +544,7 @@ fn install_obj_obj(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -584,6 +592,7 @@ fn install_obj_obj_arg(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -615,6 +624,7 @@ fn install_repr(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -646,6 +656,7 @@ fn install_get_iter(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -692,6 +703,7 @@ fn install_iter_next(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -732,6 +744,7 @@ fn install_richcmp(
             name.to_owned(),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: static_name,
+                binds_instance: true,
                 call: Box::new(f),
                 call_kw: None,
             })),
@@ -793,6 +806,7 @@ fn install_call(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f_pos),
             call_kw: Some(Box::new(f_kw)),
         })),
@@ -859,6 +873,7 @@ fn install_init(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f_pos),
             call_kw: Some(Box::new(f_kw)),
         })),
@@ -893,6 +908,7 @@ fn install_hash(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -935,6 +951,7 @@ fn install_getattro(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),
@@ -981,6 +998,7 @@ fn install_setattro(
         mname,
         Object::Builtin(Rc::new(BuiltinFn {
             name: static_name,
+            binds_instance: true,
             call: Box::new(f),
             call_kw: None,
         })),

@@ -1,5 +1,6 @@
 """RFC 0024 — real weakref semantics with GC-driven callbacks."""
 
+import gc
 import weakref
 
 
@@ -33,11 +34,14 @@ def cb(weak):
     fired.append(weak)
 
 
-b2 = Box("two")
-r3 = weakref.ref(b2, cb)
-r3._release()
+dying = Box("two")
+r3 = weakref.ref(dying, cb)
+del dying
+gc.collect()
 print("callback fired:", len(fired) == 1)
 print("ref returns None after release:", r3() is None)
+
+b2 = Box("two")
 
 
 # ---------------------------------------------------------------------------

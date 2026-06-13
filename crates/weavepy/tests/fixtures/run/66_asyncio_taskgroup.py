@@ -23,6 +23,9 @@ for item in out:
 
 
 async def main_eg():
+    # PEP 654 forbids `return` inside an `except*` block, so stash the
+    # message and return after the try statement.
+    msg = "no exc"
     try:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(asyncio.sleep(0))
@@ -31,9 +34,9 @@ async def main_eg():
                 raise ValueError("nope")
 
             tg.create_task(boom())
-        return "no exc"
     except* ValueError as eg:
-        return f"caught {len(eg.exceptions)} value error(s): {eg.exceptions[0].args[0]}"
+        msg = f"caught {len(eg.exceptions)} value error(s): {eg.exceptions[0].args[0]}"
+    return msg
 
 
 print(asyncio.run(main_eg()))

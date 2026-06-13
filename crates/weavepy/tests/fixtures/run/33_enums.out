@@ -12,4 +12,4 @@ True
 Perm.READ|WRITE
 True
 False
-unique rejected: duplicate values found in <class 'Bad'>: B -> A
+unique rejected: duplicate values found in <enum 'Bad'>: B -> A

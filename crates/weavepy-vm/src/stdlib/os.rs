@@ -144,6 +144,14 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("fspath", os_fspath),
         );
         d.insert(
+            DictKey(Object::from_static("fsdecode")),
+            builtin("fsdecode", os_fsdecode),
+        );
+        d.insert(
+            DictKey(Object::from_static("fsencode")),
+            builtin("fsencode", os_fsencode),
+        );
+        d.insert(
             DictKey(Object::from_static("walk")),
             builtin("walk", os_walk),
         );
@@ -306,6 +314,10 @@ pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
             builtin("splitext", path_splitext),
         );
         d.insert(
+            DictKey(Object::from_static("splitdrive")),
+            builtin("splitdrive", path_splitdrive),
+        );
+        d.insert(
             DictKey(Object::from_static("basename")),
             builtin("basename", path_basename),
         );
@@ -351,7 +363,7 @@ pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("realpath")),
-            builtin("realpath", path_abspath),
+            builtin("realpath", path_realpath),
         );
         d.insert(
             DictKey(Object::from_static("relpath")),
@@ -425,6 +437,7 @@ pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -439,6 +452,7 @@ fn builtin_kw(
 ) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(move |args| body(args, &[])),
         call_kw: Some(Box::new(body)),
     }))
@@ -609,6 +623,47 @@ fn os_close_fd(_fd: i64) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `os.open(path, flags, mode=0o777)` → raw fd. The flag bits are the
+/// module's own `O_*` constants (translated to `OpenOptions` here, so
+/// the values never reach the host libc, whose constants may differ).
+#[cfg(unix)]
+fn os_open_stub(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::os::unix::io::IntoRawFd;
+    let p = first_path(args, "open")?;
+    let flags = args
+        .get(1)
+        .and_then(crate::object::Object::as_i64)
+        .ok_or_else(|| crate::error::type_error("open() flags must be an int".to_owned()))?;
+    const O_WRONLY: i64 = 1;
+    const O_RDWR: i64 = 2;
+    const O_CREAT: i64 = 64;
+    const O_EXCL: i64 = 128;
+    const O_TRUNC: i64 = 512;
+    const O_APPEND: i64 = 1024;
+    let mut oo = std::fs::OpenOptions::new();
+    match flags & 0x3 {
+        O_WRONLY => oo.write(true),
+        O_RDWR => oo.read(true).write(true),
+        _ => oo.read(true),
+    };
+    if flags & O_APPEND != 0 {
+        oo.append(true);
+    }
+    if flags & O_TRUNC != 0 {
+        oo.write(true).truncate(true);
+    }
+    if flags & O_CREAT != 0 {
+        if flags & O_EXCL != 0 {
+            oo.create_new(true);
+        } else {
+            oo.create(true);
+        }
+    }
+    let f = oo.open(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    Ok(Object::Int(i64::from(f.into_raw_fd())))
+}
+
+#[cfg(not(unix))]
 fn os_open_stub(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.open(): raw fd interface is not implemented in WeavePy yet",
@@ -723,6 +778,54 @@ fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// Reduce a path-like argument to a `str` or `bytes` object, mirroring
+/// CPython's `os.fspath`: `str`/`bytes` pass through, an `str`/`bytes`
+/// subclass instance reduces to its native value. Used by `fsdecode`/
+/// `fsencode` (which themselves only special-case the str/bytes split).
+fn fspath_to_str_or_bytes(obj: &Object, func: &str) -> Result<Object, RuntimeError> {
+    match obj {
+        Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
+        Object::Instance(_) => match obj.native_value() {
+            Some(n @ (Object::Str(_) | Object::Bytes(_))) => Ok(n),
+            _ => Err(type_error(format!(
+                "expected str, bytes or os.PathLike object, not {}",
+                obj.type_name()
+            ))),
+        },
+        other => Err(type_error(format!(
+            "{}() argument must be str, bytes, or os.PathLike object, not {}",
+            func,
+            other.type_name()
+        ))),
+    }
+}
+
+/// `os.fsdecode(filename)` — decode a `bytes` path to `str` (the filesystem
+/// encoding is UTF-8 here), pass a `str` through unchanged.
+fn os_fsdecode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error("fsdecode() takes exactly one argument (0 given)"))?;
+    match fspath_to_str_or_bytes(obj, "fsdecode")? {
+        s @ Object::Str(_) => Ok(s),
+        Object::Bytes(b) => Ok(Object::from_str(String::from_utf8_lossy(&b).into_owned())),
+        _ => unreachable!("fspath_to_str_or_bytes returns only str/bytes"),
+    }
+}
+
+/// `os.fsencode(filename)` — encode a `str` path to `bytes` (UTF-8), pass a
+/// `bytes` through unchanged.
+fn os_fsencode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error("fsencode() takes exactly one argument (0 given)"))?;
+    match fspath_to_str_or_bytes(obj, "fsencode")? {
+        Object::Str(s) => Ok(Object::Bytes(Rc::from(s.as_bytes()))),
+        b @ Object::Bytes(_) => Ok(b),
+        _ => unreachable!("fspath_to_str_or_bytes returns only str/bytes"),
+    }
+}
+
 fn os_walk(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "walk")?;
     let mut out = Vec::new();
@@ -823,6 +926,7 @@ fn build_dir_entry(
             DictKey(Object::from_static("is_dir")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "is_dir",
+                binds_instance: false,
                 call: Box::new(move |_args| Ok(Object::Bool(is_dir_v))),
                 call_kw: None,
             })),
@@ -832,6 +936,7 @@ fn build_dir_entry(
             DictKey(Object::from_static("is_file")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "is_file",
+                binds_instance: false,
                 call: Box::new(move |_args| Ok(Object::Bool(is_file_v))),
                 call_kw: None,
             })),
@@ -841,6 +946,7 @@ fn build_dir_entry(
             DictKey(Object::from_static("is_symlink")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "is_symlink",
+                binds_instance: false,
                 call: Box::new(move |_args| Ok(Object::Bool(is_symlink_v))),
                 call_kw: None,
             })),
@@ -850,6 +956,7 @@ fn build_dir_entry(
             DictKey(Object::from_static("stat")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "stat",
+                binds_instance: false,
                 call: Box::new(move |_args| {
                     let meta = std::fs::metadata(&path_for_stat)
                         .map_err(|e| crate::error::io_error_to_py(&e))?;
@@ -1293,6 +1400,18 @@ fn path_splitext(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `os.path.splitdrive(p)` — on POSIX the drive component is always empty,
+/// so this returns `("", p)` (matching `posixpath.splitdrive`). Paths here
+/// are already `str` by the time callers reach this (e.g. `mimetypes`
+/// `fsdecode`s first), so we reuse the `first_path` string coercion.
+fn path_splitdrive(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "splitdrive")?;
+    Ok(Object::new_tuple(vec![
+        Object::from_static(""),
+        Object::from_str(s),
+    ]))
+}
+
 /// Mirror CPython's `os.path.splitext`: split on the *last* dot, but
 /// only when that dot follows a non-dot character (`.profile` keeps
 /// the leading dot).
@@ -1365,6 +1484,38 @@ fn path_abspath(args: &[Object]) -> Result<Object, RuntimeError> {
             .join(p)
     };
     Ok(Object::from_str(abs.to_string_lossy().into_owned()))
+}
+
+/// `os.path.realpath` — resolve symlinks via `fs::canonicalize`
+/// (CPython's non-strict mode: a nonexistent tail rides lexically on
+/// the longest resolvable prefix).
+fn path_realpath(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "realpath")?;
+    let p = PathBuf::from(&s);
+    let abs = if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir()
+            .map_err(|e| os_error(format!("realpath: {e}")))?
+            .join(p)
+    };
+    if let Ok(c) = std::fs::canonicalize(&abs) {
+        return Ok(Object::from_str(c.to_string_lossy().into_owned()));
+    }
+    let mut prefix = abs.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while prefix.file_name().is_some() {
+        if let Ok(c) = std::fs::canonicalize(&prefix) {
+            let mut out = c;
+            for t in tail.iter().rev() {
+                out.push(t);
+            }
+            return Ok(Object::from_str(normpath_lexical(&out.to_string_lossy())));
+        }
+        tail.push(prefix.file_name().expect("checked above").to_owned());
+        prefix.pop();
+    }
+    Ok(Object::from_str(normpath_lexical(&abs.to_string_lossy())))
 }
 
 fn path_normpath(args: &[Object]) -> Result<Object, RuntimeError> {

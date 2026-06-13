@@ -80,13 +80,11 @@ async def _ag():
 
 
 _a = _ag()
-try:
-    AsyncGeneratorType = type(_a)
-finally:
-    try:
-        _a.aclose()
-    except Exception:
-        pass
+AsyncGeneratorType = type(_a)
+# The never-started bootstrap agen needs no aclose() — calling it would
+# create (and discard) an aclose awaitable, tripping the gh-113753
+# "was never awaited" RuntimeWarning during interpreter startup.
+del _a, _ag
 
 
 class _C:
@@ -121,10 +119,26 @@ MethodWrapperType = _safe_type(lambda: object().__str__)
 MethodDescriptorType = _safe_type(lambda: str.join)
 ClassMethodDescriptorType = _safe_type(lambda: dict.__dict__.get("fromkeys", classmethod(lambda *a: None)))
 ModuleType = type(_sys)
-TracebackType = _safe_type(lambda: getattr(getattr(_sys, "exc_info", lambda: (None, None, None))()[2], "__class__", type(None)))
+# CPython's own idiom (Lib/types.py): raise and catch to obtain a live
+# traceback object whose class is the real `traceback` type.
+try:
+    raise TypeError
+except TypeError as _exc:
+    _tb = _exc.__traceback__
+    TracebackType = type(_tb) if _tb is not None else type(None)
+    del _tb
 FrameType = _safe_type(lambda: _sys._getframe()) if hasattr(_sys, "_getframe") else type(None)
 GetSetDescriptorType = _safe_type(lambda: type.__dict__.get("__dict__", object))
-MemberDescriptorType = GetSetDescriptorType
+
+
+class _SlotSample:
+    __slots__ = ("_member",)
+
+
+# The type of a `__slots__` storage descriptor (CPython samples
+# `FunctionType.__globals__`; a slots class is equivalent and simpler here).
+MemberDescriptorType = type(_SlotSample.__dict__["_member"])
+del _SlotSample
 CellType = _safe_type(lambda: (lambda x: (lambda: x))(1).__closure__[0])
 
 NoneType = type(None)
@@ -141,16 +155,16 @@ class MappingProxyType:
     __slots__ = ("_mapping",)
 
     def __init__(self, mapping):
-        # CPython checks for the mapping protocol via slot lookups; we
-        # accept anything that's a dict or that supplies the basics.
+        # CPython's check is `PyMapping_Check`: the *type* must supply
+        # `__getitem__` (no `keys` requirement — a custom mapping with
+        # just `__getitem__`/`__len__` is accepted).
         if isinstance(mapping, dict):
             self._mapping = mapping
             return
-        try:
-            mapping.keys
-            mapping.__getitem__
-        except AttributeError as exc:
-            raise TypeError("mappingproxy() argument must support the mapping protocol") from exc
+        if not hasattr(type(mapping), "__getitem__"):
+            raise TypeError(
+                "mappingproxy() argument must support the mapping protocol"
+            )
         self._mapping = mapping
 
     def __getitem__(self, key):
@@ -277,11 +291,88 @@ class DynamicClassAttribute:
 def coroutine(func):
     """Mark a generator function so it can be used with `await`.
 
-    CPython's full implementation rewires the function's flags; here we
-    simply return the function unchanged. Most generator-based
-    coroutines in modern code use ``async def`` directly.
+    Mirrors CPython's implementation: a generator function gets
+    `CO_ITERABLE_COROUTINE` set on its code (done natively); other
+    callables are wrapped so generator results are awaitable.
     """
-    return func
+    if not callable(func):
+        raise TypeError('types.coroutine() expects a callable')
+
+    co = getattr(func, '__code__', None)
+    flags = getattr(co, 'co_flags', None)
+    if flags is not None:
+        # Already a coroutine function or already marked: no-op.
+        if flags & 0x180:  # CO_COROUTINE | CO_ITERABLE_COROUTINE
+            return func
+        if flags & 0x20:  # CO_GENERATOR
+            return _weavepy_mark_iterable_coroutine(func)
+
+    import functools as _functools
+
+    @_functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        coro = func(*args, **kwargs)
+        cls_name = type(coro).__name__
+        if cls_name == 'coroutine' or (
+            getattr(coro, 'gi_code', None) is not None
+            and coro.gi_code.co_flags & 0x180
+        ):
+            return coro
+        if cls_name == 'generator':
+            return _GeneratorWrapper(coro)
+        return coro
+
+    return wrapped
+
+
+class _GeneratorWrapper:
+    """Adapt a plain generator into an awaitable (CPython types.py)."""
+
+    def __init__(self, gen):
+        self.__wrapped = gen
+        self.__isgen = type(gen).__name__ == 'generator'
+        self.__name__ = getattr(gen, '__name__', None)
+        self.__qualname__ = getattr(gen, '__qualname__', None)
+
+    def send(self, val):
+        return self.__wrapped.send(val)
+
+    def throw(self, tp, *rest):
+        return self.__wrapped.throw(tp, *rest)
+
+    def close(self):
+        return self.__wrapped.close()
+
+    @property
+    def gi_code(self):
+        return self.__wrapped.gi_code
+
+    @property
+    def gi_frame(self):
+        return self.__wrapped.gi_frame
+
+    @property
+    def gi_running(self):
+        return self.__wrapped.gi_running
+
+    @property
+    def gi_yieldfrom(self):
+        return self.__wrapped.gi_yieldfrom
+
+    cr_code = gi_code
+    cr_frame = gi_frame
+    cr_running = gi_running
+    cr_await = gi_yieldfrom
+
+    def __next__(self):
+        return next(self.__wrapped)
+
+    def __iter__(self):
+        if self.__isgen:
+            return self.__wrapped
+        return self
+
+    __await__ = __iter__
 
 
 def resolve_bases(bases):

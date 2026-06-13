@@ -18,7 +18,88 @@ import functools
 import gc
 import os
 import sys
+import time
+import types
 import unittest
+
+# ---------------------------------------------------------------------------
+# Platform / build flags (faithful port of CPython's test.support surface).
+# Many Lib/test modules import these at top level to gate platform-specific
+# behaviour; absent them the whole module fails to import.
+# ---------------------------------------------------------------------------
+MS_WINDOWS = (sys.platform == 'win32')
+is_jython = sys.platform.startswith('java')
+is_android = sys.platform == "android"
+is_emscripten = sys.platform == "emscripten"
+is_wasi = sys.platform == "wasi"
+is_apple_mobile = sys.platform in {"ios", "tvos", "watchos"}
+is_apple = is_apple_mobile or sys.platform == "darwin"
+is_s390x = hasattr(os, 'uname') and os.uname().machine == 's390x'
+
+# WeavePy targets the standard GIL-enabled build.
+Py_GIL_DISABLED = False
+
+has_fork_support = hasattr(os, "fork") and not (
+    is_emscripten or is_wasi or is_apple_mobile or is_android
+)
+
+
+def requires_fork():
+    return unittest.skipUnless(has_fork_support, "requires working os.fork()")
+
+
+def requires_gil_enabled(msg="needs the GIL enabled"):
+    """Decorator for skipping tests on the free-threaded build."""
+    return unittest.skipIf(Py_GIL_DISABLED, msg)
+
+
+def requires_specialization(test):
+    # WeavePy does not expose the adaptive-specialization opcodes, so these
+    # tests are not applicable; skip them the way a non-specializing build does.
+    return unittest.skip("requires specialization")(test)
+
+
+def requires_specialization_ft(test):
+    return unittest.skip("requires specialization")(test)
+
+
+# Some CPython tests are skipped on the s390x buildbots; mirror the decorator
+# so suites that reference it import cleanly (a no-op off s390x).
+skip_on_s390x = unittest.skipIf(is_s390x, 'skipped on s390x')
+
+
+def _requires_unix_version(sysname, min_version):
+    """SkipTest if running on `sysname` with a kernel older than min_version."""
+    import platform
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kw):
+            if platform.system() == sysname:
+                version_txt = platform.release().split('-', 1)[0]
+                try:
+                    version = tuple(map(int, version_txt.split('.')))
+                except ValueError:
+                    pass
+                else:
+                    if version < min_version:
+                        raise unittest.SkipTest(
+                            "%s version %s or higher required, not %s"
+                            % (sysname, '.'.join(map(str, min_version)), version_txt))
+            return func(*args, **kw)
+        return wrapper
+    return decorator
+
+
+def requires_linux_version(*min_version):
+    """Decorator raising SkipTest if the Linux kernel is older than min_version."""
+    return _requires_unix_version('Linux', min_version)
+
+
+def control_characters_c0():
+    """Return the C0 control characters (0x00-0x1F plus 0x7F) as strings."""
+    return [chr(c) for c in range(0x00, 0x20)] + ["\x7F"]
+
 
 # Pull the helper submodules in so ``from test.support import os_helper``
 # and bare ``support.os_helper`` both work.
@@ -185,8 +266,14 @@ def cpython_only(test):
 # docstrings, so this is False.
 MISSING_C_DOCSTRINGS = False
 
-# True when the build keeps docstrings (it does).
-HAVE_DOCSTRINGS = True
+
+def _check_docstrings():
+    """Just used to check if docstrings are enabled"""
+
+
+# Probe-derived, exactly as CPython's test.support computes them.
+HAVE_PY_DOCSTRINGS = _check_docstrings.__doc__ is not None
+HAVE_DOCSTRINGS = (HAVE_PY_DOCSTRINGS and not MISSING_C_DOCSTRINGS)
 
 
 def requires_docstrings(func):
@@ -270,6 +357,147 @@ def swap_item(obj, item, new_val):
         finally:
             if item in obj:
                 del obj[item]
+
+
+@contextlib.contextmanager
+def adjust_int_max_str_digits(max_digits):
+    """Temporarily change the integer string conversion length limit."""
+    current = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(max_digits)
+        yield
+    finally:
+        sys.set_int_max_str_digits(current)
+
+
+class _ClockInfo:
+    def __init__(self, implementation, resolution):
+        self.implementation = implementation
+        self.monotonic = True
+        self.adjustable = False
+        self.resolution = resolution
+
+
+class CPUStopwatch:
+    """Context manager to roughly time a CPU-bound operation.
+
+    WeavePy lacks ``time.process_time``/``time.get_clock_info`` so this is
+    backed by ``time.perf_counter``; the public surface (``seconds`` and
+    ``clock_info.resolution``) matches CPython's helper.
+    """
+
+    def __enter__(self):
+        self.clock_info = _ClockInfo("perf_counter", 1e-9)
+        self.get_time = time.perf_counter
+        self.context = disable_gc()
+        self.context.__enter__()
+        self.start_time = self.get_time()
+        self.seconds = 0.0
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            end_time = self.get_time()
+        finally:
+            result = self.context.__exit__(*exc)
+        self.seconds = end_time - self.start_time
+        return result
+
+
+def run_in_subinterp(code):
+    """Run ``code`` in a subinterpreter.
+
+    WeavePy does not implement subinterpreters, so tests that depend on
+    per-interpreter isolation are skipped rather than silently mis-run.
+    """
+    import unittest
+    raise unittest.SkipTest("subinterpreters are not supported")
+
+
+def patch(test_instance, object_to_patch, attr_name, new_value):
+    """Override 'object_to_patch'.'attr_name' with 'new_value'.
+
+    Also, add a cleanup procedure to 'test_instance' to restore
+    'object_to_patch' value for 'attr_name'.
+    The 'attr_name' should be a valid attribute for 'object_to_patch'.
+    """
+    # check that 'attr_name' is a real attribute for 'object_to_patch'
+    # will raise AttributeError if it does not exist
+    getattr(object_to_patch, attr_name)
+
+    # keep a copy of the old value
+    attr_is_local = False
+    try:
+        old_value = object_to_patch.__dict__[attr_name]
+    except (AttributeError, TypeError, KeyError):
+        old_value = getattr(object_to_patch, attr_name, None)
+    else:
+        attr_is_local = True
+
+    # restore the value when the test is done
+    def cleanup():
+        if attr_is_local:
+            setattr(object_to_patch, attr_name, old_value)
+        else:
+            try:
+                delattr(object_to_patch, attr_name)
+            except (AttributeError, TypeError, KeyError):
+                pass
+
+    test_instance.addCleanup(cleanup)
+
+    # actually override the attribute
+    setattr(object_to_patch, attr_name, new_value)
+
+
+def check__all__(test_case, module, name_of_module=None, extra=(),
+                 not_exported=()):
+    """Assert that the __all__ variable of 'module' contains all public names.
+
+    The module's public names (its API) are detected automatically based on
+    whether they are documented in the module's docstring by being prefixed by
+    a '>>>' followed by a space, or are imported from another module
+    (when ``name_of_module`` is provided).
+
+    Args:
+        test_case: an instance of unittest.TestCase to use the assert* methods.
+        module: the module to check.
+        name_of_module: the name(s) of 'module' (in case the module imports
+            objects from other modules e.g. ``collections.abc`` imports from
+            ``_collections_abc``). This argument can be a sequence of names or
+            a string.
+        extra: names that are imported into the module but aren't part of
+            ``__all__``, which are still expected to be in ``__all__``.
+        not_exported: names that are in the module but expected to not be in
+            ``__all__``.
+    """
+
+    if name_of_module is None:
+        name_of_module = (module.__name__, )
+    elif isinstance(name_of_module, str):
+        name_of_module = (name_of_module, )
+
+    expected = set(extra)
+
+    for name in dir(module):
+        if name.startswith('_') or name in not_exported:
+            continue
+        obj = getattr(module, name)
+
+        if (getattr(obj, '__module__', None) in name_of_module or
+                (not hasattr(obj, '__module__') and
+                 not isinstance(obj, types.ModuleType))):
+            expected.add(name)
+
+    test_case.assertCountEqual(module.__all__, expected)
+
+
+def setswitchinterval(interval):
+    """Set the bytecode switch interval, clamped to a sane minimum
+    (CPython clamps harder on Android; we keep the plain floor)."""
+    minimum_interval = 1e-9
+    interval = max(interval, minimum_interval)
+    sys.setswitchinterval(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -362,20 +590,72 @@ def run_doctest(module, verbosity=None, optionflags=0):
 # Misc helpers
 # ---------------------------------------------------------------------------
 
+def _test_home_dir():
+    """Best-effort absolute path of the on-disk ``Lib/test`` directory.
+
+    CPython derives this from ``support/__init__.py``'s ``__file__``, but
+    WeavePy ships ``test``/``test.support`` *frozen* — their ``__file__``
+    is a synthetic ``<frozen ...>`` token that ``abspath`` mangles into a
+    cwd-relative path. The actual ``test_*`` modules still load from disk,
+    so locate the package root via an already-imported on-disk ``test``
+    submodule, then by scanning ``sys.path`` for a ``test`` directory.
+    """
+    for name, mod in list(sys.modules.items()):
+        if name == 'test' or name.startswith('test.'):
+            f = getattr(mod, '__file__', None)
+            if f and os.path.exists(f):
+                d = os.path.dirname(os.path.abspath(f))
+                while d and os.path.basename(d) != 'test':
+                    parent = os.path.dirname(d)
+                    if parent == d:
+                        break
+                    d = parent
+                if os.path.basename(d) == 'test':
+                    return d
+    for p in sys.path:
+        cand = os.path.join(p, 'test')
+        if os.path.isdir(cand):
+            return cand
+    f = globals().get('__file__')
+    if f and os.path.exists(f):
+        return os.path.dirname(os.path.abspath(f))
+    return os.getcwd()
+
+
 def findfile(filename, subdir=None):
-    """Locate a test data file; return *filename* unchanged if not found."""
+    """Locate a test data file; return *filename* unchanged if not found.
+
+    Mirrors CPython's search order: the ``test`` home directory first
+    (where top-level data files like ``mime.types`` live), then every
+    ``sys.path`` entry.
+    """
     if os.path.isabs(filename):
         return filename
     if subdir is not None:
         filename = os.path.join(subdir, filename)
-    TEST_HOME_DIR = os.path.dirname(os.path.abspath(
-        getattr(sys.modules.get('test'), '__file__', __file__) or __file__))
-    TEST_DATA_DIR = os.path.join(TEST_HOME_DIR, "data")
-    for path in [TEST_DATA_DIR] + list(sys.path):
+    home = _test_home_dir()
+    for path in [home, os.path.join(home, "data")] + list(sys.path):
         fn = os.path.join(path, filename)
         if os.path.exists(fn):
             return fn
     return filename
+
+
+def load_package_tests(pkg_dir, loader, standard_tests, pattern):
+    """Generic ``load_tests`` body for simple test *packages*.
+
+    A package whose ``__init__.py`` only delegates to this (e.g.
+    ``test.test_inspect``) discovers and runs every ``test*`` module under
+    its directory. ``top_level_dir`` is the stdlib root so the discovered
+    modules import under their dotted ``test.<pkg>.<mod>`` names.
+    """
+    if pattern is None:
+        pattern = "test*"
+    package_tests = loader.discover(start_dir=pkg_dir,
+                                    top_level_dir=STDLIB_DIR,
+                                    pattern=pattern)
+    standard_tests.addTests(package_tests)
+    return standard_tests
 
 
 def sortdict(dict):
@@ -430,9 +710,14 @@ def catch_unraisable_exception():
 
 
 @contextlib.contextmanager
-def infinite_recursion(max_depth=100):
-    """Lower the recursion limit so a runaway recursion trips fast."""
-    if max_depth < 3:
+def infinite_recursion(max_depth=None):
+    """Raise the recursion limit so tests can recurse (nearly) without
+    bound — CPython's helper sets 20 000 by default and relies on the
+    C-stack guard underneath; callers pass a small ``max_depth`` when
+    they *want* a quick ``RecursionError``."""
+    if max_depth is None:
+        max_depth = 20_000
+    elif max_depth < 3:
         raise ValueError("max_depth must be at least 3")
     get_limit = getattr(sys, 'getrecursionlimit', None)
     set_limit = getattr(sys, 'setrecursionlimit', None)
@@ -631,10 +916,14 @@ _4G = 4 * _1G
 
 Py_DEBUG = hasattr(sys, 'gettotalrefcount')
 
-# Directory holding the test package (best-effort).
-TEST_HOME_DIR = os.path.dirname(os.path.abspath(__file__))
-TEST_SUPPORT_DIR = TEST_HOME_DIR
-STDLIB_DIR = os.path.dirname(os.path.dirname(TEST_HOME_DIR))
+# Directory holding the test package. Resolved against the on-disk
+# `Lib/test` (the frozen package's `__file__` is synthetic — see
+# `_test_home_dir`), so `STDLIB_DIR` correctly points at `Lib` for
+# `load_package_tests`' discovery `top_level_dir`.
+TEST_HOME_DIR = _test_home_dir()
+TEST_SUPPORT_DIR = os.path.join(TEST_HOME_DIR, "support")
+STDLIB_DIR = os.path.dirname(TEST_HOME_DIR)
+REPO_ROOT = os.path.dirname(STDLIB_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -753,10 +1042,6 @@ run_doctest = run_doctest
 # `SuppressCrashReport`, and the `bigaddrspacetest` decorator.
 # ---------------------------------------------------------------------------
 
-try:
-    TEST_HOME_DIR = os.path.dirname(os.path.abspath(__file__))
-except Exception:
-    TEST_HOME_DIR = os.getcwd()
 TEST_DATA_DIR = os.path.join(TEST_HOME_DIR, "data")
 
 
@@ -927,6 +1212,177 @@ def skip_if_pgo_task(test):
     """
     msg = "Not run for (non-extended) PGO task"
     return test if not _is_pgo else unittest.skip(msg)(test)
+
+
+# --- RFC 0037 (WS9): helpers many CPython test modules import from
+# `test.support`. CPython sources several of these from the `_testcapi` /
+# `_testinternalcapi` C extensions, which WeavePy does not ship; we provide
+# behaviour-equivalent fallbacks so the importing test bodies actually run.
+
+def get_c_recursion_limit():
+    """Depth at which the interpreter raises ``RecursionError``.
+
+    CPython reads ``_testcapi.Py_C_RECURSION_LIMIT`` (its separate C-stack
+    ceiling). WeavePy enforces a single Python-level recursion limit in the
+    dispatch loop (RFC 0037 WS1), so the meaningful value here is exactly
+    ``sys.getrecursionlimit()`` — what we actually raise at.
+    """
+    return sys.getrecursionlimit()
+
+
+def exceeds_recursion_limit():
+    """For recursion tests, easily exceeds default recursion limit."""
+    return get_c_recursion_limit() * 3
+
+
+def check_free_after_iterating(test, iter, cls, args=()):
+    done = False
+    def wrapper():
+        class A(cls):
+            def __del__(self):
+                nonlocal done
+                done = True
+                try:
+                    next(it)
+                except StopIteration:
+                    pass
+
+        it = iter(A(*args))
+        # Issue 26494: Shouldn't crash
+        test.assertRaises(StopIteration, next, it)
+
+    wrapper()
+    # The sequence should be deallocated just after the end of iterating
+    gc_collect()
+    test.assertTrue(done)
+
+
+def subTests(arg_names, arg_values, /, *, _do_cleanups=False):
+    """Run multiple subtests with different parameters."""
+    single_param = False
+    if isinstance(arg_names, str):
+        arg_names = arg_names.replace(',', ' ').split()
+        if len(arg_names) == 1:
+            single_param = True
+    arg_values = tuple(arg_values)
+    def decorator(func):
+        if isinstance(func, type):
+            raise TypeError('subTests() can only decorate methods, not classes')
+        @functools.wraps(func)
+        def wrapper(self, /, *args, **kwargs):
+            for values in arg_values:
+                if single_param:
+                    values = (values,)
+                subtest_kwargs = dict(zip(arg_names, values))
+                with self.subTest(**subtest_kwargs):
+                    func(self, *args, **kwargs, **subtest_kwargs)
+                if _do_cleanups:
+                    self.doCleanups()
+        return wrapper
+    return decorator
+
+
+def can_use_suppress_immortalization(suppress=True):
+    # WeavePy has no deferred-object immortalization, so the suppression
+    # context is always usable (it's a no-op).
+    return True
+
+
+@contextlib.contextmanager
+def suppress_immortalization(suppress=True):
+    """No-op on WeavePy.
+
+    CPython toggles a refcount-immortalization optimization via
+    ``_testinternalcapi``; WeavePy has no such optimization, so there is
+    nothing to suppress and the body simply runs.
+    """
+    yield
+
+
+def skip_if_suppress_immortalization():
+    # Nothing to skip: WeavePy never immortalizes deferred objects.
+    return None
+
+
+def has_no_debug_ranges():
+    # WeavePy emits per-instruction source positions (co_positions / debug
+    # ranges, RFC 0033), so tests guarded on their presence may run.
+    return False
+
+
+def requires_debug_ranges(reason='requires co_positions / debug_ranges'):
+    try:
+        skip = has_no_debug_ranges()
+    except unittest.SkipTest as e:
+        skip = True
+        reason = e.args[0] if e.args else reason
+    return unittest.skipIf(skip, reason)
+
+
+# WeavePy ships a `socket` module and its cooperative event loop does not
+# need privileged sockets, so socket-gated test modules are allowed to run.
+has_socket_support = True
+
+
+def requires_working_socket(*, module=False):
+    """Skip tests or modules that require working sockets.
+
+    Can be used as a function/class decorator or to skip an entire module.
+    """
+    msg = "requires socket support"
+    if module:
+        if not has_socket_support:
+            raise unittest.SkipTest(msg)
+    else:
+        return unittest.skipUnless(has_socket_support, msg)
+
+
+# WeavePy can spawn subprocesses through its `subprocess` module.
+has_subprocess_support = True
+
+
+def requires_subprocess():
+    """Used for subprocess, os.spawn calls, fd inheritance."""
+    return unittest.skipUnless(has_subprocess_support, "requires subprocess support")
+
+
+@contextlib.contextmanager
+def patch_list(orig):
+    """Like unittest.mock.patch.dict, but for lists."""
+    try:
+        saved = orig[:]
+        yield
+    finally:
+        orig[:] = saved
+
+
+class BrokenIter:
+    def __init__(self, init_raises=False, next_raises=False, iter_raises=False):
+        if init_raises:
+            1/0
+        self.next_raises = next_raises
+        self.iter_raises = iter_raises
+
+    def __next__(self):
+        if self.next_raises:
+            1/0
+
+    def __iter__(self):
+        if self.iter_raises:
+            1/0
+        return self
+
+
+__all__ += [
+    "get_c_recursion_limit", "exceeds_recursion_limit",
+    "check_free_after_iterating", "subTests",
+    "can_use_suppress_immortalization", "suppress_immortalization",
+    "skip_if_suppress_immortalization",
+    "has_no_debug_ranges", "requires_debug_ranges",
+    "has_socket_support", "requires_working_socket",
+    "has_subprocess_support", "requires_subprocess",
+    "patch_list", "BrokenIter",
+]
 
 
 __all__ += ["open_urlresource", "SuppressCrashReport", "bigaddrspacetest",

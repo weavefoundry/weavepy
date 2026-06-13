@@ -89,6 +89,39 @@ def _make_globals(mod_name, file, spec, loader, pkg):
     }
 
 
+def _run_module_code(code, init_globals=None, mod_name=None, mod_spec=None,
+                     pkg_name=None, script_name=None):
+    """Exec ``code`` as ``mod_name`` inside a fresh temporary module that
+    is registered in ``sys.modules`` for the duration of the run, then
+    removed — CPython's ``runpy._TempModule`` + ``_ModifiedArgv0``.
+
+    Registering the module matters: code that introspects
+    ``sys.modules[__name__]`` mid-execution (e.g. ``enum.global_enum``
+    hoisting members into the running module's globals, as ``calendar``
+    does) must see the *same* namespace it is executing in."""
+    import types
+    saved_module = sys.modules.get(mod_name)
+    saved_argv0 = sys.argv[0] if sys.argv else None
+    temp_module = types.ModuleType(mod_name)
+    sys.modules[mod_name] = temp_module
+    try:
+        if script_name is not None and sys.argv:
+            sys.argv[0] = script_name
+        mod_globals = temp_module.__dict__
+        _run_code(code, mod_globals, init_globals, mod_name, mod_spec,
+                  pkg_name, script_name)
+        # Return a snapshot so callers can't mutate the (now-removed)
+        # temporary module's namespace.
+        return dict(mod_globals)
+    finally:
+        if saved_argv0 is not None and sys.argv:
+            sys.argv[0] = saved_argv0
+        if saved_module is not None:
+            sys.modules[mod_name] = saved_module
+        elif mod_name in sys.modules:
+            del sys.modules[mod_name]
+
+
 def run_module(mod_name, init_globals=None, run_name=None, alter_sys=False):
     """Locate ``mod_name`` and exec it with ``__name__`` set."""
     if run_name is None:
@@ -112,7 +145,12 @@ def run_module(mod_name, init_globals=None, run_name=None, alter_sys=False):
             frozen_source = getter(mod_name)
         if frozen_source is not None:
             source = frozen_source
-            filename = filename or f"<frozen:{mod_name}>"
+            # A frozen module has no real path; synthesise a CPython-like
+            # ``<modpath>.py`` so ``-m``'s ``sys.argv[0]`` / argparse
+            # ``prog`` and tracebacks read naturally (``calendar.py``)
+            # rather than the opaque ``<frozen>`` placeholder.
+            if not filename or filename.startswith("<frozen"):
+                filename = name.replace(".", os.sep) + ".py"
         else:
             # Truly no source — fall back to the existing module's
             # __dict__ so callers at least get the imported names.
@@ -121,12 +159,10 @@ def run_module(mod_name, init_globals=None, run_name=None, alter_sys=False):
                 run_globals.update(init_globals)
             run_globals["__name__"] = run_name
             return run_globals
-    if alter_sys:
-        # ``argv[0]`` becomes the module filename (the Python target);
-        # the rest of argv is preserved.
-        if filename:
-            sys.argv[0] = filename
     code = compile(source, filename or f"<{name}>", "exec")
+    if alter_sys:
+        return _run_module_code(code, init_globals, run_name, spec, pkg,
+                                filename)
     run_globals = _make_globals(run_name, filename, spec, None, pkg)
     return _run_code(code, run_globals, init_globals, run_name, spec, pkg, filename)
 

@@ -42,6 +42,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 DictKey(Object::from_static(name)),
                 Object::Builtin(Rc::new(BuiltinFn {
                     name,
+                    binds_instance: false,
                     call: Box::new(fn_),
                     call_kw: None,
                 })),
@@ -69,6 +70,33 @@ fn abc_get_cache_token(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn abc_init(args: &[Object]) -> Result<Object, RuntimeError> {
     // _abc_init(cls) — initialise the registry / cache on the class.
     if let Some(Object::Type(cls)) = args.first() {
+        // CPython's `_abc_init` consumes `__abc_tpflags__`: it validates
+        // that a class doesn't claim both `Py_TPFLAGS_SEQUENCE` and
+        // `Py_TPFLAGS_MAPPING`, folds the collection bits into
+        // `tp_flags` (we keep them under a private dict key that
+        // `flags_bits` reads), and deletes the public attribute.
+        const COLLECTION_FLAGS: i64 = (1 << 5) | (1 << 6);
+        let tpflags = cls
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__abc_tpflags__")))
+            .cloned();
+        if let Some(flags) = tpflags {
+            if let Some(val) = flags.as_i64() {
+                if (val & COLLECTION_FLAGS) == COLLECTION_FLAGS {
+                    return Err(crate::error::type_error(
+                        "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING",
+                    ));
+                }
+                cls.dict.borrow_mut().insert(
+                    DictKey(Object::from_static("_abc_collection_flags")),
+                    Object::Int(val & COLLECTION_FLAGS),
+                );
+            }
+            cls.dict
+                .borrow_mut()
+                .shift_remove(&DictKey(Object::from_static("__abc_tpflags__")));
+        }
         let mut td = cls.dict.borrow_mut();
         td.insert(
             DictKey(Object::from_static("_abc_registry")),
@@ -113,7 +141,7 @@ fn abc_instancecheck(args: &[Object]) -> Result<Object, RuntimeError> {
     let cls = args.first().cloned().unwrap_or(Object::None);
     let inst = args.get(1).cloned().unwrap_or(Object::None);
     if let (Object::Type(t), Object::Instance(i)) = (&cls, &inst) {
-        if i.class.is_subclass_of(t) {
+        if i.cls().is_subclass_of(t) {
             return Ok(Object::Bool(true));
         }
         if let Some(Object::Set(reg)) = t
@@ -124,7 +152,7 @@ fn abc_instancecheck(args: &[Object]) -> Result<Object, RuntimeError> {
         {
             for entry in reg.borrow().iter() {
                 if let Object::Type(et) = &entry.0 {
-                    if i.class.is_subclass_of(et) {
+                    if i.cls().is_subclass_of(et) {
                         return Ok(Object::Bool(true));
                     }
                 }

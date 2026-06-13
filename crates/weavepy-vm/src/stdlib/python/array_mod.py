@@ -103,6 +103,18 @@ class array:
     def tobytes(self):
         return b''.join(_struct.pack(self._fmt, v) for v in self._data)
 
+    def __buffer__(self, flags):
+        # PEP 688 buffer protocol: expose the packed bytes so buffer
+        # consumers (``float``/``int``/``bytes``/``memoryview``) can read the
+        # array's contents, mirroring CPython's C-level buffer export. Back
+        # the view with a ``bytearray`` so it's *writable* — that's what lets
+        # ``struct.pack_into(memoryview(array(...)), ...)`` write through it
+        # (test_struct.test_pack_into). (The bytes are a snapshot; this
+        # list-backed array doesn't share storage with the view, but the view
+        # itself is a coherent read/write buffer, which is what consumers
+        # operate on.)
+        return memoryview(bytearray(self.tobytes()))
+
     def fromlist(self, seq):
         for v in seq:
             self._data.append(self._coerce(v))
@@ -190,3 +202,13 @@ class array:
 
 
 ArrayType = array
+
+# CPython's C module registers itself on import (array_modexec):
+# `issubclass(array.array, collections.abc.MutableSequence)` is True.
+try:
+    from collections.abc import MutableSequence as _MutableSequence
+
+    _MutableSequence.register(array)
+    del _MutableSequence
+except ImportError:
+    pass

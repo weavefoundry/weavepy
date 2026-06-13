@@ -40,6 +40,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         let buffered_iobase = make_protocol("BufferedIOBase", vec![iobase.clone()]);
         let text_iobase = make_protocol("TextIOBase", vec![iobase.clone()]);
         let fileio = make_protocol("FileIO", vec![raw_iobase.clone()]);
+        install_closed_getset(&fileio);
         let buffered_reader = make_protocol("BufferedReader", vec![buffered_iobase.clone()]);
         let buffered_writer = make_protocol("BufferedWriter", vec![buffered_iobase.clone()]);
         let buffered_random = make_protocol("BufferedRandom", vec![buffered_iobase.clone()]);
@@ -83,6 +84,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("open")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open",
+                binds_instance: false,
                 call: Box::new(io_open),
                 call_kw: None,
             })),
@@ -91,6 +93,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("open_code")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open_code",
+                binds_instance: false,
                 call: Box::new(io_open),
                 call_kw: None,
             })),
@@ -101,6 +104,40 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         filename: None,
         dict,
     })
+}
+
+/// Install `FileIO.closed` as a getset descriptor (CPython's
+/// `_io.FileIO.closed`). Type-level access yields the descriptor itself,
+/// whose `__doc__` is the curated string the descriptor tests assert on
+/// (test_descr test_descrdoc); instance access reports the file state.
+fn install_closed_getset(ty: &Rc<TypeObject>) {
+    fn closed_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        match args.first() {
+            Some(Object::File(f)) => Ok(Object::Bool(*f.closed.borrow())),
+            _ => Ok(Object::Bool(false)),
+        }
+    }
+    let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "closed",
+            binds_instance: true,
+            call: Box::new(closed_get),
+            call_kw: None,
+        })),
+        Object::None,
+        Object::None,
+        Object::from_static("True if the file is closed"),
+    )));
+    crate::descr_registry::register(
+        &prop,
+        crate::descr_registry::DescrKind::GetSet,
+        ty.clone(),
+        "closed",
+        None,
+    );
+    ty.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("closed")), prop);
 }
 
 fn make_protocol(name: &'static str, bases: Vec<Rc<TypeObject>>) -> Rc<TypeObject> {
@@ -131,6 +168,7 @@ fn make_protocol(name: &'static str, bases: Vec<Rc<TypeObject>>) -> Rc<TypeObjec
             DictKey(Object::from_static(stub_name)),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: stub_name,
+                binds_instance: true,
                 call: Box::new(stub_method),
                 call_kw: None,
             })),

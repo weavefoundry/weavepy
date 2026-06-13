@@ -19,13 +19,13 @@ use crate::sync::Rc;
 use crate::sync::RefCell;
 
 use num_bigint::BigInt;
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use crate::builtin_types::{builtin_types, instance_is_subclass};
 use crate::error::{
     index_error, key_error, runtime_error, stop_iteration, type_error, value_error, RuntimeError,
 };
-use crate::object::{BuiltinFn, DictData, DictKey, Object, PyIterator, Range};
+use crate::object::{BuiltinFn, DictData, DictKey, MethodWrapper, Object, PyIterator, Range};
 
 /// Marker name on the `BuiltinFn` returned by [`build_class_builtin`].
 /// The VM looks for this when dispatching `Call` so the call can be
@@ -39,11 +39,88 @@ pub const BUILD_CLASS_NAME: &str = "__build_class__";
 pub fn build_class_builtin() -> BuiltinFn {
     BuiltinFn {
         name: BUILD_CLASS_NAME,
+        binds_instance: false,
         call: Box::new(|_args: &[Object]| {
             Err(runtime_error("internal: __build_class__ called outside VM"))
         }),
         call_kw: None,
     }
+}
+
+/// Resolve the native constructor function for a built-in *type* by name.
+///
+/// The VM's instantiation fallback (`builtin_constructor_for`) needs the
+/// `b_*` constructor (e.g. `b_set`) even though the user-visible
+/// `__builtins__` now maps these names to the real `type` objects. Keeping
+/// this lookup independent of the `__builtins__` dict lets both coexist:
+/// `builtins.set is set` (a type) while `set(...)` still constructs through
+/// the native helper.
+pub(crate) fn builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
+    macro_rules! ctor {
+        ($n:literal, $body:expr) => {
+            Some(Rc::new(BuiltinFn {
+                name: $n,
+                binds_instance: false,
+                call: Box::new($body),
+                call_kw: None,
+            }))
+        };
+        ($n:literal, $body:expr, $kw:expr) => {
+            Some(Rc::new(BuiltinFn {
+                name: $n,
+                binds_instance: false,
+                call: Box::new($body),
+                call_kw: Some(Box::new($kw)),
+            }))
+        };
+    }
+    match name {
+        "str" => ctor!("str", b_str),
+        "int" => ctor!("int", b_int),
+        "float" => ctor!("float", b_float),
+        "complex" => ctor!("complex", b_complex),
+        "bool" => ctor!("bool", b_bool),
+        "list" => ctor!("list", b_list),
+        "tuple" => ctor!("tuple", b_tuple),
+        "dict" => ctor!("dict", b_dict),
+        "set" => ctor!("set", b_set),
+        "frozenset" => ctor!("frozenset", b_frozenset),
+        "bytes" => ctor!("bytes", b_bytes, b_bytes_kw),
+        "bytearray" => ctor!("bytearray", b_bytearray, b_bytearray_kw),
+        "object" => ctor!("object", b_object),
+        "type" => ctor!("type", b_type),
+        "range" => ctor!("range", b_range),
+        "slice" => ctor!("slice", b_slice),
+        "memoryview" => ctor!("memoryview", b_memoryview),
+        _ => None,
+    }
+}
+
+/// `slice(stop)` / `slice(start, stop[, step])` → a real `Object::Slice`,
+/// the same representation the `BUILD_SLICE` opcode produces for `a:b:c`.
+/// Without this the type's generic instantiation path made a bare
+/// `object` instance that the subscript handlers (which match
+/// `Object::Slice`) rejected. Missing positions default to `None`,
+/// matching CPython's `slice` type.
+pub(crate) fn b_slice(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (start, stop, step) = match args.len() {
+        0 => {
+            return Err(type_error("slice expected at least 1 argument, got 0"));
+        }
+        1 => (Object::None, args[0].clone(), Object::None),
+        2 => (args[0].clone(), args[1].clone(), Object::None),
+        3 => (args[0].clone(), args[1].clone(), args[2].clone()),
+        n => {
+            return Err(type_error(format!(
+                "slice expected at most 3 arguments, got {n}"
+            )));
+        }
+    };
+    Ok(Object::Slice(Rc::new(crate::object::PySlice {
+        start,
+        stop,
+        step,
+    })))
 }
 
 /// Build the dict that backs the `builtins` module.
@@ -53,6 +130,7 @@ pub fn default_builtins() -> DictData {
         ($name:literal, $body:expr) => {{
             let f = BuiltinFn {
                 name: $name,
+                binds_instance: false,
                 call: Box::new($body),
                 call_kw: None,
             };
@@ -86,6 +164,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "open",
+            binds_instance: false,
             call: Box::new(b_open),
             call_kw: Some(Box::new(b_open_kw)),
         };
@@ -121,6 +200,12 @@ pub fn default_builtins() -> DictData {
     reg!("input", b_input_unsupported);
     reg!("next", b_next);
     reg!("iter", b_iter);
+    reg!("aiter", b_aiter);
+    reg!("anext", b_anext);
+    reg!(
+        "_weavepy_mark_iterable_coroutine",
+        b_mark_iterable_coroutine
+    );
     reg!("divmod", b_divmod);
     reg!("round", b_round);
     reg!("format", b_format);
@@ -149,6 +234,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:input",
+            binds_instance: false,
             call: Box::new(b_input_unsupported),
             call_kw: None,
         };
@@ -205,6 +291,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:__import__",
+            binds_instance: false,
             call: Box::new(b_import_placeholder),
             call_kw: None,
         };
@@ -216,6 +303,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:compile",
+            binds_instance: false,
             call: Box::new(b_vm_intrinsic),
             call_kw: None,
         };
@@ -227,6 +315,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:exec",
+            binds_instance: false,
             call: Box::new(b_vm_intrinsic),
             call_kw: None,
         };
@@ -238,6 +327,7 @@ pub fn default_builtins() -> DictData {
     {
         let f = BuiltinFn {
             name: "__vm:eval",
+            binds_instance: false,
             call: Box::new(b_vm_intrinsic),
             call_kw: None,
         };
@@ -332,16 +422,17 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "strip" => Some(method("strip", str_strip)),
             "lstrip" => Some(method("lstrip", str_lstrip)),
             "rstrip" => Some(method("rstrip", str_rstrip)),
-            "split" => Some(method("split", str_split)),
-            "rsplit" => Some(method("rsplit", str_rsplit)),
-            "splitlines" => Some(method("splitlines", str_splitlines)),
+            "split" => Some(method_kw("split", str_split)),
+            "rsplit" => Some(method_kw("rsplit", str_rsplit)),
+            "splitlines" => Some(method_kw("splitlines", str_splitlines)),
             "join" => Some(method("join", str_join)),
             "startswith" => Some(method("startswith", str_startswith)),
             "endswith" => Some(method("endswith", str_endswith)),
-            "replace" => Some(method("replace", str_replace)),
+            "replace" => Some(method_kw("replace", str_replace_kw)),
             "find" => Some(method("find", str_find)),
             "rfind" => Some(method("rfind", str_rfind)),
             "index" => Some(method("index", str_index)),
+            "rindex" => Some(method("rindex", str_rindex)),
             "count" => Some(method("count", str_count)),
             "partition" => Some(method("partition", str_partition)),
             "rpartition" => Some(method("rpartition", str_rpartition)),
@@ -364,10 +455,36 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "encode" => Some(method("encode", str_encode)),
             "removeprefix" => Some(method("removeprefix", str_removeprefix)),
             "removesuffix" => Some(method("removesuffix", str_removesuffix)),
-            "format" => Some(method("format", str_format)),
-            "format_map" => Some(method("format_map", str_format_map)),
+            "format" => Some(method(".format", str_format)),
+            "format_map" => Some(method(".format_map", str_format_map)),
             "translate" => Some(method("translate", str_translate)),
             "maketrans" => Some(method("maketrans", str_maketrans)),
+            // Sequence dunders so `hasattr(s, '__getitem__')` and direct
+            // `str.__getitem__(s, i)` calls work (CPython exposes these as
+            // slot wrappers; `operator.concat` probes `__getitem__`).
+            "__getitem__" => Some(method("__getitem__", seq_getitem)),
+            "__len__" => Some(method("__len__", obj_len)),
+            "__contains__" => Some(method("__contains__", obj_contains)),
+            "__add__" => Some(seq_dunder_binop(
+                "__add__",
+                weavepy_compiler::BinOpKind::Add,
+                false,
+            )),
+            "__mul__" => Some(seq_dunder_binop(
+                "__mul__",
+                weavepy_compiler::BinOpKind::Mult,
+                false,
+            )),
+            "__rmul__" => Some(seq_dunder_binop(
+                "__rmul__",
+                weavepy_compiler::BinOpKind::Mult,
+                true,
+            )),
+            "__mod__" => Some(seq_dunder_binop(
+                "__mod__",
+                weavepy_compiler::BinOpKind::Mod,
+                false,
+            )),
             _ => None,
         },
         Object::List(_) => match name {
@@ -382,6 +499,30 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "reverse" => Some(method("reverse", list_reverse)),
             "clear" => Some(method("clear", list_clear)),
             "copy" => Some(method("copy", list_copy)),
+            // Dunders so `list.__setitem__` / `super().__getitem__` resolve
+            // for `list` subclasses (`class C(list)`).
+            "__getitem__" => Some(method("__getitem__", list_getitem)),
+            "__setitem__" => Some(method("__setitem__", list_setitem)),
+            "__delitem__" => Some(method("__delitem__", list_delitem)),
+            "__len__" => Some(method("__len__", obj_len)),
+            "__contains__" => Some(method("__contains__", obj_contains)),
+            "__add__" => Some(seq_dunder_binop(
+                "__add__",
+                weavepy_compiler::BinOpKind::Add,
+                false,
+            )),
+            "__mul__" => Some(seq_dunder_binop(
+                "__mul__",
+                weavepy_compiler::BinOpKind::Mult,
+                false,
+            )),
+            "__rmul__" => Some(seq_dunder_binop(
+                "__rmul__",
+                weavepy_compiler::BinOpKind::Mult,
+                true,
+            )),
+            "__iadd__" => Some(method("__iadd__", list_iadd)),
+            "__imul__" => Some(method("__imul__", list_imul)),
             _ => None,
         },
         Object::Dict(_) => match name {
@@ -396,11 +537,42 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "copy" => Some(method("copy", dict_copy)),
             "fromkeys" => Some(method("fromkeys", dict_fromkeys)),
             "popitem" => Some(method("popitem", dict_popitem)),
+            // Dunders so `dict.__setitem__` / `super().__setitem__` resolve
+            // for `dict` subclasses (`class C(dict)`).
+            "__setitem__" => Some(method("__setitem__", dict_setitem)),
+            "__getitem__" => Some(method("__getitem__", dict_getitem)),
+            "__delitem__" => Some(method("__delitem__", dict_delitem)),
+            // Mapping-protocol dunders exposed as bound methods so code can
+            // grab them directly — CPython's `functools._lru_cache_wrapper`
+            // caches `cache_len = cache.__len__`, and `__contains__` /
+            // `__iter__` round out `hasattr(d, …)` / explicit-call parity.
+            "__len__" => Some(method("__len__", obj_len)),
+            "__contains__" => Some(method("__contains__", obj_contains)),
+            "__iter__" => Some(method("__iter__", dict_iter_method)),
+            "__init__" => Some(method("__init__", dict_update)),
             _ => None,
         },
         Object::Tuple(_) => match name {
             "count" => Some(method("count", tuple_count)),
             "index" => Some(method("index", tuple_index)),
+            "__getitem__" => Some(method("__getitem__", seq_getitem)),
+            "__len__" => Some(method("__len__", obj_len)),
+            "__contains__" => Some(method("__contains__", obj_contains)),
+            "__add__" => Some(seq_dunder_binop(
+                "__add__",
+                weavepy_compiler::BinOpKind::Add,
+                false,
+            )),
+            "__mul__" => Some(seq_dunder_binop(
+                "__mul__",
+                weavepy_compiler::BinOpKind::Mult,
+                false,
+            )),
+            "__rmul__" => Some(seq_dunder_binop(
+                "__rmul__",
+                weavepy_compiler::BinOpKind::Mult,
+                true,
+            )),
             _ => None,
         },
         Object::Set(_) | Object::FrozenSet(_) => match name {
@@ -426,33 +598,56 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                 "symmetric_difference_update",
                 set_symmetric_difference_update,
             )),
+            // Membership dunder exposed as a bound method: CPython's
+            // `keyword.iskeyword = frozenset(kwlist).__contains__` grabs it
+            // directly, and `hasattr(s, '__contains__')` must hold.
+            "__contains__" => Some(method("__contains__", obj_contains)),
+            "__len__" => Some(method("__len__", obj_len)),
             _ => None,
         },
         Object::Bytes(_) | Object::ByteArray(_) => match name {
-            "decode" => Some(method("decode", bytes_decode)),
-            "hex" => Some(method("hex", bytes_hex)),
+            "decode" => Some(method_kw("decode", bytes_decode_kw)),
+            "hex" => Some(method_kw("hex", bytes_hex_kw)),
             "fromhex" => Some(method("fromhex", bytes_fromhex)),
             "startswith" => Some(method("startswith", bytes_startswith)),
             "endswith" => Some(method("endswith", bytes_endswith)),
             "find" => Some(method("find", bytes_find)),
             "rfind" => Some(method("rfind", bytes_rfind)),
             "index" => Some(method("index", bytes_index)),
+            "rindex" => Some(method("rindex", bytes_rindex)),
             "count" => Some(method("count", bytes_count)),
             "lower" => Some(method("lower", bytes_lower)),
             "upper" => Some(method("upper", bytes_upper)),
             "strip" => Some(method("strip", bytes_strip)),
             "lstrip" => Some(method("lstrip", bytes_lstrip)),
             "rstrip" => Some(method("rstrip", bytes_rstrip)),
-            "split" => Some(method("split", bytes_split)),
-            "splitlines" => Some(method("splitlines", bytes_splitlines)),
+            "split" => Some(method_kw("split", bytes_split_kw)),
+            "rsplit" => Some(method_kw("rsplit", bytes_rsplit_kw)),
+            "splitlines" => Some(method_kw("splitlines", bytes_splitlines_kw)),
             "join" => Some(method("join", bytes_join)),
-            "replace" => Some(method("replace", bytes_replace)),
-            "translate" => Some(method("translate", bytes_translate)),
+            "replace" => Some(method_kw("replace", bytes_replace_kw)),
+            "translate" => Some(method_kw("translate", bytes_translate_kw)),
             "maketrans" => Some(method("maketrans", bytes_maketrans)),
+            "partition" => Some(method("partition", bytes_partition)),
+            "rpartition" => Some(method("rpartition", bytes_rpartition)),
+            "removeprefix" => Some(method("removeprefix", bytes_removeprefix)),
+            "removesuffix" => Some(method("removesuffix", bytes_removesuffix)),
+            "expandtabs" => Some(method_kw("expandtabs", bytes_expandtabs)),
+            "center" => Some(method("center", bytes_center)),
+            "ljust" => Some(method("ljust", bytes_ljust)),
+            "rjust" => Some(method("rjust", bytes_rjust)),
+            "zfill" => Some(method("zfill", bytes_zfill)),
+            "capitalize" => Some(method("capitalize", bytes_capitalize)),
+            "title" => Some(method("title", bytes_title)),
+            "swapcase" => Some(method("swapcase", bytes_swapcase)),
             "isalnum" => Some(method("isalnum", bytes_isalnum)),
             "isalpha" => Some(method("isalpha", bytes_isalpha)),
             "isdigit" => Some(method("isdigit", bytes_isdigit)),
             "isspace" => Some(method("isspace", bytes_isspace)),
+            "islower" => Some(method("islower", bytes_islower)),
+            "isupper" => Some(method("isupper", bytes_isupper)),
+            "istitle" => Some(method("istitle", bytes_istitle)),
+            "isascii" => Some(method("isascii", bytes_isascii)),
             // bytearray-only mutators
             "append" if matches!(obj, Object::ByteArray(_)) => {
                 Some(method("append", bytearray_append))
@@ -467,14 +662,74 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "reverse" if matches!(obj, Object::ByteArray(_)) => {
                 Some(method("reverse", bytearray_reverse))
             }
+            "insert" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("insert", bytearray_insert))
+            }
+            "remove" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("remove", bytearray_remove))
+            }
+            "copy" if matches!(obj, Object::ByteArray(_)) => Some(method("copy", bytearray_copy)),
+            // CPython exposes the allocation size (`ob_alloc`, which
+            // includes the trailing NUL). We don't track capacity
+            // separately, so report `len + 1` — satisfies the documented
+            // `__alloc__() > len()` invariant.
+            "__alloc__" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method("__alloc__", |args| {
+                    let b = bytearray_self(args)?;
+                    let n = b.borrow().len();
+                    Ok(Object::Int(n as i64 + 1))
+                }))
+            }
+            // In-place (re)initialisation — `b.__init__(it)` resets the
+            // content; subclass `__init__` chains
+            // (`bytearray.__init__(me, *args, **kwargs)`) land here too.
+            "__init__" if matches!(obj, Object::ByteArray(_)) => {
+                Some(method_kw("__init__", bytearray_init_kw))
+            }
+            // Sequence dunders so direct calls / `hasattr` parity hold.
+            "__contains__" => Some(method("__contains__", obj_contains)),
+            "__len__" => Some(method("__len__", obj_len)),
+            "__getitem__" => Some(method("__getitem__", seq_getitem)),
+            "__add__" => Some(seq_dunder_binop(
+                "__add__",
+                weavepy_compiler::BinOpKind::Add,
+                false,
+            )),
+            "__mul__" => Some(seq_dunder_binop(
+                "__mul__",
+                weavepy_compiler::BinOpKind::Mult,
+                false,
+            )),
+            "__rmul__" => Some(seq_dunder_binop(
+                "__rmul__",
+                weavepy_compiler::BinOpKind::Mult,
+                true,
+            )),
+            // PEP 461 `%`-formatting exposed as the number-protocol
+            // dunders (`bytes_mod` fills CPython's `nb_remainder` slot,
+            // so both wrappers exist).
+            "__mod__" => Some(method("__mod__", bytes_dunder_mod)),
+            "__rmod__" => Some(method("__rmod__", bytes_dunder_rmod)),
+            "__bytes__" if matches!(obj, Object::Bytes(_)) => {
+                Some(method("__bytes__", |args| match args.first() {
+                    Some(Object::Bytes(b)) => Ok(Object::Bytes(b.clone())),
+                    _ => Err(type_error("__bytes__ requires a bytes receiver")),
+                }))
+            }
             _ => None,
         },
-        Object::File(_) => match name {
+        Object::File(f) => match name {
             "read" => Some(method("read", file_read)),
+            // Binary streams only — CPython text files genuinely lack the
+            // attribute (it lives on RawIOBase/BufferedIOBase).
+            "readinto" if f.binary => Some(method("readinto", file_readinto)),
             "readline" => Some(method("readline", file_readline)),
             "readlines" => Some(method("readlines", file_readlines)),
             "write" => Some(method("write", file_write)),
-            "writelines" => Some(method("writelines", file_writelines)),
+            // Routed through the interpreter (sentinel name) so it can
+            // consume *any* iterable via the full `__iter__`/`__next__`
+            // protocol, not just native sequences.
+            "writelines" => Some(method(".file_writelines", file_writelines)),
             "flush" => Some(method("flush", file_flush)),
             "close" => Some(method("close", file_close)),
             "seek" => Some(method("seek", file_seek)),
@@ -482,6 +737,11 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "getvalue" => Some(method("getvalue", file_getvalue)),
             "__enter__" => Some(method("__enter__", file_enter)),
             "__exit__" => Some(method("__exit__", file_exit)),
+            // A file is its own iterator (CPython): `iter(f) is f`, and
+            // each `next(f)` returns the next line, raising StopIteration
+            // at EOF.
+            "__iter__" => Some(method("__iter__", |args| file_self(args).map(Object::File))),
+            "__next__" => Some(method("__next__", file_next)),
             _ => None,
         },
         Object::MemoryView(_) => match name {
@@ -494,9 +754,23 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__exit__" => Some(method("__exit__", memoryview_exit)),
             _ => None,
         },
-        Object::DictView(_) | Object::MappingProxy(_) => match name {
+        Object::DictView(_) => match name {
             "isdisjoint" => Some(method("isdisjoint", view_isdisjoint)),
             "mapping" => None,
+            _ => None,
+        },
+        // `mappingproxy` (read-only `type.__dict__` view) forwards the
+        // read-side mapping API to the wrapped dict.
+        Object::MappingProxy(_) => match name {
+            "isdisjoint" => Some(method("isdisjoint", view_isdisjoint)),
+            "get" => Some(method("get", mappingproxy_get)),
+            "keys" => Some(method("keys", mappingproxy_keys)),
+            "values" => Some(method("values", mappingproxy_values)),
+            "items" => Some(method("items", mappingproxy_items)),
+            "copy" => Some(method("copy", mappingproxy_copy)),
+            "__getitem__" => Some(method("__getitem__", mappingproxy_getitem)),
+            "__len__" => Some(method("__len__", obj_len)),
+            "__contains__" => Some(method("__contains__", obj_contains)),
             _ => None,
         },
         Object::SimpleNamespace(_) => match name {
@@ -505,17 +779,35 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         },
         // `property` objects expose `getter`/`setter`/`deleter`
         // methods that return a *new* property carrying a patched
-        // function (the underlying decorator pattern).
+        // function (the underlying decorator pattern), plus the
+        // explicit descriptor-protocol slots — CPython's `property` is
+        // a data descriptor precisely because its *type* defines
+        // `__set__`/`__delete__`, and `inspect.isdatadescriptor`
+        // checks exactly that.
         Object::Property(_) => match name {
             "getter" => Some(method("getter", property_getter)),
             "setter" => Some(method("setter", property_setter)),
             "deleter" => Some(method("deleter", property_deleter)),
+            "__get__" => Some(method("__get__", property_dunder_get)),
+            "__set__" => Some(method("__set__", property_dunder_set)),
+            "__delete__" => Some(method("__delete__", property_dunder_delete)),
             "fget" | "fset" | "fdel" | "__doc__" => {
                 // These are looked up via `lookup_attr` in the VM
                 // rather than method dispatch; we don't return them
                 // here.
                 None
             }
+            _ => None,
+        },
+        // Non-data descriptor protocol slots, reachable both bound
+        // (`sm.__get__`) via `load_attr` and unbound
+        // (`staticmethod.__get__`) via the slot-wrapper table.
+        Object::StaticMethod(_) => match name {
+            "__get__" => Some(method("__get__", staticmethod_descr_get)),
+            _ => None,
+        },
+        Object::ClassMethod(_) => match name {
+            "__get__" => Some(method("__get__", classmethod_descr_get)),
             _ => None,
         },
         Object::Int(_) | Object::Long(_) | Object::Bool(_) => match name {
@@ -536,7 +828,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__trunc__" => Some(method("__trunc__", int_conjugate)),
             "__floor__" => Some(method("__floor__", int_conjugate)),
             "__ceil__" => Some(method("__ceil__", int_conjugate)),
-            _ => None,
+            _ => numeric_dunder(obj, name),
         },
         Object::Float(_) => match name {
             "is_integer" => Some(method("is_integer", float_is_integer)),
@@ -545,16 +837,245 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "as_integer_ratio" => Some(method("as_integer_ratio", float_as_integer_ratio)),
             "conjugate" => Some(method("conjugate", float_conjugate)),
             "__trunc__" => Some(method("__trunc__", float_trunc)),
+            "__floor__" => Some(method("__floor__", float_floor)),
+            "__ceil__" => Some(method("__ceil__", float_ceil)),
             "__round__" => Some(method("__round__", float_round)),
-            _ => None,
+            _ => numeric_dunder(obj, name),
         },
         Object::Complex(_) => match name {
             "conjugate" => Some(method("conjugate", complex_conjugate)),
+            // `complex.__complex__(self)` returns the value unchanged, so
+            // `complex(x)` / the numeric-tower probes accept a complex.
+            "__complex__" => Some(method("__complex__", |args| {
+                args.first()
+                    .cloned()
+                    .ok_or_else(|| crate::error::type_error("__complex__() missing self"))
+            })),
+            "__abs__" => Some(method("__abs__", |args| {
+                b_abs(std::slice::from_ref(args.first().unwrap_or(&Object::None)))
+            })),
+            _ => numeric_dunder(obj, name),
+        },
+        Object::Slice(_) => match name {
+            "indices" => Some(method("indices", slice_indices_method)),
+            _ => None,
+        },
+        // Built-in iterators expose `__length_hint__` (PEP 424) so
+        // `operator.length_hint`, `list()` pre-sizing, and friends can
+        // query the remaining count without consuming the iterator.
+        Object::Iter(_) => match name {
+            "__length_hint__" => Some(method("__length_hint__", iter_length_hint)),
+            "__iter__" => Some(method("__iter__", |args| {
+                args.first()
+                    .cloned()
+                    .ok_or_else(|| type_error("__iter__() missing self"))
+            })),
+            // Pickling support. The actual reduction needs the canonical
+            // `iter` builtin (so the result pickles by name and round-trips),
+            // which requires interpreter access — the VM intercepts this
+            // sentinel name in its bound-method dispatch.
+            "__reduce__" => Some(method(".iter_reduce", |_| {
+                Err(type_error("iterator.__reduce__ requires the interpreter"))
+            })),
+            "__setstate__" => Some(method("__setstate__", iter_setstate)),
             _ => None,
         },
         _ => None,
     };
     f.map(|f| Object::Builtin(Rc::new(f)))
+}
+
+/// `<iterator>.__setstate__(index)` — reposition the cursor after an
+/// unpickle (CPython's `*iter_setstate`). The index clamps to
+/// `[0, len]`; out-of-range states unpickle as an exhausted iterator.
+fn iter_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let it = match args.first() {
+        Some(Object::Iter(it)) => it.clone(),
+        _ => return Err(type_error("__setstate__() requires an iterator")),
+    };
+    let state = args
+        .get(1)
+        .and_then(|o| o.as_i64())
+        .ok_or_else(|| type_error("an integer is required"))?;
+    let clamp = |len: usize| -> usize { state.max(0).min(len as i64) as usize };
+    use crate::object::PyIterator;
+    match &mut *it.borrow_mut() {
+        PyIterator::List { items, index } => {
+            *index = clamp(items.borrow().len());
+        }
+        PyIterator::Tuple { items, index } => *index = clamp(items.len()),
+        PyIterator::Str { s, index } => *index = clamp(s.len()),
+        PyIterator::Bytes { data, index } => *index = clamp(data.len()),
+        PyIterator::ByteArray { data, index } => {
+            *index = clamp(data.borrow().len());
+        }
+        PyIterator::DictKeys { keys, index } => *index = clamp(keys.len()),
+        PyIterator::Reversed { index, .. } => *index = state.max(-1),
+        _ => {}
+    }
+    Ok(Object::None)
+}
+
+/// `<iterator>.__length_hint__()` — the number of items the iterator
+/// will still yield, when cheaply known (PEP 424). Returns `0` for
+/// exhausted/unknown-length sources, matching CPython's contract that
+/// the hint is advisory and never raises.
+fn iter_length_hint(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args.first() {
+        Some(Object::Iter(it)) => {
+            let n = it.borrow().remaining().unwrap_or(0);
+            Ok(Object::Int(n as i64))
+        }
+        _ => Err(type_error("__length_hint__() requires an iterator")),
+    }
+}
+
+/// `seq.__getitem__(self, index)` for built-in sequences — int (incl.
+/// negatives) and `slice` indexing for `str`/`list`/`tuple`/`bytes`/
+/// `bytearray`. CPython exposes these as slot wrappers; this lets
+/// `hasattr(s, '__getitem__')` succeed and direct `str.__getitem__`
+/// calls work.
+fn seq_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let recv = args
+        .first()
+        .ok_or_else(|| type_error("__getitem__() missing self"))?;
+    let index = args
+        .get(1)
+        .ok_or_else(|| type_error("__getitem__() takes exactly one argument (0 given)"))?;
+    let as_seq = |v: &Object| -> Vec<Object> {
+        match v {
+            Object::List(items) => items.borrow().clone(),
+            Object::Tuple(items) => items.to_vec(),
+            Object::Str(s) => s.chars().map(|c| Object::from_str(c.to_string())).collect(),
+            Object::Bytes(b) => b.iter().map(|x| Object::Int(i64::from(*x))).collect(),
+            Object::ByteArray(b) => b
+                .borrow()
+                .iter()
+                .map(|x| Object::Int(i64::from(*x)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    match index {
+        Object::Slice(s) => {
+            let seq = as_seq(recv);
+            let sliced = crate::slice_seq(&seq, s)?;
+            Ok(match recv {
+                Object::Str(_) => {
+                    Object::from_str(sliced.iter().map(Object::to_str).collect::<String>())
+                }
+                Object::Tuple(_) => Object::new_tuple(sliced),
+                Object::Bytes(_) => {
+                    let bytes: Vec<u8> = sliced
+                        .iter()
+                        .filter_map(|o| o.as_i64())
+                        .map(|i| i as u8)
+                        .collect();
+                    Object::new_bytes(bytes)
+                }
+                Object::ByteArray(_) => {
+                    let bytes: Vec<u8> = sliced
+                        .iter()
+                        .filter_map(|o| o.as_i64())
+                        .map(|i| i as u8)
+                        .collect();
+                    Object::new_bytearray(bytes)
+                }
+                _ => Object::new_list(sliced),
+            })
+        }
+        _ => {
+            let i = coerce_index_i64(index)?;
+            let seq = as_seq(recv);
+            let idx = crate::normalize_index(i, seq.len())?;
+            Ok(seq[idx].clone())
+        }
+    }
+}
+
+/// `obj.__len__(self)` for built-in containers.
+fn obj_len(args: &[Object]) -> Result<Object, RuntimeError> {
+    let recv = args
+        .first()
+        .ok_or_else(|| type_error("__len__() missing self"))?;
+    Ok(Object::Int(recv.len()? as i64))
+}
+
+/// `obj.__contains__(self, item)` for built-in containers.
+fn obj_contains(args: &[Object]) -> Result<Object, RuntimeError> {
+    let recv = args
+        .first()
+        .ok_or_else(|| type_error("__contains__() missing self"))?;
+    let item = args
+        .get(1)
+        .ok_or_else(|| type_error("__contains__() takes exactly one argument (0 given)"))?;
+    Ok(Object::Bool(recv.contains(item)?))
+}
+
+/// `slice.indices(length)` → the `(start, stop, step)` triple a sequence
+/// of `length` items would use, mirroring CPython's `PySlice_Unpack` +
+/// `PySlice_AdjustIndices` (`Objects/sliceobject.c`). `length` must be a
+/// non-negative integer (or `__index__`-able); `step` of 0 is a
+/// `ValueError`.
+fn slice_indices_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = match args.first() {
+        Some(Object::Slice(s)) => s.clone(),
+        _ => return Err(type_error("descriptor 'indices' requires a 'slice' object")),
+    };
+    let length = match args.get(1) {
+        Some(o) => coerce_index_i64(o)?,
+        None => return Err(type_error("indices() takes exactly one argument (0 given)")),
+    };
+    if length < 0 {
+        return Err(value_error("length should not be negative"));
+    }
+    let step = match &s.step {
+        Object::None => 1,
+        o => {
+            let st = coerce_index_i64(o)?;
+            if st == 0 {
+                return Err(value_error("slice step cannot be zero"));
+            }
+            st
+        }
+    };
+    let (lower, upper) = if step < 0 {
+        (-1i64, length - 1)
+    } else {
+        (0i64, length)
+    };
+    let clamp = |v: i64| -> i64 {
+        if v < 0 {
+            (v + length).max(lower)
+        } else {
+            v.min(upper)
+        }
+    };
+    let start = match &s.start {
+        Object::None => {
+            if step < 0 {
+                upper
+            } else {
+                lower
+            }
+        }
+        o => clamp(coerce_index_i64(o)?),
+    };
+    let stop = match &s.stop {
+        Object::None => {
+            if step < 0 {
+                lower
+            } else {
+                upper
+            }
+        }
+        o => clamp(coerce_index_i64(o)?),
+    };
+    Ok(Object::new_tuple(vec![
+        Object::Int(start),
+        Object::Int(stop),
+        Object::Int(step),
+    ]))
 }
 
 fn method(
@@ -563,9 +1084,408 @@ fn method(
 ) -> BuiltinFn {
     BuiltinFn {
         name,
+        binds_instance: true,
         call: Box::new(body),
         call_kw: None,
     }
+}
+
+// ---- sequence slot-wrapper dunders (`str.__add__`, `list.__mul__`, …) ----
+//
+// CPython exposes the sequence protocol's binary slots as wrapper
+// descriptors on each concrete type (`str.__add__`, `list.__mul__`,
+// `tuple.__rmul__`, …). Like the C wrappers, they delegate straight to
+// the native operation — its TypeErrors ("can only concatenate str …")
+// surface unchanged. Reached only via attribute access; the `a + b`
+// operator path never routes primitives through here.
+fn seq_dunder_binop(
+    name: &'static str,
+    op: weavepy_compiler::BinOpKind,
+    reflected: bool,
+) -> BuiltinFn {
+    method(name, move |args: &[Object]| {
+        let (a, b) = match args {
+            [a, b] => (a, b),
+            _ => {
+                return Err(type_error(format!(
+                    "{name} expected 2 arguments, got {}",
+                    args.len().saturating_sub(1)
+                )))
+            }
+        };
+        if reflected {
+            crate::binary_op(b, a, op)
+        } else {
+            crate::binary_op(a, b, op)
+        }
+    })
+}
+
+// ---- numeric slot-wrapper dunders (`int.__add__`, `complex.__eq__`, …) ----
+//
+// CPython exposes every numeric operator as a method on its type
+// (`int.__add__`, `(1+2j).__truediv__`, …) that follows the binary-op
+// protocol: when the *other* operand isn't a type the forward operation
+// accepts, the wrapper returns `NotImplemented` instead of raising. These
+// wrappers reproduce that so explicit dunder calls match CPython.
+//
+// They are reached only through *attribute access* — `type.__op__` (via
+// [`unbound_method`]) and `value.__op__` (via [`lookup_method`]). The hot
+// `a + b` operator path dispatches through `instance_method`, which only
+// matches user `Object::Instance`, so primitives never route their `+`
+// through here and there is neither extra overhead nor recursion risk.
+
+#[derive(Clone, Copy)]
+enum NumSelf {
+    Int,
+    Float,
+    Complex,
+}
+
+/// Classify a numeric receiver (unwrapping a built-in subclass to its
+/// native payload). Non-numerics return `None`.
+fn num_self_of(o: &Object) -> Option<NumSelf> {
+    let native = o.native_value();
+    match native.as_ref().unwrap_or(o) {
+        Object::Int(_) | Object::Long(_) | Object::Bool(_) => Some(NumSelf::Int),
+        Object::Float(_) => Some(NumSelf::Float),
+        Object::Complex(_) => Some(NumSelf::Complex),
+        _ => None,
+    }
+}
+
+/// Does the forward dunder of `kind` accept `other`? Mirrors CPython's
+/// numeric coercion ladder: `int` accepts only ints, `float` also accepts
+/// floats, `complex` also accepts complexes.
+fn num_accepts(kind: NumSelf, other: &Object) -> bool {
+    let native = other.native_value();
+    let o = native.as_ref().unwrap_or(other);
+    let is_int = matches!(o, Object::Int(_) | Object::Long(_) | Object::Bool(_));
+    let is_float = matches!(o, Object::Float(_));
+    let is_complex = matches!(o, Object::Complex(_));
+    match kind {
+        NumSelf::Int => is_int,
+        NumSelf::Float => is_int || is_float,
+        NumSelf::Complex => is_int || is_float || is_complex,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CmpDun {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Build a binary-arithmetic dunder (`__add__`, `__rmul__`, …).
+fn num_binop_method(
+    nm: &'static str,
+    kind: NumSelf,
+    op: weavepy_compiler::BinOpKind,
+    reflected: bool,
+) -> BuiltinFn {
+    method(nm, move |args| {
+        let s = args
+            .first()
+            .cloned()
+            .ok_or_else(|| type_error(format!("unbound method {nm}() needs an argument")))?;
+        let o = match args.get(1) {
+            Some(o) => o.clone(),
+            None => return Err(type_error(format!("{nm}() takes exactly one argument"))),
+        };
+        if !num_accepts(kind, &o) {
+            return Ok(crate::vm_singletons::not_implemented());
+        }
+        let (l, r) = if reflected { (&o, &s) } else { (&s, &o) };
+        crate::binary_op(l, r, op)
+    })
+}
+
+/// Build a rich-comparison dunder (`__eq__`, `__lt__`, …).
+fn num_cmp_method(nm: &'static str, kind: NumSelf, which: CmpDun) -> BuiltinFn {
+    method(nm, move |args| {
+        let s = args
+            .first()
+            .cloned()
+            .ok_or_else(|| type_error(format!("unbound method {nm}() needs an argument")))?;
+        let o = match args.get(1) {
+            Some(o) => o.clone(),
+            None => return Err(type_error(format!("{nm}() takes exactly one argument"))),
+        };
+        let ordering = matches!(which, CmpDun::Lt | CmpDun::Le | CmpDun::Gt | CmpDun::Ge);
+        // `complex` has no ordering: `<`/`<=`/`>`/`>=` always decline.
+        if ordering && matches!(kind, NumSelf::Complex) {
+            return Ok(crate::vm_singletons::not_implemented());
+        }
+        if !num_accepts(kind, &o) {
+            return Ok(crate::vm_singletons::not_implemented());
+        }
+        let result = match which {
+            CmpDun::Eq => s.eq_value(&o),
+            CmpDun::Ne => !s.eq_value(&o),
+            CmpDun::Lt | CmpDun::Le | CmpDun::Gt | CmpDun::Ge => match s.cmp(&o) {
+                Ok(ord) => match which {
+                    CmpDun::Lt => ord.is_lt(),
+                    CmpDun::Le => ord.is_le(),
+                    CmpDun::Gt => ord.is_gt(),
+                    CmpDun::Ge => ord.is_ge(),
+                    _ => unreachable!(),
+                },
+                // Unorderable (NaN) → CPython yields `False`, not an error.
+                Err(_) => false,
+            },
+        };
+        Ok(Object::Bool(result))
+    })
+}
+
+/// Build a unary dunder (`__neg__`, `__pos__`, `__abs__`).
+fn num_unary_method(nm: &'static str, op: weavepy_compiler::UnaryKind) -> BuiltinFn {
+    method(nm, move |args| {
+        let s = args
+            .first()
+            .cloned()
+            .ok_or_else(|| type_error(format!("unbound method {nm}() needs an argument")))?;
+        // Subclass instances apply the base type's op to their native
+        // payload (CPython's inherited slot ignores the subclass).
+        let s = s.native_value().unwrap_or(s);
+        crate::unary_op(&s, op)
+    })
+}
+
+/// `(value).__getnewargs__()` for the built-in numerics: `complex`
+/// reconstructs from `(real, imag)`, the rest from `(value,)`.
+fn num_getnewargs(self_o: &Object) -> Object {
+    let native = self_o.native_value();
+    let v = native.as_ref().unwrap_or(self_o);
+    match v {
+        Object::Complex(c) => Object::new_tuple(vec![Object::Float(c.real), Object::Float(c.imag)]),
+        other => Object::new_tuple(vec![other.clone()]),
+    }
+}
+
+/// Resolve a numeric slot-wrapper dunder by name for receiver `self_repr`.
+/// Returns `None` for anything that isn't a numeric dunder so the caller
+/// falls through to its other attribute paths.
+pub(crate) fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn> {
+    use weavepy_compiler::BinOpKind as B;
+    use weavepy_compiler::UnaryKind as U;
+    let kind = num_self_of(self_repr)?;
+    let not_complex = !matches!(kind, NumSelf::Complex);
+    let m = match name {
+        "__add__" => num_binop_method("__add__", kind, B::Add, false),
+        "__radd__" => num_binop_method("__radd__", kind, B::Add, true),
+        "__sub__" => num_binop_method("__sub__", kind, B::Sub, false),
+        "__rsub__" => num_binop_method("__rsub__", kind, B::Sub, true),
+        "__mul__" => num_binop_method("__mul__", kind, B::Mult, false),
+        "__rmul__" => num_binop_method("__rmul__", kind, B::Mult, true),
+        "__truediv__" => num_binop_method("__truediv__", kind, B::Div, false),
+        "__rtruediv__" => num_binop_method("__rtruediv__", kind, B::Div, true),
+        "__pow__" => num_binop_method("__pow__", kind, B::Pow, false),
+        "__rpow__" => num_binop_method("__rpow__", kind, B::Pow, true),
+        // `floordiv`/`mod` are undefined on `complex`.
+        "__floordiv__" if not_complex => num_binop_method("__floordiv__", kind, B::FloorDiv, false),
+        "__rfloordiv__" if not_complex => {
+            num_binop_method("__rfloordiv__", kind, B::FloorDiv, true)
+        }
+        "__mod__" if not_complex => num_binop_method("__mod__", kind, B::Mod, false),
+        "__rmod__" if not_complex => num_binop_method("__rmod__", kind, B::Mod, true),
+        // Bitwise / shift ops are int-only (CPython `long_*` slots).
+        "__lshift__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__lshift__", kind, B::LShift, false)
+        }
+        "__rlshift__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rlshift__", kind, B::LShift, true)
+        }
+        "__rshift__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rshift__", kind, B::RShift, false)
+        }
+        "__rrshift__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rrshift__", kind, B::RShift, true)
+        }
+        "__and__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__and__", kind, B::BitAnd, false)
+        }
+        "__rand__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rand__", kind, B::BitAnd, true)
+        }
+        "__or__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__or__", kind, B::BitOr, false)
+        }
+        "__ror__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__ror__", kind, B::BitOr, true)
+        }
+        "__xor__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__xor__", kind, B::BitXor, false)
+        }
+        "__rxor__" if matches!(kind, NumSelf::Int) => {
+            num_binop_method("__rxor__", kind, B::BitXor, true)
+        }
+        "__divmod__" if not_complex => method("__divmod__", move |args| {
+            let (a, b) = match args {
+                [a, b] => (a.clone(), b.clone()),
+                _ => return Err(type_error("__divmod__ expected 2 arguments")),
+            };
+            if !num_accepts(kind, &b) {
+                return Ok(crate::vm_singletons::not_implemented());
+            }
+            b_divmod(&[a, b])
+        }),
+        "__rdivmod__" if not_complex => method("__rdivmod__", move |args| {
+            let (a, b) = match args {
+                [a, b] => (a.clone(), b.clone()),
+                _ => return Err(type_error("__rdivmod__ expected 2 arguments")),
+            };
+            if !num_accepts(kind, &b) {
+                return Ok(crate::vm_singletons::not_implemented());
+            }
+            b_divmod(&[b, a])
+        }),
+        "__invert__" if matches!(kind, NumSelf::Int) => num_unary_method("__invert__", U::Invert),
+        "__bool__" => method("__bool__", |args| {
+            let v = args.first().cloned().unwrap_or(Object::None);
+            let v = v.native_value().unwrap_or(v);
+            Ok(Object::Bool(v.is_truthy()))
+        }),
+        "__abs__" => method("__abs__", |args| {
+            let v = args.first().cloned().unwrap_or(Object::None);
+            // Unwrap a builtin-subclass receiver to its native payload
+            // (`abs(IntSubclass(0))` routes here via the type-dict slot).
+            let v = v.native_value().unwrap_or(v);
+            b_abs(std::slice::from_ref(&v))
+        }),
+        "__eq__" => num_cmp_method("__eq__", kind, CmpDun::Eq),
+        "__ne__" => num_cmp_method("__ne__", kind, CmpDun::Ne),
+        "__lt__" => num_cmp_method("__lt__", kind, CmpDun::Lt),
+        "__le__" => num_cmp_method("__le__", kind, CmpDun::Le),
+        "__gt__" => num_cmp_method("__gt__", kind, CmpDun::Gt),
+        "__ge__" => num_cmp_method("__ge__", kind, CmpDun::Ge),
+        "__neg__" => num_unary_method("__neg__", U::Neg),
+        "__pos__" => num_unary_method("__pos__", U::Pos),
+        "__getnewargs__" => method("__getnewargs__", |args| {
+            Ok(num_getnewargs(args.first().unwrap_or(&Object::None)))
+        }),
+        "__format__" => method("__format__", |args| {
+            let value = args.first().cloned().unwrap_or(Object::None);
+            let spec = match args.get(1) {
+                Some(Object::Str(s)) => s.to_string(),
+                Some(other) => {
+                    return Err(type_error(format!(
+                        "__format__() argument 1 must be str, not {}",
+                        other.type_name()
+                    )))
+                }
+                None => String::new(),
+            };
+            // CPython: an empty spec is `PyObject_Str(self)` — a *virtual*
+            // call, so an `IntEnum` member with an overridden `__str__`
+            // formats through that override, not its int payload.
+            if spec.is_empty() {
+                return virtual_format_str(&value);
+            }
+            // A non-empty spec formats the native payload — e.g.
+            // `int.__format__(member, 'd')` is `'3'`, never the repr.
+            let value = value.native_value().unwrap_or(value);
+            crate::format_via_spec(&value, &spec).map(Object::from_str)
+        }),
+        // Exposing the numeric `__hash__` puts it in the type's MRO so a
+        // mixin like `class F(float, H)` resolves `float.__hash__` (not
+        // `H.__hash__`), matching CPython's method resolution.
+        "__hash__" => method("__hash__", |args| {
+            hash_object(args.first().unwrap_or(&Object::None))
+        }),
+        _ => return None,
+    };
+    Some(m)
+}
+
+/// `value.__getnewargs__()` for an immutable built-in subclass instance:
+/// returns `(value,)` so `copy`/`pickle` reconstruct it as
+/// `cls.__new__(cls, value)`. The receiver (`args[0]`) is the subclass
+/// instance; its wrapped native payload is the base-type value.
+fn instance_getnewargs(args: &[Object]) -> Result<Object, RuntimeError> {
+    let native = match args.first() {
+        Some(Object::Instance(inst)) => inst.native.clone(),
+        other => other.cloned(),
+    };
+    match native {
+        Some(v) => Ok(Object::new_tuple(vec![v])),
+        None => Ok(Object::new_tuple(Vec::new())),
+    }
+}
+
+/// `__getnewargs__` for a subclass of an immutable built-in whose
+/// reconstruction takes a single positional value (`int`/`float`/`str`/
+/// `bytes`/`tuple`/`bool`). Returns `None` for everything else: mutable
+/// containers rebuild from items/state, `frozenset`/`set` have no
+/// `__getnewargs__` in CPython, and `complex` uses a two-arg `(re, im)`
+/// form handled separately.
+pub fn immutable_subclass_getnewargs(native: &Object) -> Option<Object> {
+    let single_value = matches!(
+        native,
+        Object::Int(_)
+            | Object::Long(_)
+            | Object::Bool(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::Bytes(_)
+            | Object::Tuple(_)
+    );
+    single_value.then(|| Object::Builtin(Rc::new(method("__getnewargs__", instance_getnewargs))))
+}
+
+/// The `__getnewargs__` method-descriptor materialized in the *type dict*
+/// of the immutable sequence built-ins (`tuple`/`str`/`bytes`). CPython
+/// exposes `tuple.__getnewargs__` / `str.__getnewargs__` /
+/// `bytes.__getnewargs__` as real `tp_methods` entries; the numeric types
+/// get theirs separately via [`numeric_dunder`]. Materializing them lets
+/// the *type-only* lookup CPython's `object.__reduce_ex__` performs
+/// (`_PyObject_LookupSpecial`, ported as `copyreg._lookup_special`) find
+/// the hook, so `copy`/`pickle` reconstruct `cls.__new__(cls, value)`
+/// instead of an empty instance. Bound to the receiver at call time, it
+/// returns `(value,)` (the native payload for a subclass instance).
+pub fn immutable_getnewargs_method() -> Object {
+    Object::Builtin(Rc::new(method("__getnewargs__", instance_getnewargs)))
+}
+
+/// Like [`method`] but for builtins that accept keyword arguments. The
+/// body receives the positional args (with the bound receiver at index
+/// 0) *and* the keyword pairs, so it can implement CPython's mixed
+/// positional/keyword signatures (e.g. `str.split(sep=None, maxsplit=-1)`,
+/// `str.splitlines(keepends=False)`).
+fn method_kw(
+    name: &'static str,
+    body: impl Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>
+        + Send
+        + Sync
+        + 'static,
+) -> BuiltinFn {
+    let body = std::sync::Arc::new(body);
+    let positional = body.clone();
+    BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(move |args| positional(args, &[])),
+        call_kw: Some(Box::new(move |args, kwargs| body(args, kwargs))),
+    }
+}
+
+/// Resolve a parameter that may be passed positionally (`args[pos]`) or
+/// by keyword (`kwargs[name]`). Positional wins; returns `None` when the
+/// argument is absent so the caller can apply its default.
+fn arg_or_kw<'a>(
+    args: &'a [Object],
+    pos: usize,
+    kwargs: &'a [(String, Object)],
+    name: &str,
+) -> Option<&'a Object> {
+    if let Some(v) = args.get(pos) {
+        return Some(v);
+    }
+    kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v)
 }
 
 /// Built-in classmethod / staticmethod table: `Type.name` access for
@@ -585,6 +1505,450 @@ pub fn builtin_classmethod(type_name: &str, attr: &str) -> Option<Object> {
     f.map(|f| Object::Builtin(Rc::new(f)))
 }
 
+/// Unbound-method access on a built-in type, e.g. `str.upper`, `float.hex`,
+/// `list.append`. CPython exposes every instance method as an attribute of
+/// its type that takes the receiver as an explicit first argument; the
+/// `BuiltinFn`s in [`lookup_method`] already treat `args[0]` as `self`, so
+/// the same function object serves both bound (`x.upper()`) and unbound
+/// (`str.upper(x)`) call forms. We synthesise a throw-away representative of
+/// the type purely so the variant-based dispatch in [`lookup_method`] can
+/// pick the right table — the value is never inspected.
+pub fn unbound_method(type_name: &str, name: &str) -> Option<Object> {
+    let rep: Object = match type_name {
+        "str" => Object::from_static(""),
+        "float" => Object::Float(0.0),
+        "int" => Object::Int(0),
+        "bool" => Object::Bool(false),
+        "complex" => Object::new_complex(0.0, 0.0),
+        "bytes" => Object::new_bytes(Vec::<u8>::new()),
+        "bytearray" => Object::new_bytearray(Vec::<u8>::new()),
+        "list" => Object::new_list(Vec::new()),
+        "tuple" => Object::new_tuple(Vec::new()),
+        "dict" => Object::new_dict(),
+        "set" => Object::new_set(),
+        "frozenset" => Object::new_frozenset_from(std::iter::empty::<Object>()),
+        // A representative (empty) iterator so `type(it).__length_hint__`
+        // resolves to the unbound slot wrapper; the actual call receives the
+        // real iterator as `self`. `operator.length_hint` reaches it this way.
+        "iterator" => Object::Iter(Rc::new(RefCell::new(crate::object::PyIterator::Tuple {
+            items: Rc::from(Vec::<Object>::new()),
+            index: 0,
+        }))),
+        // Descriptor types: expose their protocol slots
+        // (`property.__set__`, `staticmethod.__get__`, …) for
+        // type-level access; the call receives the real descriptor as
+        // `self` via `args[0]`.
+        "property" => Object::Property(Rc::new(crate::object::PyProperty::new(
+            Object::None,
+            Object::None,
+            Object::None,
+            Object::None,
+        ))),
+        "staticmethod" => Object::StaticMethod(MethodWrapper::new(Object::None)),
+        "classmethod" => Object::ClassMethod(MethodWrapper::new(Object::None)),
+        _ => return None,
+    };
+    lookup_method(&rep, name)
+}
+
+// ---- universal object-protocol slot wrappers (`object.__repr__`, …) ----
+//
+// CPython stores a slot wrapper for the object protocol in every type's
+// `tp_dict` (`object.__repr__`, `int.__str__`, `str.__format__`, …). WeavePy
+// synthesizes these on demand for *type-level* attribute access only (the
+// instance path keeps using `repr_of` / `stringify`), and the caller caches
+// the result per `(type, name)` so identity is stable — `enum`'s bootstrap
+// compares `getattr(member_type, '__str__') is object.__str__` and
+// `found_method in (data_type_method, object_method)`.
+
+/// `object.__repr__(self)` / `int.__repr__(self)` / … — the default repr of
+/// `self`, unwrapping a built-in subclass's native payload first (so
+/// `int.__repr__(IntEnumMember)` renders the wrapped integer).
+fn slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__repr__() takes exactly one argument (0 given)"))?;
+    // CPython guards `PyObject_Repr` with `Py_EnterRecursiveCall`; the
+    // native repr can re-enter the VM (user `__repr__`), and rebinding
+    // `__repr__ = __str__` (test_descr.test_repr_as_str) creates a
+    // native-only cycle that must raise instead of overflowing.
+    let _guard = match crate::recursion::enter() {
+        crate::recursion::Enter::Ok(g) => g,
+        crate::recursion::Enter::Overflow => {
+            return Err(crate::error::recursion_error(
+                "maximum recursion depth exceeded while getting the repr of an object",
+            ))
+        }
+    };
+    let native = o.native_value();
+    // CPython's `bytearray_repr` spells the *receiver's* type name
+    // (`_PyType_Name(Py_TYPE(self))`), so a bytearray subclass renders
+    // as `ByteArraySubclass(b'…')` even without a custom `__repr__`.
+    if let (Object::Instance(inst), Some(payload @ Object::ByteArray(_))) = (o, &native) {
+        let name = inst.cls().name.clone();
+        let short = name.rsplit('.').next().unwrap_or(&name);
+        let inner = payload.repr();
+        let body = inner
+            .strip_prefix("bytearray(")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(&inner);
+        return Ok(Object::from_str(format!("{short}({body})")));
+    }
+    Ok(Object::from_str(native.as_ref().unwrap_or(o).repr()))
+}
+
+/// `str.__str__(self)` / `object.__str__(self)` — `str()` of `self`. Mirrors
+/// CPython: for a value that doesn't define its own `__str__`, this is the
+/// `repr`-derived default; for `str`/`bytes` it returns the payload.
+fn slot_str(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__str__() takes exactly one argument (0 given)"))?;
+    // See `slot_repr`: participate in the recursion limit so
+    // `__repr__`/`__str__` rebinding cycles raise `RecursionError`.
+    let _guard = match crate::recursion::enter() {
+        crate::recursion::Enter::Ok(g) => g,
+        crate::recursion::Enter::Overflow => {
+            return Err(crate::error::recursion_error(
+                "maximum recursion depth exceeded while getting the str of an object",
+            ))
+        }
+    };
+    // CPython `object.__str__` is `PyObject_Repr(self)`: a user-defined
+    // `__repr__` is dispatched through the VM so its exceptions (and
+    // RecursionError from `__repr__ = __str__` cycles) *propagate*,
+    // rather than being swallowed by the native fallback rendering.
+    // The check runs on the instance itself — *before* unwrapping any
+    // native payload — so `__str__ = object.__str__` on an `IntEnum`
+    // still routes through the member's `__repr__` rather than the
+    // wrapped int's rendering.
+    if let Object::Instance(inst) = o {
+        let key = crate::object::DictKey(Object::from_static("__repr__"));
+        let has_user_repr = inst
+            .cls()
+            .mro
+            .borrow()
+            .iter()
+            .any(|t| t.dict.borrow().contains_key(&key));
+        if has_user_repr {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame still live
+                // on this thread; the GIL keeps it exclusive.
+                let interp = unsafe { &mut *ptr };
+                if let Some(method) = crate::instance_method(o, "__repr__") {
+                    let globals = interp.builtins_dict();
+                    let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                    return Ok(Object::from_str(r.to_str()));
+                }
+            }
+        }
+    }
+    let native = o.native_value();
+    let target = native.as_ref().unwrap_or(o);
+    Ok(Object::from_str(target.to_str()))
+}
+
+/// `object.__format__(self, spec)` / `str.__format__(self, spec)` — format
+/// `self` per `spec`, unwrapping a native payload first. An empty spec is
+/// equivalent to `str(self)`.
+fn slot_format(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__format__() takes exactly 2 arguments (0 given)"))?;
+    let spec = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(Object::None) | None => String::new(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "__format__() argument 1 must be str, not {}",
+                other.type_name()
+            )))
+        }
+    };
+    // Empty spec ≡ `str(self)` — dispatched virtually so user `__str__`
+    // overrides on built-in subclasses are honoured (CPython behaviour).
+    if spec.is_empty() {
+        return virtual_format_str(o);
+    }
+    let native = o.native_value();
+    crate::format_via_spec(native.as_ref().unwrap_or(o), &spec).map(Object::from_str)
+}
+
+/// `format(x, '')` semantics shared by the built-in `__format__` slot
+/// wrappers: CPython's `<type>.__format__(self, '')` short-circuits to
+/// `PyObject_Str(self)`, a *virtual* str() that dispatches a user
+/// `__str__`/`__repr__` override before falling back to the native
+/// payload's rendering.
+fn virtual_format_str(o: &Object) -> Result<Object, RuntimeError> {
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame still live on this
+        // thread; the GIL keeps the access exclusive.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        return interp.stringify_public(o, &globals).map(Object::from_str);
+    }
+    let native = o.native_value();
+    Ok(Object::from_str(native.as_ref().unwrap_or(o).to_str()))
+}
+
+/// `type.__call__` / `function.__call__` / … — invoke `args[0]` with the
+/// remaining arguments (CPython's `tp_call` slot exposed as a wrapper).
+fn slot_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let callee = args
+        .first()
+        .ok_or_else(|| type_error("__call__ needs an argument"))?;
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+    // SAFETY: published by an enclosing VM frame still live on this
+    // thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    // `type.__call__(cls, …)` is the *default* class call: it must not
+    // re-dispatch through `type(cls).__call__`, or a metaclass
+    // `__call__` that delegates to `type.__call__` recurses forever.
+    if let Object::Type(ty) = callee {
+        return interp.type_call_default(ty, &args[1..], kwargs);
+    }
+    let globals = interp.builtins_dict();
+    interp.call_object_with_globals(callee, &args[1..], kwargs, &globals)
+}
+
+/// Resolve the slot wrapper a *built-in* type `base_name` contributes for the
+/// dunder `name`, or `None` if that type does not define it (so the caller's
+/// MRO walk falls through to the next built-in base). Reuses the canonical
+/// value-type implementations ([`unbound_method`]) and adds the universal
+/// object-protocol dunders (`__repr__`/`__str__`/`__format__`) that aren't
+/// modeled there.
+///
+/// `__str__` is intentionally restricted to the string-like built-ins; the
+/// numeric/container types inherit `object.__str__` exactly as in CPython, so
+/// `int.__str__ is object.__str__` holds and `IntEnum` correctly falls back to
+/// `int.__repr__` for member stringification.
+pub fn builtin_type_dunder(base_name: &str, name: &str) -> Option<Object> {
+    // Memoised: repeated lookups must return the *same* object so
+    // identity-based deduplication holds — enum's bootstrap compares
+    // `getattr(cls, '__format__') in (member_type.__format__,
+    // object.__format__)` to decide whether to substitute
+    // `Enum.__format__`, which only works when `int.__format__` is one
+    // stable object rather than a fresh wrapper per access.
+    thread_local! {
+        static DUNDER_CACHE: std::cell::RefCell<
+            std::collections::HashMap<String, Option<Object>>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = format!("{base_name}.{name}");
+    if let Some(hit) = DUNDER_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let computed = builtin_type_dunder_uncached(base_name, name);
+    DUNDER_CACHE.with(|c| {
+        c.borrow_mut().insert(key, computed.clone());
+    });
+    computed
+}
+
+fn builtin_type_dunder_uncached(base_name: &str, name: &str) -> Option<Object> {
+    if let Some(o) = unbound_method(base_name, name) {
+        return Some(o);
+    }
+    // `__call__` lives only on the callable types (CPython: `tp_call`
+    // present on `type`, functions, methods, and the *callable* descriptor
+    // types `method_descriptor`/`wrapper_descriptor` — but not on `object`,
+    // nor on the data-only `getset_descriptor`/`member_descriptor`). The
+    // descriptor types must carry it so `isinstance(list.append, Callable)`
+    // holds (test_collections test_Callable).
+    if name == "__call__"
+        && matches!(
+            base_name,
+            "type"
+                | "function"
+                | "builtin_function_or_method"
+                | "method"
+                | "method-wrapper"
+                | "method_descriptor"
+                | "wrapper_descriptor"
+        )
+    {
+        return Some(Object::Builtin(Rc::new(method_kw("__call__", slot_call))));
+    }
+    // `tp_str` is defined only by `object` and `str` among the value types
+    // (CPython: `'__str__' in vars(int)` is False, hence
+    // `int.__str__ is object.__str__` — identity the enum bootstrap's
+    // `found_method in (data_type_method, object_method)` check relies
+    // on). Other types fall through here so the caller's MRO walk
+    // resolves `__str__` at `object`; exceptions get their own `__str__`
+    // via type-dict entries installed at startup.
+    if name == "__str__" {
+        if base_name == "object" {
+            return Some(Object::Builtin(Rc::new(method("__str__", slot_str))));
+        }
+        if base_name == "str" {
+            // `str.__str__` is its own slot (`unicode_str`), distinct from
+            // `object.__str__`: it returns the plain-`str` value of the
+            // receiver *without* re-dispatching through `type(self).__str__`
+            // or `__repr__`. StrEnum's `__str__ = str.__str__` relies on
+            // this to yield the member's string payload.
+            return Some(Object::Builtin(Rc::new(method("__str__", str_slot_str))));
+        }
+        return None;
+    }
+    let (static_name, f): (&'static str, fn(&[Object]) -> Result<Object, RuntimeError>) = match name
+    {
+        "__repr__" => ("__repr__", slot_repr),
+        "__format__" => ("__format__", slot_format),
+        // `object`'s default rich comparisons: `==`/`!=` compare by
+        // identity (value identity for primitives) and return
+        // `NotImplemented` otherwise; the orderings are always
+        // `NotImplemented` at the `object` level.
+        "__eq__" => ("__eq__", slot_obj_eq),
+        "__ne__" => ("__ne__", slot_obj_ne),
+        "__lt__" => ("__lt__", slot_obj_ordering),
+        "__le__" => ("__le__", slot_obj_ordering),
+        "__gt__" => ("__gt__", slot_obj_ordering),
+        "__ge__" => ("__ge__", slot_obj_ordering),
+        "__dir__" => ("__dir__", b_dir),
+        "__sizeof__" => ("__sizeof__", slot_sizeof),
+        "__getstate__" => ("__getstate__", slot_getstate),
+        _ => return None,
+    };
+    Some(Object::Builtin(Rc::new(method(static_name, f))))
+}
+
+/// Crate-visible handle on the native (non-dispatching) `__repr__` slot
+/// so `type_surface` can materialize `int.__repr__`/`str.__repr__`/…
+/// entries in the value-type dicts (CPython stores a `tp_repr` wrapper
+/// per type; `enum._find_data_repr_` keys on `'__repr__' in
+/// base.__dict__`).
+pub(crate) fn value_slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+    slot_repr(args)
+}
+
+/// `<builtin method>.__get__(obj, owner)` — bind a built-in method
+/// descriptor to `obj` (CPython `method_get`). `args[0]` is the builtin
+/// itself (the receiver of the bound `__get__`).
+pub(crate) fn builtin_descriptor_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let func = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("__get__() missing descriptor"))?;
+    let instance = args.get(1).cloned().unwrap_or(Object::None);
+    if matches!(instance, Object::None) {
+        return Ok(func);
+    }
+    Ok(Object::BoundMethod(Rc::new(
+        crate::object::BoundMethod::new(instance, func),
+    )))
+}
+
+/// `method.__get__(self, obj, objtype=None)` — CPython gh-113157: a
+/// bound `method` is *already* bound, so applying the descriptor
+/// protocol to it again returns the method unchanged rather than
+/// re-binding its `__func__` to a new receiver. `args[0]` is the
+/// bound method itself (the `__get__` receiver).
+pub(crate) fn method_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    args.first()
+        .cloned()
+        .ok_or_else(|| type_error("__get__() missing method"))
+}
+
+/// `str.__str__(self)` — CPython's `unicode_str`: return the receiver
+/// itself when it is exactly `str`, or a plain-`str` copy of the native
+/// payload for `str` subclasses. No virtual re-dispatch.
+fn str_slot_str(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = args
+        .first()
+        .ok_or_else(|| type_error("__str__() takes exactly one argument (0 given)"))?;
+    match o {
+        Object::Str(_) => Ok(o.clone()),
+        _ => match o.native_value() {
+            Some(n @ Object::Str(_)) => Ok(n),
+            _ => Err(type_error(format!(
+                "descriptor '__str__' requires a 'str' object but received a '{}'",
+                o.type_name()
+            ))),
+        },
+    }
+}
+
+/// `object.__eq__(self, other)` — identity (payload equality for the
+/// primitive value types), `NotImplemented` otherwise.
+fn slot_obj_eq(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (a, b) = match args {
+        [a, b] => (a, b),
+        _ => return Err(type_error("expected 2 arguments")),
+    };
+    if object_identity(a) == object_identity(b) {
+        Ok(Object::Bool(true))
+    } else {
+        Ok(crate::vm_singletons::not_implemented())
+    }
+}
+
+/// `object.__ne__(self, other)` — the negation of `__eq__`, staying
+/// `NotImplemented` when equality is undecided.
+fn slot_obj_ne(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (a, b) = match args {
+        [a, b] => (a, b),
+        _ => return Err(type_error("expected 2 arguments")),
+    };
+    if object_identity(a) == object_identity(b) {
+        Ok(Object::Bool(false))
+    } else {
+        Ok(crate::vm_singletons::not_implemented())
+    }
+}
+
+/// `object.__lt__` / `__le__` / `__gt__` / `__ge__` — `object` defines
+/// no ordering: always `NotImplemented`.
+fn slot_obj_ordering(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(crate::vm_singletons::not_implemented())
+}
+
+/// `object.__sizeof__(self)` — a coarse byte size. WeavePy objects
+/// don't share CPython's memory layout; report the CPython-typical
+/// fixed header size so the protocol surface exists and returns a
+/// plausible positive int.
+fn slot_sizeof(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = one(args, "__sizeof__")?;
+    let size: i64 = match o {
+        Object::Instance(inst) => 16 + 8 * inst.dict.borrow().len() as i64,
+        Object::Str(s) => 49 + s.len() as i64,
+        Object::Bytes(b) => 33 + b.len() as i64,
+        Object::List(items) => 56 + 8 * items.borrow().len() as i64,
+        Object::Tuple(items) => 40 + 8 * items.len() as i64,
+        Object::Dict(d) => 64 + 24 * d.borrow().len() as i64,
+        _ => 16,
+    };
+    Ok(Object::Int(size))
+}
+
+/// `object.__getstate__(self)` — PEP 307 default pickling state: the
+/// instance `__dict__` when non-empty, else `None`. When `__slots__`
+/// values are populated, CPython returns the 2-tuple
+/// `(dict_or_None, {slot: value, …})` instead.
+fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let o = one(args, "__getstate__")?;
+    if let Object::Instance(inst) = o {
+        let slots = inst.slots_snapshot();
+        let dict_state = if inst.dict.borrow().is_empty() {
+            Object::None
+        } else {
+            Object::Dict(inst.dict.clone())
+        };
+        if !slots.is_empty() {
+            let mut slot_dict = crate::object::DictData::new();
+            for (name, value) in slots {
+                slot_dict.insert(DictKey(Object::from_str(name)), value);
+            }
+            return Ok(Object::new_tuple(vec![
+                dict_state,
+                Object::Dict(Rc::new(RefCell::new(slot_dict))),
+            ]));
+        }
+        return Ok(dict_state);
+    }
+    Ok(Object::None)
+}
+
 // ---------- free builtins ----------
 
 fn one<'a>(args: &'a [Object], name: &str) -> Result<&'a Object, RuntimeError> {
@@ -597,17 +1961,95 @@ fn b_len(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(v.len()? as i64))
 }
 
-fn b_range(args: &[Object]) -> Result<Object, RuntimeError> {
-    let to_int = |o: &Object| -> Result<i64, RuntimeError> {
-        match o {
-            Object::Int(i) => Ok(*i),
-            Object::Bool(b) => Ok(i64::from(*b)),
-            _ => Err(type_error(format!(
-                "'{}' object cannot be interpreted as an integer",
-                o.type_name()
-            ))),
+/// Coerce `o` to an `i64` index the way CPython's `__index__` protocol does:
+/// accept ints/bools directly, unwrap integer-backed subclass instances
+/// (e.g. `IntEnum` members), and otherwise invoke a Python-level `__index__`
+/// via reentry into the running interpreter. Shared by the integer-position
+/// builtins (`range`, slicing helpers, …) so they all honour `__index__`.
+/// `coerce_index_i64` widened to `i128` for consumers (like `range`)
+/// that must accept bounds beyond the machine-int span. Ints past i128
+/// get the CPython-style overflow complaint rather than silent clamping.
+pub(crate) fn coerce_index_i128(o: &Object) -> Result<i128, RuntimeError> {
+    use num_traits::ToPrimitive;
+    match o {
+        Object::Bool(b) => return Ok(i128::from(*b)),
+        Object::Int(i) => return Ok(i128::from(*i)),
+        Object::Long(b) => {
+            return b.to_i128().ok_or_else(|| {
+                crate::error::overflow_error("Python int too large to convert to C ssize_t")
+            })
         }
-    };
+        _ => {}
+    }
+    coerce_index_i64(o).map(i128::from)
+}
+
+pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
+    if let Some(v) = o.as_i64() {
+        return Ok(v);
+    }
+    if let Object::Instance(_) = o {
+        if let Some(method) = crate::instance_method(o, "__index__") {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: the pointer was published by an enclosing VM frame
+                // still live on this thread; the GIL keeps the access exclusive.
+                let interp = unsafe { &mut *ptr };
+                let globals = interp.builtins_dict();
+                let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                if let Some(v) = r.as_i64() {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+    Err(type_error(format!(
+        "'{}' object cannot be interpreted as an integer",
+        o.type_name()
+    )))
+}
+
+/// Coerce `o` to an `f64` the way CPython's float-accepting C functions
+/// (`math.*`, etc.) do: floats/ints/bools/big ints directly, built-in
+/// numeric subclass payloads by unwrapping, and otherwise via the Python
+/// `__float__` then `__index__` protocol through interpreter reentry.
+///
+/// `Ok(None)` means "not coercible" — the caller raises its own
+/// function-specific `TypeError`. `Err` propagates an exception raised
+/// inside a user `__float__`/`__index__`.
+pub(crate) fn coerce_f64_opt(o: &Object) -> Result<Option<f64>, RuntimeError> {
+    match o {
+        Object::Float(f) => Ok(Some(*f)),
+        Object::Int(i) => Ok(Some(*i as f64)),
+        Object::Bool(b) => Ok(Some(if *b { 1.0 } else { 0.0 })),
+        Object::Long(b) => {
+            use num_traits::ToPrimitive;
+            Ok(Some(b.to_f64().unwrap_or(f64::INFINITY)))
+        }
+        Object::Instance(inst) => {
+            if let Some(native) = &inst.native {
+                let native = native.clone();
+                return coerce_f64_opt(&native);
+            }
+            for dunder in ["__float__", "__index__"] {
+                if let Some(method) = crate::instance_method(o, dunder) {
+                    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                        // SAFETY: published by an enclosing VM frame still live
+                        // on this thread; the GIL keeps the access exclusive.
+                        let interp = unsafe { &mut *ptr };
+                        let globals = interp.builtins_dict();
+                        let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                        return coerce_f64_opt(&r);
+                    }
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn b_range(args: &[Object]) -> Result<Object, RuntimeError> {
+    let to_int = |o: &Object| -> Result<i128, RuntimeError> { coerce_index_i128(o) };
     let (start, stop, step) = match args.len() {
         1 => (0, to_int(&args[0])?, 1),
         2 => (to_int(&args[0])?, to_int(&args[1])?, 1),
@@ -624,9 +2066,53 @@ fn b_range(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Range(Rc::new(Range { start, stop, step })))
 }
 
+/// PEP 0467 int→str conversion cap. Raises `ValueError` when the decimal
+/// expansion of `b` would exceed `sys.get_int_max_str_digits()` (0 = off).
+///
+/// The expensive base-10 conversion is avoided for pathological inputs: the
+/// digit count is first bounded from the bit length, and the exact string is
+/// only materialised when the magnitude sits right at the limit (in which
+/// case it is small and cheap to convert).
+pub(crate) fn long_str_limit_check(b: &num_bigint::BigInt) -> Result<(), RuntimeError> {
+    let max_digits = crate::stdlib::sys::int_max_str_digits();
+    if max_digits <= 0 {
+        return Ok(());
+    }
+    let limit = max_digits as u64;
+    let bits = b.bits();
+    if bits == 0 {
+        return Ok(()); // "0" — a single digit, never exceeds the (>=640) cap.
+    }
+    const LOG10_2: f64 = std::f64::consts::LOG10_2;
+    let lower = (((bits - 1) as f64) * LOG10_2).floor() as u64 + 1;
+    if lower > limit {
+        return Err(int_to_str_limit_error(max_digits));
+    }
+    let upper = ((bits as f64) * LOG10_2).floor() as u64 + 1;
+    if upper <= limit {
+        return Ok(());
+    }
+    // Boundary case: the value is within ~1 digit of the cap, so it is small
+    // enough to expand exactly without performance risk.
+    if b.magnitude().to_str_radix(10).len() as u64 > limit {
+        return Err(int_to_str_limit_error(max_digits));
+    }
+    Ok(())
+}
+
+fn int_to_str_limit_error(max_digits: i64) -> RuntimeError {
+    value_error(format!(
+        "Exceeds the limit ({max_digits} digits) for integer string conversion; \
+         use sys.set_int_max_str_digits() to increase the limit"
+    ))
+}
+
 fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::from_static(""));
+    }
+    if let Object::Long(b) = &args[0] {
+        long_str_limit_check(b)?;
     }
     // `str(object, encoding[, errors])` decodes a bytes-like object,
     // equivalent to `object.decode(encoding, errors)`. CPython's
@@ -647,12 +2133,22 @@ fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
         let encoding = match &args[1] {
             Object::Str(e) => e.to_string(),
             Object::None => "utf-8".to_owned(),
-            _ => return Err(type_error("str() argument 'encoding' must be str")),
+            other => {
+                return Err(type_error(format!(
+                    "str() argument 'encoding' must be str, not {}",
+                    other.type_name()
+                )))
+            }
         };
         let errors = match args.get(2) {
             Some(Object::Str(e)) => e.to_string(),
             Some(Object::None) | None => "strict".to_owned(),
-            _ => return Err(type_error("str() argument 'errors' must be str")),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "str() argument 'errors' must be str, not {}",
+                    other.type_name()
+                )))
+            }
         };
         let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;
         return Ok(Object::from_str(s));
@@ -661,7 +2157,11 @@ fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_repr(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_str(one(args, "repr")?.repr()))
+    let v = one(args, "repr")?;
+    if let Object::Long(b) = v {
+        long_str_limit_check(b)?;
+    }
+    Ok(Object::from_str(v.repr()))
 }
 
 fn b_format(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -708,14 +2208,118 @@ pub fn construct_property(args: &[Object]) -> Result<Object, RuntimeError> {
 /// callable unchanged on access.
 pub fn construct_staticmethod(args: &[Object]) -> Result<Object, RuntimeError> {
     let inner = args.first().cloned().unwrap_or(Object::None);
-    Ok(Object::StaticMethod(Rc::new(inner)))
+    Ok(Object::StaticMethod(MethodWrapper::new(inner)))
 }
 
 /// `classmethod(f)` — non-data descriptor that binds the wrapped
 /// callable to the *class* (not the instance) on access.
 pub fn construct_classmethod(args: &[Object]) -> Result<Object, RuntimeError> {
     let inner = args.first().cloned().unwrap_or(Object::None);
-    Ok(Object::ClassMethod(Rc::new(inner)))
+    Ok(Object::ClassMethod(MethodWrapper::new(inner)))
+}
+
+/// Set the wrapped callable on a `staticmethod`/`classmethod`
+/// (sub)instance — CPython's `sm_init`/`cm_init`. `__new__` builds the
+/// wrapper with `__func__ == None`; this fills it in. A subclass that
+/// overrides `__init__` without chaining to `super().__init__` never
+/// reaches here, so its `__func__` stays `None` (test_descr
+/// `test_classmethod_new` / `test_staticmethod_new`).
+fn method_wrapper_set_func(args: &[Object]) {
+    let func = args.get(1).cloned().unwrap_or(Object::None);
+    match args.first() {
+        Some(Object::StaticMethod(w) | Object::ClassMethod(w)) => w.set_func(func),
+        Some(Object::Instance(i)) => {
+            if let Some(Object::StaticMethod(w) | Object::ClassMethod(w)) = i.native.as_ref() {
+                w.set_func(func);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `staticmethod.__init__(self, func)` — CPython's `sm_init`.
+pub(crate) fn staticmethod_init(args: &[Object]) -> Result<Object, RuntimeError> {
+    method_wrapper_set_func(args);
+    Ok(Object::None)
+}
+
+/// `classmethod.__init__(self, func)` — CPython's `cm_init`.
+pub(crate) fn classmethod_init(args: &[Object]) -> Result<Object, RuntimeError> {
+    method_wrapper_set_func(args);
+    Ok(Object::None)
+}
+
+/// `staticmethod.__get__(self, obj, objtype=None)` — the descriptor hook.
+/// A staticmethod ignores the binding context and hands back the wrapped
+/// callable unchanged (matching CPython's `sm_descr_get`). Exposing it as
+/// a real method lets descriptor-aware code — notably
+/// `functools.partialmethod`, which does `self.func.__get__(obj, cls)` —
+/// treat a wrapped `staticmethod` correctly. `args[0]` is the descriptor
+/// itself (the bound receiver).
+pub(crate) fn staticmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args.first() {
+        Some(Object::StaticMethod(inner)) => Ok(inner.func()),
+        // Tolerate an already-unwrapped callable (defensive).
+        Some(other) => Ok(other.clone()),
+        None => Err(type_error("staticmethod.__get__() missing self")),
+    }
+}
+
+/// `classmethod.__get__(self, obj, objtype=None)` — binds the wrapped
+/// callable to the owning *class* and returns a bound method (CPython's
+/// `cm_descr_get`). The owner is the explicit `objtype` when supplied,
+/// otherwise `type(obj)`.
+pub(crate) fn classmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inner = match args.first() {
+        Some(Object::ClassMethod(i)) => i.func(),
+        _ => return Err(type_error("classmethod.__get__() missing self")),
+    };
+    let owner = match args.get(2) {
+        Some(o) if !matches!(o, Object::None) => o.clone(),
+        _ => match args.get(1) {
+            Some(o) if !matches!(o, Object::None) => Object::Type(class_of(o)),
+            _ => return Err(type_error("classmethod.__get__(None, None) is not valid")),
+        },
+    };
+    Ok(Object::BoundMethod(Rc::new(
+        crate::object::BoundMethod::new(owner, inner),
+    )))
+}
+
+/// `function.__get__(self, obj, objtype=None)` — a plain Python function
+/// is a non-data descriptor: bound to an instance it yields a bound
+/// method, bound to `None` (class access) it returns the function itself
+/// (CPython's `func_descr_get`). Exposing it makes functions usable with
+/// descriptor-aware library code such as `functools.partialmethod`.
+pub(crate) fn function_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let func = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("__get__() missing self"))?;
+    match args.get(1) {
+        Some(obj) if !matches!(obj, Object::None) => Ok(Object::BoundMethod(Rc::new(
+            crate::object::BoundMethod::new(obj.clone(), func),
+        ))),
+        _ => Ok(func),
+    }
+}
+
+/// Build the callable `Object::Builtin` backing `staticmethod.__get__` /
+/// `classmethod.__get__`. The VM wires this into a `BoundMethod` whose
+/// receiver is the descriptor object, so `args[0]` arrives as the
+/// descriptor when the hook runs.
+pub(crate) fn descriptor_get_builtin(is_static: bool) -> Object {
+    let f = if is_static {
+        method("__get__", staticmethod_descr_get)
+    } else {
+        method("__get__", classmethod_descr_get)
+    };
+    Object::Builtin(Rc::new(f))
+}
+
+/// Build the callable `Object::Builtin` backing `function.__get__`.
+pub(crate) fn function_get_builtin() -> Object {
+    Object::Builtin(Rc::new(method("__get__", function_descr_get)))
 }
 
 fn property_with(
@@ -742,13 +2346,96 @@ fn property_deleter(args: &[Object]) -> Result<Object, RuntimeError> {
     property_with(args, crate::object::PropertyAttr::Del)
 }
 
+/// Re-enter the running interpreter to call a Python-level callable from
+/// builtin context. Shared by the explicit descriptor-protocol slots
+/// (`property.__get__` / `__set__` / `__delete__`), whose accessors are
+/// ordinary Python functions.
+/// `str(obj)` through the running interpreter (so user `__str__` /
+/// nested-exception rendering dispatches). `None` when no interpreter
+/// is live on this thread.
+pub(crate) fn str_reentrant(obj: &Object) -> Option<String> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    interp.stringify_public(obj, &globals).ok()
+}
+
+pub(crate) fn reentrant_call(callable: &Object, args: &[Object]) -> Result<Object, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+    // SAFETY: the pointer was published by an enclosing VM frame still
+    // live on this thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    interp.call_object_with_globals(callable, args, &[], &globals)
+}
+
+fn property_self(args: &[Object], op: &str) -> Result<Rc<crate::object::PyProperty>, RuntimeError> {
+    match args.first() {
+        Some(Object::Property(p)) => Ok(p.clone()),
+        _ => Err(type_error(format!(
+            "descriptor '{op}' requires a 'property' object"
+        ))),
+    }
+}
+
+/// `property.__get__(self, obj, objtype=None)` — CPython's
+/// `property_descr_get`: class access (obj is None) returns the property
+/// itself; instance access invokes `fget`.
+fn property_dunder_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = property_self(args, "__get__")?;
+    match args.get(1) {
+        Some(obj) if !matches!(obj, Object::None) => {
+            if matches!(p.fget, Object::None) {
+                return Err(crate::error::attribute_error("unreadable attribute"));
+            }
+            reentrant_call(&p.fget, &[obj.clone()])
+        }
+        _ => Ok(args[0].clone()),
+    }
+}
+
+/// `property.__set__(self, obj, value)` — CPython's `property_descr_set`.
+fn property_dunder_set(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = property_self(args, "__set__")?;
+    let (obj, value) = match (args.get(1), args.get(2)) {
+        (Some(o), Some(v)) => (o.clone(), v.clone()),
+        _ => return Err(type_error("__set__() takes exactly 3 arguments")),
+    };
+    if matches!(p.fset, Object::None) {
+        return Err(crate::error::attribute_error(
+            "property has no setter".to_owned(),
+        ));
+    }
+    reentrant_call(&p.fset, &[obj, value])?;
+    Ok(Object::None)
+}
+
+/// `property.__delete__(self, obj)` — CPython's deleter slot.
+fn property_dunder_delete(args: &[Object]) -> Result<Object, RuntimeError> {
+    let p = property_self(args, "__delete__")?;
+    let obj = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| type_error("__delete__() takes exactly 2 arguments"))?;
+    if matches!(p.fdel, Object::None) {
+        return Err(crate::error::attribute_error(
+            "property has no deleter".to_owned(),
+        ));
+    }
+    reentrant_call(&p.fdel, &[obj])?;
+    Ok(Object::None)
+}
+
 fn b_getattr(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 {
         return Err(type_error("getattr() requires at least 2 arguments"));
     }
-    let name = match &args[1] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("attribute name must be string")),
+    let name = match crate::attr_name_of(&args[1]) {
+        Some(n) => n,
+        None => return Err(type_error("attribute name must be string")),
     };
     let default = args.get(2).cloned();
     match attr_get(&args[0], &name) {
@@ -768,9 +2455,9 @@ fn b_setattr(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 3 {
         return Err(type_error("setattr() takes exactly 3 arguments"));
     }
-    let name = match &args[1] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("attribute name must be string")),
+    let name = match crate::attr_name_of(&args[1]) {
+        Some(n) => n,
+        None => return Err(type_error("attribute name must be string")),
     };
     attr_set(&args[0], &name, args[2].clone())?;
     Ok(Object::None)
@@ -780,9 +2467,9 @@ fn b_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("delattr() takes exactly 2 arguments"));
     }
-    let name = match &args[1] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("attribute name must be string")),
+    let name = match crate::attr_name_of(&args[1]) {
+        Some(n) => n,
+        None => return Err(type_error("attribute name must be string")),
     };
     attr_delete(&args[0], &name)?;
     Ok(Object::None)
@@ -792,9 +2479,9 @@ fn b_hasattr(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("hasattr() takes exactly 2 arguments"));
     }
-    let name = match &args[1] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("attribute name must be string")),
+    let name = match crate::attr_name_of(&args[1]) {
+        Some(n) => n,
+        None => return Err(type_error("attribute name must be string")),
     };
     Ok(Object::Bool(attr_get(&args[0], &name).is_some()))
 }
@@ -841,13 +2528,16 @@ fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
             | Object::BoundMethod(_)
             | Object::Type(_)
             | Object::Generator(_)
+            // Since Python 3.10 (bpo-43682) `staticmethod` objects are
+            // themselves callable, forwarding to the wrapped function.
+            | Object::StaticMethod(_)
     );
     if intrinsic {
         return Ok(Object::Bool(true));
     }
     // Instances are callable when their class exposes `__call__`.
     if let Object::Instance(inst) = v {
-        return Ok(Object::Bool(inst.class.lookup("__call__").is_some()));
+        return Ok(Object::Bool(inst.cls().lookup("__call__").is_some()));
     }
     Ok(Object::Bool(false))
 }
@@ -880,21 +2570,18 @@ fn b_locals(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// caller will see the raw object; full semantics require the VM.
 fn bind_descriptor(value: &Object, receiver: &Object) -> Object {
     match value {
-        Object::Function(_) => Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-            receiver: receiver.clone(),
-            function: value.clone(),
-        })),
-        Object::StaticMethod(inner) => (**inner).clone(),
+        Object::Function(_) => Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+            receiver.clone(),
+            value.clone(),
+        ))),
+        Object::StaticMethod(inner) => inner.func(),
         Object::ClassMethod(inner) => {
             let cls = match receiver {
-                Object::Instance(inst) => Object::Type(inst.class.clone()),
+                Object::Instance(inst) => Object::Type(inst.cls()),
                 Object::Type(_) => receiver.clone(),
                 _ => receiver.clone(),
             };
-            Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-                receiver: cls,
-                function: (**inner).clone(),
-            }))
+            Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(cls, inner.func())))
         }
         _ => value.clone(),
     }
@@ -911,7 +2598,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             {
                 return Some(v);
             }
-            if let Some(v) = inst.class.lookup(name) {
+            if let Some(v) = inst.cls().lookup(name) {
                 // Bind functions to the receiver so `getattr(inst, 'm')()`
                 // works the same as `inst.m()`. Other descriptors are
                 // left to the VM's full `descriptor_get` path.
@@ -919,7 +2606,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             }
             match name {
                 "__dict__" => Some(Object::Dict(inst.dict.clone())),
-                "__class__" => Some(Object::Type(inst.class.clone())),
+                "__class__" => Some(Object::Type(inst.cls())),
                 _ => None,
             }
         }
@@ -938,13 +2625,10 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 // binding `getattr(Cls, "a_classmethod")` returns the raw
                 // `classmethod` descriptor, which is not callable.
                 return Some(match v {
-                    Object::ClassMethod(inner) => {
-                        Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-                            receiver: Object::Type(t.clone()),
-                            function: (*inner).clone(),
-                        }))
-                    }
-                    Object::StaticMethod(inner) => (*inner).clone(),
+                    Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(
+                        crate::object::BoundMethod::new(Object::Type(t.clone()), inner.func()),
+                    )),
+                    Object::StaticMethod(inner) => inner.func(),
                     other => other,
                 });
             }
@@ -954,7 +2638,11 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             match name {
                 "__name__" | "__qualname__" => Some(Object::from_str(&t.name)),
                 "__bases__" => Some(Object::new_tuple(
-                    t.bases.iter().map(|b| Object::Type(b.clone())).collect(),
+                    t.bases
+                        .borrow()
+                        .iter()
+                        .map(|b| Object::Type(b.clone()))
+                        .collect(),
                 )),
                 "__mro__" => Some(Object::new_tuple(
                     t.mro
@@ -968,7 +2656,11 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             }
         }
         Object::Function(f) => {
-            if let Some(v) = f
+            if crate::object::is_function_slot(name) {
+                if let Some(v) = f.slot(name) {
+                    return Some(v);
+                }
+            } else if let Some(v) = f
                 .attrs
                 .borrow()
                 .get(&crate::object::DictKey(Object::from_str(name)))
@@ -982,9 +2674,9 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             // attribute access.
             match name {
                 "__name__" | "__qualname__" => Some(Object::from_str(&f.name)),
-                "__doc__" => Some(code_docstring(&f.code).unwrap_or(Object::None)),
+                "__doc__" => Some(code_docstring(&f.code()).unwrap_or(Object::None)),
                 "__dict__" => Some(Object::Dict(f.attrs.clone())),
-                "__code__" => Some(Object::Code(f.code.clone())),
+                "__code__" => Some(Object::Code(f.code())),
                 "__globals__" => Some(Object::Dict(f.globals.clone())),
                 "__defaults__" => {
                     if f.defaults.is_empty() {
@@ -1020,18 +2712,39 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             "__module__" => Some(Object::from_static("builtins")),
             "__doc__" => Some(Object::None),
             "__self__" => Some(Object::None),
+            "__objclass__" => crate::builtin_types::builtin_fn_objclass(b).map(Object::Type),
             _ => None,
         },
         Object::BoundMethod(bm) => match name {
             "__func__" => Some(bm.function.clone()),
             "__self__" => Some(bm.receiver.clone()),
+            // Defining class of a bound built-in method: the MRO entry
+            // of the receiver's class that provides this method name.
+            "__objclass__" => {
+                if let Object::Builtin(_) = &bm.function {
+                    let cls = class_of(&bm.receiver);
+                    let mro: Vec<Rc<crate::types::TypeObject>> = cls.mro.borrow().clone();
+                    let method_name = match &bm.function {
+                        Object::Builtin(b) => b.name,
+                        _ => return None,
+                    };
+                    let key = DictKey(Object::from_static(method_name));
+                    for t in mro.iter() {
+                        if t.dict.borrow().contains_key(&key) {
+                            return Some(Object::Type(t.clone()));
+                        }
+                    }
+                    return Some(Object::Type(cls));
+                }
+                None
+            }
             "__name__" => match &bm.function {
                 Object::Function(f) => Some(Object::from_str(f.name.clone())),
                 Object::Builtin(b) => Some(Object::from_static(b.name)),
                 _ => None,
             },
             "__code__" => match &bm.function {
-                Object::Function(f) => Some(Object::Code(f.code.clone())),
+                Object::Function(f) => Some(Object::Code(f.code())),
                 _ => None,
             },
             "__doc__" => Some(Object::None),
@@ -1044,10 +2757,9 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             // / `hasattr` / `getattr` should agree with attribute
             // access via the dot operator.
             if let Some(builtin) = lookup_method(obj, name) {
-                return Some(Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-                    receiver: obj.clone(),
-                    function: builtin,
-                })));
+                return Some(Object::BoundMethod(Rc::new(
+                    crate::object::BoundMethod::new(obj.clone(), builtin),
+                )));
             }
             None
         }
@@ -1084,8 +2796,11 @@ pub(crate) fn code_synthetic_attr(
         "co_names" => Some(Object::new_tuple(
             c.names.iter().map(Object::from_str).collect(),
         )),
+        // First *tracked* line — synthetic preamble instructions carry
+        // line 0, but CPython's co_firstlineno is 1-based (a module
+        // compiled from one line reports 1, not 0).
         "co_firstlineno" => Some(Object::Int(i64::from(
-            c.linetable.first().copied().unwrap_or(0),
+            c.linetable.iter().copied().find(|l| *l > 0).unwrap_or(1),
         ))),
         "co_consts" => Some(Object::new_tuple(
             c.constants
@@ -1126,14 +2841,15 @@ fn code_method_kw(
     name: &'static str,
     body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
 ) -> Object {
-    Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-        receiver: Object::Code(c.clone()),
-        function: Object::Builtin(Rc::new(BuiltinFn {
+    Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+        Object::Code(c.clone()),
+        Object::Builtin(Rc::new(BuiltinFn {
             name,
+            binds_instance: false,
             call: Box::new(move |args| body(args, &[])),
             call_kw: Some(Box::new(body)),
         })),
-    }))
+    )))
 }
 
 /// `code.replace(**kwargs)` — return a copy of the code object with
@@ -1144,6 +2860,74 @@ fn code_method_kw(
 /// stream (`co_code`, `co_linetable`, `co_stacksize`, `co_flags`, …)
 /// are accepted for drop-in compatibility but carried through from the
 /// original; an unknown keyword raises `TypeError`, as in CPython.
+/// Decode a CPython compact location table (PEP 626 / `co_linetable`)
+/// into per-unit lines; `None` marks the NO_LOCATION entries (`f_lineno`
+/// shows them as None).
+fn decode_compact_linetable(table: &[u8], firstlineno: u32) -> Vec<Option<u32>> {
+    fn varint(table: &[u8], pos: &mut usize) -> i32 {
+        let mut val: i32 = 0;
+        let mut shift = 0;
+        while *pos < table.len() {
+            let b = table[*pos];
+            *pos += 1;
+            val |= i32::from(b & 0x3F) << shift;
+            if b & 0x40 == 0 {
+                break;
+            }
+            shift += 6;
+        }
+        val
+    }
+    fn svarint(table: &[u8], pos: &mut usize) -> i32 {
+        let v = varint(table, pos);
+        if v & 1 != 0 {
+            -(v >> 1)
+        } else {
+            v >> 1
+        }
+    }
+    let mut out: Vec<Option<u32>> = Vec::new();
+    let mut pos = 0usize;
+    let mut line = firstlineno as i32;
+    while pos < table.len() {
+        let first = table[pos];
+        pos += 1;
+        if first & 0x80 == 0 {
+            break;
+        }
+        let code = (first >> 3) & 0x0F;
+        let length = ((first & 0x07) as usize) + 1;
+        let entry_line = match code {
+            15 => None,
+            13 => {
+                line += svarint(table, &mut pos);
+                Some(line)
+            }
+            14 => {
+                line += svarint(table, &mut pos);
+                let _ = varint(table, &mut pos);
+                let _ = varint(table, &mut pos);
+                let _ = varint(table, &mut pos);
+                Some(line)
+            }
+            10..=12 => {
+                line += i32::from(code) - 10;
+                let _ = varint(table, &mut pos);
+                let _ = varint(table, &mut pos);
+                Some(line)
+            }
+            _ => {
+                pos += 1;
+                Some(line)
+            }
+        };
+        for _ in 0..length {
+            out.push(entry_line.map(|l| l.max(0) as u32));
+        }
+    }
+    out
+}
+
 fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let c = code_self(args)?;
     let mut nc: weavepy_compiler::CodeObject = (*c).clone();
@@ -1199,11 +2983,30 @@ fn code_replace(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
                     }
                 }
             }
+            "co_linetable" => {
+                // Re-derive per-instruction lines from a CPython compact
+                // location table (PEP 626). Entries with the NO_LOCATION
+                // code map to the 0 sentinel, which `f_lineno` reports
+                // as None (test_missing_lineno_shows_as_none).
+                let bytes: Vec<u8> = match v {
+                    Object::Bytes(b) => b.to_vec(),
+                    _ => {
+                        return Err(type_error(
+                            "code.replace(): co_linetable must be bytes".to_owned(),
+                        ))
+                    }
+                };
+                let firstlineno = nc.linetable.first().copied().unwrap_or(1);
+                let unit_lines = decode_compact_linetable(&bytes, firstlineno);
+                for (i, slot) in nc.linetable.iter_mut().enumerate() {
+                    *slot = unit_lines.get(i).copied().flatten().unwrap_or(0);
+                }
+            }
             // Recognised CPython fields WeavePy derives on demand rather
             // than storing independently. Accepted (carried through) so
             // `replace()` callers don't break, but not independently set.
             "co_qualname" | "co_flags" | "co_stacksize" | "co_code" | "co_consts"
-            | "co_linetable" | "co_exceptiontable" | "co_nlocals" | "co_lnotab" => {}
+            | "co_exceptiontable" | "co_nlocals" | "co_lnotab" => {}
             other => {
                 return Err(type_error(format!(
                     "replace() got an unexpected keyword argument '{other}'"
@@ -1221,10 +3024,10 @@ fn code_method(
     name: &'static str,
     body: fn(&[Object]) -> Result<Object, RuntimeError>,
 ) -> Object {
-    Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-        receiver: Object::Code(c.clone()),
-        function: Object::Builtin(Rc::new(method(name, body))),
-    }))
+    Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+        Object::Code(c.clone()),
+        Object::Builtin(Rc::new(method(name, body))),
+    )))
 }
 
 /// Extract the receiver code object from a bound-method call's `args[0]`.
@@ -1243,7 +3046,11 @@ fn code_self(args: &[Object]) -> Result<Rc<weavepy_compiler::CodeObject>, Runtim
 fn code_co_positions(args: &[Object]) -> Result<Object, RuntimeError> {
     let c = code_self(args)?;
     let cp = c.to_cpython();
-    let col = |v: Option<u32>| v.map_or(Object::None, |x| Object::Int(i64::from(x)));
+    let debug_ranges = crate::vm_singletons::debug_ranges();
+    let col = |v: Option<u32>| {
+        v.filter(|_| debug_ranges)
+            .map_or(Object::None, |x| Object::Int(i64::from(x)))
+    };
     let items = cp
         .positions
         .iter()
@@ -1311,6 +3118,15 @@ fn code_varname_from_oparg(args: &[Object]) -> Result<Object, RuntimeError> {
         .ok_or_else(|| type_error("_varname_from_oparg(): index out of range".to_owned()))
 }
 
+thread_local! {
+    /// Docstring objects keyed by the constant's string-data address, so
+    /// repeated `f.__doc__` reads return the *same* `str` object (CPython
+    /// stores the docstring once on the function; `update_wrapper` tests
+    /// `assertIs(wrapper.__doc__, wrapped.__doc__)`).
+    static DOCSTRING_CACHE: std::cell::RefCell<std::collections::HashMap<usize, Object>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Return the docstring extracted from a code object, if its first
 /// constant is a string literal — CPython's `__doc__` convention.
 /// The compiler keeps the leading bare string expression as
@@ -1318,7 +3134,13 @@ fn code_varname_from_oparg(args: &[Object]) -> Result<Object, RuntimeError> {
 /// runtime via this helper.
 pub(crate) fn code_docstring(c: &weavepy_compiler::CodeObject) -> Option<Object> {
     match c.constants.first() {
-        Some(weavepy_compiler::Constant::Str(s)) => Some(Object::from_str(s.as_str())),
+        Some(weavepy_compiler::Constant::Str(s)) => Some(DOCSTRING_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .entry(s.as_ptr() as usize)
+                .or_insert_with(|| Object::from_str(s.as_str()))
+                .clone()
+        })),
         _ => None,
     }
 }
@@ -1349,7 +3171,10 @@ pub(crate) fn code_flags(c: &weavepy_compiler::CodeObject) -> u32 {
         f |= CO_GENERATOR;
     }
     if c.is_coroutine {
-        f |= CO_COROUTINE | CO_ITERABLE_COROUTINE;
+        f |= CO_COROUTINE;
+    }
+    if c.is_iterable_coroutine {
+        f |= CO_ITERABLE_COROUTINE;
     }
     if c.is_async_generator {
         f |= CO_ASYNC_GENERATOR;
@@ -1381,9 +3206,26 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
             Ok(())
         }
         Object::Function(f) => {
-            f.attrs
-                .borrow_mut()
-                .insert(crate::object::DictKey(Object::from_str(name)), value);
+            if name == "__code__" {
+                let Object::Code(c) = value else {
+                    return Err(type_error("__code__ must be set to a code object"));
+                };
+                if f.closure.len() != c.freevars.len() {
+                    return Err(crate::error::value_error(format!(
+                        "{}() requires a code object with {} free vars, not {}",
+                        f.name,
+                        f.closure.len(),
+                        c.freevars.len()
+                    )));
+                }
+                *f.code.borrow_mut() = c;
+            } else if crate::object::is_function_slot(name) {
+                f.set_slot(name, value);
+            } else {
+                f.attrs
+                    .borrow_mut()
+                    .insert(crate::object::DictKey(Object::from_str(name)), value);
+            }
             Ok(())
         }
         _ => Err(type_error(format!(
@@ -1409,9 +3251,15 @@ fn attr_delete(obj: &Object, name: &str) -> Result<(), RuntimeError> {
             Ok(())
         }
         Object::Function(f) => {
-            f.attrs
-                .borrow_mut()
-                .shift_remove(&crate::object::DictKey(Object::from_str(name)));
+            if crate::object::is_function_slot(name) {
+                f.slots
+                    .borrow_mut()
+                    .shift_remove(&crate::object::DictKey(Object::from_str(name)));
+            } else {
+                f.attrs
+                    .borrow_mut()
+                    .shift_remove(&crate::object::DictKey(Object::from_str(name)));
+            }
             Ok(())
         }
         _ => Err(type_error(format!("cannot delete attribute '{}'", name))),
@@ -1458,29 +3306,92 @@ pub(crate) fn b_int_compat(args: &[Object]) -> Result<Object, RuntimeError> {
                 crate::object::bigint_from_f64_trunc(truncated),
             ))
         }
-        Object::Str(s) => parse_int_string(s.trim(), &args[1..]),
+        Object::Str(s) => parse_int_string(&args[0], s, &args[1..]),
+        // bytes-like: each byte maps to one Latin-1 code point so non-ASCII
+        // bytes (and embedded NULs) become non-digit characters that fail to
+        // parse — with the original `b'…'` repr in the error, like CPython.
         Object::Bytes(b) => {
-            let s = std::str::from_utf8(b)
-                .map_err(|_| value_error("int() can't convert non-string with explicit base"))?;
-            parse_int_string(s.trim(), &args[1..])
+            let text: String = b.iter().map(|&c| c as char).collect();
+            parse_int_string(&args[0], &text, &args[1..])
         }
         Object::ByteArray(b) => {
-            let bytes = b.borrow();
-            let s = std::str::from_utf8(&bytes)
-                .map_err(|_| value_error("int() can't convert non-string with explicit base"))?;
-            parse_int_string(s.trim(), &args[1..])
+            let text: String = b.borrow().iter().map(|&c| c as char).collect();
+            parse_int_string(&args[0], &text, &args[1..])
         }
         _ => Err(type_error(format!(
-            "int() argument must be a string or a real number, not '{}'",
+            "int() argument must be a string, a bytes-like object or a real number, not '{}'",
             args[0].type_name()
         ))),
     }
 }
 
-fn parse_int_string(s: &str, base_arg: &[Object]) -> Result<Object, RuntimeError> {
+/// Parse the text of an `int(x, base)` call. `original` is the *original*
+/// argument object; its `repr()` is computed lazily and only when an
+/// `invalid literal` error is actually raised (so surrounding whitespace and
+/// `b'…'` framing are preserved, matching CPython, without paying the O(N)
+/// repr cost on the success / digit-limit paths). Unicode decimal digits and
+/// whitespace are normalised to ASCII first.
+fn parse_int_string(
+    original: &Object,
+    raw: &str,
+    base_arg: &[Object],
+) -> Result<Object, RuntimeError> {
     use num_bigint::BigInt;
 
-    let mut s = s;
+    // Resolve the base argument up front: the error message reports it
+    // verbatim (`base 0`, `base 20`, …), not the prefix-resolved radix.
+    let base = if base_arg.is_empty() {
+        10u32
+    } else {
+        match &base_arg[0] {
+            Object::Int(i) => u32::try_from(*i)
+                .map_err(|_| value_error("int() base must be >= 2 and <= 36, or 0"))?,
+            Object::Bool(b) => u32::from(*b),
+            Object::Long(_) => return Err(value_error("int() base must be >= 2 and <= 36, or 0")),
+            _ => return Err(type_error("int() base must be an integer".to_owned())),
+        }
+    };
+    if base == 1 || base > 36 {
+        return Err(value_error("int() base must be >= 2 and <= 36, or 0"));
+    }
+
+    // Fast DoS guard (PEP 0467): reject a pathologically long input *before*
+    // the O(N) Unicode-normalisation and underscore-stripping passes. A raw
+    // string of length L yields at least ceil((L+1)/2) digits once the only
+    // legal underscores (between two digits) are removed, so when that lower
+    // bound already exceeds the cap the value is over the limit regardless of
+    // its exact contents. Power-of-two radices parse in linear time and are
+    // exempt, matching CPython.
+    let max_digits = crate::stdlib::sys::int_max_str_digits();
+    if max_digits > 0 {
+        let radix_is_pow2 = base.is_power_of_two()
+            || (base == 0 && {
+                let t = raw.trim_start();
+                let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+                let tb = t.as_bytes();
+                tb.len() >= 2
+                    && tb[0] == b'0'
+                    && matches!(tb[1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+            });
+        if !radix_is_pow2 && raw.len().div_ceil(2) > max_digits as usize {
+            return Err(value_error(format!(
+                "Exceeds the limit ({max_digits} digits) for integer string conversion; \
+                 use sys.set_int_max_str_digits() to increase the limit"
+            )));
+        }
+    }
+
+    let invalid = || {
+        value_error(format!(
+            "invalid literal for int() with base {base}: {}",
+            original.repr()
+        ))
+    };
+
+    // Normalise Unicode decimal digits / whitespace to ASCII, then strip the
+    // surrounding whitespace CPython ignores.
+    let transformed = transform_decimal_and_space(raw);
+    let mut s = transformed.trim();
     let mut sign = 1i32;
     if let Some(stripped) = s.strip_prefix('+') {
         s = stripped;
@@ -1489,18 +3400,22 @@ fn parse_int_string(s: &str, base_arg: &[Object]) -> Result<Object, RuntimeError
         sign = -1;
     }
 
-    let base = if base_arg.is_empty() {
-        10u32
-    } else {
-        match &base_arg[0] {
-            Object::Int(i) => u32::try_from(*i)
-                .map_err(|_| value_error("int() base must be >= 2 and <= 36, or 0"))?,
-            Object::Bool(b) => u32::from(*b),
-            _ => return Err(type_error("int() base must be an integer".to_owned())),
+    // Validate underscore placement up front: CPython only accepts a single
+    // underscore between two "digit" characters (or right after a base
+    // prefix, e.g. `0x_ff`). Leading/trailing/doubled underscores such as
+    // `_1`, `1_`, `1__2` are `ValueError`s rather than silently stripped.
+    if s.contains('_') {
+        let b = s.as_bytes();
+        for (i, &c) in b.iter().enumerate() {
+            if c == b'_'
+                && !(i > 0
+                    && i + 1 < b.len()
+                    && b[i - 1].is_ascii_alphanumeric()
+                    && b[i + 1].is_ascii_alphanumeric())
+            {
+                return Err(invalid());
+            }
         }
-    };
-    if base == 1 || base > 36 {
-        return Err(value_error("int() base must be >= 2 and <= 36, or 0"));
     }
 
     // Strip a 0x/0o/0b prefix when it matches the base, or pick the
@@ -1532,19 +3447,33 @@ fn parse_int_string(s: &str, base_arg: &[Object]) -> Result<Object, RuntimeError
 
     let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
     if cleaned.is_empty() {
+        return Err(invalid());
+    }
+
+    // With base 0 a decimal literal may not carry redundant leading zeros:
+    // `int('0', 0)` / `int('00', 0)` are 0, but `int('010', 0)` is invalid
+    // (it looks like a defunct octal literal).
+    if base == 0 && radix == 10 && cleaned.starts_with('0') && cleaned.bytes().any(|c| c != b'0') {
+        return Err(invalid());
+    }
+
+    // PEP 0467 int↔str conversion cap. The digit count (sign, whitespace and
+    // underscores already stripped) is checked up front — before the O(N**2)
+    // big-int parse — so pathological inputs fail fast. Power-of-two radices
+    // (linear to parse) are exempt, matching CPython.
+    let max_digits = crate::stdlib::sys::int_max_str_digits();
+    if max_digits > 0 && !radix.is_power_of_two() && cleaned.len() > max_digits as usize {
         return Err(value_error(format!(
-            "invalid literal for int() with base {radix}: '{s}'"
+            "Exceeds the limit ({max_digits} digits) for integer string conversion: \
+             value has {} digits; use sys.set_int_max_str_digits() to increase the limit",
+            cleaned.len()
         )));
     }
 
     if let Ok(small) = i64::from_str_radix(&cleaned, radix) {
         return Ok(Object::Int(if sign < 0 { -small } else { small }));
     }
-    let big = BigInt::parse_bytes(cleaned.as_bytes(), radix).ok_or_else(|| {
-        value_error(format!(
-            "invalid literal for int() with base {radix}: '{s}'"
-        ))
-    })?;
+    let big = BigInt::parse_bytes(cleaned.as_bytes(), radix).ok_or_else(invalid)?;
     let big = if sign < 0 { -big } else { big };
     Ok(Object::int_from_bigint(big))
 }
@@ -1762,16 +3691,38 @@ fn float_hex(args: &[Object]) -> Result<Object, RuntimeError> {
 fn float_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
     // First arg is the class (float) for classmethod-style; tolerate
     // either form.
-    let s_obj = if matches!(args.first(), Some(Object::Type(_))) {
-        args.get(1)
+    let (cls, s_obj) = if matches!(args.first(), Some(Object::Type(_))) {
+        (args.first(), args.get(1))
     } else {
-        args.first()
+        (None, args.first())
     };
     let s = match s_obj {
         Some(Object::Str(s)) => s.to_string(),
         _ => return Err(type_error("fromhex() requires a string")),
     };
-    parse_float_hex(&s).map(Object::Float)
+    let x = parse_float_hex(&s)?;
+    float_fromhex_wrap(cls, x)
+}
+
+/// Wrap a parsed `fromhex` value in the requested class. For the plain
+/// `float` type that's just `Object::Float`; for a subclass we re-enter the
+/// interpreter and call `cls(x)` so the subclass's `__new__`/`__init__`
+/// run (CPython does `PyObject_CallOneArg(type, result)`).
+fn float_fromhex_wrap(cls: Option<&Object>, x: f64) -> Result<Object, RuntimeError> {
+    if let Some(Object::Type(t)) = cls {
+        let bt = crate::builtin_types::builtin_types();
+        if !crate::sync::Rc::ptr_eq(t, &bt.float_) {
+            let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                type_error("float.fromhex() subclass construction requires a running interpreter")
+            })?;
+            // SAFETY: pointer published by the running dispatch loop for this
+            // thread; re-entered synchronously like the other reentrant
+            // callbacks (`__hash__`, `__eq__`).
+            let interp = unsafe { &mut *ptr };
+            return interp.call_object(Object::Type(t.clone()), &[Object::Float(x)], &[]);
+        }
+    }
+    Ok(Object::Float(x))
 }
 
 fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1780,8 +3731,13 @@ fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Float(f) => *f,
         _ => return Err(type_error("as_integer_ratio: float expected")),
     };
-    if !f.is_finite() {
-        return Err(value_error("cannot convert non-finite float"));
+    if f.is_nan() {
+        return Err(value_error("cannot convert NaN to integer ratio"));
+    }
+    if f.is_infinite() {
+        return Err(crate::error::overflow_error(
+            "cannot convert Infinity to integer ratio",
+        ));
     }
     let bits = f.to_bits();
     let sign = if (bits >> 63) & 1 == 1 { -1i32 } else { 1 };
@@ -1826,6 +3782,36 @@ fn float_trunc(args: &[Object]) -> Result<Object, RuntimeError> {
         )),
         _ => Err(type_error("__trunc__: float expected")),
     }
+}
+
+fn float_floor(args: &[Object]) -> Result<Object, RuntimeError> {
+    match one(args, "__floor__")? {
+        Object::Float(f) => float_int_part(f.floor()),
+        _ => Err(type_error("__floor__: float expected")),
+    }
+}
+
+fn float_ceil(args: &[Object]) -> Result<Object, RuntimeError> {
+    match one(args, "__ceil__")? {
+        Object::Float(f) => float_int_part(f.ceil()),
+        _ => Err(type_error("__ceil__: float expected")),
+    }
+}
+
+/// Convert an already-floored/ceiled `f64` to an `int`, raising the same
+/// errors CPython's `float.__floor__`/`__ceil__` do for non-finite values.
+fn float_int_part(f: f64) -> Result<Object, RuntimeError> {
+    if f.is_nan() {
+        return Err(value_error("cannot convert float NaN to integer"));
+    }
+    if f.is_infinite() {
+        return Err(crate::error::overflow_error(
+            "cannot convert float infinity to integer",
+        ));
+    }
+    Ok(Object::int_from_bigint(
+        crate::object::bigint_from_f64_trunc(f),
+    ))
 }
 
 fn float_round(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1892,59 +3878,273 @@ fn format_float_hex(f: f64) -> String {
     format!("{sign_str}{m_hex}p{exp_sign}{exponent}")
 }
 
+/// `float.fromhex` string parser, a faithful port of CPython's
+/// `float_fromhex` (`Objects/floatobject.c`). Returns the parsed value
+/// (with correct round-half-even in the subnormal range), a `ValueError`
+/// for malformed input, or an `OverflowError` for values too large to
+/// represent. Works on raw bytes so embedded NULs and multibyte
+/// (fullwidth) digits are rejected exactly as CPython rejects them.
 fn parse_float_hex(s: &str) -> Result<f64, RuntimeError> {
-    let s = s.trim();
-    let lower = s.to_ascii_lowercase();
-    match lower.as_str() {
-        "nan" | "+nan" | "-nan" => return Ok(f64::NAN),
-        "inf" | "+inf" | "infinity" | "+infinity" => return Ok(f64::INFINITY),
-        "-inf" | "-infinity" => return Ok(f64::NEG_INFINITY),
-        _ => {}
-    }
-    // Optional sign.
-    let mut idx = 0usize;
+    const DBL_MANT_DIG: i64 = 53;
+    const DBL_MIN_EXP: i64 = -1021;
+    const DBL_MAX_EXP: i64 = 1024;
+    let parse_err = || value_error("invalid hexadecimal floating-point string");
+    let overflow =
+        || crate::error::overflow_error("hexadecimal value too large to represent as a float");
+
     let bytes = s.as_bytes();
-    let sign = if bytes.first() == Some(&b'-') {
-        idx += 1;
-        -1.0
-    } else {
-        if bytes.first() == Some(&b'+') {
-            idx += 1;
+    let n = bytes.len();
+    let mut i = 0usize;
+
+    // Leading whitespace.
+    while i < n && is_py_space(bytes[i]) {
+        i += 1;
+    }
+
+    // Infinities and nans (consume their own optional sign).
+    if let Some((val, end)) = parse_inf_or_nan(bytes, i) {
+        return finish_hex_tail(bytes, end, val);
+    }
+
+    // Optional sign.
+    let mut negate = false;
+    if i < n && bytes[i] == b'-' {
+        negate = true;
+        i += 1;
+    } else if i < n && bytes[i] == b'+' {
+        i += 1;
+    }
+
+    // Optional `0x` / `0X` prefix.
+    let s_store = i;
+    if i < n && bytes[i] == b'0' {
+        i += 1;
+        if i < n && (bytes[i] == b'x' || bytes[i] == b'X') {
+            i += 1;
+        } else {
+            i = s_store;
         }
-        1.0
-    };
-    let rest = &s[idx..];
-    let rest = rest
-        .strip_prefix("0x")
-        .or_else(|| rest.strip_prefix("0X"))
-        .ok_or_else(|| value_error("invalid hexadecimal float"))?;
-    // Split on 'p' / 'P'.
-    let (mantissa_part, exp_part) = match rest.find(['p', 'P']) {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => return Err(value_error("invalid hexadecimal float")),
-    };
-    let exponent: i32 = exp_part
-        .parse()
-        .map_err(|_| value_error("invalid hexadecimal float exponent"))?;
-    let (int_part, frac_part) = match mantissa_part.find('.') {
-        Some(i) => (&mantissa_part[..i], &mantissa_part[i + 1..]),
-        None => (mantissa_part, ""),
-    };
-    let mut value: f64 = 0.0;
-    for c in int_part.chars() {
-        value = value * 16.0 + f64::from(hex_digit(c)?);
     }
-    let mut frac_factor = 1.0 / 16.0;
-    for c in frac_part.chars() {
-        value += f64::from(hex_digit(c)?) * frac_factor;
-        frac_factor /= 16.0;
+
+    // Coefficient: <integer> [. <fraction>].
+    let coeff_start = i;
+    while i < n && hex_from_byte(bytes[i]) >= 0 {
+        i += 1;
     }
-    Ok(sign * value * 2f64.powi(exponent))
+    let dot_store = i;
+    let coeff_end: usize = if i < n && bytes[i] == b'.' {
+        i += 1;
+        while i < n && hex_from_byte(bytes[i]) >= 0 {
+            i += 1;
+        }
+        i - 1
+    } else {
+        i
+    };
+
+    let mut ndigits = coeff_end as i64 - coeff_start as i64;
+    let fdigits = coeff_end as i64 - dot_store as i64;
+    if ndigits == 0 {
+        return Err(parse_err());
+    }
+    let length_limit = core::cmp::min(
+        DBL_MIN_EXP - DBL_MANT_DIG - i64::MIN / 2,
+        i64::MAX / 2 + 1 - DBL_MAX_EXP,
+    ) / 4;
+    if ndigits > length_limit {
+        return Err(value_error("hexadecimal string too long to convert"));
+    }
+
+    // Optional `p <exponent>`.
+    let mut exp: i64 = 0;
+    if i < n && (bytes[i] == b'p' || bytes[i] == b'P') {
+        i += 1;
+        let exp_start = i;
+        if i < n && (bytes[i] == b'-' || bytes[i] == b'+') {
+            i += 1;
+        }
+        if !(i < n && bytes[i].is_ascii_digit()) {
+            return Err(parse_err());
+        }
+        i += 1;
+        while i < n && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        // `strtol` saturates to LONG_MIN/MAX on overflow; mirror that so a
+        // gigantic exponent funnels into the overflow/zero branches below.
+        let exp_text = std::str::from_utf8(&bytes[exp_start..i]).unwrap_or("0");
+        exp = exp_text
+            .parse::<i64>()
+            .unwrap_or(if bytes[exp_start] == b'-' {
+                i64::MIN
+            } else {
+                i64::MAX
+            });
+    }
+
+    // `HEX_DIGIT(j)` — the j'th least-significant hex digit, hopping over the
+    // radix point for digits in the integer part.
+    let hex_digit = |j: i64| -> i32 {
+        let idx = if j < fdigits {
+            coeff_end as i64 - j
+        } else {
+            coeff_end as i64 - 1 - j
+        };
+        hex_from_byte(bytes[idx as usize])
+    };
+
+    // Discard leading zeros; catch extreme over/underflow.
+    while ndigits > 0 && hex_digit(ndigits - 1) == 0 {
+        ndigits -= 1;
+    }
+    if ndigits == 0 || exp < i64::MIN / 2 {
+        return finish_hex_tail(bytes, i, if negate { -0.0 } else { 0.0 });
+    }
+    if exp > i64::MAX / 2 {
+        return Err(overflow());
+    }
+
+    // Adjust exponent for the fractional part.
+    exp -= 4 * fdigits;
+
+    // `top_exp` = one more than the exponent of the most-significant bit.
+    let mut top_exp = exp + 4 * (ndigits - 1);
+    let mut msd = hex_digit(ndigits - 1);
+    while msd != 0 {
+        top_exp += 1;
+        msd /= 2;
+    }
+
+    if top_exp < DBL_MIN_EXP - DBL_MANT_DIG {
+        return finish_hex_tail(bytes, i, if negate { -0.0 } else { 0.0 });
+    }
+    if top_exp > DBL_MAX_EXP {
+        return Err(overflow());
+    }
+
+    let lsb = core::cmp::max(top_exp, DBL_MIN_EXP) - DBL_MANT_DIG;
+    let mut x: f64 = 0.0;
+    if exp >= lsb {
+        // No rounding required.
+        let mut j = ndigits - 1;
+        while j >= 0 {
+            x = 16.0 * x + f64::from(hex_digit(j));
+            j -= 1;
+        }
+        x = crate::stdlib::math::ldexp(x, exp as i32);
+        return finish_hex_tail(bytes, i, if negate { -x } else { x });
+    }
+
+    // Rounding required. `key_digit` holds the first bit to round away.
+    let half_eps = 1i32 << ((lsb - exp - 1) % 4) as u32;
+    let key_digit = (lsb - exp - 1) / 4;
+    let mut j = ndigits - 1;
+    while j > key_digit {
+        x = 16.0 * x + f64::from(hex_digit(j));
+        j -= 1;
+    }
+    let digit = hex_digit(key_digit);
+    x = 16.0 * x + f64::from(digit & (16 - 2 * half_eps));
+
+    // Round half to even.
+    if (digit & half_eps) != 0 {
+        let mut round_up = false;
+        if (digit & (3 * half_eps - 1)) != 0
+            || (half_eps == 8 && key_digit + 1 < ndigits && (hex_digit(key_digit + 1) & 1) != 0)
+        {
+            round_up = true;
+        } else {
+            let mut k = key_digit - 1;
+            while k >= 0 {
+                if hex_digit(k) != 0 {
+                    round_up = true;
+                    break;
+                }
+                k -= 1;
+            }
+        }
+        if round_up {
+            x += f64::from(2 * half_eps);
+            if top_exp == DBL_MAX_EXP
+                && x == crate::stdlib::math::ldexp(f64::from(2 * half_eps), DBL_MANT_DIG as i32)
+            {
+                // Pre-rounding value was < DBL_MAX, post-rounding == DBL_MAX.
+                return Err(overflow());
+            }
+        }
+    }
+    x = crate::stdlib::math::ldexp(x, (exp + 4 * key_digit) as i32);
+    finish_hex_tail(bytes, i, if negate { -x } else { x })
 }
 
-fn hex_digit(c: char) -> Result<u32, RuntimeError> {
-    c.to_digit(16)
-        .ok_or_else(|| value_error("invalid hex digit"))
+/// CPython `Py_ISSPACE` for the ASCII range (space, tab, newline, vtab,
+/// formfeed, carriage return).
+fn is_py_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Value of an ASCII hex digit, or `-1` for anything else (including
+/// multibyte UTF-8 lead bytes, so fullwidth digits are rejected).
+fn hex_from_byte(b: u8) -> i32 {
+    match b {
+        b'0'..=b'9' => i32::from(b - b'0'),
+        b'a'..=b'f' => i32::from(b - b'a' + 10),
+        b'A'..=b'F' => i32::from(b - b'A' + 10),
+        _ => -1,
+    }
+}
+
+/// ASCII case-insensitive match of `pat` at `s[i..]`.
+fn ci_match(s: &[u8], i: usize, pat: &[u8]) -> bool {
+    s.len() >= i + pat.len() && s[i..i + pat.len()].eq_ignore_ascii_case(pat)
+}
+
+/// CPython `_Py_parse_inf_or_nan`: parse an optional sign followed by
+/// `inf`/`infinity`/`nan` (case-insensitive). Returns the value and the
+/// index just past the match, or `None` if no match.
+fn parse_inf_or_nan(s: &[u8], start: usize) -> Option<(f64, usize)> {
+    let n = s.len();
+    let mut i = start;
+    let mut negate = false;
+    if i < n && s[i] == b'-' {
+        negate = true;
+        i += 1;
+    } else if i < n && s[i] == b'+' {
+        i += 1;
+    }
+    if ci_match(s, i, b"inf") {
+        i += 3;
+        if ci_match(s, i, b"inity") {
+            i += 5;
+        }
+        Some((
+            if negate {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            },
+            i,
+        ))
+    } else if ci_match(s, i, b"nan") {
+        i += 3;
+        Some((if negate { -f64::NAN } else { f64::NAN }, i))
+    } else {
+        None
+    }
+}
+
+/// Skip trailing ASCII whitespace and require we've reached the end of the
+/// string (CPython rejects trailing junk, including bytes past an embedded
+/// NUL).
+fn finish_hex_tail(s: &[u8], mut i: usize, val: f64) -> Result<f64, RuntimeError> {
+    let n = s.len();
+    while i < n && is_py_space(s[i]) {
+        i += 1;
+    }
+    if i != n {
+        return Err(value_error("invalid hexadecimal floating-point string"));
+    }
+    Ok(val)
 }
 
 // ---------- classmethod-shaped wrappers used by builtin_types ----------
@@ -1955,61 +4155,94 @@ fn hex_digit(c: char) -> Result<u32, RuntimeError> {
 // routes the rest through the underlying body.
 
 pub(crate) fn b_int_from_bytes_cls(args: &[Object]) -> Result<Object, RuntimeError> {
-    int_from_bytes_method(args)
+    // CPython's `int.from_bytes` calls `cls(result)` for subclasses so
+    // e.g. `IntEnum.from_bytes(...)` resolves to the matching member.
+    let result = int_from_bytes_method(args)?;
+    fromhex_wrap_subclass(args.first(), "int", result)
+}
+
+fn fromhex_string_arg(arg: Option<&Object>) -> Result<String, RuntimeError> {
+    match arg {
+        Some(Object::Str(s)) => Ok(s.to_string()),
+        Some(other) => Err(type_error(format!(
+            "fromhex() argument must be str, not {}",
+            other.type_name()
+        ))),
+        None => Err(type_error(
+            "descriptor 'fromhex' of 'bytes' object needs an argument",
+        )),
+    }
+}
+
+/// CPython's `bytes.fromhex` on a subclass calls the subclass with the
+/// parsed result (`PyObject_CallOneArg(type, result)`), so the returned
+/// object is an instance of `cls`.
+fn fromhex_wrap_subclass(
+    cls: Option<&Object>,
+    base_name: &str,
+    result: Object,
+) -> Result<Object, RuntimeError> {
+    if let Some(cls_obj @ Object::Type(t)) = cls {
+        if t.name != base_name {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame still live on
+                // this thread; the GIL keeps the access exclusive.
+                let interp = unsafe { &mut *ptr };
+                let globals = interp.builtins_dict();
+                return interp.call_object_with_globals(cls_obj, &[result], &[], &globals);
+            }
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn b_bytes_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _cls = args.first();
-    let s = match args.get(1) {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("fromhex() argument must be str")),
-    };
+    let s = fromhex_string_arg(args.get(1))?;
     let bytes = parse_hex_bytes(&s)?;
-    Ok(Object::new_bytes(bytes))
+    fromhex_wrap_subclass(args.first(), "bytes", Object::new_bytes(bytes))
 }
 
 pub(crate) fn b_bytearray_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _cls = args.first();
-    let s = match args.get(1) {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("fromhex() argument must be str")),
-    };
+    let s = fromhex_string_arg(args.get(1))?;
     let bytes = parse_hex_bytes(&s)?;
-    Ok(Object::new_bytearray(bytes))
+    fromhex_wrap_subclass(args.first(), "bytearray", Object::new_bytearray(bytes))
 }
 
 pub(crate) fn b_float_fromhex_cls(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _cls = args.first();
+    let cls = args.first();
     let s = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
         _ => return Err(type_error("fromhex() argument must be str")),
     };
-    parse_float_hex(&s).map(Object::Float)
+    let x = parse_float_hex(&s)?;
+    float_fromhex_wrap(cls, x)
 }
 
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RuntimeError> {
-    let mut bytes = Vec::new();
-    let mut last_high: Option<u8> = None;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if last_high.is_some() {
-                return Err(value_error("non-hexadecimal number"));
-            }
+    // CPython's `_PyBytes_FromHex`: pairs of hex digits, with *ASCII*
+    // whitespace permitted only between pairs. Error positions are
+    // character offsets into the original string.
+    let hex_err = |pos: usize| {
+        value_error(format!(
+            "non-hexadecimal number found in fromhex() arg at position {pos}"
+        ))
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let mut bytes = Vec::with_capacity(chars.len() / 2);
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') {
+            i += 1;
             continue;
         }
-        let v = c
-            .to_digit(16)
-            .ok_or_else(|| value_error("non-hexadecimal number"))? as u8;
-        match last_high {
-            Some(hi) => {
-                bytes.push((hi << 4) | v);
-                last_high = None;
-            }
-            None => last_high = Some(v),
-        }
-    }
-    if last_high.is_some() {
-        return Err(value_error("non-hexadecimal number"));
+        let hi = if c.is_ascii() { c.to_digit(16) } else { None }.ok_or_else(|| hex_err(i))?;
+        let lo = match chars.get(i + 1) {
+            Some(c2) if c2.is_ascii() => c2.to_digit(16).ok_or_else(|| hex_err(i + 1))?,
+            _ => return Err(hex_err(i + 1)),
+        };
+        bytes.push(((hi << 4) | lo) as u8);
+        i += 2;
     }
     Ok(bytes)
 }
@@ -2036,19 +4269,38 @@ fn b_float(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     match &args[0] {
         Object::Int(i) => Ok(Object::Float(*i as f64)),
-        Object::Long(b) => Ok(Object::Float(b.to_f64().unwrap_or(f64::INFINITY))),
+        Object::Long(b) => {
+            // CPython raises OverflowError when the magnitude exceeds the
+            // f64 range rather than silently producing `inf`.
+            match b.to_f64() {
+                Some(f) if f.is_finite() => Ok(Object::Float(f)),
+                _ => Err(crate::error::overflow_error(
+                    "int too large to convert to float",
+                )),
+            }
+        }
         Object::Bool(b) => Ok(Object::Float(f64::from(*b))),
         Object::Float(f) => Ok(Object::Float(*f)),
-        Object::Str(s) => parse_float_str(s.trim()).map(Object::Float),
-        Object::Bytes(b) => {
-            let s = std::str::from_utf8(b).map_err(|_| value_error("invalid bytes for float()"))?;
-            parse_float_str(s.trim()).map(Object::Float)
-        }
-        Object::ByteArray(b) => {
-            let bytes = b.borrow();
-            let s = std::str::from_utf8(&bytes)
-                .map_err(|_| value_error("invalid bytes for float()"))?;
-            parse_float_str(s.trim()).map(Object::Float)
+        Object::Str(_) | Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {
+            // str / bytes-like: bytes-like buffers are decoded as ASCII-ish
+            // text; non-UTF-8 input simply fails to parse (CPython raises the
+            // same ValueError).
+            let text: Option<String> = match &args[0] {
+                Object::Str(s) => Some(s.to_string()),
+                Object::Bytes(b) => String::from_utf8(b.to_vec()).ok(),
+                Object::ByteArray(b) => String::from_utf8(b.borrow().to_vec()).ok(),
+                Object::MemoryView(mv) => String::from_utf8(mv.to_bytes()).ok(),
+                _ => unreachable!(),
+            };
+            text.as_deref()
+                .and_then(parse_float_text)
+                .map(Object::Float)
+                .ok_or_else(|| {
+                    value_error(format!(
+                        "could not convert string to float: {}",
+                        args[0].repr()
+                    ))
+                })
         }
         _ => Err(type_error(format!(
             "float() argument must be a string or a number, not '{}'",
@@ -2057,19 +4309,99 @@ fn b_float(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn parse_float_str(s: &str) -> Result<f64, RuntimeError> {
-    // Special tokens (case-insensitive). CPython accepts these forms.
-    let lower = s.to_ascii_lowercase();
-    match lower.as_str() {
-        "inf" | "infinity" | "+inf" | "+infinity" => return Ok(f64::INFINITY),
-        "-inf" | "-infinity" => return Ok(f64::NEG_INFINITY),
-        "nan" | "+nan" | "-nan" => return Ok(f64::NAN),
+/// Parse a `float()` string argument following CPython's grammar: surrounding
+/// whitespace is stripped, `inf`/`nan` spellings are accepted, and PEP 515
+/// underscores are honoured only *between* digits. Returns `None` on any
+/// malformed input (the caller renders the `could not convert` ValueError).
+fn parse_float_text(raw: &str) -> Option<f64> {
+    let transformed = transform_decimal_and_space(raw);
+    let s = transformed.trim();
+    if s.is_empty() || !valid_float_underscores(s) {
+        return None;
+    }
+    let cleaned: String = s.chars().filter(|&c| c != '_').collect();
+    match cleaned.to_ascii_lowercase().as_str() {
+        "inf" | "infinity" | "+inf" | "+infinity" => return Some(f64::INFINITY),
+        "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
+        "nan" | "+nan" => return Some(f64::NAN),
+        // Preserve the sign bit so `copysign(1.0, float('-nan'))` is -1.0.
+        "-nan" => return Some(-f64::NAN),
         _ => {}
     }
-    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
-    cleaned
-        .parse()
-        .map_err(|e: std::num::ParseFloatError| value_error(e.to_string()))
+    // Reject the bare `inf`/`infinity`/`nan` tokens that Rust's parser also
+    // accepts (CPython only takes the spellings handled above); everything
+    // else Rust accepts matches CPython's float grammar closely enough.
+    if cleaned
+        .bytes()
+        .any(|b| b.eq_ignore_ascii_case(&b'i') || b.eq_ignore_ascii_case(&b'n'))
+    {
+        return None;
+    }
+    cleaned.parse::<f64>().ok()
+}
+
+/// CPython's `_PyUnicode_TransformDecimalAndSpaceToASCII`: map Unicode
+/// decimal digits to their ASCII value and any Unicode whitespace to a
+/// plain space, so `float("\u0663.\u0661\u0664")` and
+/// `float("\N{EM SPACE}3.14")` parse. Any other non-ASCII character becomes
+/// `'?'` (and truncates), which makes the subsequent parse fail with the
+/// same `ValueError` CPython raises.
+fn transform_decimal_and_space(raw: &str) -> String {
+    if raw.is_ascii() {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if (c as u32) < 127 {
+            out.push(c);
+        } else if c.is_whitespace() {
+            out.push(' ');
+        } else if let Some(v) = unicode_decimal_value(c) {
+            out.push((b'0' + v as u8) as char);
+        } else {
+            out.push('?');
+            break;
+        }
+    }
+    out
+}
+
+/// Decimal value (0–9) of a Unicode `Nd` (Decimal_Number) character, or
+/// `None`. Each `Nd` block is exactly ten consecutive code points `0..=9`,
+/// so the block's zero is found by walking down while still in category
+/// `Nd` (bounded to nine steps).
+fn unicode_decimal_value(c: char) -> Option<u32> {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    if let Some(d) = c.to_digit(10) {
+        return Some(d);
+    }
+    if c.general_category() != GeneralCategory::DecimalNumber {
+        return None;
+    }
+    let cp = c as u32;
+    let mut zero = cp;
+    while cp - zero < 9 {
+        match char::from_u32(zero - 1) {
+            Some(p) if p.general_category() == GeneralCategory::DecimalNumber => zero -= 1,
+            _ => break,
+        }
+    }
+    Some(cp - zero)
+}
+
+/// PEP 515 underscore rule for decimal float literals: every `_` must sit
+/// directly between two ASCII digits (so `1_000` is fine but `_1`, `1_`,
+/// `1__0`, `1_.0`, `1e_5` are not).
+fn valid_float_underscores(s: &str) -> bool {
+    let b = s.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'_'
+            && !(i > 0 && b[i - 1].is_ascii_digit() && i + 1 < b.len() && b[i + 1].is_ascii_digit())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn b_bool(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2079,9 +4411,25 @@ fn b_bool(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(args[0].is_truthy()))
 }
 
-fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::new_complex(0.0, 0.0));
+    }
+    let has_second = args.len() >= 2;
+    // CPython's `complex_new` ordering: a string `real` is only valid as the
+    // sole argument; a string `imag` is never valid. Both checks precede the
+    // numeric coercion (so e.g. `complex({}, '1')` reports the string, not the
+    // dict).
+    if let Object::Str(s) = &args[0] {
+        if has_second {
+            return Err(type_error(
+                "complex() can't take second arg if first is a string",
+            ));
+        }
+        return parse_complex_string(s).map(|(r, i)| Object::new_complex(r, i));
+    }
+    if has_second && matches!(&args[1], Object::Str(_)) {
+        return Err(type_error("complex() second arg can't be a string"));
     }
     let real = match &args[0] {
         Object::Complex(c) => {
@@ -2093,16 +4441,13 @@ fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
                 },
             ))
         }
-        Object::Str(s) if args.len() == 1 => {
-            return parse_complex_string(s).map(|(r, i)| Object::new_complex(r, i));
-        }
         Object::Int(_) | Object::Long(_) | Object::Bool(_) | Object::Float(_) => {
             args[0].as_f64().expect("numeric")
         }
         other => {
             return Err(type_error(format!(
-                "complex() argument must be a string or a number, not '{}'",
-                other.type_name()
+                "complex() first argument must be a string or a number, not '{}'",
+                other.type_name_owned()
             )));
         }
     };
@@ -2115,7 +4460,7 @@ fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
             other => {
                 return Err(type_error(format!(
                     "complex() second argument must be a number, not '{}'",
-                    other.type_name()
+                    other.type_name_owned()
                 )));
             }
         }
@@ -2125,63 +4470,188 @@ fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_complex(real, imag))
 }
 
+/// Parse a `complex(str)` argument, following CPython's
+/// `complex_from_string_inner` grammar exactly:
+///
+/// ```text
+///   <float>                  - real part only
+///   <float>j                 - imaginary part only
+///   <float><signed-float>j   - real and imaginary parts
+///   <sign>j | j              - bare ±1j
+/// ```
+///
+/// with an optional pair of `repr()` parentheses, leading/trailing
+/// whitespace, and PEP 515 underscores (only between digits). Anything
+/// else — trailing garbage, a real part with no `j`, doubled signs,
+/// embedded NULs — is a `ValueError`.
 fn parse_complex_string(s: &str) -> Result<(f64, f64), RuntimeError> {
-    // CPython accepts an optional pair of parens, then a complex
-    // number like `1+2j`, `1J`, `2.5e-1+3.4j`, with `j` or `J`
-    // suffix on the imaginary half.
-    let trimmed = s.trim();
-    let s = trimmed
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .map(str::trim)
-        .unwrap_or(trimmed);
-    if s.is_empty() {
-        return Err(value_error("complex() arg is an empty string"));
+    let malformed = || value_error("complex() arg is a malformed string");
+    // Fold Unicode whitespace to ASCII space (CPython's
+    // `_PyUnicode_TransformDecimalAndSpaceToASCII`); non-ASCII, non-space
+    // characters are left to fail the parse below, exactly as CPython does.
+    let transformed: String = s
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let cleaned = strip_number_underscores(&transformed).ok_or_else(malformed)?;
+    parse_complex_inner(&cleaned).ok_or_else(malformed)
+}
+
+/// Remove PEP 515 underscores from a numeric literal, validating that
+/// each `_` sits directly between two ASCII digits. Returns `None` for a
+/// misplaced underscore (leading/trailing/doubled/adjacent to a sign,
+/// dot, exponent, or `j`).
+fn strip_number_underscores(s: &str) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' {
+            let prev = if i > 0 { chars[i - 1] } else { '\0' };
+            let next = chars.get(i + 1).copied().unwrap_or('\0');
+            if !(prev.is_ascii_digit() && next.is_ascii_digit()) {
+                return None;
+            }
+        } else {
+            out.push(c);
+        }
     }
-    // Find a `+`/`-` that splits real and imag, skipping the
-    // exponent sign in `1e-3`.
-    let bytes = s.as_bytes();
-    let mut split = None;
-    for i in (1..bytes.len()).rev() {
-        let c = bytes[i];
-        if c == b'+' || c == b'-' {
-            let prev = bytes[i - 1];
-            if prev != b'e' && prev != b'E' {
-                split = Some(i);
-                break;
+    Some(out)
+}
+
+/// Scan the longest valid C-`double` prefix of `b` (CPython's
+/// `PyOS_string_to_double`): optional sign, then `inf`/`infinity`/`nan`
+/// or a decimal mantissa with optional fraction and exponent. Returns
+/// `(value, bytes_consumed)`, or `None` when no float prefix is present.
+fn parse_double_prefix(b: &[u8]) -> Option<(f64, usize)> {
+    let n = b.len();
+    let mut i = 0;
+    if i < n && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let rest = &b[i..];
+    let starts =
+        |word: &[u8]| rest.len() >= word.len() && rest[..word.len()].eq_ignore_ascii_case(word);
+    let finish = |end: usize| -> Option<(f64, usize)> {
+        let slice = std::str::from_utf8(&b[..end]).ok()?;
+        slice.parse::<f64>().ok().map(|v| (v, end))
+    };
+    if starts(b"infinity") {
+        return finish(i + 8);
+    }
+    if starts(b"inf") {
+        return finish(i + 3);
+    }
+    if starts(b"nan") {
+        return finish(i + 3);
+    }
+    let mut has_digits = false;
+    while i < n && b[i].is_ascii_digit() {
+        i += 1;
+        has_digits = true;
+    }
+    if i < n && b[i] == b'.' {
+        i += 1;
+        while i < n && b[i].is_ascii_digit() {
+            i += 1;
+            has_digits = true;
+        }
+    }
+    if !has_digits {
+        return None;
+    }
+    if i < n && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < n && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        if j < n && b[j].is_ascii_digit() {
+            while j < n && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            i = j;
+        }
+        // No exponent digits ⇒ stop before the `e` (e.g. "1e1ej").
+    }
+    finish(i)
+}
+
+/// The core of [`parse_complex_string`], operating on an
+/// underscore-stripped, whitespace-normalized string. Mirrors CPython's
+/// `complex_from_string_inner` state machine; returns `None` on any
+/// malformed input.
+fn parse_complex_inner(s: &str) -> Option<(f64, f64)> {
+    let b = s.as_bytes();
+    let len = b.len();
+    let mut i = 0;
+    let is_space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    while i < len && is_space(b[i]) {
+        i += 1;
+    }
+    let mut got_bracket = false;
+    if i < len && b[i] == b'(' {
+        got_bracket = true;
+        i += 1;
+        while i < len && is_space(b[i]) {
+            i += 1;
+        }
+    }
+    let (mut x, mut y) = (0.0_f64, 0.0_f64);
+    match parse_double_prefix(&b[i..]) {
+        Some((z, consumed)) => {
+            i += consumed;
+            if i < len && (b[i] == b'+' || b[i] == b'-') {
+                x = z;
+                match parse_double_prefix(&b[i..]) {
+                    Some((yy, c2)) => {
+                        y = yy;
+                        i += c2;
+                    }
+                    None => {
+                        y = if b[i] == b'+' { 1.0 } else { -1.0 };
+                        i += 1;
+                    }
+                }
+                if !(i < len && (b[i] == b'j' || b[i] == b'J')) {
+                    return None;
+                }
+                i += 1;
+            } else if i < len && (b[i] == b'j' || b[i] == b'J') {
+                i += 1;
+                y = z;
+            } else {
+                x = z;
             }
         }
-    }
-    let (real_str, imag_str) = if let Some(i) = split {
-        (&s[..i], &s[i..])
-    } else if s.ends_with('j') || s.ends_with('J') {
-        ("0", s)
-    } else {
-        (s, "0")
-    };
-    let parse_part = |t: &str| -> Result<f64, RuntimeError> {
-        let stripped = t.strip_suffix(['j', 'J']).unwrap_or(t);
-        if stripped.is_empty() || stripped == "+" {
-            return Ok(1.0);
+        None => {
+            // No leading float ⇒ must be `<sign>j` or bare `j`.
+            if i < len && (b[i] == b'+' || b[i] == b'-') {
+                y = if b[i] == b'+' { 1.0 } else { -1.0 };
+                i += 1;
+            } else {
+                y = 1.0;
+            }
+            if !(i < len && (b[i] == b'j' || b[i] == b'J')) {
+                return None;
+            }
+            i += 1;
         }
-        if stripped == "-" {
-            return Ok(-1.0);
-        }
-        stripped
-            .parse::<f64>()
-            .map_err(|_| value_error(format!("complex() arg is malformed: '{s}'")))
-    };
-    let imag_is_imag = imag_str.ends_with('j') || imag_str.ends_with('J');
-    let real_is_imag = real_str.ends_with('j') || real_str.ends_with('J');
-    if real_is_imag && !imag_is_imag {
-        // Single imaginary like "5j+0"  — unusual; treat as 5j+0.
-        let real = parse_part(imag_str)?;
-        let imag = parse_part(real_str)?;
-        return Ok((real, imag));
     }
-    let real = parse_part(real_str)?;
-    let imag = parse_part(imag_str)?;
-    Ok((real, imag))
+    while i < len && is_space(b[i]) {
+        i += 1;
+    }
+    if got_bracket {
+        if !(i < len && b[i] == b')') {
+            return None;
+        }
+        i += 1;
+        while i < len && is_space(b[i]) {
+            i += 1;
+        }
+    }
+    if i != len {
+        return None;
+    }
+    Some((x, y))
 }
 
 fn b_list(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2200,6 +4670,12 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::new_tuple(Vec::new()));
     }
+    // `tuple(t)` on an exact tuple returns `t` itself (CPython reuses the
+    // immutable object; `copy.copy(partial).args is partial.args` relies
+    // on the identity).
+    if let Object::Tuple(_) = &args[0] {
+        return Ok(args[0].clone());
+    }
     let mut it = args[0].make_iter()?;
     let mut out = Vec::new();
     while let Some(v) = it.next_value() {
@@ -2211,6 +4687,12 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
 fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::new_dict());
+    }
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "dict expected at most 1 argument, got {}",
+            args.len()
+        )));
     }
     // Fast path: another built-in dict copies entry-for-entry. Avoids
     // re-iterating as a sequence of pairs (which would fail, since
@@ -2227,27 +4709,54 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     // `Vm::do_dict_call`. Anything left over is an iterable of pairs.
     let mut it = args[0].make_iter()?;
     let mut d = DictData::new();
+    let mut i = 0usize;
     while let Some(pair) = it.next_value() {
-        match pair {
-            Object::Tuple(items) if items.len() == 2 => {
-                d.insert(DictKey(items[0].clone()), items[1].clone());
-            }
-            Object::List(items) => {
-                let items = items.borrow();
-                if items.len() == 2 {
-                    d.insert(DictKey(items[0].clone()), items[1].clone());
+        // CPython `PyDict_MergeFromSeq2`: each element must itself be a
+        // sequence of exactly two items (a 2-char string works too).
+        // User instances iterate through the live interpreter (their
+        // `__iter__`/`__getitem__` is Python code).
+        let kv: Vec<Object> = if matches!(pair, Object::Instance(_)) {
+            let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+                return Err(type_error(format!(
+                    "cannot convert dictionary update sequence element #{i} to a sequence"
+                )));
+            };
+            // SAFETY: published by an enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let globals = interp.builtins_dict();
+            interp.collect_iterable(&pair, &globals).map_err(|e| {
+                if crate::is_type_error(&e) {
+                    type_error(format!(
+                        "cannot convert dictionary update sequence element #{i} to a sequence"
+                    ))
                 } else {
-                    return Err(value_error(
-                        "dictionary update sequence element is not a 2-element sequence",
-                    ));
+                    e
+                }
+            })?
+        } else {
+            let mut inner = pair.make_iter().map_err(|_| {
+                type_error(format!(
+                    "cannot convert dictionary update sequence element #{i} to a sequence"
+                ))
+            })?;
+            let mut kv = Vec::with_capacity(2);
+            while let Some(v) = inner.next_value() {
+                kv.push(v);
+                if kv.len() > 2 {
+                    break;
                 }
             }
-            _ => {
-                return Err(value_error(
-                    "dictionary update sequence element is not a 2-tuple",
-                ))
-            }
+            kv
+        };
+        if kv.len() != 2 {
+            return Err(value_error(format!(
+                "dictionary update sequence element #{i} has length {}; 2 is required",
+                kv.len()
+            )));
         }
+        let mut kv = kv.into_iter();
+        d.insert(DictKey(kv.next().unwrap()), kv.next().unwrap());
+        i += 1;
     }
     Ok(Object::Dict(Rc::new(RefCell::new(d))))
 }
@@ -2283,77 +4792,337 @@ fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_frozenset_from(out))
 }
 
-fn b_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::new_bytes(Vec::new()));
-    }
-    match &args[0] {
-        Object::Int(n) => {
-            if *n < 0 {
-                return Err(value_error("negative count"));
+/// One item of a `bytes(iterable)` source: an integer in
+/// `range(0, 256)` via the `__index__` protocol.
+fn byte_item_value(o: &Object) -> Result<u8, RuntimeError> {
+    let native = o.native_value();
+    match native.as_ref().unwrap_or(o) {
+        Object::Bool(b) => Ok(u8::from(*b)),
+        Object::Int(i) if (0..=255).contains(i) => Ok(*i as u8),
+        Object::Int(_) | Object::Long(_) => Err(value_error("bytes must be in range(0, 256)")),
+        inst @ Object::Instance(_) => {
+            let v = coerce_index_i64(inst)?;
+            if (0..=255).contains(&v) {
+                Ok(v as u8)
+            } else {
+                Err(value_error("bytes must be in range(0, 256)"))
             }
-            Ok(Object::new_bytes(vec![0u8; *n as usize]))
         }
-        Object::Str(s) => {
-            let encoding = args
-                .get(1)
-                .and_then(|x| match x {
-                    Object::Str(e) => Some(e.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "utf-8".to_owned());
-            let errors = args
-                .get(2)
-                .and_then(|x| match x {
-                    Object::Str(e) => Some(e.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "strict".to_owned());
-            let bytes = crate::stdlib::codecs_mod::encode_str(s, &encoding, &errors)?;
-            Ok(Object::new_bytes(bytes))
+        other => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            other.type_name()
+        ))),
+    }
+}
+
+/// The non-string source conversion shared by `bytes(x)` and
+/// `bytearray(x)` — CPython's `PyBytes_FromObject` /
+/// `bytearray_init` tail: index-sized count, buffer copy, or
+/// iterable of byte values.
+fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, RuntimeError> {
+    let zero_fill = |n: i64| -> Result<Vec<u8>, RuntimeError> {
+        if n < 0 {
+            return Err(value_error("negative count"));
         }
-        Object::Bytes(b) => Ok(Object::Bytes(b.clone())),
-        Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
-        other => {
-            let mut it = other.make_iter()?;
+        let mut v = Vec::new();
+        v.try_reserve_exact(n as usize).map_err(|_| {
+            RuntimeError::PyException(crate::error::PyException::from_builtin(
+                "MemoryError",
+                String::new(),
+            ))
+        })?;
+        v.resize(n as usize, 0);
+        Ok(v)
+    };
+    match src {
+        Object::Bytes(b) => Ok(b.to_vec()),
+        Object::ByteArray(b) => Ok(b.borrow().clone()),
+        Object::MemoryView(mv) => Ok(mv.to_bytes()),
+        Object::Bool(b) => zero_fill(i64::from(*b)),
+        Object::Int(n) => zero_fill(*n),
+        Object::Long(_) => Err(crate::error::overflow_error(
+            "cannot fit 'int' into an index-sized integer",
+        )),
+        Object::List(items) => {
+            // CPython re-checks the list length every iteration
+            // (gh-34973): an item's `__index__` may mutate the list.
+            let cell = items.clone();
             let mut out = Vec::new();
-            while let Some(v) = it.next_value() {
-                match v {
-                    Object::Int(i) if (0..=255).contains(&i) => out.push(i as u8),
-                    _ => return Err(value_error("bytes must be in range(0, 256)")),
+            let mut i = 0usize;
+            loop {
+                let item = {
+                    let l = cell.borrow();
+                    if i >= l.len() {
+                        break;
+                    }
+                    l[i].clone()
+                };
+                out.push(byte_item_value(&item)?);
+                i += 1;
+            }
+            Ok(out)
+        }
+        Object::Tuple(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                out.push(byte_item_value(item)?);
+            }
+            Ok(out)
+        }
+        Object::Instance(inst) => {
+            // `__bytes__` is consulted by `bytes()` only — CPython's
+            // bytearray skips straight to the count/buffer/iterable
+            // protocol.
+            if type_name == "bytes" {
+                if let Some(method) = crate::instance_method(src, "__bytes__") {
+                    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                        // SAFETY: published by an enclosing VM frame still
+                        // live on this thread; the GIL keeps it exclusive.
+                        let interp = unsafe { &mut *ptr };
+                        let globals = interp.builtins_dict();
+                        let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                        return bytes_argview(&r).map_err(|_| {
+                            type_error(format!(
+                                "__bytes__ returned non-bytes (type {})",
+                                r.type_name()
+                            ))
+                        });
+                    }
                 }
             }
-            Ok(Object::new_bytes(out))
+            // The `__index__` protocol: a TypeError raised *by* the
+            // hook falls through to the buffer/iterable path
+            // (gh-29159); any other exception propagates (gh-34974).
+            let indexable = inst
+                .native
+                .as_ref()
+                .map(|n| n.as_i64().is_some())
+                .unwrap_or(false)
+                || crate::instance_method(src, "__index__").is_some();
+            if indexable {
+                match coerce_index_i64(src) {
+                    Ok(n) => return zero_fill(n),
+                    Err(RuntimeError::PyException(e)) if e.type_name() == "TypeError" => {}
+                    Err(other) => return Err(other),
+                }
+            }
+            // Buffer protocol: a bytes/bytearray subclass instance
+            // carries its payload natively.
+            if let Some(native) = &inst.native {
+                if matches!(
+                    native,
+                    Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+                ) {
+                    return bytes_from_source_obj(&native.clone(), type_name);
+                }
+            }
+            // Iterable (including legacy `__getitem__` sequences) via
+            // interpreter reentry; `__iter__` exceptions propagate.
+            let iterable = crate::instance_method(src, "__iter__").is_some()
+                || crate::instance_method(src, "__getitem__").is_some()
+                || inst.native.is_some();
+            if !iterable {
+                return Err(type_error(format!(
+                    "cannot convert '{}' object to {}",
+                    src.type_name(),
+                    type_name
+                )));
+            }
+            bytes_from_iterable_reentrant(src, type_name)
+        }
+        other => {
+            if other.make_iter().is_err() && !matches!(other, Object::Generator(_)) {
+                return Err(type_error(format!(
+                    "cannot convert '{}' object to {}",
+                    other.type_name(),
+                    type_name
+                )));
+            }
+            bytes_from_iterable_reentrant(other, type_name)
         }
     }
 }
 
-fn b_bytearray(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::new_bytearray(Vec::new()));
-    }
-    match &args[0] {
-        Object::Int(n) => {
-            if *n < 0 {
-                return Err(value_error("negative count"));
-            }
-            Ok(Object::new_bytearray(vec![0u8; *n as usize]))
+/// Iterate any object through the running interpreter (generators,
+/// sets, user iterables) collecting byte values.
+fn bytes_from_iterable_reentrant(src: &Object, type_name: &str) -> Result<Vec<u8>, RuntimeError> {
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame still live on this
+        // thread; the GIL keeps the access exclusive.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        let items = interp.collect_iterable(src, &globals)?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in &items {
+            out.push(byte_item_value(item)?);
         }
-        Object::Str(s) => Ok(Object::new_bytearray(s.as_bytes().to_vec())),
-        Object::Bytes(b) => Ok(Object::new_bytearray(b.to_vec())),
-        Object::ByteArray(b) => Ok(Object::new_bytearray(b.borrow().clone())),
-        other => {
-            let mut it = other.make_iter()?;
-            let mut out = Vec::new();
-            while let Some(v) = it.next_value() {
-                match v {
-                    Object::Int(i) if (0..=255).contains(&i) => out.push(i as u8),
-                    _ => return Err(value_error("bytes must be in range(0, 256)")),
+        Ok(out)
+    } else {
+        let mut it = src.make_iter().map_err(|_| {
+            type_error(format!(
+                "cannot convert '{}' object to {}",
+                src.type_name(),
+                type_name
+            ))
+        })?;
+        let mut out = Vec::new();
+        while let Some(v) = it.next_value() {
+            out.push(byte_item_value(&v)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Shared `bytes(...)` / `bytearray(...)` construction — CPython's
+/// `bytes_new_impl` / `bytearray_init` argument handling, including
+/// the `encoding` / `errors` keyword rules.
+fn bytes_construct(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    type_name: &str,
+) -> Result<Vec<u8>, RuntimeError> {
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "{type_name}() takes at most 3 arguments ({} given)",
+            args.len()
+        )));
+    }
+    let mut source_obj = args.first().cloned();
+    let mut encoding_obj = args.get(1).cloned();
+    let mut errors_obj = args.get(2).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "source" => source_obj = Some(v.clone()),
+            "encoding" => encoding_obj = Some(v.clone()),
+            "errors" => errors_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "{type_name}() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let encoding = match &encoding_obj {
+        None => None,
+        Some(Object::Str(s)) => Some(s.to_string()),
+        Some(o) => {
+            return Err(type_error(format!(
+                "{type_name}() argument 'encoding' must be str, not {}",
+                o.type_name()
+            )))
+        }
+    };
+    let errors = match &errors_obj {
+        None => None,
+        Some(Object::Str(s)) => Some(s.to_string()),
+        Some(o) => {
+            return Err(type_error(format!(
+                "{type_name}() argument 'errors' must be str, not {}",
+                o.type_name()
+            )))
+        }
+    };
+    let Some(src) = source_obj.as_ref() else {
+        if encoding.is_some() {
+            return Err(type_error("encoding without a string argument"));
+        }
+        if errors.is_some() {
+            return Err(type_error("errors without a string argument"));
+        }
+        return Ok(Vec::new());
+    };
+    // String sources require an encoding; non-string sources reject one.
+    let as_str: Option<Rc<str>> = match src {
+        Object::Str(s) => Some(s.clone()),
+        Object::Instance(inst) => match &inst.native {
+            Some(Object::Str(s)) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(s) = as_str {
+        let Some(enc) = encoding else {
+            return Err(type_error("string argument without an encoding"));
+        };
+        return crate::stdlib::codecs_mod::encode_str(
+            &s,
+            &enc,
+            errors.as_deref().unwrap_or("strict"),
+        );
+    }
+    if encoding.is_some() {
+        return Err(type_error("encoding without a string argument"));
+    }
+    if errors.is_some() {
+        return Err(type_error("errors without a string argument"));
+    }
+    bytes_from_source_obj(src, type_name)
+}
+
+fn b_bytes_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // `bytes(b'…')` with the exact type returns the argument unchanged
+    // (immutable, so identity is shareable — `test_repeat_id_preserving`
+    // relies on `bytes(x) is x` style sharing).
+    if args.len() == 1 && kwargs.is_empty() {
+        if let Object::Bytes(b) = &args[0] {
+            return Ok(Object::Bytes(b.clone()));
+        }
+    }
+    // CPython `bytes_new_impl`: with no encoding/errors, `__bytes__` is
+    // consulted *before* the str complaint — so a str subclass defining
+    // `__bytes__` converts through it (issue #25766) — and a bytes-subclass
+    // result is returned as-is (issue #24731).
+    let mut source_obj = args.first().cloned();
+    let mut has_encoding = args.len() > 1;
+    let mut has_errors = args.len() > 2;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "source" => source_obj = Some(v.clone()),
+            "encoding" => has_encoding = true,
+            "errors" => has_errors = true,
+            _ => {}
+        }
+    }
+    if !has_encoding && !has_errors {
+        if let Some(src @ Object::Instance(_)) = &source_obj {
+            if let Some(method) = crate::instance_method(src, "__bytes__") {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still live
+                    // on this thread; the GIL keeps the access exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    let globals = interp.builtins_dict();
+                    let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                    let is_bytes = matches!(&r, Object::Bytes(_))
+                        || matches!(&r, Object::Instance(inst)
+                            if matches!(&inst.native, Some(Object::Bytes(_))));
+                    if !is_bytes {
+                        return Err(type_error(format!(
+                            "__bytes__ returned non-bytes (type {})",
+                            r.type_name()
+                        )));
+                    }
+                    return Ok(r);
                 }
             }
-            Ok(Object::new_bytearray(out))
         }
     }
+    Ok(Object::new_bytes(bytes_construct(args, kwargs, "bytes")?))
+}
+
+fn b_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
+    b_bytes_kw(args, &[])
+}
+
+fn b_bytearray_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    Ok(Object::new_bytearray(bytes_construct(
+        args,
+        kwargs,
+        "bytearray",
+    )?))
+}
+
+fn b_bytearray(args: &[Object]) -> Result<Object, RuntimeError> {
+    b_bytearray_kw(args, &[])
 }
 
 /// Keyword-argument-aware wrapper for `open`. CPython's signature is
@@ -2368,11 +5137,13 @@ fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     // slots and accept (but ignore) the rest.
     let mut combined: Vec<Object> = args.to_vec();
     let mut mode = combined.get(1).cloned();
+    let mut encoding = combined.get(3).cloned();
     for (k, v) in kwargs {
         match k.as_str() {
             "mode" => mode = Some(v.clone()),
-            "buffering" | "encoding" | "errors" | "newline" | "closefd" | "opener" => {
-                // Accept but don't fail: encoding is implicitly utf-8.
+            "encoding" => encoding = Some(v.clone()),
+            "buffering" | "errors" | "newline" | "closefd" | "opener" => {
+                // Accepted but not plumbed further yet.
             }
             other => {
                 return Err(type_error(format!(
@@ -2388,7 +5159,13 @@ fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
             combined[1] = m;
         }
     }
-    b_open(&combined)
+    let file = b_open(&combined)?;
+    if let (Object::File(f), Some(Object::Str(enc))) = (&file, &encoding) {
+        if !f.binary {
+            f.set_encoding(enc);
+        }
+    }
+    Ok(file)
 }
 
 fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2397,14 +5174,31 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Err(type_error("open() missing required argument: 'file'"));
     }
-    let path = match &args[0] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("open() argument 'file' must be str".to_owned())),
-    };
     let mode = match args.get(1) {
         Some(Object::Str(m)) => m.to_string(),
         Some(_) => return Err(type_error("open() mode must be str")),
         None => "r".to_owned(),
+    };
+    // `open(fd, …)` adopts an already-open raw file descriptor
+    // (produced by `os.open`); the file's `name` is the fd itself.
+    #[cfg(unix)]
+    if let Object::Int(fd) = &args[0] {
+        use std::os::unix::io::FromRawFd;
+        let fd = i32::try_from(*fd)
+            .map_err(|_| crate::error::value_error("file descriptor out of range"))?;
+        // SAFETY: ownership of the fd transfers to the new File; it was
+        // handed out by os.open (or dup) and is closed exactly once when
+        // the PyFile drops.
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        return Ok(Object::File(Rc::new(PyFile::new(
+            fd.to_string(),
+            mode,
+            FileBackend::Disk(f),
+        ))));
+    }
+    let path = match &args[0] {
+        Object::Str(s) => s.to_string(),
+        _ => return Err(type_error("open() argument 'file' must be str".to_owned())),
     };
     let mut opts = OpenOptions::new();
     let mut writing = false;
@@ -2438,14 +5232,17 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = opts
         .open(&path)
         .map_err(|e| crate::error::os_error(format!("{path}: {e}")))?;
-    Ok(Object::File(Rc::new(PyFile::new(
-        path,
-        mode,
-        FileBackend::Disk(f),
-    ))))
+    let file = PyFile::new(path, mode, FileBackend::Disk(f));
+    // Positional `open(file, mode, buffering, encoding, …)`.
+    if let Some(Object::Str(enc)) = args.get(3) {
+        if !file.binary {
+            file.set_encoding(enc);
+        }
+    }
+    Ok(Object::File(Rc::new(file)))
 }
 
-fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "abs")? {
         Object::Int(i) => match i.checked_abs() {
             Some(v) => Ok(Object::Int(v)),
@@ -2454,7 +5251,17 @@ fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
         },
         Object::Long(b) => Ok(Object::int_from_bigint(b.abs())),
         Object::Float(f) => Ok(Object::Float(f.abs())),
-        Object::Complex(c) => Ok(Object::Float((c.real * c.real + c.imag * c.imag).sqrt())),
+        Object::Complex(c) => {
+            // `hypot` (CPython's `_Py_c_abs`) avoids the spurious overflow
+            // of `sqrt(re²+im²)`; a non-finite result from finite parts is
+            // a genuine magnitude overflow → OverflowError, matching
+            // CPython's `complex___abs___impl`.
+            let m = c.real.hypot(c.imag);
+            if m.is_infinite() && c.real.is_finite() && c.imag.is_finite() {
+                return Err(crate::error::overflow_error("absolute value too large"));
+            }
+            Ok(Object::Float(m))
+        }
         Object::Bool(b) => Ok(Object::Int(i64::from(*b))),
         other => Err(type_error(format!(
             "bad operand type for abs(): '{}'",
@@ -2528,13 +5335,20 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
     let iterable = one(args, "reversed")?;
+    // Materialize the source in *forward* order; the Reversed iterator
+    // walks it back-to-front. (CPython's `reversed` uses `__reversed__`
+    // or `__len__`+`__getitem__`; a forward snapshot reproduces the same
+    // sequence for the finite iterables WeavePy handles here.)
     let mut it = iterable.make_iter()?;
     let mut buf = Vec::new();
     while let Some(v) = it.next_value() {
         buf.push(v);
     }
-    buf.reverse();
-    Ok(Object::new_list(buf))
+    let index = buf.len() as i64 - 1;
+    Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Reversed {
+        items: Rc::new(RefCell::new(buf)),
+        index,
+    }))))
 }
 
 fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2547,14 +5361,19 @@ fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         0
     };
-    let mut it = iterable.make_iter()?;
-    let mut buf = Vec::new();
-    let mut i = start;
-    while let Some(v) = it.next_value() {
-        buf.push(Object::new_tuple(vec![Object::Int(i), v]));
-        i += 1;
-    }
-    Ok(Object::new_list(buf))
+    // CPython's `enumerate(x)` wraps `iter(x)` lazily. When `x` is already an
+    // iterator, `iter(x)` returns `x` itself, so consuming the enumerate must
+    // advance the *same* iterator (test_operator's `indexOf` relies on the
+    // source iterator being left at the position after the match). Share the
+    // handle for `Object::Iter`; otherwise build a fresh underlying iterator.
+    let inner = match iterable {
+        Object::Iter(rc) => rc.clone(),
+        other => Rc::new(RefCell::new(other.make_iter()?)),
+    };
+    Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Enumerate {
+        inner,
+        count: start,
+    }))))
 }
 
 fn b_zip(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2625,58 +5444,198 @@ fn b_isinstance(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(matches_classinfo(obj, class)?))
 }
 
-fn b_super(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_super(args: &[Object]) -> Result<Object, RuntimeError> {
     // `super(C, self)` returns a proxy instance whose class is the
-    // synthesized proxy type. Zero-arg form is handled by the VM's
+    // real `super` type. Zero-arg form is handled by the VM's
     // call path (it materialises `__class__` and `self` first).
-    if args.len() != 2 {
+    if !matches!(args.len(), 1 | 2) {
         return Err(type_error(
             "super(): expected 2 arguments (zero-arg form must be called from inside a method)",
         ));
     }
     let class = match &args[0] {
         Object::Type(t) => t.clone(),
-        _ => return Err(type_error("super() arg 1 must be a class")),
+        _ => return Err(type_error("super() argument 1 must be a type")),
     };
+    if args.len() == 1 {
+        return Ok(make_unbound_super(class));
+    }
     let receiver = args[1].clone();
-    Ok(make_super(class, receiver))
+    make_super_checked(builtin_types().super_.clone(), class, receiver)
 }
 
-/// Construct a super proxy. Exposed publicly so the VM can build
-/// zero-arg super objects.
-pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Object {
-    use crate::types::TypeObject;
-    let receiver_class = match &receiver {
-        Object::Instance(inst) => inst.class.clone(),
-        _ => class.clone(),
-    };
-    let mro = receiver_class.mro.borrow();
-    let start = mro
-        .iter()
-        .position(|t| Rc::ptr_eq(t, &class))
-        .map_or(mro.len(), |i| i + 1);
-    let after: Vec<_> = mro[start..].to_vec();
-    drop(mro);
-    let proxy = Rc::new(TypeObject {
-        name: format!("super<{}>", class.name),
-        bases: after.clone(),
-        mro: RefCell::new(after),
-        dict: Rc::new(RefCell::new(DictData::new())),
-        flags: crate::types::TypeFlags::default(),
-        metaclass: RefCell::new(None),
-        slot_names: RefCell::new(Vec::new()),
-        forbids_dict: false,
-    });
+/// The one-argument form `super(C)`: an *unbound* super object. It does
+/// no MRO walking itself; it is a non-data descriptor whose `__get__`
+/// re-binds to `super(C, obj)` (the classic pre-PEP 3135
+/// `C._C__super = super(C); self.__super.meth()` idiom). It is an ordinary
+/// `super` instance with a `None` receiver.
+pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object {
     let inst = crate::types::PyInstance {
-        class: proxy,
+        class: RefCell::new(builtin_types().super_.clone()),
         dict: Rc::new(RefCell::new({
             let mut d = DictData::new();
-            d.insert(DictKey(Object::from_static("__self__")), receiver);
+            d.insert(DictKey(Object::from_static("__self__")), Object::None);
+            d.insert(
+                DictKey(Object::from_static("__thisclass__")),
+                Object::Type(class),
+            );
             d
         })),
         native: None,
+        inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
     };
     Object::Instance(Rc::new(inst))
+}
+
+/// CPython `supercheck`: validate the second `super()` argument against the
+/// first and return the class whose MRO the proxy walks (`su->obj_type`).
+///   * `obj` is `class` itself / a       → class-bound form, walk `obj`'s MRO.
+///     subclass of `class`
+///   * `type(obj)` is a subclass          → instance / metaclass form, walk
+///     of `class`                           `type(obj)`'s MRO.
+///   * otherwise                          → TypeError (the interpreter-level
+///     [`Interpreter::supercheck_full`] additionally honours `obj.__class__`).
+pub(crate) fn supercheck(
+    class: &Rc<crate::types::TypeObject>,
+    receiver: &Object,
+) -> Result<Rc<crate::types::TypeObject>, RuntimeError> {
+    if let Object::Type(t) = receiver {
+        // A type is trivially a subtype of itself even mid-construction,
+        // when its MRO isn't populated yet — CPython's `PyType_IsSubtype`
+        // falls back to the `tp_base` chain and short-circuits `a == b`
+        // (test_incomplete_super: `super(cls, cls)` inside `mro()`).
+        if Rc::ptr_eq(t, class) || t.is_subclass_of(class) {
+            return Ok(t.clone());
+        }
+    }
+    let oc = class_of(receiver);
+    if oc.is_subclass_of(class) {
+        return Ok(oc);
+    }
+    Err(type_error(
+        "super(type, obj): obj must be an instance or subtype of type",
+    ))
+}
+
+/// Build a `super` proxy of concrete type `proxy_type` (`super` or a user
+/// subclass), bound to `receiver`, walking the MRO after `class` starting
+/// from `receiver_class` (`su->obj_type`).
+pub(crate) fn build_super_proxy(
+    proxy_type: Rc<crate::types::TypeObject>,
+    class: Rc<crate::types::TypeObject>,
+    receiver: Object,
+    receiver_class: Rc<crate::types::TypeObject>,
+) -> Object {
+    let inst = crate::types::PyInstance {
+        class: RefCell::new(proxy_type),
+        dict: Rc::new(RefCell::new({
+            let mut d = DictData::new();
+            d.insert(DictKey(Object::from_static("__self__")), receiver);
+            d.insert(
+                DictKey(Object::from_static("__thisclass__")),
+                Object::Type(class),
+            );
+            // CPython's `su->obj_type` — the class whose MRO is walked,
+            // passed as `owner` to descriptor `__get__`s. Also used to
+            // detect the class-bound form (`su->obj == starttype`),
+            // where descriptors get a NULL instance (so plain functions
+            // come back *unbound*: `super().__new__(cls, v)` must not
+            // prepend a second `cls`).
+            d.insert(
+                DictKey(Object::from_static("__self_class__")),
+                Object::Type(receiver_class),
+            );
+            d
+        })),
+        native: None,
+        inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
+    };
+    Object::Instance(Rc::new(inst))
+}
+
+/// Build a `super` proxy after validating `receiver` against `class` with
+/// the *basic* (no-`__class__`-fallback) [`supercheck`].
+pub(crate) fn make_super_checked(
+    proxy_type: Rc<crate::types::TypeObject>,
+    class: Rc<crate::types::TypeObject>,
+    receiver: Object,
+) -> Result<Object, RuntimeError> {
+    let receiver_class = supercheck(&class, &receiver)?;
+    Ok(build_super_proxy(
+        proxy_type,
+        class,
+        receiver,
+        receiver_class,
+    ))
+}
+
+/// `super.__init__(self, type[, obj])` — populates a freshly allocated
+/// proxy (used when `class mysuper(super)` is instantiated and its
+/// `__init__` chains to `super().__init__(...)`). For the no-arg /
+/// `super(C, x)` builtin paths the proxy is built directly by
+/// [`make_super_checked`]; here we fill an already-created instance.
+pub fn super_init_impl(args: &[Object]) -> Result<Object, RuntimeError> {
+    let target = match args.first() {
+        Some(Object::Instance(i)) => i.clone(),
+        _ => return Err(type_error("super.__init__ requires a super instance")),
+    };
+    let class = match args.get(1) {
+        Some(Object::Type(t)) => t.clone(),
+        None => return Ok(Object::None),
+        Some(_) => return Err(type_error("super() argument 1 must be a type")),
+    };
+    let receiver = args.get(2).cloned().unwrap_or(Object::None);
+    let mut d = target.dict.borrow_mut();
+    d.insert(
+        DictKey(Object::from_static("__thisclass__")),
+        Object::Type(class.clone()),
+    );
+    if matches!(receiver, Object::None) {
+        // Unbound `super(C)` — no receiver yet; `__get__` rebinds later.
+        d.insert(DictKey(Object::from_static("__self__")), Object::None);
+        return Ok(Object::None);
+    }
+    let receiver_class = supercheck(&class, &receiver)?;
+    d.insert(DictKey(Object::from_static("__self__")), receiver);
+    d.insert(
+        DictKey(Object::from_static("__self_class__")),
+        Object::Type(receiver_class),
+    );
+    Ok(Object::None)
+}
+
+/// `super.__get__(self, obj, objtype=None)` — an unbound `super(C)` is a
+/// non-data descriptor that rebinds to `super(C, obj)` on access; an
+/// already-bound proxy returns itself.
+pub fn super_descr_get_impl(args: &[Object]) -> Result<Object, RuntimeError> {
+    let this = args.first().cloned().unwrap_or(Object::None);
+    let obj = args.get(1).cloned().unwrap_or(Object::None);
+    // Already bound (has a non-None __self__) → return self unchanged.
+    if let Object::Instance(i) = &this {
+        let (bound, class) = {
+            let d = i.dict.borrow();
+            let bound = d
+                .get(&DictKey(Object::from_static("__self__")))
+                .map(|v| !matches!(v, Object::None))
+                .unwrap_or(false);
+            let class = match d.get(&DictKey(Object::from_static("__thisclass__"))) {
+                Some(Object::Type(t)) => Some(t.clone()),
+                _ => None,
+            };
+            (bound, class)
+        };
+        if bound || matches!(obj, Object::None) {
+            return Ok(this);
+        }
+        let Some(class) = class else {
+            return Ok(this);
+        };
+        let proxy_type = i.cls();
+        return make_super_checked(proxy_type, class, obj);
+    }
+    Ok(this)
 }
 
 fn b_issubclass(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2688,7 +5647,11 @@ fn b_issubclass(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("issubclass() arg 1 must be a class")),
     };
     let info = &args[1];
-    Ok(Object::Bool(class_matches_classinfo(&cls, info)?))
+    Ok(Object::Bool(class_matches_classinfo_named(
+        &cls,
+        info,
+        "issubclass",
+    )?))
 }
 
 /// Walk `cls`'s MRO against a single type or tuple of types.
@@ -2696,10 +5659,30 @@ pub fn class_matches_classinfo(
     cls: &crate::types::TypeObject,
     info: &Object,
 ) -> Result<bool, RuntimeError> {
+    class_matches_classinfo_named(cls, info, "isinstance")
+}
+
+/// As [`class_matches_classinfo`], with the caller's function name
+/// (`isinstance`/`issubclass`) threaded through for CPython-exact
+/// error messages.
+pub fn class_matches_classinfo_named(
+    cls: &crate::types::TypeObject,
+    info: &Object,
+    func: &str,
+) -> Result<bool, RuntimeError> {
     // PEP 604 union (`int | str`) — succeed if any union arm matches.
+    // A *parameterized* arm (`list[int] | int`) is not runtime-
+    // checkable: CPython's `union_instancecheck` raises TypeError.
     if let Some(args) = crate::is_pep604_union(info) {
         for arg in &args {
-            if class_matches_classinfo(cls, arg)? {
+            if generic_alias_origin(arg).is_some() {
+                return Err(type_error(format!(
+                    "{func}() argument 2 cannot contain a parameterized generic"
+                )));
+            }
+        }
+        for arg in &args {
+            if class_matches_classinfo_named(cls, arg, func)? {
                 return Ok(true);
             }
         }
@@ -2764,8 +5747,10 @@ fn generic_alias_origin(info: &Object) -> Option<Object> {
 pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
     let bt = builtin_types();
     match obj {
-        Object::Instance(inst) => inst.class.clone(),
+        Object::Instance(inst) => inst.cls(),
         Object::None => bt.none_type.clone(),
+        // Unbound never escapes to Python; map it like None defensively.
+        Object::Unbound => bt.none_type.clone(),
         Object::Bool(_) => bt.bool_.clone(),
         Object::Int(_) => bt.int_.clone(),
         Object::Long(_) => bt.int_.clone(),
@@ -2784,10 +5769,63 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
             crate::object::DictViewKind::Values => bt.dict_values_.clone(),
             crate::object::DictViewKind::Items => bt.dict_items_.clone(),
         },
-        Object::SimpleNamespace(_) => bt.simple_namespace_.clone(),
+        // Namespace-shaped objects double as the PEP 585/604 runtime
+        // forms; their *class* must report `types.GenericAlias` /
+        // `types.UnionType` (CPython: `type(list[int])`, `type(int|str)`).
+        Object::SimpleNamespace(d) => {
+            let dict = d.borrow();
+            if dict
+                .get(&DictKey(Object::from_static("__is_pep604_union__")))
+                .is_some()
+            {
+                bt.union_type_.clone()
+            } else if dict
+                .get(&DictKey(Object::from_static("__origin__")))
+                .is_some()
+                && dict
+                    .get(&DictKey(Object::from_static("__args__")))
+                    .is_some()
+            {
+                bt.generic_alias_.clone()
+            } else {
+                bt.simple_namespace_.clone()
+            }
+        }
         Object::Type(t) => t.metaclass_or_type(),
-        Object::Function(_) | Object::Builtin(_) | Object::BoundMethod(_) => bt.function_.clone(),
-        Object::Property(_) => bt.property_.clone(),
+        Object::Function(_) => bt.function_.clone(),
+        // Rust-implemented callables are `builtin_function_or_method`,
+        // distinct from `function`, exactly as in CPython (`type(len)`).
+        // Built-in *type-dict* entries are tagged as method/wrapper
+        // descriptors (`type(str.lower)` is `method_descriptor`, not
+        // `builtin_function_or_method` — test_descr test_qualname).
+        Object::Builtin(_) => {
+            crate::descr_registry::descr_type(obj).unwrap_or_else(|| bt.builtin_function_.clone())
+        }
+        // A bound method is its own type in CPython (`type(o.m)` is `method`),
+        // which also makes `types.MethodType(func, obj)` construct one.
+        // Distinguish what the method wraps, as CPython does:
+        //   * Python function        -> `method`
+        //   * builtin slot dunder    -> `method-wrapper` (`x.__add__`)
+        //   * other builtin callable -> `builtin_function_or_method`
+        //     (`[].append` — bound C methods share the C-function type)
+        Object::BoundMethod(bm) => match &bm.function {
+            Object::Builtin(b) => {
+                let n = b.name.trim_start_matches('.');
+                if n.starts_with("__") && n.ends_with("__") {
+                    bt.method_wrapper_.clone()
+                } else {
+                    bt.builtin_function_.clone()
+                }
+            }
+            _ => bt.method_.clone(),
+        },
+        // A user `@property` is `property`; the numeric getset/member
+        // descriptors materialized into the value-type dicts are tagged
+        // (`type(float.real)` is `getset_descriptor`, `type(complex.real)`
+        // is `member_descriptor` — test_descr test_qualname).
+        Object::Property(_) => {
+            crate::descr_registry::descr_type(obj).unwrap_or_else(|| bt.property_.clone())
+        }
         Object::StaticMethod(_) => bt.staticmethod_.clone(),
         Object::ClassMethod(_) => bt.classmethod_.clone(),
         Object::Bytes(_) => bt.bytes_.clone(),
@@ -2795,14 +5833,24 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Set(_) => bt.set_.clone(),
         Object::FrozenSet(_) => bt.frozenset_.clone(),
         Object::Iter(_) => bt.iterator_.clone(),
+        // Native itertools adapters share the generic iterator type for
+        // now; `type(x).__name__` is "iterator" rather than CPython's
+        // "islice" until they get dedicated TypeObjects.
+        Object::LazyIter(_) => bt.iterator_.clone(),
         Object::Generator(_) => bt.generator_.clone(),
         Object::Coroutine(_) => bt.coroutine_.clone(),
         Object::AsyncGenerator(_) => bt.async_generator_.clone(),
+        // The transient `asend`/`athrow`/`aclose` awaitables have no
+        // dedicated singleton type; treat them as plain objects for
+        // `type()` (their faithful CPython name is still surfaced by
+        // `repr`/error messages via `Object::type_name`).
+        Object::AsyncGenAwait(_) => bt.object_.clone(),
         Object::Module(_) => bt.module_.clone(),
-        Object::Code(_) | Object::Cell(_) | Object::SlotDescriptor(_) | Object::File(_) => {
-            bt.object_.clone()
-        }
-        Object::Frame(_) | Object::Traceback(_) => bt.object_.clone(),
+        Object::SlotDescriptor(_) => bt.member_descriptor_.clone(),
+        Object::Code(_) => bt.code_.clone(),
+        Object::Cell(_) | Object::File(_) => bt.object_.clone(),
+        Object::Frame(_) => bt.frame_.clone(),
+        Object::Traceback(_) => bt.traceback_.clone(),
     }
 }
 
@@ -2878,6 +5926,7 @@ fn object_identity(obj: &Object) -> i64 {
         Object::Generator(g) => Rc::as_ptr(g) as usize as i64,
         Object::Coroutine(g) => Rc::as_ptr(g) as usize as i64,
         Object::AsyncGenerator(g) => Rc::as_ptr(g) as usize as i64,
+        Object::AsyncGenAwait(a) => Rc::as_ptr(a) as usize as i64,
         Object::File(f) => Rc::as_ptr(f) as usize as i64,
         Object::Property(p) => Rc::as_ptr(p) as usize as i64,
         Object::StaticMethod(m) => Rc::as_ptr(m) as usize as i64,
@@ -2892,6 +5941,7 @@ fn object_identity(obj: &Object) -> i64 {
         Object::Code(c) => Rc::as_ptr(c) as usize as i64,
         Object::Cell(c) => Rc::as_ptr(c) as usize as i64,
         Object::Iter(i) => Rc::as_ptr(i) as usize as i64,
+        Object::LazyIter(l) => Rc::as_ptr(l) as usize as i64,
         Object::Int(i) => i.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64),
         Object::Float(f) => (f.to_bits() as i64) ^ 0x0123_4567_89AB_CDEFu64 as i64,
         Object::Bool(b) => {
@@ -2902,17 +5952,50 @@ fn object_identity(obj: &Object) -> i64 {
             }
         }
         Object::None => 0x4E6F_6E65, // 'None' as bytes — stable sentinel.
+        Object::Unbound => 0x4E6F_6E66,
     }
 }
 
 /// Structural hash for primitives. Mirrors CPython's "hash by value"
 /// semantics for the built-in immutable types we support.
+/// Reject values that cannot serve as a dict/set key, matching CPython:
+/// `list`/`dict`/`set`/`bytearray`/`slice` are unhashable, and a `tuple`
+/// is unhashable iff any element is (the hash recurses). `frozenset` is
+/// hashable by construction. Instances carry their own `__hash__`/`None`
+/// marker handled by the VM's `do_hash_call`, so they pass here.
+pub fn ensure_hashable(obj: &Object) -> Result<(), RuntimeError> {
+    let name = match obj {
+        Object::List(_) => "list",
+        Object::Dict(_) => "dict",
+        Object::Set(_) => "set",
+        Object::ByteArray(_) => "bytearray",
+        Object::Slice(_) => "slice",
+        Object::Tuple(items) => {
+            for it in items.iter() {
+                ensure_hashable(it)?;
+            }
+            return Ok(());
+        }
+        _ => return Ok(()),
+    };
+    Err(type_error(format!("unhashable type: '{name}'")))
+}
+
 pub fn hash_object(obj: &Object) -> Result<Object, RuntimeError> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    crate::object::DictKey(obj.clone()).hash(&mut h);
-    Ok(Object::Int(h.finish() as i64))
+    ensure_hashable(obj)?;
+    // Single source of truth shared with `DictKey`'s hasher: the numeric
+    // tower uses CPython's exact reduction modulo 2**61-1 (so equal values of
+    // different numeric types hash identically and specials match
+    // `sys.hash_info`); `str`/`bytes`/`tuple`/`frozenset` get a stable
+    // value hash; an int/str/… subclass hashes as its wrapped value; a custom
+    // `__hash__` is dispatched through the interpreter. Everything else hashes
+    // by allocation identity. Keeping `hash()` and dict bucketing in lockstep
+    // is what makes custom `__hash__`/`__eq__` keys interoperate with built-in
+    // values in a `set`/`dict`.
+    if let Some(h) = crate::object::py_hash_value(obj) {
+        return Ok(Object::Int(h));
+    }
+    Ok(Object::Int(crate::object::identity_hash(obj)))
 }
 
 fn b_hash(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2925,7 +6008,7 @@ fn b_hash(args: &[Object]) -> Result<Object, RuntimeError> {
 /// fall back to a small list of dunder names. We deliberately keep
 /// this loose because runtime helpers (typing, dataclasses, abc)
 /// only need it to enumerate user attributes.
-fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
     use std::collections::BTreeSet;
     let mut names: BTreeSet<String> = BTreeSet::new();
     let obj = one(args, "dir")?;
@@ -2936,7 +6019,7 @@ fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                     names.insert(s.to_string());
                 }
             }
-            for t in inst.class.mro.borrow().iter() {
+            for t in inst.cls().mro.borrow().iter() {
                 for k in t.dict.borrow().keys() {
                     if let Object::Str(s) = &k.0 {
                         names.insert(s.to_string());
@@ -2960,7 +6043,89 @@ fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                 }
             }
         }
-        _ => {}
+        other => {
+            // Generic objects: `object.__dir__` ≈ the type's attributes.
+            for t in class_of(other).mro.borrow().iter() {
+                for k in t.dict.borrow().keys() {
+                    if let Object::Str(s) = &k.0 {
+                        names.insert(s.to_string());
+                    }
+                }
+            }
+            // The generator family's methods and introspection attrs are
+            // synthesized in `load_attr` rather than stored in type
+            // dicts; surface the same names CPython's type dicts hold.
+            let extra: &[&str] = match other {
+                Object::Generator(_) => &[
+                    "close",
+                    "send",
+                    "throw",
+                    "gi_code",
+                    "gi_frame",
+                    "gi_running",
+                    "gi_suspended",
+                    "gi_yieldfrom",
+                    "__next__",
+                    "__iter__",
+                    "__name__",
+                    "__qualname__",
+                    "__del__",
+                ],
+                Object::Coroutine(_) => &[
+                    "close",
+                    "send",
+                    "throw",
+                    "cr_await",
+                    "cr_code",
+                    "cr_frame",
+                    "cr_origin",
+                    "cr_running",
+                    "cr_suspended",
+                    "__await__",
+                    "__name__",
+                    "__qualname__",
+                    "__del__",
+                ],
+                Object::AsyncGenerator(_) => &[
+                    "aclose",
+                    "asend",
+                    "athrow",
+                    "ag_await",
+                    "ag_code",
+                    "ag_frame",
+                    "ag_running",
+                    "ag_suspended",
+                    "__aiter__",
+                    "__anext__",
+                    "__name__",
+                    "__qualname__",
+                    "__del__",
+                ],
+                // `property`'s attributes are resolved in `load_attr`
+                // rather than stored in the type dict; surface the same
+                // names CPython's `property.__dict__` exposes so
+                // `dir(property_instance)` lists them (test_descr
+                // test_properties).
+                Object::Property(_) => &[
+                    "fget",
+                    "fset",
+                    "fdel",
+                    "getter",
+                    "setter",
+                    "deleter",
+                    "__doc__",
+                    "__get__",
+                    "__set__",
+                    "__delete__",
+                    "__set_name__",
+                    "__isabstractmethod__",
+                ],
+                _ => &[],
+            };
+            for n in extra {
+                names.insert((*n).to_string());
+            }
+        }
     }
     Ok(Object::new_list(
         names.into_iter().map(Object::from_str).collect(),
@@ -2985,10 +6150,8 @@ fn b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Bool(b) => Ok(Object::from_str(format!("0x{}", i64::from(*b)))),
-        other => Err(type_error(format!(
-            "'{}' object cannot be interpreted as an integer",
-            other.type_name()
-        ))),
+        // The `__index__` protocol (CPython `PyNumber_Index`).
+        other => b_hex(&[Object::Int(coerce_index_i64(other)?)]),
     }
 }
 
@@ -3010,7 +6173,8 @@ fn b_oct(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Bool(b) => Ok(Object::from_str(format!("0o{}", i64::from(*b)))),
-        _ => Err(type_error("expected int")),
+        // The `__index__` protocol (CPython `PyNumber_Index`).
+        other => b_oct(&[Object::Int(coerce_index_i64(other)?)]),
     }
 }
 
@@ -3032,7 +6196,8 @@ fn b_bin(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Bool(b) => Ok(Object::from_str(format!("0b{}", i64::from(*b)))),
-        _ => Err(type_error("expected int")),
+        // The `__index__` protocol (CPython `PyNumber_Index`).
+        other => b_bin(&[Object::Int(coerce_index_i64(other)?)]),
     }
 }
 
@@ -3048,20 +6213,42 @@ fn b_chr(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_ord(args: &[Object]) -> Result<Object, RuntimeError> {
-    match one(args, "ord")? {
+    let arg = one(args, "ord")?;
+    let native = arg.native_value();
+    match native.as_ref().unwrap_or(arg) {
         Object::Str(s) => {
             let mut chars = s.chars();
-            let c = chars
-                .next()
-                .ok_or_else(|| type_error("ord() expected a character, but empty string given"))?;
+            let c = chars.next().ok_or_else(|| {
+                type_error("ord() expected a character, but string of length 0 found")
+            })?;
             if chars.next().is_some() {
-                return Err(type_error(
-                    "ord() expected a character, but multi-character string given",
-                ));
+                return Err(type_error(format!(
+                    "ord() expected a character, but string of length {} found",
+                    s.chars().count()
+                )));
             }
             Ok(Object::Int(i64::from(u32::from(c))))
         }
-        _ => Err(type_error("ord() expected string")),
+        Object::Bytes(b) if b.len() == 1 => Ok(Object::Int(i64::from(b[0]))),
+        Object::Bytes(b) => Err(type_error(format!(
+            "ord() expected a character, but string of length {} found",
+            b.len()
+        ))),
+        Object::ByteArray(b) => {
+            let data = b.borrow();
+            if data.len() == 1 {
+                Ok(Object::Int(i64::from(data[0])))
+            } else {
+                Err(type_error(format!(
+                    "ord() expected a character, but string of length {} found",
+                    data.len()
+                )))
+            }
+        }
+        other => Err(type_error(format!(
+            "ord() expected string of length 1, but {} found",
+            other.type_name()
+        ))),
     }
 }
 
@@ -3077,7 +6264,7 @@ fn b_input_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// given, otherwise `base ** exp`. Mirrors CPython's three-arg
 /// `pow` including the negative-exponent + mod case (the modular
 /// inverse).
-fn b_pow(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_pow(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(type_error("pow() takes 2 or 3 arguments"));
     }
@@ -3096,12 +6283,33 @@ fn b_pow(args: &[Object]) -> Result<Object, RuntimeError> {
 /// covers ints, floats, complex, and bool. Mirrors the
 /// integer/float/complex arithmetic the VM's `BinaryOp::Pow` does
 /// inline.
+/// `float ** float` shared by `pow()` and the `**` operator: a finite
+/// negative power of zero is a `ZeroDivisionError`, a fractional power of a
+/// negative base yields a `complex` (CPython promotes rather than NaN-ing).
+fn float_pow_value(x: f64, y: f64) -> Result<Object, RuntimeError> {
+    if x == 0.0 && y < 0.0 && y.is_finite() {
+        return Err(crate::error::zero_division_error(
+            "0.0 cannot be raised to a negative power",
+        ));
+    }
+    if x < 0.0 && y.fract() != 0.0 && x.is_finite() && y.is_finite() {
+        let magnitude = (-x).powf(y);
+        let theta = std::f64::consts::PI * y;
+        Ok(Object::new_complex(
+            magnitude * theta.cos(),
+            magnitude * theta.sin(),
+        ))
+    } else {
+        Ok(Object::Float(x.powf(y)))
+    }
+}
+
 fn pow_simple(base: &Object, exp: &Object) -> Result<Object, RuntimeError> {
     use num_traits::ToPrimitive;
     match (base, exp) {
         (Object::Int(x), Object::Int(y)) => {
             if *y < 0 {
-                Ok(Object::Float((*x as f64).powf(*y as f64)))
+                float_pow_value(*x as f64, *y as f64)
             } else if let Ok(e) = u32::try_from(*y) {
                 if let Some(r) = x.checked_pow(e) {
                     Ok(Object::Int(r))
@@ -3113,15 +6321,15 @@ fn pow_simple(base: &Object, exp: &Object) -> Result<Object, RuntimeError> {
                 Err(value_error("pow() exponent too large"))
             }
         }
-        (Object::Int(x), Object::Float(y)) => Ok(Object::Float((*x as f64).powf(*y))),
-        (Object::Float(x), Object::Int(y)) => Ok(Object::Float(x.powf(*y as f64))),
-        (Object::Float(x), Object::Float(y)) => Ok(Object::Float(x.powf(*y))),
+        (Object::Int(x), Object::Float(y)) => float_pow_value(*x as f64, *y),
+        (Object::Float(x), Object::Int(y)) => float_pow_value(*x, *y as f64),
+        (Object::Float(x), Object::Float(y)) => float_pow_value(*x, *y),
         (Object::Bool(b), other) => pow_simple(&Object::Int(i64::from(*b)), other),
         (other, Object::Bool(b)) => pow_simple(other, &Object::Int(i64::from(*b))),
         (Object::Long(x), Object::Int(y)) => {
             if *y < 0 {
                 let xf = x.to_f64().ok_or_else(|| value_error("int too large"))?;
-                Ok(Object::Float(xf.powf(*y as f64)))
+                float_pow_value(xf, *y as f64)
             } else if let Ok(e) = u32::try_from(*y) {
                 Ok(Object::int_from_bigint(x.as_ref().pow(e)))
             } else {
@@ -3159,25 +6367,61 @@ fn pow_modular(base: &Object, exp: &Object, m: &Object) -> Result<Object, Runtim
     if mm.is_zero() {
         return Err(value_error("pow() 3rd argument cannot be 0"));
     }
-    if e.is_negative() {
-        return Err(value_error(
-            "pow() with 3rd arg requires non-negative integer exponent in this build",
-        ));
-    }
     use num_bigint::BigInt;
     use num_traits::One;
-    let mut base_mod: BigInt = ((&b % &mm) + &mm) % &mm;
+    // Work modulo |m|; CPython gives the result the *sign* of `m` at the end.
+    let m_abs: BigInt = mm.abs();
+    // Reduce the base into [0, |m|).
+    let mut base_mod: BigInt = ((&b % &m_abs) + &m_abs) % &m_abs;
     let mut exp_val: BigInt = e.clone();
+    // A negative exponent means `pow(base, -e, m) == pow(base**-1, e, m)`,
+    // where `base**-1` is the modular inverse (CPython 3.8+). The inverse only
+    // exists when `gcd(base, m) == 1`; otherwise CPython raises ValueError.
+    if e.is_negative() {
+        match mod_inverse(&base_mod, &m_abs) {
+            Some(inv) => {
+                base_mod = inv;
+                exp_val = -e;
+            }
+            None => return Err(value_error("base is not invertible for the given modulus")),
+        }
+    }
     let mut result: BigInt = BigInt::one();
     let zero: BigInt = BigInt::from(0i64);
     while exp_val > zero {
         if &exp_val % 2i64 == BigInt::one() {
-            result = (&result * &base_mod) % &mm;
+            result = (&result * &base_mod) % &m_abs;
         }
         exp_val >>= 1;
-        base_mod = (&base_mod * &base_mod) % &mm;
+        base_mod = (&base_mod * &base_mod) % &m_abs;
+    }
+    // `result` is in [0, |m|); shift into (m, 0] when the modulus is negative
+    // so the sign matches CPython's `int.__mod__` convention.
+    if mm.is_negative() && !result.is_zero() {
+        result += &mm;
     }
     Ok(Object::int_from_bigint(result))
+}
+
+/// Modular inverse of `a` (already reduced into `[0, m)`) modulo `m > 0`, via
+/// the iterative extended Euclidean algorithm. Returns `None` when `a` and `m`
+/// are not coprime (no inverse exists). Result is normalised into `[0, m)`.
+fn mod_inverse(a: &num_bigint::BigInt, m: &num_bigint::BigInt) -> Option<num_bigint::BigInt> {
+    use num_bigint::BigInt;
+    use num_traits::{One, Zero};
+    let (mut old_r, mut r) = (a.clone(), m.clone());
+    let (mut old_s, mut s) = (BigInt::one(), BigInt::zero());
+    while !r.is_zero() {
+        let q = &old_r / &r;
+        let new_r = &old_r - &q * &r;
+        old_r = std::mem::replace(&mut r, new_r);
+        let new_s = &old_s - &q * &s;
+        old_s = std::mem::replace(&mut s, new_s);
+    }
+    if !old_r.is_one() {
+        return None;
+    }
+    Some(((old_s % m) + m) % m)
 }
 
 fn bigint_from(o: &Object, fn_name: &str) -> Result<BigInt, RuntimeError> {
@@ -3227,30 +6471,12 @@ fn b_typevar(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `memoryview(obj)` — returns a `MemoryView` over a bytes-like
 /// object. We accept `bytes`, `bytearray`, and existing
 /// `MemoryView` (which we shallow-copy, matching CPython).
-fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
+pub fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
     let arg = one(args, "memoryview")?;
     let mv = match arg {
         Object::Bytes(b) => crate::object::PyMemoryView::from_bytes(b.clone()),
         Object::ByteArray(b) => crate::object::PyMemoryView::from_bytearray(b.clone()),
-        Object::MemoryView(mv) => {
-            // Shallow clone — same backing buffer, same window.
-            crate::object::PyMemoryView {
-                buffer: match &mv.buffer {
-                    crate::object::MemoryViewBuffer::Bytes(b) => {
-                        crate::object::MemoryViewBuffer::Bytes(b.clone())
-                    }
-                    crate::object::MemoryViewBuffer::ByteArray(b) => {
-                        crate::object::MemoryViewBuffer::ByteArray(b.clone())
-                    }
-                },
-                start: crate::sync::Cell::new(mv.start.get()),
-                len: crate::sync::Cell::new(mv.len.get()),
-                readonly: crate::sync::Cell::new(mv.readonly.get()),
-                released: crate::sync::Cell::new(mv.released.get()),
-                format: crate::sync::RefCell::new(mv.format.borrow().clone()),
-                itemsize: crate::sync::Cell::new(mv.itemsize.get()),
-            }
-        }
+        Object::MemoryView(mv) => mv.shallow_clone(),
         other => {
             return Err(type_error(format!(
                 "memoryview: a bytes-like object is required, not '{}'",
@@ -3292,7 +6518,48 @@ fn b_iter(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Iter(Rc::new(RefCell::new(it))))
 }
 
-fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {
+/// `aiter(async_iterable)` — return its async iterator (PEP 525 builtin,
+/// 3.10+). VM-routed through [`crate::Vm::get_aiter`] so `__aiter__`
+/// dispatch runs; this fallback only fires if invoked outside the VM.
+fn b_aiter(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(type_error("aiter() must be called through the VM"))
+}
+
+/// Runtime support for `types.coroutine`: return a copy of a generator
+/// function whose code carries `CO_ITERABLE_COROUTINE` (CPython sets
+/// the flag by replacing `func.__code__`). Generators created by the
+/// returned function are accepted by `await` and may `yield from` a
+/// coroutine.
+fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
+    let Some(Object::Function(f)) = args.first() else {
+        return Err(type_error(
+            "_weavepy_mark_iterable_coroutine() expects a function",
+        ));
+    };
+    let mut code = (*f.code()).clone();
+    code.is_iterable_coroutine = true;
+    let marked = crate::object::PyFunction {
+        name: f.name.clone(),
+        code: RefCell::new(Rc::new(code)),
+        globals: f.globals.clone(),
+        defaults: f.defaults.clone(),
+        kw_defaults: f.kw_defaults.clone(),
+        closure: f.closure.clone(),
+        // Shared, not copied: `func.__dict__` mutations stay visible on
+        // both, matching CPython where the function object is the same.
+        attrs: f.attrs.clone(),
+        slots: RefCell::new(f.slots.borrow().clone()),
+    };
+    Ok(Object::Function(Rc::new(marked)))
+}
+
+/// `anext(async_iterator[, default])` — return the awaitable from
+/// `__anext__` (3.10+). VM-routed through [`crate::Vm::get_anext`].
+fn b_anext(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(type_error("anext() must be called through the VM"))
+}
+
+pub(crate) fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("divmod expected 2 arguments"));
     }
@@ -3301,14 +6568,22 @@ fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_tuple(vec![q, r]))
 }
 
-fn b_round(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_round(args: &[Object]) -> Result<Object, RuntimeError> {
     let value = args
         .first()
         .ok_or_else(|| type_error("round() takes at least one argument"))?;
+    // `ndigits` must be an integer (or omitted); a `Long` is saturated to
+    // `i64` (anything beyond ±323 short-circuits anyway).
     let ndigits = match args.get(1) {
         None | Some(Object::None) => None,
         Some(Object::Int(i)) => Some(*i),
         Some(Object::Bool(b)) => Some(i64::from(*b)),
+        Some(Object::Long(b)) => {
+            Some(
+                b.to_i64()
+                    .unwrap_or(if b.is_negative() { i64::MIN } else { i64::MAX }),
+            )
+        }
         Some(other) => {
             return Err(type_error(format!(
                 "'{}' object cannot be interpreted as an integer",
@@ -3317,23 +6592,121 @@ fn b_round(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     match value {
-        Object::Int(i) => match ndigits {
-            None | Some(0) => Ok(Object::Int(*i)),
-            Some(n) if n > 0 => Ok(Object::Int(*i)),
-            Some(n) => {
-                let scale = 10i64.pow(n.unsigned_abs() as u32);
-                let rounded = ((*i as f64) / scale as f64).round() as i64 * scale;
-                Ok(Object::Int(rounded))
-            }
-        },
+        Object::Int(_) | Object::Long(_) | Object::Bool(_) => round_int(value, ndigits),
         Object::Float(f) => match ndigits {
-            None => Ok(Object::Float(f.round())),
-            Some(n) => {
-                let factor = 10f64.powi(n as i32);
-                Ok(Object::Float((f * factor).round() / factor))
+            // `round(x)` (no ndigits) rounds to the nearest integer
+            // (ties-to-even) and returns an `int`.
+            None => {
+                if f.is_nan() {
+                    return Err(value_error("cannot convert float NaN to integer"));
+                }
+                if f.is_infinite() {
+                    return Err(crate::error::overflow_error(
+                        "cannot convert float infinity to integer",
+                    ));
+                }
+                Ok(float_to_int_obj(round_ties_even(*f)))
             }
+            // `round(x, n)` returns a `float`, correctly rounded (ties-to-even)
+            // to `n` decimal places.
+            Some(n) => double_round(*f, n).map(Object::Float),
         },
         _ => Err(type_error("round() argument must be int or float")),
+    }
+}
+
+/// Round a finite `f64` to the nearest integer, ties to even.
+fn round_ties_even(x: f64) -> f64 {
+    let r = x.round();
+    if (x - x.trunc()).abs() == 0.5 && (r / 2.0).fract() != 0.0 {
+        // `x` was a half-integer and `round()` (ties-away) landed on an odd
+        // integer; step toward the even neighbour.
+        r - x.signum()
+    } else {
+        r
+    }
+}
+
+/// Convert an integral `f64` to `int`/`Long`, used by `round(x)`.
+fn float_to_int_obj(r: f64) -> Object {
+    if (-(9.223_372_036_854_776e18)..9.223_372_036_854_776e18).contains(&r) {
+        Object::Int(r as i64)
+    } else {
+        BigInt::from_f64(r).map_or(Object::Int(0), |b| Object::Long(Rc::new(b)))
+    }
+}
+
+/// `round(int_like, ndigits)` — non-negative `ndigits` leave the value
+/// unchanged; negative `ndigits` round to a power of ten (ties-to-even).
+fn round_int(value: &Object, ndigits: Option<i64>) -> Result<Object, RuntimeError> {
+    let n = match ndigits {
+        None => return Ok(value.clone()),
+        Some(n) if n >= 0 => return Ok(value.clone()),
+        Some(n) => n,
+    };
+    // Negative ndigits: round to 10^(-n) via BigInt to stay exact.
+    let v = match value {
+        Object::Int(i) => BigInt::from(*i),
+        Object::Bool(b) => BigInt::from(i64::from(*b)),
+        Object::Long(b) => (**b).clone(),
+        _ => unreachable!(),
+    };
+    let pow = (-n) as u32;
+    let scale = BigInt::from(10).pow(pow);
+    let q = &v / &scale;
+    let r = &v - &q * &scale;
+    let mut result = q.clone();
+    let two = BigInt::from(2);
+    // Compare |remainder|*2 to the scale to decide rounding, breaking exact
+    // ties toward the even quotient (CPython's round-half-to-even).
+    let round_up = match (r.abs() * &two).cmp(&scale) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => (&q % &two) != BigInt::from(0),
+    };
+    if round_up {
+        if v.is_negative() {
+            result -= 1;
+        } else {
+            result += 1;
+        }
+    }
+    let scaled = result * &scale;
+    Ok(Object::int_from_bigint(scaled))
+}
+
+/// CPython's `double_round`: round `x` to `ndigits` decimal places with
+/// round-half-to-even, returning a `float`. Uses round-trip decimal
+/// formatting (Rust's formatter rounds ties-to-even, matching dtoa).
+fn double_round(x: f64, ndigits: i64) -> Result<f64, RuntimeError> {
+    if !x.is_finite() || x == 0.0 {
+        return Ok(x);
+    }
+    // Outside the representable decimal range nothing changes / underflows.
+    if ndigits > 323 {
+        return Ok(x);
+    }
+    if ndigits < -308 {
+        return Ok(0.0 * x);
+    }
+    if ndigits >= 0 {
+        let s = format!("{:.*}", ndigits as usize, x);
+        let r: f64 = s.parse().unwrap_or(x);
+        if r.is_infinite() {
+            return Err(crate::error::overflow_error(
+                "rounded value too large to represent",
+            ));
+        }
+        Ok(r)
+    } else {
+        let scale = 10f64.powi((-ndigits) as i32);
+        let r = round_ties_even(x / scale) * scale;
+        if r.is_infinite() {
+            return Err(crate::error::overflow_error(
+                "rounded value too large to represent",
+            ));
+        }
+        Ok(r)
     }
 }
 
@@ -3358,15 +6731,68 @@ fn str_strip(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(str_self(args)?.trim().to_owned()))
 }
 
-fn str_split(args: &[Object]) -> Result<Object, RuntimeError> {
-    let s = str_self(args)?;
-    let out: Vec<Object> = if args.len() == 1 {
-        s.split_whitespace().map(Object::from_str).collect()
-    } else {
-        match &args[1] {
-            Object::Str(sep) => s.split(&**sep).map(Object::from_str).collect(),
-            _ => return Err(type_error("split() argument must be str")),
+fn split_maxsplit(o: Option<&Object>) -> Result<i64, RuntimeError> {
+    match o {
+        None | Some(Object::None) => Ok(-1),
+        Some(Object::Int(n)) => Ok(*n),
+        Some(Object::Bool(b)) => Ok(i64::from(*b)),
+        Some(_) => Err(type_error("maxsplit must be an integer")),
+    }
+}
+
+/// `str.split` on runs of whitespace (the `sep is None` case), honouring
+/// `maxsplit`. Leading/trailing whitespace is stripped and empty fields
+/// are dropped, matching CPython.
+fn str_split_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
+    if maxsplit < 0 {
+        return s.split_whitespace().map(Object::from_str).collect();
+    }
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut splits = 0;
+    while i < n {
+        while i < n && chars[i].1.is_whitespace() {
+            i += 1;
         }
+        if i >= n {
+            break;
+        }
+        if splits >= maxsplit {
+            out.push(Object::from_str(s[chars[i].0..].to_string()));
+            return out;
+        }
+        let start = chars[i].0;
+        while i < n && !chars[i].1.is_whitespace() {
+            i += 1;
+        }
+        let end = if i < n { chars[i].0 } else { s.len() };
+        out.push(Object::from_str(s[start..end].to_string()));
+        splits += 1;
+    }
+    out
+}
+
+fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let sep = arg_or_kw(args, 1, kwargs, "sep");
+    let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
+    let out: Vec<Object> = match sep {
+        None | Some(Object::None) => str_split_whitespace(s, maxsplit),
+        Some(Object::Str(sep)) => {
+            if sep.is_empty() {
+                return Err(value_error("empty separator"));
+            }
+            if maxsplit < 0 {
+                s.split(&**sep).map(Object::from_str).collect()
+            } else {
+                s.splitn((maxsplit as usize).saturating_add(1), &**sep)
+                    .map(Object::from_str)
+                    .collect()
+            }
+        }
+        Some(_) => return Err(type_error("must be str or None, not other")),
     };
     Ok(Object::new_list(out))
 }
@@ -3482,7 +6908,7 @@ fn str_match_prefix_suffix(
     }
 }
 
-fn str_replace(args: &[Object]) -> Result<Object, RuntimeError> {
+fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let from = match args.get(1) {
         Some(Object::Str(p)) => p,
@@ -3492,7 +6918,75 @@ fn str_replace(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(p)) => p,
         _ => return Err(type_error("replace() expected str")),
     };
-    Ok(Object::from_str(s.replace(&**from, to)))
+    let mut count_obj = args.get(3).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "count" => count_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "replace() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let count = match count_obj {
+        None | Some(Object::None) => -1i64,
+        Some(o) => coerce_index_i64(&o)?,
+    };
+    if count == 0 {
+        return Ok(Object::from_str(s.to_string()));
+    }
+    let out = if count < 0 {
+        s.replace(&**from, to)
+    } else if from.is_empty() {
+        // `str::replacen` with an empty pattern matches between every
+        // char and at both ends, same as CPython.
+        let mut out = String::new();
+        let mut done = 0i64;
+        for (i, ch) in s.chars().enumerate() {
+            let _ = i;
+            if done < count {
+                out.push_str(to);
+                done += 1;
+            }
+            out.push(ch);
+        }
+        if done < count {
+            out.push_str(to);
+        }
+        out
+    } else {
+        s.replacen(&**from, to, count as usize)
+    };
+    Ok(Object::from_str(out))
+}
+
+/// `ADJUST_INDICES`: negative indices offset by length and floored at
+/// 0; `end` clamped to length; `start` left unclamped so a start past
+/// the end yields an invalid window (`'abc'.find('', 4) == -1`).
+fn str_search_window(args: &[Object], total_chars: i64) -> Option<(i64, i64)> {
+    let resolve = |arg: Option<&Object>, default: i64| -> i64 {
+        match arg {
+            None | Some(Object::None) => default,
+            Some(o) => match o.as_i64() {
+                Some(x) => {
+                    if x < 0 {
+                        (x + total_chars).max(0)
+                    } else {
+                        x
+                    }
+                }
+                None => default,
+            },
+        }
+    };
+    let start = resolve(args.get(2), 0);
+    let end = resolve(args.get(3), total_chars).clamp(0, total_chars);
+    if start > end {
+        None
+    } else {
+        Some((start, end))
+    }
 }
 
 fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3502,11 +6996,9 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("find() expected str")),
     };
     let total_chars = s.chars().count() as i64;
-    let start = clamp_str_index(args.get(2), 0, total_chars);
-    let end = clamp_str_index(args.get(3), total_chars, total_chars);
-    if start > end || start > total_chars {
+    let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
-    }
+    };
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
@@ -3516,20 +7008,6 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
             Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
         }
         None => Ok(Object::Int(-1)),
-    }
-}
-
-fn clamp_str_index(arg: Option<&Object>, default: i64, len: i64) -> i64 {
-    match arg {
-        Some(Object::Int(n)) => {
-            if *n < 0 {
-                (len + n).max(0)
-            } else {
-                (*n).min(len)
-            }
-        }
-        Some(Object::None) | None => default,
-        _ => default,
     }
 }
 
@@ -3613,46 +7091,72 @@ fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(out))
 }
 
-fn str_rsplit(args: &[Object]) -> Result<Object, RuntimeError> {
+/// `str.rsplit` on runs of whitespace, honouring `maxsplit` from the
+/// right. Mirrors CPython: the *last* `maxsplit` whitespace runs split,
+/// and the left remainder keeps its internal spacing.
+fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
+    if maxsplit < 0 {
+        return s.split_whitespace().map(Object::from_str).collect();
+    }
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let n = chars.len();
+    let mut out_rev: Vec<String> = Vec::new();
+    let mut i = n;
+    let mut splits = 0;
+    while i > 0 {
+        while i > 0 && chars[i - 1].1.is_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            break;
+        }
+        let end_byte = if i < n { chars[i].0 } else { s.len() };
+        if splits >= maxsplit {
+            out_rev.push(s[..end_byte].to_string());
+            break;
+        }
+        while i > 0 && !chars[i - 1].1.is_whitespace() {
+            i -= 1;
+        }
+        let start_byte = chars[i].0;
+        out_rev.push(s[start_byte..end_byte].to_string());
+        splits += 1;
+    }
+    out_rev.reverse();
+    out_rev.into_iter().map(Object::from_str).collect()
+}
+
+fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let maxsplit = args.get(2).and_then(|x| match x {
-        Object::Int(i) => Some(*i),
-        _ => None,
-    });
-    let out: Vec<Object> = match args.get(1) {
-        None | Some(Object::None) => {
-            let mut parts: Vec<&str> = s.split_whitespace().collect();
-            if let Some(n) = maxsplit {
-                if n >= 0 && (n as usize) < parts.len() - 1 {
-                    let _keep = parts.len() - n as usize;
-                }
-            }
-            parts.reverse();
-            parts.reverse();
-            parts.into_iter().map(Object::from_str).collect()
-        }
+    let sep = arg_or_kw(args, 1, kwargs, "sep");
+    let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
+    let out: Vec<Object> = match sep {
+        None | Some(Object::None) => str_rsplit_whitespace(s, maxsplit),
         Some(Object::Str(sep)) => {
-            let pieces: Vec<&str> = if let Some(n) = maxsplit {
-                if n >= 0 {
-                    s.rsplitn(n as usize + 1, &**sep).collect::<Vec<_>>()
-                } else {
-                    s.split(&**sep).collect()
-                }
-            } else {
+            if sep.is_empty() {
+                return Err(value_error("empty separator"));
+            }
+            let mut pieces: Vec<&str> = if maxsplit < 0 {
                 s.split(&**sep).collect()
+            } else {
+                let mut v: Vec<&str> = s
+                    .rsplitn((maxsplit as usize).saturating_add(1), &**sep)
+                    .collect();
+                v.reverse();
+                v
             };
-            let mut v = pieces;
-            v.reverse();
-            v.into_iter().map(Object::from_str).collect()
+            pieces.drain(..).map(Object::from_str).collect()
         }
-        _ => return Err(type_error("rsplit() argument must be str")),
+        Some(_) => return Err(type_error("must be str or None, not other")),
     };
     Ok(Object::new_list(out))
 }
 
-fn str_splitlines(args: &[Object]) -> Result<Object, RuntimeError> {
+fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let keepends = matches!(args.get(1), Some(Object::Bool(true)));
+    let keepends = arg_or_kw(args, 1, kwargs, "keepends")
+        .map(Object::is_truthy)
+        .unwrap_or(false);
     let mut out: Vec<Object> = Vec::new();
     let bytes = s.as_bytes();
     let mut start = 0;
@@ -3689,11 +7193,9 @@ fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("rfind() expected str")),
     };
     let total_chars = s.chars().count() as i64;
-    let start = clamp_str_index(args.get(2), 0, total_chars);
-    let end = clamp_str_index(args.get(3), total_chars, total_chars);
-    if start > end {
+    let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(-1));
-    }
+    };
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
@@ -3714,6 +7216,14 @@ fn str_index(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+fn str_rindex(args: &[Object]) -> Result<Object, RuntimeError> {
+    let pos = str_rfind(args)?;
+    match pos {
+        Object::Int(-1) => Err(value_error("substring not found")),
+        other => Ok(other),
+    }
+}
+
 fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let sub = match args.get(1) {
@@ -3721,11 +7231,9 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("count() expected str")),
     };
     let total_chars = s.chars().count() as i64;
-    let start = clamp_str_index(args.get(2), 0, total_chars);
-    let end = clamp_str_index(args.get(3), total_chars, total_chars);
-    if start > end {
+    let Some((start, end)) = str_search_window(args, total_chars) else {
         return Ok(Object::Int(0));
-    }
+    };
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     Ok(Object::Int(
@@ -3859,7 +7367,10 @@ fn str_isprintable(args: &[Object]) -> Result<Object, RuntimeError> {
 fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let width = match args.get(1) {
-        Some(Object::Int(i)) => *i as usize,
+        // A negative width is a no-op in CPython (`'x'.zfill(-3) == 'x'`);
+        // clamp to 0 so `*i as usize` can't wrap to a gigantic pad count.
+        Some(Object::Int(i)) => (*i).max(0) as usize,
+        Some(Object::Bool(b)) => usize::from(*b),
         _ => return Err(type_error("zfill() expected int")),
     };
     let len = s.chars().count();
@@ -3886,7 +7397,10 @@ fn str_rjust(args: &[Object]) -> Result<Object, RuntimeError> {
 fn pad_str(args: &[Object], right_align: bool) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let width = match args.get(1) {
-        Some(Object::Int(i)) => *i as usize,
+        // Negative widths are no-ops in CPython (`'x'.ljust(-3) == 'x'`);
+        // clamp so the `as usize` cast can't underflow to a huge pad count.
+        Some(Object::Int(i)) => (*i).max(0) as usize,
+        Some(Object::Bool(b)) => usize::from(*b),
         _ => return Err(type_error("expected int width")),
     };
     let fill = match args.get(2) {
@@ -3909,7 +7423,10 @@ fn pad_str(args: &[Object], right_align: bool) -> Result<Object, RuntimeError> {
 fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let width = match args.get(1) {
-        Some(Object::Int(i)) => *i as usize,
+        // Negative widths are no-ops in CPython; clamp to avoid an `as usize`
+        // underflow that would request a gigantic allocation.
+        Some(Object::Int(i)) => (*i).max(0) as usize,
+        Some(Object::Bool(b)) => usize::from(*b),
         _ => return Err(type_error("center() expected int")),
     };
     let fill = match args.get(2) {
@@ -3922,7 +7439,10 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
         return Ok(Object::from_str(s.to_owned()));
     }
     let total = width - len;
-    let left = total / 2;
+    // CPython biases the extra pad to the *left* when both the margin and the
+    // width are odd (`marg / 2 + (marg & width & 1)`), so `'Monday'.center(9)`
+    // is `'  Monday '`, not `' Monday  '`.
+    let left = total / 2 + (total & width & 1);
     let right = total - left;
     let lpad: String = std::iter::repeat_n(fill, left).collect();
     let rpad: String = std::iter::repeat_n(fill, right).collect();
@@ -3930,6 +7450,12 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "expandtabs() takes at most 1 argument ({} given)",
+            args.len() - 1
+        )));
+    }
     let s = str_self(args)?;
     let tabsize = match args.get(1) {
         Some(Object::Int(i)) => *i as usize,
@@ -3981,6 +7507,12 @@ fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "removeprefix() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let s = str_self(args)?;
     let prefix = match args.get(1) {
         Some(Object::Str(p)) => p.to_string(),
@@ -3991,6 +7523,12 @@ fn str_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "removesuffix() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let s = str_self(args)?;
     let suffix = match args.get(1) {
         Some(Object::Str(p)) => p.to_string(),
@@ -4094,6 +7632,13 @@ fn str_maketrans(args: &[Object]) -> Result<Object, RuntimeError> {
 fn list_self(args: &[Object]) -> Result<Rc<RefCell<Vec<Object>>>, RuntimeError> {
     match args.first() {
         Some(Object::List(l)) => Ok(l.clone()),
+        // A subclass of `list` (`class C(list)`) carries its items in the
+        // wrapped native payload. Unbound calls — `list.append(c, x)`,
+        // `super().append(x)` — pass the instance, so unwrap it here.
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::List(l)) => Ok(l.clone()),
+            _ => Err(type_error("expected list method receiver")),
+        },
         _ => Err(type_error("expected list method receiver")),
     }
 }
@@ -4103,6 +7648,90 @@ fn list_append(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("list.append() expected 1 argument"));
     }
     list_self(args)?.borrow_mut().push(args[1].clone());
+    Ok(Object::None)
+}
+
+// List dunders exposed on the type so `list.__setitem__` /
+// `super().__getitem__` resolve for `list` subclasses (`class C(list)`).
+// These mirror CPython's `mp_subscript`/`mp_ass_subscript` slots fully:
+// both integer and slice keys work (`_HashedSeq.__init__` does
+// `self[:] = tup` on a `list` subclass, which dispatches here now that
+// the materialized `__setitem__` is in the type dict).
+fn list_index_arg(l_len: usize, idx: &Object, what: &str) -> Result<usize, RuntimeError> {
+    match idx {
+        Object::Int(i) => {
+            let len = l_len as i64;
+            let n = if *i < 0 { i + len } else { *i };
+            if n < 0 || n >= len {
+                Err(index_error("list index out of range"))
+            } else {
+                Ok(n as usize)
+            }
+        }
+        Object::Bool(b) => list_index_arg(l_len, &Object::Int(i64::from(*b)), what),
+        _ => Err(type_error(format!(
+            "list indices must be integers or slices, not {}",
+            idx.type_name()
+        ))),
+    }
+}
+
+fn list_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let l = list_self(args)?;
+    let key = args
+        .get(1)
+        .ok_or_else(|| type_error("__getitem__ expected 1 argument"))?;
+    if let Object::Slice(s) = key {
+        let seq = l.borrow().clone();
+        return Ok(Object::new_list(crate::slice_seq(&seq, s)?));
+    }
+    let l = l.borrow();
+    let n = list_index_arg(l.len(), key, "__getitem__")?;
+    Ok(l[n].clone())
+}
+
+fn list_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let l = list_self(args)?;
+    let key = args
+        .get(1)
+        .ok_or_else(|| type_error("__setitem__ expected 2 arguments"))?;
+    let val = args
+        .get(2)
+        .ok_or_else(|| type_error("__setitem__ expected 2 arguments"))?;
+    if let Object::Slice(s) = key {
+        // Materialize the replacement *before* the mutable borrow so
+        // self-assignment (`l[:] = l`) can't alias the live borrow.
+        let mut replacement = Vec::new();
+        let mut it = val.make_iter()?;
+        while let Some(v) = it.next_value() {
+            replacement.push(v);
+        }
+        crate::apply_slice_assignment(&mut l.borrow_mut(), s, replacement)?;
+        return Ok(Object::None);
+    }
+    let mut l = l.borrow_mut();
+    let n = list_index_arg(l.len(), key, "__setitem__")?;
+    l[n] = val.clone();
+    Ok(Object::None)
+}
+
+fn list_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let l = list_self(args)?;
+    let key = args
+        .get(1)
+        .ok_or_else(|| type_error("__delitem__ expected 1 argument"))?;
+    if let Object::Slice(s) = key {
+        let mut l = l.borrow_mut();
+        let mut indices = crate::slice_indices(l.len(), s)?;
+        indices.sort_unstable();
+        for i in indices.into_iter().rev() {
+            l.remove(i);
+        }
+        return Ok(Object::None);
+    }
+    let mut l = l.borrow_mut();
+    let n = list_index_arg(l.len(), key, "__delitem__")?;
+    l.remove(n);
     Ok(Object::None)
 }
 
@@ -4143,6 +7772,42 @@ fn list_extend(args: &[Object]) -> Result<Object, RuntimeError> {
         l.borrow_mut().push(v);
     }
     Ok(Object::None)
+}
+
+/// `list.__iadd__(self, other)` — extend in place, return self
+/// (CPython `list_inplace_concat`; accepts any iterable).
+fn list_iadd(args: &[Object]) -> Result<Object, RuntimeError> {
+    list_extend(args)?;
+    Ok(args[0].clone())
+}
+
+/// `list.__imul__(self, n)` — repeat in place, return self.
+fn list_imul(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error("list.__imul__() expected 1 argument"));
+    }
+    let n = match &args[1] {
+        Object::Int(i) => *i,
+        Object::Bool(b) => i64::from(*b),
+        other => {
+            return Err(type_error(format!(
+                "can't multiply sequence by non-int of type '{}'",
+                other.type_name()
+            )))
+        }
+    };
+    let l = list_self(args)?;
+    let mut data = l.borrow_mut();
+    if n <= 0 {
+        data.clear();
+    } else {
+        let original = data.clone();
+        for _ in 1..n {
+            data.extend_from_slice(&original);
+        }
+    }
+    drop(data);
+    Ok(args[0].clone())
 }
 
 fn list_insert(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4187,11 +7852,33 @@ fn list_index(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let l = list_self(args)?;
     let l = l.borrow();
-    let pos = l
-        .iter()
-        .position(|x| x.eq_value(&args[1]))
-        .ok_or_else(|| value_error("x not in list"))?;
-    Ok(Object::Int(pos as i64))
+    // CPython `list.index(value, start=0, stop=maxsize)`: negative
+    // bounds count from the end and clamp to 0 (`PySlice_AdjustIndices`
+    // semantics), and the comparison is identity-first
+    // (`PyObject_RichCompareBool`).
+    let len = l.len() as i64;
+    let adjust = |v: i64| -> i64 {
+        if v < 0 {
+            (v + len).max(0)
+        } else {
+            v.min(len)
+        }
+    };
+    let start = match args.get(2) {
+        Some(o) => adjust(coerce_index_i64(o)?),
+        None => 0,
+    };
+    let stop = match args.get(3) {
+        Some(o) => adjust(coerce_index_i64(o)?),
+        None => len,
+    };
+    for i in start..stop {
+        let x = &l[i as usize];
+        if x.is_same(&args[1]) || x.eq_value(&args[1]) {
+            return Ok(Object::Int(i));
+        }
+    }
+    Err(value_error(format!("{} is not in list", args[1].repr())))
 }
 
 fn list_count(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4200,7 +7887,12 @@ fn list_count(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let l = list_self(args)?;
     let l = l.borrow();
-    let n = l.iter().filter(|x| x.eq_value(&args[1])).count();
+    // CPython compares with `PyObject_RichCompareBool`, which is identity-first,
+    // so `[nan].count(nan)` (the same nan) is 1.
+    let n = l
+        .iter()
+        .filter(|x| x.is_same(&args[1]) || x.eq_value(&args[1]))
+        .count();
     Ok(Object::Int(n as i64))
 }
 
@@ -4239,9 +7931,26 @@ fn list_copy(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // ---------- dict methods ----------
 
+/// `dict.__iter__(self)` → a key iterator (CPython's `dict_iter`), so
+/// `iter(d)` parity holds when the dunder is fetched explicitly.
+fn dict_iter_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let recv = args
+        .first()
+        .ok_or_else(|| type_error("__iter__() missing self"))?;
+    let it = recv.make_iter()?;
+    Ok(Object::Iter(Rc::new(RefCell::new(it))))
+}
+
 fn dict_self(args: &[Object]) -> Result<Rc<RefCell<DictData>>, RuntimeError> {
     match args.first() {
         Some(Object::Dict(d)) => Ok(d.clone()),
+        // A subclass of `dict` (`class C(dict)`) carries its entries in the
+        // wrapped native payload. Unbound calls — `dict.__setitem__(c, k, v)`,
+        // `super().__setitem__(k, v)` — pass the instance, so unwrap it here.
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::Dict(d)) => Ok(d.clone()),
+            _ => Err(type_error("expected dict method receiver")),
+        },
         _ => Err(type_error("expected dict method receiver")),
     }
 }
@@ -4258,6 +7967,44 @@ fn dict_get(args: &[Object]) -> Result<Object, RuntimeError> {
         .cloned()
         .unwrap_or(default);
     Ok(value)
+}
+
+// Container dunders exposed on the type so `dict.__setitem__`,
+// `super().__getitem__`, … resolve for `dict` subclasses. They mirror the
+// VM's subscript opcodes but operate on the (possibly unwrapped) native
+// payload. `__init__` reuses `dict_update` (clear-then-fill is unnecessary:
+// a freshly constructed subclass starts with an empty native dict).
+fn dict_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = dict_self(args)?;
+    let key = args
+        .get(1)
+        .ok_or_else(|| type_error("__setitem__ expected 2 arguments"))?;
+    let val = args
+        .get(2)
+        .ok_or_else(|| type_error("__setitem__ expected 2 arguments"))?;
+    d.borrow_mut().insert(DictKey(key.clone()), val.clone());
+    Ok(Object::None)
+}
+
+fn dict_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = dict_self(args)?;
+    let key = args
+        .get(1)
+        .ok_or_else(|| type_error("__getitem__ expected 1 argument"))?;
+    let found = d.borrow().get(&DictKey(key.clone())).cloned();
+    found.ok_or_else(|| key_error(key.repr()))
+}
+
+fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let d = dict_self(args)?;
+    let key = args
+        .get(1)
+        .ok_or_else(|| type_error("__delitem__ expected 1 argument"))?;
+    if d.borrow_mut().shift_remove(&DictKey(key.clone())).is_some() {
+        Ok(Object::None)
+    } else {
+        Err(key_error(key.repr()))
+    }
 }
 
 fn dict_keys(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4352,7 +8099,10 @@ fn tuple_count(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Tuple(t)) => t.clone(),
         _ => return Err(type_error("expected tuple")),
     };
-    let n = t.iter().filter(|x| x.eq_value(&args[1])).count();
+    let n = t
+        .iter()
+        .filter(|x| x.is_same(&args[1]) || x.eq_value(&args[1]))
+        .count();
     Ok(Object::Int(n as i64))
 }
 
@@ -4364,11 +8114,31 @@ fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Tuple(t)) => t.clone(),
         _ => return Err(type_error("expected tuple")),
     };
-    let pos = t
-        .iter()
-        .position(|x| x.eq_value(&args[1]))
-        .ok_or_else(|| value_error("x not in tuple"))?;
-    Ok(Object::Int(pos as i64))
+    // Same `(value, start=0, stop=maxsize)` window + identity-first
+    // comparison semantics as `list.index`.
+    let len = t.len() as i64;
+    let adjust = |v: i64| -> i64 {
+        if v < 0 {
+            (v + len).max(0)
+        } else {
+            v.min(len)
+        }
+    };
+    let start = match args.get(2) {
+        Some(o) => adjust(coerce_index_i64(o)?),
+        None => 0,
+    };
+    let stop = match args.get(3) {
+        Some(o) => adjust(coerce_index_i64(o)?),
+        None => len,
+    };
+    for i in start..stop {
+        let x = &t[i as usize];
+        if x.is_same(&args[1]) || x.eq_value(&args[1]) {
+            return Ok(Object::Int(i));
+        }
+    }
+    Err(value_error("tuple.index(x): x not in tuple"))
 }
 
 // ---------- dict extras ----------
@@ -4401,8 +8171,13 @@ fn dict_fromkeys(args: &[Object]) -> Result<Object, RuntimeError> {
     // shape: the bound version receives the dict as ``args[0]``;
     // the unbound version omits it. Sniff the receiver shape so a
     // single body handles both.
-    let (it_idx, value_idx) = match args.first() {
-        Some(Object::Dict(_)) | Some(Object::Type(_)) => (1usize, 2usize),
+    // A lone dict argument is the *iterable* of an unbound call
+    // (`map(dict.fromkeys, list_of_dicts)` — ChainMap.__iter__ does
+    // this); a dict in slot 0 only marks the bound receiver when more
+    // arguments follow.
+    let (it_idx, value_idx) = match (args.first(), args.len()) {
+        (Some(Object::Type(_)), _) => (1usize, 2usize),
+        (Some(Object::Dict(_)), n) if n >= 2 => (1usize, 2usize),
         _ => (0usize, 1usize),
     };
     let it = args
@@ -4707,51 +8482,250 @@ fn bytes_data(args: &[Object]) -> Result<Vec<u8>, RuntimeError> {
     }
 }
 
+/// Run `f` over the receiver's bytes *without* copying them. The search
+/// family (`find`/`rfind`/`count`/`index`/`rindex`) is called in tight
+/// loops over megabyte haystacks (test_bytes' fastsearch suite); a
+/// per-call `to_vec` of the haystack turns the O(n+m) search into an
+/// O(n) copy per call and blows the suite's time budget.
+fn with_bytes_data<R>(
+    args: &[Object],
+    f: impl FnOnce(&[u8]) -> Result<R, RuntimeError>,
+) -> Result<R, RuntimeError> {
+    match args.first() {
+        Some(Object::Bytes(b)) => f(b),
+        Some(Object::ByteArray(b)) => {
+            let guard = b.borrow();
+            f(&guard)
+        }
+        _ => Err(type_error("expected bytes-like receiver")),
+    }
+}
+
 fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
     match arg {
         Object::Bytes(b) => Ok(b.to_vec()),
         Object::ByteArray(b) => Ok(b.borrow().clone()),
-        Object::Str(s) => Ok(s.as_bytes().to_vec()),
-        Object::Int(i) if (0..=255).contains(i) => Ok(vec![*i as u8]),
-        _ => Err(type_error("a bytes-like object is required")),
+        Object::MemoryView(mv) => Ok(mv.to_bytes()),
+        Object::Instance(inst) => {
+            // bytes/bytearray subclasses carry their payload natively.
+            if let Some(native) = &inst.native {
+                let native = native.clone();
+                if matches!(
+                    native,
+                    Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+                ) {
+                    return bytes_argview(&native);
+                }
+            }
+            // PEP 688: an object exposing `__buffer__` works anywhere a
+            // bytes-like object is accepted. Reenter the interpreter to
+            // call it (CPython's PyObject_GetBuffer slot dispatch).
+            if let Some(method) = crate::instance_method(arg, "__buffer__") {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still live
+                    // on this thread; the GIL keeps the access exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    let globals = interp.builtins_dict();
+                    let r = interp.call_object_with_globals(
+                        &method,
+                        &[Object::Int(0)],
+                        &[],
+                        &globals,
+                    )?;
+                    return match &r {
+                        Object::MemoryView(mv) => Ok(mv.to_bytes()),
+                        Object::Bytes(b) => Ok(b.to_vec()),
+                        Object::ByteArray(b) => Ok(b.borrow().clone()),
+                        _ => Err(type_error(format!(
+                            "__buffer__ returned non-buffer of type '{}'",
+                            r.type_name()
+                        ))),
+                    };
+                }
+            }
+            Err(type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                arg.type_name()
+            )))
+        }
+        _ => Err(type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            arg.type_name()
+        ))),
     }
 }
 
-fn bytes_decode(args: &[Object]) -> Result<Object, RuntimeError> {
+/// Needle argument of `bytes.find` / `rfind` / `index` / `rindex` /
+/// `count` / `in`: a bytes-like object, or an integer naming a single
+/// byte (range-checked like CPython's `_getbytevalue`). Objects with a
+/// user `__index__` go through interpreter reentry like CPython's
+/// `PyNumber_Index` path.
+fn bytes_find_needle(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
+    let native = arg.native_value();
+    match native.as_ref().unwrap_or(arg) {
+        Object::Bytes(b) => Ok(b.to_vec()),
+        Object::ByteArray(b) => Ok(b.borrow().clone()),
+        Object::MemoryView(mv) => Ok(mv.to_bytes()),
+        Object::Bool(v) => Ok(vec![u8::from(*v)]),
+        Object::Int(i) => {
+            if (0..=255).contains(i) {
+                Ok(vec![*i as u8])
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        Object::Long(_) => Err(value_error("byte must be in range(0, 256)")),
+        inst @ Object::Instance(_) if crate::instance_method(inst, "__index__").is_some() => {
+            let v = coerce_index_i64(inst)?;
+            if (0..=255).contains(&v) {
+                Ok(vec![v as u8])
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        _ => Err(type_error(format!(
+            "argument should be integer or bytes-like object, not '{}'",
+            arg.type_name()
+        ))),
+    }
+}
+
+/// Build a transform result that follows the receiver's type
+/// (`bytes.lower() -> bytes`, `bytearray.lower() -> bytearray`).
+fn bytes_like_result(args: &[Object], out: Vec<u8>) -> Object {
+    if matches!(args.first(), Some(Object::ByteArray(_))) {
+        Object::new_bytearray(out)
+    } else {
+        Object::new_bytes(out)
+    }
+}
+
+fn byte_is_pyspace(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
+}
+
+fn bytes_decode_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let encoding = match args.get(1) {
+    let encoding = match arg_or_kw(args, 1, kwargs, "encoding") {
         Some(Object::Str(e)) => e.to_string(),
         None => "utf-8".to_owned(),
         _ => return Err(type_error("decode() expected str")),
     };
-    let errors = match args.get(2) {
+    let errors = match arg_or_kw(args, 2, kwargs, "errors") {
         Some(Object::Str(e)) => e.to_string(),
-        None => "strict".to_owned(),
         _ => "strict".to_owned(),
     };
     let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;
     Ok(Object::from_str(s))
 }
 
-fn bytes_hex(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
-    let sep: Option<u8> = match args.get(1) {
-        Some(Object::Str(s)) => {
-            let bytes = s.as_bytes();
-            if bytes.len() != 1 {
-                return Err(value_error("sep must be length 1."));
-            }
-            Some(bytes[0])
-        }
-        Some(Object::Bytes(b)) if b.len() == 1 => Some(b[0]),
-        Some(Object::None) | None => None,
-        _ => return Err(type_error("sep must be a 1-byte string")),
+fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let data = match args.first() {
+        Some(Object::MemoryView(mv)) => mv.to_bytes(),
+        _ => bytes_data(args)?,
     };
-    let bytes_per_sep = match args.get(2) {
+    let mut sep_obj = args.get(1).cloned();
+    let mut bps_obj = args.get(2).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "sep" => sep_obj = Some(v.clone()),
+            "bytes_per_sep" => bps_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "hex() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    // CPython sizes `sep` with `PyObject_Length`, which dispatches an
+    // overridden `__len__` — user code that may try to resize the
+    // receiving bytearray. Hold an export so that resize raises
+    // BufferError instead of leaving the hex loop reading freed
+    // memory (gh-143195).
+    let _guard = bytearray_receiver_guard(args);
+    let sep: Option<u8> = match &sep_obj {
+        None => None,
+        Some(sep_arg) => {
+            // Virtual length first (an overridden `__len__` runs here);
+            // then validate against the native payload.
+            let native = sep_arg.native_value();
+            let unwrapped = native.as_ref().unwrap_or(sep_arg);
+            let reported_len: Option<i64> = if let (Object::Instance(_), Some(m)) =
+                (sep_arg, crate::instance_method(sep_arg, "__len__"))
+            {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still
+                    // live on this thread; the GIL keeps it exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    let globals = interp.builtins_dict();
+                    let r = interp.call_object_with_globals(&m, &[], &[], &globals)?;
+                    r.as_i64()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match unwrapped {
+                Object::Str(s) => {
+                    let n = reported_len.unwrap_or_else(|| s.chars().count() as i64);
+                    if n != 1 {
+                        return Err(value_error("sep must be length 1."));
+                    }
+                    let c = s
+                        .chars()
+                        .next()
+                        .ok_or_else(|| value_error("sep must be length 1."))?;
+                    if (c as u32) > 0x7f {
+                        return Err(value_error("sep must be ASCII."));
+                    }
+                    Some(c as u8)
+                }
+                Object::Bytes(b) => {
+                    let n = reported_len.unwrap_or(b.len() as i64);
+                    if n != 1 || b.is_empty() {
+                        return Err(value_error("sep must be length 1."));
+                    }
+                    if b[0] > 0x7f {
+                        return Err(value_error("sep must be ASCII."));
+                    }
+                    Some(b[0])
+                }
+                Object::ByteArray(b) => {
+                    let b = b.borrow();
+                    let n = reported_len.unwrap_or(b.len() as i64);
+                    if n != 1 || b.is_empty() {
+                        return Err(value_error("sep must be length 1."));
+                    }
+                    if b[0] > 0x7f {
+                        return Err(value_error("sep must be ASCII."));
+                    }
+                    Some(b[0])
+                }
+                other => {
+                    return Err(type_error(format!(
+                        "sep must be str or bytes, not {}",
+                        other.type_name()
+                    )))
+                }
+            }
+        }
+    };
+    let bytes_per_sep = match &bps_obj {
         Some(Object::Int(i)) => *i,
         Some(Object::Bool(b)) => i64::from(*b),
+        Some(Object::Long(_)) => {
+            return Err(crate::error::overflow_error(
+                "Python int too large to convert to C int",
+            ))
+        }
         None => 1,
-        _ => return Err(type_error("bytes_per_sep must be int")),
+        Some(other) => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                other.type_name()
+            )))
+        }
     };
     let mut out = String::with_capacity(data.len() * 2);
     let step = bytes_per_sep.unsigned_abs() as usize;
@@ -4788,36 +8762,8 @@ fn bytes_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         args.first()
     };
-    let s = match s_obj {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("fromhex() argument must be str")),
-    };
-    let mut bytes = Vec::new();
-    let mut last_high: Option<u8> = None;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if last_high.is_some() {
-                return Err(value_error("non-hexadecimal number"));
-            }
-            continue;
-        }
-        let v = c.to_digit(16).ok_or_else(|| {
-            value_error(format!(
-                "non-hexadecimal number found in fromhex() arg at position {}",
-                c.len_utf8()
-            ))
-        })? as u8;
-        match last_high {
-            Some(hi) => {
-                bytes.push((hi << 4) | v);
-                last_high = None;
-            }
-            None => last_high = Some(v),
-        }
-    }
-    if last_high.is_some() {
-        return Err(value_error("non-hexadecimal number"));
-    }
+    let s = fromhex_string_arg(s_obj)?;
+    let bytes = parse_hex_bytes(&s)?;
     // Decide return type based on receiver: bytearray.fromhex returns bytearray;
     // bytes.fromhex returns bytes.
     if matches!(args.first(), Some(Object::ByteArray(_))) {
@@ -4828,23 +8774,39 @@ fn bytes_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
+    bytes_search_arity("startswith", args)?;
     let target = args
         .get(1)
         .ok_or_else(|| type_error("startswith() expected 1 arg"))?;
-    Ok(Object::Bool(bytes_match_prefix_suffix(
-        &data, target, true,
-    )?))
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid {
+            return Ok(Object::Bool(false));
+        }
+        Ok(Object::Bool(bytes_match_prefix_suffix(
+            &data[start..end],
+            target,
+            true,
+        )?))
+    })
 }
 
 fn bytes_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
+    bytes_search_arity("endswith", args)?;
     let target = args
         .get(1)
         .ok_or_else(|| type_error("endswith() expected 1 arg"))?;
-    Ok(Object::Bool(bytes_match_prefix_suffix(
-        &data, target, false,
-    )?))
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid {
+            return Ok(Object::Bool(false));
+        }
+        Ok(Object::Bool(bytes_match_prefix_suffix(
+            &data[start..end],
+            target,
+            false,
+        )?))
+    })
 }
 
 fn bytes_match_prefix_suffix(
@@ -4852,6 +8814,7 @@ fn bytes_match_prefix_suffix(
     target: &Object,
     prefix: bool,
 ) -> Result<bool, RuntimeError> {
+    let name = if prefix { "startswith" } else { "endswith" };
     let test = |needle: &[u8]| {
         if prefix {
             data.starts_with(needle)
@@ -4862,7 +8825,13 @@ fn bytes_match_prefix_suffix(
     match target {
         Object::Tuple(parts) => {
             for item in parts.iter() {
-                let needle = bytes_argview(item)?;
+                let needle = bytes_argview(item).map_err(|_| {
+                    type_error(format!(
+                        "tuple for {name} must only contain bytes-like objects, \
+                         not '{}'",
+                        item.type_name()
+                    ))
+                })?;
                 if test(&needle) {
                     return Ok(true);
                 }
@@ -4870,38 +8839,51 @@ fn bytes_match_prefix_suffix(
             Ok(false)
         }
         _ => {
-            let needle = bytes_argview(target)?;
+            let needle = bytes_argview(target).map_err(|_| {
+                type_error(format!(
+                    "{name} first arg must be bytes or a tuple of bytes, not {}",
+                    target.type_name()
+                ))
+            })?;
             Ok(test(&needle))
         }
     }
 }
 
 /// Resolve the optional `start`/`end` arguments of `bytes.find` and
-/// friends (positions 2 and 3) into a clamped `[start, end]` byte
-/// window, applying CPython's slice-style negative-index handling.
-fn bytes_search_range(args: &[Object], len: usize) -> (usize, usize) {
+/// friends (positions 2 and 3) the way CPython's `ADJUST_INDICES`
+/// does: negative indices are offset by the length and floored at 0,
+/// `end` is clamped to the length but `start` is **not** — a start
+/// past the end makes the window invalid (third tuple slot), which
+/// matters for empty needles (`b'abc'.find(b'', 4) == -1`).
+fn bytes_search_range(args: &[Object], len: usize) -> (usize, usize, bool) {
     let n = len as i64;
     let resolve = |o: Option<&Object>, default: i64| -> i64 {
         match o {
             None | Some(Object::None) => default,
             Some(obj) => match obj.as_i64() {
-                Some(mut x) => {
+                Some(x) => {
                     if x < 0 {
-                        x += n;
+                        (x + n).max(0)
+                    } else {
+                        x
                     }
-                    x.clamp(0, n)
                 }
                 None => default,
             },
         }
     };
-    let start = resolve(args.get(2), 0).clamp(0, n) as usize;
-    let end = resolve(args.get(3), n).clamp(0, n) as usize;
-    (start, end.max(start))
+    let raw_start = resolve(args.get(2), 0);
+    let end = resolve(args.get(3), n).clamp(0, n);
+    let invalid = raw_start > end;
+    let start = raw_start.clamp(0, end.max(0));
+    (start as usize, end as usize, invalid)
 }
 
 /// Find `sub` within `data[start..end]`, returning the *absolute*
 /// position (or -1). Mirrors `bytes.find`'s empty-needle behaviour.
+/// `memmem` is O(n + m) like CPython's stringlib fastsearch — the
+/// suite checks this (`test_adaptive_find` with megabyte needles).
 fn bytes_find_in(data: &[u8], sub: &[u8], start: usize, end: usize) -> i64 {
     if start > end || end > data.len() {
         return -1;
@@ -4910,103 +8892,163 @@ fn bytes_find_in(data: &[u8], sub: &[u8], start: usize, end: usize) -> i64 {
     if sub.is_empty() {
         return start as i64;
     }
-    if sub.len() > hay.len() {
-        return -1;
+    memchr::memmem::find(hay, sub).map_or(-1, |i| (start + i) as i64)
+}
+
+/// gh-142560: converting a search argument can run Python code (a user
+/// `__index__` / `__buffer__`) that tries to resize the receiving
+/// bytearray while the search holds its buffer. Holding a real export
+/// for the duration makes the offending resize raise `BufferError`
+/// at the mutation site, exactly like CPython.
+fn bytes_needle_guarded(args: &[Object], arg: &Object) -> Result<Vec<u8>, RuntimeError> {
+    let _guard = bytearray_receiver_guard(args);
+    bytes_find_needle(arg)
+}
+
+/// Export the receiver's buffer (when it is a bytearray) for the
+/// lifetime of the returned guard.
+fn bytearray_receiver_guard(args: &[Object]) -> Option<crate::object::ByteArrayExportGuard> {
+    match args.first() {
+        Some(Object::ByteArray(cell)) => {
+            Some(crate::object::ByteArrayExportGuard::new(cell.clone()))
+        }
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::ByteArray(cell)) => {
+                Some(crate::object::ByteArrayExportGuard::new(cell.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
     }
-    hay.windows(sub.len())
-        .position(|w| w == sub)
-        .map_or(-1, |i| (start + i) as i64)
+}
+
+/// `_PyArg_CheckPositional("find", nargs, 1, 3)` — the search family
+/// takes `sub[, start[, end]]`.
+fn bytes_search_arity(name: &str, args: &[Object]) -> Result<(), RuntimeError> {
+    let nargs = args.len().saturating_sub(1);
+    if nargs > 3 {
+        return Err(type_error(format!(
+            "{name} expected at most 3 arguments, got {nargs}"
+        )));
+    }
+    if nargs < 1 {
+        return Err(type_error(format!(
+            "{name} expected at least 1 argument, got {nargs}"
+        )));
+    }
+    Ok(())
 }
 
 fn bytes_find(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
-    let sub = bytes_argview(
+    bytes_search_arity("find", args)?;
+    let sub = bytes_needle_guarded(
+        args,
         args.get(1)
             .ok_or_else(|| type_error("find() expected 1 arg"))?,
     )?;
-    let (start, end) = bytes_search_range(args, data.len());
-    Ok(Object::Int(bytes_find_in(&data, &sub, start, end)))
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid {
+            return Ok(Object::Int(-1));
+        }
+        Ok(Object::Int(bytes_find_in(data, &sub, start, end)))
+    })
 }
 
 fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
-    let sub = bytes_argview(
+    bytes_search_arity("rfind", args)?;
+    let sub = bytes_needle_guarded(
+        args,
         args.get(1)
             .ok_or_else(|| type_error("rfind() expected 1 arg"))?,
     )?;
-    let (start, end) = bytes_search_range(args, data.len());
-    if start > end || end > data.len() {
-        return Ok(Object::Int(-1));
-    }
-    if sub.is_empty() {
-        return Ok(Object::Int(end as i64));
-    }
-    let mut last = -1i64;
-    if sub.len() <= end - start {
-        for i in start..=end - sub.len() {
-            if data[i..i + sub.len()] == sub[..] {
-                last = i as i64;
-            }
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid || end > data.len() {
+            return Ok(Object::Int(-1));
         }
-    }
-    Ok(Object::Int(last))
+        if sub.is_empty() {
+            return Ok(Object::Int(end as i64));
+        }
+        let last =
+            memchr::memmem::rfind(&data[start..end], &sub).map_or(-1, |i| (start + i) as i64);
+        Ok(Object::Int(last))
+    })
 }
 
 fn bytes_index(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_search_arity("index", args)?;
     match bytes_find(args)? {
         Object::Int(i) if i >= 0 => Ok(Object::Int(i)),
         _ => Err(value_error("subsection not found")),
     }
 }
 
+fn bytes_rindex(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_search_arity("rindex", args)?;
+    match bytes_rfind(args)? {
+        Object::Int(i) if i >= 0 => Ok(Object::Int(i)),
+        _ => Err(value_error("subsection not found")),
+    }
+}
+
 fn bytes_count(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
-    let sub = bytes_argview(
+    bytes_search_arity("count", args)?;
+    let sub = bytes_needle_guarded(
+        args,
         args.get(1)
             .ok_or_else(|| type_error("count() expected 1 arg"))?,
     )?;
-    let (start, end) = bytes_search_range(args, data.len());
-    if sub.is_empty() {
-        return Ok(Object::Int((end - start) as i64 + 1));
-    }
-    let mut n = 0i64;
-    let mut i = start;
-    while i + sub.len() <= end {
-        if data[i..i + sub.len()] == sub[..] {
-            n += 1;
-            i += sub.len();
-        } else {
-            i += 1;
+    with_bytes_data(args, |data| {
+        let (start, end, invalid) = bytes_search_range(args, data.len());
+        if invalid {
+            return Ok(Object::Int(0));
         }
+        if sub.is_empty() {
+            return Ok(Object::Int((end - start) as i64 + 1));
+        }
+        // Non-overlapping occurrences, like CPython's `stringlib_count`.
+        let n = memchr::memmem::find_iter(&data[start..end], &sub).count() as i64;
+        Ok(Object::Int(n))
+    })
+}
+
+/// CPython parity: the no-argument bytes/bytearray methods
+/// (`upper`, `islower`, …) are `METH_NOARGS` and raise `TypeError`
+/// when called with anything beyond the receiver.
+fn bytes_no_args(name: &str, args: &[Object]) -> Result<(), RuntimeError> {
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "{name}() takes no arguments ({} given)",
+            args.len() - 1
+        )));
     }
-    Ok(Object::Int(n))
+    Ok(())
 }
 
 fn bytes_lower(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::new_bytes(
-        bytes_data(args)?
-            .iter()
-            .map(|b| b.to_ascii_lowercase())
-            .collect::<Vec<_>>(),
-    ))
+    bytes_no_args("lower", args)?;
+    let out: Vec<u8> = bytes_data(args)?
+        .iter()
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    Ok(bytes_like_result(args, out))
 }
 
 fn bytes_upper(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::new_bytes(
-        bytes_data(args)?
-            .iter()
-            .map(|b| b.to_ascii_uppercase())
-            .collect::<Vec<_>>(),
-    ))
+    bytes_no_args("upper", args)?;
+    let out: Vec<u8> = bytes_data(args)?
+        .iter()
+        .map(|b| b.to_ascii_uppercase())
+        .collect();
+    Ok(bytes_like_result(args, out))
 }
 
 fn bytes_strip(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let trim_set: Vec<u8> = match args.get(1) {
-        Some(Object::Bytes(b)) => b.to_vec(),
-        Some(Object::ByteArray(b)) => b.borrow().clone(),
         None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
-        _ => return Err(type_error("strip() expected bytes")),
+        Some(other) => bytes_argview(other)?,
     };
     let start = data
         .iter()
@@ -5016,79 +9058,225 @@ fn bytes_strip(args: &[Object]) -> Result<Object, RuntimeError> {
         .iter()
         .rposition(|b| !trim_set.contains(b))
         .map_or(start, |i| i + 1);
-    Ok(Object::new_bytes(data[start..end].to_vec()))
+    Ok(bytes_like_result(args, data[start..end].to_vec()))
 }
 
 fn bytes_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let trim_set: Vec<u8> = match args.get(1) {
-        Some(Object::Bytes(b)) => b.to_vec(),
-        Some(Object::ByteArray(b)) => b.borrow().clone(),
         None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
-        _ => return Err(type_error("lstrip() expected bytes")),
+        Some(other) => bytes_argview(other)?,
     };
     let start = data
         .iter()
         .position(|b| !trim_set.contains(b))
         .unwrap_or(data.len());
-    Ok(Object::new_bytes(data[start..].to_vec()))
+    Ok(bytes_like_result(args, data[start..].to_vec()))
 }
 
 fn bytes_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let trim_set: Vec<u8> = match args.get(1) {
-        Some(Object::Bytes(b)) => b.to_vec(),
-        Some(Object::ByteArray(b)) => b.borrow().clone(),
         None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
-        _ => return Err(type_error("rstrip() expected bytes")),
+        Some(other) => bytes_argview(other)?,
     };
     let end = data
         .iter()
         .rposition(|b| !trim_set.contains(b))
         .map_or(0, |i| i + 1);
-    Ok(Object::new_bytes(data[..end].to_vec()))
+    Ok(bytes_like_result(args, data[..end].to_vec()))
 }
 
-fn bytes_split(args: &[Object]) -> Result<Object, RuntimeError> {
+/// Shared argument parsing for `bytes.split` / `rsplit`:
+/// `(sep=None, maxsplit=-1)`, both passable as keywords.
+fn bytes_split_args(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    name: &str,
+) -> Result<(Vec<u8>, Option<Vec<u8>>, i64), RuntimeError> {
     let data = bytes_data(args)?;
-    let sep: Option<Vec<u8>> = match args.get(1) {
+    let mut sep_obj = args.get(1).cloned();
+    let mut maxsplit_obj = args.get(2).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "sep" => sep_obj = Some(v.clone()),
+            "maxsplit" => maxsplit_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "{name}() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let sep = match sep_obj {
         None | Some(Object::None) => None,
-        Some(Object::Bytes(b)) => Some(b.to_vec()),
-        Some(Object::ByteArray(b)) => Some(b.borrow().clone()),
-        _ => return Err(type_error("split() expected bytes")),
+        Some(other) => {
+            // Same reentrancy hazard as the find family (gh-142560):
+            // converting `sep` can run user code (`__buffer__`) that
+            // tries to resize the receiving bytearray.
+            let _guard = bytearray_receiver_guard(args);
+            Some(bytes_argview(&other)?)
+        }
     };
-    let parts: Vec<Vec<u8>> = match sep {
-        None => data
-            .split(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c'))
-            .filter(|s| !s.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect(),
-        Some(sep) if !sep.is_empty() => {
-            let mut out: Vec<Vec<u8>> = Vec::new();
-            let mut start = 0;
+    if let Some(s) = &sep {
+        if s.is_empty() {
+            return Err(value_error("empty separator"));
+        }
+    }
+    let maxsplit = match maxsplit_obj {
+        None => -1,
+        Some(o) => o
+            .as_i64()
+            .ok_or_else(|| type_error("integer argument expected"))?,
+    };
+    Ok((data, sep, maxsplit))
+}
+
+fn bytes_split_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let (data, sep, maxsplit) = bytes_split_args(args, kwargs, "split")?;
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    match sep {
+        None => {
             let mut i = 0;
-            while i + sep.len() <= data.len() {
-                if data[i..i + sep.len()] == sep[..] {
-                    out.push(data[start..i].to_vec());
-                    i += sep.len();
-                    start = i;
-                } else {
+            let mut nsplit = 0i64;
+            while i < data.len() {
+                while i < data.len() && byte_is_pyspace(data[i]) {
                     i += 1;
                 }
+                if i >= data.len() {
+                    break;
+                }
+                if maxsplit >= 0 && nsplit >= maxsplit {
+                    parts.push(data[i..].to_vec());
+                    break;
+                }
+                let start = i;
+                while i < data.len() && !byte_is_pyspace(data[i]) {
+                    i += 1;
+                }
+                parts.push(data[start..i].to_vec());
+                nsplit += 1;
             }
-            out.push(data[start..].to_vec());
-            out
         }
-        _ => vec![data],
-    };
+        Some(sep) => {
+            let mut start = 0;
+            let mut nsplit = 0i64;
+            while maxsplit < 0 || nsplit < maxsplit {
+                match memchr::memmem::find(&data[start..], &sep) {
+                    Some(rel) => {
+                        parts.push(data[start..start + rel].to_vec());
+                        start += rel + sep.len();
+                        nsplit += 1;
+                    }
+                    None => break,
+                }
+            }
+            parts.push(data[start..].to_vec());
+        }
+    }
+    let is_ba = matches!(args.first(), Some(Object::ByteArray(_)));
     Ok(Object::new_list(
-        parts.into_iter().map(Object::new_bytes).collect(),
+        parts
+            .into_iter()
+            .map(|p| {
+                if is_ba {
+                    Object::new_bytearray(p)
+                } else {
+                    Object::new_bytes(p)
+                }
+            })
+            .collect(),
     ))
 }
 
-fn bytes_splitlines(args: &[Object]) -> Result<Object, RuntimeError> {
+fn bytes_rsplit_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let (data, sep, maxsplit) = bytes_split_args(args, kwargs, "rsplit")?;
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    match sep {
+        None => {
+            let mut i = data.len();
+            let mut nsplit = 0i64;
+            while i > 0 {
+                while i > 0 && byte_is_pyspace(data[i - 1]) {
+                    i -= 1;
+                }
+                if i == 0 {
+                    break;
+                }
+                if maxsplit >= 0 && nsplit >= maxsplit {
+                    parts.push(data[..i].to_vec());
+                    break;
+                }
+                let end = i;
+                while i > 0 && !byte_is_pyspace(data[i - 1]) {
+                    i -= 1;
+                }
+                parts.push(data[i..end].to_vec());
+                nsplit += 1;
+            }
+            parts.reverse();
+        }
+        Some(sep) => {
+            let mut end = data.len();
+            let mut nsplit = 0i64;
+            while maxsplit < 0 || nsplit < maxsplit {
+                match memchr::memmem::rfind(&data[..end], &sep) {
+                    Some(pos) => {
+                        parts.push(data[pos + sep.len()..end].to_vec());
+                        end = pos;
+                        nsplit += 1;
+                    }
+                    None => break,
+                }
+            }
+            parts.push(data[..end].to_vec());
+            parts.reverse();
+        }
+    }
+    let is_ba = matches!(args.first(), Some(Object::ByteArray(_)));
+    Ok(Object::new_list(
+        parts
+            .into_iter()
+            .map(|p| {
+                if is_ba {
+                    Object::new_bytearray(p)
+                } else {
+                    Object::new_bytes(p)
+                }
+            })
+            .collect(),
+    ))
+}
+
+fn bytes_splitlines_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let keepends = matches!(args.get(1), Some(Object::Bool(true)));
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "splitlines() takes at most 1 argument ({} given)",
+            args.len() - 1
+        )));
+    }
+    let mut keepends_obj = args.get(1).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "keepends" => keepends_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "splitlines() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let keepends = match &keepends_obj {
+        None => false,
+        Some(o) => o
+            .as_i64()
+            .map(|v| v != 0)
+            .ok_or_else(|| type_error("an integer is required"))?,
+    };
     let mut out: Vec<Object> = Vec::new();
     let mut start = 0;
     let mut i = 0;
@@ -5104,7 +9292,7 @@ fn bytes_splitlines(args: &[Object]) -> Result<Object, RuntimeError> {
             } else {
                 &data[start..no_eol]
             };
-            out.push(Object::new_bytes(slice.to_vec()));
+            out.push(bytes_like_result(args, slice.to_vec()));
             start = end;
             i = end;
         } else {
@@ -5112,9 +9300,46 @@ fn bytes_splitlines(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     if start < data.len() {
-        out.push(Object::new_bytes(data[start..].to_vec()));
+        out.push(bytes_like_result(args, data[start..].to_vec()));
     }
     Ok(Object::new_list(out))
+}
+
+/// `bytes.__mod__` / `bytearray.__mod__` — PEP 461 formatting through
+/// the running interpreter (instances may need `__bytes__`/`__repr__`).
+fn bytes_dunder_mod(args: &[Object]) -> Result<Object, RuntimeError> {
+    let receiver = args
+        .first()
+        .ok_or_else(|| type_error("__mod__ requires a receiver"))?;
+    let other = args
+        .get(1)
+        .ok_or_else(|| type_error("__mod__ expected 1 argument"))?;
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame still live on this
+        // thread; the GIL keeps the access exclusive.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        interp.bytes_percent_format(receiver, other, &globals)
+    } else {
+        Err(type_error("bytes %-formatting requires the interpreter"))
+    }
+}
+
+/// `bytes.__rmod__`: only formats when the *left* operand is bytes-like
+/// (then it's really that operand's format), otherwise `NotImplemented`.
+fn bytes_dunder_rmod(args: &[Object]) -> Result<Object, RuntimeError> {
+    let receiver = args
+        .first()
+        .ok_or_else(|| type_error("__rmod__ requires a receiver"))?;
+    let other = args
+        .get(1)
+        .ok_or_else(|| type_error("__rmod__ expected 1 argument"))?;
+    if matches!(other, Object::Bytes(_) | Object::ByteArray(_)) {
+        let swapped = [other.clone(), receiver.clone()];
+        bytes_dunder_mod(&swapped)
+    } else {
+        Ok(crate::vm_singletons::not_implemented())
+    }
 }
 
 fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5122,14 +9347,38 @@ fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
     let it = args
         .get(1)
         .ok_or_else(|| type_error("join() expected iterable"))?;
-    let mut parts: Vec<Vec<u8>> = Vec::new();
-    let mut iter = it.make_iter()?;
-    while let Some(v) = iter.next_value() {
-        match v {
-            Object::Bytes(b) => parts.push(b.to_vec()),
-            Object::ByteArray(b) => parts.push(b.borrow().clone()),
-            _ => return Err(type_error("sequence item: expected bytes")),
+    // Iterate through the interpreter so user iterables / generators
+    // work, not just native containers.
+    let items: Vec<Object> = match it {
+        Object::List(l) => l.borrow().clone(),
+        Object::Tuple(t) => t.to_vec(),
+        other => {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame still live on
+                // this thread; the GIL keeps the access exclusive.
+                let interp = unsafe { &mut *ptr };
+                let globals = interp.builtins_dict();
+                interp.collect_iterable(other, &globals)?
+            } else {
+                let mut iter = other.make_iter()?;
+                let mut out = Vec::new();
+                while let Some(v) = iter.next_value() {
+                    out.push(v);
+                }
+                out
+            }
         }
+    };
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+    for v in &items {
+        let part = bytes_argview(v).map_err(|_| {
+            type_error(format!(
+                "sequence item {}: expected a bytes-like object, {} found",
+                parts.len(),
+                v.type_name()
+            ))
+        })?;
+        parts.push(part);
     }
     let mut out = Vec::new();
     for (i, p) in parts.iter().enumerate() {
@@ -5138,10 +9387,10 @@ fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         out.extend_from_slice(p);
     }
-    Ok(Object::new_bytes(out))
+    Ok(bytes_like_result(args, out))
 }
 
-fn bytes_replace(args: &[Object]) -> Result<Object, RuntimeError> {
+fn bytes_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let from = bytes_argview(
         args.get(1)
@@ -5151,11 +9400,31 @@ fn bytes_replace(args: &[Object]) -> Result<Object, RuntimeError> {
         args.get(2)
             .ok_or_else(|| type_error("replace() expected 2 args"))?,
     )?;
+    let mut max_obj = args.get(3).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "count" => max_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "replace() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let max = match max_obj {
+        None | Some(Object::None) => -1i64,
+        Some(o) => o
+            .as_i64()
+            .ok_or_else(|| type_error("integer argument expected"))?,
+    };
     let mut out = Vec::new();
+    let mut done = 0i64;
     let mut i = 0;
     while i < data.len() {
-        if i + from.len() <= data.len() && data[i..i + from.len()] == from[..] {
+        let within_budget = max < 0 || done < max;
+        if within_budget && i + from.len() <= data.len() && data[i..i + from.len()] == from[..] {
             out.extend_from_slice(&to);
+            done += 1;
             i += from.len().max(1);
             if from.is_empty() {
                 out.push(data[i - 1]);
@@ -5165,17 +9434,41 @@ fn bytes_replace(args: &[Object]) -> Result<Object, RuntimeError> {
             i += 1;
         }
     }
-    Ok(Object::new_bytes(out))
+    // An empty needle also matches at end-of-string (CPython appends a
+    // final replacement: `b"ab".replace(b"", b"-") == b"-a-b-"`).
+    if from.is_empty() && (max < 0 || done < max) {
+        out.extend_from_slice(&to);
+    }
+    Ok(bytes_like_result(args, out))
 }
 
 /// `bytes.translate(table, /, delete=b'')` and the `bytearray`
 /// equivalent. `table` is `None` (identity) or a bytes-like of length
 /// 256; bytes present in `delete` are dropped first. The receiver's
 /// type (bytes vs bytearray) is preserved.
-fn bytes_translate(args: &[Object]) -> Result<Object, RuntimeError> {
+fn bytes_translate_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
+    let mut delete_obj = args.get(2).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "delete" => delete_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "translate() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
     let table = match args.get(1) {
-        None | Some(Object::None) => None,
+        None => {
+            return Err(type_error(
+                "translate() takes at least 1 argument (0 given)",
+            ))
+        }
+        Some(Object::None) => None,
         Some(o) => {
             let t = bytes_argview(o)?;
             if t.len() != 256 {
@@ -5184,9 +9477,9 @@ fn bytes_translate(args: &[Object]) -> Result<Object, RuntimeError> {
             Some(t)
         }
     };
-    let delete = match args.get(2) {
-        None | Some(Object::None) => Vec::new(),
-        Some(o) => bytes_argview(o)?,
+    let delete = match delete_obj {
+        None => Vec::new(),
+        Some(o) => bytes_argview(&o)?,
     };
     let mut out = Vec::with_capacity(data.len());
     for &b in &data {
@@ -5226,7 +9519,417 @@ fn bytes_maketrans(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_bytes(table))
 }
 
+fn bytes_partition(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let sep = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("partition() expected 1 arg"))?,
+    )?;
+    if sep.is_empty() {
+        return Err(value_error("empty separator"));
+    }
+    let (head, mid, tail) = match memchr::memmem::find(&data, &sep) {
+        Some(i) => (
+            data[..i].to_vec(),
+            sep.clone(),
+            data[i + sep.len()..].to_vec(),
+        ),
+        None => (data, Vec::new(), Vec::new()),
+    };
+    Ok(Object::new_tuple(vec![
+        bytes_like_result(args, head),
+        bytes_like_result(args, mid),
+        bytes_like_result(args, tail),
+    ]))
+}
+
+fn bytes_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let sep = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("rpartition() expected 1 arg"))?,
+    )?;
+    if sep.is_empty() {
+        return Err(value_error("empty separator"));
+    }
+    let (head, mid, tail) = match memchr::memmem::rfind(&data, &sep) {
+        Some(i) => (
+            data[..i].to_vec(),
+            sep.clone(),
+            data[i + sep.len()..].to_vec(),
+        ),
+        None => (Vec::new(), Vec::new(), data),
+    };
+    Ok(Object::new_tuple(vec![
+        bytes_like_result(args, head),
+        bytes_like_result(args, mid),
+        bytes_like_result(args, tail),
+    ]))
+}
+
+fn bytes_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "removeprefix() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let data = bytes_data(args)?;
+    let prefix = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("removeprefix() expected 1 arg"))?,
+    )?;
+    let out = if data.starts_with(&prefix) {
+        data[prefix.len()..].to_vec()
+    } else {
+        data
+    };
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "removesuffix() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let data = bytes_data(args)?;
+    let suffix = bytes_argview(
+        args.get(1)
+            .ok_or_else(|| type_error("removesuffix() expected 1 arg"))?,
+    )?;
+    let out = if !suffix.is_empty() && data.ends_with(&suffix) {
+        data[..data.len() - suffix.len()].to_vec()
+    } else {
+        data
+    };
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_expandtabs(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "expandtabs() takes at most 1 argument ({} given)",
+            args.len() - 1
+        )));
+    }
+    let data = bytes_data(args)?;
+    let mut tabsize_obj = args.get(1).cloned();
+    for (k, v) in kwargs {
+        if k == "tabsize" {
+            tabsize_obj = Some(v.clone());
+        } else {
+            return Err(type_error(format!(
+                "expandtabs() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    let tabsize = match tabsize_obj {
+        None => 8,
+        Some(o) => o
+            .as_i64()
+            .ok_or_else(|| type_error("integer argument expected"))?,
+    };
+    let mut out = Vec::with_capacity(data.len());
+    let mut col: i64 = 0;
+    for &b in &data {
+        match b {
+            b'\t' => {
+                if tabsize > 0 {
+                    let pad = tabsize - (col % tabsize);
+                    out.extend(std::iter::repeat_n(b' ', pad as usize));
+                    col += pad;
+                }
+            }
+            b'\n' | b'\r' => {
+                out.push(b);
+                col = 0;
+            }
+            _ => {
+                out.push(b);
+                col += 1;
+            }
+        }
+    }
+    Ok(bytes_like_result(args, out))
+}
+
+/// Shared `center`/`ljust`/`rjust` plumbing: parse `(width,
+/// fillchar=b' ')` where fillchar must be a single byte.
+fn bytes_pad_args(args: &[Object], name: &str) -> Result<(Vec<u8>, i64, u8), RuntimeError> {
+    let data = bytes_data(args)?;
+    let width = args
+        .get(1)
+        .and_then(|o| o.as_i64())
+        .ok_or_else(|| type_error(format!("{name}() expected integer width")))?;
+    let fill = match args.get(2) {
+        None => b' ',
+        Some(o) => {
+            let v = bytes_argview(o).ok().filter(|v| v.len() == 1);
+            match v {
+                Some(v) => v[0],
+                None => {
+                    return Err(type_error(format!(
+                        "{name}() argument 2 must be a byte string of length 1, \
+                         not '{}'",
+                        o.type_name()
+                    )))
+                }
+            }
+        }
+    };
+    Ok((data, width, fill))
+}
+
+fn bytes_center(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (data, width, fill) = bytes_pad_args(args, "center")?;
+    let len = data.len() as i64;
+    if width <= len {
+        return Ok(bytes_like_result(args, data));
+    }
+    // CPython biases the extra fill to the right except when `width`
+    // is odd (`bytes_center` marg computation).
+    let marg = width - len;
+    let left = marg / 2 + (marg & width & 1);
+    let mut out = Vec::with_capacity(width as usize);
+    out.extend(std::iter::repeat_n(fill, left as usize));
+    out.extend_from_slice(&data);
+    out.extend(std::iter::repeat_n(fill, (marg - left) as usize));
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_ljust(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (data, width, fill) = bytes_pad_args(args, "ljust")?;
+    let mut out = data;
+    while (out.len() as i64) < width {
+        out.push(fill);
+    }
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_rjust(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (data, width, fill) = bytes_pad_args(args, "rjust")?;
+    let len = data.len() as i64;
+    let mut out = Vec::with_capacity(width.max(len) as usize);
+    out.extend(std::iter::repeat_n(fill, (width - len).max(0) as usize));
+    out.extend_from_slice(&data);
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
+    let data = bytes_data(args)?;
+    let width = args
+        .get(1)
+        .and_then(|o| o.as_i64())
+        .ok_or_else(|| type_error("zfill() expected integer width"))?;
+    let len = data.len() as i64;
+    if width <= len {
+        return Ok(bytes_like_result(args, data));
+    }
+    let pad = (width - len) as usize;
+    let mut out = Vec::with_capacity(width as usize);
+    let body = if !data.is_empty() && (data[0] == b'+' || data[0] == b'-') {
+        out.push(data[0]);
+        &data[1..]
+    } else {
+        &data[..]
+    };
+    out.extend(std::iter::repeat_n(b'0', pad));
+    out.extend_from_slice(body);
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("capitalize", args)?;
+    let data = bytes_data(args)?;
+    let mut out = Vec::with_capacity(data.len());
+    for (i, &b) in data.iter().enumerate() {
+        out.push(if i == 0 {
+            b.to_ascii_uppercase()
+        } else {
+            b.to_ascii_lowercase()
+        });
+    }
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_title(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("title", args)?;
+    let data = bytes_data(args)?;
+    let mut out = Vec::with_capacity(data.len());
+    let mut prev_alpha = false;
+    for &b in &data {
+        if b.is_ascii_alphabetic() {
+            out.push(if prev_alpha {
+                b.to_ascii_lowercase()
+            } else {
+                b.to_ascii_uppercase()
+            });
+            prev_alpha = true;
+        } else {
+            out.push(b);
+            prev_alpha = false;
+        }
+    }
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("swapcase", args)?;
+    let data = bytes_data(args)?;
+    let out: Vec<u8> = data
+        .iter()
+        .map(|b| {
+            if b.is_ascii_uppercase() {
+                b.to_ascii_lowercase()
+            } else if b.is_ascii_lowercase() {
+                b.to_ascii_uppercase()
+            } else {
+                *b
+            }
+        })
+        .collect();
+    Ok(bytes_like_result(args, out))
+}
+
+fn bytes_islower(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("islower", args)?;
+    let data = bytes_data(args)?;
+    let has_cased = data.iter().any(u8::is_ascii_lowercase);
+    let no_upper = !data.iter().any(u8::is_ascii_uppercase);
+    Ok(Object::Bool(has_cased && no_upper))
+}
+
+fn bytes_isupper(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isupper", args)?;
+    let data = bytes_data(args)?;
+    let has_cased = data.iter().any(u8::is_ascii_uppercase);
+    let no_lower = !data.iter().any(u8::is_ascii_lowercase);
+    Ok(Object::Bool(has_cased && no_lower))
+}
+
+fn bytes_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("istitle", args)?;
+    let data = bytes_data(args)?;
+    let mut cased = false;
+    let mut prev_cased = false;
+    for &b in &data {
+        if b.is_ascii_uppercase() {
+            if prev_cased {
+                return Ok(Object::Bool(false));
+            }
+            cased = true;
+            prev_cased = true;
+        } else if b.is_ascii_lowercase() {
+            if !prev_cased {
+                return Ok(Object::Bool(false));
+            }
+            cased = true;
+            prev_cased = true;
+        } else {
+            prev_cased = false;
+        }
+    }
+    Ok(Object::Bool(cased))
+}
+
+fn bytes_isascii(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isascii", args)?;
+    let data = bytes_data(args)?;
+    Ok(Object::Bool(data.iter().all(u8::is_ascii)))
+}
+
+// ---- bytearray-only mutators beyond append/extend/pop/clear ------
+
+fn bytearray_only(args: &[Object], name: &str) -> Result<Rc<RefCell<Vec<u8>>>, RuntimeError> {
+    match args.first() {
+        Some(Object::ByteArray(b)) => Ok(b.clone()),
+        // Unbound calls on subclass instances (`bytearray.append(me, …)`)
+        // reach the native payload.
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::ByteArray(b)) => Ok(b.clone()),
+            _ => Err(type_error(format!(
+                "{name}() requires a bytearray receiver"
+            ))),
+        },
+        _ => Err(type_error(format!(
+            "{name}() requires a bytearray receiver"
+        ))),
+    }
+}
+
+/// `_getbytevalue`: an int in `range(0, 256)` via the full
+/// `__index__` protocol (native unwrap or interpreter reentry).
+/// Used by `insert`/`remove`/`append` and bytearray item assignment.
+pub(crate) fn bytearray_byte_arg(arg: &Object) -> Result<u8, RuntimeError> {
+    let native = arg.native_value();
+    match native.as_ref().unwrap_or(arg) {
+        Object::Bool(v) => Ok(u8::from(*v)),
+        Object::Int(v) if (0..=255).contains(v) => Ok(*v as u8),
+        Object::Int(_) | Object::Long(_) => Err(value_error("byte must be in range(0, 256)")),
+        inst @ Object::Instance(_) if crate::instance_method(inst, "__index__").is_some() => {
+            let v = coerce_index_i64(inst)?;
+            if (0..=255).contains(&v) {
+                Ok(v as u8)
+            } else {
+                Err(value_error("byte must be in range(0, 256)"))
+            }
+        }
+        other => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            other.type_name()
+        ))),
+    }
+}
+
+fn bytearray_insert(args: &[Object]) -> Result<Object, RuntimeError> {
+    let cell = bytearray_only(args, "insert")?;
+    let pos = args
+        .get(1)
+        .and_then(|o| o.as_i64())
+        .ok_or_else(|| type_error("insert() expected integer index"))?;
+    let byte = bytearray_byte_arg(
+        args.get(2)
+            .ok_or_else(|| type_error("insert() expected 2 args"))?,
+    )?;
+    crate::object::bytearray_check_resizable(&cell)?;
+    let mut data = cell.borrow_mut();
+    let len = data.len() as i64;
+    let idx = if pos < 0 {
+        (len + pos).max(0)
+    } else {
+        pos.min(len)
+    } as usize;
+    data.insert(idx, byte);
+    Ok(Object::None)
+}
+
+fn bytearray_remove(args: &[Object]) -> Result<Object, RuntimeError> {
+    let cell = bytearray_only(args, "remove")?;
+    let byte = bytearray_byte_arg(
+        args.get(1)
+            .ok_or_else(|| type_error("remove() expected 1 arg"))?,
+    )?;
+    let mut data = cell.borrow_mut();
+    match data.iter().position(|b| *b == byte) {
+        Some(i) => {
+            crate::object::bytearray_check_resizable(&cell)?;
+            data.remove(i);
+            Ok(Object::None)
+        }
+        None => Err(value_error("value not found in bytearray")),
+    }
+}
+
+fn bytearray_copy(args: &[Object]) -> Result<Object, RuntimeError> {
+    let cell = bytearray_only(args, "copy")?;
+    let data = cell.borrow().clone();
+    Ok(Object::new_bytearray(data))
+}
+
 fn bytes_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isalnum", args)?;
     let data = bytes_data(args)?;
     Ok(Object::Bool(
         !data.is_empty() && data.iter().all(u8::is_ascii_alphanumeric),
@@ -5234,6 +9937,7 @@ fn bytes_isalnum(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_isalpha(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isalpha", args)?;
     let data = bytes_data(args)?;
     Ok(Object::Bool(
         !data.is_empty() && data.iter().all(u8::is_ascii_alphabetic),
@@ -5241,6 +9945,7 @@ fn bytes_isalpha(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_isdigit(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isdigit", args)?;
     let data = bytes_data(args)?;
     Ok(Object::Bool(
         !data.is_empty() && data.iter().all(u8::is_ascii_digit),
@@ -5248,6 +9953,7 @@ fn bytes_isdigit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytes_no_args("isspace", args)?;
     let data = bytes_data(args)?;
     Ok(Object::Bool(
         !data.is_empty() && data.iter().all(u8::is_ascii_whitespace),
@@ -5259,19 +9965,42 @@ fn bytes_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
 fn bytearray_self(args: &[Object]) -> Result<Rc<crate::sync::RefCell<Vec<u8>>>, RuntimeError> {
     match args.first() {
         Some(Object::ByteArray(b)) => Ok(b.clone()),
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::ByteArray(b)) => Ok(b.clone()),
+            _ => Err(type_error("expected bytearray receiver")),
+        },
         _ => Err(type_error("expected bytearray receiver")),
     }
+}
+
+/// `bytearray.__init__(self, source=None, encoding=None, errors=None)` —
+/// (re)initialise the buffer *in place*. CPython's `bytearray___init___`:
+/// the content is rebuilt from the constructor arguments; a re-init that
+/// changes the length while the buffer is exported is forbidden.
+pub(crate) fn bytearray_init_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let b = bytearray_self(args)?;
+    let new = bytes_construct(&args[1..], kwargs, "bytearray")?;
+    if new.len() != b.borrow().len() {
+        crate::object::bytearray_check_resizable(&b)?;
+    }
+    *b.borrow_mut() = new;
+    Ok(Object::None)
+}
+
+pub(crate) fn bytearray_init(args: &[Object]) -> Result<Object, RuntimeError> {
+    bytearray_init_kw(args, &[])
 }
 
 fn bytearray_append(args: &[Object]) -> Result<Object, RuntimeError> {
     let b = bytearray_self(args)?;
     let value = args
         .get(1)
-        .ok_or_else(|| type_error("append() requires int"))?;
-    let byte = match value {
-        Object::Int(i) if (0..=255).contains(i) => *i as u8,
-        _ => return Err(value_error("byte must be 0..256")),
-    };
+        .ok_or_else(|| type_error("append() takes exactly one argument (0 given)"))?;
+    let byte = bytearray_byte_arg(value)?;
+    crate::object::bytearray_check_resizable(&b)?;
     b.borrow_mut().push(byte);
     Ok(Object::None)
 }
@@ -5280,30 +10009,66 @@ fn bytearray_extend(args: &[Object]) -> Result<Object, RuntimeError> {
     let b = bytearray_self(args)?;
     let other = args
         .get(1)
-        .ok_or_else(|| type_error("extend() requires iterable"))?;
-    match other {
-        Object::Bytes(buf) => b.borrow_mut().extend_from_slice(buf),
-        Object::ByteArray(buf) => b.borrow_mut().extend_from_slice(&buf.borrow()),
-        Object::List(items) => {
-            let items = items.borrow();
-            for o in items.iter() {
-                if let Object::Int(i) = o {
-                    if !(0..=255).contains(i) {
-                        return Err(value_error("byte must be 0..256"));
-                    }
-                    b.borrow_mut().push(*i as u8);
-                } else {
-                    return Err(type_error("bytearray extend with non-int"));
-                }
-            }
-        }
-        _ => return Err(type_error("bytearray.extend() expects an iterable of ints")),
+        .ok_or_else(|| type_error("extend() takes exactly 1 argument (0 given)"))?;
+    // CPython rejects `str` up front with a dedicated message —
+    // strings are iterable but never an "iterable of ints".
+    if matches!(
+        other.native_value().as_ref().unwrap_or(other),
+        Object::Str(_)
+    ) {
+        return Err(type_error("expected iterable of integers; got: 'str'"));
     }
+    // Bytes-like fast paths (with `b.extend(b)` alias safety).
+    match other {
+        Object::Bytes(buf) => {
+            if !buf.is_empty() {
+                crate::object::bytearray_check_resizable(&b)?;
+            }
+            b.borrow_mut().extend_from_slice(buf);
+            return Ok(Object::None);
+        }
+        Object::ByteArray(buf) => {
+            if !buf.borrow().is_empty() {
+                crate::object::bytearray_check_resizable(&b)?;
+            }
+            if Rc::ptr_eq(&b, buf) {
+                let mut t = b.borrow_mut();
+                let copy = t.clone();
+                t.extend_from_slice(&copy);
+            } else {
+                b.borrow_mut().extend_from_slice(&buf.borrow());
+            }
+            return Ok(Object::None);
+        }
+        _ => {}
+    }
+    // General protocol: any iterable of ints (each through `__index__`,
+    // as CPython's `bytearray_extend` does via `_getbytevalue`).
+    // Generators and user-`__iter__` objects were materialised by the
+    // interpreter's dispatch shim before reaching this builtin.
+    let mut it = other
+        .make_iter()
+        .map_err(|_| type_error(format!("can't extend bytearray with {}", other.type_name())))?;
+    // Collect first so a mid-iteration error leaves the target
+    // unchanged (CPython builds into a fresh buffer too).
+    let mut tmp: Vec<u8> = Vec::new();
+    while let Some(item) = it.next_value() {
+        tmp.push(bytearray_byte_arg(&item)?);
+    }
+    if !tmp.is_empty() {
+        crate::object::bytearray_check_resizable(&b)?;
+    }
+    b.borrow_mut().extend_from_slice(&tmp);
     Ok(Object::None)
 }
 
 fn bytearray_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     let b = bytearray_self(args)?;
+    // Resize-to-zero is a no-op on an empty buffer (CPython's
+    // `PyByteArray_Resize` short-circuits before `_canresize`).
+    if !b.borrow().is_empty() {
+        crate::object::bytearray_check_resizable(&b)?;
+    }
     b.borrow_mut().clear();
     Ok(Object::None)
 }
@@ -5320,12 +10085,13 @@ fn bytearray_pop(args: &[Object]) -> Result<Object, RuntimeError> {
             let len = buf.len() as i64;
             let n = if i < 0 { i + len } else { i };
             if n < 0 || n >= len {
-                return Err(crate::error::index_error("bytearray index out of range"));
+                return Err(crate::error::index_error("pop index out of range"));
             }
             n as usize
         }
         _ => return Err(type_error("pop() index must be int")),
     };
+    crate::object::bytearray_check_resizable(&b)?;
     let v = buf.remove(idx);
     Ok(Object::Int(i64::from(v)))
 }
@@ -5356,9 +10122,38 @@ fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
     if f.binary {
         Ok(Object::new_bytes(bytes))
     } else {
-        let s = String::from_utf8(bytes).map_err(|e| value_error(e.to_string()))?;
-        Ok(Object::from_str(s))
+        Ok(Object::from_str(f.decode_text(bytes)?))
     }
+}
+
+/// `f.readinto(b)` — read up to `len(b)` bytes into a writable
+/// bytes-like object, returning the count actually read. Only reachable
+/// on binary-mode files (the method table gates on `f.binary`).
+fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let target = match args.get(1) {
+        Some(Object::ByteArray(b)) => b.clone(),
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::ByteArray(b)) => b.clone(),
+            _ => {
+                return Err(type_error(format!(
+                    "readinto() argument must be read-write bytes-like object, not {}",
+                    inst.cls().name
+                )))
+            }
+        },
+        other => {
+            return Err(type_error(format!(
+                "readinto() argument must be read-write bytes-like object, not {}",
+                other.map_or("nothing", |o| o.type_name())
+            )))
+        }
+    };
+    let capacity = target.borrow().len();
+    let bytes = f.read_bytes(Some(capacity))?;
+    let n = bytes.len();
+    target.borrow_mut()[..n].copy_from_slice(&bytes);
+    Ok(Object::Int(n as i64))
 }
 
 fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5377,8 +10172,23 @@ fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     if f.binary {
         Ok(Object::new_bytes(out))
     } else {
-        let s = String::from_utf8(out).map_err(|e| value_error(e.to_string()))?;
-        Ok(Object::from_str(s))
+        Ok(Object::from_str(f.decode_text(out)?))
+    }
+}
+
+/// `next(file)` — return the next line, or raise StopIteration at EOF.
+/// Backs both the `__next__` method and the VM's native file iteration.
+pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    let line = file_readline(args)?;
+    let empty = match &line {
+        Object::Str(s) => s.is_empty(),
+        Object::Bytes(b) => b.is_empty(),
+        _ => true,
+    };
+    if empty {
+        Err(stop_iteration())
+    } else {
+        Ok(line)
     }
 }
 
@@ -5406,7 +10216,7 @@ fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .ok_or_else(|| type_error("write() expected 1 arg"))?;
     let n = match data {
-        Object::Str(s) => f.write_bytes(s.as_bytes())?,
+        Object::Str(s) => f.write_bytes(&f.encode_text(s)?)?,
         Object::Bytes(b) => f.write_bytes(b)?,
         Object::ByteArray(b) => f.write_bytes(&b.borrow())?,
         _ => return Err(type_error("write() argument must be str or bytes")),
@@ -5423,7 +10233,7 @@ fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
     while let Some(v) = iter.next_value() {
         match v {
             Object::Str(s) => {
-                f.write_bytes(s.as_bytes())?;
+                f.write_bytes(&f.encode_text(&s)?)?;
             }
             Object::Bytes(b) => {
                 f.write_bytes(&b)?;
@@ -5510,7 +10320,7 @@ fn memoryview_tolist(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn memoryview_release(args: &[Object]) -> Result<Object, RuntimeError> {
     let mv = memoryview_self(args)?;
-    mv.released.set(true);
+    mv.release();
     Ok(Object::None)
 }
 
@@ -5551,6 +10361,41 @@ fn memoryview_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 // ----- dict view + mappingproxy methods (RFC 0023) -----
+
+/// Re-key a `mappingproxy` receiver as the wrapped dict so the dict
+/// method implementations can be reused verbatim (the proxy is a
+/// read-only *view*, so the share is intentional).
+fn mappingproxy_args(args: &[Object]) -> Vec<Object> {
+    let mut v = args.to_vec();
+    if let Some(Object::MappingProxy(d)) = v.first() {
+        v[0] = Object::Dict(d.clone());
+    }
+    v
+}
+
+fn mappingproxy_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_get(&mappingproxy_args(args))
+}
+
+fn mappingproxy_keys(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_keys(&mappingproxy_args(args))
+}
+
+fn mappingproxy_values(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_values(&mappingproxy_args(args))
+}
+
+fn mappingproxy_items(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_items(&mappingproxy_args(args))
+}
+
+fn mappingproxy_copy(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_copy(&mappingproxy_args(args))
+}
+
+fn mappingproxy_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    dict_getitem(&mappingproxy_args(args))
+}
 
 fn view_isdisjoint(args: &[Object]) -> Result<Object, RuntimeError> {
     let other = args

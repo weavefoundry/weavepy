@@ -24,9 +24,15 @@ use crate::sync::RefCell;
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian};
 
-use crate::error::{type_error, value_error, RuntimeError};
+use crate::error::{overflow_error, type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+
+/// Upper bound on a computed struct size, mirroring CPython's
+/// `PY_SSIZE_T_MAX` guard in `_struct` (`prepare_s`). Beyond this we
+/// raise `struct.error: total struct size too long` rather than letting
+/// the repeat-count arithmetic overflow and panic the `Vec` allocator.
+const MAX_STRUCT_SIZE: usize = isize::MAX as usize;
 
 /// Format-string byte-order prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +68,13 @@ struct CompiledFormat {
 impl CompiledFormat {
     /// Parse a CPython-shaped format string.
     fn parse(fmt: &str) -> Result<Self, RuntimeError> {
+        // CPython treats the format as a C string, so an embedded NUL
+        // terminates it early and is reported up front
+        // (test_struct.test_issue35714), rather than falling through to
+        // the generic "bad char" diagnostic.
+        if fmt.contains('\0') {
+            return Err(struct_error("embedded null character"));
+        }
         let mut chars = fmt.chars().peekable();
         let endian = match chars.peek() {
             Some('@') => {
@@ -115,10 +128,14 @@ impl CompiledFormat {
             let unit = element_size(code, endian)?;
             // For 's' / 'p' the count is the byte count of the string;
             // each field is a single value but consumes `n` bytes.
-            let bytes = match code {
-                's' | 'p' => unit * n,
-                _ => unit * n,
-            };
+            // Use checked arithmetic so a pathological repeat count
+            // (e.g. `struct.calcsize('999999999999s')`) raises CPython's
+            // `struct.error: total struct size too long` instead of
+            // overflowing and panicking the `Vec` allocator.
+            let bytes = unit
+                .checked_mul(n)
+                .filter(|b| *b <= MAX_STRUCT_SIZE)
+                .ok_or_else(|| struct_error("total struct size too long"))?;
             // Native alignment: pad to alignment if @ mode.
             if endian == Endian::Native {
                 let align = native_align(code);
@@ -134,7 +151,10 @@ impl CompiledFormat {
                 }
             }
             fields.push(Field { code, count: n });
-            size += bytes;
+            size = size
+                .checked_add(bytes)
+                .filter(|s| *s <= MAX_STRUCT_SIZE)
+                .ok_or_else(|| struct_error("total struct size too long"))?;
         }
         Ok(Self {
             endian,
@@ -160,7 +180,10 @@ impl CompiledFormat {
                 values.len()
             )));
         }
-        let mut out = Vec::with_capacity(self.size);
+        // Cap the up-front reservation: `self.size` is already bounded by
+        // `MAX_STRUCT_SIZE`, but a multi-gigabyte format shouldn't pre-
+        // allocate everything at once — let the buffer grow as we write.
+        let mut out = Vec::with_capacity(self.size.min(1 << 20));
         let mut idx = 0usize;
         for f in &self.fields {
             match f.code {
@@ -201,10 +224,15 @@ impl CompiledFormat {
                     };
                     let mut buf = vec![0u8; f.count];
                     if f.count > 0 {
-                        let take = data.len().min(f.count - 1).min(255);
-                        buf[0] = take as u8;
-                        if take > 0 {
-                            buf[1..=take].copy_from_slice(&data[..take]);
+                        // CPython copies up to `count - 1` data bytes, but the
+                        // leading length byte saturates at 255 (the most a
+                        // single byte can encode). For e.g. `1000p` of 1000
+                        // bytes the buffer holds 999 data bytes yet the length
+                        // prefix reads 255 (test_struct.test_p_code).
+                        let copy = data.len().min(f.count - 1);
+                        buf[0] = copy.min(255) as u8;
+                        if copy > 0 {
+                            buf[1..=copy].copy_from_slice(&data[..copy]);
                         }
                     }
                     out.extend_from_slice(&buf);
@@ -229,18 +257,6 @@ impl CompiledFormat {
             )));
         }
         self.unpack_from_offset(buf, 0).map(|(v, _)| v)
-    }
-
-    fn unpack_from(&self, buf: &[u8], offset: usize) -> Result<Vec<Object>, RuntimeError> {
-        if buf.len() < offset + self.size {
-            return Err(struct_error(format!(
-                "unpack_from requires a buffer of at least {} bytes for unpacking {} bytes at offset {}",
-                offset + self.size,
-                self.size,
-                offset
-            )));
-        }
-        self.unpack_from_offset(buf, offset).map(|(v, _)| v)
     }
 
     fn iter_unpack(&self, buf: &[u8]) -> Result<Vec<Vec<Object>>, RuntimeError> {
@@ -311,11 +327,14 @@ fn element_size(code: char, endian: Endian) -> Result<usize, RuntimeError> {
         'q' | 'Q' | 'd' => 8,
         'n' | 'N' => match endian {
             Endian::Native => std::mem::size_of::<isize>(),
-            _ => return Err(struct_error("'n' format code only valid in native mode")),
+            // In standard / explicit-endian modes `n`/`N` simply aren't
+            // recognised; CPython reports the same "bad char" diagnostic as
+            // for any other unknown code (test_struct.test_nN_code).
+            _ => return Err(struct_error(format!("bad char in struct format: '{code}'"))),
         },
         'P' => match endian {
             Endian::Native => std::mem::size_of::<usize>(),
-            _ => return Err(struct_error("'P' format code only valid in native mode")),
+            _ => return Err(struct_error(format!("bad char in struct format: '{code}'"))),
         },
         _ => return Err(struct_error(format!("bad char in struct format: '{code}'"))),
     })
@@ -414,11 +433,19 @@ fn encode_one(
             let f = value
                 .as_f64()
                 .ok_or_else(|| struct_error("required argument is not a float"))?;
+            // A finite double whose magnitude rounds above `FLT_MAX`
+            // overflows binary32. CPython's `_PyFloat_Pack4` reports this
+            // as `OverflowError` (not `struct.error`), so the frozen
+            // wrapper lets it propagate (test_struct.test_705836).
+            let f32v = f as f32;
+            if f.is_finite() && f32v.is_infinite() {
+                return Err(overflow_error("float too large to pack with f format"));
+            }
             let mut buf = [0u8; 4];
             match endian {
-                Endian::Native => NativeEndian::write_f32(&mut buf, f as f32),
-                Endian::Standard | Endian::Little => LittleEndian::write_f32(&mut buf, f as f32),
-                Endian::Big => BigEndian::write_f32(&mut buf, f as f32),
+                Endian::Native => NativeEndian::write_f32(&mut buf, f32v),
+                Endian::Standard | Endian::Little => LittleEndian::write_f32(&mut buf, f32v),
+                Endian::Big => BigEndian::write_f32(&mut buf, f32v),
             }
             out.extend_from_slice(&buf);
             Ok(())
@@ -437,11 +464,13 @@ fn encode_one(
             Ok(())
         }
         'e' => {
-            // Half-precision IEEE 754. Convert via the bits.
+            // Half-precision IEEE 754, converted from the double with
+            // round-half-to-even (CPython `_PyFloat_Pack2`), not via an
+            // intermediate `f32` truncation.
             let f = value
                 .as_f64()
                 .ok_or_else(|| struct_error("required argument is not a float"))?;
-            let half = f32_to_half(f as f32);
+            let half = f64_to_half(f)?;
             let mut buf = [0u8; 2];
             match endian {
                 Endian::Native => NativeEndian::write_u16(&mut buf, half),
@@ -578,32 +607,92 @@ fn read_f64(endian: Endian, b: &[u8]) -> f64 {
     }
 }
 
-/// IEEE 754 binary16 conversions. Doesn't depend on `f16` because
-/// the standard library hasn't shipped a stable type yet.
-fn f32_to_half(f: f32) -> u16 {
-    let bits = f.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let mantissa = bits & 0x007F_FFFF;
-    if exp == 0xFF {
-        // NaN/Inf
-        let mant = if mantissa != 0 { 0x200 } else { 0 };
-        return sign | 0x7C00 | mant;
+/// `frexp`: decompose a finite, non-NaN `x` into `(m, e)` with
+/// `x == m * 2**e` and `0.5 <= |m| < 1` (or `m == 0` for `x == 0`).
+/// std doesn't ship `frexp`, so we do it by exponent-field surgery.
+fn frexp(x: f64) -> (f64, i32) {
+    if x == 0.0 || x.is_nan() || x.is_infinite() {
+        return (x, 0);
     }
-    let new_exp = exp - 127 + 15;
-    if new_exp >= 0x1F {
-        return sign | 0x7C00; // Inf
+    let exp_field = ((x.to_bits() >> 52) & 0x7ff) as i32;
+    if exp_field == 0 {
+        // Subnormal: scale into the normal range first, then correct `e`.
+        let scaled = x * f64::from_bits(0x43f0_0000_0000_0000); // * 2**64
+        let exp_s = ((scaled.to_bits() >> 52) & 0x7ff) as i32 - 64;
+        let m_bits = (scaled.to_bits() & !(0x7ffu64 << 52)) | (1022u64 << 52);
+        (f64::from_bits(m_bits), exp_s - 1022)
+    } else {
+        let m_bits = (x.to_bits() & !(0x7ffu64 << 52)) | (1022u64 << 52);
+        (f64::from_bits(m_bits), exp_field - 1022)
     }
-    if new_exp <= 0 {
-        if new_exp < -10 {
-            return sign;
+}
+
+#[inline]
+fn ldexp(f: f64, n: i32) -> f64 {
+    f * 2f64.powi(n)
+}
+
+/// Port of CPython's `_PyFloat_Pack2` (`Objects/floatobject.c`):
+/// convert a double to an IEEE 754 binary16 bit pattern with
+/// round-half-to-even, returning the value in host order. Raises
+/// `OverflowError` on overflow, exactly like CPython
+/// (test_struct.test_705836 / test_half_float assert `OverflowError`,
+/// which is *not* a `struct.error`).
+fn f64_to_half(x: f64) -> Result<u16, RuntimeError> {
+    let sign: u16;
+    let mut e: i32;
+    let mut bits: u16;
+    if x == 0.0 {
+        sign = u16::from(x.is_sign_negative());
+        e = 0;
+        bits = 0;
+    } else if x.is_infinite() {
+        sign = u16::from(x < 0.0);
+        e = 0x1f;
+        bits = 0;
+    } else if x.is_nan() {
+        sign = u16::from(x.is_sign_negative());
+        e = 0x1f;
+        bits = 512;
+    } else {
+        sign = u16::from(x < 0.0);
+        let ax = x.abs();
+        let (mut f, fe) = frexp(ax);
+        e = fe;
+        // Normalize f to [1.0, 2.0).
+        f *= 2.0;
+        e -= 1;
+        if e >= 16 {
+            return Err(overflow_error("float too large to pack with e format"));
+        } else if e < -25 {
+            // |x| < 2**-25 — underflow to (signed) zero.
+            f = 0.0;
+            e = 0;
+        } else if e < -14 {
+            // Gradual underflow (subnormal half).
+            f = ldexp(f, 14 + e);
+            e = 0;
+        } else {
+            e += 15;
+            f -= 1.0; // strip the implicit leading 1
         }
-        let mantissa = mantissa | 0x0080_0000;
-        let shift = (14 - new_exp) as u32;
-        let result = (mantissa >> shift) as u16;
-        return sign | result;
+        f *= 1024.0; // 2**10
+        bits = f as u16; // truncating cast
+                         // Round half to even.
+        let frac = f - f64::from(bits);
+        if frac > 0.5 || (frac == 0.5 && (bits & 1) == 1) {
+            bits += 1;
+            if bits == 1024 {
+                // Carry rippled out of the 10-bit mantissa.
+                bits = 0;
+                e += 1;
+                if e == 31 {
+                    return Err(overflow_error("float too large to pack with e format"));
+                }
+            }
+        }
     }
-    sign | ((new_exp as u16) << 10) | ((mantissa >> 13) as u16)
+    Ok(bits | ((e as u16) << 10) | (sign << 15))
 }
 
 fn half_to_f32(half: u16) -> f32 {
@@ -671,6 +760,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::from_static("Binary data packing/unpacking (RFC 0019 core)."),
         );
         register(&mut d, "calcsize", b_calcsize);
+        register(&mut d, "_value_codes", b_value_codes);
         register(&mut d, "pack", b_pack);
         register(&mut d, "unpack", b_unpack);
         register(&mut d, "pack_into", b_pack_into);
@@ -691,6 +781,7 @@ fn register(
 ) {
     let bf = BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     };
@@ -719,6 +810,31 @@ fn b_calcsize(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(cf.size as i64))
 }
 
+/// Return one format character per *value slot* the format consumes, in
+/// order (`x` pad bytes contribute nothing; `s`/`p` contribute a single
+/// slot; numeric codes contribute `count` slots). The frozen wrapper uses
+/// this to coerce each argument through the right protocol (`__index__`
+/// for integer codes, `__float__` for floats, `__bool__` for `?`) before
+/// handing concrete `int`/`float`/`bool` values to the Rust packer, which
+/// has no interpreter access of its own.
+fn b_value_codes(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fmt = fmt_arg(args, 0)?;
+    let cf = CompiledFormat::parse(&fmt)?;
+    let mut s = String::new();
+    for f in &cf.fields {
+        match f.code {
+            'x' => {}
+            's' | 'p' => s.push(f.code),
+            c => {
+                for _ in 0..f.count {
+                    s.push(c);
+                }
+            }
+        }
+    }
+    Ok(Object::from_str(s))
+}
+
 fn b_pack(args: &[Object]) -> Result<Object, RuntimeError> {
     let fmt = fmt_arg(args, 0)?;
     let cf = CompiledFormat::parse(&fmt)?;
@@ -734,30 +850,113 @@ fn b_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_tuple(vals))
 }
 
+/// Resolve a `pack_into`/`unpack_from` byte offset, matching CPython's
+/// `Py_ssize_t` coercion: ints (and `bool`) pass through, an int too big
+/// for the platform word is `OverflowError`, and any non-integer is a
+/// `TypeError` (test_struct.test_pack_into's bogus-offset cases).
+fn ssize_offset(o: &Object) -> Result<i64, RuntimeError> {
+    match o {
+        Object::Int(n) => Ok(*n),
+        Object::Bool(b) => Ok(i64::from(*b)),
+        Object::Long(_) => Err(overflow_error(
+            "Python int too large to convert to C ssize_t",
+        )),
+        other => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            other.type_name()
+        ))),
+    }
+}
+
 fn b_pack_into(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 3 {
         return Err(type_error("pack_into() requires at least 3 arguments"));
     }
     let fmt = fmt_arg(args, 0)?;
     let cf = CompiledFormat::parse(&fmt)?;
-    let offset = args[2]
-        .as_i64()
-        .ok_or_else(|| type_error("offset must be int"))?;
+    let offset = ssize_offset(&args[2])?;
     let bytes = cf.pack(&args[3..])?;
     match &args[1] {
         Object::ByteArray(buf) => {
             let mut buf = buf.borrow_mut();
-            let off = offset.max(0) as usize;
-            if buf.len() < off + bytes.len() {
-                buf.resize(off + bytes.len(), 0);
-            }
+            // Resolve the (possibly negative) offset against the buffer
+            // and bounds-check without growing it — CPython's
+            // `pack_into` writes in place and never resizes.
+            let off = resolve_buffer_offset(offset, buf.len(), cf.size, "pack_into", true)?;
             buf[off..off + bytes.len()].copy_from_slice(&bytes);
             Ok(Object::None)
         }
+        Object::MemoryView(mv) => {
+            // Writable buffer-protocol target (e.g. `memoryview(array(...))`).
+            if mv.readonly.get() {
+                return Err(type_error("cannot modify read-only memory".to_owned()));
+            }
+            let off = resolve_buffer_offset(offset, mv.len.get(), cf.size, "pack_into", true)?;
+            let base = mv.start.get();
+            match &mv.buffer {
+                crate::object::MemoryViewBuffer::ByteArray(b) => {
+                    let mut b = b.borrow_mut();
+                    b[base + off..base + off + bytes.len()].copy_from_slice(&bytes);
+                    Ok(Object::None)
+                }
+                crate::object::MemoryViewBuffer::Bytes(_) => {
+                    Err(type_error("cannot modify read-only memory".to_owned()))
+                }
+            }
+        }
         _ => Err(type_error(
-            "pack_into() requires a bytearray buffer".to_owned(),
+            "argument must be a read-write bytes-like object".to_owned(),
         )),
     }
+}
+
+/// Resolve a `pack_into`/`unpack_from` offset against a buffer of
+/// `buf_len` bytes, matching CPython's `_struct` boundary diagnostics.
+/// `size` is the struct's byte size; `for_pack` toggles the
+/// pack- vs unpack-flavoured messages. Returns the non-negative byte
+/// offset to start at, or a `struct.error` describing the overflow.
+fn resolve_buffer_offset(
+    offset: i64,
+    buf_len: usize,
+    size: usize,
+    op: &str,
+    for_pack: bool,
+) -> Result<usize, RuntimeError> {
+    let size_i = size as i128;
+    let len_i = buf_len as i128;
+    let off = i128::from(offset);
+    let resolved = if off < 0 {
+        if off + size_i > 0 {
+            let verb = if for_pack { "pack" } else { "unpack" };
+            let lead = if for_pack {
+                "no space to"
+            } else {
+                "not enough data to"
+            };
+            return Err(struct_error(format!(
+                "{lead} {verb} {size} bytes at offset {offset}"
+            )));
+        }
+        if off + len_i < 0 {
+            return Err(struct_error(format!(
+                "offset {offset} out of range for {buf_len}-byte buffer"
+            )));
+        }
+        off + len_i
+    } else {
+        off
+    };
+    // `resolved` is now non-negative. Check that `size` bytes fit.
+    if len_i - resolved < size_i {
+        let needed = (resolved as u128) + (size as u128);
+        let verb = if for_pack { "packing" } else { "unpacking" };
+        return Err(struct_error(format!(
+            "{op} requires a buffer of at least {needed} bytes for \
+             {verb} {size} bytes at offset {resolved} \
+             (actual buffer size is {buf_len})"
+        )));
+    }
+    Ok(resolved as usize)
 }
 
 fn b_unpack_from(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -767,8 +966,9 @@ fn b_unpack_from(args: &[Object]) -> Result<Object, RuntimeError> {
     let fmt = fmt_arg(args, 0)?;
     let cf = CompiledFormat::parse(&fmt)?;
     let buf = buffer_arg(&args[1])?;
-    let offset = args.get(2).and_then(|o| o.as_i64()).unwrap_or(0).max(0) as usize;
-    let vals = cf.unpack_from(&buf, offset)?;
+    let offset = args.get(2).and_then(|o| o.as_i64()).unwrap_or(0);
+    let off = resolve_buffer_offset(offset, buf.len(), cf.size, "unpack_from", false)?;
+    let (vals, _) = cf.unpack_from_offset(&buf, off)?;
     Ok(Object::new_tuple(vals))
 }
 

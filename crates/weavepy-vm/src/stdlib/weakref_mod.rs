@@ -66,6 +66,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
+        binds_instance: false,
         call: Box::new(body),
         call_kw: None,
     }))
@@ -160,6 +161,7 @@ fn build_ref_object(target: Object, callback: Object) -> Object {
             DictKey(Object::from_static("__call__")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "__call__",
+                binds_instance: false,
                 call: Box::new(call_target),
                 call_kw: None,
             })),
@@ -168,6 +170,7 @@ fn build_ref_object(target: Object, callback: Object) -> Object {
             DictKey(Object::from_static("_get")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "_get",
+                binds_instance: false,
                 call: Box::new(get_target),
                 call_kw: None,
             })),
@@ -176,6 +179,7 @@ fn build_ref_object(target: Object, callback: Object) -> Object {
             DictKey(Object::from_static("_clear")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "_clear",
+                binds_instance: false,
                 call: Box::new(clear),
                 call_kw: None,
             })),

@@ -25,6 +25,7 @@ pub mod datetime_mod;
 pub mod errno_mod;
 pub mod fcntl_mod;
 pub mod fnmatch_mod;
+pub mod functools_mod;
 pub mod gc_mod;
 pub mod glob_mod;
 pub mod gzip_mod;
@@ -33,12 +34,12 @@ pub mod hmac_mod;
 pub mod imp_mod;
 pub mod interpreters_mod;
 pub mod io;
+pub mod itertools_mod;
 pub mod json;
 pub mod lzma_mod;
 pub mod marshal_mod;
 pub mod math;
 pub mod os;
-pub mod random;
 pub mod resource_mod;
 pub mod secrets_mod;
 pub mod select_mod;
@@ -54,6 +55,7 @@ pub mod symtable_mod;
 pub mod sys;
 pub mod sys_monitoring;
 pub mod tempfile_mod;
+pub mod testinternalcapi_mod;
 pub mod thread;
 pub mod time;
 pub mod tracemalloc_real;
@@ -90,10 +92,10 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("os.path", os::build_path);
     cache.register_builtin("io", io::build);
     cache.register_builtin("json", json::build);
-    cache.register_builtin("random", random::build);
     cache.register_builtin("time", time::build);
     cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
+    cache.register_builtin("_testinternalcapi", testinternalcapi_mod::build);
     cache.register_builtin("signal", signal_mod::build);
     cache.register_builtin("select", select_mod::build);
     cache.register_builtin("_socket", socket_mod::build);
@@ -108,6 +110,8 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("fnmatch", fnmatch_mod::build);
     cache.register_builtin("glob", glob_mod::build);
     cache.register_builtin("_shutil", shutil_mod::build);
+    cache.register_builtin("_functools", functools_mod::build);
+    cache.register_builtin("_itertools", itertools_mod::build);
     cache.register_builtin("ssl", ssl_mod::build);
     cache.register_builtin("zlib", zlib_mod::build);
     cache.register_builtin("_struct", struct_mod::build);
@@ -171,9 +175,93 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/builtins.py"),
             is_package: false,
         },
+        // `keyword` — verbatim CPython keyword/soft-keyword lists +
+        // membership predicates. Imported by `dataclasses` (field-name
+        // validation) and `pydoc`/`inspect`-adjacent code.
+        FrozenSource {
+            name: "keyword",
+            source: include_str!("python/keyword.py"),
+            is_package: false,
+        },
+        // `random` — verbatim CPython distribution layer over the
+        // Rust `_random` MT19937 core (RFC 0037: `random.Random(42)`
+        // is stream-identical to CPython).
+        FrozenSource {
+            name: "random",
+            source: include_str!("python/random_mod.py"),
+            is_package: false,
+        },
+        // Internal: `_SeqIter`, the lazy legacy-`__getitem__` iterator
+        // `iter(obj)` returns when *obj* has no `__iter__` (CPython's
+        // built-in `iterator`/seqiterobject). Kept out of `builtins` to
+        // avoid leaking a name into every module's global namespace.
+        FrozenSource {
+            name: "_seqtools",
+            source: include_str!("python/_seqtools.py"),
+            is_package: false,
+        },
+        // `collections` is the verbatim CPython package init; the
+        // `_collections` accelerator below supplies `deque`/`defaultdict`
+        // (which have no pure-Python fallback in the real module), while
+        // `OrderedDict`/`namedtuple` run the reference pure-Python paths.
+        // The verbatim CPython `_collections_abc` carries the ABC
+        // definitions and `collections.abc` re-exports them (RFC 0037 WS8).
         FrozenSource {
             name: "collections",
             source: include_str!("python/collections.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "_collections",
+            source: include_str!("python/_collections.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_collections_abc",
+            source: include_str!("python/_collections_abc.py"),
+            is_package: false,
+        },
+        // `_weakrefset` (verbatim CPython): the `WeakSet` source module
+        // that `abc`/`_py_abc` import directly to back the ABC virtual-
+        // subclass registry/caches (RFC 0037 WS8).
+        FrozenSource {
+            name: "_weakrefset",
+            source: include_str!("python/_weakrefset.py"),
+            is_package: false,
+        },
+        // `_py_abc` (verbatim CPython): the pure-Python `ABCMeta`
+        // reference implementation. `test_abc` imports it directly to
+        // exercise the Python ABC machinery alongside the C `_abc` path.
+        FrozenSource {
+            name: "_py_abc",
+            source: include_str!("python/_py_abc.py"),
+            is_package: false,
+        },
+        // `_colorize`: CPython 3.13's ANSI-colour helper (verbatim). Imported
+        // by `traceback`/`test_traceback` (and the 3.13 REPL); honours
+        // NO_COLOR/FORCE_COLOR and TTY detection.
+        FrozenSource {
+            name: "_colorize",
+            source: include_str!("python/_colorize.py"),
+            is_package: false,
+        },
+        // `__future__`: the feature-flag table (verbatim CPython 3.13).
+        // `from __future__ import annotations` is a compiler directive, but
+        // the module must still be importable because real modules read its
+        // `_Feature` objects (e.g. `__future__.annotations`).
+        FrozenSource {
+            name: "__future__",
+            source: include_str!("python/future_module.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "collections.abc",
+            source: include_str!("python/collections_abc.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_collections_user",
+            source: include_str!("python/_collections_user.py"),
             is_package: false,
         },
         // RFC 0036 — `string` (constants + `Template` + `Formatter` over
@@ -197,6 +285,26 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "functools",
             source: include_str!("python/functools.py"),
+            is_package: false,
+        },
+        // RFC 0037 WS8 verbatim/faithful module ports that gate import-time
+        // clusters: `cmath` (pure-Python over the `math` core) unblocks
+        // `test_fractions`; the C-locale `locale` unblocks `test_format`
+        // and backs `calendar`'s `LocaleTextCalendar`; `calendar` is the
+        // verbatim CPython 3.13 module.
+        FrozenSource {
+            name: "cmath",
+            source: include_str!("python/cmath.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "locale",
+            source: include_str!("python/locale.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "calendar",
+            source: include_str!("python/calendar.py"),
             is_package: false,
         },
         FrozenSource {
@@ -332,6 +440,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/html_parser.py"),
             is_package: false,
         },
+        FrozenSource {
+            name: "html.entities",
+            source: include_str!("python/html_entities.py"),
+            is_package: false,
+        },
         // `urllib` is a package containing three submodules.
         FrozenSource {
             name: "urllib",
@@ -448,6 +561,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
+            name: "reprlib",
+            source: include_str!("python/reprlib.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "warnings",
             source: include_str!("python/warnings.py"),
             is_package: false,
@@ -538,6 +656,20 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/test_support_socket_helper.py"),
             is_package: false,
         },
+        // `test.support.hashlib_helper` (verbatim) — `requires_hashdigest`
+        // gate used by test_hmac and friends.
+        FrozenSource {
+            name: "test.support.hashlib_helper",
+            source: include_str!("python/test_support_hashlib_helper.py"),
+            is_package: false,
+        },
+        // `test.support.i18n_helper` — minimal shim (snapshot tests skip) so
+        // test_getopt/test_optparse import; their own tests still run.
+        FrozenSource {
+            name: "test.support.i18n_helper",
+            source: include_str!("python/test_support_i18n_helper.py"),
+            is_package: false,
+        },
         // RFC 0036 — two more 3.13 helper submodules carried verbatim:
         // `testcase` (ExceptionIsLikeMixin + float/complex assertions used
         // by test_float/test_complex) and `numbers` (the numeric-tower
@@ -550,6 +682,47 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "test.support.numbers",
             source: include_str!("python/test_support_numbers.py"),
+            is_package: false,
+        },
+        // `test.tokenizedata`: vendored lexer/tokenizer fixtures.
+        // `test_unicode_identifiers` imports `badsyntax_3131` to assert the
+        // exact `SyntaxError` for an invalid PEP 3131 identifier (`€`).
+        FrozenSource {
+            name: "test.tokenizedata",
+            source: include_str!("python/test_tokenizedata_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "test.tokenizedata.badsyntax_3131",
+            source: include_str!("python/test_tokenizedata_badsyntax_3131.py"),
+            is_package: false,
+        },
+        // `test.string_tests`: the shared CommonTest/MixinStrUnicodeUserStringTest
+        // base classes that `test_bytes`/`test_bytearray`/`test_str` derive
+        // from. Carried verbatim from CPython 3.13.
+        FrozenSource {
+            name: "test.string_tests",
+            source: include_str!("python/test_string_tests.py"),
+            is_package: false,
+        },
+        // `test.seq_tests` / `test.list_tests`: shared sequence/list test
+        // mixins (verbatim CPython 3.13) that `test_bytes`/`test_list`/
+        // `test_tuple`/`test_deque` and friends import.
+        FrozenSource {
+            name: "test.seq_tests",
+            source: include_str!("python/test_seq_tests.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "test.list_tests",
+            source: include_str!("python/test_list_tests.py"),
+            is_package: false,
+        },
+        // `test.pickletester`: only `ExtensionSaver` is carried (test_copyreg
+        // imports it); the full CPython file is ~4900 lines of pickle matrix.
+        FrozenSource {
+            name: "test.pickletester",
+            source: include_str!("python/test_pickletester.py"),
             is_package: false,
         },
         // `test.__main__` / `test.regrtest`: drive `weavepy -m test` and
@@ -671,6 +844,14 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/decimal.py"),
             is_package: false,
         },
+        // Full CPython pure-Python decimal (IEEE 754-2008: NaN/Infinity,
+        // contexts, traps, exact float/Decimal comparison + hashing). The
+        // `decimal` shim above re-exports this via `sys.modules` like CPython.
+        FrozenSource {
+            name: "_pydecimal",
+            source: include_str!("python/_pydecimal.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "py_compile",
             source: include_str!("python/py_compile.py"),
@@ -717,9 +898,52 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/importlib_resources.py"),
             is_package: false,
         },
+        // CPython's frozen import-core modules; stdlib code (pydoc,
+        // pkgutil-adjacent paths) imports these by name.
+        FrozenSource {
+            name: "importlib._bootstrap",
+            source: include_str!("python/importlib_bootstrap.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "importlib._bootstrap_external",
+            source: include_str!("python/importlib_bootstrap_external.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "pkgutil",
             source: include_str!("python/pkgutil.py"),
+            is_package: false,
+        },
+        // RFC 0037 WS8 — pydoc and its dependency closure.
+        FrozenSource {
+            name: "pydoc",
+            source: include_str!("python/pydoc.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "token",
+            source: include_str!("python/token.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "tokenize",
+            source: include_str!("python/tokenize.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "sysconfig",
+            source: include_str!("python/sysconfig.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_pyrepl",
+            source: include_str!("python/_pyrepl_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "_pyrepl.pager",
+            source: include_str!("python/_pyrepl_pager.py"),
             is_package: false,
         },
         FrozenSource {
@@ -1069,6 +1293,24 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "sre_compile",
             source: include_str!("python/sre_compile.py"),
+            is_package: false,
+        },
+        // Pure-Python stand-in for CPython's `_testlimitedcapi` C test
+        // helper. The conformance suite (e.g. `test_bytes`) imports it at
+        // class-body scope; without it the whole module aborts. We supply
+        // faithful Python equivalents of the abstract `PySequence_*`
+        // wrappers it exercises.
+        FrozenSource {
+            name: "_testlimitedcapi",
+            source: include_str!("python/_testlimitedcapi.py"),
+            is_package: false,
+        },
+        // Pure-Python stand-in for `_testcapi`, covering the traceback
+        // hooks (`exception_print` -> PyErr_Display via the traceback
+        // module, `traceback_print` -> PyTraceBack_Print).
+        FrozenSource {
+            name: "_testcapi",
+            source: include_str!("python/_testcapi.py"),
             is_package: false,
         },
     ]

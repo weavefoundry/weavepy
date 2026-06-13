@@ -550,6 +550,12 @@ _NODE_TYPES = {
     if isinstance(obj, type) and issubclass(obj, AST)
 }
 
+# PEP 634: AST nodes are matchable by position (`case ast.Expr(value)`).
+# CPython generates `__match_args__ = _fields` on every node type.
+for _node in _NODE_TYPES.values():
+    _node.__match_args__ = _node._fields
+del _node
+
 
 def _build(spec):
     """Rebuild a node tree from the value-based spec produced by ``_ast``."""
@@ -608,7 +614,15 @@ def parse(source, filename="<unknown>", mode="exec",
     if isinstance(source, (bytes, bytearray)):
         source = bytes(source).decode("utf-8")
     spec = _ast.parse(source, filename, mode)
-    return _fix_contexts(_build(spec))
+    tree = _fix_contexts(_build(spec))
+    # Remember the original text so `compile(tree, ...)` can recompile it
+    # (WeavePy compiles from source; an unmodified `ast.parse` round-trip
+    # is by far the common case).
+    try:
+        tree._weavepy_source = source
+    except Exception:
+        pass
+    return tree
 
 
 # ---------------------------------------------------------------------------
