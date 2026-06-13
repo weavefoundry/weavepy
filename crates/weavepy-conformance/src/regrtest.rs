@@ -270,9 +270,7 @@ pub fn discover_with(
             // Some regression tests are *packages* (`test_dataclasses/`
             // with an `__init__.py`); keep the `.py` label but run the
             // package entry point.
-            let pkg_init = dir
-                .join(name.trim_end_matches(".py"))
-                .join("__init__.py");
+            let pkg_init = dir.join(name.trim_end_matches(".py")).join("__init__.py");
             if pkg_init.is_file() {
                 out.push(RegrtestFile {
                     path: pkg_init,

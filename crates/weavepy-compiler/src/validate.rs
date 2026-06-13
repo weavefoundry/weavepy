@@ -275,21 +275,20 @@ impl Validator<'_> {
                     }
                 }
             }
-            StmtKind::ImportFrom { names, .. } => {
+            StmtKind::ImportFrom { names, .. }
                 if names.iter().any(|a| a.name == "*")
-                    && self.scope().kind != ScopeKind::Module
-                {
-                    // Anchor at the `*` itself — the last byte of the
-                    // statement span.
-                    let star = Span {
-                        start: weavepy_lexer::BytePos(stmt.span.end.0.saturating_sub(1)),
-                        end: stmt.span.end,
-                    };
-                    return Err(CompileError::spanned(
-                        "import * only allowed at module level",
-                        star,
-                    ));
-                }
+                    && self.scope().kind != ScopeKind::Module =>
+            {
+                // Anchor at the `*` itself — the last byte of the
+                // statement span.
+                let star = Span {
+                    start: weavepy_lexer::BytePos(stmt.span.end.0.saturating_sub(1)),
+                    end: stmt.span.end,
+                };
+                return Err(CompileError::spanned(
+                    "import * only allowed at module level",
+                    star,
+                ));
             }
             StmtKind::AnnAssign {
                 target,

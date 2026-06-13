@@ -220,9 +220,7 @@ impl TypeObject {
                     } else if sb.is_subclass_of(w) {
                         winner = Some(sb);
                     } else {
-                        return Err(type_error(
-                            "multiple bases have instance lay-out conflict",
-                        ));
+                        return Err(type_error("multiple bases have instance lay-out conflict"));
                     }
                 }
             }
@@ -536,7 +534,7 @@ impl TypeObject {
         // Iterative walk with a visited set: reentrant `__bases__`
         // assignment can leave a *cycle* through the subclass registry
         // (gh-92112), which naive recursion would loop on forever.
-        let mut visited: Vec<*const TypeObject> = vec![self as *const TypeObject];
+        let mut visited: Vec<*const TypeObject> = vec![std::ptr::from_ref::<TypeObject>(self)];
         self.getattribute_kind.set(0);
         let mut queue: Vec<Rc<TypeObject>> = self.subclasses();
         while let Some(t) = queue.pop() {

@@ -541,8 +541,7 @@ impl GcState {
             // clones here so an object reachable *only* through weakrefs
             // collapses to `gc_refs == 0` and is collected — which fires
             // `notify_clear` and flips `weakref.ref(obj)()` to `None`.
-            let weak_clones =
-                crate::weakref_registry::strong_clone_count(handle.id) as i64;
+            let weak_clones = crate::weakref_registry::strong_clone_count(handle.id) as i64;
             let outer = strong_count_for(&handle.object)
                 .saturating_sub(1)
                 .saturating_sub(weak_clones as usize) as i64;
@@ -554,10 +553,8 @@ impl GcState {
         // phases 3 and 4 are O(1) — a linear `find` here makes the
         // whole collection quadratic, which generator-heavy programs
         // (itertools pipelines) hit hard.
-        let by_id: std::collections::HashMap<ObjectId, Arc<TrackedHandle>> = candidate_set
-            .iter()
-            .map(|h| (h.id, h.clone()))
-            .collect();
+        let by_id: std::collections::HashMap<ObjectId, Arc<TrackedHandle>> =
+            candidate_set.iter().map(|h| (h.id, h.clone())).collect();
 
         // Phase 3: subtract internal refs by walking each
         // tracked object's children. Self-references count too —
@@ -791,7 +788,9 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             }
         }
         Object::Module(m) => {
-            let Ok(dict) = m.dict.try_borrow() else { return };
+            let Ok(dict) = m.dict.try_borrow() else {
+                return;
+            };
             for (k, v) in dict.iter() {
                 visit(&k.0);
                 visit(v);
@@ -1008,9 +1007,7 @@ fn run_finalizer(obj: &Object) {
 fn has_finalizer(obj: &Object) -> bool {
     match obj {
         Object::Instance(inst) => inst.cls().lookup("__del__").is_some(),
-        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
-            !g.is_finished()
-        }
+        Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => !g.is_finished(),
         _ => false,
     }
 }

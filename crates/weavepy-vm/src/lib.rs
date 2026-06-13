@@ -62,8 +62,7 @@ pub use crate::import::ModuleCache;
 use crate::import::{package_search_path, resolve_relative};
 use crate::object::{
     BoundMethod, BuiltinFn, DictData, DictKey, FileBackend, GeneratorState, MethodWrapper, Object,
-    PyFrame,
-    PyFunction, PyGenerator, PyModule, PySlice, PyTraceback,
+    PyFrame, PyFunction, PyGenerator, PyModule, PySlice, PyTraceback,
 };
 use crate::types::{PyInstance, TypeObject};
 
@@ -909,7 +908,10 @@ impl Interpreter {
             for handle in candidates {
                 // `swap` claims the finalizer so the cycle collector
                 // and a later shutdown pass can't double-run it.
-                if handle.finalized.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                if handle
+                    .finalized
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
                     continue;
                 }
                 self.invoke_finalizer(&handle.object);
@@ -935,8 +937,7 @@ impl Interpreter {
                 Ok(_) => warned = true,
                 Err(err) => {
                     let outer = Rc::new(RefCell::new(DictData::new()));
-                    let context_repr =
-                        self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
+                    let context_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
                     self.write_unraisable(&err, obj, &context_repr);
                 }
             }
@@ -982,8 +983,7 @@ impl Interpreter {
                 let globals = self.builtins.clone();
                 if let Err(err) = self.call(&finalizer, &[obj.clone()], &[], &globals) {
                     let outer = Rc::new(RefCell::new(DictData::new()));
-                    let context_repr =
-                        self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
+                    let context_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
                     self.write_unraisable(&err, obj, &context_repr);
                 }
                 return;
@@ -999,9 +999,7 @@ impl Interpreter {
         ) {
             if let Err(err) = self.gen_method_close(obj) {
                 let outer = Rc::new(RefCell::new(DictData::new()));
-                let context_repr = self
-                    .repr_of(obj, &outer)
-                    .unwrap_or_else(|_| obj.repr());
+                let context_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
                 self.write_unraisable(&err, obj, &context_repr);
             }
             return;
@@ -1013,10 +1011,7 @@ impl Interpreter {
             return;
         };
         let class_name = inst.cls().name.clone();
-        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-             obj.clone(),
-             del.clone(),
-        )));
+        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), del.clone())));
         let kwargs: Vec<(String, Object)> = Vec::new();
         let outer = Rc::new(RefCell::new(DictData::new()));
         if let Err(err) = self.call(&bound, &[], &kwargs, &outer) {
@@ -1025,9 +1020,7 @@ impl Interpreter {
             // (`cm.unraisable.object == C.__del__` holds); the printed
             // context still mirrors the bound-method repr so the
             // default hook emits `… <bound method C.__del__ of …>`.
-            let receiver_repr = self
-                .repr_of(obj, &outer)
-                .unwrap_or_else(|_| obj.repr());
+            let receiver_repr = self.repr_of(obj, &outer).unwrap_or_else(|_| obj.repr());
             let context_repr = format!("<bound method {class_name}.__del__ of {receiver_repr}>");
             self.write_unraisable(&err, &del, &context_repr);
         }
@@ -1051,8 +1044,7 @@ impl Interpreter {
                 (inst, ty, pyexc.traceback.clone())
             }
             other => {
-                let inst =
-                    crate::builtin_types::make_exception("RuntimeError", other.to_string());
+                let inst = crate::builtin_types::make_exception("RuntimeError", other.to_string());
                 let ty = match &inst {
                     Object::Instance(i) => Object::Type(i.cls()),
                     _ => Object::None,
@@ -1089,8 +1081,7 @@ impl Interpreter {
         };
         if !is_default {
             if let Some(hook) = hook {
-                let args_obj =
-                    self.make_unraisable_args(&exc_type, &exc_value, object);
+                let args_obj = self.make_unraisable_args(&exc_type, &exc_value, object);
                 let outer = self.builtins_dict();
                 if self.call(&hook, &[args_obj], &[], &outer).is_err() {
                     self.print_unraisable_default(&exc_value, &traceback, context_repr, true);
@@ -1208,7 +1199,12 @@ impl Interpreter {
             }
         };
         if let Some(hook) = user_hook {
-            match self.call(&hook, &[exc_type.clone(), value.clone(), tb.clone()], &[], &globals) {
+            match self.call(
+                &hook,
+                &[exc_type.clone(), value.clone(), tb.clone()],
+                &[],
+                &globals,
+            ) {
                 Ok(_) => return true,
                 Err(err) => {
                     // CPython: "Error in sys.excepthook:" then both
@@ -1500,9 +1496,8 @@ impl Interpreter {
         //   * a generator/coroutine *resume*  (pc != 0, gen code) — a
         //     real `next()`/`send()` that fires a `call` event and then
         //     continues line tracing from the suspension point.
-        let code_is_gen = frame.code.is_generator
-            || frame.code.is_coroutine
-            || frame.code.is_async_generator;
+        let code_is_gen =
+            frame.code.is_generator || frame.code.is_coroutine || frame.code.is_async_generator;
         let is_gen_bootstrap = code_is_gen && frame.pc == 0;
         let is_gen_resume = code_is_gen && frame.pc != 0;
         // RFC 0031 — fire the `'call'` event on frame entry. The
@@ -2480,12 +2475,7 @@ impl Interpreter {
                 let slot = ins.arg as usize;
                 if slot < frame.locals.len() {
                     if matches!(frame.locals[slot], Object::Unbound) {
-                        let name = frame
-                            .code
-                            .varnames
-                            .get(slot)
-                            .cloned()
-                            .unwrap_or_default();
+                        let name = frame.code.varnames.get(slot).cloned().unwrap_or_default();
                         return Err(Self::unbound_local(&name));
                     }
                     let old = std::mem::replace(&mut frame.locals[slot], Object::Unbound);
@@ -2659,10 +2649,8 @@ impl Interpreter {
                         // `dispatch`: a `__getitem__` that is itself a
                         // descriptor (`__getitem__ = property(...)`) must
                         // honour its `__get__` (test_descr test_properties).
-                        let method = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
-                             v.clone(),
-                             m,
-                        )));
+                        let method =
+                            Object::BoundMethod(Rc::new(BoundMethod::dispatch(v.clone(), m)));
                         self.call(
                             &method,
                             std::slice::from_ref(&i),
@@ -2685,9 +2673,7 @@ impl Interpreter {
                                         &[],
                                         &frame.globals.clone(),
                                     )?,
-                                    None => {
-                                        return Err(RuntimeError::PyException(exc))
-                                    }
+                                    None => return Err(RuntimeError::PyException(exc)),
                                 }
                             }
                             r => r?,
@@ -2708,8 +2694,8 @@ impl Interpreter {
                     };
                     if let Some(method) = meta_getitem {
                         let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                             Object::Type(ty.clone()),
-                             method,
+                            Object::Type(ty.clone()),
+                            method,
                         )));
                         self.call(
                             &bound,
@@ -2817,7 +2803,9 @@ impl Interpreter {
                                 // (`class C(complex)`, `class C(int)`, …) applies
                                 // the base type's unary op to its native payload,
                                 // matching CPython's inherited slot.
-                                None => unary_op(&v.native_value().unwrap_or_else(|| v.clone()), kind)?,
+                                None => {
+                                    unary_op(&v.native_value().unwrap_or_else(|| v.clone()), kind)?
+                                }
                             }
                         }
                     }
@@ -3596,7 +3584,9 @@ impl Interpreter {
             }
             OpCode::LoadAssertionError => {
                 frame.push(Object::Type(
-                    crate::builtin_types::builtin_types().assertion_error.clone(),
+                    crate::builtin_types::builtin_types()
+                        .assertion_error
+                        .clone(),
                 ));
             }
             OpCode::RaiseVarargs => {
@@ -3674,9 +3664,7 @@ impl Interpreter {
                 );
                 let (matched, rest) = if is_group {
                     let overrides_split = match &exc {
-                        Object::Instance(i) => {
-                            crate::builtin_types::overrides_eg_split(&i.cls())
-                        }
+                        Object::Instance(i) => crate::builtin_types::overrides_eg_split(&i.cls()),
                         _ => false,
                     };
                     if overrides_split {
@@ -4444,25 +4432,25 @@ impl Interpreter {
             // Advance `fast` two steps, severing a link to `target`.
             let Some(next) = ctx_of(&fast) else { return };
             if Rc::ptr_eq(&next, target) {
-                fast.dict.borrow_mut().insert(
-                    DictKey(Object::from_static("__context__")),
-                    Object::None,
-                );
+                fast.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_static("__context__")), Object::None);
                 return;
             }
             fast = next;
             let Some(next) = ctx_of(&fast) else { return };
             if Rc::ptr_eq(&next, target) {
-                fast.dict.borrow_mut().insert(
-                    DictKey(Object::from_static("__context__")),
-                    Object::None,
-                );
+                fast.dict
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_static("__context__")), Object::None);
                 return;
             }
             fast = next;
             // Advance `slow` one step; if it meets `fast` we're on a
             // pre-existing cycle with no `target` link — stop.
-            let Some(next_slow) = ctx_of(&slow) else { return };
+            let Some(next_slow) = ctx_of(&slow) else {
+                return;
+            };
             slow = next_slow;
             if Rc::ptr_eq(&slow, &fast) {
                 return;
@@ -4708,10 +4696,7 @@ impl Interpreter {
                     // returned as-is, like CPython's generic getattr.
                     return Ok(match f {
                         Object::Function(_) | Object::Builtin(_) => {
-                            Object::BoundMethod(Rc::new(BoundMethod::new(
-                                 obj.clone(),
-                                 f,
-                            )))
+                            Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), f)))
                         }
                         other => other,
                     });
@@ -4812,17 +4797,13 @@ impl Interpreter {
                         // currently delegating to (CPython `gi_yieldfrom`:
                         // the object on top of the suspended frame's stack
                         // when paused inside a `yield from` / `await`).
-                        "yieldfrom" if prefix == "gi_" => {
-                            return Ok(self.gen_yieldfrom(g))
-                        }
+                        "yieldfrom" if prefix == "gi_" => return Ok(self.gen_yieldfrom(g)),
                         "await" if prefix == "cr_" || prefix == "ag_" => {
                             return Ok(self.gen_yieldfrom(g))
                         }
                         // PEP-style origin tracking
                         // (`sys.set_coroutine_origin_tracking_depth`).
-                        "origin" if prefix == "cr_" => {
-                            return Ok(g.origin.borrow().clone())
-                        }
+                        "origin" if prefix == "cr_" => return Ok(g.origin.borrow().clone()),
                         _ => {}
                     }
                 }
@@ -4837,9 +4818,7 @@ impl Interpreter {
                         name: "__reduce_ex__",
                         binds_instance: false,
                         call: Box::new(move |_args| {
-                            Err(type_error(format!(
-                                "cannot pickle '{type_name}' object"
-                            )))
+                            Err(type_error(format!("cannot pickle '{type_name}' object")))
                         }),
                         call_kw: None,
                     })));
@@ -4874,18 +4853,18 @@ impl Interpreter {
             Object::Property(p) => match name {
                 // A tagged numeric getset/member (`float.real`,
                 // `complex.real`) reports CPython descriptor metadata.
-                "__name__" if crate::descr_registry::lookup(obj).is_some() => {
-                    Ok(Object::from_str(&crate::descr_registry::lookup(obj).unwrap().name))
-                }
-                "__qualname__" if crate::descr_registry::lookup(obj).is_some() => {
-                    Ok(Object::from_str(
-                        &crate::descr_registry::lookup(obj).unwrap().qualname,
-                    ))
-                }
-                "__objclass__" if crate::descr_registry::lookup(obj).is_some() => {
-                    Ok(Object::Type(crate::descr_registry::lookup(obj).unwrap().objclass))
-                }
-                "__doc__" if crate::descr_registry::lookup(obj).is_some_and(|m| m.doc.is_some()) => {
+                "__name__" if crate::descr_registry::lookup(obj).is_some() => Ok(Object::from_str(
+                    &crate::descr_registry::lookup(obj).unwrap().name,
+                )),
+                "__qualname__" if crate::descr_registry::lookup(obj).is_some() => Ok(
+                    Object::from_str(&crate::descr_registry::lookup(obj).unwrap().qualname),
+                ),
+                "__objclass__" if crate::descr_registry::lookup(obj).is_some() => Ok(Object::Type(
+                    crate::descr_registry::lookup(obj).unwrap().objclass,
+                )),
+                "__doc__"
+                    if crate::descr_registry::lookup(obj).is_some_and(|m| m.doc.is_some()) =>
+                {
                     Ok(crate::descr_registry::lookup(obj)
                         .and_then(|m| m.doc)
                         .map(Object::from_static)
@@ -4925,8 +4904,8 @@ impl Interpreter {
                 _ => {
                     if let Some(method) = self.lookup_method(obj, name) {
                         return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                             obj.clone(),
-                             method,
+                            obj.clone(),
+                            method,
                         ))));
                     }
                     Err(attribute_error(format!(
@@ -4942,7 +4921,11 @@ impl Interpreter {
                 // functools-wrapper attributes at construction and open
                 // to arbitrary writes (bpo-43682).
                 "__dict__" => Ok(Object::Dict(inner.dict.clone())),
-                _ if inner.dict.borrow().contains_key(&DictKey(Object::from_str(name))) => {
+                _ if inner
+                    .dict
+                    .borrow()
+                    .contains_key(&DictKey(Object::from_str(name))) =>
+                {
                     Ok(inner.dict.borrow()[&DictKey(Object::from_str(name))].clone())
                 }
                 // The descriptor hook. `staticmethod` is a non-data
@@ -4950,8 +4933,8 @@ impl Interpreter {
                 // function. Descriptor-aware library code (e.g.
                 // `functools.partialmethod`) relies on this being present.
                 "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                     Object::StaticMethod(inner.clone()),
-                     crate::builtins::descriptor_get_builtin(true),
+                    Object::StaticMethod(inner.clone()),
+                    crate::builtins::descriptor_get_builtin(true),
                 )))),
                 "__isabstractmethod__" => {
                     // Honour an `@abstractmethod` decorator applied
@@ -4977,15 +4960,19 @@ impl Interpreter {
                 "__func__" | "__wrapped__" => Ok(inner.func()),
                 // Instance dict, as for `staticmethod` above.
                 "__dict__" => Ok(Object::Dict(inner.dict.clone())),
-                _ if inner.dict.borrow().contains_key(&DictKey(Object::from_str(name))) => {
+                _ if inner
+                    .dict
+                    .borrow()
+                    .contains_key(&DictKey(Object::from_str(name))) =>
+                {
                     Ok(inner.dict.borrow()[&DictKey(Object::from_str(name))].clone())
                 }
                 // The descriptor hook. `cm.__get__(obj, cls)` returns the
                 // wrapped callable bound to the owning class. Library code
                 // such as `functools.partialmethod` invokes it directly.
                 "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                     Object::ClassMethod(inner.clone()),
-                     crate::builtins::descriptor_get_builtin(false),
+                    Object::ClassMethod(inner.clone()),
+                    crate::builtins::descriptor_get_builtin(false),
                 )))),
                 "__isabstractmethod__" => Ok(self
                     .load_attr(&inner.func(), "__isabstractmethod__")
@@ -5050,8 +5037,8 @@ impl Interpreter {
                 // `cls.__dict__.get(name)` on exactly this proxy type).
                 if let Some(m) = self.lookup_method(obj, name) {
                     return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                         obj.clone(),
-                         m,
+                        obj.clone(),
+                        m,
                     ))));
                 }
                 Err(attribute_error(format!(
@@ -5073,8 +5060,8 @@ impl Interpreter {
                 _ => {
                     if let Some(m) = self.lookup_method(obj, name) {
                         return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                             obj.clone(),
-                             m,
+                            obj.clone(),
+                            m,
                         ))));
                     }
                     Err(attribute_error(format!(
@@ -5116,8 +5103,7 @@ impl Interpreter {
                         // the function body, if it is a string
                         // literal, is stored as ``co_consts[0]`` and
                         // surfaces as ``__doc__``.
-                        let v =
-                            crate::builtins::code_docstring(&f.code()).unwrap_or(Object::None);
+                        let v = crate::builtins::code_docstring(&f.code()).unwrap_or(Object::None);
                         f.set_slot("__doc__", v.clone());
                         return Ok(v);
                     }
@@ -5193,8 +5179,8 @@ impl Interpreter {
                     // treat a plain function uniformly with methods.
                     "__get__" => {
                         return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                             obj.clone(),
-                             crate::builtins::function_get_builtin(),
+                            obj.clone(),
+                            crate::builtins::function_get_builtin(),
                         ))))
                     }
                     _ => {}
@@ -5244,10 +5230,9 @@ impl Interpreter {
                         name: "frame.clear",
                         binds_instance: false,
                         call: Box::new(move |_args| {
-                            let ptr = crate::vm_singletons::current_interpreter_ptr()
-                                .ok_or_else(|| {
-                                    RuntimeError::Internal("no running interpreter".to_owned())
-                                })?;
+                            let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(
+                                || RuntimeError::Internal("no running interpreter".to_owned()),
+                            )?;
                             // SAFETY: published by the enclosing VM frame.
                             let interp = unsafe { &mut *ptr };
                             interp.frame_clear(&fr)
@@ -5280,15 +5265,15 @@ impl Interpreter {
                 // reports its CPython metadata: `__qualname__` is
                 // `objclass.__qualname__ + '.' + name` and `__objclass__`
                 // the owning class (test_descr test_qualname/test_descrdoc).
-                "__qualname__" if crate::descr_registry::lookup(obj).is_some() => {
-                    Ok(Object::from_str(
-                        &crate::descr_registry::lookup(obj).unwrap().qualname,
-                    ))
-                }
-                "__objclass__" if crate::descr_registry::lookup(obj).is_some() => {
-                    Ok(Object::Type(crate::descr_registry::lookup(obj).unwrap().objclass))
-                }
-                "__doc__" if crate::descr_registry::lookup(obj).is_some_and(|m| m.doc.is_some()) => {
+                "__qualname__" if crate::descr_registry::lookup(obj).is_some() => Ok(
+                    Object::from_str(&crate::descr_registry::lookup(obj).unwrap().qualname),
+                ),
+                "__objclass__" if crate::descr_registry::lookup(obj).is_some() => Ok(Object::Type(
+                    crate::descr_registry::lookup(obj).unwrap().objclass,
+                )),
+                "__doc__"
+                    if crate::descr_registry::lookup(obj).is_some_and(|m| m.doc.is_some()) =>
+                {
                     Ok(crate::descr_registry::lookup(obj)
                         .and_then(|m| m.doc)
                         .map(Object::from_static)
@@ -5312,8 +5297,8 @@ impl Interpreter {
                 // the receiver. `enum._is_descriptor` and similar
                 // introspection key on its presence.
                 "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                     obj.clone(),
-                     Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                    obj.clone(),
+                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
                         name: "__get__",
                         binds_instance: true,
                         call: Box::new(crate::builtins::builtin_descriptor_get),
@@ -5342,8 +5327,8 @@ impl Interpreter {
                 // `m.__get__(obj, cls)` returns `m` unchanged instead of
                 // forwarding to `__func__.__get__` and re-binding to `obj`.
                 "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                     obj.clone(),
-                     Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                    obj.clone(),
+                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
                         name: "__get__",
                         binds_instance: true,
                         call: Box::new(crate::builtins::method_descr_get),
@@ -5472,8 +5457,8 @@ impl Interpreter {
                         "__next__" => {
                             let it = it.clone();
                             return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                                 obj.clone(),
-                                 Object::Builtin(Rc::new(BuiltinFn {
+                                obj.clone(),
+                                Object::Builtin(Rc::new(BuiltinFn {
                                     name: "__next__",
                                     binds_instance: true,
                                     call: Box::new(move |_args| {
@@ -5488,8 +5473,8 @@ impl Interpreter {
                         "__iter__" => {
                             let me = obj.clone();
                             return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                                 obj.clone(),
-                                 Object::Builtin(Rc::new(BuiltinFn {
+                                obj.clone(),
+                                Object::Builtin(Rc::new(BuiltinFn {
                                     name: "__iter__",
                                     binds_instance: true,
                                     call: Box::new(move |_args| Ok(me.clone())),
@@ -5502,8 +5487,8 @@ impl Interpreter {
                 }
                 if let Some(method) = self.lookup_method(obj, name) {
                     return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                         obj.clone(),
-                         method,
+                        obj.clone(),
+                        method,
                     ))));
                 }
                 Err(attribute_error(format!(
@@ -5548,8 +5533,8 @@ impl Interpreter {
             // its `__get__` honoured before the call (test_descr
             // test_getattr_hooks).
             let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
-                 instance_obj.clone(),
-                 getattribute,
+                instance_obj.clone(),
+                getattribute,
             )));
             self.call(
                 &bound,
@@ -5566,8 +5551,8 @@ impl Interpreter {
                     // `dispatch` so a descriptor `__getattr__` also honours
                     // its `__get__` (test_descr test_getattr_hooks).
                     let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
-                         instance_obj.clone(),
-                         getattr,
+                        instance_obj.clone(),
+                        getattr,
                     )));
                     self.call(
                         &bound,
@@ -5655,7 +5640,8 @@ impl Interpreter {
         let super_fields = if name != "__self__" && name != "__class__" {
             let d = inst.dict.borrow();
             match (
-                d.get(&DictKey(Object::from_static("__self_class__"))).cloned(),
+                d.get(&DictKey(Object::from_static("__self_class__")))
+                    .cloned(),
                 d.get(&DictKey(Object::from_static("__self__"))).cloned(),
                 d.get(&DictKey(Object::from_static("__thisclass__")))
                     .cloned(),
@@ -5681,9 +5667,12 @@ impl Interpreter {
                     .iter()
                     .position(|t| Rc::ptr_eq(t, &thisclass))
                     .map_or(mro.len(), |i| i + 1);
-                mro[start..]
-                    .iter()
-                    .find_map(|t| t.dict.borrow().get(&DictKey(Object::from_str(name))).cloned())
+                mro[start..].iter().find_map(|t| {
+                    t.dict
+                        .borrow()
+                        .get(&DictKey(Object::from_str(name)))
+                        .cloned()
+                })
             };
             if let Some(v) = found {
                 // CPython passes `su->obj_type` as `owner`, and a NULL
@@ -5833,8 +5822,8 @@ impl Interpreter {
             if let Some(native) = &inst.native {
                 if let Some(m) = crate::builtins::immutable_subclass_getnewargs(native) {
                     return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                         instance_obj.clone(),
-                         m,
+                        instance_obj.clone(),
+                        m,
                     ))));
                 }
             }
@@ -5853,10 +5842,7 @@ impl Interpreter {
             if let Some(native) = &inst.native {
                 let native = native.clone();
                 if let Some(m) = crate::builtins::lookup_method(&native, name) {
-                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                         native,
-                         m,
-                    ))));
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(native, m))));
                 }
             }
         }
@@ -6013,8 +5999,8 @@ impl Interpreter {
                     call_kw: None,
                 }));
                 return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                     Object::Type(ty.clone()),
-                     builtin,
+                    Object::Type(ty.clone()),
+                    builtin,
                 ))));
             }
             "__module__" => {
@@ -6158,8 +6144,8 @@ impl Interpreter {
             }
             Object::StaticMethod(inner) => Ok(inner.func()),
             Object::ClassMethod(inner) => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                 owner.clone(),
-                 inner.func(),
+                owner.clone(),
+                inner.func(),
             )))),
             Object::SlotDescriptor(slot) => match instance {
                 Object::None => Ok(attr.clone()),
@@ -6201,8 +6187,8 @@ impl Interpreter {
                     Ok(attr.clone())
                 } else {
                     Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                         instance.clone(),
-                         attr.clone(),
+                        instance.clone(),
+                        attr.clone(),
                     ))))
                 }
             }
@@ -6214,8 +6200,8 @@ impl Interpreter {
                     Ok(attr.clone())
                 } else {
                     Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                         instance.clone(),
-                         attr.clone(),
+                        instance.clone(),
+                        attr.clone(),
                     ))))
                 }
             }
@@ -6244,10 +6230,8 @@ impl Interpreter {
                 // User-defined descriptor: invoke its `__get__` if
                 // present, otherwise pass the descriptor through.
                 if let Some(get_method) = inner_inst.cls().lookup("__get__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                         attr.clone(),
-                         get_method,
-                    )));
+                    let bound =
+                        Object::BoundMethod(Rc::new(BoundMethod::new(attr.clone(), get_method)));
                     return self.call(
                         &bound,
                         &[instance.clone(), owner.clone()],
@@ -6264,16 +6248,15 @@ impl Interpreter {
     fn maybe_bind(&self, receiver: &Object, attr: Object) -> Object {
         match &attr {
             Object::Builtin(b) if !b.binds_instance => attr,
-            Object::Function(_) | Object::Builtin(_) => Object::BoundMethod(Rc::new(BoundMethod::new(
-                 receiver.clone(),
-                 attr,
-            ))),
+            Object::Function(_) | Object::Builtin(_) => {
+                Object::BoundMethod(Rc::new(BoundMethod::new(receiver.clone(), attr)))
+            }
             Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod::new(
-                 match receiver {
+                match receiver {
                     Object::Instance(inst) => Object::Type(inst.cls()),
                     other => other.clone(),
                 },
-                 inner.func(),
+                inner.func(),
             ))),
             Object::StaticMethod(inner) => inner.func(),
             _ => attr,
@@ -6543,9 +6526,7 @@ impl Interpreter {
                     'r' => self.repr_of(&value, globals)?,
                     'a' => self.ascii_of(&value, globals)?,
                     other => {
-                        return Err(value_error(format!(
-                            "Unknown conversion specifier {other}"
-                        )))
+                        return Err(value_error(format!("Unknown conversion specifier {other}")))
                     }
                 };
                 self.format_obj_str(&Object::from_str(converted), spec, globals)
@@ -6971,8 +6952,11 @@ impl Interpreter {
         let Some(warn) = self.module_attr("warnings", "warn") else {
             return Ok(());
         };
-        let category =
-            Object::Type(crate::builtin_types::builtin_types().deprecation_warning.clone());
+        let category = Object::Type(
+            crate::builtin_types::builtin_types()
+                .deprecation_warning
+                .clone(),
+        );
         let globals = self.builtins.clone();
         self.call(&warn, &[Object::from_str(message), category], &[], &globals)
             .map(|_| ())
@@ -6985,8 +6969,11 @@ impl Interpreter {
         let Some(warn) = self.module_attr("warnings", "warn") else {
             return Ok(());
         };
-        let category =
-            Object::Type(crate::builtin_types::builtin_types().runtime_warning.clone());
+        let category = Object::Type(
+            crate::builtin_types::builtin_types()
+                .runtime_warning
+                .clone(),
+        );
         let globals = self.builtins.clone();
         self.call(&warn, &[Object::from_str(message), category], &[], &globals)
             .map(|_| ())
@@ -7105,9 +7092,7 @@ impl Interpreter {
         match &args[0] {
             // A real number with an explicit base is a TypeError — the base
             // only applies to string/bytes parsing.
-            Object::Int(_) | Object::Long(_) | Object::Bool(_) | Object::Float(_)
-                if has_base =>
-            {
+            Object::Int(_) | Object::Long(_) | Object::Bool(_) | Object::Float(_) if has_base => {
                 Err(type_error(
                     "int() can't convert non-string with explicit base",
                 ))
@@ -7608,9 +7593,7 @@ impl Interpreter {
                                         RuntimeError::PyException(pe) => self
                                             .exception_matches(
                                                 &pe.instance,
-                                                &Object::Type(
-                                                    builtin_types().type_error.clone(),
-                                                ),
+                                                &Object::Type(builtin_types().type_error.clone()),
                                             )
                                             .unwrap_or(false),
                                         RuntimeError::Internal(_) => false,
@@ -7726,14 +7709,11 @@ impl Interpreter {
         // Same laziness contract as `do_map_call`: predicates that can run
         // user code (or fail to be callable at all) must be driven on
         // demand. `None` (identity predicate) stays eager-eligible.
-        let pred_native =
-            matches!(args[0], Object::None) || callable_is_pure_native(&args[0]);
+        let pred_native = matches!(args[0], Object::None) || callable_is_pure_native(&args[0]);
         if !pred_native || object_needs_vm_iter(&args[1]) {
             return match self.make_seqtools_iter("_FilterIter", args, &[], globals)? {
                 Some(it) => Ok(it),
-                None => Err(runtime_error(
-                    "internal: _seqtools._FilterIter unavailable",
-                )),
+                None => Err(runtime_error("internal: _seqtools._FilterIter unavailable")),
             };
         }
         let func = args[0].clone();
@@ -7966,8 +7946,8 @@ impl Interpreter {
             if !Rc::ptr_eq(&meta, &builtin_types().type_) {
                 if let Some(hook) = meta.lookup("__instancecheck__") {
                     let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                         Object::Type(cls.clone()),
-                         hook,
+                        Object::Type(cls.clone()),
+                        hook,
                     )));
                     let res = self.call(&bound, std::slice::from_ref(obj), &[], globals)?;
                     return Ok(Object::Bool(res.is_truthy()));
@@ -7999,10 +7979,8 @@ impl Interpreter {
             if let Some(hook) = inst.cls().lookup("__instancecheck__") {
                 // `dispatch` so a descriptor `__instancecheck__` honours its
                 // `__get__` (test_descr test_special_method_lookup).
-                let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
-                     classinfo.clone(),
-                     hook,
-                )));
+                let bound =
+                    Object::BoundMethod(Rc::new(BoundMethod::dispatch(classinfo.clone(), hook)));
                 let res = self.call(&bound, std::slice::from_ref(obj), &[], globals)?;
                 return Ok(Object::Bool(res.is_truthy()));
             }
@@ -8091,8 +8069,8 @@ impl Interpreter {
             if !Rc::ptr_eq(&meta, &builtin_types().type_) {
                 if let Some(hook) = meta.lookup("__subclasscheck__") {
                     let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                         Object::Type(info_cls.clone()),
-                         hook,
+                        Object::Type(info_cls.clone()),
+                        hook,
                     )));
                     let res = self.call(&bound, std::slice::from_ref(cls), &[], globals)?;
                     return Ok(Object::Bool(res.is_truthy()));
@@ -8126,10 +8104,8 @@ impl Interpreter {
             if let Some(hook) = inst.cls().lookup("__subclasscheck__") {
                 // `dispatch` so a descriptor `__subclasscheck__` honours its
                 // `__get__` (test_descr test_special_method_lookup).
-                let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
-                     classinfo.clone(),
-                     hook,
-                )));
+                let bound =
+                    Object::BoundMethod(Rc::new(BoundMethod::dispatch(classinfo.clone(), hook)));
                 let res = self.call(&bound, std::slice::from_ref(cls), &[], globals)?;
                 return Ok(Object::Bool(res.is_truthy()));
             }
@@ -8139,7 +8115,10 @@ impl Interpreter {
         // missing/non-tuple `__bases__` ⇒ TypeError; a non-AttributeError
         // raised while reading it propagates unchanged.
         self.check_class(cls, "issubclass() arg 1 must be a class")?;
-        self.check_class(classinfo, "issubclass() arg 2 must be a class or tuple of classes")?;
+        self.check_class(
+            classinfo,
+            "issubclass() arg 2 must be a class or tuple of classes",
+        )?;
         Ok(Object::Bool(self.abstract_issubclass(cls, classinfo)?))
     }
 
@@ -8232,10 +8211,7 @@ impl Interpreter {
                     )));
                 }
                 Some((method @ (Object::Function(_) | Object::BoundMethod(_)), _)) => {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                         obj.clone(),
-                         method,
-                    )));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), method)));
                     return self.call(&bound, &[], &[], globals);
                 }
                 // A builtin `tp_hash` slot materialized in a type dict
@@ -8300,7 +8276,8 @@ impl Interpreter {
     /// errored, so the caller falls back to native identity equality.
     pub(crate) fn reentrant_py_eq(&mut self, a: &Object, b: &Object) -> Option<bool> {
         let globals = self.builtins.clone();
-        self.dispatch_compare_op(a, b, CompareKind::Eq, &globals).ok()
+        self.dispatch_compare_op(a, b, CompareKind::Eq, &globals)
+            .ok()
     }
 
     /// VM-routed `getattr(obj, name[, default])`. Routes through the
@@ -8623,7 +8600,8 @@ impl Interpreter {
                 decorated.reverse();
             }
             if decorated.iter().any(|(k, _)| sort_key_needs_dunder_lt(k)) {
-                decorated = merge_sort_by_pylt(self, decorated, &|p: &(Object, Object)| &p.0, globals)?;
+                decorated =
+                    merge_sort_by_pylt(self, decorated, &|p: &(Object, Object)| &p.0, globals)?;
             } else {
                 // Uncomparable keys must surface the `TypeError` (CPython
                 // propagates the failed `<`), not silently compare equal.
@@ -8650,12 +8628,8 @@ impl Interpreter {
                 items.reverse();
             }
             if items.iter().any(sort_key_needs_dunder_lt) {
-                let sorted = merge_sort_by_pylt(
-                    self,
-                    std::mem::take(items),
-                    &|o: &Object| o,
-                    globals,
-                )?;
+                let sorted =
+                    merge_sort_by_pylt(self, std::mem::take(items), &|o: &Object| o, globals)?;
                 *items = sorted;
             } else {
                 let mut err: Option<RuntimeError> = None;
@@ -8857,9 +8831,7 @@ impl Interpreter {
             // element's `__eq__` runs first. Order matters for asymmetric
             // `__eq__` (e.g. an element that compares unequal to everything
             // must not be "found" by a target that compares equal to all).
-            if item.is_same(&x)
-                || self.dispatch_compare_op(&x, item, CompareKind::Eq, globals)?
-            {
+            if item.is_same(&x) || self.dispatch_compare_op(&x, item, CompareKind::Eq, globals)? {
                 return Ok(true);
             }
         }
@@ -8916,7 +8888,12 @@ impl Interpreter {
             _ => None,
         };
         match cls {
-            Some(cls) => Ok(Some(self.call(&cls, std::slice::from_ref(seq), &[], globals)?)),
+            Some(cls) => Ok(Some(self.call(
+                &cls,
+                std::slice::from_ref(seq),
+                &[],
+                globals,
+            )?)),
             None => Ok(None),
         }
     }
@@ -8984,8 +8961,8 @@ impl Interpreter {
                 let meta = ty.metaclass_or_type();
                 if let Some(method) = meta.lookup("__iter__") {
                     let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                         Object::Type(ty.clone()),
-                         method,
+                        Object::Type(ty.clone()),
+                        method,
                     )));
                     return self.call(&bound, &[], &[], globals);
                 }
@@ -9117,13 +9094,9 @@ impl Interpreter {
                     // a plain iterator — a coroutine is rejected outright,
                     // and anything without `__next__` is a non-iterator.
                     match &it {
-                        Object::Coroutine(_) => {
-                            Err(type_error("__await__() returned a coroutine"))
-                        }
+                        Object::Coroutine(_) => Err(type_error("__await__() returned a coroutine")),
                         Object::Iter(_) | Object::Generator(_) => Ok(it),
-                        Object::Instance(_) if instance_method(&it, "__next__").is_some() => {
-                            Ok(it)
-                        }
+                        Object::Instance(_) if instance_method(&it, "__next__").is_some() => Ok(it),
                         other => Err(type_error(format!(
                             "__await__() returned non-iterator of type '{}'",
                             other.type_name_owned()
@@ -9392,8 +9365,7 @@ impl Interpreter {
                     let r = *r;
                     if !*started {
                         *started = true;
-                        let t: Vec<Object> =
-                            indices.iter().map(|&ix| pool[ix].clone()).collect();
+                        let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
                         return Ok(Some(Object::Tuple(t.into())));
                     }
                     let mut i = r as i64 - 1;
@@ -9426,8 +9398,7 @@ impl Interpreter {
                     let r = *r;
                     if !*started {
                         *started = true;
-                        let t: Vec<Object> =
-                            indices.iter().map(|&ix| pool[ix].clone()).collect();
+                        let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
                         return Ok(Some(Object::Tuple(t.into())));
                     }
                     let mut i = r as i64 - 1;
@@ -9688,19 +9659,17 @@ impl Interpreter {
                 }
                 Ok(Some(item))
             }
-            Snap::Chain {
-                mut source,
-                mut active,
-            } => {
-                let write_back =
-                    |source: &Option<Object>, active: &Option<Object>| {
-                        if let LazyIterKind::Chain { source: s, active: a } =
-                            &mut *l.state.borrow_mut()
-                        {
-                            *s = source.clone();
-                            *a = active.clone();
-                        }
-                    };
+            Snap::Chain { source, mut active } => {
+                let write_back = |source: &Option<Object>, active: &Option<Object>| {
+                    if let LazyIterKind::Chain {
+                        source: s,
+                        active: a,
+                    } = &mut *l.state.borrow_mut()
+                    {
+                        *s = source.clone();
+                        *a = active.clone();
+                    }
+                };
                 loop {
                     let Some(src) = &source else {
                         write_back(&None, &None);
@@ -9789,9 +9758,7 @@ impl Interpreter {
                 if self.obj_truthy(&verdict, globals)? {
                     Ok(Some(item))
                 } else {
-                    if let LazyIterKind::TakeWhile { stopped: s, .. } =
-                        &mut *l.state.borrow_mut()
-                    {
+                    if let LazyIterKind::TakeWhile { stopped: s, .. } = &mut *l.state.borrow_mut() {
                         *s = true;
                     }
                     Ok(None)
@@ -9827,8 +9794,7 @@ impl Interpreter {
                     return Ok(None);
                 };
                 let clear = || {
-                    if let LazyIterKind::Pairwise { source: s, old: o } =
-                        &mut *l.state.borrow_mut()
+                    if let LazyIterKind::Pairwise { source: s, old: o } = &mut *l.state.borrow_mut()
                     {
                         *s = None;
                         *o = None;
@@ -9892,9 +9858,8 @@ impl Interpreter {
                             None => {
                                 numactive -= 1;
                                 if numactive == 0 {
-                                    if let LazyIterKind::ZipLongest {
-                                        numactive: na, ..
-                                    } = &mut *l.state.borrow_mut()
+                                    if let LazyIterKind::ZipLongest { numactive: na, .. } =
+                                        &mut *l.state.borrow_mut()
                                     {
                                         *na = 0;
                                     }
@@ -9942,9 +9907,7 @@ impl Interpreter {
                 let new_total = match total {
                     None => item,
                     Some(total) => match &func {
-                        None => {
-                            self.dispatch_binary_op(&total, &item, BinOpKind::Add, globals)?
-                        }
+                        None => self.dispatch_binary_op(&total, &item, BinOpKind::Add, globals)?,
                         Some(f) => self.call(f, &[total, item], &[], globals)?,
                     },
                 };
@@ -10451,7 +10414,7 @@ impl Interpreter {
         match &*g.state.borrow() {
             GeneratorState::Suspended(boxed) => boxed
                 .downcast_ref::<Frame>()
-                .map_or(true, |f| f.agen_yielded_value),
+                .is_none_or(|f| f.agen_yielded_value),
             _ => true,
         }
     }
@@ -10594,9 +10557,7 @@ impl Interpreter {
         let msg = match gen.kind {
             CoroutineKind::Generator if is_stop_iter => "generator raised StopIteration",
             CoroutineKind::Coroutine if is_stop_iter => "coroutine raised StopIteration",
-            CoroutineKind::AsyncGenerator if is_stop_iter => {
-                "async generator raised StopIteration"
-            }
+            CoroutineKind::AsyncGenerator if is_stop_iter => "async generator raised StopIteration",
             CoroutineKind::AsyncGenerator if is_stop_async => {
                 "async generator raised StopAsyncIteration"
             }
@@ -10672,10 +10633,9 @@ impl Interpreter {
             // re-enters the outer generator frame, so code in the
             // inner generator sees `f_back` chain through it
             // (`check_stack_names` expects ['f', 'g']).
-            let pushed_outer = frame.py_frame.clone().map(|py| {
+            let pushed_outer = frame.py_frame.clone().inspect(|py| {
                 *py.back.borrow_mut() = self.frame_stack.borrow().last().cloned();
                 self.frame_stack.borrow_mut().push(py.clone());
-                py
             });
             let inner_result = self.throw_into_subiter(&sub_iter, exc.clone());
             if pushed_outer.is_some() {
@@ -10851,10 +10811,8 @@ impl Interpreter {
                 // unraisable hook asserts `exc_traceback is not None`).
                 let frame_obj = self.gen_py_frame(&g);
                 *g.state.borrow_mut() = GeneratorState::Finished;
-                let err = crate::error::runtime_error(format!(
-                    "{} ignored GeneratorExit",
-                    g.kind.word()
-                ));
+                let err =
+                    crate::error::runtime_error(format!("{} ignored GeneratorExit", g.kind.word()));
                 if let RuntimeError::PyException(pyexc) = &err {
                     if let (Object::Instance(inst), Object::Frame(pf)) =
                         (&pyexc.instance, &frame_obj)
@@ -11284,13 +11242,17 @@ impl Interpreter {
             // iterable of key/value pairs).
             (Object::Dict(dst), BinOpKind::BitOr) => {
                 let src: Vec<(DictKey, Object)> = match b {
-                    Object::Dict(s) => {
-                        s.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                    }
+                    Object::Dict(s) => s
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
                     Object::Instance(_) => match b.native_value() {
-                        Some(Object::Dict(s)) => {
-                            s.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                        }
+                        Some(Object::Dict(s)) => s
+                            .borrow()
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                         _ => {
                             let pairs = self.collect_iterable(b, globals)?;
                             let mut out = Vec::with_capacity(pairs.len());
@@ -11343,8 +11305,10 @@ impl Interpreter {
             // `set`/`frozenset` in-place set algebra. `frozenset` is
             // immutable, so it falls through to the binary path which
             // returns a fresh object; only mutable `set` mutates here.
-            (Object::Set(_), BinOpKind::BitOr | BinOpKind::BitAnd | BinOpKind::Sub | BinOpKind::BitXor) =>
-            {
+            (
+                Object::Set(_),
+                BinOpKind::BitOr | BinOpKind::BitAnd | BinOpKind::Sub | BinOpKind::BitXor,
+            ) => {
                 let r = self.dispatch_binary_op(a, b, op, globals)?;
                 if let (Object::Set(dst), Object::Set(src)) = (a, &r) {
                     let new_items = src.borrow().clone();
@@ -11480,8 +11444,7 @@ impl Interpreter {
                 if overridden {
                     if let Some(method) = instance_method(b, rdunder) {
                         reflected_tried = true;
-                        let r =
-                            self.call(&method, std::slice::from_ref(a), &[], globals)?;
+                        let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
                         if !r.is_same(&not_impl) {
                             return Ok(r);
                         }
@@ -11582,9 +11545,9 @@ impl Interpreter {
                     'b' => match instance_method(obj, "__bytes__") {
                         Some(m) => {
                             let r = self.call(&m, &[], &[], globals)?;
-                            let raw = r.as_bytes_view().ok_or_else(|| {
-                                type_error("__bytes__ returned non-bytes")
-                            })?;
+                            let raw = r
+                                .as_bytes_view()
+                                .ok_or_else(|| type_error("__bytes__ returned non-bytes"))?;
                             Ok(Some(raw.iter().map(|x| *x as char).collect()))
                         }
                         None => Ok(None),
@@ -11635,8 +11598,8 @@ impl Interpreter {
             let meta = ty.metaclass_or_type();
             if let Some(m @ (Object::Function(_) | Object::BoundMethod(_))) = meta.lookup(name) {
                 return Some(Object::BoundMethod(Rc::new(BoundMethod::new(
-                     obj.clone(),
-                     m,
+                    obj.clone(),
+                    m,
                 ))));
             }
             return None;
@@ -11652,14 +11615,12 @@ impl Interpreter {
                 if matches!(fget, Object::None) {
                     return None;
                 }
-                self.call(&fget, std::slice::from_ref(obj), &[], globals).ok()
+                self.call(&fget, std::slice::from_ref(obj), &[], globals)
+                    .ok()
             }
             Object::Instance(desc) if desc.cls().lookup("__get__").is_some() => {
                 let getter = desc.cls().lookup("__get__")?;
-                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                     m.clone(),
-                     getter,
-                )));
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(m.clone(), getter)));
                 self.call(
                     &bound,
                     &[obj.clone(), Object::Type(inst.cls())],
@@ -11669,8 +11630,8 @@ impl Interpreter {
                 .ok()
             }
             _ => Some(Object::BoundMethod(Rc::new(BoundMethod::new(
-                 Object::Instance(inst),
-                 m,
+                Object::Instance(inst),
+                m,
             )))),
         }
     }
@@ -12152,33 +12113,33 @@ impl Interpreter {
                     if specialize::rc_id(&cls) == type_id {
                         let dict = cls.dict.borrow();
                         if let Some((k, v)) = dict.get_index(key_idx as usize) {
-                          if self.cached_slot_name_matches(&frame.code, name_idx, k) {
-                            let v = v.clone();
-                            drop(dict);
-                            frame.pop()?;
-                            specialize::record_hit(op_idx);
-                            // For function descriptors found on the
-                            // type we'd normally bind to the
-                            // instance — bail to the slow path
-                            // when the value is callable, so the
-                            // generic descriptor protocol runs.
-                            // (Bound-method specialization is RFC
-                            // 0022 territory.)
-                            if matches!(
-                                v,
-                                Object::Function(_)
-                                    | Object::Builtin(_)
-                                    | Object::Property(_)
-                                    | Object::ClassMethod(_)
-                                    | Object::StaticMethod(_)
-                                    | Object::SlotDescriptor(_)
-                            ) {
-                                // Push receiver back and deopt.
-                                frame.push(receiver);
-                                return self.deopt_load_attr_slow(frame, cache_pc, name_idx);
+                            if self.cached_slot_name_matches(&frame.code, name_idx, k) {
+                                let v = v.clone();
+                                drop(dict);
+                                frame.pop()?;
+                                specialize::record_hit(op_idx);
+                                // For function descriptors found on the
+                                // type we'd normally bind to the
+                                // instance — bail to the slow path
+                                // when the value is callable, so the
+                                // generic descriptor protocol runs.
+                                // (Bound-method specialization is RFC
+                                // 0022 territory.)
+                                if matches!(
+                                    v,
+                                    Object::Function(_)
+                                        | Object::Builtin(_)
+                                        | Object::Property(_)
+                                        | Object::ClassMethod(_)
+                                        | Object::StaticMethod(_)
+                                        | Object::SlotDescriptor(_)
+                                ) {
+                                    // Push receiver back and deopt.
+                                    frame.push(receiver);
+                                    return self.deopt_load_attr_slow(frame, cache_pc, name_idx);
+                                }
+                                return Ok(v);
                             }
-                            return Ok(v);
-                          }
                         }
                     }
                 }
@@ -12574,9 +12535,8 @@ impl Interpreter {
         // `PyList_Check` operand, subclasses included.
         fn unwrap_native(o: &Object) -> &Object {
             if let Object::Instance(inst) = o {
-                if let Some(
-                    n @ (Object::List(_) | Object::Tuple(_) | Object::Dict(_)),
-                ) = &inst.native
+                if let Some(n @ (Object::List(_) | Object::Tuple(_) | Object::Dict(_))) =
+                    &inst.native
                 {
                     return n;
                 }
@@ -12617,7 +12577,9 @@ impl Interpreter {
                 for (x, y) in xs.iter().zip(ys.iter()) {
                     // `PyObject_RichCompareBool` is identity-first, so a
                     // sequence containing `nan` is equal to itself.
-                    if !(x.is_same(y) || self.dispatch_compare_op(x, y, CompareKind::Eq, globals)?) {
+                    if !(x.is_same(y)
+                        || self.dispatch_compare_op(x, y, CompareKind::Eq, globals)?)
+                    {
                         return Ok(Some(false));
                     }
                 }
@@ -12630,7 +12592,9 @@ impl Interpreter {
                     return Ok(Some(false));
                 }
                 for (x, y) in xs.iter().zip(ys.iter()) {
-                    if !(x.is_same(y) || self.dispatch_compare_op(x, y, CompareKind::Eq, globals)?) {
+                    if !(x.is_same(y)
+                        || self.dispatch_compare_op(x, y, CompareKind::Eq, globals)?)
+                    {
                         return Ok(Some(false));
                     }
                 }
@@ -12686,9 +12650,7 @@ impl Interpreter {
             (Object::Tuple(xs), Object::Tuple(ys)) => {
                 (xs.iter().cloned().collect(), ys.iter().cloned().collect())
             }
-            (Object::List(xs), Object::List(ys)) => {
-                (xs.borrow().clone(), ys.borrow().clone())
-            }
+            (Object::List(xs), Object::List(ys)) => (xs.borrow().clone(), ys.borrow().clone()),
             _ => return Ok(None),
         };
         let _rg = match crate::recursion::enter() {
@@ -12884,12 +12846,7 @@ impl Interpreter {
                         Object::BoundMethod(ref bm) if matches!(&bm.function, Object::Builtin(_))
                     ) {
                         let g = self.builtins.clone();
-                        self.call(
-                            &method,
-                            &[Object::from_str(name), value],
-                            &[],
-                            &g,
-                        )?;
+                        self.call(&method, &[Object::from_str(name), value], &[], &g)?;
                         return Ok(());
                     }
                 }
@@ -12923,34 +12880,20 @@ impl Interpreter {
                         *f.code.borrow_mut() = c;
                         return Ok(());
                     }
-                    "__defaults__"
-                        if !matches!(value, Object::Tuple(_) | Object::None) =>
-                    {
+                    "__defaults__" if !matches!(value, Object::Tuple(_) | Object::None) => {
                         return Err(type_error("__defaults__ must be set to a tuple object"));
                     }
-                    "__kwdefaults__"
-                        if !matches!(value, Object::Dict(_) | Object::None) =>
-                    {
-                        return Err(type_error(
-                            "__kwdefaults__ must be set to a dict object",
-                        ));
+                    "__kwdefaults__" if !matches!(value, Object::Dict(_) | Object::None) => {
+                        return Err(type_error("__kwdefaults__ must be set to a dict object"));
                     }
                     "__name__" | "__qualname__" if !matches!(value, Object::Str(_)) => {
-                        return Err(type_error(format!(
-                            "{name} must be set to a string object"
-                        )));
+                        return Err(type_error(format!("{name} must be set to a string object")));
                     }
-                    "__annotations__"
-                        if !matches!(value, Object::Dict(_) | Object::None) =>
-                    {
-                        return Err(type_error(
-                            "__annotations__ must be set to a dict object",
-                        ));
+                    "__annotations__" if !matches!(value, Object::Dict(_) | Object::None) => {
+                        return Err(type_error("__annotations__ must be set to a dict object"));
                     }
                     "__type_params__" if !matches!(value, Object::Tuple(_)) => {
-                        return Err(type_error(
-                            "__type_params__ must be set to a tuple object",
-                        ));
+                        return Err(type_error("__type_params__ must be set to a tuple object"));
                     }
                     _ => {}
                 }
@@ -13037,9 +12980,7 @@ impl Interpreter {
                             *target.borrow_mut() = s.to_string();
                             Ok(())
                         }
-                        _ => Err(type_error(format!(
-                            "{name} must be set to a string object"
-                        ))),
+                        _ => Err(type_error(format!("{name} must be set to a string object"))),
                     },
                     _ => {
                         // Known getset/member attrs raise "not writable",
@@ -13161,9 +13102,7 @@ impl Interpreter {
                 }
                 "__traceback__" => {
                     if !matches!(value, Object::Traceback(_) | Object::None) {
-                        return Err(type_error(
-                            "__traceback__ must be a traceback or None",
-                        ));
+                        return Err(type_error("__traceback__ must be a traceback or None"));
                     }
                     value
                 }
@@ -13172,7 +13111,11 @@ impl Interpreter {
                         || matches!(&value, Object::Instance(i)
                             if i.cls().mro.borrow().iter().any(|t| t.name == "BaseException"));
                     if !ok {
-                        let what = if name == "__cause__" { "cause" } else { "context" };
+                        let what = if name == "__cause__" {
+                            "cause"
+                        } else {
+                            "context"
+                        };
                         return Err(type_error(format!(
                             "exception {what} must be None or derive from BaseException"
                         )));
@@ -13279,7 +13222,8 @@ impl Interpreter {
                     if matches!(prop.fset, Object::None) {
                         return Err(attribute_error(format!(
                             "property '{}' of '{}' object has no setter",
-                            name, inst.cls().name
+                            name,
+                            inst.cls().name
                         )));
                     }
                     let setter = prop.fset.clone();
@@ -13298,10 +13242,8 @@ impl Interpreter {
                 }
                 Object::Instance(descriptor_inst) => {
                     if let Some(setter) = descriptor_inst.cls().lookup("__set__") {
-                        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                             attr.clone(),
-                             setter,
-                        )));
+                        let bound =
+                            Object::BoundMethod(Rc::new(BoundMethod::new(attr.clone(), setter)));
                         self.call(&bound, &[obj.clone(), value], &[], &self.builtins.clone())?;
                         return Ok(());
                     }
@@ -13320,12 +13262,14 @@ impl Interpreter {
                 if inst.cls().lookup(name).is_some() {
                     return Err(attribute_error(format!(
                         "'{}' object attribute '{}' is read-only",
-                        inst.cls().name, name
+                        inst.cls().name,
+                        name
                     )));
                 }
                 return Err(attribute_error(format!(
                     "'{}' object has no attribute '{}' and no __dict__ for setting new attributes",
-                    inst.cls().name, name
+                    inst.cls().name,
+                    name
                 )));
             }
         }
@@ -13458,7 +13402,12 @@ impl Interpreter {
         // reassigned but never deleted (CPython `BaseException_*`
         // setters reject NULL).
         if matches!(name, "args" | "__traceback__" | "__cause__" | "__context__")
-            && inst.cls().mro.borrow().iter().any(|t| t.name == "BaseException")
+            && inst
+                .cls()
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| t.name == "BaseException")
             && !matches!(
                 inst.cls().lookup(name),
                 Some(Object::Property(_) | Object::Instance(_) | Object::SlotDescriptor(_))
@@ -13513,10 +13462,8 @@ impl Interpreter {
                 }
                 Object::Instance(descriptor_inst) => {
                     if let Some(deleter) = descriptor_inst.cls().lookup("__delete__") {
-                        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                             attr.clone(),
-                             deleter,
-                        )));
+                        let bound =
+                            Object::BoundMethod(Rc::new(BoundMethod::new(attr.clone(), deleter)));
                         self.call(
                             &bound,
                             std::slice::from_ref(obj),
@@ -13654,9 +13601,7 @@ impl Interpreter {
                 &coerced_index
             }
             Object::Long(_) if is_sequence => {
-                return Err(index_error(
-                    "cannot fit 'int' into an index-sized integer",
-                ))
+                return Err(index_error("cannot fit 'int' into an index-sized integer"))
             }
             _ => index,
         };
@@ -13850,9 +13795,7 @@ impl Interpreter {
                 &coerced_index
             }
             Object::Long(_) if is_sequence => {
-                return Err(index_error(
-                    "cannot fit 'int' into an index-sized integer",
-                ))
+                return Err(index_error("cannot fit 'int' into an index-sized integer"))
             }
             _ => index,
         };
@@ -13935,8 +13878,10 @@ impl Interpreter {
                     }
                     return Ok(());
                 }
-                let mut objs: Vec<Object> =
-                    data.iter().map(|byte| Object::Int(i64::from(*byte))).collect();
+                let mut objs: Vec<Object> = data
+                    .iter()
+                    .map(|byte| Object::Int(i64::from(*byte)))
+                    .collect();
                 let repl_objs: Vec<Object> = replacement
                     .iter()
                     .map(|byte| Object::Int(i64::from(*byte)))
@@ -14160,9 +14105,13 @@ impl Interpreter {
                         })?;
                         let rest: &[Object] = if args.is_empty() { &[] } else { &args[1..] };
                         return match b.name {
-                            ".u.gen_send" | ".u.cor_send" => self
-                                .gen_method_send(&receiver, rest.first().cloned().unwrap_or(Object::None)),
-                            ".u.gen_throw" | ".u.cor_throw" => self.gen_method_throw(&receiver, rest),
+                            ".u.gen_send" | ".u.cor_send" => self.gen_method_send(
+                                &receiver,
+                                rest.first().cloned().unwrap_or(Object::None),
+                            ),
+                            ".u.gen_throw" | ".u.cor_throw" => {
+                                self.gen_method_throw(&receiver, rest)
+                            }
                             ".u.gen_close" | ".u.cor_close" => self.gen_method_close(&receiver),
                             ".u.gen_next" => self.gen_method_send(&receiver, Object::None),
                             ".u.gen_iter" => {
@@ -14270,7 +14219,9 @@ impl Interpreter {
                     if b.name == "divmod" && args.len() == 2 {
                         return self.do_divmod_call(args, outer_globals);
                     }
-                    if b.name == "complex" && (args.len() == 1 || args.len() == 2) && kwargs.is_empty()
+                    if b.name == "complex"
+                        && (args.len() == 1 || args.len() == 2)
+                        && kwargs.is_empty()
                     {
                         return self.do_complex_call(args, outer_globals);
                     }
@@ -14383,9 +14334,9 @@ impl Interpreter {
                     if b.name == "getsizeof" && (args.len() == 1 || args.len() == 2) {
                         if let Some(m) = instance_method(&args[0], "__sizeof__") {
                             let n = self.call(&m, &[], &[], outer_globals)?;
-                            let n = n.as_i64().ok_or_else(|| {
-                                type_error("__sizeof__() should return an int")
-                            })?;
+                            let n = n
+                                .as_i64()
+                                .ok_or_else(|| type_error("__sizeof__() should return an int"))?;
                             // + sizeof(PyGC_Head): heap instances are GC-tracked.
                             return Ok(Object::Int(n + 16));
                         }
@@ -14521,7 +14472,9 @@ impl Interpreter {
                         }
                         let name = match args.first() {
                             Some(Object::Str(s)) => s.to_string(),
-                            Some(_) => return Err(type_error("__import__() argument 1 must be str")),
+                            Some(_) => {
+                                return Err(type_error("__import__() argument 1 must be str"))
+                            }
                             None => match kwarg("name") {
                                 Some(Object::Str(s)) => s.to_string(),
                                 _ => return Err(type_error("__import__() argument 1 must be str")),
@@ -14535,7 +14488,11 @@ impl Interpreter {
                         let level = match args.get(4).cloned().or_else(|| kwarg("level")) {
                             Some(Object::Int(i)) => i as u32,
                             Some(Object::None) | None => 0,
-                            _ => return Err(type_error("__import__() argument 5 (level) must be int")),
+                            _ => {
+                                return Err(type_error(
+                                    "__import__() argument 5 (level) must be int",
+                                ))
+                            }
                         };
                         return self.do_import(&name, &fromlist, level, outer_globals);
                     }
@@ -14593,9 +14550,7 @@ impl Interpreter {
                             let mut new_args = args.to_vec();
                             for a in new_args.iter_mut().skip(scan_from) {
                                 if object_needs_vm_iter(a) {
-                                    *a = Object::new_list(
-                                        self.collect_iterable(a, outer_globals)?,
-                                    );
+                                    *a = Object::new_list(self.collect_iterable(a, outer_globals)?);
                                 }
                             }
                             return (b.call)(&new_args);
@@ -14627,9 +14582,12 @@ impl Interpreter {
                                 )));
                             }
                         }
-                        if let Some(it) =
-                            self.make_seqtools_iter("_EnumerateIter", &ctor_args, &[], outer_globals)?
-                        {
+                        if let Some(it) = self.make_seqtools_iter(
+                            "_EnumerateIter",
+                            &ctor_args,
+                            &[],
+                            outer_globals,
+                        )? {
                             return Ok(it);
                         }
                     }
@@ -14800,7 +14758,9 @@ impl Interpreter {
                     if b.name == ".format_map" {
                         let template = match args.first() {
                             Some(Object::Str(s)) => s.to_string(),
-                            _ => return Err(type_error("str.format_map requires a 'str' receiver")),
+                            _ => {
+                                return Err(type_error("str.format_map requires a 'str' receiver"))
+                            }
                         };
                         let mapping = match args.get(1) {
                             Some(Object::Dict(d)) => d.clone(),
@@ -14823,9 +14783,11 @@ impl Interpreter {
                             None => String::new(),
                             Some(_) => return Err(type_error("format() spec must be a string")),
                         };
-                        return Ok(Object::from_str(
-                            self.format_obj_str(&args[0], &spec, outer_globals)?,
-                        ));
+                        return Ok(Object::from_str(self.format_obj_str(
+                            &args[0],
+                            &spec,
+                            outer_globals,
+                        )?));
                     }
                     // PathLike (`__fspath__`) coercion for the path-accepting
                     // builtins. Our Rust `open`/`os.fspath`/`os.fsdecode`/
@@ -14872,16 +14834,10 @@ impl Interpreter {
                     match b.name {
                         ".type_subclasses" => {
                             if let Object::Type(ty) = &bm.receiver {
-                                let subs = ty
-                                    .subclasses()
-                                    .into_iter()
-                                    .map(Object::Type)
-                                    .collect();
+                                let subs = ty.subclasses().into_iter().map(Object::Type).collect();
                                 return Ok(Object::new_list(subs));
                             }
-                            return Err(type_error(
-                                "__subclasses__() requires a type receiver",
-                            ));
+                            return Err(type_error("__subclasses__() requires a type receiver"));
                         }
                         ".gen_send" | ".cor_send" => {
                             let value = args.first().cloned().unwrap_or(Object::None);
@@ -14987,11 +14943,7 @@ impl Interpreter {
                         // wired through a sentinel name here.
                         ".object_reduce_ex" => {
                             let proto = Self::reduce_ex_proto_arg(args)?;
-                            return self.object_reduce_ex(
-                                &bm.receiver,
-                                proto,
-                                outer_globals,
-                            );
+                            return self.object_reduce_ex(&bm.receiver, proto, outer_globals);
                         }
                         ".object_reduce" => {
                             if !args.is_empty() {
@@ -15001,11 +14953,7 @@ impl Interpreter {
                                 )));
                             }
                             // CPython: `object.__reduce__` == `common_reduce(self, 0)`.
-                            return self.object_default_reduce(
-                                &bm.receiver,
-                                0,
-                                outer_globals,
-                            );
+                            return self.object_default_reduce(&bm.receiver, 0, outer_globals);
                         }
                         // `<builtin-iterator>.__reduce__()` — reduce to
                         // `(iter, (remaining_items,))` so the iterator
@@ -15024,21 +14972,20 @@ impl Interpreter {
                         // `object.__getattribute__` (i.e. no user override):
                         // run the default lookup against the bound receiver.
                         ".object_getattribute" => {
-                            let name = match args.first() {
-                                Some(Object::Str(s)) => s.to_string(),
-                                Some(other) => {
-                                    return Err(type_error(format!(
-                                        "attribute name must be string, not '{}'",
-                                        other.type_name()
-                                    )))
-                                }
-                                None => {
-                                    return Err(type_error(
+                            let name =
+                                match args.first() {
+                                    Some(Object::Str(s)) => s.to_string(),
+                                    Some(other) => {
+                                        return Err(type_error(format!(
+                                            "attribute name must be string, not '{}'",
+                                            other.type_name()
+                                        )))
+                                    }
+                                    None => return Err(type_error(
                                         "__getattribute__() takes exactly one argument (0 given)"
                                             .to_owned(),
-                                    ))
-                                }
-                            };
+                                    )),
+                                };
                             return self.object_default_getattribute(&bm.receiver, &name);
                         }
                         _ => {}
@@ -15067,16 +15014,15 @@ impl Interpreter {
                     // the result; plain functions are bound below by
                     // prepending `self`, so they must NOT redispatch.
                     let is_descr = match &bm.function {
-                        Object::Property(_)
-                        | Object::StaticMethod(_)
-                        | Object::ClassMethod(_) => true,
+                        Object::Property(_) | Object::StaticMethod(_) | Object::ClassMethod(_) => {
+                            true
+                        }
                         Object::Instance(d) => d.cls().lookup("__get__").is_some(),
                         _ => false,
                     };
                     if is_descr {
                         let owner = Object::Type(crate::builtins::class_of(&bm.receiver));
-                        let target =
-                            self.descriptor_get(&bm.function, &bm.receiver, &owner)?;
+                        let target = self.descriptor_get(&bm.function, &bm.receiver, &owner)?;
                         return self.call(&target, args, kwargs, outer_globals);
                     }
                 }
@@ -15094,8 +15040,8 @@ impl Interpreter {
                 if !Rc::ptr_eq(&meta, &bt.type_) {
                     if let Some(call_method) = meta.lookup("__call__") {
                         let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                             Object::Type(ty.clone()),
-                             call_method,
+                            Object::Type(ty.clone()),
+                            call_method,
                         )));
                         return self.call(&bound, args, kwargs, outer_globals);
                     }
@@ -15120,8 +15066,8 @@ impl Interpreter {
                 };
                 if let Some(m) = inst.cls().lookup("__call__") {
                     let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                         Object::Instance(inst.clone()),
-                         m,
+                        Object::Instance(inst.clone()),
+                        m,
                     )));
                     self.call(&bound, args, kwargs, outer_globals)
                 } else {
@@ -15258,11 +15204,7 @@ impl Interpreter {
                     other.type_name()
                 )))
             }
-            None => {
-                return Err(type_error(
-                    "function() missing required argument 'globals'",
-                ))
-            }
+            None => return Err(type_error("function() missing required argument 'globals'")),
         };
         let name = match args.get(2) {
             Some(Object::Str(s)) => s.to_string(),
@@ -15421,9 +15363,7 @@ impl Interpreter {
         // `__prepare__` is conventionally a classmethod; bind the metaclass
         // as the implicit first argument when needed.
         let (callable, prefix): (Object, Vec<Object>) = match &prep {
-            Object::ClassMethod(inner) => {
-                (inner.func(), vec![Object::Type(metaclass.clone())])
-            }
+            Object::ClassMethod(inner) => (inner.func(), vec![Object::Type(metaclass.clone())]),
             Object::StaticMethod(inner) => (inner.func(), Vec::new()),
             other => (other.clone(), vec![Object::Type(metaclass.clone())]),
         };
@@ -15517,8 +15457,12 @@ impl Interpreter {
             match entries_method {
                 Some(method) => {
                     let orig_tuple = Object::new_tuple(orig_bases.clone());
-                    let result =
-                        self.call(&method, std::slice::from_ref(&orig_tuple), &[], &body_fn.globals)?;
+                    let result = self.call(
+                        &method,
+                        std::slice::from_ref(&orig_tuple),
+                        &[],
+                        &body_fn.globals,
+                    )?;
                     match result {
                         Object::Tuple(t) => {
                             for e in t.iter() {
@@ -15577,13 +15521,14 @@ impl Interpreter {
             // `type(A)`/`type(B)` aren't `type` subclasses must still resolve
             // to the most-derived of those metaclasses, not error out against a
             // hardcoded `type` seed.
-            let mut winner: Rc<TypeObject> = explicit_meta_type.clone().unwrap_or_else(|| {
-                match resolved_bases.first() {
-                    Some(Object::Type(t)) => t.metaclass_or_type(),
-                    Some(other) => crate::builtins::class_of(other),
-                    None => bt.type_.clone(),
-                }
-            });
+            let mut winner: Rc<TypeObject> =
+                explicit_meta_type
+                    .clone()
+                    .unwrap_or_else(|| match resolved_bases.first() {
+                        Some(Object::Type(t)) => t.metaclass_or_type(),
+                        Some(other) => crate::builtins::class_of(other),
+                        None => bt.type_.clone(),
+                    });
             for b in &resolved_bases {
                 let m = match b {
                     Object::Type(t) => t.metaclass_or_type(),
@@ -15736,10 +15681,9 @@ impl Interpreter {
                 let g = body_fn.globals.clone();
                 self.class_ns_store(obj, "__classcell__", cell_obj, &g)?;
             } else {
-                class_ns.borrow_mut().insert(
-                    DictKey(Object::from_static("__classcell__")),
-                    cell_obj,
-                );
+                class_ns
+                    .borrow_mut()
+                    .insert(DictKey(Object::from_static("__classcell__")), cell_obj);
             }
         }
 
@@ -15770,8 +15714,7 @@ impl Interpreter {
         let is_plain_type = Rc::ptr_eq(&metaclass, &bt.type_);
         let ty = if is_plain_type {
             let mut dict = class_ns.borrow().clone();
-            let classcell =
-                dict.shift_remove(&DictKey(Object::from_static("__classcell__")));
+            let classcell = dict.shift_remove(&DictKey(Object::from_static("__classcell__")));
             // CPython rejects a non-cell `__classcell__` (test_slots_special2).
             if let Some(cc) = &classcell {
                 if !matches!(cc, Object::Cell(_)) {
@@ -15881,8 +15824,8 @@ impl Interpreter {
                         // `type_init`), so don't hand it kwargs it rejects.
                         let init_consumes_kwargs = matches!(init, Object::Function(_));
                         let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                             Object::Type(ty.clone()),
-                             init,
+                            Object::Type(ty.clone()),
+                            init,
                         )));
                         let init_kwargs: &[(String, Object)] = if init_consumes_kwargs {
                             &subclass_kwargs
@@ -16045,8 +15988,8 @@ impl Interpreter {
                             let init_consumes_kwargs = matches!(init, Object::Function(_));
                             if init_consumes_kwargs {
                                 let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                                     result.clone(),
-                                     init,
+                                    result.clone(),
+                                    init,
                                 )));
                                 let _ = self.call(&bound, args, kwargs, &fallback_globals())?;
                             }
@@ -16168,10 +16111,8 @@ impl Interpreter {
                 // the default builtin doesn't reject them with
                 // "builtin '__init__' does not accept keyword arguments".
                 let init_consumes_kwargs = matches!(init, Object::Function(_));
-                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                     Object::Type(ty.clone()),
-                     init,
-                )));
+                let bound =
+                    Object::BoundMethod(Rc::new(BoundMethod::new(Object::Type(ty.clone()), init)));
                 let bases_tuple = Object::new_tuple(
                     effective_bases
                         .iter()
@@ -16216,10 +16157,8 @@ impl Interpreter {
         let Some(mro_fn) = custom else {
             return crate::types::TypeObject::recompute_c3(ty);
         };
-        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-             Object::Type(ty.clone()),
-             mro_fn,
-        )));
+        let bound =
+            Object::BoundMethod(Rc::new(BoundMethod::new(Object::Type(ty.clone()), mro_fn)));
         let g = self.builtins.clone();
         let result = self.call(&bound, &[], &[], &g)?;
         let entries = self.collect_iterable(&result, &g)?;
@@ -16315,11 +16254,7 @@ impl Interpreter {
     }
 
     /// `cls.__bases__ = new_bases` — CPython's `type_set_bases`.
-    fn type_set_bases(
-        &mut self,
-        ty: &Rc<TypeObject>,
-        value: &Object,
-    ) -> Result<(), RuntimeError> {
+    fn type_set_bases(&mut self, ty: &Rc<TypeObject>, value: &Object) -> Result<(), RuntimeError> {
         let new_bases: Vec<Rc<TypeObject>> = match value {
             Object::Tuple(items) if !items.is_empty() => {
                 let mut v = Vec::with_capacity(items.len());
@@ -16329,9 +16264,7 @@ impl Interpreter {
                             // Cycle check through the *live* bases graph,
                             // not just the (possibly mid-update, see
                             // gh-92112 reentrancy) MRO.
-                            if Rc::ptr_eq(t, ty)
-                                || t.is_subclass_of(ty)
-                                || Self::bases_reach(t, ty)
+                            if Rc::ptr_eq(t, ty) || t.is_subclass_of(ty) || Self::bases_reach(t, ty)
                             {
                                 return Err(type_error(
                                     "a __bases__ item causes an inheritance cycle",
@@ -16453,7 +16386,7 @@ impl Interpreter {
             for b in &old_bases {
                 b.subclasses
                     .borrow_mut()
-                    .retain(|w| w.upgrade().map_or(true, |t| !Rc::ptr_eq(&t, ty)));
+                    .retain(|w| w.upgrade().is_none_or(|t| !Rc::ptr_eq(&t, ty)));
             }
             for b in &new_bases {
                 b.subclasses.borrow_mut().push(Rc::downgrade(ty));
@@ -16494,9 +16427,10 @@ impl Interpreter {
             let key = DictKey(Object::from_static(hook));
             let current = ty.dict.borrow().get(&key).cloned();
             if let Some(Object::Function(f)) = current {
-                ty.dict
-                    .borrow_mut()
-                    .insert(key, Object::ClassMethod(MethodWrapper::new(Object::Function(f))));
+                ty.dict.borrow_mut().insert(
+                    key,
+                    Object::ClassMethod(MethodWrapper::new(Object::Function(f))),
+                );
             }
         }
 
@@ -16513,9 +16447,10 @@ impl Interpreter {
             let key = DictKey(Object::from_static("__new__"));
             let current = ty.dict.borrow().get(&key).cloned();
             if let Some(Object::Function(f)) = current {
-                ty.dict
-                    .borrow_mut()
-                    .insert(key, Object::StaticMethod(MethodWrapper::new(Object::Function(f))));
+                ty.dict.borrow_mut().insert(
+                    key,
+                    Object::StaticMethod(MethodWrapper::new(Object::Function(f))),
+                );
             }
         }
 
@@ -16546,10 +16481,7 @@ impl Interpreter {
                 _ if slot_str(&slots).is_some() => vec![slot_str(&slots).unwrap()],
                 other => {
                     let mut it = other.make_iter().map_err(|_| {
-                        type_error(&format!(
-                            "'{}' object is not iterable",
-                            other.type_name()
-                        ))
+                        type_error(format!("'{}' object is not iterable", other.type_name()))
                     })?;
                     let mut out = Vec::new();
                     while let Some(v) = it.next_value() {
@@ -16598,7 +16530,10 @@ impl Interpreter {
             // namespace before slot processing in CPython, so they never
             // conflict here.
             for n in &names {
-                if matches!(n.as_str(), "__dict__" | "__weakref__" | "__qualname__" | "__classcell__") {
+                if matches!(
+                    n.as_str(),
+                    "__dict__" | "__weakref__" | "__qualname__" | "__classcell__"
+                ) {
                     continue;
                 }
                 if ty.dict.borrow().contains_key(&DictKey(Object::from_str(n))) {
@@ -16711,10 +16646,7 @@ impl Interpreter {
         for (attr_name, value) in entries {
             if let Object::Instance(inst) = &value {
                 if let Some(hook) = inst.cls().lookup("__set_name__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                         value.clone(),
-                         hook,
-                    )));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(value.clone(), hook)));
                     let res = self.call(
                         &bound,
                         &[Object::Type(ty.clone()), Object::from_str(&attr_name)],
@@ -16728,7 +16660,9 @@ impl Interpreter {
                     if let Err(RuntimeError::PyException(pe)) = &res {
                         pe.add_note(format!(
                             "Error calling __set_name__ on '{}' instance '{}' in '{}'",
-                            inst.cls().name, attr_name, ty.name
+                            inst.cls().name,
+                            attr_name,
+                            ty.name
                         ));
                     }
                     res?;
@@ -16847,8 +16781,8 @@ impl Interpreter {
             other => other,
         };
         let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-             Object::Type(ty.clone()),
-             callable,
+            Object::Type(ty.clone()),
+            callable,
         )));
         self.call(
             &bound,
@@ -17074,8 +17008,8 @@ impl Interpreter {
                         )));
                     }
                     return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
-                         args[1].clone(),
-                         args[0].clone(),
+                        args[1].clone(),
+                        args[0].clone(),
                     ))));
                 }
                 // `super(type[, obj])` — the type doubles as its
@@ -17269,10 +17203,8 @@ impl Interpreter {
                 // `BaseException` because its default `__init__` only
                 // populates `args` — which the fast path already did.
                 if let Some(init) = lookup_exception_init(&cls) {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                         instance.clone(),
-                         init,
-                    )));
+                    let bound =
+                        Object::BoundMethod(Rc::new(BoundMethod::new(instance.clone(), init)));
                     let result = self.call(
                         &bound,
                         args,
@@ -17355,8 +17287,8 @@ impl Interpreter {
                     // passes `cls` explicitly — the target sees it twice
                     // (CPython: `C(1, 2)` → `f(C, C, 1, 2)`).
                     Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod::new(
-                         Object::Type(cls.clone()),
-                         inner.func(),
+                        Object::Type(cls.clone()),
+                        inner.func(),
                     ))),
                     other => other,
                 };
@@ -17383,9 +17315,7 @@ impl Interpreter {
                 let bt = builtin_types();
                 let native_desc: Option<Object> = if cls.flags.is_builtin {
                     None
-                } else if cls.is_subclass_of(&bt.property_)
-                    && !Rc::ptr_eq(&cls, &bt.property_)
-                {
+                } else if cls.is_subclass_of(&bt.property_) && !Rc::ptr_eq(&cls, &bt.property_) {
                     Some(builtins::construct_property(args)?)
                 } else if cls.is_subclass_of(&bt.classmethod_)
                     && !Rc::ptr_eq(&cls, &bt.classmethod_)
@@ -17426,7 +17356,12 @@ impl Interpreter {
                 // `__init__` never calls `super().__init__`
                 // (test_exceptions NaiveException).
                 if let Object::Instance(i) = &inst {
-                    if i.cls().mro.borrow().iter().any(|t| t.name == "BaseException") {
+                    if i.cls()
+                        .mro
+                        .borrow()
+                        .iter()
+                        .any(|t| t.name == "BaseException")
+                    {
                         i.dict.borrow_mut().insert(
                             DictKey(Object::from_static("args")),
                             Object::new_tuple(args.to_vec()),
@@ -17514,10 +17449,7 @@ impl Interpreter {
                     }
                     other => other,
                 };
-                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                     instance.clone(),
-                     init,
-                )));
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(instance.clone(), init)));
                 let result = self.call(
                     &bound,
                     args,
@@ -17637,21 +17569,12 @@ impl Interpreter {
                     _ => Vec::new(),
                 };
                 if info.len() == 4 || info.len() == 6 {
-                    for (i, name) in ["filename", "lineno", "offset", "text"]
-                        .iter()
-                        .enumerate()
-                    {
+                    for (i, name) in ["filename", "lineno", "offset", "text"].iter().enumerate() {
                         dict.insert(DictKey(Object::from_static(name)), info[i].clone());
                     }
                     if info.len() == 6 {
-                        dict.insert(
-                            DictKey(Object::from_static("end_lineno")),
-                            info[4].clone(),
-                        );
-                        dict.insert(
-                            DictKey(Object::from_static("end_offset")),
-                            info[5].clone(),
-                        );
+                        dict.insert(DictKey(Object::from_static("end_lineno")), info[4].clone());
+                        dict.insert(DictKey(Object::from_static("end_offset")), info[5].clone());
                     }
                 }
             }
@@ -18265,13 +18188,8 @@ impl Interpreter {
         f: &Rc<PyFunction>,
         args: Vec<Object>,
     ) -> Result<Object, RuntimeError> {
-        let mut frame = self.make_frame(
-            f.code(),
-            args,
-            f.closure.clone(),
-            f.globals.clone(),
-            false,
-        );
+        let mut frame =
+            self.make_frame(f.code(), args, f.closure.clone(), f.globals.clone(), false);
         self.run_frame(&mut frame)
     }
 
@@ -18470,13 +18388,9 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         let cls = crate::builtins::class_of(recv);
         if let Some(reduce) = cls.lookup("__reduce__") {
-            let is_default =
-                matches!(&reduce, Object::Builtin(b) if b.name == ".object_reduce");
+            let is_default = matches!(&reduce, Object::Builtin(b) if b.name == ".object_reduce");
             if !is_default {
-                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
-                     recv.clone(),
-                     reduce,
-                )));
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(recv.clone(), reduce)));
                 return self.call(&bound, &[], &[], globals);
             }
         }
@@ -19372,19 +19286,12 @@ impl Interpreter {
                         Err(e) => return Err(e),
                     }
                 }
-                let err = import_error(format!(
-                    "cannot import name '{name}' from '{}'",
-                    m.name
-                ));
+                let err = import_error(format!("cannot import name '{name}' from '{}'", m.name));
                 // CPython's `_PyEval_ImportFrom` enriches the error with
                 // `name` (the module) and `name_from` (the missing
                 // attribute) — `traceback.py`'s suggestion machinery keys
                 // off `name_from`.
-                crate::error::set_exception_attr(
-                    &err,
-                    "name",
-                    Object::from_str(m.name.clone()),
-                );
+                crate::error::set_exception_attr(&err, "name", Object::from_str(m.name.clone()));
                 crate::error::set_exception_attr(
                     &err,
                     "name_from",
@@ -19395,11 +19302,7 @@ impl Interpreter {
                     .borrow()
                     .get(&DictKey(Object::from_static("__file__")))
                 {
-                    crate::error::set_exception_attr(
-                        &err,
-                        "path",
-                        Object::Str(path.clone()),
-                    );
+                    crate::error::set_exception_attr(&err, "path", Object::Str(path.clone()));
                 }
                 Err(err)
             }
@@ -19863,11 +19766,7 @@ pub(crate) fn slice_bound_index(o: &Object) -> Result<Option<i64>, RuntimeError>
             })))
         }
         Object::Instance(_) => Ok(Some(crate::builtins::coerce_index_i64(o).map_err(
-            |_| {
-                type_error(
-                    "slice indices must be integers or None or have an __index__ method",
-                )
-            },
+            |_| type_error("slice indices must be integers or None or have an __index__ method"),
         )?)),
         _ => Err(type_error(
             "slice indices must be integers or None or have an __index__ method",
@@ -19906,15 +19805,11 @@ pub(crate) fn apply_slice_assignment(
     replacement: Vec<Object>,
 ) -> Result<(), RuntimeError> {
     let len = data.len() as i64;
-    let step = match slice_bound_index(&s.step)? {
-        None => 1i64,
-        Some(v) => v,
-    };
+    let step = slice_bound_index(&s.step)?.unwrap_or(1i64);
     if step == 0 {
         return Err(value_error("slice step cannot be zero"));
     }
-    let start_raw =
-        slice_bound_index(&s.start)?.unwrap_or(if step > 0 { 0 } else { len - 1 });
+    let start_raw = slice_bound_index(&s.start)?.unwrap_or(if step > 0 { 0 } else { len - 1 });
     let stop_raw = slice_bound_index(&s.stop)?.unwrap_or(if step > 0 { len } else { -1 });
     let norm = |x: i64| -> i64 {
         if x < 0 {
@@ -20328,7 +20223,8 @@ fn builtin_slot_wrapper(ty: &Rc<TypeObject>, name: &str) -> Option<Object> {
             continue;
         }
         let ptr = Rc::as_ptr(&base) as usize;
-        if let Some(o) = SLOT_WRAPPER_CACHE.with(|c| c.borrow().get(&(ptr, name.to_owned())).cloned())
+        if let Some(o) =
+            SLOT_WRAPPER_CACHE.with(|c| c.borrow().get(&(ptr, name.to_owned())).cloned())
         {
             return Some(o);
         }
@@ -20532,10 +20428,7 @@ fn make_gen_method(name: &str, receiver: &Object) -> Object {
         call: Box::new(unreachable_call),
         call_kw: None,
     }));
-    Object::BoundMethod(Rc::new(BoundMethod::new(
-         receiver.clone(),
-         builtin,
-    )))
+    Object::BoundMethod(Rc::new(BoundMethod::new(receiver.clone(), builtin)))
 }
 
 thread_local! {
@@ -20762,12 +20655,7 @@ fn merge_sort_by_pylt<T: Clone>(
     while li < left.len() && ri < right.len() {
         // Stability: take from the right run only when strictly smaller
         // (timsort's `b < a` merge test).
-        if interp.dispatch_compare_op(
-            key(&right[ri]),
-            key(&left[li]),
-            CompareKind::Lt,
-            globals,
-        )? {
+        if interp.dispatch_compare_op(key(&right[ri]), key(&left[li]), CompareKind::Lt, globals)? {
             out.push(right[ri].clone());
             ri += 1;
         } else {
@@ -21480,9 +21368,7 @@ pub(crate) fn percent_format_with(
         Object::Dict(_) => Vec::new(),
         // A *tuple subclass* spreads as the argument pack too (CPython
         // PyTuple_Check) — namedtuple's `repr_fmt % self` depends on it.
-        Object::Instance(_)
-            if matches!(value.native_value(), Some(Object::Tuple(_))) =>
-        {
+        Object::Instance(_) if matches!(value.native_value(), Some(Object::Tuple(_))) => {
             match value.native_value() {
                 Some(Object::Tuple(items)) => items.to_vec(),
                 _ => unreachable!(),
@@ -21734,9 +21620,7 @@ pub(crate) fn percent_format_with(
                         // `%d` truncates a float toward zero (CPython).
                         Object::Float(f) => {
                             if f.is_nan() {
-                                return Err(value_error(
-                                    "cannot convert float NaN to integer",
-                                ));
+                                return Err(value_error("cannot convert float NaN to integer"));
                             }
                             if f.is_infinite() {
                                 return Err(overflow_error(
@@ -21758,7 +21642,7 @@ pub(crate) fn percent_format_with(
                             return Err(type_error(format!(
                                 "%{kind_msg} format: a real number is required, not {}",
                                 item.type_name_owned()
-                            )))
+                            )));
                         }
                     };
                     format_via_spec_percent(&numeric, &spec.replace(['i', 'u'], "d"))?
@@ -21784,10 +21668,9 @@ pub(crate) fn percent_format_with(
                     };
                     if !percent_is_real(&real) {
                         return Err(type_error(match mode {
-                            PercentMode::Bytes => format!(
-                                "float argument required, not {}",
-                                item.type_name_owned()
-                            ),
+                            PercentMode::Bytes => {
+                                format!("float argument required, not {}", item.type_name_owned())
+                            }
                             PercentMode::Str => {
                                 format!("must be real number, not {}", item.type_name_owned())
                             }
@@ -21801,9 +21684,7 @@ pub(crate) fn percent_format_with(
                         Object::Bool(b) => u8::from(*b),
                         Object::Int(_) | Object::Long(_) => match item.as_i64() {
                             Some(n) if (0..=255).contains(&n) => n as u8,
-                            _ => {
-                                return Err(overflow_error("%c arg not in range(256)"))
-                            }
+                            _ => return Err(overflow_error("%c arg not in range(256)")),
                         },
                         _ => match item.as_bytes_view() {
                             Some(b) if b.len() == 1 => b[0],
@@ -21821,9 +21702,7 @@ pub(crate) fn percent_format_with(
                 }
                 'c' => {
                     let ch = match &item {
-                        Object::Bool(b) => {
-                            char::from_u32(u32::from(*b)).unwrap().to_string()
-                        }
+                        Object::Bool(b) => char::from_u32(u32::from(*b)).unwrap().to_string(),
                         Object::Int(c) => u32::try_from(*c)
                             .ok()
                             .and_then(char::from_u32)
@@ -22033,7 +21912,10 @@ fn apply_format_spec_inner(
     // accepts it (as a minimum-digit count).
     if !allow_int_precision
         && parsed.precision.is_some()
-        && matches!(parsed.type_char, Some('d' | 'b' | 'o' | 'x' | 'X' | 'c' | 'n'))
+        && matches!(
+            parsed.type_char,
+            Some('d' | 'b' | 'o' | 'x' | 'X' | 'c' | 'n')
+        )
     {
         return Err(value_error(
             "Precision not allowed in integer format specifier",
@@ -22238,7 +22120,7 @@ struct ParsedSpec {
 fn accumulate_spec_digit(acc: usize, c: char) -> Result<usize, RuntimeError> {
     acc.checked_mul(10)
         .and_then(|v| v.checked_add(c as usize - '0' as usize))
-        .filter(|v| *v <= i64::MAX as usize)
+        .filter(|v| i64::try_from(*v).is_ok())
         .ok_or_else(|| value_error("Too many decimal digits in format string"))
 }
 
@@ -22515,7 +22397,7 @@ fn fixed_core(mag: f64, prec: usize) -> String {
     } else {
         let cap = FIXED_PREC_CAP;
         let mut s = format!("{mag:.cap$}");
-        s.extend(std::iter::repeat('0').take(prec - cap));
+        s.extend(std::iter::repeat_n('0', prec - cap));
         s
     }
 }
@@ -22582,7 +22464,11 @@ fn format_float_fixed(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> Strin
         return finish_special(f < 0.0, if upper { "INF" } else { "inf" }, p);
     }
     let core = fixed_core(f.abs(), prec);
-    let core = if p.alt { ensure_decimal_point(&core) } else { core };
+    let core = if p.alt {
+        ensure_decimal_point(&core)
+    } else {
+        core
+    };
     finish_float(f.is_sign_negative(), core, p)
 }
 
@@ -22609,7 +22495,11 @@ fn format_float_scientific(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> 
     }
     // Rust gives e.g. "1.230000e2"; CPython wants "1.230000e+02".
     let core = normalize_exponent(&format!("{:.*e}", prec, f.abs()), upper);
-    let core = if p.alt { ensure_decimal_point(&core) } else { core };
+    let core = if p.alt {
+        ensure_decimal_point(&core)
+    } else {
+        core
+    };
     finish_float(f.is_sign_negative(), core, p)
 }
 
@@ -22785,7 +22675,11 @@ fn format_complex(re: f64, im: f64, parsed: &ParsedSpec) -> Result<String, Runti
     } else {
         format!("{}{im_s}j", comp(re, false))
     };
-    let body = if add_parens { format!("({body})") } else { body };
+    let body = if add_parens {
+        format!("({body})")
+    } else {
+        body
+    };
     Ok(apply_alignment(&body, parsed, true))
 }
 
@@ -22934,19 +22828,6 @@ fn callable_is_pure_native(o: &Object) -> bool {
         Object::Type(t) => t.flags.is_builtin,
         _ => false,
     }
-}
-
-/// Is `e` an `IndexError` (or subclass)? Used by the legacy
-/// `__getitem__` iteration protocol to detect the end of a sequence.
-fn is_index_error(e: &RuntimeError) -> bool {
-    if let RuntimeError::PyException(pe) = e {
-        if let Object::Instance(inst) = &pe.instance {
-            return inst
-                .cls()
-                .is_subclass_of(&crate::builtin_types::builtin_types().index_error);
-        }
-    }
-    false
 }
 
 fn is_type_error(e: &RuntimeError) -> bool {
@@ -23109,13 +22990,6 @@ fn find_cell(frame: &Frame, name: &str) -> Option<Rc<RefCell<Object>>> {
                 .map(|i| i + cellvars.len())
         })
         .and_then(|idx| cells.get(idx).cloned())
-}
-
-fn is_param(code: &CodeObject, name: &str) -> bool {
-    let total = (code.arg_count + code.kwonly_count) as usize
-        + usize::from(code.has_varargs)
-        + usize::from(code.has_varkeywords);
-    code.varnames.iter().take(total).any(|n| n == name)
 }
 
 // ---------- arithmetic ----------
@@ -23334,7 +23208,9 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         (O::FrozenSet(x), O::Set(y), B::BitAnd) => {
             Ok(freeze_set_result(intersect_sets(x, &y.borrow())))
         }
-        (O::FrozenSet(x), O::FrozenSet(y), B::BitAnd) => Ok(freeze_set_result(intersect_sets(x, y))),
+        (O::FrozenSet(x), O::FrozenSet(y), B::BitAnd) => {
+            Ok(freeze_set_result(intersect_sets(x, y)))
+        }
         (O::Set(x), O::Set(y), B::Sub) => Ok(difference_sets(&x.borrow(), &y.borrow())),
         (O::Set(x), O::FrozenSet(y), B::Sub) => Ok(difference_sets(&x.borrow(), y)),
         (O::FrozenSet(x), O::Set(y), B::Sub) => {
@@ -23421,7 +23297,7 @@ fn checked_repeat_count(item_len: usize, n: i64, what: &str) -> Result<usize, Ru
         return Ok(times.min(1));
     }
     match item_len.checked_mul(times) {
-        Some(total) if total <= isize::MAX as usize => Ok(times),
+        Some(total) if isize::try_from(total).is_ok() => Ok(times),
         _ => Err(crate::error::overflow_error(format!(
             "repeated {what} is too long"
         ))),
@@ -23598,7 +23474,10 @@ fn float_pow(x: f64, y: f64) -> Result<Object, RuntimeError> {
     if x < 0.0 && y.fract() != 0.0 && x.is_finite() && y.is_finite() {
         let magnitude = (-x).powf(y);
         let theta = std::f64::consts::PI * y;
-        Ok(Object::new_complex(magnitude * theta.cos(), magnitude * theta.sin()))
+        Ok(Object::new_complex(
+            magnitude * theta.cos(),
+            magnitude * theta.sin(),
+        ))
     } else {
         Ok(Object::Float(x.powf(y)))
     }

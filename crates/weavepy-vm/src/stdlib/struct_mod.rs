@@ -678,7 +678,7 @@ fn f64_to_half(x: f64) -> Result<u16, RuntimeError> {
         }
         f *= 1024.0; // 2**10
         bits = f as u16; // truncating cast
-        // Round half to even.
+                         // Round half to even.
         let frac = f - f64::from(bits);
         if frac > 0.5 || (frac == 0.5 && (bits & 1) == 1) {
             bits += 1;
@@ -889,9 +889,7 @@ fn b_pack_into(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::MemoryView(mv) => {
             // Writable buffer-protocol target (e.g. `memoryview(array(...))`).
             if mv.readonly.get() {
-                return Err(type_error(
-                    "cannot modify read-only memory".to_owned(),
-                ));
+                return Err(type_error("cannot modify read-only memory".to_owned()));
             }
             let off = resolve_buffer_offset(offset, mv.len.get(), cf.size, "pack_into", true)?;
             let base = mv.start.get();
@@ -901,9 +899,9 @@ fn b_pack_into(args: &[Object]) -> Result<Object, RuntimeError> {
                     b[base + off..base + off + bytes.len()].copy_from_slice(&bytes);
                     Ok(Object::None)
                 }
-                crate::object::MemoryViewBuffer::Bytes(_) => Err(type_error(
-                    "cannot modify read-only memory".to_owned(),
-                )),
+                crate::object::MemoryViewBuffer::Bytes(_) => {
+                    Err(type_error("cannot modify read-only memory".to_owned()))
+                }
             }
         }
         _ => Err(type_error(
@@ -926,7 +924,7 @@ fn resolve_buffer_offset(
 ) -> Result<usize, RuntimeError> {
     let size_i = size as i128;
     let len_i = buf_len as i128;
-    let off = offset as i128;
+    let off = i128::from(offset);
     let resolved = if off < 0 {
         if off + size_i > 0 {
             let verb = if for_pack { "pack" } else { "unpack" };

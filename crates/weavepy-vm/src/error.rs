@@ -226,10 +226,7 @@ pub fn attribute_error_named(obj: &Object, name: &str) -> RuntimeError {
     if let RuntimeError::PyException(pe) = &err {
         if let Object::Instance(inst) = &pe.instance {
             let mut dict = inst.dict.borrow_mut();
-            dict.insert(
-                DictKey(Object::from_static("name")),
-                Object::from_str(name),
-            );
+            dict.insert(DictKey(Object::from_static("name")), Object::from_str(name));
             dict.insert(DictKey(Object::from_static("obj")), obj.clone());
         }
     }
@@ -401,10 +398,10 @@ pub fn syntax_error_located_as(
     let pe = PyException::from_builtin(class, message.clone());
     if let Object::Instance(inst) = &pe.instance {
         let msg_obj = Object::from_str(message);
-        let file_obj = filename.map_or(Object::None, |s| Object::from_str(s));
+        let file_obj = filename.map_or(Object::None, Object::from_str);
         let line_obj = lineno.map_or(Object::None, |n| Object::Int(i64::from(n)));
         let off_obj = offset.map_or(Object::None, |n| Object::Int(i64::from(n)));
-        let text_obj = text.map_or(Object::None, |s| Object::from_str(s));
+        let text_obj = text.map_or(Object::None, Object::from_str);
         let detail = Object::new_tuple(vec![
             file_obj.clone(),
             line_obj.clone(),

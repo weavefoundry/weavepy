@@ -26,7 +26,7 @@ use crate::object::Object;
 use crate::sync::Rc;
 use crate::types::TypeObject;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DescrKind {
     Method,
     Wrapper,
@@ -34,7 +34,7 @@ pub enum DescrKind {
     Member,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DescrMeta {
     pub kind: DescrKind,
     pub objclass: Rc<TypeObject>,
@@ -52,8 +52,8 @@ thread_local! {
 /// representation we ever tag.
 fn key(obj: &Object) -> Option<usize> {
     match obj {
-        Object::Builtin(b) => Some(Rc::as_ptr(b) as *const () as usize),
-        Object::Property(p) => Some(Rc::as_ptr(p) as *const () as usize),
+        Object::Builtin(b) => Some(Rc::as_ptr(b).cast::<()>() as usize),
+        Object::Property(p) => Some(Rc::as_ptr(p).cast::<()>() as usize),
         _ => None,
     }
 }

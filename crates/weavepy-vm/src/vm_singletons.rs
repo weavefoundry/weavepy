@@ -165,15 +165,16 @@ static WORKER_THREAD_ID: OnceLock<Mutex<std::collections::HashMap<u64, u64>>> = 
 /// The seed thread's built-in type registry. Workers adopt it (see
 /// [`snapshot_interpreter`]) so `type`/`object`/… compare pointer-equal
 /// across threads — class statements check metaclasses by identity.
-static SEED_BUILTIN_TYPES: OnceLock<Mutex<Option<crate::sync::Rc<crate::builtin_types::BuiltinTypes>>>> =
-    OnceLock::new();
+static SEED_BUILTIN_TYPES: OnceLock<
+    Mutex<Option<crate::sync::Rc<crate::builtin_types::BuiltinTypes>>>,
+> = OnceLock::new();
 
 fn seed_slot() -> &'static Mutex<Option<crate::Interpreter>> {
     INTERPRETER_SEED.get_or_init(|| Mutex::new(None))
 }
 
-fn seed_types_slot(
-) -> &'static Mutex<Option<crate::sync::Rc<crate::builtin_types::BuiltinTypes>>> {
+fn seed_types_slot() -> &'static Mutex<Option<crate::sync::Rc<crate::builtin_types::BuiltinTypes>>>
+{
     SEED_BUILTIN_TYPES.get_or_init(|| Mutex::new(None))
 }
 

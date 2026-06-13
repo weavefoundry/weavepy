@@ -146,14 +146,14 @@ impl<'src> Scanner<'src> {
         };
         // Octal escape: warn when the written value exceeds `\377`.
         if (b'0'..=b'7').contains(&esc) {
-            let mut val = (esc - b'0') as u32;
+            let mut val = u32::from(esc - b'0');
             let mut digits = String::new();
             digits.push(esc as char);
             let mut k = bs + 2;
             for _ in 0..2 {
                 match self.src.get(k) {
                     Some(&d) if (b'0'..=b'7').contains(&d) => {
-                        val = val * 8 + (d - b'0') as u32;
+                        val = val * 8 + u32::from(d - b'0');
                         digits.push(d as char);
                         k += 1;
                     }
@@ -174,7 +174,8 @@ impl<'src> Scanner<'src> {
         // a warning); bytes literals have no `u`/`U`/`N`.
         let recognised = matches!(
             esc,
-            b'\n' | b'\r'
+            b'\n'
+                | b'\r'
                 | b'\\'
                 | b'\''
                 | b'"'
@@ -322,9 +323,7 @@ impl<'src> Scanner<'src> {
                 // CPython anchors the error at the backslash itself when
                 // nothing follows, and at the offending character when
                 // one does.
-                return Err(LexError::StrayBackslash {
-                    pos: bs_pos as u32,
-                });
+                return Err(LexError::StrayBackslash { pos: bs_pos as u32 });
             }
             return Err(LexError::StrayBackslash {
                 pos: (bs_pos + 1) as u32,
@@ -633,7 +632,7 @@ impl<'src> Scanner<'src> {
 
         // Decimal integer or float — consume digits (underscores only
         // *between* digits, per CPython).
-        let mut consume_digit_run = |slf: &mut Self| -> Result<bool, LexError> {
+        let consume_digit_run = |slf: &mut Self| -> Result<bool, LexError> {
             let mut any = false;
             loop {
                 match slf.peek() {
@@ -703,9 +702,7 @@ impl<'src> Scanner<'src> {
         // ("000") and float/imaginary forms are fine.
         if !is_float && !is_imaginary {
             let lexeme = &self.src[start..int_end];
-            if lexeme.first() == Some(&b'0')
-                && lexeme.iter().any(|b| (b'1'..=b'9').contains(b))
-            {
+            if lexeme.first() == Some(&b'0') && lexeme.iter().any(|b| (b'1'..=b'9').contains(b)) {
                 return Err(LexError::InvalidNumber {
                     pos: start as u32,
                     message: "leading zeros in decimal integer literals are not permitted; \
@@ -725,9 +722,7 @@ impl<'src> Scanner<'src> {
     /// identifier is a keyword that may legally follow a number
     /// (`1if x else y`, `0in xs`, …).
     fn verify_end_of_number(&mut self, message: &str) -> Result<(), LexError> {
-        const ALLOWED: &[&str] = &[
-            "and", "else", "for", "if", "in", "is", "not", "or", "while",
-        ];
+        const ALLOWED: &[&str] = &["and", "else", "for", "if", "in", "is", "not", "or", "while"];
         let next = match self.peek() {
             Some(b) => b,
             None => return Ok(()),
@@ -868,10 +863,7 @@ impl<'src> Scanner<'src> {
                     // CPython's tokenizer validates this eagerly, so a `\N`
                     // missing its `{NAME}` is malformed *here* — even when
                     // the literal is otherwise unterminated.
-                    if !raw
-                        && self.peek_at(1) == Some(b'N')
-                        && self.peek_at(2) == Some(b'{')
-                    {
+                    if !raw && self.peek_at(1) == Some(b'N') && self.peek_at(2) == Some(b'{') {
                         self.pos += 3;
                         loop {
                             match self.peek() {
@@ -1025,27 +1017,25 @@ impl<'src> Scanner<'src> {
                 // A backslash in the expression part is only legal as a
                 // line continuation (PEP 701 re-tokenizes the field like
                 // ordinary source).
-                b'\\' => {
-                    match self.peek_at(1) {
-                        Some(b'\n') => self.pos += 2,
-                        Some(b'\r') => {
-                            self.pos += 2;
-                            if self.peek() == Some(b'\n') {
-                                self.pos += 1;
-                            }
-                        }
-                        Some(_) => {
-                            return Err(LexError::StrayBackslash {
-                                pos: (self.pos + 1) as u32,
-                            })
-                        }
-                        None => {
-                            return Err(LexError::StrayBackslash {
-                                pos: self.pos as u32,
-                            })
+                b'\\' => match self.peek_at(1) {
+                    Some(b'\n') => self.pos += 2,
+                    Some(b'\r') => {
+                        self.pos += 2;
+                        if self.peek() == Some(b'\n') {
+                            self.pos += 1;
                         }
                     }
-                }
+                    Some(_) => {
+                        return Err(LexError::StrayBackslash {
+                            pos: (self.pos + 1) as u32,
+                        })
+                    }
+                    None => {
+                        return Err(LexError::StrayBackslash {
+                            pos: self.pos as u32,
+                        })
+                    }
+                },
                 b'(' | b'[' | b'{' => {
                     stack.push(b);
                     self.pos += 1;
@@ -1106,6 +1096,7 @@ impl<'src> Scanner<'src> {
     /// closing `}`. The spec is literal text except that `{` opens a
     /// nested replacement field (its own expression) — so `#`, quotes and
     /// `:` here are *not* special.
+    #[allow(clippy::too_many_arguments)]
     fn scan_fstring_format_spec_extent(
         &mut self,
         start: usize,
@@ -1176,7 +1167,9 @@ impl<'src> Scanner<'src> {
                 // specifiers..." error. (Newlines reached *inside* a nested
                 // `{...}` field are consumed by the recursion above.)
                 b'\n' | b'\r' if !outer_triple => {
-                    return Err(LexError::FstringNewlineInSpec { pos: self.pos as u32 });
+                    return Err(LexError::FstringNewlineInSpec {
+                        pos: self.pos as u32,
+                    });
                 }
                 _ => self.pos += 1,
             }
@@ -1220,8 +1213,7 @@ impl<'src> Scanner<'src> {
         while s > 0 && self.src[s - 1].is_ascii_alphabetic() {
             s -= 1;
         }
-        let glued_to_ident =
-            s > 0 && (self.src[s - 1] == b'_' || self.src[s - 1].is_ascii_digit());
+        let glued_to_ident = s > 0 && (self.src[s - 1] == b'_' || self.src[s - 1].is_ascii_digit());
         let prefix = if !glued_to_ident && s < self.pos {
             std::str::from_utf8(&self.src[s..self.pos])
                 .ok()

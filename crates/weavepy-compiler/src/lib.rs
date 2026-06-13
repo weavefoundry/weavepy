@@ -515,9 +515,7 @@ pub fn compile_eval_with_source(
                 weavepy_lexer::Span::new(eq, eq + 1)
             }
             // Statement keywords (`del`, `pass`, …) span the keyword.
-            StmtKind::Delete(_) => {
-                weavepy_lexer::Span::new(bad.span.start.0, bad.span.start.0 + 3)
-            }
+            StmtKind::Delete(_) => weavepy_lexer::Span::new(bad.span.start.0, bad.span.start.0 + 3),
             _ => weavepy_lexer::Span::new(bad.span.start.0, bad.span.start.0 + 1),
         };
         return Err(CompileError::parser_spanned(
@@ -916,10 +914,8 @@ impl Compiler {
         const MSG: &str = "'break', 'continue' and 'return' cannot appear in an except* block";
         for s in stmts {
             match &s.kind {
-                StmtKind::Break | StmtKind::Continue => {
-                    if !in_loop {
-                        return Err(CompileError::spanned(MSG, s.span));
-                    }
+                StmtKind::Break | StmtKind::Continue if !in_loop => {
+                    return Err(CompileError::spanned(MSG, s.span));
                 }
                 StmtKind::Return(_) => {
                     return Err(CompileError::spanned(MSG, s.span));
@@ -1463,7 +1459,10 @@ impl Compiler {
             }
             StmtKind::Return(value) => {
                 if self.kind != CodeKind::Function {
-                    return Err(CompileError::spanned("'return' outside function", stmt.span));
+                    return Err(CompileError::spanned(
+                        "'return' outside function",
+                        stmt.span,
+                    ));
                 }
                 // PEP 525: async generators cannot return a value (the
                 // flag is set before the body compiles, so this sees it).
@@ -1519,7 +1518,9 @@ impl Compiler {
                     .last()
                     .ok_or_else(|| CompileError::spanned("'break' outside loop", stmt.span))?;
                 let is_for = frame_top.is_for_loop;
-                let exc_to_pop = self.handler_depth.saturating_sub(frame_top.handler_depth_at_entry);
+                let exc_to_pop = self
+                    .handler_depth
+                    .saturating_sub(frame_top.handler_depth_at_entry);
                 // Leaving `except` handler bodies on the way out: discard
                 // their handled-exception state (CPython POP_EXCEPT
                 // during block unwind).
@@ -1546,7 +1547,9 @@ impl Compiler {
                     CompileError::spanned("'continue' not properly in loop", stmt.span)
                 })?;
                 let target = frame_top.continue_target;
-                let exc_to_pop = self.handler_depth.saturating_sub(frame_top.handler_depth_at_entry);
+                let exc_to_pop = self
+                    .handler_depth
+                    .saturating_sub(frame_top.handler_depth_at_entry);
                 for _ in 0..exc_to_pop {
                     self.emit(OpCode::PopExcept, 0);
                 }
@@ -2391,7 +2394,10 @@ impl Compiler {
             } else {
                 let mut names: Vec<Constant> = Vec::with_capacity(keywords.len());
                 for k in keywords {
-                    let n = k.arg.clone().expect("kw splat handled by CallEx path above");
+                    let n = k
+                        .arg
+                        .clone()
+                        .expect("kw splat handled by CallEx path above");
                     names.push(Constant::Str(n));
                     self.compile_expr(&k.value)?;
                 }
@@ -2532,15 +2538,19 @@ impl Compiler {
         {
             let line_const = inner
                 .co
-                .intern_constant(Constant::Int(self.current_line as i64));
+                .intern_constant(Constant::Int(i64::from(self.current_line)));
             let line_name = inner.co.intern_name("__firstlineno__");
             inner.emit(OpCode::LoadConst, line_const);
             inner.emit(OpCode::StoreName, line_name);
 
             let mut attrs: HashSet<String> = HashSet::new();
             for s in body {
-                if let StmtKind::FunctionDef { args, body: fbody, .. }
-                | StmtKind::AsyncFunctionDef { args, body: fbody, .. } = &s.kind
+                if let StmtKind::FunctionDef {
+                    args, body: fbody, ..
+                }
+                | StmtKind::AsyncFunctionDef {
+                    args, body: fbody, ..
+                } = &s.kind
                 {
                     let self_name = args
                         .posonlyargs
@@ -2752,8 +2762,8 @@ impl Compiler {
         // into the stack — iterators kept live across `for` loop
         // iterations, and any propagating exception a surrounding
         // `finally` keeps on the stack for its trailing RERAISE.
-        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32
-            + self.exc_on_stack;
+        let body_depth =
+            self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32 + self.exc_on_stack;
         // Make the finally body visible to any `return`/`break`/
         // `continue` nested inside `body`/`orelse`/handlers. We pop it
         // before emitting the *direct* normal-/exception-exit copies
@@ -2887,7 +2897,10 @@ impl Compiler {
                 // behaviour); `break`/`continue`/`return` cannot leave
                 // an `except*` block at all (PEP 654), enforced via the
                 // loop-mark pushed here.
-                let unbind_stmts = h.name.as_deref().map(|n| Self::except_unbind_stmts(n, h.span));
+                let unbind_stmts = h
+                    .name
+                    .as_deref()
+                    .map(|n| Self::except_unbind_stmts(n, h.span));
                 if let Some(stmts) = &unbind_stmts {
                     self.finally_stack.push(FinallyFrame {
                         kind: FinallyKind::Stmts(stmts.clone()),
@@ -3089,7 +3102,10 @@ impl Compiler {
                 // frame covers `return`/`break`/`continue`; the inline
                 // copy below covers fallthrough; the exception-table
                 // entry further below covers a propagating exception.
-                let unbind_stmts = h.name.as_deref().map(|n| Self::except_unbind_stmts(n, h.span));
+                let unbind_stmts = h
+                    .name
+                    .as_deref()
+                    .map(|n| Self::except_unbind_stmts(n, h.span));
                 if let Some(stmts) = &unbind_stmts {
                     self.finally_stack.push(FinallyFrame {
                         kind: FinallyKind::Stmts(stmts.clone()),
@@ -3376,8 +3392,8 @@ impl Compiler {
         // *suppressed* an exception inside a `for` lost the iterator and
         // the next `FOR_ITER` found an empty stack. This matches the
         // `body_depth` convention used by `try`/`except` handlers above.
-        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32
-            + self.exc_on_stack;
+        let body_depth =
+            self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32 + self.exc_on_stack;
         self.co.exception_table.push(ExcHandler {
             start: body_start,
             end: body_end,
@@ -3980,9 +3996,7 @@ impl Compiler {
                 // start location (CPython adjusts via
                 // `update_start_location_to_match_attr`).
                 let meth = match &func.kind {
-                    ExprKind::Attribute { attr, .. } => {
-                        Some((func.span.end.0, attr.len() as u32))
-                    }
+                    ExprKind::Attribute { attr, .. } => Some((func.span.end.0, attr.len() as u32)),
                     _ => None,
                 };
                 let emit_call = |c: &mut Self, op: OpCode, arg: u32| match meth {
@@ -4438,8 +4452,8 @@ impl Compiler {
         let handler_start = self.next_offset();
         // Preserve enclosing for-loop iterators on the operand stack, the
         // same depth convention used by `try`/`except` and `compile_with`.
-        let body_depth = self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32
-            + self.exc_on_stack;
+        let body_depth =
+            self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32 + self.exc_on_stack;
         self.co.exception_table.push(ExcHandler {
             start: body_start,
             end: body_end,
@@ -4985,10 +4999,12 @@ fn emit_cmp_op(compiler: &mut Compiler, op: CmpOp) {
 fn clone_finally_frame(f: &FinallyFrame) -> FinallyFrame {
     let kind = match &f.kind {
         FinallyKind::Stmts(body) => FinallyKind::Stmts(body.clone()),
-        FinallyKind::WithExit { exit_idx } => FinallyKind::WithExit { exit_idx: *exit_idx },
-        FinallyKind::AsyncWithExit { aexit_idx } => {
-            FinallyKind::AsyncWithExit { aexit_idx: *aexit_idx }
-        }
+        FinallyKind::WithExit { exit_idx } => FinallyKind::WithExit {
+            exit_idx: *exit_idx,
+        },
+        FinallyKind::AsyncWithExit { aexit_idx } => FinallyKind::AsyncWithExit {
+            aexit_idx: *aexit_idx,
+        },
     };
     FinallyFrame {
         kind,
@@ -5334,11 +5350,7 @@ fn expr_contains_yield(expr: &Expr) -> bool {
         // makes `f` a generator. The body is excluded.
         ExprKind::Lambda { args, .. } => {
             args.defaults.iter().any(expr_contains_yield)
-                || args
-                    .kw_defaults
-                    .iter()
-                    .flatten()
-                    .any(expr_contains_yield)
+                || args.kw_defaults.iter().flatten().any(expr_contains_yield)
         }
         // A comprehension runs in its own scope, but the *leftmost* `for`
         // clause's iterable is evaluated in the enclosing scope and passed
@@ -5347,9 +5359,9 @@ fn expr_contains_yield(expr: &Expr) -> bool {
         // `def f(): list(i for i in [(yield 26)])`. (A `yield` anywhere else
         // in a comprehension is a SyntaxError, so only the first iterable
         // can contribute.)
-        ExprKind::GeneratorExp { generators, .. } => {
-            generators.first().is_some_and(|g| expr_contains_yield(&g.iter))
-        }
+        ExprKind::GeneratorExp { generators, .. } => generators
+            .first()
+            .is_some_and(|g| expr_contains_yield(&g.iter)),
         ExprKind::JoinedStr(parts) => parts.iter().any(expr_contains_yield),
         ExprKind::FormattedValue {
             value, format_spec, ..
@@ -5396,9 +5408,9 @@ fn expr_contains_yield(expr: &Expr) -> bool {
         }
         ExprKind::ListComp { generators, .. }
         | ExprKind::SetComp { generators, .. }
-        | ExprKind::DictComp { generators, .. } => {
-            generators.first().is_some_and(|g| expr_contains_yield(&g.iter))
-        }
+        | ExprKind::DictComp { generators, .. } => generators
+            .first()
+            .is_some_and(|g| expr_contains_yield(&g.iter)),
         ExprKind::Starred(inner) => expr_contains_yield(inner),
         ExprKind::Constant(_) | ExprKind::Name(_) => false,
     }
@@ -5474,11 +5486,7 @@ fn expr_contains_await(expr: &Expr) -> bool {
 /// and we do **not** treat a nested async *generator expression* as
 /// propagating — `(x async for x in a)` evaluates to an async-generator
 /// object that is not awaited in place.
-fn comp_clause_is_async(
-    generators: &[Comprehension],
-    elt: &Expr,
-    value: Option<&Expr>,
-) -> bool {
+fn comp_clause_is_async(generators: &[Comprehension], elt: &Expr, value: Option<&Expr>) -> bool {
     generators.iter().any(|g| g.is_async)
         || expr_contains_await(elt)
         || value.map(expr_contains_await).unwrap_or(false)

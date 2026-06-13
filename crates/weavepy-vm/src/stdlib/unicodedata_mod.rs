@@ -1362,8 +1362,8 @@ const EAW_RANGES: &[(u32, u32, &str)] = &[
     (0xE01F0, 0xEFFFF, "F"),
     (0xF0000, 0xFFFFD, "A"),
     (0xFFFFE, 0xFFFFF, "F"),
-    (0x100000, 0x10FFFD, "A"),
-    (0x10FFFE, 0x10FFFF, "F"),
+    (0x0010_0000, 0x0010_FFFD, "A"),
+    (0x0010_FFFE, 0x0010_FFFF, "F"),
 ];
 
 fn unicodedata_east_asian_width(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1372,7 +1372,11 @@ fn unicodedata_east_asian_width(args: &[Object]) -> Result<Object, RuntimeError>
     let idx = EAW_RANGES.partition_point(|&(start, _, _)| start <= code);
     let class = if idx > 0 {
         let (_, end, cls) = EAW_RANGES[idx - 1];
-        if code <= end { cls } else { "N" }
+        if code <= end {
+            cls
+        } else {
+            "N"
+        }
     } else {
         "N"
     };

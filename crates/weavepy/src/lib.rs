@@ -129,9 +129,7 @@ impl Error {
     pub fn system_exit_code(&self) -> Option<vm::object::Object> {
         match self {
             Error::Runtime(vm::RuntimeError::PyException(exc))
-            | Error::RuntimePrinted(vm::RuntimeError::PyException(exc)) => {
-                exc.system_exit_code()
-            }
+            | Error::RuntimePrinted(vm::RuntimeError::PyException(exc)) => exc.system_exit_code(),
             _ => None,
         }
     }

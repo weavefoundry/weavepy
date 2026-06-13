@@ -34,7 +34,9 @@ pub fn parse_module(source: &str) -> Result<Module, ParseError> {
 /// `SyntaxWarning`, or a `SyntaxError` under an `error` filter) even when
 /// a later token fails to lex/parse — e.g. `eval("'\\e' $")`. The VM
 /// replays the warnings before propagating any parse error.
-pub fn parse_module_with_warnings(source: &str) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
+pub fn parse_module_with_warnings(
+    source: &str,
+) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
     let (tok_result, warnings) = weavepy_lexer::tokenize_with_escapes(source);
     let module = match tok_result {
         Ok(tokens) => parser::parse(source, tokens),

@@ -353,8 +353,8 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// Like [`Self::skip_pep695_type_params`] but returns the
-    /// captured parameter names.
+    /// Swallows a PEP 695 `[T, *Ts, **P]` type-parameter list after a
+    /// `def`/`class`/`type` name and returns the captured parameter names.
     fn collect_pep695_type_params(&mut self) -> Result<Vec<String>, ParseError> {
         if !matches!(self.peek(), TokenKind::LSqb) {
             return Ok(Vec::new());
@@ -389,37 +389,6 @@ impl<'src> Parser<'src> {
         }
         self.expect(&TokenKind::RSqb, "`]`")?;
         Ok(names)
-    }
-
-    /// PEP 695 — `[T, *Ts, **P]` after `def`/`class`/`type` names.
-    /// We swallow the entire bracket-delimited list. This keeps
-    /// the parser permissive for any 3.12+ syntax surface; the
-    /// names are not actually bound in the function/class scope.
-    fn skip_pep695_type_params(&mut self) -> Result<(), ParseError> {
-        if !matches!(self.peek(), TokenKind::LSqb) {
-            return Ok(());
-        }
-        self.bump(); // `[`
-        let mut depth = 1i32;
-        while let Some(tok) = self.tokens.get(self.pos) {
-            match &tok.kind {
-                TokenKind::LSqb => depth += 1,
-                TokenKind::RSqb => {
-                    depth -= 1;
-                    if depth == 0 {
-                        self.bump();
-                        return Ok(());
-                    }
-                }
-                TokenKind::Endmarker => break,
-                _ => {}
-            }
-            self.bump();
-        }
-        Err(ParseError::Unexpected {
-            span: self.peek_token().span,
-            message: "unterminated type-parameter list".to_owned(),
-        })
     }
 
     /// `match` is a soft keyword. The disambiguating signal is
@@ -2533,10 +2502,6 @@ impl<'src> Parser<'src> {
         // "keyword argument repeated: <name>").
         let mut seen_keyword = false;
         let mut kw_names: Vec<String> = Vec::new();
-        // Span of the most recent argument — CPython's "Perhaps you
-        // forgot a comma?" underlines the *previous* element when two
-        // expressions abut.
-        let mut last_arg_span: Option<weavepy_lexer::Span> = None;
         loop {
             let arg_start = self.peek_token().span;
             if self.eat(&TokenKind::DoubleStar) {
@@ -2603,8 +2568,7 @@ impl<'src> Parser<'src> {
                         if !(args.is_empty() && keywords.is_empty()) {
                             return Err(ParseError::Unexpected {
                                 span,
-                                message: "Generator expression must be parenthesized"
-                                    .to_owned(),
+                                message: "Generator expression must be parenthesized".to_owned(),
                             });
                         }
                         args.push(Expr {
@@ -2617,8 +2581,7 @@ impl<'src> Parser<'src> {
                         if self.check(&TokenKind::Comma) {
                             return Err(ParseError::Unexpected {
                                 span,
-                                message: "Generator expression must be parenthesized"
-                                    .to_owned(),
+                                message: "Generator expression must be parenthesized".to_owned(),
                             });
                         }
                     } else {
@@ -2626,7 +2589,10 @@ impl<'src> Parser<'src> {
                     }
                 }
             }
-            last_arg_span = Some(arg_start.merge(self.prev_token_span()));
+            // Span of the most recent argument — CPython's "Perhaps you
+            // forgot a comma?" underlines the *previous* element when two
+            // expressions abut.
+            let last_arg_span = Some(arg_start.merge(self.prev_token_span()));
             if !self.eat(&TokenKind::Comma) {
                 // Two adjacent expressions with no comma — CPython's
                 // `invalid_expression` rule anchors the error at the
@@ -3458,8 +3424,13 @@ impl<'src> Parser<'src> {
                         return Err(scan_err);
                     }
                 };
-                let parsed =
-                    self.parse_fstring_field(&field, anchor, body_abs + (i as u32) + 1, raw, false)?;
+                let parsed = self.parse_fstring_field(
+                    &field,
+                    anchor,
+                    body_abs + (i as u32) + 1,
+                    raw,
+                    false,
+                )?;
                 parts.push(parsed);
                 i = end + 1; // skip past the closing `}`
                 continue;
@@ -3653,11 +3624,7 @@ impl<'src> Parser<'src> {
             // and not inside a string) is a comment to end of line. Skip
             // it so quotes/`!`/`:` it contains can't be mistaken for
             // string delimiters or conv/spec boundaries.
-            if in_str.is_none()
-                && b == b'#'
-                && conv_start.is_none()
-                && spec_start.is_none()
-            {
+            if in_str.is_none() && b == b'#' && conv_start.is_none() && spec_start.is_none() {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
@@ -4074,9 +4041,9 @@ fn remap_expr_spans(e: &mut Expr, map: &dyn Fn(u32) -> u32) {
             remap_expr_spans(value, map);
             remap_comps(generators, map);
         }
-        ExprKind::Starred(inner)
-        | ExprKind::YieldFrom(inner)
-        | ExprKind::Await(inner) => remap_expr_spans(inner, map),
+        ExprKind::Starred(inner) | ExprKind::YieldFrom(inner) | ExprKind::Await(inner) => {
+            remap_expr_spans(inner, map)
+        }
         ExprKind::Yield(inner) => {
             if let Some(i) = inner {
                 remap_expr_spans(i, map);
@@ -4317,10 +4284,7 @@ fn validate_fstring_conversion(
     if first.is_whitespace() {
         // CPython spans from the `!` through the end of the field.
         return Err(ParseError::Unexpected {
-            span: Span::new(
-                field_abs + (idx - 1) as u32,
-                field_abs + field.len() as u32,
-            ),
+            span: Span::new(field_abs + (idx - 1) as u32, field_abs + field.len() as u32),
             message: "f-string: conversion type must come right after the exclamation mark"
                 .to_owned(),
         });
@@ -4492,18 +4456,16 @@ pub(crate) fn partial_fstring_field_error(
             // diagnostic; anything else keeps the lexer error.
             let wins = match &e {
                 ParseError::Unexpected { message, .. }
-                | ParseError::Indentation { message, .. } => {
-                    message.starts_with("invalid syntax.")
-                        || message.starts_with("f-string: valid expression required before")
-                        || message == "f-string: expecting a valid expression after '{'"
-                        || message == "f-string: expecting '=', or '!', or ':', or '}'"
-                        || message == "f-string: missing conversion character"
-                        || message.starts_with("f-string: invalid conversion character")
-                        || message
-                            == "f-string: conversion type must come right after the exclamation mark"
-                        || message
-                            == "f-string: lambda expressions are not allowed without parentheses"
-                }
+                | ParseError::Indentation { message, .. } => message.starts_with("invalid syntax.")
+                    || message.starts_with("f-string: valid expression required before")
+                    || message == "f-string: expecting a valid expression after '{'"
+                    || message == "f-string: expecting '=', or '!', or ':', or '}'"
+                    || message == "f-string: missing conversion character"
+                    || message.starts_with("f-string: invalid conversion character")
+                    || message
+                        == "f-string: conversion type must come right after the exclamation mark"
+                    || message
+                        == "f-string: lambda expressions are not allowed without parentheses",
                 _ => false,
             };
             wins.then_some(e)
@@ -4635,7 +4597,7 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                 // character". Lone surrogates are *valid* in CPython str
                 // literals; Rust `char` can't hold them, so they degrade
                 // to U+FFFD (pre-existing representation limit).
-                if n > 0x10FFFF {
+                if n > 0x0010_FFFF {
                     return Err(unicode_err(bs, end, "illegal Unicode character"));
                 }
                 out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));

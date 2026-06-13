@@ -733,9 +733,7 @@ fn sys_set_int_max_str_digits(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     // CPython rejects values in (0, 640); 0 disables the limit.
     if n != 0 && n < 640 {
-        return Err(value_error(
-            "maxdigits must be 0 or larger than 640",
-        ));
+        return Err(value_error("maxdigits must be 0 or larger than 640"));
     }
     INT_MAX_STR_DIGITS.with(|c| c.set(n));
     Ok(Object::None)
@@ -753,16 +751,8 @@ fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
             use num_traits::ToPrimitive;
             n.to_i64().unwrap_or(i64::MAX)
         }
-        Some(_) => {
-            return Err(type_error(
-                "'limit' must be an integer",
-            ))
-        }
-        None => {
-            return Err(type_error(
-                "setrecursionlimit expected 1 argument, got 0",
-            ))
-        }
+        Some(_) => return Err(type_error("'limit' must be an integer")),
+        None => return Err(type_error("setrecursionlimit expected 1 argument, got 0")),
     };
     if limit < 1 {
         return Err(value_error(
@@ -1479,7 +1469,7 @@ thread_local! {
     /// PEP 525 `sys.set_asyncgen_hooks` — `(firstiter, finalizer)`.
     /// Per-thread in CPython (a `PyThreadState` field).
     static ASYNCGEN_HOOKS: std::cell::RefCell<(Object, Object)> =
-        std::cell::RefCell::new((Object::None, Object::None));
+        const { std::cell::RefCell::new((Object::None, Object::None)) };
 }
 
 /// The currently-installed `(firstiter, finalizer)` asyncgen hooks.

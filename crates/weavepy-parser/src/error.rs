@@ -56,8 +56,9 @@ impl ParseError {
     pub fn syntax_message(&self) -> String {
         match self {
             ParseError::Lex(e) => e.to_string(),
-            ParseError::Unexpected { message, .. }
-            | ParseError::Indentation { message, .. } => message.clone(),
+            ParseError::Unexpected { message, .. } | ParseError::Indentation { message, .. } => {
+                message.clone()
+            }
             ParseError::NotImplemented { .. } => self.to_string(),
         }
     }

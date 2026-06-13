@@ -65,13 +65,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 /// `self.func` through the interpreter.
 fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
-        return Err(type_error("partial.__call__ requires a running interpreter"));
+        return Err(type_error(
+            "partial.__call__ requires a running interpreter",
+        ));
     };
     // SAFETY: published by the enclosing VM frame on this thread.
     let interp = unsafe { &mut *ptr };
-    let slf = args
-        .first()
-        .ok_or_else(|| type_error("descriptor '__call__' of 'functools.partial' object needs an argument"))?;
+    let slf = args.first().ok_or_else(|| {
+        type_error("descriptor '__call__' of 'functools.partial' object needs an argument")
+    })?;
     let func = interp.load_attr_public(slf, "func")?;
     let stored_args = interp.load_attr_public(slf, "args")?;
     let stored_kw = interp.load_attr_public(slf, "keywords")?;

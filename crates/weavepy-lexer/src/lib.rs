@@ -245,7 +245,7 @@ mod tests {
         // genuine nested string, not the terminator.
         assert_eq!(kinds("f'{3 + 'a'}'")[0], TokenKind::String);
         assert_eq!(kinds("f'{3''}'")[0], TokenKind::String); // empty nested str
-        // The other quote is literal inside a format spec.
+                                                             // The other quote is literal inside a format spec.
         assert_eq!(kinds("f\"{x:'>10}\"")[0], TokenKind::String);
     }
 

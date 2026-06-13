@@ -145,17 +145,15 @@ impl Mt {
             // Regenerate the whole block.
             for kk in 0..(N - M) {
                 let y = (self.key[kk] & UPPER_MASK) | (self.key[kk + 1] & LOWER_MASK);
-                self.key[kk] =
-                    self.key[kk + M] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
+                self.key[kk] = self.key[kk + M] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
             }
             for kk in (N - M)..(N - 1) {
                 let y = (self.key[kk] & UPPER_MASK) | (self.key[kk + 1] & LOWER_MASK);
-                self.key[kk] = self.key[kk + M - N] ^ (y >> 1)
-                    ^ if y & 1 != 0 { MATRIX_A } else { 0 };
+                self.key[kk] =
+                    self.key[kk + M - N] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
             }
             let y = (self.key[N - 1] & UPPER_MASK) | (self.key[0] & LOWER_MASK);
-            self.key[N - 1] =
-                self.key[M - 1] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
+            self.key[N - 1] = self.key[M - 1] ^ (y >> 1) ^ if y & 1 != 0 { MATRIX_A } else { 0 };
             self.pos = 0;
         }
         let mut y = self.key[self.pos];
@@ -226,10 +224,7 @@ fn store_mt(inst: &Rc<PyInstance>, mt: &Mt) {
 
 /// Mutate-in-place fast path: run `f` against the deserialized state,
 /// then persist the (changed) words back into the bytearray buffer.
-fn with_mt<R>(
-    inst: &Rc<PyInstance>,
-    f: impl FnOnce(&mut Mt) -> R,
-) -> Result<R, RuntimeError> {
+fn with_mt<R>(inst: &Rc<PyInstance>, f: impl FnOnce(&mut Mt) -> R) -> Result<R, RuntimeError> {
     let mut mt = load_mt(inst)?;
     let r = f(&mut mt);
     store_mt(inst, &mt);
@@ -337,9 +332,8 @@ fn random_getrandbits(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(i)) => *i,
         Some(Object::Long(b)) => {
             use num_traits::ToPrimitive;
-            b.to_i64().ok_or_else(|| {
-                value_error("number of bits is too large")
-            })?
+            b.to_i64()
+                .ok_or_else(|| value_error("number of bits is too large"))?
         }
         _ => return Err(type_error("getrandbits() requires an integer argument")),
     };
@@ -403,11 +397,7 @@ fn random_randbytes(args: &[Object]) -> Result<Object, RuntimeError> {
 fn random_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_instance(args, "getstate()")?;
     let mt = load_mt(&inst)?;
-    let mut items: Vec<Object> = mt
-        .key
-        .iter()
-        .map(|w| Object::Int(i64::from(*w)))
-        .collect();
+    let mut items: Vec<Object> = mt.key.iter().map(|w| Object::Int(i64::from(*w))).collect();
     items.push(Object::Int(mt.pos as i64));
     Ok(Object::new_tuple(items))
 }

@@ -204,6 +204,23 @@ manual_map              = "allow"
 comparison_chain        = "allow"
 unnecessary_cast        = "allow"
 len_without_is_empty    = "allow"
+# Interpreter compares IEEE-754 values exactly by design (Python `==`,
+# rounding, struct packing); an epsilon would be incorrect.
+float_cmp               = "allow"
+# Sibling of the already-allowed `collapsible_if`/`collapsible_else_if`;
+# rewriting arms into guards changes match fall-through structure.
+collapsible_match       = "allow"
+# `Option<Option<T>>` deliberately encodes three weakref states.
+option_option           = "allow"
+# Hash/seed constants read more verifiably as decimal (mirrors CPython).
+decimal_bitwise_operands = "allow"
+# Stylistic field naming (e.g. `py_frame` on a frame type).
+struct_field_names      = "allow"
+# Doc-rendering nitpick, consistent with the allowed `doc_markdown`.
+doc_lazy_continuation   = "allow"
+# 1-element slice construction; clippy's own autofix is `MaybeIncorrect`
+# and the clone is a cheap refcount bump on hot call paths.
+cloned_ref_to_slice_refs = "allow"
 
 # Profiles tuned for an interpreter: aggressive release, fast incremental dev.
 [profile.dev]

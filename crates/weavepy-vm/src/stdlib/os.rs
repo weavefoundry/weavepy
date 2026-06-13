@@ -633,9 +633,7 @@ fn os_open_stub(args: &[Object]) -> Result<Object, RuntimeError> {
     let flags = args
         .get(1)
         .and_then(crate::object::Object::as_i64)
-        .ok_or_else(|| {
-            crate::error::type_error("open() flags must be an int".to_owned())
-        })?;
+        .ok_or_else(|| crate::error::type_error("open() flags must be an int".to_owned()))?;
     const O_WRONLY: i64 = 1;
     const O_RDWR: i64 = 2;
     const O_CREAT: i64 = 64;
@@ -1512,9 +1510,7 @@ fn path_realpath(args: &[Object]) -> Result<Object, RuntimeError> {
             for t in tail.iter().rev() {
                 out.push(t);
             }
-            return Ok(Object::from_str(normpath_lexical(
-                &out.to_string_lossy(),
-            )));
+            return Ok(Object::from_str(normpath_lexical(&out.to_string_lossy())));
         }
         tail.push(prefix.file_name().expect("checked above").to_owned());
         prefix.pop();

@@ -578,10 +578,9 @@ fn lazy_state(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Int(*step as i64),
             Object::Bool(*done),
         ],
-        LazyIterKind::Repeat { obj, times } => vec![
-            obj.clone(),
-            times.map_or(Object::None, Object::Int),
-        ],
+        LazyIterKind::Repeat { obj, times } => {
+            vec![obj.clone(), times.map_or(Object::None, Object::Int)]
+        }
         LazyIterKind::TeeBranch { data, index, .. } => {
             vec![data.clone(), Object::Int(*index as i64)]
         }
@@ -653,10 +652,7 @@ fn lazy_state(args: &[Object]) -> Result<Object, RuntimeError> {
             started,
             stopped,
         } => {
-            let pools: Vec<Object> = pools
-                .iter()
-                .map(|p| Object::Tuple(p.clone()))
-                .collect();
+            let pools: Vec<Object> = pools.iter().map(|p| Object::Tuple(p.clone())).collect();
             let ix: Vec<Object> = indices.iter().map(|&i| Object::Int(i as i64)).collect();
             vec![
                 Object::Tuple(pools.into()),

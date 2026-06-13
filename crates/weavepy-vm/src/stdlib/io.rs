@@ -259,7 +259,12 @@ fn tw_buffer(inst: &crate::types::PyInstance) -> Result<Rc<PyFile>, RuntimeError
 fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
     let positional = &args[1..];
-    let kw = |name: &str| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    let kw = |name: &str| {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    };
     let buffer = positional
         .first()
         .cloned()

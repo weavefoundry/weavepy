@@ -225,8 +225,7 @@ pub fn b_decode(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_lookup(args: &[Object]) -> Result<Object, RuntimeError> {
     let name = arg_str(args, 0, "lookup")?;
-    let enc =
-        lookup_encoding(&name)
+    let enc = lookup_encoding(&name)
         .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {name}")))?;
     let normalised = enc.name().to_lowercase();
     Ok(Object::from_str(normalised))
@@ -558,13 +557,7 @@ fn decode_utf8(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
         } else {
             "invalid continuation byte"
         };
-        crate::error::unicode_decode_error(
-            "utf-8",
-            bytes,
-            pos,
-            end.min(bytes.len()),
-            reason,
-        )
+        crate::error::unicode_decode_error("utf-8", bytes, pos, end.min(bytes.len()), reason)
     };
     match errors {
         "strict" => std::str::from_utf8(bytes)

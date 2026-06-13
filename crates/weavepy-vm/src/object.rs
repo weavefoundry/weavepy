@@ -417,11 +417,14 @@ pub fn bytearray_export_acquire(buf: &Rc<RefCell<Vec<u8>>>) {
         std::collections::hash_map::Entry::Occupied(mut o) => {
             // A recycled allocation address must not inherit the stale
             // count from a dead buffer.
-            let stale = o.get().0.upgrade().map_or(true, |live| !Rc::ptr_eq(&live, buf));
+            let stale = o
+                .get()
+                .0
+                .upgrade()
+                .is_none_or(|live| !Rc::ptr_eq(&live, buf));
             if stale {
                 let removed = o.get().1;
-                BYTEARRAY_EXPORT_TOTAL
-                    .fetch_sub(removed, std::sync::atomic::Ordering::AcqRel);
+                BYTEARRAY_EXPORT_TOTAL.fetch_sub(removed, std::sync::atomic::Ordering::AcqRel);
                 *o.get_mut() = (Rc::downgrade(buf), 1);
             } else {
                 o.get_mut().1 += 1;
@@ -467,10 +470,12 @@ pub fn bytearray_is_exported(buf: &Rc<RefCell<Vec<u8>>>) -> bool {
 /// invoke this when the operation would change `len`.
 pub fn bytearray_check_resizable(buf: &Rc<RefCell<Vec<u8>>>) -> Result<(), RuntimeError> {
     if bytearray_is_exported(buf) {
-        return Err(RuntimeError::PyException(crate::error::PyException::from_builtin(
-            "BufferError",
-            "Existing exports of data: object cannot be re-sized",
-        )));
+        return Err(RuntimeError::PyException(
+            crate::error::PyException::from_builtin(
+                "BufferError",
+                "Existing exports of data: object cannot be re-sized",
+            ),
+        ));
     }
     Ok(())
 }
@@ -478,6 +483,7 @@ pub fn bytearray_check_resizable(buf: &Rc<RefCell<Vec<u8>>>) -> Result<(), Runti
 /// RAII export of a bytearray buffer — what a CPython C method holds
 /// (via `PyObject_GetBuffer` on `self`) while it converts arguments
 /// that may call back into Python.
+#[derive(Debug)]
 pub struct ByteArrayExportGuard {
     buf: Rc<RefCell<Vec<u8>>>,
 }
@@ -672,7 +678,7 @@ impl MethodWrapper {
                 // Computed lazily, then pinned to the function's slots so
                 // `wrapper.__name__ is func.__name__` style identity
                 // checks hold (CPython stores one object per attribute).
-                let mut pinned = |name: &'static str, compute: &dyn Fn() -> Object| {
+                let pinned = |name: &'static str, compute: &dyn Fn() -> Object| {
                     f.slot(name).unwrap_or_else(|| {
                         let v = compute();
                         f.set_slot(name, v.clone());
@@ -680,8 +686,7 @@ impl MethodWrapper {
                     })
                 };
                 let name = pinned("__name__", &|| Object::from_str(f.name.clone()));
-                let qualname =
-                    pinned("__qualname__", &|| Object::from_str(code.qualname.clone()));
+                let qualname = pinned("__qualname__", &|| Object::from_str(code.qualname.clone()));
                 let module = pinned("__module__", &|| {
                     f.globals
                         .borrow()
@@ -717,11 +722,12 @@ impl MethodWrapper {
             other => {
                 let cls = crate::builtins::class_of(other);
                 match crate::builtin_type_doc(&cls.name) {
-                    Some(doc) if cls.flags.is_builtin => {
-                        [(DictKey(Object::from_static("__doc__")), Object::from_static(doc))]
-                            .into_iter()
-                            .collect()
-                    }
+                    Some(doc) if cls.flags.is_builtin => [(
+                        DictKey(Object::from_static("__doc__")),
+                        Object::from_static(doc),
+                    )]
+                    .into_iter()
+                    .collect(),
                     _ => DictData::new(),
                 }
             }
@@ -2168,9 +2174,7 @@ impl PyIterator {
     /// for sources whose remaining length isn't known in O(1).
     pub fn remaining(&self) -> Option<usize> {
         match self {
-            PyIterator::List { items, index } => {
-                Some(items.borrow().len().saturating_sub(*index))
-            }
+            PyIterator::List { items, index } => Some(items.borrow().len().saturating_sub(*index)),
             PyIterator::Tuple { items, index } => Some(items.len().saturating_sub(*index)),
             PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
             PyIterator::DictKeys { keys, index } => Some(keys.len().saturating_sub(*index)),
@@ -2187,11 +2191,15 @@ impl PyIterator {
                 step,
             } => {
                 if *step > 0 && *current < *stop {
-                    Some((((*stop - *current) as i128 + i128::from(*step) - 1)
-                        / i128::from(*step)) as usize)
+                    Some(
+                        ((i128::from(*stop - *current) + i128::from(*step) - 1) / i128::from(*step))
+                            as usize,
+                    )
                 } else if *step < 0 && *current > *stop {
-                    Some((((*current - *stop) as i128 + i128::from(-*step) - 1)
-                        / i128::from(-*step)) as usize)
+                    Some(
+                        ((i128::from(*current - *stop) + i128::from(-*step) - 1)
+                            / i128::from(-*step)) as usize,
+                    )
                 } else {
                     Some(0)
                 }
@@ -2221,9 +2229,11 @@ impl PyIterator {
     /// advanced.
     pub fn remaining_items(&self) -> Vec<Object> {
         match self {
-            PyIterator::List { items, index } => {
-                items.borrow().get(*index..).map(<[_]>::to_vec).unwrap_or_default()
-            }
+            PyIterator::List { items, index } => items
+                .borrow()
+                .get(*index..)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default(),
             PyIterator::Tuple { items, index } => {
                 items.get(*index..).map(<[_]>::to_vec).unwrap_or_default()
             }
@@ -2290,10 +2300,8 @@ impl PyIterator {
             PyIterator::Enumerate { inner, count } => {
                 let rest = inner.borrow().remaining_items();
                 let mut out = Vec::with_capacity(rest.len());
-                let mut i = *count;
-                for v in rest {
+                for (i, v) in (*count..).zip(rest) {
                     out.push(Object::new_tuple(vec![Object::Int(i), v]));
-                    i += 1;
                 }
                 out
             }
@@ -2339,9 +2347,9 @@ impl PyIterator {
     /// elements.
     pub fn reduce_remaining(&self) -> Object {
         match self {
-            PyIterator::Tuple { .. }
-            | PyIterator::Bytes { .. }
-            | PyIterator::ByteArray { .. } => Object::new_tuple(self.remaining_items()),
+            PyIterator::Tuple { .. } | PyIterator::Bytes { .. } | PyIterator::ByteArray { .. } => {
+                Object::new_tuple(self.remaining_items())
+            }
             PyIterator::Str { s, index } => {
                 let start = (*index).min(s.len());
                 Object::from_str(&s[start..])
@@ -2598,9 +2606,8 @@ impl Object {
                 Rc::ptr_eq(a, b) || {
                     let (a, b) = (a.borrow(), b.borrow());
                     a.len() == b.len()
-                        && a.iter().all(|(k, v)| {
-                            b.get(k).is_some_and(|w| v.is_same(w) || v.eq_value(w))
-                        })
+                        && a.iter()
+                            .all(|(k, v)| b.get(k).is_some_and(|w| v.is_same(w) || v.eq_value(w)))
                 }
             }
             // Reference-identity equality for class / module / function
@@ -2681,7 +2688,7 @@ impl Object {
             // shared `bytes_richcompare` buffer path).
             (O::Bytes(a), O::Bytes(b)) => Ok(a.as_ref().cmp(b.as_ref())),
             (O::Bytes(a), O::ByteArray(b)) => Ok(a.as_ref()[..].cmp(&b.borrow()[..])),
-            (O::ByteArray(a), O::Bytes(b)) => Ok(a.borrow()[..].cmp(&b.as_ref()[..])),
+            (O::ByteArray(a), O::Bytes(b)) => Ok(a.borrow()[..].cmp(b.as_ref())),
             (O::ByteArray(a), O::ByteArray(b)) => {
                 let bv = b.borrow().clone();
                 Ok(a.borrow()[..].cmp(&bv[..]))
@@ -2719,9 +2726,7 @@ impl Object {
             Object::Dict(d) => Ok(d.borrow().contains_key(&DictKey(item.clone()))),
             Object::Set(s) => Ok(s.borrow().contains(&DictKey(item.clone()))),
             Object::FrozenSet(s) => Ok(s.contains(&DictKey(item.clone()))),
-            Object::Bytes(haystack) => {
-                bytes_membership(haystack, item)
-            }
+            Object::Bytes(haystack) => bytes_membership(haystack, item),
             Object::ByteArray(haystack) => {
                 // Hold a buffer export: converting `item` can reenter
                 // Python (a user `__index__`/`__buffer__`) that tries to
@@ -2818,9 +2823,7 @@ impl Object {
                     // yielded element (current peaks at stop-1+step for
                     // positive step, bottoms at stop+1+step for negative),
                     // so boundary-hugging ranges take the i128 variant too.
-                    (Ok(current), Ok(stop), Ok(step))
-                        if stop.checked_add(step).is_some() =>
-                    {
+                    (Ok(current), Ok(stop), Ok(step)) if stop.checked_add(step).is_some() => {
                         PyIterator::Range {
                             current,
                             stop,
@@ -3299,10 +3302,9 @@ impl Object {
                         return parts.join(" | ");
                     }
                 }
-                if let (Some(origin), Some(Object::Tuple(items))) = (
-                    dict.get(&DictKey(Object::from_static("__origin__"))),
-                    &args,
-                ) {
+                if let (Some(origin), Some(Object::Tuple(items))) =
+                    (dict.get(&DictKey(Object::from_static("__origin__"))), &args)
+                {
                     let parts: Vec<String> = items.iter().map(type_param_repr).collect();
                     return format!("{}[{}]", type_param_repr(origin), parts.join(", "));
                 }
@@ -3469,27 +3471,6 @@ pub(crate) fn i64_cmp_f64(a: i64, b: f64) -> Result<Ordering, RuntimeError> {
     }
 }
 
-/// CPython's hash for ints: `value mod (2**61 - 1)` for 64-bit
-/// platforms.  This keeps `hash(1) == hash(1.0) == hash(True)` and
-/// also `hash(big) == hash(int(big))` for any big int.
-pub(crate) const PYTHON_HASH_MODULUS: u64 = (1u64 << 61) - 1;
-
-pub(crate) fn python_int_hash_i64(value: i64) -> i64 {
-    let modulus = i128::from(PYTHON_HASH_MODULUS);
-    let r = i128::from(value).rem_euclid(modulus) as i64;
-    // CPython returns -2 instead of -1 for hash collisions with the
-    // sentinel; we don't need the singularity handling at this level
-    // because the broader Rust hasher xors in additional bits.
-    r
-}
-
-pub(crate) fn python_int_hash_bigint(value: &BigInt) -> i64 {
-    use num_integer::Integer;
-    let modulus = BigInt::from(PYTHON_HASH_MODULUS);
-    let (_, rem) = value.div_mod_floor(&modulus);
-    rem.to_i64().unwrap_or(0)
-}
-
 /// Width of the Python numeric hash reduction: `_PyHASH_BITS` (61 on
 /// 64-bit, so the modulus is the Mersenne prime `2**61 - 1`).
 const PY_HASH_BITS: u32 = 61;
@@ -3572,7 +3553,7 @@ pub(crate) fn py_hash_double(v: f64) -> i64 {
 /// with the reserved `-1` remapped to `-2`.
 pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
     const MOD: u128 = (1u128 << PY_HASH_BITS) - 1;
-    let mut x = ((n as i128).unsigned_abs() % MOD) as i64;
+    let mut x = (i128::from(n).unsigned_abs() % MOD) as i64;
     if n < 0 {
         x = -x;
     }
@@ -3655,7 +3636,7 @@ fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
 pub(crate) fn identity_hash(obj: &Object) -> i64 {
     fn rot(p: *const ()) -> i64 {
         let u = p as usize as u64;
-        let v = (u >> 4 | u << 60) as i64;
+        let v = u.rotate_right(4) as i64;
         if v == -1 {
             -2
         } else {
@@ -3671,8 +3652,7 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
         // materialized fresh per access; hash their *name* so the hash
         // agrees with `eq_value`.
         Object::BoundMethod(r) => {
-            let self_h = py_hash_value(&r.receiver)
-                .unwrap_or_else(|| identity_hash(&r.receiver));
+            let self_h = py_hash_value(&r.receiver).unwrap_or_else(|| identity_hash(&r.receiver));
             let func_h = match &r.function {
                 Object::Builtin(b) => py_hash_bytes_slice(b.name.as_bytes()),
                 f => py_hash_value(f).unwrap_or_else(|| identity_hash(f)),
@@ -3732,10 +3712,12 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             // Order-sensitive mix (FNV-style) over element hashes so equal
             // tuples bucket together; unhashable elements would raise at the
             // `hash()` builtin, here they just fold their identity in.
-            let mut acc: u64 = 0x345678;
+            let mut acc: u64 = 0x0034_5678;
             for x in items.iter() {
                 let eh = py_hash_value(x).unwrap_or_else(|| identity_hash(x)) as u64;
-                acc = (acc ^ eh).wrapping_mul(1_000_003).wrapping_add(items.len() as u64);
+                acc = (acc ^ eh)
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(items.len() as u64);
             }
             let v = acc as i64;
             Some(if v == -1 { -2 } else { v })
@@ -3773,19 +3755,6 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         }
         _ => None,
     }
-}
-
-pub(crate) fn f64_to_i64_exact(f: f64) -> Option<i64> {
-    if !f.is_finite() {
-        return None;
-    }
-    if f.fract() != 0.0 {
-        return None;
-    }
-    if f < (i64::MIN as f64) || f > (i64::MAX as f64) {
-        return None;
-    }
-    Some(f as i64)
 }
 
 pub(crate) fn bigint_from_f64_trunc(f: f64) -> BigInt {

@@ -31,7 +31,9 @@ use crate::sync::RefCell;
 
 use crate::builtin_types::BuiltinTypes;
 use crate::error::{type_error, value_error, RuntimeError};
-use crate::object::{BuiltinFn, DictData, DictKey, MethodWrapper, Object, PyIterator, PyMemoryView};
+use crate::object::{
+    BuiltinFn, DictData, DictKey, MethodWrapper, Object, PyIterator, PyMemoryView,
+};
 use crate::types::TypeObject;
 
 /// Entry point: called once per thread when [`BuiltinTypes`] is built.
@@ -114,12 +116,46 @@ fn install_immutable_getnewargs(bt: &BuiltinTypes) {
 /// builtins are the same ones `lookup_method` resolves on instances.
 fn install_numeric_dunders(bt: &BuiltinTypes) {
     const NAMES: &[&str] = &[
-        "__add__", "__radd__", "__sub__", "__rsub__", "__mul__", "__rmul__", "__truediv__",
-        "__rtruediv__", "__floordiv__", "__rfloordiv__", "__mod__", "__rmod__", "__pow__",
-        "__rpow__", "__divmod__", "__rdivmod__", "__lshift__", "__rlshift__", "__rshift__",
-        "__rrshift__", "__and__", "__rand__", "__or__", "__ror__", "__xor__", "__rxor__",
-        "__neg__", "__pos__", "__invert__", "__abs__", "__bool__", "__eq__", "__ne__", "__lt__",
-        "__le__", "__gt__", "__ge__", "__hash__", "__format__", "__getnewargs__",
+        "__add__",
+        "__radd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__truediv__",
+        "__rtruediv__",
+        "__floordiv__",
+        "__rfloordiv__",
+        "__mod__",
+        "__rmod__",
+        "__pow__",
+        "__rpow__",
+        "__divmod__",
+        "__rdivmod__",
+        "__lshift__",
+        "__rlshift__",
+        "__rshift__",
+        "__rrshift__",
+        "__and__",
+        "__rand__",
+        "__or__",
+        "__ror__",
+        "__xor__",
+        "__rxor__",
+        "__neg__",
+        "__pos__",
+        "__invert__",
+        "__abs__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__lt__",
+        "__le__",
+        "__gt__",
+        "__ge__",
+        "__hash__",
+        "__format__",
+        "__getnewargs__",
     ];
     for (ty, rep) in [
         (&bt.int_, Object::Int(0)),
@@ -155,7 +191,13 @@ fn install_value_reprs(bt: &BuiltinTypes) {
         }
     }
     for ty in [
-        &bt.int_, &bt.bool_, &bt.float_, &bt.complex_, &bt.str_, &bt.bytes_, &bt.bytearray_,
+        &bt.int_,
+        &bt.bool_,
+        &bt.float_,
+        &bt.complex_,
+        &bt.str_,
+        &bt.bytes_,
+        &bt.bytearray_,
         &bt.tuple_,
     ] {
         install(ty);
@@ -295,7 +337,11 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
     fn fam_complex(o: &Object) -> bool {
         matches!(
             o,
-            Object::Complex(_) | Object::Int(_) | Object::Long(_) | Object::Bool(_) | Object::Float(_)
+            Object::Complex(_)
+                | Object::Int(_)
+                | Object::Long(_)
+                | Object::Bool(_)
+                | Object::Float(_)
         )
     }
     fn fam_str(o: &Object) -> bool {
@@ -362,7 +408,11 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
                     match op {
                         CompareKind::Eq | CompareKind::NotEq => {
                             if let Some(rv) = interp.deep_equal_collection(&a, &b, &globals)? {
-                                let rv = if matches!(op, CompareKind::Eq) { rv } else { !rv };
+                                let rv = if matches!(op, CompareKind::Eq) {
+                                    rv
+                                } else {
+                                    !rv
+                                };
                                 return Ok(Object::Bool(rv));
                             }
                         }
@@ -419,7 +469,11 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
         } else {
             fam_none
         };
-        insert_if_absent(&bt.complex_, name, richcmp_builtin(name, *op, fam, &bt.complex_));
+        insert_if_absent(
+            &bt.complex_,
+            name,
+            richcmp_builtin(name, *op, fam, &bt.complex_),
+        );
     }
     // dict / range: equality only.
     fn fam_dict(o: &Object) -> bool {
@@ -429,8 +483,16 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
         matches!(o, Object::Range(_))
     }
     for (name, op) in &[("__eq__", CompareKind::Eq), ("__ne__", CompareKind::NotEq)] {
-        insert_if_absent(&bt.dict_, name, richcmp_builtin(name, *op, fam_dict, &bt.dict_));
-        insert_if_absent(&bt.range_, name, richcmp_builtin(name, *op, fam_range, &bt.range_));
+        insert_if_absent(
+            &bt.dict_,
+            name,
+            richcmp_builtin(name, *op, fam_dict, &bt.dict_),
+        );
+        insert_if_absent(
+            &bt.range_,
+            name,
+            richcmp_builtin(name, *op, fam_range, &bt.range_),
+        );
     }
 }
 
@@ -675,7 +737,9 @@ fn list_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
             .ok_or_else(|| type_error("__reversed__() missing self"))?,
     );
     let Object::List(items) = &recv else {
-        return Err(type_error("descriptor '__reversed__' requires a 'list' object"));
+        return Err(type_error(
+            "descriptor '__reversed__' requires a 'list' object",
+        ));
     };
     let reversed: Vec<Object> = items.borrow().iter().rev().cloned().collect();
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
@@ -690,7 +754,9 @@ fn dict_reversed_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
             .ok_or_else(|| type_error("__reversed__() missing self"))?,
     );
     let Object::Dict(d) = &recv else {
-        return Err(type_error("descriptor '__reversed__' requires a 'dict' object"));
+        return Err(type_error(
+            "descriptor '__reversed__' requires a 'dict' object",
+        ));
     };
     let keys: Vec<Object> = d.borrow().keys().rev().map(|k| k.0.clone()).collect();
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple {
@@ -783,10 +849,26 @@ fn install_container_protocols(bt: &BuiltinTypes) {
             builtin("__reversed__", dict_view_reversed_builtin),
         );
     }
-    insert_if_absent(&bt.list_, "__reversed__", builtin("__reversed__", list_reversed_builtin));
-    insert_if_absent(&bt.dict_, "__reversed__", builtin("__reversed__", dict_reversed_builtin));
-    insert_if_absent(&bt.iterator_, "__iter__", builtin("__iter__", iter_self_builtin));
-    insert_if_absent(&bt.iterator_, "__next__", builtin("__next__", iter_next_builtin));
+    insert_if_absent(
+        &bt.list_,
+        "__reversed__",
+        builtin("__reversed__", list_reversed_builtin),
+    );
+    insert_if_absent(
+        &bt.dict_,
+        "__reversed__",
+        builtin("__reversed__", dict_reversed_builtin),
+    );
+    insert_if_absent(
+        &bt.iterator_,
+        "__iter__",
+        builtin("__iter__", iter_self_builtin),
+    );
+    insert_if_absent(
+        &bt.iterator_,
+        "__next__",
+        builtin("__next__", iter_next_builtin),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -817,9 +899,7 @@ fn set_items(o: &Object) -> Vec<DictKey> {
 /// `set | frozenset` → `set`, `frozenset | set` → `frozenset`).
 fn set_like(model: &Object, items: Vec<DictKey>) -> Object {
     match model {
-        Object::FrozenSet(_) => {
-            Object::new_frozenset_from(items.into_iter().map(|k| k.0))
-        }
+        Object::FrozenSet(_) => Object::new_frozenset_from(items.into_iter().map(|k| k.0)),
         _ => {
             let mut out = indexmap::IndexSet::new();
             for k in items {
@@ -853,10 +933,16 @@ macro_rules! set_binop {
 }
 
 set_binop!(set_sub_builtin, |a, b| {
-    set_items(a).into_iter().filter(|k| !contains_key(b, k)).collect()
+    set_items(a)
+        .into_iter()
+        .filter(|k| !contains_key(b, k))
+        .collect()
 });
 set_binop!(set_and_builtin, |a, b| {
-    set_items(a).into_iter().filter(|k| contains_key(b, k)).collect()
+    set_items(a)
+        .into_iter()
+        .filter(|k| contains_key(b, k))
+        .collect()
 });
 set_binop!(set_or_builtin, |a, b| {
     let mut items = set_items(a);
@@ -880,11 +966,14 @@ set_binop!(set_xor_builtin, |a, b| {
     items
 });
 
-/// Reflected forms: `__rsub__(self, other)` computes `other - self` with
-/// the result kind following `other` (the left operand of the original
-/// expression).
+// Reflected forms: `__rsub__(self, other)` computes `other - self` with
+// the result kind following `other` (the left operand of the original
+// expression).
 set_binop!(set_rsub_builtin, |a, b| {
-    set_items(b).into_iter().filter(|k| !contains_key(a, k)).collect()
+    set_items(b)
+        .into_iter()
+        .filter(|k| !contains_key(a, k))
+        .collect()
 });
 
 fn set_rsub_outer(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1182,9 +1271,9 @@ fn buffer_builtin(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Bytes(b) => Ok(Object::MemoryView(Rc::new(PyMemoryView::from_bytes(
             b.clone(),
         )))),
-        Object::ByteArray(b) => Ok(Object::MemoryView(Rc::new(
-            PyMemoryView::from_bytearray(b.clone()),
-        ))),
+        Object::ByteArray(b) => Ok(Object::MemoryView(Rc::new(PyMemoryView::from_bytearray(
+            b.clone(),
+        )))),
         Object::MemoryView(_) => Ok(recv.clone()),
         other => Err(value_error(format!(
             "__buffer__ not supported for '{}'",
@@ -1216,14 +1305,58 @@ fn install_method_tables(bt: &BuiltinTypes) {
         &bt.str_,
         "str",
         &[
-            "upper", "lower", "title", "capitalize", "casefold", "swapcase", "strip", "lstrip",
-            "rstrip", "split", "rsplit", "splitlines", "join", "startswith", "endswith",
-            "replace", "find", "rfind", "index", "rindex", "count", "partition", "rpartition",
-            "isdigit", "isalpha", "isalnum", "isspace", "isupper", "islower", "isascii",
-            "isnumeric", "isdecimal", "isidentifier", "isprintable", "istitle", "zfill",
-            "ljust", "rjust", "center", "expandtabs", "encode", "removeprefix", "removesuffix",
-            "translate", "maketrans", "__getitem__", "__add__", "__mul__", "__rmul__",
-            "__mod__", "__len__", "__contains__",
+            "upper",
+            "lower",
+            "title",
+            "capitalize",
+            "casefold",
+            "swapcase",
+            "strip",
+            "lstrip",
+            "rstrip",
+            "split",
+            "rsplit",
+            "splitlines",
+            "join",
+            "startswith",
+            "endswith",
+            "replace",
+            "find",
+            "rfind",
+            "index",
+            "rindex",
+            "count",
+            "partition",
+            "rpartition",
+            "isdigit",
+            "isalpha",
+            "isalnum",
+            "isspace",
+            "isupper",
+            "islower",
+            "isascii",
+            "isnumeric",
+            "isdecimal",
+            "isidentifier",
+            "isprintable",
+            "istitle",
+            "zfill",
+            "ljust",
+            "rjust",
+            "center",
+            "expandtabs",
+            "encode",
+            "removeprefix",
+            "removesuffix",
+            "translate",
+            "maketrans",
+            "__getitem__",
+            "__add__",
+            "__mul__",
+            "__rmul__",
+            "__mod__",
+            "__len__",
+            "__contains__",
         ],
     );
     install_named_methods(

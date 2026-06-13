@@ -65,7 +65,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // `ref` IS the ReferenceType type object, exactly as in CPython
         // (`_weakref.ref is _weakref.ReferenceType`); instantiation routes
         // through `construct_ref` via the VM's builtin-type special-case.
-        d.insert(DictKey(Object::from_static("ref")), Object::Type(ref_type()));
+        d.insert(
+            DictKey(Object::from_static("ref")),
+            Object::Type(ref_type()),
+        );
         d.insert(DictKey(Object::from_static("proxy")), b("proxy", new_proxy));
         d.insert(
             DictKey(Object::from_static("getweakrefcount")),
@@ -171,7 +174,11 @@ fn wrapper_referent(obj: &Object) -> Option<Option<Object>> {
     match getter {
         Some(Object::Builtin(b)) => {
             let t = (b.call)(&[]).ok()?;
-            Some(if matches!(t, Object::None) { None } else { Some(t) })
+            Some(if matches!(t, Object::None) {
+                None
+            } else {
+                Some(t)
+            })
         }
         _ => None,
     }
@@ -212,7 +219,9 @@ fn ref_type_hash(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("__hash__() missing self"))?;
     let Object::Instance(inst) = me else {
-        return Err(type_error("descriptor '__hash__' requires a 'weakref' object"));
+        return Err(type_error(
+            "descriptor '__hash__' requires a 'weakref' object",
+        ));
     };
     let cache_key = DictKey(Object::from_static("__hash_cache__"));
     if let Some(h) = inst.dict.borrow().get(&cache_key).cloned() {

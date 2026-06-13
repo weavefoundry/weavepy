@@ -19,22 +19,9 @@ use weavepy_parser::ast::{
     Arguments, Comprehension, ExceptHandler, Expr, ExprKind, MatchCase, Pattern, Stmt, StmtKind,
 };
 
-/// `_Py_Mangle` for a single identifier: `Some("_C__spam")` when
-/// `ident` is private (`__spam`) inside class `class_name`, else `None`.
-pub(crate) fn mangle_name(class_name: &str, ident: &str) -> Option<String> {
-    let stripped = class_name.trim_start_matches('_');
-    if stripped.is_empty() {
-        return None;
-    }
-    if !ident.starts_with("__") || ident.ends_with("__") || ident.contains('.') {
-        return None;
-    }
-    Some(format!("_{stripped}{ident}"))
-}
-
-/// Inverse of [`mangle_name`]: recover the source spelling of a binding
-/// that was mangled against `class_name` (used for `__name__` /
-/// `__qualname__`, which CPython keeps unmangled).
+/// Recover the source spelling of a binding that was mangled against
+/// `class_name` (used for `__name__` / `__qualname__`, which CPython
+/// keeps unmangled). Inverse of the [`Mangler`] name rewrite.
 pub(crate) fn demangle_name<'a>(class_name: &str, ident: &'a str) -> &'a str {
     let stripped = class_name.trim_start_matches('_');
     if stripped.is_empty() {

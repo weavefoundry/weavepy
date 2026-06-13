@@ -306,7 +306,10 @@ impl BuiltinTypes {
         {
             let mut d = base_exception.dict.borrow_mut();
             for key in ["__traceback__", "__context__", "__cause__"] {
-                d.insert(crate::object::DictKey(Object::from_static(key)), Object::None);
+                d.insert(
+                    crate::object::DictKey(Object::from_static(key)),
+                    Object::None,
+                );
             }
             d.insert(
                 crate::object::DictKey(Object::from_static("__suppress_context__")),
@@ -825,13 +828,41 @@ pub fn builtin_types() -> Rc<BuiltinTypes> {
 pub fn builtin_fn_objclass(b: &Rc<crate::object::BuiltinFn>) -> Option<Rc<TypeObject>> {
     let bt = builtin_types();
     let candidates: &[&Rc<TypeObject>] = &[
-        &bt.object_, &bt.type_, &bt.int_, &bt.float_, &bt.bool_, &bt.complex_, &bt.str_,
-        &bt.bytes_, &bt.bytearray_, &bt.tuple_, &bt.list_, &bt.dict_, &bt.set_, &bt.frozenset_,
-        &bt.range_, &bt.slice_, &bt.memoryview_, &bt.mappingproxy_, &bt.dict_keys_,
-        &bt.dict_values_, &bt.dict_items_, &bt.iterator_, &bt.none_type, &bt.function_,
-        &bt.method_, &bt.builtin_function_, &bt.method_wrapper_, &bt.member_descriptor_,
-        &bt.generator_, &bt.coroutine_, &bt.module_, &bt.property_, &bt.staticmethod_,
-        &bt.classmethod_, &bt.base_exception,
+        &bt.object_,
+        &bt.type_,
+        &bt.int_,
+        &bt.float_,
+        &bt.bool_,
+        &bt.complex_,
+        &bt.str_,
+        &bt.bytes_,
+        &bt.bytearray_,
+        &bt.tuple_,
+        &bt.list_,
+        &bt.dict_,
+        &bt.set_,
+        &bt.frozenset_,
+        &bt.range_,
+        &bt.slice_,
+        &bt.memoryview_,
+        &bt.mappingproxy_,
+        &bt.dict_keys_,
+        &bt.dict_values_,
+        &bt.dict_items_,
+        &bt.iterator_,
+        &bt.none_type,
+        &bt.function_,
+        &bt.method_,
+        &bt.builtin_function_,
+        &bt.method_wrapper_,
+        &bt.member_descriptor_,
+        &bt.generator_,
+        &bt.coroutine_,
+        &bt.module_,
+        &bt.property_,
+        &bt.staticmethod_,
+        &bt.classmethod_,
+        &bt.base_exception,
     ];
     let needle = Rc::as_ptr(b);
     for ty in candidates {
@@ -1036,7 +1067,9 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
             None => Object::Int(0),
             Some(o @ (Object::Int(_) | Object::Long(_))) => o.clone(),
             Some(Object::Bool(b)) => Object::Int(i64::from(*b)),
-            Some(o) => o.native_value().unwrap_or_else(|| Object::Int(o.as_i64().unwrap_or(0))),
+            Some(o) => o
+                .native_value()
+                .unwrap_or_else(|| Object::Int(o.as_i64().unwrap_or(0))),
         });
     }
     if is_strict(&bt.float_) {
@@ -1067,14 +1100,24 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
     if is_strict(&bt.bytearray_) {
         let bytes = value
             .and_then(any_elements)
-            .map(|els| els.iter().filter_map(|o| o.as_i64()).map(|i| i as u8).collect())
+            .map(|els| {
+                els.iter()
+                    .filter_map(|o| o.as_i64())
+                    .map(|i| i as u8)
+                    .collect()
+            })
             .unwrap_or_default();
         return Some(Object::ByteArray(Rc::new(RefCell::new(bytes))));
     }
     if is_strict(&bt.bytes_) {
         let bytes: Vec<u8> = value
             .and_then(any_elements)
-            .map(|els| els.iter().filter_map(|o| o.as_i64()).map(|i| i as u8).collect())
+            .map(|els| {
+                els.iter()
+                    .filter_map(|o| o.as_i64())
+                    .map(|i| i as u8)
+                    .collect()
+            })
             .unwrap_or_default();
         return Some(Object::Bytes(Rc::from(bytes.as_slice())));
     }
@@ -1117,12 +1160,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // `.args` but never runs `__init__` (CPython `BaseException_new`).
     // `UnicodeDecodeError.__new__(UnicodeDecodeError)` must succeed
     // with zero constructor arguments.
-    if cls
-        .mro
-        .borrow()
-        .iter()
-        .any(|t| t.name == "BaseException")
-    {
+    if cls.mro.borrow().iter().any(|t| t.name == "BaseException") {
         let new_args = if args.len() > 1 { &args[1..] } else { &[][..] };
         if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
             // SAFETY: published by an enclosing VM frame still live on
@@ -1165,8 +1203,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() > 1 && !cls.flags.is_builtin && native_seed_for_new(&cls, None).is_none() {
         if overrides_dunder_new(&cls) {
             return Err(crate::error::type_error(
-                "object.__new__() takes exactly one argument (the type to instantiate)"
-                    .to_owned(),
+                "object.__new__() takes exactly one argument (the type to instantiate)".to_owned(),
             ));
         }
         if !overrides_dunder_init(&cls) {
@@ -1192,8 +1229,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
                     // on this thread; the GIL keeps the access exclusive.
                     let interp = unsafe { &mut *ptr };
                     let s = interp.type_call_default(&bt.str_, &args[1..], &[])?;
-                    let inst =
-                        Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), s)));
+                    let inst = Object::Instance(Rc::new(PyInstance::with_native(cls.clone(), s)));
                     crate::gc_trace::track(inst.clone());
                     return Ok(inst);
                 }
@@ -1279,12 +1315,11 @@ fn make_default_new() -> Object {
 /// precedence in `load_attr_type`.
 fn install_gen_name_getsets(ty: &Rc<TypeObject>, kind: &'static str) {
     use crate::object::{BuiltinFn, PyProperty};
-    fn gen_of(args: &[Object]) -> Result<&crate::sync::Rc<crate::object::PyGenerator>, RuntimeError>
-    {
+    fn gen_of(
+        args: &[Object],
+    ) -> Result<&crate::sync::Rc<crate::object::PyGenerator>, RuntimeError> {
         match args.first() {
-            Some(
-                Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g),
-            ) => Ok(g),
+            Some(Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g)) => Ok(g),
             _ => Err(crate::error::type_error(
                 "descriptor requires a generator-family object",
             )),
@@ -1297,8 +1332,16 @@ fn install_gen_name_getsets(ty: &Rc<TypeObject>, kind: &'static str) {
         Ok(Object::from_str(gen_of(args)?.qualname.borrow().clone()))
     }
     let docs = [
-        ("__name__", get_name as fn(&[Object]) -> Result<Object, RuntimeError>, format!("name of the {kind}")),
-        ("__qualname__", get_qualname, format!("qualified name of the {kind}")),
+        (
+            "__name__",
+            get_name as fn(&[Object]) -> Result<Object, RuntimeError>,
+            format!("name of the {kind}"),
+        ),
+        (
+            "__qualname__",
+            get_qualname,
+            format!("qualified name of the {kind}"),
+        ),
     ];
     for (attr, f, doc) in docs {
         ty.dict.borrow_mut().insert(
@@ -1337,7 +1380,10 @@ fn install_member_descriptor_methods(member_: &Rc<TypeObject>) {
             }
         };
         let obj = args.get(1).ok_or_else(|| {
-            crate::error::type_error(format!("descriptor '{}' of object needs an argument", slot.name))
+            crate::error::type_error(format!(
+                "descriptor '{}' of object needs an argument",
+                slot.name
+            ))
         })?;
         Ok((slot, obj))
     }
@@ -1348,12 +1394,10 @@ fn install_member_descriptor_methods(member_: &Rc<TypeObject>) {
         obj: &Object,
     ) -> Result<crate::sync::Rc<crate::types::PyInstance>, RuntimeError> {
         if let Object::Instance(inst) = obj {
-            let owns = inst
-                .cls()
-                .mro
-                .borrow()
-                .iter()
-                .any(|t| t.name == slot.class_name && t.slot_names.borrow().iter().any(|n| *n == slot.name));
+            let owns =
+                inst.cls().mro.borrow().iter().any(|t| {
+                    t.name == slot.class_name && t.slot_names.borrow().contains(&slot.name)
+                });
             if owns {
                 return Ok(inst.clone());
             }
@@ -1403,7 +1447,10 @@ fn install_member_descriptor_methods(member_: &Rc<TypeObject>) {
     }
     let mut td = member_.dict.borrow_mut();
     for (name, f) in [
-        ("__get__", member_get as fn(&[Object]) -> Result<Object, RuntimeError>),
+        (
+            "__get__",
+            member_get as fn(&[Object]) -> Result<Object, RuntimeError>,
+        ),
         ("__set__", member_set),
         ("__delete__", member_delete),
     ] {
@@ -1655,7 +1702,8 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 if !removed {
                     return Err(crate::error::attribute_error(format!(
                         "'{}' object has no attribute '{}'",
-                        inst.cls().name, name
+                        inst.cls().name,
+                        name
                     )));
                 }
                 Ok(Object::None)
@@ -1678,9 +1726,9 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
         // Default `object.__hash__`: the same canonical hash the `hash()`
         // builtin falls back to when no custom `__hash__` is defined, so
         // `object.__hash__(x) == hash(x)` for any object using the default.
-        let obj = args
-            .first()
-            .ok_or_else(|| crate::error::type_error("object.__hash__() takes exactly 1 argument"))?;
+        let obj = args.first().ok_or_else(|| {
+            crate::error::type_error("object.__hash__() takes exactly 1 argument")
+        })?;
         crate::builtins::hash_object(obj)
     }
     let mut dict = object_.dict.borrow_mut();
@@ -1693,10 +1741,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
             call_kw: None,
         })),
     );
-    dict.insert(
-        DictKey(Object::from_static("__new__")),
-        make_default_new(),
-    );
+    dict.insert(DictKey(Object::from_static("__new__")), make_default_new());
     dict.insert(
         DictKey(Object::from_static("__init__")),
         Object::Builtin(Rc::new(BuiltinFn {
@@ -2036,7 +2081,9 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
             Some(Object::Type(ty)) => ty.name.clone(),
             _ => "?".to_owned(),
         };
-        Err(crate::error::type_error(format!("can't delete {name}.__name__")))
+        Err(crate::error::type_error(format!(
+            "can't delete {name}.__name__"
+        )))
     }
     type GetSetFn = fn(&[Object]) -> Result<Object, RuntimeError>;
     fn mk_getset(name: &'static str, get: GetSetFn, set: GetSetFn, del: GetSetFn) -> Object {
@@ -2063,7 +2110,10 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
         )))
     }
     for (name, getset) in [
-        ("__doc__", mk_getset("__doc__", type_doc_get, type_doc_set, type_doc_del)),
+        (
+            "__doc__",
+            mk_getset("__doc__", type_doc_get, type_doc_set, type_doc_del),
+        ),
         (
             "__qualname__",
             mk_getset(
@@ -2967,7 +3017,14 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
             // `error::syntax_error_located` overwrites them with real
             // values when a byte offset is available.
             dict.insert(DictKey(Object::from_static("msg")), msg);
-            for name in ["filename", "lineno", "offset", "text", "end_lineno", "end_offset"] {
+            for name in [
+                "filename",
+                "lineno",
+                "offset",
+                "text",
+                "end_lineno",
+                "end_offset",
+            ] {
                 dict.insert(DictKey(Object::from_static(name)), Object::None);
             }
         }
@@ -3138,7 +3195,10 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
             }
         }
         let cls = resolve_exception_group_class(cls.clone(), ctor_args)?;
-        let msg = ctor_args.first().cloned().unwrap_or(Object::from_static(""));
+        let msg = ctor_args
+            .first()
+            .cloned()
+            .unwrap_or(Object::from_static(""));
         let inst = make_exception_with_class(cls, "");
         if let Object::Instance(inst_rc) = &inst {
             let mut dict = inst_rc.dict.borrow_mut();
@@ -3231,9 +3291,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
 /// materialises as `ExceptionGroup`.
 fn exception_group_class_for(items: &[Object]) -> Rc<TypeObject> {
     let bt = builtin_types();
-    let all_exceptions = items
-        .iter()
-        .all(|e| instance_is_subclass(e, &bt.exception));
+    let all_exceptions = items.iter().all(|e| instance_is_subclass(e, &bt.exception));
     if all_exceptions {
         bt.exception_group.clone()
     } else {
@@ -3258,9 +3316,7 @@ pub fn resolve_exception_group_class(
         Some(Object::List(l)) => l.borrow().clone(),
         _ => return Ok(cls),
     };
-    let all_exceptions = items
-        .iter()
-        .all(|e| instance_is_subclass(e, &bt.exception));
+    let all_exceptions = items.iter().all(|e| instance_is_subclass(e, &bt.exception));
     if Rc::ptr_eq(&cls, &bt.base_exception_group) {
         if all_exceptions {
             return Ok(bt.exception_group.clone());
@@ -3294,7 +3350,10 @@ fn overrides_eg_method(class: &Rc<TypeObject>, name: &'static str) -> bool {
         if Rc::ptr_eq(t, &bt.base_exception_group) {
             return false;
         }
-        if t.dict.borrow().contains_key(&DictKey(Object::from_static(name))) {
+        if t.dict
+            .borrow()
+            .contains_key(&DictKey(Object::from_static(name)))
+        {
             return true;
         }
     }
@@ -3683,10 +3742,27 @@ fn install_mutable_container_init(bt: &BuiltinTypes) {
         Ok(unsafe { &mut *ptr })
     }
 
-    fn dict_init_kw(
-        args: &[Object],
-        kwargs: &[(String, Object)],
-    ) -> Result<Object, RuntimeError> {
+    fn dict_pairs_from_iterable(
+        interp: &mut crate::Interpreter,
+        src: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Vec<(DictKey, Object)>, RuntimeError> {
+        let items = interp.collect_iterable(src, globals)?;
+        let mut out = Vec::with_capacity(items.len());
+        for (i, pair) in items.into_iter().enumerate() {
+            let kv = interp.collect_iterable(&pair, globals)?;
+            if kv.len() != 2 {
+                return Err(crate::error::type_error(format!(
+                    "dictionary update sequence element #{i} has length {}; 2 is required",
+                    kv.len()
+                )));
+            }
+            out.push((DictKey(kv[0].clone()), kv[1].clone()));
+        }
+        Ok(out)
+    }
+
+    fn dict_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
         let payload = self_payload(args)?;
         let Object::Dict(target) = &payload else {
             return Err(crate::error::type_error(
@@ -3707,19 +3783,7 @@ fn install_mutable_container_init(bt: &BuiltinTypes) {
                     let view = d.borrow();
                     view.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
                 } else {
-                    let items = interp.collect_iterable(src, &globals)?;
-                    let mut out = Vec::with_capacity(items.len());
-                    for (i, pair) in items.into_iter().enumerate() {
-                        let kv = interp.collect_iterable(&pair, &globals)?;
-                        if kv.len() != 2 {
-                            return Err(crate::error::type_error(format!(
-                                "dictionary update sequence element #{i} has length {}; 2 is required",
-                                kv.len()
-                            )));
-                        }
-                        out.push((DictKey(kv[0].clone()), kv[1].clone()));
-                    }
-                    out
+                    dict_pairs_from_iterable(interp, src, &globals)?
                 };
             let mut t = target.borrow_mut();
             for (k, v) in merged {
