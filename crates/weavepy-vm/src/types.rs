@@ -199,6 +199,15 @@ impl TypeObject {
                     b.name
                 )));
             }
+            // A user class whose MRO is still unset is mid-creation (its
+            // custom metaclass `mro()` is running); CPython refuses to
+            // extend such an incomplete type (`best_base` error path).
+            if !b.flags.is_builtin && b.mro.borrow().is_empty() {
+                return Err(type_error(format!(
+                    "Cannot extend an incomplete type '{}'",
+                    b.name
+                )));
+            }
         }
         let mut winner: Option<Rc<TypeObject>> = None;
         for b in bases {
@@ -441,9 +450,20 @@ impl TypeObject {
     /// resolved slot for the type *and* anything inheriting from it. Class
     /// hierarchies are acyclic, so the recursion terminates.
     pub fn invalidate_getattribute_cache(&self) {
+        // Iterative walk with a visited set: reentrant `__bases__`
+        // assignment can leave a *cycle* through the subclass registry
+        // (gh-92112), which naive recursion would loop on forever.
+        let mut visited: Vec<*const TypeObject> = vec![self as *const TypeObject];
         self.getattribute_kind.set(0);
-        for sub in self.subclasses() {
-            sub.invalidate_getattribute_cache();
+        let mut queue: Vec<Rc<TypeObject>> = self.subclasses();
+        while let Some(t) = queue.pop() {
+            let ptr = Rc::as_ptr(&t);
+            if visited.contains(&ptr) {
+                continue;
+            }
+            visited.push(ptr);
+            t.getattribute_kind.set(0);
+            queue.extend(t.subclasses());
         }
     }
 

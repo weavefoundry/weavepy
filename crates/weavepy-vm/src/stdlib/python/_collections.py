@@ -103,6 +103,13 @@ class deque:
         return self._maxlen
 
     def append(self, x):
+        # CPython's method descriptor rejects unbound calls with a
+        # foreign receiver (`deque.append(thing, x)` — gh-92063).
+        if not isinstance(self, deque):
+            raise TypeError(
+                "descriptor 'append' for 'collections.deque' objects "
+                "doesn't apply to a '%s' object" % type(self).__name__
+            )
         self._data.append(x)
         if self._maxlen is not None and len(self._data) > self._maxlen:
             del self._data[0]

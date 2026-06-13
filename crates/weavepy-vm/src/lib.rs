@@ -1012,10 +1012,10 @@ impl Interpreter {
             return;
         };
         let class_name = inst.cls().name.clone();
-        let bound = Object::BoundMethod(Rc::new(BoundMethod {
-            receiver: obj.clone(),
-            function: del.clone(),
-        }));
+        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+             obj.clone(),
+             del.clone(),
+        )));
         let kwargs: Vec<(String, Object)> = Vec::new();
         let outer = Rc::new(RefCell::new(DictData::new()));
         if let Err(err) = self.call(&bound, &[], &kwargs, &outer) {
@@ -2655,10 +2655,10 @@ impl Interpreter {
                         .filter(|(_, owner)| !owner.flags.is_builtin)
                         .map(|(m, _)| m);
                     if let Some(m) = user_getitem {
-                        let method = Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: v.clone(),
-                            function: m,
-                        }));
+                        let method = Object::BoundMethod(Rc::new(BoundMethod::new(
+                             v.clone(),
+                             m,
+                        )));
                         self.call(
                             &method,
                             std::slice::from_ref(&i),
@@ -2703,10 +2703,10 @@ impl Interpreter {
                         meta.lookup("__getitem__")
                     };
                     if let Some(method) = meta_getitem {
-                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: Object::Type(ty.clone()),
-                            function: method,
-                        }));
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                             Object::Type(ty.clone()),
+                             method,
+                        )));
                         self.call(
                             &bound,
                             std::slice::from_ref(&i),
@@ -4672,10 +4672,10 @@ impl Interpreter {
                     // returned as-is, like CPython's generic getattr.
                     return Ok(match f {
                         Object::Function(_) | Object::Builtin(_) => {
-                            Object::BoundMethod(Rc::new(BoundMethod {
-                                receiver: obj.clone(),
-                                function: f,
-                            }))
+                            Object::BoundMethod(Rc::new(BoundMethod::new(
+                                 obj.clone(),
+                                 f,
+                            )))
                         }
                         other => other,
                     });
@@ -4869,10 +4869,10 @@ impl Interpreter {
                 }
                 _ => {
                     if let Some(method) = self.lookup_method(obj, name) {
-                        return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: obj.clone(),
-                            function: method,
-                        })));
+                        return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                             obj.clone(),
+                             method,
+                        ))));
                     }
                     Err(attribute_error(format!(
                         "'property' object has no attribute '{}'",
@@ -4894,10 +4894,10 @@ impl Interpreter {
                 // descriptor; `sm.__get__(obj, cls)` returns the wrapped
                 // function. Descriptor-aware library code (e.g.
                 // `functools.partialmethod`) relies on this being present.
-                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: Object::StaticMethod(inner.clone()),
-                    function: crate::builtins::descriptor_get_builtin(true),
-                }))),
+                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                     Object::StaticMethod(inner.clone()),
+                     crate::builtins::descriptor_get_builtin(true),
+                )))),
                 "__isabstractmethod__" => {
                     // Honour an `@abstractmethod` decorator applied
                     // *under* `@staticmethod` (`@staticmethod
@@ -4928,10 +4928,10 @@ impl Interpreter {
                 // The descriptor hook. `cm.__get__(obj, cls)` returns the
                 // wrapped callable bound to the owning class. Library code
                 // such as `functools.partialmethod` invokes it directly.
-                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: Object::ClassMethod(inner.clone()),
-                    function: crate::builtins::descriptor_get_builtin(false),
-                }))),
+                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                     Object::ClassMethod(inner.clone()),
+                     crate::builtins::descriptor_get_builtin(false),
+                )))),
                 "__isabstractmethod__" => Ok(self
                     .load_attr(&inner.func, "__isabstractmethod__")
                     .unwrap_or(Object::Bool(false))),
@@ -4994,10 +4994,10 @@ impl Interpreter {
                 // the method table (enum's `__setattr__` does
                 // `cls.__dict__.get(name)` on exactly this proxy type).
                 if let Some(m) = self.lookup_method(obj, name) {
-                    return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: obj.clone(),
-                        function: m,
-                    })));
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                         obj.clone(),
+                         m,
+                    ))));
                 }
                 Err(attribute_error(format!(
                     "'mappingproxy' object has no attribute '{name}'"
@@ -5017,10 +5017,10 @@ impl Interpreter {
                 "c_contiguous" | "f_contiguous" | "contiguous" => Ok(Object::Bool(true)),
                 _ => {
                     if let Some(m) = self.lookup_method(obj, name) {
-                        return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: obj.clone(),
-                            function: m,
-                        })));
+                        return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                             obj.clone(),
+                             m,
+                        ))));
                     }
                     Err(attribute_error(format!(
                         "'memoryview' object has no attribute '{name}'"
@@ -5137,10 +5137,10 @@ impl Interpreter {
                     // code (`functools.partialmethod`, custom descriptors)
                     // treat a plain function uniformly with methods.
                     "__get__" => {
-                        return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: obj.clone(),
-                            function: crate::builtins::function_get_builtin(),
-                        })))
+                        return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                             obj.clone(),
+                             crate::builtins::function_get_builtin(),
+                        ))))
                     }
                     _ => {}
                 }
@@ -5238,15 +5238,25 @@ impl Interpreter {
                 // (`str.__dict__['title']`, …) have a `__get__` that binds
                 // the receiver. `enum._is_descriptor` and similar
                 // introspection key on its presence.
-                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: obj.clone(),
-                    function: Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                     obj.clone(),
+                     Object::Builtin(Rc::new(crate::object::BuiltinFn {
                         name: "__get__",
                         binds_instance: true,
                         call: Box::new(crate::builtins::builtin_descriptor_get),
                         call_kw: None,
                     })),
-                }))),
+                )))),
+                // Owner type of an unbound method descriptor / slot
+                // wrapper (`list.__add__.__objclass__ is list`).
+                "__objclass__" => crate::builtin_types::builtin_fn_objclass(b)
+                    .map(Object::Type)
+                    .ok_or_else(|| {
+                        attribute_error(format!(
+                            "'builtin_function_or_method' object has no attribute '{}'",
+                            name
+                        ))
+                    }),
                 _ => Err(attribute_error(format!(
                     "'builtin_function_or_method' object has no attribute '{}'",
                     name
@@ -5278,6 +5288,25 @@ impl Interpreter {
                         name
                     ))),
                 },
+                // Defining class of a bound built-in method/slot wrapper
+                // (the receiver-class MRO entry providing the name).
+                "__objclass__" => {
+                    if let Object::Builtin(b) = &bm.function {
+                        let cls = crate::builtins::class_of(&bm.receiver);
+                        let mro: Vec<Rc<TypeObject>> = cls.mro.borrow().clone();
+                        let key = DictKey(Object::from_static(b.name));
+                        for t in mro.iter() {
+                            if t.dict.borrow().contains_key(&key) {
+                                return Ok(Object::Type(t.clone()));
+                            }
+                        }
+                        return Ok(Object::Type(cls));
+                    }
+                    Err(attribute_error(format!(
+                        "'method' object has no attribute '{}'",
+                        name
+                    )))
+                }
                 _ => {
                     // CPython's bound `method` forwards unknown attribute
                     // reads to its wrapped function (`method.__getattr__`
@@ -5357,9 +5386,9 @@ impl Interpreter {
                     match name {
                         "__next__" => {
                             let it = it.clone();
-                            return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                                receiver: obj.clone(),
-                                function: Object::Builtin(Rc::new(BuiltinFn {
+                            return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                                 obj.clone(),
+                                 Object::Builtin(Rc::new(BuiltinFn {
                                     name: "__next__",
                                     binds_instance: true,
                                     call: Box::new(move |_args| {
@@ -5369,28 +5398,28 @@ impl Interpreter {
                                     }),
                                     call_kw: None,
                                 })),
-                            })));
+                            ))));
                         }
                         "__iter__" => {
                             let me = obj.clone();
-                            return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                                receiver: obj.clone(),
-                                function: Object::Builtin(Rc::new(BuiltinFn {
+                            return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                                 obj.clone(),
+                                 Object::Builtin(Rc::new(BuiltinFn {
                                     name: "__iter__",
                                     binds_instance: true,
                                     call: Box::new(move |_args| Ok(me.clone())),
                                     call_kw: None,
                                 })),
-                            })));
+                            ))));
                         }
                         _ => {}
                     }
                 }
                 if let Some(method) = self.lookup_method(obj, name) {
-                    return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: obj.clone(),
-                        function: method,
-                    })));
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                         obj.clone(),
+                         method,
+                    ))));
                 }
                 Err(attribute_error(format!(
                     "'{}' object has no attribute '{}'",
@@ -5429,10 +5458,10 @@ impl Interpreter {
         name: &str,
     ) -> Result<Object, RuntimeError> {
         let result = if let Some(getattribute) = self.user_getattribute(&inst.cls()) {
-            let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                receiver: instance_obj.clone(),
-                function: getattribute,
-            }));
+            let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                 instance_obj.clone(),
+                 getattribute,
+            )));
             self.call(
                 &bound,
                 &[Object::from_str(name)],
@@ -5445,10 +5474,10 @@ impl Interpreter {
         match result {
             Err(e) if self.is_attribute_error(&e) => {
                 if let Some(getattr) = inst.cls().lookup("__getattr__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: instance_obj.clone(),
-                        function: getattr,
-                    }));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                         instance_obj.clone(),
+                         getattr,
+                    )));
                     self.call(
                         &bound,
                         &[Object::from_str(name)],
@@ -5681,10 +5710,10 @@ impl Interpreter {
         if name == "__getnewargs__" {
             if let Some(native) = &inst.native {
                 if let Some(m) = crate::builtins::immutable_subclass_getnewargs(native) {
-                    return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: instance_obj.clone(),
-                        function: m,
-                    })));
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                         instance_obj.clone(),
+                         m,
+                    ))));
                 }
             }
         }
@@ -5702,10 +5731,10 @@ impl Interpreter {
             if let Some(native) = &inst.native {
                 let native = native.clone();
                 if let Some(m) = crate::builtins::lookup_method(&native, name) {
-                    return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: native,
-                        function: m,
-                    })));
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                         native,
+                         m,
+                    ))));
                 }
             }
         }
@@ -5821,6 +5850,11 @@ impl Interpreter {
                 return Ok(Object::Type(best.clone()));
             }
             "__mro__" => {
+                // Mid-creation (custom metaclass `mro()` running) the MRO
+                // is unset — CPython's `tp_mro == NULL` reads as None.
+                if ty.mro.borrow().is_empty() && !ty.flags.is_builtin {
+                    return Ok(Object::None);
+                }
                 let mro = ty
                     .mro
                     .borrow()
@@ -5853,10 +5887,10 @@ impl Interpreter {
                     }),
                     call_kw: None,
                 }));
-                return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: Object::Type(ty.clone()),
-                    function: builtin,
-                })));
+                return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                     Object::Type(ty.clone()),
+                     builtin,
+                ))));
             }
             "__module__" => {
                 // User classes record `__module__` in their dict; built-in
@@ -5998,10 +6032,10 @@ impl Interpreter {
                 )
             }
             Object::StaticMethod(inner) => Ok(inner.func.clone()),
-            Object::ClassMethod(inner) => Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                receiver: owner.clone(),
-                function: inner.func.clone(),
-            }))),
+            Object::ClassMethod(inner) => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                 owner.clone(),
+                 inner.func.clone(),
+            )))),
             Object::SlotDescriptor(slot) => match instance {
                 Object::None => Ok(attr.clone()),
                 Object::Instance(inst) => {
@@ -6036,10 +6070,10 @@ impl Interpreter {
                 if matches!(instance, Object::None) {
                     Ok(attr.clone())
                 } else {
-                    Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: instance.clone(),
-                        function: attr.clone(),
-                    })))
+                    Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                         instance.clone(),
+                         attr.clone(),
+                    ))))
                 }
             }
             Object::Builtin(b) => {
@@ -6049,10 +6083,10 @@ impl Interpreter {
                 if matches!(instance, Object::None) || !b.binds_instance {
                     Ok(attr.clone())
                 } else {
-                    Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: instance.clone(),
-                        function: attr.clone(),
-                    })))
+                    Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                         instance.clone(),
+                         attr.clone(),
+                    ))))
                 }
             }
             Object::Instance(inner_inst) => {
@@ -6080,10 +6114,10 @@ impl Interpreter {
                 // User-defined descriptor: invoke its `__get__` if
                 // present, otherwise pass the descriptor through.
                 if let Some(get_method) = inner_inst.cls().lookup("__get__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: attr.clone(),
-                        function: get_method,
-                    }));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                         attr.clone(),
+                         get_method,
+                    )));
                     return self.call(
                         &bound,
                         &[instance.clone(), owner.clone()],
@@ -6100,17 +6134,17 @@ impl Interpreter {
     fn maybe_bind(&self, receiver: &Object, attr: Object) -> Object {
         match &attr {
             Object::Builtin(b) if !b.binds_instance => attr,
-            Object::Function(_) | Object::Builtin(_) => Object::BoundMethod(Rc::new(BoundMethod {
-                receiver: receiver.clone(),
-                function: attr,
-            })),
-            Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod {
-                receiver: match receiver {
+            Object::Function(_) | Object::Builtin(_) => Object::BoundMethod(Rc::new(BoundMethod::new(
+                 receiver.clone(),
+                 attr,
+            ))),
+            Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod::new(
+                 match receiver {
                     Object::Instance(inst) => Object::Type(inst.cls()),
                     other => other.clone(),
                 },
-                function: inner.func.clone(),
-            })),
+                 inner.func.clone(),
+            ))),
             Object::StaticMethod(inner) => inner.func.clone(),
             _ => attr,
         }
@@ -7801,10 +7835,10 @@ impl Interpreter {
             // we'd compute by default, so skip it to avoid recursion.
             if !Rc::ptr_eq(&meta, &builtin_types().type_) {
                 if let Some(hook) = meta.lookup("__instancecheck__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: Object::Type(cls.clone()),
-                        function: hook,
-                    }));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                         Object::Type(cls.clone()),
+                         hook,
+                    )));
                     let res = self.call(&bound, std::slice::from_ref(obj), &[], globals)?;
                     return Ok(Object::Bool(res.is_truthy()));
                 }
@@ -7833,10 +7867,10 @@ impl Interpreter {
         // shims implemented as ordinary instances.
         if let Object::Instance(inst) = classinfo {
             if let Some(hook) = inst.cls().lookup("__instancecheck__") {
-                let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: classinfo.clone(),
-                    function: hook,
-                }));
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                     classinfo.clone(),
+                     hook,
+                )));
                 let res = self.call(&bound, std::slice::from_ref(obj), &[], globals)?;
                 return Ok(Object::Bool(res.is_truthy()));
             }
@@ -7924,10 +7958,10 @@ impl Interpreter {
             let meta = info_cls.metaclass_or_type();
             if !Rc::ptr_eq(&meta, &builtin_types().type_) {
                 if let Some(hook) = meta.lookup("__subclasscheck__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: Object::Type(info_cls.clone()),
-                        function: hook,
-                    }));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                         Object::Type(info_cls.clone()),
+                         hook,
+                    )));
                     let res = self.call(&bound, std::slice::from_ref(cls), &[], globals)?;
                     return Ok(Object::Bool(res.is_truthy()));
                 }
@@ -7958,10 +7992,10 @@ impl Interpreter {
         // default (class-like instances such as `typing` aliases / unions).
         if let Object::Instance(inst) = classinfo {
             if let Some(hook) = inst.cls().lookup("__subclasscheck__") {
-                let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: classinfo.clone(),
-                    function: hook,
-                }));
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                     classinfo.clone(),
+                     hook,
+                )));
                 let res = self.call(&bound, std::slice::from_ref(cls), &[], globals)?;
                 return Ok(Object::Bool(res.is_truthy()));
             }
@@ -8064,10 +8098,10 @@ impl Interpreter {
                     )));
                 }
                 Some((method @ (Object::Function(_) | Object::BoundMethod(_)), _)) => {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: obj.clone(),
-                        function: method,
-                    }));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                         obj.clone(),
+                         method,
+                    )));
                     return self.call(&bound, &[], &[], globals);
                 }
                 // A builtin `tp_hash` slot materialized in a type dict
@@ -8815,10 +8849,10 @@ impl Interpreter {
                 // `__iter__` — that's how `list(MyEnum)` works.
                 let meta = ty.metaclass_or_type();
                 if let Some(method) = meta.lookup("__iter__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: Object::Type(ty.clone()),
-                        function: method,
-                    }));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                         Object::Type(ty.clone()),
+                         method,
+                    )));
                     return self.call(&bound, &[], &[], globals);
                 }
                 Err(type_error("'type' object is not iterable"))
@@ -11466,10 +11500,10 @@ impl Interpreter {
         if let Object::Type(ty) = obj {
             let meta = ty.metaclass_or_type();
             if let Some(m @ (Object::Function(_) | Object::BoundMethod(_))) = meta.lookup(name) {
-                return Some(Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: obj.clone(),
-                    function: m,
-                })));
+                return Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+                     obj.clone(),
+                     m,
+                ))));
             }
             return None;
         }
@@ -11488,10 +11522,10 @@ impl Interpreter {
             }
             Object::Instance(desc) if desc.cls().lookup("__get__").is_some() => {
                 let getter = desc.cls().lookup("__get__")?;
-                let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: m.clone(),
-                    function: getter,
-                }));
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                     m.clone(),
+                     getter,
+                )));
                 self.call(
                     &bound,
                     &[obj.clone(), Object::Type(inst.cls())],
@@ -11500,10 +11534,10 @@ impl Interpreter {
                 )
                 .ok()
             }
-            _ => Some(Object::BoundMethod(Rc::new(BoundMethod {
-                receiver: Object::Instance(inst),
-                function: m,
-            }))),
+            _ => Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+                 Object::Instance(inst),
+                 m,
+            )))),
         }
     }
 
@@ -13011,10 +13045,10 @@ impl Interpreter {
                 }
                 Object::Instance(descriptor_inst) => {
                     if let Some(setter) = descriptor_inst.cls().lookup("__set__") {
-                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: attr.clone(),
-                            function: setter,
-                        }));
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                             attr.clone(),
+                             setter,
+                        )));
                         self.call(&bound, &[obj.clone(), value], &[], &self.builtins.clone())?;
                         return Ok(());
                     }
@@ -13233,10 +13267,10 @@ impl Interpreter {
                 }
                 Object::Instance(descriptor_inst) => {
                     if let Some(deleter) = descriptor_inst.cls().lookup("__delete__") {
-                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: attr.clone(),
-                            function: deleter,
-                        }));
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                             attr.clone(),
+                             deleter,
+                        )));
                         self.call(
                             &bound,
                             std::slice::from_ref(obj),
@@ -14710,20 +14744,31 @@ impl Interpreter {
                 // slot dispatch invokes the descriptor's
                 // `__get__(obj, type(obj))` and calls the result; without
                 // this, `class X: __iter__ = SomeDescriptor()` breaks.
-                if let Object::Instance(d) = &bm.function {
-                    if let Some(get) = d.cls().lookup("__get__") {
-                        let owner = Object::Type(crate::builtins::class_of(&bm.receiver));
-                        let bound_get = Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: bm.function.clone(),
-                            function: get,
-                        }));
-                        let target = self.call(
-                            &bound_get,
-                            &[bm.receiver.clone(), owner],
-                            &[],
-                            outer_globals,
-                        )?;
-                        return self.call(&target, args, kwargs, outer_globals);
+                //
+                // Gated on `redispatch_descriptor`: only the deferred
+                // special-method helpers set it. A *fully-bound* method
+                // (e.g. `classmethod(partial).__get__(None, cls)`, which
+                // CPython 3.13 makes a plain `method` over the wrapped
+                // callable) must call `function` directly with the class
+                // prepended, never re-invoking `function.__get__`.
+                if bm.redispatch_descriptor {
+                    if let Object::Instance(d) = &bm.function {
+                        if let Some(get) = d.cls().lookup("__get__") {
+                            let owner =
+                                Object::Type(crate::builtins::class_of(&bm.receiver));
+                            let bound_get =
+                                Object::BoundMethod(Rc::new(BoundMethod::new(
+                                    bm.function.clone(),
+                                    get,
+                                )));
+                            let target = self.call(
+                                &bound_get,
+                                &[bm.receiver.clone(), owner],
+                                &[],
+                                outer_globals,
+                            )?;
+                            return self.call(&target, args, kwargs, outer_globals);
+                        }
                     }
                 }
                 let mut combined: Vec<Object> = Vec::with_capacity(args.len() + 1);
@@ -14739,10 +14784,10 @@ impl Interpreter {
                 let meta = ty.metaclass_or_type();
                 if !Rc::ptr_eq(&meta, &bt.type_) {
                     if let Some(call_method) = meta.lookup("__call__") {
-                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: Object::Type(ty.clone()),
-                            function: call_method,
-                        }));
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                             Object::Type(ty.clone()),
+                             call_method,
+                        )));
                         return self.call(&bound, args, kwargs, outer_globals);
                     }
                 }
@@ -14765,10 +14810,10 @@ impl Interpreter {
                     }
                 };
                 if let Some(m) = inst.cls().lookup("__call__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: Object::Instance(inst.clone()),
-                        function: m,
-                    }));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                         Object::Instance(inst.clone()),
+                         m,
+                    )));
                     self.call(&bound, args, kwargs, outer_globals)
                 } else {
                     Err(type_error(format!(
@@ -15488,10 +15533,10 @@ impl Interpreter {
                         // `type.__init__` ignores them (see CPython
                         // `type_init`), so don't hand it kwargs it rejects.
                         let init_consumes_kwargs = matches!(init, Object::Function(_));
-                        let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                            receiver: Object::Type(ty.clone()),
-                            function: init,
-                        }));
+                        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                             Object::Type(ty.clone()),
+                             init,
+                        )));
                         let init_kwargs: &[(String, Object)] = if init_consumes_kwargs {
                             &subclass_kwargs
                         } else {
@@ -15635,10 +15680,10 @@ impl Interpreter {
                             // `type.__init__` ignores them.
                             let init_consumes_kwargs = matches!(init, Object::Function(_));
                             if init_consumes_kwargs {
-                                let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                                    receiver: result.clone(),
-                                    function: init,
-                                }));
+                                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                                     result.clone(),
+                                     init,
+                                )));
                                 let _ = self.call(&bound, args, kwargs, &fallback_globals())?;
                             }
                         }
@@ -15748,10 +15793,10 @@ impl Interpreter {
                 // the default builtin doesn't reject them with
                 // "builtin '__init__' does not accept keyword arguments".
                 let init_consumes_kwargs = matches!(init, Object::Function(_));
-                let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: Object::Type(ty.clone()),
-                    function: init,
-                }));
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                     Object::Type(ty.clone()),
+                     init,
+                )));
                 let bases_tuple = Object::new_tuple(
                     effective_bases
                         .iter()
@@ -15796,15 +15841,32 @@ impl Interpreter {
         let Some(mro_fn) = custom else {
             return crate::types::TypeObject::recompute_c3(ty);
         };
-        let bound = Object::BoundMethod(Rc::new(BoundMethod {
-            receiver: Object::Type(ty.clone()),
-            function: mro_fn,
-        }));
+        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+             Object::Type(ty.clone()),
+             mro_fn,
+        )));
         let g = self.builtins.clone();
         let result = self.call(&bound, &[], &[], &g)?;
         let entries = self.collect_iterable(&result, &g)?;
         let mut mro: Vec<Rc<TypeObject>> = Vec::with_capacity(entries.len());
-        let solid_cls = ty.solid_base();
+        // The class's own layout comes from its bases (`tp_base`
+        // semantics) — its `mro` may legitimately be empty while the
+        // custom `mro()` runs (CPython's `tp_mro == NULL` window).
+        let mut solid_cls: Option<Rc<TypeObject>> = None;
+        for b in ty.bases.borrow().iter() {
+            if let Some(sb) = b.solid_base() {
+                solid_cls = match solid_cls {
+                    None => Some(sb),
+                    Some(w) => {
+                        if sb.is_subclass_of(&w) {
+                            Some(sb)
+                        } else {
+                            Some(w)
+                        }
+                    }
+                };
+            }
+        }
         for e in entries {
             let Object::Type(t) = e else {
                 return Err(type_error(format!(
@@ -15835,10 +15897,46 @@ impl Interpreter {
         if meta.flags.is_builtin || meta.lookup("mro").is_none() {
             return Ok(());
         }
-        let mro = self.compute_mro_for(ty)?;
-        *ty.mro.borrow_mut() = mro;
-        ty.invalidate_getattribute_cache();
-        Ok(())
+        // CPython calls the custom `mro()` while `tp_mro` is still NULL
+        // (the class is mid-creation); `cls.__mro__` reads None there and
+        // `__bases__` assignment must tolerate the empty-MRO window
+        // (test_incomplete_set_bases_on_self).
+        let saved = std::mem::take(&mut *ty.mro.borrow_mut());
+        let result = self.compute_mro_for(ty);
+        match result {
+            Ok(mro) => {
+                *ty.mro.borrow_mut() = mro;
+                ty.invalidate_getattribute_cache();
+                Ok(())
+            }
+            Err(e) => {
+                let mut cur = ty.mro.borrow_mut();
+                if cur.is_empty() {
+                    *cur = saved;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Is `target` reachable from `start` through the (current) direct
+    /// `bases` edges? Visited-guarded BFS — the graph can transiently
+    /// contain cycles during reentrant `__bases__` assignment.
+    fn bases_reach(start: &Rc<TypeObject>, target: &Rc<TypeObject>) -> bool {
+        let mut visited: Vec<*const TypeObject> = Vec::new();
+        let mut queue: Vec<Rc<TypeObject>> = vec![start.clone()];
+        while let Some(t) = queue.pop() {
+            if Rc::ptr_eq(&t, target) {
+                return true;
+            }
+            let ptr = Rc::as_ptr(&t);
+            if visited.contains(&ptr) {
+                continue;
+            }
+            visited.push(ptr);
+            queue.extend(t.bases.borrow().iter().cloned());
+        }
+        false
     }
 
     /// `cls.__bases__ = new_bases` — CPython's `type_set_bases`.
@@ -15853,7 +15951,13 @@ impl Interpreter {
                 for it in items.iter() {
                     match it {
                         Object::Type(t) => {
-                            if Rc::ptr_eq(t, ty) || t.is_subclass_of(ty) {
+                            // Cycle check through the *live* bases graph,
+                            // not just the (possibly mid-update, see
+                            // gh-92112 reentrancy) MRO.
+                            if Rc::ptr_eq(t, ty)
+                                || t.is_subclass_of(ty)
+                                || Self::bases_reach(t, ty)
+                            {
                                 return Err(type_error(
                                     "a __bases__ item causes an inheritance cycle",
                                 ));
@@ -15944,21 +16048,41 @@ impl Interpreter {
             }
             Ok(())
         };
-        if let Err(e) = recompute() {
-            *ty.bases.borrow_mut() = old_bases;
-            for (t, m) in saved {
-                *t.mro.borrow_mut() = m;
+        let recompute_result = recompute();
+        // Reentrancy check (gh-92112 / CPython's `type_set_bases`): a
+        // custom `mro()` running inside the recompute may itself have
+        // assigned `__bases__`. If the bases no longer match what we
+        // installed, the reentrant assignment owns the final state —
+        // touching the subclass registries (or rolling back) here would
+        // corrupt its bookkeeping, leaving cycles that infinite-loop
+        // subclass walks.
+        let reentered = {
+            let current = ty.bases.borrow();
+            current.len() != new_bases.len()
+                || current
+                    .iter()
+                    .zip(new_bases.iter())
+                    .any(|(a, b)| !Rc::ptr_eq(a, b))
+        };
+        if let Err(e) = recompute_result {
+            if !reentered {
+                *ty.bases.borrow_mut() = old_bases;
+                for (t, m) in saved {
+                    *t.mro.borrow_mut() = m;
+                }
             }
             return Err(e);
         }
-        // Re-home the subclass registries.
-        for b in &old_bases {
-            b.subclasses
-                .borrow_mut()
-                .retain(|w| w.upgrade().map_or(true, |t| !Rc::ptr_eq(&t, ty)));
-        }
-        for b in &new_bases {
-            b.subclasses.borrow_mut().push(Rc::downgrade(ty));
+        if !reentered {
+            // Re-home the subclass registries.
+            for b in &old_bases {
+                b.subclasses
+                    .borrow_mut()
+                    .retain(|w| w.upgrade().map_or(true, |t| !Rc::ptr_eq(&t, ty)));
+            }
+            for b in &new_bases {
+                b.subclasses.borrow_mut().push(Rc::downgrade(ty));
+            }
         }
         ty.invalidate_getattribute_cache();
         Ok(())
@@ -16198,10 +16322,10 @@ impl Interpreter {
         for (attr_name, value) in entries {
             if let Object::Instance(inst) = &value {
                 if let Some(hook) = inst.cls().lookup("__set_name__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: value.clone(),
-                        function: hook,
-                    }));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                         value.clone(),
+                         hook,
+                    )));
                     let res = self.call(
                         &bound,
                         &[Object::Type(ty.clone()), Object::from_str(&attr_name)],
@@ -16257,10 +16381,10 @@ impl Interpreter {
             Object::ClassMethod(inner) => inner.func.clone(),
             other => other,
         };
-        let bound = Object::BoundMethod(Rc::new(BoundMethod {
-            receiver: Object::Type(ty.clone()),
-            function: callable,
-        }));
+        let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+             Object::Type(ty.clone()),
+             callable,
+        )));
         self.call(
             &bound,
             &[],
@@ -16484,10 +16608,10 @@ impl Interpreter {
                             args.len()
                         )));
                     }
-                    return Ok(Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: args[1].clone(),
-                        function: args[0].clone(),
-                    })));
+                    return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                         args[1].clone(),
+                         args[0].clone(),
+                    ))));
                 }
                 _ => {}
             }
@@ -16668,10 +16792,10 @@ impl Interpreter {
                 // `BaseException` because its default `__init__` only
                 // populates `args` — which the fast path already did.
                 if let Some(init) = lookup_exception_init(&cls) {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: instance.clone(),
-                        function: init,
-                    }));
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                         instance.clone(),
+                         init,
+                    )));
                     let result = self.call(
                         &bound,
                         args,
@@ -16753,10 +16877,10 @@ impl Interpreter {
                     // attribute access would, and `type.__call__` still
                     // passes `cls` explicitly — the target sees it twice
                     // (CPython: `C(1, 2)` → `f(C, C, 1, 2)`).
-                    Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod {
-                        receiver: Object::Type(cls.clone()),
-                        function: inner.func.clone(),
-                    })),
+                    Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod::new(
+                         Object::Type(cls.clone()),
+                         inner.func.clone(),
+                    ))),
                     other => other,
                 };
                 let mut new_args: Vec<Object> = Vec::with_capacity(args.len() + 1);
@@ -16909,10 +17033,10 @@ impl Interpreter {
                     }
                     other => other,
                 };
-                let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: instance.clone(),
-                    function: init,
-                }));
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                     instance.clone(),
+                     init,
+                )));
                 let result = self.call(
                     &bound,
                     args,
@@ -17868,10 +17992,10 @@ impl Interpreter {
             let is_default =
                 matches!(&reduce, Object::Builtin(b) if b.name == ".object_reduce");
             if !is_default {
-                let bound = Object::BoundMethod(Rc::new(BoundMethod {
-                    receiver: recv.clone(),
-                    function: reduce,
-                }));
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                     recv.clone(),
+                     reduce,
+                )));
                 return self.call(&bound, &[], &[], globals);
             }
         }
@@ -19641,10 +19765,10 @@ fn resolve_metaclass(
 /// Bind callable `m` to `receiver` (the dunder-dispatch convention used
 /// throughout: the receiver flows in as the first argument).
 pub(crate) fn bind_method(receiver: &Object, m: Object) -> Object {
-    Object::BoundMethod(Rc::new(BoundMethod {
-        receiver: receiver.clone(),
-        function: m,
-    }))
+    // Deferred special-method dispatch: `m` is a *raw* class attribute
+    // (looked up on the metaclass), so it may itself be a descriptor
+    // instance whose `__get__` must run at call time.
+    Object::BoundMethod(Rc::new(BoundMethod::dispatch(receiver.clone(), m)))
 }
 
 /// Resolve `name` through the *metaclass* of class `v` and bind it to the
@@ -19672,10 +19796,13 @@ pub(crate) fn instance_method(obj: &Object, name: &str) -> Option<Object> {
         _ => return None,
     };
     let m = inst.cls().lookup(name)?;
-    Some(Object::BoundMethod(Rc::new(BoundMethod {
-        receiver: Object::Instance(inst),
-        function: m,
-    })))
+    // Deferred special-method dispatch: `m` is a *raw* class attribute,
+    // so a descriptor instance (`class X: __iter__ = SomeDescriptor()`)
+    // must have its `__get__` honoured at call time.
+    Some(Object::BoundMethod(Rc::new(BoundMethod::dispatch(
+        Object::Instance(inst),
+        m,
+    ))))
 }
 
 thread_local! {
@@ -19924,10 +20051,10 @@ fn make_gen_method(name: &str, receiver: &Object) -> Object {
         call: Box::new(unreachable_call),
         call_kw: None,
     }));
-    Object::BoundMethod(Rc::new(BoundMethod {
-        receiver: receiver.clone(),
-        function: builtin,
-    }))
+    Object::BoundMethod(Rc::new(BoundMethod::new(
+         receiver.clone(),
+         builtin,
+    )))
 }
 
 thread_local! {

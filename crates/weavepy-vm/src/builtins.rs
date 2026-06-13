@@ -1433,6 +1433,20 @@ pub fn immutable_subclass_getnewargs(native: &Object) -> Option<Object> {
     single_value.then(|| Object::Builtin(Rc::new(method("__getnewargs__", instance_getnewargs))))
 }
 
+/// The `__getnewargs__` method-descriptor materialized in the *type dict*
+/// of the immutable sequence built-ins (`tuple`/`str`/`bytes`). CPython
+/// exposes `tuple.__getnewargs__` / `str.__getnewargs__` /
+/// `bytes.__getnewargs__` as real `tp_methods` entries; the numeric types
+/// get theirs separately via [`numeric_dunder`]. Materializing them lets
+/// the *type-only* lookup CPython's `object.__reduce_ex__` performs
+/// (`_PyObject_LookupSpecial`, ported as `copyreg._lookup_special`) find
+/// the hook, so `copy`/`pickle` reconstruct `cls.__new__(cls, value)`
+/// instead of an empty instance. Bound to the receiver at call time, it
+/// returns `(value,)` (the native payload for a subclass instance).
+pub fn immutable_getnewargs_method() -> Object {
+    Object::Builtin(Rc::new(method("__getnewargs__", instance_getnewargs)))
+}
+
 /// Like [`method`] but for builtins that accept keyword arguments. The
 /// body receives the positional args (with the bound receiver at index
 /// 0) *and* the keyword pairs, so it can implement CPython's mixed
@@ -1808,10 +1822,10 @@ pub(crate) fn builtin_descriptor_get(args: &[Object]) -> Result<Object, RuntimeE
     if matches!(instance, Object::None) {
         return Ok(func);
     }
-    Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-        receiver: instance,
-        function: func,
-    })))
+    Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+         instance,
+         func,
+    ))))
 }
 
 /// `str.__str__(self)` — CPython's `unicode_str`: return the receiver
@@ -2221,10 +2235,10 @@ pub(crate) fn classmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeEr
             }
         },
     };
-    Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-        receiver: owner,
-        function: inner,
-    })))
+    Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+         owner,
+         inner,
+    ))))
 }
 
 /// `function.__get__(self, obj, objtype=None)` — a plain Python function
@@ -2239,10 +2253,10 @@ pub(crate) fn function_descr_get(args: &[Object]) -> Result<Object, RuntimeError
         .ok_or_else(|| type_error("__get__() missing self"))?;
     match args.get(1) {
         Some(obj) if !matches!(obj, Object::None) => {
-            Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-                receiver: obj.clone(),
-                function: func,
-            })))
+            Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+                 obj.clone(),
+                 func,
+            ))))
         }
         _ => Ok(func),
     }
@@ -2514,10 +2528,10 @@ fn b_locals(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// caller will see the raw object; full semantics require the VM.
 fn bind_descriptor(value: &Object, receiver: &Object) -> Object {
     match value {
-        Object::Function(_) => Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-            receiver: receiver.clone(),
-            function: value.clone(),
-        })),
+        Object::Function(_) => Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+             receiver.clone(),
+             value.clone(),
+        ))),
         Object::StaticMethod(inner) => inner.func.clone(),
         Object::ClassMethod(inner) => {
             let cls = match receiver {
@@ -2525,10 +2539,10 @@ fn bind_descriptor(value: &Object, receiver: &Object) -> Object {
                 Object::Type(_) => receiver.clone(),
                 _ => receiver.clone(),
             };
-            Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-                receiver: cls,
-                function: inner.func.clone(),
-            }))
+            Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+                 cls,
+                 inner.func.clone(),
+            )))
         }
         _ => value.clone(),
     }
@@ -2573,10 +2587,10 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                 // `classmethod` descriptor, which is not callable.
                 return Some(match v {
                     Object::ClassMethod(inner) => {
-                        Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-                            receiver: Object::Type(t.clone()),
-                            function: inner.func.clone(),
-                        }))
+                        Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+                             Object::Type(t.clone()),
+                             inner.func.clone(),
+                        )))
                     }
                     Object::StaticMethod(inner) => inner.func.clone(),
                     other => other,
@@ -2662,11 +2676,32 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             "__module__" => Some(Object::from_static("builtins")),
             "__doc__" => Some(Object::None),
             "__self__" => Some(Object::None),
+            "__objclass__" => crate::builtin_types::builtin_fn_objclass(b).map(Object::Type),
             _ => None,
         },
         Object::BoundMethod(bm) => match name {
             "__func__" => Some(bm.function.clone()),
             "__self__" => Some(bm.receiver.clone()),
+            // Defining class of a bound built-in method: the MRO entry
+            // of the receiver's class that provides this method name.
+            "__objclass__" => {
+                if let Object::Builtin(_) = &bm.function {
+                    let cls = class_of(&bm.receiver);
+                    let mro: Vec<Rc<crate::types::TypeObject>> = cls.mro.borrow().clone();
+                    let method_name = match &bm.function {
+                        Object::Builtin(b) => b.name,
+                        _ => return None,
+                    };
+                    let key = DictKey(Object::from_static(method_name));
+                    for t in mro.iter() {
+                        if t.dict.borrow().contains_key(&key) {
+                            return Some(Object::Type(t.clone()));
+                        }
+                    }
+                    return Some(Object::Type(cls));
+                }
+                None
+            }
             "__name__" => match &bm.function {
                 Object::Function(f) => Some(Object::from_str(f.name.clone())),
                 Object::Builtin(b) => Some(Object::from_static(b.name)),
@@ -2686,10 +2721,10 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
             // / `hasattr` / `getattr` should agree with attribute
             // access via the dot operator.
             if let Some(builtin) = lookup_method(obj, name) {
-                return Some(Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-                    receiver: obj.clone(),
-                    function: builtin,
-                })));
+                return Some(Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+                     obj.clone(),
+                     builtin,
+                ))));
             }
             None
         }
@@ -2771,15 +2806,15 @@ fn code_method_kw(
     name: &'static str,
     body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
 ) -> Object {
-    Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-        receiver: Object::Code(c.clone()),
-        function: Object::Builtin(Rc::new(BuiltinFn {
+    Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+         Object::Code(c.clone()),
+         Object::Builtin(Rc::new(BuiltinFn {
             name,
             binds_instance: false,
             call: Box::new(move |args| body(args, &[])),
             call_kw: Some(Box::new(body)),
         })),
-    }))
+    )))
 }
 
 /// `code.replace(**kwargs)` — return a copy of the code object with
@@ -2954,10 +2989,10 @@ fn code_method(
     name: &'static str,
     body: fn(&[Object]) -> Result<Object, RuntimeError>,
 ) -> Object {
-    Object::BoundMethod(Rc::new(crate::object::BoundMethod {
-        receiver: Object::Code(c.clone()),
-        function: Object::Builtin(Rc::new(method(name, body))),
-    }))
+    Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+         Object::Code(c.clone()),
+         Object::Builtin(Rc::new(method(name, body))),
+    )))
 }
 
 /// Extract the receiver code object from a bound-method call's `args[0]`.

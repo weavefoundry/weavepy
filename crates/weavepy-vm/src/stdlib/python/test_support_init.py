@@ -590,20 +590,72 @@ def run_doctest(module, verbosity=None, optionflags=0):
 # Misc helpers
 # ---------------------------------------------------------------------------
 
+def _test_home_dir():
+    """Best-effort absolute path of the on-disk ``Lib/test`` directory.
+
+    CPython derives this from ``support/__init__.py``'s ``__file__``, but
+    WeavePy ships ``test``/``test.support`` *frozen* — their ``__file__``
+    is a synthetic ``<frozen ...>`` token that ``abspath`` mangles into a
+    cwd-relative path. The actual ``test_*`` modules still load from disk,
+    so locate the package root via an already-imported on-disk ``test``
+    submodule, then by scanning ``sys.path`` for a ``test`` directory.
+    """
+    for name, mod in list(sys.modules.items()):
+        if name == 'test' or name.startswith('test.'):
+            f = getattr(mod, '__file__', None)
+            if f and os.path.exists(f):
+                d = os.path.dirname(os.path.abspath(f))
+                while d and os.path.basename(d) != 'test':
+                    parent = os.path.dirname(d)
+                    if parent == d:
+                        break
+                    d = parent
+                if os.path.basename(d) == 'test':
+                    return d
+    for p in sys.path:
+        cand = os.path.join(p, 'test')
+        if os.path.isdir(cand):
+            return cand
+    f = globals().get('__file__')
+    if f and os.path.exists(f):
+        return os.path.dirname(os.path.abspath(f))
+    return os.getcwd()
+
+
 def findfile(filename, subdir=None):
-    """Locate a test data file; return *filename* unchanged if not found."""
+    """Locate a test data file; return *filename* unchanged if not found.
+
+    Mirrors CPython's search order: the ``test`` home directory first
+    (where top-level data files like ``mime.types`` live), then every
+    ``sys.path`` entry.
+    """
     if os.path.isabs(filename):
         return filename
     if subdir is not None:
         filename = os.path.join(subdir, filename)
-    TEST_HOME_DIR = os.path.dirname(os.path.abspath(
-        getattr(sys.modules.get('test'), '__file__', __file__) or __file__))
-    TEST_DATA_DIR = os.path.join(TEST_HOME_DIR, "data")
-    for path in [TEST_DATA_DIR] + list(sys.path):
+    home = _test_home_dir()
+    for path in [home, os.path.join(home, "data")] + list(sys.path):
         fn = os.path.join(path, filename)
         if os.path.exists(fn):
             return fn
     return filename
+
+
+def load_package_tests(pkg_dir, loader, standard_tests, pattern):
+    """Generic ``load_tests`` body for simple test *packages*.
+
+    A package whose ``__init__.py`` only delegates to this (e.g.
+    ``test.test_inspect``) discovers and runs every ``test*`` module under
+    its directory. ``top_level_dir`` is the stdlib root so the discovered
+    modules import under their dotted ``test.<pkg>.<mod>`` names.
+    """
+    if pattern is None:
+        pattern = "test*"
+    package_tests = loader.discover(start_dir=pkg_dir,
+                                    top_level_dir=STDLIB_DIR,
+                                    pattern=pattern)
+    standard_tests.addTests(package_tests)
+    return standard_tests
 
 
 def sortdict(dict):
@@ -864,10 +916,13 @@ _4G = 4 * _1G
 
 Py_DEBUG = hasattr(sys, 'gettotalrefcount')
 
-# Directory holding the test package (best-effort).
-TEST_HOME_DIR = os.path.dirname(os.path.abspath(__file__))
-TEST_SUPPORT_DIR = TEST_HOME_DIR
-STDLIB_DIR = os.path.dirname(os.path.dirname(TEST_HOME_DIR))
+# Directory holding the test package. Resolved against the on-disk
+# `Lib/test` (the frozen package's `__file__` is synthetic — see
+# `_test_home_dir`), so `STDLIB_DIR` correctly points at `Lib` for
+# `load_package_tests`' discovery `top_level_dir`.
+TEST_HOME_DIR = _test_home_dir()
+TEST_SUPPORT_DIR = os.path.join(TEST_HOME_DIR, "support")
+STDLIB_DIR = os.path.dirname(TEST_HOME_DIR)
 REPO_ROOT = os.path.dirname(STDLIB_DIR)
 
 
@@ -987,10 +1042,6 @@ run_doctest = run_doctest
 # `SuppressCrashReport`, and the `bigaddrspacetest` decorator.
 # ---------------------------------------------------------------------------
 
-try:
-    TEST_HOME_DIR = os.path.dirname(os.path.abspath(__file__))
-except Exception:
-    TEST_HOME_DIR = os.getcwd()
 TEST_DATA_DIR = os.path.join(TEST_HOME_DIR, "data")
 
 

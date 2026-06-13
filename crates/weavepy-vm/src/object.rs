@@ -1027,6 +1027,46 @@ impl fmt::Debug for PyFunction {
 pub struct BoundMethod {
     pub receiver: Object,
     pub function: Object,
+    /// When `true`, this is *not* a fully-bound CPython `method` but a
+    /// *deferred special-method dispatch* (`instance_method` /
+    /// `metaclass_method`): if `function` turns out to be a descriptor
+    /// instance (a class attribute with `__get__`, e.g.
+    /// `class X: __iter__ = SomeDescriptor()`), its `__get__(receiver,
+    /// type(receiver))` is invoked at call time and the result is
+    /// called — mirroring CPython's `_PyObject_LookupSpecial`.
+    ///
+    /// When `false` (the default for a real bound method), calling
+    /// prepends `receiver` and calls `function` directly, with **no**
+    /// further descriptor resolution. This is what `classmethod.__get__`
+    /// / `function.__get__` produce: CPython 3.13 removed chained
+    /// `classmethod` descriptors, so `classmethod(partial)` must call the
+    /// wrapped `partial` with the class prepended rather than re-invoking
+    /// `partial.__get__`.
+    pub redispatch_descriptor: bool,
+}
+
+impl BoundMethod {
+    /// A fully-bound method (CPython `method`): calling it prepends
+    /// `receiver` and calls `function` directly.
+    pub fn new(receiver: Object, function: Object) -> Self {
+        BoundMethod {
+            receiver,
+            function,
+            redispatch_descriptor: false,
+        }
+    }
+
+    /// A *deferred* special-method dispatch: if `function` is itself a
+    /// descriptor instance, its `__get__` is honoured at call time. Only
+    /// the implicit special-method lookup helpers (`instance_method` /
+    /// `metaclass_method`) build these.
+    pub fn dispatch(receiver: Object, function: Object) -> Self {
+        BoundMethod {
+            receiver,
+            function,
+            redispatch_descriptor: true,
+        }
+    }
 }
 
 impl fmt::Debug for BoundMethod {
@@ -2549,7 +2589,17 @@ impl Object {
             // bound references to the same method on the same object are
             // therefore equal even though they're distinct allocations.
             (Object::BoundMethod(a), Object::BoundMethod(b)) => {
-                a.function.eq_value(&b.function) && a.receiver.is_same(&b.receiver)
+                let func_eq = match (&a.function, &b.function) {
+                    // Built-in methods are materialized fresh on each
+                    // attribute access; CPython's `meth_richcompare`
+                    // compares the C method def — same receiver + same
+                    // name resolves to the same def here.
+                    (Object::Builtin(x), Object::Builtin(y)) => {
+                        Rc::ptr_eq(x, y) || x.name == y.name
+                    }
+                    _ => a.function.eq_value(&b.function),
+                };
+                func_eq && a.receiver.is_same(&b.receiver)
             }
             // CPython's default `tp_richcompare` (no user `__eq__`) falls
             // back to *identity*: `x == x` is True and `x == y` is False
@@ -3551,7 +3601,25 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
     match obj {
         Object::Function(r) => rot(Rc::as_ptr(r).cast()),
         Object::Builtin(r) => rot(Rc::as_ptr(r).cast()),
-        Object::BoundMethod(r) => rot(Rc::as_ptr(r).cast()),
+        // CPython `method_hash`: combine `hash(__self__)` with
+        // `hash(__func__)` so two bindings of the same method on the
+        // same object hash (and compare) equal. Built-in functions are
+        // materialized fresh per access; hash their *name* so the hash
+        // agrees with `eq_value`.
+        Object::BoundMethod(r) => {
+            let self_h = py_hash_value(&r.receiver)
+                .unwrap_or_else(|| identity_hash(&r.receiver));
+            let func_h = match &r.function {
+                Object::Builtin(b) => py_hash_bytes_slice(b.name.as_bytes()),
+                f => py_hash_value(f).unwrap_or_else(|| identity_hash(f)),
+            };
+            let v = self_h ^ func_h.rotate_left(13);
+            if v == -1 {
+                -2
+            } else {
+                v
+            }
+        }
         Object::Code(r) => rot(Rc::as_ptr(r).cast()),
         Object::Cell(r) => rot(Rc::as_ptr(r).cast()),
         Object::Iter(r) => rot(Rc::as_ptr(r).cast()),

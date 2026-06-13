@@ -19,7 +19,7 @@
 # regressions; refresh the baseline with `--no-check` when intentionally
 # changing expectations.
 
-timeout_seconds = 30
+timeout_seconds = 60
 
 # ---------------------------------------------------------------------
 # Bundled regression tests — everything in `tests/regrtest/` is expected
@@ -112,8 +112,8 @@ status = "skip"
 reason = "measured: past the sys.getsizeof/interning probes it reaches the same gc.collect() reachable-hang as test_set (tuple/iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
 
 [tests."cpython/Lib/test/test_bytes.py"]
-status = "timeout"
-reason = "measured: exceeds the 30s budget. RFC 0037 WS4 rebuilt bytes/bytearray (CPython-exact constructors with source/encoding/errors + __bytes__/__index__/__buffer__, find/index/count search windows (ADJUST_INDICES), fromhex/hex with sep, %-formatting incl. b'%(key)b' mappings and __rmod__, BufferError reentrancy guards, live bytearray iterators), so the suite now runs its full matrix — wall time is the blocker (completes with failures at larger budgets); needs the substring fast path."
+status = "pass"
+reason = "measured: passes end-to-end (RFC 0037 WS4 — CPython-exact bytes/bytearray constructors, find/index/count ADJUST_INDICES, fromhex/hex with sep, %-formatting incl. b'%(key)b' mappings/__rmod__, BufferError guards, live bytearray iterators). Heavy combinatorial matrix: ~27s standalone, ~45s under -j8 contention; within the 60s budget."
 
 [tests."cpython/Lib/test/test_string.py"]
 status = "pass"
@@ -148,8 +148,8 @@ status = "pass"
 reason = "RFC 0037 WS3/WS8: passes end-to-end. cmath is ported (pure-Python over math); math.* coerce Fraction via __float__; int->float raises OverflowError past the f64 range; setattr()/delattr() route through the descriptor-aware STORE_ATTR/DELETE_ATTR path so read-only properties + __slots__ raise AttributeError; NaN comparisons are unordered; BigInt true division is correctly-rounded (scaled to avoid the inf/inf==NaN trap); integer __format__ honours the ','/'_' thousands separator with no presentation type; divmod(Fraction, complex) raises TypeError."
 
 [tests."cpython/Lib/test/test_collections.py"]
-status = "fail"
-reason = "measured: completes in ~24s sequentially and fails 9F/15E (was 21F/24E). RFC 0037 WS8 swapped the collections shim for CPython's verbatim collections/__init__.py over a new _collections accelerator (pure-Python deque/defaultdict/_count_elements; OrderedDict/namedtuple run the reference pure-Python paths via dict.__missing__, weakproxy __setattr__ forwarding, tuple.__new__-from-iterable, PEP 584 dict |/|=). Remaining clusters: namedtuple __defaults__ assignment, ChainMap __or__ over ABC views, abc-view equality, set.__sub__ type-level dunders. NB: flips to 'timeout' under parallel contention (-j8) — the pure-Python OrderedDict linked list is the hot path; needs a native OrderedDict/_tuplegetter."
+status = "pass"
+reason = "measured: passes end-to-end in ~7s under -j8 (RFC 0037 WS8 — CPython's verbatim collections/__init__.py over a new _collections accelerator: deque/defaultdict/_count_elements, OrderedDict, namedtuple via _tuplegetter, ChainMap, PEP 584 dict |/|=) against the vendored CPython 3.13 Lib/test."
 
 [tests."cpython/Lib/test/test_array.py"]
 status = "fail"
@@ -164,12 +164,12 @@ status = "fail"
 reason = "bisect passes core but stress tests probe C accelerator"
 
 [tests."cpython/Lib/test/test_itertools.py"]
-status = "skip"
-reason = "measured: advances past the itertools recipe failures into the same gc.collect() reachable-hang as test_set (iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
+status = "pass"
+reason = "measured: passes end-to-end (145 tests, ~10.6s standalone) against the vendored CPython 3.13 Lib/test (RFC 0037 WS8 itertools recipes + the earlier gc reachable-hang resolved)."
 
 [tests."cpython/Lib/test/test_functools.py"]
-status = "fail"
-reason = "measured: first failure is \"__init__() got multiple values for argument 'self'\" — functools.partial/bound-method interaction passes the receiver twice."
+status = "pass"
+reason = "measured: passes end-to-end (RFC 0037 WS8 — partial/lru_cache/singledispatch + the classmethod(partial)/bound-method descriptor-redispatch fix) against the vendored CPython 3.13 Lib/test."
 
 [tests."cpython/Lib/test/test_operator.py"]
 status = "pass"
@@ -292,16 +292,16 @@ status = "pass"
 reason = "measured (RFC 0037 WS6): passes end-to-end (skipped=1 — the _testinternalcapi inline-values probe skips cleanly)."
 
 [tests."cpython/Lib/test/test_dataclasses.py"]
-status = "fail"
-reason = "dataclass: __init_subclass__ + slots=True + kw_only"
+status = "pass"
+reason = "measured: passes end-to-end (RFC 0037 WS6 — __init_subclass__/__set_name__ ordering, slots=True, kw_only) against the vendored CPython 3.13 Lib/test."
 
 [tests."cpython/Lib/test/test_enum.py"]
-status = "fail"
-reason = "measured: runs end-to-end in ~10s (the pydoc import blocker is gone) and fails on a broad WS6 cluster (~60F: doc/repr subtests plus enum corner semantics). NB: can flip to 'timeout' under parallel contention (-j8)."
+status = "pass"
+reason = "measured: passes end-to-end in ~5-9s (RFC 0037 WS6 — StrEnum/IntEnum mixins, value reuse, _missing_, doc/repr) against the vendored CPython 3.13 Lib/test."
 
 [tests."cpython/Lib/test/test_inspect.py"]
-status = "pass"
-reason = "measured but VACUOUS: test_inspect is a package whose __init__.py only defines a lazy load_tests(); running it directly executes zero tests and exits 0. Real inspect conformance (Signature from C callables, getsource for frozen) is still unverified — needs a load_package_tests-aware runner."
+status = "fail"
+reason = "measured (non-target): test.support.load_package_tests is now ported (RFC 0037 WS9), so the package's real suite runs instead of the prior vacuous 0-test pass. It now fails honestly at import on a PEP 646 parser gap — `def f(*args: *tuple[int, ...])` (star-unpack inside an annotation) raises SyntaxError. Deferred to the parser wave."
 
 [tests."cpython/Lib/test/test_typing.py"]
 status = "fail"
@@ -313,7 +313,7 @@ reason = "WS8: verbatim _py_abc + _weakrefset ports, type.__subclasses__(), obje
 
 [tests."cpython/Lib/test/test_descr.py"]
 status = "fail"
-reason = "measured: object.__module__ + unbound type-methods now resolve (RFC 0037 WS6); the suite still reports a large mix of errors/failures across the descriptor-protocol subtests (no single root cause — slots, __set_name__, metaclass corners)."
+reason = "measured: runs 159 subtests, 135 pass; 24 fail across deep object-model corners with no single root cause. The hard blocker is test_slots, which needs cyclic-garbage finalization (s.a=[Counted(), s]; del s; gc.collect() must run __del__ on the cycle) — WeavePy's tracing GC collects acyclic finalizers but not reference cycles. Other residual clusters (wave-3): subclassing super()/super-proxy, __class__ assignment between layout-compatible heaptypes, member/getset/method/wrapper descriptor type names (test_qualname), buffer-protocol inheritance, _io.FileIO getset docs, and __sizeof__ special-method lookup. Tractable corners (dir()/module __dir__, classmethod/staticmethod __new__/__init__ split, bound-method repr) remain but don't flip the row while test_slots is blocked."
 
 [tests."cpython/Lib/test/test_iter.py"]
 status = "pass"
@@ -336,12 +336,12 @@ status = "pass"
 reason = "measured (RFC 0037): passes end-to-end — parenthesized context managers and the with-protocol error paths all hold."
 
 [tests."cpython/Lib/test/test_exceptions.py"]
-status = "fail"
-reason = "measured: recursion guard + __context__/__cause__/__suppress_context__/__traceback__ slots + add_note/with_traceback now present (RFC 0037 WS1/WS5); first remaining failure is AttributeError on AttributeError.name/.obj — the interpreter doesn't populate PEP 3134 name/obj fields when raising attribute/name errors."
+status = "pass"
+reason = "measured: passes end-to-end against the vendored CPython 3.13 Lib/test (RFC 0037 WS1 recursion guard + WS5 PEP 3134/678/654 chaining, add_note/__notes__, ExceptionGroup, and AttributeError.name/.obj population)."
 
 [tests."cpython/Lib/test/test_traceback.py"]
-status = "fail"
-reason = "measured: _colorize/__future__ now import (RFC 0037 WS5/WS7); first remaining failure is 'NameError: name IO is not defined' — the traceback module references a name (typing.IO-style) WeavePy doesn't expose at import."
+status = "pass"
+reason = "measured: passes end-to-end (RFC 0037 WS5 traceback module — StackSummary/TracebackException formatting, exception-chaining display) against the vendored CPython 3.13 Lib/test."
 
 [tests."cpython/Lib/test/test_warnings.py"]
 status = "fail"
@@ -396,8 +396,8 @@ status = "skip"
 reason = "pdb requires a terminal + readline; runs interactively"
 
 [tests."cpython/Lib/test/test_pkgutil.py"]
-status = "fail"
-reason = "pkgutil: ImpImporter (removed in 3.12) + namespace package walks"
+status = "pass"
+reason = "measured: passes end-to-end (non-target; advanced to a clean verdict on the wave-2 import/namespace-package work)."
 
 [tests."cpython/Lib/test/test_importlib.py"]
 status = "fail"
@@ -460,8 +460,8 @@ status = "fail"
 reason = "time: timezone strings + monotonic stability under leap seconds"
 
 [tests."cpython/Lib/test/test_datetime.py"]
-status = "pass"
-reason = "RFC 0036: passes end-to-end (measured against the vendored CPython 3.13 Lib/test)"
+status = "fail"
+reason = "measured (non-target): load_tests() calls import_fresh_module('datetime', fresh=['datetime','_pydatetime','_strptime'], blocked=['_datetime']) to exercise the pure-Python vs C implementations separately. WeavePy ships a single native datetime (no _pydatetime), so the C/py dual-module split can't be satisfied and load_tests errors. Revisit when datetime is re-split into _pydatetime + _datetime accelerator."
 
 [tests."cpython/Lib/test/test_csv.py"]
 status = "fail"
@@ -556,8 +556,8 @@ status = "pass"
 reason = "RFC 0037: added the missing arg-syntax SyntaxErrors (duplicate parameter name, bare * with no keyword-only arg, positional-arg-follows-keyword, repeated keyword in a call), made func.__kwdefaults__ assignable and honored at call time (replaces the keyword-only defaults wholesale), and matched CPython's too_many_positional message (\"takes from MIN to MAX\" + argument/was-were pluralization). 11/11 pass."
 
 [tests."cpython/Lib/test/test_unpack.py"]
-status = "fail"
-reason = "PEP 448 unpacking edge cases"
+status = "pass"
+reason = "measured: passes end-to-end (non-target; sequence-unpacking edge cases now clean)."
 
 [tests."cpython/Lib/test/test_unpack_ex.py"]
 status = "fail"

@@ -627,6 +627,14 @@ pub(crate) fn supports_weakref(target: &Object) -> bool {
     // slots-free (or weakref-slotted) class on the MRO is enough —
     // `__slots__ = ["__dict__"]` grants a dict but *not* weakrefs.
     let cls = inst.cls();
+    // CPython's `module` type carries `tp_weaklistoffset`, so every module
+    // object is weakly referenceable — including `types.ModuleType(...)`
+    // doubles and the fresh extension-module re-imports
+    // `import_fresh_module` hands back. `test_struct`'s reference-cycle
+    // test takes a `weakref.ref` to a freshly imported `_struct`.
+    if cls.is_subclass_of(&crate::builtin_types::builtin_types().module_) {
+        return true;
+    }
     let mro = cls.mro.borrow().clone();
     for ty in mro {
         if ty.flags.is_builtin {

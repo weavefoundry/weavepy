@@ -779,6 +779,34 @@ pub fn builtin_types() -> Rc<BuiltinTypes> {
     })
 }
 
+/// Resolve `__objclass__` for a built-in method/slot-wrapper object by
+/// locating the built-in type whose dict holds this exact descriptor
+/// (CPython stores the owner in the descriptor itself; we recover it
+/// by identity search over the materialized type dicts).
+pub fn builtin_fn_objclass(b: &Rc<crate::object::BuiltinFn>) -> Option<Rc<TypeObject>> {
+    let bt = builtin_types();
+    let candidates: &[&Rc<TypeObject>] = &[
+        &bt.object_, &bt.type_, &bt.int_, &bt.float_, &bt.bool_, &bt.complex_, &bt.str_,
+        &bt.bytes_, &bt.bytearray_, &bt.tuple_, &bt.list_, &bt.dict_, &bt.set_, &bt.frozenset_,
+        &bt.range_, &bt.slice_, &bt.memoryview_, &bt.mappingproxy_, &bt.dict_keys_,
+        &bt.dict_values_, &bt.dict_items_, &bt.iterator_, &bt.none_type, &bt.function_,
+        &bt.method_, &bt.builtin_function_, &bt.method_wrapper_, &bt.member_descriptor_,
+        &bt.generator_, &bt.coroutine_, &bt.module_, &bt.property_, &bt.staticmethod_,
+        &bt.classmethod_, &bt.base_exception,
+    ];
+    let needle = Rc::as_ptr(b);
+    for ty in candidates {
+        for (_, v) in ty.dict.borrow().iter() {
+            if let Object::Builtin(other) = v {
+                if Rc::as_ptr(other) == needle {
+                    return Some((*ty).clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// RFC 0025: adopt an existing registry on this thread. Worker threads
 /// forked from the interpreter seed must see the *same* `type`,
 /// `object`, … `TypeObject`s as the seed thread — class statements

@@ -49,6 +49,24 @@ pub fn install(bt: &BuiltinTypes) {
     install_numeric_getsets(bt);
     install_value_reprs(bt);
     install_numeric_dunders(bt);
+    install_immutable_getnewargs(bt);
+}
+
+/// Materialize `__getnewargs__` in the immutable sequence types' dicts
+/// (`'__getnewargs__' in tuple.__dict__` is True in CPython). Without a
+/// real type-dict entry, `copyreg._reduce_newobj`'s type-only
+/// `_lookup_special` can't see WeavePy's instance-synthesized hook, so
+/// `copy.copy`/`pickle` of a `tuple`/`str`/`bytes` *subclass* rebuilds an
+/// empty instance (regression caught by `test_copy.test_copy_tuple_subclass`).
+/// The numeric value types already get theirs via `install_numeric_dunders`.
+fn install_immutable_getnewargs(bt: &BuiltinTypes) {
+    for ty in [&bt.tuple_, &bt.str_, &bt.bytes_] {
+        insert_if_absent(
+            ty,
+            "__getnewargs__",
+            crate::builtins::immutable_getnewargs_method(),
+        );
+    }
 }
 
 /// Materialize the numeric operator slots in the value types' dicts
@@ -243,7 +261,9 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
         name: &'static str,
         op: CompareKind,
         family: fn(&Object) -> bool,
+        owner: &Rc<TypeObject>,
     ) -> Object {
+        let owner = crate::sync::Rc::downgrade(owner);
         Object::Builtin(Rc::new(BuiltinFn {
             name,
             binds_instance: true,
@@ -257,6 +277,19 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
                         )))
                     }
                 };
+                // Wrong-class receiver: CPython slot wrappers *raise*
+                // (bpo-37619: `class A(int): __eq__ = str.__eq__`), they
+                // don't decline with NotImplemented. The other operand
+                // failing the family check declines below.
+                if let (Some(owner), Some(first)) = (owner.upgrade(), args.first()) {
+                    let cls = crate::builtins::class_of(first);
+                    if !cls.is_subclass_of(&owner) {
+                        return Err(type_error(format!(
+                            "descriptor '{}' requires a '{}' object but received a '{}'",
+                            name, owner.name, cls.name
+                        )));
+                    }
+                }
                 if !family(&a) || !family(&b) {
                     return Ok(crate::vm_singletons::not_implemented());
                 }
@@ -317,7 +350,7 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
     ];
     for (ty, fam) in totally_ordered {
         for (name, op) in ORDERED {
-            insert_if_absent(ty, name, richcmp_builtin(name, *op, *fam));
+            insert_if_absent(ty, name, richcmp_builtin(name, *op, *fam, ty));
         }
     }
     // complex: equality across the numeric tower, ordering always
@@ -329,7 +362,7 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
         } else {
             fam_none
         };
-        insert_if_absent(&bt.complex_, name, richcmp_builtin(name, *op, fam));
+        insert_if_absent(&bt.complex_, name, richcmp_builtin(name, *op, fam, &bt.complex_));
     }
     // dict / range: equality only.
     fn fam_dict(o: &Object) -> bool {
@@ -339,8 +372,8 @@ fn install_value_richcmp(bt: &BuiltinTypes) {
         matches!(o, Object::Range(_))
     }
     for (name, op) in &[("__eq__", CompareKind::Eq), ("__ne__", CompareKind::NotEq)] {
-        insert_if_absent(&bt.dict_, name, richcmp_builtin(name, *op, fam_dict));
-        insert_if_absent(&bt.range_, name, richcmp_builtin(name, *op, fam_range));
+        insert_if_absent(&bt.dict_, name, richcmp_builtin(name, *op, fam_dict, &bt.dict_));
+        insert_if_absent(&bt.range_, name, richcmp_builtin(name, *op, fam_range, &bt.range_));
     }
 }
 
@@ -409,14 +442,42 @@ fn as_native(o: &Object) -> Object {
 /// Wrap a `lookup_method`-table builtin so an `Instance` receiver
 /// (built-in subclass) is unwrapped to its native payload before the
 /// underlying implementation runs.
-fn unwrap_shim(inner: Rc<BuiltinFn>) -> Object {
+fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
     let inner_pos = inner.clone();
     let has_kw = inner.call_kw.is_some();
+    // Static/class-method-like entries take no instance receiver;
+    // skip the descriptor receiver check for them.
+    let no_receiver = matches!(inner.name, "maketrans" | "fromkeys" | "fromhex");
+    let owner_pos = crate::sync::Rc::downgrade(owner);
+    let owner_kw = owner_pos.clone();
+    // CPython method descriptors validate the receiver
+    // (`descrobject.c::descr_check`): `list.sort(thing)` for a non-list
+    // raises TypeError instead of silently running (bpo-37619 /
+    // gh-92063).
+    fn check_receiver(
+        name: &str,
+        owner: &crate::sync::Weak<TypeObject>,
+        first: &Object,
+    ) -> Result<(), RuntimeError> {
+        if let Some(owner) = owner.upgrade() {
+            let cls = crate::builtins::class_of(first);
+            if !cls.is_subclass_of(&owner) {
+                return Err(type_error(format!(
+                    "descriptor '{}' for '{}' objects doesn't apply to a '{}' object",
+                    name, owner.name, cls.name
+                )));
+            }
+        }
+        Ok(())
+    }
     let mut shim = BuiltinFn {
         name: inner.name,
         binds_instance: inner.binds_instance,
         call: Box::new(move |args| {
             if let Some(first) = args.first() {
+                if !no_receiver {
+                    check_receiver(inner_pos.name, &owner_pos, first)?;
+                }
                 let unwrapped = as_native(first);
                 if !unwrapped.is_same(first) {
                     let mut v = args.to_vec();
@@ -436,6 +497,9 @@ fn unwrap_shim(inner: Rc<BuiltinFn>) -> Object {
                 .as_ref()
                 .expect("call_kw checked at shim construction");
             if let Some(first) = args.first() {
+                if !no_receiver {
+                    check_receiver(inner_kw.name, &owner_kw, first)?;
+                }
                 let unwrapped = as_native(first);
                 if !unwrapped.is_same(first) {
                     let mut v = args.to_vec();
@@ -1080,7 +1144,7 @@ fn install_buffer_protocol(bt: &BuiltinTypes) {
 fn install_named_methods(ty: &Rc<TypeObject>, type_name: &str, names: &[&str]) {
     for name in names {
         if let Some(Object::Builtin(inner)) = crate::builtins::unbound_method(type_name, name) {
-            insert_if_absent(ty, name, unwrap_shim(inner));
+            insert_if_absent(ty, name, unwrap_shim(inner, ty));
         }
     }
 }
