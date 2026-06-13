@@ -50,6 +50,45 @@ pub fn install(bt: &BuiltinTypes) {
     install_value_reprs(bt);
     install_numeric_dunders(bt);
     install_immutable_getnewargs(bt);
+    register_descriptor_kinds(bt);
+}
+
+/// Tag every `Object::Builtin` sitting in a built-in type's own dict as a
+/// `method_descriptor` (regular method) or `wrapper_descriptor` (C slot
+/// dunder), recording its owning class so `type(str.lower)`,
+/// `str.lower.__qualname__` and `int.__add__.__objclass__` match CPython
+/// (test_descr test_qualname). Runs last, after every install pass has
+/// populated the dicts. Properties are tagged at creation in
+/// `install_numeric_getsets`.
+fn register_descriptor_kinds(bt: &BuiltinTypes) {
+    use crate::descr_registry::{is_slot_wrapper_name, register, DescrKind};
+    for (_, value) in bt.as_globals() {
+        let Object::Type(ty) = value else { continue };
+        if !ty.flags.is_builtin {
+            continue;
+        }
+        // Snapshot the (name, value) pairs to avoid holding the dict borrow
+        // across `register` (which borrows the descr table, not this dict).
+        let entries: Vec<(String, Object)> = ty
+            .dict
+            .borrow()
+            .iter()
+            .filter_map(|(k, v)| match (&k.0, v) {
+                (Object::Str(s), Object::Builtin(b)) if b.binds_instance => {
+                    Some((s.to_string(), v.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (name, value) in entries {
+            let kind = if is_slot_wrapper_name(&name) {
+                DescrKind::Wrapper
+            } else {
+                DescrKind::Method
+            };
+            register(&value, kind, ty.clone(), &name, None);
+        }
+    }
 }
 
 /// Materialize `__getnewargs__` in the immutable sequence types' dicts
@@ -157,6 +196,8 @@ fn install_numeric_getsets(bt: &BuiltinTypes) {
     fn getset(
         ty: &Rc<TypeObject>,
         name: &'static str,
+        kind: crate::descr_registry::DescrKind,
+        doc: Option<&'static str>,
         f: fn(&[Object]) -> Result<Object, RuntimeError>,
     ) {
         let fget = Object::Builtin(Rc::new(BuiltinFn {
@@ -174,25 +215,33 @@ fn install_numeric_getsets(bt: &BuiltinTypes) {
         let key = DictKey(Object::from_static(name));
         let mut d = ty.dict.borrow_mut();
         if !d.contains_key(&key) {
+            // Tag the property so `type(float.real)` reports the right
+            // descriptor type and `float.real.__qualname__`/`__doc__`/
+            // `__objclass__` resolve (test_descr test_qualname/test_descrdoc).
+            crate::descr_registry::register(&prop, kind, ty.clone(), name, doc);
             d.insert(key, prop);
         }
     }
-    getset(&bt.int_, "numerator", |args| {
+    use crate::descr_registry::DescrKind::{GetSet, Member};
+    // CPython models `int`/`float` real/imag/numerator/denominator as
+    // `tp_getset` (getset_descriptor) but `complex` real/imag as
+    // `tp_members` (member_descriptor).
+    getset(&bt.int_, "numerator", GetSet, None, |args| {
         int_value(args.first().unwrap_or(&Object::None))
     });
-    getset(&bt.int_, "denominator", |args| {
+    getset(&bt.int_, "denominator", GetSet, None, |args| {
         int_value(args.first().unwrap_or(&Object::None)).map(|_| Object::Int(1))
     });
-    getset(&bt.int_, "real", |args| {
+    getset(&bt.int_, "real", GetSet, None, |args| {
         int_value(args.first().unwrap_or(&Object::None))
     });
-    getset(&bt.int_, "imag", |args| {
+    getset(&bt.int_, "imag", GetSet, None, |args| {
         int_value(args.first().unwrap_or(&Object::None)).map(|_| Object::Int(0))
     });
-    getset(&bt.float_, "real", |args| {
+    getset(&bt.float_, "real", GetSet, None, |args| {
         float_value(args.first().unwrap_or(&Object::None))
     });
-    getset(&bt.float_, "imag", |args| {
+    getset(&bt.float_, "imag", GetSet, None, |args| {
         float_value(args.first().unwrap_or(&Object::None)).map(|_| Object::Float(0.0))
     });
     fn complex_value(o: &Object) -> Result<(f64, f64), RuntimeError> {
@@ -205,12 +254,20 @@ fn install_numeric_getsets(bt: &BuiltinTypes) {
             _ => Err(type_error("descriptor requires a 'complex' object")),
         }
     }
-    getset(&bt.complex_, "real", |args| {
-        complex_value(args.first().unwrap_or(&Object::None)).map(|(r, _)| Object::Float(r))
-    });
-    getset(&bt.complex_, "imag", |args| {
-        complex_value(args.first().unwrap_or(&Object::None)).map(|(_, i)| Object::Float(i))
-    });
+    getset(
+        &bt.complex_,
+        "real",
+        Member,
+        Some("the real part of a complex number"),
+        |args| complex_value(args.first().unwrap_or(&Object::None)).map(|(r, _)| Object::Float(r)),
+    );
+    getset(
+        &bt.complex_,
+        "imag",
+        Member,
+        Some("the imaginary part of a complex number"),
+        |args| complex_value(args.first().unwrap_or(&Object::None)).map(|(_, i)| Object::Float(i)),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +590,11 @@ fn install_callables(bt: &BuiltinTypes) {
         &bt.method_,
         &bt.method_wrapper_,
         &bt.type_,
+        // The callable descriptor types (CPython's `method_descriptor` /
+        // `wrapper_descriptor` carry `tp_call`); `getset_descriptor` /
+        // `member_descriptor` are data-only and stay non-callable.
+        &bt.method_descriptor_,
+        &bt.wrapper_descriptor_,
     ] {
         if let Some(w) = crate::builtins::builtin_type_dunder(&ty.name, "__call__") {
             insert_if_absent(ty, "__call__", w);

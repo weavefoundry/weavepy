@@ -18,8 +18,8 @@ use parking_lot::Mutex;
 
 use crate::sync::{Rc, RefCell};
 
-use crate::object::{DictData, Object};
-use crate::types::{PyInstance, TypeFlags, TypeObject};
+use crate::object::Object;
+use crate::types::{PyInstance, TypeObject};
 
 thread_local! {
     static NOT_IMPLEMENTED: RefCell<Option<Object>> = const { RefCell::new(None) };
@@ -75,66 +75,46 @@ pub fn drain_pending_weakref_callbacks() -> Vec<(Object, Object)> {
     PENDING_WEAKREF_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
-fn make_singleton(name: &'static str) -> Object {
-    let mut dict = DictData::new();
-    // `repr(NotImplemented)` is "NotImplemented", `repr(...)` is
-    // "Ellipsis" — install a `__repr__` carrying the canonical text so
-    // every repr path renders the singleton the way CPython does.
-    let repr_text: &'static str = match name {
-        "NotImplementedType" => "NotImplemented",
-        "ellipsis" => "Ellipsis",
-        other => other,
-    };
-    fn make_repr(text: &'static str) -> Object {
-        use crate::object::BuiltinFn;
-        Object::Builtin(Rc::new(BuiltinFn {
-            name: "__repr__",
-            binds_instance: true,
-            call: Box::new(move |_args| Ok(Object::from_static(text))),
-            call_kw: None,
-        }))
-    }
-    dict.insert(
-        crate::object::DictKey(Object::from_static("__repr__")),
-        make_repr(repr_text),
-    );
-    let cls = TypeObject::new_with_flags(
-        name,
-        vec![],
-        dict,
-        TypeFlags {
-            is_exception: false,
-            is_builtin: true,
-        },
-    )
-    .expect("singleton MRO");
-    let instance = PyInstance::new(cls);
-    Object::Instance(Rc::new(instance))
+/// Build a singleton instance of the given built-in registry type.
+/// The instance carries an empty dict — the canonical repr text
+/// ("Ellipsis" / "NotImplemented") is supplied by `Object::repr`'s
+/// type-keyed special case rather than a `__repr__` dict entry, so the
+/// singleton's `dir()` stays identical to `object()`'s (test_descr
+/// test_dir: `dir(Ellipsis) == dir(object())`).
+fn make_singleton(cls: Rc<TypeObject>) -> Object {
+    Object::Instance(Rc::new(PyInstance::new(cls)))
 }
 
 /// Return the unique `NotImplemented` instance, allocating it on
 /// first access. Subsequent calls hand back the same `Rc`-shared
-/// object so `x is NotImplemented` works.
+/// object so `x is NotImplemented` works. Its class is the registry's
+/// `NotImplementedType` (an `object` subclass), so `type(NotImplemented)`
+/// and the MRO match CPython.
 pub fn not_implemented() -> Object {
     NOT_IMPLEMENTED.with(|slot| {
         let mut s = slot.borrow_mut();
         if let Some(v) = s.as_ref() {
             return v.clone();
         }
-        let v = make_singleton("NotImplementedType");
+        let cls = crate::builtin_types::builtin_types()
+            .not_implemented_type_
+            .clone();
+        let v = make_singleton(cls);
         *s = Some(v.clone());
         v
     })
 }
 
-/// Same idea for `Ellipsis` (the value of `...`).
+/// Same idea for `Ellipsis` (the value of `...`); its class is the
+/// registry's `ellipsis` type.
 pub fn ellipsis() -> Object {
     ELLIPSIS.with(|slot| {
         let mut s = slot.borrow_mut();
         if let Some(v) = s.as_ref() {
             return v.clone();
         }
-        let v = make_singleton("ellipsis");
+        let cls = crate::builtin_types::builtin_types().ellipsis_.clone();
+        let v = make_singleton(cls);
         *s = Some(v.clone());
         v
     })

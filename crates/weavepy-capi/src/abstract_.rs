@@ -175,11 +175,11 @@ fn attr_lookup(o: &Object, key: &str) -> Option<Object> {
                     })
                     .flatten()
                 }
-                Object::StaticMethod(inner) => Some(inner.func.clone()),
+                Object::StaticMethod(inner) => Some(inner.func()),
                 Object::ClassMethod(inner) => {
                     let class = Object::Type(inst.cls());
                     Some(Object::BoundMethod(weavepy_vm::sync::Rc::new(
-                        weavepy_vm::object::BoundMethod::new(class, inner.func.clone()),
+                        weavepy_vm::object::BoundMethod::new(class, inner.func()),
                     )))
                 }
                 Object::Function(_) | Object::Builtin(_) => Some(Object::BoundMethod(

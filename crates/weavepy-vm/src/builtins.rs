@@ -1749,11 +1749,21 @@ fn builtin_type_dunder_uncached(base_name: &str, name: &str) -> Option<Object> {
         return Some(o);
     }
     // `__call__` lives only on the callable types (CPython: `tp_call`
-    // present on `type`, functions, methods — not on `object`).
+    // present on `type`, functions, methods, and the *callable* descriptor
+    // types `method_descriptor`/`wrapper_descriptor` — but not on `object`,
+    // nor on the data-only `getset_descriptor`/`member_descriptor`). The
+    // descriptor types must carry it so `isinstance(list.append, Callable)`
+    // holds (test_collections test_Callable).
     if name == "__call__"
         && matches!(
             base_name,
-            "type" | "function" | "builtin_function_or_method" | "method" | "method-wrapper"
+            "type"
+                | "function"
+                | "builtin_function_or_method"
+                | "method"
+                | "method-wrapper"
+                | "method_descriptor"
+                | "wrapper_descriptor"
         )
     {
         return Some(Object::Builtin(Rc::new(method_kw("__call__", slot_call))));
@@ -1826,6 +1836,17 @@ pub(crate) fn builtin_descriptor_get(args: &[Object]) -> Result<Object, RuntimeE
          instance,
          func,
     ))))
+}
+
+/// `method.__get__(self, obj, objtype=None)` — CPython gh-113157: a
+/// bound `method` is *already* bound, so applying the descriptor
+/// protocol to it again returns the method unchanged rather than
+/// re-binding its `__func__` to a new receiver. `args[0]` is the
+/// bound method itself (the `__get__` receiver).
+pub(crate) fn method_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
+    args.first()
+        .cloned()
+        .ok_or_else(|| type_error("__get__() missing method"))
 }
 
 /// `str.__str__(self)` — CPython's `unicode_str`: return the receiver
@@ -2199,6 +2220,37 @@ pub fn construct_classmethod(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::ClassMethod(MethodWrapper::new(inner)))
 }
 
+/// Set the wrapped callable on a `staticmethod`/`classmethod`
+/// (sub)instance — CPython's `sm_init`/`cm_init`. `__new__` builds the
+/// wrapper with `__func__ == None`; this fills it in. A subclass that
+/// overrides `__init__` without chaining to `super().__init__` never
+/// reaches here, so its `__func__` stays `None` (test_descr
+/// `test_classmethod_new` / `test_staticmethod_new`).
+fn method_wrapper_set_func(args: &[Object]) {
+    let func = args.get(1).cloned().unwrap_or(Object::None);
+    match args.first() {
+        Some(Object::StaticMethod(w) | Object::ClassMethod(w)) => w.set_func(func),
+        Some(Object::Instance(i)) => {
+            if let Some(Object::StaticMethod(w) | Object::ClassMethod(w)) = i.native.as_ref() {
+                w.set_func(func);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `staticmethod.__init__(self, func)` — CPython's `sm_init`.
+pub(crate) fn staticmethod_init(args: &[Object]) -> Result<Object, RuntimeError> {
+    method_wrapper_set_func(args);
+    Ok(Object::None)
+}
+
+/// `classmethod.__init__(self, func)` — CPython's `cm_init`.
+pub(crate) fn classmethod_init(args: &[Object]) -> Result<Object, RuntimeError> {
+    method_wrapper_set_func(args);
+    Ok(Object::None)
+}
+
 /// `staticmethod.__get__(self, obj, objtype=None)` — the descriptor hook.
 /// A staticmethod ignores the binding context and hands back the wrapped
 /// callable unchanged (matching CPython's `sm_descr_get`). Exposing it as
@@ -2208,7 +2260,7 @@ pub fn construct_classmethod(args: &[Object]) -> Result<Object, RuntimeError> {
 /// itself (the bound receiver).
 pub(crate) fn staticmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
     match args.first() {
-        Some(Object::StaticMethod(inner)) => Ok(inner.func.clone()),
+        Some(Object::StaticMethod(inner)) => Ok(inner.func()),
         // Tolerate an already-unwrapped callable (defensive).
         Some(other) => Ok(other.clone()),
         None => Err(type_error("staticmethod.__get__() missing self")),
@@ -2221,7 +2273,7 @@ pub(crate) fn staticmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeE
 /// otherwise `type(obj)`.
 pub(crate) fn classmethod_descr_get(args: &[Object]) -> Result<Object, RuntimeError> {
     let inner = match args.first() {
-        Some(Object::ClassMethod(i)) => i.func.clone(),
+        Some(Object::ClassMethod(i)) => i.func(),
         _ => return Err(type_error("classmethod.__get__() missing self")),
     };
     let owner = match args.get(2) {
@@ -2532,7 +2584,7 @@ fn bind_descriptor(value: &Object, receiver: &Object) -> Object {
              receiver.clone(),
              value.clone(),
         ))),
-        Object::StaticMethod(inner) => inner.func.clone(),
+        Object::StaticMethod(inner) => inner.func(),
         Object::ClassMethod(inner) => {
             let cls = match receiver {
                 Object::Instance(inst) => Object::Type(inst.cls()),
@@ -2541,7 +2593,7 @@ fn bind_descriptor(value: &Object, receiver: &Object) -> Object {
             };
             Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
                  cls,
-                 inner.func.clone(),
+                 inner.func(),
             )))
         }
         _ => value.clone(),
@@ -2589,10 +2641,10 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                     Object::ClassMethod(inner) => {
                         Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
                              Object::Type(t.clone()),
-                             inner.func.clone(),
+                             inner.func(),
                         )))
                     }
-                    Object::StaticMethod(inner) => inner.func.clone(),
+                    Object::StaticMethod(inner) => inner.func(),
                     other => other,
                 });
             }
@@ -5407,9 +5459,9 @@ fn b_isinstance(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(matches_classinfo(obj, class)?))
 }
 
-fn b_super(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_super(args: &[Object]) -> Result<Object, RuntimeError> {
     // `super(C, self)` returns a proxy instance whose class is the
-    // synthesized proxy type. Zero-arg form is handled by the VM's
+    // real `super` type. Zero-arg form is handled by the VM's
     // call path (it materialises `__class__` and `self` first).
     if !matches!(args.len(), 1 | 2) {
         return Err(type_error(
@@ -5418,59 +5470,23 @@ fn b_super(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let class = match &args[0] {
         Object::Type(t) => t.clone(),
-        _ => return Err(type_error("super() arg 1 must be a class")),
+        _ => return Err(type_error("super() argument 1 must be a type")),
     };
     if args.len() == 1 {
         return Ok(make_unbound_super(class));
     }
     let receiver = args[1].clone();
-    Ok(make_super(class, receiver))
+    make_super_checked(builtin_types().super_.clone(), class, receiver)
 }
 
 /// The one-argument form `super(C)`: an *unbound* super object. It does
 /// no MRO walking itself; it is a non-data descriptor whose `__get__`
 /// re-binds to `super(C, obj)` (the classic pre-PEP 3135
-/// `C._C__super = super(C); self.__super.meth()` idiom).
-fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object {
-    use crate::types::TypeObject;
-    let getter = {
-        let class = class.clone();
-        method("__get__", move |args: &[Object]| {
-            // Called as `desc.__get__(obj[, owner])` — bound, so args are
-            // `[desc, obj, owner?]`.
-            let obj = args.get(1).cloned().unwrap_or(Object::None);
-            if matches!(obj, Object::None) {
-                return Ok(args.first().cloned().unwrap_or(Object::None));
-            }
-            Ok(make_super(class.clone(), obj))
-        })
-    };
-    let proxy = Rc::new(TypeObject {
-        name: "super".to_owned(),
-        qualname: RefCell::new(None),
-        bases: RefCell::new(vec![]),
-        mro: RefCell::new(vec![]),
-        dict: Rc::new(RefCell::new({
-            let mut d = DictData::new();
-            d.insert(
-                DictKey(Object::from_static("__get__")),
-                Object::Builtin(Rc::new(getter)),
-            );
-            d
-        })),
-        flags: crate::types::TypeFlags::default(),
-        metaclass: RefCell::new(None),
-        slot_names: RefCell::new(Vec::new()),
-        declares_slots: crate::sync::Cell::new(false),
-        forbids_dict: false,
-        subclasses: RefCell::new(Vec::new()),
-        getattribute_kind: crate::sync::Cell::new(0),
-    });
-    // `lookup` walks the MRO only — it must contain the type itself for
-    // the `__get__` above to be found.
-    *proxy.mro.borrow_mut() = vec![proxy.clone()];
+/// `C._C__super = super(C); self.__super.meth()` idiom). It is an ordinary
+/// `super` instance with a `None` receiver.
+pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object {
     let inst = crate::types::PyInstance {
-        class: RefCell::new(proxy),
+        class: RefCell::new(builtin_types().super_.clone()),
         dict: Rc::new(RefCell::new({
             let mut d = DictData::new();
             d.insert(DictKey(Object::from_static("__self__")), Object::None);
@@ -5487,55 +5503,54 @@ fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object {
     Object::Instance(Rc::new(inst))
 }
 
-/// Construct a super proxy. Exposed publicly so the VM can build
-/// zero-arg super objects.
-pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Object {
-    use crate::types::TypeObject;
-    // CPython's `super(C, obj_or_type)` (see `super_init_impl`) chooses
-    // which MRO to walk from the *second* argument:
-    //   * `obj` is an instance        → walk `type(obj)`'s MRO.
-    //   * `obj` is a type & subclass  → "bound-to-subclass" form, walk
-    //     of `C`                        `obj`'s own MRO (classmethods and
-    //                                   the implicit `super()` inside
-    //                                   `__init_subclass__` / `__new__`).
-    //   * `obj` is a type but NOT a   → metaclass-method form (`obj` is an
-    //     subclass of `C`               *instance* of the metaclass `C`),
-    //                                   walk `type(obj)`'s MRO.
-    // Collapsing the two type cases into one (always `obj`'s MRO, or
-    // always `C`'s MRO) breaks either diamond `__init_subclass__` or
-    // `super().__init__()` inside a metaclass, respectively.
-    let receiver_class = match &receiver {
-        Object::Instance(inst) => inst.cls(),
-        Object::Type(t) if t.is_subclass_of(&class) => t.clone(),
-        Object::Type(t) => t.metaclass_or_type(),
-        _ => class.clone(),
-    };
-    let mro = receiver_class.mro.borrow();
-    let start = mro
-        .iter()
-        .position(|t| Rc::ptr_eq(t, &class))
-        .map_or(mro.len(), |i| i + 1);
-    let after: Vec<_> = mro[start..].to_vec();
-    drop(mro);
-    let proxy = Rc::new(TypeObject {
-        name: format!("super<{}>", class.name),
-        qualname: RefCell::new(None),
-        bases: RefCell::new(after.clone()),
-        mro: RefCell::new(after),
-        dict: Rc::new(RefCell::new(DictData::new())),
-        flags: crate::types::TypeFlags::default(),
-        metaclass: RefCell::new(None),
-        slot_names: RefCell::new(Vec::new()),
-        declares_slots: crate::sync::Cell::new(false),
-        forbids_dict: false,
-        subclasses: RefCell::new(Vec::new()),
-        getattribute_kind: crate::sync::Cell::new(0),
-    });
+/// CPython `supercheck`: validate the second `super()` argument against the
+/// first and return the class whose MRO the proxy walks (`su->obj_type`).
+///   * `obj` is `class` itself / a       → class-bound form, walk `obj`'s MRO.
+///     subclass of `class`
+///   * `type(obj)` is a subclass          → instance / metaclass form, walk
+///     of `class`                           `type(obj)`'s MRO.
+///   * otherwise                          → TypeError (the interpreter-level
+///     [`Interpreter::supercheck_full`] additionally honours `obj.__class__`).
+pub(crate) fn supercheck(
+    class: &Rc<crate::types::TypeObject>,
+    receiver: &Object,
+) -> Result<Rc<crate::types::TypeObject>, RuntimeError> {
+    if let Object::Type(t) = receiver {
+        // A type is trivially a subtype of itself even mid-construction,
+        // when its MRO isn't populated yet — CPython's `PyType_IsSubtype`
+        // falls back to the `tp_base` chain and short-circuits `a == b`
+        // (test_incomplete_super: `super(cls, cls)` inside `mro()`).
+        if Rc::ptr_eq(t, class) || t.is_subclass_of(class) {
+            return Ok(t.clone());
+        }
+    }
+    let oc = class_of(receiver);
+    if oc.is_subclass_of(class) {
+        return Ok(oc);
+    }
+    Err(type_error(
+        "super(type, obj): obj must be an instance or subtype of type",
+    ))
+}
+
+/// Build a `super` proxy of concrete type `proxy_type` (`super` or a user
+/// subclass), bound to `receiver`, walking the MRO after `class` starting
+/// from `receiver_class` (`su->obj_type`).
+pub(crate) fn build_super_proxy(
+    proxy_type: Rc<crate::types::TypeObject>,
+    class: Rc<crate::types::TypeObject>,
+    receiver: Object,
+    receiver_class: Rc<crate::types::TypeObject>,
+) -> Object {
     let inst = crate::types::PyInstance {
-        class: RefCell::new(proxy),
+        class: RefCell::new(proxy_type),
         dict: Rc::new(RefCell::new({
             let mut d = DictData::new();
             d.insert(DictKey(Object::from_static("__self__")), receiver);
+            d.insert(
+                DictKey(Object::from_static("__thisclass__")),
+                Object::Type(class),
+            );
             // CPython's `su->obj_type` — the class whose MRO is walked,
             // passed as `owner` to descriptor `__get__`s. Also used to
             // detect the class-bound form (`su->obj == starttype`),
@@ -5543,8 +5558,8 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
             // come back *unbound*: `super().__new__(cls, v)` must not
             // prepend a second `cls`).
             d.insert(
-                DictKey(Object::from_static("__obj_type__")),
-                Object::Type(receiver_class.clone()),
+                DictKey(Object::from_static("__self_class__")),
+                Object::Type(receiver_class),
             );
             d
         })),
@@ -5553,6 +5568,84 @@ pub fn make_super(class: Rc<crate::types::TypeObject>, receiver: Object) -> Obje
         slots: crate::sync::RefCell::new(None),
     };
     Object::Instance(Rc::new(inst))
+}
+
+/// Build a `super` proxy after validating `receiver` against `class` with
+/// the *basic* (no-`__class__`-fallback) [`supercheck`].
+pub(crate) fn make_super_checked(
+    proxy_type: Rc<crate::types::TypeObject>,
+    class: Rc<crate::types::TypeObject>,
+    receiver: Object,
+) -> Result<Object, RuntimeError> {
+    let receiver_class = supercheck(&class, &receiver)?;
+    Ok(build_super_proxy(proxy_type, class, receiver, receiver_class))
+}
+
+/// `super.__init__(self, type[, obj])` — populates a freshly allocated
+/// proxy (used when `class mysuper(super)` is instantiated and its
+/// `__init__` chains to `super().__init__(...)`). For the no-arg /
+/// `super(C, x)` builtin paths the proxy is built directly by
+/// [`make_super_checked`]; here we fill an already-created instance.
+pub fn super_init_impl(args: &[Object]) -> Result<Object, RuntimeError> {
+    let target = match args.first() {
+        Some(Object::Instance(i)) => i.clone(),
+        _ => return Err(type_error("super.__init__ requires a super instance")),
+    };
+    let class = match args.get(1) {
+        Some(Object::Type(t)) => t.clone(),
+        None => return Ok(Object::None),
+        Some(_) => return Err(type_error("super() argument 1 must be a type")),
+    };
+    let receiver = args.get(2).cloned().unwrap_or(Object::None);
+    let mut d = target.dict.borrow_mut();
+    d.insert(
+        DictKey(Object::from_static("__thisclass__")),
+        Object::Type(class.clone()),
+    );
+    if matches!(receiver, Object::None) {
+        // Unbound `super(C)` — no receiver yet; `__get__` rebinds later.
+        d.insert(DictKey(Object::from_static("__self__")), Object::None);
+        return Ok(Object::None);
+    }
+    let receiver_class = supercheck(&class, &receiver)?;
+    d.insert(DictKey(Object::from_static("__self__")), receiver);
+    d.insert(
+        DictKey(Object::from_static("__self_class__")),
+        Object::Type(receiver_class),
+    );
+    Ok(Object::None)
+}
+
+/// `super.__get__(self, obj, objtype=None)` — an unbound `super(C)` is a
+/// non-data descriptor that rebinds to `super(C, obj)` on access; an
+/// already-bound proxy returns itself.
+pub fn super_descr_get_impl(args: &[Object]) -> Result<Object, RuntimeError> {
+    let this = args.first().cloned().unwrap_or(Object::None);
+    let obj = args.get(1).cloned().unwrap_or(Object::None);
+    // Already bound (has a non-None __self__) → return self unchanged.
+    if let Object::Instance(i) = &this {
+        let (bound, class) = {
+            let d = i.dict.borrow();
+            let bound = d
+                .get(&DictKey(Object::from_static("__self__")))
+                .map(|v| !matches!(v, Object::None))
+                .unwrap_or(false);
+            let class = match d.get(&DictKey(Object::from_static("__thisclass__"))) {
+                Some(Object::Type(t)) => Some(t.clone()),
+                _ => None,
+            };
+            (bound, class)
+        };
+        if bound || matches!(obj, Object::None) {
+            return Ok(this);
+        }
+        let Some(class) = class else {
+            return Ok(this);
+        };
+        let proxy_type = i.cls();
+        return make_super_checked(proxy_type, class, obj);
+    }
+    Ok(this)
 }
 
 fn b_issubclass(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5712,7 +5805,12 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Function(_) => bt.function_.clone(),
         // Rust-implemented callables are `builtin_function_or_method`,
         // distinct from `function`, exactly as in CPython (`type(len)`).
-        Object::Builtin(_) => bt.builtin_function_.clone(),
+        // Built-in *type-dict* entries are tagged as method/wrapper
+        // descriptors (`type(str.lower)` is `method_descriptor`, not
+        // `builtin_function_or_method` — test_descr test_qualname).
+        Object::Builtin(_) => {
+            crate::descr_registry::descr_type(obj).unwrap_or_else(|| bt.builtin_function_.clone())
+        }
         // A bound method is its own type in CPython (`type(o.m)` is `method`),
         // which also makes `types.MethodType(func, obj)` construct one.
         // Distinguish what the method wraps, as CPython does:
@@ -5731,7 +5829,13 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
             }
             _ => bt.method_.clone(),
         },
-        Object::Property(_) => bt.property_.clone(),
+        // A user `@property` is `property`; the numeric getset/member
+        // descriptors materialized into the value-type dicts are tagged
+        // (`type(float.real)` is `getset_descriptor`, `type(complex.real)`
+        // is `member_descriptor` — test_descr test_qualname).
+        Object::Property(_) => {
+            crate::descr_registry::descr_type(obj).unwrap_or_else(|| bt.property_.clone())
+        }
         Object::StaticMethod(_) => bt.staticmethod_.clone(),
         Object::ClassMethod(_) => bt.classmethod_.clone(),
         Object::Bytes(_) => bt.bytes_.clone(),
@@ -6006,6 +6110,25 @@ pub(crate) fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                     "__name__",
                     "__qualname__",
                     "__del__",
+                ],
+                // `property`'s attributes are resolved in `load_attr`
+                // rather than stored in the type dict; surface the same
+                // names CPython's `property.__dict__` exposes so
+                // `dir(property_instance)` lists them (test_descr
+                // test_properties).
+                Object::Property(_) => &[
+                    "fget",
+                    "fset",
+                    "fdel",
+                    "getter",
+                    "setter",
+                    "deleter",
+                    "__doc__",
+                    "__get__",
+                    "__set__",
+                    "__delete__",
+                    "__set_name__",
+                    "__isabstractmethod__",
                 ],
                 _ => &[],
             };

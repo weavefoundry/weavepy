@@ -819,7 +819,7 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             }
         }
         Object::StaticMethod(o) | Object::ClassMethod(o) => {
-            visit(&o.func);
+            visit(&o.func());
             if let Ok(d) = o.dict.try_borrow() {
                 for (k, v) in d.iter() {
                     visit(&k.0);
@@ -1029,6 +1029,67 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 /// Convenience: track `obj` in the current thread's GC.
 pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
+}
+
+/// A value that can never (transitively) hold a reference back to a
+/// container, and therefore can never be part of a reference cycle.
+/// Mutable byte/scalar leaves qualify; everything else is treated as
+/// potentially-cyclic so the collector errs toward tracking.
+pub fn is_atomic(obj: &Object) -> bool {
+    matches!(
+        obj,
+        Object::None
+            | Object::Unbound
+            | Object::Bool(_)
+            | Object::Int(_)
+            | Object::Long(_)
+            | Object::Float(_)
+            | Object::Complex(_)
+            | Object::Str(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+            | Object::Range(_)
+    )
+}
+
+/// True if the freshly-built container `obj` holds at least one
+/// non-atomic element and could therefore participate in a reference
+/// cycle. A `list`/`dict`/`set` of only scalar leaves (ints, strs,
+/// floats, …) can never close a cycle, so the collector skips it —
+/// this is CPython's container-untracking optimization applied at
+/// construction time, and it keeps numeric/string-heavy workloads off
+/// the GC's books entirely.
+fn container_can_cycle(obj: &Object) -> bool {
+    match obj {
+        Object::List(l) => l
+            .try_borrow()
+            .map(|v| v.iter().any(|x| !is_atomic(x)))
+            .unwrap_or(true),
+        Object::Set(s) => s
+            .try_borrow()
+            .map(|m| m.iter().any(|k| !is_atomic(&k.0)))
+            .unwrap_or(true),
+        Object::Dict(d) => d
+            .try_borrow()
+            .map(|m| m.iter().any(|(k, v)| !is_atomic(&k.0) || !is_atomic(v)))
+            .unwrap_or(true),
+        // Any other container kind: be conservative and track.
+        _ => true,
+    }
+}
+
+/// Track a freshly-created mutable container (`list`/`dict`/`set`) with
+/// the cycle collector, but only when it can actually participate in a
+/// cycle (see [`container_can_cycle`]). Returns `true` when the object
+/// was added to the tracked set, so the caller can decide whether to
+/// run a threshold-driven young collection at the allocation site.
+pub fn track_if_cyclic(obj: &Object) -> bool {
+    if container_can_cycle(obj) {
+        track(obj.clone());
+        true
+    } else {
+        false
+    }
 }
 
 /// Convenience: threshold-driven automatic collection on the current

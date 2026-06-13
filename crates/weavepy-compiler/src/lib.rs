@@ -744,11 +744,14 @@ enum FinallyKind {
     /// statements at the non-normal exit site.
     Stmts(Vec<Stmt>),
     /// Synthetic frame for a `with` block: emit
-    /// `<cm_local>.__exit__(None, None, None)` directly using the
-    /// stored fast-local index. We can't represent this as an AST
-    /// Name node because the synthetic local name (".with_cm0")
-    /// isn't a valid identifier and would fail name resolution.
-    WithExit { cm_idx: u32 },
+    /// `<exit_local>(None, None, None)` directly using the stored
+    /// fast-local index that holds the *bound* `__exit__` captured by
+    /// `BEFORE_WITH`. CPython looks `__exit__` up once (special lookup,
+    /// bypassing instance `__getattribute__`) and reuses the bound
+    /// method on every exit path; re-deriving it via `LoadAttr` would
+    /// route through `__getattribute__` (test_descr
+    /// test_special_method_lookup).
+    WithExit { exit_idx: u32 },
     /// Synthetic frame for an `async with` block: emit
     /// `await <aexit_local>(None, None, None)`. Mirrors `WithExit`
     /// but awaits the `__aexit__` coroutine, so a `return`/`break`/
@@ -2440,11 +2443,25 @@ impl Compiler {
         inner.private = Some(Rc::from(name));
         inner.co.qualname = self.compute_child_qualname(name);
         inner.current_line = self.current_line;
-        // Every class body carries a `__class__` cell so methods can
-        // close over it. `__build_class__` patches the cell with the
-        // resulting type once construction finishes.
-        inner.co.cellvars.push("__class__".to_owned());
-        inner.bindings.insert("__class__".to_owned(), Binding::Cell);
+        // CPython only gives a class body the `__class__` closure cell —
+        // and the trailing `__classcell__` store — when a method actually
+        // needs it (references zero-arg `super()` or `__class__`); see
+        // `ste_needs_class_closure`. Otherwise a user-written
+        // `__classcell__ = <value>` must survive into the namespace so
+        // `type.__new__` can reject a non-cell (test_slots_special2). We
+        // reuse the same free-variable analysis the body relies on, so the
+        // signal can't be a false negative relative to what super() needs.
+        let needs_class_closure = {
+            let mut needed = HashSet::new();
+            for s in body {
+                collect_inner_free(s, &self.bindings, &mut needed);
+            }
+            needed.contains("super") || needed.contains("__class__")
+        };
+        if needs_class_closure {
+            inner.co.cellvars.push("__class__".to_owned());
+            inner.bindings.insert("__class__".to_owned(), Binding::Cell);
+        }
 
         let mut assigned = HashSet::new();
         for s in body {
@@ -2562,11 +2579,14 @@ impl Compiler {
             inner.compile_stmt(s)?;
         }
         // Expose the `__class__` cell via `__classcell__` so the
-        // `__build_class__` builtin can patch it.
-        let class_cell_idx = inner.cell_or_free_index("__class__");
-        inner.emit(OpCode::LoadClosure, class_cell_idx);
-        let classcell_name = inner.co.intern_name("__classcell__");
-        inner.emit(OpCode::StoreName, classcell_name);
+        // `__build_class__` builtin can patch it — only when a method
+        // closed over it (see `needs_class_closure` above).
+        if needs_class_closure {
+            let class_cell_idx = inner.cell_or_free_index("__class__");
+            inner.emit(OpCode::LoadClosure, class_cell_idx);
+            let classcell_name = inner.co.intern_name("__classcell__");
+            inner.emit(OpCode::StoreName, classcell_name);
+        }
 
         let inner_code = inner.finish();
         let inner_freevars = inner_code.freevars.clone();
@@ -2646,10 +2666,10 @@ impl Compiler {
                 }
                 Ok(())
             }
-            FinallyKind::WithExit { cm_idx } => {
-                self.emit(OpCode::LoadFast, *cm_idx);
-                let exit_name = self.co.intern_name("__exit__");
-                self.emit(OpCode::LoadAttr, exit_name);
+            FinallyKind::WithExit { exit_idx } => {
+                // The bound `__exit__` was stashed at `exit_idx` by
+                // `compile_with`; call it directly (no `LoadAttr`).
+                self.emit(OpCode::LoadFast, *exit_idx);
                 let none_idx = self.co.intern_constant(Constant::None);
                 self.emit(OpCode::LoadConst, none_idx);
                 self.emit(OpCode::LoadConst, none_idx);
@@ -3280,10 +3300,12 @@ impl Compiler {
         let with_line = self.current_line;
         let with_span = self.current_span;
         let cm_name = format!(".with_cm{}", self.with_counter);
+        let exit_name_local = format!(".with_exit{}", self.with_counter);
         self.with_counter += 1;
         let cm_idx = self.var_index_or_add(&cm_name);
+        let exit_idx = self.var_index_or_add(&exit_name_local);
 
-        // Evaluate cm and stash it for later __exit__ access.
+        // Evaluate cm and stash it for later __enter__ access.
         self.compile_expr(&item.context_expr)?;
         self.current_line = with_line;
         self.current_span = with_span;
@@ -3297,10 +3319,13 @@ impl Compiler {
         } else {
             self.emit(OpCode::PopTop, 0);
         }
-        // After BEFORE_WITH the bound __exit__ remains at TOS. We
-        // immediately pop it — the exit-path emission re-derives it
-        // from the synthetic local.
-        self.emit(OpCode::PopTop, 0);
+        // After BEFORE_WITH the *bound* `__exit__` remains at TOS. Stash
+        // it in a synthetic local and reuse it on every exit path —
+        // CPython looks `__exit__` up exactly once (special lookup,
+        // bypassing instance `__getattribute__`); re-deriving it via
+        // `LoadAttr` would route through `__getattribute__` (test_descr
+        // test_special_method_lookup).
+        self.emit(OpCode::StoreFast, exit_idx);
 
         // Push a synthetic finally frame so `return`, `break`, and
         // `continue` from inside the body run `cm.__exit__(None, None, None)`
@@ -3309,7 +3334,7 @@ impl Compiler {
         // frame that emits the call from the cm's fast-local index.
         let with_loop_depth = self.loop_stack.len();
         self.finally_stack.push(FinallyFrame {
-            kind: FinallyKind::WithExit { cm_idx },
+            kind: FinallyKind::WithExit { exit_idx },
             loop_depth_at_push: with_loop_depth,
         });
 
@@ -3331,10 +3356,9 @@ impl Compiler {
         self.current_line = with_line;
         self.current_span = with_span;
 
-        // Normal exit: cm.__exit__(None, None, None).
-        self.emit(OpCode::LoadFast, cm_idx);
-        let exit_name = self.co.intern_name("__exit__");
-        self.emit(OpCode::LoadAttr, exit_name);
+        // Normal exit: <bound __exit__>(None, None, None). The bound
+        // method was captured by BEFORE_WITH and stashed at `exit_idx`.
+        self.emit(OpCode::LoadFast, exit_idx);
         let none_idx = self.co.intern_constant(Constant::None);
         self.emit(OpCode::LoadConst, none_idx);
         self.emit(OpCode::LoadConst, none_idx);
@@ -3373,8 +3397,8 @@ impl Compiler {
         // `sys.exc_info()[1]`. `PUSH_EXC_INFO` only peeks the value-stack
         // top in this VM, so `[exc]` is preserved for `WITH_EXCEPT_START`.
         let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
-        self.emit(OpCode::LoadFast, cm_idx);
-        self.emit(OpCode::LoadAttr, exit_name);
+        // The bound `__exit__` stashed by BEFORE_WITH (no `LoadAttr`).
+        self.emit(OpCode::LoadFast, exit_idx);
         // Stack: [exc, __exit__]
         self.emit(OpCode::Swap, 2);
         // Stack: [__exit__, exc]
@@ -4961,7 +4985,7 @@ fn emit_cmp_op(compiler: &mut Compiler, op: CmpOp) {
 fn clone_finally_frame(f: &FinallyFrame) -> FinallyFrame {
     let kind = match &f.kind {
         FinallyKind::Stmts(body) => FinallyKind::Stmts(body.clone()),
-        FinallyKind::WithExit { cm_idx } => FinallyKind::WithExit { cm_idx: *cm_idx },
+        FinallyKind::WithExit { exit_idx } => FinallyKind::WithExit { exit_idx: *exit_idx },
         FinallyKind::AsyncWithExit { aexit_idx } => {
             FinallyKind::AsyncWithExit { aexit_idx: *aexit_idx }
         }

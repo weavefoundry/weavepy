@@ -27,6 +27,7 @@ use weavepy_compiler::{
 
 pub mod builtin_types;
 pub mod builtins;
+pub mod descr_registry;
 pub mod error;
 pub mod ext_loader;
 pub mod frozen_code_cache;
@@ -2655,7 +2656,10 @@ impl Interpreter {
                         .filter(|(_, owner)| !owner.flags.is_builtin)
                         .map(|(m, _)| m);
                     if let Some(m) = user_getitem {
-                        let method = Object::BoundMethod(Rc::new(BoundMethod::new(
+                        // `dispatch`: a `__getitem__` that is itself a
+                        // descriptor (`__getitem__ = property(...)`) must
+                        // honour its `__get__` (test_descr test_properties).
+                        let method = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
                              v.clone(),
                              m,
                         )));
@@ -2715,8 +2719,8 @@ impl Interpreter {
                         )?
                     } else if let Some(method) = ty.lookup("__class_getitem__") {
                         let callable = match method {
-                            Object::ClassMethod(inner) => inner.func.clone(),
-                            Object::StaticMethod(inner) => inner.func.clone(),
+                            Object::ClassMethod(inner) => inner.func(),
+                            Object::StaticMethod(inner) => inner.func(),
                             other => other,
                         };
                         self.call(
@@ -3116,7 +3120,16 @@ impl Interpreter {
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
                 self.record_alloc(frame, 56 + (n as u64) * 8);
-                frame.push(Object::new_list(items));
+                let obj = Object::new_list(items);
+                // RFC 0024: a list holding a reference can close a
+                // cycle (`s.attr = [s]`); track it so the cycle
+                // collector can break and finalize it. Lists of only
+                // scalar leaves can't cycle and stay off the GC's books.
+                let tracked = gc_trace::track_if_cyclic(&obj);
+                frame.push(obj);
+                if tracked && gc_trace::maybe_auto_collect() > 0 {
+                    self.run_pending_finalizers();
+                }
             }
             OpCode::BuildTuple => {
                 let n = ins.arg as usize;
@@ -3135,7 +3148,12 @@ impl Interpreter {
                     builtins::ensure_hashable(it)?;
                 }
                 self.record_alloc(frame, 216 + (n as u64) * 16);
-                frame.push(Object::new_set_from(items));
+                let obj = Object::new_set_from(items);
+                let tracked = gc_trace::track_if_cyclic(&obj);
+                frame.push(obj);
+                if tracked && gc_trace::maybe_auto_collect() > 0 {
+                    self.run_pending_finalizers();
+                }
             }
             OpCode::BuildMap => {
                 let n = ins.arg as usize;
@@ -3153,7 +3171,12 @@ impl Interpreter {
                     d.insert(DictKey(k), v);
                 }
                 self.record_alloc(frame, 64 + (n as u64) * 16);
-                frame.push(Object::Dict(Rc::new(RefCell::new(d))));
+                let obj = Object::Dict(Rc::new(RefCell::new(d)));
+                let tracked = gc_trace::track_if_cyclic(&obj);
+                frame.push(obj);
+                if tracked && gc_trace::maybe_auto_collect() > 0 {
+                    self.run_pending_finalizers();
+                }
             }
             OpCode::BuildString => {
                 let n = ins.arg as usize;
@@ -3800,32 +3823,45 @@ impl Interpreter {
             }
             OpCode::BeforeWith => {
                 let cm = frame.pop()?;
-                // CPython `BEFORE_WITH`: a missing protocol method is a
-                // TypeError naming the protocol, not an AttributeError
-                // (`__enter__` checked first, then `__exit__`).
-                let enter_method = self.load_attr(&cm, "__enter__").map_err(|err| {
-                    if matches!(&err, RuntimeError::PyException(e) if e.type_name() == "AttributeError")
-                    {
-                        type_error(format!(
-                            "'{}' object does not support the context manager protocol",
-                            cm.type_name()
-                        ))
-                    } else {
-                        err
-                    }
-                })?;
-                let exit_method = self.load_attr(&cm, "__exit__").map_err(|err| {
-                    if matches!(&err, RuntimeError::PyException(e) if e.type_name() == "AttributeError")
-                    {
-                        type_error(format!(
-                            "'{}' object does not support the context manager protocol \
-                             (missed __exit__ method)",
-                            cm.type_name()
-                        ))
-                    } else {
-                        err
-                    }
-                })?;
+                // CPython `BEFORE_WITH` uses *special-method lookup*:
+                // `__enter__` / `__exit__` resolve on the type, bypassing
+                // instance `__getattribute__` (test_descr
+                // test_special_method_lookup). A missing protocol method is a
+                // TypeError naming the protocol (`__enter__` first, then
+                // `__exit__`). For instances we use `instance_method`
+                // (type-only, descriptor-aware); other objects keep the
+                // generic attribute path.
+                let is_inst = matches!(&cm, Object::Instance(_));
+                let enter_method = match is_inst.then(|| instance_method(&cm, "__enter__")).flatten()
+                {
+                    Some(m) => m,
+                    None => self.load_attr(&cm, "__enter__").map_err(|err| {
+                        if matches!(&err, RuntimeError::PyException(e) if e.type_name() == "AttributeError")
+                        {
+                            type_error(format!(
+                                "'{}' object does not support the context manager protocol",
+                                cm.type_name()
+                            ))
+                        } else {
+                            err
+                        }
+                    })?,
+                };
+                let exit_method = match is_inst.then(|| instance_method(&cm, "__exit__")).flatten() {
+                    Some(m) => m,
+                    None => self.load_attr(&cm, "__exit__").map_err(|err| {
+                        if matches!(&err, RuntimeError::PyException(e) if e.type_name() == "AttributeError")
+                        {
+                            type_error(format!(
+                                "'{}' object does not support the context manager protocol \
+                                 (missed __exit__ method)",
+                                cm.type_name()
+                            ))
+                        } else {
+                            err
+                        }
+                    })?,
+                };
                 let entered = self.call(&enter_method, &[], &[], &frame.globals)?;
                 // Stack on exit: [exit_method, entered_value]
                 frame.push(exit_method);
@@ -4836,6 +4872,25 @@ impl Interpreter {
             Object::Instance(inst) => self.load_attr_instance(inst, obj, name),
             Object::Type(ty) => self.load_attr_type(ty, name),
             Object::Property(p) => match name {
+                // A tagged numeric getset/member (`float.real`,
+                // `complex.real`) reports CPython descriptor metadata.
+                "__name__" if crate::descr_registry::lookup(obj).is_some() => {
+                    Ok(Object::from_str(&crate::descr_registry::lookup(obj).unwrap().name))
+                }
+                "__qualname__" if crate::descr_registry::lookup(obj).is_some() => {
+                    Ok(Object::from_str(
+                        &crate::descr_registry::lookup(obj).unwrap().qualname,
+                    ))
+                }
+                "__objclass__" if crate::descr_registry::lookup(obj).is_some() => {
+                    Ok(Object::Type(crate::descr_registry::lookup(obj).unwrap().objclass))
+                }
+                "__doc__" if crate::descr_registry::lookup(obj).is_some_and(|m| m.doc.is_some()) => {
+                    Ok(crate::descr_registry::lookup(obj)
+                        .and_then(|m| m.doc)
+                        .map(Object::from_static)
+                        .unwrap_or(Object::None))
+                }
                 "fget" => Ok(p.fget.clone()),
                 "fset" => Ok(p.fset.clone()),
                 "fdel" => Ok(p.fdel.clone()),
@@ -4882,7 +4937,7 @@ impl Interpreter {
             },
             Object::StaticMethod(inner) => match name {
                 // `__func__`/`__wrapped__` expose the wrapped callable.
-                "__func__" | "__wrapped__" => Ok(inner.func.clone()),
+                "__func__" | "__wrapped__" => Ok(inner.func()),
                 // The wrapper's own instance dict — seeded with the
                 // functools-wrapper attributes at construction and open
                 // to arbitrary writes (bpo-43682).
@@ -4903,13 +4958,13 @@ impl Interpreter {
                     // *under* `@staticmethod` (`@staticmethod
                     // @abstractmethod def f(): ...`).
                     Ok(self
-                        .load_attr(&inner.func, "__isabstractmethod__")
+                        .load_attr(&inner.func(), "__isabstractmethod__")
                         .unwrap_or(Object::Bool(false)))
                 }
                 // Metadata falls back to the wrapped callable when the
                 // seeded dict lacks it (non-function callables).
                 "__module__" | "__qualname__" | "__name__" | "__doc__" | "__annotations__" => {
-                    self.load_attr(&inner.func, name)
+                    self.load_attr(&inner.func(), name)
                 }
                 _ => Err(attribute_error(format!(
                     "'staticmethod' object has no attribute '{}'",
@@ -4919,7 +4974,7 @@ impl Interpreter {
             Object::ClassMethod(inner) => match name {
                 // `__func__` and `__wrapped__` both expose the underlying
                 // callable; `functools.wraps`/inspect walk `__wrapped__`.
-                "__func__" | "__wrapped__" => Ok(inner.func.clone()),
+                "__func__" | "__wrapped__" => Ok(inner.func()),
                 // Instance dict, as for `staticmethod` above.
                 "__dict__" => Ok(Object::Dict(inner.dict.clone())),
                 _ if inner.dict.borrow().contains_key(&DictKey(Object::from_str(name))) => {
@@ -4933,10 +4988,10 @@ impl Interpreter {
                      crate::builtins::descriptor_get_builtin(false),
                 )))),
                 "__isabstractmethod__" => Ok(self
-                    .load_attr(&inner.func, "__isabstractmethod__")
+                    .load_attr(&inner.func(), "__isabstractmethod__")
                     .unwrap_or(Object::Bool(false))),
                 "__module__" | "__qualname__" | "__name__" | "__doc__" | "__annotations__" => {
-                    self.load_attr(&inner.func, name)
+                    self.load_attr(&inner.func(), name)
                 }
                 _ => Err(attribute_error(format!(
                     "'classmethod' object has no attribute '{}'",
@@ -5221,6 +5276,24 @@ impl Interpreter {
                 ))),
             },
             Object::Builtin(b) => match name {
+                // A tagged built-in descriptor (`str.lower`, `int.__add__`)
+                // reports its CPython metadata: `__qualname__` is
+                // `objclass.__qualname__ + '.' + name` and `__objclass__`
+                // the owning class (test_descr test_qualname/test_descrdoc).
+                "__qualname__" if crate::descr_registry::lookup(obj).is_some() => {
+                    Ok(Object::from_str(
+                        &crate::descr_registry::lookup(obj).unwrap().qualname,
+                    ))
+                }
+                "__objclass__" if crate::descr_registry::lookup(obj).is_some() => {
+                    Ok(Object::Type(crate::descr_registry::lookup(obj).unwrap().objclass))
+                }
+                "__doc__" if crate::descr_registry::lookup(obj).is_some_and(|m| m.doc.is_some()) => {
+                    Ok(crate::descr_registry::lookup(obj)
+                        .and_then(|m| m.doc)
+                        .map(Object::from_static)
+                        .unwrap_or(Object::None))
+                }
                 "__name__" | "__qualname__" => {
                     Ok(Object::from_static(builtin_display_name(b.name)))
                 }
@@ -5265,6 +5338,18 @@ impl Interpreter {
             Object::BoundMethod(bm) => match name {
                 "__func__" => Ok(bm.function.clone()),
                 "__self__" => Ok(bm.receiver.clone()),
+                // gh-113157: a bound method is its own (no-op) descriptor.
+                // `m.__get__(obj, cls)` returns `m` unchanged instead of
+                // forwarding to `__func__.__get__` and re-binding to `obj`.
+                "__get__" => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                     obj.clone(),
+                     Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                        name: "__get__",
+                        binds_instance: true,
+                        call: Box::new(crate::builtins::method_descr_get),
+                        call_kw: None,
+                    })),
+                )))),
                 // `method.__name__`/`__doc__` delegate to `__func__` so a
                 // `functools.wraps`-patched attribute (stored in the
                 // function's attrs dict) wins over the compile-time name —
@@ -5458,7 +5543,11 @@ impl Interpreter {
         name: &str,
     ) -> Result<Object, RuntimeError> {
         let result = if let Some(getattribute) = self.user_getattribute(&inst.cls()) {
-            let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+            // `dispatch` (not `new`): a `__getattribute__` that is itself a
+            // descriptor (`__getattribute__ = SomeDescriptor()`) must have
+            // its `__get__` honoured before the call (test_descr
+            // test_getattr_hooks).
+            let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
                  instance_obj.clone(),
                  getattribute,
             )));
@@ -5474,7 +5563,9 @@ impl Interpreter {
         match result {
             Err(e) if self.is_attribute_error(&e) => {
                 if let Some(getattr) = inst.cls().lookup("__getattr__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                    // `dispatch` so a descriptor `__getattr__` also honours
+                    // its `__get__` (test_descr test_getattr_hooks).
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
                          instance_obj.clone(),
                          getattr,
                     )));
@@ -5539,79 +5630,94 @@ impl Interpreter {
         // Re-bind methods looked up via the proxy so they run
         // against the right `self` AND against the original class
         // (not the proxy) for classmethod binding. CPython's
-        // `super.__getattribute__` passes `su.__obj_type__` — the
+        // `super.__getattribute__` passes `su.__self_class__` — the
         // class that originally triggered super — as the `owner`
         // argument to the descriptor protocol; we mirror that here.
-        // A proxy is identified by the `__obj_type__` key, which *only*
+        // A proxy is identified by the `__self_class__` key, which *only*
         // `make_super` writes — a plain object that merely carries a
         // `__self__` attribute (`partialmethod.__get__` writes one onto
         // its bound `partial`) must stay on the normal path.
-        let super_receiver = if inst
-            .dict
-            .borrow()
-            .contains_key(&DictKey(Object::from_static("__obj_type__")))
-        {
-            inst.dict
-                .borrow()
-                .get(&DictKey(Object::from_static("__self__")))
-                .cloned()
+        //
+        // Capture the class-level descriptor *first*, before any instance
+        // dict access. CPython's `_PyType_Lookup` runs ahead of the
+        // instance dict probe, so a class attribute fetched here survives
+        // even if a hostile dict key's `__eq__` deletes it mid-lookup
+        // (test_descr test_vicious_descriptor_nonsense). The instance
+        // dict probe below (the super-proxy check, then step (2)) may run
+        // arbitrary Python via key comparison, so the order matters.
+        let meta_attr = inst.cls().lookup(name);
+        let owner = Object::Type(inst.cls());
+
+        // A *bound* super proxy carries `__self_class__` (`su->obj_type`),
+        // written only by `make_super_checked`. `__class__` and `__self__`
+        // are served from the proxy itself (CPython's `super_getattro`
+        // special-cases `__class__`), so they skip the MRO walk.
+        let super_fields = if name != "__self__" && name != "__class__" {
+            let d = inst.dict.borrow();
+            match (
+                d.get(&DictKey(Object::from_static("__self_class__"))).cloned(),
+                d.get(&DictKey(Object::from_static("__self__"))).cloned(),
+                d.get(&DictKey(Object::from_static("__thisclass__")))
+                    .cloned(),
+            ) {
+                (Some(Object::Type(obj_type)), Some(receiver), Some(Object::Type(thisclass)))
+                    if !matches!(receiver, Object::None) =>
+                {
+                    Some((obj_type, receiver, thisclass))
+                }
+                _ => None,
+            }
         } else {
             None
         };
-        if name != "__self__" {
-            if let Some(receiver) = super_receiver {
-                if let Some(v) = inst.cls().lookup(name) {
-                    // CPython passes `su->obj_type` (the MRO-walk start
-                    // class) as `owner`, and a NULL instance when
-                    // `su->obj == starttype` — the class-bound form
-                    // `super(C, cls)` inside `__new__`/classmethods —
-                    // so plain functions come back unbound while
-                    // classmethods still bind to the class.
-                    let obj_type = inst
-                        .dict
-                        .borrow()
-                        .get(&DictKey(Object::from_static("__obj_type__")))
-                        .cloned();
-                    let owner = match (&obj_type, &receiver) {
-                        (Some(Object::Type(t)), _) => Object::Type(t.clone()),
-                        (_, Object::Type(t)) => Object::Type(t.clone()),
-                        (_, Object::Instance(i)) => Object::Type(i.cls()),
-                        _ => Object::Type(inst.cls()),
-                    };
-                    let instance_for_get = match (&receiver, &owner) {
-                        (Object::Type(r), Object::Type(o)) if Rc::ptr_eq(r, o) => {
-                            Object::None
-                        }
-                        _ => receiver.clone(),
-                    };
-                    let bound = self.descriptor_get(&v, &instance_for_get, &owner)?;
-                    // `classmethod.__get__(NULL, starttype)` binds to the
-                    // class; plain functions return themselves unbound.
-                    return Ok(bound);
-                }
-                // The MRO beyond the starting class reaches a built-in base
-                // (`dict`, `list`, …) whose methods aren't stored on the type
-                // dict and so don't surface above. Resolve `name` against the
-                // receiver's native payload so `super().__setitem__`,
-                // `super().append`, … dispatch to the wrapped built-in and
-                // operate on the shared payload. (Only names absent from the
-                // MRO reach here, so this never shadows a user override.)
-                if let Object::Instance(recv) = &receiver {
-                    if let Some(native) = &recv.native {
-                        if let Ok(v) = self.load_attr(&native.clone(), name) {
-                            return Ok(v);
-                        }
+        if let Some((obj_type, receiver, thisclass)) = super_fields {
+            // Walk `obj_type`'s MRO *after* `thisclass` (CPython's
+            // `super_getattro`: start one past `su->type` in
+            // `su->obj_type->tp_mro`). The proxy's own class (`super` or a
+            // user subclass) is irrelevant to the lookup target.
+            let found = {
+                let mro = obj_type.mro.borrow();
+                let start = mro
+                    .iter()
+                    .position(|t| Rc::ptr_eq(t, &thisclass))
+                    .map_or(mro.len(), |i| i + 1);
+                mro[start..]
+                    .iter()
+                    .find_map(|t| t.dict.borrow().get(&DictKey(Object::from_str(name))).cloned())
+            };
+            if let Some(v) = found {
+                // CPython passes `su->obj_type` as `owner`, and a NULL
+                // instance when `su->obj == su->obj_type` — the class-bound
+                // form `super(C, cls)` inside `__new__`/classmethods — so
+                // plain functions come back unbound while classmethods
+                // still bind to the class.
+                let owner = Object::Type(obj_type.clone());
+                let instance_for_get = match &receiver {
+                    Object::Type(r) if Rc::ptr_eq(r, &obj_type) => Object::None,
+                    _ => receiver.clone(),
+                };
+                return self.descriptor_get(&v, &instance_for_get, &owner);
+            }
+            // The MRO beyond the starting class reaches a built-in base
+            // (`dict`, `list`, …) whose methods aren't stored on the type
+            // dict and so don't surface above. Resolve `name` against the
+            // receiver's native payload so `super().__setitem__`,
+            // `super().append`, … dispatch to the wrapped built-in and
+            // operate on the shared payload. (Only names absent from the
+            // MRO reach here, so this never shadows a user override.)
+            if let Object::Instance(recv) = &receiver {
+                if let Some(native) = &recv.native {
+                    if let Ok(v) = self.load_attr(&native.clone(), name) {
+                        return Ok(v);
                     }
                 }
-                return Err(attribute_error(format!(
-                    "'super' object has no attribute '{}'",
-                    name
-                )));
             }
+            // Not found along the delegated MRO: fall through to normal
+            // resolution so the proxy's *own* attributes (`__init__`,
+            // `__get__`, `__repr__`, `__thisclass__`, `__self__`,
+            // `__self_class__`) still resolve, ending in the generic
+            // `'super' object has no attribute …` AttributeError.
         }
-
-        let meta_attr = inst.cls().lookup(name);
-        let owner = Object::Type(inst.cls());
 
         // (1) Data descriptor on class wins over instance dict — but only
         // when it actually implements `__get__` (CPython checks
@@ -5683,6 +5789,22 @@ impl Interpreter {
                     .unwrap_or(Object::None));
             }
             _ => {}
+        }
+
+        // (3b') `classmethod`/`staticmethod` subclass instances expose the
+        // wrapper's `__func__` / `__wrapped__` / `__isabstractmethod__`.
+        // CPython serves these from member/getset descriptors on the base
+        // type; WeavePy resolves them on the native payload instead (they
+        // aren't methods, so `lookup_method` in (3e) won't surface them).
+        // `__func__` is `None` until `__init__` runs — a subclass that
+        // overrides `__init__` without chaining keeps it `None`
+        // (test_descr test_classmethod_new / test_staticmethod_new).
+        if matches!(name, "__func__" | "__wrapped__" | "__isabstractmethod__") {
+            if let Some(native @ (Object::StaticMethod(_) | Object::ClassMethod(_))) =
+                inst.native.as_ref()
+            {
+                return self.load_attr(&native.clone(), name);
+            }
         }
 
         // (3c) Subclasses of a built-in (`class C(list)`, `class C(int)`,
@@ -5761,10 +5883,12 @@ impl Interpreter {
         // its base's or metaclass's `__name__`.
         if name == "__name__" || name == "__qualname__" {
             match ty.dict.borrow().get(&DictKey(Object::from_str(name))) {
-                // A getset under `__name__` (generator/coroutine types)
-                // describes *instances*; the type's own name comes from
-                // the synthetic, as with CPython's `type.__name__`.
-                Some(v) if !matches!(v, Object::Property(_)) => return Ok(v.clone()),
+                // Only a *string* own-dict entry overrides the synthetic
+                // name. A descriptor here (a getset on generator/coroutine
+                // types, or a `__slots__ = ["__qualname__"]` member slot —
+                // test_slots_special2) describes *instances*, so the
+                // class's own name still comes from the `type` getset.
+                Some(v @ Object::Str(_)) => return Ok(v.clone()),
                 _ => {
                     // Interned so repeated reads return the *same* str
                     // object (CPython getattr(cls, '__name__') identity;
@@ -5777,6 +5901,15 @@ impl Interpreter {
                     return Ok(Object::interned_str(&ty.name));
                 }
             }
+        }
+
+        // `type.__dict__` is a getset *data descriptor* on the metatype in
+        // CPython, so it intercepts before anything else — including a
+        // `__dict__` slot descriptor a custom metaclass inherits from a
+        // plain base (`class Meta(type, Base)`), which would otherwise be
+        // (wrongly) applied to the class object (test_set_dict).
+        if name == "__dict__" {
+            return Ok(Object::MappingProxy(ty.dict.clone()));
         }
 
         let meta = ty.metaclass_or_type();
@@ -5797,14 +5930,6 @@ impl Interpreter {
                     return self.descriptor_get(attr, &self_as_obj, &Object::Type(meta.clone()));
                 }
             }
-        }
-
-        // (1b) `type.__dict__` is a getset data descriptor on the
-        // metatype in CPython, so it intercepts *before* the class's own
-        // MRO entry — which, for a heap class, is the instance-facing
-        // `subtype_dict` descriptor meant for `instance.__dict__`.
-        if name == "__dict__" {
-            return Ok(Object::MappingProxy(ty.dict.clone()));
         }
 
         // (2) Look up the name in `ty` itself (and its MRO).
@@ -6010,7 +6135,7 @@ impl Interpreter {
     /// Run the descriptor protocol against `attr` (already resolved
     /// from a class MRO). `instance` is `Object::None` when accessed
     /// directly on the class (e.g. `Foo.bar`).
-    fn descriptor_get(
+    pub(crate) fn descriptor_get(
         &mut self,
         attr: &Object,
         instance: &Object,
@@ -6031,10 +6156,10 @@ impl Interpreter {
                     &self.builtins.clone(),
                 )
             }
-            Object::StaticMethod(inner) => Ok(inner.func.clone()),
+            Object::StaticMethod(inner) => Ok(inner.func()),
             Object::ClassMethod(inner) => Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
                  owner.clone(),
-                 inner.func.clone(),
+                 inner.func(),
             )))),
             Object::SlotDescriptor(slot) => match instance {
                 Object::None => Ok(attr.clone()),
@@ -6058,9 +6183,14 @@ impl Interpreter {
                     }
                     match inst.slot_get(&slot.name) {
                         Some(v) => Ok(v),
+                        // CPython's member descriptor reports the
+                        // owning type's *fully qualified* name here
+                        // (e.g. `pkg.mod.Cls`), unlike the generic
+                        // "has no attribute" path which uses `tp_name`.
                         None => Err(attribute_error(format!(
                             "'{}' object has no attribute '{}'",
-                            inst.cls().name, slot.name
+                            inst.cls().qualified_display_name(),
+                            slot.name
                         ))),
                     }
                 }
@@ -6143,9 +6273,9 @@ impl Interpreter {
                     Object::Instance(inst) => Object::Type(inst.cls()),
                     other => other.clone(),
                 },
-                 inner.func.clone(),
+                 inner.func(),
             ))),
-            Object::StaticMethod(inner) => inner.func.clone(),
+            Object::StaticMethod(inner) => inner.func(),
             _ => attr,
         }
     }
@@ -7867,7 +7997,9 @@ impl Interpreter {
         // shims implemented as ordinary instances.
         if let Object::Instance(inst) = classinfo {
             if let Some(hook) = inst.cls().lookup("__instancecheck__") {
-                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                // `dispatch` so a descriptor `__instancecheck__` honours its
+                // `__get__` (test_descr test_special_method_lookup).
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
                      classinfo.clone(),
                      hook,
                 )));
@@ -7992,7 +8124,9 @@ impl Interpreter {
         // default (class-like instances such as `typing` aliases / unions).
         if let Object::Instance(inst) = classinfo {
             if let Some(hook) = inst.cls().lookup("__subclasscheck__") {
-                let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                // `dispatch` so a descriptor `__subclasscheck__` honours its
+                // `__get__` (test_descr test_special_method_lookup).
+                let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
                      classinfo.clone(),
                      hook,
                 )));
@@ -12585,6 +12719,134 @@ impl Interpreter {
         Ok(Some(truth))
     }
 
+    /// CPython `compatible_for_assignment` (`object_set_class`): two heap
+    /// types are layout-compatible for `__class__` reassignment iff their
+    /// most-derived struct-changing ancestors (`newbase`/`oldbase`) either
+    /// coincide, or share the same `tp_base` and add the same slots — where
+    /// "same slots added" compares the *sorted* `__slots__` member names plus
+    /// the `__dict__`/`__weakref__` contributions (`same_slots_added`). This
+    /// makes reordered slots (`["a","b"]` vs `["b","a"]`) compatible while
+    /// keeping distinct bases (`L(H)` vs `M(I)`) apart (test_set_class).
+    fn class_assign_compatible(old: &Rc<TypeObject>, new: &Rc<TypeObject>) -> bool {
+        // Differing built-in solid bases (`int` vs `object`) never share a
+        // layout, regardless of the heap slots stacked on top.
+        if old.solid_base_name() != new.solid_base_name() {
+            return false;
+        }
+        let oldbase = old.layout_struct_base();
+        let newbase = new.layout_struct_base();
+        if Rc::ptr_eq(&oldbase, &newbase) {
+            return true;
+        }
+        let same_tp_base = match (oldbase.best_base(), newbase.best_base()) {
+            (Some(a), Some(b)) => Rc::ptr_eq(&a, &b),
+            (None, None) => true,
+            _ => false,
+        };
+        same_tp_base
+            && oldbase.member_slots_sorted() == newbase.member_slots_sorted()
+            && oldbase.adds_own_dict() == newbase.adds_own_dict()
+            && oldbase.adds_own_weakref() == newbase.adds_own_weakref()
+    }
+
+    /// CPython `type_setattro`'s core: set an attribute directly on a class's
+    /// own dict (no user-metaclass `__setattr__` dispatch — this *is* the
+    /// builtin `type.__setattr__`). Rejects immutable (builtin) types and the
+    /// read-only `__dict__`/`__mro__` getsets, and routes `__bases__` /
+    /// `__qualname__` through their dedicated setters.
+    pub(crate) fn set_type_attr_direct(
+        &mut self,
+        ty: &Rc<TypeObject>,
+        name: &str,
+        value: Object,
+    ) -> Result<(), RuntimeError> {
+        if ty.flags.is_builtin {
+            return Err(type_error(format!(
+                "cannot set '{name}' attribute of immutable type '{}'",
+                ty.name
+            )));
+        }
+        // `cls.__bases__ = (…)` — CPython's `type_set_bases`: validate,
+        // recompute the MRO of the class and all its subclasses (rolling back
+        // on failure), and re-home the subclass registries.
+        if name == "__bases__" {
+            return self.type_set_bases(ty, &value);
+        }
+        // `cls.__qualname__ = …` goes through the `type` getset in CPython: it
+        // updates the slot without touching `__dict__`.
+        if name == "__qualname__" {
+            let Object::Str(s) = &value else {
+                return Err(type_error(format!(
+                    "can only assign string to {}.__qualname__, not '{}'",
+                    ty.name,
+                    value.type_name()
+                )));
+            };
+            *ty.qualname.borrow_mut() = Some(s.to_string());
+            return Ok(());
+        }
+        // The `type.__dict__` / `type.__mro__` getsets have no setter in
+        // CPython, so a class's `__dict__`/`__mro__` are read-only even on
+        // heap types (test_set_dict).
+        if matches!(name, "__dict__" | "__mro__") {
+            return Err(type_error(format!(
+                "attribute '{name}' of 'type' objects is not writable"
+            )));
+        }
+        ty.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_str(name)), value);
+        // Reassigning `__getattribute__` changes the resolved slot for this
+        // type and its subclasses; drop the cached classification.
+        if name == "__getattribute__" {
+            ty.invalidate_getattribute_cache();
+        }
+        Ok(())
+    }
+
+    /// CPython `type_setattro`'s delete half: remove a name from the class's
+    /// own dict. Rejects immutable types and the read-only layout getsets.
+    pub(crate) fn del_type_attr_direct(
+        &mut self,
+        ty: &Rc<TypeObject>,
+        name: &str,
+    ) -> Result<(), RuntimeError> {
+        if ty.flags.is_builtin {
+            return Err(type_error(format!(
+                "cannot delete '{name}' attribute of immutable type '{}'",
+                ty.name
+            )));
+        }
+        if matches!(name, "__dict__" | "__weakref__") {
+            return Err(type_error(format!(
+                "attribute '{name}' of 'type' objects is not writable"
+            )));
+        }
+        // `__name__`/`__qualname__`/`__bases__`/`__doc__` are getset slots
+        // with no deleter — even on a mutable class, deleting raises
+        // `TypeError` rather than `AttributeError` (test_descr test_qualname:
+        // `del X.__qualname__`). `__qualname__`/`__name__` live in dedicated
+        // fields, never the dict, so they'd otherwise fall through below.
+        if matches!(name, "__name__" | "__qualname__" | "__bases__" | "__doc__") {
+            return Err(type_error(format!("can't delete {}.{}", ty.name, name)));
+        }
+        let removed = ty
+            .dict
+            .borrow_mut()
+            .shift_remove(&DictKey(Object::from_str(name)))
+            .is_some();
+        if !removed {
+            return Err(attribute_error(format!(
+                "type object '{}' has no attribute '{}'",
+                ty.name, name
+            )));
+        }
+        if name == "__getattribute__" {
+            ty.invalidate_getattribute_cache();
+        }
+        Ok(())
+    }
+
     fn store_attr(&mut self, obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError> {
         match obj {
             Object::Instance(inst) => self.store_attr_instance(inst, obj, name, value),
@@ -12595,6 +12857,13 @@ impl Interpreter {
                 *p.doc.borrow_mut() = value;
                 Ok(())
             }
+            // `property.fget`/`fset`/`fdel` are read-only member descriptors
+            // in CPython; assigning raises `AttributeError: readonly
+            // attribute` (test_descr test_properties). The accessor triple is
+            // replaced via `.getter()`/`.setter()`/`.deleter()` instead.
+            Object::Property(_) if matches!(name, "fget" | "fset" | "fdel") => {
+                Err(attribute_error("readonly attribute"))
+            }
             // `classmethod`/`staticmethod` wrappers carry a writable
             // instance dict (bpo-43682): `cm.x = 42` just works.
             Object::StaticMethod(w) | Object::ClassMethod(w) => {
@@ -12604,15 +12873,11 @@ impl Interpreter {
                 Ok(())
             }
             Object::Type(ty) => {
-                if ty.flags.is_builtin {
-                    return Err(type_error(format!(
-                        "cannot set '{name}' attribute of immutable type '{}'",
-                        ty.name
-                    )));
-                }
                 // A user metaclass `__setattr__` intercepts class-attribute
                 // writes (CPython: `type(cls).__setattr__(cls, …)` —
-                // `EnumType.__setattr__` raises on member reassignment).
+                // `EnumType.__setattr__` raises on member reassignment). The
+                // builtin `type.__setattr__` is *not* a user override, so it
+                // falls through to the direct setter below.
                 if let Some(method) = metaclass_method(obj, "__setattr__") {
                     if !matches!(
                         method,
@@ -12628,35 +12893,7 @@ impl Interpreter {
                         return Ok(());
                     }
                 }
-                // `cls.__bases__ = (…)` — CPython's `type_set_bases`:
-                // validate, recompute the MRO of the class and all its
-                // subclasses (rolling back on failure), and re-home the
-                // subclass registries.
-                if name == "__bases__" {
-                    return self.type_set_bases(ty, &value);
-                }
-                // `cls.__qualname__ = …` goes through the `type` getset in
-                // CPython: it updates the slot without touching `__dict__`.
-                if name == "__qualname__" {
-                    let Object::Str(s) = &value else {
-                        return Err(type_error(format!(
-                            "can only assign string to {}.__qualname__, not '{}'",
-                            ty.name,
-                            value.type_name()
-                        )));
-                    };
-                    *ty.qualname.borrow_mut() = Some(s.to_string());
-                    return Ok(());
-                }
-                ty.dict
-                    .borrow_mut()
-                    .insert(DictKey(Object::from_str(name)), value);
-                // Reassigning `__getattribute__` changes the resolved slot for
-                // this type and its subclasses; drop the cached classification.
-                if name == "__getattribute__" {
-                    ty.invalidate_getattribute_cache();
-                }
-                Ok(())
+                self.set_type_attr_direct(ty, name, value)
             }
             Object::Module(m) => {
                 m.dict
@@ -12970,16 +13207,24 @@ impl Interpreter {
             if Rc::ptr_eq(&old_cls, new_cls) {
                 return Ok(());
             }
+            // CPython `object_set_class`: when *both* the old and new types are
+            // subtypes of `ModuleType`, the immutable-type guard is waived and
+            // the layout is always compatible (a module subclass adds no
+            // struct offset over `module`). This lets a module instance be
+            // re-pointed at a `ModuleType` subclass and back
+            // (test_object_class_assignment_between_heaptypes_and_nonheaptypes).
+            let module_ty = builtin_types().module_.clone();
+            if old_cls.is_subclass_of(&module_ty) && new_cls.is_subclass_of(&module_ty) {
+                inst.set_cls(new_cls.clone());
+                return Ok(());
+            }
             if old_cls.flags.is_builtin || new_cls.flags.is_builtin {
                 return Err(type_error(
                     "__class__ assignment only supported for mutable types \
                      or ModuleType subclasses",
                 ));
             }
-            let compatible = old_cls.solid_base_name() == new_cls.solid_base_name()
-                && old_cls.forbids_dict == new_cls.forbids_dict
-                && *old_cls.slot_names.borrow() == *new_cls.slot_names.borrow();
-            if !compatible {
+            if !Self::class_assign_compatible(&old_cls, new_cls) {
                 return Err(type_error(format!(
                     "__class__ assignment: '{}' object layout differs from '{}'",
                     new_cls.name, old_cls.name
@@ -12994,6 +13239,14 @@ impl Interpreter {
         // itself as the instance dict; our `Rc` field can't be swapped,
         // so we copy `d`'s contents instead.
         if name == "__dict__" && !inst.cls().forbids_dict {
+            // A module subclass inherits `module.__dict__`, a read-only
+            // getset: the namespace stays mutable but the attribute itself
+            // can't be reassigned (test_set_dict).
+            if inst.cls().is_subclass_of(&builtin_types().module_) {
+                return Err(attribute_error(
+                    "attribute '__dict__' of 'module' objects is not writable".to_owned(),
+                ));
+            }
             // A dict *subclass* instance is accepted too (CPython only
             // checks `PyDict_Check`; `self.__dict__ = self` for a dict
             // subclass is the test_cycle_through_dict pattern).
@@ -13121,7 +13374,12 @@ impl Interpreter {
             }
             Object::Type(ty) => {
                 // A user metaclass `__delattr__` intercepts class-attribute
-                // deletion (`EnumType.__delattr__` raises for members).
+                // deletion (`EnumType.__delattr__` raises for members). The
+                // builtin `type.__delattr__` is not a user override and falls
+                // through to the direct deleter below — which removes the name
+                // from the class's *own* dict only (inherited attributes can't
+                // be deleted via a subclass; `__dict__`/`__weakref__` are
+                // read-only layout getsets, test_set_dict).
                 if let Some(method) = metaclass_method(obj, "__delattr__") {
                     if !matches!(
                         method,
@@ -13132,26 +13390,7 @@ impl Interpreter {
                         return Ok(());
                     }
                 }
-                // `del Cls.attr` (CPython `type.__delattr__`) removes the
-                // name from the class's *own* dict only — inherited
-                // attributes can't be deleted via a subclass. Mirrors
-                // `assertFalse(hasattr(A, 'foo'))` after `del A.foo` in
-                // `abc.update_abstractmethods` round-trips.
-                let removed = ty
-                    .dict
-                    .borrow_mut()
-                    .shift_remove(&DictKey(Object::from_str(name)))
-                    .is_some();
-                if !removed {
-                    return Err(attribute_error(format!(
-                        "type object '{}' has no attribute '{}'",
-                        ty.name, name
-                    )));
-                }
-                if name == "__getattribute__" {
-                    ty.invalidate_getattribute_cache();
-                }
-                Ok(())
+                self.del_type_attr_direct(ty, name)
             }
             // `del module.attr` removes the name from the module dict
             // (CPython `module_setattro` with a NULL value).
@@ -13232,6 +13471,13 @@ impl Interpreter {
         // dropped and the instance reverts to an empty dict; the
         // inline-values state is permanently cleared.
         if name == "__dict__" && !inst.cls().forbids_dict {
+            // Module subclasses inherit the read-only `module.__dict__`
+            // getset — deletion is rejected (test_set_dict).
+            if inst.cls().is_subclass_of(&builtin_types().module_) {
+                return Err(attribute_error(
+                    "attribute '__dict__' of 'module' objects is not writable".to_owned(),
+                ));
+            }
             inst.dict.borrow_mut().clear();
             inst.inline_values.set(false);
             return Ok(());
@@ -13886,6 +14132,7 @@ impl Interpreter {
                         | "writelines"
                         | "enumerate"
                         | "prod"
+                        | "getsizeof"
                 )
         }
         let _ = outer_globals;
@@ -14126,6 +14373,22 @@ impl Interpreter {
                     }
                     if b.name == "hash" && args.len() == 1 {
                         return self.do_hash_call(&args[0], outer_globals);
+                    }
+                    // `sys.getsizeof(obj)` performs a special-method lookup of
+                    // `__sizeof__` on the *type*, honouring the descriptor
+                    // protocol (test_descr test_special_method_lookup). When a
+                    // class defines `__sizeof__` we dispatch it (descriptor or
+                    // plain) and add the GC-header overhead CPython tacks on;
+                    // otherwise we fall through to the native size estimate.
+                    if b.name == "getsizeof" && (args.len() == 1 || args.len() == 2) {
+                        if let Some(m) = instance_method(&args[0], "__sizeof__") {
+                            let n = self.call(&m, &[], &[], outer_globals)?;
+                            let n = n.as_i64().ok_or_else(|| {
+                                type_error("__sizeof__() should return an int")
+                            })?;
+                            // + sizeof(PyGC_Head): heap instances are GC-tracked.
+                            return Ok(Object::Int(n + 16));
+                        }
                     }
                     if b.name == "getattr" && (args.len() == 2 || args.len() == 3) {
                         return self.do_getattr_call(args, outer_globals);
@@ -14437,6 +14700,49 @@ impl Interpreter {
                     // (`dir(SomeEnum)` → `EnumType.__dir__`). CPython sorts
                     // the result.
                     if b.name == "dir" && args.len() == 1 {
+                        // CPython `module_dir`: a module (or module subclass
+                        // instance) reports the keys of its own `__dict__`,
+                        // not the type-MRO namespace `object.__dir__` walks.
+                        // Reading `__dict__` honours a subclass property
+                        // override, and a non-dict result is a TypeError.
+                        if let Object::Instance(inst) = &args[0] {
+                            if inst
+                                .cls()
+                                .is_subclass_of(&crate::builtin_types::builtin_types().module_)
+                            {
+                                let d = self.load_attr(&args[0], "__dict__")?;
+                                let dict_rc = match &d {
+                                    Object::Dict(dd) | Object::MappingProxy(dd) => dd.clone(),
+                                    _ => {
+                                        return Err(type_error(format!(
+                                            "{}.__dict__ is not a dictionary",
+                                            inst.cls().name
+                                        )))
+                                    }
+                                };
+                                // A module-level `__dir__` in the dict wins.
+                                let custom = dict_rc
+                                    .borrow()
+                                    .get(&DictKey(Object::from_static("__dir__")))
+                                    .cloned();
+                                if let Some(dirfunc) = custom {
+                                    let r = self.call(&dirfunc, &[], &[], outer_globals)?;
+                                    return Ok(r);
+                                }
+                                let mut names: Vec<String> = dict_rc
+                                    .borrow()
+                                    .keys()
+                                    .filter_map(|k| match &k.0 {
+                                        Object::Str(s) => Some(s.to_string()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                names.sort();
+                                return Ok(Object::new_list(
+                                    names.into_iter().map(Object::from_str).collect(),
+                                ));
+                            }
+                        }
                         let method = instance_method(&args[0], "__dir__")
                             .or_else(|| metaclass_method(&args[0], "__dir__"));
                         if let Some(method) = method {
@@ -14555,7 +14861,7 @@ impl Interpreter {
             // Since Python 3.10 (bpo-43682) `staticmethod` objects are
             // themselves callable and simply forward to the wrapped
             // function with the arguments unchanged.
-            Object::StaticMethod(inner) => self.call(&inner.func, args, kwargs, outer_globals),
+            Object::StaticMethod(inner) => self.call(&inner.func(), args, kwargs, outer_globals),
             Object::BoundMethod(bm) => {
                 // Generator / coroutine / async-generator methods are
                 // wired through internal builtin names so the
@@ -14752,23 +15058,26 @@ impl Interpreter {
                 // callable) must call `function` directly with the class
                 // prepended, never re-invoking `function.__get__`.
                 if bm.redispatch_descriptor {
-                    if let Object::Instance(d) = &bm.function {
-                        if let Some(get) = d.cls().lookup("__get__") {
-                            let owner =
-                                Object::Type(crate::builtins::class_of(&bm.receiver));
-                            let bound_get =
-                                Object::BoundMethod(Rc::new(BoundMethod::new(
-                                    bm.function.clone(),
-                                    get,
-                                )));
-                            let target = self.call(
-                                &bound_get,
-                                &[bm.receiver.clone(), owner],
-                                &[],
-                                outer_globals,
-                            )?;
-                            return self.call(&target, args, kwargs, outer_globals);
-                        }
+                    // A special method that is itself a *non-function*
+                    // descriptor — a `property`, `classmethod`/`staticmethod`,
+                    // or a user descriptor instance with `__get__`
+                    // (`class X: __getitem__ = property(...)`,
+                    // `__getattribute__ = SomeDescriptor()`). CPython's slot
+                    // lookup invokes `descr.__get__(obj, type(obj))` and calls
+                    // the result; plain functions are bound below by
+                    // prepending `self`, so they must NOT redispatch.
+                    let is_descr = match &bm.function {
+                        Object::Property(_)
+                        | Object::StaticMethod(_)
+                        | Object::ClassMethod(_) => true,
+                        Object::Instance(d) => d.cls().lookup("__get__").is_some(),
+                        _ => false,
+                    };
+                    if is_descr {
+                        let owner = Object::Type(crate::builtins::class_of(&bm.receiver));
+                        let target =
+                            self.descriptor_get(&bm.function, &bm.receiver, &owner)?;
+                        return self.call(&target, args, kwargs, outer_globals);
                     }
                 }
                 let mut combined: Vec<Object> = Vec::with_capacity(args.len() + 1);
@@ -15089,6 +15398,22 @@ impl Interpreter {
         kwds: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
+        let bases_tuple =
+            Object::new_tuple(bases.iter().map(|b| Object::Type(b.clone())).collect());
+        self.call_metaclass_prepare_tuple(metaclass, name, &bases_tuple, kwds, globals)
+    }
+
+    /// As [`Self::call_metaclass_prepare`], but with the bases already
+    /// packed into a tuple `Object` — used by the non-`type` metaclass path
+    /// where bases aren't all guaranteed to be `TypeObject`s.
+    fn call_metaclass_prepare_tuple(
+        &mut self,
+        metaclass: &Rc<TypeObject>,
+        name: &str,
+        bases_tuple: &Object,
+        kwds: &[(String, Object)],
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
         let prep = match metaclass.lookup("__prepare__") {
             Some(p) => p,
             None => return Ok(None),
@@ -15097,22 +15422,23 @@ impl Interpreter {
         // as the implicit first argument when needed.
         let (callable, prefix): (Object, Vec<Object>) = match &prep {
             Object::ClassMethod(inner) => {
-                (inner.func.clone(), vec![Object::Type(metaclass.clone())])
+                (inner.func(), vec![Object::Type(metaclass.clone())])
             }
-            Object::StaticMethod(inner) => (inner.func.clone(), Vec::new()),
+            Object::StaticMethod(inner) => (inner.func(), Vec::new()),
             other => (other.clone(), vec![Object::Type(metaclass.clone())]),
         };
-        let bases_tuple =
-            Object::new_tuple(bases.iter().map(|b| Object::Type(b.clone())).collect());
+        let bases_tuple = bases_tuple.clone();
         let mut call_args = prefix;
         call_args.push(Object::from_str(name));
         call_args.push(bases_tuple);
         let result = self.call(&callable, &call_args, kwds, globals)?;
-        // A plain dict means there's nothing to observe — keep the fast path.
-        if matches!(result, Object::Dict(_)) {
-            Ok(None)
-        } else {
-            Ok(Some(result))
+        // An *empty* plain dict means there's nothing to observe — keep the
+        // fast path. A pre-populated dict (a `__prepare__` that seeds entries,
+        // e.g. `ns['BMeta_was_here'] = True`) must be used as the class
+        // namespace so those entries survive into `__dict__` (test_metaclass).
+        match &result {
+            Object::Dict(d) if d.borrow().is_empty() => Ok(None),
+            _ => Ok(Some(result)),
         }
     }
 
@@ -15244,8 +15570,20 @@ impl Interpreter {
         };
         {
             let bt = builtin_types();
-            let mut winner: Rc<TypeObject> =
-                explicit_meta_type.clone().unwrap_or_else(|| bt.type_.clone());
+            // CPython's `__build_class__` seeds the metaclass with the type of
+            // the *first base* (or `type` when there are no bases) before the
+            // winner calculation. This matters when bases are instances of a
+            // non-`type` metaclass (test_metaclass): `class C(A, B)` where
+            // `type(A)`/`type(B)` aren't `type` subclasses must still resolve
+            // to the most-derived of those metaclasses, not error out against a
+            // hardcoded `type` seed.
+            let mut winner: Rc<TypeObject> = explicit_meta_type.clone().unwrap_or_else(|| {
+                match resolved_bases.first() {
+                    Some(Object::Type(t)) => t.metaclass_or_type(),
+                    Some(other) => crate::builtins::class_of(other),
+                    None => bt.type_.clone(),
+                }
+            });
             for b in &resolved_bases {
                 let m = match b {
                     Object::Type(t) => t.metaclass_or_type(),
@@ -15434,6 +15772,15 @@ impl Interpreter {
             let mut dict = class_ns.borrow().clone();
             let classcell =
                 dict.shift_remove(&DictKey(Object::from_static("__classcell__")));
+            // CPython rejects a non-cell `__classcell__` (test_slots_special2).
+            if let Some(cc) = &classcell {
+                if !matches!(cc, Object::Cell(_)) {
+                    return Err(type_error(format!(
+                        "__classcell__ must be a nonlocal cell, not <class '{}'>",
+                        crate::builtins::class_of(cc).qualified_display_name()
+                    )));
+                }
+            }
             let ty = TypeObject::new_user(&name, bases.clone(), dict)?;
             ty.set_metaclass(metaclass.clone());
             // PEP 3135: fill the `__class__` cell before any hook runs.
@@ -15474,15 +15821,15 @@ impl Interpreter {
             let is_type_new_sentinel = matches!(
                 new_method.as_ref(),
                 Some(Object::StaticMethod(inner)) if matches!(
-                    &inner.func,
+                    &inner.func(),
                     Object::Builtin(b) if b.name == "__new__"
                 )
             );
             let class_obj = match &new_method {
                 Some(_) if !is_type_new_sentinel => {
                     let callable = match new_method.as_ref().unwrap() {
-                        Object::StaticMethod(inner) => inner.func.clone(),
-                        Object::ClassMethod(inner) => inner.func.clone(),
+                        Object::StaticMethod(inner) => inner.func(),
+                        Object::ClassMethod(inner) => inner.func(),
                         other => other.clone(),
                     };
                     let mut new_args = Vec::with_capacity(call_args.len() + 1);
@@ -15581,6 +15928,23 @@ impl Interpreter {
         subclass_kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
         let class_ns = Rc::new(RefCell::new(DictData::new()));
+        // PEP 3115: a non-`type` metaclass still has its `__prepare__` called
+        // (recorded by `BNotMeta.__prepare__` chaining through `super()` in
+        // test_metaclass). Seed the body namespace with whatever it returns.
+        if let Object::Type(mt) = &meta {
+            let bases_tuple = Object::new_tuple(bases.to_vec());
+            if let Some(prepared) = self.call_metaclass_prepare_tuple(
+                mt,
+                name,
+                &bases_tuple,
+                subclass_kwargs,
+                &body_fn.globals,
+            )? {
+                if let Object::Dict(d) = &prepared {
+                    *class_ns.borrow_mut() = d.borrow().clone();
+                }
+            }
+        }
         {
             // Only `__module__` is injected (see the main build path);
             // `__qualname__` is stored by the compiled class body itself.
@@ -15656,14 +16020,14 @@ impl Interpreter {
         let is_type_new_sentinel = matches!(
             new_method.as_ref(),
             Some(Object::StaticMethod(inner)) if matches!(
-                &inner.func,
+                &inner.func(),
                 Object::Builtin(b) if b.name == "__new__"
             )
         );
         if let Some(new_method) = new_method {
             if !is_type_new_sentinel {
                 let callable = match &new_method {
-                    Object::StaticMethod(inner) | Object::ClassMethod(inner) => inner.func.clone(),
+                    Object::StaticMethod(inner) | Object::ClassMethod(inner) => inner.func(),
                     other => other.clone(),
                 };
                 let mut new_args = Vec::with_capacity(args.len() + 1);
@@ -15773,6 +16137,17 @@ impl Interpreter {
         // PEP 3135: `type.__new__` pops `__classcell__` from the namespace
         // and points it at the new class before any creation hook runs.
         let classcell = ns.shift_remove(&DictKey(Object::from_static("__classcell__")));
+        // CPython's `type_new_set_classcell` rejects a `__classcell__` that
+        // isn't an actual cell (e.g. `__classcell__ = 42`), reported as the
+        // repr of its type (test_slots_special2).
+        if let Some(cc) = &classcell {
+            if !matches!(cc, Object::Cell(_)) {
+                return Err(type_error(format!(
+                    "__classcell__ must be a nonlocal cell, not <class '{}'>",
+                    crate::builtins::class_of(cc).qualified_display_name()
+                )));
+            }
+        }
         let ty = TypeObject::new_user(&name, effective_bases.clone(), ns)?;
         ty.set_metaclass(metaclass.clone());
         if let Some(Object::Cell(cell)) = classcell {
@@ -16154,8 +16529,21 @@ impl Interpreter {
             // CPython accepts a single string or any iterable of strings
             // (tuple/list/set/dict/generator — `type_new` tuples it up via
             // `PySequence_Tuple`).
+            // `PyUnicode_Check` accepts `str` subclasses, so a slot name may
+            // be a plain `str` *or* an instance of a `str` subclass whose
+            // native payload is a string (gh-98783, test_slots).
+            let slot_str = |v: &Object| -> Option<String> {
+                match v {
+                    Object::Str(s) => Some(s.to_string()),
+                    Object::Instance(inst) => match &inst.native {
+                        Some(Object::Str(s)) => Some(s.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
             let names = match &slots {
-                Object::Str(s) => vec![s.to_string()],
+                _ if slot_str(&slots).is_some() => vec![slot_str(&slots).unwrap()],
                 other => {
                     let mut it = other.make_iter().map_err(|_| {
                         type_error(&format!(
@@ -16165,10 +16553,11 @@ impl Interpreter {
                     })?;
                     let mut out = Vec::new();
                     while let Some(v) = it.next_value() {
-                        if let Object::Str(s) = v {
-                            out.push(s.to_string());
-                        } else {
-                            return Err(type_error("__slots__ items must be str"));
+                        match slot_str(&v) {
+                            Some(s) => out.push(s),
+                            None => {
+                                return Err(type_error("__slots__ items must be str"));
+                            }
                         }
                     }
                     out
@@ -16351,11 +16740,87 @@ impl Interpreter {
 
     /// Run `__init_subclass__` for the first base in MRO order that
     /// defines it (excluding the new class itself). PEP 487.
+    /// `super(type[, obj])` — the constructor reached when the `super`
+    /// type (or the zero-arg `super()` call) is invoked. `proxy_type` is
+    /// the concrete class to instantiate (`super` itself here; a user
+    /// subclass goes through `__new__`/`__init__` instead).
+    fn build_super(
+        &mut self,
+        proxy_type: Rc<TypeObject>,
+        args: &[Object],
+    ) -> Result<Object, RuntimeError> {
+        match args.len() {
+            1 => match &args[0] {
+                Object::Type(t) => Ok(crate::builtins::make_unbound_super(t.clone())),
+                _ => Err(type_error("super() argument 1 must be a type")),
+            },
+            2 => {
+                let Object::Type(class) = &args[0] else {
+                    return Err(type_error("super() argument 1 must be a type"));
+                };
+                let receiver = args[1].clone();
+                let receiver_class = self.supercheck_full(class, &receiver)?;
+                Ok(crate::builtins::build_super_proxy(
+                    proxy_type,
+                    class.clone(),
+                    receiver,
+                    receiver_class,
+                ))
+            }
+            _ => Err(type_error(
+                "super(): expected 2 arguments (zero-arg form must be called from inside a method)",
+            )),
+        }
+    }
+
+    /// CPython `supercheck` including the slow `__class__` fallback: a duck
+    /// typed proxy whose `__class__` is a subtype of `type` is accepted
+    /// (test_proxy_super). Running the lookup may execute a user
+    /// `__getattribute__`, so this needs the interpreter.
+    fn supercheck_full(
+        &mut self,
+        class: &Rc<TypeObject>,
+        receiver: &Object,
+    ) -> Result<Rc<TypeObject>, RuntimeError> {
+        if let Object::Type(t) = receiver {
+            if Rc::ptr_eq(t, class) || t.is_subclass_of(class) {
+                return Ok(t.clone());
+            }
+        }
+        let oc = crate::builtins::class_of(receiver);
+        if oc.is_subclass_of(class) {
+            return Ok(oc);
+        }
+        // Slow path: honour a `__class__` that's a subtype of `type`
+        // (proxies that forward attribute access to a wrapped object).
+        if !matches!(receiver, Object::Type(_)) {
+            if let Ok(Object::Type(ca)) = self.load_attr(receiver, "__class__") {
+                if !Rc::ptr_eq(&ca, &oc) && ca.is_subclass_of(class) {
+                    return Ok(ca);
+                }
+            }
+        }
+        Err(type_error(
+            "super(type, obj): obj must be an instance or subtype of type",
+        ))
+    }
+
     fn invoke_init_subclass(
         &mut self,
         ty: &Rc<TypeObject>,
         subclass_kwargs: &[(String, Object)],
     ) -> Result<(), RuntimeError> {
+        // CPython's `type_new_init_subclass` builds `super(cls, cls)`
+        // *unconditionally* (before any hook lookup); its constructor
+        // requires `cls` to be a subtype of itself, i.e. present in its own
+        // MRO. A custom metaclass `mro()` that returns a result omitting the
+        // class (e.g. `(B,)`) makes this fail with the exact super error
+        // (gh-92112, test_disappearing_custom_mro).
+        if !ty.mro.borrow().iter().any(|t| Rc::ptr_eq(t, ty)) {
+            return Err(type_error(
+                "super(type, obj): obj must be an instance or subtype of type".to_owned(),
+            ));
+        }
         // Snapshot the MRO and bind the hook into a local first so we
         // can drop every borrow before re-entering the VM. The user
         // hook is free to mutate any class in the chain.
@@ -16378,7 +16843,7 @@ impl Interpreter {
         // CPython treats __init_subclass__ as an implicit classmethod
         // regardless of how it was defined.
         let callable = match hook {
-            Object::ClassMethod(inner) => inner.func.clone(),
+            Object::ClassMethod(inner) => inner.func(),
             other => other,
         };
         let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
@@ -16612,6 +17077,18 @@ impl Interpreter {
                          args[1].clone(),
                          args[0].clone(),
                     ))));
+                }
+                // `super(type[, obj])` — the type doubles as its
+                // constructor (zero-arg `super()` arrives here too, with
+                // `type`/`obj` injected by the VM call path). A *subclass*
+                // of `super` (`class mysuper(super)`) is not a builtin
+                // type, so it instead flows through the normal
+                // `__new__`/`__init__` path and `super.__init__`.
+                "super" => {
+                    if !kwargs.is_empty() {
+                        return Err(type_error("super() takes no keyword arguments"));
+                    }
+                    return self.build_super(cls.clone(), args);
                 }
                 _ => {}
             }
@@ -16864,7 +17341,7 @@ impl Interpreter {
             &new_fn,
             Some(Object::StaticMethod(inner))
                 if matches!(
-                    &inner.func,
+                    &inner.func(),
                     Object::Builtin(b) if b.name == "__new__"
                 )
         );
@@ -16872,14 +17349,14 @@ impl Interpreter {
             Some(_) if !is_object_new => {
                 // User-defined `__new__` — pass cls + args + kwargs.
                 let callable = match new_fn.unwrap() {
-                    Object::StaticMethod(inner) => inner.func.clone(),
+                    Object::StaticMethod(inner) => inner.func(),
                     // A `classmethod`-wrapped `__new__` binds `cls` like any
                     // attribute access would, and `type.__call__` still
                     // passes `cls` explicitly — the target sees it twice
                     // (CPython: `C(1, 2)` → `f(C, C, 1, 2)`).
                     Object::ClassMethod(inner) => Object::BoundMethod(Rc::new(BoundMethod::new(
                          Object::Type(cls.clone()),
-                         inner.func.clone(),
+                         inner.func(),
                     ))),
                     other => other,
                 };
@@ -16913,11 +17390,15 @@ impl Interpreter {
                 } else if cls.is_subclass_of(&bt.classmethod_)
                     && !Rc::ptr_eq(&cls, &bt.classmethod_)
                 {
-                    Some(builtins::construct_classmethod(args)?)
+                    // CPython `cm_new`: `__func__` is left `None` and set
+                    // by `cm_init`; passing no callable here means a
+                    // subclass with a non-chaining `__init__` keeps it
+                    // `None` (test_descr test_classmethod_new).
+                    Some(builtins::construct_classmethod(&[])?)
                 } else if cls.is_subclass_of(&bt.staticmethod_)
                     && !Rc::ptr_eq(&cls, &bt.staticmethod_)
                 {
-                    Some(builtins::construct_staticmethod(args)?)
+                    Some(builtins::construct_staticmethod(&[])?)
                 } else {
                     // Subclasses of the value/container built-ins
                     // (`class C(list)`, `class C(int)`, …) wrap a native
@@ -19882,7 +20363,7 @@ fn fallback_globals() -> Rc<RefCell<DictData>> {
 /// First-line docstrings for the built-in types (CPython's
 /// `tp_doc`). Tests assert on the leading `"<type>("` shape; the
 /// bodies are abbreviated.
-fn builtin_type_doc(name: &str) -> Option<&'static str> {
+pub(crate) fn builtin_type_doc(name: &str) -> Option<&'static str> {
     Some(match name {
         "bytes" => {
             "bytes(iterable_of_ints) -> bytes\n\
@@ -22518,7 +22999,14 @@ fn find_handler(table: &[ExcHandler], pc: u32) -> Option<&ExcHandler> {
 }
 
 fn is_super_callable(obj: &Object) -> bool {
-    matches!(obj, Object::Builtin(b) if b.name == "super")
+    // `super` is now the real type; the legacy builtin-function form is
+    // kept as a fallback for globals dicts that never received the
+    // `as_globals` override.
+    match obj {
+        Object::Builtin(b) => b.name == "super",
+        Object::Type(t) => Rc::ptr_eq(t, &builtin_types().super_),
+        _ => false,
+    }
 }
 
 /// Numeric protocol data attributes exposed by the ``numbers`` ABC

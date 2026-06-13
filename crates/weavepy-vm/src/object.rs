@@ -202,8 +202,8 @@ impl fmt::Debug for Object {
             Object::FrozenSet(s) => f.debug_set().entries(s.iter()).finish(),
             Object::File(file) => write!(f, "<file {:?}>", file.name),
             Object::Property(_) => write!(f, "<property>"),
-            Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", &inner.func),
-            Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", &inner.func),
+            Object::StaticMethod(inner) => write!(f, "<staticmethod {:?}>", &inner.func()),
+            Object::ClassMethod(inner) => write!(f, "<classmethod {:?}>", &inner.func()),
             Object::SlotDescriptor(sd) => write!(f, "<slot {:?} of {:?}>", sd.name, sd.class_name),
             Object::Frame(fr) => write!(f, "<frame at 0x{:x}>", Rc::as_ptr(fr) as usize),
             Object::Traceback(tb) => write!(f, "<traceback at 0x{:x}>", Rc::as_ptr(tb) as usize),
@@ -641,13 +641,29 @@ pub struct PyDictView {
 /// the wrapper afterwards (`cm.x = 42`).
 #[derive(Debug)]
 pub struct MethodWrapper {
-    pub func: Object,
+    /// The wrapped callable. Interior-mutable because CPython's
+    /// `classmethod`/`staticmethod` set `sm_callable`/`cm_callable` in
+    /// `__init__` (not `__new__`), so a subclass that overrides
+    /// `__init__` without chaining leaves `__func__` as `None`
+    /// (test_descr `test_classmethod_new` / `test_staticmethod_new`).
+    func: RefCell<Object>,
     pub dict: Rc<RefCell<DictData>>,
 }
 
 impl MethodWrapper {
     pub fn new(func: Object) -> Rc<Self> {
-        let dict: DictData = match &func {
+        let dict = Self::wrapper_dict_for(&func);
+        Rc::new(Self {
+            func: RefCell::new(func),
+            dict: Rc::new(RefCell::new(dict)),
+        })
+    }
+
+    /// CPython's `functools.WRAPPER_ASSIGNMENTS` copy that `cm_init` /
+    /// `sm_init` perform: seed the wrapper's instance dict from the
+    /// wrapped callable.
+    fn wrapper_dict_for(func: &Object) -> DictData {
+        match func {
             // Copy `functools.WRAPPER_ASSIGNMENTS` from a plain function
             // (CPython skips attributes the callable doesn't have, and
             // only functions are guaranteed to carry all five).
@@ -709,11 +725,22 @@ impl MethodWrapper {
                     _ => DictData::new(),
                 }
             }
-        };
-        Rc::new(Self {
-            func,
-            dict: Rc::new(RefCell::new(dict)),
-        })
+        }
+    }
+
+    /// The wrapped callable (a clone of the current value).
+    pub fn func(&self) -> Object {
+        self.func.borrow().clone()
+    }
+
+    /// Replace the wrapped callable and re-seed the wrapper dict from it,
+    /// matching CPython's `cm_init`/`sm_init` (which set the callable and
+    /// run the functools-wraps copy). A subclass that overrides
+    /// `__init__` without chaining never reaches here, so its `__func__`
+    /// stays `None`.
+    pub fn set_func(&self, func: Object) {
+        *self.dict.borrow_mut() = Self::wrapper_dict_for(&func);
+        *self.func.borrow_mut() = func;
     }
 }
 
@@ -3075,6 +3102,9 @@ impl Object {
             }
             Object::Builtin(b) => format!("<built-in function {}>", b.name),
             // CPython `method_repr`: `<bound method qualname of repr(self)>`.
+            // The name is `func.__qualname__` then `func.__name__`, and
+            // finally `?` when the wrapped callable carries neither — e.g.
+            // a `types.MethodType` bound over an arbitrary callable object.
             Object::BoundMethod(bm) => {
                 let qual = match &bm.function {
                     Object::Function(f) => f
@@ -3083,6 +3113,22 @@ impl Object {
                         .map(Object::to_str)
                         .unwrap_or_else(|| f.code().qualname.clone()),
                     Object::Builtin(b) => b.name.to_owned(),
+                    Object::Instance(i) => {
+                        let pick = |key: &str| -> Option<String> {
+                            if let Some(Object::Str(s)) =
+                                i.dict.borrow().get(&DictKey(Object::from_str(key)))
+                            {
+                                return Some(s.to_string());
+                            }
+                            match i.cls().lookup(key) {
+                                Some(Object::Str(s)) => Some(s.to_string()),
+                                _ => None,
+                            }
+                        };
+                        pick("__qualname__")
+                            .or_else(|| pick("__name__"))
+                            .unwrap_or_else(|| "?".to_owned())
+                    }
                     other => other.repr(),
                 };
                 format!("<bound method {} of {}>", qual, bm.receiver.repr())
@@ -3139,6 +3185,24 @@ impl Object {
                 file.mode
             ),
             Object::Instance(inst) => {
+                // The `Ellipsis` / `NotImplemented` singletons render as
+                // fixed text — CPython's `ellipsis`/`NotImplementedType`
+                // `tp_repr`. We supply it here, keyed on the registry type
+                // identity, rather than via a `__repr__` dict entry that
+                // would otherwise leak into `dir()` (test_descr test_dir
+                // requires `dir(Ellipsis) == dir(object())`).
+                {
+                    let cls = inst.cls();
+                    if cls.name == "ellipsis" || cls.name == "NotImplementedType" {
+                        let bt = crate::builtin_types::builtin_types();
+                        if Rc::ptr_eq(&cls, &bt.ellipsis_) {
+                            return "Ellipsis".to_owned();
+                        }
+                        if Rc::ptr_eq(&cls, &bt.not_implemented_type_) {
+                            return "NotImplemented".to_owned();
+                        }
+                    }
+                }
                 // Defer to __repr__ on the class when present. This path
                 // is reached from *native* rendering (container reprs,
                 // error messages, the Debug impl), so the user `__repr__`
@@ -3182,8 +3246,8 @@ impl Object {
             // CPython 3.10+: `<staticmethod(<function f at 0x..>)>` — the
             // wrapped callable's repr is embedded so the address matches
             // `'{!r}'.format(func)`.
-            Object::StaticMethod(inner) => format!("<staticmethod({})>", inner.func.repr()),
-            Object::ClassMethod(inner) => format!("<classmethod({})>", inner.func.repr()),
+            Object::StaticMethod(inner) => format!("<staticmethod({})>", inner.func().repr()),
+            Object::ClassMethod(inner) => format!("<classmethod({})>", inner.func().repr()),
             Object::SlotDescriptor(sd) => {
                 format!("<member '{}' of '{}' objects>", sd.name, sd.class_name)
             }

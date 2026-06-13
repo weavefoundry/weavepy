@@ -336,6 +336,89 @@ impl TypeObject {
             .map(|t| t.name.clone())
     }
 
+    /// Does this type install its own `__dict__` slot (CPython's
+    /// `tp_dictoffset` added at this level)? Used by the `__class__`
+    /// assignment layout check (`same_slots_added`).
+    pub fn adds_own_dict(&self) -> bool {
+        self.dict
+            .borrow()
+            .contains_key(&DictKey(Object::from_static("__dict__")))
+    }
+
+    /// Does this type install its own `__weakref__` slot (CPython's
+    /// `tp_weaklistoffset` added at this level)?
+    pub fn adds_own_weakref(&self) -> bool {
+        self.dict
+            .borrow()
+            .contains_key(&DictKey(Object::from_static("__weakref__")))
+    }
+
+    /// This type's own `__slots__` member names, sorted, excluding the
+    /// pseudo-slots `__dict__`/`__weakref__` (which are accounted for
+    /// separately, exactly like CPython's `ht_slots`).
+    pub fn member_slots_sorted(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .slot_names
+            .borrow()
+            .iter()
+            .filter(|s| s.as_str() != "__dict__" && s.as_str() != "__weakref__")
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Does this type change the instance C-struct relative to its base
+    /// (CPython: `!compatible_with_tp_base`)? A built-in value type owns
+    /// its layout; a heap type changes it by adding member slots, a
+    /// `__dict__`, or a `__weakref__`.
+    pub fn changes_layout(&self) -> bool {
+        if self.flags.is_builtin {
+            return self.name != "object";
+        }
+        !self.member_slots_sorted().is_empty() || self.adds_own_dict() || self.adds_own_weakref()
+    }
+
+    /// CPython `best_base`: the base contributing the instance layout —
+    /// the one whose solid base is the most derived. Ties resolve to the
+    /// first base (matching `type_new`'s left-to-right scan).
+    pub fn best_base(self: &Rc<Self>) -> Option<Rc<TypeObject>> {
+        let bases = self.bases.borrow();
+        let mut best: Option<Rc<TypeObject>> = None;
+        for b in bases.iter() {
+            if b.name == "object" && bases.len() > 1 {
+                // `object` only wins when it is the sole base.
+                if best.is_none() {
+                    best = Some(b.clone());
+                }
+                continue;
+            }
+            match &best {
+                None => best = Some(b.clone()),
+                Some(cur) => {
+                    if b.is_subclass_of(cur) {
+                        best = Some(b.clone());
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// CPython `compatible_for_assignment`'s `newbase`/`oldbase` walk:
+    /// climb the `best_base` chain past every level that doesn't change
+    /// the struct, returning the most-derived type that *does*.
+    pub fn layout_struct_base(self: &Rc<Self>) -> Rc<TypeObject> {
+        let mut cur = self.clone();
+        while !cur.changes_layout() {
+            match cur.best_base() {
+                Some(b) => cur = b,
+                None => break,
+            }
+        }
+        cur
+    }
+
     /// CPython `type.__flags__` (`tp_flags`), computed from this type's
     /// observable properties. Covers the documented/queried bits:
     /// inline-values + managed-dict (`test_class`), heap/base/ready/gc,

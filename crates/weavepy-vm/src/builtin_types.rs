@@ -66,6 +66,18 @@ pub struct BuiltinTypes {
     /// `member_descriptor` — the type of `__slots__` storage descriptors
     /// (`types.MemberDescriptorType`).
     pub member_descriptor_: Rc<TypeObject>,
+    /// `method_descriptor` — an unbound built-in method reached through a
+    /// type (`type(str.lower)`, `types.MethodDescriptorType`).
+    pub method_descriptor_: Rc<TypeObject>,
+    /// `wrapper_descriptor` — an unbound slot wrapper reached through a
+    /// type (`type(int.__add__)`, `types.WrapperDescriptorType`).
+    pub wrapper_descriptor_: Rc<TypeObject>,
+    /// `getset_descriptor` — a computed attribute descriptor reached
+    /// through a type (`type(float.real)`, `types.GetSetDescriptorType`).
+    pub getset_descriptor_: Rc<TypeObject>,
+    /// `super` — the type of `super(...)` proxies (`type(super(C, x))`).
+    /// Real (subclassable) so `class mysuper(super)` works.
+    pub super_: Rc<TypeObject>,
     pub generator_: Rc<TypeObject>,
     pub coroutine_: Rc<TypeObject>,
     pub async_generator_: Rc<TypeObject>,
@@ -179,6 +191,12 @@ impl BuiltinTypes {
         let property_ = mk("property", vec![object_.clone()]);
         let staticmethod_ = mk("staticmethod", vec![object_.clone()]);
         let classmethod_ = mk("classmethod", vec![object_.clone()]);
+        // `staticmethod.__init__`/`classmethod.__init__` set `__func__`
+        // (CPython's `sm_init`/`cm_init`); `__new__` leaves it `None`, so
+        // a subclass overriding `__init__` without chaining keeps it
+        // `None` (test_descr test_classmethod_new / test_staticmethod_new).
+        install_descriptor_init(&staticmethod_, true);
+        install_descriptor_init(&classmethod_, false);
         // Self-reference: `type.__class__ is type`. Every other
         // built-in's metaclass is `type` by default, installed in
         // bulk after the rest of the registry exists.
@@ -249,6 +267,18 @@ impl BuiltinTypes {
         // defaults.
         let member_descriptor_ = mk("member_descriptor", vec![object_.clone()]);
         install_member_descriptor_methods(&member_descriptor_);
+        // The other three CPython descriptor types, distinguished by name so
+        // `type(str.lower).__name__ == 'method_descriptor'` etc. hold
+        // (test_qualname). Their instances are tagged via `descr_registry`.
+        let method_descriptor_ = mk("method_descriptor", vec![object_.clone()]);
+        let wrapper_descriptor_ = mk("wrapper_descriptor", vec![object_.clone()]);
+        let getset_descriptor_ = mk("getset_descriptor", vec![object_.clone()]);
+        // `super` is a real, subclassable type (`class mysuper(super)`,
+        // test_supers). Its instances are ordinary `PyInstance`s carrying
+        // `__thisclass__`/`__self__`/`__self_class__`; attribute access is
+        // special-cased in `load_attr_instance_default`.
+        let super_ = mk("super", vec![object_.clone()]);
+        install_super_methods(&super_);
         let generator_ = mk("generator", vec![object_.clone()]);
         let coroutine_ = mk("coroutine", vec![object_.clone()]);
         let async_generator_ = mk("async_generator", vec![object_.clone()]);
@@ -453,6 +483,10 @@ impl BuiltinTypes {
             builtin_function_,
             method_wrapper_,
             member_descriptor_,
+            method_descriptor_,
+            wrapper_descriptor_,
+            getset_descriptor_,
+            super_,
             generator_,
             coroutine_,
             async_generator_,
@@ -578,6 +612,11 @@ impl BuiltinTypes {
             pair!(range_, "range"),
             pair!(slice_, "slice"),
             pair!(memoryview_, "memoryview"),
+            // `super` is a real type (`super(C, obj)`, `class mysuper(super)`).
+            // The `Interpreter::default` seed overrides the function-flavoured
+            // `super` entry with this type; construction routes through
+            // `instantiate`'s `"super"` case.
+            pair!(super_, "super"),
             pair!(base_exception, "BaseException"),
             pair!(exception, "Exception"),
             pair!(arithmetic_error, "ArithmeticError"),
@@ -1007,7 +1046,15 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
     if is_strict(&bt.complex_) {
         return Some(match value {
             Some(c @ Object::Complex(_)) => c.clone(),
-            Some(o) => o.native_value().filter(|n| matches!(n, Object::Complex(_))).unwrap_or(o.clone()),
+            // `complex.__new__(Sub, x)` coerces `x` to a complex (CPython
+            // `complex_new`), so a `float`/`int` seed becomes `(x+0j)` and a
+            // complex-subclass seed unwraps to its native complex — never a
+            // raw non-complex payload (test_complexes).
+            Some(o) => o
+                .native_value()
+                .filter(|n| matches!(n, Object::Complex(_)))
+                .or_else(|| o.as_complex().map(|(r, i)| Object::new_complex(r, i)))
+                .unwrap_or_else(|| Object::new_complex(0.0, 0.0)),
             None => Object::new_complex(0.0, 0.0),
         });
     }
@@ -1327,7 +1374,7 @@ fn install_member_descriptor_methods(member_: &Rc<TypeObject>) {
         inst.slot_get(&slot.name).ok_or_else(|| {
             crate::error::attribute_error(format!(
                 "'{}' object has no attribute '{}'",
-                inst.cls().name,
+                inst.cls().qualified_display_name(),
                 slot.name
             ))
         })
@@ -1370,6 +1417,81 @@ fn install_member_descriptor_methods(member_: &Rc<TypeObject>) {
             })),
         );
     }
+}
+
+/// Install `__init__` on `staticmethod`/`classmethod` (CPython's
+/// `sm_init`/`cm_init`): it sets `__func__`, which `__new__` left as
+/// `None`. Keeping the assignment in `__init__` is what makes a
+/// subclass that overrides `__init__` without chaining observe
+/// `__func__ is None`.
+fn install_descriptor_init(ty: &Rc<TypeObject>, is_static: bool) {
+    use crate::object::BuiltinFn;
+    let call: fn(&[Object]) -> Result<Object, RuntimeError> = if is_static {
+        crate::builtins::staticmethod_init
+    } else {
+        crate::builtins::classmethod_init
+    };
+    ty.dict.borrow_mut().insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            binds_instance: true,
+            call: Box::new(call),
+            call_kw: None,
+        })),
+    );
+}
+
+/// Install `super`'s own methods: `__init__` (so `class mysuper(super)`
+/// can chain `super().__init__(type, obj)`), `__get__` (rebind an unbound
+/// `super(C)` to `super(C, obj)`), and `__repr__`. The proxy's MRO walk
+/// itself lives in `load_attr_instance_default`.
+fn install_super_methods(super_: &Rc<TypeObject>) {
+    use crate::object::BuiltinFn;
+    fn super_repr(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Instance(i)) = args.first() else {
+            return Err(crate::error::type_error("super.__repr__ requires a super"));
+        };
+        let d = i.dict.borrow();
+        let this = match d.get(&DictKey(Object::from_static("__thisclass__"))) {
+            Some(Object::Type(t)) => t.name.clone(),
+            _ => "?".to_owned(),
+        };
+        let obj_type = d.get(&DictKey(Object::from_static("__self_class__")));
+        let s = match obj_type {
+            Some(Object::Type(t)) => format!("<super: <class '{}'>, <{} object>>", this, t.name),
+            _ => format!("<super: <class '{this}'>, NULL>"),
+        };
+        Ok(Object::from_str(&s))
+    }
+    let mut td = super_.dict.borrow_mut();
+    td.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            binds_instance: true,
+            call: Box::new(crate::builtins::super_init_impl),
+            call_kw: None,
+        })),
+    );
+    td.insert(
+        DictKey(Object::from_static("__get__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__get__",
+            binds_instance: true,
+            call: Box::new(crate::builtins::super_descr_get_impl),
+            call_kw: None,
+        })),
+    );
+    td.insert(
+        DictKey(Object::from_static("__repr__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__repr__",
+            binds_instance: true,
+            call: Box::new(super_repr),
+            call_kw: None,
+        })),
+    );
 }
 
 fn install_module_init(module_: &Rc<TypeObject>) {
@@ -1489,24 +1611,17 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 }
                 Ok(Object::None)
             }
-            // `type.__setattr__` semantics for a class receiver — reached
-            // via `super().__setattr__(…)` inside a metaclass override
-            // (e.g. `EnumType.__setattr__` chaining to the default).
-            Object::Type(ty) => {
-                if ty.flags.is_builtin {
-                    return Err(crate::error::type_error(format!(
-                        "cannot set '{name}' attribute of immutable type '{}'",
-                        ty.name
-                    )));
-                }
-                ty.dict
-                    .borrow_mut()
-                    .insert(DictKey(Object::from_str(&name)), args[2].clone());
-                if name == "__getattribute__" {
-                    ty.invalidate_getattribute_cache();
-                }
-                Ok(Object::None)
-            }
+            // CPython's "Carlo Verre hack" guard (`hackcheck`): applying the
+            // base `object.__setattr__` to a *type* would bypass the type's
+            // own `type_setattro`. Metaclass overrides reach the default via
+            // `super().__setattr__(…)`, which resolves to `type.__setattr__`
+            // (not here), so any type arriving at `object.__setattr__` is an
+            // illegal bypass (test_carloverre_multi_inherit_invalid). The
+            // message names the metatype, as CPython does.
+            Object::Type(_) => Err(crate::error::type_error(format!(
+                "can't apply this __setattr__ to {} object",
+                crate::builtins::class_of(&args[0]).name
+            ))),
             other => Err(crate::error::type_error(format!(
                 "object.__setattr__() requires an instance, got '{}'",
                 other.type_name()
@@ -1545,28 +1660,14 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                 }
                 Ok(Object::None)
             }
-            // `type.__delattr__` semantics for a class receiver (chained
-            // via `super().__delattr__(…)` in a metaclass override).
-            Object::Type(ty) => {
-                if ty.flags.is_builtin {
-                    return Err(crate::error::type_error(format!(
-                        "cannot delete '{name}' attribute of immutable type '{}'",
-                        ty.name
-                    )));
-                }
-                let removed = ty
-                    .dict
-                    .borrow_mut()
-                    .shift_remove(&DictKey(Object::from_str(&name)))
-                    .is_some();
-                if !removed {
-                    return Err(crate::error::attribute_error(format!(
-                        "type object '{}' has no attribute '{}'",
-                        ty.name, name
-                    )));
-                }
-                Ok(Object::None)
-            }
+            // Carlo Verre hack guard (see `object_setattr`): the base
+            // `object.__delattr__` can't be applied to a type — that bypasses
+            // `type.__delattr__`. Metaclass overrides chain through
+            // `super().__delattr__(…)` (→ `type.__delattr__`) instead.
+            Object::Type(_) => Err(crate::error::type_error(format!(
+                "can't apply this __delattr__ to {} object",
+                crate::builtins::class_of(&args[0]).name
+            ))),
             other => Err(crate::error::type_error(format!(
                 "object.__delattr__() requires an instance, got '{}'",
                 other.type_name()
@@ -1732,7 +1833,282 @@ pub fn install_type_dunders(type_: &Rc<TypeObject>) {
         // still override it.
         Ok(Object::None)
     }
+    // `type.__setattr__(cls, name, value)` — CPython `type_setattro`. This is
+    // the default a metaclass override chains to via `super().__setattr__`,
+    // and (unlike `object.__setattr__`) it is permitted to mutate a class.
+    fn type_setattr(args: &[Object]) -> Result<Object, RuntimeError> {
+        if args.len() != 3 {
+            return Err(crate::error::type_error(
+                "type.__setattr__() takes exactly 3 arguments".to_owned(),
+            ));
+        }
+        let Object::Type(ty) = &args[0] else {
+            return Err(crate::error::type_error(format!(
+                "descriptor '__setattr__' requires a 'type' object but received a '{}'",
+                args[0].type_name()
+            )));
+        };
+        let name = match &args[1] {
+            Object::Str(s) => s.to_string(),
+            _ => return Err(crate::error::type_error("attribute name must be string")),
+        };
+        let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+            crate::error::runtime_error("type.__setattr__ requires an active interpreter")
+        })?;
+        // SAFETY: published by an enclosing VM frame live on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.set_type_attr_direct(ty, &name, args[2].clone())?;
+        Ok(Object::None)
+    }
+    fn type_delattr(args: &[Object]) -> Result<Object, RuntimeError> {
+        if args.len() != 2 {
+            return Err(crate::error::type_error(
+                "type.__delattr__() takes exactly 2 arguments".to_owned(),
+            ));
+        }
+        let Object::Type(ty) = &args[0] else {
+            return Err(crate::error::type_error(format!(
+                "descriptor '__delattr__' requires a 'type' object but received a '{}'",
+                args[0].type_name()
+            )));
+        };
+        let name = match &args[1] {
+            Object::Str(s) => s.to_string(),
+            _ => return Err(crate::error::type_error("attribute name must be string")),
+        };
+        let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+            crate::error::runtime_error("type.__delattr__ requires an active interpreter")
+        })?;
+        // SAFETY: published by an enclosing VM frame live on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.del_type_attr_direct(ty, &name)?;
+        Ok(Object::None)
+    }
+    // `type.__doc__` / `__qualname__` / `__name__` are getset *data
+    // descriptors* on the metatype (CPython `type_getsets`), not plain dict
+    // strings. Modelling them as real descriptors lets
+    // `type(C).__dict__['__doc__'].__set__/__delete__` (test_descr
+    // test_set_doc) and `type.__dict__['__qualname__'].__set__` (test_qualname)
+    // behave like CPython, while normal `C.__doc__`/`C.__name__` reads stay on
+    // their existing fast paths (`load_attr_type` resolves name/qualname from
+    // the type's own fields before the metaclass descriptor is consulted).
+    fn type_doc_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__doc__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        // Built-in types expose their curated `tp_doc`; heap classes carry
+        // an own-dict `__doc__` (set to the body docstring or `None` at
+        // class creation), never inheriting a base's docstring.
+        if ty.flags.is_builtin {
+            return Ok(crate::builtin_type_doc(&ty.name)
+                .map(Object::from_static)
+                .unwrap_or(Object::None));
+        }
+        let entry = ty
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__doc__")))
+            .cloned();
+        match entry {
+            None => Ok(Object::None),
+            // A plain docstring (or `None`) is returned verbatim; the rare
+            // descriptor-valued `__doc__` (`__doc__ = SomeDescr()`) has the
+            // descriptor protocol applied, matching CPython's `type_get_doc`
+            // (test_descr test_doc_descriptor).
+            Some(v @ (Object::Str(_) | Object::None)) => Ok(v),
+            Some(v) => {
+                let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                    crate::error::runtime_error(
+                        "type.__doc__ getter requires an active interpreter",
+                    )
+                })?;
+                // SAFETY: published by an enclosing VM frame live on this thread.
+                let interp = unsafe { &mut *ptr };
+                interp.descriptor_get(&v, &Object::None, &args[0])
+            }
+        }
+    }
+    fn type_doc_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__doc__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        if ty.flags.is_builtin {
+            return Err(crate::error::type_error(format!(
+                "cannot set '__doc__' attribute of immutable type '{}'",
+                ty.name
+            )));
+        }
+        let value = args.get(1).cloned().unwrap_or(Object::None);
+        ty.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("__doc__")), value);
+        Ok(Object::None)
+    }
+    fn type_doc_del(args: &[Object]) -> Result<Object, RuntimeError> {
+        // CPython's `check_set_special_type_attr` reports the *immutable*
+        // wording even for heap classes on deletion (there is no deleter),
+        // so `del`/`__delete__` always raises here.
+        let name = match args.first() {
+            Some(Object::Type(ty)) => ty.name.clone(),
+            _ => "?".to_owned(),
+        };
+        Err(crate::error::type_error(format!(
+            "cannot delete '__doc__' attribute of immutable type '{name}'"
+        )))
+    }
+    fn type_qualname_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__qualname__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        if let Some(q) = ty.qualname.borrow().as_ref() {
+            return Ok(Object::interned_str(q));
+        }
+        Ok(Object::interned_str(&ty.name))
+    }
+    fn type_qualname_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__qualname__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        let value = args.get(1).cloned().unwrap_or(Object::None);
+        let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+            crate::error::runtime_error("type.__qualname__ setter requires an active interpreter")
+        })?;
+        // SAFETY: published by an enclosing VM frame live on this thread.
+        // `set_type_attr_direct` rejects immutable types (test_qualname:
+        // `type.__dict__['__qualname__'].__set__(str, 'Oink')` → TypeError)
+        // and validates the value is a string.
+        let interp = unsafe { &mut *ptr };
+        interp.set_type_attr_direct(ty, "__qualname__", value)?;
+        Ok(Object::None)
+    }
+    fn type_qualname_del(args: &[Object]) -> Result<Object, RuntimeError> {
+        let name = match args.first() {
+            Some(Object::Type(ty)) => ty.name.clone(),
+            _ => "?".to_owned(),
+        };
+        Err(crate::error::type_error(format!(
+            "can't delete {name}.__qualname__"
+        )))
+    }
+    fn type_name_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__name__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        // Honour an own-dict string override (a reassigned `__name__`),
+        // otherwise the type's own name — mirroring `load_attr_type`.
+        if let Some(v @ Object::Str(_)) = ty
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("__name__")))
+            .cloned()
+        {
+            return Ok(v);
+        }
+        Ok(Object::interned_str(&ty.name))
+    }
+    fn type_name_set(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Type(ty)) = args.first() else {
+            return Err(crate::error::type_error(
+                "descriptor '__name__' for 'type' objects doesn't apply to other objects",
+            ));
+        };
+        let value = args.get(1).cloned().unwrap_or(Object::None);
+        let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+            crate::error::runtime_error("type.__name__ setter requires an active interpreter")
+        })?;
+        // SAFETY: published by an enclosing VM frame live on this thread.
+        let interp = unsafe { &mut *ptr };
+        interp.set_type_attr_direct(ty, "__name__", value)?;
+        Ok(Object::None)
+    }
+    fn type_name_del(args: &[Object]) -> Result<Object, RuntimeError> {
+        let name = match args.first() {
+            Some(Object::Type(ty)) => ty.name.clone(),
+            _ => "?".to_owned(),
+        };
+        Err(crate::error::type_error(format!("can't delete {name}.__name__")))
+    }
+    type GetSetFn = fn(&[Object]) -> Result<Object, RuntimeError>;
+    fn mk_getset(name: &'static str, get: GetSetFn, set: GetSetFn, del: GetSetFn) -> Object {
+        Object::Property(Rc::new(crate::object::PyProperty::new(
+            Object::Builtin(Rc::new(BuiltinFn {
+                name,
+                binds_instance: true,
+                call: Box::new(get),
+                call_kw: None,
+            })),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name,
+                binds_instance: true,
+                call: Box::new(set),
+                call_kw: None,
+            })),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name,
+                binds_instance: true,
+                call: Box::new(del),
+                call_kw: None,
+            })),
+            Object::None,
+        )))
+    }
+    for (name, getset) in [
+        ("__doc__", mk_getset("__doc__", type_doc_get, type_doc_set, type_doc_del)),
+        (
+            "__qualname__",
+            mk_getset(
+                "__qualname__",
+                type_qualname_get,
+                type_qualname_set,
+                type_qualname_del,
+            ),
+        ),
+        (
+            "__name__",
+            mk_getset("__name__", type_name_get, type_name_set, type_name_del),
+        ),
+    ] {
+        crate::descr_registry::register(
+            &getset,
+            crate::descr_registry::DescrKind::GetSet,
+            type_.clone(),
+            name,
+            None,
+        );
+        type_
+            .dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static(name)), getset);
+    }
     let mut dict = type_.dict.borrow_mut();
+    dict.insert(
+        DictKey(Object::from_static("__setattr__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__setattr__",
+            binds_instance: true,
+            call: Box::new(type_setattr),
+            call_kw: None,
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__delattr__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__delattr__",
+            binds_instance: true,
+            call: Box::new(type_delattr),
+            call_kw: None,
+        })),
+    );
     dict.insert(
         DictKey(Object::from_static("__new__")),
         Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
