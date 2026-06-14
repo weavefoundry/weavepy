@@ -2878,6 +2878,14 @@ impl Interpreter {
                             let snapshot: Vec<Object> = items.to_vec();
                             self.seq_contains_rich(&snapshot, &item, &frame.globals.clone())?
                         }
+                        // `x in <iterator/generator>`: CPython consumes the
+                        // iterator, comparing each yielded value with `==`
+                        // (`argparse._check_value` relies on `value in
+                        // iter(choices)`). Drive it through the VM so a
+                        // Python generator / user `__next__` works too.
+                        Object::Iter(_) | Object::Generator(_) => {
+                            self.contains_via_iter(&container, &item, &frame.globals.clone())?
+                        }
                         _ => container.contains(&item)?,
                     }
                 };
@@ -5405,7 +5413,7 @@ impl Interpreter {
                         "buffer" | "raw" => {
                             return Ok(obj.clone());
                         }
-                        "name" => return Ok(Object::from_str(&f.name)),
+                        "name" => return Ok(Object::from_str(f.display_name())),
                         "mode" => return Ok(Object::from_str(&f.mode)),
                         "closed" => return Ok(Object::Bool(f.is_closed())),
                         "encoding" => {
@@ -13026,6 +13034,23 @@ impl Interpreter {
                     }
                 }
             }
+            // File objects: `f.name` is reassignable (CPython's `FileIO`
+            // exposes a writable `name`; `tempfile` relies on it). Other
+            // data attributes remain read-only.
+            Object::File(f) => match name {
+                "name" => {
+                    match value {
+                        Object::Str(s) => f.set_name(s.to_string()),
+                        other => f.set_name(other.type_name().to_owned()),
+                    }
+                    Ok(())
+                }
+                _ => Err(attribute_error(format!(
+                    "'{}' object attribute '{}' is read-only",
+                    obj.type_name(),
+                    name
+                ))),
+            },
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),

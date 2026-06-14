@@ -30,7 +30,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("copyfile")),
             b("copyfile", copyfile),
         );
-        d.insert(DictKey(Object::from_static("rmtree")), b("rmtree", rmtree));
+        d.insert(
+            DictKey(Object::from_static("rmtree")),
+            b_kw("rmtree", rmtree),
+        );
         d.insert(
             DictKey(Object::from_static("copytree")),
             b("copytree", copytree),
@@ -61,6 +64,19 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     }))
 }
 
+/// As [`b`], but the body also receives the keyword-argument list.
+fn b_kw(
+    name: &'static str,
+    body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+) -> Object {
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: false,
+        call: Box::new(move |args| body(args, &[])),
+        call_kw: Some(Box::new(body)),
+    }))
+}
+
 fn path_arg(arg: Option<&Object>) -> Result<PathBuf, RuntimeError> {
     match arg {
         Some(Object::Str(s)) => Ok(PathBuf::from(s.to_string())),
@@ -75,10 +91,28 @@ fn copyfile(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(dst.to_string_lossy().into_owned()))
 }
 
-fn rmtree(args: &[Object]) -> Result<Object, RuntimeError> {
+fn rmtree(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let path = path_arg(args.first())?;
-    std::fs::remove_dir_all(&path).map_err(|e| io_error_to_py(&e))?;
-    Ok(Object::None)
+    // CPython's `shutil.rmtree(path, ignore_errors=False, onerror=..., onexc=...)`.
+    // The frozen `tempfile.TemporaryDirectory` cleanup path calls us with the
+    // 3.12+ `onexc=` callback; we accept (and ignore) the error-handler kwargs
+    // and only honour `ignore_errors`, which is the behaviour these callers rely
+    // on. `args[1]` is the positional `ignore_errors`.
+    let ignore_errors = args
+        .get(1)
+        .or_else(|| {
+            kwargs
+                .iter()
+                .find(|(k, _)| k == "ignore_errors")
+                .map(|(_, v)| v)
+        })
+        .map(Object::is_truthy)
+        .unwrap_or(false);
+    match std::fs::remove_dir_all(&path) {
+        Ok(()) => Ok(Object::None),
+        Err(_) if ignore_errors => Ok(Object::None),
+        Err(e) => Err(io_error_to_py(&e)),
+    }
 }
 
 fn copytree(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -48,6 +48,33 @@ TESTFN_NONASCII = TESTFN_UNICODE
 # Marker used by some tests; harmless default.
 TESTFN_UNICODE_UNENCODEABLE = None
 
+# A non-ASCII character that round-trips through the filesystem encoding,
+# or '' if none does. Verbatim port of CPython 3.13's os_helper probe;
+# `test_argparse`/`test_os` reach for it.
+FS_NONASCII = ''
+for character in (
+    '\u00E6',
+    '\u0130',
+    '\u0141',
+    '\u03C6',
+    '\u041A',
+    '\u05D0',
+    '\u060C',
+    '\u062A',
+    '\u0E01',
+    '\u00A0',
+    '\u20AC',
+):
+    try:
+        if os.fsdecode(os.fsencode(character)) != character:
+            raise UnicodeError
+    except UnicodeError:
+        pass
+    else:
+        FS_NONASCII = character
+        break
+del character
+
 SAVEDCWD = os.getcwd()
 
 
@@ -367,3 +394,93 @@ def save_mode(path, quiet=False):
 
 def unlink_or_skip(filename):
     unlink(filename)
+
+
+# ---------------------------------------------------------------------------
+# chmod capability probe (verbatim port of CPython 3.13 os_helper)
+# ---------------------------------------------------------------------------
+
+_can_chmod = None
+
+
+def can_chmod():
+    global _can_chmod
+    if _can_chmod is not None:
+        return _can_chmod
+    if not hasattr(os, "chmod"):
+        _can_chmod = False
+        return _can_chmod
+    import stat as _stat
+    try:
+        with open(TESTFN, "wb"):
+            try:
+                os.chmod(TESTFN, 0o555)
+                mode1 = os.stat(TESTFN).st_mode
+                os.chmod(TESTFN, 0o777)
+                mode2 = os.stat(TESTFN).st_mode
+            except OSError:
+                can = False
+            else:
+                can = _stat.S_IMODE(mode1) != _stat.S_IMODE(mode2)
+    finally:
+        unlink(TESTFN)
+    _can_chmod = can
+    return can
+
+
+def skip_unless_working_chmod(test):
+    """Skip tests that require working os.chmod()."""
+    import unittest
+    ok = can_chmod()
+    msg = "requires working os.chmod()"
+    return test if ok else unittest.skip(msg)(test)
+
+
+# Check whether the current effective user has the capability to override
+# DAC (discretionary access control). Typically user root is able to
+# bypass file read, write, and execute permission checks. The capability
+# is independent of the effective user. See capabilities(7).
+# Verbatim port of CPython 3.13's os_helper; `test_argparse`/`test_os` reach
+# for the skip_if/skip_unless decorators.
+_can_dac_override = None
+
+def can_dac_override():
+    global _can_dac_override
+
+    if not can_chmod():
+        _can_dac_override = False
+    if _can_dac_override is not None:
+        return _can_dac_override
+
+    try:
+        with open(TESTFN, "wb") as f:
+            os.chmod(TESTFN, 0o400)
+            try:
+                with open(TESTFN, "wb"):
+                    pass
+            except OSError:
+                _can_dac_override = False
+            else:
+                _can_dac_override = True
+    finally:
+        try:
+            os.chmod(TESTFN, 0o700)
+        except OSError:
+            pass
+        unlink(TESTFN)
+
+    return _can_dac_override
+
+
+def skip_if_dac_override(test):
+    import unittest
+    ok = not can_dac_override()
+    msg = "incompatible with CAP_DAC_OVERRIDE"
+    return test if ok else unittest.skip(msg)(test)
+
+
+def skip_unless_dac_override(test):
+    import unittest
+    ok = can_dac_override()
+    msg = "requires CAP_DAC_OVERRIDE"
+    return test if ok else unittest.skip(msg)(test)

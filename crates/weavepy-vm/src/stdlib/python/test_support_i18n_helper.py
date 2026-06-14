@@ -17,6 +17,16 @@ class TestTranslationsBase(unittest.TestCase):
     def test_translation_snapshots_are_up_to_date(self):
         self.skipTest("translation snapshots unavailable under WeavePy")
 
+    def assertMsgidsEqual(self, module):
+        """Verify a module's gettext msgids match a checked-in snapshot.
+
+        CPython shells out to ``Tools/i18n/pygettext.py`` (gated on
+        ``test.test_tools`` + ``requires_subprocess``). WeavePy ships
+        neither the i18n tooling nor the snapshot data, so — exactly like
+        CPython on a checkout missing those — the check skips.
+        """
+        self.skipTest("i18n tooling (pygettext) unavailable under WeavePy")
+
 
 def update_translation_snapshots(module):
     raise unittest.SkipTest("translation snapshots unavailable under WeavePy")

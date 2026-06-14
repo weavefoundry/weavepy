@@ -16,7 +16,6 @@
 use crate::import::{FrozenSource, ModuleCache};
 
 pub mod ast_mod;
-pub mod base64_mod;
 pub mod binascii_mod;
 pub mod bz2_mod;
 pub mod codecs_mod;
@@ -102,7 +101,6 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_subprocess", subprocess_mod::build);
     cache.register_builtin("hashlib", hashlib_mod::build);
     cache.register_builtin("hmac", hmac_mod::build);
-    cache.register_builtin("base64", base64_mod::build);
     cache.register_builtin("binascii", binascii_mod::build);
     cache.register_builtin("secrets", secrets_mod::build);
     cache.register_builtin("uuid", uuid_mod::build);
@@ -270,6 +268,16 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "string",
             source: include_str!("python/string.py"),
+            is_package: false,
+        },
+        // `base64` is CPython's `Lib/base64.py` ported verbatim (pure Python
+        // over `binascii` + `struct` + `re`). It supersedes the old Rust
+        // `base64` module, which covered only RFC 3548 and ignored
+        // `altchars`/`validate`; the frozen copy adds a85/b85/z85 and the
+        // exact decode semantics `test_base64` checks.
+        FrozenSource {
+            name: "base64",
+            source: include_str!("python/base64_mod.py"),
             is_package: false,
         },
         FrozenSource {
@@ -1002,6 +1010,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "getopt",
             source: include_str!("python/getopt_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "gettext",
+            source: include_str!("python/gettext_mod.py"),
             is_package: false,
         },
         FrozenSource {

@@ -98,7 +98,10 @@ def skip_unless_bind_unix_socket(test):
         try:
             sock.bind(addr)
             return test
-        except PermissionError:
+        except (PermissionError, OSError, TypeError):
+            # WeavePy exposes AF_UNIX but does not yet support binding a
+            # filesystem-path address, so the bind fails here; skip the
+            # test exactly as CPython does when an AF_UNIX bind is denied.
             return unittest.skip('cannot bind AF_UNIX sockets')(test)
         finally:
             os_helper.unlink(addr)

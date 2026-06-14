@@ -16,6 +16,10 @@ import sys
 import time as _time
 import traceback as _traceback
 import contextlib as _contextlib
+# Exposed as a module attribute so the flattened `unittest.case` alias
+# (built at the bottom of this module) carries a `warnings` reference,
+# which CPython's `test_warnings` saves/restores in setUp/tearDown.
+import warnings
 
 
 __all__ = [
@@ -1758,3 +1762,18 @@ def main(module="__main__", defaultTest=None, argv=None, testRunner=None,
 # defined when ``async_case`` imports the package.
 from .async_case import IsolatedAsyncioTestCase  # noqa: E402
 __all__.append("IsolatedAsyncioTestCase")
+
+# CPython ships ``unittest`` as a package whose submodules (``case``,
+# ``result``, ``suite``, ``loader``, ``runner``, ``main``) hold the
+# implementation; WeavePy flattens it all into this single module. A few
+# stdlib tests reach for those submodules by name (e.g. test_warnings
+# saves and restores ``unittest.case.warnings``). Alias the flattened
+# module under each submodule name so ``unittest.case.X`` resolves to our
+# definitions and ``from unittest.case import Y`` keeps working.
+_self_module = sys.modules[__name__]
+for _submodule in ("case", "result", "suite", "loader", "runner", "signals", "main"):
+    sys.modules.setdefault("unittest." + _submodule, _self_module)
+    # Don't clobber a real attribute (e.g. the ``main`` function).
+    if not hasattr(_self_module, _submodule):
+        setattr(_self_module, _submodule, _self_module)
+del _self_module, _submodule

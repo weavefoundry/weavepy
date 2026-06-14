@@ -66,6 +66,33 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             Object::from_static(".."),
         );
         d.insert(
+            DictKey(Object::from_static("devnull")),
+            Object::from_static(if cfg!(windows) { "nul" } else { "/dev/null" }),
+        );
+        // CPython advertises which functions accept the `follow_symlinks`,
+        // `dir_fd`, `fd`, and `effective_ids` keywords via these sets.
+        // WeavePy's `os` wrappers don't implement those optional keywords,
+        // so the sets are empty — callers (e.g. the verbatim `tempfile`
+        // `_dont_follow_symlinks` / `_resetperms` helpers, `shutil`) then
+        // take the plain-call fallback path, which is correct here.
+        for name in [
+            "supports_follow_symlinks",
+            "supports_dir_fd",
+            "supports_fd",
+            "supports_effective_ids",
+        ] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::new_set_from(std::iter::empty::<Object>()),
+            );
+        }
+        // CPython sets `os.supports_bytes_environ` True on POSIX (the raw
+        // environ block is bytes) and False on Windows. We model POSIX.
+        d.insert(
+            DictKey(Object::from_static("supports_bytes_environ")),
+            Object::Bool(true),
+        );
+        d.insert(
             DictKey(Object::from_static("path")),
             Object::Module(path_mod),
         );
@@ -153,7 +180,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("walk")),
-            builtin("walk", os_walk),
+            builtin_kw("walk", os_walk),
         );
         d.insert(
             DictKey(Object::from_static("scandir")),
@@ -328,6 +355,10 @@ pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("exists")),
             builtin("exists", path_exists),
+        );
+        d.insert(
+            DictKey(Object::from_static("lexists")),
+            builtin("lexists", path_lexists),
         );
         d.insert(
             DictKey(Object::from_static("isfile")),
@@ -687,32 +718,35 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     let ty = path_like_type_singleton("stat_result");
     let inst = PyInstance::new(ty);
     let mut d = inst.dict.borrow_mut();
-    let kind_bits: i64 = if meta.is_dir() {
-        0o040_000
-    } else if meta.is_file() {
-        0o100_000
-    } else {
-        0o120_000
-    };
-    // The permission bits live in the low 9 bits of `st_mode`. On
-    // Unix we read them from the filesystem; on platforms without
-    // `PermissionsExt` we fall back to the historical hard-coded
-    // values so callers that just want to test directory/file
-    // shape still see something sensible.
+    // On Unix the OS already encodes the full `st_mode` — file-type bits
+    // (S_IFREG / S_IFDIR / S_IFCHR / S_IFBLK / S_IFLNK / S_IFIFO / S_IFSOCK)
+    // *and* permissions — so use it verbatim; otherwise char/block devices,
+    // fifos, and sockets would all misclassify (e.g. `/dev/null` showing up
+    // as a symlink). Off Unix we synthesize from the coarse `is_dir`/
+    // `is_file` shape plus a best-effort permission guess.
     #[cfg(unix)]
-    let perm_bits: i64 = {
-        use std::os::unix::fs::PermissionsExt;
-        i64::from(meta.permissions().mode() & 0o7777)
+    let mode: i64 = {
+        use std::os::unix::fs::MetadataExt;
+        i64::from(meta.mode())
     };
     #[cfg(not(unix))]
-    let perm_bits: i64 = if meta.is_dir() {
-        0o755
-    } else if meta.permissions().readonly() {
-        0o444
-    } else {
-        0o644
+    let mode: i64 = {
+        let kind_bits: i64 = if meta.is_dir() {
+            0o040_000
+        } else if meta.is_file() {
+            0o100_000
+        } else {
+            0o120_000
+        };
+        let perm_bits: i64 = if meta.is_dir() {
+            0o755
+        } else if meta.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        };
+        kind_bits | perm_bits
     };
-    let mode = kind_bits | perm_bits;
     d.insert(
         DictKey(Object::from_static("st_size")),
         Object::Int(meta.len() as i64),
@@ -826,14 +860,27 @@ fn os_fsencode(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn os_walk(args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_walk(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "walk")?;
+    // `os.walk(top, topdown=True, onerror=None, followlinks=False)`.
+    // `topdown` is positional index 1 or a keyword; the other two are
+    // accepted and (for our in-process filesystem walk) effectively the
+    // defaults, so we don't need to act on them.
+    let topdown = match args.get(1).cloned().or_else(|| {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == "topdown")
+            .map(|(_, v)| v.clone())
+    }) {
+        Some(v) => v.is_truthy(),
+        None => true,
+    };
     let mut out = Vec::new();
-    walk_dir(Path::new(&p), &mut out);
+    walk_dir(Path::new(&p), topdown, &mut out);
     Ok(Object::new_list(out))
 }
 
-fn walk_dir(root: &Path, out: &mut Vec<Object>) {
+fn walk_dir(root: &Path, topdown: bool, out: &mut Vec<Object>) {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     let entries = match std::fs::read_dir(root) {
@@ -853,11 +900,22 @@ fn walk_dir(root: &Path, out: &mut Vec<Object>) {
         Object::new_list(dirs.clone()),
         Object::new_list(files),
     ]);
-    out.push(triple);
-    for d in dirs {
-        if let Object::Str(name) = d {
-            walk_dir(&root.join(name.as_ref()), out);
+    // Top-down yields each directory before its children; bottom-up yields
+    // children first (so callers can remove files before their parent dir).
+    if topdown {
+        out.push(triple);
+        for d in &dirs {
+            if let Object::Str(name) = d {
+                walk_dir(&root.join(name.as_ref()), topdown, out);
+            }
         }
+    } else {
+        for d in &dirs {
+            if let Object::Str(name) = d {
+                walk_dir(&root.join(name.as_ref()), topdown, out);
+            }
+        }
+        out.push(triple);
     }
 }
 
@@ -1461,6 +1519,13 @@ fn path_dirname(args: &[Object]) -> Result<Object, RuntimeError> {
 fn path_exists(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = first_path(args, "exists")?;
     Ok(Object::Bool(Path::new(&s).exists()))
+}
+
+fn path_lexists(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = first_path(args, "lexists")?;
+    // lexists() uses lstat(): it returns True even for a broken symlink,
+    // so probe with symlink_metadata rather than following the link.
+    Ok(Object::Bool(std::fs::symlink_metadata(&s).is_ok()))
 }
 
 fn path_isfile(args: &[Object]) -> Result<Object, RuntimeError> {

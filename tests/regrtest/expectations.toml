@@ -73,16 +73,16 @@ status = "fail"
 reason = "low-level _thread tests exercise CPython-specific lock semantics not yet matched"
 
 [tests."cpython/Lib/test/test_threadedtempfile.py"]
-status = "fail"
-reason = "depends on parallel thread execution from the CPython model"
+status = "pass"
+reason = "measured: passes end-to-end after wiring `open(opener=...)` + file-descriptor open and `shutil.rmtree(onexc=...)`, which `tempfile.NamedTemporaryFile`/`mkstemp` rely on."
 
 [tests."cpython/Lib/test/test_gc.py"]
 status = "fail"
 reason = "RFC 0024 implements cycle GC but the detailed heuristics (gen promotion thresholds, gc.callbacks ordering, get_referrers fidelity) don't match CPython yet"
 
 [tests."cpython/Lib/test/test_weakref.py"]
-status = "fail"
-reason = "core weakref + WeakSet / WeakValueDictionary work but proxy-attr delegation lands in a follow-up"
+status = "timeout"
+reason = "the O(n^2) list-backed `WeakKeyDictionary` was rebuilt as an O(1) id-keyed dict (the 70k-entry `test_threaded_weak_key_dict_copy` no longer hangs), but the suite now reaches `test_weak_valued_len_race`, whose `gc.set_threshold` + `RefCycle` cyclic-collection stress loop hangs the cycle collector. Follow-up: cyclic-GC progress under aggressive thresholds."
 
 [tests."cpython/Lib/test/test_multiprocessing_main_handling.py"]
 status = "skip"
@@ -201,11 +201,24 @@ reason = "json encoder/decoder edge cases (sort_keys with non-str keys)"
 
 [tests."cpython/Lib/test/test_base64.py"]
 status = "fail"
-reason = "b85/a85 codec + standard_b64encode edge cases"
+# 35/40 subtests pass after the verbatim `base64.py` port (a85/b85/z85 +
+# exact validate/altchars semantics). The 5 remaining are out of the codec
+# layer: 2 need io text-vs-binary stream typing (`encode(BytesIO, StringIO)`
+# must TypeError), 2 need multi-dimensional `memoryview.cast` to reject as a
+# non-1-D buffer, and `test_encode_from_stdin` needs `python -m base64`
+# subprocess stdin piping.
+reason = "35/40: blocked on io text/binary typing, memoryview.cast ndim, subprocess stdin"
 
 [tests."cpython/Lib/test/test_binascii.py"]
 status = "fail"
-reason = "binascii: hexlify with sep + uu_codec roundtrip"
+# 89/93 subtests pass. b2a_uu/a2b_uu and b2a_qp/a2b_qp are now ported
+# byte-for-byte from Modules/binascii.c (length byte, soft-wrap, CRLF
+# normalisation, the quirky `=\r` and "broken qp" cases), a2b_base64's
+# strict/lenient padding state machine matches the exact error messages,
+# and hexlify takes sep/bytes_per_sep. The 4 remaining failures are all
+# `test_c_contiguity`, which needs non-C-contiguous memoryviews to raise
+# BufferError (a buffer-protocol feature WeavePy does not model).
+reason = "89/93: only test_c_contiguity (non-contiguous memoryview BufferError) remains"
 
 [tests."cpython/Lib/test/test_hashlib.py"]
 status = "fail"
@@ -272,8 +285,8 @@ status = "fail"
 reason = "shutil: copytree symlinks=False + chown ownership"
 
 [tests."cpython/Lib/test/test_stat.py"]
-status = "fail"
-reason = "stat: filemode for setgid/setuid + S_ISDOOR (Solaris)"
+status = "pass"
+reason = "measured: passes end-to-end after `os.stat()` reports the raw `st_mode` bits via `MetadataExt::mode()` on Unix (fixes filemode type char, e.g. 'c' for character devices) plus the frozen `stat` module."
 
 [tests."cpython/Lib/test/test_textwrap.py"]
 status = "pass"
@@ -376,16 +389,20 @@ status = "fail"
 reason = "dis: opcode coverage + line number table format differs"
 
 [tests."cpython/Lib/test/test_optparse.py"]
-status = "fail"
-reason = "optparse: deprecated but still expected to work; help formatting subtleties"
+status = "pass"
+reason = "measured: passes end-to-end after vendoring CPython's `optparse` verbatim and fixing `shutil.get_terminal_size()` to honor `os.environ['COLUMNS']`/`LINES` (so help-formatter column wrapping matches CPython)."
 
 [tests."cpython/Lib/test/test_getopt.py"]
+status = "pass"
+reason = "measured: passes end-to-end after vendoring CPython's `getopt` verbatim (frozen module) together with the `gettext` fallback it imports for localized error messages."
+
+[tests."cpython/Lib/test/test_gettext.py"]
 status = "fail"
-reason = "getopt: long option abbreviation + error messages"
+reason = "measured: `gettext` now ships (frozen verbatim) and imports — previously `ModuleNotFoundError` — so the suite runs (71/78); 7 residual errors around the C-accelerated catalog/plural-eval edges remain a follow-up."
 
 [tests."cpython/Lib/test/test_argparse.py"]
 status = "fail"
-reason = "argparse: subparsers + mutually exclusive groups"
+reason = "measured: 1841/1849 subtests pass (was a full import-gate failure) after fixing `shutil.get_terminal_size()`, functional `io.BufferedWriter`/`BufferedReader`, `enumerate(start=)`, `x in <iterator>`, and CPython-style `OSError` formatting; ~8 residual subtest failures remain a follow-up."
 
 [tests."cpython/Lib/test/test_pprint.py"]
 status = "fail"

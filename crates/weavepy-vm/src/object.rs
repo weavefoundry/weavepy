@@ -1465,6 +1465,11 @@ pub struct PyFile {
     /// Text-mode codec (`open(..., encoding=...)`); `None` means the
     /// UTF-8 default.
     pub encoding: RefCell<Option<String>>,
+    /// Python-visible `name` override. Files opened from a descriptor
+    /// start out named by their fd integer; `tempfile` (and user code)
+    /// reassign `f.name` to the real path. Stored separately so the
+    /// Rust-internal `name` (used for error messages, etc.) stays put.
+    pub name_override: RefCell<Option<String>>,
 }
 
 impl PyFile {
@@ -1478,6 +1483,36 @@ impl PyFile {
             backend: RefCell::new(backend),
             closed: RefCell::new(false),
             encoding: RefCell::new(None),
+            name_override: RefCell::new(None),
+        }
+    }
+
+    /// The Python-visible `name`: the reassigned value if one was set,
+    /// otherwise the name the file was opened with.
+    pub fn display_name(&self) -> String {
+        self.name_override
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.name.clone())
+    }
+
+    /// Reassign the Python-visible `name` (`f.name = ...`).
+    pub fn set_name(&self, name: String) {
+        *self.name_override.borrow_mut() = Some(name);
+    }
+
+    /// Whether the stream is attached to a terminal (`f.isatty()`). The
+    /// standard streams defer to the real process handles (so a piped or
+    /// redirected `sys.stdin` reports `False`); in-memory `BytesIO`/
+    /// `StringIO` buffers are never ttys.
+    pub fn isatty(&self) -> bool {
+        use std::io::IsTerminal;
+        match &*self.backend.borrow() {
+            FileBackend::Disk(f) => f.is_terminal(),
+            FileBackend::Stdin => std::io::stdin().is_terminal(),
+            FileBackend::Stdout(_) => std::io::stdout().is_terminal(),
+            FileBackend::Stderr(_) => std::io::stderr().is_terminal(),
+            FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => false,
         }
     }
 

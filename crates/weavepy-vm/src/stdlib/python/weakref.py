@@ -227,75 +227,75 @@ class WeakValueDictionary:
 class WeakKeyDictionary:
     """Dict whose keys are weakly held.
 
-    Implemented as a list of (ref, value) pairs because dict keys
-    must be hashable in a stable way — the ref's identity can change
-    once released so we re-resolve manually.
+    Backed by a plain ``dict`` keyed on ``id(key)`` (object identity),
+    mapping to ``(key_ref, value)`` pairs. This keeps every operation
+    O(1); a previous list-of-pairs design was O(n) per access and made
+    bulk population (e.g. the 70 000-entry ``test_weakref`` thread test)
+    quadratic. Each key gets a weakref whose finalize callback drops the
+    entry the instant the key dies, so a key id is never observable after
+    its object is gone — closing the id-reuse window. Keys are matched by
+    identity, which is the semantics WeakKeyDictionary is used with in
+    practice (CPython compares via the referent's hash/eq; WeavePy's
+    weakrefs are not yet usable as dict keys, hence identity here).
     """
 
     def __init__(self, mapping=None):
-        self._entries = []
+        self._data = {}
         if mapping is not None:
             self.update(mapping)
 
-    def _find(self, key):
-        for i, (kref, _value) in enumerate(self._entries):
-            target = kref()
-            if target is None:
-                continue
-            if target is key or target == key:
-                return i
-        return -1
+    def _make_remove(self, kid):
+        selfref = ref(self)
+
+        def _remove(_r, kid=kid, selfref=selfref):
+            s = selfref()
+            if s is not None:
+                s._data.pop(kid, None)
+
+        return _remove
 
     def __getitem__(self, key):
-        i = self._find(key)
-        if i < 0:
+        kref, value = self._data[id(key)]
+        if kref() is None:
+            self._data.pop(id(key), None)
             raise KeyError(key)
-        return self._entries[i][1]
+        return value
 
     def __setitem__(self, key, value):
-        i = self._find(key)
-        if i >= 0:
-            self._entries[i] = (self._entries[i][0], value)
-            return
-        kref = ref(key, lambda _r: self._scrub())
-        self._entries.append((kref, value))
+        kid = id(key)
+        self._data[kid] = (ref(key, self._make_remove(kid)), value)
 
     def __delitem__(self, key):
-        i = self._find(key)
-        if i < 0:
-            raise KeyError(key)
-        self._entries.pop(i)
-
-    def _scrub(self):
-        self._entries = [(k, v) for (k, v) in self._entries if k() is not None]
+        del self._data[id(key)]
 
     def __iter__(self):
-        for kref, _ in self._entries:
+        for kref, _ in list(self._data.values()):
             t = kref()
             if t is not None:
                 yield t
 
     def __len__(self):
-        return sum(1 for _ in self)
+        return sum(1 for (kref, _) in self._data.values() if kref() is not None)
 
     def __contains__(self, key):
-        return self._find(key) >= 0
+        entry = self._data.get(id(key))
+        return entry is not None and entry[0]() is not None
 
     def get(self, key, default=None):
-        i = self._find(key)
-        if i < 0:
+        entry = self._data.get(id(key))
+        if entry is None or entry[0]() is None:
             return default
-        return self._entries[i][1]
+        return entry[1]
 
     def keys(self):
         return list(iter(self))
 
     def values(self):
-        return [v for (k, v) in self._entries if k() is not None]
+        return [v for (kref, v) in list(self._data.values()) if kref() is not None]
 
     def items(self):
         out = []
-        for kref, v in self._entries:
+        for kref, v in list(self._data.values()):
             t = kref()
             if t is not None:
                 out.append((t, v))
@@ -314,16 +314,15 @@ class WeakKeyDictionary:
             self[k] = v
 
     def pop(self, key, *args):
-        i = self._find(key)
-        if i < 0:
+        entry = self._data.pop(id(key), None)
+        if entry is None or entry[0]() is None:
             if args:
                 return args[0]
             raise KeyError(key)
-        _, v = self._entries.pop(i)
-        return v
+        return entry[1]
 
     def clear(self):
-        self._entries.clear()
+        self._data.clear()
 
     def copy(self):
         new = WeakKeyDictionary()
@@ -350,7 +349,7 @@ class WeakKeyDictionary:
     __hash__ = None
 
     def keyrefs(self):
-        return [k for (k, _) in self._entries]
+        return [kref for (kref, _) in self._data.values()]
 
 
 class WeakSet:

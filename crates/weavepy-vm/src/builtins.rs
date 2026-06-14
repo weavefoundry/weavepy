@@ -140,6 +140,22 @@ pub fn default_builtins() -> DictData {
             );
         }};
     }
+    // As `reg!`, but the body also receives the keyword-argument list (for
+    // builtins with documented named parameters, e.g. `enumerate(x, start=)`).
+    macro_rules! reg_kw {
+        ($name:literal, $body:expr) => {{
+            let f = BuiltinFn {
+                name: $name,
+                binds_instance: false,
+                call: Box::new(|args| $body(args, &[])),
+                call_kw: Some(Box::new($body)),
+            };
+            d.insert(
+                DictKey(Object::from_static($name)),
+                Object::Builtin(Rc::new(f)),
+            );
+        }};
+    }
 
     reg!("len", b_len);
     reg!("range", b_range);
@@ -180,7 +196,7 @@ pub fn default_builtins() -> DictData {
     reg!("sum", b_sum);
     reg!("sorted", b_sorted);
     reg!("reversed", b_reversed);
-    reg!("enumerate", b_enumerate);
+    reg_kw!("enumerate", b_enumerate_kw);
     reg!("zip", b_zip);
     reg!("map", b_map);
     reg!("filter", b_filter);
@@ -732,6 +748,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "writelines" => Some(method(".file_writelines", file_writelines)),
             "flush" => Some(method("flush", file_flush)),
             "close" => Some(method("close", file_close)),
+            "isatty" => Some(method("isatty", file_isatty)),
             "seek" => Some(method("seek", file_seek)),
             "tell" => Some(method("tell", file_tell)),
             "getvalue" => Some(method("getvalue", file_getvalue)),
@@ -5231,7 +5248,7 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let f = opts
         .open(&path)
-        .map_err(|e| crate::error::os_error(format!("{path}: {e}")))?;
+        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
     let file = PyFile::new(path, mode, FileBackend::Disk(f));
     // Positional `open(file, mode, buffering, encoding, …)`.
     if let Some(Object::Str(enc)) = args.get(3) {
@@ -5349,6 +5366,27 @@ fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
         items: Rc::new(RefCell::new(buf)),
         index,
     }))))
+}
+
+fn b_enumerate_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // `enumerate(iterable, start=N)`: fold a `start` keyword into the
+    // positional form `b_enumerate` consumes (`args[1]`).
+    let mut ctor_args = args.to_vec();
+    for (k, v) in kwargs {
+        if k == "start" {
+            if ctor_args.len() >= 2 {
+                return Err(type_error(
+                    "enumerate() got multiple values for argument 'start'",
+                ));
+            }
+            ctor_args.push(v.clone());
+        } else {
+            return Err(type_error(format!(
+                "enumerate() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    b_enumerate(&ctor_args)
 }
 
 fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -10271,6 +10309,10 @@ fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
 fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     Ok(Object::Int(f.position() as i64))
+}
+
+fn file_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(file_self(args)?.isatty()))
 }
 
 fn file_getvalue(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -1550,6 +1550,10 @@ fn sys_displayhook(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sys_thread_info() -> Object {
+    // CPython exposes `sys.thread_info` as a struct-sequence with
+    // attribute access (`.name`, `.lock`, `.version`); `test_os` reads
+    // `sys.thread_info.version` at import. A SimpleNamespace gives us the
+    // same attribute surface.
     let mut d = DictData::new();
     d.insert(
         DictKey(Object::from_static("name")),
@@ -1560,5 +1564,5 @@ fn sys_thread_info() -> Object {
         Object::from_static("cooperative"),
     );
     d.insert(DictKey(Object::from_static("version")), Object::None);
-    Object::Dict(Rc::new(RefCell::new(d)))
+    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }
