@@ -97,6 +97,7 @@ byteorder   = "1.5"
 encoding_rs = "0.8"
 bzip2       = { version = "0.4", features = ["static"] }
 xz2         = "0.1"
+lzma-sys    = "0.1"
 rusqlite    = { version = "0.31", features = ["bundled"] }
 rust_decimal = "1.36"
 
@@ -138,6 +139,17 @@ cranelift-native      = "0.132"
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }
 proptest    = "1.5"
+
+# WeavePy vendors a lightly-patched `lzma-sys` (see `vendor/lzma-sys`). Upstream
+# bundles liblzma with a `config.h` that registers only the X86/SPARC BCJ
+# (branch/call/jump) filters, so `lzma.FORMAT_RAW` chains and
+# `lzma._decode_filter_properties` for ARM/ARMTHUMB/IA64/POWERPC — which CPython's
+# `test_lzma` exercises via `FILTERS_RAW_3` — fail at filter-chain init. The
+# patch only flips on the already-compiled coders; the crate is otherwise byte-
+# for-byte lzma-sys 0.1.20 (heavy non-compiled trees like docs/po/tests/cli are
+# trimmed). The override applies transitively, so `xz2` picks it up too.
+[patch.crates-io]
+lzma-sys = { path = "vendor/lzma-sys" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

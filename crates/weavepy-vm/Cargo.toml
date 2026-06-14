@@ -47,6 +47,7 @@ byteorder        = { workspace = true }
 encoding_rs      = { workspace = true }
 bzip2            = { workspace = true }
 xz2              = { workspace = true }
+lzma-sys         = { workspace = true }
 rusqlite         = { workspace = true }
 rust_decimal     = { workspace = true }
 

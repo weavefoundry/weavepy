@@ -35,11 +35,16 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         let bt = crate::builtin_types::builtin_types();
 
-        let iobase = make_protocol("IOBase", vec![bt.object_.clone()]);
-        let raw_iobase = make_protocol("RawIOBase", vec![iobase.clone()]);
-        let buffered_iobase = make_protocol("BufferedIOBase", vec![iobase.clone()]);
-        let text_iobase = make_protocol("TextIOBase", vec![iobase.clone()]);
-        let fileio = make_protocol("FileIO", vec![raw_iobase.clone()]);
+        // Share the user-facing `io` module's IOBase hierarchy (RFC 0038) so
+        // `_io.IOBase` carries the same working mixin methods
+        // (`__enter__`/`__iter__`/`writelines`/…) and the two faces stay in
+        // lockstep.
+        let fam = crate::stdlib::io::build_iobase_family();
+        let iobase = fam.iobase.clone();
+        let raw_iobase = fam.raw.clone();
+        let buffered_iobase = fam.buffered.clone();
+        let text_iobase = fam.text.clone();
+        let fileio = fam.fileio.clone();
         install_closed_getset(&fileio);
         // Functional buffered wrappers (shared with the user-facing `io`
         // module): `_io.BufferedWriter(_io.BytesIO())` actually wraps and

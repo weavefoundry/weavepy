@@ -1470,6 +1470,20 @@ pub struct PyFile {
     /// reassign `f.name` to the real path. Stored separately so the
     /// Rust-internal `name` (used for error messages, etc.) stays put.
     pub name_override: RefCell<Option<String>>,
+    /// The file was opened with a `bytes`/`bytearray` filename, so the
+    /// Python-visible `f.name` must read back as `bytes` (CPython keeps the
+    /// original object type).
+    pub name_is_bytes: crate::sync::Cell<bool>,
+    /// The stream has no filesystem name (`io.BytesIO`/`io.StringIO`): reading
+    /// `f.name` raises `AttributeError`, like CPython's in-memory streams.
+    pub no_name: crate::sync::Cell<bool>,
+    /// Per-instance attribute store (CPython's file objects carry a
+    /// `__dict__`). Lets user code monkeypatch methods/attributes on a live
+    /// stream — e.g. `bio.seekable = lambda: False` (test_bz2 `testSeekable`).
+    /// Empty by default (no allocation); checked after the fixed data
+    /// attributes but before native methods, so it shadows methods like
+    /// CPython's non-data-descriptor instance-dict rule.
+    pub extra_attrs: RefCell<Vec<(String, Object)>>,
 }
 
 impl PyFile {
@@ -1484,6 +1498,28 @@ impl PyFile {
             closed: RefCell::new(false),
             encoding: RefCell::new(None),
             name_override: RefCell::new(None),
+            name_is_bytes: crate::sync::Cell::new(false),
+            no_name: crate::sync::Cell::new(false),
+            extra_attrs: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Read a monkeypatched per-instance attribute, if set.
+    pub fn get_extra_attr(&self, name: &str) -> Option<Object> {
+        self.extra_attrs
+            .borrow()
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Set a per-instance attribute (insert or overwrite).
+    pub fn set_extra_attr(&self, name: &str, value: Object) {
+        let mut attrs = self.extra_attrs.borrow_mut();
+        if let Some(slot) = attrs.iter_mut().find(|(k, _)| k == name) {
+            slot.1 = value;
+        } else {
+            attrs.push((name.to_owned(), value));
         }
     }
 
@@ -1501,6 +1537,44 @@ impl PyFile {
         *self.name_override.borrow_mut() = Some(name);
     }
 
+    /// The Python-visible `name` *object*: `str` normally, `bytes` when the
+    /// file was opened with a bytes filename, or `None` for in-memory streams
+    /// (where the caller raises `AttributeError`). A user-set override always
+    /// wins and is returned as `str`.
+    pub fn name_obj(&self) -> Option<Object> {
+        if let Some(n) = self.name_override.borrow().clone() {
+            return Some(Object::from_str(n));
+        }
+        if self.no_name.get() {
+            return None;
+        }
+        if self.name_is_bytes.get() {
+            Some(Object::new_bytes(self.name.clone().into_bytes()))
+        } else {
+            Some(Object::from_str(self.name.clone()))
+        }
+    }
+
+    /// The binary underlayer exposed as `f.buffer` / `f.raw`. CPython's
+    /// `sys.stdin` is a text `TextIOWrapper` whose `.buffer` is a *distinct*
+    /// binary `BufferedReader`; collapsing them onto one text-mode object made
+    /// `sys.stdin.buffer.read()` hand back `str`. For a text-mode standard
+    /// input we therefore mint a binary view over the same backend (stdin is a
+    /// process-global resource, so sharing the fd is correct). Every other
+    /// stream already round-trips raw bytes through `read`/`write`, so it can
+    /// serve as its own buffer — signalled here by returning `None`.
+    pub fn binary_buffer(&self) -> Option<Object> {
+        if !self.binary && matches!(*self.backend.borrow(), FileBackend::Stdin) {
+            Some(Object::File(Rc::new(PyFile::new(
+                "<stdin>",
+                "rb",
+                FileBackend::Stdin,
+            ))))
+        } else {
+            None
+        }
+    }
+
     /// Whether the stream is attached to a terminal (`f.isatty()`). The
     /// standard streams defer to the real process handles (so a piped or
     /// redirected `sys.stdin` reports `False`); in-memory `BytesIO`/
@@ -1513,6 +1587,31 @@ impl PyFile {
             FileBackend::Stdout(_) => std::io::stdout().is_terminal(),
             FileBackend::Stderr(_) => std::io::stderr().is_terminal(),
             FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => false,
+        }
+    }
+
+    /// `f.fileno()` — the underlying OS file descriptor. Disk files expose
+    /// their real fd; the standard streams report 0/1/2; in-memory
+    /// `BytesIO`/`StringIO` have no descriptor and return `None` (the caller
+    /// raises `io.UnsupportedOperation`). Mirrors `io.IOBase.fileno`.
+    pub fn fileno(&self) -> Option<i64> {
+        match &*self.backend.borrow() {
+            #[cfg(unix)]
+            FileBackend::Disk(f) => {
+                use std::os::unix::io::AsRawFd;
+                Some(i64::from(f.as_raw_fd()))
+            }
+            #[cfg(windows)]
+            FileBackend::Disk(f) => {
+                use std::os::windows::io::AsRawHandle;
+                Some(f.as_raw_handle() as i64)
+            }
+            #[cfg(not(any(unix, windows)))]
+            FileBackend::Disk(_) => None,
+            FileBackend::Stdin => Some(0),
+            FileBackend::Stdout(_) => Some(1),
+            FileBackend::Stderr(_) => Some(2),
+            FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => None,
         }
     }
 
@@ -1593,6 +1692,19 @@ impl PyFile {
 
     pub fn close(&self) {
         *self.closed.borrow_mut() = true;
+        // Release OS-backed resources promptly. Dropping a real fd (a disk
+        // file, or a subprocess pipe re-wrapped as a `Disk` backend) closes
+        // the descriptor — and closing the write end of a child's `stdin`
+        // pipe is exactly what signals EOF so the child can finish reading.
+        // In-memory buffers are left intact so a post-close `getvalue()` still
+        // works, matching our existing `BytesIO`/`StringIO` semantics.
+        let mut backend = self.backend.borrow_mut();
+        if matches!(&*backend, FileBackend::Disk(_)) {
+            *backend = FileBackend::MemBytes {
+                data: Vec::new(),
+                pos: 0,
+            };
+        }
     }
 
     /// Read up to `n` bytes from the backend; `None` reads everything.
@@ -1644,12 +1756,34 @@ impl PyFile {
             (FileBackend::Stdout(_) | FileBackend::Stderr(_), _) => {
                 return Err(os_error("not readable"));
             }
-            (FileBackend::Stdin, _) => {
-                let mut s = String::new();
+            (FileBackend::Stdin, None) => {
+                // Raw bytes (not `read_to_string`, which would reject non-UTF-8
+                // binary data piped to `sys.stdin.buffer`). Text-mode callers
+                // decode the result via `decode_text`.
                 std::io::stdin()
-                    .read_to_string(&mut s)
+                    .read_to_end(&mut buf)
                     .map_err(|e| os_error(format!("read: {e}")))?;
-                buf = s.into_bytes();
+            }
+            (FileBackend::Stdin, Some(n)) => {
+                // Read up to `n` bytes, looping past short reads (pipes deliver
+                // data in fragments) until we have `n` or hit EOF — matching
+                // `BufferedReader.read(n)`. Honouring `n` (instead of draining
+                // all of stdin) is what makes `sys.stdin.buffer.read(size)`
+                // usable, e.g. `python -m gzip -d` over a pipe.
+                let stdin = std::io::stdin();
+                let mut handle = stdin.lock();
+                buf.resize(n, 0);
+                let mut filled = 0;
+                while filled < n {
+                    let got = handle
+                        .read(&mut buf[filled..])
+                        .map_err(|e| os_error(format!("read: {e}")))?;
+                    if got == 0 {
+                        break;
+                    }
+                    filled += got;
+                }
+                buf.truncate(filled);
             }
         }
         Ok(buf)

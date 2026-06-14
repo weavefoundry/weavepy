@@ -498,10 +498,10 @@ fn build_command(
     Ok(cmd)
 }
 
-fn pipe_reader<R: Read + 'static>(mut reader: R) -> Object {
-    // Read everything into a buffer so the Python side can iterate it
-    // as a normal file. Streaming subprocess pipes belong to the
-    // asyncio integration; for synchronous use this is enough.
+/// Drain a reader to EOF into an in-memory file. Used as the non-Unix
+/// fallback, where re-wrapping the raw fd as a `Disk` backend isn't available.
+#[cfg(not(unix))]
+fn pipe_reader_drain<R: Read + 'static>(mut reader: R) -> Object {
     let mut buf = Vec::new();
     let _ = reader.read_to_end(&mut buf);
     let pf = PyFile::new(
@@ -512,12 +512,49 @@ fn pipe_reader<R: Read + 'static>(mut reader: R) -> Object {
     Object::File(Rc::new(pf))
 }
 
+/// A child's `stdout`/`stderr` pipe, exposed *lazily* as a readable file.
+/// We re-wrap the raw fd as a `Disk` backend so reads stream straight from
+/// the OS pipe (rather than draining at spawn, which would run the child to
+/// completion before its `stdin` could be written — the bug behind
+/// `Popen.communicate(input=...)` losing all output).
+#[cfg(unix)]
+fn pipe_reader<R: std::os::fd::IntoRawFd>(reader: R) -> Object {
+    use std::os::fd::FromRawFd;
+    // SAFETY: `into_raw_fd` hands us sole ownership of a valid, open fd;
+    // the resulting `File` is the only owner and closes it on drop.
+    let file = unsafe { std::fs::File::from_raw_fd(reader.into_raw_fd()) };
+    Object::File(Rc::new(PyFile::new(
+        "<subprocess-pipe>",
+        "rb",
+        FileBackend::Disk(file),
+    )))
+}
+
+#[cfg(not(unix))]
+fn pipe_reader<R: Read + 'static>(reader: R) -> Object {
+    pipe_reader_drain(reader)
+}
+
+/// A child's `stdin` pipe, exposed as a writable file. The raw fd is
+/// re-wrapped as a `Disk` backend; `close()` (or dropping the file) closes
+/// the write end, signalling EOF to the child.
+#[cfg(unix)]
+fn pipe_writer<W: std::os::fd::IntoRawFd>(writer: W) -> Object {
+    use std::os::fd::FromRawFd;
+    // SAFETY: `into_raw_fd` hands us sole ownership of a valid, open fd;
+    // the resulting `File` is the only owner and closes it on drop.
+    let file = unsafe { std::fs::File::from_raw_fd(writer.into_raw_fd()) };
+    Object::File(Rc::new(PyFile::new(
+        "<subprocess-stdin>",
+        "wb",
+        FileBackend::Disk(file),
+    )))
+}
+
+#[cfg(not(unix))]
 fn pipe_writer<W: std::io::Write + 'static>(_writer: W) -> Object {
-    // We can't store a non-`Read` writer in `FileBackend` today, so
-    // hand back a memory buffer. The Python `Popen.communicate(input)`
-    // path goes through the synchronous `run()` flow instead — the
-    // `spawn` path's `.stdin.write(...)` is best-effort until the
-    // I/O multiplexing patch in RFC 0017 lands.
+    // No raw-fd re-wrap available; hand back an inert buffer (best-effort,
+    // matching the historical behaviour on these targets).
     let pf = PyFile::new(
         "<subprocess-stdin>",
         "wb",

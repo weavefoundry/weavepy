@@ -151,6 +151,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("open", os_open_stub),
         );
         d.insert(
+            DictKey(Object::from_static("fdopen")),
+            builtin_kw("fdopen", os_fdopen),
+        );
+        d.insert(
             DictKey(Object::from_static("stat")),
             builtin("stat", os_stat_stub),
         );
@@ -701,6 +705,42 @@ fn os_open_stub(_args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
+/// `os.fdopen(fd, mode='r', ...)` — wrap an existing OS file descriptor in a
+/// file object (CPython returns `io.open(fd, ...)`). WeavePy adopts the fd
+/// into a `Disk`-backed `PyFile`, so `read`/`write`/`seek`/`fileno` work and
+/// closing the file closes the fd.
+#[cfg(unix)]
+fn os_fdopen(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    use crate::object::{FileBackend, PyFile};
+    use std::os::unix::io::FromRawFd;
+    let fd = args
+        .first()
+        .and_then(crate::object::Object::as_i64)
+        .ok_or_else(|| crate::error::type_error("fdopen() fd must be an int".to_owned()))?;
+    let mode = match args.get(1) {
+        Some(Object::Str(s)) => s.to_string(),
+        None => "r".to_owned(),
+        Some(_) => {
+            return Err(crate::error::type_error(
+                "fdopen() mode must be str".to_owned(),
+            ))
+        }
+    };
+    // SAFETY: the caller owns `fd` (typically from `os.open`/`os.pipe`); we
+    // take ownership so the resulting file's lifetime governs the descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+    let pf = PyFile::new(format!("<fdopen fd={fd}>"), mode, FileBackend::Disk(file));
+    pf.no_name.set(true);
+    Ok(Object::File(Rc::new(pf)))
+}
+
+#[cfg(not(unix))]
+fn os_fdopen(_args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    Err(crate::error::not_implemented_error(
+        "os.fdopen(): raw fd interface is not implemented in WeavePy yet",
+    ))
+}
+
 fn os_stat_stub(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "stat")?;
     let meta = std::fs::metadata(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
@@ -801,14 +841,47 @@ fn os_chdir(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
-    match args.first() {
-        Some(Object::Str(_)) | Some(Object::Bytes(_)) => Ok(args[0].clone()),
-        Some(other) => {
-            // Best-effort: if it has __fspath__ we'd have invoked it
-            // from the VM; here we just stringify.
-            Ok(Object::from_str(format!("{:?}", other)))
+    let obj = match args.first() {
+        Some(o) => o,
+        None => return Err(type_error("fspath() takes exactly one argument")),
+    };
+    match obj {
+        Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
+        Object::Instance(_) => {
+            // A `str`/`bytes` subclass reduces to its native value (CPython
+            // `os.fspath` returns those directly).
+            if let Some(n @ (Object::Str(_) | Object::Bytes(_))) = obj.native_value() {
+                return Ok(n);
+            }
+            // Otherwise honour the `os.PathLike` protocol: call `__fspath__`
+            // and require it to yield `str`/`bytes`.
+            let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                type_error(format!(
+                    "expected str, bytes or os.PathLike object, not {}",
+                    obj.type_name()
+                ))
+            })?;
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let fspath = interp.load_attr_public(obj, "__fspath__").map_err(|_| {
+                type_error(format!(
+                    "expected str, bytes or os.PathLike object, not {}",
+                    obj.type_name()
+                ))
+            })?;
+            match interp.call_object(fspath, &[], &[])? {
+                r @ (Object::Str(_) | Object::Bytes(_)) => Ok(r),
+                other => Err(type_error(format!(
+                    "expected {}.__fspath__() to return str or bytes, not {}",
+                    obj.type_name(),
+                    other.type_name()
+                ))),
+            }
         }
-        None => Err(type_error("fspath() takes exactly one argument")),
+        other => Err(type_error(format!(
+            "expected str, bytes or os.PathLike object, not {}",
+            other.type_name()
+        ))),
     }
 }
 
@@ -1377,8 +1450,14 @@ fn os_utime(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-fn path_like_type() -> Rc<crate::types::TypeObject> {
-    path_like_type_singleton("PathLike")
+/// The process-wide `os.PathLike` ABC type. Memoised so its identity is
+/// stable across module rebuilds and so `isinstance(x, os.PathLike)` can
+/// recognise it (and apply the `__fspath__` structural check, like CPython's
+/// `PathLike.__subclasshook__`).
+pub fn path_like_type() -> Rc<crate::types::TypeObject> {
+    static CLS: std::sync::OnceLock<Rc<crate::types::TypeObject>> = std::sync::OnceLock::new();
+    CLS.get_or_init(|| path_like_type_singleton("PathLike"))
+        .clone()
 }
 
 fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
@@ -1835,8 +1914,47 @@ fn path_samefile(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn first_path(args: &[Object], func: &str) -> Result<String, RuntimeError> {
     match args.first() {
-        Some(obj) => as_str(obj, func),
+        Some(obj) => path_to_string(obj, func),
         None => Err(type_error(format!("{func}() requires a path argument"))),
+    }
+}
+
+/// Reduce a path argument to a `str`, accepting `str`, `bytes`/`bytearray`,
+/// and `os.PathLike` objects (resolved through `__fspath__`) — matching
+/// CPython's `path_converter`. Shared by the `os.*` filesystem entry points.
+pub(crate) fn path_to_string(obj: &Object, func: &str) -> Result<String, RuntimeError> {
+    match obj {
+        Object::Str(s) => Ok(s.to_string()),
+        Object::Bytes(b) => Ok(String::from_utf8_lossy(b).into_owned()),
+        Object::ByteArray(b) => Ok(String::from_utf8_lossy(&b.borrow()).into_owned()),
+        Object::Instance(_) => {
+            let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                type_error(format!(
+                    "{func}: path should be string, bytes or os.PathLike, not {}",
+                    obj.type_name()
+                ))
+            })?;
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let fspath = interp.load_attr_public(obj, "__fspath__").map_err(|_| {
+                type_error(format!(
+                    "{func}: path should be string, bytes or os.PathLike, not {}",
+                    obj.type_name()
+                ))
+            })?;
+            match interp.call_object(fspath, &[], &[])? {
+                Object::Str(s) => Ok(s.to_string()),
+                Object::Bytes(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+                other => Err(type_error(format!(
+                    "expected {func}.__fspath__() to return str or bytes, not {}",
+                    other.type_name()
+                ))),
+            }
+        }
+        other => Err(type_error(format!(
+            "{func}: path should be string, bytes or os.PathLike, not {}",
+            other.type_name()
+        ))),
     }
 }
 

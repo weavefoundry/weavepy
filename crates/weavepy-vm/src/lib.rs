@@ -5433,9 +5433,19 @@ impl Interpreter {
                 if let Object::File(f) = obj {
                     match name {
                         "buffer" | "raw" => {
+                            if let Some(b) = f.binary_buffer() {
+                                return Ok(b);
+                            }
                             return Ok(obj.clone());
                         }
-                        "name" => return Ok(Object::from_str(f.display_name())),
+                        "name" => {
+                            return match f.name_obj() {
+                                Some(o) => Ok(o),
+                                None => Err(attribute_error(
+                                    "'_io.BytesIO' object has no attribute 'name'",
+                                )),
+                            }
+                        }
                         "mode" => return Ok(Object::from_str(&f.mode)),
                         "closed" => return Ok(Object::Bool(f.is_closed())),
                         "encoding" => {
@@ -5513,6 +5523,15 @@ impl Interpreter {
                             ))));
                         }
                         _ => {}
+                    }
+                }
+                // A monkeypatched per-instance attribute on a file shadows the
+                // native method of the same name (CPython instance-dict rule
+                // for non-data descriptors): `bio.seekable = lambda: False`
+                // then `bio.seekable()` calls the lambda, unbound.
+                if let Object::File(f) = obj {
+                    if let Some(v) = f.get_extra_attr(name) {
+                        return Ok(v);
                     }
                 }
                 if let Some(method) = self.lookup_method(obj, name) {
@@ -8051,6 +8070,12 @@ impl Interpreter {
         let real = builtins::class_of(obj);
         if real.is_subclass_of(cls) {
             return Ok(Object::Bool(true));
+        }
+        // `os.PathLike` is a structural ABC (CPython `PathLike.__subclasshook__`):
+        // anything whose type defines `__fspath__` is an instance even without
+        // explicit subclassing (e.g. `pathlib.Path`, the suite's `FakePath`).
+        if Rc::ptr_eq(cls, &crate::stdlib::os::path_like_type()) {
+            return Ok(Object::Bool(real.lookup("__fspath__").is_some()));
         }
         // Only `Instance`s can carry a custom `__class__`; for every other
         // object the real type *is* `__class__`, so skip the (observable)
@@ -13067,11 +13092,15 @@ impl Interpreter {
                     }
                     Ok(())
                 }
-                _ => Err(attribute_error(format!(
-                    "'{}' object attribute '{}' is read-only",
-                    obj.type_name(),
-                    name
-                ))),
+                // CPython's file objects carry a `__dict__`, so user code can
+                // assign arbitrary attributes (and monkeypatch methods) on a
+                // live stream. Store them per-instance; `load_attr` checks this
+                // store after the fixed data attributes but before native
+                // methods, so e.g. `bio.seekable = lambda: False` takes effect.
+                _ => {
+                    f.set_extra_attr(name, value);
+                    Ok(())
+                }
             },
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",

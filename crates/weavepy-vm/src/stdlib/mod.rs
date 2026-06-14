@@ -807,6 +807,13 @@ fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         // Compression wrappers (RFC 0019).
+        // Shared buffered/decompress reader used by gzip/bz2/lzma (CPython
+        // `Lib/_compression.py`, ported verbatim).
+        FrozenSource {
+            name: "_compression",
+            source: include_str!("python/_compression.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "gzip",
             source: include_str!("python/gzip.py"),

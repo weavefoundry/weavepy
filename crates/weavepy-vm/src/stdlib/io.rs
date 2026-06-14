@@ -29,14 +29,6 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::from_static("Core tools for working with streams."),
         );
         d.insert(
-            DictKey(Object::from_static("StringIO")),
-            builtin("StringIO", io_stringio),
-        );
-        d.insert(
-            DictKey(Object::from_static("BytesIO")),
-            builtin("BytesIO", io_bytesio),
-        );
-        d.insert(
             DictKey(Object::from_static("DEFAULT_BUFFER_SIZE")),
             Object::Int(8192),
         );
@@ -95,20 +87,57 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 .collect(),
             ),
         );
-        // RFC 0023 — surface the IOBase hierarchy from `_io` so
-        // `isinstance(open(...), io.IOBase)` and similar checks work.
-        for name in [
-            "IOBase",
-            "RawIOBase",
-            "BufferedIOBase",
-            "TextIOBase",
-            "FileIO",
-            "IncrementalNewlineDecoder",
-            "UnsupportedOperation",
+        // RFC 0023/0038 — the real IOBase hierarchy with working mixin
+        // methods (`__enter__`/`__exit__`/`__iter__`/`__next__`/
+        // `writelines`/…) so Python subclasses (the `gzip`/`bz2`/`lzma`
+        // wrappers, user `io.RawIOBase`/`BufferedIOBase` subclasses, the
+        // `_compression` reader) inherit a usable stream protocol.
+        let fam = build_iobase_family();
+        for (name, cls) in [
+            ("IOBase", &fam.iobase),
+            ("RawIOBase", &fam.raw),
+            ("BufferedIOBase", &fam.buffered),
+            ("TextIOBase", &fam.text),
+            ("FileIO", &fam.fileio),
         ] {
-            let cls = make_io_protocol(name);
-            d.insert(DictKey(Object::from_static(name)), Object::Type(cls));
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::Type(cls.clone()),
+            );
         }
+        // `BytesIO`/`StringIO` are real subclassable types backed by a
+        // native in-memory file (MRO: BytesIO → BufferedIOBase → IOBase →
+        // object, StringIO → TextIOBase → IOBase → object), so the stdlib
+        // and tests can `class C(io.BytesIO)`.
+        d.insert(
+            DictKey(Object::from_static("BytesIO")),
+            Object::Type(make_memory_stream(
+                "BytesIO",
+                fam.buffered.clone(),
+                bytesio_new,
+                "BytesIO.__new__",
+            )),
+        );
+        d.insert(
+            DictKey(Object::from_static("StringIO")),
+            Object::Type(make_memory_stream(
+                "StringIO",
+                fam.text.clone(),
+                stringio_new,
+                "StringIO.__new__",
+            )),
+        );
+        d.insert(
+            DictKey(Object::from_static("IncrementalNewlineDecoder")),
+            Object::Type(make_io_protocol("IncrementalNewlineDecoder")),
+        );
+        // `io.UnsupportedOperation` is a real exception inheriting both
+        // `OSError` and `ValueError` (CPython), so `except OSError`/
+        // `except ValueError` catch it and it never escapes the test runner.
+        d.insert(
+            DictKey(Object::from_static("UnsupportedOperation")),
+            Object::Type(unsupported_operation_class()),
+        );
         // Functional buffered wrappers: a thin buffering layer over a raw
         // binary stream (e.g. `io.BufferedWriter(io.BytesIO())`). `.raw`
         // re-exposes the wrapped stream; read/write/seek delegate through.
@@ -225,41 +254,6 @@ pub(crate) fn io_text_encoding(args: &[Object]) -> Result<Object, RuntimeError> 
     }
 }
 
-fn io_stringio(args: &[Object]) -> Result<Object, RuntimeError> {
-    let initial = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
-        Some(Object::None) | None => String::new(),
-        _ => return Err(type_error("StringIO() argument must be str")),
-    };
-    Ok(Object::File(Rc::new(PyFile::new(
-        "<string>",
-        "r+",
-        FileBackend::MemText {
-            data: initial,
-            pos: 0,
-        },
-    ))))
-}
-
-fn io_bytesio(args: &[Object]) -> Result<Object, RuntimeError> {
-    let initial = match args.first() {
-        Some(Object::Bytes(b)) => b.to_vec(),
-        Some(Object::ByteArray(b)) => b.borrow().clone(),
-        Some(Object::None) | None => Vec::new(),
-        _ => return Err(value_error("BytesIO() argument must be bytes")),
-    };
-    // CPython positions the read cursor at 0 even when an initial
-    // buffer is supplied, so the caller can `read()` it back.
-    Ok(Object::File(Rc::new(PyFile::new(
-        "<bytes>",
-        "r+b",
-        FileBackend::MemBytes {
-            data: initial,
-            pos: 0,
-        },
-    ))))
-}
-
 // ---------------------------------------------------------------------------
 // TextIOWrapper — a text layer over a binary buffer.
 //
@@ -288,8 +282,10 @@ pub(crate) fn make_text_io_wrapper() -> Rc<crate::types::TypeObject> {
         );
     };
     method("write", tw_write);
+    method("writelines", iobase_writelines);
     method("read", tw_read);
     method("readline", tw_readline);
+    method("readlines", iobase_readlines);
     method("flush", tw_flush);
     method("close", tw_close);
     method("seek", tw_seek);
@@ -316,7 +312,7 @@ pub(crate) fn make_text_io_wrapper() -> Rc<crate::types::TypeObject> {
             call_kw: Some(Box::new(tw_init)),
         })),
     );
-    TypeObject::new_with_flags(
+    let ty = TypeObject::new_with_flags(
         "TextIOWrapper",
         vec![bt.object_.clone()],
         dict,
@@ -325,7 +321,260 @@ pub(crate) fn make_text_io_wrapper() -> Rc<crate::types::TypeObject> {
             is_builtin: true,
         },
     )
-    .expect("TextIOWrapper type")
+    .expect("TextIOWrapper type");
+    install_delegating_closed(&ty, tw_closed);
+    ty
+}
+
+// ---------------------------------------------------------------------------
+// BytesIO / StringIO — real, subclassable in-memory streams.
+//
+// A direct `io.BytesIO()` returns the native `Object::File` fast path the
+// rest of the VM understands (`BufferedReader` wrapping, `TextIOWrapper`
+// targets, `matches!(x, Object::File(_))` sites). A *subclass* instance
+// (`class UnseekableIO(io.BytesIO)`, the `gzip`/`test_io` idiom) is a real
+// `PyInstance` whose `native` payload is that file, so every inherited
+// stream method (read/write/seek/getvalue/…) operates on the live buffer
+// via `crate::builtins::file_self`, while user overrides win through the
+// MRO. This is what lets the stdlib subclass `io.BytesIO` at all.
+// ---------------------------------------------------------------------------
+
+/// Construct the backing in-memory `PyFile` for a `BytesIO`, reading the
+/// optional initial buffer from positionals/`initial_bytes=`.
+fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFile>, RuntimeError> {
+    let initial = args
+        .get(1)
+        .cloned()
+        .or_else(|| kw_get(kwargs, "initial_bytes"));
+    let data = match initial {
+        Some(Object::Bytes(b)) => b.to_vec(),
+        Some(Object::ByteArray(b)) => b.borrow().clone(),
+        Some(o) => o.as_bytes_view().ok_or_else(|| {
+            type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                o.type_name()
+            ))
+        })?,
+        None => Vec::new(),
+    };
+    let f = PyFile::new("<bytes>", "rb+", FileBackend::MemBytes { data, pos: 0 });
+    f.no_name.set(true);
+    Ok(Rc::new(f))
+}
+
+/// Construct the backing in-memory `PyFile` for a `StringIO`, reading the
+/// optional initial value from positionals/`initial_value=`.
+fn stringio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFile>, RuntimeError> {
+    let initial = args
+        .get(1)
+        .cloned()
+        .or_else(|| kw_get(kwargs, "initial_value"));
+    let data = match initial {
+        Some(Object::Str(s)) => s.to_string(),
+        Some(Object::None) | None => String::new(),
+        Some(_) => return Err(type_error("initial_value must be str or None, not int")),
+    };
+    let f = PyFile::new("<string>", "r+", FileBackend::MemText { data, pos: 0 });
+    f.no_name.set(true);
+    Ok(Rc::new(f))
+}
+
+fn kw_get(kwargs: &[(String, Object)], name: &str) -> Option<Object> {
+    kwargs
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
+}
+
+/// `BytesIO.__new__(cls, initial_bytes=b'')` — native `File` for the base
+/// type, a `native`-wrapping instance for a subclass.
+fn bytesio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let cls = match args.first() {
+        Some(Object::Type(t)) => t.clone(),
+        _ => return Err(type_error("BytesIO.__new__(X): X is not a type object")),
+    };
+    let file = bytesio_file(args, kwargs)?;
+    Ok(wrap_memory_stream(&cls, file))
+}
+
+/// `StringIO.__new__(cls, initial_value='', newline='\n')`.
+fn stringio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let cls = match args.first() {
+        Some(Object::Type(t)) => t.clone(),
+        _ => return Err(type_error("StringIO.__new__(X): X is not a type object")),
+    };
+    let file = stringio_file(args, kwargs)?;
+    Ok(wrap_memory_stream(&cls, file))
+}
+
+/// Return the native `File` directly for the canonical built-in type, or a
+/// `PyInstance` carrying it as `native` for a user subclass.
+fn wrap_memory_stream(cls: &Rc<crate::types::TypeObject>, file: Rc<PyFile>) -> Object {
+    if cls.flags.is_builtin {
+        Object::File(file)
+    } else {
+        Object::Instance(Rc::new(crate::types::PyInstance::with_native(
+            cls.clone(),
+            Object::File(file),
+        )))
+    }
+}
+
+/// `__enter__` / `__iter__` for a memory stream subclass: return `self`
+/// (CPython returns the stream itself, preserving the subclass identity —
+/// the native `file_*` helpers would otherwise hand back a bare `File`).
+fn mem_return_self(args: &[Object]) -> Result<Object, RuntimeError> {
+    args.first()
+        .cloned()
+        .ok_or_else(|| type_error("expected stream receiver"))
+}
+
+/// Install a `closed` property whose getter reads the native backing
+/// file (shadowing the IOBase `_iobase_closed`-flag property via MRO).
+fn install_mem_closed_property(ty: &Rc<crate::types::TypeObject>) {
+    fn closed_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        match crate::builtins::file_self(args) {
+            Ok(f) => Ok(Object::Bool(*f.closed.borrow())),
+            Err(_) => Ok(Object::Bool(false)),
+        }
+    }
+    let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "closed",
+            binds_instance: true,
+            call: Box::new(closed_get),
+            call_kw: None,
+        })),
+        Object::None,
+        Object::None,
+        Object::from_static("True if the stream is closed"),
+    )));
+    crate::descr_registry::register(
+        &prop,
+        crate::descr_registry::DescrKind::GetSet,
+        ty.clone(),
+        "closed",
+        None,
+    );
+    ty.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("closed")), prop);
+}
+
+/// Install a `closed` property whose getter is `getter` (delegates to the
+/// wrapped raw/buffer stream for the `Buffered*`/`TextIOWrapper` types,
+/// which CPython exposes as `closed`).
+fn install_delegating_closed(
+    ty: &Rc<crate::types::TypeObject>,
+    getter: fn(&[Object]) -> Result<Object, RuntimeError>,
+) {
+    let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "closed",
+            binds_instance: true,
+            call: Box::new(getter),
+            call_kw: None,
+        })),
+        Object::None,
+        Object::None,
+        Object::from_static("True if the stream is closed"),
+    )));
+    crate::descr_registry::register(
+        &prop,
+        crate::descr_registry::DescrKind::GetSet,
+        ty.clone(),
+        "closed",
+        None,
+    );
+    ty.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("closed")), prop);
+}
+
+/// `Buffered*.closed` — delegates to the wrapped raw stream (CPython
+/// `buffered_closed_get` reads `self.raw.closed`).
+fn bw_closed(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = bw_self(args)?;
+    match bw_target(&inst) {
+        Ok(RawTarget::Native(raw)) => Ok(Object::Bool(*raw.closed.borrow())),
+        Ok(RawTarget::Py(raw)) => py_get_attr(&raw, "closed"),
+        Err(_) => Ok(Object::Bool(true)),
+    }
+}
+
+/// `TextIOWrapper.closed` — delegates to the wrapped buffer's `closed`.
+fn tw_closed(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = tw_self(args)?;
+    match tw_get(&inst, "buffer") {
+        Some(buf) => py_get_attr(&buf, "closed"),
+        None => Ok(Object::Bool(true)),
+    }
+}
+
+/// Build a subclassable in-memory stream type (`BytesIO`/`StringIO`).
+fn make_memory_stream(
+    name: &'static str,
+    base: Rc<crate::types::TypeObject>,
+    new_fn: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+    new_name: &'static str,
+) -> Rc<crate::types::TypeObject> {
+    use crate::object::MethodWrapper;
+    use crate::types::{TypeFlags, TypeObject};
+    let mut dict = DictData::new();
+    let mut method = |n: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
+        dict.insert(
+            DictKey(Object::from_static(n)),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: n,
+                binds_instance: true,
+                call: Box::new(body),
+                call_kw: None,
+            })),
+        );
+    };
+    method("read", crate::builtins::file_read);
+    method("read1", crate::builtins::file_read);
+    method("readline", crate::builtins::file_readline);
+    method("readlines", crate::builtins::file_readlines);
+    method("readinto", crate::builtins::file_readinto);
+    method("readinto1", crate::builtins::file_readinto);
+    method("write", crate::builtins::file_write);
+    method("writelines", crate::builtins::file_writelines);
+    method("seek", crate::builtins::file_seek);
+    method("tell", crate::builtins::file_tell);
+    method("flush", crate::builtins::file_flush);
+    method("close", crate::builtins::file_close);
+    method("getvalue", crate::builtins::file_getvalue);
+    method("readable", crate::builtins::file_readable);
+    method("writable", crate::builtins::file_writable);
+    method("seekable", crate::builtins::file_seekable);
+    method("isatty", crate::builtins::file_isatty);
+    method("fileno", crate::builtins::file_fileno);
+    method("__next__", crate::builtins::file_next);
+    method("__iter__", mem_return_self);
+    method("__enter__", mem_return_self);
+    method("__exit__", crate::builtins::file_exit);
+    dict.insert(
+        DictKey(Object::from_static("__new__")),
+        Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
+            name: new_name,
+            binds_instance: false,
+            call: Box::new(move |a| new_fn(a, &[])),
+            call_kw: Some(Box::new(new_fn)),
+        })))),
+    );
+    let ty = TypeObject::new_with_flags(
+        name,
+        vec![base],
+        dict,
+        TypeFlags {
+            is_exception: false,
+            is_builtin: true,
+        },
+    )
+    .expect("memory stream type");
+    install_mem_closed_property(&ty);
+    ty
 }
 
 /// Pull `self` (a `TextIOWrapper` instance) out of the argument list.
@@ -379,6 +628,14 @@ fn tw_buffer(inst: &crate::types::PyInstance) -> Result<Rc<PyFile>, RuntimeError
     }
 }
 
+/// Resolve the wrapped buffer to either the native `PyFile` or an arbitrary
+/// Python binary stream object (e.g. a `BZ2File`) to delegate to.
+fn tw_buffer_target(inst: &crate::types::PyInstance) -> Result<RawTarget, RuntimeError> {
+    let buf =
+        tw_get(inst, "buffer").ok_or_else(|| value_error("underlying buffer has been detached"))?;
+    raw_target(&buf).map_err(|_| value_error("underlying buffer has been detached"))
+}
+
 /// Follow `Object::File` directly, or a `Buffered*` instance's `.raw`
 /// attribute (recursively) down to the concrete backing `PyFile`.
 fn resolve_raw_pyfile(obj: &Object) -> Result<Rc<PyFile>, RuntimeError> {
@@ -391,6 +648,415 @@ fn resolve_raw_pyfile(obj: &Object) -> Result<Rc<PyFile>, RuntimeError> {
         }
         _ => Err(crate::error::value_error("raw stream unavailable")),
     }
+}
+
+// ===========================================================================
+// IOBase hierarchy + Python-object stream delegation (RFC 0038)
+//
+// CPython's `io` ABCs (`IOBase`/`RawIOBase`/`BufferedIOBase`/`TextIOBase`)
+// ship a pile of *mixin* methods — `__enter__`/`__exit__`/`__iter__`/
+// `__next__`/`writelines`/`readlines`/`flush`/`close`/`seekable`/… — that
+// every Python stream subclass inherits. The frozen `gzip`/`bz2`/`lzma`
+// wrappers (and `_compression`) subclass these and rely on the mixins, and
+// they wrap pure-Python raw streams (`_compression.DecompressReader`) in
+// `io.BufferedReader`. So WeavePy's `io` needs (1) a real IOBase hierarchy
+// carrying those mixins and (2) `Buffered*`/`TextIOWrapper` that delegate to
+// an arbitrary Python stream object — not just the native `PyFile` fast path.
+// ===========================================================================
+
+pub(crate) struct IoFamily {
+    pub iobase: Rc<crate::types::TypeObject>,
+    pub raw: Rc<crate::types::TypeObject>,
+    pub buffered: Rc<crate::types::TypeObject>,
+    pub text: Rc<crate::types::TypeObject>,
+    pub fileio: Rc<crate::types::TypeObject>,
+}
+
+/// Build the `IOBase → {RawIOBase, BufferedIOBase, TextIOBase} → FileIO`
+/// hierarchy with the CPython mixin methods installed on the root. Shared by
+/// both the `io` and `_io` module builders so the two faces are identical.
+pub(crate) fn build_iobase_family() -> IoFamily {
+    use crate::object::MethodWrapper;
+    use crate::types::{TypeFlags, TypeObject};
+    let bt = crate::builtin_types::builtin_types();
+    let mut dict = DictData::new();
+    install_iobase_mixins(&mut dict);
+    // `io.IOBase.register(...)` — ABC virtual-subclass registration.
+    dict.insert(
+        DictKey(Object::from_static("register")),
+        Object::ClassMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
+            name: "register",
+            binds_instance: true,
+            call: Box::new(io_abc_register),
+            call_kw: None,
+        })))),
+    );
+    let flags = || TypeFlags {
+        is_exception: false,
+        is_builtin: true,
+    };
+    let iobase = TypeObject::new_with_flags("IOBase", vec![bt.object_.clone()], dict, flags())
+        .expect("IOBase must linearise");
+    install_closed_property(&iobase);
+    let child = |name: &'static str, base: &Rc<TypeObject>| {
+        TypeObject::new_with_flags(name, vec![base.clone()], DictData::new(), flags())
+            .expect("io child type must linearise")
+    };
+    let raw = child("RawIOBase", &iobase);
+    let buffered = child("BufferedIOBase", &iobase);
+    let text = child("TextIOBase", &iobase);
+    let fileio = child("FileIO", &raw);
+    IoFamily {
+        iobase,
+        raw,
+        buffered,
+        text,
+        fileio,
+    }
+}
+
+fn iobase_method(
+    dict: &mut DictData,
+    name: &'static str,
+    body: fn(&[Object]) -> Result<Object, RuntimeError>,
+) {
+    dict.insert(
+        DictKey(Object::from_static(name)),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(body),
+            call_kw: None,
+        })),
+    );
+}
+
+/// Install the `io.IOBase` mixin methods onto a fresh type dict.
+fn install_iobase_mixins(dict: &mut DictData) {
+    iobase_method(dict, "__enter__", iobase_enter);
+    iobase_method(dict, "__exit__", iobase_exit);
+    iobase_method(dict, "__iter__", iobase_iter);
+    iobase_method(dict, "__next__", iobase_next);
+    iobase_method(dict, "writelines", iobase_writelines);
+    iobase_method(dict, "readline", iobase_readline);
+    iobase_method(dict, "readlines", iobase_readlines);
+    iobase_method(dict, "flush", iobase_flush);
+    iobase_method(dict, "close", iobase_close);
+    iobase_method(dict, "seekable", iobase_false);
+    iobase_method(dict, "readable", iobase_false);
+    iobase_method(dict, "writable", iobase_false);
+    iobase_method(dict, "isatty", iobase_false);
+    iobase_method(dict, "tell", iobase_tell);
+    iobase_method(dict, "seek", iobase_unsupported);
+    iobase_method(dict, "truncate", iobase_unsupported);
+    iobase_method(dict, "fileno", iobase_unsupported);
+    iobase_method(dict, "_checkClosed", iobase_check_closed);
+    iobase_method(dict, "_checkReadable", iobase_check_readable);
+    iobase_method(dict, "_checkWritable", iobase_check_writable);
+    iobase_method(dict, "_checkSeekable", iobase_check_seekable);
+}
+
+/// `IOBase.closed` — reads the `_iobase_closed` flag set by `close()`
+/// (subclasses with their own `closed` property override this via MRO).
+fn install_closed_property(ty: &Rc<crate::types::TypeObject>) {
+    fn closed_get(args: &[Object]) -> Result<Object, RuntimeError> {
+        match args.first() {
+            Some(Object::Instance(i)) => Ok(Object::Bool(matches!(
+                tw_get(i, "_iobase_closed"),
+                Some(Object::Bool(true))
+            ))),
+            Some(Object::File(f)) => Ok(Object::Bool(*f.closed.borrow())),
+            _ => Ok(Object::Bool(false)),
+        }
+    }
+    let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "closed",
+            binds_instance: true,
+            call: Box::new(closed_get),
+            call_kw: None,
+        })),
+        Object::None,
+        Object::None,
+        Object::from_static("True if the stream is closed"),
+    )));
+    crate::descr_registry::register(
+        &prop,
+        crate::descr_registry::DescrKind::GetSet,
+        ty.clone(),
+        "closed",
+        None,
+    );
+    ty.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static("closed")), prop);
+}
+
+/// Invoke `obj.<name>(*args)` through the running interpreter. Used by the
+/// IOBase mixins and the Python-stream delegation paths.
+fn py_call(obj: &Object, name: &str, args: &[Object]) -> Result<Object, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| value_error("no running interpreter for stream delegation"))?;
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let method = interp.load_attr_public(obj, name)?;
+    interp.call_object(method, args, &[])
+}
+
+/// Read `obj.<name>` through the running interpreter (evaluating any
+/// descriptor / property). Unlike [`py_call`] this does *not* call the
+/// result — used for property reads like `closed`.
+fn py_get_attr(obj: &Object, name: &str) -> Result<Object, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| value_error("no running interpreter for stream delegation"))?;
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    interp.load_attr_public(obj, name)
+}
+
+fn obj_is_empty(o: &Object) -> bool {
+    match o {
+        Object::Bytes(b) => b.is_empty(),
+        Object::ByteArray(b) => b.borrow().is_empty(),
+        Object::Str(s) => s.is_empty(),
+        Object::None => true,
+        _ => false,
+    }
+}
+
+fn iobase_self(args: &[Object]) -> Result<Object, RuntimeError> {
+    args.first()
+        .cloned()
+        .ok_or_else(|| type_error("unbound IOBase method requires an instance"))
+}
+
+fn iobase_enter(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    iobase_check_closed(args)?;
+    Ok(me)
+}
+
+fn iobase_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    py_call(&me, "close", &[])?;
+    Ok(Object::Bool(false))
+}
+
+fn iobase_iter(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    iobase_check_closed(args)?;
+    Ok(me)
+}
+
+fn iobase_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    let line = py_call(&me, "readline", &[])?;
+    if obj_is_empty(&line) {
+        return Err(crate::error::stop_iteration());
+    }
+    Ok(line)
+}
+
+fn iobase_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    let lines = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| type_error("writelines() takes exactly one argument"))?;
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| value_error("no running interpreter for stream delegation"))?;
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let iter = interp.iter_object(lines)?;
+    while let Some(item) = interp.iter_next_object(iter.clone())? {
+        let write = interp.load_attr_public(&me, "write")?;
+        interp.call_object(write, &[item], &[])?;
+    }
+    Ok(Object::None)
+}
+
+/// Default `IOBase.readline(size=-1)` — reads a byte/char at a time via
+/// `self.read(1)`. Concrete streams (`BufferedReader`, `BZ2File`) override
+/// this; it only backs bare IOBase subclasses.
+fn iobase_readline(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    let limit = match args.get(1) {
+        Some(Object::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        if let Some(l) = limit {
+            if l >= 0 && out.len() as i64 >= l {
+                break;
+            }
+        }
+        let chunk = py_call(&me, "read", &[Object::Int(1)])?;
+        let bytes = chunk.as_bytes_view().unwrap_or_default();
+        if bytes.is_empty() {
+            break;
+        }
+        let nl = bytes[0] == b'\n';
+        out.extend_from_slice(&bytes);
+        if nl {
+            break;
+        }
+    }
+    Ok(Object::new_bytes(out))
+}
+
+fn iobase_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    let hint = match args.get(1) {
+        Some(Object::Int(n)) => *n,
+        _ => -1,
+    };
+    let mut lines: Vec<Object> = Vec::new();
+    let mut total: i64 = 0;
+    loop {
+        let line = py_call(&me, "readline", &[])?;
+        if obj_is_empty(&line) {
+            break;
+        }
+        total += line.as_bytes_view().map(|b| b.len() as i64).unwrap_or(0);
+        lines.push(line);
+        if hint > 0 && total >= hint {
+            break;
+        }
+    }
+    Ok(Object::new_list(lines))
+}
+
+fn iobase_flush(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::None)
+}
+
+fn iobase_close(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(Object::Instance(i)) = args.first() {
+        if matches!(tw_get(i, "_iobase_closed"), Some(Object::Bool(true))) {
+            return Ok(Object::None);
+        }
+        let me = Object::Instance(i.clone());
+        let _ = py_call(&me, "flush", &[]);
+        tw_set(i, "_iobase_closed", Object::Bool(true));
+    }
+    Ok(Object::None)
+}
+
+fn iobase_false(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(false))
+}
+
+fn iobase_tell(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    py_call(&me, "seek", &[Object::Int(0), Object::Int(1)])
+}
+
+fn iobase_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(RuntimeError::PyException(
+        crate::error::PyException::from_builtin(
+            "OSError",
+            "I/O operation not supported on this stream",
+        ),
+    ))
+}
+
+fn iobase_check_closed(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    // `closed` is usually a property — read (don't call) it.
+    let is_closed = match py_get_attr(&me, "closed") {
+        Ok(v) => v.is_truthy(),
+        Err(_) => match &me {
+            Object::Instance(i) => matches!(tw_get(i, "_iobase_closed"), Some(Object::Bool(true))),
+            _ => false,
+        },
+    };
+    if is_closed {
+        return Err(value_error("I/O operation on closed file."));
+    }
+    Ok(Object::None)
+}
+
+fn iobase_check_readable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    if !matches!(py_call(&me, "readable", &[])?, Object::Bool(true)) {
+        return Err(unsupported_op("File or stream is not readable."));
+    }
+    Ok(Object::None)
+}
+
+fn iobase_check_writable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    if !matches!(py_call(&me, "writable", &[])?, Object::Bool(true)) {
+        return Err(unsupported_op("File or stream is not writable."));
+    }
+    Ok(Object::None)
+}
+
+fn iobase_check_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    if !matches!(py_call(&me, "seekable", &[])?, Object::Bool(true)) {
+        return Err(unsupported_op("File or stream is not seekable."));
+    }
+    Ok(Object::None)
+}
+
+/// The shared `io.UnsupportedOperation` type (an exception inheriting both
+/// `OSError` and `ValueError`, as in CPython). Memoised so the same type
+/// identity is reused across module rebuilds and reachable from core builtins.
+pub fn unsupported_operation_class() -> Rc<crate::types::TypeObject> {
+    static CLS: std::sync::OnceLock<Rc<crate::types::TypeObject>> = std::sync::OnceLock::new();
+    CLS.get_or_init(|| {
+        let bt = crate::builtin_types::builtin_types();
+        crate::types::TypeObject::new_with_flags(
+            "UnsupportedOperation",
+            vec![bt.os_error.clone(), bt.value_error.clone()],
+            DictData::new(),
+            crate::types::TypeFlags {
+                is_exception: true,
+                is_builtin: true,
+            },
+        )
+        .expect("UnsupportedOperation must linearise")
+    })
+    .clone()
+}
+
+/// Raise an `io.UnsupportedOperation` instance with `msg`.
+pub fn unsupported_op(msg: &str) -> RuntimeError {
+    let inst = crate::builtin_types::make_exception_with_class(unsupported_operation_class(), msg);
+    RuntimeError::PyException(crate::error::PyException::new(inst))
+}
+
+// --- Python-stream delegation target for Buffered*/TextIOWrapper ----------
+
+/// What a `Buffered*`/`TextIOWrapper` wraps: either WeavePy's native
+/// in-memory/OS file (fast path) or an arbitrary Python stream object we
+/// drive through its `read`/`write`/`seek`/… methods.
+enum RawTarget {
+    Native(Rc<PyFile>),
+    Py(Object),
+}
+
+fn raw_target(obj: &Object) -> Result<RawTarget, RuntimeError> {
+    match resolve_raw_pyfile(obj) {
+        Ok(f) => Ok(RawTarget::Native(f)),
+        Err(_) => match obj {
+            Object::Instance(_) => Ok(RawTarget::Py(obj.clone())),
+            _ => Err(value_error("raw stream unavailable")),
+        },
+    }
+}
+
+fn rdbuf_get(inst: &crate::types::PyInstance) -> Vec<u8> {
+    match tw_get(inst, "_rdbuf") {
+        Some(o) => o.as_bytes_view().unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+fn rdbuf_set(inst: &crate::types::PyInstance, v: Vec<u8>) {
+    tw_set(inst, "_rdbuf", Object::new_bytes(v));
 }
 
 fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -427,6 +1093,179 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
     Ok(Object::None)
 }
 
+/// CPython's `newline` modes for `TextIOWrapper`, controlling how line
+/// endings are recognised on read and translated on write.
+#[derive(Clone, Copy, PartialEq)]
+enum NewlineMode {
+    /// `newline=None` — universal: recognise `\r`, `\r\n`, `\n`; translate
+    /// every recognised ending to `\n` on read, and `\n`→`os.linesep` on
+    /// write (a no-op on Unix targets).
+    Universal,
+    /// `newline=''` — universal recognition on read, but **no** translation.
+    Passthrough,
+    /// `newline='\n'` — only `\n` is a line ending; no translation.
+    Lf,
+    /// `newline='\r'` — only `\r` is a line ending; `\n`→`\r` on write.
+    Cr,
+    /// `newline='\r\n'` — only `\r\n` is a line ending; `\n`→`\r\n` on write.
+    CrLf,
+}
+
+fn tw_newline_mode(inst: &crate::types::PyInstance) -> NewlineMode {
+    match tw_get(inst, "newline") {
+        Some(Object::Str(s)) => match &*s {
+            "" => NewlineMode::Passthrough,
+            "\n" => NewlineMode::Lf,
+            "\r" => NewlineMode::Cr,
+            "\r\n" => NewlineMode::CrLf,
+            // An invalid `newline=` would have been rejected at construction;
+            // fall back to universal so reads still make progress.
+            _ => NewlineMode::Universal,
+        },
+        _ => NewlineMode::Universal,
+    }
+}
+
+/// Translate decoded text on read under universal-newline mode (`\r\n` and
+/// lone `\r` both become `\n`), stopping after `max_chars` output characters
+/// if given. Returns the translated text and the number of **source bytes**
+/// consumed so the caller can advance its cursor.
+fn translate_universal(s: &str, max_chars: Option<usize>) -> (String, usize) {
+    let mut out = String::new();
+    let mut out_count = 0usize;
+    let mut consumed = 0usize;
+    let mut iter = s.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        match c {
+            '\r' => {
+                out.push('\n');
+                if let Some(&(j, '\n')) = iter.peek() {
+                    iter.next();
+                    consumed = j + 1;
+                } else {
+                    consumed = i + 1;
+                }
+            }
+            other => {
+                out.push(other);
+                consumed = i + other.len_utf8();
+            }
+        }
+        out_count += 1;
+        if max_chars.is_some_and(|m| out_count >= m) {
+            break;
+        }
+    }
+    (out, consumed)
+}
+
+/// Take up to `max_chars` characters from `s` verbatim (no newline
+/// translation). Returns the slice and the number of bytes consumed.
+fn take_chars(s: &str, max_chars: Option<usize>) -> (&str, usize) {
+    match max_chars {
+        None => (s, s.len()),
+        Some(m) => {
+            let end = s.char_indices().nth(m).map(|(i, _)| i).unwrap_or(s.len());
+            (&s[..end], end)
+        }
+    }
+}
+
+/// Find the first line in `s` (including its terminator) per the given
+/// newline mode. Returns the line slice and the number of bytes it spans.
+/// `\r`/`\n` only ever appear as themselves in UTF-8/ASCII/Latin-1, so a
+/// byte scan is safe.
+fn find_line(s: &str, mode: NewlineMode) -> (&str, usize) {
+    let b = s.as_bytes();
+    let span = match mode {
+        NewlineMode::Lf => b.iter().position(|&x| x == b'\n').map(|k| k + 1),
+        NewlineMode::Cr => b.iter().position(|&x| x == b'\r').map(|k| k + 1),
+        NewlineMode::CrLf => {
+            let mut i = 0;
+            let mut found = None;
+            while i + 1 < b.len() {
+                if b[i] == b'\r' && b[i + 1] == b'\n' {
+                    found = Some(i + 2);
+                    break;
+                }
+                i += 1;
+            }
+            found
+        }
+        NewlineMode::Universal | NewlineMode::Passthrough => {
+            let mut i = 0;
+            let mut found = None;
+            while i < b.len() {
+                match b[i] {
+                    b'\n' => {
+                        found = Some(i + 1);
+                        break;
+                    }
+                    b'\r' => {
+                        found = Some(if i + 1 < b.len() && b[i + 1] == b'\n' {
+                            i + 2
+                        } else {
+                            i + 1
+                        });
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            found
+        }
+    };
+    let end = span.unwrap_or(s.len());
+    (&s[..end], end)
+}
+
+/// Materialise the underlying binary stream into a decoded character buffer
+/// on first read. CPython's `TextIOWrapper` keeps an incrementally-decoded
+/// snapshot buffer and serves `read`/`readline` from it; we read the whole
+/// (finite) stream once and cache the decoded text plus a byte cursor. The
+/// text is stored **untranslated** so newline handling can be applied per
+/// the mode at serve time.
+fn tw_ensure_decoded(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeError> {
+    if matches!(tw_get(inst, "_dec_done"), Some(Object::Bool(true))) {
+        return Ok(());
+    }
+    let raw = match tw_buffer_target(inst)? {
+        RawTarget::Native(file) => file.read_bytes(None)?,
+        RawTarget::Py(buffer) => py_call(&buffer, "read", &[])?
+            .as_bytes_view()
+            .unwrap_or_default(),
+    };
+    let encoding = tw_encoding(inst);
+    let errors = tw_errors(inst);
+    let text = crate::stdlib::codecs_mod::decode_bytes(&raw, &encoding, &errors)?;
+    tw_set(inst, "_dec_buf", Object::from_str(text));
+    tw_set(inst, "_dec_pos", Object::Int(0));
+    tw_set(inst, "_dec_done", Object::Bool(true));
+    Ok(())
+}
+
+/// Drop the decoded-snapshot cache so the next read re-materialises from the
+/// (newly repositioned) underlying buffer.
+fn tw_reset_decoded(inst: &crate::types::PyInstance) {
+    let mut d = inst.dict.borrow_mut();
+    for k in ["_dec_buf", "_dec_pos", "_dec_done"] {
+        d.shift_remove(&DictKey(Object::from_static(k)));
+    }
+}
+
+fn tw_dec_state(inst: &crate::types::PyInstance) -> (Rc<str>, usize) {
+    let buf = match tw_get(inst, "_dec_buf") {
+        Some(Object::Str(s)) => s,
+        _ => Rc::from(""),
+    };
+    let pos = match tw_get(inst, "_dec_pos") {
+        Some(Object::Int(n)) => n.max(0) as usize,
+        _ => 0,
+    };
+    let pos = pos.min(buf.len());
+    (buf, pos)
+}
+
 fn tw_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
     let text = match args.get(1) {
@@ -439,65 +1278,80 @@ fn tw_write(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         None => return Err(type_error("write() takes exactly one argument")),
     };
+    // Newline translation on write: only `\r`/`\r\n` modes rewrite `\n`.
+    // `None` maps `\n`→os.linesep, which is `\n` on WeavePy's Unix targets.
+    let translated = match tw_newline_mode(&inst) {
+        NewlineMode::Cr => text.replace('\n', "\r"),
+        NewlineMode::CrLf => text.replace('\n', "\r\n"),
+        _ => text.clone(),
+    };
     let encoding = tw_encoding(&inst);
     let errors = tw_errors(&inst);
-    let bytes = crate::stdlib::codecs_mod::encode_str(&text, &encoding, &errors)?;
-    let file = tw_buffer(&inst)?;
-    file.write_bytes(&bytes)?;
-    // TextIOWrapper.write returns the number of characters written.
+    let bytes = crate::stdlib::codecs_mod::encode_str(&translated, &encoding, &errors)?;
+    match tw_buffer_target(&inst)? {
+        RawTarget::Native(file) => {
+            file.write_bytes(&bytes)?;
+        }
+        RawTarget::Py(buffer) => {
+            py_call(&buffer, "write", &[Object::new_bytes(bytes)])?;
+        }
+    }
+    // TextIOWrapper.write returns the number of characters written (the
+    // length of the *original* argument, before newline translation).
     Ok(Object::Int(text.chars().count() as i64))
 }
 
 fn tw_read(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
-    let file = tw_buffer(&inst)?;
-    // Text size is measured in characters; we only support the
-    // read-everything form (size omitted / None / negative), which is
-    // what stream-capture helpers use.
-    let want_all = !matches!(args.get(1), Some(Object::Int(n)) if *n >= 0);
-    let raw = if want_all {
-        file.read_bytes(None)?
-    } else {
-        // Approximate: read the requested count of bytes. Good enough
-        // for ASCII-heavy capture; exact char counting would require
-        // incremental decoding.
-        match args.get(1) {
-            Some(Object::Int(n)) => file.read_bytes(Some(*n as usize))?,
-            _ => file.read_bytes(None)?,
+    tw_ensure_decoded(&inst)?;
+    let mode = tw_newline_mode(&inst);
+    let (buf, pos) = tw_dec_state(&inst);
+    let remaining = &buf[pos..];
+    // Size is measured in characters of the *translated* output; a missing,
+    // `None`, or negative size means "read all".
+    let size = match args.get(1) {
+        Some(Object::Int(n)) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    };
+    let (out, consumed) = match mode {
+        NewlineMode::Universal => translate_universal(remaining, size),
+        _ => {
+            let (slice, c) = take_chars(remaining, size);
+            (slice.to_string(), c)
         }
     };
-    let encoding = tw_encoding(&inst);
-    let errors = tw_errors(&inst);
-    let text = crate::stdlib::codecs_mod::decode_bytes(&raw, &encoding, &errors)?;
-    Ok(Object::from_str(text))
+    tw_set(&inst, "_dec_pos", Object::Int((pos + consumed) as i64));
+    Ok(Object::from_str(out))
 }
 
 fn tw_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
-    let file = tw_buffer(&inst)?;
-    // Read byte-by-byte until newline; fine for the small captured
-    // streams these tests exercise.
-    let mut line: Vec<u8> = Vec::new();
-    loop {
-        let b = file.read_bytes(Some(1))?;
-        if b.is_empty() {
-            break;
-        }
-        line.push(b[0]);
-        if b[0] == b'\n' {
-            break;
-        }
+    tw_ensure_decoded(&inst)?;
+    let mode = tw_newline_mode(&inst);
+    let (buf, pos) = tw_dec_state(&inst);
+    let remaining = &buf[pos..];
+    if remaining.is_empty() {
+        return Ok(Object::from_str(String::new()));
     }
-    let encoding = tw_encoding(&inst);
-    let errors = tw_errors(&inst);
-    let text = crate::stdlib::codecs_mod::decode_bytes(&line, &encoding, &errors)?;
-    Ok(Object::from_str(text))
+    let (line, consumed) = find_line(remaining, mode);
+    let out = match mode {
+        NewlineMode::Universal => translate_universal(line, None).0,
+        _ => line.to_string(),
+    };
+    tw_set(&inst, "_dec_pos", Object::Int((pos + consumed) as i64));
+    Ok(Object::from_str(out))
 }
 
 fn tw_flush(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
-    if let Ok(file) = tw_buffer(&inst) {
-        file.flush()?;
+    match tw_buffer_target(&inst) {
+        Ok(RawTarget::Native(file)) => {
+            file.flush()?;
+        }
+        Ok(RawTarget::Py(buffer)) => {
+            let _ = py_call(&buffer, "flush", &[]);
+        }
+        Err(_) => {}
     }
     Ok(Object::None)
 }
@@ -508,34 +1362,54 @@ fn tw_flush_noop(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn tw_close(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
-    if let Ok(file) = tw_buffer(&inst) {
-        let _ = file.flush();
-        file.close();
+    match tw_buffer_target(&inst) {
+        Ok(RawTarget::Native(file)) => {
+            let _ = file.flush();
+            file.close();
+        }
+        Ok(RawTarget::Py(buffer)) => {
+            let _ = py_call(&buffer, "close", &[]);
+        }
+        Err(_) => {}
     }
     Ok(Object::None)
 }
 
 fn tw_seek(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
-    let file = tw_buffer(&inst)?;
+    // Repositioning the underlying buffer invalidates the decoded snapshot.
+    tw_reset_decoded(&inst);
     let offset = match args.get(1) {
-        Some(Object::Int(n)) => *n as isize,
+        Some(Object::Int(n)) => *n,
         _ => 0,
     };
     let whence = match args.get(2) {
         Some(Object::Int(n)) => *n as i32,
         _ => 0,
     };
-    let pos = file.seek(offset, whence)?;
-    Ok(Object::Int(pos as i64))
+    match tw_buffer_target(&inst)? {
+        RawTarget::Native(file) => {
+            let pos = file.seek(offset as isize, whence)?;
+            Ok(Object::Int(pos as i64))
+        }
+        RawTarget::Py(buffer) => py_call(
+            &buffer,
+            "seek",
+            &[Object::Int(offset), Object::Int(i64::from(whence))],
+        ),
+    }
 }
 
 fn tw_tell(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
-    let file = tw_buffer(&inst)?;
-    // SEEK_CUR with 0 offset reports the current position.
-    let pos = file.seek(0, 1)?;
-    Ok(Object::Int(pos as i64))
+    match tw_buffer_target(&inst)? {
+        RawTarget::Native(file) => {
+            // SEEK_CUR with 0 offset reports the current position.
+            let pos = file.seek(0, 1)?;
+            Ok(Object::Int(pos as i64))
+        }
+        RawTarget::Py(buffer) => py_call(&buffer, "tell", &[]),
+    }
 }
 
 fn tw_fileno(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -547,18 +1421,27 @@ fn tw_false(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn tw_readable(args: &[Object]) -> Result<Object, RuntimeError> {
-    let inst = tw_self(args)?;
-    Ok(Object::Bool(tw_buffer(&inst).is_ok()))
+    tw_capability(args, "readable")
 }
 
 fn tw_writable(args: &[Object]) -> Result<Object, RuntimeError> {
-    let inst = tw_self(args)?;
-    Ok(Object::Bool(tw_buffer(&inst).is_ok()))
+    tw_capability(args, "writable")
 }
 
 fn tw_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
+    tw_capability(args, "seekable")
+}
+
+fn tw_capability(args: &[Object], name: &str) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
-    Ok(Object::Bool(tw_buffer(&inst).is_ok()))
+    match tw_buffer_target(&inst) {
+        Ok(RawTarget::Native(_)) => Ok(Object::Bool(true)),
+        Ok(RawTarget::Py(buffer)) => Ok(Object::Bool(matches!(
+            py_call(&buffer, name, &[]),
+            Ok(Object::Bool(true))
+        ))),
+        Err(_) => Ok(Object::Bool(false)),
+    }
 }
 
 fn tw_detach(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -587,8 +1470,18 @@ fn tw_enter(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(args[0].clone())
 }
 
-fn tw_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::None)
+/// `TextIOWrapper.__exit__` — flush + close the wrapper (and thus the
+/// underlying buffer). Essential for stacked compression streams whose
+/// final bytes are only emitted on close.
+fn tw_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+    tw_close(args)?;
+    Ok(Object::Bool(false))
+}
+
+/// `Buffered*.__exit__` — flush + close the buffered wrapper.
+fn bw_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+    bw_close(args)?;
+    Ok(Object::Bool(false))
 }
 
 fn tw_reconfigure(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -629,24 +1522,28 @@ pub(crate) fn make_buffered(name: &'static str) -> Rc<crate::types::TypeObject> 
     };
     method("write", bw_write);
     method("read", bw_read);
-    method("read1", bw_read);
+    method("read1", bw_read1);
     method("readinto", bw_readinto);
+    method("readinto1", bw_readinto);
     method("readline", bw_readline);
+    method("readlines", iobase_readlines);
+    method("writelines", iobase_writelines);
     method("peek", bw_peek);
     method("flush", bw_flush);
     method("close", bw_close);
     method("seek", bw_seek);
     method("tell", bw_tell);
     method("truncate", bw_tell);
-    method("readable", bw_true);
-    method("writable", bw_true);
-    method("seekable", bw_true);
+    method("readable", bw_readable);
+    method("writable", bw_writable);
+    method("seekable", bw_seekable);
     method("isatty", bw_false);
     method("fileno", bw_fileno);
     method("detach", bw_detach);
     method("__iter__", tw_iter);
+    method("__next__", bw_next);
     method("__enter__", tw_enter);
-    method("__exit__", tw_exit);
+    method("__exit__", bw_exit);
     // `__init__(raw, buffer_size=DEFAULT_BUFFER_SIZE)` stores the raw stream.
     dict.insert(
         DictKey(Object::from_static("__init__")),
@@ -657,7 +1554,7 @@ pub(crate) fn make_buffered(name: &'static str) -> Rc<crate::types::TypeObject> 
             call_kw: Some(Box::new(bw_init)),
         })),
     );
-    TypeObject::new_with_flags(
+    let ty = TypeObject::new_with_flags(
         name,
         vec![bt.object_.clone()],
         dict,
@@ -666,7 +1563,9 @@ pub(crate) fn make_buffered(name: &'static str) -> Rc<crate::types::TypeObject> 
             is_builtin: true,
         },
     )
-    .expect("buffered type")
+    .expect("buffered type");
+    install_delegating_closed(&ty, bw_closed);
+    ty
 }
 
 fn bw_self(args: &[Object]) -> Result<Rc<crate::types::PyInstance>, RuntimeError> {
@@ -678,13 +1577,14 @@ fn bw_self(args: &[Object]) -> Result<Rc<crate::types::PyInstance>, RuntimeError
     }
 }
 
-/// Resolve `self.raw` down to the concrete backing `PyFile`.
-fn bw_raw(inst: &crate::types::PyInstance) -> Result<Rc<PyFile>, RuntimeError> {
-    match tw_get(inst, "raw") {
-        Some(obj) => resolve_raw_pyfile(&obj),
-        None => Err(value_error("raw stream unavailable")),
-    }
+/// Resolve `self.raw` to either the native backing file or an arbitrary
+/// Python stream object to delegate to.
+fn bw_target(inst: &crate::types::PyInstance) -> Result<RawTarget, RuntimeError> {
+    let raw = tw_get(inst, "raw").ok_or_else(|| value_error("raw stream unavailable"))?;
+    raw_target(&raw)
 }
+
+const BW_CHUNK: usize = 8192;
 
 fn bw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
@@ -705,130 +1605,363 @@ fn bw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
 
 fn bw_bytes_arg(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
     match arg {
-        Some(Object::Bytes(b)) => Ok(b.to_vec()),
-        Some(Object::ByteArray(b)) => Ok(b.borrow().clone()),
-        Some(other) => Err(type_error(format!(
-            "a bytes-like object is required, not '{}'",
-            other.type_name()
-        ))),
+        Some(o) => o.as_bytes_view().ok_or_else(|| {
+            type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                o.type_name()
+            ))
+        }),
         None => Err(type_error("write() takes exactly one argument")),
     }
 }
 
 fn bw_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    let raw = bw_raw(&inst)?;
-    let bytes = bw_bytes_arg(args.get(1))?;
-    let n = raw.write_bytes(&bytes)?;
-    Ok(Object::Int(n as i64))
+    match bw_target(&inst)? {
+        RawTarget::Native(raw) => {
+            let bytes = bw_bytes_arg(args.get(1))?;
+            let n = raw.write_bytes(&bytes)?;
+            Ok(Object::Int(n as i64))
+        }
+        RawTarget::Py(raw) => {
+            let data = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| type_error("write() takes exactly one argument"))?;
+            py_call(&raw, "write", &[data])
+        }
+    }
+}
+
+/// Parse a read-size argument: `None`/absent → read-all; an int (or
+/// `__index__`-able) → that count; anything else (e.g. `float`) → TypeError,
+/// matching CPython's `BufferedReader.read`.
+fn bw_size_arg(arg: Option<&Object>) -> Result<Option<i64>, RuntimeError> {
+    match arg {
+        None | Some(Object::None) => Ok(None),
+        Some(Object::Int(n)) => Ok(Some(*n)),
+        Some(Object::Bool(b)) => Ok(Some(i64::from(*b))),
+        Some(other) => crate::builtins::coerce_index_i64(other)
+            .map(Some)
+            .map_err(|_| {
+                type_error(format!(
+                    "argument should be integer or None, not '{}'",
+                    other.type_name()
+                ))
+            }),
+    }
 }
 
 fn bw_read(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    let raw = bw_raw(&inst)?;
-    let data = match args.get(1) {
-        Some(Object::Int(n)) if *n >= 0 => raw.read_bytes(Some(*n as usize))?,
-        _ => raw.read_bytes(None)?,
-    };
-    Ok(Object::Bytes(Rc::from(data.as_slice())))
+    let size_opt = bw_size_arg(args.get(1))?;
+    let read_all = size_opt.is_none_or(|n| n < 0);
+    let size = size_opt.filter(|n| *n >= 0).unwrap_or(0) as usize;
+    match bw_target(&inst)? {
+        RawTarget::Native(raw) => {
+            let data = if read_all {
+                raw.read_bytes(None)?
+            } else {
+                raw.read_bytes(Some(size))?
+            };
+            Ok(Object::new_bytes(data))
+        }
+        RawTarget::Py(raw) => {
+            let mut buf = rdbuf_get(&inst);
+            if read_all {
+                let rest = py_call(&raw, "read", &[])?;
+                buf.extend_from_slice(&rest.as_bytes_view().unwrap_or_default());
+                rdbuf_set(&inst, Vec::new());
+                return Ok(Object::new_bytes(buf));
+            }
+            while buf.len() < size {
+                let need = size - buf.len();
+                let chunk = py_call(&raw, "read", &[Object::Int(need as i64)])?;
+                let cb = chunk.as_bytes_view().unwrap_or_default();
+                if cb.is_empty() {
+                    break;
+                }
+                buf.extend_from_slice(&cb);
+            }
+            let take = size.min(buf.len());
+            let out = buf[..take].to_vec();
+            rdbuf_set(&inst, buf[take..].to_vec());
+            Ok(Object::new_bytes(out))
+        }
+    }
+}
+
+/// `read1(size=-1)` — at most one underlying read.
+fn bw_read1(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = bw_self(args)?;
+    match bw_target(&inst)? {
+        RawTarget::Native(_) => bw_read(args),
+        RawTarget::Py(raw) => {
+            let size = match bw_size_arg(args.get(1))? {
+                Some(n) if n >= 0 => n as usize,
+                _ => BW_CHUNK,
+            };
+            let mut buf = rdbuf_get(&inst);
+            if buf.is_empty() {
+                let chunk = py_call(&raw, "read", &[Object::Int(size as i64)])?;
+                buf.extend_from_slice(&chunk.as_bytes_view().unwrap_or_default());
+            }
+            let take = size.min(buf.len());
+            let out = buf[..take].to_vec();
+            rdbuf_set(&inst, buf[take..].to_vec());
+            Ok(Object::new_bytes(out))
+        }
+    }
 }
 
 fn bw_peek(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    let raw = bw_raw(&inst)?;
-    // Read a chunk and rewind so the bytes stay available — a faithful
-    // `peek()` for the seekable in-memory streams we wrap.
-    let data = raw.read_bytes(None)?;
-    if !data.is_empty() {
-        raw.seek(-(data.len() as isize), 1)?;
+    match bw_target(&inst)? {
+        RawTarget::Native(raw) => {
+            // Read a chunk and rewind so the bytes stay available — a faithful
+            // `peek()` for the seekable in-memory streams we wrap.
+            let data = raw.read_bytes(None)?;
+            if !data.is_empty() {
+                raw.seek(-(data.len() as isize), 1)?;
+            }
+            Ok(Object::new_bytes(data))
+        }
+        RawTarget::Py(raw) => {
+            let mut buf = rdbuf_get(&inst);
+            if buf.is_empty() {
+                let chunk = py_call(&raw, "read", &[Object::Int(BW_CHUNK as i64)])?;
+                buf.extend_from_slice(&chunk.as_bytes_view().unwrap_or_default());
+                rdbuf_set(&inst, buf.clone());
+            }
+            Ok(Object::new_bytes(buf))
+        }
     }
-    Ok(Object::Bytes(Rc::from(data.as_slice())))
 }
 
 fn bw_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    let raw = bw_raw(&inst)?;
-    match args.get(1) {
-        Some(Object::ByteArray(dst)) => {
-            let cap = dst.borrow().len();
+    let dst = match args.get(1) {
+        Some(Object::ByteArray(dst)) => dst.clone(),
+        _ => {
+            return Err(type_error(
+                "readinto() argument must be a writable bytes-like object",
+            ))
+        }
+    };
+    let cap = dst.borrow().len();
+    match bw_target(&inst)? {
+        RawTarget::Native(raw) => {
             let data = raw.read_bytes(Some(cap))?;
             let n = data.len();
             dst.borrow_mut()[..n].copy_from_slice(&data);
             Ok(Object::Int(n as i64))
         }
-        _ => Err(type_error(
-            "readinto() argument must be a writable bytes-like object",
-        )),
+        RawTarget::Py(_) => {
+            // Delegate through `read(cap)` then copy into the buffer.
+            let data = bw_read(&[args[0].clone(), Object::Int(cap as i64)])?;
+            let bytes = data.as_bytes_view().unwrap_or_default();
+            let n = bytes.len().min(cap);
+            dst.borrow_mut()[..n].copy_from_slice(&bytes[..n]);
+            Ok(Object::Int(n as i64))
+        }
     }
 }
 
 fn bw_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    let raw = bw_raw(&inst)?;
-    let mut line: Vec<u8> = Vec::new();
-    loop {
-        let b = raw.read_bytes(Some(1))?;
-        if b.is_empty() {
-            break;
+    let limit = match args.get(1) {
+        Some(Object::Int(n)) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    };
+    match bw_target(&inst)? {
+        RawTarget::Native(raw) => {
+            let mut line: Vec<u8> = Vec::new();
+            loop {
+                if let Some(l) = limit {
+                    if line.len() >= l {
+                        break;
+                    }
+                }
+                let b = raw.read_bytes(Some(1))?;
+                if b.is_empty() {
+                    break;
+                }
+                line.push(b[0]);
+                if b[0] == b'\n' {
+                    break;
+                }
+            }
+            Ok(Object::new_bytes(line))
         }
-        line.push(b[0]);
-        if b[0] == b'\n' {
-            break;
+        RawTarget::Py(raw) => {
+            let mut out: Vec<u8> = Vec::new();
+            loop {
+                if let Some(l) = limit {
+                    if out.len() >= l {
+                        break;
+                    }
+                }
+                let mut buf = rdbuf_get(&inst);
+                if buf.is_empty() {
+                    let chunk = py_call(&raw, "read", &[Object::Int(BW_CHUNK as i64)])?;
+                    buf = chunk.as_bytes_view().unwrap_or_default();
+                    if buf.is_empty() {
+                        rdbuf_set(&inst, Vec::new());
+                        break;
+                    }
+                }
+                if let Some(nl) = buf.iter().position(|&c| c == b'\n') {
+                    out.extend_from_slice(&buf[..=nl]);
+                    rdbuf_set(&inst, buf[nl + 1..].to_vec());
+                    break;
+                }
+                out.extend_from_slice(&buf);
+                rdbuf_set(&inst, Vec::new());
+            }
+            if let Some(l) = limit {
+                if out.len() > l {
+                    let extra = out.split_off(l);
+                    let mut buf = extra;
+                    buf.extend_from_slice(&rdbuf_get(&inst));
+                    rdbuf_set(&inst, buf);
+                }
+            }
+            Ok(Object::new_bytes(out))
         }
     }
-    Ok(Object::Bytes(Rc::from(line.as_slice())))
+}
+
+fn bw_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    let line = bw_readline(args)?;
+    if obj_is_empty(&line) {
+        return Err(crate::error::stop_iteration());
+    }
+    Ok(line)
 }
 
 fn bw_flush(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    if let Ok(raw) = bw_raw(&inst) {
-        raw.flush()?;
+    match bw_target(&inst) {
+        Ok(RawTarget::Native(raw)) => {
+            raw.flush()?;
+        }
+        Ok(RawTarget::Py(raw)) => {
+            let _ = py_call(&raw, "flush", &[]);
+        }
+        Err(_) => {}
     }
     Ok(Object::None)
 }
 
 fn bw_close(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    if let Ok(raw) = bw_raw(&inst) {
-        let _ = raw.flush();
-        raw.close();
+    match bw_target(&inst) {
+        Ok(RawTarget::Native(raw)) => {
+            let _ = raw.flush();
+            raw.close();
+        }
+        Ok(RawTarget::Py(raw)) => {
+            let _ = py_call(&raw, "flush", &[]);
+            let _ = py_call(&raw, "close", &[]);
+        }
+        Err(_) => {}
     }
     Ok(Object::None)
 }
 
 fn bw_seek(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    let raw = bw_raw(&inst)?;
+    // `offset` must be an integer (or `__index__`-able): `None`, `bytes`, a
+    // tuple or a `float` are all `TypeError`, matching CPython's argument
+    // clinic. `whence` defaults to SEEK_SET and must be 0/1/2.
     let offset = match args.get(1) {
-        Some(Object::Int(n)) => *n as isize,
-        _ => 0,
+        Some(o) => crate::builtins::coerce_index_i64(o)?,
+        None => return Err(type_error("seek() missing required argument 'offset'")),
     };
     let whence = match args.get(2) {
-        Some(Object::Int(n)) => *n as i32,
-        _ => 0,
+        None | Some(Object::None) => 0,
+        Some(o) => crate::builtins::coerce_index_i64(o)? as i32,
     };
-    let pos = raw.seek(offset, whence)?;
-    Ok(Object::Int(pos as i64))
+    if !matches!(whence, 0..=2) {
+        return Err(value_error(format!(
+            "Invalid whence ({whence}, should be 0, 1 or 2)"
+        )));
+    }
+    match bw_target(&inst)? {
+        RawTarget::Native(raw) => {
+            let pos = raw.seek(offset as isize, whence)?;
+            Ok(Object::Int(pos as i64))
+        }
+        RawTarget::Py(raw) => {
+            let buffered = rdbuf_get(&inst).len() as i64;
+            // Discard the read-ahead buffer; recompute the absolute target for
+            // SEEK_CUR (the buffer hides bytes already consumed from `raw`).
+            rdbuf_set(&inst, Vec::new());
+            let pos = if whence == 1 {
+                let cur = py_call(&raw, "tell", &[])?.as_i64().unwrap_or(0);
+                let target = cur - buffered + offset;
+                py_call(&raw, "seek", &[Object::Int(target), Object::Int(0)])?
+            } else {
+                py_call(
+                    &raw,
+                    "seek",
+                    &[Object::Int(offset), Object::Int(i64::from(whence))],
+                )?
+            };
+            Ok(pos)
+        }
+    }
 }
 
 fn bw_tell(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    let raw = bw_raw(&inst)?;
-    let pos = raw.seek(0, 1)?;
-    Ok(Object::Int(pos as i64))
+    match bw_target(&inst)? {
+        RawTarget::Native(raw) => {
+            let pos = raw.seek(0, 1)?;
+            Ok(Object::Int(pos as i64))
+        }
+        RawTarget::Py(raw) => {
+            let buffered = rdbuf_get(&inst).len() as i64;
+            let cur = py_call(&raw, "tell", &[])?.as_i64().unwrap_or(0);
+            Ok(Object::Int(cur - buffered))
+        }
+    }
 }
 
-fn bw_true(args: &[Object]) -> Result<Object, RuntimeError> {
+fn bw_readable(args: &[Object]) -> Result<Object, RuntimeError> {
+    bw_capability(args, "readable")
+}
+
+fn bw_writable(args: &[Object]) -> Result<Object, RuntimeError> {
+    bw_capability(args, "writable")
+}
+
+fn bw_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
+    bw_capability(args, "seekable")
+}
+
+fn bw_capability(args: &[Object], name: &str) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    Ok(Object::Bool(bw_raw(&inst).is_ok()))
+    match bw_target(&inst) {
+        Ok(RawTarget::Native(_)) => Ok(Object::Bool(true)),
+        Ok(RawTarget::Py(raw)) => Ok(Object::Bool(matches!(
+            py_call(&raw, name, &[]),
+            Ok(Object::Bool(true))
+        ))),
+        Err(_) => Ok(Object::Bool(false)),
+    }
 }
 
 fn bw_false(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(false))
 }
 
-fn bw_fileno(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(value_error("underlying stream has no fileno"))
+fn bw_fileno(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = bw_self(args)?;
+    match bw_target(&inst)? {
+        RawTarget::Native(_) => Err(value_error("underlying stream has no fileno")),
+        RawTarget::Py(raw) => py_call(&raw, "fileno", &[]),
+    }
 }
 
 fn bw_detach(args: &[Object]) -> Result<Object, RuntimeError> {

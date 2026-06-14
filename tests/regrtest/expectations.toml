@@ -233,16 +233,16 @@ status = "pass"
 reason = "full zlib via flate2/zlib-rs: compressobj/decompressobj, _ZlibDecompressor, wbits/dictionary, flush modes"
 
 [tests."cpython/Lib/test/test_gzip.py"]
-status = "fail"
-reason = "gzip module: mtime preservation + multistream"
+status = "pass"
+reason = "full gzip: CPython gzip.py port over zlib.compressobj/_ZlibDecompressor + subclassable io.BytesIO, TextIOWrapper explicit-newline translation, bytes()/memoryview.cast buffer-protocol writes, and a real-pipe `python -m gzip` stdin subprocess path"
 
 [tests."cpython/Lib/test/test_bz2.py"]
-status = "fail"
-reason = "bz2 ships and imports cleanly; full test_bz2.py conformance (BZ2File multistream + compressor reuse) unverified pending a local Lib/test checkout"
+status = "pass"
+reason = "full bz2 (1 skip): BZ2File over _compression + BZ2Compressor/Decompressor, TextIOWrapper explicit-newline, and per-instance __dict__ on native streams for method monkeypatching (testSeekable)"
 
 [tests."cpython/Lib/test/test_lzma.py"]
-status = "fail"
-reason = "lzma ships and imports cleanly; full test_lzma.py conformance (raw filters + FORMAT_ALONE edges) unverified pending a local Lib/test checkout"
+status = "pass"
+reason = "full lzma (1 skip): LZMAFile + LZMACompressor/Decompressor with check-id parsing & arg validation, FORMAT_RAW filter chains and _en/_decode_filter_properties via lzma-sys raw FFI (workspace vendors lzma-sys with all BCJ filters enabled)"
 
 [tests."cpython/Lib/test/test_zipfile.py"]
 status = "fail"
