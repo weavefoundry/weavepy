@@ -419,6 +419,28 @@ impl Interpreter {
         self.stdout = stdout;
     }
 
+    /// Flush the buffered output streams. CPython's `Py_FinalizeEx`
+    /// flushes `sys.stdout`/`sys.stderr` during shutdown; we mirror that
+    /// so output survives a `SystemExit`/`sys.exit()` exit (which goes
+    /// through `std::process::exit`, bypassing Rust's normal end-of-main
+    /// stdout flush and any `Drop`-based flushing). First drive the
+    /// Python-level `sys.stdout`/`sys.stderr` `flush()` (handles a
+    /// reassigned, user-buffered stream), then flush the host sink.
+    pub fn flush_streams(&mut self) {
+        for name in ["stdout", "stderr"] {
+            if let Some(stream) = self.current_sys_attr(name) {
+                if matches!(&stream, Object::None) {
+                    continue;
+                }
+                if let Ok(flush) = self.load_attr(&stream, "flush") {
+                    let globals = self.builtins.clone();
+                    let _ = self.call(&flush, &[], &[], &globals);
+                }
+            }
+        }
+        let _ = self.stdout.borrow_mut().flush();
+    }
+
     /// RFC 0025: build a worker [`Interpreter`] that shares all
     /// shared state with `self` (builtins, module cache, stdout,
     /// excepthook, unraisable hook) but owns a **fresh** frame

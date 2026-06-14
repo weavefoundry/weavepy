@@ -749,6 +749,9 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "flush" => Some(method("flush", file_flush)),
             "close" => Some(method("close", file_close)),
             "isatty" => Some(method("isatty", file_isatty)),
+            "readable" => Some(method("readable", file_readable)),
+            "writable" => Some(method("writable", file_writable)),
+            "seekable" => Some(method("seekable", file_seekable)),
             "seek" => Some(method("seek", file_seek)),
             "tell" => Some(method("tell", file_tell)),
             "getvalue" => Some(method("getvalue", file_getvalue)),
@@ -10313,6 +10316,18 @@ fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn file_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(file_self(args)?.isatty()))
+}
+
+fn file_readable(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(file_self(args)?.readable()))
+}
+
+fn file_writable(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(file_self(args)?.writable()))
+}
+
+fn file_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(file_self(args)?.seekable()))
 }
 
 fn file_getvalue(args: &[Object]) -> Result<Object, RuntimeError> {

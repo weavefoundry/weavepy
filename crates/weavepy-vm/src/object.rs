@@ -1516,6 +1516,42 @@ impl PyFile {
         }
     }
 
+    /// `f.readable()` — whether reads are permitted. Disk files derive it
+    /// from the mode (`r`/`+`); the std streams and in-memory buffers
+    /// report their fixed capability. Mirrors `io.IOBase.readable`.
+    pub fn readable(&self) -> bool {
+        match &*self.backend.borrow() {
+            FileBackend::Stdin => true,
+            FileBackend::Stdout(_) | FileBackend::Stderr(_) => false,
+            FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => true,
+            FileBackend::Disk(_) => self.mode.contains('r') || self.mode.contains('+'),
+        }
+    }
+
+    /// `f.writable()` — whether writes are permitted.
+    pub fn writable(&self) -> bool {
+        match &*self.backend.borrow() {
+            FileBackend::Stdin => false,
+            FileBackend::Stdout(_) | FileBackend::Stderr(_) => true,
+            FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => true,
+            FileBackend::Disk(_) => {
+                self.mode.contains('w')
+                    || self.mode.contains('a')
+                    || self.mode.contains('x')
+                    || self.mode.contains('+')
+            }
+        }
+    }
+
+    /// `f.seekable()` — disk files and in-memory buffers support random
+    /// access; the live std streams do not.
+    pub fn seekable(&self) -> bool {
+        matches!(
+            &*self.backend.borrow(),
+            FileBackend::Disk(_) | FileBackend::MemBytes { .. } | FileBackend::MemText { .. }
+        )
+    }
+
     /// Set the text-mode codec. UTF-8 spellings collapse to the
     /// `None` fast path.
     pub fn set_encoding(&self, enc: &str) {

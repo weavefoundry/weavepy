@@ -222,15 +222,15 @@ reason = "89/93: only test_c_contiguity (non-contiguous memoryview BufferError) 
 
 [tests."cpython/Lib/test/test_hashlib.py"]
 status = "fail"
-reason = "hashlib: shake / blake2 variable-length digests + usedforsecurity flag"
+reason = "all 14 guaranteed algorithms (md5/sha1/sha2/sha3/shake/blake2), file_digest, usedforsecurity, and array/buffer hashing pass; residual failures are the arg-clinic signature-error sweep (test_clinic_signature_errors), read-only immutable builtin types, cross-thread hasher sharing, bigmem, and the CPython-internal __get_builtin_constructor"
 
 [tests."cpython/Lib/test/test_hmac.py"]
-status = "fail"
-reason = "hmac.compare_digest + new-style digestmod=name lookup"
+status = "pass"
+reason = "vendored hmac.py over _operator._compare_digest + hashlib usedforsecurity kwargs"
 
 [tests."cpython/Lib/test/test_zlib.py"]
-status = "fail"
-reason = "zlib compressor reuse + flush() modes"
+status = "pass"
+reason = "full zlib via flate2/zlib-rs: compressobj/decompressobj, _ZlibDecompressor, wbits/dictionary, flush modes"
 
 [tests."cpython/Lib/test/test_gzip.py"]
 status = "fail"

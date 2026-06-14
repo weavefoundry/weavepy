@@ -38,6 +38,7 @@ pub mod json;
 pub mod lzma_mod;
 pub mod marshal_mod;
 pub mod math;
+pub mod operator_accel;
 pub mod os;
 pub mod resource_mod;
 pub mod secrets_mod;
@@ -100,7 +101,7 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_socket", socket_mod::build);
     cache.register_builtin("_subprocess", subprocess_mod::build);
     cache.register_builtin("hashlib", hashlib_mod::build);
-    cache.register_builtin("hmac", hmac_mod::build);
+    cache.register_builtin("_operator", operator_accel::build);
     cache.register_builtin("binascii", binascii_mod::build);
     cache.register_builtin("secrets", secrets_mod::build);
     cache.register_builtin("uuid", uuid_mod::build);
@@ -283,6 +284,15 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "platform",
             source: include_str!("python/platform.py"),
+            is_package: false,
+        },
+        // Verbatim CPython 3.13 `hmac`. The Rust shim it replaces could not
+        // satisfy `test_hmac`'s identity check (`hmac.compare_digest is
+        // _operator._compare_digest`) nor the full `HMAC` class surface;
+        // ported over `hashlib` + `_operator._compare_digest` instead.
+        FrozenSource {
+            name: "hmac",
+            source: include_str!("python/hmac.py"),
             is_package: false,
         },
         FrozenSource {

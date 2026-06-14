@@ -74,12 +74,19 @@ mio         = { version = "1.0", features = ["os-poll", "os-ext", "net"] }
 socket2     = { version = "0.5", features = ["all"] }
 sha2        = "0.10"
 sha1        = "0.10"
+sha3        = "0.10"
 md-5        = "0.10"
 digest      = "0.10"
 hmac        = "0.12"
+blake2b_simd = "1.0"
+blake2s_simd = "1.0"
 base64      = "0.22"
 crc32fast   = "1.4"
-flate2      = { version = "1.0", default-features = false, features = ["rust_backend"] }
+# `zlib-rs` is a pure-Rust zlib reimplementation (no C dependency) that, via
+# flate2's `any_zlib` cfg, unlocks the full low-level API we need for faithful
+# `zlib` conformance: preset dictionaries (`set_dictionary`), configurable
+# `window_bits` (`new_with_window_bits`), and gzip framing (`new_gzip`).
+flate2      = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 
 # RFC 0019 — numerics and serialization.
 num-bigint  = "0.4"

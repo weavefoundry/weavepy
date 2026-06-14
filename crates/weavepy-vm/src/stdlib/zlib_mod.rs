@@ -15,9 +15,7 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::collections::HashMap;
-use std::io::Write;
 
-use flate2::write::GzDecoder;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 
 use crate::error::{type_error, value_error, RuntimeError};
@@ -62,7 +60,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // are accepted for API parity (their effect on the byte stream is not
         // observed by `test_zlib`, which only checks round-trips for them).
         d.insert(DictKey(Object::from_static("DEFLATED")), Object::Int(8));
-        d.insert(DictKey(Object::from_static("DEF_MEM_LEVEL")), Object::Int(8));
+        d.insert(
+            DictKey(Object::from_static("DEF_MEM_LEVEL")),
+            Object::Int(8),
+        );
         d.insert(
             DictKey(Object::from_static("DEF_BUF_SIZE")),
             Object::Int(16384),
@@ -212,7 +213,11 @@ fn check_decompress_wbits(wbits: i64) -> Result<(), RuntimeError> {
 
 /// Reject a positional-only `data` keyword and any unexpected keyword,
 /// raising `TypeError` like CPython's Argument Clinic.
-fn reject_kwargs(kwargs: &[(String, Object)], allowed: &[&str], fname: &str) -> Result<(), RuntimeError> {
+fn reject_kwargs(
+    kwargs: &[(String, Object)],
+    allowed: &[&str],
+    fname: &str,
+) -> Result<(), RuntimeError> {
     for (k, _) in kwargs {
         if k == "data" {
             return Err(type_error(format!(
@@ -229,14 +234,16 @@ fn reject_kwargs(kwargs: &[(String, Object)], allowed: &[&str], fname: &str) -> 
 }
 
 fn zlib_compress(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    reject_kwargs(kwargs, &["level"], "compress")?;
+    reject_kwargs(kwargs, &["level", "wbits"], "compress")?;
     let data = bytes_of(args.first())?;
     let level = int_arg(args, kwargs, 1, "level", -1);
+    let wbits = int_arg(args, kwargs, 2, "wbits", 15);
     check_level(level)?;
+    check_compress_wbits(wbits)?;
     // Share the low-level deflate path with `compressobj` so that
     // `compress(x)` and `compressobj().compress(x) + .flush()` produce
     // byte-identical output (`test_pair` asserts this equality).
-    let mut c = compress_for_wbits(level, 15);
+    let mut c = build_compress(level, wbits, &[]);
     let mut out = deflate_step(&mut c, &data, FlushCompress::None)?;
     out.extend(deflate_step(&mut c, &[], FlushCompress::Finish)?);
     Ok(Object::new_bytes(out))
@@ -253,19 +260,8 @@ fn zlib_decompress(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     reject_kwargs(kwargs, &["wbits", "bufsize"], "decompress")?;
     let data = bytes_of(args.first())?;
     let wbits = int_arg(args, kwargs, 1, "wbits", 15);
-    if (24..=31).contains(&wbits) {
-        // gzip framing: the low-level miniz API can't wrap/unwrap gzip, so
-        // use the streaming decoder (it errors on truncation via `finish`).
-        let mut decoder = GzDecoder::new(Vec::new());
-        decoder
-            .write_all(&data)
-            .map_err(|e| value_error(e.to_string()))?;
-        return Ok(Object::new_bytes(
-            decoder.finish().map_err(|e| value_error(e.to_string()))?,
-        ));
-    }
-    let mut d = decompress_for_wbits(wbits);
-    let (out, _consumed, stream_end) = inflate_step(&mut d, &data, None)?;
+    let mut d = build_decompress(wbits, &data, &[]);
+    let (out, _consumed, stream_end) = inflate_step(&mut d, &data, None, &[])?;
     if !stream_end {
         return Err(value_error(
             "Error -5 while decompressing data: incomplete or truncated stream",
@@ -289,7 +285,11 @@ struct CompressState {
 }
 
 struct DecompressState {
-    d: Decompress,
+    // `Decompress` is created lazily on the first `decompress()` so the
+    // auto-detect `wbits` ranges (`0`, `32+`) can sniff the header.
+    d: Option<Decompress>,
+    wbits: i64,
+    zdict: Vec<u8>,
     eof: bool,
 }
 
@@ -297,7 +297,9 @@ struct DecompressState {
 /// decompressor that owns its *input* buffer (rather than exposing
 /// `unconsumed_tail`) and reports `needs_input`.
 struct ZlibDecompressorState {
-    d: Decompress,
+    d: Option<Decompress>,
+    wbits: i64,
+    zdict: Vec<u8>,
     input: Vec<u8>,
     eof: bool,
     needs_input: bool,
@@ -327,23 +329,61 @@ fn next_id() -> i64 {
     })
 }
 
-/// Map CPython's `wbits` onto a `flate2` compressor. Only the *sign* is
-/// observable through the default (`miniz_oxide`) backend: negative → raw
-/// deflate (no header), non-negative → zlib header. The window magnitude is
-/// not configurable here, but `test_zlib` only requires that compress and
-/// decompress agree on the framing, which the sign captures.
-fn compress_for_wbits(level: i64, wbits: i64) -> Compress {
-    Compress::new(level_for(level), wbits >= 0)
+/// Build a `flate2` compressor honouring CPython's `wbits`:
+/// * `-9..=-15` — raw deflate (no header), window `|wbits|`.
+/// * `25..=31` — gzip framing, window `wbits-16`.
+/// * `9..=15` — zlib framing, window `wbits`.
+///
+/// A non-empty `zdict` primes the LZ77 window (`deflateSetDictionary`).
+fn build_compress(level: i64, wbits: i64, zdict: &[u8]) -> Compress {
+    let mut c = if wbits < 0 {
+        Compress::new_with_window_bits(level_for(level), false, (-wbits).clamp(9, 15) as u8)
+    } else if (25..=31).contains(&wbits) {
+        Compress::new_gzip(level_for(level), (wbits - 16).clamp(9, 15) as u8)
+    } else {
+        Compress::new_with_window_bits(level_for(level), true, wbits.clamp(9, 15) as u8)
+    };
+    if !zdict.is_empty() {
+        let _ = c.set_dictionary(zdict);
+    }
+    c
 }
 
-fn decompress_for_wbits(wbits: i64) -> Decompress {
-    Decompress::new(wbits >= 0)
+/// Build a `flate2` decompressor honouring CPython's `wbits` (incl. the
+/// gzip `16+` and auto-detect `32+` ranges). For the auto-detect range the
+/// first bytes of `data` are sniffed for the gzip magic. Raw streams carry
+/// no `FDICT` flag, so a `zdict` must be primed eagerly here; zlib streams
+/// signal `Z_NEED_DICT` and are handled in [`inflate_step`].
+fn build_decompress(wbits: i64, data: &[u8], zdict: &[u8]) -> Decompress {
+    let mut d = if wbits == 0 {
+        // "use the window size recorded in the zlib header" — a max-window
+        // decompressor accepts any zlib stream (its window is never larger).
+        Decompress::new(true)
+    } else if (8..=15).contains(&wbits) {
+        Decompress::new_with_window_bits(true, wbits.clamp(9, 15) as u8)
+    } else if (-15..=-8).contains(&wbits) {
+        Decompress::new_with_window_bits(false, (-wbits).clamp(9, 15) as u8)
+    } else if (24..=31).contains(&wbits) {
+        Decompress::new_gzip((wbits - 16).clamp(9, 15) as u8)
+    } else if data.starts_with(&[0x1f, 0x8b]) {
+        Decompress::new_gzip(15)
+    } else {
+        Decompress::new(true)
+    };
+    if wbits < 0 && !zdict.is_empty() {
+        let _ = d.set_dictionary(zdict);
+    }
+    d
 }
 
 /// Drive `Compress::compress` to completion for one call, growing the output
 /// as needed. `flush` is `None` for `compress(data)` and `Finish`/`Sync`/
 /// `Full`/`Partial` for `flush(mode)`.
-fn deflate_step(c: &mut Compress, input: &[u8], flush: FlushCompress) -> Result<Vec<u8>, RuntimeError> {
+fn deflate_step(
+    c: &mut Compress,
+    input: &[u8],
+    flush: FlushCompress,
+) -> Result<Vec<u8>, RuntimeError> {
     let mut out = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     let mut consumed = 0usize;
@@ -380,17 +420,20 @@ fn deflate_step(c: &mut Compress, input: &[u8], flush: FlushCompress) -> Result<
 }
 
 /// Drive `Decompress::decompress` for one call. `limit` caps the produced
-/// output (`max_length`); `None` means unbounded. Returns
+/// output (`max_length`); `None` means unbounded. A non-empty `dict` is
+/// installed when the zlib stream signals `Z_NEED_DICT`. Returns
 /// `(output, input_consumed, stream_end)`.
 fn inflate_step(
     d: &mut Decompress,
     input: &[u8],
     limit: Option<usize>,
+    dict: &[u8],
 ) -> Result<(Vec<u8>, usize, bool), RuntimeError> {
     let mut out = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     let mut consumed = 0usize;
     let mut stream_end = false;
+    let mut dict_set = false;
     loop {
         let room = match limit {
             Some(l) => {
@@ -403,23 +446,40 @@ fn inflate_step(
         };
         let before_in = d.total_in();
         let before_out = d.total_out();
-        let status = d
-            .decompress(&input[consumed..], &mut buf[..room], FlushDecompress::None)
-            .map_err(|e| value_error(format!("zlib: {e}")))?;
+        let result = d.decompress(&input[consumed..], &mut buf[..room], FlushDecompress::None);
         let din = (d.total_in() - before_in) as usize;
         let dout = (d.total_out() - before_out) as usize;
         out.extend_from_slice(&buf[..dout]);
         consumed += din;
-        match status {
-            Status::StreamEnd => {
+        match result {
+            Ok(Status::StreamEnd) => {
                 stream_end = true;
                 break;
             }
-            Status::BufError => break,
-            Status::Ok => {
+            Ok(Status::BufError) => break,
+            Ok(Status::Ok) => {
                 if din == 0 && dout == 0 {
                     break;
                 }
+            }
+            Err(e) => {
+                // A zlib stream with a preset dictionary stops at the header
+                // with `Z_NEED_DICT`; install the dictionary and resume.
+                if e.needs_dictionary().is_some() && !dict.is_empty() && !dict_set {
+                    d.set_dictionary(dict)
+                        .map_err(|se| value_error(format!("zlib: {se}")))?;
+                    dict_set = true;
+                    continue;
+                }
+                let code = if e.needs_dictionary().is_some() {
+                    2
+                } else {
+                    -3
+                };
+                let detail = e.message().unwrap_or("invalid input data");
+                return Err(value_error(format!(
+                    "Error {code} while decompressing data: {detail}"
+                )));
             }
         }
     }
@@ -427,7 +487,13 @@ fn inflate_step(
 }
 
 /// Optional positional-or-keyword integer argument.
-fn int_arg(args: &[Object], kwargs: &[(String, Object)], pos: usize, name: &str, default: i64) -> i64 {
+fn int_arg(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    pos: usize,
+    name: &str,
+    default: i64,
+) -> i64 {
     args.get(pos)
         .and_then(Object::as_i64)
         .or_else(|| {
@@ -439,11 +505,31 @@ fn int_arg(args: &[Object], kwargs: &[(String, Object)], pos: usize, name: &str,
         .unwrap_or(default)
 }
 
+/// Optional positional-or-keyword bytes-like argument (e.g. `zdict`).
+/// Defaults to empty; a present-but-non-bytes value raises `TypeError`.
+fn bytes_kwarg(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    pos: usize,
+    name: &str,
+) -> Result<Vec<u8>, RuntimeError> {
+    let obj = args
+        .get(pos)
+        .or_else(|| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v));
+    match obj {
+        None => Ok(Vec::new()),
+        Some(o) => o
+            .as_bytes_view()
+            .ok_or_else(|| type_error("zdict argument must support the buffer protocol")),
+    }
+}
+
 fn zlib_compressobj(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     // compressobj(level=-1, method=DEFLATED, wbits=15, memLevel=8,
-    // strategy=Z_DEFAULT_STRATEGY, zdict=b''). Only level + wbits affect us.
+    // strategy=Z_DEFAULT_STRATEGY, zdict=b''). level/wbits/zdict affect us.
     let level = int_arg(args, kwargs, 0, "level", -1);
     let wbits = int_arg(args, kwargs, 2, "wbits", 15);
+    let zdict = bytes_kwarg(args, kwargs, 5, "zdict")?;
     check_level(level)?;
     check_compress_wbits(wbits)?;
     let id = next_id();
@@ -451,7 +537,7 @@ fn zlib_compressobj(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
         r.borrow_mut().insert(
             id,
             Rc::new(RefCell::new(CompressState {
-                c: compress_for_wbits(level, wbits),
+                c: build_compress(level, wbits, &zdict),
                 done: false,
             })),
         );
@@ -463,15 +549,21 @@ fn zlib_compressobj(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
     Ok(Object::Instance(Rc::new(inst)))
 }
 
-fn zlib_decompressobj(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+fn zlib_decompressobj(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     let wbits = int_arg(args, kwargs, 0, "wbits", 15);
+    let zdict = bytes_kwarg(args, kwargs, 1, "zdict")?;
     check_decompress_wbits(wbits)?;
     let id = next_id();
     DECOMPRESS_REG.with(|r| {
         r.borrow_mut().insert(
             id,
             Rc::new(RefCell::new(DecompressState {
-                d: decompress_for_wbits(wbits),
+                d: None,
+                wbits,
+                zdict,
                 eof: false,
             })),
         );
@@ -541,7 +633,11 @@ fn decompress_class() -> Rc<TypeObject> {
     })
 }
 
-fn method_into(dict: &mut DictData, name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) {
+fn method_into(
+    dict: &mut DictData,
+    name: &'static str,
+    body: fn(&[Object]) -> Result<Object, RuntimeError>,
+) {
     dict.insert(
         DictKey(Object::from_static(name)),
         Object::Builtin(Rc::new(BuiltinFn {
@@ -628,7 +724,10 @@ fn store_decompress_attrs(args: &[Object], unused: &[u8], unconsumed: &[u8], eof
     }
 }
 
-fn decompress_decompress(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+fn decompress_decompress(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     reject_kwargs(kwargs, &["max_length"], "decompress")?;
     let id = handle_of(args)?;
     let data = bytes_of(args.get(1))?;
@@ -661,7 +760,11 @@ fn decompress_decompress(args: &[Object], kwargs: &[(String, Object)]) -> Result
         store_decompress_attrs(args, &unused, &[], true);
         return Ok(Object::new_bytes(Vec::new()));
     }
-    let (out, consumed, stream_end) = inflate_step(&mut st.d, &data, limit)?;
+    if st.d.is_none() {
+        st.d = Some(build_decompress(st.wbits, &data, &st.zdict));
+    }
+    let zdict = st.zdict.clone();
+    let (out, consumed, stream_end) = inflate_step(st.d.as_mut().unwrap(), &data, limit, &zdict)?;
     let leftover = &data[consumed..];
     if stream_end {
         st.eof = true;
@@ -684,18 +787,26 @@ fn decompress_flush(args: &[Object]) -> Result<Object, RuntimeError> {
             return Err(value_error("length must be greater than zero"));
         }
     }
-    let tail = read_bytes_attr(args, "unconsumed_tail");
     let state = DECOMPRESS_REG.with(|r| r.borrow().get(&id).cloned());
     let state = state.ok_or_else(|| value_error("zlib: stale decompressor"))?;
     let mut st = state.borrow_mut();
-    let (out, consumed, stream_end) = inflate_step(&mut st.d, &tail, None)?;
-    let leftover = tail[consumed..].to_vec();
+    // Once the stream has ended, `flush()` has nothing left to do and must
+    // NOT recompute `unused_data` — the trailing bytes were already captured
+    // by the `decompress()` call that hit the stream end.
+    if st.eof {
+        return Ok(Object::new_bytes(Vec::new()));
+    }
+    let tail = read_bytes_attr(args, "unconsumed_tail");
+    if st.d.is_none() {
+        st.d = Some(build_decompress(st.wbits, &tail, &st.zdict));
+    }
+    let zdict = st.zdict.clone();
+    let (out, consumed, stream_end) = inflate_step(st.d.as_mut().unwrap(), &tail, None, &zdict)?;
     if stream_end {
         st.eof = true;
+        let leftover = tail[consumed..].to_vec();
+        store_decompress_attrs(args, &leftover, &[], true);
     }
-    let prev_unused = read_bytes_attr(args, "unused_data");
-    let unused = if stream_end { leftover.clone() } else { prev_unused };
-    store_decompress_attrs(args, &unused, &[], st.eof);
     Ok(Object::new_bytes(out))
 }
 
@@ -789,7 +900,10 @@ fn store_zd_attrs(args: &[Object], unused: &[u8], eof: bool, needs_input: bool) 
     }
 }
 
-fn zlib_zlibdecompressor(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+fn zlib_zlibdecompressor(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     // _ZlibDecompressor(wbits=15, zdict=b'')
     if args.len() > 2 {
         return Err(type_error(
@@ -807,14 +921,13 @@ fn zlib_zlibdecompressor(args: &[Object], kwargs: &[(String, Object)]) -> Result
             )))
         }
     };
-    // `zdict` must be a bytes-like object if supplied. The pure-Rust
-    // backend can't prime the window, but validating the type keeps the
-    // error behaviour identical (test_Constructor).
-    if let Some(o) = args.get(1) {
-        if o.as_bytes_view().is_none() {
-            return Err(type_error("zdict argument must support the buffer protocol"));
-        }
-    }
+    // `zdict` must be a bytes-like object if supplied (test_Constructor).
+    let zdict = match args.get(1) {
+        None => Vec::new(),
+        Some(o) => o
+            .as_bytes_view()
+            .ok_or_else(|| type_error("zdict argument must support the buffer protocol"))?,
+    };
     for (k, _) in kwargs {
         if !matches!(k.as_str(), "wbits" | "zdict") {
             return Err(type_error(format!(
@@ -827,7 +940,9 @@ fn zlib_zlibdecompressor(args: &[Object], kwargs: &[(String, Object)]) -> Result
         r.borrow_mut().insert(
             id,
             Rc::new(RefCell::new(ZlibDecompressorState {
-                d: decompress_for_wbits(wbits),
+                d: None,
+                wbits,
+                zdict,
                 input: Vec::new(),
                 eof: false,
                 needs_input: true,
@@ -883,17 +998,27 @@ fn zlibdecompressor_decompress(
     if st.eof {
         return Err(eof_error("End of stream already reached"));
     }
+    if st.broken {
+        return Err(value_error(
+            "Error -3 while decompressing data: invalid input data",
+        ));
+    }
     // Take the buffered input out to satisfy the borrow checker, then feed
     // it (plus the new data) through one inflate step.
     let mut input = std::mem::take(&mut st.input);
     input.extend_from_slice(&data);
-    let (out, consumed, stream_end) = match inflate_step(&mut st.d, &input, limit) {
-        Ok(t) => t,
-        Err(e) => {
-            st.broken = true;
-            return Err(e);
-        }
-    };
+    if st.d.is_none() {
+        st.d = Some(build_decompress(st.wbits, &input, &st.zdict));
+    }
+    let zdict = st.zdict.clone();
+    let (out, consumed, stream_end) =
+        match inflate_step(st.d.as_mut().unwrap(), &input, limit, &zdict) {
+            Ok(t) => t,
+            Err(e) => {
+                st.broken = true;
+                return Err(e);
+            }
+        };
     let leftover = input[consumed..].to_vec();
     if stream_end {
         st.eof = true;
