@@ -1,3 +1,9 @@
+# weavepy-skip: windows
+#
+# `tempfile.gettempdir()` probes candidate directories with the raw
+# file-descriptor `os.open` interface, which WeavePy implements only on
+# Unix today (it raises `NotImplementedError` on Windows). Until we wire
+# up a Windows fd table, this fixture is unix-only.
 import os, io, tempfile
 import zipfile, tarfile
 
