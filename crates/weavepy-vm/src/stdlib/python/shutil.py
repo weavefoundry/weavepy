@@ -40,7 +40,13 @@ elif _WINDOWS:
     import nt
 
 if sys.platform == 'win32':
-    import _winapi
+    try:
+        import _winapi
+    except ImportError:
+        # WeavePy does not ship the Windows-only `_winapi` accelerator.
+        # Fall back to the same `None` sentinel CPython uses off-Windows;
+        # the `_winapi` call sites below already guard for it.
+        _winapi = None
 else:
     _winapi = None
 
