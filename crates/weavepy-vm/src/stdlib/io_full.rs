@@ -273,8 +273,15 @@ pub(crate) fn io_open_kw(
         let file_arg = slots[0].clone().unwrap_or(Object::None);
         let mode = match &slots[1] {
             Some(Object::Str(s)) => s.to_string(),
-            _ => "r".to_owned(),
+            None | Some(Object::None) => "r".to_owned(),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "open() argument 'mode' must be str, not {}",
+                    other.type_name()
+                )))
+            }
         };
+        crate::builtins::validate_open_mode(&mode)?;
         let flags = open_flags_for_mode(&mode);
         let ptr = crate::vm_singletons::current_interpreter_ptr()
             .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
@@ -416,8 +423,15 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let mode = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
-        _ => "r".to_owned(),
+        Some(Object::None) | None => "r".to_owned(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "open() argument 'mode' must be str, not {}",
+                other.type_name()
+            )))
+        }
     };
+    crate::builtins::validate_open_mode(&mode)?;
     // PEP 578 — `open(file, mode, flags)` audit event.
     crate::stdlib::sys::audit_event(
         "open",

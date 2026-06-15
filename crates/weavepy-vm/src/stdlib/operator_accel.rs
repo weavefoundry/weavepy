@@ -46,15 +46,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 
         macro_rules! reg {
             ($name:literal, $f:expr) => {{
-                d.insert(
-                    DictKey(Object::from_static($name)),
-                    Object::Builtin(Rc::new(BuiltinFn {
-                        name: $name,
-                        binds_instance: false,
-                        call: Box::new($f),
-                        call_kw: None,
-                    })),
-                );
+                let f = Object::Builtin(Rc::new(BuiltinFn {
+                    name: $name,
+                    binds_instance: false,
+                    call: Box::new($f),
+                    call_kw: None,
+                }));
+                // Attribute `__module__ == "_operator"` (CPython's C module)
+                // so `pickle` can round-trip `operator.<op>` — it resolves
+                // `getattr(_operator, qualname) is obj`. Without this the
+                // builtin would default to `"builtins"` and pickle would find
+                // the unrelated builtin of the same name (e.g. `pow`).
+                crate::descr_registry::register_module(&f, "_operator");
+                d.insert(DictKey(Object::from_static($name)), f);
                 names.push(Object::from_static($name));
             }};
         }
@@ -112,14 +116,16 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::new_list(names),
         );
 
+        let compare_digest_fn = Object::Builtin(Rc::new(BuiltinFn {
+            name: "_compare_digest",
+            binds_instance: false,
+            call: Box::new(compare_digest),
+            call_kw: None,
+        }));
+        crate::descr_registry::register_module(&compare_digest_fn, "_operator");
         d.insert(
             DictKey(Object::from_static("_compare_digest")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "_compare_digest",
-                binds_instance: false,
-                call: Box::new(compare_digest),
-                call_kw: None,
-            })),
+            compare_digest_fn,
         );
     }
     Rc::new(PyModule {

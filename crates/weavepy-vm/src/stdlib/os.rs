@@ -1284,7 +1284,12 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let entries: Vec<Object> = std::fs::read_dir(&dir_path)
-        .map_err(|e| crate::error::io_error_to_py(&e))?
+        // CPython sets `OSError.filename` to the path that failed (e.g. a
+        // `PermissionError` from `scandir` on a 0o000 dir). `shutil.rmtree`'s
+        // `onexc`/`os.walk`'s `onerror` and `tempfile`'s `_resetperms` read
+        // that attribute, so dropping it turns a clean error into a
+        // `TypeError: ... not NoneType`.
+        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&dir_path)))?
         .filter_map(|r| r.ok())
         .map(|entry| {
             let fs_path = entry.path().to_string_lossy().into_owned();

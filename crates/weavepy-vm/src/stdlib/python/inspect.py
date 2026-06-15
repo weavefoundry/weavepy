@@ -287,11 +287,29 @@ def iscoroutine(obj):
     return type(obj).__name__ == "coroutine"
 
 
+# A marker for markcoroutinefunction and iscoroutinefunction.
+_is_coroutine_mark = object()
+
+
+def _has_coroutine_mark(f):
+    while hasattr(f, "__func__"):
+        f = f.__func__
+    return getattr(f, "_is_coroutine_marker", None) is _is_coroutine_mark
+
+
+def markcoroutinefunction(func):
+    """Decorator to ensure callable is recognised as a coroutine function."""
+    if hasattr(func, "__func__"):
+        func = func.__func__
+    func._is_coroutine_marker = _is_coroutine_mark
+    return func
+
+
 def iscoroutinefunction(obj):
     code = getattr(obj, "__code__", None)
-    if code is None:
-        return False
-    return bool(getattr(code, "co_flags", 0) & CO_COROUTINE)
+    if code is not None and bool(getattr(code, "co_flags", 0) & CO_COROUTINE):
+        return True
+    return _has_coroutine_mark(obj)
 
 
 def isasyncgen(obj):

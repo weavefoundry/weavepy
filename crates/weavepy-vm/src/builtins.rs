@@ -5260,7 +5260,46 @@ fn open_path_arg(obj: &Object) -> Result<(String, bool), RuntimeError> {
     }
 }
 
-fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
+/// Validate an `open()` mode string the way CPython's `io.open` /
+/// `_io.FileIO` do, raising `ValueError`/`TypeError` *before* the
+/// filesystem is touched. Returns whether the mode is binary so callers
+/// can apply the "binary mode doesn't take an encoding argument" rule.
+pub(crate) fn validate_open_mode(mode: &str) -> Result<bool, RuntimeError> {
+    use std::collections::BTreeSet;
+    let mut modes: BTreeSet<char> = BTreeSet::new();
+    for ch in mode.chars() {
+        if !"xrwab+t".contains(ch) {
+            return Err(value_error(format!("invalid mode: '{mode}'")));
+        }
+        modes.insert(ch);
+    }
+    // A repeated flag (e.g. "rr") has more chars than the deduped set.
+    if mode.chars().count() > modes.len() {
+        return Err(value_error(format!("invalid mode: '{mode}'")));
+    }
+    let creating = modes.contains(&'x');
+    let reading = modes.contains(&'r');
+    let writing = modes.contains(&'w');
+    let appending = modes.contains(&'a');
+    let text = modes.contains(&'t');
+    let binary = modes.contains(&'b');
+    if text && binary {
+        return Err(value_error("can't have text and binary mode at once"));
+    }
+    if u8::from(creating) + u8::from(reading) + u8::from(writing) + u8::from(appending) > 1 {
+        return Err(value_error(
+            "can't have read/write/create/append mode at once",
+        ));
+    }
+    if !(creating || reading || writing || appending) {
+        return Err(value_error(
+            "must have exactly one of create/read/write/append mode",
+        ));
+    }
+    Ok(binary)
+}
+
+pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     use crate::object::{FileBackend, PyFile};
     use std::fs::OpenOptions;
     if args.is_empty() {
@@ -5268,9 +5307,13 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let mode = match args.get(1) {
         Some(Object::Str(m)) => m.to_string(),
+        // `b_open_kw` pads unset positional slots with `None` when a later
+        // keyword (e.g. `encoding=`) is supplied, so treat a `None` mode the
+        // same as an omitted one (`"r"`), not as a type error.
+        None | Some(Object::None) => "r".to_owned(),
         Some(_) => return Err(type_error("open() mode must be str")),
-        None => "r".to_owned(),
     };
+    validate_open_mode(&mode)?;
     // `open(fd, …)` adopts an already-open raw file descriptor
     // (produced by `os.open`); the file's `name` is the fd itself.
     #[cfg(unix)]

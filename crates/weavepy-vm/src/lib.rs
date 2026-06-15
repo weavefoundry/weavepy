@@ -5399,7 +5399,9 @@ impl Interpreter {
                 "__name__" | "__qualname__" => {
                     Ok(Object::from_static(builtin_display_name(b.name)))
                 }
-                "__module__" => Ok(Object::from_static("builtins")),
+                "__module__" => Ok(Object::from_static(
+                    crate::descr_registry::module_of(obj).unwrap_or("builtins"),
+                )),
                 "__doc__" => Ok(builtin_doc(b.name)
                     .map(Object::from_static)
                     .unwrap_or(Object::None)),
@@ -14448,7 +14450,15 @@ impl Interpreter {
                     {
                         return self.do_complex_call(args, outer_globals);
                     }
-                    if b.name == "pow" && (args.len() == 2 || args.len() == 3) {
+                    if b.name == "pow"
+                        && (args.len() == 2 || args.len() == 3)
+                        && crate::descr_registry::module_of_builtin(b).is_none()
+                    {
+                        // Only the canonical `builtins.pow` takes the 3-arg
+                        // modular fast-path. A same-named accelerator function
+                        // (`_operator.pow`, attributed to `_operator`) must run
+                        // its own 2-arg body so `operator.pow(1, 2, 3)` raises
+                        // `TypeError` like CPython.
                         return self.do_pow_call(args, outer_globals);
                     }
                     if b.name == "bool" && args.len() <= 1 {
@@ -18542,6 +18552,15 @@ impl Interpreter {
         if warnings.is_empty() {
             return Ok(());
         }
+        // Publish the interpreter pointer (and activate thread handles) for
+        // the duration of this call. The embedding entry point invokes us
+        // *before* `run_module_as` establishes a dispatch frame, so the
+        // `import warnings` below (which pulls in `re` → `enum`, whose
+        // `EnumType` metaclass touches `type.__delattr__`) would otherwise
+        // find no active interpreter and raise. Mirrors `call_object`.
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let _handles = self.activate_thread_handles();
         let Some(warn_explicit) = self.warnings_warn_explicit() else {
             return Ok(());
         };

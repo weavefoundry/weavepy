@@ -1616,6 +1616,10 @@ pub struct PyFile {
     /// The stream has no filesystem name (`io.BytesIO`/`io.StringIO`): reading
     /// `f.name` raises `AttributeError`, like CPython's in-memory streams.
     pub no_name: crate::sync::Cell<bool>,
+    /// CPython `FileIO(fd, closefd=...)`: when `false`, closing the stream
+    /// must *not* close the wrapped OS descriptor (the caller still owns it —
+    /// e.g. wrapping `sys.stdin`'s fd). Defaults to `true`.
+    pub closefd: crate::sync::Cell<bool>,
     /// Per-instance attribute store (CPython's file objects carry a
     /// `__dict__`). Lets user code monkeypatch methods/attributes on a live
     /// stream — e.g. `bio.seekable = lambda: False` (test_bz2 `testSeekable`).
@@ -1648,6 +1652,7 @@ impl PyFile {
             name_override: RefCell::new(None),
             name_is_bytes: crate::sync::Cell::new(false),
             no_name: crate::sync::Cell::new(false),
+            closefd: crate::sync::Cell::new(true),
             extra_attrs: RefCell::new(Vec::new()),
             binary_buffer_cache: RefCell::new(None),
         }
@@ -1933,10 +1938,27 @@ impl PyFile {
         // works, matching our existing `BytesIO`/`StringIO` semantics.
         let mut backend = self.backend.borrow_mut();
         if matches!(&*backend, FileBackend::Disk(_)) {
-            *backend = FileBackend::MemBytes {
-                data: Vec::new(),
-                pos: 0,
-            };
+            let old = std::mem::replace(
+                &mut *backend,
+                FileBackend::MemBytes {
+                    data: Vec::new(),
+                    pos: 0,
+                },
+            );
+            // `FileIO(fd, closefd=False)`: the caller still owns the
+            // descriptor, so detach it without closing (CPython leaves the fd
+            // open). Otherwise dropping the `File` closes the fd as usual.
+            if !self.closefd.get() {
+                if let FileBackend::Disk(f) = old {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::io::IntoRawFd;
+                        let _ = f.into_raw_fd();
+                    }
+                    #[cfg(not(unix))]
+                    drop(f);
+                }
+            }
         }
     }
 

@@ -439,6 +439,154 @@ fn stringio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     Ok(wrap_memory_stream(&cls, file))
 }
 
+/// Validate a `FileIO` mode string (CPython `_io.FileIO` rules) and return the
+/// equivalent binary mode for the `open()` machinery. `FileIO` is always
+/// binary: exactly one of `r`/`w`/`x`/`a` is required, at most one `+`, and a
+/// `b` is accepted (and implied). Anything else — including `t` — is a
+/// `ValueError`, so `argparse.FileType('b')('-x')` raises like CPython.
+fn normalize_fileio_mode(mode: &str) -> Result<String, RuntimeError> {
+    let mut rwxa = 0u32;
+    let mut plus = 0u32;
+    let mut base = 'r';
+    for ch in mode.chars() {
+        match ch {
+            'r' | 'w' | 'x' | 'a' => {
+                rwxa += 1;
+                base = ch;
+            }
+            '+' => plus += 1,
+            'b' => {}
+            _ => return Err(crate::error::value_error(format!("invalid mode: '{mode}'"))),
+        }
+    }
+    if rwxa != 1 || plus > 1 {
+        return Err(crate::error::value_error(
+            "Must have exactly one of create/read/write/append mode and at most one plus",
+        ));
+    }
+    let mut out = String::with_capacity(3);
+    out.push(base);
+    if plus == 1 {
+        out.push('+');
+    }
+    out.push('b');
+    Ok(out)
+}
+
+/// `FileIO.__new__(cls, file, mode='r', closefd=True, opener=None)` — the raw,
+/// always-binary file layer. WeavePy represents it with the same native
+/// `Object::File` that `open()` returns, so the `(fd, mode)` form the stdlib's
+/// pipe/socket code and `test_io` rely on (`io.FileIO(fd, "w")`) works and its
+/// `close()` releases the descriptor.
+fn fileio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let cls = match args.first() {
+        Some(Object::Type(t)) => t.clone(),
+        _ => return Err(type_error("FileIO.__new__(X): X is not a type object")),
+    };
+    let file = args
+        .get(1)
+        .cloned()
+        .or_else(|| kw_get(kwargs, "file"))
+        .ok_or_else(|| type_error("FileIO() missing required argument 'file' (pos 1)"))?;
+    let mode = match args.get(2).cloned().or_else(|| kw_get(kwargs, "mode")) {
+        None | Some(Object::None) => "rb".to_string(),
+        Some(Object::Str(s)) => s.to_string(),
+        Some(o) => {
+            return Err(type_error(format!(
+                "FileIO() argument 'mode' must be str, not {}",
+                o.type_name()
+            )))
+        }
+    };
+    let closefd = match args.get(3).cloned().or_else(|| kw_get(kwargs, "closefd")) {
+        None | Some(Object::None) => true,
+        Some(Object::Bool(b)) => b,
+        Some(Object::Int(n)) => n != 0,
+        Some(_) => true,
+    };
+    let opener = args
+        .get(4)
+        .cloned()
+        .or_else(|| kw_get(kwargs, "opener"))
+        .filter(|o| !matches!(o, Object::None));
+    let binmode = normalize_fileio_mode(&mode)?;
+    let is_fd = matches!(file, Object::Int(_) | Object::Bool(_));
+    if !closefd && !is_fd {
+        return Err(crate::error::value_error(
+            "Cannot use closefd=False with file name",
+        ));
+    }
+    let raw = match opener {
+        Some(opener) => {
+            // CPython calls `opener(file, flags)` → fd, then adopts that fd.
+            let ptr = crate::vm_singletons::current_interpreter_ptr()
+                .ok_or_else(|| crate::error::runtime_error("FileIO: no running interpreter"))?;
+            // SAFETY: published by an enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let globals = interp.builtins_dict();
+            let flags = fileio_open_flags(&binmode);
+            let fd = interp.call_object_with_globals(
+                &opener,
+                &[file.clone(), Object::Int(flags)],
+                &[],
+                &globals,
+            )?;
+            crate::builtins::b_open(&[fd, Object::from_str(binmode)])?
+        }
+        None => crate::builtins::b_open(&[file.clone(), Object::from_str(binmode)])?,
+    };
+    match raw {
+        Object::File(f) => {
+            f.closefd.set(closefd);
+            Ok(wrap_memory_stream(&cls, f))
+        }
+        other => Ok(other),
+    }
+}
+
+/// `os.open` flag bits for a normalized binary `FileIO` mode — only used to
+/// hand a plausible `flags` value to a user `opener` callback.
+fn fileio_open_flags(mode: &str) -> i64 {
+    const O_WRONLY: i64 = 1;
+    const O_RDWR: i64 = 2;
+    const O_CREAT: i64 = 64;
+    const O_EXCL: i64 = 128;
+    const O_TRUNC: i64 = 512;
+    const O_APPEND: i64 = 1024;
+    let mut flags = if mode.contains('+') {
+        O_RDWR
+    } else if mode.contains('w') || mode.contains('a') || mode.contains('x') {
+        O_WRONLY
+    } else {
+        0
+    };
+    if mode.contains('a') {
+        flags |= O_APPEND | O_CREAT;
+    }
+    if mode.contains('w') {
+        flags |= O_CREAT | O_TRUNC;
+    }
+    if mode.contains('x') {
+        flags |= O_CREAT | O_EXCL;
+    }
+    flags
+}
+
+/// Install `FileIO.__new__` so `io.FileIO(name|fd, mode, closefd, opener)` is
+/// constructible (CPython's raw file). Done once, on the shared type.
+fn install_fileio_ctor(ty: &Rc<crate::types::TypeObject>) {
+    use crate::object::MethodWrapper;
+    ty.dict.borrow_mut().insert(
+        DictKey(Object::from_static("__new__")),
+        Object::StaticMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
+            name: "FileIO.__new__",
+            binds_instance: false,
+            call: Box::new(|a| fileio_new(a, &[])),
+            call_kw: Some(Box::new(fileio_new)),
+        })))),
+    );
+}
+
 /// An empty in-memory backing file for a memory-stream *subclass* (the base
 /// type's buffer is built directly in `__new__`).
 fn empty_mem_file(name: &str, mode: &str, backend: FileBackend) -> Rc<PyFile> {
@@ -865,6 +1013,7 @@ fn build_iobase_family_inner() -> IoFamily {
     let buffered = child("BufferedIOBase", &iobase);
     let text = child("TextIOBase", &iobase);
     let fileio = child("FileIO", &raw);
+    install_fileio_ctor(&fileio);
     IoFamily {
         iobase,
         raw,
