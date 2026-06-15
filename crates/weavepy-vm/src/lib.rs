@@ -20919,6 +20919,18 @@ fn remap_oserror_to_subclass(cls: Rc<TypeObject>, args: &[Object]) -> Rc<TypeObj
     }
 }
 
+/// `ESHUTDOWN` is part of the Unix errno set but isn't exposed by `libc` on
+/// Windows (the shutdown error lives in Winsock's `WSAE*` space), so gate the
+/// comparison: faithful on Unix, and it simply never matches on Windows.
+#[cfg(unix)]
+fn is_eshutdown(e: i32) -> bool {
+    e == libc::ESHUTDOWN
+}
+#[cfg(not(unix))]
+fn is_eshutdown(_e: i32) -> bool {
+    false
+}
+
 fn oserror_subclass_name(errno: i64) -> Option<&'static str> {
     let e = errno as i32;
     let name = if e == libc::EAGAIN
@@ -20951,7 +20963,7 @@ fn oserror_subclass_name(errno: i64) -> Option<&'static str> {
         "ProcessLookupError"
     } else if e == libc::ETIMEDOUT {
         "TimeoutError"
-    } else if e == libc::EPIPE || e == libc::ESHUTDOWN {
+    } else if e == libc::EPIPE || is_eshutdown(e) {
         "BrokenPipeError"
     } else {
         return None;

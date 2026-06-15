@@ -354,7 +354,6 @@ fn open_flags_for_mode(mode: &str) -> i64 {
 /// Adopt an already-open OS file descriptor (e.g. produced by an `opener`
 /// callback or `os.open`) into a `PyFile`.
 fn file_from_fd(fd_obj: &Object, mode: &str, name: String) -> Result<Object, RuntimeError> {
-    use crate::object::{FileBackend, PyFile};
     let fd = match fd_obj {
         Object::Int(n) => *n,
         _ => return Err(type_error("opener returned a non-integer file descriptor")),
@@ -367,6 +366,7 @@ fn file_from_fd(fd_obj: &Object, mode: &str, name: String) -> Result<Object, Run
     }
     #[cfg(unix)]
     {
+        use crate::object::{FileBackend, PyFile};
         use std::os::unix::io::FromRawFd;
         let fd = i32::try_from(fd).map_err(|_| value_error("file descriptor out of range"))?;
         // SAFETY: ownership of the fd transfers to the new File; the

@@ -283,6 +283,22 @@ fn opt_u32(dict: &DictData, key: &str) -> Result<Option<u32>, RuntimeError> {
     }
 }
 
+/// `lzma_mode`/`lzma_match_finder` resolve to `c_int` under MSVC but `c_uint`
+/// on every other target (see `lzma-sys`'s `__enum_ty`). Convert a parsed
+/// `u32` option through the active repr so `opts.mode`/`opts.mf` type-check on
+/// all platforms — without an unnecessary same-type cast on the `c_uint`
+/// targets (which would trip clippy's `unnecessary_cast`).
+#[cfg(target_env = "msvc")]
+#[inline]
+fn to_lzma_enum(v: u32) -> lzma_sys::__enum_ty {
+    v as lzma_sys::__enum_ty
+}
+#[cfg(not(target_env = "msvc"))]
+#[inline]
+fn to_lzma_enum(v: u32) -> lzma_sys::__enum_ty {
+    v
+}
+
 /// Parse a single Python filter spec (a `{"id": …, …}` dict) into an owned,
 /// liblzma-ready filter, with CPython's error taxonomy
 /// (`TypeError`/`ValueError`).
@@ -335,13 +351,13 @@ fn parse_filter_spec(spec: &Object) -> Result<OwnedFilter, RuntimeError> {
                 opts.pb = v;
             }
             if let Some(v) = opt_u32(&dict, "mode")? {
-                opts.mode = v;
+                opts.mode = to_lzma_enum(v);
             }
             if let Some(v) = opt_u32(&dict, "nice_len")? {
                 opts.nice_len = v;
             }
             if let Some(v) = opt_u32(&dict, "mf")? {
-                opts.mf = v;
+                opts.mf = to_lzma_enum(v);
             }
             if let Some(v) = opt_u32(&dict, "depth")? {
                 opts.depth = v;
