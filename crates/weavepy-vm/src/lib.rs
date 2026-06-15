@@ -19209,23 +19209,30 @@ impl Interpreter {
         current.ok_or_else(|| import_error("empty module name"))
     }
 
-    /// Make `os.path` *be* the verbatim `posixpath` module (CPython's
-    /// `os.py` does `import posixpath as path; sys.modules['os.path'] =
-    /// path`). Best-effort: if `posixpath` can't be imported the Rust
-    /// `os.path` installed by the `os` factory is left untouched.
-    fn bind_os_path_to_posixpath(&mut self, os_mod: &Object) {
+    /// Make `os.path` *be* the verbatim platform path module — `ntpath`
+    /// on Windows, `posixpath` elsewhere — exactly as CPython's `os.py`
+    /// does (`import posixpath as path` / `import ntpath as path`, then
+    /// `sys.modules['os.path'] = path`). Best-effort: if the module can't
+    /// be imported the Rust `os.path` installed by the `os` factory is
+    /// left untouched.
+    fn bind_os_path(&mut self, os_mod: &Object) {
         let Object::Module(os_mod) = os_mod else {
             return;
         };
-        let pp = match self.import_path("posixpath") {
-            Ok(pp @ Object::Module(_)) => pp,
+        // Match CPython's platform selection. Binding the wrong module
+        // breaks `abspath`/`isabs`/`join` on absolute Windows paths: a
+        // `D:\…` path looks "relative" to `posixpath`, so it gets joined
+        // onto the cwd with `/` instead of being recognised as absolute.
+        let path_mod_name = if cfg!(windows) { "ntpath" } else { "posixpath" };
+        let path_mod = match self.import_path(path_mod_name) {
+            Ok(pm @ Object::Module(_)) => pm,
             _ => return,
         };
         os_mod
             .dict
             .borrow_mut()
-            .insert(DictKey(Object::from_static("path")), pp.clone());
-        self.cache.insert("os.path", pp);
+            .insert(DictKey(Object::from_static("path")), path_mod.clone());
+        self.cache.insert("os.path", path_mod);
     }
 
     /// Load a single fully-qualified module name. Honours the cache
@@ -19249,15 +19256,16 @@ impl Interpreter {
             let obj = Object::Module(module);
             self.cache.insert(full, obj.clone());
             // CPython's `os` re-exports the platform path module: `import
-            // posixpath as path` + `sys.modules['os.path'] = path`, so
-            // `os.path is posixpath` and every lexical/bytes nicety of the
-            // verbatim module applies (the hand-written Rust `os.path` built
-            // by the factory diverges on bytes paths, trailing slashes, …).
-            // Rebinding *here* — after `os` is already in `sys.modules` —
-            // lets `posixpath`'s top-level `import os` resolve without
+            // posixpath as path` (or `ntpath` on Windows) + `sys.modules
+            // ['os.path'] = path`, so `os.path is posixpath`/`ntpath` and
+            // every lexical/bytes nicety of the verbatim module applies
+            // (the hand-written Rust `os.path` built by the factory
+            // diverges on bytes paths, trailing slashes, …). Rebinding
+            // *here* — after `os` is already in `sys.modules` — lets the
+            // path module's top-level `import os` resolve without
             // recursion. On any failure the Rust fallback stays in place.
             if full == "os" {
-                self.bind_os_path_to_posixpath(&obj);
+                self.bind_os_path(&obj);
             }
             return Ok(obj);
         }
