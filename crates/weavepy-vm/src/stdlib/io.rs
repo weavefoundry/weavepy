@@ -35,6 +35,12 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(DictKey(Object::from_static("SEEK_SET")), Object::Int(0));
         d.insert(DictKey(Object::from_static("SEEK_CUR")), Object::Int(1));
         d.insert(DictKey(Object::from_static("SEEK_END")), Object::Int(2));
+        // `io.BlockingIOError` is the builtin exception re-exported (CPython
+        // lists it first in `io.__all__`); `test_io` reads it at import time.
+        d.insert(
+            DictKey(Object::from_static("BlockingIOError")),
+            Object::Type(crate::builtin_types::builtin_types().blocking_io_error.clone()),
+        );
         d.insert(
             DictKey(Object::from_static("text_encoding")),
             builtin("text_encoding", io_text_encoding),
@@ -116,6 +122,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 fam.buffered.clone(),
                 bytesio_new,
                 "BytesIO.__new__",
+                bytesio_init,
+                "BytesIO.__init__",
             )),
         );
         d.insert(
@@ -125,6 +133,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 fam.text.clone(),
                 stringio_new,
                 "StringIO.__new__",
+                stringio_init,
+                "StringIO.__init__",
             )),
         );
         d.insert(
@@ -149,7 +159,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         ] {
             d.insert(
                 DictKey(Object::from_static(name)),
-                Object::Type(make_buffered(name)),
+                Object::Type(make_buffered(name, fam.buffered.clone())),
             );
         }
         // A functional `TextIOWrapper`: a text layer over a binary buffer
@@ -157,7 +167,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // the wrapped buffer; `.buffer` exposes it again.
         d.insert(
             DictKey(Object::from_static("TextIOWrapper")),
-            Object::Type(make_text_io_wrapper()),
+            Object::Type(make_text_io_wrapper(fam.text.clone())),
         );
     }
     Rc::new(PyModule {
@@ -265,10 +275,8 @@ pub(crate) fn io_text_encoding(args: &[Object]) -> Result<Object, RuntimeError> 
 // recover them from `self`.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn make_text_io_wrapper() -> Rc<crate::types::TypeObject> {
-    use crate::builtin_types::builtin_types;
+pub(crate) fn make_text_io_wrapper(base: Rc<crate::types::TypeObject>) -> Rc<crate::types::TypeObject> {
     use crate::types::{TypeFlags, TypeObject};
-    let bt = builtin_types();
     let mut dict = DictData::new();
     let mut method = |name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
         dict.insert(
@@ -314,7 +322,7 @@ pub(crate) fn make_text_io_wrapper() -> Rc<crate::types::TypeObject> {
     );
     let ty = TypeObject::new_with_flags(
         "TextIOWrapper",
-        vec![bt.object_.clone()],
+        vec![base],
         dict,
         TypeFlags {
             is_exception: false,
@@ -388,23 +396,111 @@ fn kw_get(kwargs: &[(String, Object)], name: &str) -> Option<Object> {
 
 /// `BytesIO.__new__(cls, initial_bytes=b'')` — native `File` for the base
 /// type, a `native`-wrapping instance for a subclass.
+///
+/// CPython's `bytesio_new` *ignores* its arguments (the optional initial buffer
+/// is consumed by `bytesio_init`). We honour the initial buffer here only for
+/// the canonical `io.BytesIO(...)`, whose native-`File` return never runs
+/// `__init__`; a *subclass* gets an empty buffer and its (possibly inherited)
+/// `__init__` fills it. That way a subclass with a custom `__init__` taking
+/// unrelated arguments — e.g. test_pathlib's `DummyPathIO(files, path)` — is
+/// never handed those as bogus "initial bytes".
 fn bytesio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let cls = match args.first() {
         Some(Object::Type(t)) => t.clone(),
         _ => return Err(type_error("BytesIO.__new__(X): X is not a type object")),
     };
-    let file = bytesio_file(args, kwargs)?;
+    let file = if cls.flags.is_builtin {
+        bytesio_file(args, kwargs)?
+    } else {
+        empty_mem_file("<bytes>", "rb+", FileBackend::MemBytes { data: Vec::new(), pos: 0 })
+    };
     Ok(wrap_memory_stream(&cls, file))
 }
 
-/// `StringIO.__new__(cls, initial_value='', newline='\n')`.
+/// `StringIO.__new__(cls, initial_value='', newline='\n')`. See `bytesio_new`
+/// for why subclasses get an empty buffer here.
 fn stringio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let cls = match args.first() {
         Some(Object::Type(t)) => t.clone(),
         _ => return Err(type_error("StringIO.__new__(X): X is not a type object")),
     };
-    let file = stringio_file(args, kwargs)?;
+    let file = if cls.flags.is_builtin {
+        stringio_file(args, kwargs)?
+    } else {
+        empty_mem_file(
+            "<string>",
+            "r+",
+            FileBackend::MemText {
+                data: String::new(),
+                pos: 0,
+            },
+        )
+    };
     Ok(wrap_memory_stream(&cls, file))
+}
+
+/// An empty in-memory backing file for a memory-stream *subclass* (the base
+/// type's buffer is built directly in `__new__`).
+fn empty_mem_file(name: &str, mode: &str, backend: FileBackend) -> Rc<PyFile> {
+    let f = PyFile::new(name, mode, backend);
+    f.no_name.set(true);
+    Rc::new(f)
+}
+
+/// `BytesIO.__init__(self, initial_bytes=b'')` — fill the (empty) backing
+/// buffer of a freshly-`__new__`'d stream and rewind to position 0. A no-op
+/// when no initial buffer is supplied (the `super().__init__()` chain in
+/// custom subclass `__init__`s).
+fn bytesio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let initial = args
+        .get(1)
+        .cloned()
+        .or_else(|| kw_get(kwargs, "initial_bytes"));
+    let initial = match initial {
+        None | Some(Object::None) => return Ok(Object::None),
+        Some(o) => o,
+    };
+    let is_bytes_like = matches!(initial, Object::Bytes(_) | Object::ByteArray(_))
+        || initial.as_bytes_view().is_some();
+    if !is_bytes_like {
+        return Err(type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            initial.type_name()
+        )));
+    }
+    let me = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("BytesIO.__init__ requires a stream"))?;
+    crate::builtins::file_write(&[me.clone(), initial])?;
+    crate::builtins::file_seek(&[me, Object::Int(0)])?;
+    Ok(Object::None)
+}
+
+/// `StringIO.__init__(self, initial_value='', newline='\n')`. See
+/// `bytesio_init`; `newline` translation is handled by the backing text file.
+fn stringio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let initial = args
+        .get(1)
+        .cloned()
+        .or_else(|| kw_get(kwargs, "initial_value"));
+    let initial = match initial {
+        None | Some(Object::None) => return Ok(Object::None),
+        Some(s @ Object::Str(_)) => s,
+        Some(o) => {
+            return Err(type_error(format!(
+                "initial_value must be str or None, not {}",
+                o.type_name()
+            )))
+        }
+    };
+    let me = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("StringIO.__init__ requires a stream"))?;
+    crate::builtins::file_write(&[me.clone(), initial])?;
+    crate::builtins::file_seek(&[me, Object::Int(0)])?;
+    Ok(Object::None)
 }
 
 /// Return the native `File` directly for the canonical built-in type, or a
@@ -512,11 +608,14 @@ fn tw_closed(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 /// Build a subclassable in-memory stream type (`BytesIO`/`StringIO`).
+#[allow(clippy::type_complexity)]
 fn make_memory_stream(
     name: &'static str,
     base: Rc<crate::types::TypeObject>,
     new_fn: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
     new_name: &'static str,
+    init_fn: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+    init_name: &'static str,
 ) -> Rc<crate::types::TypeObject> {
     use crate::object::MethodWrapper;
     use crate::types::{TypeFlags, TypeObject};
@@ -562,6 +661,19 @@ fn make_memory_stream(
             call: Box::new(move |a| new_fn(a, &[])),
             call_kw: Some(Box::new(new_fn)),
         })))),
+    );
+    // A real `__init__` (CPython `bytesio_init`/`stringio_init`): `__new__`
+    // ignores the initial buffer for subclasses, so `__init__` is what applies
+    // it — both for `class C(BytesIO): pass; C(b'x')` (inherited) and for the
+    // base type's own `super().__init__()` chains.
+    dict.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: init_name,
+            binds_instance: true,
+            call: Box::new(move |a| init_fn(a, &[])),
+            call_kw: Some(Box::new(init_fn)),
+        })),
     );
     let ty = TypeObject::new_with_flags(
         name,
@@ -664,6 +776,7 @@ fn resolve_raw_pyfile(obj: &Object) -> Result<Rc<PyFile>, RuntimeError> {
 // an arbitrary Python stream object — not just the native `PyFile` fast path.
 // ===========================================================================
 
+#[derive(Clone)]
 pub(crate) struct IoFamily {
     pub iobase: Rc<crate::types::TypeObject>,
     pub raw: Rc<crate::types::TypeObject>,
@@ -672,10 +785,56 @@ pub(crate) struct IoFamily {
     pub fileio: Rc<crate::types::TypeObject>,
 }
 
-/// Build the `IOBase → {RawIOBase, BufferedIOBase, TextIOBase} → FileIO`
-/// hierarchy with the CPython mixin methods installed on the root. Shared by
-/// both the `io` and `_io` module builders so the two faces are identical.
+/// The process-wide `io`/`_io` ABC hierarchy, built once. Memoising it is
+/// load-bearing for *identity*: CPython exposes the very same type objects on
+/// both `io` and `_io` (`io.IOBase is _io.IOBase`), and `isinstance` of a
+/// native stream against `io.BufferedIOBase`/`TextIOBase` (the `pathlib`/`io`
+/// suites) compares against these exact objects.
 pub(crate) fn build_iobase_family() -> IoFamily {
+    thread_local! {
+        static IO_FAMILY: RefCell<Option<IoFamily>> = const { RefCell::new(None) };
+    }
+    IO_FAMILY.with(|slot| {
+        if let Some(f) = slot.borrow().as_ref() {
+            return f.clone();
+        }
+        let fam = build_iobase_family_inner();
+        *slot.borrow_mut() = Some(fam.clone());
+        fam
+    })
+}
+
+/// Whether a native [`PyFile`] should be considered an instance of one of the
+/// `io` ABCs (`info` is the candidate class). `None` means "not an io ABC"
+/// (the caller falls back to ordinary MRO matching). A native binary stream is
+/// reported as a `BufferedIOBase` (the common `open('rb')`/`io.BytesIO` shape);
+/// a text stream as `TextIOBase`; every stream as `IOBase`.
+pub(crate) fn file_io_abc_match(
+    file: &crate::object::PyFile,
+    info: &Rc<crate::types::TypeObject>,
+) -> Option<bool> {
+    let fam = build_iobase_family();
+    let is = |t: &Rc<crate::types::TypeObject>| Rc::ptr_eq(t, info);
+    if is(&fam.iobase) {
+        return Some(true);
+    }
+    if is(&fam.buffered) {
+        return Some(file.binary);
+    }
+    if is(&fam.text) {
+        return Some(!file.binary);
+    }
+    if is(&fam.raw) || is(&fam.fileio) {
+        // We can't distinguish a raw `FileIO` from a buffered `open('rb')`
+        // stream at the `Object::File` level; treat native streams as buffered.
+        return Some(false);
+    }
+    None
+}
+
+/// Build the `IOBase → {RawIOBase, BufferedIOBase, TextIOBase} → FileIO`
+/// hierarchy with the CPython mixin methods installed on the root.
+fn build_iobase_family_inner() -> IoFamily {
     use crate::object::MethodWrapper;
     use crate::types::{TypeFlags, TypeObject};
     let bt = crate::builtin_types::builtin_types();
@@ -1504,10 +1663,8 @@ fn tw_reconfigure(args: &[Object]) -> Result<Object, RuntimeError> {
 /// Build a functional buffered-stream type (`BufferedReader` etc.). All four
 /// share one method table; the distinctions (read-only vs write-only) don't
 /// matter for the in-memory streams WeavePy wraps here.
-pub(crate) fn make_buffered(name: &'static str) -> Rc<crate::types::TypeObject> {
-    use crate::builtin_types::builtin_types;
+pub(crate) fn make_buffered(name: &'static str, base: Rc<crate::types::TypeObject>) -> Rc<crate::types::TypeObject> {
     use crate::types::{TypeFlags, TypeObject};
-    let bt = builtin_types();
     let mut dict = DictData::new();
     let mut method = |n: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
         dict.insert(
@@ -1556,7 +1713,7 @@ pub(crate) fn make_buffered(name: &'static str) -> Rc<crate::types::TypeObject> 
     );
     let ty = TypeObject::new_with_flags(
         name,
-        vec![bt.object_.clone()],
+        vec![base],
         dict,
         TypeFlags {
             is_exception: false,

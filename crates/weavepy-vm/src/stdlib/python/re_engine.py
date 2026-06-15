@@ -65,6 +65,16 @@ class Pattern:
     # -- internal --------------------------------------------------------
 
     def _exec(self, string, pos, endpos, mode, must_advance):
+        # CPython `_sre` rejects a str/bytes mismatch between the pattern and
+        # the subject before matching (test_fnmatch.test_mix_bytes_str, plus
+        # the analogous re tests). `self.pattern` is the original str/bytes.
+        if isinstance(self.pattern, str):
+            if not isinstance(string, str):
+                raise TypeError(
+                    "cannot use a string pattern on a bytes-like object")
+        elif isinstance(string, str):
+            raise TypeError(
+                "cannot use a bytes pattern on a string-like object")
         return _sre.exec(self._handle, string, pos, endpos, mode,
                          1 if must_advance else 0)
 

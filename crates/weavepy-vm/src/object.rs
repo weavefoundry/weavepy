@@ -523,12 +523,24 @@ pub struct PyMemoryView {
     pub buffer: MemoryViewBuffer,
     /// Inclusive start offset into the buffer (in bytes).
     pub start: Cell<usize>,
-    /// Number of bytes covered by the view.
+    /// Logical size of the view, in bytes (`nbytes` == `product(shape) *
+    /// itemsize`). For a contiguous view this is also the width of the
+    /// `[start..start+len]` window; for a strided view it is the number of
+    /// bytes `tobytes()` materialises, not the span of the buffer it walks.
     pub len: Cell<usize>,
     pub readonly: Cell<bool>,
     pub released: Cell<bool>,
     pub format: RefCell<String>,
     pub itemsize: Cell<usize>,
+    /// Logical dimensions, in *elements*. Empty means "derive a 1-D
+    /// `[len / itemsize]` shape", which keeps every simple constructor a
+    /// plain literal — only `cast(shape=…)` and strided slicing store an
+    /// explicit shape.
+    pub shape: RefCell<Vec<usize>>,
+    /// Per-dimension stride, in *bytes*. Empty means "derive the
+    /// C-contiguous strides for `shape`". A negative stride (from a
+    /// `seq[::-1]`-style slice) marks the view non-contiguous.
+    pub strides: RefCell<Vec<isize>>,
 }
 
 impl PyMemoryView {
@@ -542,6 +554,8 @@ impl PyMemoryView {
             released: Cell::new(false),
             format: RefCell::new("B".to_owned()),
             itemsize: Cell::new(1),
+            shape: RefCell::new(Vec::new()),
+            strides: RefCell::new(Vec::new()),
         }
     }
 
@@ -559,6 +573,33 @@ impl PyMemoryView {
             released: Cell::new(false),
             format: RefCell::new("B".to_owned()),
             itemsize: Cell::new(1),
+            shape: RefCell::new(Vec::new()),
+            strides: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// 1-D contiguous view over an already-materialised buffer. Used by the
+    /// C-API `PyMemoryView_*` constructors, which copy the exporter's bytes
+    /// into a fresh, flat buffer (so there is no external bytearray export to
+    /// account for). `shape`/`strides` are left empty to derive the 1-D
+    /// layout from `len`/`itemsize`.
+    pub fn contiguous_1d(
+        buffer: MemoryViewBuffer,
+        len: usize,
+        readonly: bool,
+        format: String,
+        itemsize: usize,
+    ) -> Self {
+        Self {
+            buffer,
+            start: Cell::new(0),
+            len: Cell::new(len),
+            readonly: Cell::new(readonly),
+            released: Cell::new(false),
+            format: RefCell::new(format),
+            itemsize: Cell::new(itemsize),
+            shape: RefCell::new(Vec::new()),
+            strides: RefCell::new(Vec::new()),
         }
     }
 
@@ -582,6 +623,8 @@ impl PyMemoryView {
             released: Cell::new(self.released.get()),
             format: RefCell::new(self.format.borrow().clone()),
             itemsize: Cell::new(self.itemsize.get()),
+            shape: RefCell::new(self.shape.borrow().clone()),
+            strides: RefCell::new(self.strides.borrow().clone()),
         }
     }
 
@@ -595,14 +638,102 @@ impl PyMemoryView {
         }
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let start = self.start.get();
-        let end = start + self.len.get();
-        match &self.buffer {
-            MemoryViewBuffer::Bytes(b) => b[start..end].to_vec(),
-            MemoryViewBuffer::ByteArray(b) => b.borrow()[start..end].to_vec(),
+    /// Logical dimensions in elements. An empty stored `shape` derives the
+    /// 1-D `[nbytes / itemsize]` layout that every plain constructor uses.
+    pub fn shape_dims(&self) -> Vec<usize> {
+        let stored = self.shape.borrow();
+        if !stored.is_empty() {
+            return stored.clone();
         }
+        let itemsize = self.itemsize.get().max(1);
+        vec![self.len.get() / itemsize]
     }
+
+    /// Per-dimension stride in bytes. An empty stored `strides` derives the
+    /// C-contiguous layout for the current `shape`.
+    pub fn stride_bytes(&self) -> Vec<isize> {
+        let stored = self.strides.borrow();
+        if !stored.is_empty() {
+            return stored.clone();
+        }
+        c_contiguous_strides(&self.shape_dims(), self.itemsize.get().max(1))
+    }
+
+    pub fn ndim(&self) -> usize {
+        self.shape_dims().len()
+    }
+
+    /// True when the elements sit back-to-back in C (row-major) order, so a
+    /// plain `[start..start+nbytes]` slice yields them. Anything with a
+    /// negative or gapped stride (e.g. `mv[::-1]`, `mv[::2]`) is not.
+    pub fn is_c_contiguous(&self) -> bool {
+        let stored = self.strides.borrow();
+        if stored.is_empty() {
+            return true; // derived strides are C-contiguous by construction
+        }
+        *stored == c_contiguous_strides(&self.shape_dims(), self.itemsize.get().max(1))
+    }
+
+    /// Materialise the view's elements in C order. Contiguous views take the
+    /// fast `[start..start+nbytes]` path; strided/reversed views are gathered
+    /// element-by-element following `strides`, exactly like CPython's
+    /// `memoryview.tobytes()`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let itemsize = self.itemsize.get().max(1);
+        if self.is_c_contiguous() {
+            let start = self.start.get();
+            let end = start + self.len.get();
+            return match &self.buffer {
+                MemoryViewBuffer::Bytes(b) => b[start..end].to_vec(),
+                MemoryViewBuffer::ByteArray(b) => b.borrow()[start..end].to_vec(),
+            };
+        }
+        let shape = self.shape_dims();
+        let strides = self.stride_bytes();
+        let total: usize = shape.iter().product();
+        let mut out = Vec::with_capacity(total * itemsize);
+        let base = self.start.get() as isize;
+        let gather = |buf: &[u8], out: &mut Vec<u8>| {
+            let mut index = vec![0usize; shape.len()];
+            for _ in 0..total {
+                let mut off = base;
+                for (d, &i) in index.iter().enumerate() {
+                    off += (i as isize) * strides[d];
+                }
+                if off >= 0 {
+                    let off = off as usize;
+                    if off + itemsize <= buf.len() {
+                        out.extend_from_slice(&buf[off..off + itemsize]);
+                    }
+                }
+                // Increment the multi-index (last axis fastest = C order).
+                for d in (0..shape.len()).rev() {
+                    index[d] += 1;
+                    if index[d] < shape[d] {
+                        break;
+                    }
+                    index[d] = 0;
+                }
+            }
+        };
+        match &self.buffer {
+            MemoryViewBuffer::Bytes(b) => gather(b, &mut out),
+            MemoryViewBuffer::ByteArray(b) => gather(&b.borrow(), &mut out),
+        }
+        out
+    }
+}
+
+/// C-contiguous (row-major) byte strides for `shape` at the given itemsize:
+/// the last axis has stride `itemsize`, each earlier axis multiplies up.
+pub fn c_contiguous_strides(shape: &[usize], itemsize: usize) -> Vec<isize> {
+    let mut strides = vec![itemsize as isize; shape.len()];
+    let mut acc = itemsize as isize;
+    for d in (0..shape.len()).rev() {
+        strides[d] = acc;
+        acc *= shape[d] as isize;
+    }
+    strides
 }
 
 impl Drop for PyMemoryView {
@@ -1465,6 +1596,14 @@ pub struct PyFile {
     /// Text-mode codec (`open(..., encoding=...)`); `None` means the
     /// UTF-8 default.
     pub encoding: RefCell<Option<String>>,
+    /// Text-mode error handler (`open(..., errors=...)`); `None` → "strict".
+    pub errors: RefCell<Option<String>>,
+    /// Text-mode newline policy (`open(..., newline=...)`). A `None` field
+    /// value selects CPython's universal-newline default: `\r\n`/`\r`→`\n`
+    /// on read and `\n`→`os.linesep` on write. `Some("")` disables all
+    /// translation; `Some("\n"|"\r"|"\r\n")` pins an explicit line ending
+    /// (`\n`→that ending on write; no input translation).
+    pub newline: RefCell<Option<String>>,
     /// Python-visible `name` override. Files opened from a descriptor
     /// start out named by their fd integer; `tempfile` (and user code)
     /// reassign `f.name` to the real path. Stored separately so the
@@ -1484,6 +1623,13 @@ pub struct PyFile {
     /// attributes but before native methods, so it shadows methods like
     /// CPython's non-data-descriptor instance-dict rule.
     pub extra_attrs: RefCell<Vec<(String, Object)>>,
+    /// Memoised binary underlayer for a *text* standard stream (`f.buffer`).
+    /// CPython exposes a single, stable `sys.stdin.buffer` object: repeated
+    /// accesses return the *same* `BufferedReader`, so identity/`==` holds
+    /// (argparse's `FileType('-')` round-trips it). Minted lazily on first
+    /// `.buffer` access; `None` until then and for streams that are their own
+    /// buffer.
+    pub binary_buffer_cache: RefCell<Option<Object>>,
 }
 
 impl PyFile {
@@ -1497,10 +1643,13 @@ impl PyFile {
             backend: RefCell::new(backend),
             closed: RefCell::new(false),
             encoding: RefCell::new(None),
+            errors: RefCell::new(None),
+            newline: RefCell::new(None),
             name_override: RefCell::new(None),
             name_is_bytes: crate::sync::Cell::new(false),
             no_name: crate::sync::Cell::new(false),
             extra_attrs: RefCell::new(Vec::new()),
+            binary_buffer_cache: RefCell::new(None),
         }
     }
 
@@ -1564,15 +1713,42 @@ impl PyFile {
     /// stream already round-trips raw bytes through `read`/`write`, so it can
     /// serve as its own buffer — signalled here by returning `None`.
     pub fn binary_buffer(&self) -> Option<Object> {
-        if !self.binary && matches!(*self.backend.borrow(), FileBackend::Stdin) {
-            Some(Object::File(Rc::new(PyFile::new(
+        if self.binary {
+            return None;
+        }
+        // A stable, memoised object: CPython's `sys.stdin.buffer` is the same
+        // `BufferedReader` every access (so `buf is sys.stdin.buffer` and
+        // argparse's `FileType('rb')('-')` round-trip hold). Mint once, cache.
+        if let Some(buf) = self.binary_buffer_cache.borrow().as_ref() {
+            return Some(buf.clone());
+        }
+        // `sys.stdin/stdout/stderr.buffer` is the underlying *binary* stream
+        // sharing the same OS sink/source, so `print` (text) and
+        // `sys.stdout.buffer.write(b"...")` (raw bytes, e.g. `python -m
+        // base64`/`gzip`) both reach the same descriptor.
+        let backend = self.backend.borrow();
+        let buf = match &*backend {
+            FileBackend::Stdin => Some(Object::File(Rc::new(PyFile::new(
                 "<stdin>",
                 "rb",
                 FileBackend::Stdin,
-            ))))
-        } else {
-            None
+            )))),
+            FileBackend::Stdout(w) => Some(Object::File(Rc::new(PyFile::new(
+                "<stdout>",
+                "wb",
+                FileBackend::Stdout(w.clone()),
+            )))),
+            FileBackend::Stderr(w) => Some(Object::File(Rc::new(PyFile::new(
+                "<stderr>",
+                "wb",
+                FileBackend::Stderr(w.clone()),
+            )))),
+            _ => None,
+        };
+        if let Some(b) = &buf {
+            *self.binary_buffer_cache.borrow_mut() = Some(b.clone());
         }
+        buf
     }
 
     /// Whether the stream is attached to a terminal (`f.isatty()`). The
@@ -1662,20 +1838,77 @@ impl PyFile {
         };
     }
 
-    /// Encode a text-mode write through the file's codec.
-    pub fn encode_text(&self, s: &str) -> Result<Vec<u8>, RuntimeError> {
-        match &*self.encoding.borrow() {
-            Some(enc) => crate::stdlib::codecs_mod::encode_str(s, enc, "strict"),
-            None => Ok(s.as_bytes().to_vec()),
+    /// Set the text-mode error handler (`open(..., errors=...)`). A
+    /// `"strict"` handler keeps the `None` fast path.
+    pub fn set_errors(&self, errors: &str) {
+        *self.errors.borrow_mut() = if errors == "strict" {
+            None
+        } else {
+            Some(errors.to_owned())
+        };
+    }
+
+    /// Set the text-mode newline policy (`open(..., newline=...)`). The
+    /// Python value `None` leaves the field unset (universal newlines).
+    pub fn set_newline(&self, newline: Option<&str>) {
+        *self.newline.borrow_mut() = newline.map(str::to_owned);
+    }
+
+    /// The error-handler name to feed the codec layer (`"strict"` default).
+    fn errors_name(&self) -> String {
+        self.errors
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "strict".to_owned())
+    }
+
+    /// CPython newline translation applied to text-mode *output*: `\n` is
+    /// rewritten to the configured line ending. Universal mode maps `\n`→
+    /// `os.linesep` (a no-op on WeavePy's Unix targets); `''`/`'\n'` are
+    /// pass-through.
+    fn translate_newlines_write(&self, s: &str) -> String {
+        match self.newline.borrow().as_deref() {
+            Some("\r") => s.replace('\n', "\r"),
+            Some("\r\n") => s.replace('\n', "\r\n"),
+            _ => s.to_owned(),
         }
     }
 
-    /// Decode a text-mode read through the file's codec.
-    pub fn decode_text(&self, bytes: Vec<u8>) -> Result<String, RuntimeError> {
-        match &*self.encoding.borrow() {
-            Some(enc) => crate::stdlib::codecs_mod::decode_bytes(&bytes, enc, "strict"),
-            None => String::from_utf8(bytes).map_err(|e| value_error(e.to_string())),
+    /// CPython newline translation applied to text-mode *input*: only the
+    /// universal mode (`newline=None`) collapses `\r\n` and lone `\r` to
+    /// `\n`. Any explicit `newline=` (including `''`) leaves input untouched.
+    fn translate_newlines_read(&self, s: String) -> String {
+        if self.newline.borrow().is_none() && s.as_bytes().contains(&b'\r') {
+            s.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            s
         }
+    }
+
+    /// Encode a text-mode write through the file's codec, honouring the
+    /// configured `errors=` handler and `newline=` translation.
+    pub fn encode_text(&self, s: &str) -> Result<Vec<u8>, RuntimeError> {
+        let translated = self.translate_newlines_write(s);
+        let errors = self.errors_name();
+        match &*self.encoding.borrow() {
+            Some(enc) => crate::stdlib::codecs_mod::encode_str(&translated, enc, &errors),
+            None if errors == "strict" => Ok(translated.into_bytes()),
+            None => crate::stdlib::codecs_mod::encode_str(&translated, "utf-8", &errors),
+        }
+    }
+
+    /// Decode a text-mode read through the file's codec, honouring the
+    /// configured `errors=` handler and universal-newline translation.
+    pub fn decode_text(&self, bytes: Vec<u8>) -> Result<String, RuntimeError> {
+        let errors = self.errors_name();
+        let decoded = match &*self.encoding.borrow() {
+            Some(enc) => crate::stdlib::codecs_mod::decode_bytes(&bytes, enc, &errors)?,
+            None if errors == "strict" => {
+                String::from_utf8(bytes).map_err(|e| value_error(e.to_string()))?
+            }
+            None => crate::stdlib::codecs_mod::decode_bytes(&bytes, "utf-8", &errors)?,
+        };
+        Ok(self.translate_newlines_read(decoded))
     }
 
     pub fn is_closed(&self) -> bool {
@@ -3411,6 +3644,36 @@ impl Object {
                         }
                     }
                 }
+                // A subclass of `set`/`frozenset` that doesn't override
+                // `__repr__` renders with its *own* type name —
+                // `set2({7})`, not `{7}` — exactly like CPython's
+                // `set_repr` (`Py_TYPE(so) != &PySet_Type`). The native
+                // payload carries the elements; the class name comes from
+                // the instance's type.
+                if let Some(native_set @ (Object::Set(_) | Object::FrozenSet(_))) = &inst.native {
+                    let repr_key = DictKey(Object::from_static("__repr__"));
+                    let bt = crate::builtin_types::builtin_types();
+                    // CPython's `set_repr` keys off `Py_TYPE(so) != &PySet_Type`,
+                    // so a bare subclass renders as `set2({7})`. A *user* override
+                    // anywhere below the builtin `set`/`frozenset` (object's
+                    // inherited slot doesn't count) takes precedence and is run
+                    // through the normal re-dispatch path below.
+                    let has_user_repr = inst.cls().mro.borrow().iter().any(|t| {
+                        !Rc::ptr_eq(t, &bt.set_)
+                            && !Rc::ptr_eq(t, &bt.frozenset_)
+                            && !Rc::ptr_eq(t, &bt.object_)
+                            && t.dict.borrow().contains_key(&repr_key)
+                    });
+                    if !has_user_repr {
+                        let name = inst.cls().name.clone();
+                        let short = name.rsplit('.').next().unwrap_or(&name);
+                        return match native_set {
+                            Object::Set(s) => set_repr(&s.borrow(), short),
+                            Object::FrozenSet(s) => set_repr(s, short),
+                            _ => unreachable!(),
+                        };
+                    }
+                }
                 // Defer to __repr__ on the class when present. This path
                 // is reached from *native* rendering (container reprs,
                 // error messages, the Debug impl), so the user `__repr__`
@@ -3553,7 +3816,10 @@ impl Object {
             Object::ByteArray(b) => Ok(b.borrow().len()),
             Object::Set(s) => Ok(s.borrow().len()),
             Object::FrozenSet(s) => Ok(s.len()),
-            Object::MemoryView(mv) => Ok(mv.len.get()),
+            // `len(mv)` is the first-dimension element count, not the byte
+            // size — they differ once `cast` sets `itemsize > 1` or adds
+            // dimensions (`len(memoryview(b'1234').cast('I')) == 1`).
+            Object::MemoryView(mv) => Ok(mv.shape_dims().first().copied().unwrap_or(0)),
             Object::MappingProxy(d) => Ok(d.borrow().len()),
             Object::DictView(v) => Ok(v.dict.borrow().len()),
             // A subclass of a built-in container (`class C(list)`, …)
@@ -4175,6 +4441,20 @@ fn bytes_repr_inner(b: &[u8], smartquotes: bool) -> String {
     }
     out.push(quote as char);
     out
+}
+
+/// Render a native `set`/`frozenset` payload tagged with `type_name`,
+/// reproducing CPython `set_repr`'s `Py_TYPE(so) != &PySet_Type` branch.
+/// The `set.__repr__`/`frozenset.__repr__` slot wrappers use this so an
+/// explicit `set.__repr__(subclass_instance)` (as in `class S(set): def
+/// __repr__(self): return set.__repr__(self)`) still spells the subclass
+/// name rather than the base `{…}` form. Returns `None` for non-set payloads.
+pub(crate) fn set_repr_tagged(native: &Object, type_name: &str) -> Option<String> {
+    match native {
+        Object::Set(s) => Some(set_repr(&s.borrow(), type_name)),
+        Object::FrozenSet(s) => Some(set_repr(s, type_name)),
+        _ => None,
+    }
 }
 
 fn set_repr(s: &SetData, name: &str) -> String {

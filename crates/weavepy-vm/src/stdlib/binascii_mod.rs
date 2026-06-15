@@ -113,6 +113,16 @@ fn buffer_bytes(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
             ))
         }
     };
+    // CPython requests a C-contiguous buffer (`PyArg_Parse` `y*`); a strided
+    // view such as `memoryview(bytearray(b'...'))[::-2]` raises `BufferError`
+    // rather than being silently gathered.
+    if let Object::MemoryView(mv) = obj {
+        if !mv.is_c_contiguous() {
+            return Err(crate::error::buffer_error(
+                "memoryview: underlying buffer is not C-contiguous",
+            ));
+        }
+    }
     if let Some(v) = obj.as_bytes_view() {
         return Ok(v);
     }

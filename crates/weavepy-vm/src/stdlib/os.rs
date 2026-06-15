@@ -14,9 +14,10 @@ use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::path::{Path, PathBuf};
 
-use crate::error::{os_error, type_error, RuntimeError};
+use crate::error::{os_error, type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use weavepy_compiler::CompareKind;
 
 pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
     // `os.path` is a *separate* module that also gets cached in
@@ -44,6 +45,18 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("sep")),
             Object::from_static(if cfg!(windows) { "\\" } else { "/" }),
+        );
+        d.insert(
+            DictKey(Object::from_static("altsep")),
+            if cfg!(windows) {
+                Object::from_static("/")
+            } else {
+                Object::None
+            },
+        );
+        d.insert(
+            DictKey(Object::from_static("extsep")),
+            Object::from_static("."),
         );
         d.insert(
             DictKey(Object::from_static("linesep")),
@@ -103,6 +116,41 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("getcwd", os_getcwd),
         );
         d.insert(
+            DictKey(Object::from_static("getcwdb")),
+            builtin("getcwdb", os_getcwdb),
+        );
+        d.insert(
+            DictKey(Object::from_static("strerror")),
+            builtin("strerror", os_strerror),
+        );
+        d.insert(
+            DictKey(Object::from_static("fstat")),
+            builtin("fstat", os_fstat),
+        );
+        // `os.stat_result` / `posix.stat_result` — the struct-sequence type
+        // every `stat`/`lstat`/`fstat` result is an instance of, so tests can
+        // do `isinstance(st, os.stat_result)` and `posix.stat_result`.
+        d.insert(
+            DictKey(Object::from_static("stat_result")),
+            Object::Type(stat_result_type()),
+        );
+        d.insert(
+            DictKey(Object::from_static("terminal_size")),
+            Object::Type(terminal_size_type()),
+        );
+        // `os.DirEntry` — the type every `scandir` entry is an instance of.
+        // `shutil`/`glob`/user code reference it for `isinstance` checks.
+        d.insert(
+            DictKey(Object::from_static("DirEntry")),
+            Object::Type(dir_entry_type()),
+        );
+        // `os.defpath` — default search path for `exec*p*`/`spawn*p*`; CPython
+        // hard-codes `:/bin:/usr/bin` on POSIX, `.;C:\\bin` on Windows.
+        d.insert(
+            DictKey(Object::from_static("defpath")),
+            Object::from_static(if cfg!(windows) { ".;C:\\bin" } else { ":/bin:/usr/bin" }),
+        );
+        d.insert(
             DictKey(Object::from_static("getenv")),
             builtin("getenv", os_getenv),
         );
@@ -156,11 +204,11 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("stat")),
-            builtin("stat", os_stat_stub),
+            builtin_kw("stat", os_stat_kw),
         );
         d.insert(
             DictKey(Object::from_static("lstat")),
-            builtin("lstat", os_lstat),
+            builtin_kw("lstat", os_lstat_kw),
         );
         d.insert(
             DictKey(Object::from_static("readlink")),
@@ -186,9 +234,20 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("walk")),
             builtin_kw("walk", os_walk),
         );
+        // Private sentinel CPython 3.13 passes as `followlinks` to make
+        // `walk()` classify every symlink (and junction) as a regular file;
+        // `shutil.rmtree` relies on it. Identity-compared in `os_walk`.
+        d.insert(
+            DictKey(Object::from_static("_walk_symlinks_as_files")),
+            walk_symlinks_sentinel(),
+        );
         d.insert(
             DictKey(Object::from_static("scandir")),
             builtin("scandir", os_scandir),
+        );
+        d.insert(
+            DictKey(Object::from_static("access")),
+            builtin_kw("access", os_access),
         );
         d.insert(
             DictKey(Object::from_static("pipe")),
@@ -218,6 +277,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("cpu_count")),
             builtin("cpu_count", os_cpu_count),
+        );
+        d.insert(
+            DictKey(Object::from_static("process_cpu_count")),
+            builtin("process_cpu_count", os_cpu_count),
         );
         d.insert(
             DictKey(Object::from_static("kill")),
@@ -259,7 +322,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("symlink")),
-            builtin("symlink", os_symlink),
+            builtin_kw("symlink", os_symlink),
         );
         d.insert(
             DictKey(Object::from_static("link")),
@@ -267,11 +330,11 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("chmod")),
-            builtin("chmod", os_chmod),
+            builtin_kw("chmod", os_chmod),
         );
         d.insert(
             DictKey(Object::from_static("utime")),
-            builtin("utime", os_utime),
+            builtin_kw("utime", os_utime),
         );
         d.insert(
             DictKey(Object::from_static("replace")),
@@ -506,6 +569,24 @@ fn os_getcwd(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::from_str(cwd.to_string_lossy().into_owned()))
 }
 
+/// `os.getcwdb()` — the working directory as `bytes` (the OS-encoded path).
+/// `posixpath.abspath`/`realpath` call this for bytes-typed inputs.
+fn os_getcwdb(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let cwd = std::env::current_dir().map_err(|e| os_error(format!("getcwd: {e}")))?;
+    let bytes = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            cwd.as_os_str().as_bytes().to_vec()
+        }
+        #[cfg(not(unix))]
+        {
+            cwd.to_string_lossy().into_owned().into_bytes()
+        }
+    };
+    Ok(Object::Bytes(Rc::from(bytes.as_slice())))
+}
+
 fn os_getenv(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
@@ -529,8 +610,44 @@ fn os_remove(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn os_mkdir(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "mkdir")?;
-    std::fs::create_dir(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    // CPython: `mkdir(path, mode=0o777)`. The kernel masks `mode` with the
+    // process umask, so a faithful `Path.mkdir(0o555)` ends up `0o555 & ~umask`
+    // (exercised by `test_pathlib.test_mkdir_parents`).
+    let mode = match args.get(1) {
+        Some(m) => mode_arg(m, "mkdir")?,
+        None => 0o777,
+    };
+    mkdir_with_mode(&p, mode)?;
     Ok(Object::None)
+}
+
+/// Extract a POSIX permission-bits argument (`int`, or an `int` subclass
+/// instance) from an `os.*` mode parameter.
+fn mode_arg(obj: &Object, func: &str) -> Result<u32, RuntimeError> {
+    match obj.native_value().as_ref().unwrap_or(obj) {
+        Object::Int(m) => Ok(*m as u32),
+        Object::Bool(b) => Ok(u32::from(*b)),
+        _ => Err(type_error(format!(
+            "{func}: mode should be an integer, not {}",
+            obj.type_name()
+        ))),
+    }
+}
+
+fn mkdir_with_mode(path: &str, mode: u32) -> Result<(), RuntimeError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(mode)
+            .create(path)
+            .map_err(|e| crate::error::io_error_to_py_named(&e, Some(path)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::create_dir(path).map_err(|e| crate::error::io_error_to_py_named(&e, Some(path)))
+    }
 }
 
 fn os_makedirs_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -572,27 +689,33 @@ fn os_rmdir(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn os_rename(args: &[Object]) -> Result<Object, RuntimeError> {
     let src = first_path(args, "rename")?;
-    let dst = match args.get(1) {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("rename() second arg must be str")),
-    };
+    let dst = nth_path(args, 1, "rename")?;
     std::fs::rename(&src, &dst).map_err(|e| crate::error::io_error_to_py(&e))?;
     Ok(Object::None)
 }
 
 fn os_listdir(args: &[Object]) -> Result<Object, RuntimeError> {
-    let p = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
-        None => ".".to_string(),
-        _ => return Err(type_error("listdir() arg must be str")),
+    // CPython: `listdir(path='.')`. `path` may be str, bytes, or any
+    // `os.PathLike` (a `pathlib.Path`, which is what `Path.walk()` passes).
+    // A `bytes` path yields `bytes` names; everything else yields `str`.
+    let (p, want_bytes) = match args.first() {
+        None | Some(Object::None) => (".".to_string(), false),
+        Some(Object::Bytes(b)) => (String::from_utf8_lossy(b).into_owned(), true),
+        Some(other) => (path_to_string(other, "listdir")?, false),
     };
     let mut out = Vec::new();
-    let iter = std::fs::read_dir(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    let iter =
+        std::fs::read_dir(&p).map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
     for entry in iter {
         let entry = entry.map_err(|e| crate::error::io_error_to_py(&e))?;
-        out.push(Object::from_str(
-            entry.file_name().to_string_lossy().into_owned(),
-        ));
+        let name = entry.file_name();
+        if want_bytes {
+            out.push(Object::new_bytes(
+                name.to_string_lossy().into_owned().into_bytes(),
+            ));
+        } else {
+            out.push(Object::from_str(name.to_string_lossy().into_owned()));
+        }
     }
     Ok(Object::new_list(out))
 }
@@ -663,12 +786,20 @@ fn os_close_fd(_fd: i64) -> Result<Object, RuntimeError> {
 /// the values never reach the host libc, whose constants may differ).
 #[cfg(unix)]
 fn os_open_stub(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::IntoRawFd;
     let p = first_path(args, "open")?;
     let flags = args
         .get(1)
         .and_then(crate::object::Object::as_i64)
         .ok_or_else(|| crate::error::type_error("open() flags must be an int".to_owned()))?;
+    // `open(path, flags, mode=0o777)` — `mode` only matters when `O_CREAT`
+    // creates the file; the kernel masks it with the umask, so
+    // `Path.touch(0o444)` lands `0o444 & ~umask` (test_pathlib.test_touch_mode).
+    let mode = args
+        .get(2)
+        .and_then(crate::object::Object::as_i64)
+        .unwrap_or(0o777) as u32;
     const O_WRONLY: i64 = 1;
     const O_RDWR: i64 = 2;
     const O_CREAT: i64 = 64;
@@ -688,13 +819,16 @@ fn os_open_stub(args: &[Object]) -> Result<Object, RuntimeError> {
         oo.write(true).truncate(true);
     }
     if flags & O_CREAT != 0 {
+        oo.mode(mode);
         if flags & O_EXCL != 0 {
             oo.create_new(true);
         } else {
             oo.create(true);
         }
     }
-    let f = oo.open(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    let f = oo
+        .open(&p)
+        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
     Ok(Object::Int(i64::from(f.into_raw_fd())))
 }
 
@@ -741,13 +875,100 @@ fn os_fdopen(_args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, R
     ))
 }
 
-fn os_stat_stub(args: &[Object]) -> Result<Object, RuntimeError> {
+/// `os.stat(path, *, dir_fd=None, follow_symlinks=True)`. `follow_symlinks=False`
+/// makes it an `lstat` (the link itself); `shutil.copystat`/`copy2` and
+/// `pathlib`/`tempfile` pass the keyword. `dir_fd` is unsupported (only `None`).
+fn os_stat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    reject_dir_fd(kwargs, "stat")?;
+    // `os.stat(fd)` (an int) is `fstat`; `os.stat(path)` hits the filesystem.
+    // `genericpath.exists`/`isfile`/… lean on the fd form when handed a
+    // descriptor.
+    if let Some(Object::Int(_) | Object::Bool(_)) = args.first() {
+        return os_fstat(args);
+    }
     let p = first_path(args, "stat")?;
-    let meta = std::fs::metadata(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    let meta = if dir_entry_follow(kwargs) {
+        std::fs::metadata(&p)
+    } else {
+        std::fs::symlink_metadata(&p)
+    }
+    .map_err(|e| crate::error::io_error_to_py(&e))?;
     Ok(stat_result_from_meta(&meta))
 }
 
-fn os_lstat(args: &[Object]) -> Result<Object, RuntimeError> {
+/// `os.strerror(code)` — the OS message for an `errno`. The Rust formatter
+/// appends `" (os error N)"`, which CPython's bare `strerror` does not, so
+/// trim it back to just the message.
+fn os_strerror(args: &[Object]) -> Result<Object, RuntimeError> {
+    let code = match args.first().and_then(Object::as_i64) {
+        Some(c) => c,
+        None => return Err(type_error("strerror() argument must be an int")),
+    };
+    let full = std::io::Error::from_raw_os_error(code as i32).to_string();
+    let msg = full
+        .split(" (os error ")
+        .next()
+        .unwrap_or(&full)
+        .to_owned();
+    Ok(Object::from_str(msg))
+}
+
+/// Raise the CPython "bool is used as a file descriptor" `RuntimeWarning`
+/// through the live `warnings` machinery (so `assertWarns`/`catch_warnings`
+/// observe it, and an escalating filter turns it into a raised error). A no-op
+/// if no interpreter is published on this thread.
+fn warn_bool_as_fd() -> Result<(), RuntimeError> {
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the enclosing VM frame still live on this
+        // thread; the GIL keeps the pointer exclusive.
+        let interp = unsafe { &mut *ptr };
+        return interp.warn_runtime_from_builtin("bool is used as a file descriptor".to_owned());
+    }
+    Ok(())
+}
+
+/// `os.fstat(fd)` — `stat(2)` on an open descriptor. We `dup` the fd into an
+/// owned `File` (so the original stays open) and read its metadata.
+fn os_fstat(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Bool(b)) => {
+            // CPython's `PyErr_WarnEx(PyExc_RuntimeWarning, "bool is used as a
+            // file descriptor", 1)` — `os.stat(True)` etc. A filter that
+            // escalates the warning to an error propagates here.
+            warn_bool_as_fd()?;
+            i64::from(*b)
+        }
+        Some(Object::Int(n)) => *n,
+        _ => return Err(type_error("fstat() argument must be an int")),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd;
+        let fd = i32::try_from(fd).map_err(|_| value_error("file descriptor out of range"))?;
+        // SAFETY: `dup` returns a fresh owned descriptor; wrapping it in a
+        // `File` means the dup (not the caller's fd) is the one closed when
+        // the temporary drops, leaving the original descriptor intact.
+        let dup = unsafe { libc::dup(fd) };
+        if dup < 0 {
+            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        let f = unsafe { std::fs::File::from_raw_fd(dup) };
+        let meta = f.metadata().map_err(|e| crate::error::io_error_to_py(&e))?;
+        Ok(stat_result_from_meta(&meta))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        Err(crate::error::not_implemented_error(
+            "os.fstat is only supported on Unix",
+        ))
+    }
+}
+
+/// `os.lstat(path, *, dir_fd=None)` — `stat` on the link itself. `dir_fd` is
+/// unsupported (only `None`).
+fn os_lstat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    reject_dir_fd(kwargs, "lstat")?;
     let p = first_path(args, "lstat")?;
     let meta = std::fs::symlink_metadata(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
     Ok(stat_result_from_meta(&meta))
@@ -755,7 +976,7 @@ fn os_lstat(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     use crate::types::PyInstance;
-    let ty = path_like_type_singleton("stat_result");
+    let ty = stat_result_type();
     let inst = PyInstance::new(ty);
     let mut d = inst.dict.borrow_mut();
     // On Unix the OS already encodes the full `st_mode` — file-type bits
@@ -819,11 +1040,84 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
         DictKey(Object::from_static("st_ctime")),
         Object::Float(ctime),
     );
-    d.insert(DictKey(Object::from_static("st_ino")), Object::Int(0));
-    d.insert(DictKey(Object::from_static("st_dev")), Object::Int(0));
-    d.insert(DictKey(Object::from_static("st_nlink")), Object::Int(1));
-    d.insert(DictKey(Object::from_static("st_uid")), Object::Int(0));
-    d.insert(DictKey(Object::from_static("st_gid")), Object::Int(0));
+    // The remaining fields come straight from the OS `stat(2)` record on
+    // Unix. Real `st_ino`/`st_dev` are essential: `posixpath.samefile`/
+    // `samestat` compare exactly those two, so leaving them 0 made every
+    // file look identical. The `_ns` integer times, `st_blocks`,
+    // `st_blksize`, and `st_rdev` round out CPython's `stat_result`
+    // struct-sequence (RFC 0038 WS-B).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        d.insert(
+            DictKey(Object::from_static("st_ino")),
+            Object::Int(meta.ino() as i64),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_dev")),
+            Object::Int(meta.dev() as i64),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_nlink")),
+            Object::Int(meta.nlink() as i64),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_uid")),
+            Object::Int(i64::from(meta.uid())),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_gid")),
+            Object::Int(i64::from(meta.gid())),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_rdev")),
+            Object::Int(meta.rdev() as i64),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_blocks")),
+            Object::Int(meta.blocks() as i64),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_blksize")),
+            Object::Int(meta.blksize() as i64),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_mtime_ns")),
+            Object::Int(meta.mtime() * 1_000_000_000 + meta.mtime_nsec()),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_atime_ns")),
+            Object::Int(meta.atime() * 1_000_000_000 + meta.atime_nsec()),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_ctime_ns")),
+            Object::Int(meta.ctime() * 1_000_000_000 + meta.ctime_nsec()),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        d.insert(DictKey(Object::from_static("st_ino")), Object::Int(0));
+        d.insert(DictKey(Object::from_static("st_dev")), Object::Int(0));
+        d.insert(DictKey(Object::from_static("st_nlink")), Object::Int(1));
+        d.insert(DictKey(Object::from_static("st_uid")), Object::Int(0));
+        d.insert(DictKey(Object::from_static("st_gid")), Object::Int(0));
+        d.insert(DictKey(Object::from_static("st_rdev")), Object::Int(0));
+        d.insert(DictKey(Object::from_static("st_blocks")), Object::Int(0));
+        d.insert(DictKey(Object::from_static("st_blksize")), Object::Int(4096));
+        let mtime_ns = (mtime * 1e9) as i64;
+        d.insert(
+            DictKey(Object::from_static("st_mtime_ns")),
+            Object::Int(mtime_ns),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_atime_ns")),
+            Object::Int((atime * 1e9) as i64),
+        );
+        d.insert(
+            DictKey(Object::from_static("st_ctime_ns")),
+            Object::Int((ctime * 1e9) as i64),
+        );
+    }
     drop(d);
     Object::Instance(Rc::new(inst))
 }
@@ -933,99 +1227,153 @@ fn os_fsencode(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn os_walk(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    let p = first_path(args, "walk")?;
-    // `os.walk(top, topdown=True, onerror=None, followlinks=False)`.
-    // `topdown` is positional index 1 or a keyword; the other two are
-    // accepted and (for our in-process filesystem walk) effectively the
-    // defaults, so we don't need to act on them.
-    let topdown = match args.get(1).cloned().or_else(|| {
-        kwargs
-            .iter()
-            .find(|(k, _)| k == "topdown")
-            .map(|(_, v)| v.clone())
-    }) {
-        Some(v) => v.is_truthy(),
-        None => true,
-    };
-    let mut out = Vec::new();
-    walk_dir(Path::new(&p), topdown, &mut out);
-    Ok(Object::new_list(out))
+/// Process-wide `os._walk_symlinks_as_files` sentinel. A bare `object()`
+/// instance whose *identity* (`Rc::ptr_eq`) marks the "classify symlinks as
+/// files" walk mode; memoised so the value handed back through the module
+/// dict is the same object `os_walk` compares against.
+fn walk_symlinks_sentinel() -> Object {
+    use crate::types::PyInstance;
+    static SENTINEL: std::sync::OnceLock<Object> = std::sync::OnceLock::new();
+    SENTINEL
+        .get_or_init(|| {
+            let object_ty = crate::builtin_types::builtin_types().object_.clone();
+            Object::Instance(Rc::new(PyInstance::new(object_ty)))
+        })
+        .clone()
 }
 
-fn walk_dir(root: &Path, topdown: bool, out: &mut Vec<Object>) {
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-    let entries = match std::fs::read_dir(root) {
-        Ok(it) => it,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
-            dirs.push(Object::from_str(name));
-        } else {
-            files.push(Object::from_str(name));
-        }
+fn os_walk(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // `os.walk` is a lazy *generator* in CPython: callers prune the search by
+    // mutating `dirnames` in place between yields, and `os.scandir` failures
+    // are reported through `onerror`. Both are impossible to honour from a
+    // pre-built list, so we delegate to the verbatim CPython generator vendored
+    // in the frozen `_oswalk` module (which builds on our `os.scandir`).
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| type_error("os.walk: no active interpreter"))?;
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let module = interp.import_path("_oswalk")?;
+    let walk = match &module {
+        Object::Module(m) => m
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("walk")))
+            .cloned(),
+        _ => None,
     }
-    let triple = Object::new_tuple(vec![
-        Object::from_str(root.to_string_lossy().into_owned()),
-        Object::new_list(dirs.clone()),
-        Object::new_list(files),
-    ]);
-    // Top-down yields each directory before its children; bottom-up yields
-    // children first (so callers can remove files before their parent dir).
-    if topdown {
-        out.push(triple);
-        for d in &dirs {
-            if let Object::Str(name) = d {
-                walk_dir(&root.join(name.as_ref()), topdown, out);
-            }
-        }
-    } else {
-        for d in &dirs {
-            if let Object::Str(name) = d {
-                walk_dir(&root.join(name.as_ref()), topdown, out);
-            }
-        }
-        out.push(triple);
-    }
+    .ok_or_else(|| type_error("os.walk: _oswalk.walk is unavailable"))?;
+    interp.call_object(walk, args, kwargs)
 }
 
 fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
-    let p = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
-        None => ".".to_owned(),
-        _ => return Err(type_error("scandir() arg must be str")),
+    // CPython's `os.scandir` accepts str, bytes, an `os.PathLike`, or no
+    // argument (`.`). The *type* of the argument flows through to the
+    // `DirEntry.name`/`.path` it yields — `bytes` in, `bytes` out — which the
+    // verbatim `glob`/`fnmatch` bytes paths depend on.
+    let (dir_path, bytes_mode) = match args.first() {
+        None | Some(Object::None) => (".".to_owned(), false),
+        Some(Object::Str(s)) => (s.to_string(), false),
+        Some(Object::Bytes(b)) => (String::from_utf8_lossy(b).into_owned(), true),
+        Some(Object::ByteArray(b)) => (String::from_utf8_lossy(&b.borrow()).into_owned(), true),
+        Some(other @ Object::Instance(_)) => (path_to_string(other, "scandir")?, false),
+        Some(other) => {
+            return Err(type_error(format!(
+                "scandir: path should be string, bytes, os.PathLike or integer, not {}",
+                other.type_name()
+            )))
+        }
     };
-    let entries: Vec<Object> = std::fs::read_dir(&p)
+    let entries: Vec<Object> = std::fs::read_dir(&dir_path)
         .map_err(|e| crate::error::io_error_to_py(&e))?
         .filter_map(|r| r.ok())
         .map(|entry| {
-            let ft = entry.file_type().ok();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path().to_string_lossy().into_owned();
-            let is_dir = ft.as_ref().map(|f| f.is_dir()).unwrap_or(false);
-            let is_file = ft.as_ref().map(|f| f.is_file()).unwrap_or(false);
-            let is_symlink = ft.as_ref().map(|f| f.is_symlink()).unwrap_or(false);
-            build_dir_entry(name, path, is_dir, is_file, is_symlink)
+            let fs_path = entry.path().to_string_lossy().into_owned();
+            let (name_obj, path_obj) = if bytes_mode {
+                (dir_entry_name_bytes(&entry), dir_entry_path_bytes(&entry))
+            } else {
+                (
+                    Object::from_str(entry.file_name().to_string_lossy().into_owned()),
+                    Object::from_str(fs_path.clone()),
+                )
+            };
+            build_dir_entry(name_obj, path_obj, fs_path)
         })
         .collect();
-    Ok(Object::new_list(entries))
+    Ok(build_scandir_iterator(entries))
 }
 
-/// Build a CPython-compatible ``os.DirEntry`` instance: attribute
-/// access on ``name``/``path`` returns strings, while ``is_dir()``,
-/// ``is_file()``, ``is_symlink()``, and ``stat()`` are zero-arg
-/// methods so the standard ``e.is_file()`` form works.
-fn build_dir_entry(
-    name: String,
-    path: String,
-    is_dir: bool,
-    is_file: bool,
-    is_symlink: bool,
-) -> Object {
-    use crate::object::BuiltinFn;
+/// `DirEntry.name` as `bytes` for a `bytes`-mode `scandir`. On Unix the OS
+/// name is already a byte string (no transcoding); elsewhere we encode the
+/// lossy UTF-8 form as a best effort.
+fn dir_entry_name_bytes(entry: &std::fs::DirEntry) -> Object {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Object::Bytes(Rc::from(entry.file_name().as_bytes()))
+    }
+    #[cfg(not(unix))]
+    {
+        Object::Bytes(Rc::from(
+            entry.file_name().to_string_lossy().as_bytes(),
+        ))
+    }
+}
+
+/// `DirEntry.path` as `bytes` for a `bytes`-mode `scandir` (see
+/// [`dir_entry_name_bytes`]).
+fn dir_entry_path_bytes(entry: &std::fs::DirEntry) -> Object {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Object::Bytes(Rc::from(entry.path().as_os_str().as_bytes()))
+    }
+    #[cfg(not(unix))]
+    {
+        Object::Bytes(Rc::from(
+            entry.path().to_string_lossy().as_bytes(),
+        ))
+    }
+}
+
+/// `os.access(path, mode, *, dir_fd=None, effective_ids=False,
+/// follow_symlinks=True)` — test real-uid/gid accessibility of *path* for
+/// the `F_OK`/`R_OK`/`W_OK`/`X_OK` bitmask, defering to the platform
+/// `access(2)`. Returns `False` (never raises) when the path is missing or
+/// the check fails, matching CPython.
+fn os_access(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let p = first_path(args, "access")?;
+    let mode = args.get(1).and_then(Object::as_i64).unwrap_or(0) as i32;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = match std::ffi::CString::new(std::ffi::OsStr::new(&p).as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return Ok(Object::Bool(false)),
+        };
+        let rc = unsafe { libc::access(c.as_ptr(), mode) };
+        Ok(Object::Bool(rc == 0))
+    }
+    #[cfg(not(unix))]
+    {
+        // Best-effort off Unix: existence covers F_OK/R_OK; writability is
+        // approximated via the read-only metadata flag; execute is assumed.
+        let meta = match std::fs::metadata(&p) {
+            Ok(m) => m,
+            Err(_) => return Ok(Object::Bool(false)),
+        };
+        if mode & 2 != 0 && meta.permissions().readonly() {
+            return Ok(Object::Bool(false));
+        }
+        Ok(Object::Bool(true))
+    }
+}
+
+/// Wrap the materialised `DirEntry` list in a CPython-shaped
+/// `ScandirIterator`: an iterator that is *also* a context manager
+/// (`with os.scandir(p) as it:`) with a no-op `close()`. CPython's
+/// `glob`/`os.walk`/`shutil` all use the `with`-statement form, which a
+/// plain list can't satisfy.
+fn build_scandir_iterator(entries: Vec<Object>) -> Object {
     use crate::types::{PyInstance, TypeObject};
     thread_local! {
         static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
@@ -1035,96 +1383,239 @@ fn build_dir_entry(
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
+        let mut dict = DictData::new();
+        scandir_method(&mut dict, "__iter__", scandir_self);
+        scandir_method(&mut dict, "__next__", scandir_next);
+        scandir_method(&mut dict, "__enter__", scandir_self);
+        scandir_method(&mut dict, "__exit__", scandir_exit);
+        scandir_method(&mut dict, "close", scandir_exit);
+        let cls = TypeObject::new_user("posix.ScandirIterator", vec![bt.object_.clone()], dict)
+            .expect("ScandirIterator type");
+        *slot.borrow_mut() = Some(cls.clone());
+        cls
+    });
+    let it = Object::new_list(entries)
+        .make_iter()
+        .expect("list is always iterable");
+    let inst = PyInstance::with_native(class, Object::Iter(Rc::new(RefCell::new(it))));
+    Object::Instance(Rc::new(inst))
+}
+
+fn scandir_method(
+    dict: &mut DictData,
+    name: &'static str,
+    body: fn(&[Object]) -> Result<Object, RuntimeError>,
+) {
+    dict.insert(
+        DictKey(Object::from_static(name)),
+        Object::Builtin(Rc::new(crate::object::BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(body),
+            call_kw: None,
+        })),
+    );
+}
+
+fn scandir_self(args: &[Object]) -> Result<Object, RuntimeError> {
+    args.first()
+        .cloned()
+        .ok_or_else(|| type_error("ScandirIterator method requires self"))
+}
+
+fn scandir_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(Object::Instance(inst)) = args.first() {
+        if let Some(Object::Iter(it)) = &inst.native {
+            return match it.borrow_mut().next_value() {
+                Some(v) => Ok(v),
+                None => Err(crate::error::stop_iteration()),
+            };
+        }
+    }
+    Err(type_error("ScandirIterator.__next__ requires a scandir iterator"))
+}
+
+fn scandir_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::None)
+}
+
+/// Whether a `DirEntry`/`stat` call should follow symlinks. CPython defaults
+/// `follow_symlinks=True` for `is_dir`/`is_file`/`stat`.
+fn dir_entry_follow(kwargs: &[(String, Object)]) -> bool {
+    kwargs
+        .iter()
+        .find(|(k, _)| k == "follow_symlinks")
+        .map(|(_, v)| v.is_truthy())
+        .unwrap_or(true)
+}
+
+/// Build one of the lazy, `follow_symlinks`-aware `DirEntry` type predicates
+/// (`is_dir`/`is_file`). CPython's `DirEntry.is_dir()` follows symlinks by
+/// default (so a symlink-to-dir is a dir — the invariant the verbatim `glob`
+/// uses to recurse through symlinked directories), and re-`stat`s on demand.
+fn dir_entry_typecheck(name: &'static str, fs_path: String, want_dir: bool) -> Object {
+    let p_pos = fs_path.clone();
+    let classify = move |path: &str, follow: bool| -> bool {
+        let md = if follow {
+            std::fs::metadata(path)
+        } else {
+            std::fs::symlink_metadata(path)
+        };
+        md.map(|m| if want_dir { m.is_dir() } else { m.is_file() })
+            .unwrap_or(false)
+    };
+    let classify_pos = classify.clone();
+    Object::Builtin(Rc::new(crate::object::BuiltinFn {
+        name,
+        binds_instance: false,
+        call: Box::new(move |_args| Ok(Object::Bool(classify_pos(&p_pos, true)))),
+        call_kw: Some(Box::new(move |_args, kwargs| {
+            Ok(Object::Bool(classify(&fs_path, dir_entry_follow(kwargs))))
+        })),
+    }))
+}
+
+/// Build a CPython-compatible ``os.DirEntry`` instance: ``name``/``path``
+/// attributes plus the lazy ``is_dir``/``is_file``/``is_symlink``/``stat``/
+/// ``inode`` methods (all `follow_symlinks`-aware where CPython is).
+/// The shared `os.DirEntry` type. CPython exposes the `DirEntry` *type* on the
+/// `os` module (`os.DirEntry`), which `shutil` and user code reference for
+/// `isinstance` checks; every `scandir` entry is an instance of this one type.
+pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
+    use crate::types::TypeObject;
+    thread_local! {
+        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    }
+    CLS.with(|slot| {
+        if let Some(c) = slot.borrow().as_ref() {
+            return c.clone();
+        }
+        let bt = crate::builtin_types::builtin_types();
         let dict = DictData::new();
         let cls = TypeObject::new_user("DirEntry", vec![bt.object_.clone()], dict)
             .expect("DirEntry type");
         *slot.borrow_mut() = Some(cls.clone());
         cls
-    });
+    })
+}
+
+fn build_dir_entry(name: Object, path: Object, fs_path: String) -> Object {
+    use crate::object::BuiltinFn;
+    use crate::types::PyInstance;
+    let class = dir_entry_type();
     let inst = PyInstance::new(class);
     {
         let mut d = inst.dict.borrow_mut();
-        d.insert(DictKey(Object::from_static("name")), Object::from_str(name));
+        // `name`/`path` carry the *type* of the `scandir` argument: `str`
+        // entries for a `str` directory, `bytes` entries for a `bytes` one —
+        // the CPython invariant the verbatim `glob` relies on for bytes globs.
+        d.insert(DictKey(Object::from_static("name")), name);
+        d.insert(DictKey(Object::from_static("path")), path.clone());
+        // `os.PathLike`: `DirEntry.__fspath__()` returns the `.path` (str for a
+        // str scandir, bytes for a bytes one). This is what lets `shutil`'s
+        // `copytree` recurse with a `DirEntry` as `src` (the default
+        // `copy_function is copy2` path passes the entry, not a string, to
+        // `os.scandir`/`copy2`/`os.stat`).
         d.insert(
-            DictKey(Object::from_static("path")),
-            Object::from_str(path.clone()),
+            DictKey(Object::from_static("__fspath__")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__fspath__",
+                binds_instance: false,
+                call: Box::new(move |_args| Ok(path.clone())),
+                call_kw: None,
+            })),
         );
-        // Per-instance closures keep this DirEntry's own flag values
-        // alive; a class-level method would otherwise leak the first
-        // entry's flags to every subsequent one.
-        let is_dir_v = is_dir;
         d.insert(
             DictKey(Object::from_static("is_dir")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "is_dir",
-                binds_instance: false,
-                call: Box::new(move |_args| Ok(Object::Bool(is_dir_v))),
-                call_kw: None,
-            })),
+            dir_entry_typecheck("is_dir", fs_path.clone(), true),
         );
-        let is_file_v = is_file;
         d.insert(
             DictKey(Object::from_static("is_file")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "is_file",
-                binds_instance: false,
-                call: Box::new(move |_args| Ok(Object::Bool(is_file_v))),
-                call_kw: None,
-            })),
+            dir_entry_typecheck("is_file", fs_path.clone(), false),
         );
-        let is_symlink_v = is_symlink;
+        // `is_symlink()` is always an lstat (no `follow_symlinks` in CPython).
+        let p_sym = fs_path.clone();
         d.insert(
             DictKey(Object::from_static("is_symlink")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "is_symlink",
                 binds_instance: false,
-                call: Box::new(move |_args| Ok(Object::Bool(is_symlink_v))),
+                call: Box::new(move |_args| {
+                    Ok(Object::Bool(
+                        std::fs::symlink_metadata(&p_sym)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false),
+                    ))
+                }),
                 call_kw: None,
             })),
         );
-        let path_for_stat = path;
+        // `is_junction()` — Windows reparse-point junctions; always `False`
+        // on POSIX (matching `os.path.isjunction`). `os.walk`'s
+        // `_walk_symlinks_as_files` mode calls this.
+        d.insert(
+            DictKey(Object::from_static("is_junction")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "is_junction",
+                binds_instance: false,
+                call: Box::new(move |_args| Ok(Object::Bool(false))),
+                call_kw: None,
+            })),
+        );
+        // `inode()` — the entry's inode number (CPython `DirEntry.inode`).
+        let p_ino = fs_path.clone();
+        d.insert(
+            DictKey(Object::from_static("inode")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "inode",
+                binds_instance: false,
+                call: Box::new(move |_args| Ok(Object::Int(dir_entry_inode(&p_ino)))),
+                call_kw: None,
+            })),
+        );
+        let p_stat_pos = fs_path.clone();
+        let p_stat_kw = fs_path;
         d.insert(
             DictKey(Object::from_static("stat")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "stat",
                 binds_instance: false,
-                call: Box::new(move |_args| {
-                    let meta = std::fs::metadata(&path_for_stat)
-                        .map_err(|e| crate::error::io_error_to_py(&e))?;
-                    os_stat_to_result(&meta)
-                }),
-                call_kw: None,
+                call: Box::new(move |_args| dir_entry_stat(&p_stat_pos, true)),
+                call_kw: Some(Box::new(move |_args, kwargs| {
+                    dir_entry_stat(&p_stat_kw, dir_entry_follow(kwargs))
+                })),
             })),
         );
     }
     Object::Instance(Rc::new(inst))
 }
 
-/// Convert ``std::fs::Metadata`` to a ``SimpleNamespace`` shaped like
-/// CPython's ``os.stat_result``. Used by ``DirEntry.stat()`` and a
-/// future ``os.stat`` to match expectations from libraries that
-/// rely on ``st_*`` attributes.
-fn os_stat_to_result(meta: &std::fs::Metadata) -> Result<Object, RuntimeError> {
-    let d = Rc::new(RefCell::new(DictData::new()));
-    {
-        let mut m = d.borrow_mut();
-        m.insert(
-            DictKey(Object::from_static("st_size")),
-            Object::Int(meta.len() as i64),
-        );
-        m.insert(DictKey(Object::from_static("st_mode")), Object::Int(0o644));
-        m.insert(
-            DictKey(Object::from_static("st_mtime")),
-            Object::Float(
-                meta.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0),
-            ),
-        );
+/// `DirEntry.stat(follow_symlinks=True)` — a full `stat_result` for the entry,
+/// optionally on the link itself.
+fn dir_entry_stat(fs_path: &str, follow: bool) -> Result<Object, RuntimeError> {
+    let meta = if follow {
+        std::fs::metadata(fs_path)
+    } else {
+        std::fs::symlink_metadata(fs_path)
     }
-    Ok(Object::SimpleNamespace(d))
+    .map_err(|e| crate::error::io_error_to_py(&e))?;
+    Ok(stat_result_from_meta(&meta))
+}
+
+/// `DirEntry.inode()` — the entry's inode (lstat; `0` off Unix / on error).
+fn dir_entry_inode(fs_path: &str) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(fs_path)
+            .map(|m| m.ino() as i64)
+            .unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs_path;
+        0
+    }
 }
 
 #[cfg(unix)]
@@ -1326,8 +1817,43 @@ fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn os_get_terminal_size(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::new_tuple(vec![Object::Int(80), Object::Int(24)]))
+/// `os.get_terminal_size(fd=STDOUT_FILENO)` — query the controlling tty's
+/// window size via `TIOCGWINSZ`, returning an `os.terminal_size`. CPython
+/// raises `OSError` when `fd` is not a tty (e.g. output redirected to a pipe,
+/// as under the conformance harness); verbatim `shutil.get_terminal_size`
+/// catches that and substitutes its fallback, so faithfully raising here is
+/// load-bearing rather than returning a bogus 80x24.
+fn os_get_terminal_size(args: &[Object]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    {
+        let fd = match args.first() {
+            Some(Object::Int(n)) => *n as i32,
+            Some(Object::Bool(b)) => i32::from(*b),
+            None | Some(Object::None) => 1, // STDOUT_FILENO
+            _ => return Err(type_error("an integer is required")),
+        };
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+        if rc != 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        if ws.ws_col == 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::from_raw_os_error(libc::ENOTTY),
+            ));
+        }
+        Ok(make_terminal_size(
+            i64::from(ws.ws_col),
+            i64::from(ws.ws_row),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Ok(make_terminal_size(80, 24))
+    }
 }
 
 fn os_cpu_count(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1386,12 +1912,22 @@ fn os_umask(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn os_symlink(args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_symlink(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let src = first_path(args, "symlink")?;
-    let dst = match args.get(1) {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("symlink() second arg must be str")),
-    };
+    // `dst` is positional index 1, or the `dst`/`target`-less form; CPython's
+    // signature is `symlink(src, dst, target_is_directory=False, *, dir_fd=None)`.
+    // Both ends accept `os.PathLike` (`pathlib.Path`), str, or bytes.
+    let dst = nth_path(args, 1, "symlink")?;
+    // `dir_fd` (keyword-only) is unsupported; reject a non-`None` value rather
+    // than silently ignoring it. `target_is_directory` is a Windows-only hint
+    // and is accepted-and-ignored on POSIX, exactly like CPython.
+    if let Some((_, v)) = kwargs.iter().find(|(k, _)| k == "dir_fd") {
+        if !matches!(v, Object::None) {
+            return Err(crate::error::not_implemented_error(
+                "os.symlink() dir_fd is not supported in WeavePy",
+            ));
+        }
+    }
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&src, &dst).map_err(|e| crate::error::io_error_to_py(&e))?;
@@ -1408,23 +1944,47 @@ fn os_symlink(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn os_link(args: &[Object]) -> Result<Object, RuntimeError> {
     let src = first_path(args, "link")?;
-    let dst = match args.get(1) {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("link() second arg must be str")),
-    };
+    let dst = nth_path(args, 1, "link")?;
     std::fs::hard_link(&src, &dst).map_err(|e| crate::error::io_error_to_py(&e))?;
     Ok(Object::None)
 }
 
-fn os_chmod(args: &[Object]) -> Result<Object, RuntimeError> {
+/// `os.chmod(path, mode, *, dir_fd=None, follow_symlinks=True)`. `shutil`'s
+/// `copymode`/`copystat` and `_copytree` pass `follow_symlinks=`; on a symlink
+/// with `follow_symlinks=False` we chmod the link via `fchmodat` where the
+/// platform supports it, else fall back to the target (matching CPython's
+/// best-effort `lchmod` behaviour on Linux).
+fn os_chmod(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    reject_dir_fd(kwargs, "chmod")?;
     let p = first_path(args, "chmod")?;
     let mode = match args.get(1) {
         Some(Object::Int(m)) => *m as u32,
         _ => return Err(type_error("chmod() mode must be int")),
     };
+    let follow = dir_entry_follow(kwargs);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        if !follow {
+            // chmod the link itself, not its target.
+            let cpath = std::ffi::CString::new(p.as_bytes())
+                .map_err(|_| value_error("embedded null character in path"))?;
+            // SAFETY: `cpath` outlives the call.
+            let rc = unsafe {
+                libc::fchmodat(
+                    libc::AT_FDCWD,
+                    cpath.as_ptr(),
+                    mode as libc::mode_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(crate::error::io_error_to_py(
+                    &std::io::Error::last_os_error(),
+                ));
+            }
+            return Ok(Object::None);
+        }
         let mut perms = std::fs::metadata(&p)
             .map_err(|e| crate::error::io_error_to_py(&e))?
             .permissions();
@@ -1434,20 +1994,139 @@ fn os_chmod(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (p, mode);
+        let _ = (p, mode, follow);
         Ok(Object::None)
     }
 }
 
-fn os_utime(args: &[Object]) -> Result<Object, RuntimeError> {
-    // Minimal implementation: just touch the file by opening for
-    // append. A real version would call utimensat(2).
+/// `os.utime(path, times=None, *, ns=None, dir_fd=None, follow_symlinks=True)`.
+/// Sets the access/modification times via `utimensat(2)`. `times` is a
+/// `(atime, mtime)` float-seconds pair; `ns` an integer-nanoseconds pair;
+/// neither → "now". `shutil.copystat` drives the `ns=` path.
+fn os_utime(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    reject_dir_fd(kwargs, "utime")?;
     let p = first_path(args, "utime")?;
-    let _ = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&p)
-        .map_err(|e| crate::error::io_error_to_py(&e))?;
-    Ok(Object::None)
+    let kw = |name: &str| {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .filter(|o| !matches!(o, Object::None))
+    };
+    let times = args.get(1).cloned().filter(|o| !matches!(o, Object::None));
+    let ns = kw("ns");
+    if times.is_some() && ns.is_some() {
+        return Err(value_error(
+            "utime: you may specify either 'times' or 'ns' but not both",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let (atspec, mtspec) = if let Some(ns_obj) = ns {
+            let (a, m) = utime_pair_int(&ns_obj, "ns")?;
+            (ns_to_timespec(a), ns_to_timespec(m))
+        } else if let Some(t_obj) = times {
+            let (a, m) = utime_pair_float(&t_obj, "times")?;
+            (secs_to_timespec(a), secs_to_timespec(m))
+        } else {
+            let now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            };
+            (now, now)
+        };
+        let flags = if dir_entry_follow(kwargs) {
+            0
+        } else {
+            libc::AT_SYMLINK_NOFOLLOW
+        };
+        let cpath = std::ffi::CString::new(p.as_bytes())
+            .map_err(|_| value_error("embedded null character in path"))?;
+        let specs = [atspec, mtspec];
+        // SAFETY: `cpath` and `specs` outlive the call; `utimensat` only reads them.
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), specs.as_ptr(), flags) };
+        if rc != 0 {
+            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (times, ns);
+        std::fs::metadata(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+        Ok(Object::None)
+    }
+}
+
+/// Reject an unsupported non-`None` `dir_fd=` keyword the way CPython rejects
+/// it on platforms lacking the capability (`NotImplementedError`).
+fn reject_dir_fd(kwargs: &[(String, Object)], func: &str) -> Result<(), RuntimeError> {
+    if let Some((_, v)) = kwargs.iter().find(|(k, _)| k == "dir_fd") {
+        if !matches!(v, Object::None) {
+            return Err(crate::error::not_implemented_error(format!(
+                "{func}: dir_fd unavailable on this platform"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Split a 2-element `(atime, mtime)` int/tuple-or-list into a pair of i64
+/// nanoseconds for `os.utime(ns=…)`.
+#[cfg(unix)]
+fn utime_pair_int(o: &Object, name: &str) -> Result<(i64, i64), RuntimeError> {
+    let (a, b) = utime_pair(o, name)?;
+    let to_i = |x: &Object| {
+        x.as_i64()
+            .ok_or_else(|| type_error(format!("utime: '{name}' must be a tuple of two ints")))
+    };
+    Ok((to_i(&a)?, to_i(&b)?))
+}
+
+/// Split a 2-element `(atime, mtime)` float-seconds tuple-or-list for
+/// `os.utime(times=…)`.
+#[cfg(unix)]
+fn utime_pair_float(o: &Object, name: &str) -> Result<(f64, f64), RuntimeError> {
+    let (a, b) = utime_pair(o, name)?;
+    let to_f = |x: &Object| {
+        crate::builtins::coerce_f64_opt(x)
+            .ok()
+            .flatten()
+            .ok_or_else(|| type_error(format!("utime: '{name}' must be a tuple of two floats")))
+    };
+    Ok((to_f(&a)?, to_f(&b)?))
+}
+
+#[cfg(unix)]
+fn utime_pair(o: &Object, name: &str) -> Result<(Object, Object), RuntimeError> {
+    match o {
+        Object::Tuple(t) if t.len() == 2 => Ok((t[0].clone(), t[1].clone())),
+        Object::List(l) if l.borrow().len() == 2 => {
+            let b = l.borrow();
+            Ok((b[0].clone(), b[1].clone()))
+        }
+        _ => Err(type_error(format!(
+            "utime: '{name}' must be a tuple of two items"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn ns_to_timespec(n: i64) -> libc::timespec {
+    libc::timespec {
+        tv_sec: n.div_euclid(1_000_000_000) as libc::time_t,
+        tv_nsec: n.rem_euclid(1_000_000_000) as _,
+    }
+}
+
+#[cfg(unix)]
+fn secs_to_timespec(s: f64) -> libc::timespec {
+    let sec = s.floor();
+    let nsec = ((s - sec) * 1e9).round() as i64;
+    libc::timespec {
+        tv_sec: sec as libc::time_t,
+        tv_nsec: nsec.clamp(0, 999_999_999) as _,
+    }
 }
 
 /// The process-wide `os.PathLike` ABC type. Memoised so its identity is
@@ -1462,18 +2141,319 @@ pub fn path_like_type() -> Rc<crate::types::TypeObject> {
 
 fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
     use crate::builtin_types::builtin_types;
+    use crate::object::{BuiltinFn, MethodWrapper};
     use crate::types::{TypeFlags, TypeObject};
     let bt = builtin_types();
+    let mut dict = DictData::new();
+    // `os.PathLike` is an ABC; `os.PathLike.register(C)` marks `C` as a virtual
+    // subclass (CPython's `pathlib._local` does `os.PathLike.register(PurePath)`
+    // at import). Membership here is checked structurally (any `__fspath__`),
+    // so `register` just needs to exist and return its argument so the
+    // `@PathLike.register` decorator form works.
+    dict.insert(
+        DictKey(Object::from_static("register")),
+        Object::ClassMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
+            name: "register",
+            binds_instance: true,
+            call: Box::new(|args| Ok(args.get(1).cloned().unwrap_or(Object::None))),
+            call_kw: None,
+        })))),
+    );
     TypeObject::new_with_flags(
         Box::leak(name.to_owned().into_boxed_str()),
         vec![bt.object_.clone()],
-        DictData::new(),
+        dict,
         TypeFlags {
             is_exception: false,
             is_builtin: true,
         },
     )
     .expect("os.PathLike")
+}
+
+/// The "visible" struct-sequence members of `os.stat_result`, in index order
+/// — the first 10 positions `stat_result(seq)` consumes and `st[i]` returns,
+/// matching CPython's `structseq` layout (`Modules/posixmodule.c`).
+const STAT_RESULT_FIELDS: [&str; 10] = [
+    "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
+    "st_atime", "st_mtime", "st_ctime",
+];
+
+/// Process-wide memoised `os.stat_result` type. Memoisation is load-bearing
+/// for *identity*: `stat`/`lstat`/`fstat`/`DirEntry.stat()` build instances of
+/// this exact type, and the module exposes the very same object as
+/// `os.stat_result` / `posix.stat_result`, so `isinstance(os.stat(p),
+/// os.stat_result)` holds — the CPython invariant tests (and `tarfile`,
+/// `shutil`, `http.server`, …) rely on. The type is a CPython-style struct
+/// sequence: addressable both by `st_*` attribute and by integer index, and
+/// constructible from a 10-sequence (`posix.stat_result((...))`).
+fn stat_result_type() -> Rc<crate::types::TypeObject> {
+    struct_seq_type("stat_result", &STAT_RESULT_FIELDS)
+}
+
+/// `os.terminal_size` — a 2-field struct sequence (`columns`, `lines`). Verbatim
+/// `shutil.get_terminal_size()` (and hence `argparse`'s `HelpFormatter`) builds
+/// and reads these by attribute (`size.columns`) *and* constructs them from a
+/// fallback 2-tuple (`os.terminal_size(fallback)`), so it must be a real struct
+/// sequence rather than a bare tuple.
+fn terminal_size_type() -> Rc<crate::types::TypeObject> {
+    const TERMINAL_SIZE_FIELDS: [&str; 2] = ["columns", "lines"];
+    struct_seq_type("terminal_size", &TERMINAL_SIZE_FIELDS)
+}
+
+/// Build (and memoise, by `name`) a CPython-style `PyStructSequence` type:
+/// addressable both by `fields[i]` attribute and by integer index, with
+/// `__len__` == `fields.len()`, and constructible from a `>= fields.len()`
+/// sequence plus an optional trailing dict of hidden named fields. Backs
+/// `os.stat_result`, `os.terminal_size`, etc. Memoisation keeps type identity
+/// stable across module rebuilds so `isinstance` holds.
+pub(crate) fn struct_seq_type(
+    name: &'static str,
+    fields: &'static [&'static str],
+) -> Rc<crate::types::TypeObject> {
+    use crate::types::{TypeFlags, TypeObject};
+    use std::collections::HashMap;
+    thread_local! {
+        static REGISTRY: RefCell<HashMap<&'static str, Rc<TypeObject>>> =
+            RefCell::new(HashMap::new());
+    }
+    REGISTRY.with(|reg| {
+        if let Some(c) = reg.borrow().get(name) {
+            return c.clone();
+        }
+        let bt = crate::builtin_types::builtin_types();
+        let mut dict = DictData::new();
+        struct_seq_method(&mut dict, "__init__", move |args| {
+            struct_seq_init(name, fields, args)
+        });
+        struct_seq_method(&mut dict, "__getitem__", move |args| {
+            struct_seq_getitem(fields, args)
+        });
+        struct_seq_method(&mut dict, "__len__", move |_args| {
+            Ok(Object::Int(fields.len() as i64))
+        });
+        // CPython struct sequences subclass `tuple`, so `==`/`!=`/`hash()`
+        // compare the visible fields by value (e.g. `os.stat(a) == os.stat(a)`
+        // in `test_pathlib`, and using a `stat_result` as a dict key). Compare
+        // against another struct sequence of the same type or a plain tuple.
+        struct_seq_method(&mut dict, "__eq__", move |args| {
+            struct_seq_richcompare(fields, args, CompareKind::Eq)
+        });
+        struct_seq_method(&mut dict, "__ne__", move |args| {
+            struct_seq_richcompare(fields, args, CompareKind::NotEq)
+        });
+        struct_seq_method(&mut dict, "__hash__", move |args| {
+            struct_seq_hash(fields, args)
+        });
+        let cls = TypeObject::new_with_flags(
+            name,
+            vec![bt.object_.clone()],
+            dict,
+            TypeFlags {
+                is_exception: false,
+                is_builtin: true,
+            },
+        )
+        .expect("struct sequence type");
+        reg.borrow_mut().insert(name, cls.clone());
+        cls
+    })
+}
+
+fn struct_seq_method<F>(dict: &mut DictData, name: &'static str, body: F)
+where
+    F: Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync + 'static,
+{
+    dict.insert(
+        DictKey(Object::from_static(name)),
+        Object::Builtin(Rc::new(crate::object::BuiltinFn {
+            name,
+            binds_instance: true,
+            call: Box::new(body),
+            call_kw: None,
+        })),
+    );
+}
+
+/// `T(sequence[, dict])` — CPython accepts a `>= len(fields)` element sequence
+/// (the visible fields) plus an optional dict of hidden named fields. Tests
+/// fabricate stat results this way to drive `posixpath.ismount`, `shutil`
+/// device checks, etc.
+fn struct_seq_init(
+    name: &'static str,
+    fields: &'static [&'static str],
+    args: &[Object],
+) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error(format!(
+            "{name}.__init__ requires a {name} instance"
+        )));
+    };
+    let seq = args
+        .get(1)
+        .ok_or_else(|| type_error(format!("{name}() missing required argument: 'sequence'")))?;
+    let values = match seq {
+        Object::Tuple(items) => items.to_vec(),
+        Object::List(items) => items.borrow().clone(),
+        other => {
+            let mut it = other
+                .make_iter()
+                .map_err(|_| type_error(format!("{name}() argument must be a sequence")))?;
+            let mut v = Vec::new();
+            while let Some(x) = it.next_value() {
+                v.push(x);
+            }
+            v
+        }
+    };
+    if values.len() < fields.len() {
+        return Err(type_error(format!(
+            "{name}() takes a {}-sequence ({}-sequence given)",
+            fields.len(),
+            values.len()
+        )));
+    }
+    {
+        let mut d = inst.dict.borrow_mut();
+        for (field, value) in fields.iter().zip(values.iter()) {
+            d.insert(DictKey(Object::from_static(field)), value.clone());
+        }
+    }
+    // Optional second positional: a dict of named hidden fields. Snapshot the
+    // pairs before borrowing `inst.dict` mutably to avoid a double borrow if
+    // the same Rc backs both (it never does here, but keeps this panic-free).
+    if let Some(Object::Dict(extra)) = args.get(2) {
+        let pairs: Vec<(Object, Object)> = extra
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.0.clone(), v.clone()))
+            .collect();
+        let mut d = inst.dict.borrow_mut();
+        for (k, v) in pairs {
+            d.insert(DictKey(k), v);
+        }
+    }
+    Ok(Object::None)
+}
+
+fn struct_seq_getitem(
+    fields: &'static [&'static str],
+    args: &[Object],
+) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error("struct sequence indexing requires an instance"));
+    };
+    let field = |i: usize| -> Object {
+        inst.dict
+            .borrow()
+            .get(&DictKey(Object::from_static(fields[i])))
+            .cloned()
+            .unwrap_or(Object::Int(0))
+    };
+    // CPython struct sequences are tuple-backed, so slicing yields a plain
+    // `tuple` of the selected fields (e.g. `time.localtime()[:6]`, which
+    // `tarfile`/`zipfile` use to build DOS timestamps).
+    if let Some(Object::Slice(s)) = args.get(1) {
+        let idxs = crate::slice_indices(fields.len(), s)?;
+        return Ok(Object::new_tuple(idxs.into_iter().map(field).collect()));
+    }
+    let idx = args
+        .get(1)
+        .and_then(Object::as_i64)
+        .ok_or_else(|| type_error("struct sequence indices must be integers"))?;
+    let n = fields.len() as i64;
+    let i = if idx < 0 { idx + n } else { idx };
+    if i < 0 || i >= n {
+        return Err(crate::error::index_error("tuple index out of range"));
+    }
+    Ok(field(i as usize))
+}
+
+/// Read the visible (sequence) field values of a struct-sequence instance,
+/// in declaration order, defaulting absent fields to `0` (as the tuple slot
+/// would be).
+fn struct_seq_values(
+    fields: &'static [&'static str],
+    inst: &Rc<crate::types::PyInstance>,
+) -> Vec<Object> {
+    let d = inst.dict.borrow();
+    fields
+        .iter()
+        .map(|f| {
+            d.get(&DictKey(Object::from_static(f)))
+                .cloned()
+                .unwrap_or(Object::Int(0))
+        })
+        .collect()
+}
+
+/// `__eq__`/`__ne__` for struct sequences: compare the visible fields as a
+/// tuple against another instance of the *same* struct-sequence type or a
+/// plain `tuple`/`list`. Anything else yields `NotImplemented` so the other
+/// operand gets a chance (matching tuple semantics).
+fn struct_seq_richcompare(
+    fields: &'static [&'static str],
+    args: &[Object],
+    op: CompareKind,
+) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error("struct sequence comparison requires an instance"));
+    };
+    let self_tuple = Object::new_tuple(struct_seq_values(fields, inst));
+    let other = match args.get(1) {
+        Some(Object::Instance(other_inst)) if Rc::ptr_eq(&inst.cls(), &other_inst.cls()) => {
+            Object::new_tuple(struct_seq_values(fields, other_inst))
+        }
+        Some(t @ Object::Tuple(_)) => t.clone(),
+        Some(Object::List(items)) => Object::new_tuple(items.borrow().clone()),
+        _ => return Ok(crate::vm_singletons::not_implemented()),
+    };
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| type_error("struct sequence comparison: no active interpreter"))?;
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    Ok(Object::Bool(interp.op_compare(&self_tuple, &other, op)?))
+}
+
+/// `__hash__` for struct sequences: hash the visible fields as a tuple, so a
+/// `stat_result` hashes like `tuple(stat_result)` (CPython relies on this).
+fn struct_seq_hash(
+    fields: &'static [&'static str],
+    args: &[Object],
+) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error("struct sequence hash requires an instance"));
+    };
+    let tuple = Object::new_tuple(struct_seq_values(fields, inst));
+    crate::builtins::hash_object(&tuple)
+}
+
+/// Build an instance of a [`struct_seq_type`], binding `values` positionally to
+/// `fields`. Surplus `values` are ignored; missing trailing ones simply aren't
+/// set (callers pass a full row). Shared by `time.struct_time`, `os.times_result`,
+/// etc., so they all get attribute + index access for free.
+pub(crate) fn struct_seq_instance(
+    ty: Rc<crate::types::TypeObject>,
+    fields: &'static [&'static str],
+    values: Vec<Object>,
+) -> Object {
+    let inst = crate::types::PyInstance::new(ty);
+    {
+        let mut d = inst.dict.borrow_mut();
+        for (field, value) in fields.iter().zip(values.into_iter()) {
+            d.insert(DictKey(Object::from_static(field)), value);
+        }
+    }
+    Object::Instance(Rc::new(inst))
+}
+
+/// Construct an `os.terminal_size` instance with the given dimensions.
+fn make_terminal_size(columns: i64, lines: i64) -> Object {
+    struct_seq_instance(
+        terminal_size_type(),
+        &["columns", "lines"],
+        vec![Object::Int(columns), Object::Int(lines)],
+    )
 }
 
 // ---------- os.path ----------
@@ -1919,14 +2899,25 @@ fn first_path(args: &[Object], func: &str) -> Result<String, RuntimeError> {
     }
 }
 
+/// Resolve the `n`-th positional argument as a path (str/bytes/`os.PathLike`).
+/// Used for the *second* path of two-path calls (`symlink`/`link`/`rename`),
+/// which must honour `PathLike` exactly like the first (`pathlib.Path`s flow
+/// through here once they're real `os.PathLike`s).
+fn nth_path(args: &[Object], n: usize, func: &str) -> Result<String, RuntimeError> {
+    match args.get(n) {
+        Some(obj) => path_to_string(obj, func),
+        None => Err(type_error(format!("{func}() missing path argument"))),
+    }
+}
+
 /// Reduce a path argument to a `str`, accepting `str`, `bytes`/`bytearray`,
 /// and `os.PathLike` objects (resolved through `__fspath__`) — matching
 /// CPython's `path_converter`. Shared by the `os.*` filesystem entry points.
 pub(crate) fn path_to_string(obj: &Object, func: &str) -> Result<String, RuntimeError> {
-    match obj {
-        Object::Str(s) => Ok(s.to_string()),
-        Object::Bytes(b) => Ok(String::from_utf8_lossy(b).into_owned()),
-        Object::ByteArray(b) => Ok(String::from_utf8_lossy(&b.borrow()).into_owned()),
+    let s = match obj {
+        Object::Str(s) => s.to_string(),
+        Object::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        Object::ByteArray(b) => String::from_utf8_lossy(&b.borrow()).into_owned(),
         Object::Instance(_) => {
             let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
                 type_error(format!(
@@ -1943,19 +2934,30 @@ pub(crate) fn path_to_string(obj: &Object, func: &str) -> Result<String, Runtime
                 ))
             })?;
             match interp.call_object(fspath, &[], &[])? {
-                Object::Str(s) => Ok(s.to_string()),
-                Object::Bytes(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
-                other => Err(type_error(format!(
-                    "expected {func}.__fspath__() to return str or bytes, not {}",
-                    other.type_name()
-                ))),
+                Object::Str(s) => s.to_string(),
+                Object::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+                other => {
+                    return Err(type_error(format!(
+                        "expected {func}.__fspath__() to return str or bytes, not {}",
+                        other.type_name()
+                    )))
+                }
             }
         }
-        other => Err(type_error(format!(
-            "{func}: path should be string, bytes or os.PathLike, not {}",
-            other.type_name()
-        ))),
+        other => {
+            return Err(type_error(format!(
+                "{func}: path should be string, bytes or os.PathLike, not {}",
+                other.type_name()
+            )))
+        }
+    };
+    // A NUL in a path is invalid at the syscall boundary; CPython's
+    // `path_converter` raises `ValueError` rather than truncating
+    // (`os.stat('/\x00')`, `realpath('/\x00', strict=True)`).
+    if s.as_bytes().contains(&0) {
+        return Err(value_error("embedded null byte"));
     }
+    Ok(s)
 }
 
 /// Lexical path normalisation matching CPython's `os.path.normpath`:

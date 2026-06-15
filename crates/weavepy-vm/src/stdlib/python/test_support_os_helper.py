@@ -85,34 +85,64 @@ SAVEDCWD = os.getcwd()
 def unlink(filename):
     """Remove *filename*, ignoring "does not exist"."""
     try:
-        os.unlink(filename)
+        _unlink(filename)
     except (FileNotFoundError, NotADirectoryError):
         pass
 
 
+# POSIX-flavoured teardown primitives (faithful port of CPython's
+# ``os_helper``). The Windows ``_waitfor`` retry loop is irrelevant here.
+_unlink = os.unlink
+_rmdir = os.rmdir
+
+
+def _rmtree(path):
+    import stat
+    from test.support import _force_run
+
+    try:
+        shutil.rmtree(path)
+        return
+    except OSError:
+        pass
+
+    def _rmtree_inner(path):
+        for name in _force_run(path, os.listdir, path):
+            fullname = os.path.join(path, name)
+            try:
+                mode = os.lstat(fullname).st_mode
+            except OSError:
+                mode = 0
+            if stat.S_ISDIR(mode):
+                _rmtree_inner(fullname)
+                _force_run(path, os.rmdir, fullname)
+            else:
+                _force_run(path, os.unlink, fullname)
+    _rmtree_inner(path)
+    os.rmdir(path)
+
+
+def _longpath(path):
+    return path
+
+
 def rmdir(dirname):
     try:
-        os.rmdir(dirname)
+        _rmdir(dirname)
     except FileNotFoundError:
         pass
 
 
 def rmtree(path):
-    """Recursively remove *path*; ignore a missing tree."""
+    """Recursively remove *path*; ignore a missing tree.
+
+    Mirrors CPython's ``os_helper.rmtree``: a plain ``shutil.rmtree`` first,
+    falling back to a ``_force_run``-driven walk that ``chmod``s
+    inaccessible (mode-0) directories before retrying, so trees left by
+    permission tests are actually removed instead of silently leaked.
+    """
     try:
-        if shutil is not None:
-            shutil.rmtree(path, ignore_errors=True)
-            return
-    except Exception:
-        pass
-    # Fallback walk if shutil is unavailable.
-    try:
-        for root, dirs, files in os.walk(path, topdown=False):
-            for name in files:
-                unlink(os.path.join(root, name))
-            for name in dirs:
-                rmdir(os.path.join(root, name))
-        rmdir(path)
+        _rmtree(path)
     except FileNotFoundError:
         pass
 
@@ -288,6 +318,34 @@ def skip_unless_symlink(test):
     return test if ok else unittest.skip(msg)(test)
 
 
+def can_hardlink():
+    """Hard links are supported by the host filesystem surface."""
+    return hasattr(os, "link")
+
+
+def skip_unless_hardlink(test):
+    """Decorator skipping *test* when hard links are unavailable."""
+    import unittest
+    ok = can_hardlink()
+    msg = "Requires functional hardlink implementation"
+    return test if ok else unittest.skip(msg)(test)
+
+
+def can_xattr():
+    """Extended attributes are not supported by the in-process filesystem
+    surface, so report them unavailable (matching CPython on platforms
+    without xattr support)."""
+    return False
+
+
+def skip_unless_xattr(test):
+    """Skip decorator for tests that require functional extended attributes"""
+    import unittest
+    ok = can_xattr()
+    msg = "no non-broken extended attribute support"
+    return test if ok else unittest.skip(msg)(test)
+
+
 # ---------------------------------------------------------------------------
 # EnvironmentVarGuard
 # ---------------------------------------------------------------------------
@@ -347,6 +405,22 @@ class EnvironmentVarGuard:
         del self[envvar]
         for ev in envvars:
             del self[ev]
+
+    def clear(self):
+        # `collections.abc.MutableMapping.clear` deletes every key through
+        # `__delitem__`, so each removal is recorded in `_changed` and
+        # restored on exit. Iterate a snapshot since we mutate while looping.
+        for envvar in list(self.keys()):
+            del self[envvar]
+
+    def pop(self, envvar, *default):
+        if envvar in self._environ:
+            value = self._environ[envvar]
+            del self[envvar]
+            return value
+        if default:
+            return default[0]
+        raise KeyError(envvar)
 
     def copy(self):
         return dict(self._environ)

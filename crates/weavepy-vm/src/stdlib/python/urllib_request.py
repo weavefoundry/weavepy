@@ -18,7 +18,19 @@ Out of scope (raises `URLError` / `NotImplementedError`):
 import socket as _socket
 
 from urllib.error import URLError, HTTPError
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, urlencode, quote as _quote, unquote as _unquote
+
+
+def url2pathname(pathname):
+    """OS-specific conversion from a relative URL of the 'file' scheme to a
+    file system path; not recommended for general use (POSIX form)."""
+    return _unquote(pathname)
+
+
+def pathname2url(pathname):
+    """OS-specific conversion from a file system path to a relative URL of the
+    'file' scheme; not recommended for general use (POSIX form)."""
+    return _quote(pathname)
 
 
 _DEFAULT_USER_AGENT = "WeavePy-urllib/0.1"
@@ -324,4 +336,5 @@ __all__ = [
     "build_opener", "install_opener", "BaseHandler", "HTTPHandler",
     "HTTPSHandler", "HTTPRedirectHandler", "HTTPBasicAuthHandler",
     "HTTPDigestAuthHandler", "HTTPDefaultErrorHandler", "getproxies",
+    "pathname2url", "url2pathname",
 ]

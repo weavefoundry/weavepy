@@ -23,10 +23,8 @@ pub mod csv_mod;
 pub mod datetime_mod;
 pub mod errno_mod;
 pub mod fcntl_mod;
-pub mod fnmatch_mod;
 pub mod functools_mod;
 pub mod gc_mod;
-pub mod glob_mod;
 pub mod gzip_mod;
 pub mod hashlib_mod;
 pub mod hmac_mod;
@@ -106,8 +104,6 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("secrets", secrets_mod::build);
     cache.register_builtin("uuid", uuid_mod::build);
     cache.register_builtin("_tempfile", tempfile_mod::build);
-    cache.register_builtin("fnmatch", fnmatch_mod::build);
-    cache.register_builtin("glob", glob_mod::build);
     cache.register_builtin("_shutil", shutil_mod::build);
     cache.register_builtin("_functools", functools_mod::build);
     cache.register_builtin("_itertools", itertools_mod::build);
@@ -330,9 +326,24 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/contextlib.py"),
             is_package: false,
         },
+        // `pathlib` is CPython 3.13's verbatim package: the thin `__init__`
+        // re-exports `_abc` (the `PurePathBase`/`PathBase` ABCs the
+        // `test_pathlib_abc` suite drives) and `_local` (the concrete
+        // `PurePath`/`Path`/`PurePosixPath`/`PosixPath`/… classes). Ported
+        // wholesale rather than re-approximated (RFC 0038 WS-B).
         FrozenSource {
             name: "pathlib",
             source: include_str!("python/pathlib.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "pathlib._abc",
+            source: include_str!("python/pathlib_abc.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pathlib._local",
+            source: include_str!("python/pathlib_local.py"),
             is_package: false,
         },
         FrozenSource {
@@ -426,6 +437,19 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "shutil",
             source: include_str!("python/shutil.py"),
+            is_package: false,
+        },
+        // `fnmatch` / `glob` — verbatim CPython 3.13 ports (replacing the
+        // earlier Rust shims). `glob` exposes the `_Globber`/`_StringGlobber`
+        // helpers that the 3.13 `pathlib` rewrite imports.
+        FrozenSource {
+            name: "fnmatch",
+            source: include_str!("python/fnmatch.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "glob",
+            source: include_str!("python/glob.py"),
             is_package: false,
         },
         FrozenSource {
@@ -1147,6 +1171,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "posix",
             source: include_str!("python/posix_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_oswalk",
+            source: include_str!("python/_oswalk.py"),
             is_package: false,
         },
         FrozenSource {

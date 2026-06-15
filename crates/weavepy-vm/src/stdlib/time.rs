@@ -66,6 +66,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("mktime")),
             b("mktime", time_mktime),
         );
+        d.insert(
+            DictKey(Object::from_static("struct_time")),
+            Object::Type(struct_time_type()),
+        );
     }
     Rc::new(PyModule {
         name: "time".to_owned(),
@@ -81,6 +85,25 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
         call: Box::new(body),
         call_kw: None,
     }))
+}
+
+/// CPython's `time.struct_time` visible fields (index order). The hidden
+/// `tm_zone`/`tm_gmtoff` extras are set by name when available.
+const STRUCT_TIME_FIELDS: [&str; 9] = [
+    "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday", "tm_yday", "tm_isdst",
+];
+
+/// `time.struct_time` — a CPython struct sequence (named `tm_*` attributes *and*
+/// 9-element tuple indexing). Returned by `localtime`/`gmtime`; `zipfile`,
+/// `tarfile`, `email`, `http.cookiejar`, … read `.tm_year` etc. off it, so a
+/// bare tuple (the old shape) broke them with `'tuple' object has no attribute
+/// 'tm_year'`.
+fn struct_time_type() -> Rc<crate::types::TypeObject> {
+    crate::stdlib::os::struct_seq_type("struct_time", &STRUCT_TIME_FIELDS)
+}
+
+fn make_struct_time(values: Vec<Object>) -> Object {
+    crate::stdlib::os::struct_seq_instance(struct_time_type(), &STRUCT_TIME_FIELDS, values)
 }
 
 fn time_time(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -115,13 +138,30 @@ fn time_sleep(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn tuple_to_dt(args: Option<&Object>) -> Result<DateTime<Local>, RuntimeError> {
-    let tup = match args {
-        Some(Object::Tuple(t)) => t,
-        _ => return Err(type_error("expected struct_time tuple")),
+    // Accept both a bare 9-tuple/list and a real `struct_time` instance (which
+    // stores the calendar fields under their `tm_*` names but is no longer a
+    // `Tuple`). For the instance, read the visible fields positionally.
+    let get = |i: usize| -> Option<Object> {
+        match args {
+            Some(Object::Tuple(t)) => t.get(i).cloned(),
+            Some(Object::List(items)) => items.borrow().get(i).cloned(),
+            Some(Object::Instance(inst)) => inst
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static(STRUCT_TIME_FIELDS[i])))
+                .cloned(),
+            _ => None,
+        }
     };
+    if !matches!(
+        args,
+        Some(Object::Tuple(_) | Object::List(_) | Object::Instance(_))
+    ) {
+        return Err(type_error("expected struct_time tuple"));
+    }
     let extract = |i: usize| -> Result<i32, RuntimeError> {
-        match tup.get(i) {
-            Some(Object::Int(v)) => Ok(*v as i32),
+        match get(i) {
+            Some(Object::Int(v)) => Ok(v as i32),
             _ => Err(type_error("invalid struct_time")),
         }
     };
@@ -153,7 +193,7 @@ fn time_strftime(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn struct_time_from_local(dt: DateTime<Local>) -> Object {
-    Object::new_tuple(vec![
+    make_struct_time(vec![
         Object::Int(i64::from(dt.year())),
         Object::Int(i64::from(dt.month())),
         Object::Int(i64::from(dt.day())),
@@ -167,7 +207,7 @@ fn struct_time_from_local(dt: DateTime<Local>) -> Object {
 }
 
 fn struct_time_from_utc(dt: DateTime<Utc>) -> Object {
-    Object::new_tuple(vec![
+    make_struct_time(vec![
         Object::Int(i64::from(dt.year())),
         Object::Int(i64::from(dt.month())),
         Object::Int(i64::from(dt.day())),

@@ -222,6 +222,30 @@ use_resources = None
 # Verbosity. Tools (libregrtest, ``run_doctest``) flip this.
 verbose = 1
 
+
+def _force_run(path, func, *args):
+    """Run *func*; if it fails on a permission error, ``chmod`` *path* and retry.
+
+    Faithful port of CPython's ``test.support._force_run`` — the primitive
+    that lets ``os_helper.rmtree`` tear down trees containing mode-0
+    (inaccessible) directories created by tests like
+    ``test_pathlib`` / ``test_shutil``.
+    """
+    try:
+        return func(*args)
+    except FileNotFoundError as err:
+        # chmod() won't fix a missing file.
+        if verbose >= 2:
+            print('%s: %s' % (err.__class__.__name__, err))
+        raise
+    except OSError as err:
+        if verbose >= 2:
+            print('%s: %s' % (err.__class__.__name__, err))
+            print('re-run %s%r' % (func.__name__, args))
+        import stat
+        os.chmod(path, stat.S_IRWXU)
+        return func(*args)
+
 # Maximum memory a "bigmem" test may use, in bytes. 0 disables them.
 max_memuse = 0
 real_max_memuse = 0
@@ -948,18 +972,33 @@ SMALLEST = _SMALLEST()
 # Compression-module resource gates
 # ---------------------------------------------------------------------------
 
-def _requires_module(name):
+def requires_zlib(reason='requires zlib'):
     try:
-        __import__(name)
+        import zlib
     except ImportError:
-        return unittest.skip("requires %s" % name)
-    return _id
+        zlib = None
+    return unittest.skipUnless(zlib, reason)
 
+def requires_gzip(reason='requires gzip'):
+    try:
+        import gzip
+    except ImportError:
+        gzip = None
+    return unittest.skipUnless(gzip, reason)
 
-requires_zlib = _requires_module('zlib')
-requires_gzip = _requires_module('gzip')
-requires_bz2 = _requires_module('bz2')
-requires_lzma = _requires_module('lzma')
+def requires_bz2(reason='requires bz2'):
+    try:
+        import bz2
+    except ImportError:
+        bz2 = None
+    return unittest.skipUnless(bz2, reason)
+
+def requires_lzma(reason='requires lzma'):
+    try:
+        import lzma
+    except ImportError:
+        lzma = None
+    return unittest.skipUnless(lzma, reason)
 
 
 # ---------------------------------------------------------------------------

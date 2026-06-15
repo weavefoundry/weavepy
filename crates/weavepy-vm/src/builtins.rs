@@ -1615,6 +1615,20 @@ fn slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
             .unwrap_or(&inner);
         return Ok(Object::from_str(format!("{short}({body})")));
     }
+    // `set`/`frozenset` likewise spell the receiver's own type name
+    // (CPython `set_repr`: `Py_TYPE(so) != &PySet_Type`), so an explicit
+    // `set.__repr__(subclass_instance)` renders `set3({…})`. Rendering the
+    // native payload here (not re-dispatching `o.repr()`) avoids recursing
+    // back into a user `__repr__` that delegates to `set.__repr__`.
+    if let (Object::Instance(inst), Some(native_set @ (Object::Set(_) | Object::FrozenSet(_)))) =
+        (o, &native)
+    {
+        let name = inst.cls().name.clone();
+        let short = name.rsplit('.').next().unwrap_or(&name);
+        if let Some(rendered) = crate::object::set_repr_tagged(native_set, short) {
+            return Ok(Object::from_str(rendered));
+        }
+    }
     Ok(Object::from_str(native.as_ref().unwrap_or(o).repr()))
 }
 
@@ -5176,16 +5190,24 @@ fn b_bytearray(args: &[Object]) -> Result<Object, RuntimeError> {
 /// strict by default), so the kwargs are taken into the bag but
 /// ignored unless they would change behaviour we do support.
 fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    // Reuse the positional path. We fold known kwargs into positional
-    // slots and accept (but ignore) the rest.
+    // Reuse the positional path. We fold the known keyword arguments into
+    // their positional slots (`open(file, mode, buffering, encoding, errors,
+    // newline, closefd, opener)`) and accept (but ignore) the rest.
     let mut combined: Vec<Object> = args.to_vec();
-    let mut mode = combined.get(1).cloned();
-    let mut encoding = combined.get(3).cloned();
+    let set_slot = |combined: &mut Vec<Object>, idx: usize, val: Object| {
+        while combined.len() <= idx {
+            combined.push(Object::None);
+        }
+        combined[idx] = val;
+    };
     for (k, v) in kwargs {
         match k.as_str() {
-            "mode" => mode = Some(v.clone()),
-            "encoding" => encoding = Some(v.clone()),
-            "buffering" | "errors" | "newline" | "closefd" | "opener" => {
+            "mode" => set_slot(&mut combined, 1, v.clone()),
+            "buffering" => set_slot(&mut combined, 2, v.clone()),
+            "encoding" => set_slot(&mut combined, 3, v.clone()),
+            "errors" => set_slot(&mut combined, 4, v.clone()),
+            "newline" => set_slot(&mut combined, 5, v.clone()),
+            "closefd" | "opener" => {
                 // Accepted but not plumbed further yet.
             }
             other => {
@@ -5195,20 +5217,7 @@ fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
             }
         }
     }
-    if let Some(m) = mode {
-        if combined.len() < 2 {
-            combined.push(m);
-        } else {
-            combined[1] = m;
-        }
-    }
-    let file = b_open(&combined)?;
-    if let (Object::File(f), Some(Object::Str(enc))) = (&file, &encoding) {
-        if !f.binary {
-            f.set_encoding(enc);
-        }
-    }
-    Ok(file)
+    b_open(&combined)
 }
 
 /// Resolve `open()`'s `file` argument to a filesystem path string. Accepts
@@ -5312,14 +5321,30 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = opts
         .open(&path)
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
+    // CPython raises `IsADirectoryError` when `open()` targets a directory
+    // (the kernel happily opens a dir fd; the error only surfaces on `read`).
+    // Detect it eagerly so `shutil`/`zipfile`/user code see EISDIR at open
+    // time, not as a stray "Is a directory" on the first read.
+    if f.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+        return Err(crate::error::io_error_to_py_named(
+            &std::io::Error::from_raw_os_error(21),
+            Some(&path),
+        ));
+    }
     let file = PyFile::new(path, mode, FileBackend::Disk(f));
     if name_is_bytes {
         file.name_is_bytes.set(true);
     }
-    // Positional `open(file, mode, buffering, encoding, …)`.
-    if let Some(Object::Str(enc)) = args.get(3) {
-        if !file.binary {
+    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
+    if !file.binary {
+        if let Some(Object::Str(enc)) = args.get(3) {
             file.set_encoding(enc);
+        }
+        if let Some(Object::Str(err)) = args.get(4) {
+            file.set_errors(err);
+        }
+        if let Some(Object::Str(nl)) = args.get(5) {
+            file.set_newline(Some(nl));
         }
     }
     Ok(Object::File(Rc::new(file)))
@@ -5972,6 +5997,16 @@ pub fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeErr
         // without explicit subclassing (e.g. the test suite's `FakePath`).
         if Rc::ptr_eq(info_cls, &crate::stdlib::os::path_like_type()) {
             return Ok(obj_class.lookup("__fspath__").is_some());
+        }
+        // Native streams (`Object::File`: `open()`, `io.BytesIO`,
+        // `io.StringIO`, the std streams) take the fast path and report their
+        // class as `object`, but behaviourally satisfy the `io` ABCs. CPython
+        // makes `isinstance(io.BytesIO(), io.BufferedIOBase)` true; mirror that
+        // (the `pathlib`/`io` suites assert it).
+        if let Object::File(f) = obj {
+            if let Some(m) = crate::stdlib::io::file_io_abc_match(f, info_cls) {
+                return Ok(m);
+            }
         }
         let meta = info_cls.metaclass_or_type();
         if let Some(hook) = meta.lookup("__instancecheck__") {
@@ -10333,9 +10368,36 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .ok_or_else(|| type_error("write() expected 1 arg"))?;
     let n = match data {
-        Object::Str(s) => f.write_bytes(&f.encode_text(s)?)?,
-        Object::Bytes(b) => f.write_bytes(b)?,
-        Object::ByteArray(b) => f.write_bytes(&b.borrow())?,
+        Object::Str(s) => {
+            // A binary stream (`io.BytesIO`, `open(..., 'wb')`) rejects text,
+            // exactly like CPython's `BufferedWriter`/`BytesIO`.
+            if f.binary {
+                return Err(type_error("a bytes-like object is required, not 'str'"));
+            }
+            f.write_bytes(&f.encode_text(s)?)?
+        }
+        Object::Bytes(b) => {
+            if !f.binary {
+                return Err(type_error("string argument expected, got 'bytes'"));
+            }
+            f.write_bytes(b)?
+        }
+        Object::ByteArray(b) => {
+            if !f.binary {
+                return Err(type_error("string argument expected, got 'bytearray'"));
+            }
+            f.write_bytes(&b.borrow())?
+        }
+        // Any buffer-protocol object is accepted by a binary stream — CPython's
+        // `BufferedWriter.write`/`BytesIO.write` take `memoryview`/`array`/… via
+        // the buffer interface. `pathlib.Path.write_bytes` relies on this
+        // (it wraps the data in a `memoryview` before writing).
+        Object::MemoryView(mv) => {
+            if !f.binary {
+                return Err(type_error("string argument expected, got 'memoryview'"));
+            }
+            f.write_bytes(&mv.to_bytes())?
+        }
         _ => return Err(type_error("write() argument must be str or bytes")),
     };
     Ok(Object::Int(n as i64))
@@ -10430,6 +10492,23 @@ pub(crate) fn file_enter(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 pub(crate) fn file_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython's `IOBase.__exit__` calls `self.close()`, dispatched through the
+    // instance MRO, so a subclass override runs (e.g. test_pathlib's
+    // `DummyPathIO.close` that flushes `getvalue()` into a dict on context
+    // exit). Mirror that: for a subclass *instance* invoke the resolved
+    // `close` (overridden or inherited) via the interpreter; the base native
+    // stream closes directly.
+    if let Some(self_obj @ Object::Instance(_)) = args.first() {
+        if let Some(method) = crate::instance_method(self_obj, "close") {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame live on this thread.
+                let interp = unsafe { &mut *ptr };
+                let globals = interp.builtins_dict();
+                interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                return Ok(Object::None);
+            }
+        }
+    }
     file_self(args)?.close();
     Ok(Object::None)
 }
@@ -10472,6 +10551,9 @@ fn memoryview_release(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let mv = memoryview_self(args)?;
+    if mv.released.get() {
+        return Err(value_error("operation forbidden on released memoryview object"));
+    }
     // `memoryview.cast(format[, shape])`: `format` is positional-or-keyword and
     // `shape` (optional) reshapes the view for multi-dimensional indexing.
     let mut format: Option<Object> = args.get(1).cloned();
@@ -10487,49 +10569,77 @@ fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
             }
         }
     }
-    if let Some(Object::Str(fmt)) = &format {
-        *mv.format.borrow_mut() = fmt.to_string();
-        // Itemsize: 1 for B/b, 2 for h/H, 4 for i/I/f, 8 for q/Q/d.
-        let item = match fmt.as_ref() {
-            "B" | "b" | "c" => 1,
-            "h" | "H" => 2,
-            "i" | "I" | "f" => 4,
-            "q" | "Q" | "d" => 8,
-            _ => 1,
-        };
-        mv.itemsize.set(item);
+    // CPython restricts casts to C-contiguous views (`mv[::2].cast(...)`
+    // raises `TypeError: memoryview: casts are restricted to C-contiguous
+    // views`).
+    if !mv.is_c_contiguous() {
+        return Err(type_error(
+            "memoryview: casts are restricted to C-contiguous views",
+        ));
     }
-    // An explicit `shape` only changes the logical dimensions, not the flat
-    // byte window (`tobytes`/`nbytes` are unaffected). Validate that
-    // `product(shape) * itemsize` matches the buffer size, like CPython.
-    if let Some(shape) = shape {
-        let dims: Vec<Object> = match &shape {
-            Object::List(items) => items.borrow().clone(),
-            Object::Tuple(items) => items.to_vec(),
-            _ => {
-                return Err(type_error(
-                    "memoryview.cast(): shape must be a list or a tuple",
-                ))
-            }
-        };
-        let mut prod: usize = mv.itemsize.get();
-        for d in &dims {
-            match d.as_i64() {
-                Some(n) if n >= 0 => prod = prod.saturating_mul(n as usize),
+    let Some(Object::Str(fmt)) = &format else {
+        return Err(type_error("memoryview: cast format must be a string"));
+    };
+    // Itemsize: 1 for B/b/c, 2 for h/H, 4 for i/I/f, 8 for q/Q/d/n/N/P.
+    let itemsize = match fmt.as_ref() {
+        "B" | "b" | "c" => 1,
+        "h" | "H" => 2,
+        "i" | "I" | "f" | "l" | "L" => 4,
+        "q" | "Q" | "d" | "n" | "N" | "P" => 8,
+        _ => {
+            return Err(value_error(
+                "memoryview: destination format must be a native single character format prefixed with an optional '@'",
+            ))
+        }
+    };
+    let nbytes = mv.len.get();
+    if nbytes % itemsize != 0 {
+        return Err(type_error(
+            "memoryview: length is not a multiple of itemsize",
+        ));
+    }
+    // Build the new shape. With no explicit `shape`, cast yields a flat
+    // `[nbytes / itemsize]` 1-D view; an explicit shape must agree on size.
+    let dims: Vec<usize> = match shape {
+        None => vec![nbytes / itemsize],
+        Some(shape_obj) => {
+            let items: Vec<Object> = match &shape_obj {
+                Object::List(items) => items.borrow().clone(),
+                Object::Tuple(items) => items.to_vec(),
                 _ => {
                     return Err(type_error(
-                        "memoryview.cast(): elements of shape must be integers",
+                        "memoryview.cast(): shape must be a list or a tuple",
                     ))
                 }
+            };
+            let mut dims = Vec::with_capacity(items.len());
+            for d in &items {
+                match d.as_i64() {
+                    Some(n) if n >= 0 => dims.push(n as usize),
+                    _ => {
+                        return Err(type_error(
+                            "memoryview.cast(): elements of shape must be integers",
+                        ))
+                    }
+                }
             }
+            let prod: usize = dims.iter().product::<usize>().saturating_mul(itemsize);
+            if prod != nbytes {
+                return Err(type_error(
+                    "memoryview: product(shape) * itemsize != buffer size",
+                ));
+            }
+            dims
         }
-        if prod != mv.len.get() {
-            return Err(type_error(
-                "memoryview: product(shape) * itemsize != buffer size",
-            ));
-        }
-    }
-    Ok(Object::MemoryView(mv))
+    };
+    // A fresh view over the *same* buffer (shares the export); the original
+    // `mv` is left untouched, matching CPython's non-mutating `cast`.
+    let cast = mv.shallow_clone();
+    *cast.format.borrow_mut() = fmt.to_string();
+    cast.itemsize.set(itemsize);
+    *cast.strides.borrow_mut() = crate::object::c_contiguous_strides(&dims, itemsize);
+    *cast.shape.borrow_mut() = dims;
+    Ok(Object::MemoryView(Rc::new(cast)))
 }
 
 fn memoryview_hex(args: &[Object]) -> Result<Object, RuntimeError> {

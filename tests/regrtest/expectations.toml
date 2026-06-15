@@ -200,25 +200,22 @@ status = "fail"
 reason = "json encoder/decoder edge cases (sort_keys with non-str keys)"
 
 [tests."cpython/Lib/test/test_base64.py"]
-status = "fail"
-# 35/40 subtests pass after the verbatim `base64.py` port (a85/b85/z85 +
-# exact validate/altchars semantics). The 5 remaining are out of the codec
-# layer: 2 need io text-vs-binary stream typing (`encode(BytesIO, StringIO)`
-# must TypeError), 2 need multi-dimensional `memoryview.cast` to reject as a
-# non-1-D buffer, and `test_encode_from_stdin` needs `python -m base64`
-# subprocess stdin piping.
-reason = "35/40: blocked on io text/binary typing, memoryview.cast ndim, subprocess stdin"
+status = "pass"
+# Verbatim `base64.py` port (a85/b85/z85 + exact validate/altchars). The
+# last 5 closed in RFC 0038: io text-vs-binary stream typing (`StringIO.write`
+# rejects bytes; `sys.stdout.buffer` is a real binary stream), multi-dim
+# `memoryview.cast` now reports `ndim`/`shape`, and `python -m base64`
+# subprocess stdin piping works.
+reason = "verbatim base64.py; full suite passes"
 
 [tests."cpython/Lib/test/test_binascii.py"]
-status = "fail"
-# 89/93 subtests pass. b2a_uu/a2b_uu and b2a_qp/a2b_qp are now ported
-# byte-for-byte from Modules/binascii.c (length byte, soft-wrap, CRLF
-# normalisation, the quirky `=\r` and "broken qp" cases), a2b_base64's
-# strict/lenient padding state machine matches the exact error messages,
-# and hexlify takes sep/bytes_per_sep. The 4 remaining failures are all
-# `test_c_contiguity`, which needs non-C-contiguous memoryviews to raise
-# BufferError (a buffer-protocol feature WeavePy does not model).
-reason = "89/93: only test_c_contiguity (non-contiguous memoryview BufferError) remains"
+status = "pass"
+# b2a_uu/a2b_uu and b2a_qp/a2b_qp ported byte-for-byte from binascii.c,
+# a2b_base64's strict/lenient padding state machine matches CPython's exact
+# messages, hexlify takes sep/bytes_per_sep, and `test_c_contiguity` now
+# passes: strided memoryviews (`mv[::-2]`) are non-contiguous sub-views and
+# the codecs raise `BufferError` on them.
+reason = "verbatim binascii core; full suite passes"
 
 [tests."cpython/Lib/test/test_hashlib.py"]
 status = "fail"
@@ -273,12 +270,12 @@ status = "fail"
 reason = "tempfile: SpooledTemporaryFile + NamedTemporaryFile delete_on_close"
 
 [tests."cpython/Lib/test/test_glob.py"]
-status = "fail"
-reason = "glob: recursive ** semantics + case sensitivity"
+status = "pass"
+reason = "measured (RFC 0038 WS-B): passes end-to-end. Recursive `**` walks via `os.scandir` DirEntry whose `is_dir(follow_symlinks=False)` mirrors CPython 3.13 (no descent through symlinked dirs), and `os.fspath`/bytes-path round-tripping matches."
 
 [tests."cpython/Lib/test/test_fnmatch.py"]
-status = "fail"
-reason = "fnmatch.filter performance asserts"
+status = "pass"
+reason = "measured (RFC 0038 WS-B): passes end-to-end (frozen `fnmatch` over the `re` translate path)."
 
 [tests."cpython/Lib/test/test_shutil.py"]
 status = "fail"
@@ -405,8 +402,8 @@ status = "fail"
 reason = "measured: 1841/1849 subtests pass (was a full import-gate failure) after fixing `shutil.get_terminal_size()`, functional `io.BufferedWriter`/`BufferedReader`, `enumerate(start=)`, `x in <iterator>`, and CPython-style `OSError` formatting; ~8 residual subtest failures remain a follow-up."
 
 [tests."cpython/Lib/test/test_pprint.py"]
-status = "fail"
-reason = "pprint: width / depth + repr fallback for cycles"
+status = "pass"
+reason = "measured (RFC 0038 WS-C): passes end-to-end (frozen `pprint`; width/depth, sorted-dict, recursion/cycle `...` fallback, and dataclass/namedtuple reprs all match)."
 
 [tests."cpython/Lib/test/test_pdb.py"]
 status = "skip"

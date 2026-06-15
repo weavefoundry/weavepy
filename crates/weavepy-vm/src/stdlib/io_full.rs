@@ -50,14 +50,14 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // module): `_io.BufferedWriter(_io.BytesIO())` actually wraps and
         // delegates, so the stdlib's `from _io import BufferedWriter` paths
         // (and stream-capture helpers built on them) work.
-        let buffered_reader = crate::stdlib::io::make_buffered("BufferedReader");
-        let buffered_writer = crate::stdlib::io::make_buffered("BufferedWriter");
-        let buffered_random = crate::stdlib::io::make_buffered("BufferedRandom");
-        let buffered_rw = crate::stdlib::io::make_buffered("BufferedRWPair");
+        let buffered_reader = crate::stdlib::io::make_buffered("BufferedReader", buffered_iobase.clone());
+        let buffered_writer = crate::stdlib::io::make_buffered("BufferedWriter", buffered_iobase.clone());
+        let buffered_random = crate::stdlib::io::make_buffered("BufferedRandom", buffered_iobase.clone());
+        let buffered_rw = crate::stdlib::io::make_buffered("BufferedRWPair", buffered_iobase.clone());
         // Functional `TextIOWrapper` (text layer over a binary buffer), shared
         // with the user-facing `io` module so `from _io import TextIOWrapper`
         // — used by CPython's `io.py` and the stdlib test harness — works.
-        let text_io_wrapper = crate::stdlib::io::make_text_io_wrapper();
+        let text_io_wrapper = crate::stdlib::io::make_text_io_wrapper(text_iobase.clone());
         let incremental_newline =
             make_protocol("IncrementalNewlineDecoder", vec![bt.object_.clone()]);
         let unsupported_op = make_protocol(
@@ -294,7 +294,7 @@ pub(crate) fn io_open_kw(
             _ => String::new(),
         };
         let file = file_from_fd(&fd_obj, &mode, name)?;
-        apply_text_encoding(&file, slots[3].as_ref());
+        apply_text_config(&file, slots[3].as_ref(), slots[4].as_ref(), slots[5].as_ref());
         return Ok(file);
     }
 
@@ -303,9 +303,7 @@ pub(crate) fn io_open_kw(
         .iter()
         .map(|s| s.clone().unwrap_or(Object::None))
         .collect();
-    let file = io_open(&positional)?;
-    apply_text_encoding(&file, slots[3].as_ref());
-    Ok(file)
+    io_open(&positional)
 }
 
 /// Translate an `open()` mode string into WeavePy's (Linux-style) `os.open`
@@ -345,6 +343,12 @@ fn file_from_fd(fd_obj: &Object, mode: &str, name: String) -> Result<Object, Run
         Object::Int(n) => *n,
         _ => return Err(type_error("opener returned a non-integer file descriptor")),
     };
+    // A negative descriptor (e.g. a custom `opener` that returns -1) is an
+    // error, not a real fd — CPython's `FileIO` raises `ValueError: opener
+    // returned -1` rather than handing the bad fd to the OS.
+    if fd < 0 {
+        return Err(value_error(format!("opener returned {fd}")));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::io::FromRawFd;
@@ -373,13 +377,28 @@ fn file_from_fd(fd_obj: &Object, mode: &str, name: String) -> Result<Object, Run
     }
 }
 
-/// When `open()` is called in text mode with an explicit `encoding=`, push
-/// that encoding onto the resulting text file (binary files ignore it).
-fn apply_text_encoding(file: &Object, encoding: Option<&Object>) {
-    if let (Object::File(f), Some(Object::Str(enc))) = (file, encoding) {
-        if !f.binary {
-            f.set_encoding(enc);
-        }
+/// When `open()` is called in text mode, push the explicit `encoding=`,
+/// `errors=`, and `newline=` settings onto the resulting text file (binary
+/// files ignore them). Mirrors the builtin `open()` plumbing so the
+/// `io.open` path (used by `pathlib`, `tempfile`, …) honours them too.
+fn apply_text_config(
+    file: &Object,
+    encoding: Option<&Object>,
+    errors: Option<&Object>,
+    newline: Option<&Object>,
+) {
+    let Object::File(f) = file else { return };
+    if f.binary {
+        return;
+    }
+    if let Some(Object::Str(enc)) = encoding {
+        f.set_encoding(enc);
+    }
+    if let Some(Object::Str(err)) = errors {
+        f.set_errors(err);
+    }
+    if let Some(Object::Str(nl)) = newline {
+        f.set_newline(Some(nl));
     }
 }
 
@@ -423,9 +442,11 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         .open(&path)
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
     let backend = FileBackend::Disk(f);
-    let file = PyFile::new(path, mode, backend);
+    let file = Object::File(Rc::new(PyFile::new(path, mode, backend)));
     let _ = binary; // text decoding is handled by PyFile itself.
-    Ok(Object::File(Rc::new(file)))
+    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
+    apply_text_config(&file, args.get(3), args.get(4), args.get(5));
+    Ok(file)
 }
 
 /// Public entry: ensure the `_io` types exist even before module

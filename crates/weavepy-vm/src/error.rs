@@ -514,18 +514,26 @@ pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> Run
         (None, Some(f)) => format!("{strerror}: '{f}'"),
         (None, None) => strerror.clone(),
     };
-    let mut runtime = match err.kind() {
-        NotFound => file_not_found_error(message),
-        PermissionDenied => permission_error(message),
-        ConnectionRefused => connection_refused_error(message),
-        ConnectionReset => connection_reset_error(message),
-        ConnectionAborted => connection_aborted_error(message),
-        BrokenPipe => broken_pipe_error(message),
-        TimedOut => timeout_error(message),
-        WouldBlock => blocking_io_error(message),
-        Interrupted => interrupted_error(message),
-        AlreadyExists => file_exists_error(message),
-        _ => os_error(message),
+    // A few `errno`s have no stable `std::io::ErrorKind` variant yet
+    // (`IsADirectory`/`NotADirectory` are unstable) but map to specific
+    // CPython `OSError` subclasses, so dispatch on the raw number first.
+    // 21 == EISDIR, 20 == ENOTDIR on both Linux and macOS.
+    let mut runtime = match errno {
+        Some(21) => is_a_directory_error(message),
+        Some(20) => not_a_directory_error(message),
+        _ => match err.kind() {
+            NotFound => file_not_found_error(message),
+            PermissionDenied => permission_error(message),
+            ConnectionRefused => connection_refused_error(message),
+            ConnectionReset => connection_reset_error(message),
+            ConnectionAborted => connection_aborted_error(message),
+            BrokenPipe => broken_pipe_error(message),
+            TimedOut => timeout_error(message),
+            WouldBlock => blocking_io_error(message),
+            Interrupted => interrupted_error(message),
+            AlreadyExists => file_exists_error(message),
+            _ => os_error(message),
+        },
     };
     if let RuntimeError::PyException(ref mut exc) = runtime {
         if let crate::object::Object::Instance(inst) = &exc.instance {

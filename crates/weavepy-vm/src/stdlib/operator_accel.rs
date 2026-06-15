@@ -1,14 +1,22 @@
 //! The `_operator` accelerator module.
 //!
 //! WeavePy ships a pure-Python `operator` (`stdlib/python/operator_mod.py`)
-//! whose function bodies are written in Python, guarded by an optional
-//! `from _operator import *`. The only piece that *must* live in native
-//! code is `_compare_digest` — the constant-time comparison `hmac` and
-//! `secrets` reach for — because a Python implementation cannot offer the
-//! timing guarantee. Exposing it here (and nothing public) lets
-//! `hmac.compare_digest is _operator._compare_digest` hold (CPython relies
-//! on the *identity*, see `test_hmac`) without disturbing the pure-Python
-//! `operator` surface (the leading underscore keeps it out of `import *`).
+//! whose function bodies are written in Python, guarded by
+//! `from _operator import *`. CPython's real `operator.py` does the same and
+//! relies on `_operator` being a **C** module: its functions are
+//! `builtin_function_or_method`s, which (unlike a Python `def`) are *not*
+//! descriptors and so do **not** bind `self` when stored as a class
+//! attribute. The stdlib leans on this — e.g.
+//! `glob._StringGlobber.concat_path = operator.add` then calls
+//! `self.concat_path(path, text)` expecting `operator.add(path, text)`, not
+//! `add(self, path, text)`. If `operator.add` were a plain Python function it
+//! would bind `self` and raise "add() takes 2 positional arguments but 3 were
+//! given".
+//!
+//! So we expose the operator surface here as non-binding native builtins that
+//! delegate to the interpreter's own operation machinery (identical to what
+//! the `BINARY_OP`/`COMPARE_OP`/`UNARY_OP` bytecodes do, dunders and all).
+//! `_compare_digest` also lives here (constant-time compare for `hmac`).
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
@@ -16,6 +24,7 @@ use crate::sync::RefCell;
 use crate::error::{type_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use weavepy_compiler::{BinOpKind, CompareKind, UnaryKind};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::new()));
@@ -29,6 +38,80 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("__doc__")),
             Object::from_static("Operator interface."),
         );
+
+        // Names exported, in declaration order, so `from _operator import *`
+        // is deterministic (CPython's C module relies on dir() minus
+        // underscores; we publish an explicit `__all__`).
+        let mut names: Vec<Object> = Vec::new();
+
+        macro_rules! reg {
+            ($name:literal, $f:expr) => {{
+                d.insert(
+                    DictKey(Object::from_static($name)),
+                    Object::Builtin(Rc::new(BuiltinFn {
+                        name: $name,
+                        binds_instance: false,
+                        call: Box::new($f),
+                        call_kw: None,
+                    })),
+                );
+                names.push(Object::from_static($name));
+            }};
+        }
+
+        // -- binary arithmetic / bitwise --------------------------------
+        reg!("add", |a| binary(a, BinOpKind::Add, "add"));
+        reg!("sub", |a| binary(a, BinOpKind::Sub, "sub"));
+        reg!("mul", |a| binary(a, BinOpKind::Mult, "mul"));
+        reg!("truediv", |a| binary(a, BinOpKind::Div, "truediv"));
+        reg!("floordiv", |a| binary(a, BinOpKind::FloorDiv, "floordiv"));
+        reg!("mod", |a| binary(a, BinOpKind::Mod, "mod"));
+        reg!("pow", |a| binary(a, BinOpKind::Pow, "pow"));
+        reg!("lshift", |a| binary(a, BinOpKind::LShift, "lshift"));
+        reg!("rshift", |a| binary(a, BinOpKind::RShift, "rshift"));
+        reg!("and_", |a| binary(a, BinOpKind::BitAnd, "and_"));
+        reg!("or_", |a| binary(a, BinOpKind::BitOr, "or_"));
+        reg!("xor", |a| binary(a, BinOpKind::BitXor, "xor"));
+        reg!("matmul", |a| binary(a, BinOpKind::MatMult, "matmul"));
+
+        // -- in-place variants ------------------------------------------
+        reg!("iadd", |a| inplace(a, BinOpKind::Add, "iadd"));
+        reg!("isub", |a| inplace(a, BinOpKind::Sub, "isub"));
+        reg!("imul", |a| inplace(a, BinOpKind::Mult, "imul"));
+        reg!("itruediv", |a| inplace(a, BinOpKind::Div, "itruediv"));
+        reg!("ifloordiv", |a| inplace(a, BinOpKind::FloorDiv, "ifloordiv"));
+        reg!("imod", |a| inplace(a, BinOpKind::Mod, "imod"));
+        reg!("ipow", |a| inplace(a, BinOpKind::Pow, "ipow"));
+        reg!("ilshift", |a| inplace(a, BinOpKind::LShift, "ilshift"));
+        reg!("irshift", |a| inplace(a, BinOpKind::RShift, "irshift"));
+        reg!("iand", |a| inplace(a, BinOpKind::BitAnd, "iand"));
+        reg!("ior", |a| inplace(a, BinOpKind::BitOr, "ior"));
+        reg!("ixor", |a| inplace(a, BinOpKind::BitXor, "ixor"));
+        reg!("imatmul", |a| inplace(a, BinOpKind::MatMult, "imatmul"));
+
+        // -- rich comparisons -------------------------------------------
+        reg!("lt", |a| compare(a, CompareKind::Lt, "lt"));
+        reg!("le", |a| compare(a, CompareKind::LtE, "le"));
+        reg!("eq", |a| compare(a, CompareKind::Eq, "eq"));
+        reg!("ne", |a| compare(a, CompareKind::NotEq, "ne"));
+        reg!("gt", |a| compare(a, CompareKind::Gt, "gt"));
+        reg!("ge", |a| compare(a, CompareKind::GtE, "ge"));
+
+        // -- unary ------------------------------------------------------
+        reg!("neg", |a| unary(a, UnaryKind::Neg, "neg"));
+        reg!("pos", |a| unary(a, UnaryKind::Pos, "pos"));
+        reg!("invert", |a| unary(a, UnaryKind::Invert, "invert"));
+        reg!("inv", |a| unary(a, UnaryKind::Invert, "inv"));
+        reg!("not_", op_not);
+        reg!("truth", op_truth);
+        reg!("is_", op_is);
+        reg!("is_not", op_is_not);
+
+        d.insert(
+            DictKey(Object::from_static("__all__")),
+            Object::new_list(names),
+        );
+
         d.insert(
             DictKey(Object::from_static("_compare_digest")),
             Object::Builtin(Rc::new(BuiltinFn {
@@ -44,6 +127,79 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         filename: None,
         dict,
     })
+}
+
+/// Borrow the active interpreter published on this thread by the dispatch
+/// loop. Always present while a builtin runs.
+fn with_interp<F, R>(f: F) -> Result<R, RuntimeError>
+where
+    F: FnOnce(&mut crate::Interpreter) -> Result<R, RuntimeError>,
+{
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| type_error("_operator: no active interpreter"))?;
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    f(interp)
+}
+
+fn two_args<'a>(args: &'a [Object], name: &str) -> Result<(&'a Object, &'a Object), RuntimeError> {
+    match (args.first(), args.get(1)) {
+        (Some(a), Some(b)) if args.len() == 2 => Ok((a, b)),
+        _ => Err(type_error(format!(
+            "{name} expected 2 arguments, got {}",
+            args.len()
+        ))),
+    }
+}
+
+fn one_arg<'a>(args: &'a [Object], name: &str) -> Result<&'a Object, RuntimeError> {
+    match args.first() {
+        Some(a) if args.len() == 1 => Ok(a),
+        _ => Err(type_error(format!(
+            "{name} expected 1 argument, got {}",
+            args.len()
+        ))),
+    }
+}
+
+fn binary(args: &[Object], op: BinOpKind, name: &str) -> Result<Object, RuntimeError> {
+    let (a, b) = two_args(args, name)?;
+    with_interp(|interp| interp.op_binary(a, b, op))
+}
+
+fn inplace(args: &[Object], op: BinOpKind, name: &str) -> Result<Object, RuntimeError> {
+    let (a, b) = two_args(args, name)?;
+    with_interp(|interp| interp.op_inplace(a, b, op))
+}
+
+fn compare(args: &[Object], op: CompareKind, name: &str) -> Result<Object, RuntimeError> {
+    let (a, b) = two_args(args, name)?;
+    Ok(Object::Bool(with_interp(|interp| interp.op_compare(a, b, op))?))
+}
+
+fn unary(args: &[Object], op: UnaryKind, name: &str) -> Result<Object, RuntimeError> {
+    let a = one_arg(args, name)?;
+    with_interp(|interp| interp.op_unary(a, op))
+}
+
+fn op_not(args: &[Object]) -> Result<Object, RuntimeError> {
+    let a = one_arg(args, "not_")?;
+    Ok(Object::Bool(!with_interp(|interp| interp.op_truth(a))?))
+}
+
+fn op_truth(args: &[Object]) -> Result<Object, RuntimeError> {
+    let a = one_arg(args, "truth")?;
+    Ok(Object::Bool(with_interp(|interp| interp.op_truth(a))?))
+}
+
+fn op_is(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (a, b) = two_args(args, "is_")?;
+    Ok(Object::Bool(a.is_same(b)))
+}
+
+fn op_is_not(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (a, b) = two_args(args, "is_not")?;
+    Ok(Object::Bool(!a.is_same(b)))
 }
 
 /// Constant-time comparison, ported from CPython's `_tscmp`. Returns `true`
