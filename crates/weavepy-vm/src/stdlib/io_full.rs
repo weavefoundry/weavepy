@@ -50,10 +50,14 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // module): `_io.BufferedWriter(_io.BytesIO())` actually wraps and
         // delegates, so the stdlib's `from _io import BufferedWriter` paths
         // (and stream-capture helpers built on them) work.
-        let buffered_reader = crate::stdlib::io::make_buffered("BufferedReader", buffered_iobase.clone());
-        let buffered_writer = crate::stdlib::io::make_buffered("BufferedWriter", buffered_iobase.clone());
-        let buffered_random = crate::stdlib::io::make_buffered("BufferedRandom", buffered_iobase.clone());
-        let buffered_rw = crate::stdlib::io::make_buffered("BufferedRWPair", buffered_iobase.clone());
+        let buffered_reader =
+            crate::stdlib::io::make_buffered("BufferedReader", buffered_iobase.clone());
+        let buffered_writer =
+            crate::stdlib::io::make_buffered("BufferedWriter", buffered_iobase.clone());
+        let buffered_random =
+            crate::stdlib::io::make_buffered("BufferedRandom", buffered_iobase.clone());
+        let buffered_rw =
+            crate::stdlib::io::make_buffered("BufferedRWPair", buffered_iobase.clone());
         // Functional `TextIOWrapper` (text layer over a binary buffer), shared
         // with the user-facing `io` module so `from _io import TextIOWrapper`
         // — used by CPython's `io.py` and the stdlib test harness — works.
@@ -301,7 +305,12 @@ pub(crate) fn io_open_kw(
             _ => String::new(),
         };
         let file = file_from_fd(&fd_obj, &mode, name)?;
-        apply_text_config(&file, slots[3].as_ref(), slots[4].as_ref(), slots[5].as_ref());
+        apply_text_config(
+            &file,
+            slots[3].as_ref(),
+            slots[4].as_ref(),
+            slots[5].as_ref(),
+        );
         return Ok(file);
     }
 
@@ -458,7 +467,7 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
     let backend = FileBackend::Disk(f);
     let file = Object::File(Rc::new(PyFile::new(path, mode, backend)));
     let _ = binary; // text decoding is handled by PyFile itself.
-    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
+                    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
     apply_text_config(&file, args.get(3), args.get(4), args.get(5));
     Ok(file)
 }

@@ -83,7 +83,11 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg!("isub", |a| inplace(a, BinOpKind::Sub, "isub"));
         reg!("imul", |a| inplace(a, BinOpKind::Mult, "imul"));
         reg!("itruediv", |a| inplace(a, BinOpKind::Div, "itruediv"));
-        reg!("ifloordiv", |a| inplace(a, BinOpKind::FloorDiv, "ifloordiv"));
+        reg!("ifloordiv", |a| inplace(
+            a,
+            BinOpKind::FloorDiv,
+            "ifloordiv"
+        ));
         reg!("imod", |a| inplace(a, BinOpKind::Mod, "imod"));
         reg!("ipow", |a| inplace(a, BinOpKind::Pow, "ipow"));
         reg!("ilshift", |a| inplace(a, BinOpKind::LShift, "ilshift"));
@@ -180,7 +184,9 @@ fn inplace(args: &[Object], op: BinOpKind, name: &str) -> Result<Object, Runtime
 
 fn compare(args: &[Object], op: CompareKind, name: &str) -> Result<Object, RuntimeError> {
     let (a, b) = two_args(args, name)?;
-    Ok(Object::Bool(with_interp(|interp| interp.op_compare(a, b, op))?))
+    Ok(Object::Bool(with_interp(|interp| {
+        interp.op_compare(a, b, op)
+    })?))
 }
 
 fn unary(args: &[Object], op: UnaryKind, name: &str) -> Result<Object, RuntimeError> {

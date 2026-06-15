@@ -39,7 +39,11 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // lists it first in `io.__all__`); `test_io` reads it at import time.
         d.insert(
             DictKey(Object::from_static("BlockingIOError")),
-            Object::Type(crate::builtin_types::builtin_types().blocking_io_error.clone()),
+            Object::Type(
+                crate::builtin_types::builtin_types()
+                    .blocking_io_error
+                    .clone(),
+            ),
         );
         d.insert(
             DictKey(Object::from_static("text_encoding")),
@@ -275,7 +279,9 @@ pub(crate) fn io_text_encoding(args: &[Object]) -> Result<Object, RuntimeError> 
 // recover them from `self`.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn make_text_io_wrapper(base: Rc<crate::types::TypeObject>) -> Rc<crate::types::TypeObject> {
+pub(crate) fn make_text_io_wrapper(
+    base: Rc<crate::types::TypeObject>,
+) -> Rc<crate::types::TypeObject> {
     use crate::types::{TypeFlags, TypeObject};
     let mut dict = DictData::new();
     let mut method = |name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {
@@ -412,7 +418,14 @@ fn bytesio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     let file = if cls.flags.is_builtin {
         bytesio_file(args, kwargs)?
     } else {
-        empty_mem_file("<bytes>", "rb+", FileBackend::MemBytes { data: Vec::new(), pos: 0 })
+        empty_mem_file(
+            "<bytes>",
+            "rb+",
+            FileBackend::MemBytes {
+                data: Vec::new(),
+                pos: 0,
+            },
+        )
     };
     Ok(wrap_memory_stream(&cls, file))
 }
@@ -1812,7 +1825,10 @@ fn tw_reconfigure(args: &[Object]) -> Result<Object, RuntimeError> {
 /// Build a functional buffered-stream type (`BufferedReader` etc.). All four
 /// share one method table; the distinctions (read-only vs write-only) don't
 /// matter for the in-memory streams WeavePy wraps here.
-pub(crate) fn make_buffered(name: &'static str, base: Rc<crate::types::TypeObject>) -> Rc<crate::types::TypeObject> {
+pub(crate) fn make_buffered(
+    name: &'static str,
+    base: Rc<crate::types::TypeObject>,
+) -> Rc<crate::types::TypeObject> {
     use crate::types::{TypeFlags, TypeObject};
     let mut dict = DictData::new();
     let mut method = |n: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>| {

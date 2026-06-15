@@ -5171,9 +5171,7 @@ impl Interpreter {
                 // CPython for everything `cast`/slicing can produce here.
                 "c_contiguous" => Ok(Object::Bool(mv.is_c_contiguous())),
                 "contiguous" => Ok(Object::Bool(mv.is_c_contiguous())),
-                "f_contiguous" => {
-                    Ok(Object::Bool(mv.is_c_contiguous() && mv.ndim() <= 1))
-                }
+                "f_contiguous" => Ok(Object::Bool(mv.is_c_contiguous() && mv.ndim() <= 1)),
                 _ => {
                     if let Some(m) = self.lookup_method(obj, name) {
                         return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(

@@ -148,7 +148,11 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // hard-codes `:/bin:/usr/bin` on POSIX, `.;C:\\bin` on Windows.
         d.insert(
             DictKey(Object::from_static("defpath")),
-            Object::from_static(if cfg!(windows) { ".;C:\\bin" } else { ":/bin:/usr/bin" }),
+            Object::from_static(if cfg!(windows) {
+                ".;C:\\bin"
+            } else {
+                ":/bin:/usr/bin"
+            }),
         );
         d.insert(
             DictKey(Object::from_static("getenv")),
@@ -905,11 +909,7 @@ fn os_strerror(args: &[Object]) -> Result<Object, RuntimeError> {
         None => return Err(type_error("strerror() argument must be an int")),
     };
     let full = std::io::Error::from_raw_os_error(code as i32).to_string();
-    let msg = full
-        .split(" (os error ")
-        .next()
-        .unwrap_or(&full)
-        .to_owned();
+    let msg = full.split(" (os error ").next().unwrap_or(&full).to_owned();
     Ok(Object::from_str(msg))
 }
 
@@ -950,7 +950,9 @@ fn os_fstat(args: &[Object]) -> Result<Object, RuntimeError> {
         // the temporary drops, leaving the original descriptor intact.
         let dup = unsafe { libc::dup(fd) };
         if dup < 0 {
-            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         let f = unsafe { std::fs::File::from_raw_fd(dup) };
         let meta = f.metadata().map_err(|e| crate::error::io_error_to_py(&e))?;
@@ -1103,7 +1105,10 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
         d.insert(DictKey(Object::from_static("st_gid")), Object::Int(0));
         d.insert(DictKey(Object::from_static("st_rdev")), Object::Int(0));
         d.insert(DictKey(Object::from_static("st_blocks")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_blksize")), Object::Int(4096));
+        d.insert(
+            DictKey(Object::from_static("st_blksize")),
+            Object::Int(4096),
+        );
         let mtime_ns = (mtime * 1e9) as i64;
         d.insert(
             DictKey(Object::from_static("st_mtime_ns")),
@@ -1318,9 +1323,7 @@ fn dir_entry_name_bytes(entry: &std::fs::DirEntry) -> Object {
     }
     #[cfg(not(unix))]
     {
-        Object::Bytes(Rc::from(
-            entry.file_name().to_string_lossy().as_bytes(),
-        ))
+        Object::Bytes(Rc::from(entry.file_name().to_string_lossy().as_bytes()))
     }
 }
 
@@ -1334,9 +1337,7 @@ fn dir_entry_path_bytes(entry: &std::fs::DirEntry) -> Object {
     }
     #[cfg(not(unix))]
     {
-        Object::Bytes(Rc::from(
-            entry.path().to_string_lossy().as_bytes(),
-        ))
+        Object::Bytes(Rc::from(entry.path().to_string_lossy().as_bytes()))
     }
 }
 
@@ -1437,7 +1438,9 @@ fn scandir_next(args: &[Object]) -> Result<Object, RuntimeError> {
             };
         }
     }
-    Err(type_error("ScandirIterator.__next__ requires a scandir iterator"))
+    Err(type_error(
+        "ScandirIterator.__next__ requires a scandir iterator",
+    ))
 }
 
 fn scandir_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1469,7 +1472,7 @@ fn dir_entry_typecheck(name: &'static str, fs_path: String, want_dir: bool) -> O
         md.map(|m| if want_dir { m.is_dir() } else { m.is_file() })
             .unwrap_or(false)
     };
-    let classify_pos = classify.clone();
+    let classify_pos = classify;
     Object::Builtin(Rc::new(crate::object::BuiltinFn {
         name,
         binds_instance: false,
@@ -2051,7 +2054,9 @@ fn os_utime(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         // SAFETY: `cpath` and `specs` outlive the call; `utimensat` only reads them.
         let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), specs.as_ptr(), flags) };
         if rc != 0 {
-            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         Ok(Object::None)
     }
@@ -2180,8 +2185,8 @@ fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
 /// — the first 10 positions `stat_result(seq)` consumes and `st[i]` returns,
 /// matching CPython's `structseq` layout (`Modules/posixmodule.c`).
 const STAT_RESULT_FIELDS: [&str; 10] = [
-    "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
-    "st_atime", "st_mtime", "st_ctime",
+    "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size", "st_atime",
+    "st_mtime", "st_ctime",
 ];
 
 /// Process-wide memoised `os.stat_result` type. Memoisation is load-bearing
@@ -2402,7 +2407,9 @@ fn struct_seq_richcompare(
     op: CompareKind,
 ) -> Result<Object, RuntimeError> {
     let Some(Object::Instance(inst)) = args.first() else {
-        return Err(type_error("struct sequence comparison requires an instance"));
+        return Err(type_error(
+            "struct sequence comparison requires an instance",
+        ));
     };
     let self_tuple = Object::new_tuple(struct_seq_values(fields, inst));
     let other = match args.get(1) {
@@ -2445,7 +2452,7 @@ pub(crate) fn struct_seq_instance(
     let inst = crate::types::PyInstance::new(ty);
     {
         let mut d = inst.dict.borrow_mut();
-        for (field, value) in fields.iter().zip(values.into_iter()) {
+        for (field, value) in fields.iter().zip(values) {
             d.insert(DictKey(Object::from_static(field)), value);
         }
     }

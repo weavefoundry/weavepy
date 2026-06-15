@@ -10595,7 +10595,9 @@ fn memoryview_release(args: &[Object]) -> Result<Object, RuntimeError> {
 fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let mv = memoryview_self(args)?;
     if mv.released.get() {
-        return Err(value_error("operation forbidden on released memoryview object"));
+        return Err(value_error(
+            "operation forbidden on released memoryview object",
+        ));
     }
     // `memoryview.cast(format[, shape])`: `format` is positional-or-keyword and
     // `shape` (optional) reshapes the view for multi-dimensional indexing.
