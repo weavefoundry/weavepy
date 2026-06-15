@@ -52,4 +52,8 @@ __pycache__/
 # Vendored CPython checkout for the regrtest harness (opt-in, machine-local).
 # The conformance runner auto-discovers vendor/cpython/Lib/test/ when present;
 # we never commit it (size + licensing) — see docs/CONFORMANCE.md.
-/vendor/
+#
+# Ignore everything under vendor/ EXCEPT the lightly-patched lzma-sys crate,
+# which is a committed build input wired via Cargo.toml [patch.crates-io].
+/vendor/*
+!/vendor/lzma-sys/
