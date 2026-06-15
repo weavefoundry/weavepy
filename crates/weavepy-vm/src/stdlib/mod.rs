@@ -1174,6 +1174,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
+            name: "nt",
+            source: include_str!("python/nt_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "_oswalk",
             source: include_str!("python/_oswalk.py"),
             is_package: false,
