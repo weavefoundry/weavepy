@@ -488,30 +488,70 @@ pub fn child_process_error(message: impl Into<String>) -> RuntimeError {
 /// CPython-style exception we can. Falls back to a generic
 /// `OSError` for unrecognised kinds.
 pub fn io_error_to_py(err: &std::io::Error) -> RuntimeError {
+    io_error_to_py_named(err, None)
+}
+
+/// As [`io_error_to_py`], but attaches the offending path so the exception
+/// reads like CPython's: `[Errno 2] No such file or directory: 'name'`, with
+/// `.errno` / `.strerror` / `.filename` populated to match.
+pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> RuntimeError {
     use std::io::ErrorKind::{
         AlreadyExists, BrokenPipe, ConnectionAborted, ConnectionRefused, ConnectionReset,
         Interrupted, NotFound, PermissionDenied, TimedOut, WouldBlock,
     };
-    let message = err.to_string();
-    let mut runtime = match err.kind() {
-        NotFound => file_not_found_error(message),
-        PermissionDenied => permission_error(message),
-        ConnectionRefused => connection_refused_error(message),
-        ConnectionReset => connection_reset_error(message),
-        ConnectionAborted => connection_aborted_error(message),
-        BrokenPipe => broken_pipe_error(message),
-        TimedOut => timeout_error(message),
-        WouldBlock => blocking_io_error(message),
-        Interrupted => interrupted_error(message),
-        AlreadyExists => file_exists_error(message),
-        _ => os_error(message),
+    let errno = err.raw_os_error();
+    // CPython's `strerror` is the bare OS message; Rust appends a
+    // " (os error N)" decoration we strip so the text matches CPython.
+    let raw = err.to_string();
+    let strerror = match raw.find(" (os error ") {
+        Some(i) => raw[..i].to_string(),
+        None => raw,
     };
-    if let Some(errno) = err.raw_os_error() {
-        if let RuntimeError::PyException(ref mut exc) = runtime {
-            if let crate::object::Object::Instance(inst) = &exc.instance {
-                inst.dict.borrow_mut().insert(
+    // Mirror `OSError.__str__`: "[Errno N] strerror: 'filename'".
+    let message = match (errno, filename) {
+        (Some(n), Some(f)) => format!("[Errno {n}] {strerror}: '{f}'"),
+        (Some(n), None) => format!("[Errno {n}] {strerror}"),
+        (None, Some(f)) => format!("{strerror}: '{f}'"),
+        (None, None) => strerror.clone(),
+    };
+    // A few `errno`s have no stable `std::io::ErrorKind` variant yet
+    // (`IsADirectory`/`NotADirectory` are unstable) but map to specific
+    // CPython `OSError` subclasses, so dispatch on the raw number first.
+    // 21 == EISDIR, 20 == ENOTDIR on both Linux and macOS.
+    let mut runtime = match errno {
+        Some(21) => is_a_directory_error(message),
+        Some(20) => not_a_directory_error(message),
+        _ => match err.kind() {
+            NotFound => file_not_found_error(message),
+            PermissionDenied => permission_error(message),
+            ConnectionRefused => connection_refused_error(message),
+            ConnectionReset => connection_reset_error(message),
+            ConnectionAborted => connection_aborted_error(message),
+            BrokenPipe => broken_pipe_error(message),
+            TimedOut => timeout_error(message),
+            WouldBlock => blocking_io_error(message),
+            Interrupted => interrupted_error(message),
+            AlreadyExists => file_exists_error(message),
+            _ => os_error(message),
+        },
+    };
+    if let RuntimeError::PyException(ref mut exc) = runtime {
+        if let crate::object::Object::Instance(inst) = &exc.instance {
+            let mut dict = inst.dict.borrow_mut();
+            if let Some(errno) = errno {
+                dict.insert(
                     crate::object::DictKey(crate::object::Object::from_static("errno")),
                     crate::object::Object::Int(i64::from(errno)),
+                );
+            }
+            dict.insert(
+                crate::object::DictKey(crate::object::Object::from_static("strerror")),
+                crate::object::Object::from_str(strerror),
+            );
+            if let Some(f) = filename {
+                dict.insert(
+                    crate::object::DictKey(crate::object::Object::from_static("filename")),
+                    crate::object::Object::from_str(f.to_owned()),
                 );
             }
         }

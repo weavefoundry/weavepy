@@ -1,134 +1,389 @@
-"""Public ``lzma`` module (RFC 0019).
+"""Interface to the liblzma compression library.
 
-Thin wrapper over the Rust-backed ``_lzma`` core that exposes
-``compress``, ``decompress``, ``open``, and ``LZMAFile``.
+This module provides a class for reading and writing compressed files,
+classes for incremental (de)compression, and convenience functions for
+one-shot (de)compression.
+
+These classes and functions support the XZ and legacy LZMA container
+formats, as well as raw filter chains (FORMAT_RAW).
 """
 
-import _lzma
+__all__ = [
+    "CHECK_NONE", "CHECK_CRC32", "CHECK_CRC64", "CHECK_SHA256",
+    "CHECK_ID_MAX", "CHECK_UNKNOWN",
+    "FILTER_LZMA1", "FILTER_LZMA2", "FILTER_DELTA", "FILTER_X86", "FILTER_IA64",
+    "FILTER_ARM", "FILTER_ARMTHUMB", "FILTER_POWERPC", "FILTER_SPARC",
+    "FORMAT_AUTO", "FORMAT_XZ", "FORMAT_ALONE", "FORMAT_RAW",
+    "MF_HC3", "MF_HC4", "MF_BT2", "MF_BT3", "MF_BT4",
+    "MODE_FAST", "MODE_NORMAL", "PRESET_DEFAULT", "PRESET_EXTREME",
+
+    "LZMACompressor", "LZMADecompressor", "LZMAFile", "LZMAError",
+    "open", "compress", "decompress", "is_check_supported",
+]
+
+import builtins
 import io
+import os
+from _lzma import (
+    LZMACompressor, LZMADecompressor, LZMAError, is_check_supported,
+    _encode_filter_properties, _decode_filter_properties,
+    FORMAT_AUTO, FORMAT_XZ, FORMAT_ALONE, FORMAT_RAW,
+    CHECK_NONE, CHECK_CRC32, CHECK_CRC64, CHECK_SHA256,
+    PRESET_DEFAULT, PRESET_EXTREME,
+)
+import _compression
 
-_builtin_open = open
+# Constants that liblzma exposes but this build does not act on. They are
+# defined here so that callers referencing them (and ``__all__``) keep working.
+CHECK_ID_MAX = 15
+CHECK_UNKNOWN = 16
 
-FORMAT_AUTO = _lzma.FORMAT_AUTO
-FORMAT_XZ = _lzma.FORMAT_XZ
-FORMAT_ALONE = _lzma.FORMAT_ALONE
-FORMAT_RAW = _lzma.FORMAT_RAW
+FILTER_LZMA1 = 0x4000000000000001
+FILTER_LZMA2 = 0x21
+FILTER_DELTA = 0x03
+FILTER_X86 = 0x04
+FILTER_POWERPC = 0x05
+FILTER_IA64 = 0x06
+FILTER_ARM = 0x07
+FILTER_ARMTHUMB = 0x08
+FILTER_SPARC = 0x09
 
-CHECK_NONE = _lzma.CHECK_NONE
-CHECK_CRC32 = _lzma.CHECK_CRC32
-CHECK_CRC64 = _lzma.CHECK_CRC64
-CHECK_SHA256 = _lzma.CHECK_SHA256
+MF_HC3 = 0x03
+MF_HC4 = 0x04
+MF_BT2 = 0x12
+MF_BT3 = 0x13
+MF_BT4 = 0x14
 
-PRESET_DEFAULT = _lzma.PRESET_DEFAULT
-PRESET_EXTREME = _lzma.PRESET_EXTREME
-
-
-class LZMAError(Exception):
-    """Raised on LZMA compression/decompression errors."""
-
-
-def compress(data, format=FORMAT_XZ, check=-1, preset=None, filters=None):
-    if preset is None:
-        preset = PRESET_DEFAULT
-    return _lzma.compress(data, preset)
-
-
-def decompress(data, format=FORMAT_AUTO, memlimit=None, filters=None):
-    return _lzma.decompress(data)
+MODE_FAST = 1
+MODE_NORMAL = 2
 
 
-class LZMAFile:
-    def __init__(self, filename=None, mode="r", *, format=None, check=-1,
-                 preset=None, filters=None):
-        if filename is None:
-            raise TypeError("LZMAFile requires a filename")
-        if "b" not in mode:
-            mode = mode + "b"
-        self.mode = mode
-        self.name = filename
-        self._preset = preset if preset is not None else PRESET_DEFAULT
-        self._readable = "r" in mode
-        self._writable = "w" in mode or "a" in mode or "x" in mode
-        self._raw = _builtin_open(filename, mode)
-        self._buffer = b""
-        self._buffer_pos = 0
-        self._write_buffer = []
-        self._closed = False
+# Value 0 no longer used
+_MODE_READ     = 1
+# Value 2 no longer used
+_MODE_WRITE    = 3
 
-    def read(self, size=-1):
-        if not self._readable:
-            raise OSError("not readable")
-        if not self._buffer:
-            raw = self._raw.read()
-            if not raw:
-                return b""
-            self._buffer = decompress(raw)
-            self._buffer_pos = 0
-        if size is None or size < 0:
-            chunk = self._buffer[self._buffer_pos:]
-            self._buffer_pos = len(self._buffer)
-            return chunk
-        chunk = self._buffer[self._buffer_pos:self._buffer_pos + size]
-        self._buffer_pos += len(chunk)
-        return chunk
 
-    def write(self, data):
-        if not self._writable:
-            raise OSError("not writable")
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        self._write_buffer.append(data)
-        return len(data)
+class LZMAFile(_compression.BaseStream):
 
-    def flush(self):
-        if self._write_buffer:
-            payload = b"".join(self._write_buffer)
-            self._raw.write(compress(payload, preset=self._preset))
-            self._write_buffer = []
+    """A file object providing transparent LZMA (de)compression.
+
+    An LZMAFile can act as a wrapper for an existing file object, or
+    refer directly to a named file on disk.
+
+    Note that LZMAFile provides a *binary* file interface - data read
+    is returned as bytes, and data to be written must be given as bytes.
+    """
+
+    def __init__(self, filename=None, mode="r", *,
+                 format=None, check=-1, preset=None, filters=None):
+        """Open an LZMA-compressed file in binary mode.
+
+        filename can be either an actual file name (given as a str,
+        bytes, or PathLike object), in which case the named file is
+        opened, or it can be an existing file object to read from or
+        write to.
+
+        mode can be "r" for reading (default), "w" for (over)writing,
+        "x" for creating exclusively, or "a" for appending. These can
+        equivalently be given as "rb", "wb", "xb" and "ab" respectively.
+
+        format specifies the container format to use for the file.
+        If mode is "r", this defaults to FORMAT_AUTO. Otherwise, the
+        default is FORMAT_XZ.
+
+        check specifies the integrity check to use. This argument can
+        only be used when opening a file for writing. For FORMAT_XZ,
+        the default is CHECK_CRC64. FORMAT_ALONE and FORMAT_RAW do not
+        support integrity checks - for these formats, check must be
+        omitted, or be CHECK_NONE.
+
+        When opening a file for reading, the *preset* argument is not
+        meaningful, and should be omitted. The *filters* argument should
+        also be omitted, except when format is FORMAT_RAW (in which case
+        it is required).
+
+        When opening a file for writing, the settings used by the
+        compressor can be specified either as a preset compression
+        level (with the *preset* argument), or in detail as a custom
+        filter chain (with the *filters* argument).
+
+        preset (if provided) should be an integer in the range 0-9,
+        optionally OR-ed with the constant PRESET_EXTREME.
+
+        filters (if provided) should be a sequence of dicts. Each dict
+        should have an entry for "id" indicating ID of the filter, plus
+        additional entries for options to the filter.
+        """
+        self._fp = None
+        self._closefp = False
+        self._mode = None
+
+        if mode in ("r", "rb"):
+            if check != -1:
+                raise ValueError("Cannot specify an integrity check "
+                                 "when opening a file for reading")
+            if preset is not None:
+                raise ValueError("Cannot specify a preset compression "
+                                 "level when opening a file for reading")
+            if format is None:
+                format = FORMAT_AUTO
+            mode_code = _MODE_READ
+        elif mode in ("w", "wb", "a", "ab", "x", "xb"):
+            if format is None:
+                format = FORMAT_XZ
+            mode_code = _MODE_WRITE
+            self._compressor = LZMACompressor(format=format, check=check,
+                                              preset=preset, filters=filters)
+            self._pos = 0
+        else:
+            raise ValueError("Invalid mode: {!r}".format(mode))
+
+        if isinstance(filename, (str, bytes, os.PathLike)):
+            if "b" not in mode:
+                mode += "b"
+            self._fp = builtins.open(filename, mode)
+            self._closefp = True
+            self._mode = mode_code
+        elif hasattr(filename, "read") or hasattr(filename, "write"):
+            self._fp = filename
+            self._mode = mode_code
+        else:
+            raise TypeError("filename must be a str, bytes, file or PathLike object")
+
+        if self._mode == _MODE_READ:
+            raw = _compression.DecompressReader(self._fp, LZMADecompressor,
+                trailing_error=LZMAError, format=format, filters=filters)
+            self._buffer = io.BufferedReader(raw)
 
     def close(self):
-        if self._closed:
+        """Flush and close the file.
+
+        May be called more than once without error. Once the file is
+        closed, any other operation on it will raise a ValueError.
+        """
+        if self.closed:
             return
-        self.flush()
-        self._raw.close()
-        self._closed = True
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-        return False
+        try:
+            if self._mode == _MODE_READ:
+                self._buffer.close()
+                self._buffer = None
+            elif self._mode == _MODE_WRITE:
+                self._fp.write(self._compressor.flush())
+                self._compressor = None
+        finally:
+            try:
+                if self._closefp:
+                    self._fp.close()
+            finally:
+                self._fp = None
+                self._closefp = False
 
     @property
     def closed(self):
-        return self._closed
+        """True if this file is closed."""
+        return self._fp is None
 
-    def readable(self):
-        return self._readable
+    @property
+    def name(self):
+        self._check_not_closed()
+        return self._fp.name
 
-    def writable(self):
-        return self._writable
+    @property
+    def mode(self):
+        return 'wb' if self._mode == _MODE_WRITE else 'rb'
+
+    def fileno(self):
+        """Return the file descriptor for the underlying file."""
+        self._check_not_closed()
+        return self._fp.fileno()
 
     def seekable(self):
-        return False
+        """Return whether the file supports seeking."""
+        return self.readable() and self._buffer.seekable()
+
+    def readable(self):
+        """Return whether the file was opened for reading."""
+        self._check_not_closed()
+        return self._mode == _MODE_READ
+
+    def writable(self):
+        """Return whether the file was opened for writing."""
+        self._check_not_closed()
+        return self._mode == _MODE_WRITE
+
+    def peek(self, size=-1):
+        """Return buffered data without advancing the file position.
+
+        Always returns at least one byte of data, unless at EOF.
+        The exact number of bytes returned is unspecified.
+        """
+        self._check_can_read()
+        # Relies on the undocumented fact that BufferedReader.peek() always
+        # returns at least one byte (except at EOF)
+        return self._buffer.peek(size)
+
+    def read(self, size=-1):
+        """Read up to size uncompressed bytes from the file.
+
+        If size is negative or omitted, read until EOF is reached.
+        Returns b"" if the file is already at EOF.
+        """
+        self._check_can_read()
+        return self._buffer.read(size)
+
+    def read1(self, size=-1):
+        """Read up to size uncompressed bytes, while trying to avoid
+        making multiple reads from the underlying stream. Reads up to a
+        buffer's worth of data if size is negative.
+
+        Returns b"" if the file is at EOF.
+        """
+        self._check_can_read()
+        if size < 0:
+            size = io.DEFAULT_BUFFER_SIZE
+        return self._buffer.read1(size)
+
+    def readline(self, size=-1):
+        """Read a line of uncompressed bytes from the file.
+
+        The terminating newline (if present) is retained. If size is
+        non-negative, no more than size bytes will be read (in which
+        case the line may be incomplete). Returns b'' if already at EOF.
+        """
+        self._check_can_read()
+        return self._buffer.readline(size)
+
+    def write(self, data):
+        """Write a bytes object to the file.
+
+        Returns the number of uncompressed bytes written, which is
+        always the length of data in bytes. Note that due to buffering,
+        the file on disk may not reflect the data written until close()
+        is called.
+        """
+        self._check_can_write()
+        if isinstance(data, (bytes, bytearray)):
+            length = len(data)
+        else:
+            # accept any data that supports the buffer protocol
+            data = memoryview(data)
+            length = data.nbytes
+
+        compressed = self._compressor.compress(data)
+        self._fp.write(compressed)
+        self._pos += length
+        return length
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        """Change the file position.
+
+        The new position is specified by offset, relative to the
+        position indicated by whence. Possible values for whence are:
+
+            0: start of stream (default): offset must not be negative
+            1: current stream position
+            2: end of stream; offset must not be positive
+
+        Returns the new file position.
+
+        Note that seeking is emulated, so depending on the parameters,
+        this operation may be extremely slow.
+        """
+        self._check_can_seek()
+        return self._buffer.seek(offset, whence)
+
+    def tell(self):
+        """Return the current file position."""
+        self._check_not_closed()
+        if self._mode == _MODE_READ:
+            return self._buffer.tell()
+        return self._pos
 
 
-def open(filename, mode="rb", *, format=None, check=-1, preset=None,
-         filters=None, encoding=None, errors=None, newline=None):
+def open(filename, mode="rb", *,
+         format=None, check=-1, preset=None, filters=None,
+         encoding=None, errors=None, newline=None):
+    """Open an LZMA-compressed file in binary or text mode.
+
+    filename can be either an actual file name (given as a str, bytes,
+    or PathLike object), in which case the named file is opened, or it
+    can be an existing file object to read from or write to.
+
+    The mode argument can be "r", "rb" (default), "w", "wb", "x", "xb",
+    "a", or "ab" for binary mode, or "rt", "wt", "xt", or "at" for text
+    mode.
+
+    The format, check, preset and filters arguments specify the
+    compression settings, as for LZMACompressor, LZMADecompressor and
+    LZMAFile.
+
+    For binary mode, this function is equivalent to the LZMAFile
+    constructor: LZMAFile(filename, mode, ...). In this case, the
+    encoding, errors and newline arguments must not be provided.
+
+    For text mode, an LZMAFile object is created, and wrapped in an
+    io.TextIOWrapper instance with the specified encoding, error
+    handling behavior, and line ending(s).
+
+    """
     if "t" in mode:
-        binary_mode = mode.replace("t", "b")
-        if "b" not in binary_mode:
-            binary_mode += "b"
-        binary = LZMAFile(filename, binary_mode.replace("t", ""),
-                          preset=preset)
-        return io.TextIOWrapper(binary, encoding=encoding or "utf-8",
-                                errors=errors or "strict",
-                                newline=newline)
-    return LZMAFile(filename, mode, preset=preset)
+        if "b" in mode:
+            raise ValueError("Invalid mode: %r" % (mode,))
+    else:
+        if encoding is not None:
+            raise ValueError("Argument 'encoding' not supported in binary mode")
+        if errors is not None:
+            raise ValueError("Argument 'errors' not supported in binary mode")
+        if newline is not None:
+            raise ValueError("Argument 'newline' not supported in binary mode")
+
+    lz_mode = mode.replace("t", "")
+    binary_file = LZMAFile(filename, lz_mode, format=format, check=check,
+                           preset=preset, filters=filters)
+
+    if "t" in mode:
+        encoding = io.text_encoding(encoding)
+        return io.TextIOWrapper(binary_file, encoding, errors, newline)
+    else:
+        return binary_file
 
 
-__all__ = ["compress", "decompress", "LZMAFile", "LZMAError", "open",
-           "FORMAT_AUTO", "FORMAT_XZ", "FORMAT_ALONE", "FORMAT_RAW",
-           "CHECK_NONE", "CHECK_CRC32", "CHECK_CRC64", "CHECK_SHA256",
-           "PRESET_DEFAULT", "PRESET_EXTREME"]
+def compress(data, format=FORMAT_XZ, check=-1, preset=None, filters=None):
+    """Compress a block of data.
+
+    Refer to LZMACompressor's docstring for a description of the
+    optional arguments *format*, *check*, *preset* and *filters*.
+
+    For incremental compression, use an LZMACompressor instead.
+    """
+    comp = LZMACompressor(format, check, preset, filters)
+    return comp.compress(data) + comp.flush()
+
+
+def decompress(data, format=FORMAT_AUTO, memlimit=None, filters=None):
+    """Decompress a block of data.
+
+    Refer to LZMADecompressor's docstring for a description of the
+    optional arguments *format*, *check* and *filters*.
+
+    For incremental decompression, use an LZMADecompressor instead.
+    """
+    results = []
+    while True:
+        decomp = LZMADecompressor(format, memlimit, filters)
+        try:
+            res = decomp.decompress(data)
+        except LZMAError:
+            if results:
+                break  # Leftover data is not a valid LZMA/XZ stream; ignore it.
+            else:
+                raise  # Error on the first iteration; bail out.
+        results.append(res)
+        if not decomp.eof:
+            raise LZMAError("Compressed data ended before the "
+                            "end-of-stream marker was reached")
+        data = decomp.unused_data
+        if not data:
+            break
+    return b"".join(results)

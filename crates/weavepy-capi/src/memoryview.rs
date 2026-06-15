@@ -77,15 +77,13 @@ pub unsafe extern "C" fn PyMemoryView_FromObject(exporter: *mut PyObject) -> *mu
             let view_len = view.len.max(0) as usize;
             let view_itemsize = view.itemsize.max(1) as usize;
             unsafe { crate::buffer::PyBuffer_Release(&raw mut view) };
-            PyMemoryView {
-                buffer: MemoryViewBuffer::Bytes(bytes_data.into()),
-                start: Cell::new(0),
-                len: Cell::new(view_len),
-                readonly: Cell::new(readonly),
-                released: Cell::new(false),
-                format: RefCell::new("B".to_owned()),
-                itemsize: Cell::new(view_itemsize),
-            }
+            PyMemoryView::contiguous_1d(
+                MemoryViewBuffer::Bytes(bytes_data.into()),
+                view_len,
+                readonly,
+                "B".to_owned(),
+                view_itemsize,
+            )
         }
     };
     crate::object::into_owned(Object::MemoryView(weavepy_vm::sync::Rc::new(mv)))
@@ -103,6 +101,8 @@ fn clone_memoryview(other: &PyMemoryView) -> PyMemoryView {
         released: Cell::new(false),
         format: RefCell::new(other.format.borrow().clone()),
         itemsize: Cell::new(other.itemsize.get()),
+        shape: RefCell::new(other.shape.borrow().clone()),
+        strides: RefCell::new(other.strides.borrow().clone()),
     }
 }
 
@@ -126,25 +126,21 @@ pub unsafe extern "C" fn PyMemoryView_FromMemory(
     };
     let readonly = (flags & 0x100) != 0; // PyBUF_READ
     let mv = if readonly {
-        PyMemoryView {
-            buffer: MemoryViewBuffer::Bytes(bytes.into()),
-            start: Cell::new(0),
-            len: Cell::new(len),
-            readonly: Cell::new(true),
-            released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
-            itemsize: Cell::new(1),
-        }
+        PyMemoryView::contiguous_1d(
+            MemoryViewBuffer::Bytes(bytes.into()),
+            len,
+            true,
+            "B".to_owned(),
+            1,
+        )
     } else {
-        PyMemoryView {
-            buffer: MemoryViewBuffer::ByteArray(weavepy_vm::sync::Rc::new(RefCell::new(bytes))),
-            start: Cell::new(0),
-            len: Cell::new(len),
-            readonly: Cell::new(false),
-            released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
-            itemsize: Cell::new(1),
-        }
+        PyMemoryView::contiguous_1d(
+            MemoryViewBuffer::ByteArray(weavepy_vm::sync::Rc::new(RefCell::new(bytes))),
+            len,
+            false,
+            "B".to_owned(),
+            1,
+        )
     };
     crate::object::into_owned(Object::MemoryView(weavepy_vm::sync::Rc::new(mv)))
 }
@@ -173,25 +169,21 @@ pub unsafe extern "C" fn PyMemoryView_FromBuffer(view: *const Py_buffer) -> *mut
             .into_owned()
     };
     let mv = if v.readonly != 0 {
-        PyMemoryView {
-            buffer: MemoryViewBuffer::Bytes(bytes.into()),
-            start: Cell::new(0),
-            len: Cell::new(v.len.max(0) as usize),
-            readonly: Cell::new(true),
-            released: Cell::new(false),
-            format: RefCell::new(format),
-            itemsize: Cell::new(v.itemsize.max(1) as usize),
-        }
+        PyMemoryView::contiguous_1d(
+            MemoryViewBuffer::Bytes(bytes.into()),
+            v.len.max(0) as usize,
+            true,
+            format,
+            v.itemsize.max(1) as usize,
+        )
     } else {
-        PyMemoryView {
-            buffer: MemoryViewBuffer::ByteArray(weavepy_vm::sync::Rc::new(RefCell::new(bytes))),
-            start: Cell::new(0),
-            len: Cell::new(v.len.max(0) as usize),
-            readonly: Cell::new(false),
-            released: Cell::new(false),
-            format: RefCell::new(format),
-            itemsize: Cell::new(v.itemsize.max(1) as usize),
-        }
+        PyMemoryView::contiguous_1d(
+            MemoryViewBuffer::ByteArray(weavepy_vm::sync::Rc::new(RefCell::new(bytes))),
+            v.len.max(0) as usize,
+            false,
+            format,
+            v.itemsize.max(1) as usize,
+        )
     };
     crate::object::into_owned(Object::MemoryView(weavepy_vm::sync::Rc::new(mv)))
 }
@@ -225,27 +217,24 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
         unsafe { std::slice::from_raw_parts(view.buf as *const u8, view.len as usize) }.to_vec()
     };
     let readonly = view.readonly != 0;
+    let view_len = view.len.max(0) as usize;
     unsafe { crate::buffer::PyBuffer_Release(&raw mut view) };
     let mv = if readonly {
-        PyMemoryView {
-            buffer: MemoryViewBuffer::Bytes(bytes.into()),
-            start: Cell::new(0),
-            len: Cell::new(view.len.max(0) as usize),
-            readonly: Cell::new(true),
-            released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
-            itemsize: Cell::new(1),
-        }
+        PyMemoryView::contiguous_1d(
+            MemoryViewBuffer::Bytes(bytes.into()),
+            view_len,
+            true,
+            "B".to_owned(),
+            1,
+        )
     } else {
-        PyMemoryView {
-            buffer: MemoryViewBuffer::ByteArray(weavepy_vm::sync::Rc::new(RefCell::new(bytes))),
-            start: Cell::new(0),
-            len: Cell::new(view.len.max(0) as usize),
-            readonly: Cell::new(false),
-            released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
-            itemsize: Cell::new(1),
-        }
+        PyMemoryView::contiguous_1d(
+            MemoryViewBuffer::ByteArray(weavepy_vm::sync::Rc::new(RefCell::new(bytes))),
+            view_len,
+            false,
+            "B".to_owned(),
+            1,
+        )
     };
     crate::object::into_owned(Object::MemoryView(weavepy_vm::sync::Rc::new(mv)))
 }

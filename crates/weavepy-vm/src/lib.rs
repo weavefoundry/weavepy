@@ -419,6 +419,28 @@ impl Interpreter {
         self.stdout = stdout;
     }
 
+    /// Flush the buffered output streams. CPython's `Py_FinalizeEx`
+    /// flushes `sys.stdout`/`sys.stderr` during shutdown; we mirror that
+    /// so output survives a `SystemExit`/`sys.exit()` exit (which goes
+    /// through `std::process::exit`, bypassing Rust's normal end-of-main
+    /// stdout flush and any `Drop`-based flushing). First drive the
+    /// Python-level `sys.stdout`/`sys.stderr` `flush()` (handles a
+    /// reassigned, user-buffered stream), then flush the host sink.
+    pub fn flush_streams(&mut self) {
+        for name in ["stdout", "stderr"] {
+            if let Some(stream) = self.current_sys_attr(name) {
+                if matches!(&stream, Object::None) {
+                    continue;
+                }
+                if let Ok(flush) = self.load_attr(&stream, "flush") {
+                    let globals = self.builtins.clone();
+                    let _ = self.call(&flush, &[], &[], &globals);
+                }
+            }
+        }
+        let _ = self.stdout.borrow_mut().flush();
+    }
+
     /// RFC 0025: build a worker [`Interpreter`] that shares all
     /// shared state with `self` (builtins, module cache, stdout,
     /// excepthook, unraisable hook) but owns a **fresh** frame
@@ -669,6 +691,73 @@ impl Interpreter {
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
         self.call(callable, args, kwargs, globals)
+    }
+
+    /// Apply a binary operator to two objects, dispatching the full
+    /// `__op__`/`__rop__` protocol exactly as the `BINARY_OP` bytecode would.
+    /// Backs the `_operator` accelerator (`operator.add`, …) so those
+    /// functions are non-binding native builtins, matching CPython's C
+    /// `_operator` module (a Python `def` would bind `self` when used as a
+    /// class attribute, e.g. `glob._StringGlobber.concat_path = operator.add`).
+    pub(crate) fn op_binary(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: BinOpKind,
+    ) -> Result<Object, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.dispatch_binary_op(a, b, op, &globals)
+    }
+
+    /// Apply an in-place binary operator (`operator.iadd`, …).
+    pub(crate) fn op_inplace(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: BinOpKind,
+    ) -> Result<Object, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.dispatch_inplace_op(a, b, op, &globals)
+    }
+
+    /// Apply a rich comparison (`operator.lt`, …), returning the truthiness.
+    pub(crate) fn op_compare(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+    ) -> Result<bool, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.dispatch_compare_op(a, b, op, &globals)
+    }
+
+    /// Apply a unary operator (`operator.neg`/`pos`/`invert`/`not_`),
+    /// mirroring the `UNARY_OP` bytecode handler's dunder dispatch.
+    pub(crate) fn op_unary(&mut self, v: &Object, op: UnaryKind) -> Result<Object, RuntimeError> {
+        if matches!(v, Object::Instance(_)) {
+            let globals = self.builtins.clone();
+            return match op {
+                UnaryKind::Not => Ok(Object::Bool(!self.obj_truthy(v, &globals)?)),
+                UnaryKind::Neg | UnaryKind::Pos | UnaryKind::Invert => {
+                    let dunder = match op {
+                        UnaryKind::Neg => "__neg__",
+                        UnaryKind::Pos => "__pos__",
+                        _ => "__invert__",
+                    };
+                    match instance_method(v, dunder) {
+                        Some(method) => self.call(&method, &[], &[], &globals),
+                        None => unary_op(&v.native_value().unwrap_or_else(|| v.clone()), op),
+                    }
+                }
+            };
+        }
+        unary_op(v, op)
+    }
+
+    /// `operator.truth(obj)` — `bool(obj)` honouring `__bool__`/`__len__`.
+    pub(crate) fn op_truth(&mut self, v: &Object) -> Result<bool, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.obj_truthy(v, &globals)
     }
 
     /// Public iterator-construction entry point. Mirrors `iter(o)`.
@@ -2639,11 +2728,15 @@ impl Interpreter {
                     // Only dispatch a *user-defined* `__getitem__`; a slot
                     // inherited from a built-in base (e.g. `dict.__getitem__`
                     // materialized in the type dict) must take the native
-                    // path below so `__missing__` dispatch still works.
+                    // path below so `__missing__` dispatch still works. The
+                    // payload-less exception covers built-in struct-sequence
+                    // types (`os.stat_result`) whose `__getitem__` is a genuine
+                    // custom method: with no native payload the native subscript
+                    // has nothing to index, so honour the method instead.
                     let user_getitem = inst
                         .cls()
                         .lookup_with_owner("__getitem__")
-                        .filter(|(_, owner)| !owner.flags.is_builtin)
+                        .filter(|(_, owner)| !owner.flags.is_builtin || inst.native.is_none())
                         .map(|(m, _)| m);
                     if let Some(m) = user_getitem {
                         // `dispatch`: a `__getitem__` that is itself a
@@ -2877,6 +2970,14 @@ impl Interpreter {
                         Object::Tuple(items) => {
                             let snapshot: Vec<Object> = items.to_vec();
                             self.seq_contains_rich(&snapshot, &item, &frame.globals.clone())?
+                        }
+                        // `x in <iterator/generator>`: CPython consumes the
+                        // iterator, comparing each yielded value with `==`
+                        // (`argparse._check_value` relies on `value in
+                        // iter(choices)`). Drive it through the VM so a
+                        // Python generator / user `__next__` works too.
+                        Object::Iter(_) | Object::Generator(_) => {
+                            self.contains_via_iter(&container, &item, &frame.globals.clone())?
                         }
                         _ => container.contains(&item)?,
                     }
@@ -5048,15 +5149,29 @@ impl Interpreter {
             Object::MemoryView(mv) => match name {
                 "nbytes" => Ok(Object::Int(mv.len.get() as i64)),
                 "itemsize" => Ok(Object::Int(mv.itemsize.get() as i64)),
-                "ndim" => Ok(Object::Int(1)),
+                "ndim" => Ok(Object::Int(mv.ndim() as i64)),
                 "readonly" => Ok(Object::Bool(mv.readonly.get())),
                 "format" => Ok(Object::from_str(mv.format.borrow().as_str())),
-                "shape" => Ok(Object::new_tuple(vec![Object::Int(mv.len.get() as i64)])),
-                "strides" => Ok(Object::new_tuple(vec![Object::Int(
-                    mv.itemsize.get() as i64
-                )])),
+                "shape" => Ok(Object::new_tuple(
+                    mv.shape_dims()
+                        .into_iter()
+                        .map(|d| Object::Int(d as i64))
+                        .collect(),
+                )),
+                "strides" => Ok(Object::new_tuple(
+                    mv.stride_bytes()
+                        .into_iter()
+                        .map(|s| Object::Int(s as i64))
+                        .collect(),
+                )),
                 "suboffsets" => Ok(Object::new_tuple(vec![])),
-                "c_contiguous" | "f_contiguous" | "contiguous" => Ok(Object::Bool(true)),
+                // For a 1-D view C- and F-contiguity coincide; a multi-dim
+                // view is only F-contiguous when it is also 1-element-wide,
+                // so the simple `ndim <= 1 && c_contiguous` rule matches
+                // CPython for everything `cast`/slicing can produce here.
+                "c_contiguous" => Ok(Object::Bool(mv.is_c_contiguous())),
+                "contiguous" => Ok(Object::Bool(mv.is_c_contiguous())),
+                "f_contiguous" => Ok(Object::Bool(mv.is_c_contiguous() && mv.ndim() <= 1)),
                 _ => {
                     if let Some(m) = self.lookup_method(obj, name) {
                         return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
@@ -5282,7 +5397,9 @@ impl Interpreter {
                 "__name__" | "__qualname__" => {
                     Ok(Object::from_static(builtin_display_name(b.name)))
                 }
-                "__module__" => Ok(Object::from_static("builtins")),
+                "__module__" => Ok(Object::from_static(
+                    crate::descr_registry::module_of(obj).unwrap_or("builtins"),
+                )),
                 "__doc__" => Ok(builtin_doc(b.name)
                     .map(Object::from_static)
                     .unwrap_or(Object::None)),
@@ -5403,9 +5520,19 @@ impl Interpreter {
                 if let Object::File(f) = obj {
                     match name {
                         "buffer" | "raw" => {
+                            if let Some(b) = f.binary_buffer() {
+                                return Ok(b);
+                            }
                             return Ok(obj.clone());
                         }
-                        "name" => return Ok(Object::from_str(&f.name)),
+                        "name" => {
+                            return match f.name_obj() {
+                                Some(o) => Ok(o),
+                                None => Err(attribute_error(
+                                    "'_io.BytesIO' object has no attribute 'name'",
+                                )),
+                            }
+                        }
                         "mode" => return Ok(Object::from_str(&f.mode)),
                         "closed" => return Ok(Object::Bool(f.is_closed())),
                         "encoding" => {
@@ -5483,6 +5610,15 @@ impl Interpreter {
                             ))));
                         }
                         _ => {}
+                    }
+                }
+                // A monkeypatched per-instance attribute on a file shadows the
+                // native method of the same name (CPython instance-dict rule
+                // for non-data descriptors): `bio.seekable = lambda: False`
+                // then `bio.seekable()` calls the lambda, unbound.
+                if let Object::File(f) = obj {
+                    if let Some(v) = f.get_extra_attr(name) {
+                        return Ok(v);
                     }
                 }
                 if let Some(method) = self.lookup_method(obj, name) {
@@ -6962,6 +7098,18 @@ impl Interpreter {
             .map(|_| ())
     }
 
+    /// Public shim letting Rust stdlib builtins raise a `RuntimeWarning`
+    /// through the live `warnings` machinery (so `catch_warnings` /
+    /// `assertWarns` see it, and an escalating filter turns it into a raised
+    /// exception). Used by `os.stat`/`os.fstat` for the "bool is used as a
+    /// file descriptor" case, mirroring CPython's `PyErr_WarnEx`.
+    pub(crate) fn warn_runtime_from_builtin(
+        &mut self,
+        message: String,
+    ) -> Result<(), RuntimeError> {
+        self.emit_runtime_warning(message)
+    }
+
     /// Emit a `RuntimeWarning` through the live `warnings` machinery so
     /// filters / `catch_warnings` apply. Used for "coroutine … was
     /// never awaited" at finalization.
@@ -8022,6 +8170,21 @@ impl Interpreter {
         if real.is_subclass_of(cls) {
             return Ok(Object::Bool(true));
         }
+        // `os.PathLike` is a structural ABC (CPython `PathLike.__subclasshook__`):
+        // anything whose type defines `__fspath__` is an instance even without
+        // explicit subclassing (e.g. `pathlib.Path`, the suite's `FakePath`).
+        if Rc::ptr_eq(cls, &crate::stdlib::os::path_like_type()) {
+            return Ok(Object::Bool(real.lookup("__fspath__").is_some()));
+        }
+        // Native streams (`Object::File`) take the fast path with class
+        // `object`, but behaviourally satisfy the `io` ABCs — CPython makes
+        // `isinstance(io.BytesIO(), io.BufferedIOBase)` true (the `pathlib`/`io`
+        // suites assert it).
+        if let Object::File(f) = obj {
+            if let Some(m) = crate::stdlib::io::file_io_abc_match(f, cls) {
+                return Ok(Object::Bool(m));
+            }
+        }
         // Only `Instance`s can carry a custom `__class__`; for every other
         // object the real type *is* `__class__`, so skip the (observable)
         // attribute access on the negative path.
@@ -8660,9 +8823,18 @@ impl Interpreter {
     fn require_str_result(r: Object, dunder: &str) -> Result<String, RuntimeError> {
         match &r {
             Object::Str(_) => Ok(r.to_str()),
-            Object::Instance(inst) if matches!(&inst.native, Some(Object::Str(_))) => {
-                Ok(r.to_str())
-            }
+            // A `str` subclass instance (`class S(str)`) carries its value in
+            // `native`. `Object::to_str()` would `repr()` the instance
+            // (`'' -> "''"`), so pull the underlying string out directly —
+            // CPython treats a subclass result as the string itself
+            // (test_pathlib's `PurePathBase('')` round-trips a `str` subclass).
+            Object::Instance(inst) => match &inst.native {
+                Some(Object::Str(s)) => Ok(s.to_string()),
+                _ => Err(type_error(format!(
+                    "{dunder} returned non-string (type {})",
+                    r.type_name()
+                ))),
+            },
             other => Err(type_error(format!(
                 "{dunder} returned non-string (type {})",
                 other.type_name()
@@ -8782,6 +8954,15 @@ impl Interpreter {
                         .and_then(|s| s.strip_suffix(')'))
                         .unwrap_or(&inner);
                     return Ok(format!("{short}({body})"));
+                }
+                // `set`/`frozenset` subclasses likewise spell their own type
+                // name (CPython `set_repr`: `Py_TYPE(so) != &PySet_Type`), e.g.
+                // `set2({7})` / `set2()` / `fs2({9})`. `Object::repr`'s Instance
+                // arm performs exactly this tagging, so render the instance
+                // itself rather than the unwrapped payload (which would drop the
+                // class name back to `set`/`frozenset`).
+                if let Object::Set(_) | Object::FrozenSet(_) = &native {
+                    return Ok(v.repr());
                 }
                 return self.repr_of(&native, globals);
             }
@@ -13026,6 +13207,27 @@ impl Interpreter {
                     }
                 }
             }
+            // File objects: `f.name` is reassignable (CPython's `FileIO`
+            // exposes a writable `name`; `tempfile` relies on it). Other
+            // data attributes remain read-only.
+            Object::File(f) => match name {
+                "name" => {
+                    match value {
+                        Object::Str(s) => f.set_name(s.to_string()),
+                        other => f.set_name(other.type_name().to_owned()),
+                    }
+                    Ok(())
+                }
+                // CPython's file objects carry a `__dict__`, so user code can
+                // assign arbitrary attributes (and monkeypatch methods) on a
+                // live stream. Store them per-instance; `load_attr` checks this
+                // store after the fixed data attributes but before native
+                // methods, so e.g. `bio.seekable = lambda: False` takes effect.
+                _ => {
+                    f.set_extra_attr(name, value);
+                    Ok(())
+                }
+            },
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),
@@ -13701,18 +13903,39 @@ impl Interpreter {
                 Ok(Object::Int(i64::from(bytes[idx])))
             }
             (Object::MemoryView(mv), Object::Slice(slc)) => {
-                let bytes = mv.to_bytes();
-                let as_objs: Vec<Object> =
-                    bytes.iter().map(|b| Object::Int(i64::from(*b))).collect();
-                let sliced = slice_seq(&as_objs, slc)?;
-                let mut out = Vec::with_capacity(sliced.len());
-                for o in sliced {
-                    match o {
-                        Object::Int(i) => out.push(i as u8),
-                        _ => return Err(type_error("memoryview slice produced non-int")),
-                    }
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
                 }
-                Ok(Object::Bytes(Rc::from(out.as_slice())))
+                // `mv[i:j:k]` is a *sub-view* sharing the same buffer, not a
+                // copy — so `mv[::-1]`/`mv[::2]` stay non-contiguous and a
+                // later `tobytes()`/buffer export reflects the stride. Slicing
+                // adjusts the first dimension; trailing dimensions (from
+                // `cast(shape=…)`) ride along unchanged.
+                let shape = mv.shape_dims();
+                let strides = mv.stride_bytes();
+                let n = shape[0] as i64;
+                let (start_i, _stop, step, slicelen) = adjust_slice(n, slc)?;
+                let itemsize = mv.itemsize.get();
+                let stride0 = strides[0];
+                let base = mv.start.get() as isize;
+                let new_start = if slicelen > 0 {
+                    base + start_i as isize * stride0
+                } else {
+                    base
+                };
+                let mut new_shape = shape;
+                new_shape[0] = slicelen.max(0) as usize;
+                let mut new_strides = strides;
+                new_strides[0] = stride0 * step as isize;
+                let nbytes = new_shape.iter().product::<usize>() * itemsize;
+                let sub = mv.shallow_clone();
+                sub.start.set(new_start.max(0) as usize);
+                sub.len.set(nbytes);
+                *sub.shape.borrow_mut() = new_shape;
+                *sub.strides.borrow_mut() = new_strides;
+                Ok(Object::MemoryView(Rc::new(sub)))
             }
             (Object::MappingProxy(d), key) => {
                 let d = d.borrow();
@@ -14225,7 +14448,15 @@ impl Interpreter {
                     {
                         return self.do_complex_call(args, outer_globals);
                     }
-                    if b.name == "pow" && (args.len() == 2 || args.len() == 3) {
+                    if b.name == "pow"
+                        && (args.len() == 2 || args.len() == 3)
+                        && crate::descr_registry::module_of_builtin(b).is_none()
+                    {
+                        // Only the canonical `builtins.pow` takes the 3-arg
+                        // modular fast-path. A same-named accelerator function
+                        // (`_operator.pow`, attributed to `_operator`) must run
+                        // its own 2-arg body so `operator.pow(1, 2, 3)` raises
+                        // `TypeError` like CPython.
                         return self.do_pow_call(args, outer_globals);
                     }
                     if b.name == "bool" && args.len() <= 1 {
@@ -17483,6 +17714,12 @@ impl Interpreter {
     /// canonical Python `.args` tuple. Used by both `raise` and
     /// explicit `ExceptionClass(...)` calls.
     pub(crate) fn build_exception_instance(&self, cls: Rc<TypeObject>, args: &[Object]) -> Object {
+        // PEP 3151: constructing *exactly* `OSError`/`IOError` with a known
+        // errno as the first of its 2..=5 positional args produces the
+        // matching subclass (ENOTDIR → NotADirectoryError, ENOENT →
+        // FileNotFoundError, …), mirroring CPython's `oserror_new` errnomap
+        // dispatch. User subclasses of OSError are left untouched.
+        let cls = remap_oserror_to_subclass(cls, args);
         let mro_has = |name: &str| cls.mro.borrow().iter().any(|t| t.name == name);
         let is_stop_iteration = mro_has("StopIteration");
         let inst = PyInstance::new(cls.clone());
@@ -18313,6 +18550,15 @@ impl Interpreter {
         if warnings.is_empty() {
             return Ok(());
         }
+        // Publish the interpreter pointer (and activate thread handles) for
+        // the duration of this call. The embedding entry point invokes us
+        // *before* `run_module_as` establishes a dispatch frame, so the
+        // `import warnings` below (which pulls in `re` → `enum`, whose
+        // `EnumType` metaclass touches `type.__delattr__`) would otherwise
+        // find no active interpreter and raise. Mirrors `call_object`.
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let _handles = self.activate_thread_handles();
         let Some(warn_explicit) = self.warnings_warn_explicit() else {
             return Ok(());
         };
@@ -18963,6 +19209,32 @@ impl Interpreter {
         current.ok_or_else(|| import_error("empty module name"))
     }
 
+    /// Make `os.path` *be* the verbatim platform path module — `ntpath`
+    /// on Windows, `posixpath` elsewhere — exactly as CPython's `os.py`
+    /// does (`import posixpath as path` / `import ntpath as path`, then
+    /// `sys.modules['os.path'] = path`). Best-effort: if the module can't
+    /// be imported the Rust `os.path` installed by the `os` factory is
+    /// left untouched.
+    fn bind_os_path(&mut self, os_mod: &Object) {
+        let Object::Module(os_mod) = os_mod else {
+            return;
+        };
+        // Match CPython's platform selection. Binding the wrong module
+        // breaks `abspath`/`isabs`/`join` on absolute Windows paths: a
+        // `D:\…` path looks "relative" to `posixpath`, so it gets joined
+        // onto the cwd with `/` instead of being recognised as absolute.
+        let path_mod_name = if cfg!(windows) { "ntpath" } else { "posixpath" };
+        let path_mod = match self.import_path(path_mod_name) {
+            Ok(pm @ Object::Module(_)) => pm,
+            _ => return,
+        };
+        os_mod
+            .dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("path")), path_mod.clone());
+        self.cache.insert("os.path", path_mod);
+    }
+
     /// Load a single fully-qualified module name. Honours the cache
     /// first, then the built-in registry, then frozen Python sources,
     /// then the filesystem.
@@ -18983,6 +19255,18 @@ impl Interpreter {
             let module = factory(&self.cache);
             let obj = Object::Module(module);
             self.cache.insert(full, obj.clone());
+            // CPython's `os` re-exports the platform path module: `import
+            // posixpath as path` (or `ntpath` on Windows) + `sys.modules
+            // ['os.path'] = path`, so `os.path is posixpath`/`ntpath` and
+            // every lexical/bytes nicety of the verbatim module applies
+            // (the hand-written Rust `os.path` built by the factory
+            // diverges on bytes paths, trailing slashes, …). Rebinding
+            // *here* — after `os` is already in `sys.modules` — lets the
+            // path module's top-level `import os` resolve without
+            // recursion. On any failure the Rust fallback stays in place.
+            if full == "os" {
+                self.bind_os_path(&obj);
+            }
             return Ok(obj);
         }
         if let Some(frozen) = self.cache.frozen_source(full) {
@@ -20622,15 +20906,109 @@ fn exception_value(instance: &Object) -> Object {
 /// the sort key is a user instance whose class defines a real Python
 /// `__lt__` (`functools.cmp_to_key`'s `K`, rich-comparable dataclasses,
 /// …). Everything else keeps the native `Object::cmp` fast path.
+/// PEP 3151 errno → `OSError` subclass dispatch. Returns the subclass type
+/// to use when *exactly* `OSError` is being instantiated with a recognised
+/// errno; otherwise returns `cls` unchanged.
+fn remap_oserror_to_subclass(cls: Rc<TypeObject>, args: &[Object]) -> Rc<TypeObject> {
+    // Only the exact builtin `OSError` (also reachable as `IOError`/
+    // `EnvironmentError`, which alias the same type, name "OSError") remaps;
+    // a user subclass keeps its own identity.
+    if cls.name != "OSError" || !(2..=5).contains(&args.len()) {
+        return cls;
+    }
+    let Some(errno) = args.first().and_then(Object::as_i64) else {
+        return cls;
+    };
+    match oserror_subclass_name(errno) {
+        Some(name) => crate::builtin_types::builtin_types()
+            .by_name(name)
+            .unwrap_or(cls),
+        None => cls,
+    }
+}
+
+/// `ESHUTDOWN` is part of the Unix errno set but isn't exposed by `libc` on
+/// Windows (the shutdown error lives in Winsock's `WSAE*` space), so gate the
+/// comparison: faithful on Unix, and it simply never matches on Windows.
+#[cfg(unix)]
+fn is_eshutdown(e: i32) -> bool {
+    e == libc::ESHUTDOWN
+}
+#[cfg(not(unix))]
+fn is_eshutdown(_e: i32) -> bool {
+    false
+}
+
+fn oserror_subclass_name(errno: i64) -> Option<&'static str> {
+    let e = errno as i32;
+    let name = if e == libc::EAGAIN
+        || e == libc::EALREADY
+        || e == libc::EINPROGRESS
+        || e == libc::EWOULDBLOCK
+    {
+        "BlockingIOError"
+    } else if e == libc::ECHILD {
+        "ChildProcessError"
+    } else if e == libc::ECONNABORTED {
+        "ConnectionAbortedError"
+    } else if e == libc::ECONNREFUSED {
+        "ConnectionRefusedError"
+    } else if e == libc::ECONNRESET {
+        "ConnectionResetError"
+    } else if e == libc::EEXIST {
+        "FileExistsError"
+    } else if e == libc::ENOENT {
+        "FileNotFoundError"
+    } else if e == libc::EINTR {
+        "InterruptedError"
+    } else if e == libc::EISDIR {
+        "IsADirectoryError"
+    } else if e == libc::ENOTDIR {
+        "NotADirectoryError"
+    } else if e == libc::EACCES || e == libc::EPERM {
+        "PermissionError"
+    } else if e == libc::ESRCH {
+        "ProcessLookupError"
+    } else if e == libc::ETIMEDOUT {
+        "TimeoutError"
+    } else if e == libc::EPIPE || is_eshutdown(e) {
+        "BrokenPipeError"
+    } else {
+        return None;
+    };
+    Some(name)
+}
+
 fn sort_key_needs_dunder_lt(o: &Object) -> bool {
-    matches!(
-        o,
-        Object::Instance(inst)
-            if matches!(
-                inst.cls().lookup("__lt__"),
-                Some(Object::Function(_) | Object::BoundMethod(_))
-            )
-    )
+    sort_key_needs_dunder_lt_depth(o, 0)
+}
+
+/// Whether a sort key must be ordered through Python's `<` (rich-comparison
+/// dispatch) rather than the fast Rust `Object::cmp` total order. True for a
+/// custom instance carrying a `__lt__`, *and* — crucially — for a `tuple`/
+/// `list` that (recursively) contains one: the Rust `seq_cmp` path bottoms
+/// out in `Object::cmp`, which has no case for user instances and would
+/// raise a spurious "'<' not supported" (e.g. `pprint`'s `_safe_tuple` keys,
+/// which wrap each dict key/value in a `__lt__`-only `_safe_key`). The depth
+/// guard avoids unbounded recursion on self-referential containers.
+fn sort_key_needs_dunder_lt_depth(o: &Object, depth: u32) -> bool {
+    if depth > 100 {
+        return false;
+    }
+    match o {
+        Object::Instance(inst) => matches!(
+            inst.cls().lookup("__lt__"),
+            Some(Object::Function(_) | Object::BoundMethod(_))
+        ),
+        Object::Tuple(items) => items
+            .iter()
+            .any(|x| sort_key_needs_dunder_lt_depth(x, depth + 1)),
+        Object::List(items) => items
+            .borrow()
+            .iter()
+            .any(|x| sort_key_needs_dunder_lt_depth(x, depth + 1)),
+        _ => false,
+    }
 }
 
 /// Stable merge sort that orders by Python `<` (full rich-comparison

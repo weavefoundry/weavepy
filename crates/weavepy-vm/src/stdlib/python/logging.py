@@ -251,6 +251,31 @@ class Formatter:
 _defaultFormatter = Formatter()
 
 
+class BufferingFormatter:
+    """A formatter suitable for formatting a number of records."""
+
+    def __init__(self, linefmt=None):
+        if linefmt:
+            self.linefmt = linefmt
+        else:
+            self.linefmt = _defaultFormatter
+
+    def formatHeader(self, records):
+        return ""
+
+    def formatFooter(self, records):
+        return ""
+
+    def format(self, records):
+        rv = ""
+        if len(records) > 0:
+            rv = rv + self.formatHeader(records)
+            for record in records:
+                rv = rv + self.linefmt.format(record)
+            rv = rv + self.formatFooter(records)
+        return rv
+
+
 # ---------------- Filter ---------------- #
 
 class Filter:

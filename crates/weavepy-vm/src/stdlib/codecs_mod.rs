@@ -588,8 +588,14 @@ fn decode_utf8_surrogateescape(bytes: &[u8]) -> String {
                 let bad_len = e.error_len().unwrap_or(1);
                 for j in 0..bad_len {
                     let byte = bytes[i + valid + j];
+                    // CPython maps the undecodable byte to the lone low
+                    // surrogate U+DC00+byte. WeavePy's `str` is strict UTF-8
+                    // (`Rc<str>`), which cannot hold surrogates, so we
+                    // substitute U+FFFD rather than panic. Full
+                    // surrogateescape round-tripping needs a surrogate-capable
+                    // string representation (tracked separately).
                     let cp = 0xDC00 + u32::from(byte);
-                    out.push(char::from_u32(cp).unwrap());
+                    out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                 }
                 i += valid + bad_len;
             }
@@ -786,7 +792,10 @@ fn handle_decode_error(
             Ok(())
         }
         "surrogateescape" => {
-            out.push(char::from_u32(0xDC00 + u32::from(byte)).unwrap());
+            // See `decode_utf8_surrogateescape`: the U+DC00+byte surrogate is
+            // unrepresentable in a strict-UTF-8 `Rc<str>`, so fall back to
+            // U+FFFD instead of panicking on `char::from_u32`.
+            out.push(char::from_u32(0xDC00 + u32::from(byte)).unwrap_or('\u{FFFD}'));
             Ok(())
         }
         _ => Err(value_error(format!("unknown error handler: {errors}"))),

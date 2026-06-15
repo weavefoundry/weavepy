@@ -773,8 +773,26 @@ fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sys_intern(args: &[Object]) -> Result<Object, RuntimeError> {
+    // Real interning: equal strings collapse to a single canonical object so
+    // `intern(a) is intern(b)` holds for `a == b`. CPython (and code that
+    // relies on it, e.g. `pathlib`'s `sys.intern(str(x))` over path parts,
+    // exercised by `test_parts_interning`) keeps a process-wide pool; ours is
+    // per-thread, which matches WeavePy's per-thread interpreter model.
+    use std::collections::HashMap;
+    thread_local! {
+        static POOL: RefCell<HashMap<String, Object>> = RefCell::new(HashMap::new());
+    }
     match args.first() {
-        Some(Object::Str(_)) => Ok(args[0].clone()),
+        Some(s @ Object::Str(_)) => POOL.with(|pool| {
+            let key = s.to_str();
+            let mut map = pool.borrow_mut();
+            if let Some(existing) = map.get(&key) {
+                Ok(existing.clone())
+            } else {
+                map.insert(key, s.clone());
+                Ok(s.clone())
+            }
+        }),
         _ => Err(type_error("sys.intern() argument must be str")),
     }
 }
@@ -1550,6 +1568,10 @@ fn sys_displayhook(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sys_thread_info() -> Object {
+    // CPython exposes `sys.thread_info` as a struct-sequence with
+    // attribute access (`.name`, `.lock`, `.version`); `test_os` reads
+    // `sys.thread_info.version` at import. A SimpleNamespace gives us the
+    // same attribute surface.
     let mut d = DictData::new();
     d.insert(
         DictKey(Object::from_static("name")),
@@ -1560,5 +1582,5 @@ fn sys_thread_info() -> Object {
         Object::from_static("cooperative"),
     );
     d.insert(DictKey(Object::from_static("version")), Object::None);
-    Object::Dict(Rc::new(RefCell::new(d)))
+    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
 }

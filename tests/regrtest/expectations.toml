@@ -73,16 +73,16 @@ status = "fail"
 reason = "low-level _thread tests exercise CPython-specific lock semantics not yet matched"
 
 [tests."cpython/Lib/test/test_threadedtempfile.py"]
-status = "fail"
-reason = "depends on parallel thread execution from the CPython model"
+status = "pass"
+reason = "measured: passes end-to-end after wiring `open(opener=...)` + file-descriptor open and `shutil.rmtree(onexc=...)`, which `tempfile.NamedTemporaryFile`/`mkstemp` rely on."
 
 [tests."cpython/Lib/test/test_gc.py"]
 status = "fail"
 reason = "RFC 0024 implements cycle GC but the detailed heuristics (gen promotion thresholds, gc.callbacks ordering, get_referrers fidelity) don't match CPython yet"
 
 [tests."cpython/Lib/test/test_weakref.py"]
-status = "fail"
-reason = "core weakref + WeakSet / WeakValueDictionary work but proxy-attr delegation lands in a follow-up"
+status = "timeout"
+reason = "measured (RFC 0038): exceeds the committed 60s budget sequentially (killed at 60s; completes in ~90s at a larger budget, then fails). The O(n^2) list-backed `WeakKeyDictionary` was rebuilt as an O(1) id-keyed dict (the 70k-entry `test_threaded_weak_key_dict_copy` no longer hangs), but `test_weak_valued_len_race`'s `gc.set_threshold` + `RefCycle` cyclic-collection stress loop still drives the cycle collector past the budget. Follow-up: cyclic-GC progress under aggressive thresholds (GC arc, wave 4)."
 
 [tests."cpython/Lib/test/test_multiprocessing_main_handling.py"]
 status = "skip"
@@ -124,8 +124,8 @@ status = "fail"
 reason = "depends on full unicodedata DB + width handling"
 
 [tests."cpython/Lib/test/test_math.py"]
-status = "timeout"
-reason = "measured: exceeds the 30s budget even sequentially (was a completes-and-fails row; the heavy numeric loops plus interpreter overhead push it over). Underlying gaps when it ran: domain edge cases (gamma, lgamma) vs the libm path."
+status = "fail"
+reason = "measured (RFC 0038): completes in ~44s within the 60s budget and fails (86 ran, 48 fail, 300 error). Dominated by the 3.13 `math.fma` addition (`module 'math' has no attribute 'fma'`) plus gamma/lgamma domain edges. Was recorded `timeout` under the prior 30s budget; the committed 60s budget makes the true completes-and-fails status observable."
 
 [tests."cpython/Lib/test/test_int.py"]
 status = "pass"
@@ -197,83 +197,93 @@ reason = "measured: completes in ~23s sequentially with a mixed F/E run (re engi
 
 [tests."cpython/Lib/test/test_json.py"]
 status = "fail"
-reason = "json encoder/decoder edge cases (sort_keys with non-str keys)"
+reason = "measured (RFC 0038 WS-A): import-crashes during collection (0 subtests run). `test.test_json` binds `cjson.JSONDecodeError = …` against the `_json` C accelerator, which WeavePy does not ship, so the package import raises `TypeError: 'NoneType' object has no attribute 'JSONDecodeError'`. Needs a `_json` accelerator (or a test-package shim); deferred to the C-accelerator arc (wave 4)."
 
 [tests."cpython/Lib/test/test_base64.py"]
-status = "fail"
-reason = "b85/a85 codec + standard_b64encode edge cases"
+status = "pass"
+# Verbatim `base64.py` port (a85/b85/z85 + exact validate/altchars). The
+# last 5 closed in RFC 0038: io text-vs-binary stream typing (`StringIO.write`
+# rejects bytes; `sys.stdout.buffer` is a real binary stream), multi-dim
+# `memoryview.cast` now reports `ndim`/`shape`, and `python -m base64`
+# subprocess stdin piping works.
+reason = "verbatim base64.py; full suite passes"
 
 [tests."cpython/Lib/test/test_binascii.py"]
-status = "fail"
-reason = "binascii: hexlify with sep + uu_codec roundtrip"
+status = "pass"
+# b2a_uu/a2b_uu and b2a_qp/a2b_qp ported byte-for-byte from binascii.c,
+# a2b_base64's strict/lenient padding state machine matches CPython's exact
+# messages, hexlify takes sep/bytes_per_sep, and `test_c_contiguity` now
+# passes: strided memoryviews (`mv[::-2]`) are non-contiguous sub-views and
+# the codecs raise `BufferError` on them.
+reason = "verbatim binascii core; full suite passes"
 
 [tests."cpython/Lib/test/test_hashlib.py"]
 status = "fail"
-reason = "hashlib: shake / blake2 variable-length digests + usedforsecurity flag"
+reason = "measured (RFC 0038 WS-A): 45 pass, 2 fail, 2 error, 22 skip. Residual gaps are CPython implementation details: the private `hashlib.__get_builtin_constructor` helper is not exposed (Rust-backed hashlib), and `test_clinic_signature_errors` expects `TypeError` on conflicting positional/`data=`/`_=` constructor kwargs (arg-clinic signatures). Deferred — testing internal surface, not feature gaps."
 
 [tests."cpython/Lib/test/test_hmac.py"]
-status = "fail"
-reason = "hmac.compare_digest + new-style digestmod=name lookup"
+status = "pass"
+reason = "vendored hmac.py over _operator._compare_digest + hashlib usedforsecurity kwargs"
 
 [tests."cpython/Lib/test/test_zlib.py"]
-status = "fail"
-reason = "zlib compressor reuse + flush() modes"
+status = "pass"
+reason = "full zlib via flate2/zlib-rs: compressobj/decompressobj, _ZlibDecompressor, wbits/dictionary, flush modes"
 
 [tests."cpython/Lib/test/test_gzip.py"]
-status = "fail"
-reason = "gzip module: mtime preservation + multistream"
+status = "pass"
+reason = "full gzip: CPython gzip.py port over zlib.compressobj/_ZlibDecompressor + subclassable io.BytesIO, TextIOWrapper explicit-newline translation, bytes()/memoryview.cast buffer-protocol writes, and a real-pipe `python -m gzip` stdin subprocess path"
 
 [tests."cpython/Lib/test/test_bz2.py"]
-status = "fail"
-reason = "bz2 ships and imports cleanly; full test_bz2.py conformance (BZ2File multistream + compressor reuse) unverified pending a local Lib/test checkout"
+status = "pass"
+reason = "full bz2 (1 skip): BZ2File over _compression + BZ2Compressor/Decompressor, TextIOWrapper explicit-newline, and per-instance __dict__ on native streams for method monkeypatching (testSeekable)"
 
 [tests."cpython/Lib/test/test_lzma.py"]
-status = "fail"
-reason = "lzma ships and imports cleanly; full test_lzma.py conformance (raw filters + FORMAT_ALONE edges) unverified pending a local Lib/test checkout"
+status = "pass"
+reason = "full lzma (1 skip): LZMAFile + LZMACompressor/Decompressor with check-id parsing & arg validation, FORMAT_RAW filter chains and _en/_decode_filter_properties via lzma-sys raw FFI (workspace vendors lzma-sys with all BCJ filters enabled)"
 
 [tests."cpython/Lib/test/test_zipfile.py"]
 status = "fail"
-reason = "zipfile: ZIP64 + STORED writes pass but DEFLATE_64 / Bzip2 paths fail"
+reason = "measured (RFC 0038 WS-A): 47 pass, 35 fail, 193 error. The bulk of the errors are the `test_zipfile/_path` subpackage exercising the `zipfile.Path` accessor, which is absent (`module 'zipfile' has no attribute 'Path'`), plus `ZipFile.compresslevel` and the BZIP2/LZMA-in-zip compression methods. Deep `zipfile.Path` port deferred to wave 4."
 
 [tests."cpython/Lib/test/test_tarfile.py"]
 status = "fail"
-reason = "tarfile ships and imports cleanly; full test_tarfile.py conformance (PAX/GNU headers + stream modes) unverified pending a local Lib/test checkout"
+reason = "measured (RFC 0038 WS-A): 539 pass, 11 fail, 62 error of 620. First gaps: `ExFileObject` lacks `.name` and the underlying buffered `file` object lacks `truncate()`; remaining errors are PAX/GNU long-name headers and stream (`r|`/`w|`) modes. Deferred."
 
 [tests."cpython/Lib/test/test_io.py"]
 status = "fail"
-reason = "io: BufferedRandom + TextIOWrapper detach/seek interactions"
+reason = "measured (RFC 0038 WS-B): 54 pass, 38 fail, 44 error of 247 (~52s; no longer hangs after the FileIO(fd) constructor + closefd fix landed this wave). Gaps: BufferedIOBase.readinto on custom raw streams (`'Reader' object has no attribute 'readinto'`), BufferedRandom read/write interleaving, and TextIOWrapper seek/tell cookie semantics. Deferred."
 
 [tests."cpython/Lib/test/test_os.py"]
 status = "fail"
-reason = "os module: scandir nesting + os.stat_result extra fields"
+reason = "measured (RFC 0038 WS-B): 73 pass, 29 fail, 63 error (172 skip). Spread across missing `os` surface — `os.environb`, `os.device_encoding`, plus stat_result/scandir edges — rather than one root cause. The `os.scandir` OSError.filename fix landed this wave (it cleared the cross-cutting tempfile/shutil cleanup errors); the residual breadth gap is deferred."
 
 [tests."cpython/Lib/test/test_posixpath.py"]
 status = "fail"
-reason = "posixpath: realpath with strict=True + commonpath edge cases"
+reason = "measured (RFC 0038 WS-B): 86 pass, 1 fail. The sole failure is test_realpath_invalid_paths: `realpath` on a lone-surrogate path must raise `UnicodeEncodeError`, but WeavePy's UTF-8-native str replaces lone surrogates at construction so the encode never fails. Blocked on WTF-8 str storage (shared root cause with test_codecs); deferred to wave 4."
 
 [tests."cpython/Lib/test/test_pathlib.py"]
 status = "fail"
-reason = "pathlib: Path.walk + Path.full_match (3.13+)"
+reason = "measured (RFC 0038 WS-B): 764 pass, 10 fail, 3 error of 1036. The errors need AF_UNIX socket string addresses (`sock.bind(str(path))` → 'address must be a tuple'); the failures are 3.13 path-edge corners (walk/full_match/relative_to(walk_up)). Deferred."
 
 [tests."cpython/Lib/test/test_tempfile.py"]
 status = "fail"
-reason = "tempfile: SpooledTemporaryFile + NamedTemporaryFile delete_on_close"
+reason = "measured (RFC 0038 WS-B): 80 pass, 10 fail, 18 error (down from 38 error after the os.scandir OSError.filename fix this wave). The residual gap needs finalizer/weakref-driven cleanup — NamedTemporaryFile(delete=True) is not unlinked by its finalizer in time (`exists after finalizer`). Blocked on deterministic finalization (GC arc, wave 4)."
 
 [tests."cpython/Lib/test/test_glob.py"]
-status = "fail"
-reason = "glob: recursive ** semantics + case sensitivity"
+status = "pass"
+reason = "measured (RFC 0038 WS-B): passes end-to-end. Recursive `**` walks via `os.scandir` DirEntry whose `is_dir(follow_symlinks=False)` mirrors CPython 3.13 (no descent through symlinked dirs), and `os.fspath`/bytes-path round-tripping matches."
 
 [tests."cpython/Lib/test/test_fnmatch.py"]
-status = "fail"
-reason = "fnmatch.filter performance asserts"
+status = "pass"
+reason = "measured (RFC 0038 WS-B): passes end-to-end (frozen `fnmatch` over the `re` translate path)."
 
 [tests."cpython/Lib/test/test_shutil.py"]
 status = "fail"
-reason = "shutil: copytree symlinks=False + chown ownership"
+reason = "measured (RFC 0038 WS-B): 116 pass, 3 fail, 18 error (improved after the os.scandir filename fix this wave). Remaining errors: `make_archive(..., 'zip', ...)` calls `zipfile.write()` on a directory and raises `IsADirectoryError` (zipfile needs directory-entry handling), plus chown ownership. Deferred (shares the zipfile gap with test_zipfile)."
 
 [tests."cpython/Lib/test/test_stat.py"]
-status = "fail"
-reason = "stat: filemode for setgid/setuid + S_ISDOOR (Solaris)"
+status = "pass"
+reason = "measured: passes end-to-end after `os.stat()` reports the raw `st_mode` bits via `MetadataExt::mode()` on Unix (fixes filemode type char, e.g. 'c' for character devices) plus the frozen `stat` module."
 
 [tests."cpython/Lib/test/test_textwrap.py"]
 status = "pass"
@@ -345,7 +355,7 @@ reason = "measured: passes end-to-end (RFC 0037 WS5 traceback module — StackSu
 
 [tests."cpython/Lib/test/test_warnings.py"]
 status = "fail"
-reason = "warnings: filter precedence + showwarning override"
+reason = "measured (RFC 0038 WS-C): 130 pass, 28 fail, 3 error of 279. Gaps need closure-cell introspection (`'cell' object has no attribute 'cell_contents'`, used by the `@deprecated` retained-reference checks) plus filter/`catch_warnings` re-entrancy corners. Deferred (cell_contents is a VM closure-introspection gap)."
 
 [tests."cpython/Lib/test/test_contextlib.py"]
 status = "pass"
@@ -376,20 +386,24 @@ status = "fail"
 reason = "dis: opcode coverage + line number table format differs"
 
 [tests."cpython/Lib/test/test_optparse.py"]
-status = "fail"
-reason = "optparse: deprecated but still expected to work; help formatting subtleties"
+status = "pass"
+reason = "measured: passes end-to-end after vendoring CPython's `optparse` verbatim and fixing `shutil.get_terminal_size()` to honor `os.environ['COLUMNS']`/`LINES` (so help-formatter column wrapping matches CPython)."
 
 [tests."cpython/Lib/test/test_getopt.py"]
+status = "pass"
+reason = "measured: passes end-to-end after vendoring CPython's `getopt` verbatim (frozen module) together with the `gettext` fallback it imports for localized error messages."
+
+[tests."cpython/Lib/test/test_gettext.py"]
 status = "fail"
-reason = "getopt: long option abbreviation + error messages"
+reason = "measured: `gettext` now ships (frozen verbatim) and imports — previously `ModuleNotFoundError` — so the suite runs (71/78); 7 residual errors around the C-accelerated catalog/plural-eval edges remain a follow-up."
 
 [tests."cpython/Lib/test/test_argparse.py"]
 status = "fail"
-reason = "argparse: subparsers + mutually exclusive groups"
+reason = "measured (RFC 0038 WS-C): runs to completion with 1022 pass and only 2 errors remaining, both architectural: (1) `open(argparse.__file__)` fails because frozen stdlib modules report `__file__='<frozen argparse>'`; (2) TestFileTypeOpenArgs relies on `mock.patch('builtins.open')`, which WeavePy's LOAD_GLOBAL builtins fast-path bypasses. Deferred (frozen-__file__ + patchable-builtins arcs)."
 
 [tests."cpython/Lib/test/test_pprint.py"]
-status = "fail"
-reason = "pprint: width / depth + repr fallback for cycles"
+status = "pass"
+reason = "measured (RFC 0038 WS-C): passes end-to-end (frozen `pprint`; width/depth, sorted-dict, recursion/cycle `...` fallback, and dataclass/namedtuple reprs all match)."
 
 [tests."cpython/Lib/test/test_pdb.py"]
 status = "skip"
@@ -437,7 +451,7 @@ reason = "random: Mersenne Twister state save/load + SystemRandom"
 
 [tests."cpython/Lib/test/test_statistics.py"]
 status = "timeout"
-reason = "measured: exceeds the 30s budget even sequentially. Previously ran all 374 cases and failed on missing numeric-tower features (NormalDist + harmonic_mean weighted forms, Fraction/Decimal interop); the verbatim-collections swap (pure-Python Counter/OrderedDict paths) plus those suites' heavy loops push wall time past the budget. Revisit with the WS8 perf pass (native _collections accelerators)."
+reason = "measured (RFC 0038): exceeds the committed 60s budget even sequentially (killed at 60s). Underlying gaps when it ran at a larger budget: numeric-tower features (NormalDist + harmonic_mean weighted forms, Fraction/Decimal interop); the pure-Python Counter/OrderedDict paths plus those suites' heavy loops push wall time past the budget. Revisit with the C-accelerator perf arc (native _statistics/_decimal)."
 
 [tests."cpython/Lib/test/test_unicodedata.py"]
 status = "skip"
@@ -449,7 +463,7 @@ reason = "RFC 0037 WS8: faithful struct port (buffer-protocol pack_into/unpack_f
 
 [tests."cpython/Lib/test/test_codecs.py"]
 status = "fail"
-reason = "codecs: encoder/decoder state + error handlers"
+reason = "measured (RFC 0038 WS-A): 21 pass, 14 fail, 214 error. Dominated by the `surrogateescape`/`surrogatepass` error handlers (`ValueError: unknown error handler: surrogateescape`), which require lone-surrogate-preserving (WTF-8) str storage — the same str-representation change that gates test_posixpath. Deferred to the WTF-8 arc (wave 4)."
 
 [tests."cpython/Lib/test/test_calendar.py"]
 status = "pass"
@@ -465,7 +479,7 @@ reason = "measured (non-target): load_tests() calls import_fresh_module('datetim
 
 [tests."cpython/Lib/test/test_csv.py"]
 status = "fail"
-reason = "csv: DictReader fieldnames inference + dialect registration"
+reason = "measured (RFC 0038 WS-C): 20 pass, 36 fail, 59 error. The Rust `_csv` accelerator diverges from CPython: `writerow` rejects non-list/tuple rows (`writerow: row must be list/tuple`), dialect/typecode validation gaps (`bad typecode: 'w'` from the 3.13 array 'w' unicode typecode), and reader iteration returns None. Needs a faithful `_csv` port; deferred."
 
 [tests."cpython/Lib/test/test_email.py"]
 status = "fail"
@@ -477,7 +491,7 @@ reason = "html.unescape now ports CPython's full algorithm: the new html.entitie
 
 [tests."cpython/Lib/test/test_logging.py"]
 status = "fail"
-reason = "logging: handler hierarchy + dictConfig disable_existing_loggers"
+reason = "measured (RFC 0038 WS-C): import-crashes during collection (0 subtests run) — `module 'logging' has no attribute 'LoggerAdapter'`. The frozen `logging` package omits `LoggerAdapter` (and likely more public surface); the suite can't be measured until the package is completed. Deferred pending a logging-package completeness pass."
 
 [tests."cpython/Lib/test/test_locale.py"]
 status = "skip"

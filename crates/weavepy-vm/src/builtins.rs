@@ -140,6 +140,22 @@ pub fn default_builtins() -> DictData {
             );
         }};
     }
+    // As `reg!`, but the body also receives the keyword-argument list (for
+    // builtins with documented named parameters, e.g. `enumerate(x, start=)`).
+    macro_rules! reg_kw {
+        ($name:literal, $body:expr) => {{
+            let f = BuiltinFn {
+                name: $name,
+                binds_instance: false,
+                call: Box::new(|args| $body(args, &[])),
+                call_kw: Some(Box::new($body)),
+            };
+            d.insert(
+                DictKey(Object::from_static($name)),
+                Object::Builtin(Rc::new(f)),
+            );
+        }};
+    }
 
     reg!("len", b_len);
     reg!("range", b_range);
@@ -180,7 +196,7 @@ pub fn default_builtins() -> DictData {
     reg!("sum", b_sum);
     reg!("sorted", b_sorted);
     reg!("reversed", b_reversed);
-    reg!("enumerate", b_enumerate);
+    reg_kw!("enumerate", b_enumerate_kw);
     reg!("zip", b_zip);
     reg!("map", b_map);
     reg!("filter", b_filter);
@@ -732,6 +748,11 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "writelines" => Some(method(".file_writelines", file_writelines)),
             "flush" => Some(method("flush", file_flush)),
             "close" => Some(method("close", file_close)),
+            "isatty" => Some(method("isatty", file_isatty)),
+            "fileno" => Some(method("fileno", file_fileno)),
+            "readable" => Some(method("readable", file_readable)),
+            "writable" => Some(method("writable", file_writable)),
+            "seekable" => Some(method("seekable", file_seekable)),
             "seek" => Some(method("seek", file_seek)),
             "tell" => Some(method("tell", file_tell)),
             "getvalue" => Some(method("getvalue", file_getvalue)),
@@ -748,7 +769,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "tobytes" => Some(method("tobytes", memoryview_tobytes)),
             "tolist" => Some(method("tolist", memoryview_tolist)),
             "release" => Some(method("release", memoryview_release)),
-            "cast" => Some(method("cast", memoryview_cast)),
+            "cast" => Some(method_kw("cast", memoryview_cast)),
             "hex" => Some(method("hex", memoryview_hex)),
             "__enter__" => Some(method("__enter__", memoryview_enter)),
             "__exit__" => Some(method("__exit__", memoryview_exit)),
@@ -1593,6 +1614,20 @@ fn slot_repr(args: &[Object]) -> Result<Object, RuntimeError> {
             .and_then(|s| s.strip_suffix(')'))
             .unwrap_or(&inner);
         return Ok(Object::from_str(format!("{short}({body})")));
+    }
+    // `set`/`frozenset` likewise spell the receiver's own type name
+    // (CPython `set_repr`: `Py_TYPE(so) != &PySet_Type`), so an explicit
+    // `set.__repr__(subclass_instance)` renders `set3({…})`. Rendering the
+    // native payload here (not re-dispatching `o.repr()`) avoids recursing
+    // back into a user `__repr__` that delegates to `set.__repr__`.
+    if let (Object::Instance(inst), Some(native_set @ (Object::Set(_) | Object::FrozenSet(_)))) =
+        (o, &native)
+    {
+        let name = inst.cls().name.clone();
+        let short = name.rsplit('.').next().unwrap_or(&name);
+        if let Some(rendered) = crate::object::set_repr_tagged(native_set, short) {
+            return Ok(Object::from_str(rendered));
+        }
     }
     Ok(Object::from_str(native.as_ref().unwrap_or(o).repr()))
 }
@@ -4916,6 +4951,28 @@ fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, Runti
                     return bytes_from_source_obj(&native.clone(), type_name);
                 }
             }
+            // PEP 688 buffer protocol: a pure-Python object that exposes
+            // `__buffer__` (e.g. `array.array`) is copied byte-for-byte from
+            // its buffer, exactly like CPython's `bytes()` — which prefers the
+            // buffer protocol over iteration, so `bytes(array('I', ...))` yields
+            // the raw machine bytes rather than the (out-of-range) int items.
+            if let Some(method) = crate::instance_method(src, "__buffer__") {
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still live on
+                    // this thread; the GIL keeps the access exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    let globals = interp.builtins_dict();
+                    let view = interp.call_object_with_globals(
+                        &method,
+                        &[Object::Int(0)],
+                        &[],
+                        &globals,
+                    )?;
+                    if let Some(bytes) = view.as_bytes_view() {
+                        return Ok(bytes);
+                    }
+                }
+            }
             // Iterable (including legacy `__getitem__` sequences) via
             // interpreter reentry; `__iter__` exceptions propagate.
             let iterable = crate::instance_method(src, "__iter__").is_some()
@@ -5133,16 +5190,24 @@ fn b_bytearray(args: &[Object]) -> Result<Object, RuntimeError> {
 /// strict by default), so the kwargs are taken into the bag but
 /// ignored unless they would change behaviour we do support.
 fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    // Reuse the positional path. We fold known kwargs into positional
-    // slots and accept (but ignore) the rest.
+    // Reuse the positional path. We fold the known keyword arguments into
+    // their positional slots (`open(file, mode, buffering, encoding, errors,
+    // newline, closefd, opener)`) and accept (but ignore) the rest.
     let mut combined: Vec<Object> = args.to_vec();
-    let mut mode = combined.get(1).cloned();
-    let mut encoding = combined.get(3).cloned();
+    let set_slot = |combined: &mut Vec<Object>, idx: usize, val: Object| {
+        while combined.len() <= idx {
+            combined.push(Object::None);
+        }
+        combined[idx] = val;
+    };
     for (k, v) in kwargs {
         match k.as_str() {
-            "mode" => mode = Some(v.clone()),
-            "encoding" => encoding = Some(v.clone()),
-            "buffering" | "errors" | "newline" | "closefd" | "opener" => {
+            "mode" => set_slot(&mut combined, 1, v.clone()),
+            "buffering" => set_slot(&mut combined, 2, v.clone()),
+            "encoding" => set_slot(&mut combined, 3, v.clone()),
+            "errors" => set_slot(&mut combined, 4, v.clone()),
+            "newline" => set_slot(&mut combined, 5, v.clone()),
+            "closefd" | "opener" => {
                 // Accepted but not plumbed further yet.
             }
             other => {
@@ -5152,23 +5217,89 @@ fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
             }
         }
     }
-    if let Some(m) = mode {
-        if combined.len() < 2 {
-            combined.push(m);
-        } else {
-            combined[1] = m;
-        }
-    }
-    let file = b_open(&combined)?;
-    if let (Object::File(f), Some(Object::Str(enc))) = (&file, &encoding) {
-        if !f.binary {
-            f.set_encoding(enc);
-        }
-    }
-    Ok(file)
+    b_open(&combined)
 }
 
-fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
+/// Resolve `open()`'s `file` argument to a filesystem path string. Accepts
+/// `str`, `bytes`/`bytearray` (decoded as UTF-8, like `os.fsdecode`), and any
+/// `os.PathLike` (via `__fspath__`). Mirrors CPython's path coercion.
+/// Resolve `open()`'s `file` argument to a path string, reporting whether the
+/// original (or `__fspath__`-resolved) value was `bytes` so the file's
+/// Python-visible `name` can read back as `bytes`.
+fn open_path_arg(obj: &Object) -> Result<(String, bool), RuntimeError> {
+    match obj {
+        Object::Str(s) => Ok((s.to_string(), false)),
+        Object::Bytes(b) => Ok((String::from_utf8_lossy(b).into_owned(), true)),
+        Object::ByteArray(b) => Ok((String::from_utf8_lossy(&b.borrow()).into_owned(), true)),
+        Object::Instance(_) => {
+            // `os.PathLike`: call `__fspath__()` through the interpreter.
+            let ptr = crate::vm_singletons::current_interpreter_ptr()
+                .ok_or_else(|| type_error("open() argument 'file' must be str"))?;
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let fspath = interp.load_attr_public(obj, "__fspath__").map_err(|_| {
+                type_error(format!(
+                    "expected str, bytes or os.PathLike object, not {}",
+                    obj.type_name()
+                ))
+            })?;
+            let resolved = interp.call_object(fspath, &[], &[])?;
+            match resolved {
+                Object::Str(s) => Ok((s.to_string(), false)),
+                Object::Bytes(b) => Ok((String::from_utf8_lossy(&b).into_owned(), true)),
+                other => Err(type_error(format!(
+                    "expected __fspath__() to return str or bytes, not {}",
+                    other.type_name()
+                ))),
+            }
+        }
+        _ => Err(type_error(format!(
+            "expected str, bytes or os.PathLike object, not {}",
+            obj.type_name()
+        ))),
+    }
+}
+
+/// Validate an `open()` mode string the way CPython's `io.open` /
+/// `_io.FileIO` do, raising `ValueError`/`TypeError` *before* the
+/// filesystem is touched. Returns whether the mode is binary so callers
+/// can apply the "binary mode doesn't take an encoding argument" rule.
+pub(crate) fn validate_open_mode(mode: &str) -> Result<bool, RuntimeError> {
+    use std::collections::BTreeSet;
+    let mut modes: BTreeSet<char> = BTreeSet::new();
+    for ch in mode.chars() {
+        if !"xrwab+t".contains(ch) {
+            return Err(value_error(format!("invalid mode: '{mode}'")));
+        }
+        modes.insert(ch);
+    }
+    // A repeated flag (e.g. "rr") has more chars than the deduped set.
+    if mode.chars().count() > modes.len() {
+        return Err(value_error(format!("invalid mode: '{mode}'")));
+    }
+    let creating = modes.contains(&'x');
+    let reading = modes.contains(&'r');
+    let writing = modes.contains(&'w');
+    let appending = modes.contains(&'a');
+    let text = modes.contains(&'t');
+    let binary = modes.contains(&'b');
+    if text && binary {
+        return Err(value_error("can't have text and binary mode at once"));
+    }
+    if u8::from(creating) + u8::from(reading) + u8::from(writing) + u8::from(appending) > 1 {
+        return Err(value_error(
+            "can't have read/write/create/append mode at once",
+        ));
+    }
+    if !(creating || reading || writing || appending) {
+        return Err(value_error(
+            "must have exactly one of create/read/write/append mode",
+        ));
+    }
+    Ok(binary)
+}
+
+pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     use crate::object::{FileBackend, PyFile};
     use std::fs::OpenOptions;
     if args.is_empty() {
@@ -5176,9 +5307,13 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let mode = match args.get(1) {
         Some(Object::Str(m)) => m.to_string(),
+        // `b_open_kw` pads unset positional slots with `None` when a later
+        // keyword (e.g. `encoding=`) is supplied, so treat a `None` mode the
+        // same as an omitted one (`"r"`), not as a type error.
+        None | Some(Object::None) => "r".to_owned(),
         Some(_) => return Err(type_error("open() mode must be str")),
-        None => "r".to_owned(),
     };
+    validate_open_mode(&mode)?;
     // `open(fd, …)` adopts an already-open raw file descriptor
     // (produced by `os.open`); the file's `name` is the fd itself.
     #[cfg(unix)]
@@ -5196,10 +5331,7 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
             FileBackend::Disk(f),
         ))));
     }
-    let path = match &args[0] {
-        Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("open() argument 'file' must be str".to_owned())),
-    };
+    let (path, name_is_bytes) = open_path_arg(&args[0])?;
     let mut opts = OpenOptions::new();
     let mut writing = false;
     for ch in mode.chars() {
@@ -5231,12 +5363,31 @@ fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let f = opts
         .open(&path)
-        .map_err(|e| crate::error::os_error(format!("{path}: {e}")))?;
+        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
+    // CPython raises `IsADirectoryError` when `open()` targets a directory
+    // (the kernel happily opens a dir fd; the error only surfaces on `read`).
+    // Detect it eagerly so `shutil`/`zipfile`/user code see EISDIR at open
+    // time, not as a stray "Is a directory" on the first read.
+    if f.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+        return Err(crate::error::io_error_to_py_named(
+            &std::io::Error::from_raw_os_error(21),
+            Some(&path),
+        ));
+    }
     let file = PyFile::new(path, mode, FileBackend::Disk(f));
-    // Positional `open(file, mode, buffering, encoding, …)`.
-    if let Some(Object::Str(enc)) = args.get(3) {
-        if !file.binary {
+    if name_is_bytes {
+        file.name_is_bytes.set(true);
+    }
+    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
+    if !file.binary {
+        if let Some(Object::Str(enc)) = args.get(3) {
             file.set_encoding(enc);
+        }
+        if let Some(Object::Str(err)) = args.get(4) {
+            file.set_errors(err);
+        }
+        if let Some(Object::Str(nl)) = args.get(5) {
+            file.set_newline(Some(nl));
         }
     }
     Ok(Object::File(Rc::new(file)))
@@ -5349,6 +5500,27 @@ fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
         items: Rc::new(RefCell::new(buf)),
         index,
     }))))
+}
+
+fn b_enumerate_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // `enumerate(iterable, start=N)`: fold a `start` keyword into the
+    // positional form `b_enumerate` consumes (`args[1]`).
+    let mut ctor_args = args.to_vec();
+    for (k, v) in kwargs {
+        if k == "start" {
+            if ctor_args.len() >= 2 {
+                return Err(type_error(
+                    "enumerate() got multiple values for argument 'start'",
+                ));
+            }
+            ctor_args.push(v.clone());
+        } else {
+            return Err(type_error(format!(
+                "enumerate() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    b_enumerate(&ctor_args)
 }
 
 fn b_enumerate(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5863,6 +6035,22 @@ pub fn matches_classinfo(obj: &Object, info: &Object) -> Result<bool, RuntimeErr
     // `info` is a class whose metaclass overrides `__instancecheck__`,
     // route through it. Otherwise fall back to MRO inclusion.
     if let Object::Type(info_cls) = info {
+        // `os.PathLike` is a structural ABC (CPython `PathLike.__subclasshook__`):
+        // any object whose type defines `__fspath__` is an instance, even
+        // without explicit subclassing (e.g. the test suite's `FakePath`).
+        if Rc::ptr_eq(info_cls, &crate::stdlib::os::path_like_type()) {
+            return Ok(obj_class.lookup("__fspath__").is_some());
+        }
+        // Native streams (`Object::File`: `open()`, `io.BytesIO`,
+        // `io.StringIO`, the std streams) take the fast path and report their
+        // class as `object`, but behaviourally satisfy the `io` ABCs. CPython
+        // makes `isinstance(io.BytesIO(), io.BufferedIOBase)` true; mirror that
+        // (the `pathlib`/`io` suites assert it).
+        if let Object::File(f) = obj {
+            if let Some(m) = crate::stdlib::io::file_io_abc_match(f, info_cls) {
+                return Ok(m);
+            }
+        }
         let meta = info_cls.metaclass_or_type();
         if let Some(hook) = meta.lookup("__instancecheck__") {
             // We don't have a Vm handle here, so the dispatch path
@@ -10104,14 +10292,21 @@ fn bytearray_reverse(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // ---------- file methods ----------
 
-fn file_self(args: &[Object]) -> Result<Rc<crate::object::PyFile>, RuntimeError> {
+pub(crate) fn file_self(args: &[Object]) -> Result<Rc<crate::object::PyFile>, RuntimeError> {
     match args.first() {
         Some(Object::File(f)) => Ok(f.clone()),
+        // A subclass of `io.BytesIO`/`io.StringIO` is a `PyInstance` that
+        // wraps the native stream in `native`; unwrap so every inherited
+        // file method (read/write/seek/…) operates on the real buffer.
+        Some(Object::Instance(inst)) => match &inst.native {
+            Some(Object::File(f)) => Ok(f.clone()),
+            _ => Err(type_error("expected file receiver")),
+        },
         _ => Err(type_error("expected file receiver")),
     }
 }
 
-fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     let n = match args.get(1) {
         Some(Object::Int(i)) if *i >= 0 => Some(*i as usize),
@@ -10129,7 +10324,7 @@ fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `f.readinto(b)` — read up to `len(b)` bytes into a writable
 /// bytes-like object, returning the count actually read. Only reachable
 /// on binary-mode files (the method table gates on `f.binary`).
-fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     let target = match args.get(1) {
         Some(Object::ByteArray(b)) => b.clone(),
@@ -10156,7 +10351,7 @@ fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(n as i64))
 }
 
-fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     let mut out: Vec<u8> = Vec::new();
     loop {
@@ -10192,7 +10387,7 @@ pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     let mut lines: Vec<Object> = Vec::new();
     loop {
@@ -10210,21 +10405,48 @@ fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(lines))
 }
 
-fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     let data = args
         .get(1)
         .ok_or_else(|| type_error("write() expected 1 arg"))?;
     let n = match data {
-        Object::Str(s) => f.write_bytes(&f.encode_text(s)?)?,
-        Object::Bytes(b) => f.write_bytes(b)?,
-        Object::ByteArray(b) => f.write_bytes(&b.borrow())?,
+        Object::Str(s) => {
+            // A binary stream (`io.BytesIO`, `open(..., 'wb')`) rejects text,
+            // exactly like CPython's `BufferedWriter`/`BytesIO`.
+            if f.binary {
+                return Err(type_error("a bytes-like object is required, not 'str'"));
+            }
+            f.write_bytes(&f.encode_text(s)?)?
+        }
+        Object::Bytes(b) => {
+            if !f.binary {
+                return Err(type_error("string argument expected, got 'bytes'"));
+            }
+            f.write_bytes(b)?
+        }
+        Object::ByteArray(b) => {
+            if !f.binary {
+                return Err(type_error("string argument expected, got 'bytearray'"));
+            }
+            f.write_bytes(&b.borrow())?
+        }
+        // Any buffer-protocol object is accepted by a binary stream — CPython's
+        // `BufferedWriter.write`/`BytesIO.write` take `memoryview`/`array`/… via
+        // the buffer interface. `pathlib.Path.write_bytes` relies on this
+        // (it wraps the data in a `memoryview` before writing).
+        Object::MemoryView(mv) => {
+            if !f.binary {
+                return Err(type_error("string argument expected, got 'memoryview'"));
+            }
+            f.write_bytes(&mv.to_bytes())?
+        }
         _ => return Err(type_error("write() argument must be str or bytes")),
     };
     Ok(Object::Int(n as i64))
 }
 
-fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     let it = args
         .get(1)
@@ -10244,17 +10466,17 @@ fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-fn file_flush(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_flush(args: &[Object]) -> Result<Object, RuntimeError> {
     file_self(args)?.flush()?;
     Ok(Object::None)
 }
 
-fn file_close(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_close(args: &[Object]) -> Result<Object, RuntimeError> {
     file_self(args)?.close();
     Ok(Object::None)
 }
 
-fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     let offset = match args.get(1) {
         Some(Object::Int(i)) => *i as isize,
@@ -10268,22 +10490,68 @@ fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(f.seek(offset, whence)? as i64))
 }
 
-fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     Ok(Object::Int(f.position() as i64))
 }
 
-fn file_getvalue(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(file_self(args)?.isatty()))
+}
+
+pub(crate) fn file_fileno(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    if *f.closed.borrow() {
+        return Err(value_error("I/O operation on closed file"));
+    }
+    match f.fileno() {
+        Some(fd) => Ok(Object::Int(fd)),
+        // In-memory `BytesIO`/`StringIO` have no descriptor: CPython raises
+        // `io.UnsupportedOperation` (a subclass of OSError and ValueError).
+        None => Err(crate::stdlib::io::unsupported_op("fileno")),
+    }
+}
+
+pub(crate) fn file_readable(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(file_self(args)?.readable()))
+}
+
+pub(crate) fn file_writable(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(file_self(args)?.writable()))
+}
+
+pub(crate) fn file_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::Bool(file_self(args)?.seekable()))
+}
+
+pub(crate) fn file_getvalue(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     f.getvalue()
         .ok_or_else(|| type_error("getvalue() requires StringIO/BytesIO"))
 }
 
-fn file_enter(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_enter(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::File(file_self(args)?))
 }
 
-fn file_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn file_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython's `IOBase.__exit__` calls `self.close()`, dispatched through the
+    // instance MRO, so a subclass override runs (e.g. test_pathlib's
+    // `DummyPathIO.close` that flushes `getvalue()` into a dict on context
+    // exit). Mirror that: for a subclass *instance* invoke the resolved
+    // `close` (overridden or inherited) via the interpreter; the base native
+    // stream closes directly.
+    if let Some(self_obj @ Object::Instance(_)) = args.first() {
+        if let Some(method) = crate::instance_method(self_obj, "close") {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame live on this thread.
+                let interp = unsafe { &mut *ptr };
+                let globals = interp.builtins_dict();
+                interp.call_object_with_globals(&method, &[], &[], &globals)?;
+                return Ok(Object::None);
+            }
+        }
+    }
     file_self(args)?.close();
     Ok(Object::None)
 }
@@ -10324,21 +10592,99 @@ fn memoryview_release(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-fn memoryview_cast(args: &[Object]) -> Result<Object, RuntimeError> {
+fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let mv = memoryview_self(args)?;
-    if let Some(Object::Str(fmt)) = args.get(1) {
-        *mv.format.borrow_mut() = fmt.to_string();
-        // Itemsize: 1 for B/b, 2 for h/H, 4 for i/I/f, 8 for q/Q/d.
-        let item = match fmt.as_ref() {
-            "B" | "b" | "c" => 1,
-            "h" | "H" => 2,
-            "i" | "I" | "f" => 4,
-            "q" | "Q" | "d" => 8,
-            _ => 1,
-        };
-        mv.itemsize.set(item);
+    if mv.released.get() {
+        return Err(value_error(
+            "operation forbidden on released memoryview object",
+        ));
     }
-    Ok(Object::MemoryView(mv))
+    // `memoryview.cast(format[, shape])`: `format` is positional-or-keyword and
+    // `shape` (optional) reshapes the view for multi-dimensional indexing.
+    let mut format: Option<Object> = args.get(1).cloned();
+    let mut shape: Option<Object> = args.get(2).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "format" => format = Some(v.clone()),
+            "shape" => shape = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "'{other}' is an invalid keyword argument for cast()"
+                )));
+            }
+        }
+    }
+    // CPython restricts casts to C-contiguous views (`mv[::2].cast(...)`
+    // raises `TypeError: memoryview: casts are restricted to C-contiguous
+    // views`).
+    if !mv.is_c_contiguous() {
+        return Err(type_error(
+            "memoryview: casts are restricted to C-contiguous views",
+        ));
+    }
+    let Some(Object::Str(fmt)) = &format else {
+        return Err(type_error("memoryview: cast format must be a string"));
+    };
+    // Itemsize: 1 for B/b/c, 2 for h/H, 4 for i/I/f, 8 for q/Q/d/n/N/P.
+    let itemsize = match fmt.as_ref() {
+        "B" | "b" | "c" => 1,
+        "h" | "H" => 2,
+        "i" | "I" | "f" | "l" | "L" => 4,
+        "q" | "Q" | "d" | "n" | "N" | "P" => 8,
+        _ => {
+            return Err(value_error(
+                "memoryview: destination format must be a native single character format prefixed with an optional '@'",
+            ))
+        }
+    };
+    let nbytes = mv.len.get();
+    if nbytes % itemsize != 0 {
+        return Err(type_error(
+            "memoryview: length is not a multiple of itemsize",
+        ));
+    }
+    // Build the new shape. With no explicit `shape`, cast yields a flat
+    // `[nbytes / itemsize]` 1-D view; an explicit shape must agree on size.
+    let dims: Vec<usize> = match shape {
+        None => vec![nbytes / itemsize],
+        Some(shape_obj) => {
+            let items: Vec<Object> = match &shape_obj {
+                Object::List(items) => items.borrow().clone(),
+                Object::Tuple(items) => items.to_vec(),
+                _ => {
+                    return Err(type_error(
+                        "memoryview.cast(): shape must be a list or a tuple",
+                    ))
+                }
+            };
+            let mut dims = Vec::with_capacity(items.len());
+            for d in &items {
+                match d.as_i64() {
+                    Some(n) if n >= 0 => dims.push(n as usize),
+                    _ => {
+                        return Err(type_error(
+                            "memoryview.cast(): elements of shape must be integers",
+                        ))
+                    }
+                }
+            }
+            let prod: usize = dims.iter().product::<usize>().saturating_mul(itemsize);
+            if prod != nbytes {
+                return Err(type_error(
+                    "memoryview: product(shape) * itemsize != buffer size",
+                ));
+            }
+            dims
+        }
+    };
+    // A fresh view over the *same* buffer (shares the export); the original
+    // `mv` is left untouched, matching CPython's non-mutating `cast`.
+    let cast = mv.shallow_clone();
+    *cast.format.borrow_mut() = fmt.to_string();
+    cast.itemsize.set(itemsize);
+    *cast.strides.borrow_mut() = crate::object::c_contiguous_strides(&dims, itemsize);
+    *cast.shape.borrow_mut() = dims;
+    Ok(Object::MemoryView(Rc::new(cast)))
 }
 
 fn memoryview_hex(args: &[Object]) -> Result<Object, RuntimeError> {

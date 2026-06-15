@@ -16,7 +16,6 @@
 use crate::import::{FrozenSource, ModuleCache};
 
 pub mod ast_mod;
-pub mod base64_mod;
 pub mod binascii_mod;
 pub mod bz2_mod;
 pub mod codecs_mod;
@@ -24,10 +23,8 @@ pub mod csv_mod;
 pub mod datetime_mod;
 pub mod errno_mod;
 pub mod fcntl_mod;
-pub mod fnmatch_mod;
 pub mod functools_mod;
 pub mod gc_mod;
-pub mod glob_mod;
 pub mod gzip_mod;
 pub mod hashlib_mod;
 pub mod hmac_mod;
@@ -39,6 +36,7 @@ pub mod json;
 pub mod lzma_mod;
 pub mod marshal_mod;
 pub mod math;
+pub mod operator_accel;
 pub mod os;
 pub mod resource_mod;
 pub mod secrets_mod;
@@ -101,14 +99,11 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_socket", socket_mod::build);
     cache.register_builtin("_subprocess", subprocess_mod::build);
     cache.register_builtin("hashlib", hashlib_mod::build);
-    cache.register_builtin("hmac", hmac_mod::build);
-    cache.register_builtin("base64", base64_mod::build);
+    cache.register_builtin("_operator", operator_accel::build);
     cache.register_builtin("binascii", binascii_mod::build);
     cache.register_builtin("secrets", secrets_mod::build);
     cache.register_builtin("uuid", uuid_mod::build);
     cache.register_builtin("_tempfile", tempfile_mod::build);
-    cache.register_builtin("fnmatch", fnmatch_mod::build);
-    cache.register_builtin("glob", glob_mod::build);
     cache.register_builtin("_shutil", shutil_mod::build);
     cache.register_builtin("_functools", functools_mod::build);
     cache.register_builtin("_itertools", itertools_mod::build);
@@ -272,9 +267,28 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/string.py"),
             is_package: false,
         },
+        // `base64` is CPython's `Lib/base64.py` ported verbatim (pure Python
+        // over `binascii` + `struct` + `re`). It supersedes the old Rust
+        // `base64` module, which covered only RFC 3548 and ignored
+        // `altchars`/`validate`; the frozen copy adds a85/b85/z85 and the
+        // exact decode semantics `test_base64` checks.
+        FrozenSource {
+            name: "base64",
+            source: include_str!("python/base64_mod.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "platform",
             source: include_str!("python/platform.py"),
+            is_package: false,
+        },
+        // Verbatim CPython 3.13 `hmac`. The Rust shim it replaces could not
+        // satisfy `test_hmac`'s identity check (`hmac.compare_digest is
+        // _operator._compare_digest`) nor the full `HMAC` class surface;
+        // ported over `hashlib` + `_operator._compare_digest` instead.
+        FrozenSource {
+            name: "hmac",
+            source: include_str!("python/hmac.py"),
             is_package: false,
         },
         FrozenSource {
@@ -312,9 +326,24 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/contextlib.py"),
             is_package: false,
         },
+        // `pathlib` is CPython 3.13's verbatim package: the thin `__init__`
+        // re-exports `_abc` (the `PurePathBase`/`PathBase` ABCs the
+        // `test_pathlib_abc` suite drives) and `_local` (the concrete
+        // `PurePath`/`Path`/`PurePosixPath`/`PosixPath`/… classes). Ported
+        // wholesale rather than re-approximated (RFC 0038 WS-B).
         FrozenSource {
             name: "pathlib",
             source: include_str!("python/pathlib.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "pathlib._abc",
+            source: include_str!("python/pathlib_abc.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "pathlib._local",
+            source: include_str!("python/pathlib_local.py"),
             is_package: false,
         },
         FrozenSource {
@@ -408,6 +437,19 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "shutil",
             source: include_str!("python/shutil.py"),
+            is_package: false,
+        },
+        // `fnmatch` / `glob` — verbatim CPython 3.13 ports (replacing the
+        // earlier Rust shims). `glob` exposes the `_Globber`/`_StringGlobber`
+        // helpers that the 3.13 `pathlib` rewrite imports.
+        FrozenSource {
+            name: "fnmatch",
+            source: include_str!("python/fnmatch.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "glob",
+            source: include_str!("python/glob.py"),
             is_package: false,
         },
         FrozenSource {
@@ -789,6 +831,13 @@ fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         // Compression wrappers (RFC 0019).
+        // Shared buffered/decompress reader used by gzip/bz2/lzma (CPython
+        // `Lib/_compression.py`, ported verbatim).
+        FrozenSource {
+            name: "_compression",
+            source: include_str!("python/_compression.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "gzip",
             source: include_str!("python/gzip.py"),
@@ -1005,6 +1054,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
+            name: "gettext",
+            source: include_str!("python/gettext_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "optparse",
             source: include_str!("python/optparse_mod.py"),
             is_package: false,
@@ -1117,6 +1171,16 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "posix",
             source: include_str!("python/posix_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "nt",
+            source: include_str!("python/nt_mod.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_oswalk",
+            source: include_str!("python/_oswalk.py"),
             is_package: false,
         },
         FrozenSource {

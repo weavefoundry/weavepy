@@ -528,20 +528,54 @@ def cast(typ, val):
     return val
 
 
+# Registry of @overload-decorated functions, keyed
+# module -> qualname -> firstlineno -> function. Faithful port of
+# CPython 3.13's typing.overload machinery so get_overloads() works.
+_overload_registry = {}
+
+
+def _overload_dummy(*args, **kwds):
+    """Helper for @overload to raise when the implementation is called."""
+    raise NotImplementedError(
+        "You should not call an overloaded function. "
+        "A series of @overload-decorated functions "
+        "outside a stub module should always be followed "
+        "by an implementation that is not @overload-ed.")
+
+
 def overload(func):
-    """Marker decorator: the runtime simply returns a stub that
-    raises if called. Real implementations live under non-``@overload``
-    siblings."""
+    """Decorator for overloaded functions/methods.
 
-    def _stub(*args, **kwargs):
-        raise NotImplementedError(
-            f"You should not call an overloaded function. "
-            f"A series of @overload-decorated definitions must be "
-            f"followed by exactly one non-@overload-decorated definition."
-        )
+    The overloads for a function can be retrieved at runtime using the
+    get_overloads() function.
+    """
+    # classmethod and staticmethod
+    f = getattr(func, "__func__", func)
+    try:
+        mod = _overload_registry.setdefault(f.__module__, {})
+        qual = mod.setdefault(f.__qualname__, {})
+        qual[f.__code__.co_firstlineno] = func
+    except AttributeError:
+        # Not a normal function; ignore.
+        pass
+    return _overload_dummy
 
-    _stub.__name__ = getattr(func, "__name__", "overloaded")
-    return _stub
+
+def get_overloads(func):
+    """Return all defined overloads for *func* as a sequence."""
+    # classmethod and staticmethod
+    f = getattr(func, "__func__", func)
+    if f.__module__ not in _overload_registry:
+        return []
+    mod_dict = _overload_registry[f.__module__]
+    if f.__qualname__ not in mod_dict:
+        return []
+    return list(mod_dict[f.__qualname__].values())
+
+
+def clear_overloads():
+    """Clear all overloads in the registry."""
+    _overload_registry.clear()
 
 
 def get_type_hints(obj, globalns=None, localns=None, include_extras=False):
@@ -795,6 +829,8 @@ __all__ = [
     "runtime_checkable",
     "cast",
     "overload",
+    "get_overloads",
+    "clear_overloads",
     "get_type_hints",
     "get_origin",
     "get_args",

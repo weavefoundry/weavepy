@@ -46,6 +46,9 @@ def normcase(s):
 
 
 def isabs(s):
+    # Accept `os.PathLike` (e.g. `PureWindowsPath`) like CPython, which coerces
+    # with `os.fspath` before string-munging.
+    s = os.fspath(s)
     if isinstance(s, bytes):
         s = s.replace(b"/", b"\\")
         if s.startswith(b"\\\\"):
@@ -91,16 +94,91 @@ def join(path, *paths):
     return result_drive + result_path
 
 
-def splitdrive(p):
+def splitroot(p):
+    r"""Split a pathname into drive, root and tail.
+
+    The tail contains anything after the root. Faithful port of CPython
+    3.13's pure-Python ``ntpath.splitroot`` (handles drive letters, UNC
+    shares, device paths and the ``\\?\UNC\`` prefix)."""
+    p = os.fspath(p)
     if isinstance(p, bytes):
-        empty = b""
-        colon = b":"
+        sep = b'\\'
+        altsep = b'/'
+        colon = b':'
+        unc_prefix = b'\\\\?\\UNC\\'
+        empty = b''
     else:
-        empty = ""
-        colon = ":"
-    if len(p) >= 2 and p[1:2] == colon:
-        return p[:2], p[2:]
-    return empty, p
+        sep = '\\'
+        altsep = '/'
+        colon = ':'
+        unc_prefix = '\\\\?\\UNC\\'
+        empty = ''
+    normp = p.replace(altsep, sep)
+    if normp[:1] == sep:
+        if normp[1:2] == sep:
+            # UNC drives, e.g. \\server\share or \\?\UNC\server\share
+            # Device drives, e.g. \\.\device or \\?\device
+            start = 8 if normp[:8].upper() == unc_prefix else 2
+            index = normp.find(sep, start)
+            if index == -1:
+                return p, empty, empty
+            index2 = normp.find(sep, index + 1)
+            if index2 == -1:
+                return p, empty, empty
+            return p[:index2], p[index2:index2 + 1], p[index2 + 1:]
+        else:
+            # Relative path with root, e.g. \Windows
+            return empty, p[:1], p[1:]
+    elif normp[1:2] == colon:
+        if normp[2:3] == sep:
+            # Absolute drive-letter path, e.g. X:\Windows
+            return p[:2], p[2:3], p[3:]
+        else:
+            # Relative path with drive, e.g. X:Windows
+            return p[:2], empty, p[2:]
+    else:
+        # Relative path, e.g. Windows
+        return empty, empty, p
+
+
+def splitdrive(p):
+    """Split a pathname into drive/UNC sharepoint and relative path."""
+    drive, root, tail = splitroot(p)
+    return drive, root + tail
+
+
+_reserved_chars = frozenset(
+    {chr(i) for i in range(32)} |
+    {'"', '*', ':', '<', '>', '?', '|', '/', '\\'}
+)
+
+_reserved_names = frozenset(
+    {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$'} |
+    {f'COM{c}' for c in '123456789\xb9\xb2\xb3'} |
+    {f'LPT{c}' for c in '123456789\xb9\xb2\xb3'}
+)
+
+
+def isreserved(path):
+    """Return true if the pathname is reserved by the system."""
+    # Refer to "Naming Files, Paths, and Namespaces":
+    # https://docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+    path = os.fsdecode(splitroot(path)[2]).replace(altsep, sep)
+    return any(_isreservedname(name) for name in reversed(path.split(sep)))
+
+
+def _isreservedname(name):
+    """Return true if the filename is reserved by the system."""
+    # Trailing dots and spaces are reserved.
+    if name[-1:] in ('.', ' '):
+        return name not in ('.', '..')
+    # Wildcards, separators, colon, and pipe (*?"<>/\:|) are reserved.
+    # ASCII control characters (0-31) are reserved.
+    # Colon is reserved for file streams (e.g. "name:stream[:type]").
+    if _reserved_chars.intersection(name):
+        return True
+    # DOS device names are reserved (e.g. "nul" or "nul .txt").
+    return name.partition('.')[0].rstrip(' ').upper() in _reserved_names
 
 
 def split(p):

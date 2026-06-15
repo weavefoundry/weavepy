@@ -35,17 +35,33 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         let bt = crate::builtin_types::builtin_types();
 
-        let iobase = make_protocol("IOBase", vec![bt.object_.clone()]);
-        let raw_iobase = make_protocol("RawIOBase", vec![iobase.clone()]);
-        let buffered_iobase = make_protocol("BufferedIOBase", vec![iobase.clone()]);
-        let text_iobase = make_protocol("TextIOBase", vec![iobase.clone()]);
-        let fileio = make_protocol("FileIO", vec![raw_iobase.clone()]);
+        // Share the user-facing `io` module's IOBase hierarchy (RFC 0038) so
+        // `_io.IOBase` carries the same working mixin methods
+        // (`__enter__`/`__iter__`/`writelines`/…) and the two faces stay in
+        // lockstep.
+        let fam = crate::stdlib::io::build_iobase_family();
+        let iobase = fam.iobase.clone();
+        let raw_iobase = fam.raw.clone();
+        let buffered_iobase = fam.buffered.clone();
+        let text_iobase = fam.text.clone();
+        let fileio = fam.fileio.clone();
         install_closed_getset(&fileio);
-        let buffered_reader = make_protocol("BufferedReader", vec![buffered_iobase.clone()]);
-        let buffered_writer = make_protocol("BufferedWriter", vec![buffered_iobase.clone()]);
-        let buffered_random = make_protocol("BufferedRandom", vec![buffered_iobase.clone()]);
-        let buffered_rw = make_protocol("BufferedRWPair", vec![buffered_iobase.clone()]);
-        let text_io_wrapper = make_protocol("TextIOWrapper", vec![text_iobase.clone()]);
+        // Functional buffered wrappers (shared with the user-facing `io`
+        // module): `_io.BufferedWriter(_io.BytesIO())` actually wraps and
+        // delegates, so the stdlib's `from _io import BufferedWriter` paths
+        // (and stream-capture helpers built on them) work.
+        let buffered_reader =
+            crate::stdlib::io::make_buffered("BufferedReader", buffered_iobase.clone());
+        let buffered_writer =
+            crate::stdlib::io::make_buffered("BufferedWriter", buffered_iobase.clone());
+        let buffered_random =
+            crate::stdlib::io::make_buffered("BufferedRandom", buffered_iobase.clone());
+        let buffered_rw =
+            crate::stdlib::io::make_buffered("BufferedRWPair", buffered_iobase.clone());
+        // Functional `TextIOWrapper` (text layer over a binary buffer), shared
+        // with the user-facing `io` module so `from _io import TextIOWrapper`
+        // — used by CPython's `io.py` and the stdlib test harness — works.
+        let text_io_wrapper = crate::stdlib::io::make_text_io_wrapper(text_iobase.clone());
         let incremental_newline =
             make_protocol("IncrementalNewlineDecoder", vec![bt.object_.clone()]);
         let unsupported_op = make_protocol(
@@ -81,12 +97,21 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             Object::Int(8192),
         );
         d.insert(
+            DictKey(Object::from_static("text_encoding")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "text_encoding",
+                binds_instance: false,
+                call: Box::new(crate::stdlib::io::io_text_encoding),
+                call_kw: None,
+            })),
+        );
+        d.insert(
             DictKey(Object::from_static("open")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open",
                 binds_instance: false,
                 call: Box::new(io_open),
-                call_kw: None,
+                call_kw: Some(Box::new(io_open_kw)),
             })),
         );
         d.insert(
@@ -95,7 +120,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
                 name: "open_code",
                 binds_instance: false,
                 call: Box::new(io_open),
-                call_kw: None,
+                call_kw: Some(Box::new(io_open_kw)),
             })),
         );
     }
@@ -200,7 +225,200 @@ fn stub_method(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `_io.open` — delegates to the regular `open()` builtin via the VM
 /// (the call site routes through `builtin_constructor_for`). This is
 /// a thin shim so `from _io import open` works.
-fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
+/// Keyword-aware front door for [`io_open`]. CPython's signature is
+/// `open(file, mode='r', buffering=-1, encoding=None, errors=None,
+/// newline=None, closefd=True, opener=None)`; `tempfile` (and much user
+/// code) passes these by keyword. We fold the keywords back into the
+/// positional order `io_open` understands.
+pub(crate) fn io_open_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    const NAMES: [&str; 8] = [
+        "file",
+        "mode",
+        "buffering",
+        "encoding",
+        "errors",
+        "newline",
+        "closefd",
+        "opener",
+    ];
+    if args.len() > NAMES.len() {
+        return Err(type_error("open() takes at most 8 arguments"));
+    }
+    let mut slots: [Option<Object>; 8] = [None, None, None, None, None, None, None, None];
+    for (i, a) in args.iter().enumerate() {
+        slots[i] = Some(a.clone());
+    }
+    for (k, v) in kwargs {
+        match NAMES.iter().position(|n| n == k) {
+            Some(idx) => {
+                if slots[idx].is_some() {
+                    return Err(type_error(format!(
+                        "open() got multiple values for argument '{k}'"
+                    )));
+                }
+                slots[idx] = Some(v.clone());
+            }
+            None => {
+                return Err(type_error(format!(
+                    "open() got an unexpected keyword argument '{k}'"
+                )))
+            }
+        }
+    }
+    // `opener=` (CPython): call `fd = opener(file, flags)` and wrap the
+    // returned descriptor. `tempfile.NamedTemporaryFile`/`TemporaryFile`
+    // drive their open through this path, so honouring it is what makes
+    // those (and the many tests that lean on them) work.
+    let opener = slots[7].clone().filter(|o| !matches!(o, Object::None));
+    if let Some(opener) = opener {
+        let file_arg = slots[0].clone().unwrap_or(Object::None);
+        let mode = match &slots[1] {
+            Some(Object::Str(s)) => s.to_string(),
+            None | Some(Object::None) => "r".to_owned(),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "open() argument 'mode' must be str, not {}",
+                    other.type_name()
+                )))
+            }
+        };
+        crate::builtins::validate_open_mode(&mode)?;
+        let flags = open_flags_for_mode(&mode);
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+        // SAFETY: an enclosing VM frame on this thread published the
+        // pointer; the GIL keeps the reentrant access exclusive. Same
+        // pattern as `slot_call` in `builtins.rs`.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        let fd_obj = interp.call_object_with_globals(
+            &opener,
+            &[file_arg, Object::Int(flags)],
+            &[],
+            &globals,
+        )?;
+        let name = match &slots[0] {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        let file = file_from_fd(&fd_obj, &mode, name)?;
+        apply_text_config(
+            &file,
+            slots[3].as_ref(),
+            slots[4].as_ref(),
+            slots[5].as_ref(),
+        );
+        return Ok(file);
+    }
+
+    let last = slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+    let positional: Vec<Object> = slots[..last]
+        .iter()
+        .map(|s| s.clone().unwrap_or(Object::None))
+        .collect();
+    io_open(&positional)
+}
+
+/// Translate an `open()` mode string into WeavePy's (Linux-style) `os.open`
+/// flag bits, matching the constants exposed by the `os` module. Used only
+/// to hand a plausible `flags` value to a user `opener` callback.
+fn open_flags_for_mode(mode: &str) -> i64 {
+    const O_WRONLY: i64 = 1;
+    const O_RDWR: i64 = 2;
+    const O_CREAT: i64 = 64;
+    const O_EXCL: i64 = 128;
+    const O_TRUNC: i64 = 512;
+    const O_APPEND: i64 = 1024;
+    let mut flags = if mode.contains('+') {
+        O_RDWR
+    } else if mode.contains('w') || mode.contains('a') || mode.contains('x') {
+        O_WRONLY
+    } else {
+        0
+    };
+    if mode.contains('a') {
+        flags |= O_APPEND | O_CREAT;
+    }
+    if mode.contains('w') {
+        flags |= O_CREAT | O_TRUNC;
+    }
+    if mode.contains('x') {
+        flags |= O_CREAT | O_EXCL;
+    }
+    flags
+}
+
+/// Adopt an already-open OS file descriptor (e.g. produced by an `opener`
+/// callback or `os.open`) into a `PyFile`.
+fn file_from_fd(fd_obj: &Object, mode: &str, name: String) -> Result<Object, RuntimeError> {
+    let fd = match fd_obj {
+        Object::Int(n) => *n,
+        _ => return Err(type_error("opener returned a non-integer file descriptor")),
+    };
+    // A negative descriptor (e.g. a custom `opener` that returns -1) is an
+    // error, not a real fd — CPython's `FileIO` raises `ValueError: opener
+    // returned -1` rather than handing the bad fd to the OS.
+    if fd < 0 {
+        return Err(value_error(format!("opener returned {fd}")));
+    }
+    #[cfg(unix)]
+    {
+        use crate::object::{FileBackend, PyFile};
+        use std::os::unix::io::FromRawFd;
+        let fd = i32::try_from(fd).map_err(|_| value_error("file descriptor out of range"))?;
+        // SAFETY: ownership of the fd transfers to the new File; the
+        // descriptor came from `os.open`/`opener` and is closed exactly
+        // once when the PyFile drops.
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let display = if name.is_empty() {
+            fd.to_string()
+        } else {
+            name
+        };
+        Ok(Object::File(Rc::new(PyFile::new(
+            display,
+            mode,
+            FileBackend::Disk(f),
+        ))))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (mode, name);
+        Err(crate::error::runtime_error(
+            "file-descriptor open is only supported on Unix",
+        ))
+    }
+}
+
+/// When `open()` is called in text mode, push the explicit `encoding=`,
+/// `errors=`, and `newline=` settings onto the resulting text file (binary
+/// files ignore them). Mirrors the builtin `open()` plumbing so the
+/// `io.open` path (used by `pathlib`, `tempfile`, …) honours them too.
+fn apply_text_config(
+    file: &Object,
+    encoding: Option<&Object>,
+    errors: Option<&Object>,
+    newline: Option<&Object>,
+) {
+    let Object::File(f) = file else { return };
+    if f.binary {
+        return;
+    }
+    if let Some(Object::Str(enc)) = encoding {
+        f.set_encoding(enc);
+    }
+    if let Some(Object::Str(err)) = errors {
+        f.set_errors(err);
+    }
+    if let Some(Object::Str(nl)) = newline {
+        f.set_newline(Some(nl));
+    }
+}
+
+pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
     use crate::object::{FileBackend, PyFile};
     let path = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
@@ -214,8 +432,15 @@ fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let mode = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
-        _ => "r".to_owned(),
+        Some(Object::None) | None => "r".to_owned(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "open() argument 'mode' must be str, not {}",
+                other.type_name()
+            )))
+        }
     };
+    crate::builtins::validate_open_mode(&mode)?;
     // PEP 578 — `open(file, mode, flags)` audit event.
     crate::stdlib::sys::audit_event(
         "open",
@@ -238,11 +463,13 @@ fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         .create(writable || appending);
     let f = opts
         .open(&path)
-        .map_err(|e| crate::error::os_error(format!("{path}: {e}")))?;
+        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
     let backend = FileBackend::Disk(f);
-    let file = PyFile::new(path, mode, backend);
+    let file = Object::File(Rc::new(PyFile::new(path, mode, backend)));
     let _ = binary; // text decoding is handled by PyFile itself.
-    Ok(Object::File(Rc::new(file)))
+                    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
+    apply_text_config(&file, args.get(3), args.get(4), args.get(5));
+    Ok(file)
 }
 
 /// Public entry: ensure the `_io` types exist even before module

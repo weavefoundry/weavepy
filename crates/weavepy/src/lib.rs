@@ -328,6 +328,12 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
     // Do this whether the module returned normally or via `SystemExit`,
     // before the caller turns a `SystemExit` into a process exit.
     interpreter.run_shutdown_finalizers();
+    // Flush buffered stdout while the interpreter (and its sinks) are
+    // still alive. The CLI turns a `SystemExit` into `std::process::exit`,
+    // which skips Rust's end-of-main stdout flush, so without this an
+    // output-buffering `sys.exit()` run (e.g. a redirected unittest
+    // session) would lose its tail — or all of it, for sub-buffer output.
+    interpreter.flush_streams();
     result.map(|_| ())
 }
 

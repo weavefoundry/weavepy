@@ -46,6 +46,39 @@ pub struct DescrMeta {
 
 thread_local! {
     static DESCR_META: RefCell<HashMap<usize, DescrMeta>> = RefCell::new(HashMap::new());
+    /// `__module__` attribution for native builtin functions that do *not*
+    /// live in `builtins` (e.g. the `_operator` accelerator). Keyed by the
+    /// same pointer identity as [`DESCR_META`]. A builtin absent from this
+    /// table reports `__module__ == "builtins"` (CPython's default for an
+    /// un-attributed `builtin_function_or_method`). `pickle` relies on the
+    /// right answer: `operator.pow.__module__ == "_operator"` so
+    /// `getattr(_operator, "pow") is operator.pow`.
+    static BUILTIN_MODULE: RefCell<HashMap<usize, &'static str>> = RefCell::new(HashMap::new());
+}
+
+/// Attribute `obj` (a native builtin function) to module `module`, so its
+/// `__module__` reports that instead of the default `"builtins"`.
+pub fn register_module(obj: &Object, module: &'static str) {
+    let Some(k) = key(obj) else { return };
+    BUILTIN_MODULE.with(|m| {
+        m.borrow_mut().insert(k, module);
+    });
+}
+
+/// The module a builtin function was attributed to via [`register_module`],
+/// or `None` (→ caller uses `"builtins"`).
+pub fn module_of(obj: &Object) -> Option<&'static str> {
+    let k = key(obj)?;
+    BUILTIN_MODULE.with(|m| m.borrow().get(&k).copied())
+}
+
+/// As [`module_of`] but keyed directly off a `BuiltinFn` handle — used by the
+/// dispatch loop's by-name builtin fast-paths to tell a real `builtins`
+/// function apart from a same-named accelerator (e.g. `_operator.pow` must
+/// not hit the 3-arg modular `pow` fast-path).
+pub fn module_of_builtin(b: &Rc<crate::object::BuiltinFn>) -> Option<&'static str> {
+    let k = Rc::as_ptr(b).cast::<()>() as usize;
+    BUILTIN_MODULE.with(|m| m.borrow().get(&k).copied())
 }
 
 /// The pointer key for a descriptor object, or `None` if `obj` is not a

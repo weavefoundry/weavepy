@@ -1,3 +1,10 @@
+# weavepy-skip: windows
+#
+# `tempfile.mkstemp` (re-vendored from CPython in this conformance wave)
+# opens files through the raw file-descriptor `os.open` interface, which
+# WeavePy implements only on Unix today — `os.open`/`os.fdopen` raise
+# `NotImplementedError` on Windows. Until we wire up a Windows fd table,
+# this fixture is unix-only.
 import os
 import tempfile
 import shutil

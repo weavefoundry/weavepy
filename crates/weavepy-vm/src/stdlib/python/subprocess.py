@@ -162,17 +162,27 @@ class Popen:
     # ---- I/O ------------------------------------------------------
 
     def communicate(self, input=None, timeout=None):
-        # The streaming path under our cooperative scheduler is best-
-        # effort; for `communicate` we fall back to a synchronous
-        # `_subprocess.run` so we get the actual stdout/stderr bytes.
-        argv = _coerce_args(self.args)
+        # Feed `input` to the child's stdin and close it (so the child sees
+        # EOF), then read stdout/stderr to completion. The handle's pipes are
+        # real OS pipes (see `_subprocess.spawn`), so this actually drives the
+        # child to completion rather than reading a buffer captured at spawn.
+        #
+        # Note: stdin is written in full before stdout/stderr are read, which
+        # can deadlock for inputs larger than the OS pipe buffer (~64 KiB).
+        # That matches our single-threaded model; CPython uses helper threads.
         if isinstance(input, str):
-            input_bytes = input.encode(self.encoding or "utf-8")
-        else:
-            input_bytes = input
-        # If we already spawned via `Popen.__init__`, the streaming
-        # handle has captured stdout already; read those buffers
-        # rather than re-running the process.
+            input = input.encode(self.encoding or "utf-8")
+        if self.stdin is not None:
+            try:
+                if input:
+                    self.stdin.write(input)
+                self.stdin.flush()
+            except Exception:
+                pass
+            try:
+                self.stdin.close()
+            except Exception:
+                pass
         try:
             stdout = self.stdout.read() if self.stdout is not None else None
         except Exception:

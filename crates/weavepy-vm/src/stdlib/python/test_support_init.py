@@ -101,6 +101,64 @@ def control_characters_c0():
     return [chr(c) for c in range(0x00, 0x20)] + ["\x7F"]
 
 
+# The POSIX shell used by tests that shell out. ``None`` on platforms
+# without one (mirrors CPython's gate on win32/vxworks/apple-mobile).
+if sys.platform not in {"win32", "vxworks", "ios", "tvos", "watchos"}:
+    unix_shell = '/system/bin/sh' if is_android else '/bin/sh'
+else:
+    unix_shell = None
+
+
+def check_sanitizer(*, address=False, memory=False, ub=False, thread=False):
+    """Returns True if Python is compiled with sanitizer support.
+
+    Verbatim port of CPython 3.13's helper. WeavePy is a plain release
+    build with no ``-fsanitize`` flags, so this reads the (empty) sysconfig
+    CFLAGS and returns ``False`` — the sanitizer-gated tests run normally.
+    """
+    if not (address or memory or ub or thread):
+        raise ValueError('At least one of address, memory, ub or thread must be True')
+
+    import sysconfig
+    cflags = sysconfig.get_config_var('CFLAGS') or ''
+    config_args = sysconfig.get_config_var('CONFIG_ARGS') or ''
+    memory_sanitizer = (
+        '-fsanitize=memory' in cflags or
+        '--with-memory-sanitizer' in config_args
+    )
+    address_sanitizer = (
+        '-fsanitize=address' in cflags or
+        '--with-address-sanitizer' in config_args
+    )
+    ub_sanitizer = (
+        '-fsanitize=undefined' in cflags or
+        '--with-undefined-behavior-sanitizer' in config_args
+    )
+    thread_sanitizer = (
+        '-fsanitize=thread' in cflags or
+        '--with-thread-sanitizer' in config_args
+    )
+    return (
+        (memory and memory_sanitizer) or
+        (address and address_sanitizer) or
+        (ub and ub_sanitizer) or
+        (thread and thread_sanitizer)
+    )
+
+
+def skip_if_sanitizer(reason=None, *, address=False, memory=False, ub=False, thread=False):
+    """Decorator raising SkipTest if running with a sanitizer active."""
+    if not reason:
+        reason = 'not working with sanitizers active'
+    skip = check_sanitizer(address=address, memory=memory, ub=ub, thread=thread)
+    return unittest.skipIf(skip, reason)
+
+
+# gh-89363: True if fork() can hang if Python is built with Address Sanitizer
+# (ASAN): libasan race condition, dead lock in pthread_create().
+HAVE_ASAN_FORK_BUG = check_sanitizer(address=True)
+
+
 # Pull the helper submodules in so ``from test.support import os_helper``
 # and bare ``support.os_helper`` both work.
 from test.support import os_helper
@@ -163,6 +221,30 @@ use_resources = None
 
 # Verbosity. Tools (libregrtest, ``run_doctest``) flip this.
 verbose = 1
+
+
+def _force_run(path, func, *args):
+    """Run *func*; if it fails on a permission error, ``chmod`` *path* and retry.
+
+    Faithful port of CPython's ``test.support._force_run`` — the primitive
+    that lets ``os_helper.rmtree`` tear down trees containing mode-0
+    (inaccessible) directories created by tests like
+    ``test_pathlib`` / ``test_shutil``.
+    """
+    try:
+        return func(*args)
+    except FileNotFoundError as err:
+        # chmod() won't fix a missing file.
+        if verbose >= 2:
+            print('%s: %s' % (err.__class__.__name__, err))
+        raise
+    except OSError as err:
+        if verbose >= 2:
+            print('%s: %s' % (err.__class__.__name__, err))
+            print('re-run %s%r' % (func.__name__, args))
+        import stat
+        os.chmod(path, stat.S_IRWXU)
+        return func(*args)
 
 # Maximum memory a "bigmem" test may use, in bytes. 0 disables them.
 max_memuse = 0
@@ -890,18 +972,33 @@ SMALLEST = _SMALLEST()
 # Compression-module resource gates
 # ---------------------------------------------------------------------------
 
-def _requires_module(name):
+def requires_zlib(reason='requires zlib'):
     try:
-        __import__(name)
+        import zlib
     except ImportError:
-        return unittest.skip("requires %s" % name)
-    return _id
+        zlib = None
+    return unittest.skipUnless(zlib, reason)
 
+def requires_gzip(reason='requires gzip'):
+    try:
+        import gzip
+    except ImportError:
+        gzip = None
+    return unittest.skipUnless(gzip, reason)
 
-requires_zlib = _requires_module('zlib')
-requires_gzip = _requires_module('gzip')
-requires_bz2 = _requires_module('bz2')
-requires_lzma = _requires_module('lzma')
+def requires_bz2(reason='requires bz2'):
+    try:
+        import bz2
+    except ImportError:
+        bz2 = None
+    return unittest.skipUnless(bz2, reason)
+
+def requires_lzma(reason='requires lzma'):
+    try:
+        import lzma
+    except ImportError:
+        lzma = None
+    return unittest.skipUnless(lzma, reason)
 
 
 # ---------------------------------------------------------------------------
@@ -1389,3 +1486,6 @@ __all__ += ["open_urlresource", "SuppressCrashReport", "bigaddrspacetest",
             "TEST_DATA_DIR", "TEST_HOME_DIR", "skip_if_pgo_task", "Py_TRACE_REFS",
             "requires_mac_ver", "no_color", "force_not_colorized",
             "force_not_colorized_test_class", "linked_to_musl"]
+
+__all__ += ["check_sanitizer", "skip_if_sanitizer", "HAVE_ASAN_FORK_BUG",
+            "unix_shell"]

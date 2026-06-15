@@ -129,6 +129,14 @@ def _writable(buffer):
     if isinstance(buffer, memoryview):
         if buffer.readonly:
             raise TypeError("cannot modify read-only memory")
+        # `pack_into` needs a C-contiguous target; a strided view such as
+        # `mv[::2]` can't be written through (CPython's buffer request with
+        # `PyBUF_WRITABLE` fails on it). test_struct.test_pack_into asserts a
+        # TypeError here.
+        if not buffer.contiguous:
+            raise TypeError(
+                "memoryview: underlying buffer is not C-contiguous"
+            )
         return buffer
     if isinstance(buffer, (bytes, str)):
         raise TypeError(
