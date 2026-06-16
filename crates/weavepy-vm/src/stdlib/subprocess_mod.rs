@@ -115,30 +115,55 @@ fn run_call(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let mut child = cmd.spawn().map_err(|e| io_error_to_py(&e))?;
 
-    if let (Some(data), Some(mut stdin)) = (stdin_bytes, child.stdin.take()) {
-        use std::io::Write;
-        stdin.write_all(&data).map_err(|e| io_error_to_py(&e))?;
-        drop(stdin);
-    }
-
-    let mut out_bytes: Vec<u8> = Vec::new();
-    let mut err_bytes: Vec<u8> = Vec::new();
-    if let Some(mut s) = child.stdout.take() {
-        s.read_to_end(&mut out_bytes)
-            .map_err(|e| io_error_to_py(&e))?;
-    }
-    if let Some(mut s) = child.stderr.take() {
-        s.read_to_end(&mut err_bytes)
-            .map_err(|e| io_error_to_py(&e))?;
-    }
+    // Drain stdin/stdout/stderr concurrently. A child that fills one
+    // pipe blocks until we read it, so writing all of stdin before
+    // reading any output — or reading one output stream to EOF before
+    // the other — can deadlock once a pipe's kernel buffer (~64 KiB)
+    // fills. Reader/writer threads mirror CPython's `communicate()`.
+    let stdin_join = match (stdin_bytes, child.stdin.take()) {
+        (Some(data), Some(mut stdin)) => Some(std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&data);
+            // Dropping `stdin` here closes the write end → EOF to child.
+        })),
+        _ => None,
+    };
+    let out_join = child
+        .stdout
+        .take()
+        .map(|mut s| std::thread::spawn(move || read_pipe_to_end(&mut s)));
+    let err_join = child
+        .stderr
+        .take()
+        .map(|mut s| std::thread::spawn(move || read_pipe_to_end(&mut s)));
 
     let status = wait_with_timeout(&mut child, timeout)?;
+
+    if let Some(h) = stdin_join {
+        let _ = h.join();
+    }
+    let out_bytes = out_join.map(join_reader).unwrap_or_default();
+    let err_bytes = err_join.map(join_reader).unwrap_or_default();
     let rc = status_code(status);
     Ok(Object::new_tuple(vec![
         Object::Int(rc),
         Object::new_bytes(out_bytes),
         Object::new_bytes(err_bytes),
     ]))
+}
+
+/// Read a child pipe to EOF, returning the bytes. Best-effort: a read
+/// error yields whatever was buffered so far (matching CPython's
+/// `communicate`, which tolerates a partially-read pipe on child death).
+fn read_pipe_to_end<R: Read>(reader: &mut R) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = reader.read_to_end(&mut buf);
+    buf
+}
+
+/// Join a reader thread, defaulting to empty bytes if it panicked.
+fn join_reader(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
 }
 
 /// Block-wait on `child` until exit, honouring `timeout` if any.

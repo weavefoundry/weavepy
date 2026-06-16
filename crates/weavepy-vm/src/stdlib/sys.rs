@@ -156,6 +156,16 @@ pub fn build_with_state(
             DictKey(Object::from_static("getprofile")),
             builtin("getprofile", sys_getprofile),
         );
+        // Internal hooks behind `threading.settrace_all_threads` /
+        // `setprofile_all_threads` (PEP 669-adjacent, gh-93503).
+        d.insert(
+            DictKey(Object::from_static("_settraceallthreads")),
+            builtin("_settraceallthreads", sys_settraceallthreads),
+        );
+        d.insert(
+            DictKey(Object::from_static("_setprofileallthreads")),
+            builtin("_setprofileallthreads", sys_setprofileallthreads),
+        );
         d.insert(
             DictKey(Object::from_static("getsizeof")),
             builtin("getsizeof", sys_getsizeof),
@@ -429,11 +439,18 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             Object::List(cache.argv.clone()),
         );
 
-        // Static identity.
+        // Static identity. Shaped like CPython's `sys.version`
+        // (`VERSION (buildno[, date[, time]]) [compiler]`) so
+        // `platform._sys_version()` — used by `platform`,
+        // `sysconfig`, `wsgiref`, and large parts of `test.support`
+        // — parses it instead of raising `ValueError`. The build/
+        // compiler tokens are tagged `WeavePy`; `python_implementation()`
+        // still reports `CPython` (no PyPy/Jython/IronPython marker), so
+        // implementation-gated stdlib tests behave as on CPython.
         d.insert(
             DictKey(Object::from_static("version")),
             Object::from_str(format!(
-                "{}.{}.{} (WeavePy)",
+                "{}.{}.{} (WeavePy) [WeavePy]",
                 PY_VERSION.0, PY_VERSION.1, PY_VERSION.2
             )),
         );
@@ -992,6 +1009,18 @@ fn sys_setprofile(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+fn sys_settraceallthreads(args: &[Object]) -> Result<Object, RuntimeError> {
+    let hook = args.first().cloned().unwrap_or(Object::None);
+    crate::trace::set_trace_all_threads(hook);
+    Ok(Object::None)
+}
+
+fn sys_setprofileallthreads(args: &[Object]) -> Result<Object, RuntimeError> {
+    let hook = args.first().cloned().unwrap_or(Object::None);
+    crate::trace::set_profile_all_threads(hook);
+    Ok(Object::None)
+}
+
 fn sys_gettrace(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(crate::trace::trace_hook().unwrap_or(Object::None))
 }
@@ -1430,7 +1459,7 @@ fn stdlib_module_names_value() -> Object {
     ] {
         set.insert(DictKey(Object::from_static(n)));
     }
-    Object::FrozenSet(Rc::new(set))
+    Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(set)))
 }
 
 /// `sys.getrefcount(obj)` — best-effort, derived from the real

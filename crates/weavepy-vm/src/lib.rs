@@ -693,6 +693,17 @@ impl Interpreter {
         self.call(callable, args, kwargs, globals)
     }
 
+    /// `repr(v)` against the interpreter's builtins — the same path the
+    /// `repr()` builtin and `{v!r}` f-strings take. Worker threads use
+    /// this to format `Exception ignored in thread started by <func>`
+    /// identically to CPython.
+    pub fn repr_object(&mut self, v: &Object) -> Result<String, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let globals = self.builtins.clone();
+        self.repr_of(v, &globals)
+    }
+
     /// Apply a binary operator to two objects, dispatching the full
     /// `__op__`/`__rop__` protocol exactly as the `BINARY_OP` bytecode would.
     /// Backs the `_operator` accelerator (`operator.add`, …) so those
@@ -847,6 +858,11 @@ impl Interpreter {
         name: &str,
         file: Option<&str>,
     ) -> Result<Object, RuntimeError> {
+        // RFC 0039: the OS thread that runs the top-level module is the
+        // `_thread.interrupt_main()` / SIGINT target. Idempotent — the
+        // first caller (the real main thread) wins, so the in-process
+        // conformance runner's repeated `run_module` calls don't move it.
+        crate::gil::mark_main_thread();
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
@@ -908,15 +924,22 @@ impl Interpreter {
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
                 !g.is_finished()
             }
-            _ => return,
+            // Containers (dict/list/set/tuple/bound method/…) carry no
+            // finalizer, but a *tracked* one may still need prompt
+            // reclamation — see the `tracked && !finalizable` arm below.
+            _ => false,
         };
         let id = crate::weakref_registry::id_of(&dropped);
         let watched = crate::weakref_registry::count_for(id) > 0;
-        if !finalizable && !watched {
+        let tracked = gc_trace::is_tracked(id);
+        // Nothing parked on this object needs prompt handling: no
+        // finalizer to run, no weakref to clear, and no cycle-GC strong
+        // handle pinning it. Ordinary `Rc` drop reclaims it.
+        if !finalizable && !watched && !tracked {
             return;
         }
         let strong = gc_trace::strong_count_for(&dropped);
-        let registry_holds = usize::from(gc_trace::is_tracked(id));
+        let registry_holds = usize::from(tracked);
         let weak_clones = crate::weakref_registry::strong_clone_count(id);
         // `dropped` itself accounts for one reference.
         if strong > 1 + registry_holds + weak_clones {
@@ -934,6 +957,75 @@ impl Interpreter {
             self.run_pending_finalizers();
         }
         crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(id));
+        self.run_pending_finalizers();
+        // RFC 0039 (WS4): a dead, *acyclic*, non-finalizable tracked
+        // object (a dict/list/set/tuple/bound method/plain instance whose
+        // last program reference just went away) would otherwise linger
+        // in the cycle collector's tracked set: its strong handle keeps
+        // it — and everything it transitively references — alive until
+        // the next collection, which a quiescing interpreter may never
+        // run. The refcount test above already proved it is not part of a
+        // reference cycle (a self/mutual reference would inflate
+        // `strong`), so untracking it here is sound: `dropped` is the
+        // last reference, and dropping it on return reclaims the object
+        // by refcount and releases its children — exactly CPython's
+        // prompt `tp_dealloc`. Finalizable objects keep their handle (its
+        // `finalized` flag guards against a double `__del__` from a later
+        // collection).
+        if tracked && !finalizable {
+            gc_trace::with_state(|s| s.untrack_id(id));
+        }
+    }
+
+    /// Emulate CPython deleting a terminating thread's thread-state
+    /// dict: drop `ident`'s slot from every `_threading_local.local`.
+    /// Run from the native worker teardown (`spawn_python_worker`) the
+    /// instant a worker's target returns, while the worker still holds
+    /// the GIL. This is what lets a `threading._DummyThread` created by
+    /// a *foreign* thread be removed from `threading._active` when that
+    /// thread exits (`test_threading.test_foreign_thread`): the dummy's
+    /// `_DeleteDummyThreadOnDel` is parked in thread-local storage, and
+    /// clearing the slot finalizes it, which pops the dummy from
+    /// `_active`. No-op when `_threading_local` was never imported.
+    pub fn run_thread_local_death_cleanup(&mut self, ident: i64) {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let Some(module) = self.cache.get("_threading_local") else {
+            return;
+        };
+        let func = match &module {
+            Object::Module(m) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("_clear_thread")))
+                .cloned(),
+            _ => None,
+        };
+        let Some(func) = func else {
+            return;
+        };
+        let globals = self.builtins.clone();
+        let cleared = match self.call(&func, &[Object::Int(ident)], &[], &globals) {
+            Ok(v) => matches!(v, Object::Int(n) if n > 0),
+            Err(err) => {
+                let is_exit = matches!(&err,
+                    RuntimeError::PyException(exc) if exc.system_exit_code().is_some());
+                if !is_exit {
+                    let context_repr = func.repr();
+                    self.write_unraisable(&err, &func, &context_repr);
+                }
+                false
+            }
+        };
+        // Only pay for a collection when this thread actually parked
+        // thread-local data. The slot we just detached is now unreachable
+        // acyclic garbage; a collection finalizes it now (running e.g.
+        // `_DeleteDummyThreadOnDel.__del__`, which pops the dummy from
+        // `threading._active`) instead of deferring to the next
+        // allocation-driven GC, which a quiescing interpreter may never hit.
+        if cleared {
+            crate::gc_trace::collect_all();
+        }
         self.run_pending_finalizers();
     }
 
@@ -965,6 +1057,64 @@ impl Interpreter {
                 if let Err(err) = self.call(&cb, std::slice::from_ref(&wr), &[], &globals) {
                     let context_repr = wr.repr();
                     self.write_unraisable(&err, &wr, &context_repr);
+                }
+            }
+        }
+    }
+
+    /// CPython's `Py_FinalizeEx` shutdown prologue, in order:
+    ///
+    /// 1. `wait_for_thread_shutdown()` — if `threading` was imported,
+    ///    call `threading._shutdown()`, which runs the
+    ///    `threading._register_atexit` callbacks and then **joins every
+    ///    non-daemon thread**. A `SystemExit` from a worker is swallowed
+    ///    by the worker; any other failure of `_shutdown()` itself is
+    ///    reported through the unraisable hook against the `threading`
+    ///    module (matching `PyErr_WriteUnraisable(threading)`).
+    /// 2. `_PyAtExit_Call()` — run the `atexit` module's registered
+    ///    callbacks in LIFO order, each error routed through the
+    ///    unraisable hook.
+    ///
+    /// Runs before [`Self::run_shutdown_finalizers`] (which flips
+    /// `sys.is_finalizing()` and runs `__del__` for everything still
+    /// alive), so non-daemon threads have finished and atexit output is
+    /// produced before the interpreter tears down.
+    pub fn run_interpreter_shutdown(&mut self) {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        // (1) threading._shutdown() — only when threading was imported,
+        // exactly like CPython's `wait_for_thread_shutdown`.
+        if let Some(threading) = self.cache.get("threading") {
+            let shutdown = match &threading {
+                Object::Module(m) => m
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("_shutdown")))
+                    .cloned(),
+                _ => None,
+            };
+            if let Some(shutdown) = shutdown {
+                let globals = self.builtins.clone();
+                if let Err(err) = self.call(&shutdown, &[], &[], &globals) {
+                    let is_exit = matches!(&err,
+                        RuntimeError::PyException(exc) if exc.system_exit_code().is_some());
+                    if !is_exit {
+                        let context_repr = threading.repr();
+                        self.write_unraisable(&err, &threading, &context_repr);
+                    }
+                }
+            }
+        }
+        // (2) atexit callbacks (LIFO). `atexit` collects them in a
+        // thread-local; drain and run each with the live interpreter.
+        for (func, args, kwargs) in crate::stdlib::atexit_mod::take_handlers() {
+            let globals = self.builtins.clone();
+            if let Err(err) = self.call(&func, &args, &kwargs, &globals) {
+                let is_exit = matches!(&err,
+                    RuntimeError::PyException(exc) if exc.system_exit_code().is_some());
+                if !is_exit {
+                    let context_repr = func.repr();
+                    self.write_unraisable(&err, &func, &context_repr);
                 }
             }
         }
@@ -1123,6 +1273,22 @@ impl Interpreter {
     /// prints `Exception ignored in: <context>` plus the traceback to
     /// stderr and swallows the error so it can't change the exit status.
     fn write_unraisable(&mut self, err: &RuntimeError, object: &Object, context_repr: &str) {
+        self.write_unraisable_msg(err, object, context_repr, None);
+    }
+
+    /// Like [`Self::write_unraisable`] but with an explicit `err_msg`
+    /// (CPython's `PyErr_FormatUnraisable`). The low-level
+    /// `_thread.start_new_thread` reports an uncaught worker exception as
+    /// `Exception ignored in thread started by <func>` with a `None`
+    /// object — distinct from `threading.Thread`, which routes through
+    /// `threading.excepthook`.
+    pub fn write_unraisable_msg(
+        &mut self,
+        err: &RuntimeError,
+        object: &Object,
+        context_repr: &str,
+        err_msg: Option<&str>,
+    ) {
         let (exc_value, exc_type, traceback) = match err {
             RuntimeError::PyException(pyexc) => {
                 let inst = pyexc.instance.clone();
@@ -1170,15 +1336,21 @@ impl Interpreter {
         };
         if !is_default {
             if let Some(hook) = hook {
-                let args_obj = self.make_unraisable_args(&exc_type, &exc_value, object);
+                let args_obj = self.make_unraisable_args(&exc_type, &exc_value, object, err_msg);
                 let outer = self.builtins_dict();
                 if self.call(&hook, &[args_obj], &[], &outer).is_err() {
-                    self.print_unraisable_default(&exc_value, &traceback, context_repr, true);
+                    self.print_unraisable_default(
+                        &exc_value,
+                        &traceback,
+                        context_repr,
+                        true,
+                        err_msg,
+                    );
                 }
                 return;
             }
         }
-        self.print_unraisable_default(&exc_value, &traceback, context_repr, false);
+        self.print_unraisable_default(&exc_value, &traceback, context_repr, false, err_msg);
     }
 
     /// Build the `UnraisableHookArgs`-shaped object passed to a custom
@@ -1189,6 +1361,7 @@ impl Interpreter {
         exc_type: &Object,
         exc_value: &Object,
         object: &Object,
+        err_msg: Option<&str>,
     ) -> Object {
         let mut d = DictData::new();
         d.insert(DictKey(Object::from_static("exc_type")), exc_type.clone());
@@ -1206,7 +1379,11 @@ impl Interpreter {
             _ => Object::None,
         };
         d.insert(DictKey(Object::from_static("exc_traceback")), tb);
-        d.insert(DictKey(Object::from_static("err_msg")), Object::None);
+        let err_msg_obj = match err_msg {
+            Some(m) => Object::from_str(m.to_owned()),
+            None => Object::None,
+        };
+        d.insert(DictKey(Object::from_static("err_msg")), err_msg_obj);
         d.insert(DictKey(Object::from_static("object")), object.clone());
         Object::SimpleNamespace(Rc::new(RefCell::new(d)))
     }
@@ -1220,16 +1397,25 @@ impl Interpreter {
         traceback: &[crate::error::TracebackEntry],
         context_repr: &str,
         hook_failed: bool,
+        err_msg: Option<&str>,
     ) {
         use std::io::Write;
         let mut s = String::new();
         if hook_failed {
             s.push_str("Exception ignored in sys.unraisablehook: ");
+            s.push_str(context_repr);
+            s.push('\n');
+        } else if let Some(msg) = err_msg {
+            // CPython's `PyErr_FormatUnraisable`: the formatted message
+            // already names the context (e.g. the thread's target), so
+            // it replaces the generic `Exception ignored in:` header.
+            s.push_str(msg);
+            s.push_str(":\n");
         } else {
             s.push_str("Exception ignored in: ");
+            s.push_str(context_repr);
+            s.push('\n');
         }
-        s.push_str(context_repr);
-        s.push('\n');
         if !traceback.is_empty() {
             s.push_str("Traceback (most recent call last):\n");
             for e in traceback {
@@ -1548,6 +1734,20 @@ impl Interpreter {
                 )));
             }
         };
+        if std::env::var_os("WP_DBG_SAMPLE").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CALLS: AtomicU64 = AtomicU64::new(0);
+            let n = CALLS.fetch_add(1, Ordering::Relaxed);
+            if n % 2_000 == 0 {
+                eprintln!(
+                    "[WP_SAMPLE n={}] depth={} qualname={} file={}",
+                    n,
+                    crate::recursion::current_depth(),
+                    frame.code.qualname,
+                    frame.code.filename,
+                );
+            }
+        }
         // Captured before `sent` is consumed below; only the tier-2
         // entry guard reads it, so it's gated to the `jit` feature to
         // stay warning-free in default builds.
@@ -1631,6 +1831,12 @@ impl Interpreter {
             }
         }
         let result = loop {
+            // RFC 0039 (WS2): cooperative GIL hand-off. Cheap
+            // thread-local countdown in the common case; drops and
+            // re-acquires the GIL every ~128 opcodes when another
+            // thread is blocked waiting for it, so compute-bound
+            // threads can't starve the rest.
+            crate::gil::periodic_gil_checkpoint();
             // Mirror the live `pc` into the snapshot so `f_lineno`
             // reads correctly when user code introspects via
             // `sys._getframe`.
@@ -1674,7 +1880,23 @@ impl Interpreter {
                     self.fire_opcode_event(&py_frame)?;
                 }
             }
-            match self.step(frame) {
+            // RFC 0039: service pending signals (`_thread.interrupt_main`,
+            // `signal.raise_signal`) on the main thread — the Rust
+            // analogue of CPython's `PyErr_CheckSignals`. The probe is a
+            // single relaxed load, so the no-signal path — i.e. nearly
+            // always — stays free. Feeding any handler-raised error
+            // through the same arm as `step`'s `Err` keeps it catchable
+            // by a surrounding `try/except`, exactly as CPython.
+            let stepped =
+                if crate::stdlib::signal_mod::signals_pending() && crate::gil::is_main_thread() {
+                    match self.run_pending_signals(&py_frame) {
+                        Ok(()) => self.step(frame),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    self.step(frame)
+                };
+            match stepped {
                 Ok(StepOutcome::Continue) => {}
                 Ok(StepOutcome::Return(v)) => {
                     if crate::trace::any_observers_active() {
@@ -2216,6 +2438,63 @@ impl Interpreter {
         Ok(())
     }
 
+    /// RFC 0039: run handlers for any tripped signals — the Rust
+    /// analogue of CPython's `PyErr_CheckSignals`. The dispatch loop
+    /// calls this on the main thread when a signal is pending. Each
+    /// tripped signal's disposition is consulted: `SIG_DFL` (0) and
+    /// `SIG_IGN` (1) are no-ops (CPython only raises on a *default*
+    /// SIGINT because it installs the `default_int_handler` callable at
+    /// startup — which we model, so it lands in the callable arm), while
+    /// a Python handler is invoked `handler(signum, frame)`. Any
+    /// exception it raises propagates through the dispatch loop's normal
+    /// error path, so it stays catchable by a surrounding `try/except`.
+    fn run_pending_signals(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        for signum in crate::stdlib::signal_mod::take_tripped() {
+            let handler = crate::stdlib::signal_mod::handler_for(signum);
+            match handler {
+                Object::Int(_) => {}
+                callable => {
+                    let globals = self.builtins.clone();
+                    self.call(
+                        &callable,
+                        &[
+                            Object::Int(i64::from(signum)),
+                            Object::Frame(py_frame.clone()),
+                        ],
+                        &[],
+                        &globals,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Service pending OS signals from outside the bytecode loop — e.g.
+    /// a blocking `lock.acquire()` on the main thread that woke on
+    /// `EINTR` (RFC 0039 `test_threadsignals`). Runs each tripped
+    /// signal's Python handler with `frame=None`; a handler that raises
+    /// (e.g. `KeyboardInterrupt`) propagates to the caller so the
+    /// blocking call is abandoned with that exception.
+    pub fn run_pending_signals_public(&mut self) -> Result<(), RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        for signum in crate::stdlib::signal_mod::take_tripped() {
+            let handler = crate::stdlib::signal_mod::handler_for(signum);
+            if let Object::Int(_) = handler {
+                continue;
+            }
+            let globals = self.builtins.clone();
+            self.call(
+                &handler,
+                &[Object::Int(i64::from(signum)), Object::None],
+                &[],
+                &globals,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Fire the `'line'` event when the source line changes.
     fn fire_line_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
         let frame_trace = py_frame.trace.borrow().clone();
@@ -2568,6 +2847,13 @@ impl Interpreter {
                         return Err(Self::unbound_local(&name));
                     }
                     let old = std::mem::replace(&mut frame.locals[slot], Object::Unbound);
+                    // Refresh the live-locals mirror *now* so its phantom
+                    // clone of the slot we just emptied doesn't mask the
+                    // binding's removal from `prompt_reap_dropped`'s
+                    // refcount test. The mirror is otherwise only re-synced
+                    // at the next loop step — too late for a finalizer or
+                    // weakref that should fire on this `del`.
+                    self.sync_py_locals(frame);
                     self.prompt_reap_dropped(old);
                 }
             }
@@ -5836,6 +6122,50 @@ impl Interpreter {
                         return Ok(v);
                     }
                 }
+            }
+            // `object.__repr__` / `object.__str__` are identity slots that
+            // WeavePy keeps as native behaviour rather than type-dict
+            // entries, so the MRO walk above can't find them. CPython's
+            // `super_getattro` resolves them to `object`'s slot wrappers
+            // (`object_repr` / `object_str`); mirror that so
+            // `super().__repr__()` / `super().__str__()` delegate to the
+            // base implementation instead of falling through to the super
+            // proxy's *own* repr. `__repr__` is the non-virtual
+            // `<Cls object at 0x…>` (computed here directly); `__str__` is
+            // `PyObject_Repr(self)` (a *virtual* repr dispatch), routed via
+            // the `.object_str` sentinel that `Interpreter::call`
+            // intercepts. Only pure-Python receivers reach here — built-in
+            // bases (`dict`, `list`, …) were already served by the native
+            // payload probe just above.
+            if matches!(name, "__repr__" | "__str__") {
+                let func = if name == "__repr__" {
+                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                        name: "__repr__",
+                        binds_instance: true,
+                        call: Box::new(|args: &[Object]| {
+                            let o = args.first().ok_or_else(|| {
+                                type_error("__repr__() takes exactly one argument (0 given)")
+                            })?;
+                            Ok(Object::from_str(object_base_repr_string(o)))
+                        }),
+                        call_kw: None,
+                    }))
+                } else {
+                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                        name: ".object_str",
+                        binds_instance: true,
+                        call: Box::new(|_| {
+                            Err(crate::error::runtime_error(
+                                "object.__str__ must be dispatched via Interpreter::call",
+                            ))
+                        }),
+                        call_kw: None,
+                    }))
+                };
+                return Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+                    receiver.clone(),
+                    func,
+                ))));
             }
             // Not found along the delegated MRO: fall through to normal
             // resolution so the proxy's *own* attributes (`__init__`,
@@ -13678,12 +14008,11 @@ impl Interpreter {
                 _ => {}
             }
         }
-        if inst
+        let removed = inst
             .dict
             .borrow_mut()
-            .shift_remove(&DictKey(Object::from_str(name)))
-            .is_none()
-        {
+            .shift_remove(&DictKey(Object::from_str(name)));
+        let Some(removed) = removed else {
             // Slots class: a name resolving on the class (non-data
             // descriptor) is "read-only", like the store path.
             if inst.cls().forbids_dict && inst.cls().lookup(name).is_some() {
@@ -13694,7 +14023,15 @@ impl Interpreter {
                 )));
             }
             return Err(crate::error::attribute_error_named(obj, name));
-        }
+        };
+        // CPython decrefs the detached value immediately; if that was its
+        // last reference its `tp_dealloc` runs now (`__del__`, weakref
+        // clearing) and any dead acyclic container it held is reclaimed.
+        // Emulate that prompt death so e.g. `Thread.run`'s
+        // `del self._target, self._args, self._kwargs` releases the
+        // thread's hold on its argument cycle without waiting for a GC
+        // pass (`test_threading.test_no_refcycle_through_target`).
+        self.prompt_reap_dropped(removed);
         Ok(())
     }
 
@@ -15185,6 +15522,21 @@ impl Interpreter {
                             }
                             // CPython: `object.__reduce__` == `common_reduce(self, 0)`.
                             return self.object_default_reduce(&bm.receiver, 0, outer_globals);
+                        }
+                        // `super().__str__()` resolving to `object.__str__`:
+                        // CPython `object_str` is `PyObject_Repr(self)`, a
+                        // *virtual* repr dispatch (so a subclass `__repr__`
+                        // is honoured). Routed through this sentinel because
+                        // it needs VM access to re-enter `__repr__`.
+                        ".object_str" => {
+                            if !args.is_empty() {
+                                return Err(type_error(format!(
+                                    "__str__() takes no arguments ({} given)",
+                                    args.len()
+                                )));
+                            }
+                            let s = self.repr_of(&bm.receiver, outer_globals)?;
+                            return Ok(Object::from_str(s));
                         }
                         // `<builtin-iterator>.__reduce__()` — reduce to
                         // `(iter, (remaining_items,))` so the iterator
@@ -17192,6 +17544,22 @@ impl Interpreter {
                 "weakref" => {
                     return crate::stdlib::weakref_real::construct_ref(args, kwargs);
                 }
+                // RFC 0039: `threading.Lock` is `_thread.LockType`, so
+                // calling the `lock`/`RLock` type must construct a working
+                // lock (CPython's `LockType()` / `RLock()`), not a bare
+                // instance missing the `acquire`/`release` closures.
+                "lock" => {
+                    // CPython's `_thread.LockType` constructor takes no
+                    // arguments (`threading.Lock(1)` / `Lock(a=1)` raise
+                    // TypeError).
+                    if !args.is_empty() || !kwargs.is_empty() {
+                        return Err(type_error("lock() takes no arguments"));
+                    }
+                    return Ok(crate::stdlib::thread_real::new_lock_object());
+                }
+                "RLock" => {
+                    return Ok(crate::stdlib::thread_real::new_rlock_object());
+                }
                 // `types.TracebackType(tb_next, tb_frame, tb_lasti,
                 // tb_lineno)` — explicitly constructible since 3.7.
                 "traceback" => {
@@ -18000,9 +18368,12 @@ impl Interpreter {
             match slot {
                 Some(slot) => {
                     if filled[slot] {
+                        // CPython renders these argument-binding errors
+                        // with `co_qualname` (`Class.meth()`), not the
+                        // bare `co_name`.
                         return Err(type_error(format!(
                             "{}() got multiple values for argument '{}'",
-                            f.name, name
+                            code.qualname, name
                         )));
                     }
                     positional[slot] = value.clone();
@@ -18018,12 +18389,12 @@ impl Interpreter {
                         return Err(type_error(format!(
                             "{}() got some positional-only arguments passed as \
                              keyword arguments: '{}'",
-                            f.name, name
+                            code.qualname, name
                         )));
                     } else {
                         return Err(type_error(format!(
                             "{}() got an unexpected keyword argument '{}'",
-                            f.name, name
+                            code.qualname, name
                         )));
                     }
                 }
@@ -19614,15 +19985,34 @@ impl Interpreter {
             }
         };
         let dict = m.dict.borrow();
-        if let Some(Object::List(all_list)) = dict.get(&DictKey(Object::from_static("__all__"))) {
-            let names: Vec<String> = all_list
-                .borrow()
-                .iter()
-                .filter_map(|o| match o {
-                    Object::Str(s) => Some(s.to_string()),
-                    _ => None,
-                })
-                .collect();
+        // `__all__` may be any sequence; CPython commonly ships it as a
+        // tuple (the whole `asyncio` package does). Honour list *and*
+        // tuple, else `from pkg import *` leaks every public global —
+        // including modules the package imported (e.g. a submodule's
+        // `import subprocess`), which would shadow the real
+        // `pkg.subprocess` attribute.
+        let all_names: Option<Vec<String>> =
+            match dict.get(&DictKey(Object::from_static("__all__"))) {
+                Some(Object::List(l)) => Some(
+                    l.borrow()
+                        .iter()
+                        .filter_map(|o| match o {
+                            Object::Str(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                Some(Object::Tuple(t)) => Some(
+                    t.iter()
+                        .filter_map(|o| match o {
+                            Object::Str(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            };
+        if let Some(names) = all_names {
             let mut g = globals.borrow_mut();
             for n in names {
                 if let Some(v) = dict.get(&DictKey(Object::from_str(&n))) {
@@ -20533,6 +20923,23 @@ fn builtin_slot_wrapper(ty: &Rc<TypeObject>, name: &str) -> Option<Object> {
     None
 }
 
+/// `object.__repr__(o)` (CPython `object_repr`): the identity repr
+/// `<module.qualname object at 0x…>`, computed **without** re-dispatching
+/// to a subclass `__repr__`. This non-virtual form is what
+/// `super().__repr__()` must return — a class that overrides `__repr__`
+/// and chains to `super().__repr__()` would otherwise recurse forever.
+/// Non-instance receivers fall back to the value's own repr.
+pub(crate) fn object_base_repr_string(o: &Object) -> String {
+    match o {
+        Object::Instance(inst) => format!(
+            "<{} object at 0x{:x}>",
+            inst.cls().qualified_display_name(),
+            Rc::as_ptr(inst) as usize
+        ),
+        _ => o.repr(),
+    }
+}
+
 /// Return a fresh empty globals dict — used by the awaitable
 /// dispatch paths that don't have a frame's globals handy. The
 /// dispatched method itself carries its own `__globals__`.
@@ -21056,7 +21463,7 @@ fn freeze_set_result(o: Object) -> Object {
                 Ok(cell) => cell.into_inner(),
                 Err(rc) => rc.borrow().clone(),
             };
-            Object::FrozenSet(Rc::new(data))
+            Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(data)))
         }
         other => other,
     }
@@ -23577,28 +23984,66 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         // result kind follows the *left* operand (CPython's `set_and` &
         // co. use `PyAnySet_Check` on the other operand and build a result
         // of `Py_TYPE(self)`).
-        (O::Set(x), O::Set(y), B::BitOr) => Ok(union_sets(&x.borrow(), &y.borrow())),
-        (O::Set(x), O::FrozenSet(y), B::BitOr) => Ok(union_sets(&x.borrow(), y)),
-        (O::FrozenSet(x), O::Set(y), B::BitOr) => Ok(freeze_set_result(union_sets(x, &y.borrow()))),
+        // Snapshot `set` operands out of their `RefCell` before running
+        // the op: the element `__hash__`/`__eq__` invoked while building
+        // the result can re-enter and mutate the operand (bpo-46615's
+        // "Bad.__eq__ clears the set" probe). Holding a live `borrow()`
+        // across that callback would hit a `BorrowMutError`; cloning the
+        // backing `SetData` first means the callback mutates the original
+        // freely while we compute from a stable snapshot — no crash,
+        // matching CPython's "don't crash; maybe raise RuntimeError".
+        (O::Set(x), O::Set(y), B::BitOr) => {
+            let (xs, ys) = (x.borrow().clone(), y.borrow().clone());
+            Ok(union_sets(&xs, &ys))
+        }
+        (O::Set(x), O::FrozenSet(y), B::BitOr) => {
+            let xs = x.borrow().clone();
+            Ok(union_sets(&xs, y))
+        }
+        (O::FrozenSet(x), O::Set(y), B::BitOr) => {
+            let ys = y.borrow().clone();
+            Ok(freeze_set_result(union_sets(x, &ys)))
+        }
         (O::FrozenSet(x), O::FrozenSet(y), B::BitOr) => Ok(freeze_set_result(union_sets(x, y))),
-        (O::Set(x), O::Set(y), B::BitAnd) => Ok(intersect_sets(&x.borrow(), &y.borrow())),
-        (O::Set(x), O::FrozenSet(y), B::BitAnd) => Ok(intersect_sets(&x.borrow(), y)),
+        (O::Set(x), O::Set(y), B::BitAnd) => {
+            let (xs, ys) = (x.borrow().clone(), y.borrow().clone());
+            Ok(intersect_sets(&xs, &ys))
+        }
+        (O::Set(x), O::FrozenSet(y), B::BitAnd) => {
+            let xs = x.borrow().clone();
+            Ok(intersect_sets(&xs, y))
+        }
         (O::FrozenSet(x), O::Set(y), B::BitAnd) => {
-            Ok(freeze_set_result(intersect_sets(x, &y.borrow())))
+            let ys = y.borrow().clone();
+            Ok(freeze_set_result(intersect_sets(x, &ys)))
         }
         (O::FrozenSet(x), O::FrozenSet(y), B::BitAnd) => {
             Ok(freeze_set_result(intersect_sets(x, y)))
         }
-        (O::Set(x), O::Set(y), B::Sub) => Ok(difference_sets(&x.borrow(), &y.borrow())),
-        (O::Set(x), O::FrozenSet(y), B::Sub) => Ok(difference_sets(&x.borrow(), y)),
+        (O::Set(x), O::Set(y), B::Sub) => {
+            let (xs, ys) = (x.borrow().clone(), y.borrow().clone());
+            Ok(difference_sets(&xs, &ys))
+        }
+        (O::Set(x), O::FrozenSet(y), B::Sub) => {
+            let xs = x.borrow().clone();
+            Ok(difference_sets(&xs, y))
+        }
         (O::FrozenSet(x), O::Set(y), B::Sub) => {
-            Ok(freeze_set_result(difference_sets(x, &y.borrow())))
+            let ys = y.borrow().clone();
+            Ok(freeze_set_result(difference_sets(x, &ys)))
         }
         (O::FrozenSet(x), O::FrozenSet(y), B::Sub) => Ok(freeze_set_result(difference_sets(x, y))),
-        (O::Set(x), O::Set(y), B::BitXor) => Ok(symmetric_diff_sets(&x.borrow(), &y.borrow())),
-        (O::Set(x), O::FrozenSet(y), B::BitXor) => Ok(symmetric_diff_sets(&x.borrow(), y)),
+        (O::Set(x), O::Set(y), B::BitXor) => {
+            let (xs, ys) = (x.borrow().clone(), y.borrow().clone());
+            Ok(symmetric_diff_sets(&xs, &ys))
+        }
+        (O::Set(x), O::FrozenSet(y), B::BitXor) => {
+            let xs = x.borrow().clone();
+            Ok(symmetric_diff_sets(&xs, y))
+        }
         (O::FrozenSet(x), O::Set(y), B::BitXor) => {
-            Ok(freeze_set_result(symmetric_diff_sets(x, &y.borrow())))
+            let ys = y.borrow().clone();
+            Ok(freeze_set_result(symmetric_diff_sets(x, &ys)))
         }
         (O::FrozenSet(x), O::FrozenSet(y), B::BitXor) => {
             Ok(freeze_set_result(symmetric_diff_sets(x, y)))

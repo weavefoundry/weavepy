@@ -392,6 +392,8 @@ pub const CPYTHON_REGRTEST_INCLUDE: &[&str] = &[
     "test_socket.py",
     "test_subprocess.py",
     "test_select.py",
+    "test_poll.py",
+    "test_kqueue.py",
     "test_signal.py",
     "test_ssl.py",
     "test_urllib.py",

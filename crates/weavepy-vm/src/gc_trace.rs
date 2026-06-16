@@ -323,6 +323,64 @@ impl GcState {
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Reclaim every tracked object on this thread whose only remaining
+    /// strong reference is the cycle collector's own handle — dead
+    /// *acyclic* garbage that CPython's refcounting frees the instant
+    /// its last binding drops, but which our per-thread strong handle
+    /// pins until a collection. Skips finalizable objects (their
+    /// `__del__` must be ordered by a finalizing collection) and
+    /// weakref-watched objects (clearing their weakrefs runs user
+    /// callbacks). Because every survivor of these filters runs no
+    /// Python on the way out, this is safe to call from any GIL-holding
+    /// safe point — notably a `Thread.join` return, where a worker has
+    /// just dropped the last *program* reference to objects this thread
+    /// allocated (RFC 0039 WS4: cross-thread prompt reclamation across
+    /// the per-thread-heap boundary). Iterates to a fixpoint so freeing
+    /// one object reclaims any acyclic chain it anchored. Returns the
+    /// number of objects reclaimed.
+    pub fn reap_dead_acyclic(&self) -> usize {
+        // A collection already walks the same set; never re-enter it.
+        if self.collecting.get() {
+            return 0;
+        }
+        let mut reclaimed = 0usize;
+        loop {
+            let dead: Vec<ObjectId> = {
+                let index = self.index.borrow();
+                index
+                    .iter()
+                    .filter(|(id, h)| {
+                        strong_count_for(&h.object) <= 1
+                            && !has_finalizer(&h.object)
+                            && crate::weakref_registry::count_for(**id) == 0
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            };
+            if dead.is_empty() {
+                break;
+            }
+            for id in dead {
+                // Re-validate under a fresh borrow: a free earlier in this
+                // batch may have already reclaimed `id` as a child, or
+                // (it cannot here, counts only fall) revived it.
+                let still_dead = match self.index.borrow().get(&id) {
+                    Some(h) => {
+                        strong_count_for(&h.object) <= 1
+                            && !has_finalizer(&h.object)
+                            && crate::weakref_registry::count_for(id) == 0
+                    }
+                    None => false,
+                };
+                if still_dead {
+                    self.untrack_id(id);
+                    reclaimed += 1;
+                }
+            }
+        }
+        reclaimed
+    }
+
     pub fn is_tracked(&self, id: ObjectId) -> bool {
         self.index.borrow().contains_key(&id)
     }
@@ -1128,6 +1186,12 @@ pub fn mark_finalized(id: ObjectId) -> bool {
 /// on the current thread's GC (see [`GcState::finalization_candidates`]).
 pub fn finalization_candidates() -> Vec<Arc<TrackedHandle>> {
     with_state(|s| s.finalization_candidates())
+}
+
+/// Convenience: refcount-reclaim dead acyclic garbage on the current
+/// thread's GC (see [`GcState::reap_dead_acyclic`]).
+pub fn reap_dead_acyclic() -> usize {
+    with_state(|s| s.reap_dead_acyclic())
 }
 
 /// Convenience: run a full collection on the current thread's

@@ -133,8 +133,20 @@ struct CompiledCode {
     groups: usize,
 }
 
-thread_local! {
-    static REGISTRY: RefCell<Vec<Rc<CompiledCode>>> = const { RefCell::new(Vec::new()) };
+/// Process-global compiled-pattern registry.
+///
+/// RFC 0039 (WS1): worker threads share the parent's compiled
+/// patterns, so the registry must be process-wide rather than
+/// thread-local — otherwise a pattern compiled on the main thread
+/// yields `_sre.exec: invalid pattern handle` the moment a worker
+/// thread tries to `exec` it (e.g. `threading`/`logging` module-level
+/// regexes used from a `Thread.run`). Handles are indices that only
+/// ever grow, so they stay valid across threads; `CompiledCode` is
+/// immutable after compilation, so sharing it is race-free.
+fn registry() -> &'static parking_lot::Mutex<Vec<Rc<CompiledCode>>> {
+    static REGISTRY: std::sync::OnceLock<parking_lot::Mutex<Vec<Rc<CompiledCode>>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,11 +1385,11 @@ fn sre_compile(args: &[Object]) -> Result<Object, RuntimeError> {
             .ok_or_else(|| type_error("_sre.compile: code"))?,
     )?;
     let groups = arg_i64(args, 1, "groups")?.max(0) as usize;
-    let handle = REGISTRY.with(|reg| {
-        let mut reg = reg.borrow_mut();
+    let handle = {
+        let mut reg = registry().lock();
         reg.push(Rc::new(CompiledCode { code, groups }));
         reg.len() - 1
-    });
+    };
     Ok(Object::Int(handle as i64))
 }
 
@@ -1388,7 +1400,7 @@ fn sre_compile(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `2 * groups` code-point indices (`-1` for an unset group).
 fn sre_exec(args: &[Object]) -> Result<Object, RuntimeError> {
     let handle = arg_i64(args, 0, "handle")? as usize;
-    let cc = REGISTRY.with(|reg| reg.borrow().get(handle).cloned());
+    let cc = registry().lock().get(handle).cloned();
     let cc = cc.ok_or_else(|| value_error("_sre.exec: invalid pattern handle"))?;
     let subject = subject_to_vec(args.get(1).ok_or_else(|| type_error("_sre.exec: string"))?)?;
     let slen = subject.len() as i64;

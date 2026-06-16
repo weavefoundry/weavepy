@@ -2062,20 +2062,46 @@ fn bw_peek(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bw_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
-    let dst = match args.get(1) {
-        Some(Object::ByteArray(dst)) => dst.clone(),
+    // Accept a bytearray or a writable, contiguous `memoryview` window over
+    // one (CPython parity — `readinto` takes any read-write buffer).
+    let (dst, start, cap) = match args.get(1) {
+        Some(Object::ByteArray(dst)) => {
+            let cap = dst.borrow().len();
+            (dst.clone(), 0usize, cap)
+        }
+        Some(Object::MemoryView(mv)) => {
+            if mv.released.get() {
+                return Err(value_error(
+                    "operation forbidden on released memoryview object",
+                ));
+            }
+            if mv.readonly.get() || !mv.is_c_contiguous() {
+                return Err(type_error(
+                    "readinto() argument must be a writable bytes-like object",
+                ));
+            }
+            match &mv.buffer {
+                crate::object::MemoryViewBuffer::ByteArray(b) => {
+                    (b.clone(), mv.start.get(), mv.len.get())
+                }
+                crate::object::MemoryViewBuffer::Bytes(_) => {
+                    return Err(type_error(
+                        "readinto() argument must be a writable bytes-like object",
+                    ))
+                }
+            }
+        }
         _ => {
             return Err(type_error(
                 "readinto() argument must be a writable bytes-like object",
             ))
         }
     };
-    let cap = dst.borrow().len();
     match bw_target(&inst)? {
         RawTarget::Native(raw) => {
             let data = raw.read_bytes(Some(cap))?;
             let n = data.len();
-            dst.borrow_mut()[..n].copy_from_slice(&data);
+            dst.borrow_mut()[start..start + n].copy_from_slice(&data);
             Ok(Object::Int(n as i64))
         }
         RawTarget::Py(_) => {
@@ -2083,7 +2109,7 @@ fn bw_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
             let data = bw_read(&[args[0].clone(), Object::Int(cap as i64)])?;
             let bytes = data.as_bytes_view().unwrap_or_default();
             let n = bytes.len().min(cap);
-            dst.borrow_mut()[..n].copy_from_slice(&bytes[..n]);
+            dst.borrow_mut()[start..start + n].copy_from_slice(&bytes[..n]);
             Ok(Object::Int(n as i64))
         }
     }

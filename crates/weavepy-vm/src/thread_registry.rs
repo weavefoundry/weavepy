@@ -183,6 +183,17 @@ impl ThreadRegistry {
         self.entries.read().len()
     }
 
+    /// Number of threads still running — `_thread._count()`. Finished
+    /// entries linger in the registry (so a late `join()` still works),
+    /// so a plain `len()` would over-count.
+    pub fn running_count(&self) -> usize {
+        self.entries
+            .read()
+            .values()
+            .filter(|e| e.is_alive())
+            .count()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.read().is_empty()
     }
@@ -196,20 +207,36 @@ impl ThreadRegistry {
     /// Joins all non-daemon threads. Called at interpreter
     /// shutdown so user-visible work runs to completion before
     /// the process exits.
+    ///
+    /// Re-scans the registry after each pass: a non-daemon thread we
+    /// join may itself have started further non-daemon threads (a
+    /// thread spawned from another thread, gh test_thread_from_thread).
+    /// A newly started worker is registered before its parent's body
+    /// returns, so by the time the parent's join completes the child is
+    /// already visible. The loop terminates once a full pass joins
+    /// nothing new — i.e. every non-daemon handle has been taken and
+    /// joined.
     pub fn join_non_daemon(&self) {
-        let entries: Vec<_> = self
-            .entries
-            .read()
-            .values()
-            .filter(|e| !e.is_daemon())
-            .cloned()
-            .collect();
-        for entry in entries {
-            // Wait for the finished event first (cooperative);
-            // then take and join the handle to surface any panic.
-            entry.finished.wait();
-            if let Some(h) = entry.take_handle() {
-                let _ = h.join();
+        loop {
+            let entries: Vec<_> = self
+                .entries
+                .read()
+                .values()
+                .filter(|e| !e.is_daemon())
+                .cloned()
+                .collect();
+            let mut joined_any = false;
+            for entry in entries {
+                // Wait for the finished event first (cooperative);
+                // then take and join the handle to surface any panic.
+                entry.finished.wait();
+                if let Some(h) = entry.take_handle() {
+                    let _ = h.join();
+                    joined_any = true;
+                }
+            }
+            if !joined_any {
+                break;
             }
         }
     }

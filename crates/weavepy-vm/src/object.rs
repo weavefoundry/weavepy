@@ -100,8 +100,10 @@ pub enum Object {
     /// `IndexSet<DictKey>` so iteration order is insertion order
     /// (CPython 3.7+ semantics).
     Set(Rc<RefCell<SetData>>),
-    /// Immutable set `frozenset(...)`.
-    FrozenSet(Rc<SetData>),
+    /// Immutable set `frozenset(...)`. Wrapped in [`FrozenSetObj`] so the
+    /// CPython `so_hash` cache (frozensets are immutable, so their hash is
+    /// computed once) rides along with the element storage.
+    FrozenSet(Rc<FrozenSetObj>),
     /// File-like object — opened by `open()`, returned by
     /// `io.StringIO`/`io.BytesIO`, and the values behind
     /// `sys.stdin`/`stdout`/`stderr`.
@@ -722,6 +724,41 @@ impl PyMemoryView {
         }
         out
     }
+
+    /// Format string with a leading native-order `@` stripped, matching
+    /// CPython's `cmp_structure` (which compares `format+1` when the first
+    /// byte is `@`). `memoryview(b'x')` is `"B"`; `bytes`/`bytearray` buffers
+    /// are also `"B"`.
+    fn norm_format(&self) -> String {
+        let f = self.format.borrow();
+        f.strip_prefix('@').unwrap_or(&f).to_owned()
+    }
+
+    /// `memoryview == memoryview` per CPython's `memory_richcompare`: equal
+    /// only when the normalized format, itemsize, ndim and shape all match
+    /// *and* the materialised elements are byte-identical. (Released views
+    /// are handled by the caller as identity comparison.)
+    pub fn buffer_eq(&self, other: &PyMemoryView) -> bool {
+        if self.released.get() || other.released.get() {
+            return false;
+        }
+        self.norm_format() == other.norm_format()
+            && self.itemsize.get() == other.itemsize.get()
+            && self.shape_dims() == other.shape_dims()
+            && self.to_bytes() == other.to_bytes()
+    }
+
+    /// `memoryview == bytes`/`bytearray`. A bytes-like exposes a 1-D `"B"`,
+    /// itemsize-1 buffer, so the view is only equal when it has that same
+    /// shape and its bytes match.
+    pub fn eq_byte_slice(&self, bytes: &[u8]) -> bool {
+        if self.released.get() {
+            return false;
+        }
+        self.norm_format() == "B" && self.itemsize.get() == 1 && self.ndim() == 1 && {
+            self.to_bytes() == bytes
+        }
+    }
 }
 
 /// C-contiguous (row-major) byte strides for `shape` at the given itemsize:
@@ -950,6 +987,56 @@ pub struct SlotDescriptor {
 /// Ordered set backing for [`Object::Set`] and [`Object::FrozenSet`].
 pub type SetData = indexmap::IndexSet<DictKey>;
 
+/// Backing object for [`Object::FrozenSet`]: the element storage plus a
+/// lazily-computed hash cache.
+///
+/// CPython caches `frozenset_hash` in the object's `so_hash` field
+/// (`Objects/setobject.c`) because a frozenset is immutable, so its hash
+/// never changes. Without that cache, `hash()` re-walks the whole
+/// structure every call — and for *nested* frozensets (e.g. the von
+/// Neumann ordinals built by `test_set`'s `test_hash_effectiveness`) the
+/// recursion is exponential, turning a sub-second test into minutes.
+///
+/// [`Deref`](std::ops::Deref)s to [`SetData`] so the many read sites that
+/// call `.iter()`/`.len()`/`.contains()` keep working unchanged.
+pub struct FrozenSetObj {
+    data: SetData,
+    /// `None` until the first `hash()`; then the bit-exact CPython hash.
+    hash: crate::sync::Cell<Option<i64>>,
+}
+
+impl FrozenSetObj {
+    pub fn new(data: SetData) -> Self {
+        Self {
+            data,
+            hash: crate::sync::Cell::new(None),
+        }
+    }
+
+    /// The cached hash, if it has already been computed.
+    pub fn cached_hash(&self) -> Option<i64> {
+        self.hash.get()
+    }
+
+    /// Memoise the computed hash for subsequent `hash()` calls.
+    pub fn store_hash(&self, value: i64) {
+        self.hash.set(Some(value));
+    }
+}
+
+impl std::ops::Deref for FrozenSetObj {
+    type Target = SetData;
+    fn deref(&self) -> &SetData {
+        &self.data
+    }
+}
+
+impl std::fmt::Debug for FrozenSetObj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.data.iter()).finish()
+    }
+}
+
 // ---------- supporting types ----------
 
 /// Rectangular-form complex number (RFC 0019). CPython's
@@ -1034,6 +1121,11 @@ fn current_interp_hash(obj: &Object) -> Option<i64> {
     // running thread and used only to re-enter the interpreter synchronously,
     // mirroring the established reentrant-callback pattern in `_imp`/`_thread`.
     let interp = unsafe { &mut *ptr };
+    // RFC 0039 (WS5): this re-entrant `__hash__` may run while a `set`/`dict`
+    // holds its `GilCell` mutex (we were called from `DictKey::hash` during an
+    // insert/lookup). Suppress the cooperative GIL hand-off for its duration so
+    // another thread can't take the GIL and then deadlock on that same mutex.
+    let _no_yield = crate::gil::no_gil_handoff();
     interp.reentrant_py_hash(obj)
 }
 
@@ -1042,6 +1134,10 @@ fn current_interp_eq(a: &Object, b: &Object) -> Option<bool> {
     let ptr = crate::vm_singletons::current_interpreter_ptr()?;
     // SAFETY: see `current_interp_hash`.
     let interp = unsafe { &mut *ptr };
+    // RFC 0039 (WS5): same GIL ↔ cell-mutex hazard as `current_interp_hash` —
+    // this `__eq__` can run while a container holds its borrow during a
+    // collision check, so hold off the cooperative hand-off until it returns.
+    let _no_yield = crate::gil::no_gil_handoff();
     interp.reentrant_py_eq(a, b)
 }
 
@@ -3044,11 +3140,35 @@ impl Object {
             (Object::Bytes(a), Object::ByteArray(b)) | (Object::ByteArray(b), Object::Bytes(a)) => {
                 a[..] == *b.borrow()
             }
-            (Object::Set(a), Object::Set(b)) => sets_equal(&a.borrow(), &b.borrow()),
+            // Snapshot mutable `set` operands before comparing: the element
+            // `__eq__` invoked during the membership probe can re-enter and
+            // clear the operand (bpo-46615), and holding a live `borrow()`
+            // across that callback would panic with `BorrowMutError`.
+            (Object::Set(a), Object::Set(b)) => {
+                let (a, b) = (a.borrow().clone(), b.borrow().clone());
+                sets_equal(&a, &b)
+            }
             (Object::FrozenSet(a), Object::FrozenSet(b)) => sets_equal(a, b),
             (Object::Set(a), Object::FrozenSet(b)) | (Object::FrozenSet(b), Object::Set(a)) => {
-                sets_equal(&a.borrow(), b)
+                let a = a.borrow().clone();
+                sets_equal(&a, b)
             }
+            // `memoryview` compares by buffer contents (CPython
+            // `memory_richcompare`): structural match on format/itemsize/
+            // shape plus byte-identical elements. A released view falls back
+            // to object identity, exactly like CPython's `BASE_INACCESSIBLE`.
+            (Object::MemoryView(a), Object::MemoryView(b)) => {
+                if a.released.get() || b.released.get() {
+                    Rc::ptr_eq(a, b)
+                } else {
+                    a.buffer_eq(b)
+                }
+            }
+            (Object::MemoryView(a), Object::Bytes(b)) | (Object::Bytes(b), Object::MemoryView(a)) => {
+                a.eq_byte_slice(b)
+            }
+            (Object::MemoryView(a), Object::ByteArray(b))
+            | (Object::ByteArray(b), Object::MemoryView(a)) => a.eq_byte_slice(&b.borrow()),
             // `slice` objects compare as the `(start, stop, step)` triple
             // (CPython's `slice_richcompare`), identity-first per field so
             // `slice(None)` fields (NaN-free here, but consistent) match.
@@ -4216,6 +4336,14 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             Some(if v == -1 { -2 } else { v })
         }
         Object::FrozenSet(s) => {
+            // A frozenset is immutable, so its hash is computed once and
+            // cached (CPython's `so_hash`). This is not just an optimisation:
+            // nested frozensets would otherwise re-hash their whole
+            // sub-structure on every call (exponential for von Neumann
+            // ordinals — see `FrozenSetObj`).
+            if let Some(h) = s.cached_hash() {
+                return Some(h);
+            }
             // CPython's `frozenset_hash` (Objects/setobject.c), bit-exact:
             // `collections.abc.Set._hash` reimplements the same algorithm
             // in Python and the two must agree (`hash(fs) == Set._hash(fs)`).
@@ -4228,7 +4356,9 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             acc ^= (acc >> 11) ^ (acc >> 25);
             acc = acc.wrapping_mul(69_069).wrapping_add(907_133_923);
             let v = acc as i64;
-            Some(if v == -1 { 590_923_713 } else { v })
+            let v = if v == -1 { 590_923_713 } else { v };
+            s.store_hash(v);
+            Some(v)
         }
         Object::Instance(inst) => {
             // A user-defined `__hash__` outranks the wrapped value's hash —
@@ -4589,7 +4719,7 @@ impl Object {
         for v in iter {
             s.insert(DictKey(v));
         }
-        Object::FrozenSet(Rc::new(s))
+        Object::FrozenSet(Rc::new(FrozenSetObj::new(s)))
     }
 
     pub fn new_bytes(data: impl Into<Vec<u8>>) -> Self {

@@ -47,6 +47,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             b("perf_counter", time_monotonic),
         );
         d.insert(
+            DictKey(Object::from_static("get_clock_info")),
+            b("get_clock_info", time_get_clock_info),
+        );
+        d.insert(
             DictKey(Object::from_static("sleep")),
             b("sleep", time_sleep),
         );
@@ -120,6 +124,65 @@ fn time_ns(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(now.as_nanos() as i64))
 }
 
+/// `time.get_clock_info(name)` — a namespace with `implementation`,
+/// `monotonic`, `adjustable`, and `resolution`. asyncio reads
+/// `get_clock_info('monotonic').resolution` when building a loop.
+fn time_get_clock_info(args: &[Object]) -> Result<Object, RuntimeError> {
+    let name = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("get_clock_info() argument must be a str")),
+    };
+    let (implementation, monotonic, adjustable) = match name.as_str() {
+        "monotonic" | "perf_counter" => ("mach_absolute_time()", true, false),
+        "time" => ("clock_gettime(CLOCK_REALTIME)", false, true),
+        "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false),
+        "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false),
+        other => {
+            return Err(crate::error::value_error(format!("unknown clock: {other}")))
+        }
+    };
+    thread_local! {
+        static CLOCK_INFO_TYPE: RefCell<Option<Rc<crate::types::TypeObject>>> =
+            const { RefCell::new(None) };
+    }
+    let cls = CLOCK_INFO_TYPE.with(|slot| {
+        if let Some(c) = slot.borrow().as_ref() {
+            return c.clone();
+        }
+        let bt = crate::builtin_types::builtin_types();
+        let cls = crate::types::TypeObject::new_user(
+            "clock_info",
+            vec![bt.object_.clone()],
+            DictData::new(),
+        )
+        .expect("clock_info class must linearise");
+        *slot.borrow_mut() = Some(cls.clone());
+        cls
+    });
+    let inst = Rc::new(crate::types::PyInstance::new(cls));
+    {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("implementation")),
+            Object::from_static(implementation),
+        );
+        d.insert(
+            DictKey(Object::from_static("monotonic")),
+            Object::Bool(monotonic),
+        );
+        d.insert(
+            DictKey(Object::from_static("adjustable")),
+            Object::Bool(adjustable),
+        );
+        // 1 ns — the resolution of the underlying nanosecond clocks.
+        d.insert(
+            DictKey(Object::from_static("resolution")),
+            Object::Float(1e-9),
+        );
+    }
+    Ok(Object::Instance(inst))
+}
+
 fn time_monotonic(_args: &[Object]) -> Result<Object, RuntimeError> {
     let elapsed = EPOCH.with(|e| e.elapsed());
     Ok(Object::Float(elapsed.as_secs_f64()))
@@ -129,10 +192,24 @@ fn time_sleep(args: &[Object]) -> Result<Object, RuntimeError> {
     let secs = match args.first() {
         Some(Object::Int(i)) => *i as f64,
         Some(Object::Float(f)) => *f,
+        Some(Object::Bool(b)) => f64::from(*b),
         _ => return Err(type_error("sleep expects a number")),
     };
+    if secs.is_nan() || secs < 0.0 {
+        // CPython raises ValueError for a negative sleep.
+        return Err(crate::error::value_error(
+            "sleep length must be non-negative",
+        ));
+    }
     if secs > 0.0 {
-        thread::sleep(Duration::from_secs_f64(secs));
+        // CPython's `time.sleep` releases the GIL for the duration of
+        // the sleep so other threads run (RFC 0039). Holding it would
+        // serialize the whole interpreter behind one sleeping thread —
+        // e.g. a `threading.Barrier` peer that `time.sleep`s would stall
+        // every other peer's timed `wait()`.
+        crate::gil::allow_threads_then(|| {
+            thread::sleep(Duration::from_secs_f64(secs));
+        });
     }
     Ok(Object::None)
 }

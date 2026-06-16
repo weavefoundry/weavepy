@@ -6012,11 +6012,18 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Generator(_) => bt.generator_.clone(),
         Object::Coroutine(_) => bt.coroutine_.clone(),
         Object::AsyncGenerator(_) => bt.async_generator_.clone(),
-        // The transient `asend`/`athrow`/`aclose` awaitables have no
-        // dedicated singleton type; treat them as plain objects for
-        // `type()` (their faithful CPython name is still surfaced by
-        // `repr`/error messages via `Object::type_name`).
-        Object::AsyncGenAwait(_) => bt.object_.clone(),
+        // The `asend`/`athrow`/`aclose` awaitables get CPython's dedicated
+        // types: `asend` (also backing `__anext__`) is `async_generator_asend`;
+        // `athrow`/`aclose` are `async_generator_athrow`. Real types let
+        // `_collections_abc` register them as `Coroutine`s, so
+        // `asyncio.iscoroutine(agen.aclose())` holds and `create_task`/
+        // `ensure_future` accept them (PEP 525 finalization, shutdown).
+        Object::AsyncGenAwait(a) => match a.kind {
+            crate::object::AgenAwaitKind::Send => bt.async_generator_asend_.clone(),
+            crate::object::AgenAwaitKind::Throw | crate::object::AgenAwaitKind::Close => {
+                bt.async_generator_athrow_.clone()
+            }
+        },
         Object::Module(_) => bt.module_.clone(),
         Object::SlotDescriptor(_) => bt.member_descriptor_.clone(),
         Object::Code(_) => bt.code_.clone(),
@@ -8398,14 +8405,90 @@ fn set_self(args: &[Object]) -> Result<Object, RuntimeError> {
         .ok_or_else(|| type_error("expected set receiver"))
 }
 
-fn set_apply_inplace<F: FnOnce(&mut crate::object::SetData)>(
-    args: &[Object],
-    f: F,
-) -> Result<Object, RuntimeError> {
+/// A single-element in-place set mutation (`add`/`discard`/`clear`).
+enum SetInplaceOp {
+    Add(DictKey),
+    Discard(DictKey),
+    Clear,
+}
+
+fn apply_set_inplace_op(s: &mut crate::object::SetData, op: SetInplaceOp) {
+    match op {
+        SetInplaceOp::Add(k) => {
+            s.insert(k);
+        }
+        SetInplaceOp::Discard(k) => {
+            s.shift_remove(&k);
+        }
+        SetInplaceOp::Clear => s.clear(),
+    }
+}
+
+thread_local! {
+    /// In-place set mutations that a *re-entrant* `add`/`discard`/`clear`
+    /// (called from inside an element's `__hash__`/`__eq__` while an outer
+    /// frame already holds the set's borrow) could not apply immediately.
+    ///
+    /// CPython tolerates this (e.g. `test_set`'s
+    /// `test_hash_collision_concurrent_add`, where a hash-colliding
+    /// `__eq__` calls `s.add(...)` during another `s.add`). Rather than
+    /// panic on the re-entrant `borrow_mut`, the inner call records its op
+    /// here keyed by the set's identity; the outer frame replays it once
+    /// its own mutation completes, so the final contents match CPython.
+    static SET_DEFERRED_OPS: std::cell::RefCell<Vec<(usize, SetInplaceOp)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain and return any deferred ops queued against `ptr`. The queue
+/// borrow is released before the caller applies them, so a further
+/// re-entrant mutation during replay can queue again without conflict.
+fn take_deferred_set_ops(ptr: usize) -> Vec<SetInplaceOp> {
+    SET_DEFERRED_OPS.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut drained = Vec::new();
+        let mut i = 0;
+        while i < q.len() {
+            if q[i].0 == ptr {
+                drained.push(q.remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        drained
+    })
+}
+
+fn set_apply_inplace(args: &[Object], op: SetInplaceOp) -> Result<Object, RuntimeError> {
     match set_self(args)? {
         Object::Set(s) => {
-            f(&mut s.borrow_mut());
-            Ok(Object::None)
+            let ptr = Rc::as_ptr(&s) as usize;
+            match s.try_borrow_mut() {
+                Ok(mut b) => {
+                    apply_set_inplace_op(&mut b, op);
+                    // Replay anything a re-entrant callback deferred while we
+                    // held the borrow. Looping handles nested re-entrancy.
+                    loop {
+                        let replay = take_deferred_set_ops(ptr);
+                        if replay.is_empty() {
+                            break;
+                        }
+                        for op in replay {
+                            apply_set_inplace_op(&mut b, op);
+                        }
+                    }
+                    Ok(Object::None)
+                }
+                Err(_) => {
+                    // An outer frame holds the borrow (re-entrant mutation
+                    // from a `__hash__`/`__eq__` callback). Defer; the outer
+                    // frame replays once it finishes.
+                    SET_DEFERRED_OPS.with(|q| q.borrow_mut().push((ptr, op)));
+                    Ok(Object::None)
+                }
+            }
         }
         Object::FrozenSet(_) => Err(type_error("frozenset is immutable")),
         _ => Err(type_error("expected set receiver")),
@@ -8432,9 +8515,7 @@ fn set_add(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("add() expected 1 arg"))?;
-    set_apply_inplace(args, |s| {
-        s.insert(DictKey(v));
-    })
+    set_apply_inplace(args, SetInplaceOp::Add(DictKey(v)))
 }
 
 fn set_discard(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8442,9 +8523,7 @@ fn set_discard(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("discard() expected 1 arg"))?;
-    set_apply_inplace(args, |s| {
-        s.shift_remove(&DictKey(v));
-    })
+    set_apply_inplace(args, SetInplaceOp::Discard(DictKey(v)))
 }
 
 fn set_remove(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8482,7 +8561,7 @@ fn set_pop(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_clear(args: &[Object]) -> Result<Object, RuntimeError> {
-    set_apply_inplace(args, |s| s.clear())
+    set_apply_inplace(args, SetInplaceOp::Clear)
 }
 
 fn set_copy(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8502,13 +8581,34 @@ fn set_update(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("frozenset is immutable"));
     }
     if let Object::Set(s) = &receiver {
+        // Build on a snapshot so an element `__hash__` that re-enters and
+        // mutates `s` can't fire while we hold `s.borrow_mut()` (bpo-46615).
+        let mut acc: crate::object::SetData = s.borrow().clone();
         for other in args.iter().skip(1) {
             for k in set_iter_items(other)? {
-                s.borrow_mut().insert(k);
+                acc.insert(k);
             }
         }
+        *s.borrow_mut() = acc;
     }
     Ok(Object::None)
+}
+
+/// Wrap a computed set body in the storage kind of the *receiver*: CPython's
+/// `frozenset.union`/`intersection`/`difference`/`symmetric_difference`
+/// return a `frozenset`, while `set`'s return a `set`. Subclass receivers
+/// produce the base type (`set`/`frozenset`), matching CPython.
+fn set_result_like(receiver: Option<&Object>, body: crate::object::SetData) -> Object {
+    let frozen = match receiver {
+        Some(Object::FrozenSet(_)) => true,
+        Some(Object::Instance(inst)) => matches!(inst.native, Some(Object::FrozenSet(_))),
+        _ => false,
+    };
+    if frozen {
+        Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(body)))
+    } else {
+        Object::Set(Rc::new(RefCell::new(body)))
+    }
 }
 
 fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8523,7 +8623,7 @@ fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
             out.insert(k);
         }
     }
-    Ok(Object::Set(Rc::new(RefCell::new(out))))
+    Ok(set_result_like(args.first(), out))
 }
 
 fn set_intersection(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8541,7 +8641,7 @@ fn set_intersection(args: &[Object]) -> Result<Object, RuntimeError> {
         let other_set: crate::object::SetData = set_iter_items(other)?.into_iter().collect();
         acc.retain(|k| other_set.contains(k));
     }
-    Ok(Object::Set(Rc::new(RefCell::new(acc))))
+    Ok(set_result_like(args.first(), acc))
 }
 
 fn set_difference(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8559,17 +8659,17 @@ fn set_difference(args: &[Object]) -> Result<Object, RuntimeError> {
         let other_set: crate::object::SetData = set_iter_items(other)?.into_iter().collect();
         acc.retain(|k| !other_set.contains(k));
     }
-    Ok(Object::Set(Rc::new(RefCell::new(acc))))
+    Ok(set_result_like(args.first(), acc))
 }
 
 fn set_symmetric_difference(args: &[Object]) -> Result<Object, RuntimeError> {
-    let mut a: crate::object::SetData = match args.first() {
+    let a: crate::object::SetData = match args.first() {
         Some(first) => set_iter_items(first)?.into_iter().collect(),
         None => return Ok(Object::new_set()),
     };
     let b: crate::object::SetData = match args.get(1) {
         Some(other) => set_iter_items(other)?.into_iter().collect(),
-        None => return Ok(Object::Set(Rc::new(RefCell::new(a)))),
+        None => return Ok(set_result_like(args.first(), a)),
     };
     let mut out = crate::object::SetData::new();
     for k in a.iter().filter(|k| !b.contains(*k)) {
@@ -8578,8 +8678,7 @@ fn set_symmetric_difference(args: &[Object]) -> Result<Object, RuntimeError> {
     for k in b.iter().filter(|k| !a.contains(*k)) {
         out.insert(k.clone());
     }
-    let _ = &mut a;
-    Ok(Object::Set(Rc::new(RefCell::new(out))))
+    Ok(set_result_like(args.first(), out))
 }
 
 fn set_issubset(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8629,11 +8728,16 @@ fn set_difference_update(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("frozenset is immutable"));
     }
     if let Object::Set(s) = set_self(args)? {
+        // Compute on a snapshot so the element `__hash__`/`__eq__` we
+        // invoke (which may re-enter and clear `s`) never runs while we
+        // hold `s.borrow_mut()` — see the bpo-46615 note in `set_intersection_update`.
+        let mut keep: crate::object::SetData = s.borrow().clone();
         for other in args.iter().skip(1) {
             for k in set_iter_items(other)? {
-                s.borrow_mut().shift_remove(&k);
+                keep.shift_remove(&k);
             }
         }
+        *s.borrow_mut() = keep;
     }
     Ok(Object::None)
 }
@@ -10326,6 +10430,36 @@ pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
 /// on binary-mode files (the method table gates on `f.binary`).
 pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    // A writable `memoryview` is a valid target (CPython's `readinto`
+    // accepts any read-write buffer). asyncio's `_sock_sendfile_fallback`
+    // hands `file.readinto` a `memoryview(bytearray(...))`.
+    if let Some(Object::MemoryView(mv)) = args.get(1) {
+        if mv.released.get() {
+            return Err(value_error(
+                "operation forbidden on released memoryview object",
+            ));
+        }
+        if mv.readonly.get() || !mv.is_c_contiguous() {
+            return Err(type_error(
+                "readinto() argument must be read-write bytes-like object, not memoryview",
+            ));
+        }
+        let capacity = mv.len.get();
+        let bytes = f.read_bytes(Some(capacity))?;
+        let n = bytes.len();
+        match &mv.buffer {
+            crate::object::MemoryViewBuffer::ByteArray(b) => {
+                let start = mv.start.get();
+                b.borrow_mut()[start..start + n].copy_from_slice(&bytes);
+            }
+            crate::object::MemoryViewBuffer::Bytes(_) => {
+                return Err(type_error(
+                    "readinto() argument must be read-write bytes-like object, not memoryview",
+                ));
+            }
+        }
+        return Ok(Object::Int(n as i64));
+    }
     let target = match args.get(1) {
         Some(Object::ByteArray(b)) => b.clone(),
         Some(Object::Instance(inst)) => match &inst.native {

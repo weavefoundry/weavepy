@@ -910,12 +910,20 @@ fn set_like(model: &Object, items: Vec<DictKey>) -> Object {
     }
 }
 
-fn contains_key(o: &Object, k: &DictKey) -> bool {
-    match o {
-        Object::Set(s) => s.borrow().contains(k),
-        Object::FrozenSet(s) => s.contains(k),
-        _ => false,
+/// Owned membership snapshot of a set operand.
+///
+/// Set operators must run element `__hash__`/`__eq__` (which, per the
+/// bpo-46615 regression tests, can re-enter and `clear()` the operands)
+/// *without* holding a borrow on any live `Object::Set` cell. We snapshot
+/// the elements out under a short-lived borrow (`set_items`) and rebuild a
+/// detached `IndexSet`, so a re-entrant mutation touches a cell we are no
+/// longer borrowing instead of panicking with `BorrowMutError`.
+fn snapshot_set(o: &Object) -> indexmap::IndexSet<DictKey> {
+    let mut out = indexmap::IndexSet::new();
+    for k in set_items(o) {
+        out.insert(k);
     }
+    out
 }
 
 macro_rules! set_binop {
@@ -933,34 +941,36 @@ macro_rules! set_binop {
 }
 
 set_binop!(set_sub_builtin, |a, b| {
+    let bs = snapshot_set(b);
     set_items(a)
         .into_iter()
-        .filter(|k| !contains_key(b, k))
+        .filter(|k| !bs.contains(k))
         .collect()
 });
 set_binop!(set_and_builtin, |a, b| {
+    let bs = snapshot_set(b);
     set_items(a)
         .into_iter()
-        .filter(|k| contains_key(b, k))
+        .filter(|k| bs.contains(k))
         .collect()
 });
 set_binop!(set_or_builtin, |a, b| {
-    let mut items = set_items(a);
+    let as_ = snapshot_set(a);
+    let mut items: Vec<DictKey> = as_.iter().cloned().collect();
     for k in set_items(b) {
-        if !contains_key(a, &k) {
+        if !as_.contains(&k) {
             items.push(k);
         }
     }
     items
 });
 set_binop!(set_xor_builtin, |a, b| {
-    let mut items: Vec<DictKey> = set_items(a)
-        .into_iter()
-        .filter(|k| !contains_key(b, k))
-        .collect();
-    for k in set_items(b) {
-        if !contains_key(a, &k) {
-            items.push(k);
+    let as_ = snapshot_set(a);
+    let bs = snapshot_set(b);
+    let mut items: Vec<DictKey> = as_.iter().filter(|k| !bs.contains(*k)).cloned().collect();
+    for k in bs.iter() {
+        if !as_.contains(k) {
+            items.push(k.clone());
         }
     }
     items
@@ -970,9 +980,10 @@ set_binop!(set_xor_builtin, |a, b| {
 // the result kind following `other` (the left operand of the original
 // expression).
 set_binop!(set_rsub_builtin, |a, b| {
+    let as_ = snapshot_set(a);
     set_items(b)
         .into_iter()
-        .filter(|k| !contains_key(a, k))
+        .filter(|k| !as_.contains(k))
         .collect()
 });
 
@@ -996,9 +1007,10 @@ fn set_rsub_outer(args: &[Object]) -> Result<Object, RuntimeError> {
 fn set_rand_outer(args: &[Object]) -> Result<Object, RuntimeError> {
     match two_sets(args) {
         Some((a, b)) => {
+            let as_ = snapshot_set(&a);
             let items = set_items(&b)
                 .into_iter()
-                .filter(|k| contains_key(&a, k))
+                .filter(|k| as_.contains(k))
                 .collect();
             Ok(set_like(&b, items))
         }
@@ -1009,9 +1021,10 @@ fn set_rand_outer(args: &[Object]) -> Result<Object, RuntimeError> {
 fn set_ror_outer(args: &[Object]) -> Result<Object, RuntimeError> {
     match two_sets(args) {
         Some((a, b)) => {
-            let mut items = set_items(&b);
+            let bs = snapshot_set(&b);
+            let mut items: Vec<DictKey> = bs.iter().cloned().collect();
             for k in set_items(&a) {
-                if !contains_key(&b, &k) {
+                if !bs.contains(&k) {
                     items.push(k);
                 }
             }
@@ -1024,13 +1037,13 @@ fn set_ror_outer(args: &[Object]) -> Result<Object, RuntimeError> {
 fn set_rxor_outer(args: &[Object]) -> Result<Object, RuntimeError> {
     match two_sets(args) {
         Some((a, b)) => {
-            let mut items: Vec<DictKey> = set_items(&b)
-                .into_iter()
-                .filter(|k| !contains_key(&a, k))
-                .collect();
-            for k in set_items(&a) {
-                if !contains_key(&b, &k) {
-                    items.push(k);
+            let as_ = snapshot_set(&a);
+            let bs = snapshot_set(&b);
+            let mut items: Vec<DictKey> =
+                bs.iter().filter(|k| !as_.contains(*k)).cloned().collect();
+            for k in as_.iter() {
+                if !bs.contains(k) {
+                    items.push(k.clone());
                 }
             }
             Ok(set_like(&b, items))
@@ -1040,7 +1053,8 @@ fn set_rxor_outer(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_subset(a: &Object, b: &Object) -> bool {
-    set_items(a).iter().all(|k| contains_key(b, k))
+    let bs = snapshot_set(b);
+    set_items(a).iter().all(|k| bs.contains(k))
 }
 
 macro_rules! set_cmp {
@@ -1084,7 +1098,7 @@ set_cmp!(set_ne_builtin, |a, b| {
 /// and return it; decline for frozenset/non-set operands so the VM
 /// falls back to the binary form (CPython only defines these on `set`).
 macro_rules! set_iop {
-    ($fname:ident, $apply:expr) => {
+    ($fname:ident, $compute:expr) => {
         fn $fname(args: &[Object]) -> Result<Object, RuntimeError> {
             let recv = as_native(
                 args.first()
@@ -1100,8 +1114,19 @@ macro_rules! set_iop {
             if !matches!(other, Object::Set(_) | Object::FrozenSet(_)) {
                 return Ok(crate::vm_singletons::not_implemented());
             }
-            let apply: fn(&mut indexmap::IndexSet<DictKey>, &Object) = $apply;
-            apply(&mut target.borrow_mut(), &other);
+            // Compute the new contents from a *detached* snapshot of the
+            // receiver, then publish in a borrow that runs no Python. The
+            // element `__hash__`/`__eq__` invoked while computing may
+            // re-enter and `clear()` the receiver (bpo-46615); because we
+            // hold no borrow on `target` during that window, the re-entrant
+            // mutation hits an un-borrowed cell instead of panicking.
+            let compute: fn(
+                indexmap::IndexSet<DictKey>,
+                &Object,
+            ) -> indexmap::IndexSet<DictKey> = $compute;
+            let snapshot = target.borrow().clone();
+            let result = compute(snapshot, &other);
+            *target.borrow_mut() = result;
             // Return the original receiver (subclass instance included)
             // so `s -= t` preserves identity.
             Ok(args[0].clone())
@@ -1109,20 +1134,28 @@ macro_rules! set_iop {
     };
 }
 
-set_iop!(set_isub_builtin, |t, o| {
-    for k in set_items(o) {
-        t.shift_remove(&k);
-    }
+set_iop!(set_isub_builtin, |mut t, o| {
+    let os = snapshot_set(o);
+    t.retain(|k| !os.contains(k));
+    t
 });
 set_iop!(set_iand_builtin, |t, o| {
-    t.retain(|k| contains_key(o, k));
+    let os = snapshot_set(o);
+    let mut out = indexmap::IndexSet::new();
+    for k in t {
+        if os.contains(&k) {
+            out.insert(k);
+        }
+    }
+    out
 });
-set_iop!(set_ior_builtin, |t, o| {
+set_iop!(set_ior_builtin, |mut t, o| {
     for k in set_items(o) {
         t.insert(k);
     }
+    t
 });
-set_iop!(set_ixor_builtin, |t, o| {
+set_iop!(set_ixor_builtin, |mut t, o| {
     for k in set_items(o) {
         if t.contains(&k) {
             t.shift_remove(&k);
@@ -1130,6 +1163,7 @@ set_iop!(set_ixor_builtin, |t, o| {
             t.insert(k);
         }
     }
+    t
 });
 
 fn install_set_operators(bt: &BuiltinTypes) {

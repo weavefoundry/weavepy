@@ -578,6 +578,22 @@ def clear_overloads():
     _overload_registry.clear()
 
 
+def final(f):
+    """Decorator to indicate final methods and final classes.
+
+    Mirrors CPython: set ``__final__ = True`` on the decorated object
+    when writable (best-effort, e.g. not on built-in descriptors) and
+    return it unchanged.
+    """
+    try:
+        f.__final__ = True
+    except (AttributeError, TypeError):
+        # Best effort: skip objects like properties / descriptors that
+        # don't allow setting attributes.
+        pass
+    return f
+
+
 def get_type_hints(obj, globalns=None, localns=None, include_extras=False):
     """Return a dict of annotations for the given class or function.
 

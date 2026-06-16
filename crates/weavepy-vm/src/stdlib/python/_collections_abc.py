@@ -113,7 +113,18 @@ del _coro
 async def _ag(): yield
 _ag = _ag()
 async_generator = type(_ag)
-del _ag
+# The single-shot awaitables behind `agen.asend()`/`agen.__anext__()` and
+# `agen.athrow()`/`agen.aclose()`. CPython treats them as coroutines
+# (structurally); register them so `asyncio.iscoroutine(agen.aclose())` is
+# true and `loop.create_task(agen.aclose())` works — PEP 525 finalization
+# and `shutdown_asyncgens` depend on it.
+_asend = _ag.asend(None)
+async_generator_asend = type(_asend)
+_asend.close()
+_athrow = _ag.aclose()
+async_generator_athrow = type(_athrow)
+_athrow.close()
+del _ag, _asend, _athrow
 
 
 ### ONE-TRICK PONIES ###
@@ -204,6 +215,10 @@ class Coroutine(Awaitable):
 
 
 Coroutine.register(coroutine)
+# `agen.asend()/athrow()/aclose()` awaitables are coroutine-like (CPython
+# recognises them via the structural `Coroutine.__subclasshook__`).
+Coroutine.register(async_generator_asend)
+Coroutine.register(async_generator_athrow)
 
 
 class AsyncIterable(metaclass=ABCMeta):

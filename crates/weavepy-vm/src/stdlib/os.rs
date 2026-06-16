@@ -263,6 +263,14 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("dup2", os_dup2),
         );
         d.insert(
+            DictKey(Object::from_static("get_inheritable")),
+            builtin("get_inheritable", os_get_inheritable),
+        );
+        d.insert(
+            DictKey(Object::from_static("set_inheritable")),
+            builtin("set_inheritable", os_set_inheritable),
+        );
+        d.insert(
             DictKey(Object::from_static("isatty")),
             builtin("isatty", os_isatty),
         );
@@ -293,6 +301,18 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("waitpid")),
             builtin("waitpid", os_waitpid),
+        );
+        d.insert(
+            DictKey(Object::from_static("waitstatus_to_exitcode")),
+            builtin("waitstatus_to_exitcode", os_waitstatus_to_exitcode),
+        );
+        d.insert(
+            DictKey(Object::from_static("set_blocking")),
+            builtin("set_blocking", os_set_blocking),
+        );
+        d.insert(
+            DictKey(Object::from_static("get_blocking")),
+            builtin("get_blocking", os_get_blocking),
         );
         // Common signal numbers — match libc on POSIX.
         d.insert(DictKey(Object::from_static("SIGTERM")), Object::Int(15));
@@ -1683,6 +1703,107 @@ fn os_waitpid(_args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
+/// `os.waitstatus_to_exitcode(status)` — convert a `wait()`/`waitpid()`
+/// status to an exit code: the exit status for a normal exit, or the
+/// negated signal number for a signal-terminated child. asyncio's
+/// `ThreadedChildWatcher._do_waitpid` calls this from its reaper thread;
+/// when it was missing the thread died with `AttributeError` and the
+/// subprocess waiter future never resolved, hanging every
+/// `create_subprocess_*` call (and the `test_events`/`test_subprocess`
+/// suites). Mirrors CPython's `os.waitstatus_to_exitcode`.
+#[cfg(unix)]
+fn os_waitstatus_to_exitcode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let status = match args.first() {
+        Some(Object::Int(s)) => *s as libc::c_int,
+        Some(Object::Bool(b)) => libc::c_int::from(*b),
+        _ => return Err(type_error("an integer is required")),
+    };
+    if libc::WIFEXITED(status) {
+        Ok(Object::Int(i64::from(libc::WEXITSTATUS(status))))
+    } else if libc::WIFSIGNALED(status) {
+        Ok(Object::Int(i64::from(-libc::WTERMSIG(status))))
+    } else if libc::WIFSTOPPED(status) {
+        Err(value_error(format!(
+            "process stopped by delivery of signal {}",
+            libc::WSTOPSIG(status)
+        )))
+    } else {
+        Err(value_error(format!("invalid wait status: {status}")))
+    }
+}
+
+#[cfg(not(unix))]
+fn os_waitstatus_to_exitcode(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(crate::error::not_implemented_error(
+        "os.waitstatus_to_exitcode() is only implemented on POSIX in WeavePy",
+    ))
+}
+
+/// `os.set_blocking(fd, blocking)` — toggle `O_NONBLOCK` on a file
+/// descriptor via `fcntl`. asyncio's pipe and socket transports set
+/// their fds non-blocking through this; without it, subprocess pipe
+/// transports raised `AttributeError` mid-setup.
+#[cfg(unix)]
+fn os_set_blocking(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(n)) => *n as libc::c_int,
+        _ => return Err(type_error("an integer is required")),
+    };
+    let blocking = match args.get(1) {
+        Some(Object::Bool(b)) => *b,
+        Some(Object::Int(n)) => *n != 0,
+        _ => return Err(type_error("set_blocking() takes a bool")),
+    };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    let new = if blocking {
+        flags & !libc::O_NONBLOCK
+    } else {
+        flags | libc::O_NONBLOCK
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, new) } < 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(Object::None)
+}
+
+#[cfg(not(unix))]
+fn os_set_blocking(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(crate::error::not_implemented_error(
+        "os.set_blocking() is only implemented on POSIX in WeavePy",
+    ))
+}
+
+/// `os.get_blocking(fd)` — `True` if `fd` is in blocking mode (i.e.
+/// `O_NONBLOCK` is clear).
+#[cfg(unix)]
+fn os_get_blocking(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(n)) => *n as libc::c_int,
+        _ => return Err(type_error("an integer is required")),
+    };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(Object::Bool(flags & libc::O_NONBLOCK == 0))
+}
+
+#[cfg(not(unix))]
+fn os_get_blocking(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(crate::error::not_implemented_error(
+        "os.get_blocking() is only implemented on POSIX in WeavePy",
+    ))
+}
+
 fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {
     #[cfg(unix)]
     {
@@ -1752,6 +1873,69 @@ fn os_dup2(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `os.get_inheritable(fd)` — a descriptor is inheritable iff its
+/// close-on-exec flag is clear (CPython's `_Py_get_inheritable`).
+fn os_get_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        Some(Object::Bool(b)) => i32::from(*b),
+        _ => return Err(type_error("get_inheritable() arg must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        Ok(Object::Bool(flags & libc::FD_CLOEXEC == 0))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        Err(crate::error::not_implemented_error(
+            "os.get_inheritable() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+/// `os.set_inheritable(fd, inheritable)` — toggle the close-on-exec flag
+/// (CPython's `_Py_set_inheritable`).
+fn os_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        Some(Object::Bool(b)) => i32::from(*b),
+        _ => return Err(type_error("set_inheritable() arg must be int")),
+    };
+    let inheritable = match args.get(1) {
+        Some(Object::Bool(b)) => *b,
+        Some(Object::Int(n)) => *n != 0,
+        _ => return Err(type_error("set_inheritable() arg2 must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        let new = if inheritable {
+            flags & !libc::FD_CLOEXEC
+        } else {
+            flags | libc::FD_CLOEXEC
+        };
+        if new != flags && unsafe { libc::fcntl(fd, libc::F_SETFD, new) } < 0 {
+            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fd, inheritable);
+        Err(crate::error::not_implemented_error(
+            "os.set_inheritable() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
 fn os_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(i)) => *i,
@@ -1797,6 +1981,25 @@ fn os_read(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// Run any tripped OS-signal handlers on the main thread, propagating a
+/// handler that raises (PEP 475). A no-op off the main thread (Python
+/// signal handlers only run there) and when nothing is pending. Used by the
+/// blocking `os` syscalls so an `EINTR` runs the handler before retrying.
+#[cfg(unix)]
+fn service_pending_signals() -> Result<(), RuntimeError> {
+    if !crate::gil::is_main_thread() || !crate::stdlib::signal_mod::signals_pending() {
+        return Ok(());
+    }
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the active builtin call on this (main) thread;
+        // the interpreter outlives this synchronous re-entrant call, mirroring
+        // the `select`/`_thread` blocking-signal pattern.
+        let interp = unsafe { &mut *ptr };
+        interp.run_pending_signals_public()?;
+    }
+    Ok(())
+}
+
 fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(i)) => *i as i32,
@@ -1810,11 +2013,26 @@ fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     #[cfg(unix)]
     {
-        let r = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        if r < 0 {
-            return Err(crate::error::os_error("write() failed"));
+        // Release the GIL across the (possibly blocking) write so peers run,
+        // and honour PEP 475: when a signal interrupts the write (`EINTR`),
+        // run the tripped Python handler before retrying. A handler that
+        // raises (e.g. a `SIGALRM` that does `1/0`) then abandons a write
+        // blocked on a full pipe instead of looping forever — exactly what
+        // `test_io`'s `SignalsTest.test_interrupted_write_*` exercises.
+        loop {
+            let r = crate::gil::allow_threads_then(|| unsafe {
+                libc::write(fd, data.as_ptr().cast(), data.len())
+            });
+            if r < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    service_pending_signals()?;
+                    continue;
+                }
+                return Err(crate::error::io_error_to_py(&err));
+            }
+            return Ok(Object::Int(r as i64));
         }
-        Ok(Object::Int(r as i64))
     }
     #[cfg(not(unix))]
     {

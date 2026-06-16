@@ -173,6 +173,7 @@ impl TypeObject {
                         | "ellipsis"
                         | "range"
                         | "slice"
+                        | "lock"
                         | "memoryview"
                         | "function"
                         | "builtin_function_or_method"

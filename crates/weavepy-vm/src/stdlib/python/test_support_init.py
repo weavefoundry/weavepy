@@ -256,6 +256,45 @@ INTERNET_TIMEOUT = 60.0
 SHORT_TIMEOUT = 30.0
 LONG_TIMEOUT = 5 * 60.0
 
+# Largest buffer size pipe/socket I/O tests will push through a single
+# write (CPython's `test.support.PIPE_MAX_SIZE`). Sized to comfortably
+# exceed any platform pipe buffer so a "fill the pipe" probe blocks.
+PIPE_MAX_SIZE = 4 * 1024 * 1024 + 1
+SOCK_MAX_SIZE = 16 * 1024 * 1024 + 1
+
+
+def busy_retry(timeout, err_msg=None, /, *, error=True):
+    """Run the loop body until "break" stops the loop (CPython verbatim)."""
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+
+    start_time = time.monotonic()
+    deadline = start_time + timeout
+
+    while True:
+        yield
+
+        if time.monotonic() >= deadline:
+            break
+
+    if error:
+        dt = time.monotonic() - start_time
+        msg = f"timeout ({dt:.1f} seconds)"
+        if err_msg:
+            msg = f"{msg}: {err_msg}"
+        raise AssertionError(msg)
+
+
+def sleeping_retry(timeout, err_msg=None, /,
+                   *, init_delay=0.010, max_delay=1.0, error=True):
+    """Wait strategy that applies exponential backoff (CPython verbatim)."""
+    delay = init_delay
+    for _ in busy_retry(timeout, err_msg, error=error):
+        yield
+
+        time.sleep(delay)
+        delay = min(delay * 2, max_delay)
+
 
 class ResourceDenied(unittest.SkipTest):
     """A resource the test needs is not enabled, so the test skips."""
@@ -1074,13 +1113,16 @@ def bigmemtest(size, memuse, dry_run=True):
                 maxsize = 5147
             else:
                 maxsize = size_val
-            if real_max_memuse and real_max_memuse < maxsize * memuse:
-                if dry_run:
-                    maxsize = 5147
-                else:
-                    raise unittest.SkipTest(
-                        "not enough memory: %.1fG minimum needed" %
-                        (size_val * memuse / (1024 ** 3)))
+            # Match CPython exactly: a `dry_run=False` bigmemtest run
+            # without `-M` (so `real_max_memuse == 0`) is *skipped*, not
+            # run at the 5147 dummy size. Dropping the `or not dry_run`
+            # clause made `test_queue`'s `test_many_threads` fan out to
+            # 2 * 5147 OS threads and fail with `pthread_create: EAGAIN`.
+            if ((real_max_memuse or not dry_run)
+                    and real_max_memuse < maxsize * memuse):
+                raise unittest.SkipTest(
+                    "not enough memory: %.1fG minimum needed" %
+                    (size_val * memuse / (1024 ** 3)))
             return f(self, maxsize)
         wrapper.size = size
         wrapper.memuse = memuse
@@ -1103,6 +1145,12 @@ def reap_children():
             break
         if pid == 0:
             break
+
+
+def maybe_get_event_loop_policy():
+    """Return the global event loop policy if one is set, else return None."""
+    import asyncio.events
+    return asyncio.events._event_loop_policy
 
 
 def get_pagesize():

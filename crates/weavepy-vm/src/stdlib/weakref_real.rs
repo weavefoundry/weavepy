@@ -644,6 +644,13 @@ pub(crate) fn supports_weakref(target: &Object) -> bool {
     if cls.is_subclass_of(&crate::builtin_types::builtin_types().module_) {
         return true;
     }
+    // The native `_thread` synchronisation primitives carry a
+    // `tp_weaklistoffset` in CPython (`lock_tests` takes weakrefs to
+    // them). They're builtin types with an all-builtin MRO, so the loop
+    // below would otherwise reject them.
+    if matches!(cls.name.as_str(), "lock" | "RLock" | "_ThreadHandle") {
+        return true;
+    }
     let mro = cls.mro.borrow().clone();
     for ty in mro {
         if ty.flags.is_builtin {

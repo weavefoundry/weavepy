@@ -61,32 +61,40 @@ struct SocketState {
     blocking: bool,
 }
 
-thread_local! {
-    static REGISTRY: RefCell<HashMap<i64, Rc<RefCell<SocketState>>>> =
-        RefCell::new(HashMap::new());
-    static NEXT_HANDLE: RefCell<i64> = const { RefCell::new(0) };
-    static SOCKET_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+// The socket registry is process-global (shared across all OS threads),
+// *not* thread-local. RFC 0039 gives WeavePy real threads, and CPython
+// sockets are usable from any thread — most critically asyncio's self-pipe
+// write end (`loop._csock`) is created on the loop thread but written from
+// executor worker threads inside `call_soon_threadsafe` to wake the
+// selector. A thread-local registry made that socket resolve to "fd -1 /
+// already closed" off its creating thread, so the wakeup byte was silently
+// dropped and any loop blocked in `select()` waiting on a cross-thread
+// result (`run_in_executor`, `call_soon_threadsafe`) deadlocked forever.
+// `Rc`/`RefCell` here alias `Arc`/`GilCell` (RFC 0025), so the stored
+// `SocketState` handles are already `Send + Sync`.
+fn registry() -> &'static parking_lot::Mutex<HashMap<i64, Rc<RefCell<SocketState>>>> {
+    static REGISTRY: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<i64, Rc<RefCell<SocketState>>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
 fn next_handle(state: Rc<RefCell<SocketState>>) -> i64 {
-    let handle = NEXT_HANDLE.with(|c| {
-        let mut n = c.borrow_mut();
-        // Use the underlying OS fd as the handle if available so
-        // `fileno()` returns something a host C library would accept.
-        // Fall back to a monotonically increasing counter for
-        // platforms (or modes) where we can't extract the raw fd.
-        let h = state
-            .borrow()
-            .inner
-            .as_ref()
-            .and_then(raw_fd_of)
-            .unwrap_or_else(|| {
-                *n += 1;
-                -*n
-            });
-        h
-    });
-    REGISTRY.with(|r| r.borrow_mut().insert(handle, state));
+    use std::sync::atomic::{AtomicI64, Ordering};
+    // Synthetic-handle counter for sockets without an extractable OS fd.
+    static NEXT_HANDLE: AtomicI64 = AtomicI64::new(0);
+    // Use the underlying OS fd as the handle if available so `fileno()`
+    // returns something a host C library would accept. Fall back to a
+    // monotonically *decreasing* synthetic id otherwise. The `state` borrow
+    // is a temporary scoped to this statement, so it's released before
+    // `state` is moved into the registry below.
+    let handle = state
+        .borrow()
+        .inner
+        .as_ref()
+        .and_then(raw_fd_of)
+        .unwrap_or_else(|| -(NEXT_HANDLE.fetch_add(1, Ordering::Relaxed) + 1));
+    registry().lock().insert(handle, state);
     handle
 }
 
@@ -107,14 +115,35 @@ fn raw_fd_of(_sock: &Socket) -> Option<i64> {
     None
 }
 
+/// Consume a `Socket`, releasing its OS file descriptor *without* closing
+/// it. This is the ownership transfer `socket.detach()` performs: the
+/// Python object stops managing the fd, but the fd stays open for the
+/// caller. Dropping the `Socket` (as `Option::take` then drop would) is
+/// wrong here — it closes the fd, and with socket2's IO-safety that turns
+/// a later legitimate close of the same fd into a process abort.
+#[cfg(unix)]
+fn into_raw_fd_of(sock: Socket) -> i64 {
+    use std::os::unix::io::IntoRawFd;
+    i64::from(sock.into_raw_fd())
+}
+
+#[cfg(windows)]
+fn into_raw_fd_of(sock: Socket) -> i64 {
+    use std::os::windows::io::IntoRawSocket;
+    sock.into_raw_socket() as i64
+}
+
+#[cfg(not(any(unix, windows)))]
+fn into_raw_fd_of(_sock: Socket) -> i64 {
+    -1
+}
+
 fn get_state(handle: i64) -> Option<Rc<RefCell<SocketState>>> {
-    REGISTRY.with(|r| r.borrow().get(&handle).cloned())
+    registry().lock().get(&handle).cloned()
 }
 
 fn remove_state(handle: i64) {
-    REGISTRY.with(|r| {
-        r.borrow_mut().remove(&handle);
-    });
+    registry().lock().remove(&handle);
 }
 
 /// Borrow the raw OS file descriptor for the given socket handle.
@@ -182,6 +211,18 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Int(41),
         );
         d.insert(DictKey(Object::from_static("IPPROTO_ICMP")), Object::Int(1));
+
+        // IPv6 socket options. `IPV6_V6ONLY` differs by platform
+        // (BSD/macOS use 27, Linux uses 26); asyncio's `create_server`
+        // sets it on dual-stack listeners.
+        d.insert(
+            DictKey(Object::from_static("IPV6_V6ONLY")),
+            Object::Int(if cfg!(any(target_os = "macos", target_os = "ios")) {
+                27
+            } else {
+                26
+            }),
+        );
 
         // Option levels.
         d.insert(
@@ -352,23 +393,31 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
 // ---- socket class construction ----
 
 fn socket_class() -> Rc<TypeObject> {
-    SOCKET_CLASS.with(|slot| {
-        if let Some(c) = slot.borrow().as_ref() {
-            return c.clone();
-        }
-        let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
-        for (name, method) in socket_methods() {
-            dict.insert(DictKey(Object::from_str(name)), method);
-        }
-        let cls = TypeObject::new_user("socket", vec![bt.object_.clone()], dict)
-            .expect("socket class must linearise");
-        // The constructor lives on the class as `__init__`, and the
-        // module-level `socket.socket(...)` callable goes through
-        // `Vm::instantiate` which dispatches it.
-        *slot.borrow_mut() = Some(cls.clone());
-        cls
-    })
+    // Process-global (shared across threads) so a socket built on a worker
+    // thread is an instance of the *same* class object as `socket.socket`
+    // exported from the module, keeping `isinstance` correct cross-thread.
+    // Construction never re-enters `socket_class()`, so `get_or_init` is safe.
+    static SOCKET_CLASS: std::sync::OnceLock<Rc<TypeObject>> = std::sync::OnceLock::new();
+    SOCKET_CLASS
+        .get_or_init(|| {
+            let bt = crate::builtin_types::builtin_types();
+            let mut dict = DictData::new();
+            for (name, method) in socket_methods() {
+                dict.insert(DictKey(Object::from_str(name)), method);
+            }
+            let cls = TypeObject::new_user("socket", vec![bt.object_.clone()], dict)
+                .expect("socket class must linearise");
+            // Expose `family`/`type`/`proto`/`timeout` as class-level getset
+            // descriptors so they show up in `dir(socket.socket)` (CPython
+            // parity); this is what `unittest.mock`'s `spec=` allow-list and
+            // a number of `test_asyncio` transport tests depend on.
+            install_socket_getset(&cls);
+            // The constructor lives on the class as `__init__`, and the
+            // module-level `socket.socket(...)` callable goes through
+            // `Vm::instantiate` which dispatches it.
+            cls
+        })
+        .clone()
 }
 
 fn socket_methods() -> Vec<(&'static str, Object)> {
@@ -386,7 +435,17 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
         };
     }
     vec![
-        m!("__init__", sock_init),
+        // `__init__` is kwargs-aware: `socket(family=..., type=..., proto=...,
+        // fileno=...)` is idiomatic CPython (e.g. asyncio's `_connect_sock`).
+        (
+            "__init__",
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__init__",
+                binds_instance: true,
+                call: Box::new(|args| sock_init_kw(args, &[])),
+                call_kw: Some(Box::new(sock_init_kw)),
+            })),
+        ),
         m!("__enter__", sock_enter),
         m!("__exit__", sock_exit),
         m!("__repr__", sock_repr),
@@ -413,6 +472,7 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
         m!("close", sock_close),
         m!("shutdown", sock_shutdown),
         m!("detach", sock_detach),
+        m!("dup", sock_dup),
         m!("makefile", sock_makefile),
         m!("family_get", sock_family_attr),
         m!("type_get", sock_type_attr),
@@ -441,30 +501,158 @@ fn state_of(args: &[Object]) -> Result<Rc<RefCell<SocketState>>, RuntimeError> {
     get_state(handle).ok_or_else(|| os_error("socket already closed"))
 }
 
+/// Wrap an already-open OS file descriptor in a `socket2::Socket`,
+/// taking ownership of it (matching CPython's `socket(fileno=fd)`, which
+/// does *not* dup the fd). Used by the `fileno=` constructor path.
+#[cfg(unix)]
+fn wrap_fd_socket(fd: i64) -> Result<Socket, RuntimeError> {
+    use std::os::unix::io::FromRawFd;
+    if fd < 0 {
+        return Err(os_error("negative file descriptor"));
+    }
+    Ok(unsafe { Socket::from_raw_fd(fd as std::os::unix::io::RawFd) })
+}
+
+#[cfg(windows)]
+fn wrap_fd_socket(fd: i64) -> Result<Socket, RuntimeError> {
+    use std::os::windows::io::FromRawSocket;
+    Ok(unsafe { Socket::from_raw_socket(fd as u64 as std::os::windows::io::RawSocket) })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn wrap_fd_socket(_fd: i64) -> Result<Socket, RuntimeError> {
+    Err(os_error("fileno argument is not supported on this platform"))
+}
+
+/// Reconstruct a *non-owning* `Socket` view over an already-open fd.
+///
+/// The returned `ManuallyDrop` deliberately never runs `Socket`'s
+/// destructor, so dropping it does **not** close the descriptor — the
+/// real owner stays inside `SocketState::inner`. Callers only ever take
+/// `&*view`.
+#[cfg(unix)]
+fn fd_to_socket_view(fd: i64) -> std::mem::ManuallyDrop<Socket> {
+    use std::os::unix::io::FromRawFd;
+    std::mem::ManuallyDrop::new(unsafe { Socket::from_raw_fd(fd as std::os::unix::io::RawFd) })
+}
+
+#[cfg(windows)]
+fn fd_to_socket_view(fd: i64) -> std::mem::ManuallyDrop<Socket> {
+    use std::os::windows::io::FromRawSocket;
+    std::mem::ManuallyDrop::new(unsafe {
+        Socket::from_raw_socket(fd as u64 as std::os::windows::io::RawSocket)
+    })
+}
+
+/// Drive a blocking socket syscall with the GIL released and *without*
+/// holding the `SocketState` cell borrow.
+///
+/// RFC 0039 (real threads + GIL): a blocking syscall must mirror
+/// CPython's `Py_BEGIN_ALLOW_THREADS … Py_END_ALLOW_THREADS`, otherwise
+/// two failure modes appear once sockets are touched from more than one
+/// OS thread:
+///
+/// 1. **Cell deadlock.** Holding the socket's `RefCell`/`GilCell` borrow
+///    across the syscall parks any peer thread that tries to
+///    `borrow`/`borrow_mut` the *same* socket — e.g. the loop thread
+///    closing a listener during teardown while a server thread is parked
+///    in `accept()`, or an executor worker closing a socket the loop is
+///    reading. The observed `test_streams` hang was exactly this: the
+///    loop thread blocked in `close()`'s `borrow_mut` behind a server
+///    thread blocked in `accept()`.
+/// 2. **GIL starvation.** Keeping the GIL held across the syscall stops
+///    every other Python thread from running for the syscall's whole
+///    (unbounded) duration.
+///
+/// We snapshot the raw fd, drop the borrow, then run the syscall through
+/// [`allow_threads_then`]. Peers can run — and may even legitimately
+/// `close()` this fd to interrupt us, in which case the syscall fails
+/// with `EBADF`, exactly as on CPython.
+#[cfg(any(unix, windows))]
+fn blocking_socket_io<R>(
+    state: &Rc<RefCell<SocketState>>,
+    f: impl FnOnce(&Socket) -> std::io::Result<R>,
+) -> Result<R, RuntimeError> {
+    let fd = {
+        let b = state.borrow();
+        let sock = b.inner.as_ref().ok_or_else(|| os_error("socket closed"))?;
+        raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?
+    };
+    let view = fd_to_socket_view(fd);
+    crate::gil::allow_threads_then(|| f(&view)).map_err(|e| io_error_to_py(&e))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn blocking_socket_io<R>(
+    _state: &Rc<RefCell<SocketState>>,
+    _f: impl FnOnce(&Socket) -> std::io::Result<R>,
+) -> Result<R, RuntimeError> {
+    Err(os_error("sockets are not supported on this platform"))
+}
+
 fn sock_init(args: &[Object]) -> Result<Object, RuntimeError> {
-    // args[0] = self, then positional family/type/proto/fileno.
+    sock_init_kw(args, &[])
+}
+
+fn sock_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // CPython signature: socket(family=-1, type=-1, proto=-1, fileno=None).
+    // args[0] is self; the rest fill family/type/proto/fileno positionally,
+    // and any of those four may instead be passed by keyword.
     let inst = extract_self(args)?;
-    let family = match args.get(1) {
-        Some(Object::Int(i)) => *i as i32,
-        None | Some(Object::None) => libc_af_inet() as i32,
-        _ => return Err(type_error("family must be int")),
+    const NAMES: [&str; 4] = ["family", "type", "proto", "fileno"];
+    let pos = &args[1..];
+    if pos.len() > NAMES.len() {
+        return Err(type_error(format!(
+            "socket() takes at most {} arguments ({} given)",
+            NAMES.len(),
+            pos.len()
+        )));
+    }
+    let mut slots: [Option<Object>; 4] = [None, None, None, None];
+    for (i, v) in pos.iter().enumerate() {
+        slots[i] = Some(v.clone());
+    }
+    for (k, v) in kwargs {
+        match NAMES.iter().position(|n| n == k) {
+            Some(idx) if slots[idx].is_some() => {
+                return Err(type_error(format!(
+                    "socket() got multiple values for argument '{k}'"
+                )));
+            }
+            Some(idx) => slots[idx] = Some(v.clone()),
+            None => {
+                return Err(type_error(format!(
+                    "socket() got an unexpected keyword argument '{k}'"
+                )));
+            }
+        }
+    }
+    let as_i32 = |slot: &Option<Object>, default: i32, what: &str| -> Result<i32, RuntimeError> {
+        match slot {
+            // CPython treats the -1 sentinel as "use the default".
+            Some(Object::Int(i)) if *i == -1 => Ok(default),
+            Some(Object::Int(i)) => Ok(*i as i32),
+            None | Some(Object::None) => Ok(default),
+            _ => Err(type_error(format!("{what} must be int"))),
+        }
     };
-    let kind = match args.get(2) {
-        Some(Object::Int(i)) => *i as i32,
-        None | Some(Object::None) => libc_sock_stream() as i32,
-        _ => return Err(type_error("type must be int")),
+    let family = as_i32(&slots[0], libc_af_inet() as i32, "family")?;
+    let kind = as_i32(&slots[1], libc_sock_stream() as i32, "type")?;
+    let proto = as_i32(&slots[2], 0, "proto")?;
+    let fileno = match &slots[3] {
+        None | Some(Object::None) => None,
+        Some(Object::Int(fd)) => Some(*fd),
+        _ => return Err(type_error("fileno must be int or None")),
     };
-    let proto = match args.get(3) {
-        Some(Object::Int(i)) => *i as i32,
-        None | Some(Object::None) => 0,
-        _ => return Err(type_error("proto must be int")),
+    let inner = match fileno {
+        Some(fd) => wrap_fd_socket(fd)?,
+        None => Socket::new(
+            Domain::from(family),
+            Type::from(kind),
+            Some(Protocol::from(proto)),
+        )
+        .map_err(|e| io_error_to_py(&e))?,
     };
-    let inner = Socket::new(
-        Domain::from(family),
-        Type::from(kind),
-        Some(Protocol::from(proto)),
-    )
-    .map_err(|e| io_error_to_py(&e))?;
     let state = Rc::new(RefCell::new(SocketState {
         inner: Some(inner),
         family,
@@ -566,14 +754,7 @@ fn sock_listen(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
-    let (new_sock, addr) = {
-        let s_borrow = state.borrow();
-        let sock = s_borrow
-            .inner
-            .as_ref()
-            .ok_or_else(|| os_error("socket closed"))?;
-        sock.accept().map_err(|e| io_error_to_py(&e))?
-    };
+    let (new_sock, addr) = blocking_socket_io(&state, |sock| sock.accept())?;
     let (family, kind, proto) = {
         let s = state.borrow();
         (s.family, s.kind, s.proto)
@@ -611,63 +792,78 @@ fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sock_connect(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
-    let family = state.borrow().family;
+    let (family, timeout) = {
+        let b = state.borrow();
+        (b.family, b.timeout)
+    };
     let addr = parse_socket_address(args.get(1), family)?;
-    let s_borrow = state.borrow();
-    let sock = s_borrow
-        .inner
-        .as_ref()
-        .ok_or_else(|| os_error("socket closed"))?;
-    let timeout = s_borrow.timeout;
-    match timeout {
-        Some(t) => sock.connect_timeout(&SockAddr::from(addr), t),
-        None => sock.connect(&SockAddr::from(addr)),
-    }
-    .map_err(|e| io_error_to_py(&e))?;
+    let sockaddr = SockAddr::from(addr);
+    blocking_socket_io(&state, move |sock| match timeout {
+        // A strictly-positive timeout means "timeout mode": bound the
+        // connect with `connect_timeout`.
+        Some(t) if !t.is_zero() => sock.connect_timeout(&sockaddr, t),
+        // `Some(0)` is non-blocking mode (CPython couples
+        // `setblocking(False)`/`settimeout(0)` to a zero timeout) and
+        // `None` is blocking. In both cases issue a plain `connect`: on a
+        // non-blocking fd it surfaces `EINPROGRESS`/`EWOULDBLOCK`, exactly
+        // like CPython, instead of being mis-read as a 0-second deadline.
+        _ => sock.connect(&sockaddr),
+    })?;
     Ok(Object::None)
 }
 
 fn sock_connect_ex(args: &[Object]) -> Result<Object, RuntimeError> {
     match sock_connect(args) {
         Ok(_) => Ok(Object::Int(0)),
+        // CPython's `connect_ex` returns the raw C errno instead of
+        // raising. asyncio's `loop.sock_connect` depends on this: it
+        // treats `EINPROGRESS`/`EWOULDBLOCK` as "in flight" and anything
+        // else as a hard failure. `io_error_to_py` stashes the errno on
+        // the exception's `.errno`, so recover it from there.
         Err(RuntimeError::PyException(p)) => {
-            // CPython returns the errno; we don't track that, so
-            // return a non-zero placeholder.
-            let _ = p;
-            Ok(Object::Int(-1))
+            let errno = errno_of_exception(&p).unwrap_or(libc::EINVAL as i64);
+            Ok(Object::Int(errno))
         }
         Err(e) => Err(e),
     }
 }
 
+/// Recover the integer `errno` an `OSError`-family exception was built with
+/// (see [`crate::error::io_error_to_py`]), if present.
+fn errno_of_exception(p: &crate::error::PyException) -> Option<i64> {
+    if let Object::Instance(inst) = &p.instance {
+        if let Some(Object::Int(n)) = inst
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("errno")))
+        {
+            return Some(*n);
+        }
+    }
+    None
+}
+
 fn sock_send(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let data = extract_bytes(args.get(1))?;
-    let s_borrow = state.borrow();
-    let sock = s_borrow
-        .inner
-        .as_ref()
-        .ok_or_else(|| os_error("socket closed"))?;
-    let n = sock.send(&data).map_err(|e| io_error_to_py(&e))?;
+    let n = blocking_socket_io(&state, |sock| sock.send(&data))?;
     Ok(Object::Int(n as i64))
 }
 
 fn sock_sendall(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let data = extract_bytes(args.get(1))?;
-    let s_borrow = state.borrow();
-    let sock = s_borrow
-        .inner
-        .as_ref()
-        .ok_or_else(|| os_error("socket closed"))?;
-    let mut offset = 0;
-    while offset < data.len() {
-        let n = sock.send(&data[offset..]).map_err(|e| io_error_to_py(&e))?;
-        if n == 0 {
-            return Err(broken_pipe());
+    blocking_socket_io(&state, |sock| {
+        let mut offset = 0;
+        while offset < data.len() {
+            let n = sock.send(&data[offset..])?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            offset += n;
         }
-        offset += n;
-    }
+        Ok(())
+    })?;
     Ok(Object::None)
 }
 
@@ -676,14 +872,8 @@ fn sock_sendto(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = extract_bytes(args.get(1))?;
     let family = state.borrow().family;
     let addr = parse_socket_address(args.get(2), family)?;
-    let s_borrow = state.borrow();
-    let sock = s_borrow
-        .inner
-        .as_ref()
-        .ok_or_else(|| os_error("socket closed"))?;
-    let n = sock
-        .send_to(&data, &SockAddr::from(addr))
-        .map_err(|e| io_error_to_py(&e))?;
+    let sockaddr = SockAddr::from(addr);
+    let n = blocking_socket_io(&state, |sock| sock.send_to(&data, &sockaddr))?;
     Ok(Object::Int(n as i64))
 }
 
@@ -694,14 +884,7 @@ fn sock_recv(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("recv: bufsize must be int")),
     };
     let mut buf: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); bufsize];
-    let n = {
-        let s_borrow = state.borrow();
-        let sock = s_borrow
-            .inner
-            .as_ref()
-            .ok_or_else(|| os_error("socket closed"))?;
-        sock.recv(&mut buf).map_err(|e| io_error_to_py(&e))?
-    };
+    let n = blocking_socket_io(&state, |sock| sock.recv(&mut buf))?;
     let initialised: Vec<u8> = buf[..n]
         .iter()
         .map(|m| unsafe { m.assume_init() })
@@ -727,14 +910,7 @@ fn sock_recv_into(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("recv_into expects a bytearray")),
     };
     let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); cap];
-    let n = {
-        let s_borrow = state.borrow();
-        let sock = s_borrow
-            .inner
-            .as_ref()
-            .ok_or_else(|| os_error("socket closed"))?;
-        sock.recv(&mut buf).map_err(|e| io_error_to_py(&e))?
-    };
+    let n = blocking_socket_io(&state, |sock| sock.recv(&mut buf))?;
     if let Some(Object::ByteArray(b)) = buffer {
         let mut bytes = b.borrow_mut();
         for i in 0..n {
@@ -751,14 +927,7 @@ fn sock_recvfrom(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("recvfrom: bufsize must be int")),
     };
     let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); bufsize];
-    let (n, addr) = {
-        let s_borrow = state.borrow();
-        let sock = s_borrow
-            .inner
-            .as_ref()
-            .ok_or_else(|| os_error("socket closed"))?;
-        sock.recv_from(&mut buf).map_err(|e| io_error_to_py(&e))?
-    };
+    let (n, addr) = blocking_socket_io(&state, |sock| sock.recv_from(&mut buf))?;
     let initialised: Vec<u8> = buf[..n]
         .iter()
         .map(|m| unsafe { m.assume_init() })
@@ -786,7 +955,19 @@ fn sock_setblocking(args: &[Object]) -> Result<Object, RuntimeError> {
         sock.set_nonblocking(!flag)
             .map_err(|e| io_error_to_py(&e))?;
     }
-    state.borrow_mut().blocking = flag;
+    {
+        let mut s = state.borrow_mut();
+        s.blocking = flag;
+        // CPython couples blocking-mode and timeout: `setblocking(False)`
+        // is exactly `settimeout(0.0)` and `setblocking(True)` is
+        // `settimeout(None)`. asyncio relies on `gettimeout() == 0` to
+        // confirm a socket is non-blocking, so keep them in lockstep.
+        s.timeout = if flag {
+            None
+        } else {
+            Some(Duration::from_secs(0))
+        };
+    }
     Ok(Object::None)
 }
 
@@ -804,18 +985,41 @@ fn sock_settimeout(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(n)) => Some(Duration::from_secs(*n as u64)),
         _ => return Err(type_error("settimeout: arg must be number or None")),
     };
+    // CPython: a zero timeout puts the socket in non-blocking mode; a
+    // positive timeout is "timeout mode" (also non-blocking at the fd
+    // level, with the wait bounded by the runtime); `None` is blocking.
     {
         let s_borrow = state.borrow();
         let sock = s_borrow
             .inner
             .as_ref()
             .ok_or_else(|| os_error("socket closed"))?;
-        sock.set_read_timeout(timeout)
-            .map_err(|e| io_error_to_py(&e))?;
-        sock.set_write_timeout(timeout)
-            .map_err(|e| io_error_to_py(&e))?;
+        match timeout {
+            // Zero ⇒ pure non-blocking; don't program a 0-duration SO_*TIMEO
+            // (some platforms read that as "block forever").
+            Some(d) if d.is_zero() => {
+                sock.set_nonblocking(true).map_err(|e| io_error_to_py(&e))?;
+            }
+            Some(d) => {
+                sock.set_read_timeout(Some(d))
+                    .map_err(|e| io_error_to_py(&e))?;
+                sock.set_write_timeout(Some(d))
+                    .map_err(|e| io_error_to_py(&e))?;
+            }
+            None => {
+                sock.set_nonblocking(false)
+                    .map_err(|e| io_error_to_py(&e))?;
+                sock.set_read_timeout(None).map_err(|e| io_error_to_py(&e))?;
+                sock.set_write_timeout(None)
+                    .map_err(|e| io_error_to_py(&e))?;
+            }
+        }
     }
-    state.borrow_mut().timeout = timeout;
+    {
+        let mut s = state.borrow_mut();
+        s.timeout = timeout;
+        s.blocking = timeout.is_none();
+    }
     Ok(Object::None)
 }
 
@@ -830,7 +1034,7 @@ fn sock_gettimeout(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sock_setsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
-    let _level = match args.get(1) {
+    let level = match args.get(1) {
         Some(Object::Int(n)) => *n as i32,
         _ => return Err(type_error("setsockopt: level must be int")),
     };
@@ -864,8 +1068,8 @@ fn sock_setsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
     } else if optname == libc_so_broadcast() as i32 {
         sock.set_broadcast(want != 0)
             .map_err(|e| io_error_to_py(&e))?;
-    } else if optname == 1 {
-        // TCP_NODELAY
+    } else if level == 6 && optname == 1 {
+        // TCP_NODELAY (level IPPROTO_TCP/SOL_TCP).
         sock.set_nodelay(want != 0)
             .map_err(|e| io_error_to_py(&e))?;
     } else if optname == libc_so_sndbuf() as i32 {
@@ -880,6 +1084,10 @@ fn sock_setsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sock_getsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
+    let level = match args.get(1) {
+        Some(Object::Int(n)) => *n as i32,
+        _ => return Err(type_error("getsockopt: level must be int")),
+    };
     let optname = match args.get(2) {
         Some(Object::Int(n)) => *n as i32,
         _ => return Err(type_error("getsockopt: optname must be int")),
@@ -889,6 +1097,12 @@ fn sock_getsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
         .inner
         .as_ref()
         .ok_or_else(|| os_error("socket closed"))?;
+    let as_int = |b: bool| Object::Int(i64::from(b));
+    // TCP_NODELAY lives at the IPPROTO_TCP/SOL_TCP level (6); disambiguate
+    // it from SOL_SOCKET options that share the numeric optname 1.
+    if level == 6 && optname == 1 {
+        return Ok(as_int(sock.nodelay().map_err(|e| io_error_to_py(&e))?));
+    }
     if optname == 4 {
         // SO_ERROR — return last error number, or 0.
         let err = sock.take_error().ok().flatten();
@@ -898,7 +1112,33 @@ fn sock_getsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     if optname == 3 {
         // SO_TYPE — return our recorded kind.
-        return Ok(Object::Int(i64::from(state.borrow().kind)));
+        return Ok(Object::Int(i64::from(s_borrow.kind)));
+    }
+    // Read back the SO_* options we know how to set, so a
+    // setsockopt/getsockopt round-trip reflects reality (CPython parity;
+    // asyncio's `_set_nodelay` and several transport tests rely on this).
+    if optname == libc_so_reuseaddr() as i32 {
+        return Ok(as_int(sock.reuse_address().map_err(|e| io_error_to_py(&e))?));
+    }
+    #[cfg(unix)]
+    if optname == libc_so_reuseport() as i32 {
+        return Ok(as_int(sock.reuse_port().map_err(|e| io_error_to_py(&e))?));
+    }
+    if optname == libc_so_keepalive() as i32 {
+        return Ok(as_int(sock.keepalive().map_err(|e| io_error_to_py(&e))?));
+    }
+    if optname == libc_so_broadcast() as i32 {
+        return Ok(as_int(sock.broadcast().map_err(|e| io_error_to_py(&e))?));
+    }
+    if optname == libc_so_sndbuf() as i32 {
+        return Ok(Object::Int(
+            sock.send_buffer_size().map_err(|e| io_error_to_py(&e))? as i64,
+        ));
+    }
+    if optname == libc_so_rcvbuf() as i32 {
+        return Ok(Object::Int(
+            sock.recv_buffer_size().map_err(|e| io_error_to_py(&e))? as i64,
+        ));
     }
     // For anything else, return 0 as a safe default.
     Ok(Object::Int(0))
@@ -978,14 +1218,77 @@ fn sock_shutdown(args: &[Object]) -> Result<Object, RuntimeError> {
 fn sock_detach(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = extract_self(args)?;
     let h = extract_handle(&inst)?;
+    // Release the fd without closing it, and report the real OS fd.
+    let mut fd = h;
     if let Some(state) = get_state(h) {
-        state.borrow_mut().inner.take();
+        if let Some(sock) = state.borrow_mut().inner.take() {
+            fd = into_raw_fd_of(sock);
+        }
     }
     remove_state(h);
     inst.dict
         .borrow_mut()
         .insert(DictKey(Object::from_static("_handle")), Object::Int(-1));
-    Ok(Object::Int(h))
+    Ok(Object::Int(fd))
+}
+
+/// `socket.dup()` — duplicate the underlying fd (real `dup(2)`) and wrap
+/// it in a fresh `socket` object that shares the family/type/proto. The
+/// duplicate is an independent fd: closing one leaves the other usable,
+/// matching CPython's `socket.dup()`.
+fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
+    let state = state_of(args)?;
+    let (family, kind, proto) = {
+        let s = state.borrow();
+        (s.family, s.kind, s.proto)
+    };
+    let new_fd = {
+        let b = state.borrow();
+        let sock = b.inner.as_ref().ok_or_else(|| os_error("socket closed"))?;
+        let fd = raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?;
+        #[cfg(unix)]
+        {
+            let dup = unsafe { libc::dup(fd as i32) };
+            if dup < 0 {
+                return Err(io_error_to_py(&std::io::Error::last_os_error()));
+            }
+            i64::from(dup)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+            return Err(os_error("socket.dup is only supported on Unix"));
+        }
+    };
+    let inner = wrap_fd_socket(new_fd)?;
+    let new_state = Rc::new(RefCell::new(SocketState {
+        inner: Some(inner),
+        family,
+        kind,
+        proto,
+        timeout: None,
+        blocking: true,
+    }));
+    let handle = next_handle(new_state);
+    let cls = socket_class();
+    let inst = Rc::new(PyInstance::new(cls));
+    {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(DictKey(Object::from_static("_handle")), Object::Int(handle));
+        d.insert(
+            DictKey(Object::from_static("family")),
+            Object::Int(i64::from(family)),
+        );
+        d.insert(
+            DictKey(Object::from_static("type")),
+            Object::Int(i64::from(kind)),
+        );
+        d.insert(
+            DictKey(Object::from_static("proto")),
+            Object::Int(i64::from(proto)),
+        );
+    }
+    Ok(Object::Instance(inst))
 }
 
 fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1066,6 +1369,78 @@ fn sock_proto_attr(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(i64::from(v)))
 }
 
+/// Read one of the `family`/`type`/`proto` ints from the instance dict
+/// (where `sock_init` stashed them). Used by the class-level getset
+/// descriptors below: reading the dict keeps the value available after
+/// `close()` (CPython keeps `family`/`type`/`proto` on a closed socket)
+/// and avoids touching the live `SocketState`.
+fn sock_dict_int(args: &[Object], key: &'static str) -> Result<Object, RuntimeError> {
+    let inst = extract_self(args)?;
+    let v = inst.dict.borrow().get(&DictKey(Object::from_static(key))).cloned();
+    Ok(v.unwrap_or(Object::Int(-1)))
+}
+
+fn sock_family_prop(args: &[Object]) -> Result<Object, RuntimeError> {
+    sock_dict_int(args, "family")
+}
+
+fn sock_type_prop(args: &[Object]) -> Result<Object, RuntimeError> {
+    sock_dict_int(args, "type")
+}
+
+fn sock_proto_prop(args: &[Object]) -> Result<Object, RuntimeError> {
+    sock_dict_int(args, "proto")
+}
+
+fn sock_timeout_prop(args: &[Object]) -> Result<Object, RuntimeError> {
+    // Mirror `gettimeout()`: float seconds, or None for blocking mode.
+    match state_of(args) {
+        Ok(state) => match state.borrow().timeout {
+            Some(d) => Ok(Object::Float(d.as_secs_f64())),
+            None => Ok(Object::None),
+        },
+        Err(_) => Ok(Object::None),
+    }
+}
+
+/// Install `family`/`type`/`proto`/`timeout` as class-level getset
+/// descriptors. CPython exposes these as getset descriptors on
+/// `socket.socket`, so they appear in `dir(socket.socket)` — which is
+/// what `unittest.mock.Mock(spec=socket.socket)` builds its attribute
+/// allow-list from. Without them, mocked sockets reject `sock.family`
+/// (breaking large swaths of `test_asyncio`'s transport tests).
+fn install_socket_getset(cls: &Rc<TypeObject>) {
+    let props: [(&'static str, fn(&[Object]) -> Result<Object, RuntimeError>); 4] = [
+        ("family", sock_family_prop),
+        ("type", sock_type_prop),
+        ("proto", sock_proto_prop),
+        ("timeout", sock_timeout_prop),
+    ];
+    for (name, getter) in props {
+        let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
+            Object::Builtin(Rc::new(BuiltinFn {
+                name,
+                binds_instance: true,
+                call: Box::new(getter),
+                call_kw: None,
+            })),
+            Object::None,
+            Object::None,
+            Object::None,
+        )));
+        crate::descr_registry::register(
+            &prop,
+            crate::descr_registry::DescrKind::GetSet,
+            cls.clone(),
+            name,
+            None,
+        );
+        cls.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static(name)), prop);
+    }
+}
+
 // ---- helpers ----
 
 fn parse_socket_address(arg: Option<&Object>, family: i32) -> Result<SocketAddr, RuntimeError> {
@@ -1097,11 +1472,23 @@ fn parse_socket_address(arg: Option<&Object>, family: i32) -> Result<SocketAddr,
     } else {
         host.as_str()
     };
-    let parsed = format!("{host_for_lookup}:{port}")
+    let candidates: Vec<SocketAddr> = format!("{host_for_lookup}:{port}")
         .to_socket_addrs()
         .map_err(|e| io_error_to_py(&e))?
-        .next()
-        .ok_or_else(|| os_error("could not resolve address"))?;
+        .collect();
+    // Respect the socket's address family. A name like "localhost" resolves
+    // to *both* ::1 and 127.0.0.1; binding/connecting an AF_INET socket to an
+    // IPv6 sockaddr (or vice-versa) fails with EAFNOSUPPORT, so pick a
+    // candidate matching the socket family, falling back to the first.
+    let parsed = if family == libc_af_inet6() as i32 {
+        candidates.iter().find(|a| a.is_ipv6()).copied()
+    } else if family == libc_af_inet() as i32 {
+        candidates.iter().find(|a| a.is_ipv4()).copied()
+    } else {
+        None
+    }
+    .or_else(|| candidates.first().copied())
+    .ok_or_else(|| os_error("could not resolve address"))?;
     Ok(parsed)
 }
 
@@ -1128,12 +1515,19 @@ fn extract_bytes(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
         Some(Object::Bytes(b)) => Ok(b.to_vec()),
         Some(Object::ByteArray(b)) => Ok(b.borrow().clone()),
         Some(Object::Str(s)) => Ok(s.as_bytes().to_vec()),
+        // `memoryview` is a bytes-like object; asyncio's sendfile fallback
+        // sends `view[:read]` slices. `to_bytes()` materialises the (possibly
+        // sliced/strided) window.
+        Some(Object::MemoryView(mv)) => {
+            if mv.released.get() {
+                return Err(value_error(
+                    "operation forbidden on released memoryview object",
+                ));
+            }
+            Ok(mv.to_bytes())
+        }
         _ => Err(type_error("expected bytes-like object")),
     }
-}
-
-fn broken_pipe() -> RuntimeError {
-    crate::error::broken_pipe_error("connection closed")
 }
 
 // ---- module-level functions ----
@@ -1406,7 +1800,7 @@ fn mod_inet_aton(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let ip: Ipv4Addr = s
         .parse()
-        .map_err(|_| value_error(format!("illegal IP address: {s}")))?;
+        .map_err(|_| os_error("illegal IP address string passed to inet_aton"))?;
     Ok(Object::new_bytes(ip.octets().to_vec()))
 }
 
@@ -1433,15 +1827,20 @@ fn mod_inet_pton(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Str(s)) => s.to_string(),
         _ => return Err(type_error("inet_pton: addr must be str")),
     };
+    // CPython's `inet_pton` reports a malformed address with `OSError`
+    // ("illegal IP address string passed to inet_pton"), *not* `ValueError`.
+    // asyncio's `_ipaddr_info` relies on this: it calls `inet_pton` to test
+    // whether a host is already a literal IP and treats `OSError` as "needs
+    // DNS resolution", so raising the wrong type breaks `sock_connect`.
     if family == libc_af_inet() as i32 {
         let ip: Ipv4Addr = s
             .parse()
-            .map_err(|_| value_error(format!("illegal IPv4 address: {s}")))?;
+            .map_err(|_| os_error("illegal IP address string passed to inet_pton"))?;
         Ok(Object::new_bytes(ip.octets().to_vec()))
     } else if family == libc_af_inet6() as i32 {
         let ip: Ipv6Addr = s
             .parse()
-            .map_err(|_| value_error(format!("illegal IPv6 address: {s}")))?;
+            .map_err(|_| os_error("illegal IP address string passed to inet_pton"))?;
         Ok(Object::new_bytes(ip.octets().to_vec()))
     } else {
         Err(os_error("inet_pton: unsupported family"))
@@ -1485,15 +1884,19 @@ fn mod_htonl(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-thread_local! {
-    static DEFAULT_TIMEOUT: RefCell<Option<f64>> = const { RefCell::new(None) };
+// Process-global, matching CPython: `socket.setdefaulttimeout()` affects
+// every thread's newly created sockets, not just the calling thread's.
+fn default_timeout() -> &'static parking_lot::Mutex<Option<f64>> {
+    static DEFAULT_TIMEOUT: std::sync::OnceLock<parking_lot::Mutex<Option<f64>>> =
+        std::sync::OnceLock::new();
+    DEFAULT_TIMEOUT.get_or_init(|| parking_lot::Mutex::new(None))
 }
 
 fn mod_getdefaulttimeout(_args: &[Object]) -> Result<Object, RuntimeError> {
-    DEFAULT_TIMEOUT.with(|c| match *c.borrow() {
+    match *default_timeout().lock() {
         None => Ok(Object::None),
         Some(f) => Ok(Object::Float(f)),
-    })
+    }
 }
 
 fn mod_setdefaulttimeout(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1503,7 +1906,7 @@ fn mod_setdefaulttimeout(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(n)) => Some(*n as f64),
         _ => return Err(type_error("setdefaulttimeout: arg must be float or None")),
     };
-    DEFAULT_TIMEOUT.with(|c| *c.borrow_mut() = value);
+    *default_timeout().lock() = value;
     Ok(Object::None)
 }
 
