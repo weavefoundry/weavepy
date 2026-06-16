@@ -1885,7 +1885,9 @@ fn os_get_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
     {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         if flags < 0 {
-            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         Ok(Object::Bool(flags & libc::FD_CLOEXEC == 0))
     }
@@ -1915,7 +1917,9 @@ fn os_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
     {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         if flags < 0 {
-            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         let new = if inheritable {
             flags & !libc::FD_CLOEXEC
@@ -1923,7 +1927,9 @@ fn os_set_inheritable(args: &[Object]) -> Result<Object, RuntimeError> {
             flags | libc::FD_CLOEXEC
         };
         if new != flags && unsafe { libc::fcntl(fd, libc::F_SETFD, new) } < 0 {
-            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         Ok(Object::None)
     }

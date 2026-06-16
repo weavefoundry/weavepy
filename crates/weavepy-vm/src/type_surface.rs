@@ -1120,10 +1120,8 @@ macro_rules! set_iop {
             // re-enter and `clear()` the receiver (bpo-46615); because we
             // hold no borrow on `target` during that window, the re-entrant
             // mutation hits an un-borrowed cell instead of panicking.
-            let compute: fn(
-                indexmap::IndexSet<DictKey>,
-                &Object,
-            ) -> indexmap::IndexSet<DictKey> = $compute;
+            let compute: fn(indexmap::IndexSet<DictKey>, &Object) -> indexmap::IndexSet<DictKey> =
+                $compute;
             let snapshot = target.borrow().clone();
             let result = compute(snapshot, &other);
             *target.borrow_mut() = result;

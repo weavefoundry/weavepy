@@ -436,17 +436,17 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
             let (blocking, timeout_obj) = resolve_acquire_args(args, kwargs)?;
             let timeout = parse_timeout(timeout_obj.as_ref());
-        let me = crate::gil::current_thread_id();
-        if !blocking {
-            return Ok(Object::Bool(acquire_lock.try_acquire(me)));
-        }
-        // RFC 0025: drop the GIL across the blocking acquire so
-        // other threads (including the one holding the lock) can
-        // run. Without this, `Thread.join` would deadlock — the
-        // joining thread sits in `acquire()` with the GIL held,
-        // and the worker can never run `_delete()` to release.
-        match timeout {
-            Some(Duration::ZERO) => Ok(Object::Bool(acquire_lock.try_acquire(me))),
+            let me = crate::gil::current_thread_id();
+            if !blocking {
+                return Ok(Object::Bool(acquire_lock.try_acquire(me)));
+            }
+            // RFC 0025: drop the GIL across the blocking acquire so
+            // other threads (including the one holding the lock) can
+            // run. Without this, `Thread.join` would deadlock — the
+            // joining thread sits in `acquire()` with the GIL held,
+            // and the worker can never run `_delete()` to release.
+            match timeout {
+                Some(Duration::ZERO) => Ok(Object::Bool(acquire_lock.try_acquire(me))),
                 Some(d) => Ok(Object::Bool(lock_acquire_interruptible(
                     &acquire_lock,
                     me,
@@ -457,8 +457,8 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
                     me,
                     None,
                 )?)),
-        }
-    };
+            }
+        };
     let release_lock = lock.clone();
     let release = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         release_lock.release().map_err(runtime_error)?;
@@ -523,16 +523,16 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
             let (blocking, timeout_obj) = resolve_acquire_args(args, kwargs)?;
             let timeout = parse_timeout(timeout_obj.as_ref());
-        let me = crate::gil::current_thread_id();
-        if !blocking {
-            return Ok(Object::Bool(acquire_lock.try_acquire(me)));
-        }
-        // Mirror the non-reentrant lock's GIL-drop behaviour
-        // (RFC 0025) — a reentrant acquire by the owning thread is
-        // a cheap counter bump and doesn't need the drop, but the
-        // blocking-on-foreign-owner case absolutely does.
-        match timeout {
-            Some(Duration::ZERO) => Ok(Object::Bool(acquire_lock.try_acquire(me))),
+            let me = crate::gil::current_thread_id();
+            if !blocking {
+                return Ok(Object::Bool(acquire_lock.try_acquire(me)));
+            }
+            // Mirror the non-reentrant lock's GIL-drop behaviour
+            // (RFC 0025) — a reentrant acquire by the owning thread is
+            // a cheap counter bump and doesn't need the drop, but the
+            // blocking-on-foreign-owner case absolutely does.
+            match timeout {
+                Some(Duration::ZERO) => Ok(Object::Bool(acquire_lock.try_acquire(me))),
                 Some(d) => Ok(Object::Bool(rlock_acquire_interruptible(
                     &acquire_lock,
                     me,
@@ -543,8 +543,8 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
                     me,
                     None,
                 )?)),
-        }
-    };
+            }
+        };
     let release_lock = rlock.clone();
     let release = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         let me = crate::gil::current_thread_id();

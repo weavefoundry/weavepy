@@ -479,6 +479,10 @@ fn seconds_to_timeval(secs: f64) -> libc::timeval {
 }
 
 #[cfg(unix)]
+// `tv_usec` is `c_int` (i32) on macOS but `c_long` (i64) on Linux; an `as f64`
+// cast is the only portable spelling (`f64::from` won't compile for i64), so
+// suppress the platform-specific cast-lossless lint here.
+#[allow(clippy::cast_lossless)]
 fn timeval_to_seconds(tv: libc::timeval) -> f64 {
     tv.tv_sec as f64 + tv.tv_usec as f64 / 1_000_000.0
 }

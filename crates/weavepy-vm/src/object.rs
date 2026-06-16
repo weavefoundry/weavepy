@@ -1160,6 +1160,97 @@ fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
     }
 }
 
+/// `a == b` with CPython's `PyObject_RichCompareBool(a, b, Py_EQ)`
+/// semantics, for sequence membership / `count` / `index`:
+///
+/// 1. identity first — `x is y` ⇒ equal (so `nan in [nan]` for the same
+///    nan is `True`), then
+/// 2. when either operand carries a user `__eq__`, dispatch the *full*
+///    Python comparison (both directions, reflected `__eq__`), and
+///    **propagate** any exception it raises (CPython's `list.count` /
+///    `.index` let a `__eq__` exception escape), otherwise
+/// 3. fall back to native structural equality.
+///
+/// The interpreter is reached through the published per-thread pointer —
+/// the same bridge `DictKey`/`_thread`/the C-API use — so a plain
+/// `fn(&[Object])` builtin can honour Python comparisons. With no active
+/// interpreter (pure-Rust setup) it degrades to `eq_value`.
+pub(crate) fn member_eq(a: &Object, b: &Object) -> Result<bool, RuntimeError> {
+    if a.is_same(b) {
+        return Ok(true);
+    }
+    if instance_has_custom_dunder(a, "__eq__") || instance_has_custom_dunder(b, "__eq__") {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: see `current_interp_eq`.
+            let interp = unsafe { &mut *ptr };
+            let _no_yield = crate::gil::no_gil_handoff();
+            return interp.reentrant_py_eq_bool(a, b);
+        }
+    }
+    Ok(a.eq_value(b))
+}
+
+// ---- recursive-`repr` guard (CPython `Py_ReprEnter`/`Py_ReprLeave`) ----
+
+struct ReprGuardState {
+    /// Ids of containers whose `repr` is currently being rendered on this
+    /// thread, so a self-referential container yields `[...]`/`{...}` rather
+    /// than recursing forever.
+    stack: Vec<usize>,
+    /// Set when nesting reached `sys.getrecursionlimit()`; the outermost
+    /// `repr`/`str` boundary turns it into a `RecursionError`.
+    overflow: bool,
+}
+
+thread_local! {
+    static REPR_GUARD: RefCell<ReprGuardState> =
+        const { RefCell::new(ReprGuardState { stack: Vec::new(), overflow: false }) };
+}
+
+/// Begin rendering container `id`. Returns `false` when `id` is already being
+/// rendered (a reference cycle — the caller emits its `…` marker) or when the
+/// nesting depth has hit `sys.getrecursionlimit()` (sets the overflow flag, so
+/// the boundary raises `RecursionError` instead of blowing the native stack).
+fn repr_enter(id: usize) -> bool {
+    REPR_GUARD.with(|g| {
+        let mut b = g.borrow_mut();
+        if b.stack.contains(&id) {
+            return false;
+        }
+        if b.stack.len() >= crate::recursion::recursion_limit() {
+            b.overflow = true;
+            return false;
+        }
+        b.stack.push(id);
+        true
+    })
+}
+
+/// Finish rendering the container most recently admitted by [`repr_enter`].
+fn repr_leave() {
+    REPR_GUARD.with(|g| {
+        g.borrow_mut().stack.pop();
+    });
+}
+
+/// Render `f` at a Python-visible `repr()`/`str()` boundary, mapping a
+/// recursion-limit overflow to `Err(())` (the caller raises `RecursionError`).
+/// Only the *outermost* boundary clears/inspects the overflow flag, so a
+/// user `__repr__` that itself calls `repr()` still shares one cycle stack.
+pub(crate) fn repr_guarded<F: FnOnce() -> String>(f: F) -> Result<String, ()> {
+    let outer = REPR_GUARD.with(|g| g.borrow().stack.is_empty());
+    if outer {
+        REPR_GUARD.with(|g| g.borrow_mut().overflow = false);
+    }
+    let s = f();
+    let overflowed = outer && REPR_GUARD.with(|g| std::mem::take(&mut g.borrow_mut().overflow));
+    if overflowed {
+        Err(())
+    } else {
+        Ok(s)
+    }
+}
+
 impl PartialEq for DictKey {
     fn eq(&self, other: &Self) -> bool {
         // CPython compares dict/set keys with `a is b or a == b`; the identity
@@ -3164,9 +3255,8 @@ impl Object {
                     a.buffer_eq(b)
                 }
             }
-            (Object::MemoryView(a), Object::Bytes(b)) | (Object::Bytes(b), Object::MemoryView(a)) => {
-                a.eq_byte_slice(b)
-            }
+            (Object::MemoryView(a), Object::Bytes(b))
+            | (Object::Bytes(b), Object::MemoryView(a)) => a.eq_byte_slice(b),
             (Object::MemoryView(a), Object::ByteArray(b))
             | (Object::ByteArray(b), Object::MemoryView(a)) => a.eq_byte_slice(&b.borrow()),
             // `slice` objects compare as the `(start, stop, step)` triple
@@ -3291,12 +3381,29 @@ impl Object {
     pub fn contains(&self, item: &Self) -> Result<bool, RuntimeError> {
         match self {
             // CPython's `PyObject_RichCompareBool` short-circuits on identity
-            // before `==`, so `nan in [nan]` (the *same* nan) is `True`.
-            Object::Tuple(items) => Ok(items.iter().any(|x| x.is_same(item) || x.eq_value(item))),
-            Object::List(items) => Ok(items
-                .borrow()
-                .iter()
-                .any(|x| x.is_same(item) || x.eq_value(item))),
+            // before `==` (so `nan in [nan]` for the same nan is `True`) and
+            // otherwise dispatches Python `__eq__` (both directions),
+            // propagating any exception it raises.
+            Object::Tuple(items) => {
+                for x in items.iter() {
+                    if member_eq(x, item)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Object::List(items) => {
+                // Snapshot strong refs: a user `__eq__` may mutate this list
+                // mid-scan (CPython re-checks bounds each step), so we must
+                // not hold the borrow across the comparison.
+                let snapshot = items.borrow().clone();
+                for x in &snapshot {
+                    if member_eq(x, item)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
             Object::Str(haystack) => match item {
                 Object::Str(needle) => Ok(haystack.contains(&**needle)),
                 _ => Err(type_error(
@@ -3627,6 +3734,10 @@ impl Object {
                 out
             }
             Object::Tuple(items) => {
+                let id = Rc::as_ptr(items).cast::<()>() as usize;
+                if !repr_enter(id) {
+                    return "(...)".to_owned();
+                }
                 let mut s = String::from("(");
                 for (i, x) in items.iter().enumerate() {
                     if i > 0 {
@@ -3638,32 +3749,65 @@ impl Object {
                     s.push(',');
                 }
                 s.push(')');
+                repr_leave();
                 s
             }
             Object::List(items) => {
-                let items = items.borrow();
+                let id = Rc::as_ptr(items).cast::<()>() as usize;
+                if !repr_enter(id) {
+                    return "[...]".to_owned();
+                }
+                // Index with a fresh length check each step, cloning the
+                // element and releasing the borrow *before* rendering it:
+                // an element's `__repr__` may mutate this very list
+                // (test_list.test_repr_mutate pops it), which CPython's
+                // index-based `list_repr` tolerates — holding the borrow
+                // across the call would instead panic the cell.
                 let mut s = String::from("[");
-                for (i, x) in items.iter().enumerate() {
+                let mut i = 0usize;
+                loop {
+                    let x = {
+                        let borrowed = items.borrow();
+                        if i >= borrowed.len() {
+                            break;
+                        }
+                        borrowed[i].clone()
+                    };
                     if i > 0 {
                         s.push_str(", ");
                     }
                     s.push_str(&x.repr());
+                    i += 1;
                 }
                 s.push(']');
+                repr_leave();
                 s
             }
             Object::Dict(d) => {
-                let d = d.borrow();
+                let id = Rc::as_ptr(d).cast::<()>() as usize;
+                if !repr_enter(id) {
+                    return "{...}".to_owned();
+                }
+                // Snapshot the entries so a key/value `__repr__` that mutates
+                // this dict can't panic the borrowed cell mid-render.
+                let pairs: Vec<(Object, Object)> = {
+                    let borrowed = d.borrow();
+                    borrowed
+                        .iter()
+                        .map(|(k, v)| (k.0.clone(), v.clone()))
+                        .collect()
+                };
                 let mut s = String::from("{");
-                for (i, (k, v)) in d.iter().enumerate() {
+                for (i, (k, v)) in pairs.iter().enumerate() {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&k.0.repr());
+                    s.push_str(&k.repr());
                     s.push_str(": ");
                     s.push_str(&v.repr());
                 }
                 s.push('}');
+                repr_leave();
                 s
             }
             Object::Range(r) => {
@@ -4322,18 +4466,23 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         Object::Str(s) => Some(py_hash_bytes_slice(s.as_bytes())),
         Object::Bytes(b) => Some(py_hash_bytes_slice(b)),
         Object::Tuple(items) => {
-            // Order-sensitive mix (FNV-style) over element hashes so equal
-            // tuples bucket together; unhashable elements would raise at the
-            // `hash()` builtin, here they just fold their identity in.
-            let mut acc: u64 = 0x0034_5678;
+            // CPython 3.13 `tuplehash` (Objects/tupleobject.c), bit-exact:
+            // an xxHash-derived mix over the element hashes. `test_tuple`'s
+            // `test_hash_exact` pins specific 64-bit results, so the constants
+            // and the rotate/multiply order must match CPython exactly.
+            const XXPRIME_1: u64 = 11_400_714_785_074_694_791;
+            const XXPRIME_2: u64 = 14_029_467_366_897_019_727;
+            const XXPRIME_5: u64 = 2_870_177_450_012_600_261;
+            let mut acc: u64 = XXPRIME_5;
             for x in items.iter() {
-                let eh = py_hash_value(x).unwrap_or_else(|| identity_hash(x)) as u64;
-                acc = (acc ^ eh)
-                    .wrapping_mul(1_000_003)
-                    .wrapping_add(items.len() as u64);
+                let lane = py_hash_value(x).unwrap_or_else(|| identity_hash(x)) as u64;
+                acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
+                acc = acc.rotate_left(31);
+                acc = acc.wrapping_mul(XXPRIME_1);
             }
+            acc = acc.wrapping_add((items.len() as u64) ^ (XXPRIME_5 ^ 3_527_539));
             let v = acc as i64;
-            Some(if v == -1 { -2 } else { v })
+            Some(if v == -1 { 1_546_275_796 } else { v })
         }
         Object::FrozenSet(s) => {
             // A frozenset is immutable, so its hash is computed once and

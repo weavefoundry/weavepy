@@ -1738,7 +1738,7 @@ impl Interpreter {
             use std::sync::atomic::{AtomicU64, Ordering};
             static CALLS: AtomicU64 = AtomicU64::new(0);
             let n = CALLS.fetch_add(1, Ordering::Relaxed);
-            if n % 2_000 == 0 {
+            if n.is_multiple_of(2_000) {
                 eprintln!(
                     "[WP_SAMPLE n={}] depth={} qualname={} file={}",
                     n,
@@ -6162,10 +6162,9 @@ impl Interpreter {
                         call_kw: None,
                     }))
                 };
-                return Ok(Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
-                    receiver.clone(),
-                    func,
-                ))));
+                return Ok(Object::BoundMethod(Rc::new(
+                    crate::object::BoundMethod::new(receiver.clone(), func),
+                )));
             }
             // Not found along the delegated MRO: fall through to normal
             // resolution so the proxy's *own* attributes (`__init__`,
@@ -8773,6 +8772,20 @@ impl Interpreter {
             .ok()
     }
 
+    /// Like [`reentrant_py_eq`] but **propagates** an exception raised by a
+    /// user `__eq__` (CPython's `PyObject_RichCompareBool`, which `list` /
+    /// `tuple` `count`/`index`/`in` let escape) instead of swallowing it.
+    /// The result object's truthiness is taken via `__bool__`, matching the
+    /// `PyObject_IsTrue` step.
+    pub(crate) fn reentrant_py_eq_bool(
+        &mut self,
+        a: &Object,
+        b: &Object,
+    ) -> Result<bool, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.dispatch_compare_op(a, b, CompareKind::Eq, &globals)
+    }
+
     /// VM-routed `getattr(obj, name[, default])`. Routes through the
     /// full `load_attr` path so descriptors (properties, classmethods,
     /// user `__get__` / `__getattr__`) behave exactly as `obj.name`
@@ -9055,6 +9068,11 @@ impl Interpreter {
             Some(Object::List(l)) => l.clone(),
             _ => return Err(type_error("list.sort expects a list receiver")),
         };
+        // `list.sort(*, key=None, reverse=False)` is keyword-only:
+        // `[].sort(42, 42)` is a TypeError, not a silent no-op.
+        if args.len() > 1 {
+            return Err(type_error("sort() takes no positional arguments"));
+        }
         let reverse = kwargs
             .iter()
             .find_map(|(k, v)| (k == "reverse").then(|| v.is_truthy()))
@@ -9062,9 +9080,23 @@ impl Interpreter {
         let key_fn = kwargs
             .iter()
             .find_map(|(k, v)| (k == "key").then(|| v.clone()));
-        let mut items = list.borrow().clone();
-        self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals)?;
+        // CPython detaches the backing array for the duration of the sort
+        // (sets `ob_item = NULL`, size 0) so a `key`/comparator that re-enters
+        // the list sees it empty and can't corrupt the slice being sorted.
+        // After sorting it restores the sorted items, then — if the user
+        // mutated the now-empty list mid-sort — raises "list modified during
+        // sort" (test_list/test_sort `selfmodifyingComparison`).
+        let mut items = std::mem::take(&mut *list.borrow_mut());
+        let sort_result = self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals);
+        let mutated = !list.borrow().is_empty();
+        // Restore the saved items (fully sorted on success, partially on
+        // error); CPython discards whatever the mutation left behind.
         *list.borrow_mut() = items;
+        // A key/comparison error takes precedence over the mutation report.
+        sort_result?;
+        if mutated {
+            return Err(value_error("list modified during sort"));
+        }
         Ok(Object::None)
     }
 
@@ -9254,7 +9286,13 @@ impl Interpreter {
         if let Object::Long(b) = v {
             crate::builtins::long_str_limit_check(b)?;
         }
-        Ok(v.to_str())
+        // `str()` of a container delegates to `repr`, so guard it the same
+        // way (cyclic → `[...]`, over-deep → `RecursionError`).
+        crate::object::repr_guarded(|| v.to_str()).map_err(|()| {
+            crate::error::recursion_error(
+                "maximum recursion depth exceeded while getting the str of an object",
+            )
+        })
     }
 
     fn repr_of(
@@ -9308,7 +9346,14 @@ impl Interpreter {
         if let Object::Long(b) = v {
             crate::builtins::long_str_limit_check(b)?;
         }
-        Ok(v.repr())
+        // A self-referential container renders `[...]`; one nested past
+        // `sys.getrecursionlimit()` raises `RecursionError` rather than
+        // overflowing the native stack (test_list.test_repr_deep).
+        crate::object::repr_guarded(|| v.repr()).map_err(|()| {
+            crate::error::recursion_error(
+                "maximum recursion depth exceeded while getting the repr of an object",
+            )
+        })
     }
 
     /// Either build a native iterator (for built-ins) or call
@@ -11866,7 +11911,13 @@ impl Interpreter {
                         data.clear();
                     } else {
                         let unit = data.len();
-                        checked_repeat_count(unit, n, "bytes")?;
+                        let times = checked_repeat_count(unit, n, "bytes")?;
+                        // Reserve up front so `b *= huge` surfaces `MemoryError`
+                        // instead of OOM-growing the buffer one copy at a time.
+                        let extra = unit.saturating_mul(times.saturating_sub(1));
+                        if data.try_reserve_exact(extra).is_err() {
+                            return Err(crate::error::memory_error(""));
+                        }
                         let original = data.clone();
                         for _ in 1..n {
                             data.extend_from_slice(&original);
@@ -11887,7 +11938,15 @@ impl Interpreter {
                     if n <= 0 {
                         data.clear();
                     } else {
-                        checked_repeat_count(data.len(), n, "list")?;
+                        let unit = data.len();
+                        let times = checked_repeat_count(unit, n, "list")?;
+                        // Reserve up front so `lst *= huge` raises `MemoryError`
+                        // rather than OOM-growing the list one copy at a time
+                        // (the non-in-place `lst * n` path already guards this).
+                        let extra = unit.saturating_mul(times.saturating_sub(1));
+                        if data.try_reserve_exact(extra).is_err() {
+                            return Err(crate::error::memory_error(""));
+                        }
                         let original = data.clone();
                         for _ in 1..n {
                             data.extend_from_slice(&original);
@@ -12834,6 +12893,14 @@ impl Interpreter {
                         drop(it);
                         frame.push(v);
                     } else {
+                        // Exhausted: detach from the backing list so a later
+                        // `append`/`extend` can't resurrect the iterator
+                        // (CPython clears `it_seq` on first StopIteration).
+                        // Mirrors `PyIterator::next_value`; without this the
+                        // generic path detaches but this fast path leaks a
+                        // live cursor (test_list.test_exhausted_iterator,
+                        // test_tier2_invalidates_iterator).
+                        *items = Rc::new(RefCell::new(Vec::new()));
                         drop(it);
                         frame.pop()?;
                         frame.pc += jump_arg;
@@ -13097,19 +13164,41 @@ impl Interpreter {
                 Ok(Some(true))
             }
             (Object::List(xs), Object::List(ys)) => {
-                let xs = xs.borrow().clone();
-                let ys = ys.borrow().clone();
-                if xs.len() != ys.len() {
+                // CPython `list_richcompare` (Py_EQ): an up-front length
+                // shortcut, then an element-wise scan over the *live* lists
+                // that re-reads each length every step. A user `__eq__` may
+                // mutate either operand mid-compare (bpo-38588): if it clears
+                // both lists, the size re-check below sees two empty lists
+                // and reports equal — so we cannot snapshot up front.
+                if xs.borrow().len() != ys.borrow().len() {
                     return Ok(Some(false));
                 }
-                for (x, y) in xs.iter().zip(ys.iter()) {
-                    if !(x.is_same(y)
-                        || self.dispatch_compare_op(x, y, CompareKind::Eq, globals)?)
+                let mut i = 0usize;
+                loop {
+                    let (xi, yi) = {
+                        let xb = xs.borrow();
+                        let yb = ys.borrow();
+                        if i >= xb.len() || i >= yb.len() {
+                            break;
+                        }
+                        (xb[i].clone(), yb[i].clone())
+                    };
+                    if !(xi.is_same(&yi)
+                        || self.dispatch_compare_op(&xi, &yi, CompareKind::Eq, globals)?)
                     {
-                        return Ok(Some(false));
+                        break;
                     }
+                    i += 1;
                 }
-                Ok(Some(true))
+                // Consumed all of either live list → compare live lengths;
+                // otherwise we stopped on a differing element, so `==` False.
+                let len_x = xs.borrow().len();
+                let len_y = ys.borrow().len();
+                if i >= len_x || i >= len_y {
+                    Ok(Some(len_x == len_y))
+                } else {
+                    Ok(Some(false))
+                }
             }
             (Object::Dict(xs), Object::Dict(ys)) => {
                 // Snapshot both mappings before recursing so a user
@@ -14294,6 +14383,14 @@ impl Interpreter {
                 "bytearray indices must be integers or slices, not {}",
                 other.type_name()
             ))),
+            (Object::Tuple(_), other) => Err(type_error(format!(
+                "tuple indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
+            (Object::List(_), other) => Err(type_error(format!(
+                "list indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
             (_, _) => Err(type_error(format!(
                 "'{}' object is not subscriptable with '{}'",
                 container.type_name(),
@@ -14461,6 +14558,13 @@ impl Interpreter {
             }
             (Object::ByteArray(_), other) => Err(type_error(format!(
                 "bytearray indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
+            // A list *does* support assignment; a bad index type is the
+            // "indices must be integers or slices" TypeError (matching the
+            // read path), not "does not support item assignment".
+            (Object::List(_), other) => Err(type_error(format!(
+                "list indices must be integers or slices, not {}",
                 other.type_name()
             ))),
             _ => Err(type_error(format!(
@@ -18048,11 +18152,25 @@ impl Interpreter {
                     }
                     other => other,
                 };
+                // CPython: an *inherited* builtin `__init__` (`list`/`set`/…)
+                // that takes no keywords ignores excess keyword arguments when
+                // the subclass overrode `__new__` — the clinic's
+                // `_PyArg_NoKeywords` check is gated on
+                // `tp_new == base.tp_new`. The overriding `__new__` already
+                // consumed those kwargs (`class S(list): __new__(cls, seq,
+                // newarg=None)`), so drop them here instead of tripping
+                // "builtin '__init__' does not accept keyword arguments".
+                let drop_init_kwargs = !is_object_new
+                    && matches!(
+                        &init,
+                        Object::Builtin(b) if b.name == "__init__" && b.call_kw.is_none()
+                    );
+                let init_kwargs: &[(String, Object)] = if drop_init_kwargs { &[] } else { kwargs };
                 let bound = Object::BoundMethod(Rc::new(BoundMethod::new(instance.clone(), init)));
                 let result = self.call(
                     &bound,
                     args,
-                    kwargs,
+                    init_kwargs,
                     &Rc::new(RefCell::new(DictData::new())),
                 )?;
                 if !matches!(result, Object::None) {
@@ -19142,6 +19260,52 @@ impl Interpreter {
                 builtin,
                 Object::new_tuple(vec![Object::ByteArray(data.clone())]),
                 Object::Int(*index as i64),
+            ]));
+        }
+        // A list iterator reduces to `(iter, (live_list,), index)` — the
+        // *same* backing store + cursor (CPython `listiter_reduce`), so
+        // co-pickling `(iter(xs), xs)` memoizes to one shared list and the
+        // unpickled iterator tracks later mutations (test_list
+        // `test_iterator_pickle`). `PyIterator::List` also backs materialized
+        // set/dict/file iterators whose `items` is a private snapshot of the
+        // full sequence; reducing those the same way still round-trips — the
+        // snapshot holds every element and `index` keeps the cursor, so
+        // `list(unpickled)` replays exactly the not-yet-seen items.
+        if let crate::object::PyIterator::List { items, index } = &*it.borrow() {
+            // A detached (exhausted) list iterator reduces to `(iter, ([],))`
+            // — an empty list and *no* index (CPython `listiter_reduce` with
+            // `it_seq == NULL`). We detach by emptying `items` on exhaustion,
+            // so an empty backing store is the exhausted signal
+            // (test_iter `test_reduce_mutating_builtins_iter`).
+            if items.borrow().is_empty() {
+                return Ok(Object::new_tuple(vec![
+                    builtin,
+                    Object::new_tuple(vec![Object::new_list(Vec::new())]),
+                ]));
+            }
+            return Ok(Object::new_tuple(vec![
+                builtin,
+                Object::new_tuple(vec![Object::List(items.clone())]),
+                Object::Int(*index as i64),
+            ]));
+        }
+        // A reverse iterator reduces to `(reversed, (forward_list,), index)`
+        // — the shared forward store + the descending cursor (CPython
+        // `listreviter_reduce`); `(reversed(xs), xs)` memoizes to one list.
+        if let crate::object::PyIterator::Reversed { items, index } = &*it.borrow() {
+            // Exhausted reverse iterator → `(reversed, ([],))` (CPython
+            // `listreviter_reduce` with `it_seq == NULL`); detach empties
+            // `items`, so an empty store is the exhausted signal.
+            if items.borrow().is_empty() {
+                return Ok(Object::new_tuple(vec![
+                    builtin,
+                    Object::new_tuple(vec![Object::new_list(Vec::new())]),
+                ]));
+            }
+            return Ok(Object::new_tuple(vec![
+                builtin,
+                Object::new_tuple(vec![Object::List(items.clone())]),
+                Object::Int(*index),
             ]));
         }
         // Snapshot remaining *after* the lookup, mirroring CPython reading
@@ -24078,6 +24242,11 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::new_tuple(out))
         }
         (O::Tuple(x), O::Int(n), B::Mult) | (O::Int(n), O::Tuple(x), B::Mult) => {
+            // CPython `tuplerepeat`: `t * 1` returns the *same* (exact) tuple
+            // object, so `id(t) == id(t * 1)` holds (seq_tests.test_repeat).
+            if *n == 1 {
+                return Ok(Object::Tuple(x.clone()));
+            }
             let times = checked_repeat_count(x.len(), *n, "tuple")?;
             let mut out: Vec<Object> = try_alloc_vec(x.len() * times)?;
             for _ in 0..times {
@@ -24114,7 +24283,11 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
 /// `OverflowError` when `len * n` exceeds `PY_SSIZE_T_MAX` (e.g.
 /// `b"abc" * sys.maxsize`) — without this, `Vec::with_capacity` aborts
 /// the whole process on allocation failure.
-fn checked_repeat_count(item_len: usize, n: i64, what: &str) -> Result<usize, RuntimeError> {
+pub(crate) fn checked_repeat_count(
+    item_len: usize,
+    n: i64,
+    what: &str,
+) -> Result<usize, RuntimeError> {
     let times = if n < 0 { 0 } else { n as usize };
     if item_len == 0 {
         return Ok(times.min(1));

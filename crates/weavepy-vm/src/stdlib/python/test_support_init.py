@@ -39,6 +39,9 @@ is_s390x = hasattr(os, 'uname') and os.uname().machine == 's390x'
 # WeavePy targets the standard GIL-enabled build.
 Py_GIL_DISABLED = False
 
+NHASHBITS = sys.hash_info.width  # number of bits in hash() result
+assert NHASHBITS in (32, 64)
+
 has_fork_support = hasattr(os, "fork") and not (
     is_emscripten or is_wasi or is_apple_mobile or is_android
 )

@@ -521,7 +521,9 @@ fn wrap_fd_socket(fd: i64) -> Result<Socket, RuntimeError> {
 
 #[cfg(not(any(unix, windows)))]
 fn wrap_fd_socket(_fd: i64) -> Result<Socket, RuntimeError> {
-    Err(os_error("fileno argument is not supported on this platform"))
+    Err(os_error(
+        "fileno argument is not supported on this platform",
+    ))
 }
 
 /// Reconstruct a *non-owning* `Socket` view over an already-open fd.
@@ -821,7 +823,7 @@ fn sock_connect_ex(args: &[Object]) -> Result<Object, RuntimeError> {
         // else as a hard failure. `io_error_to_py` stashes the errno on
         // the exception's `.errno`, so recover it from there.
         Err(RuntimeError::PyException(p)) => {
-            let errno = errno_of_exception(&p).unwrap_or(libc::EINVAL as i64);
+            let errno = errno_of_exception(&p).unwrap_or(i64::from(libc::EINVAL));
             Ok(Object::Int(errno))
         }
         Err(e) => Err(e),
@@ -1009,7 +1011,8 @@ fn sock_settimeout(args: &[Object]) -> Result<Object, RuntimeError> {
             None => {
                 sock.set_nonblocking(false)
                     .map_err(|e| io_error_to_py(&e))?;
-                sock.set_read_timeout(None).map_err(|e| io_error_to_py(&e))?;
+                sock.set_read_timeout(None)
+                    .map_err(|e| io_error_to_py(&e))?;
                 sock.set_write_timeout(None)
                     .map_err(|e| io_error_to_py(&e))?;
             }
@@ -1118,7 +1121,9 @@ fn sock_getsockopt(args: &[Object]) -> Result<Object, RuntimeError> {
     // setsockopt/getsockopt round-trip reflects reality (CPython parity;
     // asyncio's `_set_nodelay` and several transport tests rely on this).
     if optname == libc_so_reuseaddr() as i32 {
-        return Ok(as_int(sock.reuse_address().map_err(|e| io_error_to_py(&e))?));
+        return Ok(as_int(
+            sock.reuse_address().map_err(|e| io_error_to_py(&e))?,
+        ));
     }
     #[cfg(unix)]
     if optname == libc_so_reuseport() as i32 {
@@ -1376,7 +1381,11 @@ fn sock_proto_attr(args: &[Object]) -> Result<Object, RuntimeError> {
 /// and avoids touching the live `SocketState`.
 fn sock_dict_int(args: &[Object], key: &'static str) -> Result<Object, RuntimeError> {
     let inst = extract_self(args)?;
-    let v = inst.dict.borrow().get(&DictKey(Object::from_static(key))).cloned();
+    let v = inst
+        .dict
+        .borrow()
+        .get(&DictKey(Object::from_static(key)))
+        .cloned();
     Ok(v.unwrap_or(Object::Int(-1)))
 }
 

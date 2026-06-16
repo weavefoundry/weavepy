@@ -247,9 +247,8 @@ fn fd_of(obj: &Object) -> Result<i32, RuntimeError> {
         Object::Int(n) => Ok(*n as i32),
         Object::Bool(b) => Ok(i32::from(*b)),
         _ => {
-            let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
-                type_error("argument must be an int, or have a fileno() method")
-            })?;
+            let ptr = crate::vm_singletons::current_interpreter_ptr()
+                .ok_or_else(|| type_error("argument must be an int, or have a fileno() method"))?;
             // SAFETY: published by the active builtin call on this thread.
             let interp = unsafe { &mut *ptr };
             let fileno = interp
@@ -364,7 +363,6 @@ fn select_select(args: &[Object]) -> Result<Object, RuntimeError> {
     for (fd, _) in &xlist {
         want(*fd, libc::POLLPRI);
     }
-    drop(want);
 
     blocking_retry(timeout, |slice| {
         for p in pollfds.iter_mut() {
@@ -386,12 +384,8 @@ fn select_select(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(ebadf_error());
     }
 
-    let revents_of = |fd: i32| -> libc::c_short {
-        pollfds
-            .iter()
-            .find(|p| p.fd == fd)
-            .map_or(0, |p| p.revents)
-    };
+    let revents_of =
+        |fd: i32| -> libc::c_short { pollfds.iter().find(|p| p.fd == fd).map_or(0, |p| p.revents) };
     // A hung-up/errored fd reads and writes as ready (CPython's
     // `select(2)` reports it in both sets); preserve input order and the
     // original objects.
@@ -504,7 +498,11 @@ fn poll_factory(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn poll_handle(args: &[Object]) -> Result<i64, RuntimeError> {
     match args.first() {
         Some(Object::Instance(i)) if i.cls().name == "poll" => {
-            match i.dict.borrow().get(&DictKey(Object::from_static("_handle"))) {
+            match i
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("_handle")))
+            {
                 Some(Object::Int(h)) => Ok(*h),
                 _ => Err(os_error("poll object is closed")),
             }
@@ -528,15 +526,17 @@ fn parse_eventmask(arg: Option<&Object>) -> Result<libc::c_short, RuntimeError> 
             if *n < 0 {
                 Err(crate::error::value_error("negative event mask"))
             } else if *n > i64::from(u16::MAX) {
-                Err(crate::error::overflow_error("event mask value out of range"))
+                Err(crate::error::overflow_error(
+                    "event mask value out of range",
+                ))
             } else {
                 Ok(*n as u16 as libc::c_short)
             }
         }
         Some(Object::Bool(b)) => Ok(libc::c_short::from(*b)),
-        Some(Object::Long(_)) => {
-            Err(crate::error::overflow_error("event mask value out of range"))
-        }
+        Some(Object::Long(_)) => Err(crate::error::overflow_error(
+            "event mask value out of range",
+        )),
         Some(_) => Err(type_error("integer argument expected, got non-integer")),
     }
 }
@@ -544,7 +544,10 @@ fn parse_eventmask(arg: Option<&Object>) -> Result<libc::c_short, RuntimeError> 
 #[cfg(unix)]
 fn poll_register(args: &[Object]) -> Result<Object, RuntimeError> {
     let handle = poll_handle(args)?;
-    let fd = fd_of(args.get(1).ok_or_else(|| type_error("register() requires a file descriptor"))?)?;
+    let fd = fd_of(
+        args.get(1)
+            .ok_or_else(|| type_error("register() requires a file descriptor"))?,
+    )?;
     let mask = parse_eventmask(args.get(2))?;
     let mut reg = poll_registry().lock().unwrap();
     let st = reg
@@ -558,7 +561,10 @@ fn poll_register(args: &[Object]) -> Result<Object, RuntimeError> {
 #[cfg(unix)]
 fn poll_modify(args: &[Object]) -> Result<Object, RuntimeError> {
     let handle = poll_handle(args)?;
-    let fd = fd_of(args.get(1).ok_or_else(|| type_error("modify() requires a file descriptor"))?)?;
+    let fd = fd_of(
+        args.get(1)
+            .ok_or_else(|| type_error("modify() requires a file descriptor"))?,
+    )?;
     let mask = parse_eventmask(args.get(2))?;
     let mut reg = poll_registry().lock().unwrap();
     let st = reg
@@ -579,7 +585,10 @@ fn poll_modify(args: &[Object]) -> Result<Object, RuntimeError> {
 #[cfg(unix)]
 fn poll_unregister(args: &[Object]) -> Result<Object, RuntimeError> {
     let handle = poll_handle(args)?;
-    let fd = fd_of(args.get(1).ok_or_else(|| type_error("unregister() requires a file descriptor"))?)?;
+    let fd = fd_of(
+        args.get(1)
+            .ok_or_else(|| type_error("unregister() requires a file descriptor"))?,
+    )?;
     let mut reg = poll_registry().lock().unwrap();
     let st = reg
         .get_mut(&handle)
@@ -714,7 +723,7 @@ mod kqueue_impl {
     fn dur_to_timespec(d: Duration) -> libc::timespec {
         libc::timespec {
             tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
-            tv_nsec: d.subsec_nanos() as libc::c_long,
+            tv_nsec: libc::c_long::from(d.subsec_nanos()),
         }
     }
 
@@ -1002,7 +1011,9 @@ mod kqueue_impl {
         };
         let fd = unsafe { libc::kqueue() };
         if fd < 0 {
-            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         set_cloexec(fd);
         store_kqueue(&inst, fd);
@@ -1011,7 +1022,10 @@ mod kqueue_impl {
 
     /// `select.kqueue.fromfd(fd)` — wrap an existing control fd.
     fn kqueue_fromfd(args: &[Object]) -> Result<Object, RuntimeError> {
-        let fd = fd_of(args.first().ok_or_else(|| type_error("fromfd() requires an fd"))?)?;
+        let fd = fd_of(
+            args.first()
+                .ok_or_else(|| type_error("fromfd() requires an fd"))?,
+        )?;
         let inst = Rc::new(PyInstance::new(kqueue_class()));
         store_kqueue(&inst, fd);
         Ok(Object::Instance(inst))
@@ -1076,7 +1090,10 @@ mod kqueue_impl {
                 let items = interp
                     .collect_iterable(other, &globals)
                     .map_err(|_| type_error("changelist must be an iterable or None"))?;
-                items.iter().map(kevent_to_native).collect::<Result<_, _>>()?
+                items
+                    .iter()
+                    .map(kevent_to_native)
+                    .collect::<Result<_, _>>()?
             }
         };
 
@@ -1115,7 +1132,7 @@ mod kqueue_impl {
             let ts = slice.map(dur_to_timespec);
             let tsp = ts
                 .as_ref()
-                .map_or(std::ptr::null(), |t| t as *const libc::timespec);
+                .map_or(std::ptr::null(), std::ptr::from_ref);
             let r = unsafe {
                 libc::kevent(
                     kq,

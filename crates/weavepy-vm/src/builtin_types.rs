@@ -2321,7 +2321,9 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
                     "[Errno {errno_s}] {strerror_s}: {f1} -> {f2}"
                 )));
             }
-            return Ok(Object::from_str(format!("[Errno {errno_s}] {strerror_s}: {f1}")));
+            return Ok(Object::from_str(format!(
+                "[Errno {errno_s}] {strerror_s}: {f1}"
+            )));
         }
         if set(&errno) && set(&strerror) {
             return Ok(Object::from_str(format!("[Errno {errno_s}] {strerror_s}")));
@@ -2333,7 +2335,11 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
                 [single] => Object::from_str(single.to_str()),
                 _ => Object::from_str(format!(
                     "({})",
-                    items.iter().map(Object::repr).collect::<Vec<_>>().join(", ")
+                    items
+                        .iter()
+                        .map(Object::repr)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )),
             }),
             _ => Ok(Object::from_static("")),

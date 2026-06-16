@@ -49,8 +49,8 @@ status = "fail"
 reason = "depends on dict order corner cases + leaking CPython implementation details"
 
 [tests."cpython/Lib/test/test_list.py"]
-status = "skip"
-reason = "measured: past the sys.getsizeof/refcount probes it reaches the same gc.collect() reachable-hang as test_set (list/iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
+status = "pass"
+reason = "RFC 0039 WS5: the gc.collect() reachable-hang is gone. All 67 tests pass (1 skip for the CPython-only sizeof probe). Required CPython-faithful list fidelity: `PyObject_RichCompareBool` semantics for `count`/`index`/`remove`/`in` and `list_richcompare` (identity-first then Python `__eq__`, with the live-length re-read so a mutating `__eq__` matches bpo-38588), `METH_NOARGS`/positional-only arity for `pop`/`clear`/`copy`/`reverse`/`sort`, `list.sort` list-modified-during-sort detection (detach + re-check), `__setitem__` 'indices must be integers or slices' message, list-iterator detach-on-exhaustion in the FOR_ITER fast path, recursive-repr cycle detection (`[...]`) with RecursionError, an inherited builtin `__init__` that tolerates excess kwargs when `__new__` is overridden, and shared-store list/reverse-iterator pickling (`(iter|reversed, (live_list,), index)`)."
 
 [tests."cpython/Lib/test/test_set.py"]
 status = "fail"
@@ -108,8 +108,8 @@ reason = "depends on real multiprocessing implementation (RFC 0026)"
 # ---------------------------------------------------------------------
 
 [tests."cpython/Lib/test/test_tuple.py"]
-status = "skip"
-reason = "measured: past the sys.getsizeof/interning probes it reaches the same gc.collect() reachable-hang as test_set (tuple/iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
+status = "pass"
+reason = "RFC 0039 WS5: the gc.collect() reachable-hang is gone (the cycle collector no longer rescans the whole generation). All 38 tests pass (4 skips for CPython-only sizeof/refcount probes). Required CPython-faithful tuple fidelity: xxPrime-based tuple hashing (`tuplehash`), `PyObject_RichCompareBool` semantics for `count`/`index`/`in` (identity-first, then Python `__eq__`), `t * 1 is t` identity, and recursive-repr cycle detection (`(...)`)."
 
 [tests."cpython/Lib/test/test_bytes.py"]
 status = "pass"
@@ -251,7 +251,7 @@ reason = "measured (RFC 0038 WS-A): 539 pass, 11 fail, 62 error of 620. First ga
 
 [tests."cpython/Lib/test/test_io.py"]
 status = "fail"
-reason = "measured (RFC 0038 WS-B): 54 pass, 38 fail, 44 error of 247 (~52s; no longer hangs after the FileIO(fd) constructor + closefd fix landed this wave). Gaps: BufferedIOBase.readinto on custom raw streams (`'Reader' object has no attribute 'readinto'`), BufferedRandom read/write interleaving, and TextIOWrapper seek/tell cookie semantics. Deferred."
+reason = "measured (RFC 0038 WS-B, updated RFC 0039 WS5): completes in ~52s (fail) — no hang. A prior wave measured 54 pass / 38 fail / 44 error of 247; RFC 0039 then fixed a SignalsTest regression so `PySignalsTest.test_interrupted_write_{buffered,unbuffered}` now pass. A `SIGALRM` arriving during a blocking `os.write` to a full pipe is now delivered to the VM main thread: WeavePy runs the interpreter on a spawned `weavepy-main` stack thread, so the async signals are blocked on the parked process-main OS thread that would otherwise steal them (only tripping the flag while the VM thread's syscall never sees EINTR). `os.write` also releases the GIL across the write and services tripped handlers on `EINTR`. The blocking write then returns and the buffered layer raises the handler's `ZeroDivisionError` per PEP 475 instead of blocking forever. Residual gaps (deferred): BufferedIOBase.readinto on custom raw streams (`'Reader' object has no attribute 'readinto'`), BufferedRandom read/write interleaving, TextIOWrapper seek/tell cookie semantics, and native `io.open(fd:int)` (CSignalsTest)."
 
 [tests."cpython/Lib/test/test_os.py"]
 status = "fail"

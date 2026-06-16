@@ -9,6 +9,34 @@ CPython on a platform where multiprocessing is unavailable.
 
 from concurrent.futures._base import Executor, BrokenExecutor
 
+# EXTRA_QUEUED_CALLS mirrors CPython's process.py constant; some callers
+# (and `from concurrent.futures.process import *`) reference it.
+EXTRA_QUEUED_CALLS = 1
+
+_system_limits_checked = False
+_system_limited = None
+
+
+def _check_system_limits():
+    """CPython exposes this so callers can detect platforms where a real
+    process pool can't be built. WeavePy has no multiprocessing process
+    runtime, so we behave exactly like such a platform: raise
+    ``NotImplementedError``. `test.test_concurrent_futures` keys its
+    ProcessPool skips off this, so the ThreadPool suite still runs.
+    """
+    global _system_limits_checked, _system_limited
+    if _system_limits_checked:
+        if _system_limited:
+            raise NotImplementedError(_system_limited)
+        return
+    _system_limits_checked = True
+    _system_limited = (
+        "ProcessPoolExecutor is unavailable: WeavePy has no multiprocessing "
+        "process runtime (RFC 0026 ships threads/queues, not a fork/spawn "
+        "worker pool)."
+    )
+    raise NotImplementedError(_system_limited)
+
 
 class BrokenProcessPool(BrokenExecutor):
     """Raised when a process in a ProcessPoolExecutor terminated abruptly."""

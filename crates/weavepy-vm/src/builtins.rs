@@ -2019,6 +2019,20 @@ pub(crate) fn coerce_index_i128(o: &Object) -> Result<i128, RuntimeError> {
     coerce_index_i64(o).map(i128::from)
 }
 
+/// Coerce a `list.index`/`tuple.index` start/stop bound to `i64`, clamping
+/// an out-of-range big integer to `i64::MAX`/`i64::MIN` the way CPython's
+/// `_PyEval_SliceIndex` saturates a `Py_ssize_t` — so `index(x, 4*sys.maxsize)`
+/// is an empty window, not an `OverflowError`.
+pub(crate) fn seq_index_bound(o: &Object) -> Result<i64, RuntimeError> {
+    if let Object::Long(b) = o {
+        if let Some(v) = b.to_i64() {
+            return Ok(v);
+        }
+        return Ok(if b.is_negative() { i64::MIN } else { i64::MAX });
+    }
+    coerce_index_i64(o)
+}
+
 pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
     if let Some(v) = o.as_i64() {
         return Ok(v);
@@ -5486,10 +5500,22 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
     let iterable = one(args, "reversed")?;
-    // Materialize the source in *forward* order; the Reversed iterator
-    // walks it back-to-front. (CPython's `reversed` uses `__reversed__`
-    // or `__len__`+`__getitem__`; a forward snapshot reproduces the same
-    // sequence for the finite iterables WeavePy handles here.)
+    // A plain list shares its backing store with the reverse-iterator
+    // (CPython `list___reversed__`): the iterator holds the *live* list and
+    // a descending cursor, so co-pickling `(reversed(xs), xs)` memoizes one
+    // list and the iterator sees later mutations (test_list
+    // `test_reversed_pickle`).
+    if let Object::List(items) = iterable {
+        let index = items.borrow().len() as i64 - 1;
+        return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Reversed {
+            items: items.clone(),
+            index,
+        }))));
+    }
+    // Otherwise materialize the source in *forward* order; the Reversed
+    // iterator walks it back-to-front. (CPython's `reversed` uses
+    // `__reversed__` or `__len__`+`__getitem__`; a forward snapshot
+    // reproduces the same sequence for the finite iterables handled here.)
     let mut it = iterable.make_iter()?;
     let mut buf = Vec::new();
     while let Some(v) = it.next_value() {
@@ -7931,6 +7957,14 @@ fn list_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn list_pop(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `list.pop(index=-1)` accepts at most one positional argument
+    // (`[].pop(1, 2)` is a TypeError in CPython, not an IndexError).
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "pop expected at most 1 argument, got {}",
+            args.len() - 1
+        )));
+    }
     let l = list_self(args)?;
     let mut l = l.borrow_mut();
     let idx = if args.len() > 1 {
@@ -7962,6 +7996,23 @@ fn list_extend(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("list.extend() expected 1 argument"));
     }
     let l = list_self(args)?;
+    // Fast path for exact list/tuple sources: snapshot the source items
+    // first. CPython reads the source's length once, so `a.extend(a)`
+    // *doubles* `a`; iterating the live list while pushing to it would
+    // instead grow without bound (a hang that the OOM killer ends).
+    match &args[1] {
+        Object::List(src) => {
+            let items: Vec<Object> = src.borrow().clone();
+            l.borrow_mut().extend(items);
+            return Ok(Object::None);
+        }
+        Object::Tuple(src) => {
+            let items: Vec<Object> = src.iter().cloned().collect();
+            l.borrow_mut().extend(items);
+            return Ok(Object::None);
+        }
+        _ => {}
+    }
     let mut it = args[1].make_iter()?;
     while let Some(v) = it.next_value() {
         l.borrow_mut().push(v);
@@ -7996,6 +8047,12 @@ fn list_imul(args: &[Object]) -> Result<Object, RuntimeError> {
     if n <= 0 {
         data.clear();
     } else {
+        let unit = data.len();
+        let times = crate::checked_repeat_count(unit, n, "list")?;
+        let extra = unit.saturating_mul(times.saturating_sub(1));
+        if data.try_reserve_exact(extra).is_err() {
+            return Err(crate::error::memory_error(""));
+        }
         let original = data.clone();
         for _ in 1..n {
             data.extend_from_slice(&original);
@@ -8032,26 +8089,45 @@ fn list_remove(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("list.remove() expected 1 argument"));
     }
     let l = list_self(args)?;
-    let mut l = l.borrow_mut();
-    let pos = l
-        .iter()
-        .position(|x| x.eq_value(&args[1]))
-        .ok_or_else(|| value_error("list.remove(x): x not in list"))?;
-    l.remove(pos);
-    Ok(Object::None)
+    // CPython `list.remove` walks the *live* list by index with
+    // `PyObject_RichCompareBool` (identity-first, then Python `__eq__`),
+    // so `ALWAYS_EQ` matches the first element and a mutating `__eq__`
+    // can't panic the borrowed cell: clone each element and release the
+    // borrow before comparing.
+    let mut i = 0usize;
+    loop {
+        let x = {
+            let b = l.borrow();
+            if i >= b.len() {
+                break;
+            }
+            b[i].clone()
+        };
+        if crate::object::member_eq(&x, &args[1])? {
+            let mut b = l.borrow_mut();
+            if i < b.len() {
+                b.remove(i);
+            }
+            return Ok(Object::None);
+        }
+        i += 1;
+    }
+    Err(value_error("list.remove(x): x not in list"))
 }
 
 fn list_index(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 {
         return Err(type_error("list.index() expected at least 1 argument"));
     }
-    let l = list_self(args)?;
-    let l = l.borrow();
-    // CPython `list.index(value, start=0, stop=maxsize)`: negative
-    // bounds count from the end and clamp to 0 (`PySlice_AdjustIndices`
-    // semantics), and the comparison is identity-first
-    // (`PyObject_RichCompareBool`).
-    let len = l.len() as i64;
+    // Snapshot strong refs: CPython `list.index` re-reads by index because a
+    // user `__eq__` can mutate the list mid-scan; cloning the handles keeps us
+    // panic-free without holding the borrow across the comparison.
+    let items: Vec<Object> = list_self(args)?.borrow().clone();
+    // CPython `list.index(value, start=0, stop=maxsize)`: negative bounds count
+    // from the end and clamp to 0 (`PySlice_AdjustIndices` semantics), and the
+    // comparison is `PyObject_RichCompareBool` (identity-first, then Python
+    // `__eq__` both directions, propagating exceptions).
+    let len = items.len() as i64;
     let adjust = |v: i64| -> i64 {
         if v < 0 {
             (v + len).max(0)
@@ -8060,18 +8136,19 @@ fn list_index(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let start = match args.get(2) {
-        Some(o) => adjust(coerce_index_i64(o)?),
+        Some(o) => adjust(seq_index_bound(o)?),
         None => 0,
     };
     let stop = match args.get(3) {
-        Some(o) => adjust(coerce_index_i64(o)?),
+        Some(o) => adjust(seq_index_bound(o)?),
         None => len,
     };
-    for i in start..stop {
-        let x = &l[i as usize];
-        if x.is_same(&args[1]) || x.eq_value(&args[1]) {
+    let mut i = start;
+    while i < stop {
+        if crate::object::member_eq(&items[i as usize], &args[1])? {
             return Ok(Object::Int(i));
         }
+        i += 1;
     }
     Err(value_error(format!("{} is not in list", args[1].repr())))
 }
@@ -8080,15 +8157,18 @@ fn list_count(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("list.count() expected 1 argument"));
     }
-    let l = list_self(args)?;
-    let l = l.borrow();
-    // CPython compares with `PyObject_RichCompareBool`, which is identity-first,
-    // so `[nan].count(nan)` (the same nan) is 1.
-    let n = l
-        .iter()
-        .filter(|x| x.is_same(&args[1]) || x.eq_value(&args[1]))
-        .count();
-    Ok(Object::Int(n as i64))
+    // Snapshot strong refs (a user `__eq__` may mutate the list mid-scan).
+    // CPython compares with `PyObject_RichCompareBool`: identity-first (so
+    // `[nan].count(nan)` for the same nan is 1), then Python `__eq__` both
+    // directions, letting any `__eq__` exception propagate.
+    let items: Vec<Object> = list_self(args)?.borrow().clone();
+    let mut n: i64 = 0;
+    for x in &items {
+        if crate::object::member_eq(x, &args[1])? {
+            n += 1;
+        }
+    }
+    Ok(Object::Int(n))
 }
 
 fn list_sort(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8109,16 +8189,26 @@ fn list_sort(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn list_reverse(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `list.reverse()` is `METH_NOARGS`: extra arguments are a TypeError.
+    if args.len() != 1 {
+        return Err(type_error("reverse() takes no arguments (1 given)"));
+    }
     list_self(args)?.borrow_mut().reverse();
     Ok(Object::None)
 }
 
 fn list_clear(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 1 {
+        return Err(type_error("clear() takes no arguments (1 given)"));
+    }
     list_self(args)?.borrow_mut().clear();
     Ok(Object::None)
 }
 
 fn list_copy(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 1 {
+        return Err(type_error("copy() takes no arguments (1 given)"));
+    }
     let l = list_self(args)?;
     let v = l.borrow().clone();
     Ok(Object::new_list(v))
@@ -8294,11 +8384,15 @@ fn tuple_count(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Tuple(t)) => t.clone(),
         _ => return Err(type_error("expected tuple")),
     };
-    let n = t
-        .iter()
-        .filter(|x| x.is_same(&args[1]) || x.eq_value(&args[1]))
-        .count();
-    Ok(Object::Int(n as i64))
+    // `PyObject_RichCompareBool`: identity-first, then Python `__eq__` (both
+    // directions), propagating any exception the comparison raises.
+    let mut n: i64 = 0;
+    for x in t.iter() {
+        if crate::object::member_eq(x, &args[1])? {
+            n += 1;
+        }
+    }
+    Ok(Object::Int(n))
 }
 
 fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8320,18 +8414,19 @@ fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let start = match args.get(2) {
-        Some(o) => adjust(coerce_index_i64(o)?),
+        Some(o) => adjust(seq_index_bound(o)?),
         None => 0,
     };
     let stop = match args.get(3) {
-        Some(o) => adjust(coerce_index_i64(o)?),
+        Some(o) => adjust(seq_index_bound(o)?),
         None => len,
     };
-    for i in start..stop {
-        let x = &t[i as usize];
-        if x.is_same(&args[1]) || x.eq_value(&args[1]) {
+    let mut i = start;
+    while i < stop {
+        if crate::object::member_eq(&t[i as usize], &args[1])? {
             return Ok(Object::Int(i));
         }
+        i += 1;
     }
     Err(value_error("tuple.index(x): x not in tuple"))
 }

@@ -137,9 +137,7 @@ fn time_get_clock_info(args: &[Object]) -> Result<Object, RuntimeError> {
         "time" => ("clock_gettime(CLOCK_REALTIME)", false, true),
         "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false),
         "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false),
-        other => {
-            return Err(crate::error::value_error(format!("unknown clock: {other}")))
-        }
+        other => return Err(crate::error::value_error(format!("unknown clock: {other}"))),
     };
     thread_local! {
         static CLOCK_INFO_TYPE: RefCell<Option<Rc<crate::types::TypeObject>>> =
