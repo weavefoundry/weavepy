@@ -4704,15 +4704,21 @@ fn parse_complex_inner(s: &str) -> Option<(f64, f64)> {
 }
 
 fn b_list(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::new_list(Vec::new()));
-    }
-    let mut it = args[0].make_iter()?;
-    let mut out = Vec::new();
-    while let Some(v) = it.next_value() {
-        out.push(v);
-    }
-    Ok(Object::new_list(out))
+    let out = if args.is_empty() {
+        Vec::new()
+    } else {
+        let mut it = args[0].make_iter()?;
+        let mut out = Vec::new();
+        while let Some(v) = it.next_value() {
+            out.push(v);
+        }
+        out
+    };
+    let obj = Object::new_list(out);
+    // CPython tracks every list; keep `list(...)` consistent with the
+    // `[]` literal path so `gc.is_tracked` and cycle collection agree.
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
 }
 
 fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4735,7 +4741,9 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
-        return Ok(Object::new_dict());
+        let obj = Object::new_dict();
+        crate::gc_trace::track(obj.clone());
+        return Ok(obj);
     }
     if args.len() > 1 {
         return Err(type_error(format!(
@@ -4751,7 +4759,9 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
         for (k, v) in src.borrow().iter() {
             d.insert(k.clone(), v.clone());
         }
-        return Ok(Object::Dict(Rc::new(RefCell::new(d))));
+        let obj = Object::Dict(Rc::new(RefCell::new(d)));
+        crate::gc_trace::track(obj.clone());
+        return Ok(obj);
     }
     // Mapping path for user-defined classes (`__keys__` style) is
     // handled by the VM before dispatching here — see
@@ -4807,7 +4817,9 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
         d.insert(DictKey(kv.next().unwrap()), kv.next().unwrap());
         i += 1;
     }
-    Ok(Object::Dict(Rc::new(RefCell::new(d))))
+    let obj = Object::Dict(Rc::new(RefCell::new(d)));
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
 }
 
 fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4818,15 +4830,20 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::new_set());
-    }
-    let mut it = args[0].make_iter()?;
-    let mut out = Vec::new();
-    while let Some(v) = it.next_value() {
-        out.push(v);
-    }
-    Ok(Object::new_set_from(out))
+    let out = if args.is_empty() {
+        Vec::new()
+    } else {
+        let mut it = args[0].make_iter()?;
+        let mut out = Vec::new();
+        while let Some(v) = it.next_value() {
+            out.push(v);
+        }
+        out
+    };
+    let obj = Object::new_set_from(out);
+    // CPython tracks every set (`gc.is_tracked(set())` is True).
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
 }
 
 fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {

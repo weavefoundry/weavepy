@@ -1034,21 +1034,32 @@ impl Interpreter {
     /// finalizer are routed through `sys.unraisablehook` (the
     /// default hook prints `Exception ignored in: …` to stderr,
     /// exactly like CPython) so they don't propagate.
-    pub fn run_pending_finalizers(&mut self) {
+    pub fn run_pending_finalizers(&mut self) -> usize {
         // Finalizers run arbitrary Python (`__del__` → traceback →
         // native islice, …), so the interpreter pointer must be
         // published here just like the public call entry points: the
         // shutdown pass reaches this outside any published frame.
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        // Number of `__del__` finalizers actually run. The cycle-GC
+        // interception uses this to decide whether a follow-up collection is
+        // worthwhile (a finalizer may have dropped the last reference to — or
+        // resurrected — a deferred object).
+        let mut finalizers_run = 0usize;
         loop {
             let pending = crate::vm_singletons::drain_pending_finalizers();
             let callbacks = crate::vm_singletons::drain_pending_weakref_callbacks();
             if pending.is_empty() && callbacks.is_empty() {
-                return;
+                return finalizers_run;
             }
             for obj in pending {
                 self.invoke_finalizer(&obj);
+                finalizers_run += 1;
+                // The finalizer has now run to completion: mark the object
+                // finalized and clear its deferral flag so the next collection
+                // treats it as plain garbage (if it wasn't resurrected) and
+                // never runs `__del__` a second time.
+                crate::gc_trace::complete_finalizer(crate::weakref_registry::id_of(&obj));
             }
             // Weakref callbacks run after finalizers (CPython's order);
             // errors route through the unraisable hook.
@@ -1060,6 +1071,87 @@ impl Interpreter {
                 }
             }
         }
+    }
+
+    /// Invoke every callable in `gc.callbacks` with `(phase, info)`, where
+    /// `info` is a fresh dict carrying `generation`, `collected`, and
+    /// `uncollectable` — CPython's `invoke_gc_callback` contract. Called with
+    /// `phase == "start"` before a collection and `"stop"` after. A no-op when
+    /// `gc` hasn't been imported or its callback list is empty. Errors route
+    /// through the unraisable hook, matching CPython.
+    pub fn fire_gc_callbacks(
+        &mut self,
+        phase: &'static str,
+        generation: usize,
+        collected: usize,
+        uncollectable: usize,
+    ) {
+        let callbacks = match self.cache.get("gc") {
+            Some(Object::Module(m)) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("callbacks")))
+                .cloned(),
+            _ => None,
+        };
+        let Some(Object::List(list)) = callbacks else {
+            return;
+        };
+        // Snapshot the list so a callback that mutates `gc.callbacks` can't
+        // invalidate the iteration.
+        let cbs: Vec<Object> = list.borrow().clone();
+        if cbs.is_empty() {
+            return;
+        }
+        let mut info = DictData::new();
+        info.insert(
+            DictKey(Object::from_static("generation")),
+            Object::Int(generation as i64),
+        );
+        info.insert(
+            DictKey(Object::from_static("collected")),
+            Object::Int(collected as i64),
+        );
+        info.insert(
+            DictKey(Object::from_static("uncollectable")),
+            Object::Int(uncollectable as i64),
+        );
+        let info_obj = Object::Dict(Rc::new(RefCell::new(info)));
+        let phase_obj = Object::from_static(phase);
+        let globals = self.builtins.clone();
+        for cb in cbs {
+            let cb_args = [phase_obj.clone(), info_obj.clone()];
+            if let Err(err) = self.call(&cb, &cb_args, &[], &globals) {
+                let context_repr = cb.repr();
+                self.write_unraisable(&err, &cb, &context_repr);
+            }
+        }
+    }
+
+    /// Move the objects the cycle collector parked in its Rust-side garbage
+    /// buffer (`GcState::garbage` — uncollectable cycles and everything kept
+    /// under `gc.DEBUG_SAVEALL`) into the Python-visible `gc.garbage` list,
+    /// where user code can inspect them. Returns the number transferred this
+    /// call (the collection's "uncollectable" count for `gc.callbacks`).
+    pub fn drain_gc_garbage(&mut self) -> usize {
+        let parked: Vec<Object> =
+            gc_trace::with_state(|s| std::mem::take(&mut *s.garbage.borrow_mut()));
+        let n = parked.len();
+        if n == 0 {
+            return 0;
+        }
+        let list = match self.cache.get("gc") {
+            Some(Object::Module(m)) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("garbage")))
+                .cloned(),
+            _ => None,
+        };
+        if let Some(Object::List(list)) = list {
+            list.borrow_mut().extend(parked);
+        }
+        n
     }
 
     /// CPython's `Py_FinalizeEx` shutdown prologue, in order:
@@ -3496,13 +3588,15 @@ impl Interpreter {
                 let items = frame.stack.split_off(split);
                 self.record_alloc(frame, 56 + (n as u64) * 8);
                 let obj = Object::new_list(items);
-                // RFC 0024: a list holding a reference can close a
-                // cycle (`s.attr = [s]`); track it so the cycle
-                // collector can break and finalize it. Lists of only
-                // scalar leaves can't cycle and stay off the GC's books.
-                let tracked = gc_trace::track_if_cyclic(&obj);
+                // RFC 0024/0039: CPython tracks *every* list — `gc.is_tracked([])`
+                // is True — and a list can close a cycle through later mutation
+                // (`l = []; l.append(l)`), which the content-gated optimization
+                // missed entirely. Track unconditionally so the collector both
+                // reports it via `gc.get_objects()`/`is_tracked` and can break
+                // the cycle when it becomes unreachable.
+                gc_trace::track(obj.clone());
                 frame.push(obj);
-                if tracked && gc_trace::maybe_auto_collect() > 0 {
+                if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }
             }
@@ -3511,6 +3605,18 @@ impl Interpreter {
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
                 self.record_alloc(frame, 40 + (n as u64) * 8);
+                // A tuple is immutable, so it can never *anchor* a reference
+                // cycle on its own: any cycle that passes through a tuple
+                // (`l = []; t = (l,); l.append(t)`) is necessarily closed by a
+                // mutable container (`l`), which *is* tracked. The collector
+                // reaches the tuple's contents transitively from that anchor, so
+                // the cycle is still found and broken without the tuple itself
+                // being a GC root. Deliberately *don't* track tuples here: the
+                // GC index holds a strong reference, so tracking a transient
+                // arg-tuple/`(type, value, tb)` triple would pin it past the
+                // point CPython frees it by refcount — inflating
+                // `sys.getrefcount` of its elements (`test_traceback`'s
+                // `test_no_refs_to_exception_and_traceback_objects`).
                 frame.push(Object::new_tuple(items));
             }
             OpCode::BuildSet => {
@@ -3524,9 +3630,11 @@ impl Interpreter {
                 }
                 self.record_alloc(frame, 216 + (n as u64) * 16);
                 let obj = Object::new_set_from(items);
-                let tracked = gc_trace::track_if_cyclic(&obj);
+                // CPython tracks every set (`gc.is_tracked(set())` is True);
+                // track unconditionally like lists.
+                gc_trace::track(obj.clone());
                 frame.push(obj);
-                if tracked && gc_trace::maybe_auto_collect() > 0 {
+                if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }
             }
@@ -3547,9 +3655,11 @@ impl Interpreter {
                 }
                 self.record_alloc(frame, 64 + (n as u64) * 16);
                 let obj = Object::Dict(Rc::new(RefCell::new(d)));
-                let tracked = gc_trace::track_if_cyclic(&obj);
+                // CPython tracks dicts at creation; track unconditionally so a
+                // dict that becomes cyclic (`d = {}; d[0] = d`) is collectable.
+                gc_trace::track(obj.clone());
                 frame.push(obj);
-                if tracked && gc_trace::maybe_auto_collect() > 0 {
+                if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }
             }
@@ -3914,7 +4024,14 @@ impl Interpreter {
                     attrs: Rc::new(RefCell::new(DictData::new())),
                     slots,
                 };
-                frame.push(Object::Function(Rc::new(f)));
+                // A function participates in cycles through its globals
+                // (`exec(src, d)` builds `d -> f -> d`), its `__dict__`, and
+                // any closure cell that closes over the function. Track it so
+                // `gc.collect()` can reclaim those cycles and `gc.is_tracked(f)`
+                // reports True, matching CPython (functions are GC objects).
+                let obj = Object::Function(Rc::new(f));
+                gc_trace::track(obj.clone());
+                frame.push(obj);
             }
             OpCode::BuildSlice => {
                 let step = frame.pop()?;
@@ -12796,6 +12913,12 @@ impl Interpreter {
                             if let Some((_, slot)) =
                                 inst.dict.borrow_mut().get_index_mut(key_idx as usize)
                             {
+                                // Mirror the slow path: a bound method stored
+                                // on the instance must join the cycle collector
+                                // (see `generic_setattr_instance`).
+                                if matches!(val, Object::BoundMethod(_)) {
+                                    gc_trace::track(val.clone());
+                                }
                                 *slot = val;
                                 specialize::record_hit(op_idx);
                                 return Ok(());
@@ -13893,6 +14016,15 @@ impl Interpreter {
                     name
                 )));
             }
+        }
+        // A bound method stashed on the instance (`self.cb = self.handler`)
+        // closes a `self -> __dict__ -> method -> self` cycle. Bound methods
+        // are otherwise materialised transiently per call and left untracked
+        // to keep dispatch cheap; track the ones that actually escape into an
+        // instance attribute so the cycle collector can reclaim them
+        // (CPython's `method` type is always GC-tracked — `test_method`).
+        if matches!(value, Object::BoundMethod(_)) {
+            gc_trace::track(value.clone());
         }
         inst.dict
             .borrow_mut()
@@ -15186,9 +15318,77 @@ impl Interpreter {
                     // semantics where `gc.collect()` returns *after*
                     // every finaliser has fired.
                     if b.name == ".gc.collect" {
-                        let result = (b.call)(args)?;
-                        self.run_pending_finalizers();
-                        return Ok(result);
+                        // `generation` may be positional or the `generation=`
+                        // keyword (CPython accepts both). Validate it the way
+                        // the argument clinic does: out-of-range int → ValueError,
+                        // non-int → TypeError.
+                        let raw = args.first().cloned().or_else(|| {
+                            kwargs
+                                .iter()
+                                .find(|(k, _)| k == "generation")
+                                .map(|(_, v)| v.clone())
+                        });
+                        let generation = match raw {
+                            None | Some(Object::None) => gc_trace::N_GENERATIONS - 1,
+                            Some(Object::Bool(flag)) => usize::from(flag),
+                            Some(Object::Int(n)) => {
+                                if n < 0 || n as usize >= gc_trace::N_GENERATIONS {
+                                    return Err(value_error(format!(
+                                        "generation parameter must be between 0 and {} (inclusive)",
+                                        gc_trace::N_GENERATIONS - 1
+                                    )));
+                                }
+                                n as usize
+                            }
+                            Some(other) => {
+                                return Err(type_error(format!(
+                                    "'{}' object cannot be interpreted as an integer",
+                                    other.type_name()
+                                )));
+                            }
+                        };
+                        // CPython invokes every `gc.callbacks` entry with
+                        // ("start", info) before the sweep and ("stop", info)
+                        // after, where `info` carries generation/collected/
+                        // uncollectable. Fire them around the real collection.
+                        self.fire_gc_callbacks("start", generation, 0, 0);
+                        // CPython's collector runs `__del__` finalizers *during*
+                        // the collection and then re-scans to see which objects
+                        // their finalizers resurrected — all within one
+                        // `gc.collect()`. WeavePy's GC layer can't call Python,
+                        // so it instead *defers* finalizable garbage (queuing
+                        // `__del__` and keeping the object tracked) rather than
+                        // reclaiming it. We reproduce CPython's single-call
+                        // semantics here: collect, drain the queued finalizers,
+                        // then collect again to reap whatever those finalizers
+                        // didn't resurrect. Loop to a fixpoint so finalizer
+                        // chains settle, and sum the per-pass counts — a
+                        // non-resurrected finalizable object is reclaimed (and
+                        // counted) in the follow-up pass, matching CPython.
+                        let mut collected = gc_trace::collect_upto(generation);
+                        for _ in 0..gc_trace::MAX_COLLECT_PASSES {
+                            let ran = self.run_pending_finalizers();
+                            if ran == 0 {
+                                break;
+                            }
+                            let more = gc_trace::collect_upto(generation);
+                            collected += more;
+                            if more == 0 {
+                                break;
+                            }
+                        }
+                        // The collector parks uncollectable / DEBUG_SAVEALL
+                        // objects in a Rust-side buffer (it can't touch the
+                        // interpreter). Move them into the Python-visible
+                        // `gc.garbage` list now that we can.
+                        let uncollectable = self.drain_gc_garbage();
+                        self.fire_gc_callbacks(
+                            "stop",
+                            generation,
+                            collected,
+                            uncollectable,
+                        );
+                        return Ok(Object::Int(collected as i64));
                     }
                     // Pre-materialize VM-only iterables (generators, user
                     // `__iter__` instances, metaclass-iterable classes) for
@@ -18080,7 +18280,7 @@ impl Interpreter {
                 // collection right here; without it the tracked set
                 // (which holds strong handles) grows without bound and
                 // long test runs degrade superlinearly.
-                if gc_trace::maybe_auto_collect() > 0 {
+                if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }
                 inst
@@ -18723,7 +18923,7 @@ impl Interpreter {
                     gc_trace::track(obj.clone());
                     // Threshold-driven young collection at the
                     // allocation site, as in the instance path.
-                    if gc_trace::maybe_auto_collect() > 0 {
+                    if gc_trace::maybe_auto_collect() {
                         self.run_pending_finalizers();
                     }
                     Ok(obj)
