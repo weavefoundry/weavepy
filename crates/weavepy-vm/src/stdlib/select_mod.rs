@@ -25,7 +25,9 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
-use crate::error::{os_error, type_error, RuntimeError};
+#[cfg(unix)]
+use crate::error::type_error;
+use crate::error::{os_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 

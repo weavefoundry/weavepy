@@ -1241,6 +1241,7 @@ fn sock_detach(args: &[Object]) -> Result<Object, RuntimeError> {
 /// it in a fresh `socket` object that shares the family/type/proto. The
 /// duplicate is an independent fd: closing one leaves the other usable,
 /// matching CPython's `socket.dup()`.
+#[cfg(unix)]
 fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let (family, kind, proto) = {
@@ -1251,19 +1252,11 @@ fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
         let b = state.borrow();
         let sock = b.inner.as_ref().ok_or_else(|| os_error("socket closed"))?;
         let fd = raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?;
-        #[cfg(unix)]
-        {
-            let dup = unsafe { libc::dup(fd as i32) };
-            if dup < 0 {
-                return Err(io_error_to_py(&std::io::Error::last_os_error()));
-            }
-            i64::from(dup)
+        let dup = unsafe { libc::dup(fd as i32) };
+        if dup < 0 {
+            return Err(io_error_to_py(&std::io::Error::last_os_error()));
         }
-        #[cfg(not(unix))]
-        {
-            let _ = fd;
-            return Err(os_error("socket.dup is only supported on Unix"));
-        }
+        i64::from(dup)
     };
     let inner = wrap_fd_socket(new_fd)?;
     let new_state = Rc::new(RefCell::new(SocketState {
@@ -1294,6 +1287,15 @@ fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
         );
     }
     Ok(Object::Instance(inst))
+}
+
+/// On non-Unix platforms WeavePy has no `dup(2)`-backed fd duplication, so
+/// `socket.dup()` is unsupported (mirrors the `#[cfg(not(unix))]` stubs used
+/// elsewhere in this module and in `select`).
+#[cfg(not(unix))]
+fn sock_dup(args: &[Object]) -> Result<Object, RuntimeError> {
+    let _ = state_of(args)?;
+    Err(os_error("socket.dup is only supported on Unix"))
 }
 
 fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -544,7 +544,7 @@ pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> Run
         Some(n) if n == libc::ECONNREFUSED => connection_refused_error(message),
         Some(n) if n == libc::ECONNRESET => connection_reset_error(message),
         Some(n) if n == libc::ECONNABORTED => connection_aborted_error(message),
-        Some(n) if n == libc::EPIPE || n == libc::ESHUTDOWN => broken_pipe_error(message),
+        Some(n) if n == libc::EPIPE || crate::is_eshutdown(n) => broken_pipe_error(message),
         Some(n) if n == libc::ECHILD => child_process_error(message),
         Some(n) if n == libc::EEXIST => file_exists_error(message),
         Some(n) if n == libc::ENOENT => file_not_found_error(message),
