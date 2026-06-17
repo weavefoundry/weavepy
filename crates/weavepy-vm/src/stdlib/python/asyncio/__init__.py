@@ -40,8 +40,17 @@ __all__ = (base_events.__all__ +
            transports.__all__)
 
 if sys.platform == 'win32':  # pragma: no cover
-    from .windows_events import *
-    __all__ += windows_events.__all__
+    # WeavePy has no IOCP backend on Windows: the `_overlapped` / `_winapi` /
+    # `msvcrt` extensions that `windows_events` (the Proactor loop) needs
+    # aren't provided, and the selector backend is gated on a Unix `select(2)`
+    # adapter. Degrade gracefully so `import asyncio` still succeeds — which
+    # keeps transitive importers like `unittest` working on Windows — even
+    # though constructing/running an event loop there isn't supported yet.
+    try:
+        from .windows_events import *
+        __all__ += windows_events.__all__
+    except ImportError:
+        pass
 else:
     from .unix_events import *  # pragma: no cover
     __all__ += unix_events.__all__
