@@ -1,3 +1,9 @@
+# weavepy-skip: windows
+#
+# asyncio is built on the Unix-only `select`/`selectors` backend right now
+# (no IOCP / winsock `select(2)` adapter), so the event loop can't start on
+# Windows (`ModuleNotFoundError: No module named '_overlapped'`). Unix-only
+# until that backend lands.
 import asyncio
 
 

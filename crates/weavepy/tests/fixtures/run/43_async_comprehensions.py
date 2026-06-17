@@ -1,3 +1,10 @@
+# weavepy-skip: windows
+#
+# asyncio is built on the Unix-only `select`/`selectors` backend right now
+# (no IOCP / winsock `select(2)` adapter), so the event loop can't start on
+# Windows (`ModuleNotFoundError: No module named '_overlapped'`). Unix-only
+# until that backend lands.
+#
 # Async comprehensions — PEP 530. Exercises `await` inside list,
 # set, dict, and generator comprehensions as well as the `async for`
 # form. The await-in-elt variant is a regression guard for a closure
