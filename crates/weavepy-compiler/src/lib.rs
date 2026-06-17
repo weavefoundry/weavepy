@@ -649,6 +649,19 @@ struct Compiler {
     /// Monotonic counter for synthetic locals used by `return` inside
     /// `try/finally` to preserve the value across the finally body.
     finally_counter: u32,
+    /// Monotonic id stamped on every [`FinallyFrame`] when it is pushed.
+    /// Used to associate a return/break/continue-path *inline copy* of a
+    /// finally body with the specific `try`/`with` it belongs to.
+    next_finally_id: u32,
+    /// PC ranges where a `finally` (or `with`-exit) body was inlined for a
+    /// non-exceptional exit (`return`/`break`/`continue`), keyed by the
+    /// owning frame's id. A `raise` inside such an inlined body must
+    /// propagate to an *enclosing* try — not re-enter (and re-run) the
+    /// same try's finally — so [`Self::push_body_exc_entries`] punches
+    /// these ranges out of that try's exception-table coverage, matching
+    /// CPython (whose return-path finally lives outside the protected
+    /// body range). Each entry is `(frame_id, start, end)`.
+    finally_holes: Vec<(u32, u32, u32)>,
     /// Source byte→line table shared by every nested compiler from the
     /// same `compile_module_*` call.
     line_index: Rc<LineIndex>,
@@ -764,6 +777,10 @@ struct FinallyFrame {
     /// determine whether `break`/`continue` should run this finally
     /// (only if the relevant loop is outside the finally scope).
     loop_depth_at_push: usize,
+    /// Stable id (see [`Compiler::next_finally_id`]). Lets a
+    /// return/break/continue-path inline copy of this frame's body be
+    /// excluded from the owning try's exception-table coverage.
+    id: u32,
 }
 
 impl Compiler {
@@ -794,6 +811,8 @@ impl Compiler {
             chain_counter: 0,
             with_counter: 0,
             finally_counter: 0,
+            next_finally_id: 0,
+            finally_holes: Vec::new(),
             line_index,
             current_line: 0,
             current_span: (0, 0),
@@ -1491,6 +1510,7 @@ impl Compiler {
                     self.emit(OpCode::StoreFast, tmp_idx);
                     let frames = std::mem::take(&mut self.finally_stack);
                     let mut compiled: Result<(), CompileError> = Ok(());
+                    let mut hole_starts: Vec<(u32, u32)> = Vec::new();
                     for (i, frame) in frames.iter().enumerate().rev() {
                         // While compiling this finally body, hide it
                         // from the stack so nested `return`s inside the
@@ -1498,9 +1518,11 @@ impl Compiler {
                         let saved_finally: Vec<FinallyFrame> =
                             frames.iter().take(i).map(clone_finally_frame).collect();
                         self.finally_stack = saved_finally;
+                        let inline_start = self.next_offset();
                         if let Err(e) = self.emit_finally_frame(frame) {
                             compiled = Err(e);
                         }
+                        hole_starts.push((frame.id, inline_start));
                         self.finally_stack.clear();
                         if compiled.is_err() {
                             break;
@@ -1508,6 +1530,17 @@ impl Compiler {
                     }
                     self.finally_stack = frames;
                     compiled?;
+                    // The inlined finally bodies ran here for the return;
+                    // the `LoadFast`/`ReturnValue` below cannot raise.
+                    // Exclude each frame's inline (extended through the end
+                    // of the whole run, so an outer frame's `raise` is also
+                    // excluded from inner tries) from its owning try's
+                    // exception coverage, so a `raise` inside a return-path
+                    // finally propagates outward instead of re-running it.
+                    let inline_end = self.next_offset();
+                    for (id, start) in hole_starts {
+                        self.finally_holes.push((id, start, inline_end));
+                    }
                     self.emit(OpCode::LoadFast, tmp_idx);
                 }
                 self.emit(OpCode::ReturnValue, 0);
@@ -2631,6 +2664,67 @@ impl Compiler {
     /// by an exception table entry; matched handlers fall through to
     /// the `else` branch, unmatched ones re-raise. `finally` runs on
     /// every exit path.
+    /// Allocate a fresh, process-wide-unique id for a [`FinallyFrame`].
+    fn fresh_finally_id(&mut self) -> u32 {
+        self.next_finally_id += 1;
+        self.next_finally_id
+    }
+
+    /// Push exception-table entries covering `[start, end)` → `handler`,
+    /// but with the `finally`/`with`-exit inline copies that belong to
+    /// frame `frame_id` punched out as "holes". A `return`/`break`/
+    /// `continue` inlines its pending finally bodies at the exit site,
+    /// physically *inside* the protected body; without the holes a
+    /// `raise` from such an inlined finally would be re-caught here and
+    /// run the finally a second time (CPython runs it exactly once,
+    /// because its return-path finally sits outside the body's covered
+    /// range). `frame_id == None` punches nothing.
+    fn push_body_exc_entries(
+        &mut self,
+        start: u32,
+        end: u32,
+        handler: u32,
+        depth: u32,
+        push_lasti: bool,
+        frame_id: Option<u32>,
+    ) {
+        if end <= start {
+            return;
+        }
+        let mut holes: Vec<(u32, u32)> = match frame_id {
+            Some(fid) => self
+                .finally_holes
+                .iter()
+                .filter(|(id, hs, he)| *id == fid && *hs < end && *he > start)
+                .map(|(_, hs, he)| ((*hs).max(start), (*he).min(end)))
+                .collect(),
+            None => Vec::new(),
+        };
+        holes.sort_by_key(|(hs, _)| *hs);
+        let mut cur = start;
+        for (hs, he) in holes {
+            if hs > cur {
+                self.co.exception_table.push(ExcHandler {
+                    start: cur,
+                    end: hs,
+                    handler,
+                    depth,
+                    push_lasti,
+                });
+            }
+            cur = cur.max(he);
+        }
+        if cur < end {
+            self.co.exception_table.push(ExcHandler {
+                start: cur,
+                end,
+                handler,
+                depth,
+                push_lasti,
+            });
+        }
+    }
+
     /// Inline every `finally` clause that lives *inside* the
     /// enclosing loop (i.e. was pushed after the current loop frame),
     /// in innermost-out order. Used by `break` / `continue` so the
@@ -2652,6 +2746,7 @@ impl Compiler {
         // Walk innermost out; on each iteration further trim the
         // finally stack so a `return` nested inside a finally body
         // can't re-inline its own ancestors infinitely.
+        let mut hole_starts: Vec<(u32, u32)> = Vec::new();
         for (offset, frame) in to_inline.iter().enumerate() {
             let outer_count = saved.len().saturating_sub(offset + 1);
             self.finally_stack = saved
@@ -2659,9 +2754,21 @@ impl Compiler {
                 .take(outer_count)
                 .map(clone_finally_frame)
                 .collect();
+            let inline_start = self.next_offset();
             self.emit_finally_frame(frame)?;
+            hole_starts.push((frame.id, inline_start));
         }
         self.finally_stack = saved;
+        // Each inlined finally runs once, here, for the loop exit; a
+        // `raise` from it must skip this try's own coverage (and that of
+        // any inner try) and propagate to an enclosing one. Extend every
+        // hole to the end of the whole inline run so an outer frame's
+        // `raise` is excluded from inner tries too. The trailing
+        // `PopTop`/jump the caller emits cannot raise.
+        let inline_end = self.next_offset();
+        for (id, start) in hole_starts {
+            self.finally_holes.push((id, start, inline_end));
+        }
         Ok(())
     }
 
@@ -2770,11 +2877,21 @@ impl Compiler {
         // below — those copies must not see themselves on the stack.
         let pushed_finally = has_finally;
         if pushed_finally {
+            let id = self.fresh_finally_id();
             self.finally_stack.push(FinallyFrame {
                 kind: FinallyKind::Stmts(finalbody.to_vec()),
                 loop_depth_at_push: self.loop_stack.len(),
+                id,
             });
         }
+        // The finally frame whose return/break/continue-path inlines must
+        // be punched out of this statement's body coverage. With a
+        // `finally` it is this try's own frame (just pushed, now on top);
+        // without one it is the innermost *enclosing* finally, since a
+        // `return` through this body still inlines that enclosing finally
+        // here. Captured before the body compiles so nested frames pushed
+        // by inner `try`s don't shadow it.
+        let body_frame_id = self.finally_stack.last().map(|f| f.id);
         let body_start = self.next_offset();
         for s in body {
             self.compile_stmt(s)?;
@@ -2828,13 +2945,14 @@ impl Compiler {
             //   exception groups everything that's still alive);
             // - inside a clause body the *matched* sub-group is the
             //   active exception (`sys.exc_info()`, bare `raise`).
-            self.co.exception_table.push(ExcHandler {
-                start: body_start,
-                end: body_end,
-                handler: handlers_start,
-                depth: body_depth,
-                push_lasti: false,
-            });
+            self.push_body_exc_entries(
+                body_start,
+                body_end,
+                handlers_start,
+                body_depth,
+                false,
+                body_frame_id,
+            );
             // Back-patched to the pc past the handler region (see the
             // non-`except*` branch for the rationale).
             let push_exc_site = self.emit(OpCode::PushExcInfo, 0);
@@ -2902,9 +3020,11 @@ impl Compiler {
                     .as_deref()
                     .map(|n| Self::except_unbind_stmts(n, h.span));
                 if let Some(stmts) = &unbind_stmts {
+                    let id = self.fresh_finally_id();
                     self.finally_stack.push(FinallyFrame {
                         kind: FinallyKind::Stmts(stmts.clone()),
                         loop_depth_at_push: self.loop_stack.len(),
+                        id,
                     });
                 }
                 for s in &h.body {
@@ -3034,13 +3154,14 @@ impl Compiler {
             // Record the handler-body end on PUSH_EXC_INFO (see below).
             self.co.instructions[push_exc_site as usize].arg = end;
         } else if has_handlers {
-            self.co.exception_table.push(ExcHandler {
-                start: body_start,
-                end: body_end,
-                handler: handlers_start,
-                depth: body_depth,
-                push_lasti: false,
-            });
+            self.push_body_exc_entries(
+                body_start,
+                body_end,
+                handlers_start,
+                body_depth,
+                false,
+                body_frame_id,
+            );
             // The arg is back-patched below to the pc just past this
             // handler region; the VM tags the active-handler entry with
             // it so an exception escaping the handler to an enclosing
@@ -3106,10 +3227,14 @@ impl Compiler {
                     .name
                     .as_deref()
                     .map(|n| Self::except_unbind_stmts(n, h.span));
+                let mut unbind_frame_id: Option<u32> = None;
                 if let Some(stmts) = &unbind_stmts {
+                    let id = self.fresh_finally_id();
+                    unbind_frame_id = Some(id);
                     self.finally_stack.push(FinallyFrame {
                         kind: FinallyKind::Stmts(stmts.clone()),
                         loop_depth_at_push: self.loop_stack.len(),
+                        id,
                     });
                 }
                 let hbody_start = self.next_offset();
@@ -3143,16 +3268,20 @@ impl Compiler {
                         let cleanup_end = self.next_offset();
                         self.co.instructions[cleanup_push as usize].arg = cleanup_end;
                         self.patch_jump(over, cleanup_end);
-                        self.co.exception_table.push(ExcHandler {
-                            start: hbody_start,
-                            end: hbody_end,
-                            handler: cleanup_start,
-                            depth: body_depth,
-                            // CPython marks the unbind-cleanup with the
-                            // lasti flag: its RERAISE restores f_lasti to
-                            // the raise site inside the except body.
-                            push_lasti: true,
-                        });
+                        // CPython marks the unbind-cleanup with the lasti
+                        // flag: its RERAISE restores f_lasti to the raise
+                        // site inside the except body. Punch out this
+                        // clause's own `return`-path `del e` inline so a
+                        // `raise` from it (or a following inlined finally)
+                        // doesn't re-enter the unbind cleanup.
+                        self.push_body_exc_entries(
+                            hbody_start,
+                            hbody_end,
+                            cleanup_start,
+                            body_depth,
+                            true,
+                            unbind_frame_id,
+                        );
                     }
                 }
                 if has_finally {
@@ -3221,15 +3350,19 @@ impl Compiler {
                 }
                 // Appended after any entries pushed while compiling
                 // nested statements, so the forward "innermost-first"
-                // scan in the VM still prefers those.
+                // scan in the VM still prefers those. Each range is
+                // punched for this try's own finally so a `return` from a
+                // clause body (which inlines the finally here) doesn't
+                // re-run it via the cleanup path if it raises.
                 for (s, e) in cleanup_ranges {
-                    self.co.exception_table.push(ExcHandler {
-                        start: s,
-                        end: e,
-                        handler: cleanup_start,
-                        depth: body_depth,
-                        push_lasti: false,
-                    });
+                    self.push_body_exc_entries(
+                        s,
+                        e,
+                        cleanup_start,
+                        body_depth,
+                        false,
+                        body_frame_id,
+                    );
                 }
             }
             // Patch handler-exit jumps to end.
@@ -3247,13 +3380,14 @@ impl Compiler {
             // re-raises. Popping the exception eagerly (as we did
             // historically) left RERAISE with nothing to pop and
             // produced a `stack underflow` once the finally ran.
-            self.co.exception_table.push(ExcHandler {
-                start: body_start,
-                end: body_end,
-                handler: handlers_start,
-                depth: body_depth,
-                push_lasti: false,
-            });
+            self.push_body_exc_entries(
+                body_start,
+                body_end,
+                handlers_start,
+                body_depth,
+                false,
+                body_frame_id,
+            );
             // Record the propagating exception as the active handled
             // exception for the duration of the finally body. Without
             // this a `raise` inside `finally` (e.g. a `@contextmanager`
@@ -3349,9 +3483,11 @@ impl Compiler {
         // CLEANUP_THROW / SETUP_WITH; we encode it as a `WithExit`
         // frame that emits the call from the cm's fast-local index.
         let with_loop_depth = self.loop_stack.len();
+        let with_frame_id = self.fresh_finally_id();
         self.finally_stack.push(FinallyFrame {
             kind: FinallyKind::WithExit { exit_idx },
             loop_depth_at_push: with_loop_depth,
+            id: with_frame_id,
         });
 
         let body_start = self.next_offset();
@@ -3394,16 +3530,20 @@ impl Compiler {
         // `body_depth` convention used by `try`/`except` handlers above.
         let body_depth =
             self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32 + self.exc_on_stack;
-        self.co.exception_table.push(ExcHandler {
-            start: body_start,
-            end: body_end,
-            handler: handler_start,
-            depth: body_depth,
-            // CPython's SETUP_WITH cleanup carries the lasti flag: when
-            // __exit__ doesn't suppress, RERAISE restores f_lasti to the
-            // raising instruction inside the body (PEP 626).
-            push_lasti: true,
-        });
+        // CPython's SETUP_WITH cleanup carries the lasti flag: when
+        // __exit__ doesn't suppress, RERAISE restores f_lasti to the
+        // raising instruction inside the body (PEP 626). A `return`/
+        // `break`/`continue` from the body inlines `__exit__(None,None,
+        // None)` here; punch that inline out so a `raise` from it isn't
+        // re-caught and `__exit__` re-invoked with the exception triple.
+        self.push_body_exc_entries(
+            body_start,
+            body_end,
+            handler_start,
+            body_depth,
+            true,
+            Some(with_frame_id),
+        );
         // Stack: [exc]. Record the propagating exception as the active
         // handled exception for the duration of the `__exit__` call so a
         // `raise` inside `__exit__` chains it as the new exception's
@@ -4406,11 +4546,13 @@ impl Compiler {
         // `@asynccontextmanager` used as a decorator never ran its
         // post-`yield` cleanup).
         let awith_loop_depth = self.loop_stack.len();
+        let awith_frame_id = self.fresh_finally_id();
         self.finally_stack.push(FinallyFrame {
             kind: FinallyKind::AsyncWithExit {
                 aexit_idx: slot_idx,
             },
             loop_depth_at_push: awith_loop_depth,
+            id: awith_frame_id,
         });
 
         let body_start = self.next_offset();
@@ -4454,14 +4596,18 @@ impl Compiler {
         // same depth convention used by `try`/`except` and `compile_with`.
         let body_depth =
             self.loop_stack.iter().filter(|fr| fr.is_for_loop).count() as u32 + self.exc_on_stack;
-        self.co.exception_table.push(ExcHandler {
-            start: body_start,
-            end: body_end,
-            handler: handler_start,
-            depth: body_depth,
-            // Same lasti semantics as the sync `with` cleanup.
-            push_lasti: true,
-        });
+        // Same lasti semantics as the sync `with` cleanup. Punch out the
+        // body's `return`/`break`/`continue`-path `await __aexit__(None,
+        // None, None)` inline so a `raise` from it isn't re-caught and
+        // `__aexit__` re-awaited with the exception triple.
+        self.push_body_exc_entries(
+            body_start,
+            body_end,
+            handler_start,
+            body_depth,
+            true,
+            Some(awith_frame_id),
+        );
         // Stack: [exc]. Record the propagating exception as the active
         // handled exception for the duration of the awaited `__aexit__`,
         // exactly as the sync `with` handler does. Without it the body's
@@ -5009,6 +5155,7 @@ fn clone_finally_frame(f: &FinallyFrame) -> FinallyFrame {
     FinallyFrame {
         kind,
         loop_depth_at_push: f.loop_depth_at_push,
+        id: f.id,
     }
 }
 
@@ -5222,6 +5369,40 @@ fn collect_inner_free(
             value: Some(value), ..
         } => {
             collect_inner_free_expr(value, outer_bindings, out);
+        }
+        StmtKind::Assert { test, msg } => {
+            // `assert <comp> [, <comp>]` evaluates both expressions in this
+            // scope. A comprehension here captures our locals just like one
+            // in an `Expr`/`Assign` statement, so its outer reads must drive
+            // cell promotion — otherwise the pre-pass leaves the name a plain
+            // local (STORE_FAST) while `compile_comprehension` later promotes
+            // it to a cell, and the comp-call reads an unfilled cell
+            // (`UnboundLocalError`). Mirrors `collect_reads_stmt`.
+            collect_inner_free_expr(test, outer_bindings, out);
+            if let Some(m) = msg {
+                collect_inner_free_expr(m, outer_bindings, out);
+            }
+        }
+        StmtKind::Delete(targets) => {
+            // `del x[<comp>]` / `del x.attr` evaluate the container/slice in
+            // this scope; a comprehension in a subscript captures our locals.
+            for t in targets {
+                collect_inner_free_expr(t, outer_bindings, out);
+            }
+        }
+        StmtKind::Match { subject, cases } => {
+            // The subject and every guard are ordinary expressions evaluated
+            // in this scope and may contain capturing comprehensions; case
+            // bodies are statements that recurse normally.
+            collect_inner_free_expr(subject, outer_bindings, out);
+            for c in cases {
+                if let Some(g) = &c.guard {
+                    collect_inner_free_expr(g, outer_bindings, out);
+                }
+                for s in &c.body {
+                    collect_inner_free(s, outer_bindings, out);
+                }
+            }
         }
         _ => {}
     }

@@ -26,6 +26,9 @@
 //!   raises events must not infinitely recurse. We disable hook
 //!   firing for the duration of any hook callout.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
 use crate::object::Object;
 use crate::sync::RefCell;
 
@@ -39,6 +42,18 @@ thread_local! {
     /// doesn't infinitely recurse.
     static HOOK_REENTRY: RefCell<u32> = const { RefCell::new(0) };
 }
+
+// `threading.settrace_all_threads` / `setprofile_all_threads` (via
+// `sys._settraceallthreads` / `sys._setprofileallthreads`) install a
+// hook on *every* thread, including ones already running. WeavePy can't
+// write another thread's thread-local, so we keep a process-global
+// fallback: a thread with no explicit per-thread hook observes the
+// all-threads hook instead. The `*_SET` gates keep the common
+// (no-global-hook) path a single relaxed bool load.
+static ALL_TRACE_HOOK: Mutex<Option<Object>> = Mutex::new(None);
+static ALL_PROFILE_HOOK: Mutex<Option<Object>> = Mutex::new(None);
+static ALL_TRACE_SET: AtomicBool = AtomicBool::new(false);
+static ALL_PROFILE_SET: AtomicBool = AtomicBool::new(false);
 
 /// Bookkeeping for PEP 669 `sys.monitoring`.
 ///
@@ -100,7 +115,27 @@ pub fn set_trace_hook(hook: Object) {
 }
 
 pub fn trace_hook() -> Option<Object> {
-    TRACE_HOOK.with(|cell| cell.borrow().clone())
+    if let Some(h) = TRACE_HOOK.with(|cell| cell.borrow().clone()) {
+        return Some(h);
+    }
+    if ALL_TRACE_SET.load(Ordering::Acquire) {
+        return ALL_TRACE_HOOK.lock().unwrap().clone();
+    }
+    None
+}
+
+/// `threading.settrace_all_threads` — install `hook` on every thread.
+/// Sets the calling thread's own hook *and* the process-global
+/// fallback, so threads already running (which we can't reach through
+/// their thread-locals) observe it via [`trace_hook`].
+pub fn set_trace_all_threads(hook: Object) {
+    let opt = match hook {
+        Object::None => None,
+        other => Some(other),
+    };
+    ALL_TRACE_SET.store(opt.is_some(), Ordering::Release);
+    *ALL_TRACE_HOOK.lock().unwrap() = opt.clone();
+    TRACE_HOOK.with(|cell| *cell.borrow_mut() = opt);
 }
 
 pub fn set_profile_hook(hook: Object) {
@@ -113,7 +148,24 @@ pub fn set_profile_hook(hook: Object) {
 }
 
 pub fn profile_hook() -> Option<Object> {
-    PROFILE_HOOK.with(|cell| cell.borrow().clone())
+    if let Some(h) = PROFILE_HOOK.with(|cell| cell.borrow().clone()) {
+        return Some(h);
+    }
+    if ALL_PROFILE_SET.load(Ordering::Acquire) {
+        return ALL_PROFILE_HOOK.lock().unwrap().clone();
+    }
+    None
+}
+
+/// `threading.setprofile_all_threads` — see [`set_trace_all_threads`].
+pub fn set_profile_all_threads(hook: Object) {
+    let opt = match hook {
+        Object::None => None,
+        other => Some(other),
+    };
+    ALL_PROFILE_SET.store(opt.is_some(), Ordering::Release);
+    *ALL_PROFILE_HOOK.lock().unwrap() = opt.clone();
+    PROFILE_HOOK.with(|cell| *cell.borrow_mut() = opt);
 }
 
 pub fn with_monitoring<R>(f: impl FnOnce(&mut MonitoringTools) -> R) -> R {
@@ -142,6 +194,8 @@ pub fn audit_hooks() -> Vec<Object> {
 pub fn any_observers_active() -> bool {
     TRACE_HOOK.with(|cell| cell.borrow().is_some())
         || PROFILE_HOOK.with(|cell| cell.borrow().is_some())
+        || ALL_TRACE_SET.load(Ordering::Acquire)
+        || ALL_PROFILE_SET.load(Ordering::Acquire)
         || MONITORING_TOOLS.with(|cell| cell.borrow().union_mask() != 0)
 }
 

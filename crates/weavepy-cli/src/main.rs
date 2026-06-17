@@ -271,15 +271,36 @@ fn main() -> ExitCode {
 /// lazily by the OS, so it costs address space, not memory.
 fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
     const STACK_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB reserve
+
+    // The interpreter runs on the spawned `weavepy-main` thread, not the
+    // process's initial OS thread (which only parks in `join()` below).
+    // Block the asynchronous, process-directed signals (SIGINT, SIGALRM,
+    // …) on this initial thread *before* spawning so a signal racing in
+    // during startup can't be stolen by the soon-to-be-parked thread —
+    // where it would merely trip the pending flag while the VM thread's
+    // blocking syscall never gets EINTR (CPython's test_io SignalsTest
+    // would then hang forever). The VM thread re-enables them for itself
+    // first thing, making it the sole, deterministic delivery target.
+    weavepy::vm::stdlib::signal_mod::block_async_signals_current_thread();
+
+    let vm_entry = move || -> ExitCode {
+        weavepy::vm::stdlib::signal_mod::unblock_async_signals_current_thread();
+        entry()
+    };
+
     match std::thread::Builder::new()
         .name("weavepy-main".to_owned())
         .stack_size(STACK_BYTES)
-        .spawn(entry)
+        .spawn(vm_entry)
     {
         Ok(handle) => handle.join().unwrap_or(ExitCode::FAILURE),
-        // Extremely unlikely, but if the OS refuses the thread, fall
-        // back to running on the current (main) thread.
-        Err(_) => entry(),
+        // Extremely unlikely, but if the OS refuses the thread, fall back
+        // to running on the current thread — restore signal delivery here
+        // first since we blocked it above.
+        Err(_) => {
+            weavepy::vm::stdlib::signal_mod::unblock_async_signals_current_thread();
+            entry()
+        }
     }
 }
 

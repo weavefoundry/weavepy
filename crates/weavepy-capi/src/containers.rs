@@ -754,7 +754,9 @@ pub unsafe extern "C" fn PyFrozenSet_New(iterable: *mut PyObject) -> *mut PyObje
     if !iterable.is_null() {
         seed_set(&mut data, iterable);
     }
-    crate::object::into_owned(Object::FrozenSet(Rc::new(data)))
+    crate::object::into_owned(Object::FrozenSet(Rc::new(
+        weavepy_vm::object::FrozenSetObj::new(data),
+    )))
 }
 
 fn seed_set(data: &mut SetData, iterable: *mut PyObject) {

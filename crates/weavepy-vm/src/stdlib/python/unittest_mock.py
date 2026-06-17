@@ -47,6 +47,18 @@ class _DefaultSentinel:
 DEFAULT = _DefaultSentinel()
 
 
+class _DeletedSentinel:
+    def __repr__(self):
+        return "DELETED"
+
+
+# Marks an attribute that was explicitly `del`'d off a mock, so subsequent
+# access raises AttributeError instead of auto-vivifying a fresh child
+# (CPython mock's `sentinel.DELETED`). Used by tests that probe optional
+# platform features, e.g. `del m_socket.SO_REUSEPORT`.
+_deleted = _DeletedSentinel()
+
+
 class _ANY:
     def __eq__(self, other):
         return True
@@ -242,10 +254,22 @@ class NonCallableMock:
         self._check_attr(name)
         children = self._mock_children
         if name in children:
-            return children[name]
+            child = children[name]
+            if child is _deleted:
+                raise AttributeError(name)
+            return child
         child = MagicMock(name=f"{self._mock_name}.{name}")
         children[name] = child
         return child
+
+    def __delattr__(self, name):
+        # Match CPython mock: a deleted attribute is tombstoned so later
+        # access raises AttributeError rather than auto-creating a child.
+        if name in self.__dict__:
+            object.__delattr__(self, name)
+        elif self._mock_children.get(name) is _deleted:
+            raise AttributeError(name)
+        self._mock_children[name] = _deleted
 
     def __setattr__(self, name, value):
         if self._mock_spec_set is not None and name not in self._mock_methods and not name.startswith("_"):
@@ -396,6 +420,14 @@ class Mock(NonCallableMock):
         self._mock_mock_calls.append(c)
         if self._mock_side_effect is not None:
             effect = self._mock_side_effect
+            # An exception *class* is callable, so this must precede the
+            # `callable` branch below — otherwise `side_effect=ValueError`
+            # would be *instantiated and returned* rather than raised
+            # (CPython's mock checks `_is_exception` first).
+            if isinstance(effect, BaseException) or (
+                isinstance(effect, type) and issubclass(effect, BaseException)
+            ):
+                raise effect
             if callable(effect):
                 rv = effect(*args, **kwargs)
                 if rv is not DEFAULT:
@@ -455,6 +487,21 @@ class MagicMock(Mock):
     def __exit__(self, *exc):
         return False
 
+    # Numeric protocol defaults (CPython mock's `_return_values`): a bare
+    # MagicMock is usable wherever an int/float is expected, e.g.
+    # `int(sock.fileno())` in asyncio's `_ensure_fd_no_transport`.
+    def __int__(self):
+        return 1
+
+    def __index__(self):
+        return 1
+
+    def __float__(self):
+        return 1.0
+
+    def __complex__(self):
+        return 1j
+
 
 # CPython models NonCallableMagicMock as a multi-base class
 # (NonCallableMock + MagicMock); WeavePy's MRO does not yet accept
@@ -502,6 +549,29 @@ def create_autospec(spec, *args, **kwargs):
 
 # ---------------- patch ---------------- #
 
+
+def _is_async_obj(obj):
+    """True when `obj` is (or wraps) a coroutine function / awaitable.
+
+    Mirrors CPython's `unittest.mock._is_async_obj`: an existing non-async
+    mock is never treated as async, a bound method is unwrapped to its
+    `__func__`, and the result is judged by `iscoroutinefunction` /
+    `isawaitable`. Used by `patch` to pick `AsyncMock` when replacing an
+    `async def` target so the replacement returns awaitables.
+    """
+    import inspect
+
+    if isinstance(obj, NonCallableMock) and not isinstance(obj, AsyncMock):
+        return False
+    if hasattr(obj, "__func__"):
+        obj = obj.__func__
+    try:
+        from asyncio import iscoroutinefunction
+    except Exception:
+        iscoroutinefunction = inspect.iscoroutinefunction
+    return iscoroutinefunction(obj) or inspect.isawaitable(obj)
+
+
 class _patch:
     def __init__(self, target, attribute, new=DEFAULT, spec=None, create=False,
                  spec_set=None, autospec=None, new_callable=None, **kwargs):
@@ -541,6 +611,12 @@ class _patch:
         if new is DEFAULT:
             if self.new_callable is not None:
                 new = self.new_callable(**self.kwargs)
+            elif self.spec is None and self._had and _is_async_obj(self._original):
+                # Replacing an `async def` target: CPython substitutes an
+                # `AsyncMock` so calling it yields an awaitable (e.g. so a
+                # patched coroutine method can be `await`ed / wrapped in a
+                # Task). See `_patch.__enter__` Klass selection upstream.
+                new = AsyncMock(**self.kwargs)
             else:
                 new = MagicMock(**self.kwargs)
         setattr(obj, self.attribute, new)
@@ -560,9 +636,17 @@ class _patch:
     def __call__(self, func):
         def wrapper(*args, **kwargs):
             with self as new_mock:
-                return func(*args, new_mock, **kwargs)
+                # CPython only threads the patched object into the wrapped
+                # function when it created the replacement itself (`new is
+                # DEFAULT`). An explicit `new=` (e.g. `patch(target, None)`)
+                # is applied silently and must not add a positional arg.
+                if self.new is DEFAULT:
+                    return func(*args, new_mock, **kwargs)
+                return func(*args, **kwargs)
 
         wrapper.__name__ = getattr(func, "__name__", "patched")
+        wrapper.__doc__ = getattr(func, "__doc__", None)
+        wrapper.__wrapped__ = func
         return wrapper
 
     def start(self):

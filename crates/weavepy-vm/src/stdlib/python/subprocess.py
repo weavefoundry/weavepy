@@ -20,12 +20,97 @@ Notes:
   RFC 0017 ships in a separate patch.
 """
 
+import sys
 import _subprocess
 
 
 PIPE = _subprocess.PIPE
 DEVNULL = _subprocess.DEVNULL
 STDOUT = _subprocess.STDOUT
+
+
+def _optim_args_from_interpreter_flags():
+    """Return a list of command-line arguments reproducing the current
+    optimization settings in sys.flags."""
+    args = []
+    value = getattr(sys.flags, "optimize", 0)
+    if value > 0:
+        args.append("-" + "O" * value)
+    return args
+
+
+def _args_from_interpreter_flags():
+    """Return a list of command-line arguments reproducing the current
+    settings in sys.flags, sys.warnoptions and sys._xoptions.
+
+    Used by `multiprocessing` (and so `concurrent.futures.process`) to
+    re-launch a faithful child interpreter.
+    """
+    flag_opt_map = {
+        "debug": "d",
+        "dont_write_bytecode": "B",
+        "no_site": "S",
+        "verbose": "v",
+        "bytes_warning": "b",
+        "quiet": "q",
+        # -O is handled in _optim_args_from_interpreter_flags()
+    }
+    args = _optim_args_from_interpreter_flags()
+    for flag, opt in flag_opt_map.items():
+        v = getattr(sys.flags, flag, 0)
+        if v and v > 0:
+            args.append("-" + opt * v)
+
+    if getattr(sys.flags, "isolated", 0):
+        args.append("-I")
+    else:
+        if getattr(sys.flags, "ignore_environment", 0):
+            args.append("-E")
+        if getattr(sys.flags, "no_user_site", 0):
+            args.append("-s")
+    if getattr(sys.flags, "safe_path", 0):
+        args.append("-P")
+
+    # -W options
+    warnopts = list(getattr(sys, "warnoptions", []))
+    bytes_warning = getattr(sys.flags, "bytes_warning", 0)
+    xoptions = getattr(sys, "_xoptions", {})
+    dev_mode = "dev" in xoptions
+
+    def _discard(seq, value):
+        try:
+            seq.remove(value)
+        except ValueError:
+            pass
+
+    if bytes_warning > 1:
+        _discard(warnopts, "error::BytesWarning")
+    elif bytes_warning:
+        _discard(warnopts, "default::BytesWarning")
+    if dev_mode:
+        _discard(warnopts, "default")
+    for opt in warnopts:
+        args.append("-W" + opt)
+
+    # -X options
+    if dev_mode:
+        args.extend(("-X", "dev"))
+    for opt in (
+        "faulthandler",
+        "tracemalloc",
+        "importtime",
+        "showrefcount",
+        "utf8",
+    ):
+        if opt in xoptions:
+            value = xoptions[opt]
+            if value is True:
+                arg = opt
+            else:
+                arg = "%s=%s" % (opt, value)
+            args.extend(("-X", arg))
+
+    return args
 
 
 class SubprocessError(Exception):
@@ -79,10 +164,26 @@ class CompletedProcess:
             raise CalledProcessError(self.returncode, self.args, self.stdout, self.stderr)
 
 
+def _fsencode_item(item):
+    """Coerce one argv element to `str`, mirroring CPython's acceptance
+    of `str`, `bytes`, and `os.PathLike` program/argument items."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, (bytes, bytearray)):
+        return bytes(item).decode(sys.getfilesystemencoding(), "surrogateescape")
+    fspath = getattr(item, "__fspath__", None)
+    if fspath is not None:
+        return _fsencode_item(fspath())
+    raise TypeError(
+        "argv items must be str, bytes, or os.PathLike, not %s"
+        % type(item).__name__
+    )
+
+
 def _coerce_args(args):
-    if isinstance(args, str):
-        return [args]
-    return list(args)
+    if isinstance(args, (str, bytes)):
+        return [_fsencode_item(args)]
+    return [_fsencode_item(a) for a in args]
 
 
 def _maybe_decode(data, text, encoding):
@@ -102,9 +203,20 @@ class Popen:
     """
 
     def __init__(self, args, bufsize=-1, executable=None, stdin=None,
-                 stdout=None, stderr=None, cwd=None, env=None,
-                 universal_newlines=None, shell=False, text=None,
-                 encoding=None, errors=None):
+                 stdout=None, stderr=None, preexec_fn=None, close_fds=True,
+                 shell=False, cwd=None, env=None, universal_newlines=None,
+                 startupinfo=None, creationflags=0, restore_signals=True,
+                 start_new_session=False, pass_fds=(), *, user=None,
+                 group=None, extra_groups=None, encoding=None, errors=None,
+                 text=None, umask=-1, pipesize=-1, process_group=None):
+        # `preexec_fn`, `close_fds`, `pass_fds`, `restore_signals`,
+        # `start_new_session`, `umask`, `process_group`, `user`/`group`/
+        # `extra_groups`, `startupinfo`, and `creationflags` are accepted
+        # for CPython-signature compatibility. The ones our `_subprocess`
+        # spawn primitive can't yet honour (fd inheritance control, setsid,
+        # credential switching, Windows creation flags) are recorded but not
+        # enforced — faithful enough for the I/O- and exit-code-driven tests,
+        # with full enforcement gated on a deeper spawn primitive (RFC 0017).
         self.args = args
         self.encoding = encoding
         self._text = text if text is not None else (universal_newlines or False)

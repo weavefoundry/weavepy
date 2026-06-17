@@ -178,7 +178,12 @@ impl WeakRefRegistry {
             g.slots.remove(&id).unwrap_or_default()
         };
         let mut out = Vec::with_capacity(entries.len());
-        for w in entries {
+        // CPython fires a referent's weakref callbacks newest-first (its
+        // weakref list inserts at the head), so a chain of
+        // `weakref.finalize(obj, …)` runs in reverse order of creation
+        // (`test_weakref` `FinalizeTestCase.test_order`). The registry keeps
+        // them in registration order, so walk it in reverse here.
+        for w in entries.into_iter().rev() {
             if let Some(slot) = w.upgrade() {
                 let cb = slot.clear();
                 out.push((slot, cb));

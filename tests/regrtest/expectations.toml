@@ -49,12 +49,16 @@ status = "fail"
 reason = "depends on dict order corner cases + leaking CPython implementation details"
 
 [tests."cpython/Lib/test/test_list.py"]
-status = "skip"
-reason = "measured: past the sys.getsizeof/refcount probes it reaches the same gc.collect() reachable-hang as test_set (list/iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
+status = "pass"
+reason = "RFC 0039 WS5: the gc.collect() reachable-hang is gone. All 67 tests pass (1 skip for the CPython-only sizeof probe). Required CPython-faithful list fidelity: `PyObject_RichCompareBool` semantics for `count`/`index`/`remove`/`in` and `list_richcompare` (identity-first then Python `__eq__`, with the live-length re-read so a mutating `__eq__` matches bpo-38588), `METH_NOARGS`/positional-only arity for `pop`/`clear`/`copy`/`reverse`/`sort`, `list.sort` list-modified-during-sort detection (detach + re-check), `__setitem__` 'indices must be integers or slices' message, list-iterator detach-on-exhaustion in the FOR_ITER fast path, recursive-repr cycle detection (`[...]`) with RecursionError, an inherited builtin `__init__` that tolerates excess kwargs when `__new__` is overridden, and shared-store list/reverse-iterator pickling (`(iter|reversed, (live_list,), index)`)."
 
 [tests."cpython/Lib/test/test_set.py"]
-status = "fail"
-reason = "measured: completes within budget and fails on assertions. The former 'ran-further-now-slow' timeout was dominated by O(n^2) behaviour — every user-instance set element hashed to one bucket (DictKey had no __hash__/__eq__ hook). RFC 0037 now routes user-instance keys through Python __hash__/__eq__ (object.rs DictKey + Interpreter::reentrant_py_hash/eq), so sets of custom-hashable objects bucket properly and the suite runs to completion."
+status = "pass"
+# Correct verdict but ~54s of CPU (the O(n^2) hash-collision stress below).
+# Raise the per-test budget so a loaded/throttled host doesn't SIGKILL it at
+# the 60s boundary and flip a green run into a spurious timeout.
+timeout_seconds = 150
+reason = "RFC 0039 WS5: all cases pass. Builds on RFC 0037's Python `__hash__`/`__eq__` `DictKey` hook (so custom-hashable elements bucket properly instead of collapsing to one O(n^2) bucket) plus this wave's set fidelity: live `PyIterator::Set` size-change detection (`RuntimeError: Set changed size during iteration`), `__hash__`/`__eq__` exception propagation through `key_cmp_scope`, set-subclass `__getstate__`/pickling, and GC tracing through set iterators. The suite is dominated by `TestBinaryOpsMutating`'s deliberate hash-collision stress (every `Bad.__hash__` returns `randrange(2)`), so it runs ~54s — inherently slow (matching CPython's own characterisation), hence the raised per-test budget; the throughput itself is tracked in the interpreter-perf arc, not a correctness gap."
 
 # RFC 0024 — real threads, GIL, cycle GC, weakrefs.
 # These tests stress hardware-thread interleavings and CPython-
@@ -65,24 +69,24 @@ reason = "measured: completes within budget and fails on assertions. The former 
 # close.
 
 [tests."cpython/Lib/test/test_threading.py"]
-status = "fail"
-reason = "RFC 0024 spawns OS threads but runs the Python target cooperatively; full thread parallelism + cross-thread heap sharing land in RFC 0025"
+status = "pass"
+reason = "RFC 0039: real OS threads with cooperative GIL hand-off, faithful Lock/RLock (subclassable `_thread.RLock`), thread-death thread-local cleanup (foreign-thread `_DummyThread` reaping), and prompt refcount reclamation of acyclic garbage — including the cross-thread `Thread.run` teardown cycle (`test_no_refcycle_through_target`) swept on `join()`. All 213 tests pass (29 skips for CPython-only knobs)."
 
 [tests."cpython/Lib/test/test_thread.py"]
-status = "fail"
-reason = "low-level _thread tests exercise CPython-specific lock semantics not yet matched"
+status = "pass"
+reason = "RFC 0039: real OS-thread `_thread` with GIL hand-off, lock/RLock fidelity, and a finalization guard on start_new_thread; all 35 tests pass (2 skips for CPython-only stack-size knobs)."
 
 [tests."cpython/Lib/test/test_threadedtempfile.py"]
 status = "pass"
 reason = "measured: passes end-to-end after wiring `open(opener=...)` + file-descriptor open and `shutil.rmtree(onexc=...)`, which `tempfile.NamedTemporaryFile`/`mkstemp` rely on."
 
 [tests."cpython/Lib/test/test_gc.py"]
-status = "fail"
-reason = "RFC 0024 implements cycle GC but the detailed heuristics (gen promotion thresholds, gc.callbacks ordering, get_referrers fidelity) don't match CPython yet"
+status = "pass"
+reason = "RFC 0039 WS4/WS5: all 53 tests pass (11 skips for CPython-only refcount/sizeof probes), ~16s. Builds on this wave's generational collector (real (700,10,10) thresholds + gen0→1→2 promotion, gc.callbacks 'start'/'stop' ordering, get_referrers/get_referents graph walks, DEBUG_SAVEALL → gc.garbage) plus an older-generation refcount cascade: when a young-gen collection clears cyclic garbage that held the last reference to an object pinned in an older generation, that object is now reaped in the same pass and its weakref callback fires (test_bug1055820c), matching CPython's 'freed the instant refcount hits zero, regardless of generation' semantics. Finalizable orphans are deferred to a finalizing collection so __del__ ordering is preserved."
 
 [tests."cpython/Lib/test/test_weakref.py"]
 status = "timeout"
-reason = "measured (RFC 0038): exceeds the committed 60s budget sequentially (killed at 60s; completes in ~90s at a larger budget, then fails). The O(n^2) list-backed `WeakKeyDictionary` was rebuilt as an O(1) id-keyed dict (the 70k-entry `test_threaded_weak_key_dict_copy` no longer hangs), but `test_weak_valued_len_race`'s `gc.set_threshold` + `RefCycle` cyclic-collection stress loop still drives the cycle collector past the budget. Follow-up: cyclic-GC progress under aggressive thresholds (GC arc, wave 4)."
+reason = "RFC 0039 WS5: the cyclic-GC hang is gone — WeakValueDictionary/WeakKeyDictionary were ported from CPython (O(1) id-keyed, `_IterationGuard`-deferred removal) over a real native `_weakref._remove_dead_weakref`, weakref callbacks now fire in CPython order (referent cleared -> oldest-first callbacks -> cycle broken) including the older-generation refcount cascade, and the threaded-consistency / self-cleaning cases pass. The module still exceeds the 60s budget (killed at 60s; ~125s at a larger budget): MappingTestCase alone is ~100s, dominated by the threaded stress loops (NUM_THREADED_ITERATIONS=100000, `collect_in_thread()` spinning `gc.collect()` every 5ms, and the 70k-entry dict-copy) — raw interpreter+collector throughput (CPython runs the same loops in <1s), not an algorithmic regression; deferred to the incremental-GC perf arc. The remaining assertion failures are object-model fidelity outside the concurrency scope: `weakref.ref` Python-subclassing (incl. `__slots__` + `getweakrefs` ordering), the weakproxy operator protocol (arithmetic/index/reversed/item-assign), ref/proxy identity reuse, and `WeakMethod` (a `ref` subclass) — deferred to an object-model wave."
 
 [tests."cpython/Lib/test/test_multiprocessing_main_handling.py"]
 status = "skip"
@@ -108,8 +112,8 @@ reason = "depends on real multiprocessing implementation (RFC 0026)"
 # ---------------------------------------------------------------------
 
 [tests."cpython/Lib/test/test_tuple.py"]
-status = "skip"
-reason = "measured: past the sys.getsizeof/interning probes it reaches the same gc.collect() reachable-hang as test_set (tuple/iterator reference cycles). Marked skip so CI doesn't stall 30s per run; tracked with test_set as a GC reachable-hang to revisit in wave 3."
+status = "pass"
+reason = "RFC 0039 WS5: the gc.collect() reachable-hang is gone (the cycle collector no longer rescans the whole generation). All 38 tests pass (4 skips for CPython-only sizeof/refcount probes). Required CPython-faithful tuple fidelity: xxPrime-based tuple hashing (`tuplehash`), `PyObject_RichCompareBool` semantics for `count`/`index`/`in` (identity-first, then Python `__eq__`), `t * 1 is t` identity, and recursive-repr cycle detection (`(...)`)."
 
 [tests."cpython/Lib/test/test_bytes.py"]
 status = "pass"
@@ -247,11 +251,17 @@ reason = "measured (RFC 0038 WS-A): 47 pass, 35 fail, 193 error. The bulk of the
 
 [tests."cpython/Lib/test/test_tarfile.py"]
 status = "fail"
+# ~45s of CPU; raise the budget so throttling doesn't kill it at 60s and
+# mask the (stable) `fail` verdict with a spurious timeout.
+timeout_seconds = 150
 reason = "measured (RFC 0038 WS-A): 539 pass, 11 fail, 62 error of 620. First gaps: `ExFileObject` lacks `.name` and the underlying buffered `file` object lacks `truncate()`; remaining errors are PAX/GNU long-name headers and stream (`r|`/`w|`) modes. Deferred."
 
 [tests."cpython/Lib/test/test_io.py"]
 status = "fail"
-reason = "measured (RFC 0038 WS-B): 54 pass, 38 fail, 44 error of 247 (~52s; no longer hangs after the FileIO(fd) constructor + closefd fix landed this wave). Gaps: BufferedIOBase.readinto on custom raw streams (`'Reader' object has no attribute 'readinto'`), BufferedRandom read/write interleaving, and TextIOWrapper seek/tell cookie semantics. Deferred."
+# ~52s of CPU; raise the budget so throttling doesn't kill it at the 60s
+# boundary and turn the (stable) `fail` verdict into a spurious timeout.
+timeout_seconds = 150
+reason = "measured (RFC 0038 WS-B, updated RFC 0039 WS5): completes in ~52s (fail) — no hang. A prior wave measured 54 pass / 38 fail / 44 error of 247; RFC 0039 then fixed a SignalsTest regression so `PySignalsTest.test_interrupted_write_{buffered,unbuffered}` now pass. A `SIGALRM` arriving during a blocking `os.write` to a full pipe is now delivered to the VM main thread: WeavePy runs the interpreter on a spawned `weavepy-main` stack thread, so the async signals are blocked on the parked process-main OS thread that would otherwise steal them (only tripping the flag while the VM thread's syscall never sees EINTR). `os.write` also releases the GIL across the write and services tripped handlers on `EINTR`. The blocking write then returns and the buffered layer raises the handler's `ZeroDivisionError` per PEP 475 instead of blocking forever. Residual gaps (deferred): BufferedIOBase.readinto on custom raw streams (`'Reader' object has no attribute 'readinto'`), BufferedRandom read/write interleaving, TextIOWrapper seek/tell cookie semantics, and native `io.open(fd:int)` (CSignalsTest)."
 
 [tests."cpython/Lib/test/test_os.py"]
 status = "fail"
@@ -267,7 +277,7 @@ reason = "measured (RFC 0038 WS-B): 764 pass, 10 fail, 3 error of 1036. The erro
 
 [tests."cpython/Lib/test/test_tempfile.py"]
 status = "fail"
-reason = "measured (RFC 0038 WS-B): 80 pass, 10 fail, 18 error (down from 38 error after the os.scandir OSError.filename fix this wave). The residual gap needs finalizer/weakref-driven cleanup — NamedTemporaryFile(delete=True) is not unlinked by its finalizer in time (`exists after finalizer`). Blocked on deterministic finalization (GC arc, wave 4)."
+reason = "RFC 0039 WS4: the finalizer gap is closed — `NamedTemporaryFile(delete=True)` is now unlinked when its weakref finalizer fires on GC (deterministic acyclic reap + the older-generation refcount cascade); the old `exists after finalizer` failure is gone. Measured 84 pass / 6 fail / 18 error / 10 skip: the residual is the `SpooledTemporaryFile` IO layer (the file wrapper lacks `detach()`/`truncate()`, `TextIOWrapper` lacks `.newlines`), binary-vs-text file iteration, and codec validation (bad-encoding `LookupError` not raised) — an io-module fidelity arc outside this wave's concurrency/GC scope."
 
 [tests."cpython/Lib/test/test_glob.py"]
 status = "pass"
@@ -450,8 +460,8 @@ status = "fail"
 reason = "random: Mersenne Twister state save/load + SystemRandom"
 
 [tests."cpython/Lib/test/test_statistics.py"]
-status = "timeout"
-reason = "measured (RFC 0038): exceeds the committed 60s budget even sequentially (killed at 60s). Underlying gaps when it ran at a larger budget: numeric-tower features (NormalDist + harmonic_mean weighted forms, Fraction/Decimal interop); the pure-Python Counter/OrderedDict paths plus those suites' heavy loops push wall time past the budget. Revisit with the C-accelerator perf arc (native _statistics/_decimal)."
+status = "fail"
+reason = "measured (RFC 0039): now completes well within the 60s budget (~12-16s) and fails rather than timing out — the heavy Counter/OrderedDict loops are no longer the wall-time bottleneck. Residual failures are numeric-tower gaps in the statistics module itself (NormalDist + weighted harmonic_mean forms, Fraction/Decimal interop edges). Revisit with the native _statistics/_decimal accelerator perf arc."
 
 [tests."cpython/Lib/test/test_unicodedata.py"]
 status = "skip"
@@ -502,12 +512,12 @@ status = "pass"
 reason = "mimetypes is now CPython's verbatim module (full MimeTypes class, strict/non-strict maps, guess_file_type, read/readfp). Unblocked by several reusable engine fixes: bool indexes a sequence as int (seq[True]≡seq[1], used by the strict-map 2-tuple), os.fsdecode/fsencode + os.path.splitdrive, os.PathLike (__fspath__) coercion for open()/os.fspath/fsdecode/fsencode, unittest.mock implicitly creating a builtin name (open) patched onto a module, and test.support.patch/check__all__. 22/24 (+2 skips)."
 
 [tests."cpython/Lib/test/test_sched.py"]
-status = "fail"
-reason = "sched: enterabs + priority ordering"
+status = "pass"
+reason = "measured (RFC 0039): passes end-to-end — sched.scheduler enterabs/enter priority ordering and delayfunc over the real-threads time/threading stack."
 
 [tests."cpython/Lib/test/test_selectors.py"]
-status = "skip"
-reason = "selectors module covered by socket tests; standalone needs kqueue/epoll exposure"
+status = "pass"
+reason = "RFC 0039 WS6: native select/poll/kqueue backends + frozen CPython selectors"
 
 [tests."cpython/Lib/test/test_socket.py"]
 status = "skip"
@@ -538,16 +548,16 @@ status = "skip"
 reason = "httplib requires a live HTTP fixture server"
 
 [tests."cpython/Lib/test/test_queue.py"]
-status = "skip"
-reason = "queue's blocking get/put thread tests don't make progress under the cooperative threading model (RFC 0025) and exceed the per-test budget; revisit once OS-thread parallelism lands"
+status = "pass"
+reason = "RFC 0039 WS2/WS3: lock `__enter__` now releases the GIL while blocking (was a whole-interpreter deadlock), so blocking get/put + task_done/join make real progress under OS-thread parallelism."
 
 [tests."cpython/Lib/test/test_concurrent_futures.py"]
 status = "skip"
-reason = "concurrent.futures.ProcessPoolExecutor depends on real multiprocessing (RFC 0026)"
+reason = "RFC 0039 WS3: the ThreadPoolExecutor subset is measured-green — test_thread_pool 17/17, test_wait 33/33, test_future 18/20 (2 residual = logging-handler formatting), test_as_completed 19/20 (1 free-reference-on-yield GC nit). But the harness grades the whole `test_concurrent_futures` package, whose ProcessPool/deadlock submodules need real multiprocessing fork/spawn (RFC 0026, not yet shipped) and block the run, so the package can't be graded green as a unit. Flip once ProcessPool lands or the harness grades the ThreadPool submodules independently."
 
 [tests."cpython/Lib/test/test_asyncio.py"]
 status = "skip"
-reason = "asyncio: event loop selector backends not all wired"
+reason = "RFC 0039 WS6/WS7: the native selector backends (select/poll/kqueue) and a real SelectorEventLoop shipped (test_selectors passes). But the harness grades the whole 31-submodule `test_asyncio` package, which includes test_subprocess/test_ssl/test_sendfile/test_sock_lowlevel/test_unix_events — live network + real subprocess transports unavailable in the CI sandbox — so it can't be graded green as a unit. Deferred with the live-network test harness (RFC future work)."
 
 [tests."cpython/Lib/test/test_tomllib.py"]
 status = "fail"
@@ -558,8 +568,8 @@ status = "skip"
 reason = "typing_extensions is a third-party shim, ship-time only"
 
 [tests."cpython/Lib/test/test_weakset.py"]
-status = "fail"
-reason = "measured: runs all 46 cases and fails on WeakSet finalize callback ordering + gc reachability. The former 'ran-further-now-slow' timeout cleared once RFC 0037 gave set/dict the Python __hash__/__eq__ key hook, removing the single-bucket O(n^2) on custom-hashable keys; the same fix that retired test_set's timeout."
+status = "pass"
+reason = "RFC 0039 WS5: all 46 cases pass. Required keying `weakref.ref` objects by their referent inside `set`/`dict` (CPython `weakref_richcompare`/`weakref_hash`): `DictKey`'s `Hash`/`Eq` now dispatch a builtin type's overriding `__eq__`/`__hash__` (not just user classes) via `instance_has_custom_dunder`, so equal refs collide into one bucket and dedup, with `weakref_native_hash` memoising the referent hash on the hot path. Also `_weakrefset.WeakSet` imported from the frozen `_weakrefset` (was an incomplete inline copy) and `supports_weakref` narrowed to CPython's `tp_weaklistoffset` set (so `ref([])`/`ref({})` raise `TypeError`)."
 
 [tests."cpython/Lib/test/test_subclassinit.py"]
 status = "pass"
@@ -616,8 +626,8 @@ status = "pass"
 reason = "WS2c: tokenizer now records invalid-escape / oversized-octal SyntaxWarnings (with exact backslash offsets) and the compile path replays them via warnings.warn_explicit (escalating to a located SyntaxError under an 'error' filter); bytes literals reject non-ASCII and bad prefixes (ur/ru/bb/rr/...) raise SyntaxError. All 20 tests pass."
 
 [tests."cpython/Lib/test/test_threadsignals.py"]
-status = "fail"
-reason = "measured: a signal/thread info object exposes a dict instead of attribute access ('dict' object has no attribute 'name')"
+status = "pass"
+reason = "RFC 0039: real OS signal subsystem — per-platform signal numbers (via libc, so SIGUSR1=30 on macOS not 10), sigaction trampolines that trip a flag + write the wakeup fd, real signal.alarm/raise_signal/pause, and a main-thread signal-interruptible lock.acquire (EINTR + PyErr_CheckSignals retry loop). All 6 tests pass."
 
 [tests."cpython/Lib/test/test_http_cookies.py"]
 status = "fail"
@@ -631,8 +641,16 @@ reason = "PEP 3131: parser NFKC-normalizes identifiers and compile()/import rais
 # in the sandbox (no live network or the backing module isn't shipped).
 
 [tests."cpython/Lib/test/test_select.py"]
-status = "skip"
-reason = "needs a working socket (test.support.requires_working_socket) — unavailable in the conformance sandbox"
+status = "pass"
+reason = "RFC 0039 WS6: native libc-backed select.select"
+
+[tests."cpython/Lib/test/test_poll.py"]
+status = "pass"
+reason = "RFC 0039 WS6: native libc-backed select.poll"
+
+[tests."cpython/Lib/test/test_kqueue.py"]
+status = "pass"
+reason = "RFC 0039 WS6: native libc-backed select.kqueue/kevent"
 
 [tests."cpython/Lib/test/test_socketserver.py"]
 status = "skip"

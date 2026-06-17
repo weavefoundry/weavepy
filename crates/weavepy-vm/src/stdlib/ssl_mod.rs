@@ -78,13 +78,42 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::from_static("VerifyMode"),
         );
         d.insert(DictKey(Object::from_static("Purpose")), purpose_dict());
+        // SSL exception hierarchy (CPython `ssl` / `_ssl`):
+        //   SSLError(OSError)
+        //     ├ SSLZeroReturnError ├ SSLWantReadError ├ SSLWantWriteError
+        //     ├ SSLSyscallError    └ SSLEOFError
+        //   SSLCertVerificationError(SSLError, ValueError)  [= CertificateError]
+        // asyncio's `sslproto` imports `SSLWantReadError`/`SSLSyscallError`
+        // at module load, so these must exist even without a TLS engine.
+        let bt = crate::builtin_types::builtin_types();
+        let ssl_error = exc_subclass("SSLError", vec![bt.os_error.clone()]);
         d.insert(
             DictKey(Object::from_static("SSLError")),
-            Object::Type(crate::builtin_types::builtin_types().os_error.clone()),
+            Object::Type(ssl_error.clone()),
+        );
+        for name in [
+            "SSLZeroReturnError",
+            "SSLWantReadError",
+            "SSLWantWriteError",
+            "SSLSyscallError",
+            "SSLEOFError",
+        ] {
+            d.insert(
+                DictKey(Object::from_str(name)),
+                Object::Type(exc_subclass(name, vec![ssl_error.clone()])),
+            );
+        }
+        let cert_error = exc_subclass(
+            "SSLCertVerificationError",
+            vec![ssl_error.clone(), bt.value_error.clone()],
+        );
+        d.insert(
+            DictKey(Object::from_static("SSLCertVerificationError")),
+            Object::Type(cert_error.clone()),
         );
         d.insert(
             DictKey(Object::from_static("CertificateError")),
-            Object::Type(crate::builtin_types::builtin_types().value_error.clone()),
+            Object::Type(cert_error),
         );
         d.insert(
             DictKey(Object::from_static("create_default_context")),
@@ -106,6 +135,23 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("match_hostname")),
             b("match_hostname", match_hostname_stub),
         );
+        // `SSLSocket` / `SSLObject` exist purely so that the `isinstance`
+        // guards in asyncio (`base_events._check_ssl_socket`) and user code
+        // resolve — WeavePy never produces instances of them (the TLS engine
+        // is RFC 0017 future work), so those checks simply return `False`.
+        for name in ["SSLSocket", "SSLObject"] {
+            d.insert(
+                DictKey(Object::from_str(name)),
+                Object::Type(
+                    crate::types::TypeObject::new_user(
+                        name,
+                        vec![bt.object_.clone()],
+                        DictData::new(),
+                    )
+                    .expect("ssl class must linearise"),
+                ),
+            );
+        }
     }
     Rc::new(PyModule {
         name: "ssl".to_owned(),
@@ -121,6 +167,15 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
         call: Box::new(body),
         call_kw: None,
     }))
+}
+
+/// Build an exception subclass with the given bases and an empty body.
+fn exc_subclass(
+    name: &'static str,
+    bases: Vec<Rc<crate::types::TypeObject>>,
+) -> Rc<crate::types::TypeObject> {
+    crate::types::TypeObject::new_user(name, bases, DictData::new())
+        .expect("ssl exception class must linearise")
 }
 
 fn purpose_dict() -> Object {

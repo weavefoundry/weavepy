@@ -23,7 +23,8 @@ use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use crate::builtin_types::{builtin_types, instance_is_subclass};
 use crate::error::{
-    index_error, key_error, runtime_error, stop_iteration, type_error, value_error, RuntimeError,
+    index_error, key_error, key_error_object, runtime_error, stop_iteration, type_error,
+    value_error, RuntimeError,
 };
 use crate::object::{BuiltinFn, DictData, DictKey, MethodWrapper, Object, PyIterator, Range};
 
@@ -591,36 +592,49 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             )),
             _ => None,
         },
-        Object::Set(_) | Object::FrozenSet(_) => match name {
-            "add" => Some(method("add", set_add)),
-            "discard" => Some(method("discard", set_discard)),
-            "remove" => Some(method("remove", set_remove)),
-            "pop" => Some(method("pop", set_pop)),
-            "clear" => Some(method("clear", set_clear)),
-            "copy" => Some(method("copy", set_copy)),
-            "update" => Some(method("update", set_update)),
-            "union" => Some(method("union", set_union)),
-            "intersection" => Some(method("intersection", set_intersection)),
-            "difference" => Some(method("difference", set_difference)),
-            "symmetric_difference" => {
-                Some(method("symmetric_difference", set_symmetric_difference))
+        Object::Set(_) | Object::FrozenSet(_) => {
+            // The in-place mutators live on `set` only — `frozenset` is
+            // immutable, so `hasattr(frozenset(), 'add')` is False (CPython
+            // exposes no `set_add`/`set_clear`/… on `PyFrozenSet_Type`).
+            // test_set's `test_badcmp` gates its `add`/`discard`/`remove`
+            // probes on exactly this `hasattr`.
+            let mutators_ok = matches!(obj, Object::Set(_));
+            match name {
+                "add" if mutators_ok => Some(method("add", set_add)),
+                "discard" if mutators_ok => Some(method("discard", set_discard)),
+                "remove" if mutators_ok => Some(method("remove", set_remove)),
+                "pop" if mutators_ok => Some(method("pop", set_pop)),
+                "clear" if mutators_ok => Some(method("clear", set_clear)),
+                "update" if mutators_ok => Some(method("update", set_update)),
+                "intersection_update" if mutators_ok => {
+                    Some(method("intersection_update", set_intersection_update))
+                }
+                "difference_update" if mutators_ok => {
+                    Some(method("difference_update", set_difference_update))
+                }
+                "symmetric_difference_update" if mutators_ok => Some(method(
+                    "symmetric_difference_update",
+                    set_symmetric_difference_update,
+                )),
+                // Methods shared by `set` and `frozenset`.
+                "copy" => Some(method("copy", set_copy)),
+                "union" => Some(method("union", set_union)),
+                "intersection" => Some(method("intersection", set_intersection)),
+                "difference" => Some(method("difference", set_difference)),
+                "symmetric_difference" => {
+                    Some(method("symmetric_difference", set_symmetric_difference))
+                }
+                "issubset" => Some(method("issubset", set_issubset)),
+                "issuperset" => Some(method("issuperset", set_issuperset)),
+                "isdisjoint" => Some(method("isdisjoint", set_isdisjoint)),
+                // Membership dunder exposed as a bound method: CPython's
+                // `keyword.iskeyword = frozenset(kwlist).__contains__` grabs it
+                // directly, and `hasattr(s, '__contains__')` must hold.
+                "__contains__" => Some(method("__contains__", obj_contains)),
+                "__len__" => Some(method("__len__", obj_len)),
+                _ => None,
             }
-            "issubset" => Some(method("issubset", set_issubset)),
-            "issuperset" => Some(method("issuperset", set_issuperset)),
-            "isdisjoint" => Some(method("isdisjoint", set_isdisjoint)),
-            "intersection_update" => Some(method("intersection_update", set_intersection_update)),
-            "difference_update" => Some(method("difference_update", set_difference_update)),
-            "symmetric_difference_update" => Some(method(
-                "symmetric_difference_update",
-                set_symmetric_difference_update,
-            )),
-            // Membership dunder exposed as a bound method: CPython's
-            // `keyword.iskeyword = frozenset(kwlist).__contains__` grabs it
-            // directly, and `hasattr(s, '__contains__')` must hold.
-            "__contains__" => Some(method("__contains__", obj_contains)),
-            "__len__" => Some(method("__len__", obj_len)),
-            _ => None,
-        },
+        }
         Object::Bytes(_) | Object::ByteArray(_) => match name {
             "decode" => Some(method_kw("decode", bytes_decode_kw)),
             "hex" => Some(method_kw("hex", bytes_hex_kw)),
@@ -1523,7 +1537,19 @@ pub fn builtin_classmethod(type_name: &str, attr: &str) -> Option<Object> {
         ("dict", "fromkeys") => Some(method("fromkeys", dict_fromkeys)),
         _ => None,
     };
-    f.map(|f| Object::Builtin(Rc::new(f)))
+    // These are CPython class/static methods: `dict.fromkeys`, `str.maketrans`,
+    // etc. are already "bound" (to the type) when read off the type, and they
+    // are *not* instance descriptors. Each body scans its arguments from slot
+    // 0, so they never need a prepended receiver. Mark them `binds_instance =
+    // false` so that when one is stashed as a class attribute and later read
+    // through an *instance* (`class C: ctor = dict.fromkeys; C().ctor(it)`),
+    // `maybe_bind` returns it unchanged instead of wrongly rebinding it to the
+    // instance (which made `self` look like the iterable — bpo-46615's
+    // `TestMethodsMutating_Set_Dict`).
+    f.map(|mut f| {
+        f.binds_instance = false;
+        Object::Builtin(Rc::new(f))
+    })
 }
 
 /// Unbound-method access on a built-in type, e.g. `str.upper`, `float.hex`,
@@ -2017,6 +2043,20 @@ pub(crate) fn coerce_index_i128(o: &Object) -> Result<i128, RuntimeError> {
         _ => {}
     }
     coerce_index_i64(o).map(i128::from)
+}
+
+/// Coerce a `list.index`/`tuple.index` start/stop bound to `i64`, clamping
+/// an out-of-range big integer to `i64::MAX`/`i64::MIN` the way CPython's
+/// `_PyEval_SliceIndex` saturates a `Py_ssize_t` — so `index(x, 4*sys.maxsize)`
+/// is an empty window, not an `OverflowError`.
+pub(crate) fn seq_index_bound(o: &Object) -> Result<i64, RuntimeError> {
+    if let Object::Long(b) = o {
+        if let Some(v) = b.to_i64() {
+            return Ok(v);
+        }
+        return Ok(if b.is_negative() { i64::MIN } else { i64::MAX });
+    }
+    coerce_index_i64(o)
 }
 
 pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
@@ -4690,15 +4730,21 @@ fn parse_complex_inner(s: &str) -> Option<(f64, f64)> {
 }
 
 fn b_list(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::new_list(Vec::new()));
-    }
-    let mut it = args[0].make_iter()?;
-    let mut out = Vec::new();
-    while let Some(v) = it.next_value() {
-        out.push(v);
-    }
-    Ok(Object::new_list(out))
+    let out = if args.is_empty() {
+        Vec::new()
+    } else {
+        let mut it = args[0].make_iter()?;
+        let mut out = Vec::new();
+        while let Some(v) = it.next_value() {
+            out.push(v);
+        }
+        out
+    };
+    let obj = Object::new_list(out);
+    // CPython tracks every list; keep `list(...)` consistent with the
+    // `[]` literal path so `gc.is_tracked` and cycle collection agree.
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
 }
 
 fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4721,7 +4767,9 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
-        return Ok(Object::new_dict());
+        let obj = Object::new_dict();
+        crate::gc_trace::track(obj.clone());
+        return Ok(obj);
     }
     if args.len() > 1 {
         return Err(type_error(format!(
@@ -4737,7 +4785,9 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
         for (k, v) in src.borrow().iter() {
             d.insert(k.clone(), v.clone());
         }
-        return Ok(Object::Dict(Rc::new(RefCell::new(d))));
+        let obj = Object::Dict(Rc::new(RefCell::new(d)));
+        crate::gc_trace::track(obj.clone());
+        return Ok(obj);
     }
     // Mapping path for user-defined classes (`__keys__` style) is
     // handled by the VM before dispatching here — see
@@ -4793,7 +4843,9 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
         d.insert(DictKey(kv.next().unwrap()), kv.next().unwrap());
         i += 1;
     }
-    Ok(Object::Dict(Rc::new(RefCell::new(d))))
+    let obj = Object::Dict(Rc::new(RefCell::new(d)));
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
 }
 
 fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4804,27 +4856,64 @@ fn b_type(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
-    if args.is_empty() {
-        return Ok(Object::new_set());
+    // `set()` takes at most one positional argument (the iterable);
+    // `set([], 2)` is a `TypeError` (CPython `set_init`, test_new_or_init).
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "set expected at most 1 argument, got {}",
+            args.len()
+        )));
     }
-    let mut it = args[0].make_iter()?;
-    let mut out = Vec::new();
-    while let Some(v) = it.next_value() {
-        out.push(v);
-    }
-    Ok(Object::new_set_from(out))
+    let out = if args.is_empty() {
+        crate::object::SetData::new()
+    } else {
+        // `set([[]])` raises `TypeError: unhashable type: 'list'` — check
+        // each element as it is admitted, like CPython's `set_init`. A
+        // custom `__eq__`/`__hash__` that raises during a collision aborts
+        // construction (test_badcmp `set([BadCmp(), BadCmp()])`).
+        let mut it = args[0].make_iter()?;
+        let mut out = crate::object::SetData::new();
+        while let Some(v) = it.next_value() {
+            let key = set_insert_key(&v)?;
+            crate::object::key_cmp_scope(|| out.insert(key))?;
+        }
+        out
+    };
+    let obj = Object::Set(Rc::new(RefCell::new(out)));
+    // CPython tracks every set (`gc.is_tracked(set())` is True).
+    crate::gc_trace::track(obj.clone());
+    Ok(obj)
 }
 
 fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `frozenset()` takes at most one positional argument (CPython
+    // `frozenset_new`); `frozenset([], 2)` is a `TypeError`.
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "frozenset expected at most 1 argument, got {}",
+            args.len()
+        )));
+    }
     if args.is_empty() {
         return Ok(Object::new_frozenset_from(Vec::new()));
     }
-    let mut it = args[0].make_iter()?;
-    let mut out = Vec::new();
-    while let Some(v) = it.next_value() {
-        out.push(v);
+    // `frozenset(f)` where `f` is *already* an exact frozenset returns `f`
+    // itself — CPython `frozenset_new` short-circuits on `PyFrozenSet_CheckExact`
+    // so the immutable object is shared (test_constructor_identity). A
+    // frozenset *subclass* instance is not exact, so it still builds a fresh
+    // frozenset.
+    if let Object::FrozenSet(_) = &args[0] {
+        return Ok(args[0].clone());
     }
-    Ok(Object::new_frozenset_from(out))
+    let mut it = args[0].make_iter()?;
+    let mut out = crate::object::SetData::new();
+    while let Some(v) = it.next_value() {
+        let key = set_insert_key(&v)?;
+        crate::object::key_cmp_scope(|| out.insert(key))?;
+    }
+    Ok(Object::FrozenSet(Rc::new(
+        crate::object::FrozenSetObj::new(out),
+    )))
 }
 
 /// One item of a `bytes(iterable)` source: an integer in
@@ -5486,10 +5575,22 @@ fn b_sorted(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
     let iterable = one(args, "reversed")?;
-    // Materialize the source in *forward* order; the Reversed iterator
-    // walks it back-to-front. (CPython's `reversed` uses `__reversed__`
-    // or `__len__`+`__getitem__`; a forward snapshot reproduces the same
-    // sequence for the finite iterables WeavePy handles here.)
+    // A plain list shares its backing store with the reverse-iterator
+    // (CPython `list___reversed__`): the iterator holds the *live* list and
+    // a descending cursor, so co-pickling `(reversed(xs), xs)` memoizes one
+    // list and the iterator sees later mutations (test_list
+    // `test_reversed_pickle`).
+    if let Object::List(items) = iterable {
+        let index = items.borrow().len() as i64 - 1;
+        return Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Reversed {
+            items: items.clone(),
+            index,
+        }))));
+    }
+    // Otherwise materialize the source in *forward* order; the Reversed
+    // iterator walks it back-to-front. (CPython's `reversed` uses
+    // `__reversed__` or `__len__`+`__getitem__`; a forward snapshot
+    // reproduces the same sequence for the finite iterables handled here.)
     let mut it = iterable.make_iter()?;
     let mut buf = Vec::new();
     while let Some(v) = it.next_value() {
@@ -5656,6 +5757,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
         native: None,
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
+        hash_cache: crate::sync::Cell::new(None),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -5723,6 +5825,7 @@ pub(crate) fn build_super_proxy(
         native: None,
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
+        hash_cache: crate::sync::Cell::new(None),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -6012,11 +6115,18 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Generator(_) => bt.generator_.clone(),
         Object::Coroutine(_) => bt.coroutine_.clone(),
         Object::AsyncGenerator(_) => bt.async_generator_.clone(),
-        // The transient `asend`/`athrow`/`aclose` awaitables have no
-        // dedicated singleton type; treat them as plain objects for
-        // `type()` (their faithful CPython name is still surfaced by
-        // `repr`/error messages via `Object::type_name`).
-        Object::AsyncGenAwait(_) => bt.object_.clone(),
+        // The `asend`/`athrow`/`aclose` awaitables get CPython's dedicated
+        // types: `asend` (also backing `__anext__`) is `async_generator_asend`;
+        // `athrow`/`aclose` are `async_generator_athrow`. Real types let
+        // `_collections_abc` register them as `Coroutine`s, so
+        // `asyncio.iscoroutine(agen.aclose())` holds and `create_task`/
+        // `ensure_future` accept them (PEP 525 finalization, shutdown).
+        Object::AsyncGenAwait(a) => match a.kind {
+            crate::object::AgenAwaitKind::Send => bt.async_generator_asend_.clone(),
+            crate::object::AgenAwaitKind::Throw | crate::object::AgenAwaitKind::Close => {
+                bt.async_generator_athrow_.clone()
+            }
+        },
         Object::Module(_) => bt.module_.clone(),
         Object::SlotDescriptor(_) => bt.member_descriptor_.clone(),
         Object::Code(_) => bt.code_.clone(),
@@ -6167,6 +6277,33 @@ pub fn ensure_hashable(obj: &Object) -> Result<(), RuntimeError> {
         _ => return Ok(()),
     };
     Err(type_error(format!("unhashable type: '{name}'")))
+}
+
+/// The `DictKey` used to *insert* `obj` into a set/frozenset: a built-in
+/// unhashable container (`list`/`dict`/`set`/`bytearray`/`slice`, or a
+/// tuple containing one) raises `TypeError: unhashable type: 'X'` just like
+/// CPython. Instances pass through — their `__hash__`/`None` is dispatched
+/// lazily by the `DictKey` hasher.
+pub(crate) fn set_insert_key(obj: &Object) -> Result<DictKey, RuntimeError> {
+    ensure_hashable(obj)?;
+    Ok(DictKey(obj.clone()))
+}
+
+/// The `DictKey` used for set *membership* tests (`in`, `remove`, `discard`):
+/// like [`set_insert_key`], but a `set` operand — itself unhashable — is
+/// looked up as the equivalent `frozenset`. This reproduces CPython's
+/// `set_lookkey`, which retries an unhashable `set` key as a temporary
+/// frozenset so `{1, 2} in {frozenset({1, 2})}` is `True` and
+/// `myset.discard({1, 2})` finds a stored `frozenset({1, 2})`.
+pub(crate) fn set_membership_key(obj: &Object) -> Result<DictKey, RuntimeError> {
+    if let Object::Set(s) = obj {
+        let body = s.borrow().clone();
+        return Ok(DictKey(Object::FrozenSet(Rc::new(
+            crate::object::FrozenSetObj::new(body),
+        ))));
+    }
+    ensure_hashable(obj)?;
+    Ok(DictKey(obj.clone()))
 }
 
 pub fn hash_object(obj: &Object) -> Result<Object, RuntimeError> {
@@ -6679,7 +6816,9 @@ fn b_next(args: &[Object]) -> Result<Object, RuntimeError> {
     let it = one(args, "next")?;
     let default = args.get(1).cloned();
     if let Object::Iter(it) = it {
-        match it.borrow_mut().next_value() {
+        // `next()`'s optional default only suppresses StopIteration; a
+        // "changed size during iteration" RuntimeError still propagates.
+        match it.borrow_mut().next_value_checked()? {
             Some(v) => Ok(v),
             None => default.ok_or_else(stop_iteration),
         }
@@ -7924,6 +8063,14 @@ fn list_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn list_pop(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `list.pop(index=-1)` accepts at most one positional argument
+    // (`[].pop(1, 2)` is a TypeError in CPython, not an IndexError).
+    if args.len() > 2 {
+        return Err(type_error(format!(
+            "pop expected at most 1 argument, got {}",
+            args.len() - 1
+        )));
+    }
     let l = list_self(args)?;
     let mut l = l.borrow_mut();
     let idx = if args.len() > 1 {
@@ -7955,6 +8102,23 @@ fn list_extend(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("list.extend() expected 1 argument"));
     }
     let l = list_self(args)?;
+    // Fast path for exact list/tuple sources: snapshot the source items
+    // first. CPython reads the source's length once, so `a.extend(a)`
+    // *doubles* `a`; iterating the live list while pushing to it would
+    // instead grow without bound (a hang that the OOM killer ends).
+    match &args[1] {
+        Object::List(src) => {
+            let items: Vec<Object> = src.borrow().clone();
+            l.borrow_mut().extend(items);
+            return Ok(Object::None);
+        }
+        Object::Tuple(src) => {
+            let items: Vec<Object> = src.iter().cloned().collect();
+            l.borrow_mut().extend(items);
+            return Ok(Object::None);
+        }
+        _ => {}
+    }
     let mut it = args[1].make_iter()?;
     while let Some(v) = it.next_value() {
         l.borrow_mut().push(v);
@@ -7989,6 +8153,12 @@ fn list_imul(args: &[Object]) -> Result<Object, RuntimeError> {
     if n <= 0 {
         data.clear();
     } else {
+        let unit = data.len();
+        let times = crate::checked_repeat_count(unit, n, "list")?;
+        let extra = unit.saturating_mul(times.saturating_sub(1));
+        if data.try_reserve_exact(extra).is_err() {
+            return Err(crate::error::memory_error(""));
+        }
         let original = data.clone();
         for _ in 1..n {
             data.extend_from_slice(&original);
@@ -8025,26 +8195,45 @@ fn list_remove(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("list.remove() expected 1 argument"));
     }
     let l = list_self(args)?;
-    let mut l = l.borrow_mut();
-    let pos = l
-        .iter()
-        .position(|x| x.eq_value(&args[1]))
-        .ok_or_else(|| value_error("list.remove(x): x not in list"))?;
-    l.remove(pos);
-    Ok(Object::None)
+    // CPython `list.remove` walks the *live* list by index with
+    // `PyObject_RichCompareBool` (identity-first, then Python `__eq__`),
+    // so `ALWAYS_EQ` matches the first element and a mutating `__eq__`
+    // can't panic the borrowed cell: clone each element and release the
+    // borrow before comparing.
+    let mut i = 0usize;
+    loop {
+        let x = {
+            let b = l.borrow();
+            if i >= b.len() {
+                break;
+            }
+            b[i].clone()
+        };
+        if crate::object::member_eq(&x, &args[1])? {
+            let mut b = l.borrow_mut();
+            if i < b.len() {
+                b.remove(i);
+            }
+            return Ok(Object::None);
+        }
+        i += 1;
+    }
+    Err(value_error("list.remove(x): x not in list"))
 }
 
 fn list_index(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 {
         return Err(type_error("list.index() expected at least 1 argument"));
     }
-    let l = list_self(args)?;
-    let l = l.borrow();
-    // CPython `list.index(value, start=0, stop=maxsize)`: negative
-    // bounds count from the end and clamp to 0 (`PySlice_AdjustIndices`
-    // semantics), and the comparison is identity-first
-    // (`PyObject_RichCompareBool`).
-    let len = l.len() as i64;
+    // Snapshot strong refs: CPython `list.index` re-reads by index because a
+    // user `__eq__` can mutate the list mid-scan; cloning the handles keeps us
+    // panic-free without holding the borrow across the comparison.
+    let items: Vec<Object> = list_self(args)?.borrow().clone();
+    // CPython `list.index(value, start=0, stop=maxsize)`: negative bounds count
+    // from the end and clamp to 0 (`PySlice_AdjustIndices` semantics), and the
+    // comparison is `PyObject_RichCompareBool` (identity-first, then Python
+    // `__eq__` both directions, propagating exceptions).
+    let len = items.len() as i64;
     let adjust = |v: i64| -> i64 {
         if v < 0 {
             (v + len).max(0)
@@ -8053,18 +8242,19 @@ fn list_index(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let start = match args.get(2) {
-        Some(o) => adjust(coerce_index_i64(o)?),
+        Some(o) => adjust(seq_index_bound(o)?),
         None => 0,
     };
     let stop = match args.get(3) {
-        Some(o) => adjust(coerce_index_i64(o)?),
+        Some(o) => adjust(seq_index_bound(o)?),
         None => len,
     };
-    for i in start..stop {
-        let x = &l[i as usize];
-        if x.is_same(&args[1]) || x.eq_value(&args[1]) {
+    let mut i = start;
+    while i < stop {
+        if crate::object::member_eq(&items[i as usize], &args[1])? {
             return Ok(Object::Int(i));
         }
+        i += 1;
     }
     Err(value_error(format!("{} is not in list", args[1].repr())))
 }
@@ -8073,15 +8263,18 @@ fn list_count(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("list.count() expected 1 argument"));
     }
-    let l = list_self(args)?;
-    let l = l.borrow();
-    // CPython compares with `PyObject_RichCompareBool`, which is identity-first,
-    // so `[nan].count(nan)` (the same nan) is 1.
-    let n = l
-        .iter()
-        .filter(|x| x.is_same(&args[1]) || x.eq_value(&args[1]))
-        .count();
-    Ok(Object::Int(n as i64))
+    // Snapshot strong refs (a user `__eq__` may mutate the list mid-scan).
+    // CPython compares with `PyObject_RichCompareBool`: identity-first (so
+    // `[nan].count(nan)` for the same nan is 1), then Python `__eq__` both
+    // directions, letting any `__eq__` exception propagate.
+    let items: Vec<Object> = list_self(args)?.borrow().clone();
+    let mut n: i64 = 0;
+    for x in &items {
+        if crate::object::member_eq(x, &args[1])? {
+            n += 1;
+        }
+    }
+    Ok(Object::Int(n))
 }
 
 fn list_sort(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8102,16 +8295,26 @@ fn list_sort(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn list_reverse(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `list.reverse()` is `METH_NOARGS`: extra arguments are a TypeError.
+    if args.len() != 1 {
+        return Err(type_error("reverse() takes no arguments (1 given)"));
+    }
     list_self(args)?.borrow_mut().reverse();
     Ok(Object::None)
 }
 
 fn list_clear(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 1 {
+        return Err(type_error("clear() takes no arguments (1 given)"));
+    }
     list_self(args)?.borrow_mut().clear();
     Ok(Object::None)
 }
 
 fn list_copy(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.len() != 1 {
+        return Err(type_error("copy() takes no arguments (1 given)"));
+    }
     let l = list_self(args)?;
     let v = l.borrow().clone();
     Ok(Object::new_list(v))
@@ -8287,11 +8490,15 @@ fn tuple_count(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Tuple(t)) => t.clone(),
         _ => return Err(type_error("expected tuple")),
     };
-    let n = t
-        .iter()
-        .filter(|x| x.is_same(&args[1]) || x.eq_value(&args[1]))
-        .count();
-    Ok(Object::Int(n as i64))
+    // `PyObject_RichCompareBool`: identity-first, then Python `__eq__` (both
+    // directions), propagating any exception the comparison raises.
+    let mut n: i64 = 0;
+    for x in t.iter() {
+        if crate::object::member_eq(x, &args[1])? {
+            n += 1;
+        }
+    }
+    Ok(Object::Int(n))
 }
 
 fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8313,18 +8520,19 @@ fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let start = match args.get(2) {
-        Some(o) => adjust(coerce_index_i64(o)?),
+        Some(o) => adjust(seq_index_bound(o)?),
         None => 0,
     };
     let stop = match args.get(3) {
-        Some(o) => adjust(coerce_index_i64(o)?),
+        Some(o) => adjust(seq_index_bound(o)?),
         None => len,
     };
-    for i in start..stop {
-        let x = &t[i as usize];
-        if x.is_same(&args[1]) || x.eq_value(&args[1]) {
+    let mut i = start;
+    while i < stop {
+        if crate::object::member_eq(&t[i as usize], &args[1])? {
             return Ok(Object::Int(i));
         }
+        i += 1;
     }
     Err(value_error("tuple.index(x): x not in tuple"))
 }
@@ -8353,19 +8561,17 @@ fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn dict_fromkeys(args: &[Object]) -> Result<Object, RuntimeError> {
-    // ``fromkeys`` is exposed both as a bound method on a dict
-    // (``{}.fromkeys(...)``) and as an unbound classmethod
-    // (``dict.fromkeys(...)``). The two call sites have a different
-    // shape: the bound version receives the dict as ``args[0]``;
-    // the unbound version omits it. Sniff the receiver shape so a
-    // single body handles both.
-    // A lone dict argument is the *iterable* of an unbound call
-    // (`map(dict.fromkeys, list_of_dicts)` — ChainMap.__iter__ does
-    // this); a dict in slot 0 only marks the bound receiver when more
-    // arguments follow.
-    let (it_idx, value_idx) = match (args.first(), args.len()) {
-        (Some(Object::Type(_)), _) => (1usize, 2usize),
-        (Some(Object::Dict(_)), n) if n >= 2 => (1usize, 2usize),
+    // ``fromkeys`` is a *classmethod*: `cls` is the only receiver it ever
+    // binds, so the keys always come from the first ordinary argument —
+    // never from a "bound dict". Accessing it through an instance/class
+    // (`{}.fromkeys(it, val)`, `D.fromkeys(it, val)`) prepends the class, so
+    // a leading `Type` shifts the iterable to slot 1; accessing it through
+    // the builtin `dict` type itself (`dict.fromkeys(it, val)`) passes no
+    // class, leaving the iterable in slot 0. Critically, the iterable may
+    // *be* a dict (`dict.fromkeys(other_dict, value)` — bpo do_not_rehash),
+    // so we must not mistake a dict in slot 0 for a bound receiver.
+    let (it_idx, value_idx) = match args.first() {
+        Some(Object::Type(_)) => (1usize, 2usize),
         _ => (0usize, 1usize),
     };
     let it = args
@@ -8398,14 +8604,93 @@ fn set_self(args: &[Object]) -> Result<Object, RuntimeError> {
         .ok_or_else(|| type_error("expected set receiver"))
 }
 
-fn set_apply_inplace<F: FnOnce(&mut crate::object::SetData)>(
-    args: &[Object],
-    f: F,
-) -> Result<Object, RuntimeError> {
+/// A single-element in-place set mutation (`add`/`discard`/`clear`).
+enum SetInplaceOp {
+    Add(DictKey),
+    Discard(DictKey),
+    Clear,
+}
+
+fn apply_set_inplace_op(s: &mut crate::object::SetData, op: SetInplaceOp) {
+    match op {
+        SetInplaceOp::Add(k) => {
+            s.insert(k);
+        }
+        SetInplaceOp::Discard(k) => {
+            s.shift_remove(&k);
+        }
+        SetInplaceOp::Clear => s.clear(),
+    }
+}
+
+thread_local! {
+    /// In-place set mutations that a *re-entrant* `add`/`discard`/`clear`
+    /// (called from inside an element's `__hash__`/`__eq__` while an outer
+    /// frame already holds the set's borrow) could not apply immediately.
+    ///
+    /// CPython tolerates this (e.g. `test_set`'s
+    /// `test_hash_collision_concurrent_add`, where a hash-colliding
+    /// `__eq__` calls `s.add(...)` during another `s.add`). Rather than
+    /// panic on the re-entrant `borrow_mut`, the inner call records its op
+    /// here keyed by the set's identity; the outer frame replays it once
+    /// its own mutation completes, so the final contents match CPython.
+    static SET_DEFERRED_OPS: std::cell::RefCell<Vec<(usize, SetInplaceOp)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain and return any deferred ops queued against `ptr`. The queue
+/// borrow is released before the caller applies them, so a further
+/// re-entrant mutation during replay can queue again without conflict.
+fn take_deferred_set_ops(ptr: usize) -> Vec<SetInplaceOp> {
+    SET_DEFERRED_OPS.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut drained = Vec::new();
+        let mut i = 0;
+        while i < q.len() {
+            if q[i].0 == ptr {
+                drained.push(q.remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        drained
+    })
+}
+
+fn set_apply_inplace(args: &[Object], op: SetInplaceOp) -> Result<Object, RuntimeError> {
     match set_self(args)? {
         Object::Set(s) => {
-            f(&mut s.borrow_mut());
-            Ok(Object::None)
+            let ptr = Rc::as_ptr(&s) as usize;
+            match s.try_borrow_mut() {
+                Ok(mut b) => {
+                    // A colliding `__eq__` that raises during `add`/`discard`
+                    // aborts the mutation in CPython (test_badcmp `s.add`/
+                    // `s.discard`/`s.remove` of a `BadCmp`).
+                    crate::object::key_cmp_scope(|| apply_set_inplace_op(&mut b, op))?;
+                    // Replay anything a re-entrant callback deferred while we
+                    // held the borrow. Looping handles nested re-entrancy.
+                    loop {
+                        let replay = take_deferred_set_ops(ptr);
+                        if replay.is_empty() {
+                            break;
+                        }
+                        for op in replay {
+                            apply_set_inplace_op(&mut b, op);
+                        }
+                    }
+                    Ok(Object::None)
+                }
+                Err(_) => {
+                    // An outer frame holds the borrow (re-entrant mutation
+                    // from a `__hash__`/`__eq__` callback). Defer; the outer
+                    // frame replays once it finishes.
+                    SET_DEFERRED_OPS.with(|q| q.borrow_mut().push((ptr, op)));
+                    Ok(Object::None)
+                }
+            }
         }
         Object::FrozenSet(_) => Err(type_error("frozenset is immutable")),
         _ => Err(type_error("expected set receiver")),
@@ -8417,10 +8702,14 @@ fn set_iter_items(obj: &Object) -> Result<Vec<DictKey>, RuntimeError> {
         Object::Set(s) => Ok(s.borrow().iter().cloned().collect()),
         Object::FrozenSet(s) => Ok(s.iter().cloned().collect()),
         other => {
+            // An arbitrary iterable feeding a set operation
+            // (`union`/`update`/`difference`/…): each element becomes a set
+            // key, so an unhashable one (`s.union([[]])`) raises `TypeError`
+            // exactly like CPython, instead of being silently bucketed.
             let mut it = other.make_iter()?;
             let mut out = Vec::new();
             while let Some(v) = it.next_value() {
-                out.push(DictKey(v));
+                out.push(set_insert_key(&v)?);
             }
             Ok(out)
         }
@@ -8432,9 +8721,8 @@ fn set_add(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("add() expected 1 arg"))?;
-    set_apply_inplace(args, |s| {
-        s.insert(DictKey(v));
-    })
+    // `set.add` *inserts*: an unhashable element (incl. a `set`) raises.
+    set_apply_inplace(args, SetInplaceOp::Add(set_insert_key(&v)?))
 }
 
 fn set_discard(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8442,9 +8730,9 @@ fn set_discard(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("discard() expected 1 arg"))?;
-    set_apply_inplace(args, |s| {
-        s.shift_remove(&DictKey(v));
-    })
+    // `set.discard` is a membership op: a `set` operand looks up its
+    // frozenset equivalent; a `list`/etc. still raises TypeError.
+    set_apply_inplace(args, SetInplaceOp::Discard(set_membership_key(&v)?))
 }
 
 fn set_remove(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8452,12 +8740,17 @@ fn set_remove(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("remove() expected 1 arg"))?;
+    let key = set_membership_key(&v)?;
     match set_self(args)? {
         Object::Set(s) => {
-            if s.borrow_mut().shift_remove(&DictKey(v.clone())) {
+            let removed = crate::object::key_cmp_scope(|| s.borrow_mut().shift_remove(&key))?;
+            if removed {
                 Ok(Object::None)
             } else {
-                Err(key_error(v.repr()))
+                // CPython's `set.remove` raises `KeyError(key)` carrying the
+                // *original* operand object (so `e.args[0] is key`), not the
+                // frozenset used for the lookup nor its repr string.
+                Err(key_error_object(v))
             }
         }
         Object::FrozenSet(_) => Err(type_error("frozenset is immutable")),
@@ -8482,7 +8775,7 @@ fn set_pop(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_clear(args: &[Object]) -> Result<Object, RuntimeError> {
-    set_apply_inplace(args, |s| s.clear())
+    set_apply_inplace(args, SetInplaceOp::Clear)
 }
 
 fn set_copy(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8502,13 +8795,37 @@ fn set_update(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("frozenset is immutable"));
     }
     if let Object::Set(s) = &receiver {
+        // Build on a snapshot so an element `__hash__` that re-enters and
+        // mutates `s` can't fire while we hold `s.borrow_mut()` (bpo-46615).
+        let mut acc: crate::object::SetData = s.borrow().clone();
         for other in args.iter().skip(1) {
             for k in set_iter_items(other)? {
-                s.borrow_mut().insert(k);
+                // A colliding `__eq__` raising during the merge aborts the
+                // update (test_8420_set_merge: `bad_eq.__eq__` raises
+                // ZeroDivisionError).
+                crate::object::key_cmp_scope(|| acc.insert(k))?;
             }
         }
+        *s.borrow_mut() = acc;
     }
     Ok(Object::None)
+}
+
+/// Wrap a computed set body in the storage kind of the *receiver*: CPython's
+/// `frozenset.union`/`intersection`/`difference`/`symmetric_difference`
+/// return a `frozenset`, while `set`'s return a `set`. Subclass receivers
+/// produce the base type (`set`/`frozenset`), matching CPython.
+fn set_result_like(receiver: Option<&Object>, body: crate::object::SetData) -> Object {
+    let frozen = match receiver {
+        Some(Object::FrozenSet(_)) => true,
+        Some(Object::Instance(inst)) => matches!(inst.native, Some(Object::FrozenSet(_))),
+        _ => false,
+    };
+    if frozen {
+        Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(body)))
+    } else {
+        Object::Set(Rc::new(RefCell::new(body)))
+    }
 }
 
 fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8523,7 +8840,7 @@ fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
             out.insert(k);
         }
     }
-    Ok(Object::Set(Rc::new(RefCell::new(out))))
+    Ok(set_result_like(args.first(), out))
 }
 
 fn set_intersection(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8541,7 +8858,7 @@ fn set_intersection(args: &[Object]) -> Result<Object, RuntimeError> {
         let other_set: crate::object::SetData = set_iter_items(other)?.into_iter().collect();
         acc.retain(|k| other_set.contains(k));
     }
-    Ok(Object::Set(Rc::new(RefCell::new(acc))))
+    Ok(set_result_like(args.first(), acc))
 }
 
 fn set_difference(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8559,17 +8876,17 @@ fn set_difference(args: &[Object]) -> Result<Object, RuntimeError> {
         let other_set: crate::object::SetData = set_iter_items(other)?.into_iter().collect();
         acc.retain(|k| !other_set.contains(k));
     }
-    Ok(Object::Set(Rc::new(RefCell::new(acc))))
+    Ok(set_result_like(args.first(), acc))
 }
 
 fn set_symmetric_difference(args: &[Object]) -> Result<Object, RuntimeError> {
-    let mut a: crate::object::SetData = match args.first() {
+    let a: crate::object::SetData = match args.first() {
         Some(first) => set_iter_items(first)?.into_iter().collect(),
         None => return Ok(Object::new_set()),
     };
     let b: crate::object::SetData = match args.get(1) {
         Some(other) => set_iter_items(other)?.into_iter().collect(),
-        None => return Ok(Object::Set(Rc::new(RefCell::new(a)))),
+        None => return Ok(set_result_like(args.first(), a)),
     };
     let mut out = crate::object::SetData::new();
     for k in a.iter().filter(|k| !b.contains(*k)) {
@@ -8578,8 +8895,7 @@ fn set_symmetric_difference(args: &[Object]) -> Result<Object, RuntimeError> {
     for k in b.iter().filter(|k| !a.contains(*k)) {
         out.insert(k.clone());
     }
-    let _ = &mut a;
-    Ok(Object::Set(Rc::new(RefCell::new(out))))
+    Ok(set_result_like(args.first(), out))
 }
 
 fn set_issubset(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8629,11 +8945,16 @@ fn set_difference_update(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("frozenset is immutable"));
     }
     if let Object::Set(s) = set_self(args)? {
+        // Compute on a snapshot so the element `__hash__`/`__eq__` we
+        // invoke (which may re-enter and clear `s`) never runs while we
+        // hold `s.borrow_mut()` — see the bpo-46615 note in `set_intersection_update`.
+        let mut keep: crate::object::SetData = s.borrow().clone();
         for other in args.iter().skip(1) {
             for k in set_iter_items(other)? {
-                s.borrow_mut().shift_remove(&k);
+                keep.shift_remove(&k);
             }
         }
+        *s.borrow_mut() = keep;
     }
     Ok(Object::None)
 }
@@ -10326,6 +10647,36 @@ pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
 /// on binary-mode files (the method table gates on `f.binary`).
 pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    // A writable `memoryview` is a valid target (CPython's `readinto`
+    // accepts any read-write buffer). asyncio's `_sock_sendfile_fallback`
+    // hands `file.readinto` a `memoryview(bytearray(...))`.
+    if let Some(Object::MemoryView(mv)) = args.get(1) {
+        if mv.released.get() {
+            return Err(value_error(
+                "operation forbidden on released memoryview object",
+            ));
+        }
+        if mv.readonly.get() || !mv.is_c_contiguous() {
+            return Err(type_error(
+                "readinto() argument must be read-write bytes-like object, not memoryview",
+            ));
+        }
+        let capacity = mv.len.get();
+        let bytes = f.read_bytes(Some(capacity))?;
+        let n = bytes.len();
+        match &mv.buffer {
+            crate::object::MemoryViewBuffer::ByteArray(b) => {
+                let start = mv.start.get();
+                b.borrow_mut()[start..start + n].copy_from_slice(&bytes);
+            }
+            crate::object::MemoryViewBuffer::Bytes(_) => {
+                return Err(type_error(
+                    "readinto() argument must be read-write bytes-like object, not memoryview",
+                ));
+            }
+        }
+        return Ok(Object::Int(n as i64));
+    }
     let target = match args.get(1) {
         Some(Object::ByteArray(b)) => b.clone(),
         Some(Object::Instance(inst)) => match &inst.native {

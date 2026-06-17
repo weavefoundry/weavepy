@@ -107,6 +107,16 @@ def skip_unless_bind_unix_socket(test):
             os_helper.unlink(addr)
 
 
+def skip_if_tcp_blackhole(test):
+    """Decorator skipping *test* on hosts with a TCP blackhole sysctl.
+
+    CPython probes a macOS-only `net.inet.tcp.blackhole` sysctl that, when
+    set, silently drops packets and would hang connection tests. WeavePy's
+    test hosts don't enable it, so this is a pass-through (never skips).
+    """
+    return test
+
+
 @contextlib.contextmanager
 def transient_internet(resource_name, *, timeout=30.0, errnos=()):
     """Turn transient network failures inside the block into skips."""

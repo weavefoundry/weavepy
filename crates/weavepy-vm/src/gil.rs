@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::sync::GilLock;
 
@@ -186,6 +186,20 @@ pub struct GilState {
     /// nested `PyGILState_Ensure` / `_Release` pair doesn't
     /// drop the lock prematurely).
     pub depth: AtomicI64,
+    /// Monotonic counter bumped on every successful (blocking)
+    /// `acquire`. The cooperative hand-off in
+    /// [`periodic_gil_checkpoint`] reads it before dropping the
+    /// GIL and waits for it to advance, proving another thread
+    /// actually took the lock before re-acquiring. This is
+    /// WeavePy's analogue of CPython's `gil->switch_number`.
+    pub switch_number: AtomicU64,
+    /// Paired with [`Self::switch_cond`] to implement CPython's
+    /// `gil->switch_cond` blocking hand-off: a thread that drops the
+    /// GIL for a waiter parks here until [`Self::switch_number`]
+    /// advances (proving the waiter took the lock), instead of
+    /// burning CPU in a `sched_yield` spin.
+    pub switch_mutex: Mutex<()>,
+    pub switch_cond: Condvar,
     /// Pending-call queue. `EvalBreaker::pending_calls` mirrors
     /// the size for the hot-path probe.
     pub pending: Mutex<Vec<PendingCall>>,
@@ -204,8 +218,23 @@ impl GilState {
             breaker: EvalBreaker::new(),
             holder: AtomicU64::new(0),
             depth: AtomicI64::new(0),
+            switch_number: AtomicU64::new(0),
+            switch_mutex: Mutex::new(()),
+            switch_cond: Condvar::new(),
             pending: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Bump `switch_number` and wake any thread parked in
+    /// [`maybe_yield_gil`] waiting to confirm the hand-off. Called
+    /// from both `acquire` paths right after the lock is taken.
+    #[inline]
+    fn note_acquired(&self) {
+        self.switch_number.fetch_add(1, Ordering::AcqRel);
+        // notify_all on a parking_lot Condvar doesn't require holding
+        // `switch_mutex`; the yielder re-checks `switch_number` under
+        // the mutex so this can't lose a wakeup.
+        self.switch_cond.notify_all();
     }
 
     /// Acquire the GIL on behalf of the calling thread. Returns
@@ -214,6 +243,7 @@ impl GilState {
         self.breaker.add_waiter();
         let lock_guard = self.lock.lock();
         self.breaker.remove_waiter();
+        self.note_acquired();
         let me = current_thread_id();
         self.holder.store(me, Ordering::Release);
         self.depth.fetch_add(1, Ordering::AcqRel);
@@ -236,6 +266,7 @@ impl GilState {
     /// Try to acquire without blocking.
     pub fn try_acquire(self: &Arc<Self>) -> Option<GilGuard> {
         let lock_guard = self.lock.try_lock()?;
+        self.note_acquired();
         let me = current_thread_id();
         self.holder.store(me, Ordering::Release);
         self.depth.fetch_add(1, Ordering::AcqRel);
@@ -352,6 +383,38 @@ pub fn global_gil() -> Arc<GilState> {
     GLOBAL.get_or_init(|| Arc::new(GilState::new())).clone()
 }
 
+// ---------------------------------------------------------------------------
+// Main-thread identification — RFC 0039.
+//
+// Simulated signals (`_thread.interrupt_main`, `signal.raise_signal`)
+// are always *handled* on the main thread, mirroring CPython's
+// `PyErr_CheckSignals`. The dispatch loop drains tripped signals only
+// when it's running on the main thread, so we record that thread's OS
+// id once and compare against it cheaply.
+// ---------------------------------------------------------------------------
+
+/// OS id of the thread that runs `__main__` — where signal handlers
+/// run. Zero until [`mark_main_thread`] records it.
+static MAIN_THREAD_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Record the calling OS thread as the main Python thread. Idempotent:
+/// the first caller (the thread that enters `run_module`) wins, so
+/// re-entrant `run_module` calls (the in-process conformance runner)
+/// don't reassign it.
+pub fn mark_main_thread() {
+    let me = current_thread_id();
+    let _ = MAIN_THREAD_ID.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed);
+}
+
+/// Whether the calling thread is the main Python thread. Used to gate
+/// signal-handler delivery to the main thread. If no main thread has
+/// been marked yet (`mark_main_thread` never ran), treats the caller as
+/// main so a bare interpreter embedding still services signals.
+pub fn is_main_thread() -> bool {
+    let main = MAIN_THREAD_ID.load(Ordering::Acquire);
+    main == 0 || main == current_thread_id()
+}
+
 // RFC 0025: a thread-local stack of `GilGuard`s, owned per-OS-thread.
 // Both the C-API's `PyGILState_Ensure` / `PyEval_SaveThread` and the
 // VM's worker-thread entry pre-push their guard here so any Rust
@@ -422,6 +485,148 @@ pub fn allow_threads_then<R>(f: impl FnOnce() -> R) -> R {
     }
     GIL_GUARD_STACK.with(|cell| *cell.borrow_mut() = fresh);
     result
+}
+
+/// How many dispatch-loop opcodes elapse between cooperative GIL
+/// hand-off checks. CPython switches on a 5ms wall-clock interval;
+/// we approximate with an opcode countdown that's cheap to test in
+/// the hot path (a thread-local decrement, no atomics).
+const GIL_CHECK_INTERVAL: u32 = 128;
+
+std::thread_local! {
+    static YIELD_COUNTDOWN: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(GIL_CHECK_INTERVAL) };
+
+    /// Depth of nested "no cooperative GIL hand-off" critical sections
+    /// on this thread. While `> 0`, [`maybe_yield_gil`] refuses to drop
+    /// the GIL at a periodic checkpoint.
+    ///
+    /// RFC 0039 (WS5): a [`crate::sync::GilCell`] borrow holds the
+    /// cell's reentrant mutex for the borrow's whole lifetime. If the
+    /// GIL were handed off while that mutex is held — e.g. a
+    /// `set.add(x)` / `d[k] = v` that runs a Python `__hash__`/`__eq__`
+    /// mid-insert — another thread could take the GIL and then block
+    /// forever on the *same* cell's mutex inside `try_borrow_mut`
+    /// (a GIL ↔ cell-mutex lock inversion). The holder, parked waiting
+    /// to re-acquire the GIL, never finishes the insert nor releases the
+    /// borrow, so every thread (and even a daemon watchdog) starves.
+    ///
+    /// Re-entrant container hash/eq therefore run inside one of these
+    /// sections, so the insert completes atomically with respect to
+    /// thread switches — matching the observable result CPython
+    /// produces. Blocking releases ([`allow_threads_then`]) are
+    /// deliberately *unaffected*: a `__hash__` that waits on a
+    /// `threading.Lock` must still drop the GIL so the holder can run.
+    static NO_YIELD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Enter a critical section in which the cooperative per-opcode GIL
+/// hand-off is suppressed. Returns a guard that leaves the section on
+/// drop; the deferred hand-off resumes at the next checkpoint once the
+/// outermost section exits. See [`NO_YIELD_DEPTH`] for the rationale.
+#[must_use]
+pub fn no_gil_handoff() -> NoYieldGuard {
+    NO_YIELD_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
+    NoYieldGuard(())
+}
+
+#[inline]
+fn no_yield_active() -> bool {
+    NO_YIELD_DEPTH.with(std::cell::Cell::get) > 0
+}
+
+/// RAII guard returned by [`no_gil_handoff`]. Decrements the
+/// thread-local critical-section depth on drop.
+#[allow(missing_debug_implementations)]
+pub struct NoYieldGuard(());
+
+impl Drop for NoYieldGuard {
+    fn drop(&mut self) {
+        NO_YIELD_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Cooperative GIL hand-off point, called from the bytecode
+/// dispatch loop once per instruction.
+///
+/// RFC 0039 (WS2): without this, a compute-bound thread holds the
+/// GIL forever (the only other release path is `allow_threads_then`,
+/// reached only on blocking I/O / lock waits). That starves every
+/// other thread — `threading.Thread.start()` would hang because the
+/// freshly-spawned worker can never acquire the GIL to signal
+/// `_started`. Mirrors CPython's `eval_breaker` / `gil_drop_request`
+/// switch driven by `sys.setswitchinterval`.
+///
+/// The fast path is a thread-local countdown decrement; the GIL is
+/// only actually dropped every [`GIL_CHECK_INTERVAL`] opcodes *and*
+/// only when another thread is blocked waiting for it.
+#[inline]
+pub fn periodic_gil_checkpoint() {
+    let fire = YIELD_COUNTDOWN.with(|c| {
+        let n = c.get();
+        if n <= 1 {
+            c.set(GIL_CHECK_INTERVAL);
+            true
+        } else {
+            c.set(n - 1);
+            false
+        }
+    });
+    if fire {
+        maybe_yield_gil();
+    }
+}
+
+/// Hand the GIL to a waiting thread, if any. Drops the calling
+/// thread's guard stack (releasing the lock), spins briefly so a
+/// waiter can take it, then re-acquires. No-op when nobody is
+/// waiting or when this thread doesn't hold the GIL via the stack.
+fn maybe_yield_gil() {
+    // RFC 0039 (WS5): never hand off the GIL while this thread is in a
+    // no-yield critical section — i.e. holding a container's `GilCell`
+    // mutex across a re-entrant Python `__hash__`/`__eq__`. Yielding
+    // there risks a GIL ↔ cell-mutex deadlock (see `NO_YIELD_DEPTH`).
+    // The hand-off simply resumes at the next checkpoint once the
+    // section exits, a few opcodes later.
+    if no_yield_active() {
+        return;
+    }
+    let gil = global_gil();
+    if gil.breaker.waiter_count() == 0 {
+        return;
+    }
+    let popped: Vec<GilGuard> =
+        GIL_GUARD_STACK.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    if popped.is_empty() {
+        // No guard on this thread's stack — we're in a nested native
+        // context that didn't push one. Nothing to hand off.
+        return;
+    }
+    let count = popped.len();
+    let gen = gil.switch_number.load(Ordering::Acquire);
+    drop(popped); // releases the GIL
+                  // Park on `switch_cond` until a waiter actually takes the lock
+                  // (`switch_number` advances) rather than spinning on `sched_yield`.
+                  // This is CPython's `gil->switch_cond` hand-off: cheap to wait,
+                  // no CPU burn, and the bounded `wait_for` is a safety net against
+                  // a waiter that vanished between the count check and the park.
+    {
+        let mut guard = gil.switch_mutex.lock();
+        while gil.switch_number.load(Ordering::Acquire) == gen && gil.breaker.waiter_count() > 0 {
+            if gil
+                .switch_cond
+                .wait_for(&mut guard, Duration::from_millis(5))
+                .timed_out()
+            {
+                break;
+            }
+        }
+    }
+    let mut fresh = Vec::with_capacity(count);
+    for _ in 0..count {
+        fresh.push(gil.acquire());
+    }
+    GIL_GUARD_STACK.with(|cell| *cell.borrow_mut() = fresh);
 }
 
 /// Best-effort current-thread native id. Returns the OS thread

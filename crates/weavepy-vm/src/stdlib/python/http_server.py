@@ -39,17 +39,43 @@ _RESPONSES = {
 class HTTPServer:
     """A simple single-threaded HTTP server."""
 
-    def __init__(self, server_address, RequestHandlerClass):
+    allow_reuse_address = 1
+
+    def __init__(self, server_address, RequestHandlerClass,
+                 bind_and_activate=True):
         self.server_address = server_address
         self.RequestHandlerClass = RequestHandlerClass
         self.socket = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-        try:
-            self.socket.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        except OSError:
-            pass
-        self.socket.bind(server_address)
-        self.socket.listen(5)
         self._running = False
+        if bind_and_activate:
+            try:
+                self.server_bind()
+                self.server_activate()
+            except:
+                self.server_close()
+                raise
+
+    def server_bind(self):
+        # Mirror CPython's HTTPServer.server_bind: rebind, then refresh
+        # `server_address` from `getsockname()` so an ephemeral (port 0)
+        # bind exposes the *real* port to clients — otherwise callers
+        # connect to port 0 and get EADDRNOTAVAIL. Subclasses
+        # (e.g. wsgiref's WSGIServer) override this and call up, so it
+        # must exist as a hook rather than being inlined into __init__.
+        if self.allow_reuse_address:
+            try:
+                self.socket.setsockopt(_socket.SOL_SOCKET,
+                                       _socket.SO_REUSEADDR, 1)
+            except OSError:
+                pass
+        self.socket.bind(self.server_address)
+        self.server_address = self.socket.getsockname()
+        host, port = self.server_address[:2]
+        self.server_name = _socket.getfqdn(host)
+        self.server_port = port
+
+    def server_activate(self):
+        self.socket.listen(5)
 
     def serve_forever(self, poll_interval=0.5):
         self._running = True
@@ -238,15 +264,32 @@ class BaseHTTPRequestHandler:
                 pos[0] += len(data)
                 return data
 
-            def readline(self):
+            def readline(self, size=-1):
                 idx = body.find(b"\n", pos[0])
                 if idx == -1:
-                    data = body[pos[0]:]
-                    pos[0] = len(body)
-                    return data
-                data = body[pos[0]:idx + 1]
-                pos[0] = idx + 1
+                    end = len(body)
+                else:
+                    end = idx + 1
+                if size is not None and size >= 0:
+                    end = min(end, pos[0] + size)
+                data = body[pos[0]:end]
+                pos[0] = end
                 return data
+
+            def readlines(self, hint=-1):
+                lines = []
+                while True:
+                    line = self.readline()
+                    if not line:
+                        break
+                    lines.append(line)
+                return lines
+
+            def __iter__(self):
+                return iter(self.readlines())
+
+            def close(self):
+                pass
         return _R()
 
     def send_error(self, code, message=None, explain=None):

@@ -5,15 +5,15 @@
 //! CPython solved this with a generational tracing collector
 //! sitting on top of refcounting; we follow the same design.
 //!
-//! Note: `Arc<TrackedHandle>` triggers Clippy's
-//! `arc_with_non_send_sync` because `TrackedHandle` holds an
-//! `Object`, which contains `Rc`s (`!Send`). That's intentional
-//! in the sub-interpreter-per-thread model — handles never cross
-//! thread boundaries; we use `Arc` only because the GC and the
-//! weakref registry both need shared ownership of the same slot
-//! within a single thread. Suppressed module-wide.
-
-#![allow(clippy::arc_with_non_send_sync)]
+//! The collector is **process-global** (see [`with_state`]): after
+//! RFC 0025 the heap is `Arc`-rooted and `Object` is `Send + Sync`,
+//! so objects — and the cycles they form — routinely span OS threads.
+//! A single shared `GcState` is the only design that can break a
+//! cross-thread cycle, and it mirrors CPython's one-collector-per-
+//! interpreter model. `Arc<TrackedHandle>` gives the collector and
+//! the weakref registry shared ownership of each slot; the `Arc` is
+//! genuinely `Send + Sync` now, so no Clippy suppression is needed for
+//! it.
 //!
 //! The model:
 //!
@@ -85,6 +85,19 @@ use crate::weakref_registry::{id_of, ObjectId};
 pub const N_GENERATIONS: usize = 3;
 pub const DEFAULT_THRESHOLDS: [usize; N_GENERATIONS] = [700, 10, 10];
 
+/// Upper bound on the number of mark-sweep passes a single
+/// [`GcState::collect`] runs to reach a fixpoint. Convergence is normally 2–3
+/// passes (one to clear the bulk, one or two to drop subgraphs a transient
+/// reference pinned); the cap only guards against pathological churn. Also
+/// bounds the collect→finalize→collect retry loop the interpreter runs to
+/// settle `__del__` chains within a single `gc.collect()`.
+pub const MAX_COLLECT_PASSES: usize = 16;
+
+/// `gc.DEBUG_SAVEALL`: instead of freeing unreachable objects, append them to
+/// `gc.garbage` so a debugging session can inspect what would have been
+/// collected. Mirrors CPython's `gc.set_debug(gc.DEBUG_SAVEALL)`.
+const DEBUG_SAVEALL: i64 = 0x20;
+
 /// Walk all child references reachable through `obj`. Used by
 /// the GC's mark phase. Container types should implement this;
 /// leaf types do nothing.
@@ -123,9 +136,23 @@ pub struct TrackedHandle {
     /// Generation index (0..N_GENERATIONS). Survivors are
     /// promoted by incrementing this.
     pub generation: AtomicUsize,
-    /// Has this object's `__del__` already run? CPython
+    /// Position of this handle within its owning `Vec` —
+    /// `generations[generation].handles` normally, or the `frozen`
+    /// list when `color == Frozen`. Maintained by every site that
+    /// pushes, drains, or rebuilds those vectors so that
+    /// [`GcState::untrack_id`] can `swap_remove` in O(1) instead of
+    /// scanning every generation (which made drop-heavy,
+    /// large-heap workloads quadratic — RFC 0039 WS4).
+    pub slot: AtomicUsize,
+    /// Has this object's `__del__` already *run* to completion? CPython
     /// guarantees a finaliser runs at most once.
     pub finalized: AtomicBool,
+    /// Has this object's `__del__` been *queued* by a collection but not yet
+    /// run? While set, the object is kept tracked and excluded from the
+    /// `collected` count: its finalizer (drained after `gc.collect()` returns)
+    /// may resurrect it, and CPython only counts objects that are actually
+    /// reclaimed. Cleared once the finalizer completes (`finalized` is set).
+    pub finalize_queued: AtomicBool,
 }
 
 #[allow(non_upper_case_globals)]
@@ -144,8 +171,26 @@ impl TrackedHandle {
             gc_refs: AtomicI64::new(0),
             color: AtomicI64::new(color::White),
             generation: AtomicUsize::new(generation),
+            slot: AtomicUsize::new(0),
             finalized: AtomicBool::new(false),
+            finalize_queued: AtomicBool::new(false),
         }
+    }
+}
+
+/// Swap-remove the handle at `slot` from `vec`, fixing up the slot
+/// index of whatever handle gets moved into the vacated position.
+/// O(1): the only handle whose position changes is the one swapped
+/// in from the end, and its `slot` field is corrected here so the
+/// per-handle position invariant holds after the call.
+#[inline]
+fn swap_remove_handle(vec: &mut Vec<Arc<TrackedHandle>>, slot: usize) {
+    if slot >= vec.len() {
+        return;
+    }
+    vec.swap_remove(slot);
+    if let Some(moved) = vec.get(slot) {
+        moved.slot.store(slot, Ordering::Release);
     }
 }
 
@@ -166,10 +211,14 @@ pub struct GcStats {
 
 /// Public state of the cycle GC.
 ///
-/// Lives per-interpreter (per-OS-thread, in the sub-interpreter
-/// model). Stored in a `thread_local!` so cross-thread sharing
-/// of `Object`s — which is forbidden by `Rc`'s `!Send` contract
-/// anyway — is impossible by construction.
+/// A single instance lives in a process-global `LazyLock` (see
+/// [`with_state`]) and is shared by every OS thread, mirroring
+/// CPython's one-collector-per-interpreter model. This is required
+/// for correctness: post-RFC-0025 the heap is `Arc`-rooted and a
+/// cycle's links can be allocated on different threads, so only a
+/// shared tracked-set can ever observe and break such a cycle. All
+/// fields are `Sync` (interior `GilCell`s + atomics), so concurrent
+/// access is memory-safe; the GIL additionally serializes mutators.
 #[allow(missing_debug_implementations)]
 pub struct GcState {
     generations: RefCell<[Generation; N_GENERATIONS]>,
@@ -182,8 +231,11 @@ pub struct GcState {
     /// Re-entrancy guard: a collection can indirectly allocate (e.g.
     /// queued finalizers running Python at the next safe point may
     /// re-enter `track`), and a nested collection would see torn
-    /// generation lists.
-    collecting: std::cell::Cell<bool>,
+    /// generation lists. An `AtomicBool` (rather than a `Cell`) so the
+    /// whole `GcState` is `Sync` and can live in a process-global
+    /// `LazyLock` — the cycle collector is shared across every OS
+    /// thread, matching the `Arc`-rooted shared heap (RFC 0039 WS4).
+    collecting: AtomicBool,
     /// Per-generation thresholds. Gen 0's threshold is
     /// "allocations since last gen 0 collection"; gens 1 and 2
     /// are "collections of the previous gen since last
@@ -214,6 +266,11 @@ pub struct GcState {
     /// Total tracked-object population (live count). Useful
     /// for `gc.get_count` and for the threshold check.
     pub tracked_count: AtomicUsize,
+    /// Ids whose `__del__` has been run (or queued) by a finalizing
+    /// collection or teardown. Persists past the point where the handle
+    /// leaves the tracked set so `gc.is_finalized()` still answers `True`
+    /// for an object its finalizer resurrected (PEP 442 / `test_is_finalized`).
+    finalized_ids: RefCell<std::collections::HashSet<ObjectId>>,
 }
 
 impl Default for GcState {
@@ -272,7 +329,7 @@ impl GcState {
         Self {
             generations: RefCell::new(Default::default()),
             index: RefCell::new(std::collections::HashMap::new()),
-            collecting: std::cell::Cell::new(false),
+            collecting: AtomicBool::new(false),
             thresholds: RefCell::new(DEFAULT_THRESHOLDS),
             counts: RefCell::new([0; N_GENERATIONS]),
             frozen: RefCell::new(Vec::new()),
@@ -283,6 +340,33 @@ impl GcState {
             enabled: AtomicBool::new(true),
             tracked_version: AtomicUsize::new(0),
             tracked_count: AtomicUsize::new(0),
+            finalized_ids: RefCell::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Record that `id`'s finalizer has been run (or queued). Survives the
+    /// handle's removal from the tracked set so `gc.is_finalized` keeps
+    /// answering `True` for a resurrected object.
+    pub fn note_finalized(&self, id: ObjectId) {
+        self.finalized_ids.borrow_mut().insert(id);
+    }
+
+    /// Has `id`'s finalizer already run? Backs `gc.is_finalized`.
+    pub fn was_finalized(&self, id: ObjectId) -> bool {
+        self.finalized_ids.borrow().contains(&id)
+    }
+
+    /// Record that `id`'s finalizer has finished running: set `finalized`,
+    /// clear the `finalize_queued` deferral flag, and remember it for
+    /// `gc.is_finalized`. Called by the interpreter the moment a queued
+    /// `__del__` returns, so the next collection treats a non-resurrected
+    /// object as plain dead garbage (and a resurrected one is never
+    /// re-finalized).
+    pub fn complete_finalizer(&self, id: ObjectId) {
+        self.note_finalized(id);
+        if let Some(h) = self.handle_for(id) {
+            h.finalized.store(true, Ordering::Release);
+            h.finalize_queued.store(false, Ordering::Release);
         }
     }
 
@@ -297,8 +381,16 @@ impl GcState {
             }
             let handle = Arc::new(TrackedHandle::new(obj, 0));
             index.insert(new_id, handle.clone());
-            self.generations.borrow_mut()[0].handles.push(handle);
+            let mut gens = self.generations.borrow_mut();
+            handle.slot.store(gens[0].handles.len(), Ordering::Release);
+            gens[0].handles.push(handle);
         }
+        // `finalized_ids` is keyed by object id (a pointer), which the
+        // allocator recycles. A freshly tracked object at a recycled address
+        // must start *un*-finalized, so drop any stale entry — otherwise
+        // `gc.is_finalized(new_obj)` would inherit the previous tenant's
+        // finalized flag (`test_is_finalized`).
+        self.finalized_ids.borrow_mut().remove(&new_id);
         self.tracked_count.fetch_add(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
         self.bump_count(0);
@@ -308,19 +400,97 @@ impl GcState {
     /// after an object is reclaimed, and by the explicit
     /// `gc._untrack(obj)` extension.
     pub fn untrack_id(&self, id: ObjectId) {
-        if self.index.borrow_mut().remove(&id).is_none() {
+        let Some(handle) = self.index.borrow_mut().remove(&id) else {
             return;
+        };
+        // O(1) removal via the handle's cached `slot`. The index is the
+        // dedupe authority, so exactly one handle existed for `id`, and
+        // its `slot`/`generation`/`color` pinpoint its position without a
+        // per-generation scan (which made drop-heavy large heaps
+        // quadratic — RFC 0039 WS4).
+        let slot = handle.slot.load(Ordering::Acquire);
+        if handle.color.load(Ordering::Acquire) == color::Frozen {
+            let mut frozen = self.frozen.borrow_mut();
+            debug_assert!(
+                frozen.get(slot).is_some_and(|h| Arc::ptr_eq(h, &handle)),
+                "frozen slot index out of sync"
+            );
+            swap_remove_handle(&mut frozen, slot);
+        } else {
+            let g = handle
+                .generation
+                .load(Ordering::Acquire)
+                .min(N_GENERATIONS - 1);
+            let mut gens = self.generations.borrow_mut();
+            debug_assert!(
+                gens[g]
+                    .handles
+                    .get(slot)
+                    .is_some_and(|h| Arc::ptr_eq(h, &handle)),
+                "generation slot index out of sync"
+            );
+            swap_remove_handle(&mut gens[g].handles, slot);
         }
-        let mut gens = self.generations.borrow_mut();
-        for gen in gens.iter_mut() {
-            gen.handles.retain(|h| h.id != id);
-        }
-        drop(gens);
-        self.frozen.borrow_mut().retain(|h| h.id != id);
-        // The index is the dedupe authority, so exactly one handle
-        // existed for `id`.
         self.tracked_count.fetch_sub(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Reclaim every tracked object on this thread whose only remaining
+    /// strong reference is the cycle collector's own handle — dead
+    /// *acyclic* garbage that CPython's refcounting frees the instant
+    /// its last binding drops, but which our per-thread strong handle
+    /// pins until a collection. Skips finalizable objects (their
+    /// `__del__` must be ordered by a finalizing collection) and
+    /// weakref-watched objects (clearing their weakrefs runs user
+    /// callbacks). Because every survivor of these filters runs no
+    /// Python on the way out, this is safe to call from any GIL-holding
+    /// safe point — notably a `Thread.join` return, where a worker has
+    /// just dropped the last *program* reference to objects this thread
+    /// allocated (RFC 0039 WS4: cross-thread prompt reclamation across
+    /// the per-thread-heap boundary). Iterates to a fixpoint so freeing
+    /// one object reclaims any acyclic chain it anchored. Returns the
+    /// number of objects reclaimed.
+    pub fn reap_dead_acyclic(&self) -> usize {
+        // A collection already walks the same set; never re-enter it.
+        if self.collecting.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut reclaimed = 0usize;
+        loop {
+            let dead: Vec<ObjectId> = {
+                let index = self.index.borrow();
+                index
+                    .iter()
+                    .filter(|(id, h)| {
+                        strong_count_for(&h.object) <= 1
+                            && !has_finalizer(&h.object)
+                            && crate::weakref_registry::count_for(**id) == 0
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            };
+            if dead.is_empty() {
+                break;
+            }
+            for id in dead {
+                // Re-validate under a fresh borrow: a free earlier in this
+                // batch may have already reclaimed `id` as a child, or
+                // (it cannot here, counts only fall) revived it.
+                let still_dead = match self.index.borrow().get(&id) {
+                    Some(h) => {
+                        strong_count_for(&h.object) <= 1
+                            && !has_finalizer(&h.object)
+                            && crate::weakref_registry::count_for(id) == 0
+                    }
+                    None => false,
+                };
+                if still_dead {
+                    self.untrack_id(id);
+                    reclaimed += 1;
+                }
+            }
+        }
+        reclaimed
     }
 
     pub fn is_tracked(&self, id: ObjectId) -> bool {
@@ -340,16 +510,24 @@ impl GcState {
     /// the cycle collector) guarantees each `__del__` runs at most once.
     pub fn finalization_candidates(&self) -> Vec<Arc<TrackedHandle>> {
         let mut out = Vec::new();
+        let pending = |h: &Arc<TrackedHandle>| {
+            !h.finalized.load(Ordering::Acquire)
+                // A finalizer already queued by a collection (but not yet
+                // drained) must not be listed again — the pending queue owns
+                // it, and running it twice would double-fire `__del__`.
+                && !h.finalize_queued.load(Ordering::Acquire)
+                && has_finalizer(&h.object)
+        };
         let gens = self.generations.borrow();
         for gen in gens.iter() {
             for h in &gen.handles {
-                if !h.finalized.load(Ordering::Acquire) && has_finalizer(&h.object) {
+                if pending(h) {
                     out.push(h.clone());
                 }
             }
         }
         for h in self.frozen.borrow().iter() {
-            if !h.finalized.load(Ordering::Acquire) && has_finalizer(&h.object) {
+            if pending(h) {
                 out.push(h.clone());
             }
         }
@@ -393,15 +571,15 @@ impl GcState {
     /// Callers must be at a safe point (no outstanding container
     /// borrows); the interpreter invokes this from its allocation
     /// sites.
-    pub fn maybe_auto_collect(&self) -> usize {
-        if !self.is_enabled() || self.collecting.get() {
-            return 0;
+    pub fn maybe_auto_collect(&self) -> bool {
+        if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
+            return false;
         }
         let (count0, eligible) = {
             let counts = self.counts.borrow();
             let thresholds = self.thresholds.borrow();
             if thresholds[0] == 0 {
-                return 0;
+                return false;
             }
             let mut gen = 0;
             if counts[1] + 1 >= thresholds[1] {
@@ -413,9 +591,15 @@ impl GcState {
             (counts[0] >= thresholds[0], gen)
         };
         if !count0 {
-            return 0;
+            return false;
         }
-        self.collect(eligible)
+        // Automatic young collection: single incremental pass, no whole-index
+        // acyclic reap (see `collect_impl`'s `exact` discussion). Report that a
+        // collection ran (regardless of how many objects it reclaimed) so the
+        // caller drains any `__del__` finalizers it deferred — without paying a
+        // pending-queue probe on every allocation.
+        self.collect_impl(eligible, false);
+        true
     }
 
     /// Total population (across all generations + frozen).
@@ -463,6 +647,7 @@ impl GcState {
         for g in gens.iter_mut() {
             for h in g.handles.drain(..) {
                 h.color.store(color::Frozen, Ordering::Release);
+                h.slot.store(frozen.len(), Ordering::Release);
                 frozen.push(h);
             }
         }
@@ -472,11 +657,15 @@ impl GcState {
     /// `gc.unfreeze()` — move every frozen object back to
     /// generation 0.
     pub fn unfreeze_all(&self) {
-        let mut frozen = self.frozen.borrow_mut();
+        // Lock order: generations before frozen, matching `freeze_all`
+        // (consistent ordering avoids a cross-cell deadlock now that the
+        // GC is process-global — RFC 0039 WS4).
         let mut gens = self.generations.borrow_mut();
+        let mut frozen = self.frozen.borrow_mut();
         for h in frozen.drain(..) {
             h.color.store(color::White, Ordering::Release);
             h.generation.store(0, Ordering::Release);
+            h.slot.store(gens[0].handles.len(), Ordering::Release);
             gens[0].handles.push(h);
         }
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
@@ -488,15 +677,73 @@ impl GcState {
 
     /// Collect generations `0..=upto`. Returns the number of
     /// objects reclaimed.
+    ///
+    /// Runs regardless of `gc.isenabled()`: CPython's `gc.disable()` only
+    /// suppresses the *automatic*, threshold-driven collections (see
+    /// [`Self::maybe_auto_collect`]); an explicit `gc.collect()` always runs a
+    /// full sweep. (`test_gc` disables the collector module-wide via
+    /// `setUpModule` and then asserts that explicit collections still reclaim
+    /// cycles.) The re-entrancy guard still applies — a collection triggered
+    /// from inside a collection (e.g. an allocating finalizer) is a no-op.
     pub fn collect(&self, upto: usize) -> usize {
-        if !self.is_enabled() || self.collecting.get() {
+        // An explicit `gc.collect()` is "exact": it reaps acyclic dead and
+        // iterates to a fixpoint so the returned count matches CPython.
+        self.collect_impl(upto, true)
+    }
+
+    /// Shared collection body. `exact` selects between the two cost/precision
+    /// profiles:
+    ///
+    /// * `true` — an explicit `gc.collect()`. Reap acyclic dead up front (so
+    ///   they stay out of the cyclic count and `DEBUG_SAVEALL`) and iterate the
+    ///   mark-sweep to a fixpoint, reproducing CPython's "one call reclaims all
+    ///   current cyclic garbage" guarantee that `test_gc`'s exact-count
+    ///   assertions depend on.
+    /// * `false` — a threshold-driven *automatic* young collection. CPython's
+    ///   auto path is a single incremental pass (leftover garbage waits for the
+    ///   next trigger or an explicit collect), so we skip both the whole-index
+    ///   acyclic reap and the fixpoint loop. That keeps the per-allocation cost
+    ///   flat: with the reap+fixpoint on every auto-collect, an allocation-heavy
+    ///   suite (`test_set`'s mutation stress) re-scanned the entire accumulated
+    ///   tracked set several times per trigger and blew the time budget.
+    fn collect_impl(&self, upto: usize, exact: bool) -> usize {
+        if self.collecting.load(Ordering::Acquire) {
             return 0;
         }
-        self.collecting.set(true);
+        if exact {
+            // Reap dead *acyclic* garbage first. CPython frees these by refcount
+            // the instant their last binding drops, so they never reach the
+            // cycle collector; we pin them on the registry handle until now.
+            // Doing it up front keeps them out of the cyclic `collected` count
+            // *and* out of `gc.garbage` under `DEBUG_SAVEALL` (`test_saveall`
+            // asserts only the genuine cycle is saved, not an incidental dead
+            // `[]` temporary).
+            self.reap_dead_acyclic();
+        }
+        self.collecting.store(true, Ordering::Release);
         let gen = upto.min(N_GENERATIONS - 1);
-        // One merged pass: `collect_generation(gen)` already takes
-        // every younger generation as part of its candidate set.
-        let collected = self.collect_generation(gen);
+        // Iterate the mark-sweep to a fixpoint (exact only). Reachability is
+        // seeded from an *approximate* outer refcount (`Rc::strong_count`), so a
+        // transient Rust-side reference (an operand-stack slot not yet
+        // overwritten, an in-flight clone) can make a dead object — and
+        // everything reachable only through it — look live for a single pass.
+        // CPython's collector is refcount-exact and reclaims *all* current
+        // cyclic garbage in one `gc.collect()`; the count tests in `test_gc`
+        // (`gc.collect()` returns exactly the cycle size) depend on that
+        // completeness. Repeating until a pass collects nothing reproduces it:
+        // each pass re-seeds from a fresh refcount snapshot, so a reference that
+        // was transient last pass no longer pins its subgraph. Passes collect a
+        // strictly shrinking set, so this converges quickly; the cap is a guard
+        // against pathological churn.
+        let passes = if exact { MAX_COLLECT_PASSES } else { 1 };
+        let mut collected = 0usize;
+        for _ in 0..passes {
+            let n = self.collect_generation(gen);
+            collected += n;
+            if n == 0 {
+                break;
+            }
+        }
         {
             let mut stats = self.stats.borrow_mut();
             stats[gen].collections = stats[gen].collections.saturating_add(1);
@@ -515,7 +762,7 @@ impl GcState {
                 counts[gen + 1] = counts[gen + 1].saturating_add(1);
             }
         }
-        self.collecting.set(false);
+        self.collecting.store(false, Ordering::Release);
         collected
     }
 
@@ -553,15 +800,112 @@ impl GcState {
         // phases 3 and 4 are O(1) — a linear `find` here makes the
         // whole collection quadratic, which generator-heavy programs
         // (itertools pipelines) hit hard.
-        let by_id: std::collections::HashMap<ObjectId, Arc<TrackedHandle>> =
+        let mut by_id: std::collections::HashMap<ObjectId, Arc<TrackedHandle>> =
             candidate_set.iter().map(|h| (h.id, h.clone())).collect();
+
+        // Phase 2b: promote untracked iterators reachable from the candidate
+        // set to *temporary* candidates for this pass only. CPython GC-tracks
+        // its `*_iterator` objects, so an iterator-mediated cycle (bug #3680:
+        // `obj.x = iter(set_containing_obj)`) is collectible: the iterator's
+        // single internal ref to the container has to be subtracted off the
+        // container's `gc_refs`, otherwise the container looks externally
+        // reachable and pins the whole cycle. We keep transient *loop*
+        // iterators untracked for speed (enrolling every `for`-loop iterator
+        // in a generation regressed allocation-heavy suites by triggering far
+        // more young collections); instead we discover only the iterators that
+        // are actually reachable from already-tracked objects, here, while a
+        // collection is already in flight. The temporary handles take part in
+        // the subtract/mark walk (so their edges are accounted) but never enter
+        // a generation, are never cleared/finalized, never touch the index, and
+        // are not counted as collected — they're dropped when this pass ends,
+        // and the underlying iterator is freed by refcount once the real
+        // objects in its (dead) cycle are cleared.
+        let mut temp_handles: Vec<Arc<TrackedHandle>> = Vec::new();
+        {
+            // `work` holds cheap `Arc` handles, never extra `Object` clones, so
+            // the only strong reference a discovered object gains is the one
+            // inside its temporary handle. Scanning `work` by index lets newly
+            // discovered objects extend it, so a private buffer reached through
+            // an iterator (and any iterator reached through that buffer) is
+            // promoted too. We promote untracked iterators and untracked
+            // `list` buffers: a snapshot iterator (`frozenset`/`dict.values()`/
+            // file) hands back a fresh, untracked `Object::List` for its
+            // buffer, whose `-> elements` edges have to be accounted for the
+            // cycle to collapse. An `iter(list)` shares the live list's buffer,
+            // which is already a real candidate and is found by id below.
+            let mut work: Vec<Arc<TrackedHandle>> = candidate_set.clone();
+            let mut scanned = 0usize;
+            while scanned < work.len() {
+                let h = work[scanned].clone();
+                scanned += 1;
+                // Immutable containers (tuple/frozenset) and iterators are not
+                // persistently GC-tracked — pinning them in a generation would
+                // hold transient `(type, value, tb)` triples and loop iterators
+                // alive past the point CPython frees them by refcount
+                // (`test_traceback`'s `getrefcount` asserts, the loop-iterator
+                // churn that regressed allocation-heavy suites). But a cycle can
+                // still *route through* one (`l=[]; t=(l,); l.append(t)`;
+                // `obj.x = iter(set_containing_obj)`), so we discover the ones
+                // reachable from the (mutable, tracked) candidate set here and
+                // promote them to temporary candidates: their internal edges are
+                // accounted, the dead ones are counted, and the handles are
+                // dropped when the pass ends (no persistent pinning).
+                //
+                // Lists are tracked at creation, so an *untracked* list is only
+                // ever an iterator's private snapshot buffer (`frozenset`/
+                // `dict.values()`/file iterators); promote those only when
+                // reached directly through an iterator, so we never re-scan the
+                // whole (already tracked) list population.
+                let parent_is_iter = matches!(&h.object, Object::Iter(_));
+                traverse_object(&h.object, &mut |child| {
+                    let promote = match child {
+                        Object::Iter(_) | Object::Tuple(_) | Object::FrozenSet(_) => true,
+                        Object::List(_) => parent_is_iter,
+                        _ => false,
+                    };
+                    if !promote {
+                        return;
+                    }
+                    let cid = id_of(child);
+                    if by_id.contains_key(&cid) {
+                        return;
+                    }
+                    let handle = Arc::new(TrackedHandle::new(child.clone(), 0));
+                    by_id.insert(cid, handle.clone());
+                    temp_handles.push(handle.clone());
+                    work.push(handle);
+                });
+            }
+            // Seed `gc_refs` *after* discovery: an iterator synthesises a fresh
+            // `Object::List`/`Object::Set` wrapper for its buffer on each
+            // traverse, and that wrapper is alive only for the duration of the
+            // `visit` call above. Computing the outer refcount here — once
+            // every such transient clone has been dropped — keeps the seed
+            // exact (referrers + the one clone the handle itself holds).
+            for handle in &temp_handles {
+                let weak_clones = crate::weakref_registry::strong_clone_count(handle.id) as i64;
+                let outer = strong_count_for(&handle.object)
+                    .saturating_sub(1)
+                    .saturating_sub(weak_clones as usize) as i64;
+                handle.gc_refs.store(outer, Ordering::Release);
+                handle.color.store(color::White, Ordering::Release);
+            }
+        }
+
+        // Real candidates plus the temporary iterator candidates take part in
+        // the subtract/mark walk; only the real ones are reclaimed below.
+        let scan_all: Vec<Arc<TrackedHandle>> = candidate_set
+            .iter()
+            .chain(temp_handles.iter())
+            .cloned()
+            .collect();
 
         // Phase 3: subtract internal refs by walking each
         // tracked object's children. Self-references count too —
         // a `self.self = self` instance has one internal ref to
         // itself which must be subtracted off so a pure self-cycle
         // collapses to gc_refs == 0.
-        for handle in &candidate_set {
+        for handle in &scan_all {
             traverse_object(&handle.object, &mut |child| {
                 if let Some(target) = by_id.get(&id_of(child)) {
                     target.gc_refs.fetch_sub(1, Ordering::AcqRel);
@@ -572,7 +916,7 @@ impl GcState {
         // Phase 4: anything with gc_refs > 0 is reachable from
         // outside; mark it black and propagate.
         let mut grey: Vec<Arc<TrackedHandle>> = Vec::new();
-        for handle in &candidate_set {
+        for handle in &scan_all {
             if handle.gc_refs.load(Ordering::Acquire) > 0 {
                 handle.color.store(color::Grey, Ordering::Release);
                 grey.push(handle.clone());
@@ -590,20 +934,102 @@ impl GcState {
             });
         }
 
-        // Phase 5: white objects are unreachable. Notify
-        // weakrefs, run finalisers, and clear container fields
-        // to break cycles.
+        // Phase 5: white objects are unreachable cyclic garbage.
         let unreachable: Vec<Arc<TrackedHandle>> = candidate_set
             .iter()
             .filter(|h| h.color.load(Ordering::Acquire) == color::White)
             .cloned()
             .collect();
-        let collected = unreachable.len();
 
-        // 5a: clear weakrefs for every unreachable object,
-        // queueing callbacks for invocation in 5d.
-        let mut weakref_callbacks = Vec::new();
+        // Split the unreachable set into objects whose `__del__` hasn't run
+        // yet ("deferred") and the rest. A deferred object is queued for
+        // finalization and kept tracked: its finalizer (drained right after
+        // `gc.collect()` returns control to the interpreter) might resurrect
+        // it, and CPython only counts objects it actually reclaims
+        // (`test_resurrection_*`). The interpreter then collects again — by
+        // which point the finalizer has set `finalized`, so a survivor that
+        // wasn't resurrected falls into `dead` and is reclaimed (its weakrefs
+        // cleared in that second pass, so single-`collect()` weakref tests
+        // still observe `ref() is None`).
+        let mut deferred: Vec<Arc<TrackedHandle>> = Vec::new();
+        let mut maybe_dead: Vec<Arc<TrackedHandle>> = Vec::new();
         for h in &unreachable {
+            let pending_finalizer =
+                has_finalizer(&h.object) && !h.finalized.load(Ordering::Acquire);
+            if pending_finalizer {
+                deferred.push(h.clone());
+            } else {
+                maybe_dead.push(h.clone());
+            }
+        }
+
+        // Queue each deferred object's finalizer (once) and recolor it Black so
+        // the reachability walk below can treat it as a protected root.
+        let mut protect_stack: Vec<Arc<TrackedHandle>> = Vec::new();
+        for h in &deferred {
+            if !h.finalize_queued.swap(true, Ordering::AcqRel) {
+                run_finalizer(&h.object);
+            }
+            h.color.store(color::Black, Ordering::Release);
+            protect_stack.push(h.clone());
+        }
+
+        // CPython runs `finalize_garbage` *before* `delete_garbage`, so a
+        // pending finalizer always sees its own class, closure cells, and
+        // referents intact — even when those are themselves unreachable cyclic
+        // garbage (a locally-defined class whose only instance is dying, the
+        // `__del__` function closing over the cycle, …). Reproduce that by
+        // protecting the whole finalizer-reachable subgraph: starting from the
+        // deferred roots, recolor every reachable White candidate Black so it
+        // survives this pass. Those objects are reclaimed by a later pass once
+        // the owning finalizer has run and they, too, are plain garbage.
+        // Without this, clearing the class/`__del__` mid-cycle left the queued
+        // finalizer running against a torn-down namespace (its writes no-oped).
+        while let Some(h) = protect_stack.pop() {
+            traverse_object(&h.object, &mut |child| {
+                if let Some(target) = by_id.get(&id_of(child)) {
+                    if target.color.load(Ordering::Acquire) == color::White {
+                        target.color.store(color::Black, Ordering::Release);
+                        protect_stack.push(target.clone());
+                    }
+                }
+            });
+        }
+
+        // Whatever stayed White after protecting the finalizer subgraph is
+        // genuinely dead this pass.
+        let dead: Vec<Arc<TrackedHandle>> = maybe_dead
+            .into_iter()
+            .filter(|h| h.color.load(Ordering::Acquire) == color::White)
+            .collect();
+        let collected = dead.len();
+
+        // Temporarily-promoted iterators / immutable containers (tuple,
+        // frozenset) that ended up White are genuine cyclic garbage: they'll be
+        // freed by refcount the moment the mutable anchor in their cycle is
+        // cleared just below. CPython counts each in the `gc.collect()` total
+        // (`test_tuple` asserts the closing tuple is counted alongside its
+        // list), so fold the dead real-object temporaries into the *reported*
+        // count. The private list buffers an iterator snapshots have no CPython
+        // counterpart, so they don't count; and none of these were ever in
+        // `tracked_count`, so that bookkeeping uses `collected` (real) below.
+        let mut reported = collected;
+        for h in &temp_handles {
+            if h.color.load(Ordering::Acquire) == color::White
+                && matches!(
+                    h.object,
+                    Object::Iter(_) | Object::Tuple(_) | Object::FrozenSet(_)
+                )
+            {
+                reported += 1;
+            }
+        }
+
+        // 5a: clear weakrefs for the reclaimed objects, queueing callbacks for
+        // invocation in 5d. Deferred (possibly-resurrected) objects keep their
+        // weakrefs until a later pass confirms they're dead.
+        let mut weakref_callbacks = Vec::new();
+        for h in &dead {
             let cleared = crate::weakref_registry::notify_clear(h.id);
             for (slot, cb) in cleared {
                 if let Some(cb) = cb {
@@ -612,27 +1038,88 @@ impl GcState {
             }
         }
 
-        // 5b: queue `__del__` finalisers (drained later by the
-        // eval loop, which has interpreter access). The
-        // `finalized` flag ensures each runs at most once even
-        // across multiple collection passes.
-        for h in &unreachable {
-            if !h.finalized.swap(true, Ordering::AcqRel) {
-                run_finalizer(&h.object);
+        // 5b (RFC 0039 WS5): before tearing the dead objects down, record the
+        // children they referenced *outside* this collection's candidate set.
+        // These seed the older-generation refcount cascade in 5c2; they must
+        // be captured here, while the dead objects' fields are still intact.
+        let saveall = self.debug.load(Ordering::Acquire) & DEBUG_SAVEALL != 0;
+        let mut cascade_seed: Vec<ObjectId> = Vec::new();
+        if !saveall {
+            for h in &dead {
+                traverse_object(&h.object, &mut |child| {
+                    cascade_seed.push(id_of(child));
+                });
             }
         }
 
-        // 5c: clear container fields to break cycles. CPython
-        // skips this for objects with a `__del__` so the
-        // finaliser can still read its `self` attributes; we do
-        // the same. The cycle is reclaimed on the next GC pass
-        // once the finaliser has run and (presumably) released
-        // its references.
-        for h in &unreachable {
-            if has_finalizer(&h.object) {
-                continue;
+        // 5c: break cycles by clearing the reclaimed objects' fields — or,
+        // under `gc.DEBUG_SAVEALL`, park them in `gc.garbage` intact for
+        // inspection instead of tearing them down.
+        if saveall {
+            let mut garbage = self.garbage.borrow_mut();
+            for h in &dead {
+                garbage.push(h.object.clone());
             }
-            clear_object_fields(&h.object);
+        } else {
+            for h in &dead {
+                clear_object_fields(&h.object);
+            }
+        }
+
+        // 5c2 (RFC 0039 WS5): cascade refcount-reclamation into *older*
+        // generations the current pass didn't scan. CPython frees an object
+        // the instant its refcount hits zero, regardless of generation:
+        // clearing a young cyclic-garbage object (`c1`) drops the last
+        // reference to an old object (`c0`) it pointed at, which frees `c0`
+        // and fires `c0`'s weakref callback — even during a young-only
+        // collection (`test_gc` `test_bug1055820c`). Our tracked handle pins
+        // such an object, so the refcount never reaches zero on its own;
+        // emulate the cascade explicitly. Starting from the children the now
+        // cleared dead objects referenced (captured in 5b), reap any tracked
+        // object that (a) isn't part of this collection's candidate set (those
+        // are handled by the normal mark/rebuild) and (b) is now reachable only
+        // through its own tracked handle and weakref slots, firing its weakref
+        // callbacks and recursing into its children. Finalizable orphans are
+        // left for a finalizing collection so `__del__` ordering is preserved.
+        if !saveall {
+            let dead_ids: std::collections::HashSet<ObjectId> = dead.iter().map(|h| h.id).collect();
+            let mut worklist = cascade_seed;
+            let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+            while let Some(cid) = worklist.pop() {
+                if dead_ids.contains(&cid) || by_id.contains_key(&cid) || !seen.insert(cid) {
+                    // Dead (already reaped), a candidate this collection owns,
+                    // or already visited — skip.
+                    continue;
+                }
+                let Some(h) = self.index.borrow().get(&cid).cloned() else {
+                    continue;
+                };
+                // Leave finalizable objects to a finalizing collection.
+                if has_finalizer(&h.object) {
+                    continue;
+                }
+                let weak_clones = crate::weakref_registry::strong_clone_count(cid);
+                let effective = strong_count_for(&h.object)
+                    .saturating_sub(1)
+                    .saturating_sub(weak_clones);
+                if effective != 0 {
+                    // Still reachable from a survivor — keep it.
+                    continue;
+                }
+                // Orphaned: fire its weakref callbacks (queued in 5d below),
+                // capture its children for the cascade, tear it down, and drop
+                // it from the tracked set.
+                for (slot, cb) in crate::weakref_registry::notify_clear(cid) {
+                    if let Some(cb) = cb {
+                        weakref_callbacks.push((slot, cb));
+                    }
+                }
+                traverse_object(&h.object, &mut |child| {
+                    worklist.push(id_of(child));
+                });
+                clear_object_fields(&h.object);
+                self.untrack_id(cid);
+            }
         }
 
         // 5d: queue weakref callbacks (after finalisers and cyclic
@@ -663,7 +1150,7 @@ impl GcState {
         );
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
 
-        collected
+        reported
     }
 
     fn snapshot_for_collection(&self, upto: usize) -> Vec<Arc<TrackedHandle>> {
@@ -678,8 +1165,13 @@ impl GcState {
     }
 
     fn rebuild_generations(&self, upto: usize, candidates: &[Arc<TrackedHandle>]) {
-        let mut gens = self.generations.borrow_mut();
+        // Lock order MUST match `track` (index before generations): the
+        // collector and a mutator thread can both reach the GC under the
+        // shared, process-global state, and acquiring these two cells in
+        // opposite orders is a textbook deadlock (observed under
+        // `test_weakref`'s background-collector loop — RFC 0039 WS4).
         let mut index = self.index.borrow_mut();
+        let mut gens = self.generations.borrow_mut();
         for g in 0..=upto.min(N_GENERATIONS - 1) {
             gens[g].handles.clear();
         }
@@ -693,6 +1185,7 @@ impl GcState {
             let new_g = (g + 1).min(N_GENERATIONS - 1);
             h.generation.store(new_g, Ordering::Release);
             h.color.store(color::White, Ordering::Release);
+            h.slot.store(gens[new_g].handles.len(), Ordering::Release);
             gens[new_g].handles.push(h.clone());
         }
     }
@@ -772,6 +1265,16 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
             }
         }
         Object::Instance(i) => {
+            // CPython's `subtype_traverse` visits `Py_TYPE(self)` for heap
+            // types: a user class is itself GC-tracked and an instance holds a
+            // strong ref to it, so a class reachable *only* through its
+            // instances (e.g. `A.a = A(); del A`) must see that edge subtracted
+            // or it never collects. Built-in types are immortal and untracked,
+            // so skip them (the `by_id` lookup would miss anyway).
+            let cls = i.cls();
+            if !cls.flags.is_builtin {
+                visit(&Object::Type(cls));
+            }
             if let Ok(m) = i.dict.try_borrow() {
                 for (k, v) in m.iter() {
                     visit(&k.0);
@@ -785,6 +1288,16 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                         visit(v);
                     }
                 }
+            }
+            // A built-in *container* subclass (`class C(list)`, `D(dict)`,
+            // `S(set)`, …) keeps its payload in `native`; that container is
+            // an internal, separately-untracked detail of the instance, so
+            // its elements are the instance's real children. Walk them so
+            // the collector sees cycles routed through subclass storage and
+            // prompt reclamation can follow such a chain (a leaf `native`
+            // like an `int`/`str` subclass simply has no children).
+            if let Some(native) = &i.native {
+                traverse_object(native, visit);
             }
         }
         Object::Module(m) => {
@@ -864,8 +1377,38 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
                 }
             }
         }
-        Object::Function(_)
-        | Object::Builtin(_)
+        Object::Function(f) => {
+            // CPython `func_traverse` visits globals, defaults, kwdefaults,
+            // closure, __dict__ and the slot values (annotations, qualname,
+            // …). The `f -> __globals__ -> f` self-cycle that `exec(src, d)`
+            // builds (`test_function`) closes through `globals`, so it must
+            // be walked. A module-level function's globals is the module
+            // namespace dict, which isn't a tracked candidate on its own —
+            // the `by_id` lookup simply misses it, so visiting is harmless.
+            visit(&Object::Dict(f.globals.clone()));
+            for d in &f.defaults {
+                visit(d);
+            }
+            for (_, v) in &f.kw_defaults {
+                visit(v);
+            }
+            for cell in &f.closure {
+                visit(cell);
+            }
+            if let Ok(attrs) = f.attrs.try_borrow() {
+                for (k, v) in attrs.iter() {
+                    visit(&k.0);
+                    visit(v);
+                }
+            }
+            if let Ok(slots) = f.slots.try_borrow() {
+                for (k, v) in slots.iter() {
+                    visit(&k.0);
+                    visit(v);
+                }
+            }
+        }
+        Object::Builtin(_)
         | Object::Generator(_)
         | Object::Coroutine(_)
         | Object::AsyncGenerator(_)
@@ -961,6 +1504,19 @@ pub fn clear_object_fields(obj: &Object) {
                 *v = Object::None;
             }
         }
+        Object::Function(f) => {
+            // Break the function's outgoing edges (CPython `func_clear`).
+            // `globals` is intentionally left alone: it's a shared namespace
+            // dict (a module's `__dict__` or the `exec` target), reclaimed as
+            // its own candidate if it too is unreachable — clearing it here
+            // could wipe a live module.
+            if let Ok(mut attrs) = f.attrs.try_borrow_mut() {
+                attrs.clear();
+            }
+            if let Ok(mut slots) = f.slots.try_borrow_mut() {
+                slots.clear();
+            }
+        }
         Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
             // Dropping the suspended frame box breaks the cycle
             // (the finalizer — close() — has already run by the
@@ -1012,18 +1568,32 @@ fn has_finalizer(obj: &Object) -> bool {
     }
 }
 
-thread_local! {
-    static GC_STATE: GcState = GcState::new();
-}
+/// The cycle collector is **process-global**, not per-thread.
+///
+/// RFC 0025 made the entire VM heap `Arc`-rooted: `Object` is `Send +
+/// Sync` and a container allocated on one OS thread can be referenced
+/// from another. A per-thread collector therefore cannot work — it
+/// would never see (and so never break) a cycle whose links were
+/// allocated on different threads, and a background `gc.collect()`
+/// thread (CPython's documented pattern, exercised by
+/// `test_weakref`/`test_gc`) would only ever sweep its own empty
+/// state while the mutator thread's garbage grew without bound.
+///
+/// A single shared `GcState` matches CPython's one-collector-per-
+/// interpreter model. It is safe because every mutation of a tracked
+/// object and every collection happens under the GIL (so accesses are
+/// serialized), and `GcState`'s interior `GilCell`s make each borrow
+/// memory-safe even if that invariant is ever violated. The state is
+/// never dropped (statics have no drop glue); process teardown
+/// finalizes survivors via [`GcState::finalization_candidates`].
+static GC_STATE: std::sync::LazyLock<GcState> = std::sync::LazyLock::new(GcState::new);
 
-/// Run a closure with the per-thread GC state. The state lives
-/// in a thread-local because `Object` is `!Send` (it owns
-/// `Rc<…>` payloads) and each interpreter has its own heap.
+/// Run a closure with the shared, process-global GC state.
 pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
-    GC_STATE.with(|s| f(s))
+    f(&GC_STATE)
 }
 
-/// Convenience: track `obj` in the current thread's GC.
+/// Convenience: track `obj` in the shared, process-global GC.
 pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
 }
@@ -1070,6 +1640,10 @@ fn container_can_cycle(obj: &Object) -> bool {
             .try_borrow()
             .map(|m| m.iter().any(|(k, v)| !is_atomic(&k.0) || !is_atomic(v)))
             .unwrap_or(true),
+        // A tuple can only anchor a cycle through a non-atomic element. An
+        // empty or all-scalar tuple (the interned `()`, `(1, 2)`, …) can never
+        // close one, so it stays off the GC's books.
+        Object::Tuple(t) => t.iter().any(|x| !is_atomic(x)),
         // Any other container kind: be conservative and track.
         _ => true,
     }
@@ -1093,12 +1667,12 @@ pub fn track_if_cyclic(obj: &Object) -> bool {
 /// thread's GC (see [`GcState::maybe_auto_collect`]). Returns the
 /// number of objects reclaimed; the caller should drain pending
 /// finalizers when this is non-zero.
-pub fn maybe_auto_collect() -> usize {
-    let n = with_state(GcState::maybe_auto_collect);
-    if n > 0 {
+pub fn maybe_auto_collect() -> bool {
+    let ran = with_state(GcState::maybe_auto_collect);
+    if ran {
         sweep_weakref_only_targets();
     }
-    n
+    ran
 }
 
 /// Convenience: find a tracked handle by object id (O(1) via the
@@ -1118,20 +1692,39 @@ pub fn is_tracked(id: ObjectId) -> bool {
 /// won't double-run `__del__`). Returns false if it was already
 /// claimed or the object isn't tracked.
 pub fn mark_finalized(id: ObjectId) -> bool {
+    with_state(|s| s.note_finalized(id));
     match find_handle(id) {
         Some(h) => !h.finalized.swap(true, Ordering::AcqRel),
         None => false,
     }
 }
 
+/// Convenience: has `id`'s finalizer already run on the current thread?
+/// Backs `gc.is_finalized`.
+pub fn was_finalized(id: ObjectId) -> bool {
+    with_state(|s| s.was_finalized(id))
+}
+
+/// Convenience: mark `id`'s finalizer as finished on the current thread's GC
+/// (see [`GcState::complete_finalizer`]).
+pub fn complete_finalizer(id: ObjectId) {
+    with_state(|s| s.complete_finalizer(id));
+}
+
 /// Convenience: snapshot all tracked objects with an unrun `__del__`
-/// on the current thread's GC (see [`GcState::finalization_candidates`]).
+/// in the shared GC (see [`GcState::finalization_candidates`]).
 pub fn finalization_candidates() -> Vec<Arc<TrackedHandle>> {
     with_state(|s| s.finalization_candidates())
 }
 
-/// Convenience: run a full collection on the current thread's
-/// GC. Returns the number of objects collected.
+/// Convenience: refcount-reclaim dead acyclic garbage in the shared
+/// GC (see [`GcState::reap_dead_acyclic`]).
+pub fn reap_dead_acyclic() -> usize {
+    with_state(|s| s.reap_dead_acyclic())
+}
+
+/// Convenience: run a full collection on the shared GC. Returns the
+/// number of objects collected.
 pub fn collect_all() -> usize {
     let n = with_state(|s| s.collect(N_GENERATIONS - 1));
     sweep_weakref_only_targets();

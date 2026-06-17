@@ -31,97 +31,107 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::from_static("Standard errno system symbols."),
         );
 
+        // On unix the numeric value comes from the host `libc` so it
+        // matches what real syscalls return (e.g. `EINPROGRESS` is 115
+        // on Linux but 36 on macOS) and round-trips against
+        // `OSError.errno`. On other platforms we fall back to the
+        // canonical Linux numbers. `errorcode` maps value → name; when
+        // two names share a value (`EAGAIN`/`EWOULDBLOCK`), the last
+        // insertion wins, matching how CPython overwrites the slot.
+        #[cfg(unix)]
         macro_rules! e {
-            ($name:literal, $value:expr) => {
-                d.insert(DictKey(Object::from_static($name)), Object::Int($value));
-                errorcode.insert(DictKey(Object::Int($value)), Object::from_static($name));
+            ($name:literal, $libc:ident, $_fallback:literal) => {
+                let v = i64::from(libc::$libc);
+                d.insert(DictKey(Object::from_static($name)), Object::Int(v));
+                errorcode.insert(DictKey(Object::Int(v)), Object::from_static($name));
+            };
+        }
+        #[cfg(not(unix))]
+        macro_rules! e {
+            ($name:literal, $libc:ident, $fallback:literal) => {
+                d.insert(DictKey(Object::from_static($name)), Object::Int($fallback));
+                errorcode.insert(DictKey(Object::Int($fallback)), Object::from_static($name));
             };
         }
 
-        // POSIX standard. Values here match Linux / macOS where they
-        // share; the few divergences (EAGAIN vs EWOULDBLOCK on some
-        // BSDs, EDEADLK on Solaris) are picked for the most common
-        // host platforms WeavePy ships on.
-        e!("EPERM", 1);
-        e!("ENOENT", 2);
-        e!("ESRCH", 3);
-        e!("EINTR", 4);
-        e!("EIO", 5);
-        e!("ENXIO", 6);
-        e!("E2BIG", 7);
-        e!("ENOEXEC", 8);
-        e!("EBADF", 9);
-        e!("ECHILD", 10);
-        e!("EAGAIN", 11);
-        e!("EWOULDBLOCK", 11);
-        e!("ENOMEM", 12);
-        e!("EACCES", 13);
-        e!("EFAULT", 14);
-        e!("ENOTBLK", 15);
-        e!("EBUSY", 16);
-        e!("EEXIST", 17);
-        e!("EXDEV", 18);
-        e!("ENODEV", 19);
-        e!("ENOTDIR", 20);
-        e!("EISDIR", 21);
-        e!("EINVAL", 22);
-        e!("ENFILE", 23);
-        e!("EMFILE", 24);
-        e!("ENOTTY", 25);
-        e!("ETXTBSY", 26);
-        e!("EFBIG", 27);
-        e!("ENOSPC", 28);
-        e!("ESPIPE", 29);
-        e!("EROFS", 30);
-        e!("EMLINK", 31);
-        e!("EPIPE", 32);
-        e!("EDOM", 33);
-        e!("ERANGE", 34);
-        e!("EDEADLK", 35);
-        e!("ENAMETOOLONG", 36);
-        e!("ENOLCK", 37);
-        e!("ENOSYS", 38);
-        e!("ENOTEMPTY", 39);
-        e!("ELOOP", 40);
-        e!("ENOMSG", 42);
-        e!("EIDRM", 43);
+        e!("EPERM", EPERM, 1);
+        e!("ENOENT", ENOENT, 2);
+        e!("ESRCH", ESRCH, 3);
+        e!("EINTR", EINTR, 4);
+        e!("EIO", EIO, 5);
+        e!("ENXIO", ENXIO, 6);
+        e!("E2BIG", E2BIG, 7);
+        e!("ENOEXEC", ENOEXEC, 8);
+        e!("EBADF", EBADF, 9);
+        e!("ECHILD", ECHILD, 10);
+        e!("EAGAIN", EAGAIN, 11);
+        e!("EWOULDBLOCK", EWOULDBLOCK, 11);
+        e!("ENOMEM", ENOMEM, 12);
+        e!("EACCES", EACCES, 13);
+        e!("EFAULT", EFAULT, 14);
+        e!("ENOTBLK", ENOTBLK, 15);
+        e!("EBUSY", EBUSY, 16);
+        e!("EEXIST", EEXIST, 17);
+        e!("EXDEV", EXDEV, 18);
+        e!("ENODEV", ENODEV, 19);
+        e!("ENOTDIR", ENOTDIR, 20);
+        e!("EISDIR", EISDIR, 21);
+        e!("EINVAL", EINVAL, 22);
+        e!("ENFILE", ENFILE, 23);
+        e!("EMFILE", EMFILE, 24);
+        e!("ENOTTY", ENOTTY, 25);
+        e!("ETXTBSY", ETXTBSY, 26);
+        e!("EFBIG", EFBIG, 27);
+        e!("ENOSPC", ENOSPC, 28);
+        e!("ESPIPE", ESPIPE, 29);
+        e!("EROFS", EROFS, 30);
+        e!("EMLINK", EMLINK, 31);
+        e!("EPIPE", EPIPE, 32);
+        e!("EDOM", EDOM, 33);
+        e!("ERANGE", ERANGE, 34);
+        e!("EDEADLK", EDEADLK, 35);
+        e!("ENAMETOOLONG", ENAMETOOLONG, 36);
+        e!("ENOLCK", ENOLCK, 37);
+        e!("ENOSYS", ENOSYS, 38);
+        e!("ENOTEMPTY", ENOTEMPTY, 39);
+        e!("ELOOP", ELOOP, 40);
+        e!("ENOMSG", ENOMSG, 42);
+        e!("EIDRM", EIDRM, 43);
 
-        // Networking subset (Linux numbering; macOS differs but the
-        // CPython API only exposes the symbolic names).
-        e!("EPROTO", 71);
-        e!("EOVERFLOW", 75);
-        e!("ENOTSOCK", 88);
-        e!("EDESTADDRREQ", 89);
-        e!("EMSGSIZE", 90);
-        e!("EPROTOTYPE", 91);
-        e!("ENOPROTOOPT", 92);
-        e!("EPROTONOSUPPORT", 93);
-        e!("ESOCKTNOSUPPORT", 94);
-        e!("EOPNOTSUPP", 95);
-        e!("ENOTSUP", 95);
-        e!("EPFNOSUPPORT", 96);
-        e!("EAFNOSUPPORT", 97);
-        e!("EADDRINUSE", 98);
-        e!("EADDRNOTAVAIL", 99);
-        e!("ENETDOWN", 100);
-        e!("ENETUNREACH", 101);
-        e!("ENETRESET", 102);
-        e!("ECONNABORTED", 103);
-        e!("ECONNRESET", 104);
-        e!("ENOBUFS", 105);
-        e!("EISCONN", 106);
-        e!("ENOTCONN", 107);
-        e!("ESHUTDOWN", 108);
-        e!("ETOOMANYREFS", 109);
-        e!("ETIMEDOUT", 110);
-        e!("ECONNREFUSED", 111);
-        e!("EHOSTDOWN", 112);
-        e!("EHOSTUNREACH", 113);
-        e!("EALREADY", 114);
-        e!("EINPROGRESS", 115);
-        e!("ESTALE", 116);
-        e!("EDQUOT", 122);
-        e!("ECANCELED", 125);
+        e!("EPROTO", EPROTO, 71);
+        e!("EOVERFLOW", EOVERFLOW, 75);
+        e!("ENOTSOCK", ENOTSOCK, 88);
+        e!("EDESTADDRREQ", EDESTADDRREQ, 89);
+        e!("EMSGSIZE", EMSGSIZE, 90);
+        e!("EPROTOTYPE", EPROTOTYPE, 91);
+        e!("ENOPROTOOPT", ENOPROTOOPT, 92);
+        e!("EPROTONOSUPPORT", EPROTONOSUPPORT, 93);
+        e!("ESOCKTNOSUPPORT", ESOCKTNOSUPPORT, 94);
+        e!("EOPNOTSUPP", EOPNOTSUPP, 95);
+        e!("ENOTSUP", ENOTSUP, 95);
+        e!("EPFNOSUPPORT", EPFNOSUPPORT, 96);
+        e!("EAFNOSUPPORT", EAFNOSUPPORT, 97);
+        e!("EADDRINUSE", EADDRINUSE, 98);
+        e!("EADDRNOTAVAIL", EADDRNOTAVAIL, 99);
+        e!("ENETDOWN", ENETDOWN, 100);
+        e!("ENETUNREACH", ENETUNREACH, 101);
+        e!("ENETRESET", ENETRESET, 102);
+        e!("ECONNABORTED", ECONNABORTED, 103);
+        e!("ECONNRESET", ECONNRESET, 104);
+        e!("ENOBUFS", ENOBUFS, 105);
+        e!("EISCONN", EISCONN, 106);
+        e!("ENOTCONN", ENOTCONN, 107);
+        e!("ESHUTDOWN", ESHUTDOWN, 108);
+        e!("ETOOMANYREFS", ETOOMANYREFS, 109);
+        e!("ETIMEDOUT", ETIMEDOUT, 110);
+        e!("ECONNREFUSED", ECONNREFUSED, 111);
+        e!("EHOSTDOWN", EHOSTDOWN, 112);
+        e!("EHOSTUNREACH", EHOSTUNREACH, 113);
+        e!("EALREADY", EALREADY, 114);
+        e!("EINPROGRESS", EINPROGRESS, 115);
+        e!("ESTALE", ESTALE, 116);
+        e!("EDQUOT", EDQUOT, 122);
+        e!("ECANCELED", ECANCELED, 125);
 
         d.insert(
             DictKey(Object::from_static("errorcode")),

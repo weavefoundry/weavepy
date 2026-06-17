@@ -361,6 +361,15 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/enum.py"),
             is_package: false,
         },
+        // `termios` — constants-only shim so pure-Python `tty` (pulled in by
+        // `test_asyncio.test_events`) imports. Real terminal control is not
+        // implemented; the tty syscalls fail cleanly on non-terminal fds and
+        // the pty-backed tests skip (no `os.openpty`).
+        FrozenSource {
+            name: "termios",
+            source: include_str!("python/termios_mod.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "dataclasses",
             source: include_str!("python/dataclasses.py"),
@@ -382,6 +391,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
+            name: "_threading_local",
+            source: include_str!("python/_threading_local.py"),
+            is_package: false,
+        },
+        FrozenSource {
             name: "queue",
             source: include_str!("python/queue.py"),
             is_package: false,
@@ -391,13 +405,16 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/multiprocessing.py"),
             is_package: false,
         },
-        // The `concurrent` package is a tiny shim that re-exports
-        // `futures`. We model it as a frozen package with an
-        // (effectively empty) `__init__` and a flat `futures`
-        // submodule. Note we use `concurrent_futures.py` on disk —
-        // the dotted name still resolves correctly because the
-        // import machinery keys off the registered module name, not
-        // the source filename.
+        // RFC 0039 (WS7): the *real* CPython `concurrent.futures`
+        // package, frozen verbatim from `vendor/cpython/Lib/concurrent/
+        // futures/`. `ThreadPoolExecutor` now spins up real OS worker
+        // threads (the old single-file shim ran `submit`ted work
+        // synchronously on the caller, which broke `run_in_executor`
+        // thread-affinity and the `test_asyncio` executor tests). The
+        // dotted names resolve via the registered module name, not the
+        // source filename. `process` is a stub (no multiprocessing
+        // runtime); it stays importable so the lazy `__getattr__` in
+        // `__init__` and `from concurrent.futures import *` still work.
         FrozenSource {
             name: "concurrent",
             source: "",
@@ -405,12 +422,193 @@ fn frozen_sources() -> &'static [FrozenSource] {
         },
         FrozenSource {
             name: "concurrent.futures",
-            source: include_str!("python/concurrent_futures.py"),
+            source: include_str!("python/concurrent_futures_init.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "concurrent.futures._base",
+            source: include_str!("python/concurrent_futures_base.py"),
             is_package: false,
         },
         FrozenSource {
+            name: "concurrent.futures.thread",
+            source: include_str!("python/concurrent_futures_thread.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "concurrent.futures.process",
+            source: include_str!("python/concurrent_futures_process.py"),
+            is_package: false,
+        },
+        // RFC 0039 (WS7): the *real* CPython `asyncio` package, frozen
+        // verbatim from `vendor/cpython/Lib/asyncio/`, running over the WS6
+        // native selector backends. Replaces the old cooperative single-file
+        // shim. The Windows-only submodules (`windows_events`/`windows_utils`/
+        // `proactor_events`) are frozen for completeness but never imported on
+        // a non-win32 build, so their `_winapi`/`_overlapped` deps don't load.
+        FrozenSource {
             name: "asyncio",
-            source: include_str!("python/asyncio.py"),
+            source: include_str!("python/asyncio/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "asyncio.base_events",
+            source: include_str!("python/asyncio/base_events.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.base_futures",
+            source: include_str!("python/asyncio/base_futures.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.base_subprocess",
+            source: include_str!("python/asyncio/base_subprocess.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.base_tasks",
+            source: include_str!("python/asyncio/base_tasks.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.constants",
+            source: include_str!("python/asyncio/constants.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.coroutines",
+            source: include_str!("python/asyncio/coroutines.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.events",
+            source: include_str!("python/asyncio/events.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.exceptions",
+            source: include_str!("python/asyncio/exceptions.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.format_helpers",
+            source: include_str!("python/asyncio/format_helpers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.futures",
+            source: include_str!("python/asyncio/futures.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.locks",
+            source: include_str!("python/asyncio/locks.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.log",
+            source: include_str!("python/asyncio/log.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.mixins",
+            source: include_str!("python/asyncio/mixins.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.proactor_events",
+            source: include_str!("python/asyncio/proactor_events.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.protocols",
+            source: include_str!("python/asyncio/protocols.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.queues",
+            source: include_str!("python/asyncio/queues.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.runners",
+            source: include_str!("python/asyncio/runners.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.selector_events",
+            source: include_str!("python/asyncio/selector_events.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.sslproto",
+            source: include_str!("python/asyncio/sslproto.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.staggered",
+            source: include_str!("python/asyncio/staggered.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.streams",
+            source: include_str!("python/asyncio/streams.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.subprocess",
+            source: include_str!("python/asyncio/subprocess.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.taskgroups",
+            source: include_str!("python/asyncio/taskgroups.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.tasks",
+            source: include_str!("python/asyncio/tasks.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.threads",
+            source: include_str!("python/asyncio/threads.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.timeouts",
+            source: include_str!("python/asyncio/timeouts.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.transports",
+            source: include_str!("python/asyncio/transports.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.trsock",
+            source: include_str!("python/asyncio/trsock.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.unix_events",
+            source: include_str!("python/asyncio/unix_events.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.windows_events",
+            source: include_str!("python/asyncio/windows_events.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.windows_utils",
+            source: include_str!("python/asyncio/windows_utils.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "asyncio.__main__",
+            source: include_str!("python/asyncio/__main__.py"),
             is_package: false,
         },
         // High-level wrappers over Rust cores from RFC 0017.
@@ -1106,6 +1304,7 @@ fn frozen_sources() -> &'static [FrozenSource] {
             is_package: false,
         },
         FrozenSource {
+            // RFC 0039 WS7: faithful CPython async_case (persistent Runner).
             name: "unittest.async_case",
             source: include_str!("python/unittest_async.py"),
             is_package: false,

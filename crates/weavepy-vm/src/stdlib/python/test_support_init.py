@@ -39,6 +39,9 @@ is_s390x = hasattr(os, 'uname') and os.uname().machine == 's390x'
 # WeavePy targets the standard GIL-enabled build.
 Py_GIL_DISABLED = False
 
+NHASHBITS = sys.hash_info.width  # number of bits in hash() result
+assert NHASHBITS in (32, 64)
+
 has_fork_support = hasattr(os, "fork") and not (
     is_emscripten or is_wasi or is_apple_mobile or is_android
 )
@@ -255,6 +258,45 @@ LOOPBACK_TIMEOUT = 5.0
 INTERNET_TIMEOUT = 60.0
 SHORT_TIMEOUT = 30.0
 LONG_TIMEOUT = 5 * 60.0
+
+# Largest buffer size pipe/socket I/O tests will push through a single
+# write (CPython's `test.support.PIPE_MAX_SIZE`). Sized to comfortably
+# exceed any platform pipe buffer so a "fill the pipe" probe blocks.
+PIPE_MAX_SIZE = 4 * 1024 * 1024 + 1
+SOCK_MAX_SIZE = 16 * 1024 * 1024 + 1
+
+
+def busy_retry(timeout, err_msg=None, /, *, error=True):
+    """Run the loop body until "break" stops the loop (CPython verbatim)."""
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+
+    start_time = time.monotonic()
+    deadline = start_time + timeout
+
+    while True:
+        yield
+
+        if time.monotonic() >= deadline:
+            break
+
+    if error:
+        dt = time.monotonic() - start_time
+        msg = f"timeout ({dt:.1f} seconds)"
+        if err_msg:
+            msg = f"{msg}: {err_msg}"
+        raise AssertionError(msg)
+
+
+def sleeping_retry(timeout, err_msg=None, /,
+                   *, init_delay=0.010, max_delay=1.0, error=True):
+    """Wait strategy that applies exponential backoff (CPython verbatim)."""
+    delay = init_delay
+    for _ in busy_retry(timeout, err_msg, error=error):
+        yield
+
+        time.sleep(delay)
+        delay = min(delay * 2, max_delay)
 
 
 class ResourceDenied(unittest.SkipTest):
@@ -612,6 +654,43 @@ def gc_threshold(*args):
         yield
     finally:
         gc.set_threshold(*old_threshold)
+
+
+def late_deletion(obj):
+    """
+    Keep a Python alive as long as possible.
+
+    Create a reference cycle and store the cycle in an object deleted late in
+    Python finalization. Try to keep the object alive until the very last
+    garbage collection.
+
+    The function keeps a strong reference by design. It should be called in a
+    subprocess to not mark a test as "leaking a reference".
+    """
+
+    # Late CPython finalization:
+    # - finalize_interp_clear()
+    # - _PyInterpreterState_Clear(): Clear PyInterpreterState members
+    #   (ex: codec_search_path, before_forkers)
+    # - clear os.register_at_fork() callbacks
+    # - clear codecs.register() callbacks
+
+    ref_cycle = [obj]
+    ref_cycle.append(ref_cycle)
+
+    # Store a reference in PyInterpreterState.codec_search_path
+    import codecs
+    def search_func(encoding):
+        return None
+    search_func.reference = ref_cycle
+    codecs.register(search_func)
+
+    if hasattr(os, 'register_at_fork'):
+        # Store a reference in PyInterpreterState.before_forkers
+        def atfork_func():
+            pass
+        atfork_func.reference = ref_cycle
+        os.register_at_fork(before=atfork_func)
 
 
 # ---------------------------------------------------------------------------
@@ -1074,13 +1153,16 @@ def bigmemtest(size, memuse, dry_run=True):
                 maxsize = 5147
             else:
                 maxsize = size_val
-            if real_max_memuse and real_max_memuse < maxsize * memuse:
-                if dry_run:
-                    maxsize = 5147
-                else:
-                    raise unittest.SkipTest(
-                        "not enough memory: %.1fG minimum needed" %
-                        (size_val * memuse / (1024 ** 3)))
+            # Match CPython exactly: a `dry_run=False` bigmemtest run
+            # without `-M` (so `real_max_memuse == 0`) is *skipped*, not
+            # run at the 5147 dummy size. Dropping the `or not dry_run`
+            # clause made `test_queue`'s `test_many_threads` fan out to
+            # 2 * 5147 OS threads and fail with `pthread_create: EAGAIN`.
+            if ((real_max_memuse or not dry_run)
+                    and real_max_memuse < maxsize * memuse):
+                raise unittest.SkipTest(
+                    "not enough memory: %.1fG minimum needed" %
+                    (size_val * memuse / (1024 ** 3)))
             return f(self, maxsize)
         wrapper.size = size
         wrapper.memuse = memuse
@@ -1103,6 +1185,12 @@ def reap_children():
             break
         if pid == 0:
             break
+
+
+def maybe_get_event_loop_policy():
+    """Return the global event loop policy if one is set, else return None."""
+    import asyncio.events
+    return asyncio.events._event_loop_policy
 
 
 def get_pagesize():

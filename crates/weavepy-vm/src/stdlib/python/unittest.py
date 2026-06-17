@@ -45,7 +45,44 @@ __all__ = [
     "registerResult",
     "removeResult",
     "removeHandler",
+    "addModuleCleanup",
+    "doModuleCleanups",
+    "enterModuleContext",
 ]
+
+
+# --------------------------------------------------------------------------
+# Module-level cleanups (CPython unittest.case.addModuleCleanup family).
+# --------------------------------------------------------------------------
+
+_module_cleanups = []
+
+
+def addModuleCleanup(function, /, *args, **kwargs):
+    """Register *function* to be called on module teardown (LIFO)."""
+    _module_cleanups.append((function, args, kwargs))
+
+
+def enterModuleContext(cm):
+    """Enter the supplied context manager and schedule its exit for
+    module teardown."""
+    result = type(cm).__enter__(cm)
+    addModuleCleanup(type(cm).__exit__, cm, None, None, None)
+    return result
+
+
+def doModuleCleanups():
+    """Run, in LIFO order, the functions registered with
+    ``addModuleCleanup``. Returns a list of ``(exc_type, exc, tb)`` for
+    any that raised (mirrors ``doClassCleanups``)."""
+    exceptions = []
+    while _module_cleanups:
+        function, args, kwargs = _module_cleanups.pop()
+        try:
+            function(*args, **kwargs)
+        except Exception:
+            exceptions.append(sys.exc_info())
+    return exceptions
 
 
 # --------------------------------------------------------------------------
@@ -483,11 +520,22 @@ class TestCase:
     def skipTest(self, reason):
         raise SkipTest(reason)
 
+    def _callSetUp(self):
+        # Indirection point (CPython) so ``IsolatedAsyncioTestCase`` can run
+        # ``setUp``/``asyncSetUp`` inside its persistent event loop + context.
+        self.setUp()
+
     def _callTestMethod(self, method):
         # Indirection point CPython uses so ``IsolatedAsyncioTestCase``
         # can drive an ``async def`` test through an event loop. The
         # default just calls the (synchronous) method.
         method()
+
+    def _callTearDown(self):
+        self.tearDown()
+
+    def _callCleanup(self, function, /, *args, **kwargs):
+        function(*args, **kwargs)
 
     def shortDescription(self):
         doc = self._testMethodDoc
@@ -546,7 +594,7 @@ class TestCase:
         while self._cleanups:
             function, args, kwargs = self._cleanups.pop()
             try:
-                function(*args, **kwargs)
+                self._callCleanup(function, *args, **kwargs)
             except KeyboardInterrupt:
                 raise
             except Exception:
@@ -620,7 +668,7 @@ class TestCase:
 
             # setUp
             try:
-                self.setUp()
+                self._callSetUp()
             except SkipTest as e:
                 result.addSkip(self, str(e))
                 return result
@@ -667,7 +715,7 @@ class TestCase:
 
             # tearDown
             try:
-                self.tearDown()
+                self._callTearDown()
             except KeyboardInterrupt:
                 raise
             except Exception:
@@ -682,12 +730,12 @@ class TestCase:
         return result
 
     def debug(self):
-        self.setUp()
-        getattr(self, self._testMethodName)()
-        self.tearDown()
+        self._callSetUp()
+        self._callTestMethod(getattr(self, self._testMethodName))
+        self._callTearDown()
         while self._cleanups:
             function, args, kwargs = self._cleanups.pop()
-            function(*args, **kwargs)
+            self._callCleanup(function, *args, **kwargs)
 
     def __call__(self, *args, **kwds):
         return self.run(*args, **kwds)
@@ -1165,6 +1213,11 @@ class TestSuite:
             except Exception:
                 self._createClassOrModuleLevelException(
                     result, sys.exc_info(), "tearDownModule", previousModule)
+        # Module-level cleanups run regardless of whether tearDownModule
+        # was defined (CPython runs them after tearDownModule).
+        for exc_info in doModuleCleanups():
+            self._createClassOrModuleLevelException(
+                result, exc_info, "moduleCleanUp", previousModule)
 
     def _tearDownPreviousClass(self, test, result):
         previousClass = getattr(result, "_previousTestClass", None)

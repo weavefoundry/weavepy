@@ -81,6 +81,15 @@ pub struct BuiltinTypes {
     pub generator_: Rc<TypeObject>,
     pub coroutine_: Rc<TypeObject>,
     pub async_generator_: Rc<TypeObject>,
+    /// The awaitables returned by `agen.asend(...)` / `agen.__anext__()`
+    /// and `agen.athrow(...)` / `agen.aclose()` (CPython's
+    /// `async_generator_asend` / `async_generator_athrow`). Giving them
+    /// real types lets `_collections_abc` register them as `Coroutine`s,
+    /// so `asyncio.iscoroutine(agen.aclose())` is true and
+    /// `loop.create_task(agen.aclose())` works (PEP 525 finalization,
+    /// `shutdown_asyncgens`).
+    pub async_generator_asend_: Rc<TypeObject>,
+    pub async_generator_athrow_: Rc<TypeObject>,
     /// `types.FrameType` / `types.TracebackType`.
     pub frame_: Rc<TypeObject>,
     pub code_: Rc<TypeObject>,
@@ -282,6 +291,11 @@ impl BuiltinTypes {
         let generator_ = mk("generator", vec![object_.clone()]);
         let coroutine_ = mk("coroutine", vec![object_.clone()]);
         let async_generator_ = mk("async_generator", vec![object_.clone()]);
+        // The single-shot awaitables behind `asend`/`athrow`/`aclose`.
+        // CPython names them `async_generator_asend` / `_athrow`; `aclose`
+        // reuses the `_athrow` type.
+        let async_generator_asend_ = mk("async_generator_asend", vec![object_.clone()]);
+        let async_generator_athrow_ = mk("async_generator_athrow", vec![object_.clone()]);
         install_gen_name_getsets(&generator_, "generator");
         install_gen_name_getsets(&coroutine_, "coroutine");
         install_gen_name_getsets(&async_generator_, "async generator");
@@ -493,6 +507,8 @@ impl BuiltinTypes {
             generator_,
             coroutine_,
             async_generator_,
+            async_generator_asend_,
+            async_generator_athrow_,
             frame_,
             code_,
             traceback_,
@@ -901,6 +917,27 @@ pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
         .by_name(class_name)
         .unwrap_or_else(|| bt.exception.clone());
     make_exception_with_class(class, message)
+}
+
+/// Build a built-in exception instance whose single `args[0]` element is the
+/// *object* `arg`, not a stringified message — `KeyError(key)` where
+/// `e.args[0] is key`. CPython's `KeyError.__str__` renders `repr(args[0])`,
+/// which our `exc_str` already reproduces; we set `message` to that repr so
+/// the Rust Display/traceback path matches too.
+pub fn make_exception_with_object(class_name: &str, arg: Object) -> Object {
+    let exc = make_exception(class_name, "");
+    if let Object::Instance(inst) = &exc {
+        let mut dict = inst.dict.borrow_mut();
+        dict.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![arg.clone()]),
+        );
+        dict.insert(
+            DictKey(Object::from_static("message")),
+            Object::from_str(arg.repr()),
+        );
+    }
+    exc
 }
 
 /// Build a faithful `UnicodeEncodeError` instance carrying the 5-tuple
@@ -2279,6 +2316,56 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         }
         Ok(Object::None)
     }
+    // CPython's `OSError_str` (`Objects/exceptions.c`): prefer the
+    // `[Errno N] strerror[: filename[ -> filename2]]` shape when the
+    // named fields are populated (the 2..5-arg form), else fall back to
+    // `BaseException.__str__`. The named slots default to `None`, which
+    // we treat as "unset".
+    fn oserror_str(args: &[Object]) -> Result<Object, RuntimeError> {
+        let Some(Object::Instance(inst)) = args.first() else {
+            return Ok(Object::from_static(""));
+        };
+        let dict = inst.dict.borrow();
+        let get = |name: &'static str| dict.get(&DictKey(Object::from_static(name))).cloned();
+        let set = |o: &Option<Object>| matches!(o, Some(v) if !matches!(v, Object::None));
+        let errno = get("errno");
+        let strerror = get("strerror");
+        let filename = get("filename");
+        let filename2 = get("filename2");
+        let errno_s = errno.as_ref().map(Object::to_str).unwrap_or_default();
+        let strerror_s = strerror.as_ref().map(Object::to_str).unwrap_or_default();
+        if set(&filename) {
+            let f1 = filename.as_ref().map(Object::repr).unwrap_or_default();
+            if set(&filename2) {
+                let f2 = filename2.as_ref().map(Object::repr).unwrap_or_default();
+                return Ok(Object::from_str(format!(
+                    "[Errno {errno_s}] {strerror_s}: {f1} -> {f2}"
+                )));
+            }
+            return Ok(Object::from_str(format!(
+                "[Errno {errno_s}] {strerror_s}: {f1}"
+            )));
+        }
+        if set(&errno) && set(&strerror) {
+            return Ok(Object::from_str(format!("[Errno {errno_s}] {strerror_s}")));
+        }
+        // BaseException.__str__: "" / str(arg) / repr(args).
+        match dict.get(&DictKey(Object::from_static("args"))) {
+            Some(Object::Tuple(items)) => Ok(match items.as_ref() {
+                [] => Object::from_static(""),
+                [single] => Object::from_str(single.to_str()),
+                _ => Object::from_str(format!(
+                    "({})",
+                    items
+                        .iter()
+                        .map(Object::repr)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }),
+            _ => Ok(Object::from_static("")),
+        }
+    }
     let mut dict = os_error.dict.borrow_mut();
     dict.insert(
         DictKey(Object::from_static("__init__")),
@@ -2286,6 +2373,15 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
             name: "__init__",
             binds_instance: true,
             call: Box::new(oserror_init),
+            call_kw: None,
+        })),
+    );
+    dict.insert(
+        DictKey(Object::from_static("__str__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__str__",
+            binds_instance: true,
+            call: Box::new(oserror_str),
             call_kw: None,
         })),
     );
@@ -2977,6 +3073,7 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
     use crate::types::PyInstance;
     let is_os = is_subclass_by_name(&class, "OSError");
     let is_syntax = is_subclass_by_name(&class, "SyntaxError");
+    let is_stop_iteration = is_subclass_by_name(&class, "StopIteration");
     let inst = PyInstance::new(class);
     let msg = Object::from_str(message);
     // A messageless raise (`StopIteration()`, `GeneratorExit()`, …)
@@ -2988,6 +3085,19 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
     };
     {
         let mut dict = inst.dict.borrow_mut();
+        // PEP 380: `StopIteration.value` is always present (CPython sets it
+        // in `StopIteration.__init__`, defaulting to None). A Rust-raised
+        // bare `StopIteration` must answer `.value` too — asyncio's
+        // `Task.__step` reads `exc.value` on every coroutine return, and a
+        // missing attribute leaves the task wedged (gh: shutdown_asyncgens).
+        if is_stop_iteration {
+            let value = if msg.to_str().is_empty() {
+                Object::None
+            } else {
+                msg.clone()
+            };
+            dict.insert(DictKey(Object::from_static("value")), value);
+        }
         dict.insert(DictKey(Object::from_static("args")), args);
         dict.insert(DictKey(Object::from_static("message")), msg.clone());
         // Always-present `BaseException` slots (see `build_exception_instance`):
@@ -3845,11 +3955,22 @@ fn install_mutable_container_init(bt: &BuiltinTypes) {
             }
             None => Vec::new(),
         };
+        // Enforce hashability as each element is admitted, exactly like the
+        // free-function `set(...)` constructor (`set_insert_key` →
+        // `ensure_hashable`). Building the keyed list *before* mutating the
+        // target means an unhashable element (`MySet([[]])`) raises
+        // `TypeError` without leaving the set half-filled.
+        let mut keys = Vec::with_capacity(items.len());
+        for item in items {
+            keys.push(crate::builtins::set_insert_key(&item)?);
+        }
         let mut t = target.borrow_mut();
         t.clear();
-        for item in items {
-            t.insert(DictKey(item));
-        }
+        crate::object::key_cmp_scope(|| {
+            for k in keys {
+                t.insert(k);
+            }
+        })?;
         Ok(Object::None)
     }
 
@@ -3945,7 +4066,20 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
     // (which unwraps the native payload), so `object.__hash__(x) == hash(x)`.
     fn install_hash(ty: &Rc<TypeObject>) {
         fn value_hash(args: &[Object]) -> Result<Object, RuntimeError> {
-            crate::builtins::hash_object(args.first().unwrap_or(&Object::None))
+            let obj = args.first().unwrap_or(&Object::None);
+            // `int.__hash__(self)` / `float.__hash__(self)` / … must hash the
+            // *underlying value* directly, exactly like CPython's
+            // `long_hash`/`float_hash` type slot. It must NOT re-dispatch
+            // through a subclass's Python `__hash__`, otherwise the common
+            // idiom `class H(int): def __hash__(self): return int.__hash__(self)`
+            // recurses (HashCountingInt in test_set) until the recursion limit.
+            // Unwrap an int/str/… subclass instance to the primitive it wraps
+            // so the hash is computed on the value, bypassing the override.
+            let target = match obj {
+                Object::Instance(inst) => inst.native.as_ref().unwrap_or(obj),
+                other => other,
+            };
+            crate::builtins::hash_object(target)
         }
         ty.dict.borrow_mut().insert(
             DictKey(Object::from_static("__hash__")),

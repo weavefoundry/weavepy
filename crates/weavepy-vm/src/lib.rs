@@ -169,6 +169,18 @@ impl Frame {
 /// Cycle-GC traversal hook for generator-family objects: walk the
 /// suspended frame's locals, evaluation stack, and cells so cycles
 /// running through a generator frame (`g.send(g)`) are detectable.
+/// Registered with `gc_trace::register_traverse`: lets the cycle GC walk
+/// the objects a built-in iterator ([`Object::Iter`]) keeps alive. The
+/// `PyIterator` body is private to `object`, so tracing routes through
+/// its [`PyIterator::gc_referents`] helper.
+fn iter_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
+    if let Object::Iter(it) = obj {
+        if let Ok(it) = it.try_borrow() {
+            it.gc_referents(visit);
+        }
+    }
+}
+
 /// Registered with `gc_trace::register_traverse` at interpreter init
 /// because `Frame` is private to this module.
 fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
@@ -367,6 +379,12 @@ impl Default for Interpreter {
                 },
                 generator_frame_traverse,
             );
+            // Bug #3680: a built-in iterator (list/set/dict-keys/… iterator)
+            // can close a reference cycle through the items it buffers or the
+            // live set it walks. Teach the cycle GC to trace through it so
+            // e.g. `obj.x = iter(set_containing_obj)` is collectable
+            // (`test_set.test_container_iterator`).
+            crate::gc_trace::register_traverse(|o| matches!(o, Object::Iter(_)), iter_traverse);
         });
         let excepthook = Rc::new(RefCell::new(Object::None));
         let unraisable_hook = Rc::new(RefCell::new(Object::None));
@@ -693,6 +711,17 @@ impl Interpreter {
         self.call(callable, args, kwargs, globals)
     }
 
+    /// `repr(v)` against the interpreter's builtins — the same path the
+    /// `repr()` builtin and `{v!r}` f-strings take. Worker threads use
+    /// this to format `Exception ignored in thread started by <func>`
+    /// identically to CPython.
+    pub fn repr_object(&mut self, v: &Object) -> Result<String, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let globals = self.builtins.clone();
+        self.repr_of(v, &globals)
+    }
+
     /// Apply a binary operator to two objects, dispatching the full
     /// `__op__`/`__rop__` protocol exactly as the `BINARY_OP` bytecode would.
     /// Backs the `_operator` accelerator (`operator.add`, …) so those
@@ -847,6 +876,11 @@ impl Interpreter {
         name: &str,
         file: Option<&str>,
     ) -> Result<Object, RuntimeError> {
+        // RFC 0039: the OS thread that runs the top-level module is the
+        // `_thread.interrupt_main()` / SIGINT target. Idempotent — the
+        // first caller (the real main thread) wins, so the in-process
+        // conformance runner's repeated `run_module` calls don't move it.
+        crate::gil::mark_main_thread();
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
@@ -903,37 +937,180 @@ impl Interpreter {
             }
             return;
         }
-        let finalizable = match &dropped {
+        let id0 = crate::weakref_registry::id_of(&dropped);
+        // Nothing parked on this object needs prompt handling: no
+        // finalizer to run, no weakref to clear, and no cycle-GC strong
+        // handle pinning it. Ordinary `Rc` drop reclaims it (and any
+        // *untracked* children it anchors, recursively, by refcount).
+        if !Self::object_is_finalizable(&dropped)
+            && crate::weakref_registry::count_for(id0) == 0
+            && !gc_trace::is_tracked(id0)
+        {
+            return;
+        }
+        // Is `dropped` actually dead — i.e. is this its last
+        // program-visible reference? The caller still holds `dropped`
+        // (one reference), the GC may hold a handle, and weakrefs may
+        // hold strong clones; anything beyond that is a live binding and
+        // we must leave the object to the cycle collector.
+        if !Self::is_refcount_dead(&dropped, 1) {
+            return;
+        }
+        // RFC 0039 (WS4): cascade through the dead *acyclic* subgraph,
+        // emulating CPython's refcount-driven `tp_dealloc` chain. Freeing
+        // `dropped` drops the last reference to its tracked children,
+        // which become dead in turn; each is finalized (in `tp_finalize`
+        // order — `__del__` before the object's contents are released)
+        // and untracked here instead of lingering in the GC's tracked set
+        // pinned by its own handle. Without this, a deep acyclic chain of
+        // finalizable/tracked objects (`test_gc.test_trashcan_threads`,
+        // `test_weakref`'s len-race) is only drained one layer per
+        // O(heap) collection — quadratic, and easily never finished for a
+        // quiescing interpreter. A reference *cycle* never enters the
+        // cascade: its members reference one another, so the refcount
+        // test below keeps `strong` above the dead threshold and leaves
+        // the cycle to the tracing collector.
+        let mut work = vec![dropped];
+        while let Some(obj) = work.pop() {
+            let id = crate::weakref_registry::id_of(&obj);
+            let finalizable = Self::object_is_finalizable(&obj);
+            // Run `__del__` once, while `obj` and its children are still
+            // intact (CPython runs `tp_finalize` before `tp_clear`). A
+            // tracked object claims its finalizer via the GC handle's
+            // one-shot flag; an untracked finalizable object (a generator
+            // the GC never saw) runs directly.
+            if finalizable {
+                let claimed = if gc_trace::is_tracked(id) {
+                    gc_trace::mark_finalized(id)
+                } else {
+                    true
+                };
+                if claimed {
+                    crate::vm_singletons::push_pending_finalizer(obj.clone());
+                    self.run_pending_finalizers();
+                    // The finalizer ran arbitrary Python and may have
+                    // resurrected `obj` (stashed it somewhere reachable).
+                    // If so it is alive again: leave it tracked and stop
+                    // cascading through it.
+                    if !Self::is_refcount_dead(&obj, 1) {
+                        continue;
+                    }
+                }
+            }
+            // Clear weakrefs and queue their callbacks (CPython clears
+            // weakrefs after `tp_finalize`).
+            crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(id));
+            self.run_pending_finalizers();
+            if !Self::is_refcount_dead(&obj, 1) {
+                continue;
+            }
+            // Snapshot the tracked children before `obj` is freed: those
+            // are the only ones a strong GC handle would otherwise pin
+            // (untracked children are reclaimed by ordinary `Rc` drop).
+            let mut child_ids: Vec<crate::weakref_registry::ObjectId> = Vec::new();
+            gc_trace::traverse_object(&obj, &mut |c| {
+                let cid = crate::weakref_registry::id_of(c);
+                if gc_trace::is_tracked(cid) {
+                    child_ids.push(cid);
+                }
+            });
+            // Drop the GC's strong handle, then our own reference: `obj`
+            // is reclaimed by `Rc` here and its children lose a reference.
+            if gc_trace::is_tracked(id) {
+                gc_trace::with_state(|s| s.untrack_id(id));
+            }
+            drop(obj);
+            // Any tracked child that just lost its last program reference
+            // is the next link in the chain.
+            for cid in child_ids {
+                if let Some(h) = gc_trace::find_handle(cid) {
+                    let weak = crate::weakref_registry::strong_clone_count(cid);
+                    // `h.object` is the GC's own strong reference; the
+                    // child is dead iff nothing beyond that handle and its
+                    // weakref clones still points at it.
+                    if gc_trace::strong_count_for(&h.object) <= 1 + weak {
+                        work.push(h.object.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Does `obj` carry a finalizer that prompt reclamation must run
+    /// before freeing it? Instances with `__del__`, and unfinished
+    /// generators/coroutines/async-generators (their `close()` delivers
+    /// `GeneratorExit`).
+    fn object_is_finalizable(obj: &Object) -> bool {
+        match obj {
             Object::Instance(i) => i.cls().lookup("__del__").is_some(),
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
                 !g.is_finished()
             }
-            _ => return,
-        };
-        let id = crate::weakref_registry::id_of(&dropped);
-        let watched = crate::weakref_registry::count_for(id) > 0;
-        if !finalizable && !watched {
-            return;
+            _ => false,
         }
-        let strong = gc_trace::strong_count_for(&dropped);
+    }
+
+    /// Is `obj` dead in refcount terms — does the caller hold its last
+    /// program-visible reference? `local_refs` is the number of strong
+    /// references the caller itself holds (the binding being dropped, or
+    /// a work-list entry). The GC's own handle and weakref strong clones
+    /// are discounted: neither is a program-visible binding.
+    fn is_refcount_dead(obj: &Object, local_refs: usize) -> bool {
+        let id = crate::weakref_registry::id_of(obj);
         let registry_holds = usize::from(gc_trace::is_tracked(id));
         let weak_clones = crate::weakref_registry::strong_clone_count(id);
-        // `dropped` itself accounts for one reference.
-        if strong > 1 + registry_holds + weak_clones {
+        gc_trace::strong_count_for(obj) <= local_refs + registry_holds + weak_clones
+    }
+
+    /// Emulate CPython deleting a terminating thread's thread-state
+    /// dict: drop `ident`'s slot from every `_threading_local.local`.
+    /// Run from the native worker teardown (`spawn_python_worker`) the
+    /// instant a worker's target returns, while the worker still holds
+    /// the GIL. This is what lets a `threading._DummyThread` created by
+    /// a *foreign* thread be removed from `threading._active` when that
+    /// thread exits (`test_threading.test_foreign_thread`): the dummy's
+    /// `_DeleteDummyThreadOnDel` is parked in thread-local storage, and
+    /// clearing the slot finalizes it, which pops the dummy from
+    /// `_active`. No-op when `_threading_local` was never imported.
+    pub fn run_thread_local_death_cleanup(&mut self, ident: i64) {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let Some(module) = self.cache.get("_threading_local") else {
             return;
+        };
+        let func = match &module {
+            Object::Module(m) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("_clear_thread")))
+                .cloned(),
+            _ => None,
+        };
+        let Some(func) = func else {
+            return;
+        };
+        let globals = self.builtins.clone();
+        let cleared = match self.call(&func, &[Object::Int(ident)], &[], &globals) {
+            Ok(v) => matches!(v, Object::Int(n) if n > 0),
+            Err(err) => {
+                let is_exit = matches!(&err,
+                    RuntimeError::PyException(exc) if exc.system_exit_code().is_some());
+                if !is_exit {
+                    let context_repr = func.repr();
+                    self.write_unraisable(&err, &func, &context_repr);
+                }
+                false
+            }
+        };
+        // Only pay for a collection when this thread actually parked
+        // thread-local data. The slot we just detached is now unreachable
+        // acyclic garbage; a collection finalizes it now (running e.g.
+        // `_DeleteDummyThreadOnDel.__del__`, which pops the dummy from
+        // `threading._active`) instead of deferring to the next
+        // allocation-driven GC, which a quiescing interpreter may never hit.
+        if cleared {
+            crate::gc_trace::collect_all();
         }
-        // Dead in refcount terms. CPython order: __del__ first, then
-        // weakrefs are cleared.
-        if finalizable && gc_trace::mark_finalized(id) {
-            crate::vm_singletons::push_pending_finalizer(dropped.clone());
-            self.run_pending_finalizers();
-        } else if finalizable && registry_holds == 0 {
-            // Not tracked (shouldn't happen for instances/generators,
-            // but stay safe): run the finalizer directly.
-            crate::vm_singletons::push_pending_finalizer(dropped.clone());
-            self.run_pending_finalizers();
-        }
-        crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(id));
         self.run_pending_finalizers();
     }
 
@@ -942,21 +1119,32 @@ impl Interpreter {
     /// finalizer are routed through `sys.unraisablehook` (the
     /// default hook prints `Exception ignored in: …` to stderr,
     /// exactly like CPython) so they don't propagate.
-    pub fn run_pending_finalizers(&mut self) {
+    pub fn run_pending_finalizers(&mut self) -> usize {
         // Finalizers run arbitrary Python (`__del__` → traceback →
         // native islice, …), so the interpreter pointer must be
         // published here just like the public call entry points: the
         // shutdown pass reaches this outside any published frame.
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        // Number of `__del__` finalizers actually run. The cycle-GC
+        // interception uses this to decide whether a follow-up collection is
+        // worthwhile (a finalizer may have dropped the last reference to — or
+        // resurrected — a deferred object).
+        let mut finalizers_run = 0usize;
         loop {
             let pending = crate::vm_singletons::drain_pending_finalizers();
             let callbacks = crate::vm_singletons::drain_pending_weakref_callbacks();
             if pending.is_empty() && callbacks.is_empty() {
-                return;
+                return finalizers_run;
             }
             for obj in pending {
                 self.invoke_finalizer(&obj);
+                finalizers_run += 1;
+                // The finalizer has now run to completion: mark the object
+                // finalized and clear its deferral flag so the next collection
+                // treats it as plain garbage (if it wasn't resurrected) and
+                // never runs `__del__` a second time.
+                crate::gc_trace::complete_finalizer(crate::weakref_registry::id_of(&obj));
             }
             // Weakref callbacks run after finalizers (CPython's order);
             // errors route through the unraisable hook.
@@ -965,6 +1153,145 @@ impl Interpreter {
                 if let Err(err) = self.call(&cb, std::slice::from_ref(&wr), &[], &globals) {
                     let context_repr = wr.repr();
                     self.write_unraisable(&err, &wr, &context_repr);
+                }
+            }
+        }
+    }
+
+    /// Invoke every callable in `gc.callbacks` with `(phase, info)`, where
+    /// `info` is a fresh dict carrying `generation`, `collected`, and
+    /// `uncollectable` — CPython's `invoke_gc_callback` contract. Called with
+    /// `phase == "start"` before a collection and `"stop"` after. A no-op when
+    /// `gc` hasn't been imported or its callback list is empty. Errors route
+    /// through the unraisable hook, matching CPython.
+    pub fn fire_gc_callbacks(
+        &mut self,
+        phase: &'static str,
+        generation: usize,
+        collected: usize,
+        uncollectable: usize,
+    ) {
+        let callbacks = match self.cache.get("gc") {
+            Some(Object::Module(m)) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("callbacks")))
+                .cloned(),
+            _ => None,
+        };
+        let Some(Object::List(list)) = callbacks else {
+            return;
+        };
+        // Snapshot the list so a callback that mutates `gc.callbacks` can't
+        // invalidate the iteration.
+        let cbs: Vec<Object> = list.borrow().clone();
+        if cbs.is_empty() {
+            return;
+        }
+        let mut info = DictData::new();
+        info.insert(
+            DictKey(Object::from_static("generation")),
+            Object::Int(generation as i64),
+        );
+        info.insert(
+            DictKey(Object::from_static("collected")),
+            Object::Int(collected as i64),
+        );
+        info.insert(
+            DictKey(Object::from_static("uncollectable")),
+            Object::Int(uncollectable as i64),
+        );
+        let info_obj = Object::Dict(Rc::new(RefCell::new(info)));
+        let phase_obj = Object::from_static(phase);
+        let globals = self.builtins.clone();
+        for cb in cbs {
+            let cb_args = [phase_obj.clone(), info_obj.clone()];
+            if let Err(err) = self.call(&cb, &cb_args, &[], &globals) {
+                let context_repr = cb.repr();
+                self.write_unraisable(&err, &cb, &context_repr);
+            }
+        }
+    }
+
+    /// Move the objects the cycle collector parked in its Rust-side garbage
+    /// buffer (`GcState::garbage` — uncollectable cycles and everything kept
+    /// under `gc.DEBUG_SAVEALL`) into the Python-visible `gc.garbage` list,
+    /// where user code can inspect them. Returns the number transferred this
+    /// call (the collection's "uncollectable" count for `gc.callbacks`).
+    pub fn drain_gc_garbage(&mut self) -> usize {
+        let parked: Vec<Object> =
+            gc_trace::with_state(|s| std::mem::take(&mut *s.garbage.borrow_mut()));
+        let n = parked.len();
+        if n == 0 {
+            return 0;
+        }
+        let list = match self.cache.get("gc") {
+            Some(Object::Module(m)) => m
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("garbage")))
+                .cloned(),
+            _ => None,
+        };
+        if let Some(Object::List(list)) = list {
+            list.borrow_mut().extend(parked);
+        }
+        n
+    }
+
+    /// CPython's `Py_FinalizeEx` shutdown prologue, in order:
+    ///
+    /// 1. `wait_for_thread_shutdown()` — if `threading` was imported,
+    ///    call `threading._shutdown()`, which runs the
+    ///    `threading._register_atexit` callbacks and then **joins every
+    ///    non-daemon thread**. A `SystemExit` from a worker is swallowed
+    ///    by the worker; any other failure of `_shutdown()` itself is
+    ///    reported through the unraisable hook against the `threading`
+    ///    module (matching `PyErr_WriteUnraisable(threading)`).
+    /// 2. `_PyAtExit_Call()` — run the `atexit` module's registered
+    ///    callbacks in LIFO order, each error routed through the
+    ///    unraisable hook.
+    ///
+    /// Runs before [`Self::run_shutdown_finalizers`] (which flips
+    /// `sys.is_finalizing()` and runs `__del__` for everything still
+    /// alive), so non-daemon threads have finished and atexit output is
+    /// produced before the interpreter tears down.
+    pub fn run_interpreter_shutdown(&mut self) {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        // (1) threading._shutdown() — only when threading was imported,
+        // exactly like CPython's `wait_for_thread_shutdown`.
+        if let Some(threading) = self.cache.get("threading") {
+            let shutdown = match &threading {
+                Object::Module(m) => m
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("_shutdown")))
+                    .cloned(),
+                _ => None,
+            };
+            if let Some(shutdown) = shutdown {
+                let globals = self.builtins.clone();
+                if let Err(err) = self.call(&shutdown, &[], &[], &globals) {
+                    let is_exit = matches!(&err,
+                        RuntimeError::PyException(exc) if exc.system_exit_code().is_some());
+                    if !is_exit {
+                        let context_repr = threading.repr();
+                        self.write_unraisable(&err, &threading, &context_repr);
+                    }
+                }
+            }
+        }
+        // (2) atexit callbacks (LIFO). `atexit` collects them in a
+        // thread-local; drain and run each with the live interpreter.
+        for (func, args, kwargs) in crate::stdlib::atexit_mod::take_handlers() {
+            let globals = self.builtins.clone();
+            if let Err(err) = self.call(&func, &args, &kwargs, &globals) {
+                let is_exit = matches!(&err,
+                    RuntimeError::PyException(exc) if exc.system_exit_code().is_some());
+                if !is_exit {
+                    let context_repr = func.repr();
+                    self.write_unraisable(&err, &func, &context_repr);
                 }
             }
         }
@@ -1123,6 +1450,22 @@ impl Interpreter {
     /// prints `Exception ignored in: <context>` plus the traceback to
     /// stderr and swallows the error so it can't change the exit status.
     fn write_unraisable(&mut self, err: &RuntimeError, object: &Object, context_repr: &str) {
+        self.write_unraisable_msg(err, object, context_repr, None);
+    }
+
+    /// Like [`Self::write_unraisable`] but with an explicit `err_msg`
+    /// (CPython's `PyErr_FormatUnraisable`). The low-level
+    /// `_thread.start_new_thread` reports an uncaught worker exception as
+    /// `Exception ignored in thread started by <func>` with a `None`
+    /// object — distinct from `threading.Thread`, which routes through
+    /// `threading.excepthook`.
+    pub fn write_unraisable_msg(
+        &mut self,
+        err: &RuntimeError,
+        object: &Object,
+        context_repr: &str,
+        err_msg: Option<&str>,
+    ) {
         let (exc_value, exc_type, traceback) = match err {
             RuntimeError::PyException(pyexc) => {
                 let inst = pyexc.instance.clone();
@@ -1170,15 +1513,21 @@ impl Interpreter {
         };
         if !is_default {
             if let Some(hook) = hook {
-                let args_obj = self.make_unraisable_args(&exc_type, &exc_value, object);
+                let args_obj = self.make_unraisable_args(&exc_type, &exc_value, object, err_msg);
                 let outer = self.builtins_dict();
                 if self.call(&hook, &[args_obj], &[], &outer).is_err() {
-                    self.print_unraisable_default(&exc_value, &traceback, context_repr, true);
+                    self.print_unraisable_default(
+                        &exc_value,
+                        &traceback,
+                        context_repr,
+                        true,
+                        err_msg,
+                    );
                 }
                 return;
             }
         }
-        self.print_unraisable_default(&exc_value, &traceback, context_repr, false);
+        self.print_unraisable_default(&exc_value, &traceback, context_repr, false, err_msg);
     }
 
     /// Build the `UnraisableHookArgs`-shaped object passed to a custom
@@ -1189,6 +1538,7 @@ impl Interpreter {
         exc_type: &Object,
         exc_value: &Object,
         object: &Object,
+        err_msg: Option<&str>,
     ) -> Object {
         let mut d = DictData::new();
         d.insert(DictKey(Object::from_static("exc_type")), exc_type.clone());
@@ -1206,7 +1556,11 @@ impl Interpreter {
             _ => Object::None,
         };
         d.insert(DictKey(Object::from_static("exc_traceback")), tb);
-        d.insert(DictKey(Object::from_static("err_msg")), Object::None);
+        let err_msg_obj = match err_msg {
+            Some(m) => Object::from_str(m.to_owned()),
+            None => Object::None,
+        };
+        d.insert(DictKey(Object::from_static("err_msg")), err_msg_obj);
         d.insert(DictKey(Object::from_static("object")), object.clone());
         Object::SimpleNamespace(Rc::new(RefCell::new(d)))
     }
@@ -1220,16 +1574,25 @@ impl Interpreter {
         traceback: &[crate::error::TracebackEntry],
         context_repr: &str,
         hook_failed: bool,
+        err_msg: Option<&str>,
     ) {
         use std::io::Write;
         let mut s = String::new();
         if hook_failed {
             s.push_str("Exception ignored in sys.unraisablehook: ");
+            s.push_str(context_repr);
+            s.push('\n');
+        } else if let Some(msg) = err_msg {
+            // CPython's `PyErr_FormatUnraisable`: the formatted message
+            // already names the context (e.g. the thread's target), so
+            // it replaces the generic `Exception ignored in:` header.
+            s.push_str(msg);
+            s.push_str(":\n");
         } else {
             s.push_str("Exception ignored in: ");
+            s.push_str(context_repr);
+            s.push('\n');
         }
-        s.push_str(context_repr);
-        s.push('\n');
         if !traceback.is_empty() {
             s.push_str("Traceback (most recent call last):\n");
             for e in traceback {
@@ -1548,6 +1911,20 @@ impl Interpreter {
                 )));
             }
         };
+        if std::env::var_os("WP_DBG_SAMPLE").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CALLS: AtomicU64 = AtomicU64::new(0);
+            let n = CALLS.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(2_000) {
+                eprintln!(
+                    "[WP_SAMPLE n={}] depth={} qualname={} file={}",
+                    n,
+                    crate::recursion::current_depth(),
+                    frame.code.qualname,
+                    frame.code.filename,
+                );
+            }
+        }
         // Captured before `sent` is consumed below; only the tier-2
         // entry guard reads it, so it's gated to the `jit` feature to
         // stay warning-free in default builds.
@@ -1631,6 +2008,12 @@ impl Interpreter {
             }
         }
         let result = loop {
+            // RFC 0039 (WS2): cooperative GIL hand-off. Cheap
+            // thread-local countdown in the common case; drops and
+            // re-acquires the GIL every ~128 opcodes when another
+            // thread is blocked waiting for it, so compute-bound
+            // threads can't starve the rest.
+            crate::gil::periodic_gil_checkpoint();
             // Mirror the live `pc` into the snapshot so `f_lineno`
             // reads correctly when user code introspects via
             // `sys._getframe`.
@@ -1674,7 +2057,23 @@ impl Interpreter {
                     self.fire_opcode_event(&py_frame)?;
                 }
             }
-            match self.step(frame) {
+            // RFC 0039: service pending signals (`_thread.interrupt_main`,
+            // `signal.raise_signal`) on the main thread — the Rust
+            // analogue of CPython's `PyErr_CheckSignals`. The probe is a
+            // single relaxed load, so the no-signal path — i.e. nearly
+            // always — stays free. Feeding any handler-raised error
+            // through the same arm as `step`'s `Err` keeps it catchable
+            // by a surrounding `try/except`, exactly as CPython.
+            let stepped =
+                if crate::stdlib::signal_mod::signals_pending() && crate::gil::is_main_thread() {
+                    match self.run_pending_signals(&py_frame) {
+                        Ok(()) => self.step(frame),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    self.step(frame)
+                };
+            match stepped {
                 Ok(StepOutcome::Continue) => {}
                 Ok(StepOutcome::Return(v)) => {
                     if crate::trace::any_observers_active() {
@@ -2216,6 +2615,63 @@ impl Interpreter {
         Ok(())
     }
 
+    /// RFC 0039: run handlers for any tripped signals — the Rust
+    /// analogue of CPython's `PyErr_CheckSignals`. The dispatch loop
+    /// calls this on the main thread when a signal is pending. Each
+    /// tripped signal's disposition is consulted: `SIG_DFL` (0) and
+    /// `SIG_IGN` (1) are no-ops (CPython only raises on a *default*
+    /// SIGINT because it installs the `default_int_handler` callable at
+    /// startup — which we model, so it lands in the callable arm), while
+    /// a Python handler is invoked `handler(signum, frame)`. Any
+    /// exception it raises propagates through the dispatch loop's normal
+    /// error path, so it stays catchable by a surrounding `try/except`.
+    fn run_pending_signals(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        for signum in crate::stdlib::signal_mod::take_tripped() {
+            let handler = crate::stdlib::signal_mod::handler_for(signum);
+            match handler {
+                Object::Int(_) => {}
+                callable => {
+                    let globals = self.builtins.clone();
+                    self.call(
+                        &callable,
+                        &[
+                            Object::Int(i64::from(signum)),
+                            Object::Frame(py_frame.clone()),
+                        ],
+                        &[],
+                        &globals,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Service pending OS signals from outside the bytecode loop — e.g.
+    /// a blocking `lock.acquire()` on the main thread that woke on
+    /// `EINTR` (RFC 0039 `test_threadsignals`). Runs each tripped
+    /// signal's Python handler with `frame=None`; a handler that raises
+    /// (e.g. `KeyboardInterrupt`) propagates to the caller so the
+    /// blocking call is abandoned with that exception.
+    pub fn run_pending_signals_public(&mut self) -> Result<(), RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        for signum in crate::stdlib::signal_mod::take_tripped() {
+            let handler = crate::stdlib::signal_mod::handler_for(signum);
+            if let Object::Int(_) = handler {
+                continue;
+            }
+            let globals = self.builtins.clone();
+            self.call(
+                &handler,
+                &[Object::Int(i64::from(signum)), Object::None],
+                &[],
+                &globals,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Fire the `'line'` event when the source line changes.
     fn fire_line_event(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
         let frame_trace = py_frame.trace.borrow().clone();
@@ -2568,6 +3024,13 @@ impl Interpreter {
                         return Err(Self::unbound_local(&name));
                     }
                     let old = std::mem::replace(&mut frame.locals[slot], Object::Unbound);
+                    // Refresh the live-locals mirror *now* so its phantom
+                    // clone of the slot we just emptied doesn't mask the
+                    // binding's removal from `prompt_reap_dropped`'s
+                    // refcount test. The mirror is otherwise only re-synced
+                    // at the next loop step — too late for a finalizer or
+                    // weakref that should fire on this `del`.
+                    self.sync_py_locals(frame);
                     self.prompt_reap_dropped(old);
                 }
             }
@@ -3146,7 +3609,7 @@ impl Interpreter {
                     it_obj = fresh;
                 }
                 let next = match &it_obj {
-                    Object::Iter(it) => it.borrow_mut().next_value(),
+                    Object::Iter(it) => it.borrow_mut().next_value_checked()?,
                     Object::LazyIter(l) => {
                         let g = frame.globals.clone();
                         self.lazy_iter_next(&l.clone(), &g)?
@@ -3210,13 +3673,15 @@ impl Interpreter {
                 let items = frame.stack.split_off(split);
                 self.record_alloc(frame, 56 + (n as u64) * 8);
                 let obj = Object::new_list(items);
-                // RFC 0024: a list holding a reference can close a
-                // cycle (`s.attr = [s]`); track it so the cycle
-                // collector can break and finalize it. Lists of only
-                // scalar leaves can't cycle and stay off the GC's books.
-                let tracked = gc_trace::track_if_cyclic(&obj);
+                // RFC 0024/0039: CPython tracks *every* list — `gc.is_tracked([])`
+                // is True — and a list can close a cycle through later mutation
+                // (`l = []; l.append(l)`), which the content-gated optimization
+                // missed entirely. Track unconditionally so the collector both
+                // reports it via `gc.get_objects()`/`is_tracked` and can break
+                // the cycle when it becomes unreachable.
+                gc_trace::track(obj.clone());
                 frame.push(obj);
-                if tracked && gc_trace::maybe_auto_collect() > 0 {
+                if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }
             }
@@ -3225,6 +3690,18 @@ impl Interpreter {
                 let split = frame.stack.len().saturating_sub(n);
                 let items = frame.stack.split_off(split);
                 self.record_alloc(frame, 40 + (n as u64) * 8);
+                // A tuple is immutable, so it can never *anchor* a reference
+                // cycle on its own: any cycle that passes through a tuple
+                // (`l = []; t = (l,); l.append(t)`) is necessarily closed by a
+                // mutable container (`l`), which *is* tracked. The collector
+                // reaches the tuple's contents transitively from that anchor, so
+                // the cycle is still found and broken without the tuple itself
+                // being a GC root. Deliberately *don't* track tuples here: the
+                // GC index holds a strong reference, so tracking a transient
+                // arg-tuple/`(type, value, tb)` triple would pin it past the
+                // point CPython frees it by refcount — inflating
+                // `sys.getrefcount` of its elements (`test_traceback`'s
+                // `test_no_refs_to_exception_and_traceback_objects`).
                 frame.push(Object::new_tuple(items));
             }
             OpCode::BuildSet => {
@@ -3238,9 +3715,11 @@ impl Interpreter {
                 }
                 self.record_alloc(frame, 216 + (n as u64) * 16);
                 let obj = Object::new_set_from(items);
-                let tracked = gc_trace::track_if_cyclic(&obj);
+                // CPython tracks every set (`gc.is_tracked(set())` is True);
+                // track unconditionally like lists.
+                gc_trace::track(obj.clone());
                 frame.push(obj);
-                if tracked && gc_trace::maybe_auto_collect() > 0 {
+                if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }
             }
@@ -3261,9 +3740,11 @@ impl Interpreter {
                 }
                 self.record_alloc(frame, 64 + (n as u64) * 16);
                 let obj = Object::Dict(Rc::new(RefCell::new(d)));
-                let tracked = gc_trace::track_if_cyclic(&obj);
+                // CPython tracks dicts at creation; track unconditionally so a
+                // dict that becomes cyclic (`d = {}; d[0] = d`) is collectable.
+                gc_trace::track(obj.clone());
                 frame.push(obj);
-                if tracked && gc_trace::maybe_auto_collect() > 0 {
+                if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }
             }
@@ -3628,7 +4109,14 @@ impl Interpreter {
                     attrs: Rc::new(RefCell::new(DictData::new())),
                     slots,
                 };
-                frame.push(Object::Function(Rc::new(f)));
+                // A function participates in cycles through its globals
+                // (`exec(src, d)` builds `d -> f -> d`), its `__dict__`, and
+                // any closure cell that closes over the function. Track it so
+                // `gc.collect()` can reclaim those cycles and `gc.is_tracked(f)`
+                // reports True, matching CPython (functions are GC objects).
+                let obj = Object::Function(Rc::new(f));
+                gc_trace::track(obj.clone());
+                frame.push(obj);
             }
             OpCode::BuildSlice => {
                 let step = frame.pop()?;
@@ -5589,9 +6077,11 @@ impl Interpreter {
                                     name: "__next__",
                                     binds_instance: true,
                                     call: Box::new(move |_args| {
-                                        it.borrow_mut()
-                                            .next_value()
-                                            .ok_or_else(crate::error::stop_iteration)
+                                        match it.borrow_mut().next_value_checked() {
+                                            Ok(Some(v)) => Ok(v),
+                                            Ok(None) => Err(crate::error::stop_iteration()),
+                                            Err(e) => Err(e),
+                                        }
                                     }),
                                     call_kw: None,
                                 })),
@@ -5836,6 +6326,49 @@ impl Interpreter {
                         return Ok(v);
                     }
                 }
+            }
+            // `object.__repr__` / `object.__str__` are identity slots that
+            // WeavePy keeps as native behaviour rather than type-dict
+            // entries, so the MRO walk above can't find them. CPython's
+            // `super_getattro` resolves them to `object`'s slot wrappers
+            // (`object_repr` / `object_str`); mirror that so
+            // `super().__repr__()` / `super().__str__()` delegate to the
+            // base implementation instead of falling through to the super
+            // proxy's *own* repr. `__repr__` is the non-virtual
+            // `<Cls object at 0x…>` (computed here directly); `__str__` is
+            // `PyObject_Repr(self)` (a *virtual* repr dispatch), routed via
+            // the `.object_str` sentinel that `Interpreter::call`
+            // intercepts. Only pure-Python receivers reach here — built-in
+            // bases (`dict`, `list`, …) were already served by the native
+            // payload probe just above.
+            if matches!(name, "__repr__" | "__str__") {
+                let func = if name == "__repr__" {
+                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                        name: "__repr__",
+                        binds_instance: true,
+                        call: Box::new(|args: &[Object]| {
+                            let o = args.first().ok_or_else(|| {
+                                type_error("__repr__() takes exactly one argument (0 given)")
+                            })?;
+                            Ok(Object::from_str(object_base_repr_string(o)))
+                        }),
+                        call_kw: None,
+                    }))
+                } else {
+                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                        name: ".object_str",
+                        binds_instance: true,
+                        call: Box::new(|_| {
+                            Err(crate::error::runtime_error(
+                                "object.__str__ must be dispatched via Interpreter::call",
+                            ))
+                        }),
+                        call_kw: None,
+                    }))
+                };
+                return Ok(Object::BoundMethod(Rc::new(
+                    crate::object::BoundMethod::new(receiver.clone(), func),
+                )));
             }
             // Not found along the delegated MRO: fall through to normal
             // resolution so the proxy's *own* attributes (`__init__`,
@@ -8406,23 +8939,21 @@ impl Interpreter {
     /// `__hash__` dispatch fails, so the caller can fall back to the native
     /// structural hash.
     pub(crate) fn reentrant_py_hash(&mut self, obj: &Object) -> Option<i64> {
-        // Only dispatch when the class supplies a *callable* `__hash__`.
-        // Without this guard, an instance that inherits the default
-        // (object) hash would send `do_hash_call` down its
+        // Only dispatch when the class supplies a genuinely overriding
+        // `__hash__`. Without this guard, an instance that inherits the
+        // default (object) hash would send `do_hash_call` down its
         // `builtins::hash_object` fallback, which re-enters `DictKey::hash`
         // and recurses until the stack overflows. Returning `None` here
         // lets `DictKey` use its constant fallback (identity semantics),
-        // exactly as before this hook existed.
-        let Object::Instance(inst) = obj else {
+        // exactly as before this hook existed. The gate is shared with
+        // `DictKey`'s `Hash`/`Eq` (`instance_has_custom_dunder`) so the two
+        // never disagree — a built-in type like `weakref` that hashes by
+        // referent must dispatch here too, otherwise its `ref` objects fall
+        // back to identity hashes and equal refs land in different set slots.
+        if !matches!(obj, Object::Instance(_)) {
             return None;
-        };
-        let dispatchable = match inst.cls().lookup_with_owner("__hash__") {
-            Some((Object::Function(_) | Object::BoundMethod(_), _)) => true,
-            // Callable non-function dunder from a user class (Mock).
-            Some((Object::None, _)) | None => false,
-            Some((_, owner)) => !owner.flags.is_builtin,
-        };
-        if !dispatchable {
+        }
+        if !crate::object::instance_has_custom_dunder(obj, "__hash__") {
             return None;
         }
         let globals = self.builtins.clone();
@@ -8430,7 +8961,15 @@ impl Interpreter {
             Ok(Object::Int(i)) => Some(i),
             Ok(Object::Bool(b)) => Some(i64::from(b)),
             Ok(Object::Long(b)) => Some(crate::object::py_hash_long_bigint(&b)),
-            _ => None,
+            // A `__hash__` that raised (or returned a non-int) aborts the
+            // surrounding set/dict probe in CPython. Park the exception so
+            // `key_cmp_scope` re-raises it; fall back to the identity bucket
+            // only when nothing was raised.
+            Err(e) => {
+                crate::object::stash_key_cmp_error(e);
+                None
+            }
+            Ok(_) => None,
         }
     }
 
@@ -8439,8 +8978,31 @@ impl Interpreter {
     /// errored, so the caller falls back to native identity equality.
     pub(crate) fn reentrant_py_eq(&mut self, a: &Object, b: &Object) -> Option<bool> {
         let globals = self.builtins.clone();
+        match self.dispatch_compare_op(a, b, CompareKind::Eq, &globals) {
+            Ok(v) => Some(v),
+            // `__eq__` raised during a hash-table collision check. CPython's
+            // `PyObject_RichCompareBool` returns -1 and the set/dict op aborts;
+            // park the exception for `key_cmp_scope` to re-raise, and report
+            // "not equal" so the infallible `Eq` trait can return.
+            Err(e) => {
+                crate::object::stash_key_cmp_error(e);
+                None
+            }
+        }
+    }
+
+    /// Like [`reentrant_py_eq`] but **propagates** an exception raised by a
+    /// user `__eq__` (CPython's `PyObject_RichCompareBool`, which `list` /
+    /// `tuple` `count`/`index`/`in` let escape) instead of swallowing it.
+    /// The result object's truthiness is taken via `__bool__`, matching the
+    /// `PyObject_IsTrue` step.
+    pub(crate) fn reentrant_py_eq_bool(
+        &mut self,
+        a: &Object,
+        b: &Object,
+    ) -> Result<bool, RuntimeError> {
+        let globals = self.builtins.clone();
         self.dispatch_compare_op(a, b, CompareKind::Eq, &globals)
-            .ok()
     }
 
     /// VM-routed `getattr(obj, name[, default])`. Routes through the
@@ -8725,6 +9287,11 @@ impl Interpreter {
             Some(Object::List(l)) => l.clone(),
             _ => return Err(type_error("list.sort expects a list receiver")),
         };
+        // `list.sort(*, key=None, reverse=False)` is keyword-only:
+        // `[].sort(42, 42)` is a TypeError, not a silent no-op.
+        if args.len() > 1 {
+            return Err(type_error("sort() takes no positional arguments"));
+        }
         let reverse = kwargs
             .iter()
             .find_map(|(k, v)| (k == "reverse").then(|| v.is_truthy()))
@@ -8732,9 +9299,23 @@ impl Interpreter {
         let key_fn = kwargs
             .iter()
             .find_map(|(k, v)| (k == "key").then(|| v.clone()));
-        let mut items = list.borrow().clone();
-        self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals)?;
+        // CPython detaches the backing array for the duration of the sort
+        // (sets `ob_item = NULL`, size 0) so a `key`/comparator that re-enters
+        // the list sees it empty and can't corrupt the slice being sorted.
+        // After sorting it restores the sorted items, then — if the user
+        // mutated the now-empty list mid-sort — raises "list modified during
+        // sort" (test_list/test_sort `selfmodifyingComparison`).
+        let mut items = std::mem::take(&mut *list.borrow_mut());
+        let sort_result = self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals);
+        let mutated = !list.borrow().is_empty();
+        // Restore the saved items (fully sorted on success, partially on
+        // error); CPython discards whatever the mutation left behind.
         *list.borrow_mut() = items;
+        // A key/comparison error takes precedence over the mutation report.
+        sort_result?;
+        if mutated {
+            return Err(value_error("list modified during sort"));
+        }
         Ok(Object::None)
     }
 
@@ -8924,7 +9505,13 @@ impl Interpreter {
         if let Object::Long(b) = v {
             crate::builtins::long_str_limit_check(b)?;
         }
-        Ok(v.to_str())
+        // `str()` of a container delegates to `repr`, so guard it the same
+        // way (cyclic → `[...]`, over-deep → `RecursionError`).
+        crate::object::repr_guarded(|| v.to_str()).map_err(|()| {
+            crate::error::recursion_error(
+                "maximum recursion depth exceeded while getting the str of an object",
+            )
+        })
     }
 
     fn repr_of(
@@ -8978,7 +9565,14 @@ impl Interpreter {
         if let Object::Long(b) = v {
             crate::builtins::long_str_limit_check(b)?;
         }
-        Ok(v.repr())
+        // A self-referential container renders `[...]`; one nested past
+        // `sys.getrecursionlimit()` raises `RecursionError` rather than
+        // overflowing the native stack (test_list.test_repr_deep).
+        crate::object::repr_guarded(|| v.repr()).map_err(|()| {
+            crate::error::recursion_error(
+                "maximum recursion depth exceeded while getting the repr of an object",
+            )
+        })
     }
 
     /// Either build a native iterator (for built-ins) or call
@@ -9380,7 +9974,7 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
         match iter {
-            Object::Iter(it) => Ok(it.borrow_mut().next_value()),
+            Object::Iter(it) => it.borrow_mut().next_value_checked(),
             Object::LazyIter(l) => self.lazy_iter_next(l, globals),
             Object::Generator(g) => match self.generator_send(g, Object::None) {
                 Ok(v) => Ok(Some(v)),
@@ -11536,7 +12130,13 @@ impl Interpreter {
                         data.clear();
                     } else {
                         let unit = data.len();
-                        checked_repeat_count(unit, n, "bytes")?;
+                        let times = checked_repeat_count(unit, n, "bytes")?;
+                        // Reserve up front so `b *= huge` surfaces `MemoryError`
+                        // instead of OOM-growing the buffer one copy at a time.
+                        let extra = unit.saturating_mul(times.saturating_sub(1));
+                        if data.try_reserve_exact(extra).is_err() {
+                            return Err(crate::error::memory_error(""));
+                        }
                         let original = data.clone();
                         for _ in 1..n {
                             data.extend_from_slice(&original);
@@ -11557,7 +12157,15 @@ impl Interpreter {
                     if n <= 0 {
                         data.clear();
                     } else {
-                        checked_repeat_count(data.len(), n, "list")?;
+                        let unit = data.len();
+                        let times = checked_repeat_count(unit, n, "list")?;
+                        // Reserve up front so `lst *= huge` raises `MemoryError`
+                        // rather than OOM-growing the list one copy at a time
+                        // (the non-in-place `lst * n` path already guards this).
+                        let extra = unit.saturating_mul(times.saturating_sub(1));
+                        if data.try_reserve_exact(extra).is_err() {
+                            return Err(crate::error::memory_error(""));
+                        }
                         let original = data.clone();
                         for _ in 1..n {
                             data.extend_from_slice(&original);
@@ -12407,6 +13015,12 @@ impl Interpreter {
                             if let Some((_, slot)) =
                                 inst.dict.borrow_mut().get_index_mut(key_idx as usize)
                             {
+                                // Mirror the slow path: a bound method stored
+                                // on the instance must join the cycle collector
+                                // (see `generic_setattr_instance`).
+                                if matches!(val, Object::BoundMethod(_)) {
+                                    gc_trace::track(val.clone());
+                                }
                                 *slot = val;
                                 specialize::record_hit(op_idx);
                                 return Ok(());
@@ -12504,6 +13118,14 @@ impl Interpreter {
                         drop(it);
                         frame.push(v);
                     } else {
+                        // Exhausted: detach from the backing list so a later
+                        // `append`/`extend` can't resurrect the iterator
+                        // (CPython clears `it_seq` on first StopIteration).
+                        // Mirrors `PyIterator::next_value`; without this the
+                        // generic path detaches but this fast path leaks a
+                        // live cursor (test_list.test_exhausted_iterator,
+                        // test_tier2_invalidates_iterator).
+                        *items = Rc::new(RefCell::new(Vec::new()));
                         drop(it);
                         frame.pop()?;
                         frame.pc += jump_arg;
@@ -12767,19 +13389,41 @@ impl Interpreter {
                 Ok(Some(true))
             }
             (Object::List(xs), Object::List(ys)) => {
-                let xs = xs.borrow().clone();
-                let ys = ys.borrow().clone();
-                if xs.len() != ys.len() {
+                // CPython `list_richcompare` (Py_EQ): an up-front length
+                // shortcut, then an element-wise scan over the *live* lists
+                // that re-reads each length every step. A user `__eq__` may
+                // mutate either operand mid-compare (bpo-38588): if it clears
+                // both lists, the size re-check below sees two empty lists
+                // and reports equal — so we cannot snapshot up front.
+                if xs.borrow().len() != ys.borrow().len() {
                     return Ok(Some(false));
                 }
-                for (x, y) in xs.iter().zip(ys.iter()) {
-                    if !(x.is_same(y)
-                        || self.dispatch_compare_op(x, y, CompareKind::Eq, globals)?)
+                let mut i = 0usize;
+                loop {
+                    let (xi, yi) = {
+                        let xb = xs.borrow();
+                        let yb = ys.borrow();
+                        if i >= xb.len() || i >= yb.len() {
+                            break;
+                        }
+                        (xb[i].clone(), yb[i].clone())
+                    };
+                    if !(xi.is_same(&yi)
+                        || self.dispatch_compare_op(&xi, &yi, CompareKind::Eq, globals)?)
                     {
-                        return Ok(Some(false));
+                        break;
                     }
+                    i += 1;
                 }
-                Ok(Some(true))
+                // Consumed all of either live list → compare live lengths;
+                // otherwise we stopped on a differing element, so `==` False.
+                let len_x = xs.borrow().len();
+                let len_y = ys.borrow().len();
+                if i >= len_x || i >= len_y {
+                    Ok(Some(len_x == len_y))
+                } else {
+                    Ok(Some(false))
+                }
             }
             (Object::Dict(xs), Object::Dict(ys)) => {
                 // Snapshot both mappings before recursing so a user
@@ -13475,6 +14119,15 @@ impl Interpreter {
                 )));
             }
         }
+        // A bound method stashed on the instance (`self.cb = self.handler`)
+        // closes a `self -> __dict__ -> method -> self` cycle. Bound methods
+        // are otherwise materialised transiently per call and left untracked
+        // to keep dispatch cheap; track the ones that actually escape into an
+        // instance attribute so the cycle collector can reclaim them
+        // (CPython's `method` type is always GC-tracked — `test_method`).
+        if matches!(value, Object::BoundMethod(_)) {
+            gc_trace::track(value.clone());
+        }
         inst.dict
             .borrow_mut()
             .insert(DictKey(Object::from_str(name)), value);
@@ -13678,12 +14331,11 @@ impl Interpreter {
                 _ => {}
             }
         }
-        if inst
+        let removed = inst
             .dict
             .borrow_mut()
-            .shift_remove(&DictKey(Object::from_str(name)))
-            .is_none()
-        {
+            .shift_remove(&DictKey(Object::from_str(name)));
+        let Some(removed) = removed else {
             // Slots class: a name resolving on the class (non-data
             // descriptor) is "read-only", like the store path.
             if inst.cls().forbids_dict && inst.cls().lookup(name).is_some() {
@@ -13694,7 +14346,15 @@ impl Interpreter {
                 )));
             }
             return Err(crate::error::attribute_error_named(obj, name));
-        }
+        };
+        // CPython decrefs the detached value immediately; if that was its
+        // last reference its `tp_dealloc` runs now (`__del__`, weakref
+        // clearing) and any dead acyclic container it held is reclaimed.
+        // Emulate that prompt death so e.g. `Thread.run`'s
+        // `del self._target, self._args, self._kwargs` releases the
+        // thread's hold on its argument cycle without waiting for a GC
+        // pass (`test_threading.test_no_refcycle_through_target`).
+        self.prompt_reap_dropped(removed);
         Ok(())
     }
 
@@ -13957,6 +14617,14 @@ impl Interpreter {
                 "bytearray indices must be integers or slices, not {}",
                 other.type_name()
             ))),
+            (Object::Tuple(_), other) => Err(type_error(format!(
+                "tuple indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
+            (Object::List(_), other) => Err(type_error(format!(
+                "list indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
             (_, _) => Err(type_error(format!(
                 "'{}' object is not subscriptable with '{}'",
                 container.type_name(),
@@ -14124,6 +14792,13 @@ impl Interpreter {
             }
             (Object::ByteArray(_), other) => Err(type_error(format!(
                 "bytearray indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
+            // A list *does* support assignment; a bad index type is the
+            // "indices must be integers or slices" TypeError (matching the
+            // read path), not "does not support item assignment".
+            (Object::List(_), other) => Err(type_error(format!(
+                "list indices must be integers or slices, not {}",
                 other.type_name()
             ))),
             _ => Err(type_error(format!(
@@ -14745,9 +15420,72 @@ impl Interpreter {
                     // semantics where `gc.collect()` returns *after*
                     // every finaliser has fired.
                     if b.name == ".gc.collect" {
-                        let result = (b.call)(args)?;
-                        self.run_pending_finalizers();
-                        return Ok(result);
+                        // `generation` may be positional or the `generation=`
+                        // keyword (CPython accepts both). Validate it the way
+                        // the argument clinic does: out-of-range int → ValueError,
+                        // non-int → TypeError.
+                        let raw = args.first().cloned().or_else(|| {
+                            kwargs
+                                .iter()
+                                .find(|(k, _)| k == "generation")
+                                .map(|(_, v)| v.clone())
+                        });
+                        let generation = match raw {
+                            None | Some(Object::None) => gc_trace::N_GENERATIONS - 1,
+                            Some(Object::Bool(flag)) => usize::from(flag),
+                            Some(Object::Int(n)) => {
+                                if n < 0 || n as usize >= gc_trace::N_GENERATIONS {
+                                    return Err(value_error(format!(
+                                        "generation parameter must be between 0 and {} (inclusive)",
+                                        gc_trace::N_GENERATIONS - 1
+                                    )));
+                                }
+                                n as usize
+                            }
+                            Some(other) => {
+                                return Err(type_error(format!(
+                                    "'{}' object cannot be interpreted as an integer",
+                                    other.type_name()
+                                )));
+                            }
+                        };
+                        // CPython invokes every `gc.callbacks` entry with
+                        // ("start", info) before the sweep and ("stop", info)
+                        // after, where `info` carries generation/collected/
+                        // uncollectable. Fire them around the real collection.
+                        self.fire_gc_callbacks("start", generation, 0, 0);
+                        // CPython's collector runs `__del__` finalizers *during*
+                        // the collection and then re-scans to see which objects
+                        // their finalizers resurrected — all within one
+                        // `gc.collect()`. WeavePy's GC layer can't call Python,
+                        // so it instead *defers* finalizable garbage (queuing
+                        // `__del__` and keeping the object tracked) rather than
+                        // reclaiming it. We reproduce CPython's single-call
+                        // semantics here: collect, drain the queued finalizers,
+                        // then collect again to reap whatever those finalizers
+                        // didn't resurrect. Loop to a fixpoint so finalizer
+                        // chains settle, and sum the per-pass counts — a
+                        // non-resurrected finalizable object is reclaimed (and
+                        // counted) in the follow-up pass, matching CPython.
+                        let mut collected = gc_trace::collect_upto(generation);
+                        for _ in 0..gc_trace::MAX_COLLECT_PASSES {
+                            let ran = self.run_pending_finalizers();
+                            if ran == 0 {
+                                break;
+                            }
+                            let more = gc_trace::collect_upto(generation);
+                            collected += more;
+                            if more == 0 {
+                                break;
+                            }
+                        }
+                        // The collector parks uncollectable / DEBUG_SAVEALL
+                        // objects in a Rust-side buffer (it can't touch the
+                        // interpreter). Move them into the Python-visible
+                        // `gc.garbage` list now that we can.
+                        let uncollectable = self.drain_gc_garbage();
+                        self.fire_gc_callbacks("stop", generation, collected, uncollectable);
+                        return Ok(Object::Int(collected as i64));
                     }
                     // Pre-materialize VM-only iterables (generators, user
                     // `__iter__` instances, metaclass-iterable classes) for
@@ -14772,7 +15510,7 @@ impl Interpreter {
                             | "issuperset"
                             | "isdisjoint"
                             | "writelines"
-                    ) && !(b.name == "update" && !matches!(args.first(), Some(Object::Set(_))))
+                    ) && !(b.name == "update" && !receiver_is_native_set(args.first()))
                     {
                         // `fromkeys` may take its iterable in slot 0 (unbound
                         // classmethod form); the others iterate args[1..].
@@ -15185,6 +15923,21 @@ impl Interpreter {
                             }
                             // CPython: `object.__reduce__` == `common_reduce(self, 0)`.
                             return self.object_default_reduce(&bm.receiver, 0, outer_globals);
+                        }
+                        // `super().__str__()` resolving to `object.__str__`:
+                        // CPython `object_str` is `PyObject_Repr(self)`, a
+                        // *virtual* repr dispatch (so a subclass `__repr__`
+                        // is honoured). Routed through this sentinel because
+                        // it needs VM access to re-enter `__repr__`.
+                        ".object_str" => {
+                            if !args.is_empty() {
+                                return Err(type_error(format!(
+                                    "__str__() takes no arguments ({} given)",
+                                    args.len()
+                                )));
+                            }
+                            let s = self.repr_of(&bm.receiver, outer_globals)?;
+                            return Ok(Object::from_str(s));
                         }
                         // `<builtin-iterator>.__reduce__()` — reduce to
                         // `(iter, (remaining_items,))` so the iterator
@@ -17192,6 +17945,22 @@ impl Interpreter {
                 "weakref" => {
                     return crate::stdlib::weakref_real::construct_ref(args, kwargs);
                 }
+                // RFC 0039: `threading.Lock` is `_thread.LockType`, so
+                // calling the `lock`/`RLock` type must construct a working
+                // lock (CPython's `LockType()` / `RLock()`), not a bare
+                // instance missing the `acquire`/`release` closures.
+                "lock" => {
+                    // CPython's `_thread.LockType` constructor takes no
+                    // arguments (`threading.Lock(1)` / `Lock(a=1)` raise
+                    // TypeError).
+                    if !args.is_empty() || !kwargs.is_empty() {
+                        return Err(type_error("lock() takes no arguments"));
+                    }
+                    return Ok(crate::stdlib::thread_real::new_lock_object());
+                }
+                "RLock" => {
+                    return Ok(crate::stdlib::thread_real::new_rlock_object());
+                }
                 // `types.TracebackType(tb_next, tb_frame, tb_lasti,
                 // tb_lineno)` — explicitly constructible since 3.7.
                 "traceback" => {
@@ -17608,7 +18377,7 @@ impl Interpreter {
                 // collection right here; without it the tracked set
                 // (which holds strong handles) grows without bound and
                 // long test runs degrade superlinearly.
-                if gc_trace::maybe_auto_collect() > 0 {
+                if gc_trace::maybe_auto_collect() {
                     self.run_pending_finalizers();
                 }
                 inst
@@ -17680,11 +18449,38 @@ impl Interpreter {
                     }
                     other => other,
                 };
+                // CPython: an *inherited* builtin `__init__` (`list`/`set`/…)
+                // that takes no keywords ignores excess keyword arguments when
+                // the subclass overrode `__new__` — the clinic's
+                // `_PyArg_NoKeywords` check is gated on
+                // `tp_new == base.tp_new`. The overriding `__new__` already
+                // consumed those kwargs (`class S(list): __new__(cls, seq,
+                // newarg=None)`), so drop them here instead of tripping
+                // "builtin '__init__' does not accept keyword arguments".
+                // `set`/`frozenset` are the exception: `set_init` calls
+                // `_PyArg_NoKeywords` *unconditionally*, so a set subclass that
+                // overrides only `__new__` still rejects keyword arguments
+                // (bpo-43413 / test_set `test_keywords_in_subclass`:
+                // `subclass_with_new([1, 2], newarg=3)` is a TypeError). `list`/
+                // `bytearray` inits ignore them (test_list's sibling test
+                // succeeds), so the drop only applies off the set path.
+                let recv_is_set = matches!(
+                    &instance,
+                    Object::Instance(i)
+                        if matches!(i.native.as_ref(), Some(Object::Set(_) | Object::FrozenSet(_)))
+                );
+                let drop_init_kwargs = !is_object_new
+                    && !recv_is_set
+                    && matches!(
+                        &init,
+                        Object::Builtin(b) if b.name == "__init__" && b.call_kw.is_none()
+                    );
+                let init_kwargs: &[(String, Object)] = if drop_init_kwargs { &[] } else { kwargs };
                 let bound = Object::BoundMethod(Rc::new(BoundMethod::new(instance.clone(), init)));
                 let result = self.call(
                     &bound,
                     args,
-                    kwargs,
+                    init_kwargs,
                     &Rc::new(RefCell::new(DictData::new())),
                 )?;
                 if !matches!(result, Object::None) {
@@ -18000,9 +18796,12 @@ impl Interpreter {
             match slot {
                 Some(slot) => {
                     if filled[slot] {
+                        // CPython renders these argument-binding errors
+                        // with `co_qualname` (`Class.meth()`), not the
+                        // bare `co_name`.
                         return Err(type_error(format!(
                             "{}() got multiple values for argument '{}'",
-                            f.name, name
+                            code.qualname, name
                         )));
                     }
                     positional[slot] = value.clone();
@@ -18018,12 +18817,12 @@ impl Interpreter {
                         return Err(type_error(format!(
                             "{}() got some positional-only arguments passed as \
                              keyword arguments: '{}'",
-                            f.name, name
+                            code.qualname, name
                         )));
                     } else {
                         return Err(type_error(format!(
                             "{}() got an unexpected keyword argument '{}'",
-                            f.name, name
+                            code.qualname, name
                         )));
                     }
                 }
@@ -18234,7 +19033,7 @@ impl Interpreter {
                     gc_trace::track(obj.clone());
                     // Threshold-driven young collection at the
                     // allocation site, as in the instance path.
-                    if gc_trace::maybe_auto_collect() > 0 {
+                    if gc_trace::maybe_auto_collect() {
                         self.run_pending_finalizers();
                     }
                     Ok(obj)
@@ -18663,6 +19462,45 @@ impl Interpreter {
         if matches!(recv, Object::Iter(_)) {
             return self.iter_reduce(recv, globals);
         }
+        // `set`/`frozenset` and their subclasses reduce as
+        // `(type, (list(elements),), state)` — CPython `set_reduce`. The
+        // default newobj reduction rebuilds an *empty* set because a set's
+        // elements ride in its constructor argument, not in the `__new__`
+        // call; without this, `copy.deepcopy`/`pickle` of a set silently
+        // drop every element (test_set test_deepcopy/test_deep_copy/
+        // test_pickling).
+        let set_payload = match recv {
+            Object::Set(_) | Object::FrozenSet(_) => Some(recv.clone()),
+            Object::Instance(inst) => match &inst.native {
+                Some(n @ (Object::Set(_) | Object::FrozenSet(_))) => Some(n.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(payload) = set_payload {
+            let elems: Vec<Object> = match &payload {
+                Object::Set(s) => s.borrow().iter().map(|k| k.0.clone()).collect(),
+                Object::FrozenSet(s) => s.iter().map(|k| k.0.clone()).collect(),
+                _ => unreachable!("set_payload is Set or FrozenSet by construction"),
+            };
+            let type_obj = crate::builtins::class_of(recv);
+            let args = Object::new_tuple(vec![Object::new_list(elems)]);
+            // Subclass instance state (`s.x = ...` in `__dict__`, plus any
+            // `__slots__` values) rides in the pickle state. Route through the
+            // object's own `__getstate__` (CPython `set_reduce` calls
+            // `_PyObject_GetState`) so a slotted subclass round-trips its slot
+            // values (test_pickling TestSetSubclassWithSlots) and a user
+            // `__getstate__` override is honoured. A base set/frozenset has no
+            // instance state → `None`.
+            let state = match recv {
+                Object::Instance(_) => {
+                    let getstate = self.load_attr(recv, "__getstate__")?;
+                    self.call(&getstate, &[], &[], globals)?
+                }
+                _ => Object::None,
+            };
+            return Ok(Object::new_tuple(vec![Object::Type(type_obj), args, state]));
+        }
         self.object_default_reduce(recv, proto, globals)
     }
 
@@ -18771,6 +19609,52 @@ impl Interpreter {
                 builtin,
                 Object::new_tuple(vec![Object::ByteArray(data.clone())]),
                 Object::Int(*index as i64),
+            ]));
+        }
+        // A list iterator reduces to `(iter, (live_list,), index)` — the
+        // *same* backing store + cursor (CPython `listiter_reduce`), so
+        // co-pickling `(iter(xs), xs)` memoizes to one shared list and the
+        // unpickled iterator tracks later mutations (test_list
+        // `test_iterator_pickle`). `PyIterator::List` also backs materialized
+        // set/dict/file iterators whose `items` is a private snapshot of the
+        // full sequence; reducing those the same way still round-trips — the
+        // snapshot holds every element and `index` keeps the cursor, so
+        // `list(unpickled)` replays exactly the not-yet-seen items.
+        if let crate::object::PyIterator::List { items, index } = &*it.borrow() {
+            // A detached (exhausted) list iterator reduces to `(iter, ([],))`
+            // — an empty list and *no* index (CPython `listiter_reduce` with
+            // `it_seq == NULL`). We detach by emptying `items` on exhaustion,
+            // so an empty backing store is the exhausted signal
+            // (test_iter `test_reduce_mutating_builtins_iter`).
+            if items.borrow().is_empty() {
+                return Ok(Object::new_tuple(vec![
+                    builtin,
+                    Object::new_tuple(vec![Object::new_list(Vec::new())]),
+                ]));
+            }
+            return Ok(Object::new_tuple(vec![
+                builtin,
+                Object::new_tuple(vec![Object::List(items.clone())]),
+                Object::Int(*index as i64),
+            ]));
+        }
+        // A reverse iterator reduces to `(reversed, (forward_list,), index)`
+        // — the shared forward store + the descending cursor (CPython
+        // `listreviter_reduce`); `(reversed(xs), xs)` memoizes to one list.
+        if let crate::object::PyIterator::Reversed { items, index } = &*it.borrow() {
+            // Exhausted reverse iterator → `(reversed, ([],))` (CPython
+            // `listreviter_reduce` with `it_seq == NULL`); detach empties
+            // `items`, so an empty store is the exhausted signal.
+            if items.borrow().is_empty() {
+                return Ok(Object::new_tuple(vec![
+                    builtin,
+                    Object::new_tuple(vec![Object::new_list(Vec::new())]),
+                ]));
+            }
+            return Ok(Object::new_tuple(vec![
+                builtin,
+                Object::new_tuple(vec![Object::List(items.clone())]),
+                Object::Int(*index),
             ]));
         }
         // Snapshot remaining *after* the lookup, mirroring CPython reading
@@ -19614,15 +20498,34 @@ impl Interpreter {
             }
         };
         let dict = m.dict.borrow();
-        if let Some(Object::List(all_list)) = dict.get(&DictKey(Object::from_static("__all__"))) {
-            let names: Vec<String> = all_list
-                .borrow()
-                .iter()
-                .filter_map(|o| match o {
-                    Object::Str(s) => Some(s.to_string()),
-                    _ => None,
-                })
-                .collect();
+        // `__all__` may be any sequence; CPython commonly ships it as a
+        // tuple (the whole `asyncio` package does). Honour list *and*
+        // tuple, else `from pkg import *` leaks every public global —
+        // including modules the package imported (e.g. a submodule's
+        // `import subprocess`), which would shadow the real
+        // `pkg.subprocess` attribute.
+        let all_names: Option<Vec<String>> =
+            match dict.get(&DictKey(Object::from_static("__all__"))) {
+                Some(Object::List(l)) => Some(
+                    l.borrow()
+                        .iter()
+                        .filter_map(|o| match o {
+                            Object::Str(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                Some(Object::Tuple(t)) => Some(
+                    t.iter()
+                        .filter_map(|o| match o {
+                            Object::Str(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            };
+        if let Some(names) = all_names {
             let mut g = globals.borrow_mut();
             for n in names {
                 if let Some(v) = dict.get(&DictKey(Object::from_str(&n))) {
@@ -20533,6 +21436,23 @@ fn builtin_slot_wrapper(ty: &Rc<TypeObject>, name: &str) -> Option<Object> {
     None
 }
 
+/// `object.__repr__(o)` (CPython `object_repr`): the identity repr
+/// `<module.qualname object at 0x…>`, computed **without** re-dispatching
+/// to a subclass `__repr__`. This non-virtual form is what
+/// `super().__repr__()` must return — a class that overrides `__repr__`
+/// and chains to `super().__repr__()` would otherwise recurse forever.
+/// Non-instance receivers fall back to the value's own repr.
+pub(crate) fn object_base_repr_string(o: &Object) -> String {
+    match o {
+        Object::Instance(inst) => format!(
+            "<{} object at 0x{:x}>",
+            inst.cls().qualified_display_name(),
+            Rc::as_ptr(inst) as usize
+        ),
+        _ => o.repr(),
+    }
+}
+
 /// Return a fresh empty globals dict — used by the awaitable
 /// dispatch paths that don't have a frame's globals handy. The
 /// dispatched method itself carries its own `__globals__`.
@@ -21056,7 +21976,7 @@ fn freeze_set_result(o: Object) -> Object {
                 Ok(cell) => cell.into_inner(),
                 Err(rc) => rc.borrow().clone(),
             };
-            Object::FrozenSet(Rc::new(data))
+            Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(data)))
         }
         other => other,
     }
@@ -23179,6 +24099,20 @@ fn group_decimal(mag: u64, sep: char) -> String {
 /// potentially unbounded and side-effecting, so `map`/`filter`/`zip`
 /// build *lazy* iterators over them; plain native containers take the
 /// eager fast path.
+/// True when `o` is a mutable `set` (or a *subclass instance* whose native
+/// payload is a `set`). `set.update` pre-materializes VM-only iterable
+/// arguments (generators / user `__iter__`), but `dict.update` has its own
+/// richer protocol; this predicate keeps a set-subclass receiver on the
+/// set path while letting a `dict`/dict-subclass receiver fall through to
+/// `do_dict_update_call`.
+fn receiver_is_native_set(o: Option<&Object>) -> bool {
+    match o {
+        Some(Object::Set(_)) => true,
+        Some(Object::Instance(i)) => matches!(i.native.as_ref(), Some(Object::Set(_))),
+        _ => false,
+    }
+}
+
 fn object_needs_vm_iter(o: &Object) -> bool {
     // A class whose *metaclass* defines `__iter__` (e.g. `list(SomeEnum)`
     // → `EnumType.__iter__`) iterates through the interpreter too.
@@ -23577,28 +24511,66 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         // result kind follows the *left* operand (CPython's `set_and` &
         // co. use `PyAnySet_Check` on the other operand and build a result
         // of `Py_TYPE(self)`).
-        (O::Set(x), O::Set(y), B::BitOr) => Ok(union_sets(&x.borrow(), &y.borrow())),
-        (O::Set(x), O::FrozenSet(y), B::BitOr) => Ok(union_sets(&x.borrow(), y)),
-        (O::FrozenSet(x), O::Set(y), B::BitOr) => Ok(freeze_set_result(union_sets(x, &y.borrow()))),
+        // Snapshot `set` operands out of their `RefCell` before running
+        // the op: the element `__hash__`/`__eq__` invoked while building
+        // the result can re-enter and mutate the operand (bpo-46615's
+        // "Bad.__eq__ clears the set" probe). Holding a live `borrow()`
+        // across that callback would hit a `BorrowMutError`; cloning the
+        // backing `SetData` first means the callback mutates the original
+        // freely while we compute from a stable snapshot — no crash,
+        // matching CPython's "don't crash; maybe raise RuntimeError".
+        (O::Set(x), O::Set(y), B::BitOr) => {
+            let (xs, ys) = (x.borrow().clone(), y.borrow().clone());
+            Ok(union_sets(&xs, &ys))
+        }
+        (O::Set(x), O::FrozenSet(y), B::BitOr) => {
+            let xs = x.borrow().clone();
+            Ok(union_sets(&xs, y))
+        }
+        (O::FrozenSet(x), O::Set(y), B::BitOr) => {
+            let ys = y.borrow().clone();
+            Ok(freeze_set_result(union_sets(x, &ys)))
+        }
         (O::FrozenSet(x), O::FrozenSet(y), B::BitOr) => Ok(freeze_set_result(union_sets(x, y))),
-        (O::Set(x), O::Set(y), B::BitAnd) => Ok(intersect_sets(&x.borrow(), &y.borrow())),
-        (O::Set(x), O::FrozenSet(y), B::BitAnd) => Ok(intersect_sets(&x.borrow(), y)),
+        (O::Set(x), O::Set(y), B::BitAnd) => {
+            let (xs, ys) = (x.borrow().clone(), y.borrow().clone());
+            Ok(intersect_sets(&xs, &ys))
+        }
+        (O::Set(x), O::FrozenSet(y), B::BitAnd) => {
+            let xs = x.borrow().clone();
+            Ok(intersect_sets(&xs, y))
+        }
         (O::FrozenSet(x), O::Set(y), B::BitAnd) => {
-            Ok(freeze_set_result(intersect_sets(x, &y.borrow())))
+            let ys = y.borrow().clone();
+            Ok(freeze_set_result(intersect_sets(x, &ys)))
         }
         (O::FrozenSet(x), O::FrozenSet(y), B::BitAnd) => {
             Ok(freeze_set_result(intersect_sets(x, y)))
         }
-        (O::Set(x), O::Set(y), B::Sub) => Ok(difference_sets(&x.borrow(), &y.borrow())),
-        (O::Set(x), O::FrozenSet(y), B::Sub) => Ok(difference_sets(&x.borrow(), y)),
+        (O::Set(x), O::Set(y), B::Sub) => {
+            let (xs, ys) = (x.borrow().clone(), y.borrow().clone());
+            Ok(difference_sets(&xs, &ys))
+        }
+        (O::Set(x), O::FrozenSet(y), B::Sub) => {
+            let xs = x.borrow().clone();
+            Ok(difference_sets(&xs, y))
+        }
         (O::FrozenSet(x), O::Set(y), B::Sub) => {
-            Ok(freeze_set_result(difference_sets(x, &y.borrow())))
+            let ys = y.borrow().clone();
+            Ok(freeze_set_result(difference_sets(x, &ys)))
         }
         (O::FrozenSet(x), O::FrozenSet(y), B::Sub) => Ok(freeze_set_result(difference_sets(x, y))),
-        (O::Set(x), O::Set(y), B::BitXor) => Ok(symmetric_diff_sets(&x.borrow(), &y.borrow())),
-        (O::Set(x), O::FrozenSet(y), B::BitXor) => Ok(symmetric_diff_sets(&x.borrow(), y)),
+        (O::Set(x), O::Set(y), B::BitXor) => {
+            let (xs, ys) = (x.borrow().clone(), y.borrow().clone());
+            Ok(symmetric_diff_sets(&xs, &ys))
+        }
+        (O::Set(x), O::FrozenSet(y), B::BitXor) => {
+            let xs = x.borrow().clone();
+            Ok(symmetric_diff_sets(&xs, y))
+        }
         (O::FrozenSet(x), O::Set(y), B::BitXor) => {
-            Ok(freeze_set_result(symmetric_diff_sets(x, &y.borrow())))
+            let ys = y.borrow().clone();
+            Ok(freeze_set_result(symmetric_diff_sets(x, &ys)))
         }
         (O::FrozenSet(x), O::FrozenSet(y), B::BitXor) => {
             Ok(freeze_set_result(symmetric_diff_sets(x, y)))
@@ -23633,6 +24605,11 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::new_tuple(out))
         }
         (O::Tuple(x), O::Int(n), B::Mult) | (O::Int(n), O::Tuple(x), B::Mult) => {
+            // CPython `tuplerepeat`: `t * 1` returns the *same* (exact) tuple
+            // object, so `id(t) == id(t * 1)` holds (seq_tests.test_repeat).
+            if *n == 1 {
+                return Ok(Object::Tuple(x.clone()));
+            }
             let times = checked_repeat_count(x.len(), *n, "tuple")?;
             let mut out: Vec<Object> = try_alloc_vec(x.len() * times)?;
             for _ in 0..times {
@@ -23669,7 +24646,11 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
 /// `OverflowError` when `len * n` exceeds `PY_SSIZE_T_MAX` (e.g.
 /// `b"abc" * sys.maxsize`) — without this, `Vec::with_capacity` aborts
 /// the whole process on allocation failure.
-fn checked_repeat_count(item_len: usize, n: i64, what: &str) -> Result<usize, RuntimeError> {
+pub(crate) fn checked_repeat_count(
+    item_len: usize,
+    n: i64,
+    what: &str,
+) -> Result<usize, RuntimeError> {
     let times = if n < 0 { 0 } else { n as usize };
     if item_len == 0 {
         return Ok(times.min(1));

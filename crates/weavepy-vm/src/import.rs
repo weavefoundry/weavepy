@@ -84,6 +84,12 @@ impl ModuleCache {
     /// of the same name return whatever is in the cache, regardless
     /// of whether the original loader has finished.
     pub fn insert(&self, full_name: &str, module: Object) {
+        // CPython tracks module objects with the cycle GC (`gc.is_tracked(gc)`
+        // is True); a module's globals routinely close cycles (a function
+        // defined in the module captures the module's dict). Track on install.
+        if matches!(module, Object::Module(_)) {
+            crate::gc_trace::track(module.clone());
+        }
         self.modules
             .borrow_mut()
             .insert(DictKey(Object::from_str(full_name)), module);

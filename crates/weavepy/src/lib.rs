@@ -322,6 +322,12 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
         }
         other => other.map_err(Error::from),
     };
+    // CPython's `Py_FinalizeEx` first joins non-daemon threads
+    // (`threading._shutdown()`) and runs `atexit` callbacks, *then*
+    // finalizes everything still alive. Do the same so a program that
+    // returns from `__main__` while a non-daemon worker is still running
+    // waits for it (and its output) before exit.
+    interpreter.run_interpreter_shutdown();
     // CPython runs finalizers for everything still alive during
     // interpreter shutdown — including a module-global object whose
     // `__del__` raises (which is reported via `sys.unraisablehook`).

@@ -32,7 +32,7 @@ use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::sync::atomic::Ordering;
 
-use crate::error::{type_error, RuntimeError};
+use crate::error::{type_error, value_error, RuntimeError};
 use crate::gc_trace::{self, N_GENERATIONS};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
@@ -101,7 +101,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("get_objects")),
-            b("get_objects", get_objects),
+            bkw("get_objects", get_objects),
         );
         d.insert(
             DictKey(Object::from_static("get_referrers")),
@@ -165,6 +165,49 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
     }))
 }
 
+fn bkw(
+    name: &'static str,
+    body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+) -> Object {
+    Object::Builtin(Rc::new(BuiltinFn::with_kwargs(name, body)))
+}
+
+/// Resolve a `generation` argument shared by `get_objects` / `collect`.
+/// Accepts it positionally or as the `generation=` keyword. `None`/absent
+/// means "all generations" (returns `None`); an out-of-range int raises
+/// `ValueError` and a non-int raises `TypeError`, matching CPython's
+/// `gc_get_objects_impl` argument clinic.
+fn generation_arg(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Option<usize>, RuntimeError> {
+    let raw = args.first().cloned().or_else(|| {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == "generation")
+            .map(|(_, v)| v.clone())
+    });
+    match raw {
+        None | Some(Object::None) => Ok(None),
+        // `bool` is an `int` subclass in Python, so `True`/`False` index gens.
+        Some(Object::Bool(b)) => Ok(Some(usize::from(b))),
+        Some(Object::Int(n)) => {
+            if n < 0 || n as usize >= N_GENERATIONS {
+                Err(value_error(format!(
+                    "generation parameter must be between 0 and {} (inclusive)",
+                    N_GENERATIONS - 1
+                )))
+            } else {
+                Ok(Some(n as usize))
+            }
+        }
+        Some(other) => Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            other.type_name()
+        ))),
+    }
+}
+
 /// Internal name: prefixed with `.gc.` so the interpreter's call
 /// dispatcher can recognise this builtin and drain pending
 /// `__del__` finalizers after the underlying mark-sweep returns.
@@ -223,12 +266,13 @@ fn isenabled(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(gc_trace::with_state(|s| s.is_enabled())))
 }
 
-fn get_objects(args: &[Object]) -> Result<Object, RuntimeError> {
-    let gen = match args.first() {
-        Some(Object::Int(n)) => Some((*n).max(0) as usize),
-        _ => None,
-    };
+fn get_objects(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let gen = generation_arg(args, kwargs)?;
     let objs = gc_trace::with_state(|s| s.snapshot(gen));
+    // Deliberately *not* GC-tracked: the result is a transient snapshot, and
+    // tracking it would let a previous call's leaked list show up in the next
+    // call's snapshot while collection is disabled (breaks
+    // `test_get_objects_arguments`, which asserts the two lengths are equal).
     Ok(Object::new_list(objs))
 }
 
@@ -269,8 +313,11 @@ fn is_tracked(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(gc_trace::with_state(|s| s.is_tracked(id))))
 }
 
-fn is_finalized(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Bool(false))
+fn is_finalized(args: &[Object]) -> Result<Object, RuntimeError> {
+    let target = args
+        .first()
+        .ok_or_else(|| type_error("is_finalized() requires 1 argument"))?;
+    Ok(Object::Bool(gc_trace::was_finalized(id_of(target))))
 }
 
 fn set_debug(args: &[Object]) -> Result<Object, RuntimeError> {

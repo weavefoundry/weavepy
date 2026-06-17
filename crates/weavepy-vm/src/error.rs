@@ -237,6 +237,15 @@ pub fn key_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("KeyError", message))
 }
 
+/// A `KeyError` whose `args[0]` is the missing key *object* (so
+/// `e.args[0] is key`), matching CPython's `set.remove`/`dict[…]` —
+/// `str(e)` still renders `repr(key)`.
+pub fn key_error_object(key: crate::object::Object) -> RuntimeError {
+    RuntimeError::PyException(PyException::new(
+        crate::builtin_types::make_exception_with_object("KeyError", key),
+    ))
+}
+
 pub fn index_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("IndexError", message))
 }
@@ -514,13 +523,33 @@ pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> Run
         (None, Some(f)) => format!("{strerror}: '{f}'"),
         (None, None) => strerror.clone(),
     };
-    // A few `errno`s have no stable `std::io::ErrorKind` variant yet
-    // (`IsADirectory`/`NotADirectory` are unstable) but map to specific
-    // CPython `OSError` subclasses, so dispatch on the raw number first.
-    // 21 == EISDIR, 20 == ENOTDIR on both Linux and macOS.
+    // Dispatch on the raw `errno` first (via `libc`, so the numbers are
+    // correct per-platform): `std::io::ErrorKind` collapses or omits
+    // several errnos that map to distinct CPython `OSError` subclasses
+    // under PEP 3151. Most important here: `EINPROGRESS`/`EALREADY` have
+    // no `ErrorKind` variant but must become `BlockingIOError`, which is
+    // what asyncio's non-blocking `sock_connect` catches.
     let mut runtime = match errno {
-        Some(21) => is_a_directory_error(message),
-        Some(20) => not_a_directory_error(message),
+        Some(n) if n == libc::EISDIR => is_a_directory_error(message),
+        Some(n) if n == libc::ENOTDIR => not_a_directory_error(message),
+        Some(n)
+            if n == libc::EAGAIN
+                || n == libc::EWOULDBLOCK
+                || n == libc::EINPROGRESS
+                || n == libc::EALREADY =>
+        {
+            blocking_io_error(message)
+        }
+        Some(n) if n == libc::EINTR => interrupted_error(message),
+        Some(n) if n == libc::ECONNREFUSED => connection_refused_error(message),
+        Some(n) if n == libc::ECONNRESET => connection_reset_error(message),
+        Some(n) if n == libc::ECONNABORTED => connection_aborted_error(message),
+        Some(n) if n == libc::EPIPE || crate::is_eshutdown(n) => broken_pipe_error(message),
+        Some(n) if n == libc::ECHILD => child_process_error(message),
+        Some(n) if n == libc::EEXIST => file_exists_error(message),
+        Some(n) if n == libc::ENOENT => file_not_found_error(message),
+        Some(n) if n == libc::EACCES || n == libc::EPERM => permission_error(message),
+        Some(n) if n == libc::ETIMEDOUT => timeout_error(message),
         _ => match err.kind() {
             NotFound => file_not_found_error(message),
             PermissionDenied => permission_error(message),
@@ -537,21 +566,33 @@ pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> Run
     };
     if let RuntimeError::PyException(ref mut exc) = runtime {
         if let crate::object::Object::Instance(inst) = &exc.instance {
+            use crate::object::{DictKey, Object};
             let mut dict = inst.dict.borrow_mut();
             if let Some(errno) = errno {
                 dict.insert(
-                    crate::object::DictKey(crate::object::Object::from_static("errno")),
-                    crate::object::Object::Int(i64::from(errno)),
+                    DictKey(Object::from_static("errno")),
+                    Object::Int(i64::from(errno)),
+                );
+                // CPython: a syscall `OSError` carries `args == (errno,
+                // strerror)`, so `e.args[0]` is the integer errno (not
+                // the formatted message). The `[Errno N] …` rendering is
+                // reconstructed by `OSError.__str__` from these fields.
+                dict.insert(
+                    DictKey(Object::from_static("args")),
+                    Object::new_tuple(vec![
+                        Object::Int(i64::from(errno)),
+                        Object::from_str(strerror.clone()),
+                    ]),
                 );
             }
             dict.insert(
-                crate::object::DictKey(crate::object::Object::from_static("strerror")),
-                crate::object::Object::from_str(strerror),
+                DictKey(Object::from_static("strerror")),
+                Object::from_str(strerror),
             );
             if let Some(f) = filename {
                 dict.insert(
-                    crate::object::DictKey(crate::object::Object::from_static("filename")),
-                    crate::object::Object::from_str(f.to_owned()),
+                    DictKey(Object::from_static("filename")),
+                    Object::from_str(f.to_owned()),
                 );
             }
         }
