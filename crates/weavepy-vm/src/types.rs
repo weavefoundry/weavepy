@@ -720,6 +720,17 @@ pub struct PyInstance {
     /// values and `object.__getstate__` can report them separately.
     /// `None` until the first slot write (most instances have none).
     pub slots: RefCell<Option<DictData>>,
+    /// Memoised Python `__hash__` result, populated lazily *only* for
+    /// instances that wrap an **immutable** builtin value (an `int`/`str`/
+    /// `tuple`/… subclass). Such an instance's value can't change, so its
+    /// `__hash__` is genuinely constant and may be cached — which is what
+    /// lets CPython's hash-table reuse (`set(dict)`, `dict.fromkeys(set)`,
+    /// …) observe exactly one `__hash__` call per element
+    /// (`test_set`/`test_dict` `test_do_not_rehash_dict_keys`). A plain
+    /// `object` subclass with a side-effecting or conditionally-raising
+    /// `__hash__` (test_dict's `BadHash`) wraps no native value and is
+    /// never cached here, so it is re-invoked on every probe like CPython.
+    pub hash_cache: Cell<Option<i64>>,
 }
 
 impl PyInstance {
@@ -730,6 +741,7 @@ impl PyInstance {
             native: None,
             inline_values: Cell::new(true),
             slots: RefCell::new(None),
+            hash_cache: Cell::new(None),
         }
     }
 
@@ -742,6 +754,7 @@ impl PyInstance {
             native: Some(native),
             inline_values: Cell::new(true),
             slots: RefCell::new(None),
+            hash_cache: Cell::new(None),
         }
     }
 

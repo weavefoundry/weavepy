@@ -509,6 +509,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         native: None,
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
+        hash_cache: crate::sync::Cell::new(None),
     });
     Object::Instance(inst)
 }
@@ -667,6 +668,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         native: None,
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
+        hash_cache: crate::sync::Cell::new(None),
     });
     Object::Instance(inst)
 }
@@ -1340,6 +1342,7 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
         native: None,
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
+        hash_cache: crate::sync::Cell::new(None),
     });
     Object::Instance(inst)
 }

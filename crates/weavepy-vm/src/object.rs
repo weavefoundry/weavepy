@@ -21,7 +21,7 @@ use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 use weavepy_compiler::CodeObject;
 
-use crate::error::{os_error, type_error, value_error, RuntimeError};
+use crate::error::{os_error, runtime_error, type_error, value_error, RuntimeError};
 use crate::types::{PyInstance, TypeObject};
 
 /// RFC 0025 compile-time gate: every `Object` variant — and therefore
@@ -1145,18 +1145,31 @@ fn current_interp_eq(a: &Object, b: &Object) -> Option<bool> {
 /// `name` dunder (a real Python `def`, not the inherited identity default).
 /// Used to gate the reentrant `__eq__` dispatch so plain instances keep the
 /// native identity fast path.
-fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
+pub(crate) fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
     let Object::Instance(inst) = obj else {
         return false;
     };
     match inst.cls().lookup_with_owner(name) {
         Some((Object::Function(_) | Object::BoundMethod(_), _)) => true,
         Some((Object::None, _)) | None => false,
-        // Non-function dunder supplied by a user class — e.g.
+        // A non-function dunder. A user class supplying it (e.g.
         // `unittest.mock` installs `Mock` instances as `__hash__` /
-        // `__eq__` on per-instance subclasses. Built-in owners keep
-        // the native identity fast path.
-        Some((_, owner)) => !owner.flags.is_builtin,
+        // `__eq__` on per-instance subclasses) needs Python dispatch.
+        Some((_, owner)) if !owner.flags.is_builtin => true,
+        // A built-in type that *overrides* the dunder in its own dict
+        // rather than inheriting `object`'s identity default needs Python
+        // dispatch too: `weakref` compares/hashes by referent, so its
+        // `ref` objects can't be keyed by the native identity path
+        // (`test_weakref`/`test_weakset` rely on `ref(a) == ref(a)` and
+        // matching hashes finding the same set slot). `object`'s own
+        // `__eq__`/`__hash__` — where every *plain* instance resolves —
+        // stay native so ordinary objects keep identity semantics, and
+        // value-wrapping subclasses (`class C(int)`, struct sequences)
+        // keep their native structural comparison via `native`.
+        Some((_, owner)) => {
+            inst.native.is_none()
+                && !Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_)
+        }
     }
 }
 
@@ -1280,6 +1293,46 @@ impl PartialEq for DictKey {
 }
 
 impl Eq for DictKey {}
+
+thread_local! {
+    /// First exception raised by a Python `__hash__`/`__eq__` invoked from
+    /// `DictKey`'s `Hash`/`Eq` while a `set`/`dict` probed the hash table.
+    /// Those Rust traits are infallible, so they can't return the error the
+    /// way CPython's `PyObject_Hash`/`PyObject_RichCompareBool` do (returning
+    /// -1 to abort the operation). Instead the error is parked here and the
+    /// surrounding set/dict operation re-raises it via [`key_cmp_scope`]
+    /// (`test_set` `test_badcmp` / `test_8420_set_merge`).
+    static KEY_CMP_ERROR: RefCell<Option<RuntimeError>> = const { RefCell::new(None) };
+}
+
+/// Park `err` as the pending key-comparison error (first one wins, matching
+/// CPython aborting on the first failed compare). Called from the reentrant
+/// `__hash__`/`__eq__` bridges when the callback raises.
+pub(crate) fn stash_key_cmp_error(err: RuntimeError) {
+    KEY_CMP_ERROR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+    });
+}
+
+/// Run `f` — a closure that performs `IndexSet`/`IndexMap` probes which may
+/// re-enter a Python `__hash__`/`__eq__` — and surface any exception those
+/// callbacks raised. The pending error of an *outer* scope is saved across
+/// the call and restored afterwards, so a re-entrant set/dict mutation from
+/// inside a comparison (`bad_eq.__eq__` calling `set2.clear()`) neither loses
+/// nor steals the outer operation's error.
+pub(crate) fn key_cmp_scope<T>(f: impl FnOnce() -> T) -> Result<T, RuntimeError> {
+    let saved = KEY_CMP_ERROR.with(|slot| slot.borrow_mut().take());
+    let out = f();
+    let mine = KEY_CMP_ERROR.with(|slot| slot.borrow_mut().take());
+    KEY_CMP_ERROR.with(|slot| *slot.borrow_mut() = saved);
+    match mine {
+        Some(err) => Err(err),
+        None => Ok(out),
+    }
+}
 
 impl Hash for DictKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -2679,6 +2732,21 @@ pub enum PyIterator {
     /// and then scans the tail with `for elem in it`). Cloning the cursor
     /// instead would silently fork the position.
     Shared(Rc<RefCell<PyIterator>>),
+    /// Live iterator over a mutable `set` (CPython's `setiterobject`).
+    /// Unlike the snapshot iterators above it keeps the *set object*
+    /// alive and walks it by slot index, so (a) the cycle GC can trace
+    /// `iter -> set -> elements` (`test_container_iterator`) and (b) a
+    /// size change between `__next__` calls is detected against the
+    /// `len` snapshot and raises `RuntimeError: Set changed size during
+    /// iteration` (`test_changingSizeWhileIterating`), exactly like
+    /// `setiter_iternext` comparing `si_used` to `so->used`.
+    Set {
+        set: Rc<RefCell<SetData>>,
+        index: usize,
+        /// `so->used` at iterator creation; a later mismatch is the
+        /// "changed size during iteration" trip-wire.
+        len: usize,
+    },
 }
 
 impl PyIterator {
@@ -2793,6 +2861,16 @@ impl PyIterator {
                 Some(Object::new_tuple(vec![Object::Int(i), v]))
             }
             PyIterator::Shared(inner) => inner.borrow_mut().next_value(),
+            PyIterator::Set { set, index, .. } => {
+                let v = set.borrow().get_index(*index).map(|k| k.0.clone());
+                match v {
+                    Some(v) => {
+                        *index += 1;
+                        Some(v)
+                    }
+                    None => None,
+                }
+            }
             PyIterator::Reversed { items, index } => {
                 if *index < 0 {
                     *items = Rc::new(RefCell::new(Vec::new()));
@@ -2815,6 +2893,97 @@ impl PyIterator {
         }
     }
 
+    /// Whether this iterator can participate in a reference cycle and so
+    /// should be enrolled with the cycle GC when created (CPython tracks
+    /// these `*_iterator` objects). Scalar iterators (`range`, `str`,
+    /// `bytes`, `bytearray`) buffer no `Object`s and can never close a
+    /// cycle, so they stay off the GC's books — keeping the hot
+    /// `for i in range(...)` path allocation-light.
+    pub fn can_cycle(&self) -> bool {
+        matches!(
+            self,
+            PyIterator::List { .. }
+                | PyIterator::Tuple { .. }
+                | PyIterator::DictKeys { .. }
+                | PyIterator::Set { .. }
+                | PyIterator::Reversed { .. }
+                | PyIterator::Enumerate { .. }
+                | PyIterator::Shared(_)
+        )
+    }
+
+    /// Visit every [`Object`] this iterator keeps alive, for the cycle
+    /// GC's `tp_traverse`. CPython implements `*_iterator.tp_traverse`
+    /// for exactly this reason (bug #3680 — a set iterator stored on an
+    /// element of the set it iterates is an uncollectable cycle without
+    /// it). The snapshot iterators expose their buffered items; the live
+    /// `Set` iterator exposes the set's current elements.
+    pub fn gc_referents(&self, visit: &mut dyn FnMut(&Object)) {
+        match self {
+            PyIterator::List { items, .. } | PyIterator::Reversed { items, .. } => {
+                // `iter(list)` shares the *live* list's backing buffer (the
+                // same `Rc<RefCell<Vec>>`), so the referent edge to subtract is
+                // `iter -> list`, not `iter -> elements`: the list object is a
+                // GC candidate in its own right and accounts `list -> elements`
+                // via `traverse_object`. Visiting the elements here instead
+                // would leave the list's internal refcount unsubtracted,
+                // stranding it as a false root (and pinning the cycle).
+                // Snapshot iterators (`frozenset`/`dict.values()`/file) hold a
+                // *private* buffer that no tracked list shares; the collector's
+                // transient-promotion step treats that buffer as a temporary
+                // candidate so its `-> elements` edges are still accounted.
+                visit(&Object::List(items.clone()));
+            }
+            PyIterator::Tuple { items, .. } => {
+                for v in items.iter() {
+                    visit(v);
+                }
+            }
+            PyIterator::DictKeys { keys, .. } => {
+                for k in keys {
+                    visit(&k.0);
+                }
+            }
+            PyIterator::Set { set, .. } => {
+                // The iterator holds the *set* (a shared `Rc`), and the set
+                // holds the element `Rc`s — so the cycle edge to subtract is
+                // `iter -> set`, with the set's own `tp_traverse` accounting
+                // `set -> elements`. Visiting the elements directly here would
+                // leave the set's internal refcount unsubtracted, stranding it
+                // (and everything it reaches) as a false root.
+                visit(&Object::Set(set.clone()));
+            }
+            PyIterator::Enumerate { inner, .. } | PyIterator::Shared(inner) => {
+                if let Ok(inner) = inner.try_borrow() {
+                    inner.gc_referents(visit);
+                }
+            }
+            // No `Object` referents: the payload is plain bytes / scalars.
+            PyIterator::Str { .. }
+            | PyIterator::Bytes { .. }
+            | PyIterator::ByteArray { .. }
+            | PyIterator::Range { .. }
+            | PyIterator::RangeHuge { .. } => {}
+        }
+    }
+
+    /// Like [`next_value`], but enforces CPython's "container changed
+    /// size during iteration" invariant before yielding. Used on the
+    /// *user-visible* `__next__` boundaries (`FOR_ITER`, the `next()`
+    /// builtin, `iter.__next__()`); the many internal consumers that
+    /// drain a freshly-built iterator without mutating its source can
+    /// keep calling the cheaper [`next_value`].
+    pub fn next_value_checked(&mut self) -> Result<Option<Object>, RuntimeError> {
+        if let PyIterator::Set { set, len, .. } = self {
+            // `setiter_iternext`: a size change since creation is fatal,
+            // even on the step that would otherwise raise StopIteration.
+            if set.borrow().len() != *len {
+                return Err(runtime_error("Set changed size during iteration"));
+            }
+        }
+        Ok(self.next_value())
+    }
+
     /// Number of items remaining, when cheaply known. Backs the
     /// `__length_hint__` slot CPython's built-in iterators expose
     /// (`operator.length_hint`, list pre-sizing, …). Returns `None`
@@ -2831,6 +3000,9 @@ impl PyIterator {
             }
             PyIterator::Enumerate { inner, .. } => inner.borrow().remaining(),
             PyIterator::Shared(inner) => inner.borrow().remaining(),
+            PyIterator::Set { set, index, .. } => {
+                Some(set.borrow().len().saturating_sub(*index))
+            }
             PyIterator::Reversed { index, .. } => Some((*index + 1).max(0) as usize),
             PyIterator::Range {
                 current,
@@ -2953,6 +3125,12 @@ impl PyIterator {
                 out
             }
             PyIterator::Shared(inner) => inner.borrow().remaining_items(),
+            PyIterator::Set { set, index, .. } => set
+                .borrow()
+                .iter()
+                .skip(*index)
+                .map(|k| k.0.clone())
+                .collect(),
             PyIterator::Reversed { items, index } => {
                 // Not-yet-yielded values, in yield order: items[index]..items[0].
                 let items = items.borrow();
@@ -3411,8 +3589,18 @@ impl Object {
                 )),
             },
             Object::Dict(d) => Ok(d.borrow().contains_key(&DictKey(item.clone()))),
-            Object::Set(s) => Ok(s.borrow().contains(&DictKey(item.clone()))),
-            Object::FrozenSet(s) => Ok(s.contains(&DictKey(item.clone()))),
+            // Set membership retries an unhashable `set` operand as a
+            // frozenset (CPython `set_lookkey`); a `list`/etc. still raises.
+            Object::Set(s) => {
+                let key = crate::builtins::set_membership_key(item)?;
+                // A custom `__eq__` raising during a hash collision aborts the
+                // lookup in CPython (test_badcmp `s.__contains__(BadCmp())`).
+                key_cmp_scope(|| s.borrow().contains(&key))
+            }
+            Object::FrozenSet(s) => {
+                let key = crate::builtins::set_membership_key(item)?;
+                key_cmp_scope(|| s.contains(&key))
+            }
             Object::Bytes(haystack) => bytes_membership(haystack, item),
             Object::ByteArray(haystack) => {
                 // Hold a buffer export: converting `item` can reenter
@@ -3529,10 +3717,12 @@ impl Object {
                 Ok(PyIterator::DictKeys { keys, index: 0 })
             }
             Object::Set(s) => {
-                let items: Vec<Object> = s.borrow().iter().map(|k| k.0.clone()).collect();
-                Ok(PyIterator::List {
-                    items: Rc::new(RefCell::new(items)),
+                // A *live* iterator (not a snapshot): keep the set alive for
+                // the cycle GC to trace and detect size changes mid-iteration.
+                Ok(PyIterator::Set {
+                    set: s.clone(),
                     index: 0,
+                    len: s.borrow().len(),
                 })
             }
             Object::FrozenSet(s) => {
@@ -3899,8 +4089,12 @@ impl Object {
             Object::ByteArray(b) => {
                 format!("bytearray({})", bytes_repr_inner(&b.borrow(), false))
             }
-            Object::Set(s) => set_repr(&s.borrow(), "set"),
-            Object::FrozenSet(s) => set_repr(s, "frozenset"),
+            Object::Set(s) => {
+                set_repr(&set_items(&s.borrow()), "set", Rc::as_ptr(s).cast::<()>() as usize)
+            }
+            Object::FrozenSet(s) => {
+                set_repr(&set_items(s), "frozenset", Rc::as_ptr(s).cast::<()>() as usize)
+            }
             Object::File(file) => format!(
                 "<_io.{} name='{}' mode='{}'>",
                 if file.binary {
@@ -3954,8 +4148,14 @@ impl Object {
                         let name = inst.cls().name.clone();
                         let short = name.rsplit('.').next().unwrap_or(&name);
                         return match native_set {
-                            Object::Set(s) => set_repr(&s.borrow(), short),
-                            Object::FrozenSet(s) => set_repr(s, short),
+                            Object::Set(s) => set_repr(
+                                &set_items(&s.borrow()),
+                                short,
+                                Rc::as_ptr(s).cast::<()>() as usize,
+                            ),
+                            Object::FrozenSet(s) => {
+                                set_repr(&set_items(s), short, Rc::as_ptr(s).cast::<()>() as usize)
+                            }
                             _ => unreachable!(),
                         };
                     }
@@ -4448,6 +4648,28 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
     }
 }
 
+/// Whether an instance's wrapped `native` value (the primitive an
+/// `int`/`str`/… subclass *is*) is one of the **immutable** builtins, so a
+/// custom `__hash__` derived from it is constant and safe to memoise on the
+/// instance. Mutable wrappers (`list`/`dict`/`set`/`bytearray`) and the
+/// `None`/absent case are excluded — see [`PyInstance::hash_cache`].
+fn native_is_immutable(native: Option<&Object>) -> bool {
+    matches!(
+        native,
+        Some(
+            Object::Int(_)
+                | Object::Long(_)
+                | Object::Bool(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::Str(_)
+                | Object::Bytes(_)
+                | Object::Tuple(_)
+                | Object::FrozenSet(_)
+        )
+    )
+}
+
 /// Canonical Python `hash(obj)` value, shared by the `hash()` builtin and
 /// the [`DictKey`] hasher. Bucketing every key by this single value (rather
 /// than a type-tagged structural hash) is what lets objects Python considers
@@ -4510,10 +4732,38 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             Some(v)
         }
         Object::Instance(inst) => {
+            // A `weakref.ref` hashes as its referent (CPython `weakref_hash`),
+            // computed natively and memoised so the hot `DictKey` path never
+            // pays a reentrant `__hash__` dispatch — see `weakref_native_hash`.
+            if let Some(h) = crate::stdlib::weakref_real::weakref_native_hash(obj) {
+                return Some(h);
+            }
             // A user-defined `__hash__` outranks the wrapped value's hash —
             // e.g. functools' `_HashedSeq(list)` caches its hash precisely so
             // the (unhashable) list payload is never consulted.
             if instance_has_custom_dunder(obj, "__hash__") {
+                // When the instance wraps an *immutable* builtin value (an
+                // `int`/`str`/`tuple`/… subclass), the value can't change, so
+                // a custom `__hash__` is genuinely constant and may be
+                // memoised. This is what makes CPython's hash-table reuse
+                // (`set(dict)`, `dict.fromkeys(set)`, `s.difference(d)`, …)
+                // observe exactly **one** `__hash__` call per element
+                // (`test_set`/`test_dict::test_do_not_rehash_dict_keys`).
+                //
+                // A plain `object` subclass with a side-effecting or
+                // conditionally-raising `__hash__` (test_dict's `BadHash`)
+                // wraps no native value, so it is *never* cached and is
+                // re-invoked on every probe exactly like CPython.
+                if native_is_immutable(inst.native.as_ref()) {
+                    if let Some(h) = inst.hash_cache.get() {
+                        return Some(h);
+                    }
+                    let h = current_interp_hash(obj);
+                    if let Some(h) = h {
+                        inst.hash_cache.set(Some(h));
+                    }
+                    return h;
+                }
                 return current_interp_hash(obj);
             }
             if let Some(native) = &inst.native {
@@ -4752,14 +5002,39 @@ fn bytes_repr_inner(b: &[u8], smartquotes: bool) -> String {
 /// name rather than the base `{…}` form. Returns `None` for non-set payloads.
 pub(crate) fn set_repr_tagged(native: &Object, type_name: &str) -> Option<String> {
     match native {
-        Object::Set(s) => Some(set_repr(&s.borrow(), type_name)),
-        Object::FrozenSet(s) => Some(set_repr(s, type_name)),
+        Object::Set(s) => Some(set_repr(
+            &set_items(&s.borrow()),
+            type_name,
+            Rc::as_ptr(s).cast::<()>() as usize,
+        )),
+        Object::FrozenSet(s) => Some(set_repr(
+            &set_items(s),
+            type_name,
+            Rc::as_ptr(s).cast::<()>() as usize,
+        )),
         _ => None,
     }
 }
 
-fn set_repr(s: &SetData, name: &str) -> String {
-    if s.is_empty() {
+/// Snapshot a set payload's elements as owned `Object`s. CPython's
+/// `set_repr` first materialises the keys (`PySequence_List`) so the set's
+/// own borrow is released before any element `__repr__` runs — an element
+/// that mutates the set then can't panic the `RefCell`.
+fn set_items(s: &SetData) -> Vec<Object> {
+    s.iter().map(|k| k.0.clone()).collect()
+}
+
+/// Render a `set`/`frozenset`/subclass whose (already-snapshotted) elements
+/// are `items`, tagged with `name` (the type's name). `id` is the payload's
+/// identity for the recursive-`repr` guard, so a self-referential set renders
+/// `name(...)` — exactly CPython `set_repr`'s `Py_ReprEnter` returning the
+/// `"%s(...)"` marker keyed on `Py_TYPE(so)->tp_name`.
+fn set_repr(items: &[Object], name: &str, id: usize) -> String {
+    if !repr_enter(id) {
+        return format!("{name}(...)");
+    }
+    if items.is_empty() {
+        repr_leave();
         return format!("{name}()");
     }
     let mut out = String::new();
@@ -4769,16 +5044,17 @@ fn set_repr(s: &SetData, name: &str) -> String {
         out.push('(');
     }
     out.push('{');
-    for (i, k) in s.iter().enumerate() {
+    for (i, k) in items.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
-        out.push_str(&k.0.repr());
+        out.push_str(&k.repr());
     }
     out.push('}');
     if !use_braces {
         out.push(')');
     }
+    repr_leave();
     out
 }
 

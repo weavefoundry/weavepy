@@ -237,6 +237,15 @@ pub fn key_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("KeyError", message))
 }
 
+/// A `KeyError` whose `args[0]` is the missing key *object* (so
+/// `e.args[0] is key`), matching CPython's `set.remove`/`dict[…]` —
+/// `str(e)` still renders `repr(key)`.
+pub fn key_error_object(key: crate::object::Object) -> RuntimeError {
+    RuntimeError::PyException(PyException::new(
+        crate::builtin_types::make_exception_with_object("KeyError", key),
+    ))
+}
+
 pub fn index_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("IndexError", message))
 }

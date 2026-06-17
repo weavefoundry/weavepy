@@ -159,6 +159,17 @@ pub struct ExpectedEntry {
     /// Human-readable reason (free-form), e.g. "blocked on UnpackEx".
     #[serde(default)]
     pub reason: Option<String>,
+    /// Per-test wall-clock budget override, in seconds. When present it
+    /// supersedes the global [`Expectations::timeout_seconds`] for this
+    /// test only. Used for correct-but-slow tests whose *verdict* is
+    /// stable but whose WeavePy wall-time sits near the global budget —
+    /// e.g. an O(n^2) Python-callback hash-collision stress — so a
+    /// loaded/thermally-throttled host would otherwise SIGKILL them
+    /// mid-run and flip a `pass`/`fail` into a spurious `timeout`. This
+    /// only ever *raises* headroom; a genuine runaway still trips the
+    /// (larger) budget.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 impl Expectations {
@@ -641,9 +652,28 @@ pub fn run_one_with(
         };
     }
 
+    // A per-test `timeout_seconds` override raises the wall budget for
+    // this label only (correct-but-slow tests near the global budget).
+    let eff_timeout = expectations
+        .tests
+        .get(&file.label)
+        .and_then(|e| e.timeout_seconds)
+        .map(Duration::from_secs)
+        .unwrap_or(opts.timeout);
+
     match opts.mode {
-        ExecutionMode::InProcess => run_inprocess(file, expected, opts.timeout),
-        ExecutionMode::Subprocess => run_subprocess(file, expected, opts),
+        ExecutionMode::InProcess => run_inprocess(file, expected, eff_timeout),
+        ExecutionMode::Subprocess => {
+            if eff_timeout == opts.timeout {
+                run_subprocess(file, expected, opts)
+            } else {
+                let scoped = RunnerOptions {
+                    timeout: eff_timeout,
+                    ..opts.clone()
+                };
+                run_subprocess(file, expected, &scoped)
+            }
+        }
     }
 }
 
@@ -1063,7 +1093,21 @@ mod simple_toml {
             other => return Err(format!("[tests.{label}] bad status {other:?}")),
         };
         let reason = table.get("reason").cloned();
-        top.tests.insert(label, ExpectedEntry { status, reason });
+        let timeout_seconds = match table.get("timeout_seconds") {
+            Some(v) => Some(
+                v.parse::<u64>()
+                    .map_err(|_| format!("[tests.{label}] bad timeout_seconds {v:?}"))?,
+            ),
+            None => None,
+        };
+        top.tests.insert(
+            label,
+            ExpectedEntry {
+                status,
+                reason,
+                timeout_seconds,
+            },
+        );
         table.clear();
         Ok(())
     }
@@ -1113,6 +1157,11 @@ mod simple_toml {
                 [tests.\"cpython/Lib/test/test_grammar.py\"]\n\
                 status = \"fail\"\n\
                 reason = \"top-level await unsupported\"\n\
+                \n\
+                [tests.\"cpython/Lib/test/test_set.py\"]\n\
+                status = \"pass\"\n\
+                timeout_seconds = 150\n\
+                reason = \"slow hash-collision stress\"\n\
             ";
             let exp = parse(body).unwrap();
             assert_eq!(exp.timeout_seconds, Some(5));
@@ -1120,6 +1169,15 @@ mod simple_toml {
             assert_eq!(
                 exp.get("cpython/Lib/test/test_grammar.py"),
                 Some(TestStatus::Fail)
+            );
+            // Per-test override is parsed; tests without one stay `None`.
+            assert_eq!(
+                exp.tests["cpython/Lib/test/test_set.py"].timeout_seconds,
+                Some(150)
+            );
+            assert_eq!(
+                exp.tests["cpython/Lib/test/test_grammar.py"].timeout_seconds,
+                None
             );
         }
     }

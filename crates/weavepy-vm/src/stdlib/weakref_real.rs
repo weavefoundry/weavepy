@@ -184,6 +184,34 @@ fn wrapper_referent(obj: &Object) -> Option<Option<Object>> {
     }
 }
 
+/// Native `weakref.__hash__` for the `DictKey` hot path: a `ref`'s hash
+/// is its referent's hash, computed once and memoised on the ref
+/// (CPython's `weakref_hash`, which caches `wr_hash`). Computing it here
+/// — directly, via the same `py_hash_value`/identity reduction the
+/// `hash()` builtin uses — avoids a reentrant `__hash__` *dispatch* per
+/// hash-table probe, which is otherwise catastrophic for large
+/// `WeakKeyDictionary`/`WeakValueDictionary` workloads keyed by `ref`s
+/// (`test_weakref` `test_threaded_weak_key_dict_copy`'s 70k entries).
+/// Returns `None` when `obj` isn't a `ref`, or its referent is already
+/// gone and no hash was ever cached (the caller then falls back to the
+/// ref's identity bucket — a dead, never-hashed ref matches nothing).
+pub(crate) fn weakref_native_hash(obj: &Object) -> Option<i64> {
+    let Object::Instance(inst) = obj else {
+        return None;
+    };
+    if !Rc::ptr_eq(&inst.cls(), &ref_type()) {
+        return None;
+    }
+    if let Some(h) = inst.hash_cache.get() {
+        return Some(h);
+    }
+    let target = wrapper_referent(obj).flatten()?;
+    let h = crate::object::py_hash_value(&target)
+        .unwrap_or_else(|| crate::object::identity_hash(&target));
+    inst.hash_cache.set(Some(h));
+    Some(h)
+}
+
 /// Type-level `weakref.__eq__` — CPython's `weakref_richcompare`:
 /// while both referents are alive compare them with `==`; once either
 /// side is dead, fall back to identity of the *refs* themselves. A
@@ -614,6 +642,7 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
         native: None,
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
+        hash_cache: crate::sync::Cell::new(None),
     });
     // Back-pointer so `obj.__weakref__` / `getweakrefs(obj)` can return
     // this same wrapper object.
@@ -628,8 +657,28 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
 /// user class contributes its implicit weakref support). Everything
 /// else in our heap remains permissively weakref-able.
 pub(crate) fn supports_weakref(target: &Object) -> bool {
-    let Object::Instance(inst) = target else {
-        return true;
+    let inst = match target {
+        Object::Instance(inst) => inst,
+        // Built-ins that carry a `tp_weaklistoffset` in CPython and so can
+        // be the target of a `weakref.ref`: `set`, `bytearray`, functions,
+        // classes, modules, generators/coroutines/async-generators, file
+        // objects and `types.SimpleNamespace`.
+        Object::Set(_)
+        | Object::ByteArray(_)
+        | Object::Function(_)
+        | Object::Type(_)
+        | Object::Module(_)
+        | Object::Generator(_)
+        | Object::Coroutine(_)
+        | Object::AsyncGenerator(_)
+        | Object::File(_)
+        | Object::SimpleNamespace(_) => return true,
+        // Everything else — numbers, `str`/`bytes`, `tuple`/`list`/`dict`/
+        // `frozenset`/`range`, slices, the descriptor and internal frame/
+        // code/iterator types — has no weak-reference support, exactly like
+        // CPython, so `weakref.ref([])` / `ref({})` / `ref(1)` raise
+        // `TypeError` (`test_weakset` passes `[[]]` to assert this).
+        _ => return false,
     };
     // CPython: a heap class contributes weakref support unless it
     // declares `__slots__` without listing `"__weakref__"`. Any single
@@ -719,11 +768,37 @@ fn get_weakrefs(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(out))
 }
 
-fn remove_dead_weakref(_args: &[Object]) -> Result<Object, RuntimeError> {
-    // Compatibility entry. Real cleanup happens via the GC's
-    // notify_clear path; this helper is occasionally called
-    // by `WeakValueDictionary` / `WeakKeyDictionary` to prune
-    // explicit slots and is a no-op today.
+/// `_weakref._remove_dead_weakref(dct, key)` — CPython's atomic
+/// dead-weakref pruner (`Modules/_weakref.c`). Removes `dct[key]` *only*
+/// if the value currently stored there is a weakref whose referent has
+/// been cleared. `WeakValueDictionary` relies on this from its removal
+/// callback: a key may have been rebound to a fresh, live weakref
+/// between the old value's death and the callback firing, and that live
+/// entry must survive (`test_weakref` threaded-consistency).
+fn remove_dead_weakref(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (Some(dict_obj), Some(key)) = (args.first(), args.get(1)) else {
+        return Err(type_error(
+            "_remove_dead_weakref expected 2 arguments, got fewer",
+        ));
+    };
+    let Object::Dict(d) = dict_obj else {
+        return Err(type_error("_remove_dead_weakref expected a dictionary"));
+    };
+    let dk = DictKey(key.clone());
+    // Snapshot the current value, dropping the shared borrow before any
+    // mutation so the conditional remove can take the exclusive borrow.
+    let value = crate::object::key_cmp_scope(|| d.borrow().get(&dk).cloned())?;
+    let Some(value) = value else {
+        return Ok(Object::None);
+    };
+    // `Some(None)` == a weakref wrapper whose referent is gone. Anything
+    // else (a live ref, or a non-weakref value) is left in place — this
+    // is CPython's `is_dead_weakref` predicate.
+    if matches!(wrapper_referent(&value), Some(None)) {
+        crate::object::key_cmp_scope(|| {
+            d.borrow_mut().shift_remove(&dk);
+        })?;
+    }
     Ok(Object::None)
 }
 

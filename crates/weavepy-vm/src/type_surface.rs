@@ -76,7 +76,12 @@ fn register_descriptor_kinds(bt: &BuiltinTypes) {
             .borrow()
             .iter()
             .filter_map(|(k, v)| match (&k.0, v) {
-                (Object::Str(s), Object::Builtin(b)) if b.binds_instance => {
+                // Instance-binding builtins are `method_descriptor`s. The
+                // class/static-method descriptors (`fromkeys`/`maketrans`/
+                // `fromhex`) are now non-binding (see `unwrap_shim`) but still
+                // need their `__qualname__`/`__objclass__` recorded, so admit
+                // them explicitly by name.
+                (Object::Str(s), Object::Builtin(b)) if b.binds_instance || is_no_receiver_descr(s) => {
                     Some((s.to_string(), v.clone()))
                 }
                 _ => None,
@@ -537,6 +542,15 @@ fn install_object_compare(bt: &BuiltinTypes) {
     }
 }
 
+/// True for the named-method-table entries that are CPython class/static
+/// methods rather than instance methods (`dict.fromkeys`, `str.maketrans`,
+/// `bytes.fromhex`/`bytearray.fromhex`). Their bodies scan arguments from
+/// slot 0 and take no instance receiver, so the type-surface shim must not
+/// prepend `self` and must not rebind when read through an instance.
+fn is_no_receiver_descr(name: &str) -> bool {
+    matches!(name, "maketrans" | "fromkeys" | "fromhex")
+}
+
 /// Insert `name` into `ty`'s dict unless already present.
 fn insert_if_absent(ty: &Rc<TypeObject>, name: &str, value: Object) {
     let key = DictKey(Object::from_str(name));
@@ -566,7 +580,7 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
     let has_kw = inner.call_kw.is_some();
     // Static/class-method-like entries take no instance receiver;
     // skip the descriptor receiver check for them.
-    let no_receiver = matches!(inner.name, "maketrans" | "fromkeys" | "fromhex");
+    let no_receiver = is_no_receiver_descr(inner.name);
     let owner_pos = crate::sync::Rc::downgrade(owner);
     let owner_kw = owner_pos.clone();
     // CPython method descriptors validate the receiver
@@ -591,7 +605,15 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
     }
     let mut shim = BuiltinFn {
         name: inner.name,
-        binds_instance: inner.binds_instance,
+        // `maketrans`/`fromkeys`/`fromhex` are CPython class/static methods:
+        // they take no instance receiver (the body scans args from slot 0), so
+        // reading one off an *instance* (`class C: ctor = dict.fromkeys;
+        // C().ctor(it)`) must NOT prepend `self` — otherwise `self` is fed in
+        // as the iterable (bpo-46615's `TestMethodsMutating_Set_Dict`). A
+        // non-binding builtin is returned unchanged by
+        // `maybe_bind`/`descriptor_get`, matching CPython where `dict.fromkeys`
+        // is already class-bound and not an instance descriptor.
+        binds_instance: inner.binds_instance && !no_receiver,
         call: Box::new(move |args| {
             if let Some(first) = args.first() {
                 if !no_receiver {

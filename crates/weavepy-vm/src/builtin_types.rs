@@ -919,6 +919,27 @@ pub fn make_exception(class_name: &str, message: impl Into<String>) -> Object {
     make_exception_with_class(class, message)
 }
 
+/// Build a built-in exception instance whose single `args[0]` element is the
+/// *object* `arg`, not a stringified message — `KeyError(key)` where
+/// `e.args[0] is key`. CPython's `KeyError.__str__` renders `repr(args[0])`,
+/// which our `exc_str` already reproduces; we set `message` to that repr so
+/// the Rust Display/traceback path matches too.
+pub fn make_exception_with_object(class_name: &str, arg: Object) -> Object {
+    let exc = make_exception(class_name, "");
+    if let Object::Instance(inst) = &exc {
+        let mut dict = inst.dict.borrow_mut();
+        dict.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![arg.clone()]),
+        );
+        dict.insert(
+            DictKey(Object::from_static("message")),
+            Object::from_str(arg.repr()),
+        );
+    }
+    exc
+}
+
 /// Build a faithful `UnicodeEncodeError` instance carrying the 5-tuple
 /// `(encoding, object, start, end, reason)` its custom `__init__`/`__str__`
 /// expect (see [`install_unicode_error_dunders`]). The strict-mode codec
@@ -3934,11 +3955,22 @@ fn install_mutable_container_init(bt: &BuiltinTypes) {
             }
             None => Vec::new(),
         };
+        // Enforce hashability as each element is admitted, exactly like the
+        // free-function `set(...)` constructor (`set_insert_key` →
+        // `ensure_hashable`). Building the keyed list *before* mutating the
+        // target means an unhashable element (`MySet([[]])`) raises
+        // `TypeError` without leaving the set half-filled.
+        let mut keys = Vec::with_capacity(items.len());
+        for item in items {
+            keys.push(crate::builtins::set_insert_key(&item)?);
+        }
         let mut t = target.borrow_mut();
         t.clear();
-        for item in items {
-            t.insert(DictKey(item));
-        }
+        crate::object::key_cmp_scope(|| {
+            for k in keys {
+                t.insert(k);
+            }
+        })?;
         Ok(Object::None)
     }
 
@@ -4034,7 +4066,20 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
     // (which unwraps the native payload), so `object.__hash__(x) == hash(x)`.
     fn install_hash(ty: &Rc<TypeObject>) {
         fn value_hash(args: &[Object]) -> Result<Object, RuntimeError> {
-            crate::builtins::hash_object(args.first().unwrap_or(&Object::None))
+            let obj = args.first().unwrap_or(&Object::None);
+            // `int.__hash__(self)` / `float.__hash__(self)` / … must hash the
+            // *underlying value* directly, exactly like CPython's
+            // `long_hash`/`float_hash` type slot. It must NOT re-dispatch
+            // through a subclass's Python `__hash__`, otherwise the common
+            // idiom `class H(int): def __hash__(self): return int.__hash__(self)`
+            // recurses (HashCountingInt in test_set) until the recursion limit.
+            // Unwrap an int/str/… subclass instance to the primitive it wraps
+            // so the hash is computed on the value, bypassing the override.
+            let target = match obj {
+                Object::Instance(inst) => inst.native.as_ref().unwrap_or(obj),
+                other => other,
+            };
+            crate::builtins::hash_object(target)
         }
         ty.dict.borrow_mut().insert(
             DictKey(Object::from_static("__hash__")),

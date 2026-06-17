@@ -169,6 +169,18 @@ impl Frame {
 /// Cycle-GC traversal hook for generator-family objects: walk the
 /// suspended frame's locals, evaluation stack, and cells so cycles
 /// running through a generator frame (`g.send(g)`) are detectable.
+/// Registered with `gc_trace::register_traverse`: lets the cycle GC walk
+/// the objects a built-in iterator ([`Object::Iter`]) keeps alive. The
+/// `PyIterator` body is private to `object`, so tracing routes through
+/// its [`PyIterator::gc_referents`] helper.
+fn iter_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
+    if let Object::Iter(it) = obj {
+        if let Ok(it) = it.try_borrow() {
+            it.gc_referents(visit);
+        }
+    }
+}
+
 /// Registered with `gc_trace::register_traverse` at interpreter init
 /// because `Frame` is private to this module.
 fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
@@ -366,6 +378,15 @@ impl Default for Interpreter {
                     )
                 },
                 generator_frame_traverse,
+            );
+            // Bug #3680: a built-in iterator (list/set/dict-keys/… iterator)
+            // can close a reference cycle through the items it buffers or the
+            // live set it walks. Teach the cycle GC to trace through it so
+            // e.g. `obj.x = iter(set_containing_obj)` is collectable
+            // (`test_set.test_container_iterator`).
+            crate::gc_trace::register_traverse(
+                |o| matches!(o, Object::Iter(_)),
+                iter_traverse,
             );
         });
         let excepthook = Rc::new(RefCell::new(Object::None));
@@ -919,62 +940,129 @@ impl Interpreter {
             }
             return;
         }
-        let finalizable = match &dropped {
+        let id0 = crate::weakref_registry::id_of(&dropped);
+        // Nothing parked on this object needs prompt handling: no
+        // finalizer to run, no weakref to clear, and no cycle-GC strong
+        // handle pinning it. Ordinary `Rc` drop reclaims it (and any
+        // *untracked* children it anchors, recursively, by refcount).
+        if !Self::object_is_finalizable(&dropped)
+            && crate::weakref_registry::count_for(id0) == 0
+            && !gc_trace::is_tracked(id0)
+        {
+            return;
+        }
+        // Is `dropped` actually dead — i.e. is this its last
+        // program-visible reference? The caller still holds `dropped`
+        // (one reference), the GC may hold a handle, and weakrefs may
+        // hold strong clones; anything beyond that is a live binding and
+        // we must leave the object to the cycle collector.
+        if !Self::is_refcount_dead(&dropped, 1) {
+            return;
+        }
+        // RFC 0039 (WS4): cascade through the dead *acyclic* subgraph,
+        // emulating CPython's refcount-driven `tp_dealloc` chain. Freeing
+        // `dropped` drops the last reference to its tracked children,
+        // which become dead in turn; each is finalized (in `tp_finalize`
+        // order — `__del__` before the object's contents are released)
+        // and untracked here instead of lingering in the GC's tracked set
+        // pinned by its own handle. Without this, a deep acyclic chain of
+        // finalizable/tracked objects (`test_gc.test_trashcan_threads`,
+        // `test_weakref`'s len-race) is only drained one layer per
+        // O(heap) collection — quadratic, and easily never finished for a
+        // quiescing interpreter. A reference *cycle* never enters the
+        // cascade: its members reference one another, so the refcount
+        // test below keeps `strong` above the dead threshold and leaves
+        // the cycle to the tracing collector.
+        let mut work = vec![dropped];
+        while let Some(obj) = work.pop() {
+            let id = crate::weakref_registry::id_of(&obj);
+            let finalizable = Self::object_is_finalizable(&obj);
+            // Run `__del__` once, while `obj` and its children are still
+            // intact (CPython runs `tp_finalize` before `tp_clear`). A
+            // tracked object claims its finalizer via the GC handle's
+            // one-shot flag; an untracked finalizable object (a generator
+            // the GC never saw) runs directly.
+            if finalizable {
+                let claimed = if gc_trace::is_tracked(id) {
+                    gc_trace::mark_finalized(id)
+                } else {
+                    true
+                };
+                if claimed {
+                    crate::vm_singletons::push_pending_finalizer(obj.clone());
+                    self.run_pending_finalizers();
+                    // The finalizer ran arbitrary Python and may have
+                    // resurrected `obj` (stashed it somewhere reachable).
+                    // If so it is alive again: leave it tracked and stop
+                    // cascading through it.
+                    if !Self::is_refcount_dead(&obj, 1) {
+                        continue;
+                    }
+                }
+            }
+            // Clear weakrefs and queue their callbacks (CPython clears
+            // weakrefs after `tp_finalize`).
+            crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(id));
+            self.run_pending_finalizers();
+            if !Self::is_refcount_dead(&obj, 1) {
+                continue;
+            }
+            // Snapshot the tracked children before `obj` is freed: those
+            // are the only ones a strong GC handle would otherwise pin
+            // (untracked children are reclaimed by ordinary `Rc` drop).
+            let mut child_ids: Vec<crate::weakref_registry::ObjectId> = Vec::new();
+            gc_trace::traverse_object(&obj, &mut |c| {
+                let cid = crate::weakref_registry::id_of(c);
+                if gc_trace::is_tracked(cid) {
+                    child_ids.push(cid);
+                }
+            });
+            // Drop the GC's strong handle, then our own reference: `obj`
+            // is reclaimed by `Rc` here and its children lose a reference.
+            if gc_trace::is_tracked(id) {
+                gc_trace::with_state(|s| s.untrack_id(id));
+            }
+            drop(obj);
+            // Any tracked child that just lost its last program reference
+            // is the next link in the chain.
+            for cid in child_ids {
+                if let Some(h) = gc_trace::find_handle(cid) {
+                    let weak = crate::weakref_registry::strong_clone_count(cid);
+                    // `h.object` is the GC's own strong reference; the
+                    // child is dead iff nothing beyond that handle and its
+                    // weakref clones still points at it.
+                    if gc_trace::strong_count_for(&h.object) <= 1 + weak {
+                        work.push(h.object.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Does `obj` carry a finalizer that prompt reclamation must run
+    /// before freeing it? Instances with `__del__`, and unfinished
+    /// generators/coroutines/async-generators (their `close()` delivers
+    /// `GeneratorExit`).
+    fn object_is_finalizable(obj: &Object) -> bool {
+        match obj {
             Object::Instance(i) => i.cls().lookup("__del__").is_some(),
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
                 !g.is_finished()
             }
-            // Containers (dict/list/set/tuple/bound method/…) carry no
-            // finalizer, but a *tracked* one may still need prompt
-            // reclamation — see the `tracked && !finalizable` arm below.
             _ => false,
-        };
-        let id = crate::weakref_registry::id_of(&dropped);
-        let watched = crate::weakref_registry::count_for(id) > 0;
-        let tracked = gc_trace::is_tracked(id);
-        // Nothing parked on this object needs prompt handling: no
-        // finalizer to run, no weakref to clear, and no cycle-GC strong
-        // handle pinning it. Ordinary `Rc` drop reclaims it.
-        if !finalizable && !watched && !tracked {
-            return;
         }
-        let strong = gc_trace::strong_count_for(&dropped);
-        let registry_holds = usize::from(tracked);
+    }
+
+    /// Is `obj` dead in refcount terms — does the caller hold its last
+    /// program-visible reference? `local_refs` is the number of strong
+    /// references the caller itself holds (the binding being dropped, or
+    /// a work-list entry). The GC's own handle and weakref strong clones
+    /// are discounted: neither is a program-visible binding.
+    fn is_refcount_dead(obj: &Object, local_refs: usize) -> bool {
+        let id = crate::weakref_registry::id_of(obj);
+        let registry_holds = usize::from(gc_trace::is_tracked(id));
         let weak_clones = crate::weakref_registry::strong_clone_count(id);
-        // `dropped` itself accounts for one reference.
-        if strong > 1 + registry_holds + weak_clones {
-            return;
-        }
-        // Dead in refcount terms. CPython order: __del__ first, then
-        // weakrefs are cleared.
-        if finalizable && gc_trace::mark_finalized(id) {
-            crate::vm_singletons::push_pending_finalizer(dropped.clone());
-            self.run_pending_finalizers();
-        } else if finalizable && registry_holds == 0 {
-            // Not tracked (shouldn't happen for instances/generators,
-            // but stay safe): run the finalizer directly.
-            crate::vm_singletons::push_pending_finalizer(dropped.clone());
-            self.run_pending_finalizers();
-        }
-        crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(id));
-        self.run_pending_finalizers();
-        // RFC 0039 (WS4): a dead, *acyclic*, non-finalizable tracked
-        // object (a dict/list/set/tuple/bound method/plain instance whose
-        // last program reference just went away) would otherwise linger
-        // in the cycle collector's tracked set: its strong handle keeps
-        // it — and everything it transitively references — alive until
-        // the next collection, which a quiescing interpreter may never
-        // run. The refcount test above already proved it is not part of a
-        // reference cycle (a self/mutual reference would inflate
-        // `strong`), so untracking it here is sound: `dropped` is the
-        // last reference, and dropping it on return reclaims the object
-        // by refcount and releases its children — exactly CPython's
-        // prompt `tp_dealloc`. Finalizable objects keep their handle (its
-        // `finalized` flag guards against a double `__del__` from a later
-        // collection).
-        if tracked && !finalizable {
-            gc_trace::with_state(|s| s.untrack_id(id));
-        }
+        gc_trace::strong_count_for(obj) <= local_refs + registry_holds + weak_clones
     }
 
     /// Emulate CPython deleting a terminating thread's thread-state
@@ -3524,7 +3612,7 @@ impl Interpreter {
                     it_obj = fresh;
                 }
                 let next = match &it_obj {
-                    Object::Iter(it) => it.borrow_mut().next_value(),
+                    Object::Iter(it) => it.borrow_mut().next_value_checked()?,
                     Object::LazyIter(l) => {
                         let g = frame.globals.clone();
                         self.lazy_iter_next(&l.clone(), &g)?
@@ -5992,9 +6080,11 @@ impl Interpreter {
                                     name: "__next__",
                                     binds_instance: true,
                                     call: Box::new(move |_args| {
-                                        it.borrow_mut()
-                                            .next_value()
-                                            .ok_or_else(crate::error::stop_iteration)
+                                        match it.borrow_mut().next_value_checked() {
+                                            Ok(Some(v)) => Ok(v),
+                                            Ok(None) => Err(crate::error::stop_iteration()),
+                                            Err(e) => Err(e),
+                                        }
                                     }),
                                     call_kw: None,
                                 })),
@@ -8852,23 +8942,21 @@ impl Interpreter {
     /// `__hash__` dispatch fails, so the caller can fall back to the native
     /// structural hash.
     pub(crate) fn reentrant_py_hash(&mut self, obj: &Object) -> Option<i64> {
-        // Only dispatch when the class supplies a *callable* `__hash__`.
-        // Without this guard, an instance that inherits the default
-        // (object) hash would send `do_hash_call` down its
+        // Only dispatch when the class supplies a genuinely overriding
+        // `__hash__`. Without this guard, an instance that inherits the
+        // default (object) hash would send `do_hash_call` down its
         // `builtins::hash_object` fallback, which re-enters `DictKey::hash`
         // and recurses until the stack overflows. Returning `None` here
         // lets `DictKey` use its constant fallback (identity semantics),
-        // exactly as before this hook existed.
-        let Object::Instance(inst) = obj else {
+        // exactly as before this hook existed. The gate is shared with
+        // `DictKey`'s `Hash`/`Eq` (`instance_has_custom_dunder`) so the two
+        // never disagree — a built-in type like `weakref` that hashes by
+        // referent must dispatch here too, otherwise its `ref` objects fall
+        // back to identity hashes and equal refs land in different set slots.
+        if !matches!(obj, Object::Instance(_)) {
             return None;
-        };
-        let dispatchable = match inst.cls().lookup_with_owner("__hash__") {
-            Some((Object::Function(_) | Object::BoundMethod(_), _)) => true,
-            // Callable non-function dunder from a user class (Mock).
-            Some((Object::None, _)) | None => false,
-            Some((_, owner)) => !owner.flags.is_builtin,
-        };
-        if !dispatchable {
+        }
+        if !crate::object::instance_has_custom_dunder(obj, "__hash__") {
             return None;
         }
         let globals = self.builtins.clone();
@@ -8876,7 +8964,15 @@ impl Interpreter {
             Ok(Object::Int(i)) => Some(i),
             Ok(Object::Bool(b)) => Some(i64::from(b)),
             Ok(Object::Long(b)) => Some(crate::object::py_hash_long_bigint(&b)),
-            _ => None,
+            // A `__hash__` that raised (or returned a non-int) aborts the
+            // surrounding set/dict probe in CPython. Park the exception so
+            // `key_cmp_scope` re-raises it; fall back to the identity bucket
+            // only when nothing was raised.
+            Err(e) => {
+                crate::object::stash_key_cmp_error(e);
+                None
+            }
+            Ok(_) => None,
         }
     }
 
@@ -8885,8 +8981,17 @@ impl Interpreter {
     /// errored, so the caller falls back to native identity equality.
     pub(crate) fn reentrant_py_eq(&mut self, a: &Object, b: &Object) -> Option<bool> {
         let globals = self.builtins.clone();
-        self.dispatch_compare_op(a, b, CompareKind::Eq, &globals)
-            .ok()
+        match self.dispatch_compare_op(a, b, CompareKind::Eq, &globals) {
+            Ok(v) => Some(v),
+            // `__eq__` raised during a hash-table collision check. CPython's
+            // `PyObject_RichCompareBool` returns -1 and the set/dict op aborts;
+            // park the exception for `key_cmp_scope` to re-raise, and report
+            // "not equal" so the infallible `Eq` trait can return.
+            Err(e) => {
+                crate::object::stash_key_cmp_error(e);
+                None
+            }
+        }
     }
 
     /// Like [`reentrant_py_eq`] but **propagates** an exception raised by a
@@ -9872,7 +9977,7 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
         match iter {
-            Object::Iter(it) => Ok(it.borrow_mut().next_value()),
+            Object::Iter(it) => it.borrow_mut().next_value_checked(),
             Object::LazyIter(l) => self.lazy_iter_next(l, globals),
             Object::Generator(g) => match self.generator_send(g, Object::None) {
                 Ok(v) => Ok(Some(v)),
@@ -15413,7 +15518,7 @@ impl Interpreter {
                             | "issuperset"
                             | "isdisjoint"
                             | "writelines"
-                    ) && !(b.name == "update" && !matches!(args.first(), Some(Object::Set(_))))
+                    ) && !(b.name == "update" && !receiver_is_native_set(args.first()))
                     {
                         // `fromkeys` may take its iterable in slot 0 (unbound
                         // classmethod form); the others iterate args[1..].
@@ -18360,7 +18465,20 @@ impl Interpreter {
                 // consumed those kwargs (`class S(list): __new__(cls, seq,
                 // newarg=None)`), so drop them here instead of tripping
                 // "builtin '__init__' does not accept keyword arguments".
+                // `set`/`frozenset` are the exception: `set_init` calls
+                // `_PyArg_NoKeywords` *unconditionally*, so a set subclass that
+                // overrides only `__new__` still rejects keyword arguments
+                // (bpo-43413 / test_set `test_keywords_in_subclass`:
+                // `subclass_with_new([1, 2], newarg=3)` is a TypeError). `list`/
+                // `bytearray` inits ignore them (test_list's sibling test
+                // succeeds), so the drop only applies off the set path.
+                let recv_is_set = matches!(
+                    &instance,
+                    Object::Instance(i)
+                        if matches!(i.native.as_ref(), Some(Object::Set(_) | Object::FrozenSet(_)))
+                );
                 let drop_init_kwargs = !is_object_new
+                    && !recv_is_set
                     && matches!(
                         &init,
                         Object::Builtin(b) if b.name == "__init__" && b.call_kw.is_none()
@@ -19351,6 +19469,45 @@ impl Interpreter {
         // default (which would try to pickle the unexposed iterator type).
         if matches!(recv, Object::Iter(_)) {
             return self.iter_reduce(recv, globals);
+        }
+        // `set`/`frozenset` and their subclasses reduce as
+        // `(type, (list(elements),), state)` — CPython `set_reduce`. The
+        // default newobj reduction rebuilds an *empty* set because a set's
+        // elements ride in its constructor argument, not in the `__new__`
+        // call; without this, `copy.deepcopy`/`pickle` of a set silently
+        // drop every element (test_set test_deepcopy/test_deep_copy/
+        // test_pickling).
+        let set_payload = match recv {
+            Object::Set(_) | Object::FrozenSet(_) => Some(recv.clone()),
+            Object::Instance(inst) => match &inst.native {
+                Some(n @ (Object::Set(_) | Object::FrozenSet(_))) => Some(n.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(payload) = set_payload {
+            let elems: Vec<Object> = match &payload {
+                Object::Set(s) => s.borrow().iter().map(|k| k.0.clone()).collect(),
+                Object::FrozenSet(s) => s.iter().map(|k| k.0.clone()).collect(),
+                _ => unreachable!("set_payload is Set or FrozenSet by construction"),
+            };
+            let type_obj = crate::builtins::class_of(recv);
+            let args = Object::new_tuple(vec![Object::new_list(elems)]);
+            // Subclass instance state (`s.x = ...` in `__dict__`, plus any
+            // `__slots__` values) rides in the pickle state. Route through the
+            // object's own `__getstate__` (CPython `set_reduce` calls
+            // `_PyObject_GetState`) so a slotted subclass round-trips its slot
+            // values (test_pickling TestSetSubclassWithSlots) and a user
+            // `__getstate__` override is honoured. A base set/frozenset has no
+            // instance state → `None`.
+            let state = match recv {
+                Object::Instance(_) => {
+                    let getstate = self.load_attr(recv, "__getstate__")?;
+                    self.call(&getstate, &[], &[], globals)?
+                }
+                _ => Object::None,
+            };
+            return Ok(Object::new_tuple(vec![Object::Type(type_obj), args, state]));
         }
         self.object_default_reduce(recv, proto, globals)
     }
@@ -23950,6 +24107,20 @@ fn group_decimal(mag: u64, sep: char) -> String {
 /// potentially unbounded and side-effecting, so `map`/`filter`/`zip`
 /// build *lazy* iterators over them; plain native containers take the
 /// eager fast path.
+/// True when `o` is a mutable `set` (or a *subclass instance* whose native
+/// payload is a `set`). `set.update` pre-materializes VM-only iterable
+/// arguments (generators / user `__iter__`), but `dict.update` has its own
+/// richer protocol; this predicate keeps a set-subclass receiver on the
+/// set path while letting a `dict`/dict-subclass receiver fall through to
+/// `do_dict_update_call`.
+fn receiver_is_native_set(o: Option<&Object>) -> bool {
+    match o {
+        Some(Object::Set(_)) => true,
+        Some(Object::Instance(i)) => matches!(i.native.as_ref(), Some(Object::Set(_))),
+        _ => false,
+    }
+}
+
 fn object_needs_vm_iter(o: &Object) -> bool {
     // A class whose *metaclass* defines `__iter__` (e.g. `list(SomeEnum)`
     // → `EnumType.__iter__`) iterates through the interpreter too.
