@@ -81,7 +81,9 @@ fn register_descriptor_kinds(bt: &BuiltinTypes) {
                 // `fromhex`) are now non-binding (see `unwrap_shim`) but still
                 // need their `__qualname__`/`__objclass__` recorded, so admit
                 // them explicitly by name.
-                (Object::Str(s), Object::Builtin(b)) if b.binds_instance || is_no_receiver_descr(s) => {
+                (Object::Str(s), Object::Builtin(b))
+                    if b.binds_instance || is_no_receiver_descr(s) =>
+                {
                     Some((s.to_string(), v.clone()))
                 }
                 _ => None,

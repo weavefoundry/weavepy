@@ -44,7 +44,9 @@ with ThreadPoolExecutor() as ex:
 with ThreadPoolExecutor() as ex:
     fs = [ex.submit(square, i) for i in range(3)]
     done = list(as_completed(fs))
-    print("as_completed:", [f.result() for f in done])
+    # `as_completed` yields in completion order, which is nondeterministic
+    # with real worker threads — sort by value so the fixture is stable.
+    print("as_completed:", sorted(f.result() for f in done))
 
 with ThreadPoolExecutor() as ex:
     fs = [ex.submit(square, i) for i in range(3)]
@@ -52,6 +54,12 @@ with ThreadPoolExecutor() as ex:
     print("wait done:", len(result.done), "not done:", len(result.not_done))
 
 
-# ProcessPoolExecutor behaves the same way in our single-process model.
-with ProcessPoolExecutor() as ex:
-    print(ex.submit(square, 9).result())
+# ProcessPoolExecutor is importable but unavailable in WeavePy's
+# single-process model (no multiprocessing runtime): constructing one
+# raises NotImplementedError, matching CPython on a platform without
+# multiprocessing. Use ThreadPoolExecutor instead.
+try:
+    ProcessPoolExecutor()
+    print("ProcessPoolExecutor: constructed")
+except NotImplementedError:
+    print("ProcessPoolExecutor: NotImplementedError")

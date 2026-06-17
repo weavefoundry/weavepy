@@ -5,4 +5,4 @@ done: True value: 42
 caught: boom 7
 as_completed: [0, 1, 4]
 wait done: 3 not done: 0
-81
+ProcessPoolExecutor: NotImplementedError

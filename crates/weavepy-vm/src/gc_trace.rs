@@ -883,8 +883,7 @@ impl GcState {
             // every such transient clone has been dropped — keeps the seed
             // exact (referrers + the one clone the handle itself holds).
             for handle in &temp_handles {
-                let weak_clones =
-                    crate::weakref_registry::strong_clone_count(handle.id) as i64;
+                let weak_clones = crate::weakref_registry::strong_clone_count(handle.id) as i64;
                 let outer = strong_count_for(&handle.object)
                     .saturating_sub(1)
                     .saturating_sub(weak_clones as usize) as i64;
@@ -895,8 +894,11 @@ impl GcState {
 
         // Real candidates plus the temporary iterator candidates take part in
         // the subtract/mark walk; only the real ones are reclaimed below.
-        let scan_all: Vec<Arc<TrackedHandle>> =
-            candidate_set.iter().chain(temp_handles.iter()).cloned().collect();
+        let scan_all: Vec<Arc<TrackedHandle>> = candidate_set
+            .iter()
+            .chain(temp_handles.iter())
+            .cloned()
+            .collect();
 
         // Phase 3: subtract internal refs by walking each
         // tracked object's children. Self-references count too —
@@ -1080,11 +1082,9 @@ impl GcState {
         // callbacks and recursing into its children. Finalizable orphans are
         // left for a finalizing collection so `__del__` ordering is preserved.
         if !saveall {
-            let dead_ids: std::collections::HashSet<ObjectId> =
-                dead.iter().map(|h| h.id).collect();
+            let dead_ids: std::collections::HashSet<ObjectId> = dead.iter().map(|h| h.id).collect();
             let mut worklist = cascade_seed;
-            let mut seen: std::collections::HashSet<ObjectId> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
             while let Some(cid) = worklist.pop() {
                 if dead_ids.contains(&cid) || by_id.contains_key(&cid) || !seen.insert(cid) {
                     // Dead (already reaped), a candidate this collection owns,

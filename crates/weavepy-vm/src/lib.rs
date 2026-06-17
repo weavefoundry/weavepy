@@ -384,10 +384,7 @@ impl Default for Interpreter {
             // live set it walks. Teach the cycle GC to trace through it so
             // e.g. `obj.x = iter(set_containing_obj)` is collectable
             // (`test_set.test_container_iterator`).
-            crate::gc_trace::register_traverse(
-                |o| matches!(o, Object::Iter(_)),
-                iter_traverse,
-            );
+            crate::gc_trace::register_traverse(|o| matches!(o, Object::Iter(_)), iter_traverse);
         });
         let excepthook = Rc::new(RefCell::new(Object::None));
         let unraisable_hook = Rc::new(RefCell::new(Object::None));
@@ -15487,12 +15484,7 @@ impl Interpreter {
                         // interpreter). Move them into the Python-visible
                         // `gc.garbage` list now that we can.
                         let uncollectable = self.drain_gc_garbage();
-                        self.fire_gc_callbacks(
-                            "stop",
-                            generation,
-                            collected,
-                            uncollectable,
-                        );
+                        self.fire_gc_callbacks("stop", generation, collected, uncollectable);
                         return Ok(Object::Int(collected as i64));
                     }
                     // Pre-materialize VM-only iterables (generators, user

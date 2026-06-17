@@ -1130,9 +1130,7 @@ mod kqueue_impl {
             };
             // `None` slice (off-main, block forever) → NULL timespec.
             let ts = slice.map(dur_to_timespec);
-            let tsp = ts
-                .as_ref()
-                .map_or(std::ptr::null(), std::ptr::from_ref);
+            let tsp = ts.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
             let r = unsafe {
                 libc::kevent(
                     kq,

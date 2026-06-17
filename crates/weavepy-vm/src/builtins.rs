@@ -4911,7 +4911,9 @@ fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
         let key = set_insert_key(&v)?;
         crate::object::key_cmp_scope(|| out.insert(key))?;
     }
-    Ok(Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(out))))
+    Ok(Object::FrozenSet(Rc::new(
+        crate::object::FrozenSetObj::new(out),
+    )))
 }
 
 /// One item of a `bytes(iterable)` source: an integer in

@@ -3000,9 +3000,7 @@ impl PyIterator {
             }
             PyIterator::Enumerate { inner, .. } => inner.borrow().remaining(),
             PyIterator::Shared(inner) => inner.borrow().remaining(),
-            PyIterator::Set { set, index, .. } => {
-                Some(set.borrow().len().saturating_sub(*index))
-            }
+            PyIterator::Set { set, index, .. } => Some(set.borrow().len().saturating_sub(*index)),
             PyIterator::Reversed { index, .. } => Some((*index + 1).max(0) as usize),
             PyIterator::Range {
                 current,
@@ -4089,12 +4087,16 @@ impl Object {
             Object::ByteArray(b) => {
                 format!("bytearray({})", bytes_repr_inner(&b.borrow(), false))
             }
-            Object::Set(s) => {
-                set_repr(&set_items(&s.borrow()), "set", Rc::as_ptr(s).cast::<()>() as usize)
-            }
-            Object::FrozenSet(s) => {
-                set_repr(&set_items(s), "frozenset", Rc::as_ptr(s).cast::<()>() as usize)
-            }
+            Object::Set(s) => set_repr(
+                &set_items(&s.borrow()),
+                "set",
+                Rc::as_ptr(s).cast::<()>() as usize,
+            ),
+            Object::FrozenSet(s) => set_repr(
+                &set_items(s),
+                "frozenset",
+                Rc::as_ptr(s).cast::<()>() as usize,
+            ),
             Object::File(file) => format!(
                 "<_io.{} name='{}' mode='{}'>",
                 if file.binary {
