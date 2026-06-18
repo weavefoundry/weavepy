@@ -1988,12 +1988,80 @@ impl PyFile {
                 "wb",
                 FileBackend::Stderr(w.clone()),
             )))),
+            // A *text* disk file (CPython's `TextIOWrapper`) exposes its binary
+            // underlayer (`BufferedRandom`). We collapse the buffer/raw layers
+            // into one `PyFile`, so mint a binary sibling over a `dup`-ed
+            // descriptor: a duplicated fd shares the OS file *description*, so
+            // the two stay in lock-step on the seek offset (which is what
+            // `SpooledTemporaryFile.rollover`'s `buffer.write` + `seek` relies
+            // on). `try_clone` failing simply means no `.buffer`.
+            FileBackend::Disk(file) => file.try_clone().ok().map(|dup| {
+                let mut binmode = self.mode.replace('t', "");
+                if !binmode.contains('b') {
+                    binmode.push('b');
+                }
+                let bf = PyFile::new(self.name.clone(), binmode, FileBackend::Disk(dup));
+                if let Some(n) = self.name_override.borrow().as_ref() {
+                    *bf.name_override.borrow_mut() = Some(n.clone());
+                }
+                bf.name_is_bytes.set(self.name_is_bytes.get());
+                Object::File(Rc::new(bf))
+            }),
             _ => None,
         };
         if let Some(b) = &buf {
             *self.binary_buffer_cache.borrow_mut() = Some(b.clone());
         }
         buf
+    }
+
+    /// The stream's `mode` attribute as CPython reports it. A binary stream
+    /// (CPython `FileIO`/`Buffered*`) normalises to canonical form, so
+    /// `open(p, 'w+b').mode == 'rb+'` and `open(p, 'wb').mode == 'wb'`. A text
+    /// stream (`TextIOWrapper`) reports the mode string it was opened with.
+    pub fn reported_mode(&self) -> String {
+        if !self.binary {
+            return self.mode.clone();
+        }
+        let m = &self.mode;
+        let created = m.contains('x');
+        let appending = m.contains('a');
+        let plus = m.contains('+');
+        let readable = m.contains('r') || plus;
+        let writable = m.contains('w') || appending || created || plus;
+        if created {
+            if readable {
+                "xb+"
+            } else {
+                "xb"
+            }
+        } else if appending {
+            if readable {
+                "ab+"
+            } else {
+                "ab"
+            }
+        } else if readable {
+            if writable {
+                "rb+"
+            } else {
+                "rb"
+            }
+        } else {
+            "wb"
+        }
+        .to_string()
+    }
+
+    /// Whether this stream is an in-memory `BytesIO`/`StringIO` buffer rather
+    /// than a real disk file or standard stream. CPython's in-memory streams
+    /// do not carry the `mode`/`name` attributes that OS-backed file objects
+    /// do, so callers gate those attributes on this.
+    pub fn is_memory(&self) -> bool {
+        matches!(
+            &*self.backend.borrow(),
+            FileBackend::MemBytes { .. } | FileBackend::MemText { .. }
+        )
     }
 
     /// Whether the stream is attached to a terminal (`f.isatty()`). The
@@ -2181,21 +2249,37 @@ impl PyFile {
             let old = std::mem::replace(
                 &mut *backend,
                 FileBackend::MemBytes {
-                    data: Vec::new(),
+                    data: Rc::new(RefCell::new(Vec::new())),
                     pos: 0,
                 },
             );
-            // `FileIO(fd, closefd=False)`: the caller still owns the
-            // descriptor, so detach it without closing (CPython leaves the fd
-            // open). Otherwise dropping the `File` closes the fd as usual.
-            if !self.closefd.get() {
-                if let FileBackend::Disk(f) = old {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::io::IntoRawFd;
-                        let _ = f.into_raw_fd();
+            if let FileBackend::Disk(f) = old {
+                #[cfg(unix)]
+                {
+                    // Always detach the fd from Rust's `File` (an `OwnedFd`)
+                    // before closing. User code can legitimately close the
+                    // descriptor out from under us — e.g.
+                    // `os.close(f.fileno())` in CPython's
+                    // `test_subprocess` — and letting `File`'s checked drop
+                    // run `close(2)` on an already-closed fd aborts the whole
+                    // process ("IO Safety violation: owned file descriptor
+                    // already closed"). CPython models fds as plain ints, so a
+                    // double close is merely `EBADF`; we mirror that by
+                    // closing the raw fd ourselves and swallowing the error.
+                    //
+                    // `closefd=False` (`FileIO(fd, closefd=False)`): the caller
+                    // keeps ownership, so we detach without closing.
+                    use std::os::unix::io::IntoRawFd;
+                    let fd = f.into_raw_fd();
+                    if self.closefd.get() {
+                        unsafe {
+                            libc::close(fd);
+                        }
                     }
-                    #[cfg(not(unix))]
+                }
+                #[cfg(not(unix))]
+                {
+                    // No portable raw-fd detach here; closing is unavoidable.
                     drop(f);
                 }
             }
@@ -2222,12 +2306,14 @@ impl PyFile {
                     .map_err(|e| os_error(format!("read: {e}")))?;
             }
             (FileBackend::MemBytes { data, pos }, None) => {
-                buf.extend_from_slice(&data[*pos..]);
-                *pos = data.len();
+                let d = data.borrow();
+                buf.extend_from_slice(&d[*pos..]);
+                *pos = d.len();
             }
             (FileBackend::MemBytes { data, pos }, Some(n)) => {
-                let end = (*pos + n).min(data.len());
-                buf.extend_from_slice(&data[*pos..end]);
+                let d = data.borrow();
+                let end = (*pos + n).min(d.len());
+                buf.extend_from_slice(&d[*pos..end]);
                 *pos = end;
             }
             (FileBackend::MemText { data, pos }, None) => {
@@ -2312,19 +2398,57 @@ impl PyFile {
         self.decode_text(out)
     }
 
+    /// Read one line and return it as a `bytes` object (binary mode) or a
+    /// `str` (text mode), or `None` at EOF. Backs lazy file iteration
+    /// (`for line in f`) for *both* modes — CPython's file object is its
+    /// own iterator and a binary file yields `bytes` lines.
+    pub fn readline_obj(&self) -> Result<Option<Object>, RuntimeError> {
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let b = self.read_bytes(Some(1))?;
+            if b.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&b);
+            if b[0] == b'\n' {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Ok(None);
+        }
+        if self.binary {
+            Ok(Some(Object::new_bytes(out)))
+        } else {
+            Ok(Some(Object::from_str(self.decode_text(out)?)))
+        }
+    }
+
     pub fn write_bytes(&self, data: &[u8]) -> Result<usize, RuntimeError> {
         self.check_open()?;
         let mut backend = self.backend.borrow_mut();
         let n = match &mut *backend {
-            FileBackend::Disk(f) => f.write(data).map_err(|e| os_error(format!("write: {e}")))?,
+            FileBackend::Disk(f) => f
+                .write(data)
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::MemBytes { data: buf, pos } => {
-                if *pos == buf.len() {
-                    buf.extend_from_slice(data);
+                // CPython's `bytesio.c` `write` runs `check_exports` first: a
+                // `BytesIO` with a live `getbuffer()` export refuses *any*
+                // write (it might re-size the shared buffer).
+                bytearray_check_resizable(buf)?;
+                let mut b = buf.borrow_mut();
+                if *pos > b.len() {
+                    // Seeked past EOF: writing zero-fills the gap (CPython
+                    // `BytesIO`/`FileIO` sparse-write semantics).
+                    b.resize(*pos, 0);
+                }
+                if *pos == b.len() {
+                    b.extend_from_slice(data);
                 } else {
-                    let end = (*pos + data.len()).min(buf.len());
-                    buf[*pos..end].copy_from_slice(&data[..end - *pos]);
+                    let end = (*pos + data.len()).min(b.len());
+                    b[*pos..end].copy_from_slice(&data[..end - *pos]);
                     if data.len() > end - *pos {
-                        buf.extend_from_slice(&data[end - *pos..]);
+                        b.extend_from_slice(&data[end - *pos..]);
                     }
                 }
                 *pos += data.len();
@@ -2346,11 +2470,11 @@ impl PyFile {
             FileBackend::Stdout(sink) => sink
                 .borrow_mut()
                 .write(data)
-                .map_err(|e| os_error(format!("write: {e}")))?,
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::Stderr(sink) => sink
                 .borrow_mut()
                 .write(data)
-                .map_err(|e| os_error(format!("write: {e}")))?,
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::Stdin => return Err(os_error("not writable")),
         };
         Ok(n)
@@ -2360,15 +2484,17 @@ impl PyFile {
         self.check_open()?;
         let mut backend = self.backend.borrow_mut();
         match &mut *backend {
-            FileBackend::Disk(f) => f.flush().map_err(|e| os_error(format!("flush: {e}")))?,
+            FileBackend::Disk(f) => f
+                .flush()
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::Stdout(sink) => sink
                 .borrow_mut()
                 .flush()
-                .map_err(|e| os_error(format!("flush: {e}")))?,
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::Stderr(sink) => sink
                 .borrow_mut()
                 .flush()
-                .map_err(|e| os_error(format!("flush: {e}")))?,
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             _ => {}
         }
         Ok(())
@@ -2406,13 +2532,16 @@ impl PyFile {
         let mut backend = self.backend.borrow_mut();
         match &mut *backend {
             FileBackend::MemBytes { data, pos } => {
+                let dlen = data.borrow().len();
                 let new_pos = match whence {
                     0 => offset.max(0) as usize,
                     1 => (*pos as isize + offset).max(0) as usize,
-                    2 => (data.len() as isize + offset).max(0) as usize,
+                    2 => (dlen as isize + offset).max(0) as usize,
                     _ => return Err(value_error("invalid whence")),
                 };
-                *pos = new_pos.min(data.len());
+                // CPython's in-memory streams allow seeking *past* the end
+                // (the next write zero-fills the gap); don't clamp to `dlen`.
+                *pos = new_pos;
                 Ok(*pos)
             }
             FileBackend::MemText { data, pos } => {
@@ -2442,13 +2571,82 @@ impl PyFile {
         }
     }
 
+    /// `truncate(size=None)` — resize the stream to `size` bytes (or the
+    /// current position when `None`), returning the new size. The stream
+    /// position is left unchanged, matching CPython's `IOBase.truncate`.
+    /// Growing only extends an in-memory buffer; on disk it delegates to
+    /// `ftruncate(2)` via `File::set_len`.
+    pub fn truncate(&self, size: Option<u64>) -> Result<u64, RuntimeError> {
+        self.check_open()?;
+        self.flush()?;
+        let mut backend = self.backend.borrow_mut();
+        match &mut *backend {
+            FileBackend::MemBytes { data, pos } => {
+                // `truncate` re-sizes; refused while a `getbuffer()` view is
+                // live (CPython `bytesio.c` `check_exports`).
+                bytearray_check_resizable(data)?;
+                let n = size.unwrap_or(*pos as u64) as usize;
+                let mut d = data.borrow_mut();
+                if n < d.len() {
+                    d.truncate(n);
+                } else {
+                    d.resize(n, 0);
+                }
+                Ok(n as u64)
+            }
+            FileBackend::MemText { data, pos } => {
+                let n = size.unwrap_or(*pos as u64) as usize;
+                if n < data.len() {
+                    // Clamp to a char boundary so we never split a UTF-8
+                    // scalar (WeavePy's MemText position is a byte offset).
+                    let mut cut = n;
+                    while cut > 0 && !data.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    data.truncate(cut);
+                    Ok(cut as u64)
+                } else {
+                    Ok(data.len() as u64)
+                }
+            }
+            FileBackend::Disk(f) => {
+                use std::io::Seek;
+                let n = match size {
+                    Some(s) => s,
+                    None => f
+                        .stream_position()
+                        .map_err(|e| os_error(format!("truncate: {e}")))?,
+                };
+                f.set_len(n).map_err(|e| os_error(format!("truncate: {e}")))?;
+                Ok(n)
+            }
+            _ => Err(os_error("File or stream is not seekable")),
+        }
+    }
+
     /// Extract the entire buffer of an in-memory StringIO/BytesIO.
     /// Used by `StringIO.getvalue()` / `BytesIO.getvalue()`.
     pub fn getvalue(&self) -> Option<Object> {
         match &*self.backend.borrow() {
-            FileBackend::MemBytes { data, .. } => Some(Object::Bytes(Rc::from(data.as_slice()))),
+            FileBackend::MemBytes { data, .. } => {
+                Some(Object::Bytes(Rc::from(data.borrow().as_slice())))
+            }
             FileBackend::MemText { data, .. } => Some(Object::from_str(data.clone())),
             _ => None,
+        }
+    }
+
+    /// `BytesIO.getbuffer()` — a *writable* `memoryview` aliasing the
+    /// in-memory buffer (CPython's `bytesio_getbuffer`). Sharing the
+    /// `Rc<RefCell<Vec<u8>>>` means writes through the view land in the
+    /// stream, and the export keeps the buffer pinned (a subsequent
+    /// `write`/`truncate` raises `BufferError`) until the view is released.
+    pub fn getbuffer(&self) -> Result<Object, RuntimeError> {
+        match &*self.backend.borrow() {
+            FileBackend::MemBytes { data, .. } => Ok(Object::MemoryView(Rc::new(
+                PyMemoryView::from_bytearray(data.clone()),
+            ))),
+            _ => Err(type_error("getbuffer() requires a BytesIO")),
         }
     }
 }
@@ -2459,12 +2657,57 @@ impl fmt::Debug for PyFile {
     }
 }
 
+impl Drop for PyFile {
+    fn drop(&mut self) {
+        // Close any still-open OS descriptor *ourselves* rather than letting
+        // Rust's `File` (an `OwnedFd`) run its checked drop. User code can
+        // close the fd out from under us (`os.close(f.fileno())`), and Rust's
+        // checked close aborts the whole process on a double close ("IO Safety
+        // violation"). CPython models fds as plain ints where that is just
+        // `EBADF`, so we close the raw fd and swallow the error. If `close()`
+        // already ran the backend is an in-memory buffer (no-op here);
+        // `closefd=False` detaches without closing.
+        #[cfg(unix)]
+        {
+            let Ok(mut backend) = self.backend.try_borrow_mut() else {
+                return;
+            };
+            if matches!(&*backend, FileBackend::Disk(_)) {
+                let old = std::mem::replace(
+                    &mut *backend,
+                    FileBackend::MemBytes {
+                        data: Rc::new(RefCell::new(Vec::new())),
+                        pos: 0,
+                    },
+                );
+                if let FileBackend::Disk(f) = old {
+                    use std::os::unix::io::IntoRawFd;
+                    let fd = f.into_raw_fd();
+                    if self.closefd.get() {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Concrete backing store for a [`PyFile`].
 pub enum FileBackend {
     /// A real file on disk.
     Disk(std::fs::File),
-    /// In-memory byte buffer (`io.BytesIO`).
-    MemBytes { data: Vec<u8>, pos: usize },
+    /// In-memory byte buffer (`io.BytesIO`). The data lives behind a shared
+    /// `Rc<RefCell<Vec<u8>>>` (the same store a `bytearray`/`memoryview`
+    /// uses) so `BytesIO.getbuffer()` can hand out a *writable* view that
+    /// aliases the buffer — and the export-tracking machinery
+    /// (`bytearray_is_exported`) makes resize-while-exported raise
+    /// `BufferError`, matching CPython's `bytesio.c` `check_exports`.
+    MemBytes {
+        data: Rc<RefCell<Vec<u8>>>,
+        pos: usize,
+    },
     /// In-memory UTF-8 buffer (`io.StringIO`).
     MemText { data: String, pos: usize },
     /// The interpreter's process stdout sink.
@@ -2747,6 +2990,17 @@ pub enum PyIterator {
         /// "changed size during iteration" trip-wire.
         len: usize,
     },
+    /// Lazy line iterator over an open file object. In CPython a file *is*
+    /// its own iterator and reads exactly one line per `__next__`, so we
+    /// hold the `PyFile` and stream line-by-line rather than draining the
+    /// whole stream up front. This is required for (a) pipes / growing
+    /// files / `sys.stdin` where eager draining would block until EOF, and
+    /// (b) binary-mode files, which must yield `bytes` lines (CPython makes
+    /// binary files iterable too — `multiprocessing.resource_tracker.main`
+    /// does `for line in open(fd, 'rb')`).
+    File {
+        file: Rc<PyFile>,
+    },
 }
 
 impl PyIterator {
@@ -2861,6 +3115,10 @@ impl PyIterator {
                 Some(Object::new_tuple(vec![Object::Int(i), v]))
             }
             PyIterator::Shared(inner) => inner.borrow_mut().next_value(),
+            // Lazy file line. The error channel is `next_value_checked`
+            // (used by FOR_ITER / `next()`); the rare internal drain that
+            // calls `next_value` treats a read error as end-of-stream.
+            PyIterator::File { file } => file.readline_obj().ok().flatten(),
             PyIterator::Set { set, index, .. } => {
                 let v = set.borrow().get_index(*index).map(|k| k.0.clone());
                 match v {
@@ -2958,12 +3216,14 @@ impl PyIterator {
                     inner.gc_referents(visit);
                 }
             }
-            // No `Object` referents: the payload is plain bytes / scalars.
+            // No `Object` referents: the payload is plain bytes / scalars,
+            // or (for `File`) an OS handle that buffers no Python objects.
             PyIterator::Str { .. }
             | PyIterator::Bytes { .. }
             | PyIterator::ByteArray { .. }
             | PyIterator::Range { .. }
-            | PyIterator::RangeHuge { .. } => {}
+            | PyIterator::RangeHuge { .. }
+            | PyIterator::File { .. } => {}
         }
     }
 
@@ -2980,6 +3240,11 @@ impl PyIterator {
             if set.borrow().len() != *len {
                 return Err(runtime_error("Set changed size during iteration"));
             }
+        }
+        if let PyIterator::File { file } = self {
+            // Surface read errors (OSError, decode errors) at the
+            // user-visible `__next__` boundary instead of swallowing them.
+            return file.readline_obj();
         }
         Ok(self.next_value())
     }
@@ -3034,6 +3299,8 @@ impl PyIterator {
                     Some(0)
                 }
             }
+            // A stream's remaining length isn't known without reading it.
+            PyIterator::File { .. } => None,
         }
     }
 
@@ -3142,6 +3409,10 @@ impl PyIterator {
                 }
                 out
             }
+            // A file iterator can't be snapshotted without consuming the
+            // stream; file objects aren't picklable, so `__reduce__` never
+            // reaches here in practice. Empty keeps it side-effect-free.
+            PyIterator::File { .. } => Vec::new(),
         }
     }
 
@@ -3779,24 +4050,13 @@ impl Object {
                 Ok(PyIterator::DictKeys { keys, index: 0 })
             }
             Object::File(file) => {
-                // CPython iterates a text-mode file by repeatedly
-                // invoking ``readline`` until it returns ``""``. We
-                // realise the buffer up front (for the in-memory
-                // backends; real OS handles read on demand inside
-                // ``readline``) and wrap the lines in a ``List``
-                // iterator — same observable behaviour.
-                let mut lines: Vec<Object> = Vec::new();
-                loop {
-                    let line = file.readline_unbounded()?;
-                    if line.is_empty() {
-                        break;
-                    }
-                    lines.push(Object::from_str(line));
-                }
-                Ok(PyIterator::List {
-                    items: Rc::new(RefCell::new(lines)),
-                    index: 0,
-                })
+                // CPython's file object is its own iterator: each step calls
+                // ``readline`` and yields the line, raising StopIteration at
+                // EOF. We stream lazily (one line per `next`) rather than
+                // draining up front — eager draining would block on pipes /
+                // `sys.stdin` until EOF and breaks binary-mode files, which
+                // must yield ``bytes`` lines.
+                Ok(PyIterator::File { file: file.clone() })
             }
             // A native iterator is its own iterable: `iter(it) is it` in
             // Python, and passing one to a plain builtin (`zip`,

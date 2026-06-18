@@ -371,7 +371,14 @@ fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFil
         })?,
         None => Vec::new(),
     };
-    let f = PyFile::new("<bytes>", "rb+", FileBackend::MemBytes { data, pos: 0 });
+    let f = PyFile::new(
+        "<bytes>",
+        "rb+",
+        FileBackend::MemBytes {
+            data: Rc::new(crate::sync::RefCell::new(data)),
+            pos: 0,
+        },
+    );
     f.no_name.set(true);
     Ok(Rc::new(f))
 }
@@ -422,7 +429,7 @@ fn bytesio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
             "<bytes>",
             "rb+",
             FileBackend::MemBytes {
-                data: Vec::new(),
+                data: Rc::new(crate::sync::RefCell::new(Vec::new())),
                 pos: 0,
             },
         )
@@ -802,9 +809,14 @@ fn make_memory_stream(
     method("writelines", crate::builtins::file_writelines);
     method("seek", crate::builtins::file_seek);
     method("tell", crate::builtins::file_tell);
+    method("truncate", crate::builtins::file_truncate);
     method("flush", crate::builtins::file_flush);
     method("close", crate::builtins::file_close);
     method("getvalue", crate::builtins::file_getvalue);
+    // `getbuffer()` is a binary-stream method only — `StringIO` lacks it.
+    if name == "BytesIO" {
+        method("getbuffer", crate::builtins::file_getbuffer);
+    }
     method("readable", crate::builtins::file_readable);
     method("writable", crate::builtins::file_writable);
     method("seekable", crate::builtins::file_seekable);
@@ -1400,6 +1412,10 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
         Some(Object::Str(s)) => s.to_string(),
         _ => "utf-8".to_owned(),
     };
+    // CPython resolves the codec in `TextIOWrapper.__init__`, so an unknown
+    // encoding raises `LookupError` at construction (e.g.
+    // `SpooledTemporaryFile(mode='w+', encoding='bad-encoding')`).
+    crate::stdlib::io_full::validate_text_encoding(&encoding)?;
     let errors = positional.get(2).cloned().or_else(|| kw("errors"));
     let errors = match errors {
         Some(Object::Str(s)) => s.to_string(),
@@ -1410,6 +1426,8 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
     tw_set(&inst, "encoding", Object::from_str(encoding));
     tw_set(&inst, "errors", Object::from_str(errors));
     tw_set(&inst, "newline", newline.unwrap_or(Object::None));
+    // `newlines` starts `None` and is populated as terminators are read.
+    tw_set(&inst, "newlines", Object::None);
     tw_set(&inst, "_detached", Object::Bool(false));
     Ok(Object::None)
 }
@@ -1445,6 +1463,70 @@ fn tw_newline_mode(inst: &crate::types::PyInstance) -> NewlineMode {
         },
         _ => NewlineMode::Universal,
     }
+}
+
+// CPython's `IncrementalNewlineDecoder` records which line terminators it has
+// seen so `TextIOWrapper.newlines` can report them. The flags are OR-ed as
+// terminators are decoded and mapped to `None`/str/tuple on read.
+const SEEN_CR: i64 = 1;
+const SEEN_LF: i64 = 2;
+const SEEN_CRLF: i64 = 4;
+
+/// Map the OR-ed `SEEN_*` bitmask to CPython's `TextIOWrapper.newlines`
+/// value: `None` when nothing was seen, a single string for one terminator,
+/// or a `(\r, \n, \r\n)`-ordered tuple of those present.
+fn newlines_value(mask: i64) -> Object {
+    let mut parts: Vec<Object> = Vec::new();
+    if mask & SEEN_CR != 0 {
+        parts.push(Object::from_static("\r"));
+    }
+    if mask & SEEN_LF != 0 {
+        parts.push(Object::from_static("\n"));
+    }
+    if mask & SEEN_CRLF != 0 {
+        parts.push(Object::from_static("\r\n"));
+    }
+    match parts.len() {
+        0 => Object::None,
+        1 => parts.into_iter().next().unwrap(),
+        _ => Object::new_tuple(parts),
+    }
+}
+
+/// Scan the *untranslated* source text just consumed by a read and fold the
+/// terminators it contains into the wrapper's `newlines` state. Only the
+/// universal-recognition modes (`newline=None` and `newline=''`) track
+/// newlines, matching CPython; the explicit modes leave `newlines` `None`.
+fn tw_record_newlines(inst: &crate::types::PyInstance, src: &str) {
+    if src.is_empty() {
+        return;
+    }
+    let mut mask = match tw_get(inst, "_newlines_seen") {
+        Some(Object::Int(n)) => n,
+        _ => 0,
+    };
+    let b = src.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\r' => {
+                if i + 1 < b.len() && b[i + 1] == b'\n' {
+                    mask |= SEEN_CRLF;
+                    i += 2;
+                } else {
+                    mask |= SEEN_CR;
+                    i += 1;
+                }
+            }
+            b'\n' => {
+                mask |= SEEN_LF;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    tw_set(inst, "_newlines_seen", Object::Int(mask));
+    tw_set(inst, "newlines", newlines_value(mask));
 }
 
 /// Translate decoded text on read under universal-newline mode (`\r\n` and
@@ -1641,6 +1723,9 @@ fn tw_read(args: &[Object]) -> Result<Object, RuntimeError> {
             (slice.to_string(), c)
         }
     };
+    if matches!(mode, NewlineMode::Universal | NewlineMode::Passthrough) {
+        tw_record_newlines(&inst, &remaining[..consumed]);
+    }
     tw_set(&inst, "_dec_pos", Object::Int((pos + consumed) as i64));
     Ok(Object::from_str(out))
 }
@@ -1659,6 +1744,9 @@ fn tw_readline(args: &[Object]) -> Result<Object, RuntimeError> {
         NewlineMode::Universal => translate_universal(line, None).0,
         _ => line.to_string(),
     };
+    if matches!(mode, NewlineMode::Universal | NewlineMode::Passthrough) {
+        tw_record_newlines(&inst, &remaining[..consumed]);
+    }
     tw_set(&inst, "_dec_pos", Object::Int((pos + consumed) as i64));
     Ok(Object::from_str(out))
 }
@@ -1855,7 +1943,7 @@ pub(crate) fn make_buffered(
     method("close", bw_close);
     method("seek", bw_seek);
     method("tell", bw_tell);
-    method("truncate", bw_tell);
+    method("truncate", bw_truncate);
     method("readable", bw_readable);
     method("writable", bw_writable);
     method("seekable", bw_seekable);
@@ -2272,6 +2360,31 @@ fn bw_tell(args: &[Object]) -> Result<Object, RuntimeError> {
             let buffered = rdbuf_get(&inst).len() as i64;
             let cur = py_call(&raw, "tell", &[])?.as_i64().unwrap_or(0);
             Ok(Object::Int(cur - buffered))
+        }
+    }
+}
+
+/// `BufferedWriter/Random.truncate(pos=None)` — flush the buffer, then
+/// resize the underlying raw stream (default: current position). CPython
+/// returns the new size and leaves the stream position unchanged.
+fn bw_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = bw_self(args)?;
+    let size = args.get(1).cloned();
+    match bw_target(&inst)? {
+        RawTarget::Native(raw) => {
+            raw.flush()?;
+            let pos = match size.as_ref() {
+                None | Some(Object::None) => None,
+                Some(o) => Some(crate::builtins::coerce_index_i64(o)?.max(0) as u64),
+            };
+            Ok(Object::Int(raw.truncate(pos)? as i64))
+        }
+        RawTarget::Py(raw) => {
+            let _ = py_call(&raw, "flush", &[]);
+            match size.as_ref() {
+                None | Some(Object::None) => py_call(&raw, "truncate", &[]),
+                Some(o) => py_call(&raw, "truncate", std::slice::from_ref(o)),
+            }
         }
     }
 }

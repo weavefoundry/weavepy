@@ -532,7 +532,10 @@ fn pipe_reader_drain<R: Read + 'static>(mut reader: R) -> Object {
     let pf = PyFile::new(
         "<subprocess-pipe>",
         "rb",
-        FileBackend::MemBytes { data: buf, pos: 0 },
+        FileBackend::MemBytes {
+            data: crate::sync::Rc::new(crate::sync::RefCell::new(buf)),
+            pos: 0,
+        },
     );
     Object::File(Rc::new(pf))
 }
@@ -584,7 +587,7 @@ fn pipe_writer<W: std::io::Write + 'static>(_writer: W) -> Object {
         "<subprocess-stdin>",
         "wb",
         FileBackend::MemBytes {
-            data: Vec::new(),
+            data: crate::sync::Rc::new(crate::sync::RefCell::new(Vec::new())),
             pos: 0,
         },
     );

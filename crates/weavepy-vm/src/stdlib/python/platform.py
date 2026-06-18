@@ -467,9 +467,17 @@ def _mac_ver_xml():
     except ImportError:
         return None
 
-    with open(fn, 'rb') as f:
-        pl = plistlib.load(f)
-    release = pl['ProductVersion']
+    # Tolerate a plist parser that can't read the system file (WeavePy's
+    # plistlib XML reader lags the full expat surface): callers treat a
+    # `None` result as "macOS version unknown" and fall back, exactly as
+    # they do when the file is missing — rather than letting the parse
+    # error escape and break every `@support.requires_mac_ver` test.
+    try:
+        with open(fn, 'rb') as f:
+            pl = plistlib.load(f)
+        release = pl['ProductVersion']
+    except Exception:
+        return None
     versioninfo = ('', '', '')
     machine = os.uname().machine
     if machine in ('ppc', 'Power Macintosh'):

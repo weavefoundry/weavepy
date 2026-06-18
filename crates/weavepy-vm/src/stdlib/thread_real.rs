@@ -184,6 +184,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     // imported during interpreter startup, so the calling thread's id is
     // the main-thread ident `threading._MainThread` will report.
     let _ = MAIN_THREAD_IDENT.set(main_thread_ident_now());
+    // RFC 0040 WS4: register the main thread's pthread_t under its ident so
+    // `signal.pthread_kill(get_ident(), sig)` from the main thread resolves.
+    #[cfg(unix)]
+    super::signal_mod::register_current_thread_pthread(main_thread_ident_now());
     Rc::new(PyModule {
         name: "_thread".to_owned(),
         filename: None,
@@ -483,6 +487,11 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         let _ = exit_lock.release();
         Ok(Object::Bool(false))
     };
+    let reinit_lock = lock.clone();
+    let at_fork_reinit = move |_args: &[Object]| -> Result<Object, RuntimeError> {
+        reinit_lock.force_reset();
+        Ok(Object::None)
+    };
     {
         let acquire_obj = b_dyn_kw("acquire", acquire);
         let release_obj = b_dyn("release", release);
@@ -501,6 +510,10 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         d.insert(
             DictKey(Object::from_static("__exit__")),
             b_dyn("__exit__", exit),
+        );
+        d.insert(
+            DictKey(Object::from_static("_at_fork_reinit")),
+            b_dyn("_at_fork_reinit", at_fork_reinit),
         );
     }
     let inst = Rc::new(PyInstance {
@@ -623,11 +636,20 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         let _ = exit_lock.release(me);
         Ok(Object::Bool(false))
     };
+    let reinit_lock = rlock.clone();
+    let at_fork_reinit = move |_args: &[Object]| -> Result<Object, RuntimeError> {
+        reinit_lock.force_reset();
+        Ok(Object::None)
+    };
     {
         let mut d = dict.borrow_mut();
         d.insert(
             DictKey(Object::from_static("acquire")),
             b_dyn_kw("acquire", acquire),
+        );
+        d.insert(
+            DictKey(Object::from_static("_at_fork_reinit")),
+            b_dyn("_at_fork_reinit", at_fork_reinit),
         );
         d.insert(
             DictKey(Object::from_static("release")),
@@ -1002,6 +1024,10 @@ fn spawn_python_worker(
         .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
             crate::vm_singletons::install_worker_thread_id(synth_id);
+            // RFC 0040 WS4: record this worker's pthread_t so
+            // `signal.pthread_kill(ident, sig)` can target it.
+            #[cfg(unix)]
+            super::signal_mod::register_current_thread_pthread(synth_id);
             // The parent published this entry into the slot below
             // before returning. Spin a few microseconds if we got here
             // first (extremely unlikely because the parent holds the
@@ -1083,6 +1109,8 @@ fn spawn_python_worker(
             }
             entry.mark_finished();
             let _ = worker_lock.release();
+            #[cfg(unix)]
+            super::signal_mod::unregister_thread_pthread(synth_id);
             crate::vm_singletons::clear_worker_thread_id();
         })
         .map_err(|e| runtime_error(format!("failed to spawn thread: {}", e)))?;

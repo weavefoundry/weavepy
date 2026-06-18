@@ -8,7 +8,6 @@
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
@@ -103,7 +102,7 @@ const STRUCT_TIME_FIELDS: [&str; 9] = [
 /// bare tuple (the old shape) broke them with `'tuple' object has no attribute
 /// 'tm_year'`.
 fn struct_time_type() -> Rc<crate::types::TypeObject> {
-    crate::stdlib::os::struct_seq_type("struct_time", &STRUCT_TIME_FIELDS)
+    crate::stdlib::os::struct_seq_type("struct_time", "time", &STRUCT_TIME_FIELDS)
 }
 
 fn make_struct_time(values: Vec<Object>) -> Object {
@@ -205,9 +204,66 @@ fn time_sleep(args: &[Object]) -> Result<Object, RuntimeError> {
         // serialize the whole interpreter behind one sleeping thread —
         // e.g. a `threading.Barrier` peer that `time.sleep`s would stall
         // every other peer's timed `wait()`.
-        crate::gil::allow_threads_then(|| {
-            thread::sleep(Duration::from_secs_f64(secs));
-        });
+        //
+        // It is also a signal-delivery point: a SIGINT (or any handled
+        // signal) arriving mid-sleep must break the wait and run the Python
+        // handler, so `time.sleep(30)` raises `KeyboardInterrupt` promptly
+        // (test_subprocess.test_send_signal). On POSIX we loop over
+        // `nanosleep`, which returns `EINTR` with the unslept remainder when
+        // a signal interrupts it; we re-acquire the GIL, service pending
+        // handlers (which may raise), then resume for the remainder.
+        #[cfg(unix)]
+        {
+            let mut remaining = Duration::from_secs_f64(secs);
+            loop {
+                let leftover = crate::gil::allow_threads_then(|| {
+                    let req = libc::timespec {
+                        tv_sec: remaining.as_secs() as libc::time_t,
+                        tv_nsec: libc::c_long::from(remaining.subsec_nanos() as i32),
+                    };
+                    let mut rem = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    let rc = unsafe { libc::nanosleep(&req, &mut rem) };
+                    if rc == 0 {
+                        None
+                    } else if std::io::Error::last_os_error().raw_os_error()
+                        == Some(libc::EINTR)
+                    {
+                        Some(Duration::new(
+                            rem.tv_sec.max(0) as u64,
+                            rem.tv_nsec.clamp(0, 999_999_999) as u32,
+                        ))
+                    } else {
+                        // Any other error: stop sleeping (CPython would raise,
+                        // but nanosleep only fails with EINTR/EINVAL here).
+                        Some(Duration::ZERO)
+                    }
+                });
+                match leftover {
+                    None => break,
+                    Some(rem) => {
+                        // GIL re-acquired: run any handler the signal tripped.
+                        if crate::stdlib::signal_mod::signals_pending() {
+                            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                                unsafe { (*ptr).run_pending_signals_public()? };
+                            }
+                        }
+                        if rem.is_zero() {
+                            break;
+                        }
+                        remaining = rem;
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            crate::gil::allow_threads_then(|| {
+                std::thread::sleep(Duration::from_secs_f64(secs));
+            });
+        }
     }
     Ok(Object::None)
 }

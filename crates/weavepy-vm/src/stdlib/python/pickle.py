@@ -12,6 +12,7 @@ raise ``PicklingError`` instead of silently producing a bytestream
 that cannot be loaded.
 """
 
+import copyreg
 import io
 import struct
 
@@ -258,6 +259,24 @@ class _Pickler:
             return
         if tname == "set":
             self._save_set(obj, frozen=False)
+            return
+        # Custom reducers registered through a dispatch table. CPython
+        # consults a *per-instance* `dispatch_table` when the pickler
+        # defines one (this is how `multiprocessing.reduction.ForkingPickler`
+        # routes `Connection`/`socket`/bound-method fd-passing through
+        # `duplicate_for_child`), otherwise the process-global
+        # `copyreg.dispatch_table`. Either is checked before the generic
+        # `__reduce_ex__` protocol. Keyed on the exact `type(obj)`.
+        dt = getattr(self, "dispatch_table", None)
+        if dt is None:
+            dt = copyreg.dispatch_table
+        reductor = dt.get(type(obj))
+        if reductor is not None:
+            rv = reductor(obj)
+            if isinstance(rv, str):
+                self._save_global(rv.rsplit(".", 1)[0] if "." in rv else "builtins", rv)
+            else:
+                self._save_reduce(rv, obj)
             return
         # Functions / classes / methods — pickle them by qualified name.
         # The unpickler will `import_module(<module>); getattr(...)`.

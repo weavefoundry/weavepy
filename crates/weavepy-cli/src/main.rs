@@ -37,26 +37,29 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// up front in `main()` keeps the unsugar trivial.
 const SUBCOMMANDS: &[&str] = &["regrtest"];
 
-/// Run a `weavepy --multiprocessing-fork` child. The parent has
-/// arranged for the pickled task to arrive on the fd named in
-/// `WEAVEPY_MP_PAYLOAD_FD` (defaults to `3`); we simply hand off to
-/// `multiprocessing._run_spawn_child()`, which knows how to read the
-/// payload, restore sys.path / cwd, and invoke the target callable.
-///
-/// The child's exit code is the value `_run_spawn_child()` returns,
-/// stashed in a sentinel env var (`WEAVEPY_MP_EXIT_CODE`) so we can
-/// re-read it from Rust without re-entering the VM.
-fn run_multiprocessing_child() -> ExitCode {
-    // `_run_spawn_child` invokes the worker target and then calls
-    // `_multiprocessing._exit(code)` which `std::process::exit`s
-    // directly — so this `Ok(())` arm is only reached when the worker
-    // chose to fall through cleanly without an explicit exit (treated
-    // as success).
+/// Run a `weavepy --multiprocessing-fork <kwds...>` child. The vendored
+/// `multiprocessing.popen_spawn_posix`/`popen_forkserver` re-exec us with
+/// CPython's frozen command line: `argv == [exe, "--multiprocessing-fork",
+/// "tracker_fd=N", "pipe_handle=M", …]`. We must therefore preserve the real
+/// argv (so `spawn.is_forking(sys.argv)` holds and the `name=value` kwds are
+/// parseable) and hand off to `multiprocessing._run_spawn_child()`, which
+/// mirrors CPython's `spawn.spawn_main` POSIX body and *returns* the child's
+/// exit code (rather than `sys.exit`-ing, so the Rust bridge controls the
+/// process status).
+fn run_multiprocessing_child(raw: &[String]) -> ExitCode {
+    // `_run_spawn_child` runs the worker target via `spawn._main` and returns
+    // its exit code; `_multiprocessing._exit(code)` then `std::process::exit`s
+    // directly, so the `Ok(())` arm is only reached on a clean fall-through.
     let snippet = "import multiprocessing, _multiprocessing\n\
                    _mp_code = multiprocessing._run_spawn_child()\n\
                    _multiprocessing._exit(int(_mp_code) if _mp_code is not None else 0)\n";
+    let argv = if raw.is_empty() {
+        vec!["weavepy".to_owned()]
+    } else {
+        raw.to_vec()
+    };
     let opts = RunOptions::new("<multiprocessing-fork>")
-        .with_argv(vec!["weavepy".to_owned()])
+        .with_argv(argv)
         .with_flags(InterpreterFlags::default());
     match weavepy::run_source_with_options(snippet, &opts) {
         Ok(()) => ExitCode::SUCCESS,
@@ -285,6 +288,10 @@ fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
 
     let vm_entry = move || -> ExitCode {
         weavepy::vm::stdlib::signal_mod::unblock_async_signals_current_thread();
+        // Arm SIGINT -> KeyboardInterrupt at startup (CPython does this during
+        // interpreter init), so even scripts that never `import signal` raise
+        // KeyboardInterrupt on ^C instead of being killed by the kernel default.
+        weavepy::vm::stdlib::signal_mod::install_startup_dispositions();
         entry()
     };
 
@@ -299,6 +306,7 @@ fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
         // first since we blocked it above.
         Err(_) => {
             weavepy::vm::stdlib::signal_mod::unblock_async_signals_current_thread();
+            weavepy::vm::stdlib::signal_mod::install_startup_dispositions();
             entry()
         }
     }
@@ -315,7 +323,7 @@ fn main_dispatch() -> ExitCode {
     // `multiprocessing._run_spawn_child()` which reads the pickled
     // task off the inherited fd and runs it.
     if raw.iter().any(|a| a == "--multiprocessing-fork") {
-        return run_multiprocessing_child();
+        return run_multiprocessing_child(&raw);
     }
 
     // Bare subcommand dispatch (e.g. `weavepy regrtest ...`) — must
@@ -390,6 +398,33 @@ fn split_argv(raw: Vec<String>) -> (Vec<String>, Option<(&'static str, String)>,
             let m = arg[2..].to_owned();
             let rest: Vec<String> = iter.collect();
             return (wp, Some(("m", m)), rest);
+        }
+        // Clustered single-letter options where `-c`/`-m` follows some boolean
+        // flags, e.g. `-uc CMD` == `-u -c CMD` and `-uIcCMD` == `-u -I -c CMD`
+        // (CPython accepts this; `test_subprocess` spawns children as `-uc`).
+        // The `c`/`m` consumes the rest of the cluster as its value, else the
+        // next argv element.
+        if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 2 {
+            let body: Vec<char> = arg[1..].chars().collect();
+            if let Some(pos) = body.iter().position(|&c| c == 'c' || c == 'm') {
+                const BOOL_SHORT: &[char] = &[
+                    'O', 'b', 'B', 'd', 'E', 'i', 'I', 'S', 's', 'q', 'P', 'u', 'v', 'x',
+                ];
+                if body[..pos].iter().all(|c| BOOL_SHORT.contains(c)) {
+                    for &c in &body[..pos] {
+                        wp.push(format!("-{c}"));
+                    }
+                    let kind = if body[pos] == 'c' { "c" } else { "m" };
+                    let after: String = body[pos + 1..].iter().collect();
+                    let value = if after.is_empty() {
+                        iter.next().unwrap_or_default()
+                    } else {
+                        after
+                    };
+                    let rest: Vec<String> = iter.collect();
+                    return (wp, Some((kind, value)), rest);
+                }
+            }
         }
         if arg == "-" {
             let rest: Vec<String> = iter.collect();

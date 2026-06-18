@@ -310,7 +310,7 @@ pub(crate) fn io_open_kw(
             slots[3].as_ref(),
             slots[4].as_ref(),
             slots[5].as_ref(),
-        );
+        )?;
         return Ok(file);
     }
 
@@ -402,12 +402,20 @@ fn apply_text_config(
     encoding: Option<&Object>,
     errors: Option<&Object>,
     newline: Option<&Object>,
-) {
-    let Object::File(f) = file else { return };
+) -> Result<(), RuntimeError> {
+    let Object::File(f) = file else {
+        return Ok(());
+    };
     if f.binary {
-        return;
+        return Ok(());
     }
     if let Some(Object::Str(enc)) = encoding {
+        // CPython resolves the codec at construction time (via
+        // `_PyCodec_LookupTextEncoding`), so an unknown encoding raises
+        // `LookupError` from `open()`/`TextIOWrapper(...)` — not later at the
+        // first read. Validate against the live codec registry so e.g.
+        // `tempfile.TemporaryFile(encoding='bad-encoding')` fails eagerly.
+        validate_text_encoding(enc)?;
         f.set_encoding(enc);
     }
     if let Some(Object::Str(err)) = errors {
@@ -416,10 +424,63 @@ fn apply_text_config(
     if let Some(Object::Str(nl)) = newline {
         f.set_newline(Some(nl));
     }
+    Ok(())
+}
+
+/// Look the encoding up in the running interpreter's `codecs` registry,
+/// mirroring CPython's eager codec resolution. Returns `Ok(())` when the
+/// codec is known and propagates `codecs.lookup`'s `LookupError` otherwise.
+/// A missing interpreter (should not happen for user-facing `open`) is
+/// treated as "do not block".
+pub(crate) fn validate_text_encoding(encoding: &str) -> Result<(), RuntimeError> {
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Ok(());
+    };
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    // Be tolerant of early bootstrap: if `codecs` isn't importable yet (or has
+    // no `lookup`), skip validation rather than wedge interpreter start-up.
+    // Only the codec lookup itself — which raises `LookupError` for an unknown
+    // encoding — is allowed to fail the open.
+    let Ok(codecs) = interp.import_path("codecs") else {
+        return Ok(());
+    };
+    let Ok(lookup) = interp.load_attr_public(&codecs, "lookup") else {
+        return Ok(());
+    };
+    interp.call_object(lookup, &[Object::from_str(encoding)], &[])?;
+    Ok(())
 }
 
 pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
     use crate::object::{FileBackend, PyFile};
+    // `open(fd, mode, ...)` — adopt an already-open OS descriptor, exactly
+    // like CPython's `io.FileIO(fd)` / `io.open(fd)`. `subprocess.Popen`
+    // wraps its pipe ends this way, and `os.fdopen` is a thin alias.
+    if let Some(Object::Int(fd)) = args.first() {
+        let mode = match args.get(1) {
+            Some(Object::Str(s)) => s.to_string(),
+            Some(Object::None) | None => "r".to_owned(),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "open() argument 'mode' must be str, not {}",
+                    other.type_name()
+                )))
+            }
+        };
+        crate::builtins::validate_open_mode(&mode)?;
+        if *fd < 0 {
+            return Err(value_error("negative file descriptor"));
+        }
+        let file = file_from_fd(&Object::Int(*fd), &mode, String::new())?;
+        // `closefd=False` (positional index 6): the caller keeps ownership
+        // of the descriptor; closing the stream must not close the fd.
+        if let (Object::File(f), Some(Object::Bool(false))) = (&file, args.get(6)) {
+            f.closefd.set(false);
+        }
+        apply_text_config(&file, args.get(3), args.get(4), args.get(5))?;
+        return Ok(file);
+    }
     let path = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
         Some(other) => {
@@ -468,7 +529,7 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
     let file = Object::File(Rc::new(PyFile::new(path, mode, backend)));
     let _ = binary; // text decoding is handled by PyFile itself.
                     // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
-    apply_text_config(&file, args.get(3), args.get(4), args.get(5));
+    apply_text_config(&file, args.get(3), args.get(4), args.get(5))?;
     Ok(file)
 }
 

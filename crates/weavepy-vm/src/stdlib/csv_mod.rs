@@ -159,7 +159,7 @@ fn reader_call(args: &[Object]) -> Result<Object, RuntimeError> {
             // Read the whole backing object as a string and split.
             let snapshot = match &*file.backend.borrow() {
                 crate::object::FileBackend::MemBytes { data, .. } => {
-                    String::from_utf8_lossy(data).into_owned()
+                    String::from_utf8_lossy(&data.borrow()).into_owned()
                 }
                 crate::object::FileBackend::MemText { data, .. } => data.clone(),
                 _ => String::new(),
@@ -324,7 +324,7 @@ fn write_to(target: &Object, line: &str) -> Result<(), RuntimeError> {
             let mut state = file.backend.borrow_mut();
             match &mut *state {
                 crate::object::FileBackend::MemBytes { data, pos: _ } => {
-                    data.extend_from_slice(line.as_bytes());
+                    data.borrow_mut().extend_from_slice(line.as_bytes());
                 }
                 crate::object::FileBackend::MemText { data, pos: _ } => {
                     data.push_str(line);

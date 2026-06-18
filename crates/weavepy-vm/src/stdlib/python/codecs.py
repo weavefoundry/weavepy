@@ -31,7 +31,8 @@ class CodecInfo:
     uses."""
 
     def __init__(self, encode, decode, streamreader=None, streamwriter=None,
-                 incrementalencoder=None, incrementaldecoder=None, name=None):
+                 incrementalencoder=None, incrementaldecoder=None, name=None,
+                 *, _is_text_encoding=None):
         self.encode = encode
         self.decode = decode
         self.streamreader = streamreader
@@ -39,6 +40,18 @@ class CodecInfo:
         self.incrementalencoder = incrementalencoder
         self.incrementaldecoder = incrementaldecoder
         self.name = name
+        # CPython marks binary transforms (hex/base64/zlib/…) with
+        # `_is_text_encoding = False` so `io.TextIOWrapper` and friends can
+        # reject them; text codecs default to True.
+        if _is_text_encoding is not None:
+            self._is_text_encoding = _is_text_encoding
+
+    _is_text_encoding = True
+
+    def __repr__(self):
+        return "<%s.%s object for encoding %s at %#x>" % (
+            self.__class__.__module__, self.__class__.__qualname__,
+            self.name, id(self))
 
     def __getitem__(self, idx):
         return (self.encode, self.decode, self.streamreader, self.streamwriter)[idx]
@@ -50,11 +63,26 @@ class CodecInfo:
         return 4
 
 
-def _make_codec(encoding, encode_fn, decode_fn):
+def _make_codec(encoding, encode_fn, decode_fn, _is_text_encoding=True):
+    # Build generic incremental factories on top of the stateless
+    # (encode, decode) pair so `codecs.getincremental*` work for the
+    # built-in codecs without a bespoke class each. The stream
+    # reader/writer factories are intentionally left unset: a faithful
+    # `StreamReader`/`StreamWriter` is part of the deferred codecs wave,
+    # and a half-built one is worse than `None` (callers fall back).
+    def _mk_incremental_encoder(errors="strict"):
+        return _FuncIncrementalEncoder(encode_fn, errors)
+
+    def _mk_incremental_decoder(errors="strict"):
+        return _FuncIncrementalDecoder(decode_fn, errors)
+
     return CodecInfo(
         encode=encode_fn,
         decode=decode_fn,
+        incrementalencoder=_mk_incremental_encoder,
+        incrementaldecoder=_mk_incremental_decoder,
         name=encoding,
+        _is_text_encoding=_is_text_encoding,
     )
 
 
@@ -129,12 +157,99 @@ _PURE_CODECS = {
 }
 
 
+def _utf_8_sig_encode(input, errors="strict"):
+    return (BOM_UTF8 + _codecs.utf_8_encode(input, errors)[0], len(input))
+
+
+def _utf_8_sig_decode(input, errors="strict"):
+    input = bytes(input)
+    prefix = 0
+    if input[:3] == BOM_UTF8:
+        input = input[3:]
+        prefix = 3
+    (output, consumed) = _codecs.utf_8_decode(input, errors)
+    return (output, consumed + prefix)
+
+
+class _UTF8SigIncrementalEncoder(IncrementalEncoder):
+    """utf-8-sig incremental encoder: emit the BOM exactly once (CPython
+    ``encodings/utf_8_sig.py``). ``setstate(0)`` is how ``TextIOWrapper``
+    suppresses the BOM when appending to a non-empty file."""
+
+    def __init__(self, errors="strict"):
+        super().__init__(errors)
+        self.first = 1
+
+    def encode(self, input, final=False):
+        if self.first:
+            self.first = 0
+            return BOM_UTF8 + _codecs.utf_8_encode(input, self.errors)[0]
+        return _codecs.utf_8_encode(input, self.errors)[0]
+
+    def reset(self):
+        super().reset()
+        self.first = 1
+
+    def getstate(self):
+        return self.first
+
+    def setstate(self, state):
+        self.first = state
+
+
+class _UTF8SigIncrementalDecoder(BufferedIncrementalDecoder):
+    """utf-8-sig incremental decoder: strip a leading BOM once."""
+
+    def __init__(self, errors="strict"):
+        super().__init__(errors)
+        self.first = 1
+
+    def _buffer_decode(self, input, errors, final):
+        if self.first:
+            if len(input) < 3:
+                if BOM_UTF8.startswith(input):
+                    # Not enough data yet to decide; wait for more.
+                    return ("", 0)
+                self.first = 0
+            else:
+                self.first = 0
+                if input[:3] == BOM_UTF8:
+                    (output, consumed) = _codecs.utf_8_decode(input[3:], errors)
+                    return (output, consumed + 3)
+        return _codecs.utf_8_decode(input, errors)
+
+    def reset(self):
+        super().reset()
+        self.first = 1
+
+    def getstate(self):
+        return (self.buffer, self.first)
+
+    def setstate(self, state):
+        (buffer, first) = state
+        self.buffer = buffer
+        self.first = first
+
+
+def _utf_8_sig_codecinfo(name="utf-8-sig"):
+    return CodecInfo(
+        encode=_utf_8_sig_encode,
+        decode=_utf_8_sig_decode,
+        incrementalencoder=_UTF8SigIncrementalEncoder,
+        incrementaldecoder=_UTF8SigIncrementalDecoder,
+        name="utf-8-sig",
+        _is_text_encoding=True,
+    )
+
+
 def lookup(encoding):
     encoding = encoding.lower()
     if encoding in _USER_CODECS:
         return _USER_CODECS[encoding]
     if _normalise(encoding) in _USER_CODECS:
         return _USER_CODECS[_normalise(encoding)]
+    if _normalise(encoding) == "utf_8_sig":
+        return _utf_8_sig_codecinfo(encoding)
     if encoding in _PURE_CODECS or _normalise(encoding) in _PURE_CODECS:
         key = encoding if encoding in _PURE_CODECS else _normalise(encoding)
         encode_fn, decode_fn = _PURE_CODECS[key]
@@ -148,13 +263,32 @@ def lookup(encoding):
     # Generic fall-through via the engine's own lookup.
     try:
         canonical = _codecs.lookup(encoding)
-    except ValueError as e:
-        raise LookupError(str(e)) from None
+    except ValueError:
+        # The built-in engine doesn't know this name; defer to any
+        # user-registered search functions (CPython's `codecs.register`
+        # protocol — the search is called with the normalised name and
+        # returns a `CodecInfo`/4-tuple or `None`).
+        info = _search_registered(_normalise(encoding))
+        if info is not None:
+            return info
+        raise LookupError("unknown encoding: " + encoding) from None
     def encode(s, errors="strict"):
         return _codecs.encode(s, canonical, errors)
     def decode(b, errors="strict"):
         return _codecs.decode(b, canonical, errors)
     return _make_codec(canonical, encode, decode)
+
+
+def _search_registered(name):
+    """Run the registered search functions in order, returning the first
+    non-``None`` result coerced to a :class:`CodecInfo`."""
+    for search in _SEARCH_FUNCS:
+        result = search(name)
+        if result is not None:
+            if not isinstance(result, CodecInfo):
+                result = CodecInfo(*result)
+            return result
+    return None
 
 
 def encode(obj, encoding="utf-8", errors="strict"):
@@ -179,6 +313,16 @@ def register(search_function):
         _SEARCH_FUNCS.append(search_function)
 
 
+def unregister(search_function):
+    """Unregister a codec search function previously passed to
+    :func:`register` (no-op if it was never registered). Mirrors
+    CPython 3.10+ `codecs.unregister`."""
+    try:
+        _SEARCH_FUNCS.remove(search_function)
+    except ValueError:
+        return
+
+
 _SEARCH_FUNCS = []
 
 
@@ -201,6 +345,66 @@ def lookup_error(name):
             raise exc
         return passthrough
     raise LookupError(f"unknown error handler name '{name}'")
+
+
+def getencoder(encoding):
+    """The stateless ``encode`` callable for *encoding*."""
+    return lookup(encoding).encode
+
+
+def getdecoder(encoding):
+    """The stateless ``decode`` callable for *encoding*."""
+    return lookup(encoding).decode
+
+
+def getincrementalencoder(encoding):
+    """The ``IncrementalEncoder`` factory for *encoding*."""
+    encoder = lookup(encoding).incrementalencoder
+    if encoder is None:
+        raise LookupError(encoding)
+    return encoder
+
+
+def getincrementaldecoder(encoding):
+    """The ``IncrementalDecoder`` factory for *encoding*."""
+    decoder = lookup(encoding).incrementaldecoder
+    if decoder is None:
+        raise LookupError(encoding)
+    return decoder
+
+
+def getreader(encoding):
+    """The ``StreamReader`` factory for *encoding*."""
+    return lookup(encoding).streamreader
+
+
+def getwriter(encoding):
+    """The ``StreamWriter`` factory for *encoding*."""
+    return lookup(encoding).streamwriter
+
+
+def iterencode(iterator, encoding, errors="strict", **kwargs):
+    """Incrementally encode the strings from *iterator*."""
+    encoder = getincrementalencoder(encoding)(errors, **kwargs)
+    for input in iterator:
+        output = encoder.encode(input)
+        if output:
+            yield output
+    output = encoder.encode("", True)
+    if output:
+        yield output
+
+
+def iterdecode(iterator, encoding, errors="strict", **kwargs):
+    """Incrementally decode the bytes from *iterator*."""
+    decoder = getincrementaldecoder(encoding)(errors, **kwargs)
+    for input in iterator:
+        output = decoder.decode(input)
+        if output:
+            yield output
+    output = decoder.decode(b"", True)
+    if output:
+        yield output
 
 
 # ---------- incremental codecs ----------
@@ -241,11 +445,95 @@ class IncrementalDecoder:
 
 
 class BufferedIncrementalEncoder(IncrementalEncoder):
-    pass
+    """Base for encoders that may buffer a trailing partial character."""
+
+    def __init__(self, errors="strict"):
+        super().__init__(errors)
+        self.buffer = ""
+
+    def _buffer_encode(self, input, errors, final):
+        raise NotImplementedError
+
+    def encode(self, input, final=False):
+        data = self.buffer + input
+        (result, consumed) = self._buffer_encode(data, self.errors, final)
+        self.buffer = data[consumed:]
+        return result
+
+    def reset(self):
+        IncrementalEncoder.reset(self)
+        self.buffer = ""
+
+    def getstate(self):
+        return self.buffer or 0
+
+    def setstate(self, state):
+        self.buffer = state or ""
 
 
 class BufferedIncrementalDecoder(IncrementalDecoder):
-    pass
+    """Base for decoders that may buffer a trailing partial byte sequence."""
+
+    def __init__(self, errors="strict"):
+        super().__init__(errors)
+        self.buffer = b""
+
+    def _buffer_decode(self, input, errors, final):
+        raise NotImplementedError
+
+    def decode(self, input, final=False):
+        data = self.buffer + bytes(input)
+        (result, consumed) = self._buffer_decode(data, self.errors, final)
+        self.buffer = data[consumed:]
+        return result
+
+    def reset(self):
+        IncrementalDecoder.reset(self)
+        self.buffer = b""
+
+    def getstate(self):
+        return (self.buffer, 0)
+
+    def setstate(self, state):
+        self.buffer = state[0]
+
+
+class _FuncIncrementalEncoder(IncrementalEncoder):
+    """Generic incremental encoder over a stateless ``encode(input, errors)``
+    callable. Adequate for the byte-per-character text codecs; stateful
+    encodings (e.g. the utf-16 BOM) are handled by their own factories."""
+
+    def __init__(self, encode, errors="strict"):
+        super().__init__(errors)
+        self._encode = encode
+
+    def encode(self, input, final=False):
+        if not input:
+            return b""
+        return self._encode(input, self.errors)[0]
+
+
+class _FuncIncrementalDecoder(BufferedIncrementalDecoder):
+    """Generic incremental decoder over a stateless ``decode(input, errors)``
+    callable. Keeps a trailing partial multibyte sequence buffered until more
+    data (or ``final``) arrives."""
+
+    def __init__(self, decode, errors="strict"):
+        super().__init__(errors)
+        self._decode = decode
+
+    def _buffer_decode(self, input, errors, final):
+        if final or not input:
+            return self._decode(input, errors)
+        # Decode as much as possible, leaving a trailing partial sequence
+        # (at most a few bytes for the variable-width encodings) buffered.
+        for split in range(len(input), max(len(input) - 4, -1), -1):
+            try:
+                result, _ = self._decode(input[:split], errors)
+            except (UnicodeDecodeError, ValueError):
+                continue
+            return (result, split)
+        return ("", 0)
 
 
 class StreamReader:
@@ -288,6 +576,31 @@ class StreamReaderWriter:
 
     def write(self, data):
         return self.writer.write(data)
+
+
+class _FuncStreamReader(StreamReader):
+    """Generic ``StreamReader`` over a stateless ``decode`` callable."""
+
+    def __init__(self, decode, stream, errors="strict"):
+        StreamReader.__init__(self, stream, errors)
+        self._decode = decode
+
+    def read(self, size=-1, chars=-1, firstline=False):
+        data = self.stream.read() if size < 0 else self.stream.read(size)
+        if isinstance(data, str):
+            return data
+        return self._decode(data, self.errors)[0]
+
+
+class _FuncStreamWriter(StreamWriter):
+    """Generic ``StreamWriter`` over a stateless ``encode`` callable."""
+
+    def __init__(self, encode, stream, errors="strict"):
+        StreamWriter.__init__(self, stream, errors)
+        self._encode = encode
+
+    def write(self, s):
+        return self.stream.write(self._encode(s, self.errors)[0])
 
 
 # ---------- helpers for utf-8/utf-16 file IO ----------
@@ -356,8 +669,11 @@ _ERROR_HANDLERS["replace"] = replace_errors
 __all__ = [
     "BOM", "BOM_UTF8", "BOM_UTF16", "BOM_UTF16_BE", "BOM_UTF16_LE",
     "BOM_UTF32", "BOM_UTF32_BE", "BOM_UTF32_LE", "BOM_BE", "BOM_LE",
-    "encode", "decode", "lookup", "register", "register_error",
-    "lookup_error", "CodecInfo",
+    "encode", "decode", "lookup", "register", "unregister",
+    "register_error", "lookup_error", "CodecInfo",
+    "getencoder", "getdecoder", "getincrementalencoder",
+    "getincrementaldecoder", "getreader", "getwriter",
+    "iterencode", "iterdecode",
     "IncrementalEncoder", "IncrementalDecoder",
     "BufferedIncrementalEncoder", "BufferedIncrementalDecoder",
     "StreamReader", "StreamWriter", "StreamReaderWriter",

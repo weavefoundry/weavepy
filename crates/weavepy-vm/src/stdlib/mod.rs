@@ -38,6 +38,8 @@ pub mod marshal_mod;
 pub mod math;
 pub mod operator_accel;
 pub mod os;
+pub mod os_process;
+pub mod posixsubprocess_mod;
 pub mod resource_mod;
 pub mod secrets_mod;
 pub mod select_mod;
@@ -94,10 +96,16 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
     cache.register_builtin("_testinternalcapi", testinternalcapi_mod::build);
-    cache.register_builtin("signal", signal_mod::build);
+    // RFC 0040 WS4 — the native core is `_signal`; the frozen `signal.py`
+    // (CPython's) layers the `Signals`/`Handlers`/`Sigmasks` IntEnums and
+    // the enum-coercing `signal`/`getsignal`/`pthread_sigmask` wrappers.
+    cache.register_builtin("_signal", signal_mod::build);
     cache.register_builtin("select", select_mod::build);
     cache.register_builtin("_socket", socket_mod::build);
     cache.register_builtin("_subprocess", subprocess_mod::build);
+    // RFC 0040 WS2 — the CPython-faithful fork+exec primitive behind the
+    // verbatim `subprocess.Popen` driver.
+    cache.register_builtin("_posixsubprocess", posixsubprocess_mod::build);
     cache.register_builtin("hashlib", hashlib_mod::build);
     cache.register_builtin("_operator", operator_accel::build);
     cache.register_builtin("binascii", binascii_mod::build);
@@ -126,6 +134,9 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_weakref", weakref_real::build);
     cache.register_builtin("gc", gc_real::build);
     cache.register_builtin("_multiprocessing", multiprocessing_mod::build);
+    // RFC 0040 (WS5): shm_open/shm_unlink core for `multiprocessing`'s
+    // resource_tracker + shared_memory.
+    cache.register_builtin("_posixshmem", multiprocessing_mod::build_posixshmem);
     cache.register_builtin("_datetime", datetime_mod::build);
     // RFC 0029 — `_imp` bridges the C-extension loader into the
     // frozen `importlib.machinery.ExtensionFileLoader`.
@@ -168,6 +179,33 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "builtins",
             source: include_str!("python/builtins.py"),
+            is_package: false,
+        },
+        // RFC 0040 WS1 — upgrades the native `os` module's `environ`/
+        // `environb` to CPython's write-through `_Environ` mappings. Imported
+        // for its side effect immediately after the native `os` module is
+        // built (see `Interpreter::load_one`).
+        FrozenSource {
+            name: "_weave_envinit",
+            source: include_str!("python/_weave_envinit.py"),
+            is_package: false,
+        },
+        // RFC 0040 WS7 — CPython's pure-Python `io` reference implementation.
+        // `test_io`/`test_fileio` import `_pyio` and exercise *both* the native
+        // `io` and `_pyio` side-by-side; without it the whole suite fails to
+        // import. Vendored verbatim from CPython (`Lib/_pyio.py`).
+        FrozenSource {
+            name: "_pyio",
+            source: include_str!("python/_pyio.py"),
+            is_package: false,
+        },
+        // RFC 0040 WS4 — CPython's `signal.py`: layers the `Signals`/
+        // `Handlers`/`Sigmasks` IntEnums over the native `_signal` core and
+        // wraps `signal`/`getsignal`/`pthread_sigmask`/`sigwait`/
+        // `valid_signals` to coerce ints to/from those enums.
+        FrozenSource {
+            name: "signal",
+            source: include_str!("python/signal.py"),
             is_package: false,
         },
         // `keyword` — verbatim CPython keyword/soft-keyword lists +
@@ -400,9 +438,128 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/queue.py"),
             is_package: false,
         },
+        // RFC 0040 (WS5): the *real* CPython `multiprocessing` package,
+        // frozen verbatim from `vendor/cpython/Lib/multiprocessing/`,
+        // running over the native `_multiprocessing` SemLock core, the
+        // `_posixshmem` shared-memory core, `_posixsubprocess.fork_exec`
+        // (spawn rides the standard `weavepy -c ...` + `os.posix_spawn`
+        // path), and `os.fork` (the fork start method). Replaces the
+        // single-file RFC 0026 shim. The Windows-only submodules
+        // (`popen_spawn_win32`) are frozen for completeness but never
+        // imported on POSIX.
         FrozenSource {
             name: "multiprocessing",
-            source: include_str!("python/multiprocessing.py"),
+            source: include_str!("python/multiprocessing/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "multiprocessing.connection",
+            source: include_str!("python/multiprocessing/connection.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.context",
+            source: include_str!("python/multiprocessing/context.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.forkserver",
+            source: include_str!("python/multiprocessing/forkserver.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.heap",
+            source: include_str!("python/multiprocessing/heap.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.managers",
+            source: include_str!("python/multiprocessing/managers.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.pool",
+            source: include_str!("python/multiprocessing/pool.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.popen_fork",
+            source: include_str!("python/multiprocessing/popen_fork.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.popen_forkserver",
+            source: include_str!("python/multiprocessing/popen_forkserver.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.popen_spawn_posix",
+            source: include_str!("python/multiprocessing/popen_spawn_posix.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.popen_spawn_win32",
+            source: include_str!("python/multiprocessing/popen_spawn_win32.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.process",
+            source: include_str!("python/multiprocessing/process.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.queues",
+            source: include_str!("python/multiprocessing/queues.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.reduction",
+            source: include_str!("python/multiprocessing/reduction.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.resource_sharer",
+            source: include_str!("python/multiprocessing/resource_sharer.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.resource_tracker",
+            source: include_str!("python/multiprocessing/resource_tracker.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.shared_memory",
+            source: include_str!("python/multiprocessing/shared_memory.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.sharedctypes",
+            source: include_str!("python/multiprocessing/sharedctypes.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.spawn",
+            source: include_str!("python/multiprocessing/spawn.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.synchronize",
+            source: include_str!("python/multiprocessing/synchronize.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.util",
+            source: include_str!("python/multiprocessing/util.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "multiprocessing.dummy",
+            source: include_str!("python/multiprocessing/dummy/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "multiprocessing.dummy.connection",
+            source: include_str!("python/multiprocessing/dummy/connection.py"),
             is_package: false,
         },
         // RFC 0039 (WS7): the *real* CPython `concurrent.futures`

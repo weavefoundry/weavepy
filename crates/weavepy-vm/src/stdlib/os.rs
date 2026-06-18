@@ -158,6 +158,18 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("getenv")),
             builtin("getenv", os_getenv),
         );
+        // Low-level environ mutators. CPython's `os.putenv`/`os.unsetenv` poke
+        // the C environment directly (they do *not* touch `os.environ`), which
+        // is what a `preexec_fn` relies on so the value survives into the
+        // exec'd child (test_subprocess.test_preexec).
+        d.insert(
+            DictKey(Object::from_static("putenv")),
+            builtin("putenv", os_putenv),
+        );
+        d.insert(
+            DictKey(Object::from_static("unsetenv")),
+            builtin("unsetenv", os_unsetenv),
+        );
         d.insert(
             DictKey(Object::from_static("getpid")),
             builtin("getpid", os_getpid),
@@ -260,7 +272,15 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(DictKey(Object::from_static("dup")), builtin("dup", os_dup));
         d.insert(
             DictKey(Object::from_static("dup2")),
-            builtin("dup2", os_dup2),
+            builtin_kw("dup2", os_dup2),
+        );
+        d.insert(
+            DictKey(Object::from_static("lseek")),
+            builtin("lseek", os_lseek),
+        );
+        d.insert(
+            DictKey(Object::from_static("ftruncate")),
+            builtin("ftruncate", os_ftruncate),
         );
         d.insert(
             DictKey(Object::from_static("get_inheritable")),
@@ -320,6 +340,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(DictKey(Object::from_static("SIGINT")), Object::Int(2));
         d.insert(DictKey(Object::from_static("SIGHUP")), Object::Int(1));
         d.insert(DictKey(Object::from_static("WNOHANG")), Object::Int(1));
+
+        // RFC 0040 WS1: POSIX process & fd primitives (fork/exec*/
+        // posix_spawn/wait*/W*/closerange/setsid/register_at_fork/…).
+        crate::stdlib::os_process::register(&mut d);
         d.insert(
             DictKey(Object::from_static("get_exec_path")),
             builtin("get_exec_path", os_get_exec_path),
@@ -340,6 +364,37 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("getegid")),
             builtin("getegid", os_getgid),
         );
+        // Real-/effective-id setters. Beyond letting privilege-dropping code
+        // run, their mere presence flips CPython's `skipIf(hasattr(os,
+        // 'setreuid'))` guards (test_subprocess.test_user_error /
+        // test_group_error), which only apply on platforms lacking them.
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("setuid")),
+                builtin("setuid", os_setuid),
+            );
+            d.insert(
+                DictKey(Object::from_static("setgid")),
+                builtin("setgid", os_setgid),
+            );
+            d.insert(
+                DictKey(Object::from_static("seteuid")),
+                builtin("seteuid", os_seteuid),
+            );
+            d.insert(
+                DictKey(Object::from_static("setegid")),
+                builtin("setegid", os_setegid),
+            );
+            d.insert(
+                DictKey(Object::from_static("setreuid")),
+                builtin("setreuid", os_setreuid),
+            );
+            d.insert(
+                DictKey(Object::from_static("setregid")),
+                builtin("setregid", os_setregid),
+            );
+        }
         d.insert(
             DictKey(Object::from_static("umask")),
             builtin("umask", os_umask),
@@ -379,6 +434,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("O_NONBLOCK")),
             Object::Int(2048),
         );
+        // `lseek` whence values — identical across every POSIX platform.
+        d.insert(DictKey(Object::from_static("SEEK_SET")), Object::Int(0));
+        d.insert(DictKey(Object::from_static("SEEK_CUR")), Object::Int(1));
+        d.insert(DictKey(Object::from_static("SEEK_END")), Object::Int(2));
         d.insert(DictKey(Object::from_static("F_OK")), Object::Int(0));
         d.insert(DictKey(Object::from_static("R_OK")), Object::Int(4));
         d.insert(DictKey(Object::from_static("W_OK")), Object::Int(2));
@@ -556,7 +615,10 @@ pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
     })
 }
 
-fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
+pub(super) fn builtin(
+    name: &'static str,
+    body: fn(&[Object]) -> Result<Object, RuntimeError>,
+) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         binds_instance: false,
@@ -568,7 +630,7 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 /// As [`builtin`], but the body also takes a keyword-argument list.
 /// Use this for surfaces where CPython exposes named parameters
 /// (e.g. `os.makedirs(path, mode=0o777, exist_ok=False)`).
-fn builtin_kw(
+pub(super) fn builtin_kw(
     name: &'static str,
     body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
 ) -> Object {
@@ -578,6 +640,20 @@ fn builtin_kw(
         call: Box::new(move |args| body(args, &[])),
         call_kw: Some(Box::new(body)),
     }))
+}
+
+/// Extract the elements of a list/tuple/set into a `Vec<Object>`. Used by
+/// the process primitives (`os_process`) to read `argv`, `file_actions`,
+/// and signal sets without re-implementing the sequence protocol. Returns
+/// `None` for non-sequence objects.
+pub(super) fn sequence_items(o: &Object) -> Option<Vec<Object>> {
+    match o {
+        Object::Tuple(t) => Some(t.to_vec()),
+        Object::List(l) => Some(l.borrow().clone()),
+        Object::Set(s) => Some(s.borrow().iter().map(|k| k.0.clone()).collect()),
+        Object::FrozenSet(s) => Some(s.iter().map(|k| k.0.clone()).collect()),
+        _ => None,
+    }
 }
 
 fn initial_environ() -> Object {
@@ -620,6 +696,59 @@ fn os_getenv(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(std::env::var_os(&key).map_or(default, |v| {
         Object::from_str(v.to_string_lossy().into_owned())
     }))
+}
+
+/// Coerce an `os.putenv`/`os.unsetenv` argument (str or bytes-like) to a
+/// NUL-free C string, raising `ValueError` on an embedded NUL like CPython.
+#[cfg(unix)]
+fn env_cstring(o: Option<&Object>, what: &str) -> Result<std::ffi::CString, RuntimeError> {
+    let bytes = match o {
+        Some(Object::Str(s)) => s.as_bytes().to_vec(),
+        Some(Object::Bytes(b)) => b.to_vec(),
+        Some(Object::ByteArray(b)) => b.borrow().clone(),
+        _ => return Err(type_error(format!("putenv() {what} must be str or bytes"))),
+    };
+    std::ffi::CString::new(bytes).map_err(|_| crate::error::value_error("embedded null byte"))
+}
+
+fn os_putenv(args: &[Object]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    {
+        let name = env_cstring(args.first(), "name")?;
+        let value = env_cstring(args.get(1), "value")?;
+        // setenv (overwrite=1) edits the live C environ, so a later `execv`
+        // (which passes the inherited environ) carries the change into the
+        // child — exactly what `os.putenv` promises.
+        if unsafe { libc::setenv(name.as_ptr(), value.as_ptr(), 1) } != 0 {
+            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Err(crate::error::not_implemented_error(
+            "os.putenv() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+fn os_unsetenv(args: &[Object]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    {
+        let name = env_cstring(args.first(), "name")?;
+        if unsafe { libc::unsetenv(name.as_ptr()) } != 0 {
+            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Err(crate::error::not_implemented_error(
+            "os.unsetenv() is only implemented on POSIX in WeavePy",
+        ))
+    }
 }
 
 fn os_getpid(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1035,21 +1164,40 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
         Object::Int(meta.len() as i64),
     );
     d.insert(DictKey(Object::from_static("st_mode")), Object::Int(mode));
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0.0_f64, |d| d.as_secs_f64());
-    let atime = meta
-        .accessed()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0.0_f64, |d| d.as_secs_f64());
-    let ctime = meta
-        .created()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(mtime, |d| d.as_secs_f64());
+    // On Unix derive the float `st_*time` straight from the integer
+    // nanosecond fields below, so `st_atime` and `st_atime_ns` describe the
+    // *same* instant (CPython invariant: `test_stat_attributes` checks they
+    // agree to within tens of microseconds). Using `Metadata::accessed()` —
+    // a separately-rounded `SystemTime` — drifts from the raw `atime_nsec`.
+    #[cfg(unix)]
+    let (atime, mtime, ctime) = {
+        use std::os::unix::fs::MetadataExt;
+        let ns = |s: i64, n: i64| (s as f64) + (n as f64) * 1e-9;
+        (
+            ns(meta.atime(), meta.atime_nsec()),
+            ns(meta.mtime(), meta.mtime_nsec()),
+            ns(meta.ctime(), meta.ctime_nsec()),
+        )
+    };
+    #[cfg(not(unix))]
+    let (atime, mtime, ctime) = {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0_f64, |d| d.as_secs_f64());
+        let atime = meta
+            .accessed()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0_f64, |d| d.as_secs_f64());
+        let ctime = meta
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(mtime, |d| d.as_secs_f64());
+        (atime, mtime, ctime)
+    };
     d.insert(
         DictKey(Object::from_static("st_mtime")),
         Object::Float(mtime),
@@ -1148,14 +1296,78 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
 }
 
 fn os_readlink(args: &[Object]) -> Result<Object, RuntimeError> {
-    let p = first_path(args, "readlink")?;
-    let t = std::fs::read_link(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    // CPython's `os.readlink` returns the same string flavour as its argument:
+    // a `bytes`/bytes-`PathLike` path yields `bytes`, a `str` path yields `str`.
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error("readlink() requires a path argument"))?;
+    let resolved = resolve_fspath_obj(obj, "readlink")?;
+    let want_bytes = matches!(resolved, Object::Bytes(_));
+    let pstr = match &resolved {
+        Object::Str(s) => s.to_string(),
+        Object::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        _ => unreachable!("resolve_fspath_obj returns str/bytes"),
+    };
+    if pstr.as_bytes().contains(&0) {
+        return Err(value_error("embedded null byte"));
+    }
+    let t = std::fs::read_link(&pstr).map_err(|e| crate::error::io_error_to_py(&e))?;
+    if want_bytes {
+        use std::os::unix::ffi::OsStringExt;
+        return Ok(Object::new_bytes(t.into_os_string().into_vec()));
+    }
     Ok(Object::from_str(t.to_string_lossy().into_owned()))
+}
+
+/// Resolve a path argument to a concrete `str`/`bytes` object, honouring the
+/// `os.PathLike` protocol once. Unlike [`path_to_string`] this preserves the
+/// `bytes`-vs-`str` flavour so callers (e.g. `readlink`) can mirror it in the
+/// result, matching CPython's `path_t` converter.
+fn resolve_fspath_obj(obj: &Object, func: &str) -> Result<Object, RuntimeError> {
+    match obj {
+        Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
+        Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
+        Object::Instance(_) => {
+            if let Some(n @ (Object::Str(_) | Object::Bytes(_))) = obj.native_value() {
+                return Ok(n);
+            }
+            let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                type_error(format!(
+                    "{func}: path should be string, bytes or os.PathLike, not {}",
+                    obj.type_name()
+                ))
+            })?;
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let fspath = interp.load_attr_public(obj, "__fspath__").map_err(|_| {
+                type_error(format!(
+                    "{func}: path should be string, bytes or os.PathLike, not {}",
+                    obj.type_name()
+                ))
+            })?;
+            match interp.call_object(fspath, &[], &[])? {
+                r @ (Object::Str(_) | Object::Bytes(_)) => Ok(r),
+                Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
+                other => Err(type_error(format!(
+                    "expected {func}.__fspath__() to return str or bytes, not {}",
+                    other.type_name()
+                ))),
+            }
+        }
+        other => Err(type_error(format!(
+            "{func}: path should be string, bytes or os.PathLike, not {}",
+            other.type_name()
+        ))),
+    }
 }
 
 fn os_chdir(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "chdir")?;
-    std::env::set_current_dir(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    // Attach the offending path so the raised OSError carries `.filename`
+    // (CPython does this for path syscalls; subprocess's bad-cwd tests compare
+    // `os.chdir(bad).filename` against the error surfaced from the child).
+    std::env::set_current_dir(&p)
+        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
     Ok(Object::None)
 }
 
@@ -1648,13 +1860,15 @@ fn dir_entry_inode(fs_path: &str) -> i64 {
 
 #[cfg(unix)]
 fn os_kill(args: &[Object]) -> Result<Object, RuntimeError> {
-    let pid = match args.first() {
-        Some(Object::Int(p)) => *p as libc::pid_t,
-        _ => return Err(type_error("kill() pid must be int")),
+    // Accept int subclasses (e.g. `signal.Signals` enum members) for both
+    // args, matching CPython's `__index__` coercion.
+    let pid = match args.first().and_then(Object::as_i64) {
+        Some(p) => p as libc::pid_t,
+        None => return Err(type_error("kill() pid must be int")),
     };
-    let sig = match args.get(1) {
-        Some(Object::Int(s)) => *s as libc::c_int,
-        _ => return Err(type_error("kill() signal must be int")),
+    let sig = match args.get(1).and_then(Object::as_i64) {
+        Some(s) => s as libc::c_int,
+        None => return Err(type_error("kill() signal must be int")),
     };
     let rc = unsafe { libc::kill(pid, sig) };
     if rc != 0 {
@@ -1684,12 +1898,24 @@ fn os_waitpid(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("waitpid() options must be int")),
     };
     let mut status: libc::c_int = 0;
-    let rc = unsafe { libc::waitpid(pid, &raw mut status, options) };
-    if rc < 0 {
-        return Err(crate::error::io_error_to_py(
-            &std::io::Error::last_os_error(),
-        ));
-    }
+    let status_ptr: *mut libc::c_int = &raw mut status;
+    // Release the GIL across the (blocking, unless WNOHANG) wait so peer
+    // threads run — `multiprocessing`/`subprocess` join a child on one thread
+    // while result/worker handler threads keep draining pipes. Honour PEP 475
+    // on `EINTR`. Mirrors `os.wait4`/`wait3`.
+    let rc = loop {
+        let rc =
+            crate::gil::allow_threads_then(|| unsafe { libc::waitpid(pid, status_ptr, options) });
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                service_pending_signals()?;
+                continue;
+            }
+            return Err(crate::error::io_error_to_py(&err));
+        }
+        break rc;
+    };
     Ok(Object::new_tuple(vec![
         Object::Int(i64::from(rc)),
         Object::Int(i64::from(status)),
@@ -1808,9 +2034,27 @@ fn os_pipe(_args: &[Object]) -> Result<Object, RuntimeError> {
     #[cfg(unix)]
     {
         let mut fds = [0i32; 2];
+        // PEP 446: descriptors created by Python are non-inheritable
+        // (close-on-exec). This is also load-bearing for
+        // `_posixsubprocess.fork_exec`'s error pipe: the write end must
+        // auto-close on a successful `exec` so the parent reads EOF and
+        // knows the child launched. Use `pipe2(O_CLOEXEC)` where it exists
+        // (atomic), else `pipe()` + `fcntl(FD_CLOEXEC)`.
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
         let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
         if rc != 0 {
             return Err(crate::error::os_error("pipe() failed"));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
+        unsafe {
+            for &fd in &fds {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
         }
         Ok(Object::new_tuple(vec![
             Object::Int(i64::from(fds[0])),
@@ -1847,7 +2091,7 @@ fn os_dup(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn os_dup2(args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_dup2(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(i)) => *i as i32,
         _ => return Err(type_error("dup2() arg must be int")),
@@ -1856,19 +2100,112 @@ fn os_dup2(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Int(i)) => *i as i32,
         _ => return Err(type_error("dup2() arg2 must be int")),
     };
+    // CPython's `os.dup2(fd, fd2, inheritable=True)` — `dup2` itself produces
+    // an inheritable (CLOEXEC-clear) descriptor, so we only have to *set*
+    // close-on-exec afterward when the caller asks for a non-inheritable copy.
+    let inheritable = match args
+        .get(2)
+        .or_else(|| kwargs.iter().find(|(k, _)| k == "inheritable").map(|(_, v)| v))
+    {
+        None => true,
+        Some(Object::Bool(b)) => *b,
+        Some(Object::Int(n)) => *n != 0,
+        Some(_) => return Err(type_error("dup2() inheritable must be bool")),
+    };
     #[cfg(unix)]
     {
         let new = unsafe { libc::dup2(fd, newfd) };
         if new < 0 {
-            return Err(crate::error::os_error("dup2() failed"));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        if !inheritable {
+            let flags = unsafe { libc::fcntl(new, libc::F_GETFD) };
+            if flags >= 0 {
+                unsafe { libc::fcntl(new, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            }
         }
         Ok(Object::Int(i64::from(new)))
     }
     #[cfg(not(unix))]
     {
-        let _ = (fd, newfd);
+        let _ = (fd, newfd, inheritable);
         Err(crate::error::not_implemented_error(
             "os.dup2() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+/// `os.lseek(fd, pos, how)` — reposition the kernel file offset and return
+/// the new absolute offset. `how` is one of `SEEK_SET`/`SEEK_CUR`/`SEEK_END`.
+fn os_lseek(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        _ => return Err(type_error("lseek() fd must be int")),
+    };
+    let pos = match args.get(1) {
+        Some(Object::Int(i)) => *i,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => return Err(type_error("lseek() pos must be int")),
+    };
+    let how = match args.get(2) {
+        Some(Object::Int(i)) => *i as i32,
+        _ => return Err(type_error("lseek() how must be int")),
+    };
+    #[cfg(unix)]
+    {
+        let off = unsafe { libc::lseek(fd, pos as libc::off_t, how) };
+        if off < 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(Object::Int(off as i64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fd, pos, how);
+        Err(crate::error::not_implemented_error(
+            "os.lseek() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
+/// `os.ftruncate(fd, length)` — truncate (or extend) the file behind an
+/// open descriptor to `length` bytes. Backs `io.FileIO.truncate()` and the
+/// buffered `truncate()` path `test_io` exercises.
+fn os_ftruncate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        Some(Object::Bool(b)) => i32::from(*b),
+        _ => return Err(type_error("ftruncate() fd must be int")),
+    };
+    let length = match args.get(1) {
+        Some(Object::Int(i)) => *i,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => return Err(type_error("ftruncate() length must be int")),
+    };
+    if length < 0 {
+        return Err(crate::error::io_error_to_py(&std::io::Error::from_raw_os_error(
+            22, // EINVAL
+        )));
+    }
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::ftruncate(fd, length as libc::off_t) };
+        if rc != 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fd, length);
+        Err(crate::error::not_implemented_error(
+            "os.ftruncate() is only implemented on POSIX in WeavePy",
         ))
     }
 }
@@ -1971,12 +2308,34 @@ fn os_read(args: &[Object]) -> Result<Object, RuntimeError> {
     #[cfg(unix)]
     {
         let mut buf = vec![0u8; n];
-        let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), n) };
-        if r < 0 {
-            return Err(crate::error::os_error("read() failed"));
+        let ptr = buf.as_mut_ptr();
+        // Release the GIL across the (possibly blocking) read so peer threads
+        // run. Without this a single blocking `os.read` — e.g. a
+        // `multiprocessing.Pool` result-handler thread parked on its outqueue
+        // pipe, or any `Connection.recv` (POSIX `Connection._read = os.read`) —
+        // holds the GIL for its whole wait and deadlocks every other thread in
+        // the interpreter (the task-handler can never deliver work). Mirrors
+        // `os_write` and CPython's `Py_BEGIN_ALLOW_THREADS` around `read(2)`.
+        // Honour PEP 475: on `EINTR` run the tripped Python signal handler
+        // before retrying (a handler that raises abandons the read).
+        loop {
+            let r =
+                crate::gil::allow_threads_then(|| unsafe { libc::read(fd, ptr.cast(), n) });
+            if r < 0 {
+                // Carry errno so callers see the right subclass — e.g.
+                // `BlockingIOError` (EAGAIN) on a non-blocking fd and
+                // `BrokenPipeError` (EPIPE). `subprocess.communicate` relies on
+                // this when draining pipes through a selector loop.
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    service_pending_signals()?;
+                    continue;
+                }
+                return Err(crate::error::io_error_to_py(&err));
+            }
+            buf.truncate(r as usize);
+            return Ok(Object::new_bytes(buf));
         }
-        buf.truncate(r as usize);
-        Ok(Object::new_bytes(buf))
     }
     #[cfg(not(unix))]
     {
@@ -2014,6 +2373,10 @@ fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = match args.get(1) {
         Some(Object::Bytes(b)) => b.to_vec(),
         Some(Object::ByteArray(b)) => b.borrow().clone(),
+        // `subprocess.communicate(memoryview(...))` slices its input buffer
+        // and hands the resulting memoryview straight to `os.write`; CPython
+        // accepts any buffer-protocol object here, so materialise the view.
+        Some(Object::MemoryView(mv)) => mv.to_bytes(),
         Some(Object::Str(s)) => s.as_bytes().to_vec(),
         _ => return Err(type_error("write() arg2 must be bytes-like")),
     };
@@ -2125,6 +2488,99 @@ fn os_getgid(_args: &[Object]) -> Result<Object, RuntimeError> {
     {
         Ok(Object::Int(0))
     }
+}
+
+/// Shared id-converter for the `set*id` family. CPython routes these through
+/// `_Py_Uid_Converter`/`_Py_Gid_Converter`, which reject anything outside the
+/// platform's unsigned 32-bit id range with `OverflowError`/`ValueError`.
+#[cfg(unix)]
+fn id_arg(args: &[Object], idx: usize, what: &str) -> Result<u32, RuntimeError> {
+    // Mirror CPython's `_Py_Uid_Converter`/`_Py_Gid_Converter`:
+    //  * a non-integer argument is a `TypeError`,
+    //  * the sentinel `-1` is accepted and forwarded as `(id_t)-1`,
+    //  * any other value outside the unsigned 32-bit id range is an
+    //    `OverflowError` (not a `ValueError`).
+    let value = match args.get(idx) {
+        Some(Object::Bool(b)) => i64::from(*b),
+        Some(Object::Int(i)) => *i,
+        Some(other) => other
+            .as_i64()
+            .ok_or_else(|| type_error(format!("{what} should be integer, not {}", other.type_name())))?,
+        None => return Err(type_error(format!("{what} should be integer"))),
+    };
+    if value == -1 {
+        return Ok(u32::MAX);
+    }
+    if value < 0 || value > i64::from(u32::MAX) {
+        return Err(crate::error::overflow_error(format!("{what} is not in range")));
+    }
+    Ok(value as u32)
+}
+
+#[cfg(unix)]
+fn os_setuid(args: &[Object]) -> Result<Object, RuntimeError> {
+    let uid = id_arg(args, 0, "uid")?;
+    if unsafe { libc::setuid(uid as libc::uid_t) } != 0 {
+        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::None)
+}
+
+#[cfg(unix)]
+fn os_setgid(args: &[Object]) -> Result<Object, RuntimeError> {
+    let gid = id_arg(args, 0, "gid")?;
+    if unsafe { libc::setgid(gid as libc::gid_t) } != 0 {
+        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::None)
+}
+
+#[cfg(unix)]
+fn os_seteuid(args: &[Object]) -> Result<Object, RuntimeError> {
+    let uid = id_arg(args, 0, "uid")?;
+    if unsafe { libc::seteuid(uid as libc::uid_t) } != 0 {
+        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::None)
+}
+
+#[cfg(unix)]
+fn os_setegid(args: &[Object]) -> Result<Object, RuntimeError> {
+    let gid = id_arg(args, 0, "gid")?;
+    if unsafe { libc::setegid(gid as libc::gid_t) } != 0 {
+        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::None)
+}
+
+/// Like [`id_arg`] but accepts the special value `-1`, which `setre*id` use to
+/// mean "leave this id unchanged"; it is forwarded as `(id_t)-1`.
+#[cfg(unix)]
+fn id_arg_or_keep(args: &[Object], idx: usize, what: &str) -> Result<libc::uid_t, RuntimeError> {
+    match args.get(idx) {
+        Some(Object::Int(-1)) => Ok((-1i32) as libc::uid_t),
+        _ => id_arg(args, idx, what).map(|v| v as libc::uid_t),
+    }
+}
+
+#[cfg(unix)]
+fn os_setreuid(args: &[Object]) -> Result<Object, RuntimeError> {
+    let ruid = id_arg_or_keep(args, 0, "ruid")?;
+    let euid = id_arg_or_keep(args, 1, "euid")?;
+    if unsafe { libc::setreuid(ruid, euid) } != 0 {
+        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::None)
+}
+
+#[cfg(unix)]
+fn os_setregid(args: &[Object]) -> Result<Object, RuntimeError> {
+    let rgid = id_arg_or_keep(args, 0, "rgid")? as libc::gid_t;
+    let egid = id_arg_or_keep(args, 1, "egid")? as libc::gid_t;
+    if unsafe { libc::setregid(rgid, egid) } != 0 {
+        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::None)
 }
 
 fn os_umask(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2422,7 +2878,7 @@ const STAT_RESULT_FIELDS: [&str; 10] = [
 /// sequence: addressable both by `st_*` attribute and by integer index, and
 /// constructible from a 10-sequence (`posix.stat_result((...))`).
 fn stat_result_type() -> Rc<crate::types::TypeObject> {
-    struct_seq_type("stat_result", &STAT_RESULT_FIELDS)
+    struct_seq_type("stat_result", "os", &STAT_RESULT_FIELDS)
 }
 
 /// `os.terminal_size` — a 2-field struct sequence (`columns`, `lines`). Verbatim
@@ -2432,7 +2888,7 @@ fn stat_result_type() -> Rc<crate::types::TypeObject> {
 /// sequence rather than a bare tuple.
 fn terminal_size_type() -> Rc<crate::types::TypeObject> {
     const TERMINAL_SIZE_FIELDS: [&str; 2] = ["columns", "lines"];
-    struct_seq_type("terminal_size", &TERMINAL_SIZE_FIELDS)
+    struct_seq_type("terminal_size", "os", &TERMINAL_SIZE_FIELDS)
 }
 
 /// Build (and memoise, by `name`) a CPython-style `PyStructSequence` type:
@@ -2443,6 +2899,7 @@ fn terminal_size_type() -> Rc<crate::types::TypeObject> {
 /// stable across module rebuilds so `isinstance` holds.
 pub(crate) fn struct_seq_type(
     name: &'static str,
+    module: &'static str,
     fields: &'static [&'static str],
 ) -> Rc<crate::types::TypeObject> {
     use crate::types::{TypeFlags, TypeObject};
@@ -2457,8 +2914,23 @@ pub(crate) fn struct_seq_type(
         }
         let bt = crate::builtin_types::builtin_types();
         let mut dict = DictData::new();
+        // `__module__`/`__qualname__` let `pickle`/`copy` find the type by
+        // reference (e.g. `os.stat_result`) instead of guessing `builtins`.
+        dict.insert(
+            DictKey(Object::from_static("__module__")),
+            Object::from_static(module),
+        );
+        dict.insert(
+            DictKey(Object::from_static("__qualname__")),
+            Object::from_static(name),
+        );
         struct_seq_method(&mut dict, "__init__", move |args| {
             struct_seq_init(name, fields, args)
+        });
+        // `__reduce__` makes the struct sequence picklable as
+        // `(type, (visible_tuple, hidden_dict))` — CPython's `structseq_reduce`.
+        struct_seq_method(&mut dict, "__reduce__", move |args| {
+            struct_seq_reduce(name, module, fields, args)
         });
         struct_seq_method(&mut dict, "__getitem__", move |args| {
             struct_seq_getitem(fields, args)
@@ -2578,11 +3050,13 @@ fn struct_seq_getitem(
         return Err(type_error("struct sequence indexing requires an instance"));
     };
     let field = |i: usize| -> Object {
-        inst.dict
+        let v = inst
+            .dict
             .borrow()
             .get(&DictKey(Object::from_static(fields[i])))
             .cloned()
-            .unwrap_or(Object::Int(0))
+            .unwrap_or(Object::Int(0));
+        struct_seq_slot(fields[i], v)
     };
     // CPython struct sequences are tuple-backed, so slicing yields a plain
     // `tuple` of the selected fields (e.g. `time.localtime()[:6]`, which
@@ -2614,11 +3088,71 @@ fn struct_seq_values(
     fields
         .iter()
         .map(|f| {
-            d.get(&DictKey(Object::from_static(f)))
+            let v = d
+                .get(&DictKey(Object::from_static(f)))
                 .cloned()
-                .unwrap_or(Object::Int(0))
+                .unwrap_or(Object::Int(0));
+            struct_seq_slot(f, v)
         })
         .collect()
+}
+
+/// `__reduce__` for a struct sequence: `(type, (visible_tuple, hidden_dict))`.
+///
+/// Mirrors CPython's `structseq_reduce`. The visible tuple carries the
+/// sequence slots (integer `st_*time`s for `stat_result`); the hidden dict
+/// carries every *named-only* member plus the float `st_atime`/`st_mtime`/
+/// `st_ctime` values that the integer slots can't reconstruct. On unpickling,
+/// `struct_seq_init(type, (seq, dict))` restores both.
+fn struct_seq_reduce(
+    name: &'static str,
+    module: &'static str,
+    fields: &'static [&'static str],
+    args: &[Object],
+) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error("struct sequence reduce requires an instance"));
+    };
+    let visible = Object::new_tuple(struct_seq_values(fields, inst));
+    let extra = Rc::new(RefCell::new(DictData::new()));
+    {
+        let d = inst.dict.borrow();
+        let mut e = extra.borrow_mut();
+        for (k, v) in d.iter() {
+            let keep = match &k.0 {
+                Object::Str(s) => {
+                    let ks = s.to_string();
+                    let ks = ks.as_str();
+                    !fields.iter().any(|f| *f == ks)
+                        || matches!(ks, "st_atime" | "st_mtime" | "st_ctime")
+                }
+                _ => true,
+            };
+            if keep {
+                e.insert(DictKey(k.0.clone()), v.clone());
+            }
+        }
+    }
+    let cls = Object::Type(struct_seq_type(name, module, fields));
+    Ok(Object::new_tuple(vec![
+        cls,
+        Object::new_tuple(vec![visible, Object::Dict(extra)]),
+    ]))
+}
+
+/// Map a struct-sequence field to its *sequence-slot* representation.
+///
+/// CPython's `os.stat_result` is the canonical example: the named attributes
+/// `st_atime`/`st_mtime`/`st_ctime` are floats, but the corresponding tuple
+/// slots (`st[7..10]`, and therefore `tuple(st)`, hashing and comparison)
+/// hold the *integer* seconds. Everything else passes through unchanged.
+fn struct_seq_slot(field: &str, value: Object) -> Object {
+    if matches!(field, "st_atime" | "st_mtime" | "st_ctime") {
+        if let Object::Float(f) = value {
+            return Object::Int(f as i64);
+        }
+    }
+    value
 }
 
 /// `__eq__`/`__ne__` for struct sequences: compare the visible fields as a

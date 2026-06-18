@@ -297,6 +297,14 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
     let key = encoding_key(encoding);
     Ok(match key.as_str() {
         "utf8" => Some(encode_utf8(s, errors)?),
+        "utf8sig" => {
+            // UTF-8 with a leading BOM (CPython `utf_8_sig`). The stateless
+            // codec always prepends the BOM; the BOM-once-per-stream nuance
+            // lives in the incremental encoder (frozen `codecs.py`).
+            let mut out = vec![0xEF, 0xBB, 0xBF];
+            out.extend(encode_utf8(s, errors)?);
+            Some(out)
+        }
         "ascii" => Some(encode_ascii(s, errors)?),
         "latin1" | "iso88591" => Some(encode_latin1(s, errors)?),
         "utf16" => Some(encode_utf16(s, false, true)),
@@ -320,6 +328,13 @@ fn decode_special(
     let key = encoding_key(encoding);
     Ok(match key.as_str() {
         "utf8" => Some(decode_utf8(bytes, errors)?),
+        "utf8sig" => {
+            // Strip a single leading UTF-8 BOM if present, then decode.
+            let body = bytes
+                .strip_prefix(&[0xEF, 0xBB, 0xBF][..])
+                .unwrap_or(bytes);
+            Some(decode_utf8(body, errors)?)
+        }
         "ascii" => Some(decode_ascii(bytes, errors)?),
         "latin1" | "iso88591" => Some(decode_latin1(bytes)),
         "utf16" => Some(decode_utf16(bytes, None)?),

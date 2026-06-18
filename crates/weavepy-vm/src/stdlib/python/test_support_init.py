@@ -1092,6 +1092,11 @@ _4G = 4 * _1G
 
 Py_DEBUG = hasattr(sys, 'gettotalrefcount')
 
+# Profile-guided-optimization build flags. WeavePy is never a PGO build, so
+# both are False (tests gate slow/extra assertions on these).
+PGO = False
+PGO_EXTENDED = False
+
 # Directory holding the test package. Resolved against the on-disk
 # `Lib/test` (the frozen package's `__file__` is synthetic — see
 # `_test_home_dir`), so `STDLIB_DIR` correctly points at `Lib` for
@@ -1185,6 +1190,50 @@ def reap_children():
             break
         if pid == 0:
             break
+
+
+def wait_process(pid, *, exitcode, timeout=None):
+    """Wait until process *pid* completes and assert its exit code.
+
+    Mirrors `test.support.wait_process`: poll `waitpid(WNOHANG)` until the
+    child is reaped (or *timeout* elapses, in which case it is killed and an
+    AssertionError raised), then compare the decoded exit status to
+    *exitcode*.
+    """
+    if os.name == "nt":
+        pid2, status = os.waitpid(pid, 0)
+        if status != exitcode:
+            raise AssertionError(
+                f"process {pid} exit code {status} != {exitcode}")
+        return
+
+    if timeout is None:
+        timeout = SHORT_TIMEOUT
+    deadline = time.monotonic() + timeout
+    while True:
+        pid2, status = os.waitpid(pid, os.WNOHANG)
+        if pid2 != 0:
+            break
+        if time.monotonic() > deadline:
+            try:
+                import signal
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            raise AssertionError(
+                f"process {pid} not terminated after {timeout} seconds")
+        time.sleep(0.01)
+
+    if os.WIFSIGNALED(status):
+        exit_status = -os.WTERMSIG(status)
+    elif os.WIFEXITED(status):
+        exit_status = os.WEXITSTATUS(status)
+    else:
+        raise AssertionError(f"unknown wait status: {status!r}")
+    if exit_status != exitcode:
+        raise AssertionError(
+            f"process {pid} exit code {exit_status} != {exitcode}")
 
 
 def maybe_get_event_loop_policy():

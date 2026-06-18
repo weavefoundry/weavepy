@@ -186,6 +186,25 @@ pub fn unblock_async_signals_current_thread() {
     }
 }
 
+/// Install SIGINT's startup disposition (the `default_int_handler`
+/// trampoline) the way CPython does during interpreter init — *before* any
+/// `import signal`. Without this, a script that never imports `signal` (e.g.
+/// `python -c "import time; time.sleep(30)"`, as `test_subprocess`'
+/// `_kill_process` spawns) would take the kernel default for SIGINT and die
+/// silently instead of raising `KeyboardInterrupt`. Idempotent: re-importing
+/// `signal` just re-installs the same disposition.
+#[cfg(unix)]
+pub fn install_startup_dispositions() {
+    // Seed the handler table (SIGINT -> default_int_handler) and arm the
+    // kernel trampoline so a tripped SIGINT is serviced by the dispatch loop.
+    let _ = handlers();
+    set_os_disposition(SIGINT, OsDisposition::Trip);
+}
+
+/// No-op on non-Unix targets (Windows uses a different signal model).
+#[cfg(not(unix))]
+pub fn install_startup_dispositions() {}
+
 /// No-op on non-Unix targets (Windows uses a different signal model).
 #[cfg(not(unix))]
 pub fn block_async_signals_current_thread() {}
@@ -278,7 +297,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         let mut d = dict.borrow_mut();
         d.insert(
             DictKey(Object::from_static("__name__")),
-            Object::from_static("signal"),
+            Object::from_static("_signal"),
         );
         d.insert(
             DictKey(Object::from_static("__doc__")),
@@ -352,12 +371,43 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("pthread_kill")),
-            b("pthread_kill", noop_int),
+            b("pthread_kill", pthread_kill),
         );
         d.insert(
             DictKey(Object::from_static("valid_signals")),
             b("valid_signals", valid_signals),
         );
+
+        // Signal-mask machinery (RFC 0040 WS4). Present on every POSIX
+        // host; the frozen `signal.py` keys its `Sigmasks` enum and the
+        // `pthread_sigmask`/`sigwait`/`sigpending` wrappers off these.
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("pthread_sigmask")),
+                b("pthread_sigmask", pthread_sigmask),
+            );
+            d.insert(
+                DictKey(Object::from_static("sigwait")),
+                b("sigwait", sigwait),
+            );
+            d.insert(
+                DictKey(Object::from_static("sigpending")),
+                b("sigpending", sigpending),
+            );
+            d.insert(
+                DictKey(Object::from_static("SIG_BLOCK")),
+                Object::Int(i64::from(libc::SIG_BLOCK)),
+            );
+            d.insert(
+                DictKey(Object::from_static("SIG_UNBLOCK")),
+                Object::Int(i64::from(libc::SIG_UNBLOCK)),
+            );
+            d.insert(
+                DictKey(Object::from_static("SIG_SETMASK")),
+                Object::Int(i64::from(libc::SIG_SETMASK)),
+            );
+        }
 
         // Itimer constants — frozen modules occasionally import them.
         d.insert(DictKey(Object::from_static("ITIMER_REAL")), Object::Int(0));
@@ -375,7 +425,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     const SIGINT_NUM: i32 = 2;
     set_os_disposition(SIGINT_NUM, OsDisposition::Trip);
     Rc::new(PyModule {
-        name: "signal".to_owned(),
+        name: "_signal".to_owned(),
         filename: None,
         dict,
     })
@@ -415,7 +465,14 @@ fn signal_signal(args: &[Object]) -> Result<Object, RuntimeError> {
                 "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object",
             ))
         }
-        _ => OsDisposition::Trip,
+        h if is_callable_handler(h) => OsDisposition::Trip,
+        // `None` and other non-callables are a TypeError, matching
+        // CPython's `PyCallable_Check` gate in `signal_signal_impl`.
+        _ => {
+            return Err(type_error(
+                "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object",
+            ))
+        }
     };
     // SIGKILL / SIGSTOP can't be caught or ignored: CPython's
     // `signal.signal()` surfaces the kernel's `EINVAL` as an `OSError`.
@@ -512,7 +569,11 @@ fn signal_setitimer(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut old: libc::itimerval = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::setitimer(which, &raw const new, &raw mut old) };
         if rc != 0 {
-            return Err(crate::error::os_error("setitimer failed"));
+            // A bad `which` (e.g. -1) fails with EINVAL; the frozen
+            // `signal.py` re-raises this OSError as `signal.ItimerError`.
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         Ok(Object::new_tuple(vec![
             Object::Float(timeval_to_seconds(old.it_value)),
@@ -541,7 +602,9 @@ fn signal_getitimer(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut cur: libc::itimerval = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::getitimer(which, &raw mut cur) };
         if rc != 0 {
-            return Err(crate::error::os_error("getitimer failed"));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         Ok(Object::new_tuple(vec![
             Object::Float(timeval_to_seconds(cur.it_value)),
@@ -599,7 +662,28 @@ fn signal_pause(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn signal_getsignal(args: &[Object]) -> Result<Object, RuntimeError> {
     let sig = signum(args.first())?;
+    // CPython's `getsignal` validates the range and raises `ValueError`
+    // for an out-of-range signal number (test_signal probes `getsignal(4242)`).
+    if sig < 1 || sig >= nsig() {
+        return Err(value_error("signal number out of range"));
+    }
     Ok(handler_for(sig))
+}
+
+/// CPython's `signal()` requires the handler to be `SIG_DFL`/`SIG_IGN`
+/// (the int sentinels) or a callable; anything else (e.g. `None`) is a
+/// `TypeError`. Mirrors the `callable()` builtin's notion of callable.
+fn is_callable_handler(o: &Object) -> bool {
+    match o {
+        Object::Function(_)
+        | Object::Builtin(_)
+        | Object::BoundMethod(_)
+        | Object::Type(_)
+        | Object::Generator(_)
+        | Object::StaticMethod(_) => true,
+        Object::Instance(inst) => inst.cls().lookup("__call__").is_some(),
+        _ => false,
+    }
 }
 
 fn default_int_handler(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -640,27 +724,243 @@ fn raise_signal(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn strsignal(args: &[Object]) -> Result<Object, RuntimeError> {
     let sig = signum(args.first())?;
-    Ok(Object::from_str(format!("Signal {sig}")))
+    // CPython returns None for signal numbers outside the valid range.
+    if sig < 1 || sig >= nsig() {
+        return Ok(Object::None);
+    }
+    #[cfg(unix)]
+    {
+        let ptr = unsafe { libc::strsignal(sig as libc::c_int) };
+        if ptr.is_null() {
+            return Ok(Object::None);
+        }
+        let msg = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        Ok(Object::from_str(msg))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Object::from_str(format!("Signal {sig}")))
+    }
 }
 
 fn set_wakeup_fd(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(n)) => *n as i32,
+        Some(Object::Bool(b)) => i32::from(*b),
         None => -1,
         Some(_) => return Err(type_error("an integer is required")),
     };
+    // CPython validates a real fd: it must exist (else `OSError`) and be in
+    // non-blocking mode (else `ValueError`), so the async-signal-safe
+    // `write()` in the handler can never block. `fd == -1` clears the wakeup.
+    #[cfg(unix)]
+    if fd != -1 {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        if flags & libc::O_NONBLOCK == 0 {
+            return Err(value_error(format!(
+                "the fd {fd} must be in non-blocking mode"
+            )));
+        }
+    }
     let prev = WAKEUP_FD.swap(fd, Ordering::AcqRel);
     Ok(Object::Int(i64::from(prev)))
 }
 
-fn noop_int(_args: &[Object]) -> Result<Object, RuntimeError> {
+// ---------------------------------------------------------------------------
+// RFC 0040 WS4 — signal-mask surface (`pthread_sigmask`, `sigwait`,
+// `sigpending`) and a faithful `pthread_kill`.
+// ---------------------------------------------------------------------------
+
+/// Per-thread `pthread_t` keyed by the *synthetic* ident
+/// `_thread.get_ident()` reports. `pthread_kill(tid, sig)` resolves the
+/// handle here. Stored as a `usize` (the pointer/`c_ulong` bits) so the
+/// map is `Send`; reconstructed via `transmute` on use. Both `pthread_t`
+/// and `usize` are pointer-sized on every target we build.
+#[cfg(unix)]
+fn pthread_registry() -> &'static Mutex<HashMap<u64, usize>> {
+    static R: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record the calling OS thread's `pthread_t` under `ident`. Called from
+/// the worker-thread trampoline (and main-thread init) so `pthread_kill`
+/// can target a specific Python thread the way CPython does.
+#[cfg(unix)]
+pub fn register_current_thread_pthread(ident: u64) {
+    let key = unsafe { std::mem::transmute::<libc::pthread_t, usize>(libc::pthread_self()) };
+    pthread_registry().lock().unwrap().insert(ident, key);
+}
+
+/// Drop a thread's `pthread_t` mapping when it exits.
+#[cfg(unix)]
+pub fn unregister_thread_pthread(ident: u64) {
+    pthread_registry().lock().unwrap().remove(&ident);
+}
+
+/// Collect signal numbers from any Python iterable (`set`/`frozenset`/
+/// `list`/generator) for the sigset-shaped arguments. Uses the live
+/// interpreter (the GIL is held inside a builtin call) the same way
+/// `builtin_types::elements_via_interp` does.
+#[cfg(unix)]
+fn collect_signal_ints(obj: &Object) -> Result<Vec<i32>, RuntimeError> {
+    let items: Vec<Object> = {
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| type_error("argument must be an iterable of signal numbers"))?;
+        // SAFETY: published by an enclosing VM frame still live on this
+        // thread; the GIL keeps the access exclusive.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        interp.collect_iterable(obj, &globals)?
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        match it.as_i64() {
+            Some(n) => out.push(n as i32),
+            None => return Err(value_error("signal_set must contain signal numbers")),
+        }
+    }
+    Ok(out)
+}
+
+/// Build a `sigset_t` from a list of signal numbers, validating each.
+#[cfg(unix)]
+fn build_sigset(sigs: &[i32]) -> Result<libc::sigset_t, RuntimeError> {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        for &s in sigs {
+            if s < 1 || s >= nsig() {
+                return Err(value_error("signal number out of range"));
+            }
+            libc::sigaddset(&raw mut set, s);
+        }
+        Ok(set)
+    }
+}
+
+/// Turn a `sigset_t` into a Python `set` of the signal numbers it
+/// contains (scanning the host's valid range).
+#[cfg(unix)]
+fn sigset_to_pyset(set: &libc::sigset_t) -> Object {
+    let mut members = Vec::new();
+    for s in 1..nsig() {
+        if unsafe { libc::sigismember(set, s) } == 1 {
+            members.push(Object::Int(i64::from(s)));
+        }
+    }
+    Object::new_set_from(members.into_iter())
+}
+
+/// `signal.pthread_sigmask(how, mask)` — block/unblock/replace the
+/// calling thread's signal mask, returning the *old* mask as a set.
+#[cfg(unix)]
+fn pthread_sigmask(args: &[Object]) -> Result<Object, RuntimeError> {
+    let how = match args.first().and_then(Object::as_i64) {
+        Some(n) => n as libc::c_int,
+        None => return Err(type_error("an integer is required")),
+    };
+    // CPython does *not* pre-validate `how`: an unknown value (e.g. 1700)
+    // reaches `pthread_sigmask(3)`, which fails with EINVAL and surfaces
+    // as `OSError` — exactly what `test_pthread_sigmask_arguments` asserts.
+    let mask_obj = args
+        .get(1)
+        .ok_or_else(|| type_error("pthread_sigmask() takes exactly 2 arguments"))?;
+    let sigs = collect_signal_ints(mask_obj)?;
+    let set = build_sigset(&sigs)?;
+    let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::pthread_sigmask(how, &raw const set, &raw mut old) };
+    if rc != 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::from_raw_os_error(rc),
+        ));
+    }
+    Ok(sigset_to_pyset(&old))
+}
+
+/// `signal.sigwait(sigset)` — block (GIL released) until one of the
+/// signals in `sigset` is delivered, returning its number.
+#[cfg(unix)]
+fn sigwait(args: &[Object]) -> Result<Object, RuntimeError> {
+    let sigset_obj = args
+        .first()
+        .ok_or_else(|| type_error("sigwait() takes exactly 1 argument"))?;
+    let sigs = collect_signal_ints(sigset_obj)?;
+    let set = build_sigset(&sigs)?;
+    let mut received: libc::c_int = 0;
+    let rc = crate::gil::allow_threads_then(|| unsafe { libc::sigwait(&raw const set, &raw mut received) });
+    if rc != 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::from_raw_os_error(rc),
+        ));
+    }
+    Ok(Object::Int(i64::from(received)))
+}
+
+/// `signal.sigpending()` — the set of signals pending delivery to the
+/// calling thread.
+#[cfg(unix)]
+fn sigpending(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::sigpending(&raw mut set) };
+    if rc != 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(sigset_to_pyset(&set))
+}
+
+/// `signal.pthread_kill(thread_id, signalnum)` — deliver `signalnum` to
+/// the thread whose `_thread.get_ident()` is `thread_id`. `signalnum == 0`
+/// performs the standard existence check.
+#[cfg(unix)]
+fn pthread_kill(args: &[Object]) -> Result<Object, RuntimeError> {
+    let tid = match args.first() {
+        Some(Object::Int(n)) => *n as u64,
+        Some(Object::Bool(b)) => u64::from(*b),
+        _ => return Err(type_error("an integer is required")),
+    };
+    let sig = signum(args.get(1))?;
+    if sig < 0 || sig >= nsig() {
+        return Err(value_error("signal number out of range"));
+    }
+    let key = pthread_registry().lock().unwrap().get(&tid).copied();
+    // Fall back to the caller's own handle for an ident we never
+    // registered (e.g. the bootstrap thread before registration).
+    let key = key
+        .unwrap_or_else(|| unsafe {
+            std::mem::transmute::<libc::pthread_t, usize>(libc::pthread_self())
+        });
+    let pt = unsafe { std::mem::transmute::<usize, libc::pthread_t>(key) };
+    let rc = unsafe { libc::pthread_kill(pt, sig as libc::c_int) };
+    if rc != 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::from_raw_os_error(rc),
+        ));
+    }
+    Ok(Object::None)
+}
+
+/// No-op stub retained for non-Unix builds (Windows lacks the POSIX
+/// signal-mask surface).
+#[cfg(not(unix))]
+fn pthread_kill(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
 fn signum(arg: Option<&Object>) -> Result<i32, RuntimeError> {
-    match arg {
-        Some(Object::Int(n)) => Ok(*n as i32),
-        _ => Err(type_error("signal number must be an int")),
+    // Accept any int (incl. `signal.Signals`/`Handlers` IntEnum members,
+    // which are int subclasses) — CPython's C funcs coerce via `__index__`.
+    match arg.and_then(Object::as_i64) {
+        Some(n) => Ok(n as i32),
+        None => Err(type_error("signal number must be an int")),
     }
 }
 

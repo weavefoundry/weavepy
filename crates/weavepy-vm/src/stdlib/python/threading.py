@@ -117,7 +117,14 @@ def gettrace():
 
 # Synchronization classes
 
-Lock = _LockType
+# CPython binds `threading.Lock` to the `_thread.allocate_lock` *factory*
+# (a builtin function), not to the lock type. Two observable consequences
+# rely on this: `multiprocessing.managers.SyncManager.register('Lock',
+# threading.Lock)` stores a by-name-picklable factory (the lock *type*
+# `_thread.lock` is not reachable as `_thread.lock`, so a Manager over
+# `spawn` would fail to pickle its registry), and `repr(threading.Lock)`
+# is a function repr. Match CPython exactly.
+Lock = _allocate_lock
 
 def RLock(*args, **kwargs):
     """Factory function that returns a new reentrant lock.

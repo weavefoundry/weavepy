@@ -506,6 +506,21 @@ impl RealLock {
     pub fn is_locked(&self) -> bool {
         self.state.lock().held
     }
+
+    /// Forcibly return the lock to the fresh, unlocked state, ignoring any
+    /// current holder. This backs `_thread.lock._at_fork_reinit()`: after a
+    /// `fork()` the child inherits the lock's *memory* but none of the other
+    /// threads, so a lock left `held` by a now-defunct thread would deadlock
+    /// forever. CPython reinitialises the underlying mutex here; we do the
+    /// equivalent by clearing the state and waking any (impossible, but
+    /// harmless) waiter.
+    pub fn force_reset(&self) {
+        let mut state = self.state.lock();
+        state.held = false;
+        state.owner = None;
+        drop(state);
+        self.cv.notify_all();
+    }
 }
 
 /// A real cross-thread reentrant mutex with CPython
@@ -626,6 +641,17 @@ impl RealRLock {
 
     pub fn depth(&self) -> usize {
         self.state.lock().depth
+    }
+
+    /// Forcibly drop all ownership/recursion state, backing
+    /// `_thread.RLock._at_fork_reinit()`. See [`RealLock::force_reset`] for
+    /// why a post-`fork()` child needs this.
+    pub fn force_reset(&self) {
+        let mut state = self.state.lock();
+        state.owner = None;
+        state.depth = 0;
+        drop(state);
+        self.cv.notify_all();
     }
 }
 

@@ -885,6 +885,14 @@ impl Interpreter {
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
         let globals = self.build_module_globals(name, file, None);
+        // CPython's `__main__` always carries `__spec__` (None when run as a
+        // script, a real `ModuleSpec` under `-m`). `multiprocessing.spawn`'s
+        // `get_preparation_data` does `getattr(main_module.__spec__, ...)`, so
+        // the attribute must exist even for the plain `weavepy script.py` path.
+        globals.borrow_mut().insert(
+            DictKey(Object::from_static("__spec__")),
+            Object::None,
+        );
         // Insert the module into `sys.modules` so callers can introspect
         // `sys.modules["__main__"]` (pickle by qualified name and the
         // multiprocessing spawn helper both rely on this).
@@ -6007,7 +6015,22 @@ impl Interpreter {
                 // serve as its own buffer.
                 if let Object::File(f) = obj {
                     match name {
-                        "buffer" | "raw" => {
+                        "buffer" => {
+                            // Only a *text* stream exposes `.buffer` (its binary
+                            // underlayer). Binary streams (`BytesIO`,
+                            // `BufferedRandom`, `FileIO`) have none in CPython —
+                            // `SpooledTemporaryFile.rollover` switches on
+                            // `hasattr(f, 'buffer')` to tell a text rollover from
+                            // a binary one, so a binary file must fall through to
+                            // `AttributeError` here.
+                            if let Some(b) = f.binary_buffer() {
+                                return Ok(b);
+                            }
+                        }
+                        "raw" => {
+                            // `.raw` is the raw layer under a buffered binary
+                            // stream; our collapsed `PyFile` is its own raw layer
+                            // (and a text stream forwards to its binary buffer).
                             if let Some(b) = f.binary_buffer() {
                                 return Ok(b);
                             }
@@ -6021,23 +6044,39 @@ impl Interpreter {
                                 )),
                             }
                         }
-                        "mode" => return Ok(Object::from_str(&f.mode)),
+                        "mode" => {
+                            // In-memory `BytesIO`/`StringIO` carry no `.mode`
+                            // (CPython); OS-backed files and standard streams
+                            // do. `SpooledTemporaryFile.mode` relies on the
+                            // `BytesIO` `AttributeError` to fall back to the
+                            // requested mode string. Binary streams report the
+                            // canonical `FileIO` mode (`'w+b'` → `'rb+'`).
+                            if !f.is_memory() {
+                                return Ok(Object::from_str(f.reported_mode()));
+                            }
+                        }
                         "closed" => return Ok(Object::Bool(f.is_closed())),
                         "encoding" => {
-                            return Ok(if f.binary {
-                                Object::None
-                            } else {
-                                Object::from_static("utf-8")
-                            })
+                            // Only *text* OS-backed streams (CPython's
+                            // `TextIOWrapper`) expose `.encoding`; binary
+                            // streams and in-memory `BytesIO`/`StringIO` raise
+                            // `AttributeError`.
+                            if !f.binary && !f.is_memory() {
+                                return Ok(Object::from_static("utf-8"));
+                            }
                         }
                         "errors" => {
-                            return Ok(if f.binary {
-                                Object::None
-                            } else {
-                                Object::from_static("strict")
-                            })
+                            if !f.binary && !f.is_memory() {
+                                return Ok(Object::from_static("strict"));
+                            }
                         }
-                        "newlines" => return Ok(Object::None),
+                        "newlines" => {
+                            // Text streams (including `StringIO`) expose
+                            // `.newlines`; binary streams do not.
+                            if !f.binary {
+                                return Ok(Object::None);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -19876,9 +19915,25 @@ impl Interpreter {
             }
             _ => return Err(type_error("exec() locals must be a mapping")),
         };
-        let code_rc = match source {
-            Object::Code(c) => c,
-            Object::Str(src) => {
+        // Accept str, bytes/bytearray (decoded via the PEP 263 cookie, UTF-8
+        // default, like CPython), or an already-compiled code object.
+        let exec_src: Option<String> = match &source {
+            Object::Code(_) => None,
+            Object::Str(src) => Some(src.to_string()),
+            Object::Bytes(b) => Some(crate::decode_compile_source_bytes(b, "<string>")?),
+            Object::ByteArray(b) => {
+                Some(crate::decode_compile_source_bytes(&b.borrow(), "<string>")?)
+            }
+            other => {
+                return Err(type_error(format!(
+                    "exec() expected str or code, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        let code_rc = match (exec_src, source) {
+            (None, Object::Code(c)) => c,
+            (Some(src), _) => {
                 // A malformed source must surface as `SyntaxError` (with a
                 // location), exactly like `compile()` — CPython's `exec`
                 // never raises `ValueError` for bad syntax. Invalid-escape
@@ -19889,12 +19944,7 @@ impl Interpreter {
                         .map_err(|e| compile_error_to_syntax_error(&e, &src, "<string>"))?;
                 Rc::new(compiled)
             }
-            other => {
-                return Err(type_error(format!(
-                    "exec() expected str or code, got {}",
-                    other.type_name()
-                )))
-            }
+            _ => unreachable!(),
         };
         // Ensure the globals dict carries a `__builtins__` entry so
         // user code can reach `print`, `range`, etc. Mirrors how
@@ -19991,6 +20041,13 @@ impl Interpreter {
                 return self.run_frame(&mut frame);
             }
             Object::Str(s) => s.to_string(),
+            // CPython's `eval`/`exec` accept a bytes/bytearray source and
+            // decode it honouring a PEP 263 coding cookie (UTF-8 default).
+            // `test_subprocess` round-trips child stdout through `eval(...)`.
+            Object::Bytes(b) => crate::decode_compile_source_bytes(&b, "<string>")?,
+            Object::ByteArray(b) => {
+                crate::decode_compile_source_bytes(&b.borrow(), "<string>")?
+            }
             other => {
                 return Err(type_error(format!(
                     "eval() expected str or code, got {}",
@@ -20119,11 +20176,51 @@ impl Interpreter {
         self.cache.insert("os.path", path_mod);
     }
 
+    /// Install CPython's write-through `os.environ` / `os.environb`
+    /// (`_Environ` mappings) over the native snapshot, by importing the
+    /// `_weave_envinit` helper for its side effect (RFC 0040 WS1).
+    ///
+    /// Idempotent and self-healing: a successful import leaves
+    /// `_weave_envinit` in the module cache, which short-circuits future
+    /// calls. An early-startup failure (the `abc` machinery the mapping
+    /// subclasses isn't ready when `os` is first imported) is rolled back
+    /// out of the cache so the next `os` import retries — by then user code
+    /// is running and every dependency resolves. The `INSTALLING` guard
+    /// breaks the re-entrant `import os` the helper itself performs.
+    fn ensure_os_environ(&mut self) {
+        thread_local! {
+            static INSTALLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        // Already installed for this interpreter?
+        if self.cache.get("_weave_envinit").is_some() {
+            return;
+        }
+        if INSTALLING.with(std::cell::Cell::get) {
+            return;
+        }
+        INSTALLING.with(|c| c.set(true));
+        let result = self.import_path("_weave_envinit");
+        INSTALLING.with(|c| c.set(false));
+        if result.is_err() {
+            // Drop the half-initialised module so a later import retries.
+            self.cache.remove("_weave_envinit");
+        }
+    }
+
     /// Load a single fully-qualified module name. Honours the cache
     /// first, then the built-in registry, then frozen Python sources,
     /// then the filesystem.
     fn load_one(&mut self, full: &str) -> Result<Object, RuntimeError> {
         if let Some(cached) = self.cache.get(full) {
+            // RFC 0040 WS1 — `os` is imported extremely early in startup
+            // (before the `abc`/`collections.abc` machinery the `_Environ`
+            // mapping subclasses is ready), so the first attempt to install
+            // the write-through `environ`/`environb` can fail. Retry on every
+            // subsequent `os` import until it lands; once it does the
+            // `_weave_envinit` module is cached and this is a no-op.
+            if full == "os" {
+                self.ensure_os_environ();
+            }
             return Ok(cached);
         }
         // During interpreter shutdown only already-imported modules
@@ -20150,6 +20247,9 @@ impl Interpreter {
             // recursion. On any failure the Rust fallback stays in place.
             if full == "os" {
                 self.bind_os_path(&obj);
+                // RFC 0040 WS1 — replace the native snapshot `environ` with
+                // CPython's write-through `_Environ` (and add `environb`).
+                self.ensure_os_environ();
             }
             return Ok(obj);
         }
@@ -24484,6 +24584,25 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             out.extend_from_slice(x);
             out.extend_from_slice(&yb);
             Ok(Object::new_bytes(out))
+        }
+        // `bytes`/`bytearray` + any other buffer-protocol object
+        // (`memoryview`, …). CPython's `bytes_concat` calls
+        // `PyObject_GetBuffer` on *both* operands, so `b'x' + memoryview(...)`
+        // concatenates; the result type follows the left operand.
+        // `multiprocessing.connection._send_bytes` depends on this for
+        // `header + buf`, where `buf` is a `BytesIO.getbuffer()` view.
+        // (`memoryview` itself has no `__add__`, so there's no left-side arm.)
+        (O::Bytes(x), O::MemoryView(mv), B::Add) => {
+            let y = mv.to_bytes();
+            let mut out = Vec::with_capacity(x.len() + y.len());
+            out.extend_from_slice(x);
+            out.extend_from_slice(&y);
+            Ok(Object::new_bytes(out))
+        }
+        (O::ByteArray(x), O::MemoryView(mv), B::Add) => {
+            let mut out = x.borrow().clone();
+            out.extend_from_slice(&mv.to_bytes());
+            Ok(Object::new_bytearray(out))
         }
         (O::Bytes(x), O::Int(n), B::Mult) | (O::Int(n), O::Bytes(x), B::Mult) => {
             // `b * 1` returns the operand itself — bytes are immutable, so

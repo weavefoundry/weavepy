@@ -753,6 +753,8 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             // Binary streams only — CPython text files genuinely lack the
             // attribute (it lives on RawIOBase/BufferedIOBase).
             "readinto" if f.binary => Some(method("readinto", file_readinto)),
+            "readinto1" if f.binary => Some(method("readinto1", file_readinto)),
+            "truncate" => Some(method("truncate", file_truncate)),
             "readline" => Some(method("readline", file_readline)),
             "readlines" => Some(method("readlines", file_readlines)),
             "write" => Some(method("write", file_write)),
@@ -770,6 +772,9 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "seek" => Some(method("seek", file_seek)),
             "tell" => Some(method("tell", file_tell)),
             "getvalue" => Some(method("getvalue", file_getvalue)),
+            // `BytesIO.getbuffer()` — binary in-memory streams only (CPython
+            // text `StringIO` genuinely lacks the attribute).
+            "getbuffer" if f.binary => Some(method("getbuffer", file_getbuffer)),
             "__enter__" => Some(method("__enter__", file_enter)),
             "__exit__" => Some(method("__exit__", file_exit)),
             // A file is its own iterator (CPython): `iter(f) is f`, and
@@ -5296,8 +5301,15 @@ fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
             "encoding" => set_slot(&mut combined, 3, v.clone()),
             "errors" => set_slot(&mut combined, 4, v.clone()),
             "newline" => set_slot(&mut combined, 5, v.clone()),
-            "closefd" | "opener" => {
-                // Accepted but not plumbed further yet.
+            // `closefd` *is* honoured (positional slot 6): `open(fd, ...,
+            // closefd=False)` must hand back a stream that releases the
+            // descriptor without closing it. `multiprocessing.popen_spawn_posix`
+            // writes the child's pickle through `open(parent_w, 'wb',
+            // closefd=False)` and then closes that fd itself via a `Finalize`,
+            // so dropping the flag double-closes `parent_w` (EBADF).
+            "closefd" => set_slot(&mut combined, 6, v.clone()),
+            "opener" => {
+                // Accepted but not plumbed through the positional builtin path.
             }
             other => {
                 return Err(type_error(format!(
@@ -5403,6 +5415,20 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(_) => return Err(type_error("open() mode must be str")),
     };
     validate_open_mode(&mode)?;
+    // `closefd` (positional slot 6, default True). When False the caller
+    // keeps ownership of the descriptor — closing the stream detaches the fd
+    // without `close(2)`. Only meaningful for the `open(fd, …)` form; CPython
+    // raises `ValueError` for `closefd=False` with a path.
+    let closefd = match args.get(6) {
+        None | Some(Object::None) => true,
+        Some(Object::Bool(b)) => *b,
+        Some(Object::Int(n)) => *n != 0,
+        Some(_) => true,
+    };
+    let is_fd = matches!(&args[0], Object::Int(_));
+    if !closefd && !is_fd {
+        return Err(value_error("Cannot use closefd=False with file name"));
+    }
     // `open(fd, …)` adopts an already-open raw file descriptor
     // (produced by `os.open`); the file's `name` is the fd itself.
     #[cfg(unix)]
@@ -5412,13 +5438,23 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
             .map_err(|_| crate::error::value_error("file descriptor out of range"))?;
         // SAFETY: ownership of the fd transfers to the new File; it was
         // handed out by os.open (or dup) and is closed exactly once when
-        // the PyFile drops.
+        // the PyFile drops — unless `closefd=False`, in which case the
+        // PyFile detaches the fd on close instead of running `close(2)`.
         let f = unsafe { std::fs::File::from_raw_fd(fd) };
-        return Ok(Object::File(Rc::new(PyFile::new(
-            fd.to_string(),
-            mode,
-            FileBackend::Disk(f),
-        ))));
+        let file = PyFile::new(fd.to_string(), mode, FileBackend::Disk(f));
+        file.closefd.set(closefd);
+        if !file.binary {
+            if let Some(Object::Str(enc)) = args.get(3) {
+                file.set_encoding(enc);
+            }
+            if let Some(Object::Str(err)) = args.get(4) {
+                file.set_errors(err);
+            }
+            if let Some(Object::Str(nl)) = args.get(5) {
+                file.set_newline(Some(nl));
+            }
+        }
+        return Ok(Object::File(Rc::new(file)));
     }
     let (path, name_is_bytes) = open_path_arg(&args[0])?;
     let mut opts = OpenOptions::new();
@@ -8348,6 +8384,13 @@ fn dict_self(args: &[Object]) -> Result<Rc<RefCell<DictData>>, RuntimeError> {
 
 fn dict_get(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    // `dict.get(key[, default])` — CPython rejects a third positional.
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "get expected at most 2 arguments, got {}",
+            args.len() - 1
+        )));
+    }
     let key = args
         .get(1)
         .ok_or_else(|| type_error("dict.get() expected at least 1 argument"))?;
@@ -8398,8 +8441,22 @@ fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `dict.keys()`/`values()`/`items()` take no positional arguments beyond
+/// `self`; CPython raises `TypeError` for any extra (`mapping_tests` checks
+/// `d.keys(None)`).
+fn dict_view_no_args(args: &[Object], name: &str) -> Result<(), RuntimeError> {
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "{name}() takes no arguments ({} given)",
+            args.len() - 1
+        )));
+    }
+    Ok(())
+}
+
 fn dict_keys(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    dict_view_no_args(args, "keys")?;
     Ok(Object::DictView(Rc::new(crate::object::PyDictView {
         dict: d,
         kind: crate::object::DictViewKind::Keys,
@@ -8408,6 +8465,7 @@ fn dict_keys(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn dict_values(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    dict_view_no_args(args, "values")?;
     Ok(Object::DictView(Rc::new(crate::object::PyDictView {
         dict: d,
         kind: crate::object::DictViewKind::Values,
@@ -8416,6 +8474,7 @@ fn dict_values(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn dict_items(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    dict_view_no_args(args, "items")?;
     Ok(Object::DictView(Rc::new(crate::object::PyDictView {
         dict: d,
         kind: crate::object::DictViewKind::Items,
@@ -10846,6 +10905,20 @@ pub(crate) fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(f.position() as i64))
 }
 
+pub(crate) fn file_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let size = match args.get(1) {
+        None | Some(Object::None) => None,
+        Some(Object::Bool(b)) => Some(u64::from(*b)),
+        Some(Object::Int(i)) if *i >= 0 => Some(*i as u64),
+        Some(Object::Int(_)) => {
+            return Err(value_error("Negative size value not allowed"))
+        }
+        Some(o) => Some(coerce_index_i64(o)?.max(0) as u64),
+    };
+    Ok(Object::Int(f.truncate(size)? as i64))
+}
+
 pub(crate) fn file_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(file_self(args)?.isatty()))
 }
@@ -10875,6 +10948,11 @@ pub(crate) fn file_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(file_self(args)?.seekable()))
 }
 
+pub(crate) fn file_getbuffer(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    f.getbuffer()
+}
+
 pub(crate) fn file_getvalue(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     f.getvalue()
@@ -10882,7 +10960,14 @@ pub(crate) fn file_getvalue(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 pub(crate) fn file_enter(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::File(file_self(args)?))
+    // CPython's `IOBase.__enter__` runs `self._checkClosed()` first, so
+    // re-entering a closed file (e.g. `with already_closed_tempfile:`) raises
+    // `ValueError` rather than silently succeeding.
+    let f = file_self(args)?;
+    if f.is_closed() {
+        return Err(value_error("I/O operation on closed file"));
+    }
+    Ok(Object::File(f))
 }
 
 pub(crate) fn file_exit(args: &[Object]) -> Result<Object, RuntimeError> {

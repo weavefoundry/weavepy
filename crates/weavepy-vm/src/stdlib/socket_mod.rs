@@ -727,14 +727,13 @@ fn sock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
 fn sock_bind(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let family = state.borrow().family;
-    let addr = parse_socket_address(args.get(1), family)?;
+    let addr = parse_sockaddr2(args.get(1), family)?;
     let s_borrow = state.borrow();
     let sock = s_borrow
         .inner
         .as_ref()
         .ok_or_else(|| os_error("socket closed"))?;
-    sock.bind(&SockAddr::from(addr))
-        .map_err(|e| io_error_to_py(&e))?;
+    sock.bind(&addr).map_err(|e| io_error_to_py(&e))?;
     Ok(Object::None)
 }
 
@@ -798,8 +797,7 @@ fn sock_connect(args: &[Object]) -> Result<Object, RuntimeError> {
         let b = state.borrow();
         (b.family, b.timeout)
     };
-    let addr = parse_socket_address(args.get(1), family)?;
-    let sockaddr = SockAddr::from(addr);
+    let sockaddr = parse_sockaddr2(args.get(1), family)?;
     blocking_socket_io(&state, move |sock| match timeout {
         // A strictly-positive timeout means "timeout mode": bound the
         // connect with `connect_timeout`.
@@ -1503,6 +1501,87 @@ fn parse_socket_address(arg: Option<&Object>, family: i32) -> Result<SocketAddr,
     Ok(parsed)
 }
 
+/// Build a `socket2::SockAddr` for an `AF_UNIX` path. Handles both
+/// pathname sockets (NUL-terminated on the wire) and Linux abstract-namespace
+/// sockets (a leading NUL, length-delimited, no terminator). `multiprocessing`
+/// (Manager/forkserver) and `socketserver`'s `UnixStreamServer` bind such
+/// addresses on POSIX, so `bind`/`connect` must accept a bare path here.
+#[cfg(unix)]
+fn sockaddr_unix_from_bytes(path: &[u8]) -> Result<SockAddr, RuntimeError> {
+    use std::mem;
+    let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    // SAFETY: `sockaddr_storage` is large enough to alias a `sockaddr_un`.
+    let su = unsafe { &mut *(std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_un>()) };
+    su.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let cap = su.sun_path.len();
+    let is_abstract = path.first() == Some(&0);
+    // Pathname sockets reserve one byte for the trailing NUL.
+    let max = if is_abstract { cap } else { cap.saturating_sub(1) };
+    if path.len() > max {
+        return Err(os_error("AF_UNIX path too long"));
+    }
+    for (i, &b) in path.iter().enumerate() {
+        su.sun_path[i] = b as libc::c_char;
+    }
+    // `offsetof(sockaddr_un, sun_path)` portably: total size minus the
+    // path array (2 on both Linux and macOS). Pathname sockets add the
+    // terminator to the length they report to the kernel.
+    let offset = mem::size_of::<libc::sockaddr_un>() - cap;
+    let len = if is_abstract {
+        offset + path.len()
+    } else {
+        offset + path.len() + 1
+    };
+    // SAFETY: `storage` holds a fully-initialised `sockaddr_un` of `len` bytes.
+    Ok(unsafe { SockAddr::new(storage, len as libc::socklen_t) })
+}
+
+/// Extract the path from an `AF_UNIX` `SockAddr`, or `None` if it isn't one.
+/// Pathname sockets are returned NUL-trimmed; abstract sockets keep their
+/// leading NUL (CPython surfaces them the same way).
+#[cfg(unix)]
+fn sockaddr_unix_path(addr: &SockAddr) -> Option<String> {
+    if addr.family() != libc::AF_UNIX as libc::sa_family_t {
+        return None;
+    }
+    // SAFETY: family is AF_UNIX, so the storage is a `sockaddr_un`.
+    let su: &libc::sockaddr_un = unsafe { &*(addr.as_ptr().cast::<libc::sockaddr_un>()) };
+    let total = addr.len() as usize;
+    let base = std::mem::size_of::<libc::sockaddr_un>() - su.sun_path.len();
+    if total <= base {
+        return Some(String::new()); // unnamed
+    }
+    let path_len = (total - base).min(su.sun_path.len());
+    // SAFETY: `sun_path` holds at least `path_len` initialised bytes.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(su.sun_path.as_ptr().cast::<u8>(), path_len) };
+    if bytes.first() == Some(&0) {
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    } else {
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+    }
+}
+
+/// Resolve a Python socket-address argument into a `socket2::SockAddr`,
+/// dispatching on the socket's address family: an `AF_UNIX` socket takes a
+/// `str`/`bytes` path, everything else the `(host, port[, …])` tuple parsed
+/// by [`parse_socket_address`].
+fn parse_sockaddr2(arg: Option<&Object>, family: i32) -> Result<SockAddr, RuntimeError> {
+    #[cfg(unix)]
+    if family == libc::AF_UNIX as i32 {
+        let path: Vec<u8> = match arg {
+            Some(Object::Str(s)) => s.as_bytes().to_vec(),
+            Some(Object::Bytes(b)) => b.to_vec(),
+            Some(Object::ByteArray(b)) => b.borrow().clone(),
+            _ => return Err(type_error("AF_UNIX address must be a str or bytes path")),
+        };
+        return sockaddr_unix_from_bytes(&path);
+    }
+    let addr = parse_socket_address(arg, family)?;
+    Ok(SockAddr::from(addr))
+}
+
 fn sockaddr_to_tuple(addr: &SockAddr, _family: i32) -> Object {
     if let Some(v4) = addr.as_socket_ipv4() {
         Object::new_tuple(vec![
@@ -1517,6 +1596,12 @@ fn sockaddr_to_tuple(addr: &SockAddr, _family: i32) -> Object {
             Object::Int(i64::from(v6.scope_id())),
         ])
     } else {
+        // `AF_UNIX` (and the unnamed/empty case): CPython returns the path
+        // as a plain `str`, not a `(host, port)` tuple.
+        #[cfg(unix)]
+        if let Some(path) = sockaddr_unix_path(addr) {
+            return Object::from_str(path);
+        }
         Object::new_tuple(vec![Object::from_static(""), Object::Int(0)])
     }
 }
