@@ -1870,6 +1870,28 @@ fn os_kill(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(s) => s as libc::c_int,
         None => return Err(type_error("kill() signal must be int")),
     };
+    // A process-directed signal to *our own* process is, in CPython's
+    // single-threaded model, delivered to the main thread (the main
+    // thread *is* the process). WeavePy runs the interpreter on a
+    // dedicated VM thread while the process's initial OS thread parks
+    // with async signals blocked; a self-directed `kill` issued while
+    // the VM thread has `sig` blocked can otherwise be absorbed by the
+    // parked thread's per-thread pending queue, invisible to
+    // `sigpending()` and never delivered (`test_signal`
+    // test_pthread_sigmask / test_sigpending). Route it onto the VM main
+    // thread via `pthread_kill` to reproduce the single-threaded
+    // semantics. Real process groups (`pid <= 0`) and other pids take
+    // the genuine `kill` path.
+    if pid == unsafe { libc::getpid() } && sig != 0 {
+        if let Some(rc) = crate::stdlib::signal_mod::deliver_to_vm_main(sig as i32) {
+            if rc != 0 {
+                return Err(crate::error::io_error_to_py(
+                    &std::io::Error::from_raw_os_error(rc),
+                ));
+            }
+            return Ok(Object::None);
+        }
+    }
     let rc = unsafe { libc::kill(pid, sig) };
     if rc != 0 {
         return Err(crate::error::io_error_to_py(

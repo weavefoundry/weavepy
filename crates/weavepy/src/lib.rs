@@ -133,6 +133,20 @@ impl Error {
             _ => None,
         }
     }
+
+    /// `true` when an unhandled `KeyboardInterrupt` reached the top
+    /// level. The CLI then mimics CPython's `exit_sigint()` — reset
+    /// `SIGINT` to `SIG_DFL` and `kill(getpid(), SIGINT)` — so the
+    /// process terminates *by the signal*.
+    pub fn is_keyboard_interrupt(&self) -> bool {
+        match self {
+            Error::Runtime(vm::RuntimeError::PyException(exc))
+            | Error::RuntimePrinted(vm::RuntimeError::PyException(exc)) => {
+                exc.is_keyboard_interrupt()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Convenience: parse, compile, and execute a Python source string under a

@@ -1577,14 +1577,13 @@ impl Interpreter {
     /// `Exception ignored in: …` header, the traceback, and the
     /// exception line to stderr.
     fn print_unraisable_default(
-        &self,
+        &mut self,
         exc_value: &Object,
         traceback: &[crate::error::TracebackEntry],
         context_repr: &str,
         hook_failed: bool,
         err_msg: Option<&str>,
     ) {
-        use std::io::Write;
         let mut s = String::new();
         if hook_failed {
             s.push_str("Exception ignored in sys.unraisablehook: ");
@@ -1622,8 +1621,53 @@ impl Interpreter {
         } else {
             s.push_str(&format!("{kind}: {msg}\n"));
         }
+        self.write_text_to_sys_stderr(&s);
+    }
+
+    /// Write `text` to the interpreter's `sys.stderr` (the Python
+    /// object), so a test that redirects `sys.stderr` — e.g.
+    /// `test.support.captured_stderr()` swapping in a `StringIO` —
+    /// observes runtime-emitted diagnostics (unraisable-hook output,
+    /// the signal wakeup-fd write error). Falls back to the raw OS
+    /// `stderr` fd when `sys.stderr` is unavailable or its `write`
+    /// raises (early init / shutdown), matching CPython's
+    /// `_PyErr_WriteUnraisableMsg`, which targets `sys.stderr`.
+    fn write_text_to_sys_stderr(&mut self, text: &str) {
+        let stderr_obj = {
+            let sys_module = self
+                .cache
+                .modules
+                .borrow()
+                .get(&DictKey(Object::from_static("sys")))
+                .cloned();
+            match sys_module {
+                Some(Object::Module(m)) => m
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("stderr")))
+                    .cloned(),
+                _ => None,
+            }
+        };
+        if let Some(stderr_obj) = stderr_obj {
+            if !matches!(stderr_obj, Object::None) {
+                if let Ok(write) = self.load_attr(&stderr_obj, "write") {
+                    let globals = self.builtins.clone();
+                    if self
+                        .call(&write, &[Object::from_str(text.to_owned())], &[], &globals)
+                        .is_ok()
+                    {
+                        if let Ok(flush) = self.load_attr(&stderr_obj, "flush") {
+                            let _ = self.call(&flush, &[], &[], &globals);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        use std::io::Write;
         let mut stderr = std::io::stderr().lock();
-        let _ = stderr.write_all(s.as_bytes());
+        let _ = stderr.write_all(text.as_bytes());
     }
 
     /// CPython `PyErr_Print` for an uncaught exception reaching the
@@ -2633,7 +2677,23 @@ impl Interpreter {
     /// a Python handler is invoked `handler(signum, frame)`. Any
     /// exception it raises propagates through the dispatch loop's normal
     /// error path, so it stays catchable by a surrounding `try/except`.
+    /// Report a pending signal wakeup-fd write error (recorded by the
+    /// async-signal-safe trampoline when its `write()` failed) through
+    /// `sys.unraisablehook`, matching CPython's `report_wakeup_*_error`.
+    /// The OSError is built from the captured `errno`; the contextual
+    /// message becomes the unraisable header so `captured_stderr()` sees
+    /// `Exception ignored when trying to write to the signal wakeup fd:`
+    /// followed by `OSError: [Errno N] ...`.
+    fn report_signal_wakeup_error(&mut self) {
+        if let Some(errno) = crate::stdlib::signal_mod::take_wakeup_write_error() {
+            let err = crate::error::io_error_to_py(&std::io::Error::from_raw_os_error(errno));
+            let msg = "Exception ignored when trying to write to the signal wakeup fd";
+            self.write_unraisable_msg(&err, &Object::None, msg, Some(msg));
+        }
+    }
+
     fn run_pending_signals(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        self.report_signal_wakeup_error();
         for signum in crate::stdlib::signal_mod::take_tripped() {
             let handler = crate::stdlib::signal_mod::handler_for(signum);
             match handler {
@@ -2664,6 +2724,7 @@ impl Interpreter {
     pub fn run_pending_signals_public(&mut self) -> Result<(), RuntimeError> {
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        self.report_signal_wakeup_error();
         for signum in crate::stdlib::signal_mod::take_tripped() {
             let handler = crate::stdlib::signal_mod::handler_for(signum);
             if let Object::Int(_) = handler {

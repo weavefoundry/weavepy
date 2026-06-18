@@ -115,12 +115,33 @@ impl ModuleCache {
         self.frozen.borrow().get(name).copied()
     }
 
+    /// The *live* `sys.path` list. The loader must read this rather than
+    /// the cached `self.path` Rc because Python code can **rebind**
+    /// `sys.path` (`sys.path = [...]`) — replacing the list object
+    /// instead of mutating the shared one. `multiprocessing`'s spawn
+    /// child does exactly this in `spawn.prepare()` (`sys.path =
+    /// data['sys_path']`), so a child that only sees the stale `self.path`
+    /// can't locate on-disk submodules. CPython's import system always
+    /// consults `sys.modules['sys'].path`; mirror that, falling back to
+    /// the aliased Rc when the `sys` module isn't built yet (early init).
+    fn live_sys_path(&self) -> Vec<Object> {
+        if let Some(Object::Module(sys_mod)) = self.get("sys") {
+            if let Some(Object::List(l)) = sys_mod
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static("path")))
+            {
+                return l.borrow().clone();
+            }
+        }
+        self.path.borrow().clone()
+    }
+
     /// Snapshot the current `sys.path` as a list of `PathBuf`s,
     /// dropping entries that aren't strings. Cheap enough for the
     /// inner loop because `sys.path` is short.
     pub fn search_dirs(&self) -> Vec<PathBuf> {
-        self.path
-            .borrow()
+        self.live_sys_path()
             .iter()
             .filter_map(|o| match o {
                 Object::Str(s) => Some(PathBuf::from(s.as_ref())),

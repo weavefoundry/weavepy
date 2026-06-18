@@ -811,6 +811,13 @@ fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
                 let diag = err.format(source, &opts.filename);
                 let _ = stderr.write_all(diag.as_bytes());
             }
+            // bpo-1054041: an unhandled KeyboardInterrupt must terminate
+            // the process *via* SIGINT (so a shell sees death-by-signal,
+            // returncode == -SIGINT), after the traceback is printed.
+            // This is CPython's `exit_sigint()` in Modules/main.c.
+            if err.is_keyboard_interrupt() {
+                exit_via_sigint();
+            }
             anyhow::bail!(DIAGNOSTIC_SENTINEL);
         }
     }
@@ -839,6 +846,30 @@ fn exit_with_system_exit(code: weavepy::vm::object::Object) -> ! {
     };
     let _ = io::stderr().flush();
     std::process::exit(status);
+}
+
+/// Terminate via `SIGINT` under the default disposition, the way
+/// CPython's `exit_sigint()` does when a `KeyboardInterrupt` goes
+/// unhandled: reset `SIGINT` to `SIG_DFL` and `kill(getpid(), SIGINT)`
+/// so the process dies *by the signal* (`returncode == -SIGINT`), which
+/// is what shells and `subprocess` inspect. Falls back to exit code 130
+/// (128 + SIGINT) if, impossibly, the signal doesn't terminate us.
+#[cfg(unix)]
+fn exit_via_sigint() -> ! {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    // Reset SIGINT to SIG_DFL, unblock it on this thread, and raise it
+    // process-wide so we die *by the signal* (returncode == -SIGINT).
+    weavepy::vm::stdlib::signal_mod::die_via_sigint();
+    // Unreachable in practice; the signal terminates us above.
+    std::process::exit(130);
+}
+
+#[cfg(not(unix))]
+fn exit_via_sigint() -> ! {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    std::process::exit(0xC0_00_01_3A_u32 as i32);
 }
 
 fn run_repl(flags: InterpreterFlags, startup: Option<&Path>, argv: Vec<String>) -> Result<()> {

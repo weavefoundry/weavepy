@@ -1154,6 +1154,16 @@ fn interrupt_main(args: &[Object]) -> Result<Object, RuntimeError> {
     if signum < 1 || signum >= crate::stdlib::signal_mod::nsig() {
         return Err(value_error("signal number out of range"));
     }
+    // gh-102397: `interrupt_main()` racing with interpreter finalization
+    // (e.g. from a `__del__` running during shutdown) can't reliably
+    // deliver the signal — the main eval loop is tearing down. CPython
+    // raises `OSError: Signal N ignored due to race condition` rather
+    // than silently dropping it (test_signal.test__thread_interrupt_main).
+    if crate::vm_singletons::is_finalizing() {
+        return Err(crate::error::os_error(format!(
+            "Signal {signum} ignored due to race condition"
+        )));
+    }
     crate::stdlib::signal_mod::trip_signal(signum);
     Ok(Object::None)
 }

@@ -171,6 +171,101 @@ def _utf_8_sig_decode(input, errors="strict"):
     return (output, consumed + prefix)
 
 
+# ---------- incremental codec base classes ----------
+#
+# These base classes must precede the concrete `_UTF8Sig*` /
+# `_Func*` subclasses (and any other module-level `class X(Incremental…)`)
+# so the names resolve at class-definition (import) time.
+
+
+class IncrementalEncoder:
+    def __init__(self, errors="strict"):
+        self.errors = errors
+
+    def encode(self, input, final=False):
+        raise NotImplementedError
+
+    def reset(self):
+        pass
+
+    def getstate(self):
+        return 0
+
+    def setstate(self, state):
+        pass
+
+
+class IncrementalDecoder:
+    def __init__(self, errors="strict"):
+        self.errors = errors
+
+    def decode(self, input, final=False):
+        raise NotImplementedError
+
+    def reset(self):
+        pass
+
+    def getstate(self):
+        return (b"", 0)
+
+    def setstate(self, state):
+        pass
+
+
+class BufferedIncrementalEncoder(IncrementalEncoder):
+    """Base for encoders that may buffer a trailing partial character."""
+
+    def __init__(self, errors="strict"):
+        super().__init__(errors)
+        self.buffer = ""
+
+    def _buffer_encode(self, input, errors, final):
+        raise NotImplementedError
+
+    def encode(self, input, final=False):
+        data = self.buffer + input
+        (result, consumed) = self._buffer_encode(data, self.errors, final)
+        self.buffer = data[consumed:]
+        return result
+
+    def reset(self):
+        IncrementalEncoder.reset(self)
+        self.buffer = ""
+
+    def getstate(self):
+        return self.buffer or 0
+
+    def setstate(self, state):
+        self.buffer = state or ""
+
+
+class BufferedIncrementalDecoder(IncrementalDecoder):
+    """Base for decoders that may buffer a trailing partial byte sequence."""
+
+    def __init__(self, errors="strict"):
+        super().__init__(errors)
+        self.buffer = b""
+
+    def _buffer_decode(self, input, errors, final):
+        raise NotImplementedError
+
+    def decode(self, input, final=False):
+        data = self.buffer + bytes(input)
+        (result, consumed) = self._buffer_decode(data, self.errors, final)
+        self.buffer = data[consumed:]
+        return result
+
+    def reset(self):
+        IncrementalDecoder.reset(self)
+        self.buffer = b""
+
+    def getstate(self):
+        return (self.buffer, 0)
+
+    def setstate(self, state):
+        self.buffer = state[0]
+
+
 class _UTF8SigIncrementalEncoder(IncrementalEncoder):
     """utf-8-sig incremental encoder: emit the BOM exactly once (CPython
     ``encodings/utf_8_sig.py``). ``setstate(0)`` is how ``TextIOWrapper``
@@ -407,95 +502,7 @@ def iterdecode(iterator, encoding, errors="strict", **kwargs):
         yield output
 
 
-# ---------- incremental codecs ----------
-
-
-class IncrementalEncoder:
-    def __init__(self, errors="strict"):
-        self.errors = errors
-
-    def encode(self, input, final=False):
-        raise NotImplementedError
-
-    def reset(self):
-        pass
-
-    def getstate(self):
-        return 0
-
-    def setstate(self, state):
-        pass
-
-
-class IncrementalDecoder:
-    def __init__(self, errors="strict"):
-        self.errors = errors
-
-    def decode(self, input, final=False):
-        raise NotImplementedError
-
-    def reset(self):
-        pass
-
-    def getstate(self):
-        return (b"", 0)
-
-    def setstate(self, state):
-        pass
-
-
-class BufferedIncrementalEncoder(IncrementalEncoder):
-    """Base for encoders that may buffer a trailing partial character."""
-
-    def __init__(self, errors="strict"):
-        super().__init__(errors)
-        self.buffer = ""
-
-    def _buffer_encode(self, input, errors, final):
-        raise NotImplementedError
-
-    def encode(self, input, final=False):
-        data = self.buffer + input
-        (result, consumed) = self._buffer_encode(data, self.errors, final)
-        self.buffer = data[consumed:]
-        return result
-
-    def reset(self):
-        IncrementalEncoder.reset(self)
-        self.buffer = ""
-
-    def getstate(self):
-        return self.buffer or 0
-
-    def setstate(self, state):
-        self.buffer = state or ""
-
-
-class BufferedIncrementalDecoder(IncrementalDecoder):
-    """Base for decoders that may buffer a trailing partial byte sequence."""
-
-    def __init__(self, errors="strict"):
-        super().__init__(errors)
-        self.buffer = b""
-
-    def _buffer_decode(self, input, errors, final):
-        raise NotImplementedError
-
-    def decode(self, input, final=False):
-        data = self.buffer + bytes(input)
-        (result, consumed) = self._buffer_decode(data, self.errors, final)
-        self.buffer = data[consumed:]
-        return result
-
-    def reset(self):
-        IncrementalDecoder.reset(self)
-        self.buffer = b""
-
-    def getstate(self):
-        return (self.buffer, 0)
-
-    def setstate(self, state):
-        self.buffer = state[0]
+# ---------- incremental codecs (function adapters) ----------
 
 
 class _FuncIncrementalEncoder(IncrementalEncoder):

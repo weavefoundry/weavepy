@@ -104,6 +104,20 @@ impl PyException {
         }
     }
 
+    /// `true` when this exception is a `KeyboardInterrupt` (or a
+    /// subclass). The CLI uses it to reproduce CPython's `exit_sigint()`:
+    /// an unhandled `KeyboardInterrupt` at the top level re-raises
+    /// `SIGINT` under `SIG_DFL` so the process dies *by the signal*
+    /// (`returncode == -SIGINT`), not with a plain code 1
+    /// (`test_signal.PosixTests.test_keyboard_interrupt_exit_code`).
+    pub fn is_keyboard_interrupt(&self) -> bool {
+        let Object::Instance(inst) = &self.instance else {
+            return false;
+        };
+        inst.cls()
+            .is_subclass_of(&crate::builtin_types::builtin_types().keyboard_interrupt)
+    }
+
     /// When this exception is a `SystemExit` (or a subclass), return
     /// its exit `code`: the explicit `.code` attribute, falling back to
     /// the single `args` element (`()` → `None`, `(x,)` → `x`,

@@ -2307,18 +2307,28 @@ impl PyFile {
             }
             (FileBackend::MemBytes { data, pos }, None) => {
                 let d = data.borrow();
-                buf.extend_from_slice(&d[*pos..]);
-                *pos = d.len();
+                // The position can sit *past* the end after a seek beyond
+                // EOF (legal for BytesIO); reading there yields b'' and
+                // leaves the position untouched — never slice out of range.
+                if *pos < d.len() {
+                    buf.extend_from_slice(&d[*pos..]);
+                    *pos = d.len();
+                }
             }
             (FileBackend::MemBytes { data, pos }, Some(n)) => {
                 let d = data.borrow();
-                let end = (*pos + n).min(d.len());
-                buf.extend_from_slice(&d[*pos..end]);
-                *pos = end;
+                if *pos < d.len() {
+                    let end = (*pos + n).min(d.len());
+                    buf.extend_from_slice(&d[*pos..end]);
+                    *pos = end;
+                }
             }
             (FileBackend::MemText { data, pos }, None) => {
-                buf.extend_from_slice(&data.as_bytes()[*pos..]);
-                *pos = data.len();
+                let bytes = data.as_bytes();
+                if *pos < bytes.len() {
+                    buf.extend_from_slice(&bytes[*pos..]);
+                    *pos = bytes.len();
+                }
             }
             (FileBackend::MemText { data, pos }, Some(n)) => {
                 let bytes = data.as_bytes();

@@ -17,9 +17,42 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
-use crate::error::{os_error, type_error, RuntimeError};
+use crate::error::{os_error, overflow_error, type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+
+/// Coerce a Python object to a C `int` resource id, matching CPython's
+/// `getrlimit`/`setrlimit` argument parsing: an out-of-range int raises
+/// `OverflowError` (`Object::Long` never fits, since it auto-demotes to
+/// `Int` when it does), a non-int raises `TypeError`.
+fn resource_id(obj: &Object) -> Result<i32, RuntimeError> {
+    match obj {
+        Object::Int(n) => i32::try_from(*n)
+            .map_err(|_| overflow_error("Python int too large to convert to C int")),
+        Object::Bool(b) => Ok(i32::from(*b)),
+        Object::Long(_) => Err(overflow_error(
+            "Python int too large to convert to C int",
+        )),
+        _ => Err(type_error("an integer is required")),
+    }
+}
+
+/// Coerce a Python object to an `rlim_t` (mirrors CPython's
+/// `(rlim_t)PyLong_AsLongLong`): an int wider than 64 bits raises
+/// `OverflowError`, a non-int raises `TypeError`. Negative values are
+/// cast to the wide unsigned representation exactly as CPython does
+/// (the kernel then rejects them with `EINVAL`, which the caller maps to
+/// `ValueError`).
+fn rlim_from_obj(obj: &Object) -> Result<u64, RuntimeError> {
+    match obj {
+        Object::Int(n) => Ok(*n as u64),
+        Object::Bool(b) => Ok(u64::from(*b)),
+        Object::Long(_) => Err(overflow_error(
+            "Python int too large to convert to C long long",
+        )),
+        _ => Err(type_error("an integer is required")),
+    }
+}
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::new()));
@@ -83,10 +116,13 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 }
 
 fn resource_getrlimit(args: &[Object]) -> Result<Object, RuntimeError> {
-    let which = match args.first() {
-        Some(Object::Int(n)) => *n as i32,
-        _ => return Err(type_error("getrlimit() requires an int resource id")),
-    };
+    if args.len() != 1 {
+        return Err(type_error(format!(
+            "getrlimit() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+    let which = resource_id(&args[0])?;
     let mut rlim = RawRlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -108,34 +144,44 @@ fn resource_getrlimit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn resource_setrlimit(args: &[Object]) -> Result<Object, RuntimeError> {
-    let which = match args.first() {
-        Some(Object::Int(n)) => *n as i32,
-        _ => return Err(type_error("setrlimit() requires an int resource id")),
-    };
-    let (soft, hard) = match args.get(1) {
-        Some(Object::Tuple(t)) if t.len() == 2 => {
-            let s = match &t[0] {
-                Object::Int(n) => *n,
-                _ => return Err(type_error("setrlimit() limits must be ints")),
-            };
-            let h = match &t[1] {
-                Object::Int(n) => *n,
-                _ => return Err(type_error("setrlimit() limits must be ints")),
-            };
-            (s, h)
+    if args.len() != 2 {
+        return Err(type_error(format!(
+            "setrlimit() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+    let which = resource_id(&args[0])?;
+    // CPython requires a 2-element *sequence*; a wrong length is a
+    // ValueError ("expected a tuple of 2 integers"), a non-sequence is a
+    // TypeError. Element type/overflow errors come from `rlim_from_obj`.
+    let items: Vec<Object> = match &args[1] {
+        Object::Tuple(t) => t.iter().cloned().collect(),
+        Object::List(l) => l.borrow().clone(),
+        _ => {
+            return Err(type_error(
+                "setrlimit() argument 2 must be a sequence of 2 integers",
+            ))
         }
-        _ => return Err(type_error("setrlimit() expects a 2-tuple of limits")),
     };
+    if items.len() != 2 {
+        return Err(value_error("expected a tuple of 2 integers"));
+    }
     let rlim = RawRlimit {
-        rlim_cur: soft as u64,
-        rlim_max: hard as u64,
+        rlim_cur: rlim_from_obj(&items[0])?,
+        rlim_max: rlim_from_obj(&items[1])?,
     };
     let ret = unsafe { libc_setrlimit(which, &rlim) };
     if ret != 0 {
-        return Err(os_error(format!(
-            "setrlimit({which}) failed: errno={}",
-            last_os_error_code()
-        )));
+        // CPython maps the two common setrlimit errnos to ValueError so a
+        // negative/oversized limit (EINVAL) or an attempt to raise a hard
+        // limit without privilege (EPERM) is catchable as ValueError
+        // (test_resource.test_fsize_negative / test_setrlimit).
+        let e = last_os_error_code();
+        return Err(match e {
+            libc::EINVAL => value_error("current limit exceeds maximum limit"),
+            libc::EPERM => value_error("not allowed to raise maximum limit"),
+            _ => os_error(format!("setrlimit({which}) failed: errno={e}")),
+        });
     }
     Ok(Object::None)
 }

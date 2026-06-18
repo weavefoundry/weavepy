@@ -25,7 +25,7 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{type_error, value_error, RuntimeError};
@@ -36,6 +36,73 @@ use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 /// handler writes the signal byte here so a `select`/`poll` loop wakes.
 /// `-1` when unset. Read inside the async-signal-safe handler.
 static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// `true` once `set_wakeup_fd` has been told the fd is a socket (so the
+/// async-signal-safe writer uses `send(MSG_DONTWAIT)` instead of
+/// `write`, matching CPython's `_Py_set_wakeup_fd` socket path on the
+/// `WakeupSocketSignalTests`). Packed alongside the fd: the high bit of
+/// the stored value flags "is a socket". We keep a separate atomic for
+/// clarity.
+static WAKEUP_FD_IS_SOCKET: AtomicBool = AtomicBool::new(false);
+
+/// `true` when `set_wakeup_fd(..., warn_on_full_buffer=False)` asked the
+/// async handler to *silently* drop a byte that doesn't fit (rather than
+/// emit the "Exception ignored when trying to write to the signal wakeup
+/// fd" message). Defaults to warning, matching CPython.
+static WAKEUP_WARN_ON_FULL: AtomicBool = AtomicBool::new(true);
+
+/// Records the most recent `errno` from a failed async-signal-safe
+/// wakeup-fd write, so the main thread can raise the matching
+/// `OSError` from `PyErr_CheckSignals` (CPython reports the write
+/// failure via `sys.unraisablehook` / stderr — see
+/// `WakeupSignalTests.test_wakeup_write_error`). `0` ≡ no error.
+static WAKEUP_WRITE_ERRNO: AtomicI32 = AtomicI32::new(0);
+
+/// The VM "main" OS thread's `pthread_t` (as a `usize`), published at
+/// interpreter startup. WeavePy runs the interpreter on a spawned
+/// `weavepy-main` thread while the process's initial OS thread parks in
+/// `join()` with the async signals blocked. A process-directed signal
+/// (`os.kill(getpid(), sig)`) sent while the VM thread has `sig` blocked
+/// can be absorbed by the parked initial thread's per-thread pending
+/// queue (Darwin makes it thread-pending there), where it is invisible
+/// to `sigpending()` and never delivered — `test_signal`'s
+/// `test_pthread_sigmask` / `test_sigpending`. Routing a self-directed
+/// `os.kill` through `pthread_kill` onto this thread reproduces the
+/// single-threaded CPython semantics (the main thread *is* the process).
+#[cfg(unix)]
+static VM_MAIN_PTHREAD: AtomicI64 = AtomicI64::new(0);
+
+/// Publish the calling thread as the VM main thread (see
+/// [`VM_MAIN_PTHREAD`]). Called once at interpreter startup on the VM
+/// thread, before any user code runs.
+#[cfg(unix)]
+pub fn set_vm_main_thread() {
+    let bits = unsafe { std::mem::transmute::<libc::pthread_t, usize>(libc::pthread_self()) };
+    VM_MAIN_PTHREAD.store(bits as i64, Ordering::Release);
+}
+
+#[cfg(not(unix))]
+pub fn set_vm_main_thread() {}
+
+/// Deliver `sig` to the VM main thread via `pthread_kill`, reproducing a
+/// single-threaded process's `kill(getpid(), sig)`. Returns the raw
+/// `pthread_kill` return code (0 on success, an errno on failure), or
+/// `None` if the main thread isn't published yet (caller falls back to a
+/// real `kill`).
+#[cfg(unix)]
+pub fn deliver_to_vm_main(sig: i32) -> Option<i32> {
+    let bits = VM_MAIN_PTHREAD.load(Ordering::Acquire);
+    if bits == 0 {
+        return None;
+    }
+    let pt = unsafe { std::mem::transmute::<usize, libc::pthread_t>(bits as usize) };
+    Some(unsafe { libc::pthread_kill(pt, sig as libc::c_int) })
+}
+
+#[cfg(not(unix))]
+pub fn deliver_to_vm_main(_sig: i32) -> Option<i32> {
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Process-global signal state (RFC 0039).
@@ -99,10 +166,35 @@ extern "C" fn handler_trampoline(signum: libc::c_int) {
     let fd = WAKEUP_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         let byte = [s as u8];
-        unsafe {
-            libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1);
+        let rc = unsafe { libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1) };
+        if rc < 0 {
+            // CPython's `trip_signal`: a failed wakeup-fd write is
+            // reported on the main thread *unless* it's a full
+            // non-blocking buffer and the user opted out of that warning
+            // (`set_wakeup_fd(..., warn_on_full_buffer=False)`).
+            let err = errno_now();
+            let is_full = err == libc::EWOULDBLOCK || err == libc::EAGAIN;
+            if WAKEUP_WARN_ON_FULL.load(Ordering::Relaxed) || !is_full {
+                // Record the first such errno; the main thread drains it
+                // from `PyErr_CheckSignals` and emits the OSError.
+                let _ = WAKEUP_WRITE_ERRNO.compare_exchange(
+                    0,
+                    err,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+            }
         }
     }
+}
+
+/// Read `errno` inside the async-signal-safe handler. `__errno_location`
+/// / `__error` are async-signal-safe by POSIX.
+#[cfg(unix)]
+fn errno_now() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(0)
 }
 
 /// Install the kernel disposition for `signum` via `sigaction`. We omit
@@ -186,6 +278,32 @@ pub fn unblock_async_signals_current_thread() {
     }
 }
 
+/// Reproduce CPython's `exit_sigint()` (Modules/main.c): when a
+/// `KeyboardInterrupt` reaches the top level unhandled, reset `SIGINT`
+/// to `SIG_DFL`, unblock it on the calling thread, and re-raise it
+/// process-wide so the interpreter terminates *by the signal*
+/// (`returncode == -SIGINT`) rather than with a generic exit code —
+/// `test_signal.PosixTests.test_keyboard_interrupt_exit_code`. Does not
+/// return: the signal kills the process.
+#[cfg(unix)]
+pub fn die_via_sigint() {
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+        libc::kill(libc::getpid(), libc::SIGINT);
+    }
+    // The default SIGINT disposition terminates us synchronously once it is
+    // delivered; pause briefly so the kernel can act before any fallback.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+/// No-op fallback on non-Unix targets.
+#[cfg(not(unix))]
+pub fn die_via_sigint() {}
+
 /// Install SIGINT's startup disposition (the `default_int_handler`
 /// trampoline) the way CPython does during interpreter init — *before* any
 /// `import signal`. Without this, a script that never imports `signal` (e.g.
@@ -195,10 +313,25 @@ pub fn unblock_async_signals_current_thread() {
 /// `signal` just re-installs the same disposition.
 #[cfg(unix)]
 pub fn install_startup_dispositions() {
+    // Publish this (VM main) thread as the deterministic delivery target
+    // for self-directed `os.kill` (see `VM_MAIN_PTHREAD`).
+    set_vm_main_thread();
     // Seed the handler table (SIGINT -> default_int_handler) and arm the
     // kernel trampoline so a tripped SIGINT is serviced by the dispatch loop.
     let _ = handlers();
     set_os_disposition(SIGINT, OsDisposition::Trip);
+
+    // CPython's `_PySignal_Init` ignores SIGPIPE and SIGXFSZ at startup so
+    // a write to a closed pipe / past RLIMIT_FSIZE returns EPIPE / EFBIG
+    // (raising the catchable `BrokenPipeError` / `OSError`) instead of the
+    // kernel default killing the process (test_resource.test_fsize_enforced,
+    // and broken-pipe handling across test_subprocess / test_io). Record
+    // SIG_IGN in the handler table too, so `getsignal()` matches CPython
+    // (which reads the live C disposition when seeding its table).
+    for sig in [libc::SIGPIPE, libc::SIGXFSZ] {
+        set_handler(sig, Object::Int(1));
+        set_os_disposition(sig, OsDisposition::Ignore);
+    }
 }
 
 /// No-op on non-Unix targets (Windows uses a different signal model).
@@ -273,6 +406,20 @@ pub fn trip_signal(signum: i32) {
 #[inline]
 pub fn signals_pending() -> bool {
     ANY_TRIPPED.load(Ordering::Relaxed)
+}
+
+/// Drain a pending wakeup-fd write error (set by the async-signal-safe
+/// trampoline). Returns the `errno` to report, or `None` if there is no
+/// pending error. The main thread calls this from `PyErr_CheckSignals`
+/// and raises the matching `OSError` via the unraisable hook
+/// (`test_signal` WakeupSignalTests / WakeupSocketSignalTests).
+pub fn take_wakeup_write_error() -> Option<i32> {
+    let err = WAKEUP_WRITE_ERRNO.swap(0, Ordering::AcqRel);
+    if err == 0 {
+        None
+    } else {
+        Some(err)
+    }
 }
 
 /// Drain tripped signals in ascending numeric order (CPython's order),
@@ -367,7 +514,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("set_wakeup_fd")),
-            b("set_wakeup_fd", set_wakeup_fd),
+            Object::Builtin(Rc::new(BuiltinFn::with_kwargs(
+                "set_wakeup_fd",
+                set_wakeup_fd,
+            ))),
         );
         d.insert(
             DictKey(Object::from_static("pthread_kill")),
@@ -724,9 +874,10 @@ fn raise_signal(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn strsignal(args: &[Object]) -> Result<Object, RuntimeError> {
     let sig = signum(args.first())?;
-    // CPython returns None for signal numbers outside the valid range.
+    // CPython's `signal_strsignal_impl` raises ValueError for a signal
+    // number outside `[1, NSIG)` (test_out_of_range_signal_number_raises_error).
     if sig < 1 || sig >= nsig() {
-        return Ok(Object::None);
+        return Err(value_error("signal number out of range"));
     }
     #[cfg(unix)]
     {
@@ -745,13 +896,36 @@ fn strsignal(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn set_wakeup_fd(args: &[Object]) -> Result<Object, RuntimeError> {
+fn set_wakeup_fd(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(n)) => *n as i32,
         Some(Object::Bool(b)) => i32::from(*b),
         None => -1,
         Some(_) => return Err(type_error("an integer is required")),
     };
+    // `signal.set_wakeup_fd(fd, *, warn_on_full_buffer=True)` — the
+    // keyword controls whether a full non-blocking wakeup-fd buffer is
+    // reported. Defaults to True (and resets to True when omitted, so a
+    // prior `warn_on_full_buffer=False` doesn't leak — test_signal
+    // WakeupSocketSignalTests.test_warn_on_full_buffer).
+    let mut warn_on_full_buffer = true;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "warn_on_full_buffer" => {
+                warn_on_full_buffer = match v {
+                    Object::Bool(b) => *b,
+                    Object::Int(n) => *n != 0,
+                    Object::None => true,
+                    _ => true,
+                };
+            }
+            other => {
+                return Err(type_error(format!(
+                    "set_wakeup_fd() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
     // CPython validates a real fd: it must exist (else `OSError`) and be in
     // non-blocking mode (else `ValueError`), so the async-signal-safe
     // `write()` in the handler can never block. `fd == -1` clears the wakeup.
@@ -769,6 +943,10 @@ fn set_wakeup_fd(args: &[Object]) -> Result<Object, RuntimeError> {
             )));
         }
     }
+    WAKEUP_WARN_ON_FULL.store(warn_on_full_buffer, Ordering::Release);
+    // Clear any stale recorded write error when the wakeup fd changes.
+    WAKEUP_WRITE_ERRNO.store(0, Ordering::Release);
+    let _ = &WAKEUP_FD_IS_SOCKET; // reserved for the Windows send() path
     let prev = WAKEUP_FD.swap(fd, Ordering::AcqRel);
     Ok(Object::Int(i64::from(prev)))
 }
