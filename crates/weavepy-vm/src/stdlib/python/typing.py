@@ -338,6 +338,34 @@ class Generic:
         return cls
 
 
+# CPython's constrained `AnyStr` plus the generic I/O stream ABCs. These are
+# annotation-only markers here (type erasure), but real code imports them:
+# `from typing import BinaryIO` (e.g. zipfile's `_path`), so the names must
+# exist and be subscriptable.
+AnyStr = TypeVar("AnyStr", bytes, str)
+
+
+class IO(Generic[AnyStr]):
+    """Generic base for the return type of `open()`."""
+
+    __slots__ = ()
+
+
+class BinaryIO(IO[bytes]):
+    """Typed stream of `bytes` (binary-mode `open`)."""
+
+    __slots__ = ()
+
+
+class TextIO(IO[str]):
+    """Typed stream of `str` (text-mode `open`)."""
+
+    __slots__ = ()
+
+
+Text = str
+
+
 class _ProtocolMeta(type):
     """Metaclass for :class:`Protocol`. ``@runtime_checkable`` plumbs
     a structural ``__instancecheck__`` here so user code can write

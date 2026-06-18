@@ -254,7 +254,9 @@ fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
     // "unsafe" contract) and always `exec`s or `_exit`s.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
     }
     if pid > 0 {
         // Parent.
@@ -373,7 +375,12 @@ fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
             if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
                 let interp = &mut *ptr;
                 if interp.call_object(preexec_fn.clone(), &[], &[]).is_err() {
-                    child_report(errpipe_write, b"SubprocessError", 0, b"Exception occurred in preexec_fn.");
+                    child_report(
+                        errpipe_write,
+                        b"SubprocessError",
+                        0,
+                        b"Exception occurred in preexec_fn.",
+                    );
                 }
             }
         }
@@ -398,7 +405,11 @@ fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
                 saved_errno = e;
             }
         }
-        let report_errno = if saved_errno != 0 { saved_errno } else { errno() };
+        let report_errno = if saved_errno != 0 {
+            saved_errno
+        } else {
+            errno()
+        };
         child_report(errpipe_write, b"OSError", report_errno, b"");
     }
 }
@@ -428,13 +439,207 @@ unsafe fn set_cloexec(fd: i32) {
     }
 }
 
-/// Close every fd in `[start, max]` except those in the sorted `keep`
-/// set (async-signal-safe; ignores `EBADF`).
+/// Close every open fd `>= start` except those in the `keep` set
+/// (async-signal-safe; ignores `EBADF`).
+///
+/// Prefers enumerating the per-process fd directory (`/proc/self/fd` on
+/// Linux, `/dev/fd` elsewhere), exactly as CPython's `_close_open_fds`
+/// does. That matters because a bounded `[start, sysconf(_SC_OPEN_MAX))`
+/// sweep misses descriptors inherited *above* a lowered `RLIMIT_NOFILE`
+/// (`sysconf`/`getrlimit` both report only the lowered soft limit, while
+/// the original `rlim_max` may be effectively unbounded and impossible to
+/// brute-force) — see `test_close_fds_when_max_fd_is_lowered` (bpo-21618).
+/// Falls back to the bounded sweep when the directory can't be read.
 ///
 /// # Safety
 /// Called only in the forked child.
 #[cfg(unix)]
 unsafe fn close_open_fds(start: i32, keep: &[i32]) {
+    if unsafe { close_open_fds_via_dir(start, keep) } {
+        return;
+    }
+    unsafe { close_open_fds_brute_force(start, keep) };
+}
+
+/// Parse a NUL-terminated ASCII fd-number directory entry name (e.g.
+/// `b"42\0"`). Returns `None` for `.`/`..`/non-numeric/overflowing names.
+///
+/// # Safety
+/// `p` must point to a NUL-terminated C string.
+#[cfg(unix)]
+unsafe fn parse_fd_name(mut p: *const libc::c_char) -> Option<i32> {
+    let mut val: i64 = 0;
+    let mut any = false;
+    loop {
+        let c = unsafe { *p } as u8;
+        if c == 0 {
+            break;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + i64::from(c - b'0');
+        if val > i64::from(i32::MAX) {
+            return None;
+        }
+        any = true;
+        p = unsafe { p.add(1) };
+    }
+    if any {
+        Some(val as i32)
+    } else {
+        None
+    }
+}
+
+/// Drain the collected descriptors, falling back to the bounded sweep when
+/// more were found than the fixed scratch buffer could hold.
+///
+/// # Safety
+/// Called only in the forked child.
+#[cfg(unix)]
+unsafe fn drain_close(to_close: &[i32], overflow: bool, start: i32, keep: &[i32]) {
+    for &fd in to_close {
+        unsafe { libc::close(fd) };
+    }
+    if overflow {
+        unsafe { close_open_fds_brute_force(start, keep) };
+    }
+}
+
+/// Enumerate `/proc/self/fd` via the raw `getdents64` syscall (no malloc,
+/// so it's safe between `fork` and `exec` even if other threads existed)
+/// and close every descriptor `>= start` not in `keep`. Returns `true` on
+/// success, `false` if the directory couldn't be opened.
+///
+/// # Safety
+/// Called only in the forked child.
+#[cfg(all(unix, target_os = "linux"))]
+unsafe fn close_open_fds_via_dir(start: i32, keep: &[i32]) -> bool {
+    const FD_DIR: &[u8] = b"/proc/self/fd\0";
+    // `d_reclen` (u16) is at byte offset 16 in `linux_dirent64`; the name
+    // follows the header at offset 19. Stable kernel ABI.
+    const RECLEN_OFF: usize = 16;
+    const NAME_OFF: usize = 19;
+
+    let dir_fd = unsafe {
+        libc::open(
+            FD_DIR.as_ptr().cast::<libc::c_char>(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if dir_fd < 0 {
+        return false;
+    }
+
+    // 8-aligned scratch so the per-entry header reads are well-aligned.
+    #[repr(align(8))]
+    struct Buf([u8; 8192]);
+    let mut buf = Buf([0u8; 8192]);
+
+    // Collect first, close after the directory is fully read, so closing a
+    // listed descriptor can't perturb the kernel's directory iteration.
+    let mut to_close = [0i32; 4096];
+    let mut count = 0usize;
+    let mut overflow = false;
+
+    loop {
+        let nread = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                dir_fd,
+                buf.0.as_mut_ptr(),
+                buf.0.len(),
+            ) as isize
+        };
+        if nread <= 0 {
+            break; // EOF or error
+        }
+        let mut off: isize = 0;
+        while off < nread {
+            let ent = unsafe { buf.0.as_ptr().offset(off) };
+            // `d_reclen` is a native-endian u16; read it byte-wise to avoid a
+            // potentially-unaligned u16 pointer load.
+            let reclen_lo = unsafe { *ent.add(RECLEN_OFF) };
+            let reclen_hi = unsafe { *ent.add(RECLEN_OFF + 1) };
+            let reclen = isize::from(u16::from_ne_bytes([reclen_lo, reclen_hi]));
+            if reclen <= 0 {
+                break;
+            }
+            let name_ptr = unsafe { ent.add(NAME_OFF).cast::<libc::c_char>() };
+            if let Some(fd) = unsafe { parse_fd_name(name_ptr) } {
+                if fd >= start && fd != dir_fd && !keep.contains(&fd) {
+                    if count < to_close.len() {
+                        to_close[count] = fd;
+                        count += 1;
+                    } else {
+                        overflow = true;
+                    }
+                }
+            }
+            off += reclen;
+        }
+    }
+
+    unsafe { libc::close(dir_fd) };
+    unsafe { drain_close(&to_close[..count], overflow, start, keep) };
+    true
+}
+
+/// Enumerate `/dev/fd` via `opendir`/`readdir` and close every descriptor
+/// `>= start` not in `keep`. Returns `true` on success, `false` if the
+/// directory couldn't be opened. This mirrors CPython's non-Linux
+/// `_close_open_fds_maybe_unsafe` path (the libc directory walker is the
+/// only portable option there).
+///
+/// # Safety
+/// Called only in the forked child.
+#[cfg(all(unix, not(target_os = "linux")))]
+unsafe fn close_open_fds_via_dir(start: i32, keep: &[i32]) -> bool {
+    const FD_DIR: &[u8] = b"/dev/fd\0";
+    let dir = unsafe { libc::opendir(FD_DIR.as_ptr().cast::<libc::c_char>()) };
+    if dir.is_null() {
+        return false;
+    }
+    let dir_fd = unsafe { libc::dirfd(dir) };
+
+    // Collect first, close after `closedir`, so closing a listed descriptor
+    // can't perturb the directory iteration.
+    let mut to_close = [0i32; 4096];
+    let mut count = 0usize;
+    let mut overflow = false;
+
+    loop {
+        let ent = unsafe { libc::readdir(dir) };
+        if ent.is_null() {
+            break;
+        }
+        let name_ptr = unsafe { (*ent).d_name.as_ptr() };
+        if let Some(fd) = unsafe { parse_fd_name(name_ptr) } {
+            if fd >= start && fd != dir_fd && !keep.contains(&fd) {
+                if count < to_close.len() {
+                    to_close[count] = fd;
+                    count += 1;
+                } else {
+                    overflow = true;
+                }
+            }
+        }
+    }
+
+    unsafe { libc::closedir(dir) };
+    unsafe { drain_close(&to_close[..count], overflow, start, keep) };
+    true
+}
+
+/// Close every fd in `[start, max)` except those in `keep` — the bounded
+/// fallback when the fd directory is unavailable (async-signal-safe;
+/// ignores `EBADF`).
+///
+/// # Safety
+/// Called only in the forked child.
+#[cfg(unix)]
+unsafe fn close_open_fds_brute_force(start: i32, keep: &[i32]) {
     let max = {
         let m = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
         if m <= 0 || m > 1 << 20 {

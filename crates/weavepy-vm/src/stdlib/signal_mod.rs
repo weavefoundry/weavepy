@@ -77,7 +77,11 @@ static VM_MAIN_PTHREAD: AtomicI64 = AtomicI64::new(0);
 /// thread, before any user code runs.
 #[cfg(unix)]
 pub fn set_vm_main_thread() {
-    let bits = unsafe { std::mem::transmute::<libc::pthread_t, usize>(libc::pthread_self()) };
+    // `pthread_t` is an integer on Linux and an opaque pointer on macOS;
+    // an address-preserving `as` cast to `usize` is correct on both and
+    // avoids a clippy `useless_transmute` on the platforms where the
+    // types already coincide.
+    let bits = unsafe { libc::pthread_self() } as usize;
     VM_MAIN_PTHREAD.store(bits as i64, Ordering::Release);
 }
 
@@ -95,7 +99,7 @@ pub fn deliver_to_vm_main(sig: i32) -> Option<i32> {
     if bits == 0 {
         return None;
     }
-    let pt = unsafe { std::mem::transmute::<usize, libc::pthread_t>(bits as usize) };
+    let pt = bits as usize as libc::pthread_t;
     Some(unsafe { libc::pthread_kill(pt, sig as libc::c_int) })
 }
 
@@ -192,9 +196,7 @@ extern "C" fn handler_trampoline(signum: libc::c_int) {
 /// / `__error` are async-signal-safe by POSIX.
 #[cfg(unix)]
 fn errno_now() -> i32 {
-    std::io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(0)
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 /// Install the kernel disposition for `signum` via `sigaction`. We omit
@@ -972,7 +974,7 @@ fn pthread_registry() -> &'static Mutex<HashMap<u64, usize>> {
 /// can target a specific Python thread the way CPython does.
 #[cfg(unix)]
 pub fn register_current_thread_pthread(ident: u64) {
-    let key = unsafe { std::mem::transmute::<libc::pthread_t, usize>(libc::pthread_self()) };
+    let key = unsafe { libc::pthread_self() } as usize;
     pthread_registry().lock().unwrap().insert(ident, key);
 }
 
@@ -1026,6 +1028,10 @@ fn build_sigset(sigs: &[i32]) -> Result<libc::sigset_t, RuntimeError> {
 /// Turn a `sigset_t` into a Python `set` of the signal numbers it
 /// contains (scanning the host's valid range).
 #[cfg(unix)]
+// `sigset_t` is a 128-byte struct on Linux (where CI runs clippy) but a
+// 4-byte int on macOS; the by-reference signature is correct for the large
+// platform, so silence the macOS-only "trivially copy, pass by value" hint.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn sigset_to_pyset(set: &libc::sigset_t) -> Object {
     let mut members = Vec::new();
     for s in 1..nsig() {
@@ -1033,7 +1039,7 @@ fn sigset_to_pyset(set: &libc::sigset_t) -> Object {
             members.push(Object::Int(i64::from(s)));
         }
     }
-    Object::new_set_from(members.into_iter())
+    Object::new_set_from(members)
 }
 
 /// `signal.pthread_sigmask(how, mask)` — block/unblock/replace the
@@ -1072,7 +1078,9 @@ fn sigwait(args: &[Object]) -> Result<Object, RuntimeError> {
     let sigs = collect_signal_ints(sigset_obj)?;
     let set = build_sigset(&sigs)?;
     let mut received: libc::c_int = 0;
-    let rc = crate::gil::allow_threads_then(|| unsafe { libc::sigwait(&raw const set, &raw mut received) });
+    let rc = crate::gil::allow_threads_then(|| unsafe {
+        libc::sigwait(&raw const set, &raw mut received)
+    });
     if rc != 0 {
         return Err(crate::error::io_error_to_py(
             &std::io::Error::from_raw_os_error(rc),
@@ -1112,11 +1120,8 @@ fn pthread_kill(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = pthread_registry().lock().unwrap().get(&tid).copied();
     // Fall back to the caller's own handle for an ident we never
     // registered (e.g. the bootstrap thread before registration).
-    let key = key
-        .unwrap_or_else(|| unsafe {
-            std::mem::transmute::<libc::pthread_t, usize>(libc::pthread_self())
-        });
-    let pt = unsafe { std::mem::transmute::<usize, libc::pthread_t>(key) };
+    let key = key.unwrap_or_else(|| unsafe { libc::pthread_self() } as usize);
+    let pt = key as libc::pthread_t;
     let rc = unsafe { libc::pthread_kill(pt, sig as libc::c_int) };
     if rc != 0 {
         return Err(crate::error::io_error_to_py(

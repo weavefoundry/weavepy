@@ -21,6 +21,17 @@ for _name in dir(_os):
     _names.append(_name)
 
 
+# macOS `fcopyfile(3)` fast-copy hooks live behind a leading underscore, so
+# the ``dir(_os)`` loop above skips them — re-export explicitly so the bundled
+# ``shutil`` (and ``test_shutil.TestZeroCopyMACOS``) find ``posix._fcopyfile``
+# and the ``_COPYFILE_*`` flag bits exactly where CPython's ``posix`` puts them.
+if hasattr(_os, "_fcopyfile"):
+    _fcopyfile = _os._fcopyfile
+    _COPYFILE_ACL = _os._COPYFILE_ACL
+    _COPYFILE_STAT = _os._COPYFILE_STAT
+    _COPYFILE_XATTR = _os._COPYFILE_XATTR
+    _COPYFILE_DATA = _os._COPYFILE_DATA
+
 # A couple of POSIX-only constants that ``os`` may not expose
 # explicitly (kept here so ``from posix import *`` matches CPython).
 F_OK = getattr(_os, "F_OK", 0)

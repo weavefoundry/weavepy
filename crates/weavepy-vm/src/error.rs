@@ -518,6 +518,17 @@ pub fn io_error_to_py(err: &std::io::Error) -> RuntimeError {
 /// reads like CPython's: `[Errno 2] No such file or directory: 'name'`, with
 /// `.errno` / `.strerror` / `.filename` populated to match.
 pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> RuntimeError {
+    io_error_to_py_named2(err, filename, None)
+}
+
+/// As [`io_error_to_py_named`], but for two-path syscalls (`rename`, `link`,
+/// `symlink`, `replace`): populates `.filename` *and* `.filename2` and renders
+/// `[Errno N] strerror: 'src' -> 'dst'`, matching CPython's `OSError.__str__`.
+pub fn io_error_to_py_named2(
+    err: &std::io::Error,
+    filename: Option<&str>,
+    filename2: Option<&str>,
+) -> RuntimeError {
     use std::io::ErrorKind::{
         AlreadyExists, BrokenPipe, ConnectionAborted, ConnectionRefused, ConnectionReset,
         Interrupted, NotFound, PermissionDenied, TimedOut, WouldBlock,
@@ -530,12 +541,15 @@ pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> Run
         Some(i) => raw[..i].to_string(),
         None => raw,
     };
-    // Mirror `OSError.__str__`: "[Errno N] strerror: 'filename'".
-    let message = match (errno, filename) {
-        (Some(n), Some(f)) => format!("[Errno {n}] {strerror}: '{f}'"),
-        (Some(n), None) => format!("[Errno {n}] {strerror}"),
-        (None, Some(f)) => format!("{strerror}: '{f}'"),
-        (None, None) => strerror.clone(),
+    // Mirror `OSError.__str__`: "[Errno N] strerror: 'filename'[ -> 'filename2']".
+    let suffix = match (filename, filename2) {
+        (Some(f), Some(f2)) => format!(": '{f}' -> '{f2}'"),
+        (Some(f), None) => format!(": '{f}'"),
+        (None, _) => String::new(),
+    };
+    let message = match errno {
+        Some(n) => format!("[Errno {n}] {strerror}{suffix}"),
+        None => format!("{strerror}{suffix}"),
     };
     // Dispatch on the raw `errno` first (via `libc`, so the numbers are
     // correct per-platform): `std::io::ErrorKind` collapses or omits
@@ -607,6 +621,12 @@ pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> Run
                 dict.insert(
                     DictKey(Object::from_static("filename")),
                     Object::from_str(f.to_owned()),
+                );
+            }
+            if let Some(f2) = filename2 {
+                dict.insert(
+                    DictKey(Object::from_static("filename2")),
+                    Object::from_str(f2.to_owned()),
                 );
             }
         }

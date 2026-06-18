@@ -264,7 +264,9 @@ fn fcntl_lockf(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(not(unix))]
 fn fcntl_lockf(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::os_error("lockf is not supported on this platform"))
+    Err(crate::error::os_error(
+        "lockf is not supported on this platform",
+    ))
 }
 
 fn optional_off(arg: Option<&Object>, name: &str) -> Result<i64, RuntimeError> {
@@ -292,14 +294,13 @@ fn coerce_fd(arg: Option<&Object>) -> Result<i32, RuntimeError> {
             .fileno()
             .ok_or_else(|| value_error("I/O operation on closed file"))?,
         other => {
-            let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
-                type_error("argument must be an int, or have a fileno() method.")
-            })?;
+            let ptr = crate::vm_singletons::current_interpreter_ptr()
+                .ok_or_else(|| type_error("argument must be an int, or have a fileno() method."))?;
             // SAFETY: published by the enclosing VM frame on this thread.
             let interp = unsafe { &mut *ptr };
-            let meth = interp.load_attr_public(other, "fileno").map_err(|_| {
-                type_error("argument must be an int, or have a fileno() method.")
-            })?;
+            let meth = interp
+                .load_attr_public(other, "fileno")
+                .map_err(|_| type_error("argument must be an int, or have a fileno() method."))?;
             match interp.call_object(meth, &[], &[])? {
                 Object::Int(n) => n,
                 Object::Bool(b) => i64::from(b),

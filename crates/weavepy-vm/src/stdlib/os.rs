@@ -307,6 +307,14 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("get_terminal_size", os_get_terminal_size),
         );
         d.insert(
+            DictKey(Object::from_static("uname")),
+            builtin("uname", os_uname),
+        );
+        d.insert(
+            DictKey(Object::from_static("uname_result")),
+            Object::Type(uname_result_type()),
+        );
+        d.insert(
             DictKey(Object::from_static("cpu_count")),
             builtin("cpu_count", os_cpu_count),
         );
@@ -449,6 +457,58 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(DictKey(Object::from_static("EX_SOFTWARE")), Object::Int(70));
         d.insert(DictKey(Object::from_static("EX_OSERR")), Object::Int(71));
         d.insert(DictKey(Object::from_static("EX_IOERR")), Object::Int(74));
+        // macOS `fcopyfile(3)` fast clone. CPython exposes `posix._fcopyfile`
+        // plus the `_COPYFILE_*` flag bits; `shutil.copyfile` uses them for a
+        // zero-copy reflink on APFS/HFS+ (`test_shutil.TestZeroCopyMACOS`, and
+        // the `_HAS_FCOPYFILE` fast path in the bundled `shutil`).
+        #[cfg(target_os = "macos")]
+        {
+            d.insert(
+                DictKey(Object::from_static("_fcopyfile")),
+                builtin("_fcopyfile", os_fcopyfile),
+            );
+            d.insert(
+                DictKey(Object::from_static("_COPYFILE_ACL")),
+                Object::Int(1),
+            );
+            d.insert(
+                DictKey(Object::from_static("_COPYFILE_STAT")),
+                Object::Int(2),
+            );
+            d.insert(
+                DictKey(Object::from_static("_COPYFILE_XATTR")),
+                Object::Int(4),
+            );
+            d.insert(
+                DictKey(Object::from_static("_COPYFILE_DATA")),
+                Object::Int(8),
+            );
+        }
+
+        // NOTE: `os.pathconf`/`os.fpathconf`/`os.pathconf_names` are
+        // intentionally deferred to the WS1 (os/posix) `dir_fd` work. Exposing
+        // `PC_PATH_MAX` alone lets `tarfile`'s `test_realpath_limit_attack`
+        // (CVE-2025-4517 regression) build a near-PATH_MAX symlink/dir tree
+        // that WeavePy can only clean up once `shutil.rmtree` can take its
+        // fd-based path (`os.{open,stat,unlink,rmdir}` with `dir_fd` +
+        // `os.scandir(fd)`); until then it would leave un-removable debris that
+        // cascades into other tests. Land `pathconf` together with `dir_fd`.
+
+        // `os.supports_follow_symlinks` must hold the *function objects* that
+        // honour `follow_symlinks=` — `shutil.copystat`/`copy2` and `tempfile`
+        // test membership (`fn in os.supports_follow_symlinks`) and fall back to
+        // a no-op (returning `None`) otherwise. WeavePy's `stat`/`chmod`/`utime`
+        // all thread the keyword through to `*at(AT_SYMLINK_NOFOLLOW)`, so
+        // advertise exactly those (CPython lists more, but we only claim what we
+        // faithfully implement).
+        let follow_objs: Vec<Object> = ["stat", "chmod", "utime"]
+            .iter()
+            .filter_map(|n| d.get(&DictKey(Object::from_static(n))).cloned())
+            .collect();
+        d.insert(
+            DictKey(Object::from_static("supports_follow_symlinks")),
+            Object::new_set_from(follow_objs),
+        );
     }
     Rc::new(PyModule {
         name: "os".to_owned(),
@@ -720,7 +780,9 @@ fn os_putenv(args: &[Object]) -> Result<Object, RuntimeError> {
         // (which passes the inherited environ) carries the change into the
         // child — exactly what `os.putenv` promises.
         if unsafe { libc::setenv(name.as_ptr(), value.as_ptr(), 1) } != 0 {
-            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         Ok(Object::None)
     }
@@ -738,7 +800,9 @@ fn os_unsetenv(args: &[Object]) -> Result<Object, RuntimeError> {
     {
         let name = env_cstring(args.first(), "name")?;
         if unsafe { libc::unsetenv(name.as_ptr()) } != 0 {
-            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         Ok(Object::None)
     }
@@ -757,7 +821,7 @@ fn os_getpid(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn os_remove(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "remove")?;
-    std::fs::remove_file(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    std::fs::remove_file(&p).map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
     Ok(Object::None)
 }
 
@@ -822,13 +886,26 @@ fn os_makedirs_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
             }
         }
     }
+    // CPython's `makedirs` ends with a bare `mkdir(name)` on the leaf, so an
+    // already-existing target raises `FileExistsError` unless `exist_ok=True`
+    // (`shutil.copytree(dirs_exist_ok=False)` relies on this). Rust's
+    // `create_dir_all` is happy when the leaf exists, so reproduce the check
+    // ourselves before delegating.
+    if !exist_ok && std::fs::symlink_metadata(&p).is_ok() {
+        // EEXIST is 17 on Linux/macOS/Windows; spelled as a literal so this
+        // (non-`cfg`-gated) helper stays portable.
+        return Err(crate::error::io_error_to_py_named(
+            &std::io::Error::from_raw_os_error(17),
+            Some(&p),
+        ));
+    }
     match std::fs::create_dir_all(&p) {
         Ok(()) => Ok(Object::None),
         Err(e) => {
             if exist_ok && std::path::Path::new(&p).is_dir() {
                 Ok(Object::None)
             } else {
-                Err(crate::error::io_error_to_py(&e))
+                Err(crate::error::io_error_to_py_named(&e, Some(&p)))
             }
         }
     }
@@ -836,14 +913,15 @@ fn os_makedirs_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
 
 fn os_rmdir(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "rmdir")?;
-    std::fs::remove_dir(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    std::fs::remove_dir(&p).map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
     Ok(Object::None)
 }
 
 fn os_rename(args: &[Object]) -> Result<Object, RuntimeError> {
     let src = first_path(args, "rename")?;
     let dst = nth_path(args, 1, "rename")?;
-    std::fs::rename(&src, &dst).map_err(|e| crate::error::io_error_to_py(&e))?;
+    std::fs::rename(&src, &dst)
+        .map_err(|e| crate::error::io_error_to_py_named2(&e, Some(&src), Some(&dst)))?;
     Ok(Object::None)
 }
 
@@ -860,7 +938,7 @@ fn os_listdir(args: &[Object]) -> Result<Object, RuntimeError> {
     let iter =
         std::fs::read_dir(&p).map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
     for entry in iter {
-        let entry = entry.map_err(|e| crate::error::io_error_to_py(&e))?;
+        let entry = entry.map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
         let name = entry.file_name();
         if want_bytes {
             out.push(Object::new_bytes(
@@ -992,6 +1070,46 @@ fn os_open_stub(_args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
+/// `posix._fcopyfile(in_fd, out_fd, flags)` — macOS-only wrapper over
+/// `fcopyfile(3)`, mirroring CPython's `os__fcopyfile_impl`. `shutil`'s
+/// `_fastcopy_fcopyfile` calls this with two file descriptors and a
+/// `_COPYFILE_*` flag mask for a copy-on-write clone on APFS/HFS+.
+#[cfg(target_os = "macos")]
+fn os_fcopyfile(args: &[Object]) -> Result<Object, RuntimeError> {
+    extern "C" {
+        fn fcopyfile(
+            from: libc::c_int,
+            to: libc::c_int,
+            state: *mut libc::c_void,
+            flags: u32,
+        ) -> libc::c_int;
+    }
+    let in_fd = args
+        .first()
+        .and_then(crate::object::Object::as_i64)
+        .ok_or_else(|| crate::error::type_error("_fcopyfile() in_fd must be an int".to_owned()))?
+        as libc::c_int;
+    let out_fd = args
+        .get(1)
+        .and_then(crate::object::Object::as_i64)
+        .ok_or_else(|| crate::error::type_error("_fcopyfile() out_fd must be an int".to_owned()))?
+        as libc::c_int;
+    let flags = args
+        .get(2)
+        .and_then(crate::object::Object::as_i64)
+        .ok_or_else(|| crate::error::type_error("_fcopyfile() flags must be an int".to_owned()))?
+        as u32;
+    // SAFETY: `in_fd`/`out_fd` are caller-supplied descriptors; a NULL
+    // `copyfile_state_t` is the documented "no state" form.
+    let rc = unsafe { fcopyfile(in_fd, out_fd, std::ptr::null_mut(), flags) };
+    if rc < 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(Object::None)
+}
+
 /// `os.fdopen(fd, mode='r', ...)` — wrap an existing OS file descriptor in a
 /// file object (CPython returns `io.open(fd, ...)`). WeavePy adopts the fd
 /// into a `Disk`-backed `PyFile`, so `read`/`write`/`seek`/`fileno` work and
@@ -1045,7 +1163,7 @@ fn os_stat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     } else {
         std::fs::symlink_metadata(&p)
     }
-    .map_err(|e| crate::error::io_error_to_py(&e))?;
+    .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
     Ok(stat_result_from_meta(&meta))
 }
 
@@ -1121,7 +1239,8 @@ fn os_fstat(args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_lstat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     reject_dir_fd(kwargs, "lstat")?;
     let p = first_path(args, "lstat")?;
-    let meta = std::fs::symlink_metadata(&p).map_err(|e| crate::error::io_error_to_py(&e))?;
+    let meta = std::fs::symlink_metadata(&p)
+        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
     Ok(stat_result_from_meta(&meta))
 }
 
@@ -1311,7 +1430,8 @@ fn os_readlink(args: &[Object]) -> Result<Object, RuntimeError> {
     if pstr.as_bytes().contains(&0) {
         return Err(value_error("embedded null byte"));
     }
-    let t = std::fs::read_link(&pstr).map_err(|e| crate::error::io_error_to_py(&e))?;
+    let t = std::fs::read_link(&pstr)
+        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&pstr)))?;
     if want_bytes {
         use std::os::unix::ffi::OsStringExt;
         return Ok(Object::new_bytes(t.into_os_string().into_vec()));
@@ -1366,8 +1486,7 @@ fn os_chdir(args: &[Object]) -> Result<Object, RuntimeError> {
     // Attach the offending path so the raised OSError carries `.filename`
     // (CPython does this for path syscalls; subprocess's bad-cwd tests compare
     // `os.chdir(bad).filename` against the error surfaced from the child).
-    std::env::set_current_dir(&p)
-        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+    std::env::set_current_dir(&p).map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
     Ok(Object::None)
 }
 
@@ -1838,7 +1957,7 @@ fn dir_entry_stat(fs_path: &str, follow: bool) -> Result<Object, RuntimeError> {
     } else {
         std::fs::symlink_metadata(fs_path)
     }
-    .map_err(|e| crate::error::io_error_to_py(&e))?;
+    .map_err(|e| crate::error::io_error_to_py_named(&e, Some(fs_path)))?;
     Ok(stat_result_from_meta(&meta))
 }
 
@@ -2125,10 +2244,12 @@ fn os_dup2(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
     // CPython's `os.dup2(fd, fd2, inheritable=True)` — `dup2` itself produces
     // an inheritable (CLOEXEC-clear) descriptor, so we only have to *set*
     // close-on-exec afterward when the caller asks for a non-inheritable copy.
-    let inheritable = match args
-        .get(2)
-        .or_else(|| kwargs.iter().find(|(k, _)| k == "inheritable").map(|(_, v)| v))
-    {
+    let inheritable = match args.get(2).or_else(|| {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == "inheritable")
+            .map(|(_, v)| v)
+    }) {
         None => true,
         Some(Object::Bool(b)) => *b,
         Some(Object::Int(n)) => *n != 0,
@@ -2209,9 +2330,11 @@ fn os_ftruncate(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("ftruncate() length must be int")),
     };
     if length < 0 {
-        return Err(crate::error::io_error_to_py(&std::io::Error::from_raw_os_error(
-            22, // EINVAL
-        )));
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::from_raw_os_error(
+                22, // EINVAL
+            ),
+        ));
     }
     #[cfg(unix)]
     {
@@ -2341,8 +2464,7 @@ fn os_read(args: &[Object]) -> Result<Object, RuntimeError> {
         // Honour PEP 475: on `EINTR` run the tripped Python signal handler
         // before retrying (a handler that raises abandons the read).
         loop {
-            let r =
-                crate::gil::allow_threads_then(|| unsafe { libc::read(fd, ptr.cast(), n) });
+            let r = crate::gil::allow_threads_then(|| unsafe { libc::read(fd, ptr.cast(), n) });
             if r < 0 {
                 // Carry errno so callers see the right subclass — e.g.
                 // `BlockingIOError` (EAGAIN) on a non-blocking fd and
@@ -2432,6 +2554,47 @@ fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
             "os.write() is only implemented on POSIX in WeavePy",
         ))
     }
+}
+
+/// `os.uname()` — host identification via `uname(2)`, returned as an
+/// `os.uname_result` struct sequence. `platform.uname()`/`platform.mac_ver()`
+/// (and thus `@support.requires_mac_ver`, `test_shutil.test_tarfile_vs_tar`)
+/// read `.sysname`/`.release`/`.machine`.
+#[cfg(unix)]
+fn os_uname(_args: &[Object]) -> Result<Object, RuntimeError> {
+    // SAFETY: `uname` fills the zeroed `utsname`; we only read it afterwards.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&raw mut uts) } != 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    fn field(arr: &[libc::c_char]) -> Object {
+        let bytes: Vec<u8> = arr
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        Object::from_str(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    Ok(struct_seq_instance(
+        uname_result_type(),
+        &UNAME_FIELDS,
+        vec![
+            field(&uts.sysname),
+            field(&uts.nodename),
+            field(&uts.release),
+            field(&uts.version),
+            field(&uts.machine),
+        ],
+    ))
+}
+
+#[cfg(not(unix))]
+fn os_uname(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(crate::error::not_implemented_error(
+        "os.uname() is only available on POSIX in WeavePy",
+    ))
 }
 
 /// `os.get_terminal_size(fd=STDOUT_FILENO)` — query the controlling tty's
@@ -2525,16 +2688,21 @@ fn id_arg(args: &[Object], idx: usize, what: &str) -> Result<u32, RuntimeError> 
     let value = match args.get(idx) {
         Some(Object::Bool(b)) => i64::from(*b),
         Some(Object::Int(i)) => *i,
-        Some(other) => other
-            .as_i64()
-            .ok_or_else(|| type_error(format!("{what} should be integer, not {}", other.type_name())))?,
+        Some(other) => other.as_i64().ok_or_else(|| {
+            type_error(format!(
+                "{what} should be integer, not {}",
+                other.type_name()
+            ))
+        })?,
         None => return Err(type_error(format!("{what} should be integer"))),
     };
     if value == -1 {
         return Ok(u32::MAX);
     }
     if value < 0 || value > i64::from(u32::MAX) {
-        return Err(crate::error::overflow_error(format!("{what} is not in range")));
+        return Err(crate::error::overflow_error(format!(
+            "{what} is not in range"
+        )));
     }
     Ok(value as u32)
 }
@@ -2543,7 +2711,9 @@ fn id_arg(args: &[Object], idx: usize, what: &str) -> Result<u32, RuntimeError> 
 fn os_setuid(args: &[Object]) -> Result<Object, RuntimeError> {
     let uid = id_arg(args, 0, "uid")?;
     if unsafe { libc::setuid(uid as libc::uid_t) } != 0 {
-        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
     }
     Ok(Object::None)
 }
@@ -2552,7 +2722,9 @@ fn os_setuid(args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_setgid(args: &[Object]) -> Result<Object, RuntimeError> {
     let gid = id_arg(args, 0, "gid")?;
     if unsafe { libc::setgid(gid as libc::gid_t) } != 0 {
-        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
     }
     Ok(Object::None)
 }
@@ -2561,7 +2733,9 @@ fn os_setgid(args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_seteuid(args: &[Object]) -> Result<Object, RuntimeError> {
     let uid = id_arg(args, 0, "uid")?;
     if unsafe { libc::seteuid(uid as libc::uid_t) } != 0 {
-        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
     }
     Ok(Object::None)
 }
@@ -2570,7 +2744,9 @@ fn os_seteuid(args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_setegid(args: &[Object]) -> Result<Object, RuntimeError> {
     let gid = id_arg(args, 0, "gid")?;
     if unsafe { libc::setegid(gid as libc::gid_t) } != 0 {
-        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
     }
     Ok(Object::None)
 }
@@ -2590,7 +2766,9 @@ fn os_setreuid(args: &[Object]) -> Result<Object, RuntimeError> {
     let ruid = id_arg_or_keep(args, 0, "ruid")?;
     let euid = id_arg_or_keep(args, 1, "euid")?;
     if unsafe { libc::setreuid(ruid, euid) } != 0 {
-        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
     }
     Ok(Object::None)
 }
@@ -2600,7 +2778,9 @@ fn os_setregid(args: &[Object]) -> Result<Object, RuntimeError> {
     let rgid = id_arg_or_keep(args, 0, "rgid")? as libc::gid_t;
     let egid = id_arg_or_keep(args, 1, "egid")? as libc::gid_t;
     if unsafe { libc::setregid(rgid, egid) } != 0 {
-        return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
     }
     Ok(Object::None)
 }
@@ -2640,7 +2820,8 @@ fn os_symlink(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     }
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(&src, &dst).map_err(|e| crate::error::io_error_to_py(&e))?;
+        std::os::unix::fs::symlink(&src, &dst)
+            .map_err(|e| crate::error::io_error_to_py_named2(&e, Some(&src), Some(&dst)))?;
         Ok(Object::None)
     }
     #[cfg(not(unix))]
@@ -2655,7 +2836,8 @@ fn os_symlink(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
 fn os_link(args: &[Object]) -> Result<Object, RuntimeError> {
     let src = first_path(args, "link")?;
     let dst = nth_path(args, 1, "link")?;
-    std::fs::hard_link(&src, &dst).map_err(|e| crate::error::io_error_to_py(&e))?;
+    std::fs::hard_link(&src, &dst)
+        .map_err(|e| crate::error::io_error_to_py_named2(&e, Some(&src), Some(&dst)))?;
     Ok(Object::None)
 }
 
@@ -2689,17 +2871,19 @@ fn os_chmod(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
                 )
             };
             if rc != 0 {
-                return Err(crate::error::io_error_to_py(
+                return Err(crate::error::io_error_to_py_named(
                     &std::io::Error::last_os_error(),
+                    Some(&p),
                 ));
             }
             return Ok(Object::None);
         }
         let mut perms = std::fs::metadata(&p)
-            .map_err(|e| crate::error::io_error_to_py(&e))?
+            .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?
             .permissions();
         perms.set_mode(mode);
-        std::fs::set_permissions(&p, perms).map_err(|e| crate::error::io_error_to_py(&e))?;
+        std::fs::set_permissions(&p, perms)
+            .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
         Ok(Object::None)
     }
     #[cfg(not(unix))]
@@ -2756,8 +2940,9 @@ fn os_utime(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
         // SAFETY: `cpath` and `specs` outlive the call; `utimensat` only reads them.
         let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), specs.as_ptr(), flags) };
         if rc != 0 {
-            return Err(crate::error::io_error_to_py(
+            return Err(crate::error::io_error_to_py_named(
                 &std::io::Error::last_os_error(),
+                Some(&p),
             ));
         }
         Ok(Object::None)
@@ -3145,7 +3330,7 @@ fn struct_seq_reduce(
                 Object::Str(s) => {
                     let ks = s.to_string();
                     let ks = ks.as_str();
-                    !fields.iter().any(|f| *f == ks)
+                    !fields.contains(&ks)
                         || matches!(ks, "st_atime" | "st_mtime" | "st_ctime")
                 }
                 _ => true,
@@ -3246,6 +3431,15 @@ fn make_terminal_size(columns: i64, lines: i64) -> Object {
         &["columns", "lines"],
         vec![Object::Int(columns), Object::Int(lines)],
     )
+}
+
+/// Field names for `os.uname_result` (CPython's `posix.uname_result`).
+const UNAME_FIELDS: [&str; 5] = ["sysname", "nodename", "release", "version", "machine"];
+
+/// `os.uname_result` — the 5-field struct sequence returned by `os.uname()`
+/// (`platform.uname`/`mac_ver` read `.machine`, `.release`, `.sysname`).
+fn uname_result_type() -> Rc<crate::types::TypeObject> {
+    struct_seq_type("uname_result", "os", &UNAME_FIELDS)
 }
 
 // ---------- os.path ----------

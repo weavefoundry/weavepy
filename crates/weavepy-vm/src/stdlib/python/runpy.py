@@ -142,7 +142,11 @@ def run_module(mod_name, init_globals=None, run_name=None, alter_sys=False):
         frozen_source = None
         getter = getattr(sys, "_get_frozen_source", None)
         if getter is not None:
-            frozen_source = getter(mod_name)
+            # Use the *resolved* name, not the original argument: running a
+            # frozen package (`-m zipfile`) redirects to `<pkg>.__main__`, so
+            # we must fetch that submodule's source rather than re-running the
+            # package `__init__`.
+            frozen_source = getter(name)
         if frozen_source is not None:
             source = frozen_source
             # A frozen module has no real path; synthesise a CPython-like

@@ -194,6 +194,10 @@ fn lookup_encoding(name: &str) -> Option<&'static Encoding> {
         "big5" | "csbig5" => Encoding::for_label(b"big5"),
         "euckr" | "ksc56011987" => Encoding::for_label(b"euc-kr"),
         "eucjp" | "ujis" => Encoding::for_label(b"euc-jp"),
+        // KOI8 Cyrillic — `encoding_rs` knows these, but only under the
+        // hyphenated WHATWG labels our normaliser strips.
+        "koi8r" | "cskoi8r" => Encoding::for_label(b"koi8-r"),
+        "koi8u" => Encoding::for_label(b"koi8-u"),
         _ => Encoding::for_label(normalised.as_bytes()),
     }
 }
@@ -316,6 +320,7 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
         "rawunicodeescape" => Some(encode_raw_unicode_escape(s)),
         "unicodeescape" => Some(encode_unicode_escape(s)),
         "cp437" | "437" | "ibm437" => Some(encode_cp437(s, errors)?),
+        "utf7" => Some(encode_utf7(s)),
         _ => None,
     })
 }
@@ -330,9 +335,7 @@ fn decode_special(
         "utf8" => Some(decode_utf8(bytes, errors)?),
         "utf8sig" => {
             // Strip a single leading UTF-8 BOM if present, then decode.
-            let body = bytes
-                .strip_prefix(&[0xEF, 0xBB, 0xBF][..])
-                .unwrap_or(bytes);
+            let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
             Some(decode_utf8(body, errors)?)
         }
         "ascii" => Some(decode_ascii(bytes, errors)?),
@@ -346,6 +349,7 @@ fn decode_special(
         "rawunicodeescape" => Some(decode_raw_unicode_escape(bytes)?),
         "unicodeescape" => Some(decode_unicode_escape(bytes)?),
         "cp437" | "437" | "ibm437" => Some(decode_cp437(bytes)),
+        "utf7" => Some(decode_utf7(bytes, errors)?),
         _ => None,
     })
 }
@@ -408,6 +412,261 @@ fn encode_cp437(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
                 }
             }
         }
+    }
+    Ok(out)
+}
+
+// ---------- UTF-7 (RFC 2152) ----------
+//
+// `encoding_rs` has no UTF-7, but real code drives it (e.g. `tarfile` opened
+// with `encoding='utf7'`). Ported faithfully from CPython 3.13's
+// `_PyUnicode_EncodeUTF7` / `PyUnicode_DecodeUTF7Stateful`
+// (Objects/unicodeobject.c). The stateless codec encodes the modified-Base64
+// shifted sequences over UTF-16 code units. Because WeavePy's `str` is strict
+// UTF-8, lone surrogates produced by malformed input become U+FFFD (the same
+// concession the UTF-8 surrogateescape path makes).
+
+const UTF7_BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// CPython `utf7_category`: 0=Set D, 1=Set O, 2=whitespace, 3=must-base64.
+#[rustfmt::skip]
+const UTF7_CATEGORY: [u8; 128] = [
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 3, 3, 2, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    2, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 3, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 1, 1, 1,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 3, 3,
+];
+
+#[inline]
+fn utf7_is_base64(c: u32) -> bool {
+    if c > 127 {
+        return false;
+    }
+    let b = c as u8;
+    b.is_ascii_uppercase() || b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'+' || b == b'/'
+}
+
+#[inline]
+fn utf7_from_base64(c: u32) -> u64 {
+    let b = c as u8;
+    if b.is_ascii_uppercase() {
+        u64::from(b - b'A')
+    } else if b.is_ascii_lowercase() {
+        u64::from(b - b'a') + 26
+    } else if b.is_ascii_digit() {
+        u64::from(b - b'0') + 52
+    } else if b == b'+' {
+        62
+    } else {
+        63
+    }
+}
+
+#[inline]
+fn utf7_to_base64(n: u64) -> u8 {
+    UTF7_BASE64[(n & 0x3f) as usize]
+}
+
+/// `DECODE_DIRECT`: an ASCII byte (other than `+`) that decodes as itself.
+#[inline]
+fn utf7_decode_direct(c: u32) -> bool {
+    c <= 127 && c != u32::from(b'+')
+}
+
+/// `ENCODE_DIRECT(c, directO=1, directWS=1)` — the Python codec passes
+/// `base64SetO=0`/`base64WhiteSpace=0`, so every ASCII char outside category 3
+/// is emitted literally.
+#[inline]
+fn utf7_encode_direct(c: u32) -> bool {
+    c > 0 && c < 128 && UTF7_CATEGORY[c as usize] != 3
+}
+
+/// Push a (possibly surrogate) code point; WeavePy `str` can't hold lone
+/// surrogates, so they degrade to U+FFFD (see module note).
+#[inline]
+fn utf7_push(out: &mut String, cp: u32) {
+    out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+}
+
+fn encode_utf7(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut in_shift = false;
+    let mut base64bits: u32 = 0;
+    let mut base64buffer: u64 = 0;
+    for c in s.chars() {
+        let mut ch = c as u32;
+        if in_shift {
+            if utf7_encode_direct(ch) {
+                if base64bits > 0 {
+                    out.push(utf7_to_base64(base64buffer << (6 - base64bits)));
+                    base64buffer = 0;
+                    base64bits = 0;
+                }
+                in_shift = false;
+                if utf7_is_base64(ch) || ch == u32::from(b'-') {
+                    out.push(b'-');
+                }
+                out.push(ch as u8);
+                continue;
+            }
+            // else: fall through to encode_char.
+        } else if ch == u32::from(b'+') {
+            out.push(b'+');
+            out.push(b'-');
+            continue;
+        } else if utf7_encode_direct(ch) {
+            out.push(ch as u8);
+            continue;
+        } else {
+            out.push(b'+');
+            in_shift = true;
+            // fall through to encode_char.
+        }
+        // encode_char: accumulate UTF-16 code unit(s) into the base64 buffer.
+        if ch >= 0x10000 {
+            let v = ch - 0x10000;
+            let hi = 0xD800 + (v >> 10);
+            base64bits += 16;
+            base64buffer = (base64buffer << 16) | u64::from(hi);
+            while base64bits >= 6 {
+                out.push(utf7_to_base64(base64buffer >> (base64bits - 6)));
+                base64bits -= 6;
+            }
+            ch = 0xDC00 + (v & 0x3FF);
+        }
+        base64bits += 16;
+        base64buffer = (base64buffer << 16) | u64::from(ch);
+        while base64bits >= 6 {
+            out.push(utf7_to_base64(base64buffer >> (base64bits - 6)));
+            base64bits -= 6;
+        }
+    }
+    if base64bits > 0 {
+        out.push(utf7_to_base64(base64buffer << (6 - base64bits)));
+    }
+    if in_shift {
+        out.push(b'-');
+    }
+    out
+}
+
+fn decode_utf7(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
+    let mut out = String::with_capacity(bytes.len());
+    let mut in_shift = false;
+    let mut base64bits: u32 = 0;
+    let mut base64buffer: u64 = 0;
+    let mut surrogate: u32 = 0;
+    let e = bytes.len();
+    let mut s = 0usize;
+
+    // Apply the configured error handler to a decode error spanning
+    // `start..end`. Returns `Err` for strict; otherwise substitutes
+    // (`replace`) or drops (`ignore`/others) and lets scanning continue.
+    macro_rules! utf7_error {
+        ($start:expr, $end:expr, $reason:expr) => {{
+            match errors {
+                "ignore" => {}
+                _ => {
+                    if errors == "strict" {
+                        return Err(crate::error::unicode_decode_error(
+                            "utf7", bytes, $start, $end, $reason,
+                        ));
+                    }
+                    // `replace`, `backslashreplace`, etc. — best-effort U+FFFD.
+                    out.push('\u{FFFD}');
+                }
+            }
+        }};
+    }
+
+    while s < e {
+        let ch = u32::from(bytes[s]);
+        if in_shift {
+            if utf7_is_base64(ch) {
+                base64buffer = (base64buffer << 6) | utf7_from_base64(ch);
+                base64bits += 6;
+                s += 1;
+                if base64bits >= 16 {
+                    let out_ch = ((base64buffer >> (base64bits - 16)) & 0xFFFF) as u32;
+                    base64bits -= 16;
+                    base64buffer &= (1u64 << base64bits) - 1;
+                    if surrogate != 0 {
+                        if (0xDC00..=0xDFFF).contains(&out_ch) {
+                            let joined = 0x10000 + ((surrogate - 0xD800) << 10) + (out_ch - 0xDC00);
+                            utf7_push(&mut out, joined);
+                            surrogate = 0;
+                            continue;
+                        }
+                        utf7_push(&mut out, surrogate);
+                        surrogate = 0;
+                    }
+                    if (0xD800..=0xDBFF).contains(&out_ch) {
+                        surrogate = out_ch;
+                    } else {
+                        utf7_push(&mut out, out_ch);
+                    }
+                }
+            } else {
+                // Leaving a base-64 section.
+                in_shift = false;
+                if base64bits >= 6 {
+                    let start = s;
+                    s += 1;
+                    utf7_error!(start, s, "partial character in shift sequence");
+                    base64bits = 0;
+                    base64buffer = 0;
+                    surrogate = 0;
+                    continue;
+                } else if base64bits > 0 && base64buffer != 0 {
+                    let start = s;
+                    s += 1;
+                    utf7_error!(start, s, "non-zero padding bits in shift sequence");
+                    base64bits = 0;
+                    base64buffer = 0;
+                    surrogate = 0;
+                    continue;
+                }
+                if surrogate != 0 && utf7_decode_direct(ch) {
+                    utf7_push(&mut out, surrogate);
+                }
+                surrogate = 0;
+                base64bits = 0;
+                base64buffer = 0;
+                if ch == u32::from(b'-') {
+                    s += 1;
+                }
+            }
+        } else if ch == u32::from(b'+') {
+            let start = s;
+            s += 1;
+            if s < e && bytes[s] == b'-' {
+                s += 1;
+                out.push('+');
+            } else if s < e && !utf7_is_base64(u32::from(bytes[s])) {
+                s += 1;
+                utf7_error!(start, s, "ill-formed sequence");
+            } else {
+                in_shift = true;
+                surrogate = 0;
+                base64bits = 0;
+                base64buffer = 0;
+            }
+        } else if utf7_decode_direct(ch) {
+            s += 1;
+            out.push(ch as u8 as char);
+        } else {
+            let start = s;
+            s += 1;
+            utf7_error!(start, s, "unexpected special character");
+        }
+    }
+
+    if in_shift && (surrogate != 0 || base64bits >= 6 || (base64bits > 0 && base64buffer != 0)) {
+        utf7_error!(s, e, "unterminated shift sequence");
     }
     Ok(out)
 }

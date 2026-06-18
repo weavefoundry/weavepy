@@ -359,6 +359,13 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/calendar.py"),
             is_package: false,
         },
+        // RFC 0040 WS8 — `time.strptime` delegates here, exactly as
+        // CPython's `timemodule.c` does (`_strptime._strptime_time`).
+        FrozenSource {
+            name: "_strptime",
+            source: include_str!("python/_strptime.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "contextlib",
             source: include_str!("python/contextlib.py"),
@@ -1208,9 +1215,31 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/lzma.py"),
             is_package: false,
         },
+        // RFC 0040 WS8 — `zipfile` is CPython 3.13's faithful package
+        // (`zipfile/__init__.py` + the `zipfile._path` Path accessor), not
+        // the old custom single-module shim. Bundled verbatim and frozen as
+        // a package so `zipfile.Path`, `PyZipFile`, ZIP64, per-file
+        // compression, `mkdir`, `testzip`, etc. all work.
         FrozenSource {
             name: "zipfile",
             source: include_str!("python/zipfile.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "zipfile._path",
+            source: include_str!("python/zipfile__path.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "zipfile._path.glob",
+            source: include_str!("python/zipfile__path_glob.py"),
+            is_package: false,
+        },
+        // `python -m zipfile` runs the package's `__main__` (runpy redirects
+        // `<pkg>` -> `<pkg>.__main__`); ship it so the CLI works.
+        FrozenSource {
+            name: "zipfile.__main__",
+            source: include_str!("python/zipfile__main__.py"),
             is_package: false,
         },
         FrozenSource {

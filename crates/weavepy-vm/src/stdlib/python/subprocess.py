@@ -496,7 +496,16 @@ class Popen:
 
     def _resolve_user(self, user):
         if isinstance(user, int):
-            return user
+            # Mirror CPython's `_Py_Uid_Converter`: uid_t is an unsigned 32-bit
+            # integer, validated in the *parent* before the fork. A value past
+            # the type's range overflows (`user=2**64` -> OverflowError); an
+            # out-of-range value such as -1 raises ValueError, rather than
+            # being handed to setuid() in the child and failing with EPERM.
+            if user > 2 ** 32 - 1:
+                raise OverflowError("user id is greater than maximum")
+            if user < 0:
+                raise ValueError("user id is not within the allowed range")
+            return int(user)
         if isinstance(user, str):
             try:
                 import pwd
@@ -750,7 +759,12 @@ class Popen:
                     # The failure was the child's chdir(cwd), so the offending
                     # filename the parent reports is the cwd (test_exception_cwd).
                     err_filename = cwd
-                elif err_msg == "noexec":
+                elif err_msg.startswith("noexec"):
+                    # A pre-exec setup step failed (setuid/setgid/setpgid): the
+                    # child never reached exec, so the error is about the
+                    # privilege operation, not the executable file. Report no
+                    # filename — `test_user` asserts PermissionError.filename is
+                    # None for an EPERM setuid on a non-root host.
                     err_msg = ""
                     err_filename = None
                 else:
@@ -1065,7 +1079,12 @@ class Popen:
             if _f is not None:
                 try:
                     os.set_blocking(_f.fileno(), False)
-                except (OSError, ValueError):
+                except (OSError, ValueError, TypeError):
+                    # A test may replace a std stream with a mock whose
+                    # fileno() is not a real descriptor (test_communicate_
+                    # BrokenPipeError_stdin_close_with_timeout); making the
+                    # pipe non-blocking is a best-effort fast-path, so a
+                    # bogus fileno is simply skipped rather than fatal.
                     pass
 
         # Track the payload through a byte-oriented view so the offset, the

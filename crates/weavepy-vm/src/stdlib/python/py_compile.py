@@ -48,27 +48,51 @@ def cache_from_source(path, optimization=""):
 
 def compile(file, cfile=None, dfile=None, doraise=False, optimize=-1,
             invalidation_mode=None, quiet=0):
-    """Byte-compile *file* into a ``.pyc`` next to it (or in cfile)."""
+    """Byte-compile *file* into a ``.pyc`` next to it (or in cfile).
+
+    Mirrors CPython's ``py_compile.compile``: read the source, compile it
+    with the built-in compiler at the requested optimization level (wrapping
+    any compile error in :class:`PyCompileError`), then write the PEP-552
+    timestamp ``.pyc`` framing the WeavePy loader understands.
+    """
+    import builtins
     if cfile is None:
-        cfile = _cache_from_source(file)
+        if optimize >= 0:
+            opt = "" if optimize == 0 else optimize
+            cfile = _cache_from_source(file, optimization=opt)
+        else:
+            cfile = _cache_from_source(file)
     try:
         with open(file, "r", encoding="utf-8") as f:
             source = f.read()
         st = os.stat(file)
         mtime = int(st.st_mtime)
         size = int(st.st_size)
-        # The actual compile step is provided by the CLI via the
-        # ``__weavepy_compile__`` builtin; we delegate when present
-        # and fall back to a stub when running under the standalone
-        # interpreter without a compile entrypoint.
-        compile_fn = globals().get("__weavepy_compile__")
-        if compile_fn is None:
-            raise PyCompileError(
-                "RuntimeError",
-                "py_compile requires the WeavePy CLI",
-                file,
-            )
-        code = compile_fn(source, file, "exec")
+    except OSError as e:
+        if doraise:
+            raise PyCompileError(type(e).__name__, e, file)
+        if quiet < 2:
+            print("py_compile: skipping %r: %s" % (file, e))
+        return None
+    # The real compile step is the interpreter's built-in `compile`, exactly
+    # as CPython's `SourceFileLoader.source_to_code` ultimately calls. A
+    # SyntaxError (etc.) is reported as a PyCompileError so callers like
+    # `zipfile.PyZipFile` can fall back to shipping the raw `.py`.
+    try:
+        code = builtins.compile(source, dfile or file, "exec", optimize=optimize)
+    except Exception as err:
+        py_exc = PyCompileError(
+            type(err).__name__,
+            err,
+            dfile or file,
+            "%s: %s" % (type(err).__name__, err),
+        )
+        if doraise:
+            raise py_exc
+        if quiet < 2:
+            print(py_exc.msg)
+        return None
+    try:
         os.makedirs(os.path.dirname(cfile), exist_ok=True)
         with open(cfile, "wb") as f:
             f.write(MAGIC_NUMBER)
@@ -76,13 +100,13 @@ def compile(file, cfile=None, dfile=None, doraise=False, optimize=-1,
             f.write(struct.pack("<I", mtime & 0xFFFFFFFF))
             f.write(struct.pack("<I", size & 0xFFFFFFFF))
             f.write(marshal.dumps(code))
-        return cfile
     except OSError as e:
         if doraise:
             raise PyCompileError(type(e).__name__, e, file)
         if quiet < 2:
             print("py_compile: skipping %r: %s" % (file, e))
         return None
+    return cfile
 
 
 def main(args=None):

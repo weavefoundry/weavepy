@@ -499,10 +499,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // `sys._base_executable` mirrors `sys.executable` outside a venv
         // (CPython sets it to the real interpreter; `test_os.PidTests` and
         // `subprocess` reach for it when re-launching the interpreter).
-        d.insert(
-            DictKey(Object::from_static("_base_executable")),
-            executable,
-        );
+        d.insert(DictKey(Object::from_static("_base_executable")), executable);
         d.insert(
             DictKey(Object::from_static("implementation")),
             implementation_value(),

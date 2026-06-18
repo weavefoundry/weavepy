@@ -52,6 +52,48 @@ def _escape(s):
     )
 
 
+def _iterfind(elem, path):
+    """A small subset of ElementPath sufficient for the bundled stdlib.
+
+    Supports ``.`` (self), a leading ``./``, the ``*`` child wildcard, exact
+    tag steps, ``/``-separated multi-step paths, and the ``//`` descendant
+    axis (e.g. ``.//tag``). Predicates (``[...]``) are not implemented.
+    """
+    if not path:
+        return
+    if path == ".":
+        yield elem
+        return
+    if path.startswith("./"):
+        path = path[2:]
+    # Split into steps; an empty step (from "//") means "descendant axis".
+    steps = path.split("/")
+
+    def walk(node, steps):
+        if not steps:
+            yield node
+            return
+        step, rest = steps[0], steps[1:]
+        if step == "":
+            # Descendant-or-self axis for the following step.
+            nxt = rest[0] if rest else "*"
+            tail = rest[1:]
+            for d in node.iter():
+                if d is node:
+                    continue
+                if nxt == "*" or d.tag == nxt:
+                    yield from walk(d, tail)
+            return
+        if step == ".":
+            yield from walk(node, rest)
+            return
+        for c in node._children:
+            if step == "*" or c.tag == step:
+                yield from walk(c, rest)
+
+    yield from walk(elem, steps)
+
+
 class Element:
     def __init__(self, tag, attrib=None, **extra):
         self.tag = tag
@@ -96,13 +138,15 @@ class Element:
         return list(self.attrib.items())
 
     def find(self, path):
-        for c in self._children:
-            if c.tag == path:
-                return c
+        for c in _iterfind(self, path):
+            return c
         return None
 
     def findall(self, path):
-        return [c for c in self._children if c.tag == path]
+        return list(_iterfind(self, path))
+
+    def iterfind(self, path):
+        return _iterfind(self, path)
 
     def findtext(self, path, default=None):
         c = self.find(path)

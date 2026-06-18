@@ -889,10 +889,9 @@ impl Interpreter {
         // script, a real `ModuleSpec` under `-m`). `multiprocessing.spawn`'s
         // `get_preparation_data` does `getattr(main_module.__spec__, ...)`, so
         // the attribute must exist even for the plain `weavepy script.py` path.
-        globals.borrow_mut().insert(
-            DictKey(Object::from_static("__spec__")),
-            Object::None,
-        );
+        globals
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("__spec__")), Object::None);
         // Insert the module into `sys.modules` so callers can introspect
         // `sys.modules["__main__"]` (pickle by qualified name and the
         // multiprocessing spawn helper both rely on this).
@@ -6121,21 +6120,33 @@ impl Interpreter {
                             // Only *text* OS-backed streams (CPython's
                             // `TextIOWrapper`) expose `.encoding`; binary
                             // streams and in-memory `BytesIO`/`StringIO` raise
-                            // `AttributeError`.
+                            // `AttributeError`. Report the codec the stream was
+                            // actually opened with (defaulting to UTF-8).
                             if !f.binary && !f.is_memory() {
-                                return Ok(Object::from_static("utf-8"));
+                                let enc = f
+                                    .encoding
+                                    .borrow()
+                                    .clone()
+                                    .unwrap_or_else(|| "utf-8".to_owned());
+                                return Ok(Object::from_str(enc));
                             }
                         }
                         "errors" => {
                             if !f.binary && !f.is_memory() {
-                                return Ok(Object::from_static("strict"));
+                                let err = f
+                                    .errors
+                                    .borrow()
+                                    .clone()
+                                    .unwrap_or_else(|| "strict".to_owned());
+                                return Ok(Object::from_str(err));
                             }
                         }
                         "newlines" => {
                             // Text streams (including `StringIO`) expose
-                            // `.newlines`; binary streams do not.
+                            // `.newlines`; binary streams do not. The value
+                            // reflects the line endings seen so far.
                             if !f.binary {
-                                return Ok(Object::None);
+                                return Ok(f.newlines_obj());
                             }
                         }
                         _ => {}
@@ -13956,10 +13967,11 @@ impl Interpreter {
             // data attributes remain read-only.
             Object::File(f) => match name {
                 "name" => {
-                    match value {
-                        Object::Str(s) => f.set_name(s.to_string()),
-                        other => f.set_name(other.type_name().to_owned()),
-                    }
+                    // CPython's `FileIO.name` is a plain writable attribute: it
+                    // round-trips whatever object is assigned (str path, bytes
+                    // path, or the integer fd that `tempfile` rewrites it to for
+                    // anonymous temp files). Store the value verbatim.
+                    f.set_name(value.clone());
                     Ok(())
                 }
                 // CPython's file objects carry a `__dict__`, so user code can
@@ -14892,6 +14904,113 @@ impl Interpreter {
             }
             (Object::ByteArray(_), other) => Err(type_error(format!(
                 "bytearray indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
+            (Object::MemoryView(mv), Object::Int(i)) => {
+                // `mv[i] = x` writes through to the backing buffer (only a
+                // writable `bytearray`-backed view is assignable; a `bytes`
+                // view is read-only). CPython: `memoryview_ass_sub`.
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                if mv.readonly.get() {
+                    return Err(type_error("cannot modify read-only memory"));
+                }
+                let shape = mv.shape_dims();
+                if shape.len() != 1 {
+                    return Err(type_error(
+                        "memoryview: assignment to multi-dimensional view is not supported",
+                    ));
+                }
+                let itemsize = mv.itemsize.get();
+                if itemsize != 1 {
+                    return Err(type_error(
+                        "memoryview: setting an item of this format is not supported",
+                    ));
+                }
+                let idx = normalize_index(*i, shape[0])?;
+                let byte = crate::builtins::bytearray_byte_arg(&value)?;
+                let stride0 = mv.stride_bytes()[0];
+                let off = (mv.start.get() as isize + idx as isize * stride0) as usize;
+                match &mv.buffer {
+                    crate::object::MemoryViewBuffer::ByteArray(b) => {
+                        b.borrow_mut()[off] = byte;
+                        Ok(())
+                    }
+                    crate::object::MemoryViewBuffer::Bytes(_) => {
+                        Err(type_error("cannot modify read-only memory"))
+                    }
+                }
+            }
+            (Object::MemoryView(mv), Object::Slice(slc)) => {
+                // `mv[i:j:k] = bytes-like` — the RHS must expose exactly
+                // `slicelen * itemsize` bytes; they are scattered into the
+                // backing buffer following the view's stride so a reversed /
+                // strided sub-view assigns correctly (CPython
+                // `memory_ass_sub` -> `memory_setitem_obj`). This is the path
+                // `_pyio.BufferedReader.readinto` drives (`buf[a:b] = data`).
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                if mv.readonly.get() {
+                    return Err(type_error("cannot modify read-only memory"));
+                }
+                let shape = mv.shape_dims();
+                if shape.len() != 1 {
+                    return Err(type_error(
+                        "memoryview: assignment to multi-dimensional view is not supported",
+                    ));
+                }
+                let itemsize = mv.itemsize.get();
+                let n = shape[0] as i64;
+                let (start_i, _stop, step, slicelen) = adjust_slice(n, slc)?;
+                let src: Vec<u8> = match &value {
+                    Object::Bytes(b) => b.to_vec(),
+                    Object::ByteArray(b) => b.borrow().clone(),
+                    Object::MemoryView(src) => {
+                        if src.released.get() {
+                            return Err(value_error(
+                                "operation forbidden on released memoryview object",
+                            ));
+                        }
+                        src.to_bytes()
+                    }
+                    other => {
+                        return Err(type_error(format!(
+                            "a bytes-like object is required, not '{}'",
+                            other.type_name()
+                        )))
+                    }
+                };
+                if src.len() != slicelen as usize * itemsize {
+                    return Err(value_error(
+                        "memoryview assignment: lvalue and rvalue have different structures",
+                    ));
+                }
+                let stride0 = mv.stride_bytes()[0];
+                let base = mv.start.get() as isize;
+                match &mv.buffer {
+                    crate::object::MemoryViewBuffer::ByteArray(b) => {
+                        let mut d = b.borrow_mut();
+                        for k in 0..slicelen {
+                            let elem = start_i + k * step;
+                            let off = (base + elem as isize * stride0) as usize;
+                            let s = k as usize * itemsize;
+                            d[off..off + itemsize].copy_from_slice(&src[s..s + itemsize]);
+                        }
+                        Ok(())
+                    }
+                    crate::object::MemoryViewBuffer::Bytes(_) => {
+                        Err(type_error("cannot modify read-only memory"))
+                    }
+                }
+            }
+            (Object::MemoryView(_), other) => Err(type_error(format!(
+                "memoryview: invalid slice key: {}",
                 other.type_name()
             ))),
             // A list *does* support assignment; a bad index type is the
@@ -20106,9 +20225,7 @@ impl Interpreter {
             // decode it honouring a PEP 263 coding cookie (UTF-8 default).
             // `test_subprocess` round-trips child stdout through `eval(...)`.
             Object::Bytes(b) => crate::decode_compile_source_bytes(&b, "<string>")?,
-            Object::ByteArray(b) => {
-                crate::decode_compile_source_bytes(&b.borrow(), "<string>")?
-            }
+            Object::ByteArray(b) => crate::decode_compile_source_bytes(&b.borrow(), "<string>")?,
             other => {
                 return Err(type_error(format!(
                     "eval() expected str or code, got {}",
@@ -20486,6 +20603,17 @@ impl Interpreter {
             globals.borrow_mut().insert(
                 DictKey(Object::from_static("__path__")),
                 Object::new_list(Vec::new()),
+            );
+            // A real package's `__file__` ends in `/__init__.py`, so
+            // `os.path.dirname(__file__)` is the package directory. Code
+            // relies on that shape — e.g. `zipfile`'s overlap-warning passes
+            // `skip_file_prefixes=(os.path.dirname(__file__),)` to attribute
+            // the warning to its caller. Keep the code object's `co_filename`
+            // as the bare `<frozen pkg>` for tracebacks, but give `__file__`
+            // the faithful `<frozen pkg>/__init__.py` form.
+            globals.borrow_mut().insert(
+                DictKey(Object::from_static("__file__")),
+                Object::from_str(format!("{filename}/__init__.py")),
             );
         }
         let module_obj = Object::Module(Rc::new(PyModule {

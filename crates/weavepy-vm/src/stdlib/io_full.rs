@@ -516,12 +516,17 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         mode.contains('w') || mode.contains('a') || mode.contains('+') || mode.contains('x');
     let appending = mode.contains('a');
     let truncate = mode.contains('w');
+    // `'x'` is exclusive-create (O_CREAT|O_EXCL): it must fail with
+    // `FileExistsError` when the path already exists. `create_new(true)`
+    // expresses exactly that and supersedes `create`/`truncate`.
+    let exclusive = mode.contains('x');
     let mut opts = std::fs::OpenOptions::new();
     opts.read(!writable || mode.contains('+'))
         .write(writable)
         .append(appending)
-        .truncate(truncate)
-        .create(writable || appending);
+        .truncate(truncate && !exclusive)
+        .create(!exclusive && (writable || appending))
+        .create_new(exclusive);
     let f = opts
         .open(&path)
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;

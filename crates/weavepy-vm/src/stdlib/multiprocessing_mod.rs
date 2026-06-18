@@ -348,7 +348,7 @@ fn semlock_new(args: &[Object]) -> Result<Object, RuntimeError> {
     let kind = sem_arg_int(args, 1, "kind")?;
     let value = sem_arg_int(args, 2, "value")?;
     let maxvalue = sem_arg_int(args, 3, "maxvalue")?;
-    if value < 0 || value > SEM_VALUE_MAX {
+    if !(0..=SEM_VALUE_MAX).contains(&value) {
         return Err(value_error("semaphore initial value out of range"));
     }
     let name = match args.get(4) {
@@ -434,7 +434,10 @@ fn make_semlock_instance(inner: Arc<SemInner>) -> Object {
             DictKey(Object::from_static("handle")),
             Object::Int(inner.handle as i64),
         );
-        d.insert(DictKey(Object::from_static("kind")), Object::Int(inner.kind));
+        d.insert(
+            DictKey(Object::from_static("kind")),
+            Object::Int(inner.kind),
+        );
         d.insert(
             DictKey(Object::from_static("maxvalue")),
             Object::Int(inner.maxvalue),
@@ -474,8 +477,7 @@ fn make_semlock_instance(inner: Arc<SemInner>) -> Object {
             b_dyn("_is_mine", move |_| {
                 let me = crate::gil::current_thread_id();
                 Ok(Object::Bool(
-                    im.last_tid.load(Ordering::SeqCst) == me
-                        && im.count.load(Ordering::SeqCst) > 0,
+                    im.last_tid.load(Ordering::SeqCst) == me && im.count.load(Ordering::SeqCst) > 0,
                 ))
             }),
         );
@@ -495,7 +497,9 @@ fn make_semlock_instance(inner: Arc<SemInner>) -> Object {
         let en = inner.clone();
         d.insert(
             DictKey(Object::from_static("__enter__")),
-            b_dyn_kw("__enter__", move |args, kwargs| sem_acquire(&en, args, kwargs)),
+            b_dyn_kw("__enter__", move |args, kwargs| {
+                sem_acquire(&en, args, kwargs)
+            }),
         );
         let ex = inner.clone();
         d.insert(
@@ -680,7 +684,8 @@ fn sem_wait_slice(handle: *mut libc::sem_t, slice: Duration) -> std::io::Result<
 fn sem_release(inner: &Arc<SemInner>) -> Result<Object, RuntimeError> {
     let me = crate::gil::current_thread_id();
     if inner.kind == RECURSIVE_MUTEX_KIND {
-        if !(inner.last_tid.load(Ordering::SeqCst) == me && inner.count.load(Ordering::SeqCst) > 0) {
+        if !(inner.last_tid.load(Ordering::SeqCst) == me && inner.count.load(Ordering::SeqCst) > 0)
+        {
             return Err(assertion_error(
                 "attempt to release recursive lock not owned by thread",
             ));
@@ -695,7 +700,8 @@ fn sem_release(inner: &Arc<SemInner>) -> Result<Object, RuntimeError> {
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let mut v: libc::c_int = 0;
-        if unsafe { libc::sem_getvalue(inner.handle, &mut v) } == 0 && i64::from(v) >= inner.maxvalue
+        if unsafe { libc::sem_getvalue(inner.handle, &mut v) } == 0
+            && i64::from(v) >= inner.maxvalue
         {
             return Err(value_error("semaphore or lock released too many times"));
         }

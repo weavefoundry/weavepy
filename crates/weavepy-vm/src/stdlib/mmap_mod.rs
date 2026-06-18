@@ -43,6 +43,32 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         ] {
             d.insert(DictKey(Object::from_static(n)), Object::Int(v));
         }
+        // `mmap.PAGESIZE`/`ALLOCATIONGRANULARITY`: the live system page size
+        // (`multiprocessing.heap.Heap` uses it as its default arena size). On
+        // POSIX the allocation granularity equals the page size.
+        let pagesize: i64 = {
+            #[cfg(unix)]
+            {
+                let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if v > 0 {
+                    v as i64
+                } else {
+                    4096
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                4096
+            }
+        };
+        d.insert(
+            DictKey(Object::from_static("PAGESIZE")),
+            Object::Int(pagesize),
+        );
+        d.insert(
+            DictKey(Object::from_static("ALLOCATIONGRANULARITY")),
+            Object::Int(pagesize),
+        );
         d.insert(
             DictKey(Object::from_static("mmap")),
             Object::Type(mmap_type()),

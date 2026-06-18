@@ -177,7 +177,10 @@ fn obj_to_int(o: &Object, what: &str) -> Result<i64, RuntimeError> {
 /// str/bytes. Returns the `CString`s (which own the storage) plus the
 /// pointer vector — the caller must keep both alive across the syscall.
 #[cfg(unix)]
-fn build_argv(seq: &Object, what: &str) -> Result<(Vec<CString>, Vec<*const libc::c_char>), RuntimeError> {
+fn build_argv(
+    seq: &Object,
+    what: &str,
+) -> Result<(Vec<CString>, Vec<*const libc::c_char>), RuntimeError> {
     let items = crate::stdlib::os::sequence_items(seq)
         .ok_or_else(|| type_error(format!("{what}: argv must be a sequence of str/bytes")))?;
     if items.is_empty() {
@@ -195,7 +198,10 @@ fn build_argv(seq: &Object, what: &str) -> Result<(Vec<CString>, Vec<*const libc
 /// Build a NULL-terminated envp from a mapping (`dict`) or a sequence of
 /// `b"K=V"` items. `subprocess` passes a `dict`; `execve` accepts either.
 #[cfg(unix)]
-fn build_envp(env: &Object, what: &str) -> Result<(Vec<CString>, Vec<*const libc::c_char>), RuntimeError> {
+fn build_envp(
+    env: &Object,
+    what: &str,
+) -> Result<(Vec<CString>, Vec<*const libc::c_char>), RuntimeError> {
     let mut owned: Vec<CString> = Vec::new();
     // The environment may arrive as a plain `dict`, as one of `os.environ`/
     // `os.environb` (the `_Environ` mappings whose canonical bytes->bytes
@@ -218,11 +224,9 @@ fn build_envp(env: &Object, what: &str) -> Result<(Vec<CString>, Vec<*const libc
                     return Err(value_error("illegal environment variable name"));
                 }
                 kv.push(b'=');
-                kv.extend_from_slice(
-                    &bytes_of(v).ok_or_else(|| {
-                        type_error(format!("{what}: environment values must be str/bytes"))
-                    })?,
-                );
+                kv.extend_from_slice(&bytes_of(v).ok_or_else(|| {
+                    type_error(format!("{what}: environment values must be str/bytes"))
+                })?);
                 owned.push(CString::new(kv).map_err(|_| value_error("embedded null byte"))?);
             }
         }
@@ -303,12 +307,16 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(not(unix))]
 fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.fork() requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.fork() requires POSIX",
+    ))
 }
 
 #[cfg(unix)]
 fn os_exit_now(args: &[Object]) -> Result<Object, RuntimeError> {
-    let code = args.first().map_or(0, |o| obj_to_int(o, "_exit").unwrap_or(0));
+    let code = args
+        .first()
+        .map_or(0, |o| obj_to_int(o, "_exit").unwrap_or(0));
     // SAFETY: `_exit(2)` never returns and runs no atexit handlers.
     unsafe { libc::_exit(code as libc::c_int) }
 }
@@ -333,13 +341,20 @@ fn os_abort(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 #[cfg(unix)]
-fn do_exec(path: &Object, argv: &Object, envp: Option<&Object>, what: &str) -> Result<Object, RuntimeError> {
+fn do_exec(
+    path: &Object,
+    argv: &Object,
+    envp: Option<&Object>,
+    what: &str,
+) -> Result<Object, RuntimeError> {
     let cpath = obj_to_cstring(path, what)?;
-    let (_argv_owned, argv_ptrs) = build_argv(argv, what)?;
+    let (argv_owned, argv_ptrs) = build_argv(argv, what)?;
     // CPython's `os.execv`/`execve` reject an empty first argument
     // (`argv[0]`) with `ValueError` before reaching `execve(2)`.
-    if _argv_owned.first().is_some_and(|c| c.as_bytes().is_empty()) {
-        return Err(value_error(format!("{what}() arg 2 first element cannot be empty")));
+    if argv_owned.first().is_some_and(|c| c.as_bytes().is_empty()) {
+        return Err(value_error(format!(
+            "{what}() arg 2 first element cannot be empty"
+        )));
     }
     // SAFETY: NULL-terminated argv/envp built above; on success exec does not
     // return, on failure errno is set. The `_owned` vectors stay alive.
@@ -356,24 +371,36 @@ fn do_exec(path: &Object, argv: &Object, envp: Option<&Object>, what: &str) -> R
 #[cfg(unix)]
 fn os_execv(args: &[Object]) -> Result<Object, RuntimeError> {
     let (path, argv) = (
-        args.first().ok_or_else(|| type_error("execv: missing path"))?,
-        args.get(1).ok_or_else(|| type_error("execv: missing argv"))?,
+        args.first()
+            .ok_or_else(|| type_error("execv: missing path"))?,
+        args.get(1)
+            .ok_or_else(|| type_error("execv: missing argv"))?,
     );
     do_exec(path, argv, None, "execv")
 }
 
 #[cfg(unix)]
 fn os_execve(args: &[Object]) -> Result<Object, RuntimeError> {
-    let path = args.first().ok_or_else(|| type_error("execve: missing path"))?;
-    let argv = args.get(1).ok_or_else(|| type_error("execve: missing argv"))?;
-    let env = args.get(2).ok_or_else(|| type_error("execve: missing env"))?;
+    let path = args
+        .first()
+        .ok_or_else(|| type_error("execve: missing path"))?;
+    let argv = args
+        .get(1)
+        .ok_or_else(|| type_error("execve: missing argv"))?;
+    let env = args
+        .get(2)
+        .ok_or_else(|| type_error("execve: missing env"))?;
     do_exec(path, argv, Some(env), "execve")
 }
 
 #[cfg(unix)]
 fn os_execvp(args: &[Object]) -> Result<Object, RuntimeError> {
-    let path = args.first().ok_or_else(|| type_error("execvp: missing file"))?;
-    let argv = args.get(1).ok_or_else(|| type_error("execvp: missing argv"))?;
+    let path = args
+        .first()
+        .ok_or_else(|| type_error("execvp: missing file"))?;
+    let argv = args
+        .get(1)
+        .ok_or_else(|| type_error("execvp: missing argv"))?;
     let cpath = obj_to_cstring(path, "execvp")?;
     let (_argv_owned, argv_ptrs) = build_argv(argv, "execvp")?;
     // SAFETY: as `do_exec`, but searches PATH.
@@ -385,9 +412,15 @@ fn os_execvp(args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_execvpe(args: &[Object]) -> Result<Object, RuntimeError> {
     // execvpe(file, argv, env): PATH search + explicit env. macOS lacks
     // execvpe(3), so resolve via PATH ourselves then execve.
-    let file = args.first().ok_or_else(|| type_error("execvpe: missing file"))?;
-    let argv = args.get(1).ok_or_else(|| type_error("execvpe: missing argv"))?;
-    let env = args.get(2).ok_or_else(|| type_error("execvpe: missing env"))?;
+    let file = args
+        .first()
+        .ok_or_else(|| type_error("execvpe: missing file"))?;
+    let argv = args
+        .get(1)
+        .ok_or_else(|| type_error("execvpe: missing argv"))?;
+    let env = args
+        .get(2)
+        .ok_or_else(|| type_error("execvpe: missing env"))?;
     let file_bytes = bytes_of(file).ok_or_else(|| type_error("execvpe: file must be str/bytes"))?;
     let candidates = resolve_path(&file_bytes, env);
     let mut last = last_os_err();
@@ -413,7 +446,7 @@ fn resolve_path(file: &[u8], env: &Object) -> Vec<Vec<u8>> {
             // backing store is bytes-keyed (b"PATH").
             d.get(&DictKey(Object::from_static("PATH")))
                 .or_else(|| d.get(&DictKey(Object::new_bytes(b"PATH".to_vec()))))
-                .and_then(|v| bytes_of(&v))
+                .and_then(bytes_of)
         })
         .unwrap_or_else(|| b"/usr/bin:/bin".to_vec());
     let mut out = Vec::new();
@@ -431,19 +464,27 @@ fn resolve_path(file: &[u8], env: &Object) -> Vec<Vec<u8>> {
 
 #[cfg(not(unix))]
 fn os_execv(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.execv requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.execv requires POSIX",
+    ))
 }
 #[cfg(not(unix))]
 fn os_execve(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.execve requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.execve requires POSIX",
+    ))
 }
 #[cfg(not(unix))]
 fn os_execvp(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.execvp requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.execvp requires POSIX",
+    ))
 }
 #[cfg(not(unix))]
 fn os_execvpe(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.execvpe requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.execvpe requires POSIX",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -465,9 +506,15 @@ fn posix_spawn_impl(
     kwargs: &[(String, Object)],
     search_path: bool,
 ) -> Result<Object, RuntimeError> {
-    let path = args.first().ok_or_else(|| type_error("posix_spawn: missing path"))?;
-    let argv = args.get(1).ok_or_else(|| type_error("posix_spawn: missing argv"))?;
-    let env = args.get(2).ok_or_else(|| type_error("posix_spawn: missing env"))?;
+    let path = args
+        .first()
+        .ok_or_else(|| type_error("posix_spawn: missing path"))?;
+    let argv = args
+        .get(1)
+        .ok_or_else(|| type_error("posix_spawn: missing argv"))?;
+    let env = args
+        .get(2)
+        .ok_or_else(|| type_error("posix_spawn: missing env"))?;
     let cpath = obj_to_cstring(path, "posix_spawn")?;
     let (argv_owned, _argv_ptrs) = build_argv(argv, "posix_spawn")?;
     let (env_owned, _env_ptrs) = build_envp(env, "posix_spawn")?;
@@ -498,7 +545,12 @@ fn posix_spawn_impl(
             for action in &actions {
                 let parts = crate::stdlib::os::sequence_items(action)
                     .ok_or_else(|| type_error("posix_spawn: file_action must be a tuple"))?;
-                let kind = obj_to_int(parts.first().ok_or_else(|| type_error("empty file_action"))?, "file_action")?;
+                let kind = obj_to_int(
+                    parts
+                        .first()
+                        .ok_or_else(|| type_error("empty file_action"))?,
+                    "file_action",
+                )?;
                 match kind {
                     // POSIX_SPAWN_OPEN
                     0 => {
@@ -521,7 +573,9 @@ fn posix_spawn_impl(
                     // POSIX_SPAWN_CLOSE
                     1 => {
                         let fd = obj_to_int(&parts[1], "close fd")? as libc::c_int;
-                        unsafe { libc::posix_spawn_file_actions_addclose(&raw mut file_actions, fd) };
+                        unsafe {
+                            libc::posix_spawn_file_actions_addclose(&raw mut file_actions, fd)
+                        };
                     }
                     // POSIX_SPAWN_DUP2
                     2 => {
@@ -537,7 +591,10 @@ fn posix_spawn_impl(
         }
     }
 
-    if matches!(kw("setsid"), Some(Object::Bool(true)) | Some(Object::Int(1))) {
+    if matches!(
+        kw("setsid"),
+        Some(Object::Bool(true)) | Some(Object::Int(1))
+    ) {
         #[cfg(target_os = "linux")]
         {
             spawn_flags |= libc::POSIX_SPAWN_SETSID as libc::c_short;
@@ -555,7 +612,10 @@ fn posix_spawn_impl(
             spawn_flags |= libc::POSIX_SPAWN_SETPGROUP as libc::c_short;
         }
     }
-    if matches!(kw("resetids"), Some(Object::Bool(true)) | Some(Object::Int(1))) {
+    if matches!(
+        kw("resetids"),
+        Some(Object::Bool(true)) | Some(Object::Int(1))
+    ) {
         spawn_flags |= libc::POSIX_SPAWN_RESETIDS as libc::c_short;
     }
     if let Some(sd) = kw("setsigdef") {
@@ -613,18 +673,24 @@ fn posix_spawn_impl(
         libc::posix_spawnattr_destroy(&raw mut attr);
     }
     if rc != 0 {
-        return Err(crate::error::io_error_to_py(&std::io::Error::from_raw_os_error(rc)));
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::from_raw_os_error(rc),
+        ));
     }
     Ok(Object::Int(i64::from(pid)))
 }
 
 #[cfg(not(unix))]
 fn os_posix_spawn(_args: &[Object], _kw: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.posix_spawn requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.posix_spawn requires POSIX",
+    ))
 }
 #[cfg(not(unix))]
 fn os_posix_spawnp(_args: &[Object], _kw: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.posix_spawnp requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.posix_spawnp requires POSIX",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -653,13 +719,21 @@ fn os_wait(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn wait_rusage(args: &[Object], with_pid: bool) -> Result<Object, RuntimeError> {
-    let (pid_arg, opt_idx) = if with_pid { (Some(0usize), 1usize) } else { (None, 0usize) };
+    let (pid_arg, opt_idx) = if with_pid {
+        (Some(0usize), 1usize)
+    } else {
+        (None, 0usize)
+    };
     let options = match args.get(opt_idx) {
         Some(o) => obj_to_int(o, "options")? as libc::c_int,
         None => 0,
     };
     let target_pid = match pid_arg {
-        Some(i) => obj_to_int(args.get(i).ok_or_else(|| type_error("wait4: missing pid"))?, "pid")? as libc::pid_t,
+        Some(i) => obj_to_int(
+            args.get(i)
+                .ok_or_else(|| type_error("wait4: missing pid"))?,
+            "pid",
+        )? as libc::pid_t,
         None => -1,
     };
     let mut status: libc::c_int = 0;
@@ -696,7 +770,7 @@ fn os_wait4(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn build_rusage(ru: &libc::rusage) -> Object {
-    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0;
+    let tv = |t: libc::timeval| t.tv_sec as f64 + f64::from(t.tv_usec) / 1_000_000.0;
     Object::new_tuple(vec![
         Object::Float(tv(ru.ru_utime)),
         Object::Float(tv(ru.ru_stime)),
@@ -719,15 +793,21 @@ fn build_rusage(ru: &libc::rusage) -> Object {
 
 #[cfg(not(unix))]
 fn os_wait(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.wait requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.wait requires POSIX",
+    ))
 }
 #[cfg(not(unix))]
 fn os_wait3(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.wait3 requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.wait3 requires POSIX",
+    ))
 }
 #[cfg(not(unix))]
 fn os_wait4(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.wait4 requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.wait4 requires POSIX",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -753,7 +833,9 @@ macro_rules! wmacro {
             #[cfg(not(unix))]
             {
                 let _ = args;
-                Err(crate::error::not_implemented_error("W* status macros require POSIX"))
+                Err(crate::error::not_implemented_error(
+                    "W* status macros require POSIX",
+                ))
             }
         }
     };
@@ -766,7 +848,9 @@ macro_rules! wmacro {
             #[cfg(not(unix))]
             {
                 let _ = args;
-                Err(crate::error::not_implemented_error("W* status macros require POSIX"))
+                Err(crate::error::not_implemented_error(
+                    "W* status macros require POSIX",
+                ))
             }
         }
     };
@@ -806,8 +890,14 @@ fn os_getsid(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn os_setpgid(args: &[Object]) -> Result<Object, RuntimeError> {
-    let pid = obj_to_int(args.first().ok_or_else(|| type_error("setpgid: pid"))?, "pid")? as libc::pid_t;
-    let pgid = obj_to_int(args.get(1).ok_or_else(|| type_error("setpgid: pgid"))?, "pgid")? as libc::pid_t;
+    let pid = obj_to_int(
+        args.first().ok_or_else(|| type_error("setpgid: pid"))?,
+        "pid",
+    )? as libc::pid_t;
+    let pgid = obj_to_int(
+        args.get(1).ok_or_else(|| type_error("setpgid: pgid"))?,
+        "pgid",
+    )? as libc::pid_t;
     if unsafe { libc::setpgid(pid, pgid) } < 0 {
         return Err(last_os_err());
     }
@@ -816,7 +906,10 @@ fn os_setpgid(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn os_getpgid(args: &[Object]) -> Result<Object, RuntimeError> {
-    let pid = obj_to_int(args.first().ok_or_else(|| type_error("getpgid: pid"))?, "pid")? as libc::pid_t;
+    let pid = obj_to_int(
+        args.first().ok_or_else(|| type_error("getpgid: pid"))?,
+        "pid",
+    )? as libc::pid_t;
     let rc = unsafe { libc::getpgid(pid) };
     if rc < 0 {
         return Err(last_os_err());
@@ -844,7 +937,10 @@ fn os_getppid(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn os_tcgetpgrp(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fd = obj_to_int(args.first().ok_or_else(|| type_error("tcgetpgrp: fd"))?, "fd")? as libc::c_int;
+    let fd = obj_to_int(
+        args.first().ok_or_else(|| type_error("tcgetpgrp: fd"))?,
+        "fd",
+    )? as libc::c_int;
     let rc = unsafe { libc::tcgetpgrp(fd) };
     if rc < 0 {
         return Err(last_os_err());
@@ -854,8 +950,14 @@ fn os_tcgetpgrp(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn os_tcsetpgrp(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fd = obj_to_int(args.first().ok_or_else(|| type_error("tcsetpgrp: fd"))?, "fd")? as libc::c_int;
-    let pgid = obj_to_int(args.get(1).ok_or_else(|| type_error("tcsetpgrp: pgid"))?, "pgid")? as libc::pid_t;
+    let fd = obj_to_int(
+        args.first().ok_or_else(|| type_error("tcsetpgrp: fd"))?,
+        "fd",
+    )? as libc::c_int;
+    let pgid = obj_to_int(
+        args.get(1).ok_or_else(|| type_error("tcsetpgrp: pgid"))?,
+        "pgid",
+    )? as libc::pid_t;
     if unsafe { libc::tcsetpgrp(fd, pgid) } < 0 {
         return Err(last_os_err());
     }
@@ -864,8 +966,12 @@ fn os_tcsetpgrp(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn os_killpg(args: &[Object]) -> Result<Object, RuntimeError> {
-    let pgid = obj_to_int(args.first().ok_or_else(|| type_error("killpg: pgid"))?, "pgid")? as libc::pid_t;
-    let sig = obj_to_int(args.get(1).ok_or_else(|| type_error("killpg: sig"))?, "sig")? as libc::c_int;
+    let pgid = obj_to_int(
+        args.first().ok_or_else(|| type_error("killpg: pgid"))?,
+        "pgid",
+    )? as libc::pid_t;
+    let sig =
+        obj_to_int(args.get(1).ok_or_else(|| type_error("killpg: sig"))?, "sig")? as libc::c_int;
     if unsafe { libc::killpg(pgid, sig) } < 0 {
         return Err(last_os_err());
     }
@@ -963,8 +1069,16 @@ use nonunix_ids::*;
 
 #[cfg(unix)]
 fn os_closerange(args: &[Object]) -> Result<Object, RuntimeError> {
-    let lo = obj_to_int(args.first().ok_or_else(|| type_error("closerange: fd_low"))?, "fd_low")? as libc::c_int;
-    let hi = obj_to_int(args.get(1).ok_or_else(|| type_error("closerange: fd_high"))?, "fd_high")? as libc::c_int;
+    let lo = obj_to_int(
+        args.first()
+            .ok_or_else(|| type_error("closerange: fd_low"))?,
+        "fd_low",
+    )? as libc::c_int;
+    let hi = obj_to_int(
+        args.get(1)
+            .ok_or_else(|| type_error("closerange: fd_high"))?,
+        "fd_high",
+    )? as libc::c_int;
     for fd in lo..hi {
         // EBADF is ignored, matching CPython.
         unsafe { libc::close(fd) };
@@ -974,7 +1088,10 @@ fn os_closerange(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn os_pipe2(args: &[Object]) -> Result<Object, RuntimeError> {
-    let flags = obj_to_int(args.first().ok_or_else(|| type_error("pipe2: flags"))?, "flags")? as libc::c_int;
+    let flags = obj_to_int(
+        args.first().ok_or_else(|| type_error("pipe2: flags"))?,
+        "flags",
+    )? as libc::c_int;
     let mut fds = [0i32; 2];
     #[cfg(target_os = "linux")]
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), flags) };
@@ -1006,11 +1123,15 @@ fn os_pipe2(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(not(unix))]
 fn os_closerange(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.closerange requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.closerange requires POSIX",
+    ))
 }
 #[cfg(not(unix))]
 fn os_pipe2(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error("os.pipe2 requires POSIX"))
+    Err(crate::error::not_implemented_error(
+        "os.pipe2 requires POSIX",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,9 +1140,18 @@ fn os_pipe2(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(target_os = "linux")]
 fn os_sched_getaffinity(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _pid = args.first().map_or(Ok(0), |o| obj_to_int(o, "sched_getaffinity"))?;
+    let _pid = args
+        .first()
+        .map_or(Ok(0), |o| obj_to_int(o, "sched_getaffinity"))?;
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sched_getaffinity(_pid as libc::pid_t, std::mem::size_of::<libc::cpu_set_t>(), &raw mut set) } < 0 {
+    if unsafe {
+        libc::sched_getaffinity(
+            _pid as libc::pid_t,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &raw mut set,
+        )
+    } < 0
+    {
         return Err(last_os_err());
     }
     let mut cpus = Vec::new();
@@ -1069,7 +1199,11 @@ fn os_sched_yield(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn os_device_encoding(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fd = obj_to_int(args.first().ok_or_else(|| type_error("device_encoding: fd"))?, "fd")? as libc::c_int;
+    let fd = obj_to_int(
+        args.first()
+            .ok_or_else(|| type_error("device_encoding: fd"))?,
+        "fd",
+    )? as libc::c_int;
     if unsafe { libc::isatty(fd) } == 0 {
         return Ok(Object::None);
     }

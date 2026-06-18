@@ -5442,6 +5442,7 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
         // PyFile detaches the fd on close instead of running `close(2)`.
         let f = unsafe { std::fs::File::from_raw_fd(fd) };
         let file = PyFile::new(fd.to_string(), mode, FileBackend::Disk(f));
+        file.name_is_fd.set(true);
         file.closefd.set(closefd);
         if !file.binary {
             if let Some(Object::Str(enc)) = args.get(3) {
@@ -10911,9 +10912,7 @@ pub(crate) fn file_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
         None | Some(Object::None) => None,
         Some(Object::Bool(b)) => Some(u64::from(*b)),
         Some(Object::Int(i)) if *i >= 0 => Some(*i as u64),
-        Some(Object::Int(_)) => {
-            return Err(value_error("Negative size value not allowed"))
-        }
+        Some(Object::Int(_)) => return Err(value_error("Negative size value not allowed")),
         Some(o) => Some(coerce_index_i64(o)?.max(0) as u64),
     };
     Ok(Object::Int(f.truncate(size)? as i64))

@@ -1846,13 +1846,20 @@ pub struct PyFile {
     pub newline: RefCell<Option<String>>,
     /// Python-visible `name` override. Files opened from a descriptor
     /// start out named by their fd integer; `tempfile` (and user code)
-    /// reassign `f.name` to the real path. Stored separately so the
-    /// Rust-internal `name` (used for error messages, etc.) stays put.
-    pub name_override: RefCell<Option<String>>,
+    /// reassign `f.name` to the real path — or, for an anonymous temp file,
+    /// back to the integer fd. Stored as an arbitrary object so the override
+    /// faithfully round-trips `str`, `bytes`, and `int` (CPython's `FileIO`
+    /// exposes a plain writable `name`). The Rust-internal `name` (used for
+    /// error messages, etc.) stays put.
+    pub name_override: RefCell<Option<Object>>,
     /// The file was opened with a `bytes`/`bytearray` filename, so the
     /// Python-visible `f.name` must read back as `bytes` (CPython keeps the
     /// original object type).
     pub name_is_bytes: crate::sync::Cell<bool>,
+    /// The file was opened directly from an integer file descriptor
+    /// (`open(fd)`), so — absent a later override — `f.name` must read back as
+    /// that `int`, exactly like CPython's `FileIO` (`test_int_name_attribute`).
+    pub name_is_fd: crate::sync::Cell<bool>,
     /// The stream has no filesystem name (`io.BytesIO`/`io.StringIO`): reading
     /// `f.name` raises `AttributeError`, like CPython's in-memory streams.
     pub no_name: crate::sync::Cell<bool>,
@@ -1874,6 +1881,11 @@ pub struct PyFile {
     /// `.buffer` access; `None` until then and for streams that are their own
     /// buffer.
     pub binary_buffer_cache: RefCell<Option<Object>>,
+    /// Observed line endings, as CPython's `IncrementalNewlineDecoder` tracks
+    /// them for the text-mode `.newlines` attribute. Bit flags: `1`=`\r`,
+    /// `2`=`\n`, `4`=`\r\n`. Updated on every text-mode read (regardless of the
+    /// `newline=` translation policy); `0` reads back as `None`.
+    pub seennl: crate::sync::Cell<u8>,
 }
 
 impl PyFile {
@@ -1891,10 +1903,12 @@ impl PyFile {
             newline: RefCell::new(None),
             name_override: RefCell::new(None),
             name_is_bytes: crate::sync::Cell::new(false),
+            name_is_fd: crate::sync::Cell::new(false),
             no_name: crate::sync::Cell::new(false),
             closefd: crate::sync::Cell::new(true),
             extra_attrs: RefCell::new(Vec::new()),
             binary_buffer_cache: RefCell::new(None),
+            seennl: crate::sync::Cell::new(0),
         }
     }
 
@@ -1917,17 +1931,10 @@ impl PyFile {
         }
     }
 
-    /// The Python-visible `name`: the reassigned value if one was set,
-    /// otherwise the name the file was opened with.
-    pub fn display_name(&self) -> String {
-        self.name_override
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| self.name.clone())
-    }
-
-    /// Reassign the Python-visible `name` (`f.name = ...`).
-    pub fn set_name(&self, name: String) {
+    /// Reassign the Python-visible `name` (`f.name = ...`). Accepts any
+    /// object so an fd integer round-trips faithfully (CPython's `tempfile`
+    /// rewrites `raw.name` to the fd for anonymous temp files).
+    pub fn set_name(&self, name: Object) {
         *self.name_override.borrow_mut() = Some(name);
     }
 
@@ -1937,10 +1944,16 @@ impl PyFile {
     /// wins and is returned as `str`.
     pub fn name_obj(&self) -> Option<Object> {
         if let Some(n) = self.name_override.borrow().clone() {
-            return Some(Object::from_str(n));
+            return Some(n);
         }
         if self.no_name.get() {
             return None;
+        }
+        if self.name_is_fd.get() {
+            // Opened from a bare fd: `name` is the integer descriptor.
+            if let Ok(fd) = self.name.parse::<i64>() {
+                return Some(Object::Int(fd));
+            }
         }
         if self.name_is_bytes.get() {
             Some(Object::new_bytes(self.name.clone().into_bytes()))
@@ -2191,10 +2204,54 @@ impl PyFile {
     /// universal mode (`newline=None`) collapses `\r\n` and lone `\r` to
     /// `\n`. Any explicit `newline=` (including `''`) leaves input untouched.
     fn translate_newlines_read(&self, s: String) -> String {
+        // CPython's `IncrementalNewlineDecoder` records observed line endings
+        // on every read for the `.newlines` attribute, *independent* of whether
+        // translation is enabled — so update the tally before translating.
+        self.record_seen_newlines(&s);
         if self.newline.borrow().is_none() && s.as_bytes().contains(&b'\r') {
             s.replace("\r\n", "\n").replace('\r', "\n")
         } else {
             s
+        }
+    }
+
+    /// Fold the line endings present in a freshly decoded chunk into `seennl`.
+    fn record_seen_newlines(&self, s: &str) {
+        if !s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+            return;
+        }
+        let crlf = s.matches("\r\n").count();
+        let cr = s.as_bytes().iter().filter(|&&b| b == b'\r').count() - crlf;
+        let lf = s.as_bytes().iter().filter(|&&b| b == b'\n').count() - crlf;
+        let mut flags = self.seennl.get();
+        if cr > 0 {
+            flags |= 1;
+        }
+        if lf > 0 {
+            flags |= 2;
+        }
+        if crlf > 0 {
+            flags |= 4;
+        }
+        self.seennl.set(flags);
+    }
+
+    /// The Python-visible text-mode `.newlines`: `None` when nothing has been
+    /// read yet, a single string when one kind of ending was seen, or a tuple
+    /// of all kinds seen — matching CPython's `IncrementalNewlineDecoder`.
+    pub fn newlines_obj(&self) -> Object {
+        let tup = |parts: &[&'static str]| {
+            Object::new_tuple(parts.iter().map(|p| Object::from_static(p)).collect())
+        };
+        match self.seennl.get() {
+            1 => Object::from_static("\r"),
+            2 => Object::from_static("\n"),
+            3 => tup(&["\r", "\n"]),
+            4 => Object::from_static("\r\n"),
+            5 => tup(&["\r", "\r\n"]),
+            6 => tup(&["\n", "\r\n"]),
+            7 => tup(&["\r", "\n", "\r\n"]),
+            _ => Object::None,
         }
     }
 
@@ -2494,9 +2551,7 @@ impl PyFile {
         self.check_open()?;
         let mut backend = self.backend.borrow_mut();
         match &mut *backend {
-            FileBackend::Disk(f) => f
-                .flush()
-                .map_err(|e| crate::error::io_error_to_py(&e))?,
+            FileBackend::Disk(f) => f.flush().map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::Stdout(sink) => sink
                 .borrow_mut()
                 .flush()
@@ -2627,7 +2682,8 @@ impl PyFile {
                         .stream_position()
                         .map_err(|e| os_error(format!("truncate: {e}")))?,
                 };
-                f.set_len(n).map_err(|e| os_error(format!("truncate: {e}")))?;
+                f.set_len(n)
+                    .map_err(|e| os_error(format!("truncate: {e}")))?;
                 Ok(n)
             }
             _ => Err(os_error("File or stream is not seekable")),

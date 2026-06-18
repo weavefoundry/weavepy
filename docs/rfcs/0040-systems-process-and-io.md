@@ -311,6 +311,61 @@ That is **~12 rows flipping `skip`/`fail` → `pass`**. Rows that prove
 deeper than estimated are rewritten to a measured `reason` and deferred
 rather than expanding the commit.
 
+## Measured outcome
+
+Per the "measured, not aspirational" rule, this records the *as-landed*
+status of every targeted row (a fresh subprocess sweep, `--check` clean,
+build green, bundled fixtures landed). Four rows flipped to `pass`; the
+rest advanced to a measured `fail`/`skip` with the residual cause named in
+`expectations.toml` and deferred to the arc that actually gates them.
+
+| Row | Outcome | Measured |
+|---|---|---|
+| `test_signal` (WS4) | **pass** ✓ | 57 run, 0F/0E, 12 skip |
+| `test_zipfile` (WS8) | **pass** ✓ | 343 run, 0F/0E, 6 skip |
+| `test_shutil` (WS8) | **pass** ✓ | 207 run, 0F/0E, 68 skip |
+| `test_fcntl` (WS1) | **pass** ✓ | 12 run, 4 skip |
+| `test_subprocess` (WS2/WS3) | advanced (fail) | 292 pass / 7F / 2E / 53 skip (was 286/10F/5E) |
+| `test_tarfile` (WS8) | advanced (fail) | 632 pass / 4F / 1E / 8 skip |
+| `test_tempfile` (WS8) | advanced (fail) | 107 pass / 1F / 2E / 8 skip |
+| `test_io` (WS7) | advanced (fail) | 330 pass / 209F / 88E / 34 skip |
+| `test_os` / `test_posix` (WS1) | advanced (fail) | breadth tail measured-rewritten |
+| `test_multiprocessing_{fork,spawn,forkserver,main_handling}` (WS5) | deferred (skip) | core real; manager-server + sync stack incomplete |
+| `test_concurrent_futures` (WS6) | deferred (skip) | gated on WS5 `multiprocessing` |
+
+The deferrals trace to four arcs that are out of this wave's scope:
+
+- **WS5 `multiprocessing` (4 rows) + WS6 futures (1 row).** The
+  `_multiprocessing` core (SemLock, `spawn` re-exec, Pipe/Queue) is real
+  and basic round-trips work, but the full `managers` server-process +
+  `synchronize` fidelity is incomplete — the spawn suite crashes/deadlocks
+  inside the Manager tests (`WithManagerTestBarrier`). That is the ~9K-LOC
+  bulk of WS5 and is left as the next wave's headline; the bundled
+  in-process fixtures (`test_multiprocessing_*`, `test_sysproc_*`) pin the
+  parts that do work.
+- **WS7 io-layer architecture.** WeavePy's `io.open` returns a monolithic
+  `PyFile` (fixed io-class identity, OS-buffered, no Python-level write
+  buffer) instead of CPython's layered `FileIO`→`Buffered*`→`TextIOWrapper`
+  stack. The remaining `test_io`/`test_subprocess` io failures
+  (`BufferedRandom` interleaving, `TextIOWrapper` opaque cookies, `bufsize=0`
+  → `RawIOBase`, binary line-buffering) need that layering — which this RFC
+  explicitly scopes out ("close the measured behavioural gaps rather than
+  rewrite the layer").
+- **WTF-8 `str` storage** (a named Non-goal): the `surrogateescape`/
+  lone-surrogate cases in `test_tarfile`, `test_subprocess`
+  (`test_undecodable_env`), `test_codecs`, and `test_posixpath`.
+- **Deterministic finalization** (the GC arc): the refcount-prompt
+  destructor cases in `test_tempfile`, `test_io`, and `test_subprocess`
+  (`test_zombie_fast_process_del`).
+
+This wave's subprocess fixes that did land on top of the WS1–WS3 base:
+the `fork_exec` close-fds sweep now enumerates the per-process fd
+directory (so descriptors above a *lowered* `RLIMIT_NOFILE` are closed,
+bpo-21618); a failed pre-exec credential step reports `OSError.filename =
+None` and the `user`/uid argument is range-validated in the parent
+(`user=-1`→ValueError, `2**64`→OverflowError); and `_communicate`
+tolerates a mocked stdin without a real `fileno()`.
+
 ## Non-goals / Drawbacks
 
 - **WTF-8 string storage stays out of scope.** `test_posixpath`'s sole

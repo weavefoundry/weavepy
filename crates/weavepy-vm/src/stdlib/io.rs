@@ -363,13 +363,17 @@ fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFil
     let data = match initial {
         Some(Object::Bytes(b)) => b.to_vec(),
         Some(Object::ByteArray(b)) => b.borrow().clone(),
+        // CPython's `BytesIO(initial_bytes=None)` is explicitly allowed and
+        // means "start empty" (the C arg is `O` with a NULL default that the
+        // init treats as no data) — `test_tarfile`'s filter helper relies on
+        // `io.BytesIO(None)`.
+        Some(Object::None) | None => Vec::new(),
         Some(o) => o.as_bytes_view().ok_or_else(|| {
             type_error(format!(
                 "a bytes-like object is required, not '{}'",
                 o.type_name()
             ))
         })?,
-        None => Vec::new(),
     };
     let f = PyFile::new(
         "<bytes>",
@@ -725,6 +729,38 @@ fn install_mem_closed_property(ty: &Rc<crate::types::TypeObject>) {
         .insert(DictKey(Object::from_static("closed")), prop);
 }
 
+/// Install a read-only property `attr` whose getter is `getter`. Used for the
+/// stream attributes (`closed`/`name`/`mode`) that CPython's `Buffered*` /
+/// `TextIOWrapper` expose by delegating to the wrapped stream.
+fn install_delegating_attr(
+    ty: &Rc<crate::types::TypeObject>,
+    attr: &'static str,
+    doc: &'static str,
+    getter: fn(&[Object]) -> Result<Object, RuntimeError>,
+) {
+    let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: attr,
+            binds_instance: true,
+            call: Box::new(getter),
+            call_kw: None,
+        })),
+        Object::None,
+        Object::None,
+        Object::from_static(doc),
+    )));
+    crate::descr_registry::register(
+        &prop,
+        crate::descr_registry::DescrKind::GetSet,
+        ty.clone(),
+        attr,
+        None,
+    );
+    ty.dict
+        .borrow_mut()
+        .insert(DictKey(Object::from_static(attr)), prop);
+}
+
 /// Install a `closed` property whose getter is `getter` (delegates to the
 /// wrapped raw/buffer stream for the `Buffered*`/`TextIOWrapper` types,
 /// which CPython exposes as `closed`).
@@ -732,27 +768,7 @@ fn install_delegating_closed(
     ty: &Rc<crate::types::TypeObject>,
     getter: fn(&[Object]) -> Result<Object, RuntimeError>,
 ) {
-    let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
-        Object::Builtin(Rc::new(BuiltinFn {
-            name: "closed",
-            binds_instance: true,
-            call: Box::new(getter),
-            call_kw: None,
-        })),
-        Object::None,
-        Object::None,
-        Object::from_static("True if the stream is closed"),
-    )));
-    crate::descr_registry::register(
-        &prop,
-        crate::descr_registry::DescrKind::GetSet,
-        ty.clone(),
-        "closed",
-        None,
-    );
-    ty.dict
-        .borrow_mut()
-        .insert(DictKey(Object::from_static("closed")), prop);
+    install_delegating_attr(ty, "closed", "True if the stream is closed", getter);
 }
 
 /// `Buffered*.closed` — delegates to the wrapped raw stream (CPython
@@ -1035,7 +1051,17 @@ fn build_iobase_family_inner() -> IoFamily {
             .expect("io child type must linearise")
     };
     let raw = child("RawIOBase", &iobase);
-    let buffered = child("BufferedIOBase", &iobase);
+    // `BufferedIOBase` carries the default `readinto`/`readinto1` that delegate
+    // to `read`/`read1` (CPython's `_bufferediobase_readinto_generic`), so a
+    // pure-Python subclass that only implements `read`/`read1` still supports
+    // `readinto`.
+    let buffered = {
+        let mut bd = DictData::new();
+        iobase_method(&mut bd, "readinto", bufferediobase_readinto);
+        iobase_method(&mut bd, "readinto1", bufferediobase_readinto1);
+        TypeObject::new_with_flags("BufferedIOBase", vec![iobase.clone()], bd, flags())
+            .expect("io child type must linearise")
+    };
     let text = child("TextIOBase", &iobase);
     let fileio = child("FileIO", &raw);
     install_fileio_ctor(&fileio);
@@ -1260,6 +1286,68 @@ fn iobase_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(lines))
 }
 
+/// Extract a writable byte buffer (`bytearray` or a writable, contiguous
+/// `memoryview` over one) as `(storage, start, capacity)` — the argument shape
+/// CPython's `readinto`/`readinto1` accept.
+fn readinto_writable_buffer(
+    arg: Option<&Object>,
+) -> Result<(Rc<RefCell<Vec<u8>>>, usize, usize), RuntimeError> {
+    match arg {
+        Some(Object::ByteArray(dst)) => {
+            let cap = dst.borrow().len();
+            Ok((dst.clone(), 0, cap))
+        }
+        Some(Object::MemoryView(mv)) => {
+            if mv.released.get() {
+                return Err(value_error(
+                    "operation forbidden on released memoryview object",
+                ));
+            }
+            if mv.readonly.get() || !mv.is_c_contiguous() {
+                return Err(type_error(
+                    "readinto() argument must be a writable bytes-like object",
+                ));
+            }
+            match &mv.buffer {
+                crate::object::MemoryViewBuffer::ByteArray(b) => {
+                    Ok((b.clone(), mv.start.get(), mv.len.get()))
+                }
+                crate::object::MemoryViewBuffer::Bytes(_) => Err(type_error(
+                    "readinto() argument must be a writable bytes-like object",
+                )),
+            }
+        }
+        _ => Err(type_error(
+            "readinto() argument must be a writable bytes-like object",
+        )),
+    }
+}
+
+/// Default `BufferedIOBase.readinto(b)` / `readinto1(b)` (CPython's
+/// `_bufferediobase_readinto_generic`): read up to `len(b)` bytes via the
+/// stream's own `read`/`read1` and copy them into the buffer, returning the
+/// count. Only used by subclasses that implement `read`/`read1` but not
+/// `readinto` (concrete native streams register their own).
+fn bufferediobase_readinto_via(args: &[Object], read_method: &str) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    let (dst, start, cap) = readinto_writable_buffer(args.get(1))?;
+    let data = py_call(&me, read_method, &[Object::Int(cap as i64)])?;
+    let bytes = data
+        .as_bytes_view()
+        .ok_or_else(|| type_error(format!("{read_method}() should return bytes")))?;
+    let n = bytes.len().min(cap);
+    dst.borrow_mut()[start..start + n].copy_from_slice(&bytes[..n]);
+    Ok(Object::Int(n as i64))
+}
+
+fn bufferediobase_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
+    bufferediobase_readinto_via(args, "read")
+}
+
+fn bufferediobase_readinto1(args: &[Object]) -> Result<Object, RuntimeError> {
+    bufferediobase_readinto_via(args, "read1")
+}
+
 fn iobase_flush(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
@@ -1286,12 +1374,10 @@ fn iobase_tell(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn iobase_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(RuntimeError::PyException(
-        crate::error::PyException::from_builtin(
-            "OSError",
-            "I/O operation not supported on this stream",
-        ),
-    ))
+    // CPython's `IOBase.{seek,truncate,fileno}` raise `io.UnsupportedOperation`
+    // (a subclass of both OSError and ValueError), not a plain OSError — code
+    // does `self.assertRaises(io.UnsupportedOperation, fid.fileno)`.
+    Err(unsupported_op("I/O operation not supported on this stream"))
 }
 
 fn iobase_check_closed(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1975,7 +2061,31 @@ pub(crate) fn make_buffered(
     )
     .expect("buffered type");
     install_delegating_closed(&ty, bw_closed);
+    // CPython's `Buffered*` expose `.name` / `.mode` by forwarding to the
+    // wrapped raw stream (`buffered_name_get`/`buffered_mode_get`), so e.g.
+    // `tarfile.ExFileObject(BufferedReader).name` resolves to the underlying
+    // `_FileInFile.name`, and `open('f','rb').name == 'f'`.
+    install_delegating_attr(&ty, "name", "Name of the underlying stream", bw_name);
+    install_delegating_attr(&ty, "mode", "Mode of the underlying stream", bw_mode);
     ty
+}
+
+/// `Buffered*.name` — forwards to the wrapped raw stream's `name`, raising
+/// `AttributeError` when the raw stream has none (CPython delegates the
+/// attribute lookup and lets the `AttributeError` propagate).
+fn bw_name(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = bw_self(args)?;
+    let raw =
+        tw_get(&inst, "raw").ok_or_else(|| crate::error::attribute_error("'name'".to_owned()))?;
+    py_get_attr(&raw, "name")
+}
+
+/// `Buffered*.mode` — forwards to the wrapped raw stream's `mode`.
+fn bw_mode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = bw_self(args)?;
+    let raw =
+        tw_get(&inst, "raw").ok_or_else(|| crate::error::attribute_error("'mode'".to_owned()))?;
+    py_get_attr(&raw, "mode")
 }
 
 fn bw_self(args: &[Object]) -> Result<Rc<crate::types::PyInstance>, RuntimeError> {
@@ -2405,10 +2515,12 @@ fn bw_capability(args: &[Object], name: &str) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
     match bw_target(&inst) {
         Ok(RawTarget::Native(_)) => Ok(Object::Bool(true)),
-        Ok(RawTarget::Py(raw)) => Ok(Object::Bool(matches!(
-            py_call(&raw, name, &[]),
-            Ok(Object::Bool(true))
-        ))),
+        // CPython's `Buffered*.{readable,writable,seekable}` return
+        // `self.raw.<name>()` and let any exception propagate — a stream-mode
+        // `tarfile._FileInFile.seekable()` calls the underlying `_Stream`'s
+        // (absent) `seekable`, so the `AttributeError` must surface, not be
+        // silently coerced to `False` (`test_extractfile_attrs`).
+        Ok(RawTarget::Py(raw)) => Ok(Object::Bool(py_call(&raw, name, &[])?.is_truthy())),
         Err(_) => Ok(Object::Bool(false)),
     }
 }

@@ -30,9 +30,7 @@ fn resource_id(obj: &Object) -> Result<i32, RuntimeError> {
         Object::Int(n) => i32::try_from(*n)
             .map_err(|_| overflow_error("Python int too large to convert to C int")),
         Object::Bool(b) => Ok(i32::from(*b)),
-        Object::Long(_) => Err(overflow_error(
-            "Python int too large to convert to C int",
-        )),
+        Object::Long(_) => Err(overflow_error("Python int too large to convert to C int")),
         _ => Err(type_error("an integer is required")),
     }
 }

@@ -1516,7 +1516,11 @@ fn sockaddr_unix_from_bytes(path: &[u8]) -> Result<SockAddr, RuntimeError> {
     let cap = su.sun_path.len();
     let is_abstract = path.first() == Some(&0);
     // Pathname sockets reserve one byte for the trailing NUL.
-    let max = if is_abstract { cap } else { cap.saturating_sub(1) };
+    let max = if is_abstract {
+        cap
+    } else {
+        cap.saturating_sub(1)
+    };
     if path.len() > max {
         return Err(os_error("AF_UNIX path too long"));
     }
