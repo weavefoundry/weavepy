@@ -75,7 +75,14 @@ for _candidate in ("fork", "forkpty", "wait", "waitpid", "wait3", "wait4",
         _names.append(_candidate)
 
 
-environ = _os.environ
+# CPython's ``posix.environ`` is a plain ``dict`` with *bytes* keys and values
+# on POSIX hosts (the raw environment block); ``os.environ`` is the decoded
+# ``str`` mapping layered on top. WeavePy keeps the bytes snapshot in
+# ``os.environb``, so mirror CPython by exposing that here (falling back to the
+# ``str`` mapping on platforms without ``environb``).
+environ = getattr(_os, "environb", None)
+if environ is None:
+    environ = _os.environ
 sep = _os.sep
 linesep = _os.linesep
 defpath = getattr(_os, "defpath", "/bin:/usr/bin")

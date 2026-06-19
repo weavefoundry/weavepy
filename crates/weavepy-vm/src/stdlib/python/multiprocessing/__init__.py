@@ -60,4 +60,11 @@ def _run_spawn_child():
     resource_tracker._resource_tracker._fd = kwds.get('tracker_fd')
     fd = kwds['pipe_handle']
     parent_sentinel = os.dup(fd)
+    if os.environ.get('WEAVEPY_MP_DEBUG'):
+        import traceback
+        try:
+            return spawn._main(fd, parent_sentinel)
+        except BaseException:
+            traceback.print_exc()
+            raise
     return spawn._main(fd, parent_sentinel)

@@ -64,10 +64,13 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         let text_io_wrapper = crate::stdlib::io::make_text_io_wrapper(text_iobase.clone());
         let incremental_newline =
             make_protocol("IncrementalNewlineDecoder", vec![bt.object_.clone()]);
-        let unsupported_op = make_protocol(
-            "UnsupportedOperation",
-            vec![bt.os_error.clone(), bt.value_error.clone()],
-        );
+        // Use the *canonical* `io.UnsupportedOperation` type (the memoised one
+        // raised by the native IO methods via `io::unsupported_op`), so that
+        // `isinstance(exc, io.UnsupportedOperation)` holds for errors raised by
+        // `FileIO`/`BytesIO`/`Buffered*` — gzip/bz2/lzma and `test_io` all do
+        // `assertRaises(io.UnsupportedOperation, ...)`. Building a *fresh*
+        // `make_protocol` class here would diverge from the raised type.
+        let unsupported_op = crate::stdlib::io::unsupported_operation_class();
 
         for (name, cls) in [
             ("IOBase", &iobase),
@@ -322,33 +325,11 @@ pub(crate) fn io_open_kw(
     io_open(&positional)
 }
 
-/// Translate an `open()` mode string into WeavePy's (Linux-style) `os.open`
-/// flag bits, matching the constants exposed by the `os` module. Used only
-/// to hand a plausible `flags` value to a user `opener` callback.
+/// Translate an `open()` mode string into the host platform's `os.open` flag
+/// bits, matching the constants exposed by the `os` module. Used only to hand a
+/// plausible `flags` value to a user `opener` callback.
 fn open_flags_for_mode(mode: &str) -> i64 {
-    const O_WRONLY: i64 = 1;
-    const O_RDWR: i64 = 2;
-    const O_CREAT: i64 = 64;
-    const O_EXCL: i64 = 128;
-    const O_TRUNC: i64 = 512;
-    const O_APPEND: i64 = 1024;
-    let mut flags = if mode.contains('+') {
-        O_RDWR
-    } else if mode.contains('w') || mode.contains('a') || mode.contains('x') {
-        O_WRONLY
-    } else {
-        0
-    };
-    if mode.contains('a') {
-        flags |= O_APPEND | O_CREAT;
-    }
-    if mode.contains('w') {
-        flags |= O_CREAT | O_TRUNC;
-    }
-    if mode.contains('x') {
-        flags |= O_CREAT | O_EXCL;
-    }
-    flags
+    crate::stdlib::os::open_flags_for_mode(mode)
 }
 
 /// Adopt an already-open OS file descriptor (e.g. produced by an `opener`

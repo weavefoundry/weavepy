@@ -90,7 +90,13 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("math", math::build);
     cache.register_builtin("os", os::build);
     cache.register_builtin("os.path", os::build_path);
-    cache.register_builtin("io", io::build);
+    // RFC 0040 WS7 — the public `io` module is a thin frozen wrapper
+    // (`python/io.py`) that re-exports the native `_io` accelerator, exactly
+    // like CPython's real `Lib/io.py` (`io.BufferedReader is _io.BufferedReader`,
+    // `type(open(f,'rb')) is io.BufferedReader`, shared IOBase ABC family). The
+    // native classes live in `_io` (see `io_full::build`, which calls
+    // `io::build` internally); `_pyio` is the separate pure-Python twin that
+    // `test_io` imports directly as its "Py" variant.
     cache.register_builtin("json", json::build);
     cache.register_builtin("time", time::build);
     cache.register_builtin("_thread", thread_real::build);
@@ -197,6 +203,15 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "_pyio",
             source: include_str!("python/_pyio.py"),
+            is_package: false,
+        },
+        // RFC 0040 WS7 — the public `io` module: a thin re-export of the native
+        // `_io` accelerator, mirroring CPython's real `Lib/io.py`. Preserves
+        // type identity (`io.BufferedReader is _io.BufferedReader`) and the
+        // shared IOBase ABC family; `_pyio` stays the separate pure-Python twin.
+        FrozenSource {
+            name: "io",
+            source: include_str!("python/io.py"),
             is_package: false,
         },
         // RFC 0040 WS4 — CPython's `signal.py`: layers the `Signals`/

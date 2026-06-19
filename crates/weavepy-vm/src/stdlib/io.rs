@@ -315,7 +315,18 @@ pub(crate) fn make_text_io_wrapper(
     method("__next__", tw_next);
     method("__enter__", tw_enter);
     method("__exit__", tw_exit);
-    method("reconfigure", tw_reconfigure);
+    // `reconfigure(*, encoding, errors, newline, line_buffering, write_through)`
+    // is keyword-only in CPython — register with a `call_kw` so the kwargs form
+    // (`reconfigure(newline='')`, `reconfigure(encoding='utf-8')`) works.
+    dict.insert(
+        DictKey(Object::from_static("reconfigure")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "reconfigure",
+            binds_instance: true,
+            call: Box::new(tw_reconfigure),
+            call_kw: Some(Box::new(tw_reconfigure_kw)),
+        })),
+    );
     // `__init__` needs keyword arguments (encoding=, errors=, newline=, …).
     dict.insert(
         DictKey(Object::from_static("__init__")),
@@ -569,31 +580,10 @@ fn fileio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
 }
 
 /// `os.open` flag bits for a normalized binary `FileIO` mode — only used to
-/// hand a plausible `flags` value to a user `opener` callback.
+/// hand a plausible `flags` value to a user `opener` callback. Delegates to the
+/// shared host-platform builder so the bits match the `os.O_*` constants.
 fn fileio_open_flags(mode: &str) -> i64 {
-    const O_WRONLY: i64 = 1;
-    const O_RDWR: i64 = 2;
-    const O_CREAT: i64 = 64;
-    const O_EXCL: i64 = 128;
-    const O_TRUNC: i64 = 512;
-    const O_APPEND: i64 = 1024;
-    let mut flags = if mode.contains('+') {
-        O_RDWR
-    } else if mode.contains('w') || mode.contains('a') || mode.contains('x') {
-        O_WRONLY
-    } else {
-        0
-    };
-    if mode.contains('a') {
-        flags |= O_APPEND | O_CREAT;
-    }
-    if mode.contains('w') {
-        flags |= O_CREAT | O_TRUNC;
-    }
-    if mode.contains('x') {
-        flags |= O_CREAT | O_EXCL;
-    }
-    flags
+    crate::stdlib::os::open_flags_for_mode(mode)
 }
 
 /// Install `FileIO.__new__` so `io.FileIO(name|fd, mode, closefd, opener)` is
@@ -1050,7 +1040,18 @@ fn build_iobase_family_inner() -> IoFamily {
         TypeObject::new_with_flags(name, vec![base.clone()], DictData::new(), flags())
             .expect("io child type must linearise")
     };
-    let raw = child("RawIOBase", &iobase);
+    // `RawIOBase` carries the default `read`/`readall` that delegate to the
+    // subclass `readinto` (CPython's `_pyio.RawIOBase.read`/`readall`), so a
+    // pure-Python subclass that only implements `readinto` still supports
+    // `read()`/`readall()` — and the layered `_pyio.BufferedReader` can call
+    // `raw.readall()` on such a raw.
+    let raw = {
+        let mut rd = DictData::new();
+        iobase_method(&mut rd, "read", rawiobase_read);
+        iobase_method(&mut rd, "readall", rawiobase_readall);
+        TypeObject::new_with_flags("RawIOBase", vec![iobase.clone()], rd, flags())
+            .expect("io child type must linearise")
+    };
     // `BufferedIOBase` carries the default `readinto`/`readinto1` that delegate
     // to `read`/`read1` (CPython's `_bufferediobase_readinto_generic`), so a
     // pure-Python subclass that only implements `read`/`read1` still supports
@@ -1262,6 +1263,56 @@ fn iobase_readline(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     Ok(Object::new_bytes(out))
+}
+
+/// `RawIOBase.read(size=-1)` — CPython's default: a negative size delegates to
+/// `readall()`; otherwise allocate a `bytearray(size)`, fill it with one
+/// `self.readinto(b)`, and return `bytes(b[:n])` (or `None` for a non-blocking
+/// `readinto` that returned `None`).
+fn rawiobase_read(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    let size = match args.get(1) {
+        Some(Object::Int(n)) => *n,
+        Some(Object::None) | None => -1,
+        Some(Object::Bool(b)) => i64::from(*b),
+        Some(_) => return Err(type_error("read() argument must be an integer")),
+    };
+    if size < 0 {
+        return py_call(&me, "readall", &[]);
+    }
+    let buf = Object::new_bytearray(vec![0u8; size as usize]);
+    let n = py_call(&me, "readinto", std::slice::from_ref(&buf))?;
+    let n = match n {
+        Object::None => return Ok(Object::None),
+        Object::Int(n) if n >= 0 => n as usize,
+        _ => return Err(type_error("readinto() should return a non-negative integer")),
+    };
+    let bytes = buf.as_bytes_view().unwrap_or_default();
+    Ok(Object::new_bytes(bytes[..n.min(bytes.len())].to_vec()))
+}
+
+/// `RawIOBase.readall()` — read and return all bytes until EOF by repeatedly
+/// calling `self.read(DEFAULT_BUFFER_SIZE)` (CPython's `_pyio.RawIOBase.readall`).
+fn rawiobase_readall(args: &[Object]) -> Result<Object, RuntimeError> {
+    let me = iobase_self(args)?;
+    let mut res: Vec<u8> = Vec::new();
+    let mut got_any = false;
+    loop {
+        let data = py_call(&me, "read", &[Object::Int(8192)])?;
+        if matches!(data, Object::None) {
+            if got_any {
+                break;
+            }
+            return Ok(Object::None);
+        }
+        let bytes = data.as_bytes_view().unwrap_or_default();
+        if bytes.is_empty() {
+            break;
+        }
+        got_any = true;
+        res.extend_from_slice(&bytes);
+    }
+    Ok(Object::new_bytes(res))
 }
 
 fn iobase_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1839,12 +1890,13 @@ fn tw_readline(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn tw_flush(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
+    // Propagate flush errors (CPython parity — `test_flush_error_on_close`).
     match tw_buffer_target(&inst) {
         Ok(RawTarget::Native(file)) => {
             file.flush()?;
         }
         Ok(RawTarget::Py(buffer)) => {
-            let _ = py_call(&buffer, "flush", &[]);
+            py_call(&buffer, "flush", &[])?;
         }
         Err(_) => {}
     }
@@ -1857,13 +1909,32 @@ fn tw_flush_noop(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn tw_close(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
+    // CPython `TextIOWrapper.close()`: flush the text layer, then close the
+    // wrapped buffer; idempotent, and a flush error propagates after close.
     match tw_buffer_target(&inst) {
         Ok(RawTarget::Native(file)) => {
-            let _ = file.flush();
+            if *file.closed.borrow() {
+                return Ok(Object::None);
+            }
+            let flush_err = file.flush().err();
             file.close();
+            if let Some(e) = flush_err {
+                return Err(e);
+            }
         }
         Ok(RawTarget::Py(buffer)) => {
-            let _ = py_call(&buffer, "close", &[]);
+            if py_get_attr(&buffer, "closed")
+                .map(|c| c.is_truthy())
+                .unwrap_or(false)
+            {
+                return Ok(Object::None);
+            }
+            let flush_err = tw_flush(args).err();
+            let close_res = py_call(&buffer, "close", &[]);
+            if let Some(e) = flush_err {
+                return Err(e);
+            }
+            close_res?;
         }
         Err(_) => {}
     }
@@ -1962,7 +2033,21 @@ fn tw_next(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn tw_enter(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(args[0].clone())
+    let me = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("__enter__ requires a stream instance"))?;
+    // CPython's `IOBase.__enter__` calls `self._checkClosed()`, so re-entering a
+    // closed stream as a context manager raises `ValueError`
+    // (`test_context_manager`). Shared by `Buffered*` and `TextIOWrapper`, both
+    // of which expose a delegating `closed` property.
+    if py_get_attr(&me, "closed")
+        .map(|c| c.is_truthy())
+        .unwrap_or(false)
+    {
+        return Err(value_error("I/O operation on closed file."));
+    }
+    Ok(me)
 }
 
 /// `TextIOWrapper.__exit__` — flush + close the wrapper (and thus the
@@ -1980,9 +2065,37 @@ fn bw_exit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn tw_reconfigure(args: &[Object]) -> Result<Object, RuntimeError> {
-    // Accept (and ignore) encoding/newline reconfiguration requests; the
-    // common case in tests is `reconfigure(newline='')`.
-    let _ = tw_self(args)?;
+    tw_reconfigure_kw(args, &[])
+}
+
+/// `TextIOWrapper.reconfigure(*, encoding, errors, newline, line_buffering,
+/// write_through)` — apply the recognised text parameters onto the wrapper's
+/// stored state. `None` for `encoding`/`errors` means "leave unchanged"
+/// (CPython parity); the common test cases are `reconfigure(newline='')` and
+/// `reconfigure(encoding=..., errors=...)`.
+fn tw_reconfigure_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let inst = tw_self(args)?;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "encoding" => {
+                if !matches!(v, Object::None) {
+                    tw_set(&inst, "encoding", v.clone());
+                }
+            }
+            "errors" => {
+                if !matches!(v, Object::None) {
+                    tw_set(&inst, "errors", v.clone());
+                }
+            }
+            "newline" => tw_set(&inst, "newline", v.clone()),
+            "line_buffering" => tw_set(&inst, "line_buffering", v.clone()),
+            "write_through" => tw_set(&inst, "write_through", v.clone()),
+            _ => {}
+        }
+    }
     Ok(Object::None)
 }
 
@@ -2104,6 +2217,26 @@ fn bw_target(inst: &crate::types::PyInstance) -> Result<RawTarget, RuntimeError>
     raw_target(&raw)
 }
 
+/// Guard every buffered I/O method, mirroring CPython's `CHECK_INITIALIZED` +
+/// `CHECK_CLOSED`: raise `ValueError("I/O operation on closed file.")` when the
+/// wrapper has been closed or detached (a missing/closed raw counts as closed).
+/// `test_io`'s `test_io_after_close`/`test_multi_close`/`test_context_manager`
+/// and CPython's own `Buffered*` all assert this.
+fn bw_check_open(inst: &crate::types::PyInstance) -> Result<(), RuntimeError> {
+    let closed = match bw_target(inst) {
+        Ok(RawTarget::Native(raw)) => *raw.closed.borrow(),
+        Ok(RawTarget::Py(raw)) => py_get_attr(&raw, "closed")
+            .map(|c| c.is_truthy())
+            .unwrap_or(false),
+        // No raw at all → detached or never initialised: treat as closed.
+        Err(_) => true,
+    };
+    if closed {
+        return Err(value_error("I/O operation on closed file."));
+    }
+    Ok(())
+}
+
 const BW_CHUNK: usize = 8192;
 
 fn bw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -2119,6 +2252,21 @@ fn bw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
                 .map(|(_, v)| v.clone())
         })
         .ok_or_else(|| type_error("a raw stream is required"))?;
+    // `buffer_size` (2nd positional, or the `buffer_size=` kwarg) must be
+    // strictly positive — CPython raises `ValueError("buffer size must be
+    // strictly positive")`. Only validate genuine ints: `BufferedRWPair`'s
+    // 2nd positional is the *writer* stream, not a size.
+    let bufsize = positional.get(1).cloned().or_else(|| {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == "buffer_size")
+            .map(|(_, v)| v.clone())
+    });
+    if let Some(Object::Int(n)) = bufsize {
+        if n <= 0 {
+            return Err(value_error("buffer size must be strictly positive"));
+        }
+    }
     tw_set(&inst, "raw", raw);
     Ok(Object::None)
 }
@@ -2137,6 +2285,7 @@ fn bw_bytes_arg(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
 
 fn bw_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    bw_check_open(&inst)?;
     match bw_target(&inst)? {
         RawTarget::Native(raw) => {
             let bytes = bw_bytes_arg(args.get(1))?;
@@ -2174,6 +2323,7 @@ fn bw_size_arg(arg: Option<&Object>) -> Result<Option<i64>, RuntimeError> {
 
 fn bw_read(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    bw_check_open(&inst)?;
     let size_opt = bw_size_arg(args.get(1))?;
     let read_all = size_opt.is_none_or(|n| n < 0);
     let size = size_opt.filter(|n| *n >= 0).unwrap_or(0) as usize;
@@ -2214,6 +2364,7 @@ fn bw_read(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `read1(size=-1)` — at most one underlying read.
 fn bw_read1(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    bw_check_open(&inst)?;
     match bw_target(&inst)? {
         RawTarget::Native(_) => bw_read(args),
         RawTarget::Py(raw) => {
@@ -2236,6 +2387,7 @@ fn bw_read1(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bw_peek(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    bw_check_open(&inst)?;
     match bw_target(&inst)? {
         RawTarget::Native(raw) => {
             // Read a chunk and rewind so the bytes stay available — a faithful
@@ -2260,6 +2412,7 @@ fn bw_peek(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bw_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    bw_check_open(&inst)?;
     // Accept a bytearray or a writable, contiguous `memoryview` window over
     // one (CPython parity — `readinto` takes any read-write buffer).
     let (dst, start, cap) = match args.get(1) {
@@ -2315,6 +2468,7 @@ fn bw_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bw_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    bw_check_open(&inst)?;
     let limit = match args.get(1) {
         Some(Object::Int(n)) if *n >= 0 => Some(*n as usize),
         _ => None,
@@ -2401,14 +2555,33 @@ fn bw_flush(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bw_close(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    // CPython's `close()` is idempotent (a second close is a no-op), flushes
+    // first, and re-raises a flush/close error *after* the raw is closed
+    // (`test_flush_error_on_close`/`test_close_error_on_close`/`test_multi_close`).
     match bw_target(&inst) {
         Ok(RawTarget::Native(raw)) => {
-            let _ = raw.flush();
+            if *raw.closed.borrow() {
+                return Ok(Object::None);
+            }
+            let flush_err = raw.flush().err();
             raw.close();
+            if let Some(e) = flush_err {
+                return Err(e);
+            }
         }
         Ok(RawTarget::Py(raw)) => {
-            let _ = py_call(&raw, "flush", &[]);
-            let _ = py_call(&raw, "close", &[]);
+            if py_get_attr(&raw, "closed")
+                .map(|c| c.is_truthy())
+                .unwrap_or(false)
+            {
+                return Ok(Object::None);
+            }
+            let flush_err = py_call(&raw, "flush", &[]).err();
+            let close_res = py_call(&raw, "close", &[]);
+            if let Some(e) = flush_err {
+                return Err(e);
+            }
+            close_res?;
         }
         Err(_) => {}
     }
@@ -2417,6 +2590,7 @@ fn bw_close(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bw_seek(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    bw_check_open(&inst)?;
     // `offset` must be an integer (or `__index__`-able): `None`, `bytes`, a
     // tuple or a `float` are all `TypeError`, matching CPython's argument
     // clinic. `whence` defaults to SEEK_SET and must be 0/1/2.
@@ -2461,6 +2635,7 @@ fn bw_seek(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bw_tell(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    bw_check_open(&inst)?;
     match bw_target(&inst)? {
         RawTarget::Native(raw) => {
             let pos = raw.seek(0, 1)?;
@@ -2479,6 +2654,7 @@ fn bw_tell(args: &[Object]) -> Result<Object, RuntimeError> {
 /// returns the new size and leaves the stream position unchanged.
 fn bw_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = bw_self(args)?;
+    bw_check_open(&inst)?;
     let size = args.get(1).cloned();
     match bw_target(&inst)? {
         RawTarget::Native(raw) => {

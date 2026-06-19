@@ -245,6 +245,22 @@ unsafe fn async_signal_set() -> libc::sigset_t {
     }
 }
 
+/// The process's *inherited* signal mask, captured on the initial thread
+/// before WeavePy blocks the async signals there. The VM thread restores
+/// exactly this mask so a mask the parent deliberately handed us (e.g.
+/// `os.posix_spawn(..., setsigmask=[SIGUSR1])`) is preserved instead of being
+/// clobbered — CPython keeps the inherited mask (`test_posix.test_setsigmask`).
+#[cfg(unix)]
+struct StoredSigset(libc::sigset_t);
+// `sigset_t` is a plain POD bitmask; sharing it across the (sequential,
+// spawn-synchronized) initial→VM thread handoff is sound.
+#[cfg(unix)]
+unsafe impl Send for StoredSigset {}
+#[cfg(unix)]
+unsafe impl Sync for StoredSigset {}
+#[cfg(unix)]
+static ORIGINAL_SIGMASK: std::sync::OnceLock<StoredSigset> = std::sync::OnceLock::new();
+
 /// Block the asynchronous, process-directed signals on the *calling*
 /// thread so the kernel delivers them elsewhere.
 ///
@@ -260,23 +276,36 @@ unsafe fn async_signal_set() -> libc::sigset_t {
 /// signals on the parked thread forces delivery onto the VM thread,
 /// restoring CPython's "a signal interrupts the main thread's blocking
 /// call" semantics. See [`unblock_async_signals_current_thread`].
+///
+/// The mask in effect *before* this blocks (the mask the process inherited
+/// from its parent) is stashed so the VM thread can restore it verbatim.
 #[cfg(unix)]
 pub fn block_async_signals_current_thread() {
     unsafe {
         let set = async_signal_set();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut old);
+        let _ = ORIGINAL_SIGMASK.set(StoredSigset(old));
     }
 }
 
-/// Unblock the asynchronous signals on the calling thread — the inverse
-/// of [`block_async_signals_current_thread`]. The VM thread calls this at
-/// startup so it is the sole thread with these signals unblocked and thus
-/// the deterministic delivery target for `SIGINT`/`SIGALRM`/etc.
+/// Restore the process's inherited signal mask on the calling thread — the
+/// counterpart of [`block_async_signals_current_thread`]. The VM thread calls
+/// this at startup so it becomes the deterministic delivery target for every
+/// signal that was deliverable at process start, *without* unblocking any
+/// signal the parent deliberately blocked for us (a `posix_spawn`
+/// `setsigmask`): CPython preserves that inherited mask
+/// (`test_posix.test_setsigmask`). If no inherited mask was captured (the
+/// blocking step never ran), fall back to simply unblocking the async set.
 #[cfg(unix)]
 pub fn unblock_async_signals_current_thread() {
     unsafe {
-        let set = async_signal_set();
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+        if let Some(mask) = ORIGINAL_SIGMASK.get() {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const mask.0, std::ptr::null_mut());
+        } else {
+            let set = async_signal_set();
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+        }
     }
 }
 
@@ -849,22 +878,22 @@ fn raise_signal(args: &[Object]) -> Result<Object, RuntimeError> {
     if sig < 1 || sig >= nsig() {
         return Err(value_error("signal number out of range"));
     }
-    // Deliver the signal for real (CPython's `raise()`), so the kernel
-    // runs our trampoline on whichever thread called us; the main thread
-    // then services the Python handler. When the disposition is our
-    // trampoline this is equivalent to a direct trip; doing the real
-    // `raise` also honours `SIG_DFL`/`SIG_IGN` faithfully.
+    // Deliver the signal for real, exactly like CPython's
+    // `signal_raise_signal_impl` (`raise(signalnum)`): the kernel runs our
+    // trampoline on whichever thread called us and the main thread then
+    // services any Python handler. Crucially we must `raise` *unconditionally*
+    // — including when the disposition is `SIG_DFL` with no Python handler — so
+    // a default-action signal performs that default action (terminate / dump /
+    // ignore) just like CPython. The previous "trip a flag instead, to avoid
+    // process death" shortcut made `raise_signal(SIGUSR1)` a silent no-op and
+    // broke `test_posix.test_setsigdef` (child spawned with
+    // `setsigdef=[SIGUSR1]` must die with `-SIGUSR1`). `SIG_IGN` and
+    // blocked signals are still honoured by the kernel (ignored / left pending),
+    // so `test_setsigmask` keeps exiting 0.
     #[cfg(unix)]
     {
-        let installed = !matches!(handler_for(sig), Object::Int(0));
-        if installed {
-            unsafe {
-                libc::raise(sig as libc::c_int);
-            }
-        } else {
-            // No Python handler — emulate without risking process death
-            // for the common test signals by tripping the flag.
-            trip_signal(sig);
+        unsafe {
+            libc::raise(sig as libc::c_int);
         }
     }
     #[cfg(not(unix))]

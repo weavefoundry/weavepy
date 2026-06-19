@@ -15,8 +15,16 @@ if sys.platform in {'win32', 'cygwin'}:
 else:
     _setmode = None
 
-import io
-from io import (__all__, SEEK_SET, SEEK_CUR, SEEK_END)
+# WeavePy: import the low-level accelerator (`_io`) rather than the public
+# `io` module. CPython's `_pyio` imports `io`, but in WeavePy the public `io`
+# module is a frozen wrapper that re-exports *this* module's layered classes
+# (BufferedReader/Writer/Random, TextIOWrapper, open). Importing `io` here
+# would create a circular import; `_io` carries every name `_pyio` needs
+# (`SEEK_*`, `__all__`, `open_code`, `UnsupportedOperation`, the IOBase ABCs)
+# and `_io.IOBase is io.IOBase`, so virtual-subclass registration below still
+# makes `isinstance(_pyio_obj, io.IOBase)` hold.
+import _io as io
+from _io import (__all__, SEEK_SET, SEEK_CUR, SEEK_END)
 
 valid_seek_flags = {0, 1, 2}  # Hardwired values
 if hasattr(os, 'SEEK_HOLE') :

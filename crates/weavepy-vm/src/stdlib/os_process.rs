@@ -88,8 +88,15 @@ pub(super) fn register(d: &mut DictData) {
     reg!("setgroups", os_setgroups);
 
     // --- affinity / scheduling ---
-    reg!("sched_getaffinity", os_sched_getaffinity);
-    reg!("sched_setaffinity", os_sched_setaffinity);
+    // CPU affinity is a Linux-only surface; CPython doesn't expose
+    // `sched_{get,set}affinity` on macOS/BSD, so neither do we (a guarded
+    // `hasattr` then drives the fallback — `test_posix.test_sched_getaffinity`
+    // skips rather than erroring).
+    #[cfg(target_os = "linux")]
+    {
+        reg!("sched_getaffinity", os_sched_getaffinity);
+        reg!("sched_setaffinity", os_sched_setaffinity);
+    }
     reg!("sched_yield", os_sched_yield);
 
     // --- small surface gaps test_os probes ---
@@ -112,6 +119,20 @@ pub(super) fn register(d: &mut DictData) {
     con!("POSIX_SPAWN_OPEN", 0);
     con!("POSIX_SPAWN_CLOSE", 1);
     con!("POSIX_SPAWN_DUP2", 2);
+
+    // --- dynamic-loader (`dlopen(3)`) mode flags ---
+    // CPython's `posix`/`os` expose the `RTLD_*` bits used by `ctypes` and by
+    // `sys.setdlopenflags`. Values are platform-specific, so source them from
+    // `libc` rather than hardcoding (`test_posix.test_rtld_constants` asserts
+    // the four canonical names exist).
+    con!("RTLD_LAZY", i64::from(libc::RTLD_LAZY));
+    con!("RTLD_NOW", i64::from(libc::RTLD_NOW));
+    con!("RTLD_GLOBAL", i64::from(libc::RTLD_GLOBAL));
+    con!("RTLD_LOCAL", i64::from(libc::RTLD_LOCAL));
+    con!("RTLD_NODELETE", i64::from(libc::RTLD_NODELETE));
+    con!("RTLD_NOLOAD", i64::from(libc::RTLD_NOLOAD));
+    #[cfg(target_os = "linux")]
+    con!("RTLD_DEEPBIND", i64::from(libc::RTLD_DEEPBIND));
 
     // --- sysexits-style exit codes (CPython exposes these) ---
     con!("EX_OK", 0);
@@ -500,6 +521,21 @@ fn os_posix_spawnp(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     posix_spawn_impl(args, kwargs, true)
 }
 
+/// Validate a signal number for `setsigdef`/`setsigmask` (CPython rejects
+/// `n <= 0` or `n >= NSIG` with `ValueError` —
+/// `test_posix.test_setsigdef_wrong_type` passes `signal.NSIG`).
+#[cfg(unix)]
+fn signum_in_range(sig: i64) -> Result<libc::c_int, RuntimeError> {
+    #[cfg(target_os = "linux")]
+    const NSIG: i64 = 65;
+    #[cfg(not(target_os = "linux"))]
+    const NSIG: i64 = 32;
+    if sig <= 0 || sig >= NSIG {
+        return Err(value_error(format!("signal number {sig} out of range")));
+    }
+    Ok(sig as libc::c_int)
+}
+
 #[cfg(unix)]
 fn posix_spawn_impl(
     args: &[Object],
@@ -528,6 +564,27 @@ fn posix_spawn_impl(
 
     let kw = |name: &str| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v);
 
+    // Validate the keyword *shapes* up front — before allocating the spawn
+    // attribute structs — so the error paths need no cleanup. CPython raises
+    // these eagerly (`test_posix.test_scheduler_wrong_type`,
+    // `test_setsigdef_wrong_type`, `test_setsigmask_wrong_type`).
+    if let Some(sched) = kw("scheduler") {
+        let ok = matches!(sched, Object::None)
+            || matches!(sched, Object::Tuple(t) if t.len() == 2);
+        if !ok {
+            return Err(type_error("scheduler must be a tuple or None"));
+        }
+    }
+    for name in ["setsigdef", "setsigmask"] {
+        if let Some(v) = kw(name) {
+            if !matches!(v, Object::None) && crate::stdlib::os::sequence_items(v).is_none() {
+                return Err(type_error(format!(
+                    "{name} must be an iterable of integers"
+                )));
+            }
+        }
+    }
+
     // SAFETY: init/destroy paired below; pointers from above kept alive.
     let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
     let mut attr: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
@@ -551,9 +608,18 @@ fn posix_spawn_impl(
                         .ok_or_else(|| type_error("empty file_action"))?,
                     "file_action",
                 )?;
+                // Each action tuple has a fixed arity per selector; a wrong
+                // length, wrong element type, or unknown selector is a
+                // `TypeError` (`test_posix.test_bad_file_actions`). The arity
+                // checks also keep the `parts[..]` indexing panic-free.
                 match kind {
-                    // POSIX_SPAWN_OPEN
+                    // POSIX_SPAWN_OPEN: (mode, fd, path, oflag, mode)
                     0 => {
+                        if parts.len() != 5 {
+                            return Err(type_error(
+                                "POSIX_SPAWN_OPEN file_action requires 5 elements",
+                            ));
+                        }
                         let fd = obj_to_int(&parts[1], "open fd")? as libc::c_int;
                         let p = obj_to_cstring(&parts[2], "open path")?;
                         let oflag = obj_to_int(&parts[3], "open flag")? as libc::c_int;
@@ -570,22 +636,32 @@ fn posix_spawn_impl(
                         }
                         open_cstrs.push(p);
                     }
-                    // POSIX_SPAWN_CLOSE
+                    // POSIX_SPAWN_CLOSE: (mode, fd)
                     1 => {
+                        if parts.len() != 2 {
+                            return Err(type_error(
+                                "POSIX_SPAWN_CLOSE file_action requires 2 elements",
+                            ));
+                        }
                         let fd = obj_to_int(&parts[1], "close fd")? as libc::c_int;
                         unsafe {
                             libc::posix_spawn_file_actions_addclose(&raw mut file_actions, fd)
                         };
                     }
-                    // POSIX_SPAWN_DUP2
+                    // POSIX_SPAWN_DUP2: (mode, fd, new_fd)
                     2 => {
+                        if parts.len() != 3 {
+                            return Err(type_error(
+                                "POSIX_SPAWN_DUP2 file_action requires 3 elements",
+                            ));
+                        }
                         let fd = obj_to_int(&parts[1], "dup2 fd")? as libc::c_int;
                         let fd2 = obj_to_int(&parts[2], "dup2 fd2")? as libc::c_int;
                         unsafe {
                             libc::posix_spawn_file_actions_adddup2(&raw mut file_actions, fd, fd2)
                         };
                     }
-                    _ => return Err(value_error("posix_spawn: unknown file_action")),
+                    _ => return Err(type_error("Unknown file_actions item")),
                 }
             }
         }
@@ -623,7 +699,7 @@ fn posix_spawn_impl(
             let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
             unsafe { libc::sigemptyset(&raw mut set) };
             for s in &sigs {
-                let n = obj_to_int(s, "setsigdef")? as libc::c_int;
+                let n = signum_in_range(obj_to_int(s, "setsigdef")?)?;
                 unsafe { libc::sigaddset(&raw mut set, n) };
             }
             unsafe { libc::posix_spawnattr_setsigdefault(&raw mut attr, &raw const set) };
@@ -635,7 +711,7 @@ fn posix_spawn_impl(
             let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
             unsafe { libc::sigemptyset(&raw mut set) };
             for s in &sigs {
-                let n = obj_to_int(s, "setsigmask")? as libc::c_int;
+                let n = signum_in_range(obj_to_int(s, "setsigmask")?)?;
                 unsafe { libc::sigaddset(&raw mut set, n) };
             }
             unsafe { libc::posix_spawnattr_setsigmask(&raw mut attr, &raw const set) };
@@ -673,8 +749,12 @@ fn posix_spawn_impl(
         libc::posix_spawnattr_destroy(&raw mut attr);
     }
     if rc != 0 {
-        return Err(crate::error::io_error_to_py(
+        // CPython reports the offending program path as `exc.filename`
+        // (`test_posix.test_no_such_executable`).
+        let fname = cpath.to_str().ok();
+        return Err(crate::error::io_error_to_py_named(
             &std::io::Error::from_raw_os_error(rc),
+            fname,
         ));
     }
     Ok(Object::Int(i64::from(pid)))
@@ -918,7 +998,8 @@ fn os_getpgid(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 #[cfg(unix)]
-fn os_getpgrp(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_getpgrp(args: &[Object]) -> Result<Object, RuntimeError> {
+    super::os::require_no_args(args, "getpgrp")?;
     Ok(Object::Int(i64::from(unsafe { libc::getpgrp() })))
 }
 
@@ -931,7 +1012,8 @@ fn os_setpgrp(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 #[cfg(unix)]
-fn os_getppid(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_getppid(args: &[Object]) -> Result<Object, RuntimeError> {
+    super::os::require_no_args(args, "getppid")?;
     Ok(Object::Int(i64::from(unsafe { libc::getppid() })))
 }
 
@@ -1088,10 +1170,19 @@ fn os_closerange(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn os_pipe2(args: &[Object]) -> Result<Object, RuntimeError> {
-    let flags = obj_to_int(
-        args.first().ok_or_else(|| type_error("pipe2: flags"))?,
-        "flags",
-    )? as libc::c_int;
+    // `os.pipe2(flags)` — exactly one *integer* argument
+    // (`test_posix.test_pipe2` checks `pipe2('DEADBEEF')` and `pipe2(0, 0)`
+    // both raise `TypeError`).
+    if args.len() != 1 {
+        return Err(type_error(format!(
+            "pipe2() takes exactly 1 argument ({} given)",
+            args.len()
+        )));
+    }
+    let flags = match args.first() {
+        Some(Object::Int(n)) => *n as libc::c_int,
+        _ => return Err(type_error("pipe2() argument must be an integer")),
+    };
     let mut fds = [0i32; 2];
     #[cfg(target_os = "linux")]
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), flags) };
@@ -1165,22 +1256,6 @@ fn os_sched_getaffinity(args: &[Object]) -> Result<Object, RuntimeError> {
 #[cfg(target_os = "linux")]
 fn os_sched_setaffinity(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn os_sched_getaffinity(_args: &[Object]) -> Result<Object, RuntimeError> {
-    // Not available on macOS/BSD — match CPython, which doesn't expose it
-    // there either, by raising AttributeError-style. Callers use a guarded
-    // hasattr; returning NotImplementedError keeps them on the fallback.
-    Err(crate::error::not_implemented_error(
-        "sched_getaffinity is Linux-only",
-    ))
-}
-#[cfg(not(target_os = "linux"))]
-fn os_sched_setaffinity(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "sched_setaffinity is Linux-only",
-    ))
 }
 
 #[cfg(unix)]
@@ -1259,9 +1334,46 @@ static ATFORK: Mutex<Option<AtForkHandlers>> = Mutex::new(None);
 /// after_in_child=None)` — record callables fired around `os.fork()` and
 /// the `multiprocessing` fork start method.
 pub(super) fn register_at_fork_kw(
-    _args: &[Object],
+    args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
+    // CPython's `os.register_at_fork` is keyword-only and each supplied
+    // handler must be callable — not `None`, not an arbitrary object
+    // (`test_posix.test_register_at_fork`).
+    if !args.is_empty() {
+        return Err(type_error(
+            "register_at_fork() takes no positional arguments",
+        ));
+    }
+    fn is_callable(o: &Object) -> bool {
+        match o {
+            Object::Function(_)
+            | Object::Builtin(_)
+            | Object::BoundMethod(_)
+            | Object::Type(_)
+            | Object::Generator(_)
+            | Object::StaticMethod(_) => true,
+            Object::Instance(inst) => inst.cls().lookup("__call__").is_some(),
+            _ => false,
+        }
+    }
+    let mut has_handler = false;
+    for (k, v) in kwargs {
+        if matches!(k.as_str(), "before" | "after_in_parent" | "after_in_child") {
+            if !is_callable(v) {
+                return Err(type_error(format!(
+                    "register_at_fork() argument '{k}' must be callable, not {}",
+                    v.type_name()
+                )));
+            }
+            has_handler = true;
+        }
+    }
+    // At least one handler must be supplied (`test_posix.test_register_at_fork`
+    // checks the no-argument call raises).
+    if !has_handler {
+        return Err(type_error("At least one argument is required."));
+    }
     let mut guard = ATFORK.lock();
     let h = guard.get_or_insert_with(|| AtForkHandlers {
         before: Vec::new(),
@@ -1269,9 +1381,6 @@ pub(super) fn register_at_fork_kw(
         after_in_child: Vec::new(),
     });
     for (k, v) in kwargs {
-        if matches!(v, Object::None) {
-            continue;
-        }
         match k.as_str() {
             "before" => h.before.push(v.clone()),
             "after_in_parent" => h.after_in_parent.push(v.clone()),

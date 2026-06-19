@@ -35,6 +35,7 @@ pub mod gc_trace;
 pub mod gil;
 pub mod import;
 pub mod object;
+pub mod proc_init;
 pub mod pycache;
 pub mod recursion;
 pub mod specialize;
@@ -4072,14 +4073,27 @@ impl Interpreter {
                         })?;
                         let keys = self.call(&key_method, &[], &[], &globals)?;
                         let keys = self.collect_iterable(&keys, &globals)?;
-                        let mut t = target.borrow_mut();
+                        // Resolve each value through the *full* subscript protocol
+                        // (`subscr_via_protocol` honours a user-defined
+                        // `__getitem__`, which the raw `binary_subscr` skips) so
+                        // `{**mapping}` works for any `Mapping` — notably
+                        // `os._Environ`, the source of `{**os.environ}`. Collect
+                        // the pairs first: `__getitem__` re-enters the VM and the
+                        // target dict is a GC root on the stack, so we must not
+                        // hold its `borrow_mut` across the call.
+                        let mut pairs = Vec::with_capacity(keys.len());
                         for k in keys {
-                            let value = self.binary_subscr(&other, &k).map_err(|_| {
-                                type_error(format!(
-                                    "cannot access key in {} for ** spread",
-                                    other.type_name()
-                                ))
-                            })?;
+                            let value =
+                                self.subscr_via_protocol(&other, &k, &globals).map_err(|_| {
+                                    type_error(format!(
+                                        "cannot access key in {} for ** spread",
+                                        other.type_name()
+                                    ))
+                                })?;
+                            pairs.push((k, value));
+                        }
+                        let mut t = target.borrow_mut();
+                        for (k, value) in pairs {
                             t.insert(crate::object::DictKey(k), value);
                         }
                     }
@@ -6116,6 +6130,14 @@ impl Interpreter {
                             }
                         }
                         "closed" => return Ok(Object::Bool(f.is_closed())),
+                        // `FileIO.closefd` (CPython): OS-backed streams expose
+                        // whether they own the descriptor; in-memory streams
+                        // have no such attribute.
+                        "closefd" => {
+                            if !f.is_memory() {
+                                return Ok(Object::Bool(f.closefd.get()));
+                            }
+                        }
                         "encoding" => {
                             // Only *text* OS-backed streams (CPython's
                             // `TextIOWrapper`) expose `.encoding`; binary
@@ -8844,7 +8866,41 @@ impl Interpreter {
                 Err(e) => return Err(e),
             }
         }
+        // Native ABCs (e.g. the `io` `IOBase`/`RawIOBase`/`BufferedIOBase`/
+        // `TextIOBase` family) record virtual subclasses in a `_abc_registry`
+        // set via `register()`. CPython's `ABCMeta.__subclasscheck__` honours
+        // that registry; the native isinstance path must too, otherwise
+        // `isinstance(_pyio.BufferedReader(...), io.IOBase)` — the layered `io`
+        // module's classes are the registered `_pyio` ones — wrongly returns
+        // False. Match if `real` is, or descends from, any registered class.
+        if Self::class_is_abc_registered(cls, &real) {
+            return Ok(Object::Bool(true));
+        }
         Ok(Object::Bool(false))
+    }
+
+    /// Whether `candidate` is registered against the native ABC `cls` via its
+    /// `_abc_registry` set (directly, or as a descendant of a registered
+    /// virtual subclass). Mirrors one level of CPython's
+    /// `ABCMeta.__subclasscheck__` registry walk — sufficient for the `io` ABC
+    /// family, where `_pyio` registers each of `IOBase`/`RawIOBase`/
+    /// `BufferedIOBase`/`TextIOBase`.
+    fn class_is_abc_registered(cls: &Rc<TypeObject>, candidate: &Rc<TypeObject>) -> bool {
+        let reg = cls
+            .dict
+            .borrow()
+            .get(&crate::object::DictKey(Object::from_static("_abc_registry")))
+            .cloned();
+        if let Some(Object::Set(s)) = reg {
+            for k in s.borrow().iter() {
+                if let Object::Type(r) = &k.0 {
+                    if Rc::ptr_eq(r, candidate) || candidate.is_subclass_of(r) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// `issubclass(cls, classinfo)` — same protocol as

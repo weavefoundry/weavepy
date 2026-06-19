@@ -258,6 +258,11 @@ The following implementation-specific options are available:
 ";
 
 fn main() -> ExitCode {
+    // Undo Rust's pre-`main` `sanitize_standard_fds` (which re-opens any closed
+    // std fd onto `/dev/null`) so an inherited-closed stdin/stdout/stderr stays
+    // closed, matching CPython (`test_posix.test_close_file`). Must run before
+    // any descriptor work.
+    weavepy::vm::proc_init::restore_initial_std_fds();
     run_on_large_stack(main_dispatch)
 }
 

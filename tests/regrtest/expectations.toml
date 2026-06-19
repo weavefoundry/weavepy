@@ -444,8 +444,8 @@ status = "pass"
 reason = "measured (RFC 0040 WS1): passes end-to-end (12 run, 4 skip). The `test_lockf_{exclusive,share}` cases drive a `multiprocessing.get_context('spawn')` child that unpickles the test function from `test.test_fcntl`; they were failing because the spawn child rebinds `sys.path` in `spawn.prepare()` (`sys.path = data['sys_path']`) and WeavePy's import loader read a stale cached path snapshot. The loader now consults the live `sys.modules['sys'].path` (CPython-faithful), so the child resolves on-disk submodules and the lockf BlockingIOError round-trips."
 
 [tests."cpython/Lib/test/test_posix.py"]
-status = "fail"
-reason = "posix wrapper: posix_spawn + os.scheduler_*"
+status = "pass"
+reason = "RFC 0040 WS1/WS4: passes in the canonical subprocess mode (178 run, 0F/0E, 99 skip). Landed: os.pipe2 honouring O_NONBLOCK/O_CLOEXEC via host libc O_* values (macOS differs from Linux), signal.raise_signal delivering real signals unconditionally (setsigdef kills the child), posix_spawn setsigmask preserved by capturing+restoring the inherited signal mask on the VM thread, and a pre-main C constructor (proc_init) that re-closes any inherited-closed standard fd the Rust runtime's sanitize_standard_fds reopened to /dev/null (test_close_file)."
 
 [tests."cpython/Lib/test/test_uuid.py"]
 status = "fail"

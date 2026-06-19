@@ -420,6 +420,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin_kw("chmod", os_chmod),
         );
         d.insert(
+            DictKey(Object::from_static("fchmod")),
+            builtin("fchmod", os_fchmod),
+        );
+        d.insert(
             DictKey(Object::from_static("utime")),
             builtin_kw("utime", os_utime),
         );
@@ -431,16 +435,90 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("PathLike")),
             Object::Type(path_like_type()),
         );
-        d.insert(DictKey(Object::from_static("O_RDONLY")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("O_WRONLY")), Object::Int(1));
-        d.insert(DictKey(Object::from_static("O_RDWR")), Object::Int(2));
-        d.insert(DictKey(Object::from_static("O_CREAT")), Object::Int(64));
-        d.insert(DictKey(Object::from_static("O_EXCL")), Object::Int(128));
-        d.insert(DictKey(Object::from_static("O_TRUNC")), Object::Int(512));
-        d.insert(DictKey(Object::from_static("O_APPEND")), Object::Int(1024));
+        // File-open flag bits. On POSIX these are sourced from `libc` so each
+        // constant equals the *host* platform's real `O_*` value: CPython
+        // exposes the native values, and `os.pipe2`/`os.open`/`fcntl` pass them
+        // straight to the kernel. On Linux they match the historical hard-coded
+        // numbers; on macOS several differ — `O_NONBLOCK` is `0x4` (not the
+        // Linux `0x800`), and `O_TRUNC`/`O_APPEND`/`O_CREAT`/`O_EXCL` likewise.
+        // The old Linux-valued constants made `os.pipe2(os.O_NONBLOCK)` a no-op
+        // on macOS (`flags & libc::O_NONBLOCK == 0`), so the pipe stayed
+        // blocking (`test_posix.test_pipe2`). O_RDONLY/WRONLY/RDWR are 0/1/2 on
+        // every platform.
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("O_RDONLY")),
+                Object::Int(i64::from(libc::O_RDONLY)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_WRONLY")),
+                Object::Int(i64::from(libc::O_WRONLY)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_RDWR")),
+                Object::Int(i64::from(libc::O_RDWR)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_CREAT")),
+                Object::Int(i64::from(libc::O_CREAT)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_EXCL")),
+                Object::Int(i64::from(libc::O_EXCL)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_TRUNC")),
+                Object::Int(i64::from(libc::O_TRUNC)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_APPEND")),
+                Object::Int(i64::from(libc::O_APPEND)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_NONBLOCK")),
+                Object::Int(i64::from(libc::O_NONBLOCK)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_NDELAY")),
+                Object::Int(i64::from(libc::O_NDELAY)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_SYNC")),
+                Object::Int(i64::from(libc::O_SYNC)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_NOCTTY")),
+                Object::Int(i64::from(libc::O_NOCTTY)),
+            );
+            d.insert(
+                DictKey(Object::from_static("O_ACCMODE")),
+                Object::Int(i64::from(libc::O_ACCMODE)),
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            d.insert(DictKey(Object::from_static("O_RDONLY")), Object::Int(0));
+            d.insert(DictKey(Object::from_static("O_WRONLY")), Object::Int(1));
+            d.insert(DictKey(Object::from_static("O_RDWR")), Object::Int(2));
+            d.insert(DictKey(Object::from_static("O_CREAT")), Object::Int(64));
+            d.insert(DictKey(Object::from_static("O_EXCL")), Object::Int(128));
+            d.insert(DictKey(Object::from_static("O_TRUNC")), Object::Int(512));
+            d.insert(DictKey(Object::from_static("O_APPEND")), Object::Int(1024));
+            d.insert(DictKey(Object::from_static("O_NONBLOCK")), Object::Int(2048));
+        }
+        // `O_CLOEXEC` is platform-specific (and `O_DIRECT` is Linux-only), so
+        // source them from `libc` — `os.pipe2`/`os.open` callers and
+        // `test_posix.test_pipe2` expect them present.
+        #[cfg(unix)]
         d.insert(
-            DictKey(Object::from_static("O_NONBLOCK")),
-            Object::Int(2048),
+            DictKey(Object::from_static("O_CLOEXEC")),
+            Object::Int(i64::from(libc::O_CLOEXEC)),
+        );
+        #[cfg(target_os = "linux")]
+        d.insert(
+            DictKey(Object::from_static("O_DIRECT")),
+            Object::Int(i64::from(libc::O_DIRECT)),
         );
         // `lseek` whence values — identical across every POSIX platform.
         d.insert(DictKey(Object::from_static("SEEK_SET")), Object::Int(0));
@@ -687,6 +765,21 @@ pub(super) fn builtin(
     }))
 }
 
+/// Reject any positional arguments. CPython's argument-clinic-generated
+/// no-arg syscalls (`os.getpid`, `os.getuid`, `os.uname`, …) raise
+/// `TypeError` when handed an argument (`test_posix.testNoArgFunctions`
+/// asserts this for the whole family); WeavePy's native bodies otherwise
+/// silently ignore extras, so gate them through this helper.
+pub(super) fn require_no_args(args: &[Object], name: &str) -> Result<(), RuntimeError> {
+    if !args.is_empty() {
+        return Err(crate::error::type_error(format!(
+            "{name}() takes no arguments ({} given)",
+            args.len()
+        )));
+    }
+    Ok(())
+}
+
 /// As [`builtin`], but the body also takes a keyword-argument list.
 /// Use this for surfaces where CPython exposes named parameters
 /// (e.g. `os.makedirs(path, mode=0o777, exist_ok=False)`).
@@ -724,14 +817,16 @@ fn initial_environ() -> Object {
     Object::Dict(Rc::new(RefCell::new(d)))
 }
 
-fn os_getcwd(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_getcwd(args: &[Object]) -> Result<Object, RuntimeError> {
+    require_no_args(args, "getcwd")?;
     let cwd = std::env::current_dir().map_err(|e| os_error(format!("getcwd: {e}")))?;
     Ok(Object::from_str(cwd.to_string_lossy().into_owned()))
 }
 
 /// `os.getcwdb()` — the working directory as `bytes` (the OS-encoded path).
 /// `posixpath.abspath`/`realpath` call this for bytes-typed inputs.
-fn os_getcwdb(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_getcwdb(args: &[Object]) -> Result<Object, RuntimeError> {
+    require_no_args(args, "getcwdb")?;
     let cwd = std::env::current_dir().map_err(|e| os_error(format!("getcwd: {e}")))?;
     let bytes = {
         #[cfg(unix)]
@@ -775,6 +870,14 @@ fn os_putenv(args: &[Object]) -> Result<Object, RuntimeError> {
     #[cfg(unix)]
     {
         let name = env_cstring(args.first(), "name")?;
+        // An `=` in the *name* is illegal (it would split the `NAME=VALUE`
+        // record); CPython raises `ValueError` rather than letting `setenv`
+        // fail with `EINVAL` (`test_posix.test_putenv`).
+        if name.as_bytes().contains(&b'=') {
+            return Err(crate::error::value_error(
+                "illegal environment variable name",
+            ));
+        }
         let value = env_cstring(args.get(1), "value")?;
         // setenv (overwrite=1) edits the live C environ, so a later `execv`
         // (which passes the inherited environ) carries the change into the
@@ -815,7 +918,8 @@ fn os_unsetenv(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn os_getpid(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_getpid(args: &[Object]) -> Result<Object, RuntimeError> {
+    require_no_args(args, "getpid")?;
     Ok(Object::Int(i64::from(std::process::id())))
 }
 
@@ -932,6 +1036,14 @@ fn os_listdir(args: &[Object]) -> Result<Object, RuntimeError> {
     let (p, want_bytes) = match args.first() {
         None | Some(Object::None) => (".".to_string(), false),
         Some(Object::Bytes(b)) => (String::from_utf8_lossy(b).into_owned(), true),
+        // CPython's path converter accepts str/bytes/PathLike but rejects the
+        // bytes-*like* `bytearray`/`memoryview` (`test_listdir_bytes_like`).
+        Some(other @ (Object::ByteArray(_) | Object::MemoryView(_))) => {
+            return Err(type_error(format!(
+                "listdir: path should be string, bytes or os.PathLike, not {}",
+                other.type_name()
+            )));
+        }
         Some(other) => (path_to_string(other, "listdir")?, false),
     };
     let mut out = Vec::new();
@@ -1031,14 +1143,17 @@ fn os_open_stub(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(2)
         .and_then(crate::object::Object::as_i64)
         .unwrap_or(0o777) as u32;
-    const O_WRONLY: i64 = 1;
-    const O_RDWR: i64 = 2;
-    const O_CREAT: i64 = 64;
-    const O_EXCL: i64 = 128;
-    const O_TRUNC: i64 = 512;
-    const O_APPEND: i64 = 1024;
+    // Interpret the flag bits with the *host* platform's `libc` values, matching
+    // the `O_*` constants the `os` module exposes — on macOS these differ from
+    // Linux, so hard-coding Linux numbers here mis-decoded macOS flag masks.
+    const O_WRONLY: i64 = libc::O_WRONLY as i64;
+    const O_RDWR: i64 = libc::O_RDWR as i64;
+    const O_CREAT: i64 = libc::O_CREAT as i64;
+    const O_EXCL: i64 = libc::O_EXCL as i64;
+    const O_TRUNC: i64 = libc::O_TRUNC as i64;
+    const O_APPEND: i64 = libc::O_APPEND as i64;
     let mut oo = std::fs::OpenOptions::new();
-    match flags & 0x3 {
+    match flags & i64::from(libc::O_ACCMODE) {
         O_WRONLY => oo.write(true),
         O_RDWR => oo.read(true).write(true),
         _ => oo.read(true),
@@ -1068,6 +1183,49 @@ fn os_open_stub(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.open(): raw fd interface is not implemented in WeavePy yet",
     ))
+}
+
+/// The `os.open` flag bits for a text/binary mode string, using the same
+/// host-platform `O_*` values the `os` module exposes. `io.FileIO`/`io.open`
+/// use this only to synthesize the `flags` argument handed to a user `opener`
+/// callback, so it must agree with `os.O_*` (and hence the kernel) — otherwise
+/// an opener that forwards to `os.open` would see Linux-flavoured bits on macOS.
+pub(crate) fn open_flags_for_mode(mode: &str) -> i64 {
+    let (o_wronly, o_rdwr, o_creat, o_excl, o_trunc, o_append) = open_flag_bits();
+    let mut flags = if mode.contains('+') {
+        o_rdwr
+    } else if mode.contains('w') || mode.contains('a') || mode.contains('x') {
+        o_wronly
+    } else {
+        0
+    };
+    if mode.contains('a') {
+        flags |= o_append | o_creat;
+    }
+    if mode.contains('w') {
+        flags |= o_creat | o_trunc;
+    }
+    if mode.contains('x') {
+        flags |= o_creat | o_excl;
+    }
+    flags
+}
+
+#[cfg(unix)]
+fn open_flag_bits() -> (i64, i64, i64, i64, i64, i64) {
+    (
+        i64::from(libc::O_WRONLY),
+        i64::from(libc::O_RDWR),
+        i64::from(libc::O_CREAT),
+        i64::from(libc::O_EXCL),
+        i64::from(libc::O_TRUNC),
+        i64::from(libc::O_APPEND),
+    )
+}
+
+#[cfg(not(unix))]
+fn open_flag_bits() -> (i64, i64, i64, i64, i64, i64) {
+    (1, 2, 64, 128, 512, 1024)
 }
 
 /// `posix._fcopyfile(in_fd, out_fd, flags)` — macOS-only wrapper over
@@ -1155,7 +1313,26 @@ fn os_stat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     // `genericpath.exists`/`isfile`/… lean on the fd form when handed a
     // descriptor.
     if let Some(Object::Int(_) | Object::Bool(_)) = args.first() {
+        // `follow_symlinks` is meaningless for a descriptor; CPython rejects
+        // the combination (`test_posix.test_stat_fd_zero_follow_symlinks`).
+        let follow_explicit = kwargs.iter().any(|(k, _)| k == "follow_symlinks");
+        if follow_explicit && !dir_entry_follow(kwargs) {
+            return Err(value_error("cannot use fd and follow_symlinks together"));
+        }
         return os_fstat(args);
+    }
+    // The `stat`/`fstat` path-or-fd converter accepts str/bytes/PathLike or an
+    // integer fd — but *not* `bytearray`, `None`, `float`, … . Reject those
+    // eagerly with CPython's "or integer" wording
+    // (`test_posix.test_stat`/`test_fstat`).
+    match args.first() {
+        Some(Object::Str(_) | Object::Bytes(_) | Object::Instance(_)) => {}
+        other => {
+            let tn = other.map_or("NoneType".to_string(), |o| o.type_name().to_string());
+            return Err(type_error(format!(
+                "stat: path should be string, bytes, os.PathLike or integer, not {tn}"
+            )));
+        }
     }
     let p = first_path(args, "stat")?;
     let meta = if dir_entry_follow(kwargs) {
@@ -2561,7 +2738,8 @@ fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
 /// (and thus `@support.requires_mac_ver`, `test_shutil.test_tarfile_vs_tar`)
 /// read `.sysname`/`.release`/`.machine`.
 #[cfg(unix)]
-fn os_uname(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_uname(args: &[Object]) -> Result<Object, RuntimeError> {
+    require_no_args(args, "uname")?;
     // SAFETY: `uname` fills the zeroed `utsname`; we only read it afterwards.
     let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
     if unsafe { libc::uname(&raw mut uts) } != 0 {
@@ -2653,7 +2831,8 @@ fn os_get_exec_path(_args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(parts))
 }
 
-fn os_getuid(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_getuid(args: &[Object]) -> Result<Object, RuntimeError> {
+    require_no_args(args, "getuid")?;
     #[cfg(unix)]
     {
         Ok(Object::Int(i64::from(unsafe { libc::getuid() })))
@@ -2664,7 +2843,8 @@ fn os_getuid(_args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-fn os_getgid(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_getgid(args: &[Object]) -> Result<Object, RuntimeError> {
+    require_no_args(args, "getgid")?;
     #[cfg(unix)]
     {
         Ok(Object::Int(i64::from(unsafe { libc::getgid() })))
@@ -2846,8 +3026,44 @@ fn os_link(args: &[Object]) -> Result<Object, RuntimeError> {
 /// with `follow_symlinks=False` we chmod the link via `fchmodat` where the
 /// platform supports it, else fall back to the target (matching CPython's
 /// best-effort `lchmod` behaviour on Linux).
+/// `os.fchmod(fd, mode)` — change the permission bits of an open file
+/// descriptor (`posix.fchmod`; `test_posix.test_fchmod_file`). A thin
+/// wrapper over `fchmod(2)`.
+fn os_fchmod(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(n)) => *n,
+        _ => return Err(type_error("fchmod() fd must be int")),
+    };
+    let mode = match args.get(1) {
+        Some(Object::Int(m)) => *m,
+        _ => return Err(type_error("fchmod() mode must be int")),
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: plain syscall on a caller-supplied descriptor.
+        let rc = unsafe { libc::fchmod(fd as libc::c_int, mode as libc::mode_t) };
+        if rc != 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fd, mode);
+        Err(crate::error::not_implemented_error("fchmod is POSIX-only"))
+    }
+}
+
 fn os_chmod(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     reject_dir_fd(kwargs, "chmod")?;
+    // CPython's `os.chmod` accepts an open file descriptor in place of a path
+    // and dispatches to `fchmod(2)` (`test_posix.test_fchmod_file` calls
+    // `posix.chmod(fd, mode)`).
+    if let Some(Object::Int(_)) = args.first() {
+        return os_fchmod(args);
+    }
     let p = first_path(args, "chmod")?;
     let mode = match args.get(1) {
         Some(Object::Int(m)) => *m as u32,

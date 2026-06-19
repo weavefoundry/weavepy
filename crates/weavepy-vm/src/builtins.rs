@@ -769,6 +769,34 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "readable" => Some(method("readable", file_readable)),
             "writable" => Some(method("writable", file_writable)),
             "seekable" => Some(method("seekable", file_seekable)),
+            // `IOBase` private protocol helpers the layered `_pyio` Buffered*/
+            // TextIOWrapper classes call on the raw stream they wrap.
+            "_checkReadable" => Some(method("_checkReadable", file_check_readable)),
+            "_checkWritable" => Some(method("_checkWritable", file_check_writable)),
+            "_checkSeekable" => Some(method("_checkSeekable", file_check_seekable)),
+            "_checkClosed" => Some(method("_checkClosed", file_check_closed)),
+            // `RawIOBase.readall` (binary only) — `_pyio.BufferedReader` uses it
+            // for a full read of the wrapped native raw.
+            "readall" if f.binary => Some(method("readall", file_readall)),
+            // In-memory `BytesIO`/`StringIO` are copyable in CPython (real file
+            // streams are not). `copy.deepcopy(x)` looks up `__deepcopy__` on the
+            // *instance*, so exposing it here lets `copy.copy`/`copy.deepcopy`
+            // (e.g. `test_tarfile`'s `NoneInfoTests`, which deep-copies a TarInfo
+            // carrying a `BytesIO`) produce an independent buffer at the same
+            // stream position instead of raising `cannot pickle`.
+            "__copy__" | "__deepcopy__"
+                if matches!(
+                    &*f.backend.borrow(),
+                    crate::object::FileBackend::MemBytes { .. }
+                        | crate::object::FileBackend::MemText { .. }
+                ) =>
+            {
+                Some(method("__deepcopy__", file_copy_mem))
+            }
+            // Real file streams are unpicklable (CPython raises TypeError).
+            "__reduce__" => Some(method("__reduce__", file_reduce_forbidden)),
+            "__reduce_ex__" => Some(method("__reduce_ex__", file_reduce_forbidden)),
+            "__getstate__" => Some(method("__getstate__", file_reduce_forbidden)),
             "seek" => Some(method("seek", file_seek)),
             "tell" => Some(method("tell", file_tell)),
             "getvalue" => Some(method("getvalue", file_getvalue)),
@@ -10945,6 +10973,118 @@ pub(crate) fn file_writable(args: &[Object]) -> Result<Object, RuntimeError> {
 
 pub(crate) fn file_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(file_self(args)?.seekable()))
+}
+
+// `IOBase._checkReadable/_checkWritable/_checkSeekable/_checkClosed` — the
+// private protocol helpers CPython's `io` objects expose. The layered `_pyio`
+// Buffered*/TextIOWrapper classes call these on the raw stream they wrap (e.g.
+// `BufferedRandom.__init__` does `raw._checkSeekable()`); native `Object::File`
+// raws must answer them, raising `io.UnsupportedOperation`/`ValueError` exactly
+// as CPython's `_io._IOBase` does.
+pub(crate) fn file_check_readable(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !file_self(args)?.readable() {
+        return Err(crate::stdlib::io::unsupported_op(
+            "File or stream is not readable.",
+        ));
+    }
+    Ok(Object::None)
+}
+
+pub(crate) fn file_check_writable(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !file_self(args)?.writable() {
+        return Err(crate::stdlib::io::unsupported_op(
+            "File or stream is not writable.",
+        ));
+    }
+    Ok(Object::None)
+}
+
+pub(crate) fn file_check_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !file_self(args)?.seekable() {
+        return Err(crate::stdlib::io::unsupported_op(
+            "File or stream is not seekable.",
+        ));
+    }
+    Ok(Object::None)
+}
+
+pub(crate) fn file_check_closed(args: &[Object]) -> Result<Object, RuntimeError> {
+    if *file_self(args)?.closed.borrow() {
+        return Err(value_error("I/O operation on closed file."));
+    }
+    Ok(Object::None)
+}
+
+/// `RawIOBase.readall()` — read and return all bytes until EOF. CPython's
+/// `_pyio.BufferedReader` falls back to `raw.readall()` for a full read; a
+/// native binary `Object::File` answers it as a sizeless `read()`.
+pub(crate) fn file_readall(args: &[Object]) -> Result<Object, RuntimeError> {
+    let self_arg = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("readall() requires a file"))?;
+    file_read(std::slice::from_ref(&self_arg))
+}
+
+/// `BytesIO.__copy__` / `__deepcopy__` — produce an *independent* in-memory
+/// stream with the same contents and stream position. CPython's `BytesIO` and
+/// `StringIO` are copyable & pickleable (real file streams are not), so
+/// `copy.copy`/`copy.deepcopy` of one yields a fresh buffer positioned
+/// identically. The contents are immutable atoms (`bytes`/`str`), so a shallow
+/// clone of the backing buffer is already a correct deep copy.
+pub(crate) fn file_copy_mem(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::object::FileBackend;
+    let f = file_self(args)?;
+    let pos = f.position();
+    let new_file = match &*f.backend.borrow() {
+        FileBackend::MemBytes { data, .. } => {
+            let cloned = data.borrow().clone();
+            let nf = crate::object::PyFile::new(
+                "<bytes>",
+                "rb+",
+                FileBackend::MemBytes {
+                    data: Rc::new(crate::sync::RefCell::new(cloned)),
+                    pos,
+                },
+            );
+            nf.no_name.set(true);
+            nf
+        }
+        FileBackend::MemText { data, .. } => {
+            let nf = crate::object::PyFile::new(
+                "<string>",
+                "r+",
+                FileBackend::MemText {
+                    data: data.clone(),
+                    pos,
+                },
+            );
+            nf.no_name.set(true);
+            nf
+        }
+        _ => return Err(type_error("cannot copy a non-memory stream")),
+    };
+    Ok(Object::File(Rc::new(new_file)))
+}
+
+/// `IOBase.__getstate__` / `__reduce_ex__` — CPython forbids pickling stream
+/// objects (`TypeError: cannot pickle '_io.X' object`). Native `Object::File`
+/// streams mirror that so `test_io`'s `test_pickling` (which asserts the
+/// TypeError) passes.
+pub(crate) fn file_reduce_forbidden(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let name = if !f.binary {
+        "_io.TextIOWrapper"
+    } else if matches!(&*f.backend.borrow(), crate::object::FileBackend::MemBytes { .. }) {
+        "_io.BytesIO"
+    } else if f.writable() && f.readable() {
+        "_io.BufferedRandom"
+    } else if f.writable() {
+        "_io.BufferedWriter"
+    } else {
+        "_io.BufferedReader"
+    };
+    Err(type_error(format!("cannot pickle '{name}' object")))
 }
 
 pub(crate) fn file_getbuffer(args: &[Object]) -> Result<Object, RuntimeError> {

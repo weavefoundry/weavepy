@@ -303,7 +303,16 @@ pub fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<(), Er
         // `.pth` file can't break the interpreter outright.
         let _ = interpreter.run_site();
     }
-    let file_for_main = if opts.filename == "<string>" || opts.filename == "<stdin>" {
+    // Synthetic source names are wrapped in angle brackets (`<string>`,
+    // `<stdin>`, `<multiprocessing-fork>`, …) and, like CPython, must *not*
+    // install `__main__.__file__` — only a real on-disk script does. This is
+    // load-bearing for `multiprocessing` spawn: a spawned child runs the
+    // `<multiprocessing-fork>` bridge as `__main__`; if that carried a
+    // `__file__`, `multiprocessing.spawn.get_preparation_data` would record
+    // `init_main_from_path='<multiprocessing-fork>'` and every *nested* spawn
+    // (resource_tracker, manager server, a Pool created inside a worker) would
+    // `runpy.run_path('<multiprocessing-fork>')` → `FileNotFoundError`.
+    let file_for_main = if opts.filename.starts_with('<') && opts.filename.ends_with('>') {
         None
     } else {
         Some(opts.filename.as_str())
