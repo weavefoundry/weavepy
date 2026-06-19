@@ -110,6 +110,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             Object::Module(path_mod),
         );
         d.insert(DictKey(Object::from_static("environ")), initial_environ());
+        // `os.environb` (the bytes-keyed sibling) is installed by the
+        // `_weave_envinit` frozen module, which upgrades both `environ` and
+        // `environb` to CPython `_Environ` mappings over one shared store —
+        // so no native `environb` default is needed here.
 
         d.insert(
             DictKey(Object::from_static("getcwd")),
@@ -283,6 +287,18 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             builtin("ftruncate", os_ftruncate),
         );
         d.insert(
+            DictKey(Object::from_static("truncate")),
+            builtin("truncate", os_truncate),
+        );
+        d.insert(
+            DictKey(Object::from_static("times")),
+            builtin("times", os_times),
+        );
+        d.insert(
+            DictKey(Object::from_static("times_result")),
+            Object::Type(times_result_type()),
+        );
+        d.insert(
             DictKey(Object::from_static("get_inheritable")),
             builtin("get_inheritable", os_get_inheritable),
         );
@@ -293,6 +309,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("isatty")),
             builtin("isatty", os_isatty),
+        );
+        d.insert(
+            DictKey(Object::from_static("device_encoding")),
+            builtin("device_encoding", os_device_encoding),
         );
         d.insert(
             DictKey(Object::from_static("read")),
@@ -2396,7 +2416,18 @@ fn os_dup(args: &[Object]) -> Result<Object, RuntimeError> {
     {
         let new = unsafe { libc::dup(fd) };
         if new < 0 {
-            return Err(crate::error::os_error("dup() failed"));
+            // Preserve the real errno (`EBADF` for a closed/invalid fd) so
+            // `os.dup(bad).errno == errno.EBADF` — `test_os.TestInvalidFD`.
+            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        // PEP 446: `os.dup` returns a *non-inheritable* descriptor (FD_CLOEXEC
+        // set), unlike the raw `dup(2)`. `test_os.FDInheritanceTests.test_dup`
+        // asserts `os.get_inheritable(dup_fd) is False`.
+        unsafe {
+            let flags = libc::fcntl(new, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(new, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
         }
         Ok(Object::Int(i64::from(new)))
     }
@@ -2495,6 +2526,47 @@ fn os_lseek(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `os.ftruncate(fd, length)` — truncate (or extend) the file behind an
 /// open descriptor to `length` bytes. Backs `io.FileIO.truncate()` and the
 /// buffered `truncate()` path `test_io` exercises.
+/// `os.truncate(path, length)` — truncate a file given a path (str/bytes/
+/// `PathLike`) or an open fd (int). The fd form is exactly `os.ftruncate`.
+fn os_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
+    // An int first argument is a file descriptor → delegate to `ftruncate`.
+    if matches!(args.first(), Some(Object::Int(_) | Object::Bool(_))) {
+        return os_ftruncate(args);
+    }
+    let length = match args.get(1) {
+        Some(Object::Int(i)) => *i,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => return Err(type_error("truncate() length must be int")),
+    };
+    if length < 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::from_raw_os_error(22), // EINVAL
+        ));
+    }
+    let p = first_path(args, "truncate")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let cpath = std::ffi::CString::new(std::ffi::OsStr::new(&p).as_bytes())
+            .map_err(|_| value_error("embedded null character in path"))?;
+        let rc = unsafe { libc::truncate(cpath.as_ptr(), length as libc::off_t) };
+        if rc != 0 {
+            return Err(crate::error::io_error_to_py_named(
+                &std::io::Error::last_os_error(),
+                Some(&p),
+            ));
+        }
+        Ok(Object::None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (p, length);
+        Err(crate::error::not_implemented_error(
+            "os.truncate() is only implemented on POSIX in WeavePy",
+        ))
+    }
+}
+
 fn os_ftruncate(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(i)) => *i as i32,
@@ -2618,6 +2690,45 @@ fn os_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `os.device_encoding(fd)` — the encoding of the terminal attached to
+/// `fd`, or `None` when `fd` is not a tty. On POSIX CPython returns the
+/// locale codeset (`nl_langinfo(CODESET)`); we do the same so a tty fd
+/// reports e.g. `"UTF-8"` and a pipe/file reports `None`.
+fn os_device_encoding(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        Some(Object::Int(i)) => *i as i32,
+        Some(Object::Bool(b)) => i32::from(*b),
+        _ => return Err(type_error("device_encoding() arg must be int")),
+    };
+    #[cfg(unix)]
+    {
+        if unsafe { libc::isatty(fd) } == 0 {
+            return Ok(Object::None);
+        }
+        let codeset = unsafe {
+            let p = libc::nl_langinfo(libc::CODESET);
+            if p.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        // An empty/unset locale codeset still implies the C locale's
+        // default; CPython falls back to UTF-8 on macOS, ASCII on Linux's
+        // "C" locale. Use UTF-8 as the portable default rather than "".
+        if codeset.is_empty() {
+            Ok(Object::from_static("UTF-8"))
+        } else {
+            Ok(Object::from_str(codeset))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        Ok(Object::None)
+    }
+}
+
 fn os_read(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(i)) => *i as i32,
@@ -2698,8 +2809,15 @@ fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
         // and hands the resulting memoryview straight to `os.write`; CPython
         // accepts any buffer-protocol object here, so materialise the view.
         Some(Object::MemoryView(mv)) => mv.to_bytes(),
-        Some(Object::Str(s)) => s.as_bytes().to_vec(),
-        _ => return Err(type_error("write() arg2 must be bytes-like")),
+        // CPython's `os.write` requires a bytes-like object and rejects `str`
+        // (`test_os.FileTests.test_write`) — only the buffer protocol applies.
+        Some(other) => {
+            return Err(type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                other.type_name()
+            )))
+        }
+        None => return Err(type_error("write() takes exactly 2 positional arguments")),
     };
     #[cfg(unix)]
     {
@@ -2774,6 +2892,56 @@ fn os_uname(_args: &[Object]) -> Result<Object, RuntimeError> {
         "os.uname() is only available on POSIX in WeavePy",
     ))
 }
+
+/// Field names of `os.times_result` (CPython `Modules/posixmodule.c`).
+const TIMES_FIELDS: [&str; 5] = [
+    "user",
+    "system",
+    "children_user",
+    "children_system",
+    "elapsed",
+];
+
+/// Memoised `os.times_result` struct-sequence type (`isinstance` identity).
+fn times_result_type() -> Rc<crate::types::TypeObject> {
+    struct_seq_type("times_result", "os", &TIMES_FIELDS)
+}
+
+/// `os.times()` — process & children CPU times plus wall-clock elapsed, each in
+/// seconds, as an `os.times_result` struct sequence (`test_os.TimesTests`).
+#[cfg(unix)]
+fn os_times(args: &[Object]) -> Result<Object, RuntimeError> {
+    require_no_args(args, "times")?;
+    // SAFETY: `times(2)` fills the zeroed `tms`; we only read it afterwards.
+    let mut buf: libc::tms = unsafe { std::mem::zeroed() };
+    let elapsed = unsafe { libc::times(&raw mut buf) };
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let tps = if ticks > 0 { ticks as f64 } else { 100.0 };
+    let secs = |t: libc::clock_t| Object::Float(t as f64 / tps);
+    Ok(struct_seq_instance(
+        times_result_type(),
+        &TIMES_FIELDS,
+        vec![
+            secs(buf.tms_utime),
+            secs(buf.tms_stime),
+            secs(buf.tms_cutime),
+            secs(buf.tms_cstime),
+            Object::Float(elapsed as f64 / tps),
+        ],
+    ))
+}
+
+#[cfg(not(unix))]
+fn os_times(args: &[Object]) -> Result<Object, RuntimeError> {
+    require_no_args(args, "times")?;
+    let zero = || Object::Float(0.0);
+    Ok(struct_seq_instance(
+        times_result_type(),
+        &TIMES_FIELDS,
+        vec![zero(), zero(), zero(), zero(), zero()],
+    ))
+}
+
 
 /// `os.get_terminal_size(fd=STDOUT_FILENO)` — query the controlling tty's
 /// window size via `TIOCGWINSZ`, returning an `os.terminal_size`. CPython
@@ -3123,7 +3291,12 @@ fn os_utime(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
             .map(|(_, v)| v.clone())
             .filter(|o| !matches!(o, Object::None))
     };
-    let times = args.get(1).cloned().filter(|o| !matches!(o, Object::None));
+    // `times` is positional-or-keyword in CPython; `test_os.UtimeTests`
+    // exercises both `os.utime(p, (a, m))` and `os.utime(p, times=(a, m))`.
+    let times = match args.get(1).cloned().filter(|o| !matches!(o, Object::None)) {
+        Some(t) => Some(t),
+        None => kw("times"),
+    };
     let ns = kw("ns");
     if times.is_some() && ns.is_some() {
         return Err(value_error(
@@ -3212,14 +3385,13 @@ fn utime_pair_float(o: &Object, name: &str) -> Result<(f64, f64), RuntimeError> 
 
 #[cfg(unix)]
 fn utime_pair(o: &Object, name: &str) -> Result<(Object, Object), RuntimeError> {
+    // CPython requires a *tuple* of exactly two items for both `times` and `ns`
+    // — a list (or any other sequence) raises TypeError, and a wrong arity too
+    // (`test_os.UtimeTests.test_utime_invalid_arguments`).
     match o {
         Object::Tuple(t) if t.len() == 2 => Ok((t[0].clone(), t[1].clone())),
-        Object::List(l) if l.borrow().len() == 2 => {
-            let b = l.borrow();
-            Ok((b[0].clone(), b[1].clone()))
-        }
         _ => Err(type_error(format!(
-            "utime: '{name}' must be a tuple of two items"
+            "utime: '{name}' must be either a tuple of two ints or None"
         ))),
     }
 }
@@ -3234,8 +3406,11 @@ fn ns_to_timespec(n: i64) -> libc::timespec {
 
 #[cfg(unix)]
 fn secs_to_timespec(s: f64) -> libc::timespec {
+    // CPython's `os.utime` rounds the sub-second part *towards minus infinity*
+    // (`_PyTime_ROUND_FLOOR`), not to nearest — `test_os.UtimeTests` relies on
+    // this (it adds 0.5ns precisely so a round-to-nearest would be off by one).
     let sec = s.floor();
-    let nsec = ((s - sec) * 1e9).round() as i64;
+    let nsec = ((s - sec) * 1e9).floor() as i64;
     libc::timespec {
         tv_sec: sec as libc::time_t,
         tv_nsec: nsec.clamp(0, 999_999_999) as _,

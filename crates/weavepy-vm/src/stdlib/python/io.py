@@ -28,13 +28,17 @@ __all__ = ["BlockingIOError", "open", "open_code", "IOBase", "RawIOBase",
            "UnsupportedOperation", "SEEK_SET", "SEEK_CUR", "SEEK_END",
            "DEFAULT_BUFFER_SIZE", "text_encoding", "IncrementalNewlineDecoder"]
 
+# Exactly like CPython's `Lib/io.py`: the public `io` namespace re-exports the
+# native accelerator (`_io`) wholesale, so `io.BufferedReader is
+# _io.BufferedReader`, `type(open(f, 'rb')) is io.BufferedReader`, and the
+# `IOBase` ABC family is shared. Every other stdlib module (`tarfile`,
+# `zipfile`, `subprocess`, `gzip`, …) goes through this fast native stack — the
+# pure-Python reference (`_pyio`) is *not* wired in here; `test_io` imports it
+# directly to build its "Py" variant, matching CPython. (Routing the public
+# `io` through `_pyio` would be both slower — pure-Python buffering over the
+# `os.*` syscalls — and unfaithful to CPython's C-default architecture.)
 from _io import (DEFAULT_BUFFER_SIZE, BlockingIOError, UnsupportedOperation,
-                 open, open_code, FileIO, BytesIO, StringIO, BufferedReader,
-                 BufferedWriter, BufferedRWPair, BufferedRandom,
-                 IncrementalNewlineDecoder, TextIOWrapper, IOBase, RawIOBase,
-                 BufferedIOBase, TextIOBase, SEEK_SET, SEEK_CUR, SEEK_END,
-                 text_encoding)
-
-# Pull in anything else the accelerator exposes (constants, helpers) without
-# clobbering the canonical names above.
-from _io import *  # noqa: F401,F403
+                 open_code, open, FileIO, BytesIO, StringIO, IOBase, RawIOBase,
+                 BufferedIOBase, BufferedReader, BufferedWriter, BufferedRWPair,
+                 BufferedRandom, TextIOBase, TextIOWrapper, text_encoding,
+                 IncrementalNewlineDecoder, SEEK_SET, SEEK_CUR, SEEK_END)

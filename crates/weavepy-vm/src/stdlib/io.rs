@@ -1363,7 +1363,12 @@ fn readinto_writable_buffer(
                 crate::object::MemoryViewBuffer::ByteArray(b) => {
                     Ok((b.clone(), mv.start.get(), mv.len.get()))
                 }
-                crate::object::MemoryViewBuffer::Bytes(_) => Err(type_error(
+                // `Bytes` is read-only; `Shared` (mmap/shm) has no owning
+                // `Vec` to hand back through this bytearray-shaped helper, so
+                // it can't be a `readinto` target on the pure-Python buffered
+                // path (native FileIO.readinto handles its own buffers).
+                crate::object::MemoryViewBuffer::Bytes(_)
+                | crate::object::MemoryViewBuffer::Shared(_) => Err(type_error(
                     "readinto() argument must be a writable bytes-like object",
                 )),
             }
@@ -2435,7 +2440,8 @@ fn bw_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
                 crate::object::MemoryViewBuffer::ByteArray(b) => {
                     (b.clone(), mv.start.get(), mv.len.get())
                 }
-                crate::object::MemoryViewBuffer::Bytes(_) => {
+                crate::object::MemoryViewBuffer::Bytes(_)
+                | crate::object::MemoryViewBuffer::Shared(_) => {
                     return Err(type_error(
                         "readinto() argument must be a writable bytes-like object",
                     ))

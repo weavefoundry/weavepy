@@ -1179,6 +1179,34 @@ def precisionbigmemtest(size, memuse, dry_run=True):
     return bigmemtest(size, memuse, dry_run)
 
 
+def flush_std_streams():
+    if sys.stdout is not None:
+        sys.stdout.flush()
+    if sys.stderr is not None:
+        sys.stderr.flush()
+
+
+def print_warning(msg):
+    # bpo-45410: Explicitly flush stdout to keep logs in order
+    flush_std_streams()
+    stream = print_warning.orig_stderr
+    for line in msg.splitlines():
+        print(f"Warning -- {line}", file=stream)
+    stream.flush()
+
+
+# bpo-39983: Store the original sys.stderr at Python startup to be able to
+# log warnings even if sys.stderr is captured temporarily by a test.
+print_warning.orig_stderr = sys.stderr
+
+
+# Flag used by saved_test_environment of test.libregrtest.save_env, to check if
+# a test modified the environment. threading_helper.threading_cleanup() sets it
+# when it fails to cleanup threads, and the multiprocessing test teardowns read
+# it. Reset to False before running a new test.
+environment_altered = False
+
+
 def reap_children():
     """Best-effort reap of any leaked child processes (no-op on success)."""
     if not hasattr(os, 'waitpid') or not hasattr(os, 'WNOHANG'):

@@ -21,9 +21,25 @@ use crate::sync::{Rc, RefCell};
 use crate::object::Object;
 use crate::types::{PyInstance, TypeObject};
 
+/// `NotImplemented` / `Ellipsis` are **process-global** singletons, not
+/// per-thread: CPython's `x is NotImplemented` identity test must hold no
+/// matter which OS thread minted the value. A thread-local here was a real
+/// bug — `object.__subclasshook__` (and every `return NotImplemented`
+/// site) handed back the *current thread's* instance, so an ABC
+/// `issubclass()` running on a worker thread saw `ok is not NotImplemented`
+/// and tripped `_py_abc`'s `assert isinstance(ok, bool)` (e.g. importing
+/// `decimal`/`numbers` on a `multiprocessing.managers` accepter thread).
+/// `Object` is `Send + Sync` (it is `Arc`/`GilCell`-backed), so a single
+/// shared instance is safe to serve everywhere.
+///
+/// These are stored as a plain [`OnceLock<Object>`] (not a `Mutex`): they are
+/// read on *every* `return NotImplemented` rich-compare/binop fallback and on
+/// every `...`/`Ellipsis` reference — one of the hottest paths in the VM. A
+/// per-call `Mutex::lock()` there serialised the path and measurably slowed
+/// io/comparison-heavy suites (test_io/test_tarfile/test_zipfile ran ~3-5×
+/// slower). `OnceLock` is a one-time atomic init, then a lock-free read.
+
 thread_local! {
-    static NOT_IMPLEMENTED: RefCell<Option<Object>> = const { RefCell::new(None) };
-    static ELLIPSIS: RefCell<Option<Object>> = const { RefCell::new(None) };
     /// Pending `__del__` finalizer invocations queued by the cycle
     /// GC. Drained at the next eval-loop tick by the interpreter.
     /// See [`crate::gc_trace::run_finalizer`] for the producer side.
@@ -91,33 +107,25 @@ fn make_singleton(cls: Rc<TypeObject>) -> Object {
 /// `NotImplementedType` (an `object` subclass), so `type(NotImplemented)`
 /// and the MRO match CPython.
 pub fn not_implemented() -> Object {
-    NOT_IMPLEMENTED.with(|slot| {
-        let mut s = slot.borrow_mut();
-        if let Some(v) = s.as_ref() {
-            return v.clone();
-        }
+    static SLOT: OnceLock<Object> = OnceLock::new();
+    SLOT.get_or_init(|| {
         let cls = crate::builtin_types::builtin_types()
             .not_implemented_type_
             .clone();
-        let v = make_singleton(cls);
-        *s = Some(v.clone());
-        v
+        make_singleton(cls)
     })
+    .clone()
 }
 
 /// Same idea for `Ellipsis` (the value of `...`); its class is the
 /// registry's `ellipsis` type.
 pub fn ellipsis() -> Object {
-    ELLIPSIS.with(|slot| {
-        let mut s = slot.borrow_mut();
-        if let Some(v) = s.as_ref() {
-            return v.clone();
-        }
+    static SLOT: OnceLock<Object> = OnceLock::new();
+    SLOT.get_or_init(|| {
         let cls = crate::builtin_types::builtin_types().ellipsis_.clone();
-        let v = make_singleton(cls);
-        *s = Some(v.clone());
-        v
+        make_singleton(cls)
     })
+    .clone()
 }
 
 /// CPython's `help`/`copyright`/`license`/`credits` builtins are

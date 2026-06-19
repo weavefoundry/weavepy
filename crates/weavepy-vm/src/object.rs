@@ -503,6 +503,25 @@ impl Drop for ByteArrayExportGuard {
     }
 }
 
+/// A raw, externally-owned memory region a [`PyMemoryView`] can window
+/// over — an `mmap.mmap` mapping or a `multiprocessing.shared_memory`
+/// block. The region is kept alive by the `Arc` held in
+/// [`MemoryViewBuffer::Shared`]; access is by raw pointer because the
+/// memory is genuinely aliased (shared across OS threads, and across
+/// processes for a file/anon shared mapping), exactly like CPython's
+/// mmap/shared-memory buffer export. Writes through the view land in the
+/// shared region. Serialisation of concurrent access is the caller's job
+/// (the GIL plus, for `multiprocessing`, the heap/semaphore locks).
+pub trait SharedMemBuffer: std::fmt::Debug + Send + Sync {
+    /// Region length in bytes.
+    fn byte_len(&self) -> usize;
+    /// Pointer to the first byte of the region (stable for the region's
+    /// lifetime — `mmap`/shared memory never moves).
+    fn data_ptr(&self) -> *mut u8;
+    /// Whether the region is read-only (an `ACCESS_READ` mapping).
+    fn is_readonly(&self) -> bool;
+}
+
 /// Backing buffer for a [`PyMemoryView`].
 #[derive(Debug)]
 pub enum MemoryViewBuffer {
@@ -512,6 +531,46 @@ pub enum MemoryViewBuffer {
     /// shared-state semantics so writes through the view land in
     /// the underlying buffer.
     ByteArray(Rc<RefCell<Vec<u8>>>),
+    /// A raw shared-memory region (`mmap`, `shared_memory`). Writes land
+    /// in the region so other threads/processes mapping it observe them.
+    Shared(Rc<dyn SharedMemBuffer>),
+}
+
+impl MemoryViewBuffer {
+    /// A read-only slice over the *entire* backing region. For `Shared`
+    /// this aliases the live mapping; for `Bytes`/`ByteArray` it borrows
+    /// the owned buffer. The returned slice is valid for `'a` because the
+    /// backing is kept alive by `self`.
+    ///
+    /// # Safety / aliasing
+    /// For `Shared`, the region is intentionally aliased shared memory; do
+    /// not hold the returned slice across a write through the same view.
+    pub fn with_read<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        match self {
+            MemoryViewBuffer::Bytes(b) => f(b),
+            MemoryViewBuffer::ByteArray(b) => f(&b.borrow()),
+            MemoryViewBuffer::Shared(s) => {
+                let slice = unsafe { std::slice::from_raw_parts(s.data_ptr(), s.byte_len()) };
+                f(slice)
+            }
+        }
+    }
+
+    /// A mutable slice over the entire backing region, or `None` for a
+    /// read-only backing (`Bytes`, or an `ACCESS_READ` `Shared`).
+    pub fn with_write<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        match self {
+            MemoryViewBuffer::Bytes(_) => None,
+            MemoryViewBuffer::ByteArray(b) => Some(f(&mut b.borrow_mut())),
+            MemoryViewBuffer::Shared(s) => {
+                if s.is_readonly() {
+                    return None;
+                }
+                let slice = unsafe { std::slice::from_raw_parts_mut(s.data_ptr(), s.byte_len()) };
+                Some(f(slice))
+            }
+        }
+    }
 }
 
 /// `memoryview(obj)` — a thin window into another bytes-like object.
@@ -553,6 +612,24 @@ impl PyMemoryView {
             start: Cell::new(0),
             len: Cell::new(len),
             readonly: Cell::new(true),
+            released: Cell::new(false),
+            format: RefCell::new("B".to_owned()),
+            itemsize: Cell::new(1),
+            shape: RefCell::new(Vec::new()),
+            strides: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// `memoryview(mmap_or_shm)` — a window over a raw shared-memory
+    /// region. Writable unless the region is `ACCESS_READ`.
+    pub fn from_shared(buf: Rc<dyn SharedMemBuffer>) -> Self {
+        let len = buf.byte_len();
+        let readonly = buf.is_readonly();
+        Self {
+            buffer: MemoryViewBuffer::Shared(buf),
+            start: Cell::new(0),
+            len: Cell::new(len),
+            readonly: Cell::new(readonly),
             released: Cell::new(false),
             format: RefCell::new("B".to_owned()),
             itemsize: Cell::new(1),
@@ -616,6 +693,7 @@ impl PyMemoryView {
                 }
                 MemoryViewBuffer::ByteArray(b.clone())
             }
+            MemoryViewBuffer::Shared(s) => MemoryViewBuffer::Shared(s.clone()),
         };
         Self {
             buffer,
@@ -685,10 +763,7 @@ impl PyMemoryView {
         if self.is_c_contiguous() {
             let start = self.start.get();
             let end = start + self.len.get();
-            return match &self.buffer {
-                MemoryViewBuffer::Bytes(b) => b[start..end].to_vec(),
-                MemoryViewBuffer::ByteArray(b) => b.borrow()[start..end].to_vec(),
-            };
+            return self.buffer.with_read(|all| all[start..end].to_vec());
         }
         let shape = self.shape_dims();
         let strides = self.stride_bytes();
@@ -718,10 +793,7 @@ impl PyMemoryView {
                 }
             }
         };
-        match &self.buffer {
-            MemoryViewBuffer::Bytes(b) => gather(b, &mut out),
-            MemoryViewBuffer::ByteArray(b) => gather(&b.borrow(), &mut out),
-        }
+        self.buffer.with_read(|buf| gather(buf, &mut out));
         out
     }
 

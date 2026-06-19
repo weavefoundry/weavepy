@@ -9,7 +9,49 @@ import errno
 import stat
 import sys
 # Import _thread instead of threading to reduce startup cost
-from _thread import allocate_lock as Lock
+from _thread import allocate_lock as _allocate_lock, get_ident as _get_ident
+
+
+class Lock:
+    """A buffered-stream lock that detects same-thread reentry.
+
+    CPython's C ``_io`` guards every buffered operation with ``ENTER_BUFFERED``,
+    which acquires the per-object lock *without* dead-locking when the same
+    thread re-enters it (e.g. a signal handler that writes to the very stream
+    being flushed): it raises ``RuntimeError("reentrant call ...")`` instead.
+    The pure-Python reference uses a plain ``_thread`` lock and only avoids the
+    dead-lock by where CPython happens to run pending signal handlers; under
+    WeavePy's eval breaker the handler can run while the lock is held, which
+    would dead-lock. We restore CPython's documented behaviour here: real
+    cross-thread blocking, but a ``RuntimeError`` on same-thread reentry
+    (``test_io.test_reentrant_write_buffered`` accepts exactly that).
+    """
+
+    __slots__ = ("_lock", "_owner")
+
+    def __init__(self):
+        self._lock = _allocate_lock()
+        self._owner = None
+
+    def acquire(self, blocking=True, timeout=-1):
+        me = _get_ident()
+        if self._owner == me:
+            raise RuntimeError("reentrant call inside a buffered stream")
+        acquired = self._lock.acquire(blocking, timeout)
+        if acquired:
+            self._owner = me
+        return acquired
+
+    def release(self):
+        self._owner = None
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
 if sys.platform in {'win32', 'cygwin'}:
     from msvcrt import setmode as _setmode
 else:
@@ -1067,6 +1109,18 @@ class BufferedReader(_BufferedIOMixin):
         mode. If size is negative, read until EOF or until read() would
         block.
         """
+        # CPython's C `_io.BufferedReader.read` coerces its argument with
+        # `PyNumber_Index`, so a non-integer (e.g. `read(0.0)`) is a TypeError
+        # raised *before* any state mutation. The pure-Python reference skipped
+        # that check and would corrupt `_read_pos` mid-slice; restore it so the
+        # _pyio-backed `io` matches the C layer (test_bz2.testRead).
+        if size is not None:
+            try:
+                size = size.__index__()
+            except AttributeError:
+                raise TypeError(
+                    "argument should be integer or None, not "
+                    f"{type(size).__name__!r}") from None
         if size is not None and size < -1:
             raise ValueError("invalid number of bytes to read")
         with self._read_lock:
@@ -1254,6 +1308,12 @@ class BufferedWriter(_BufferedIOMixin):
     def write(self, b):
         if isinstance(b, str):
             raise TypeError("can't write str to binary stream")
+        # CPython's C `_io.BufferedWriter.write` requires a bytes-like argument
+        # (`PyObject_GetBuffer`): a plain list/tuple of ints is a TypeError, not
+        # something silently iterated. `memoryview(b)` reproduces that contract
+        # (a cheap view over bytes/bytearray/array buffers) so the strictness
+        # matches the C layer now that WeavePy's public `io` is backed by _pyio.
+        b = memoryview(b)
         with self._write_lock:
             if self.closed:
                 raise ValueError("write to closed file")

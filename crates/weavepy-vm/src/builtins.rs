@@ -6867,6 +6867,16 @@ pub fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Bytes(b) => crate::object::PyMemoryView::from_bytes(b.clone()),
         Object::ByteArray(b) => crate::object::PyMemoryView::from_bytearray(b.clone()),
         Object::MemoryView(mv) => mv.shallow_clone(),
+        // `mmap.mmap` (and, through it, `multiprocessing` shared-memory
+        // arenas) exports the buffer protocol over its raw mapping.
+        Object::Instance(inst)
+            if inst.cls().name == "mmap"
+                && crate::stdlib::mmap_mod::shared_buffer(inst).is_some() =>
+        {
+            let buf = crate::stdlib::mmap_mod::shared_buffer(inst)
+                .expect("shared_buffer present per guard");
+            crate::object::PyMemoryView::from_shared(buf)
+        }
         other => {
             return Err(type_error(format!(
                 "memoryview: a bytes-like object is required, not '{}'",
@@ -10639,6 +10649,39 @@ fn bytearray_extend(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         _ => {}
     }
+    // Buffer protocol (PEP 3118 / PEP 688): a `memoryview` or any object that
+    // exports a buffer (`array.array`, mmap, …) extends with its *raw bytes*,
+    // not its iterated items — matching CPython's `bytearray.extend`, which
+    // routes any `PyObject_CheckBuffer` argument through `bytearray_setslice`
+    // before the integer-iteration fallback. Without this, e.g.
+    // `bytearray().extend(array('I', [1000]))` — exactly what
+    // `_pyio.BufferedWriter.write` does for `gzip`/`bz2` array writes — would
+    // iterate the out-of-range int items and raise.
+    if matches!(other, Object::MemoryView(_)) {
+        let bytes = other.as_bytes_view().unwrap_or_default();
+        if !bytes.is_empty() {
+            crate::object::bytearray_check_resizable(&b)?;
+        }
+        b.borrow_mut().extend_from_slice(&bytes);
+        return Ok(Object::None);
+    }
+    if let Some(method) = crate::instance_method(other, "__buffer__") {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame still live on this
+            // thread; the GIL keeps the access exclusive.
+            let interp = unsafe { &mut *ptr };
+            let globals = interp.builtins_dict();
+            let view =
+                interp.call_object_with_globals(&method, &[Object::Int(0)], &[], &globals)?;
+            if let Some(bytes) = view.as_bytes_view() {
+                if !bytes.is_empty() {
+                    crate::object::bytearray_check_resizable(&b)?;
+                }
+                b.borrow_mut().extend_from_slice(&bytes);
+                return Ok(Object::None);
+            }
+        }
+    }
     // General protocol: any iterable of ints (each through `__index__`,
     // as CPython's `bytearray_extend` does via `_getbytevalue`).
     // Generators and user-`__iter__` objects were materialised by the
@@ -10752,16 +10795,14 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
         let capacity = mv.len.get();
         let bytes = f.read_bytes(Some(capacity))?;
         let n = bytes.len();
-        match &mv.buffer {
-            crate::object::MemoryViewBuffer::ByteArray(b) => {
-                let start = mv.start.get();
-                b.borrow_mut()[start..start + n].copy_from_slice(&bytes);
-            }
-            crate::object::MemoryViewBuffer::Bytes(_) => {
-                return Err(type_error(
-                    "readinto() argument must be read-write bytes-like object, not memoryview",
-                ));
-            }
+        let start = mv.start.get();
+        let wrote = mv
+            .buffer
+            .with_write(|d| d[start..start + n].copy_from_slice(&bytes));
+        if wrote.is_none() {
+            return Err(type_error(
+                "readinto() argument must be read-write bytes-like object, not memoryview",
+            ));
         }
         return Ok(Object::Int(n as i64));
     }

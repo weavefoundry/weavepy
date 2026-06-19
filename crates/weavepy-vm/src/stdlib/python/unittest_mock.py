@@ -213,6 +213,46 @@ def _get_method(name, func):
     return method
 
 
+# Default `.return_value` for magic methods that must yield a type-correct
+# result the protocol can use (CPython mock's `_return_values`). `__exit__`
+# must be falsey so a `with mock:` block never silently swallows an
+# exception; the rest fall back to a fresh child mock.
+_magic_defaults = {
+    "__exit__": False,
+    "__aexit__": False,
+}
+
+
+class _MagicProxy:
+    """Descriptor installed on a `MagicMock`'s per-instance class for a
+    configurable magic method (e.g. `__enter__`). On first access it
+    materialises a child mock, installs that child in its place, and
+    returns it — so `mock.__enter__` is a real configurable mock
+    (`.return_value` is settable) *and* the protocol invocation
+    `type(mock).__enter__(mock)` reaches the same child. Mirrors CPython's
+    `unittest.mock.MagicProxy`; the lazy creation is what avoids the
+    infinite recursion that eagerly building child mocks (themselves
+    MagicMocks) would cause."""
+
+    def __init__(self, name, parent):
+        self.name = name
+        self.parent = parent
+
+    def _create_mock(self):
+        parent = self.parent
+        child = MagicMock(name=f"{parent._mock_name}.{self.name}")
+        if self.name in _magic_defaults:
+            child.return_value = _magic_defaults[self.name]
+        # Routes through Mock.__setattr__'s magic path, which installs the
+        # child on the per-instance class (replacing this proxy) and records
+        # it in `_mock_children`.
+        setattr(parent, self.name, child)
+        return child
+
+    def __get__(self, obj, objtype=None):
+        return self._create_mock()
+
+
 class NonCallableMock:
     """A non-callable mock object (parent of Mock)."""
 
@@ -462,9 +502,17 @@ class Mock(NonCallableMock):
 class MagicMock(Mock):
     """A `Mock` with magic-method protocols pre-wired."""
 
+    # Context-manager (and async-CM) dunders are *configurable* child
+    # mocks, not fixed methods, so `mock.__enter__.return_value = ...`
+    # works (the `mock_open` idiom, and any `with mock:` a test patches).
+    # Installed lazily via `_MagicProxy` to dodge eager-recursion.
+    _configurable_magics = ("__enter__", "__exit__")
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         object.__setattr__(self, "_magic_iter", iter([]))
+        for magic in MagicMock._configurable_magics:
+            setattr(type(self), magic, _MagicProxy(magic, self))
 
     def __iter__(self):
         return iter(self._magic_iter)
@@ -479,12 +527,6 @@ class MagicMock(Mock):
         return True
 
     def __contains__(self, item):
-        return False
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
         return False
 
     # Numeric protocol defaults (CPython mock's `_return_values`): a bare

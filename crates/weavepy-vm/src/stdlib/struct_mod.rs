@@ -893,16 +893,10 @@ fn b_pack_into(args: &[Object]) -> Result<Object, RuntimeError> {
             }
             let off = resolve_buffer_offset(offset, mv.len.get(), cf.size, "pack_into", true)?;
             let base = mv.start.get();
-            match &mv.buffer {
-                crate::object::MemoryViewBuffer::ByteArray(b) => {
-                    let mut b = b.borrow_mut();
-                    b[base + off..base + off + bytes.len()].copy_from_slice(&bytes);
-                    Ok(Object::None)
-                }
-                crate::object::MemoryViewBuffer::Bytes(_) => {
-                    Err(type_error("cannot modify read-only memory".to_owned()))
-                }
-            }
+            mv.buffer
+                .with_write(|b| b[base + off..base + off + bytes.len()].copy_from_slice(&bytes))
+                .map(|()| Object::None)
+                .ok_or_else(|| type_error("cannot modify read-only memory".to_owned()))
         }
         _ => Err(type_error(
             "argument must be a read-write bytes-like object".to_owned(),

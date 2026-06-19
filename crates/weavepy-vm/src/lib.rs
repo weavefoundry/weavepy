@@ -14726,6 +14726,27 @@ impl Interpreter {
                 Ok(Object::ByteArray(Rc::new(RefCell::new(out))))
             }
             (Object::MemoryView(mv), Object::Int(i)) => {
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                let shape = mv.shape_dims();
+                if shape.len() == 1 {
+                    // 1-D: index by element, honouring stride + format so a
+                    // `cast('i')` view yields ints, `cast('d')` yields floats,
+                    // etc. (CPython `memory_subscript` -> `unpack_single`).
+                    let itemsize = mv.itemsize.get().max(1);
+                    let idx = normalize_index(*i, shape[0])?;
+                    let stride0 = mv.stride_bytes()[0];
+                    let off = (mv.start.get() as isize + idx as isize * stride0) as usize;
+                    let fmt = mv_format_char(&mv.format.borrow());
+                    return mv
+                        .buffer
+                        .with_read(|all| mv_unpack_single(fmt, &all[off..off + itemsize]));
+                }
+                // Multi-dimensional integer indexing is not yet a sub-view;
+                // fall back to the flat byte read used previously.
                 let bytes = mv.to_bytes();
                 let idx = normalize_index(*i, bytes.len())?;
                 Ok(Object::Int(i64::from(bytes[idx])))
@@ -14980,25 +15001,16 @@ impl Interpreter {
                         "memoryview: assignment to multi-dimensional view is not supported",
                     ));
                 }
-                let itemsize = mv.itemsize.get();
-                if itemsize != 1 {
-                    return Err(type_error(
-                        "memoryview: setting an item of this format is not supported",
-                    ));
-                }
+                let itemsize = mv.itemsize.get().max(1);
                 let idx = normalize_index(*i, shape[0])?;
-                let byte = crate::builtins::bytearray_byte_arg(&value)?;
+                let fmt = mv_format_char(&mv.format.borrow());
+                let mut packed = vec![0u8; itemsize];
+                mv_pack_single(fmt, &value, &mut packed)?;
                 let stride0 = mv.stride_bytes()[0];
                 let off = (mv.start.get() as isize + idx as isize * stride0) as usize;
-                match &mv.buffer {
-                    crate::object::MemoryViewBuffer::ByteArray(b) => {
-                        b.borrow_mut()[off] = byte;
-                        Ok(())
-                    }
-                    crate::object::MemoryViewBuffer::Bytes(_) => {
-                        Err(type_error("cannot modify read-only memory"))
-                    }
-                }
+                mv.buffer
+                    .with_write(|all| all[off..off + itemsize].copy_from_slice(&packed))
+                    .ok_or_else(|| type_error("cannot modify read-only memory"))
             }
             (Object::MemoryView(mv), Object::Slice(slc)) => {
                 // `mv[i:j:k] = bytes-like` — the RHS must expose exactly
@@ -15049,21 +15061,16 @@ impl Interpreter {
                 }
                 let stride0 = mv.stride_bytes()[0];
                 let base = mv.start.get() as isize;
-                match &mv.buffer {
-                    crate::object::MemoryViewBuffer::ByteArray(b) => {
-                        let mut d = b.borrow_mut();
+                mv.buffer
+                    .with_write(|d| {
                         for k in 0..slicelen {
                             let elem = start_i + k * step;
                             let off = (base + elem as isize * stride0) as usize;
                             let s = k as usize * itemsize;
                             d[off..off + itemsize].copy_from_slice(&src[s..s + itemsize]);
                         }
-                        Ok(())
-                    }
-                    crate::object::MemoryViewBuffer::Bytes(_) => {
-                        Err(type_error("cannot modify read-only memory"))
-                    }
-                }
+                    })
+                    .ok_or_else(|| type_error("cannot modify read-only memory"))
             }
             (Object::MemoryView(_), other) => Err(type_error(format!(
                 "memoryview: invalid slice key: {}",
@@ -15768,6 +15775,37 @@ impl Interpreter {
                     // underlying static builtins call `Object::make_iter`
                     // directly, which can't drive a Python frame. `dict.update`
                     // has its own richer protocol below, so it's excluded here.
+                    //
+                    // `bytearray.extend` over a buffer exporter (`array.array`,
+                    // `memoryview`, mmap, …) copies the raw bytes through the
+                    // buffer protocol rather than iterating items — matching
+                    // CPython, whose `bytearray.extend` routes any buffer object
+                    // through `bytearray_setslice` *before* the integer-iteration
+                    // fallback. Route those straight to the native method (which
+                    // handles `__buffer__`) so the materialiser below doesn't
+                    // first iterate them into out-of-range int items. `list.extend`
+                    // always iterates, so this is restricted to a bytearray
+                    // receiver.
+                    if b.name == "extend"
+                        && matches!(args.first(), Some(Object::ByteArray(_)))
+                        && args.get(1).is_some_and(|a| {
+                            // Only the materialiser below (gated on
+                            // `object_needs_vm_iter`) would wrongly iterate a
+                            // buffer exporter into ints — so the buffer fast-path
+                            // only matters for those. Short-circuit on the cheap
+                            // `needs_vm_iter` check *before* the `__buffer__` MRO
+                            // lookup, so the hot `bytearray.extend(bytes)` path
+                            // (bytes/bytearray/memoryview are all not vm-iter, and
+                            // the native method handles them directly) pays no
+                            // method-resolution cost. `array.array` is a frozen
+                            // Python class (an `Object::Instance`), so it is
+                            // caught here and routed to the buffer copy.
+                            object_needs_vm_iter(a)
+                                && crate::instance_method(a, "__buffer__").is_some()
+                        })
+                    {
+                        return (b.call)(args);
+                    }
                     if matches!(
                         b.name,
                         "join"
@@ -21606,6 +21644,111 @@ pub(crate) fn normalize_index(i: i64, len: usize) -> Result<usize, RuntimeError>
         return Err(index_error("index out of range"));
     }
     Ok(idx as usize)
+}
+
+/// The significant single-character code of a memoryview/struct format,
+/// dropping a leading native/standard byte-order prefix. `memoryview.cast`
+/// only admits native single-char formats, so byte order is always native.
+pub(crate) fn mv_format_char(fmt: &str) -> char {
+    let s = fmt.strip_prefix(['@', '=', '<', '>', '!']).unwrap_or(fmt);
+    s.chars().next().unwrap_or('B')
+}
+
+/// Unpack one native-endian element (`bytes.len() == itemsize`) into a
+/// Python scalar, per CPython `memoryobject.c:unpack_single`. Integer
+/// formats yield `int`, `f`/`d` yield `float`, `?` yields `bool`, and `c`
+/// yields a length-1 `bytes`.
+pub(crate) fn mv_unpack_single(fmt: char, bytes: &[u8]) -> Result<Object, RuntimeError> {
+    let a2 = || -> [u8; 2] { bytes[..2].try_into().unwrap() };
+    let a4 = || -> [u8; 4] { bytes[..4].try_into().unwrap() };
+    let a8 = || -> [u8; 8] { bytes[..8].try_into().unwrap() };
+    Ok(match fmt {
+        'b' => Object::Int(i64::from(bytes[0] as i8)),
+        'B' => Object::Int(i64::from(bytes[0])),
+        '?' => Object::Bool(bytes[0] != 0),
+        'c' => Object::Bytes(Rc::from(&bytes[..1])),
+        'h' => Object::Int(i64::from(i16::from_ne_bytes(a2()))),
+        'H' => Object::Int(i64::from(u16::from_ne_bytes(a2()))),
+        'i' => Object::Int(i64::from(i32::from_ne_bytes(a4()))),
+        'I' => Object::Int(i64::from(u32::from_ne_bytes(a4()))),
+        'l' | 'q' | 'n' => Object::Int(i64::from_ne_bytes(a8())),
+        'L' | 'Q' | 'N' | 'P' => Object::int_from_i128(i128::from(u64::from_ne_bytes(a8()))),
+        'f' => Object::Float(f64::from(f32::from_ne_bytes(a4()))),
+        'd' => Object::Float(f64::from_ne_bytes(a8())),
+        _ => {
+            return Err(type_error(
+                "memoryview: format not supported for element access",
+            ))
+        }
+    })
+}
+
+/// Pack a Python scalar into `out` (`out.len() == itemsize`) in native byte
+/// order, per CPython `memoryobject.c:pack_single`. Wrong operand types
+/// raise `TypeError`, out-of-range integers raise `ValueError`.
+pub(crate) fn mv_pack_single(
+    fmt: char,
+    value: &Object,
+    out: &mut [u8],
+) -> Result<(), RuntimeError> {
+    let as_i128 = |v: &Object| -> Option<i128> {
+        match v {
+            Object::Bool(b) => Some(i128::from(*b)),
+            Object::Int(i) => Some(i128::from(*i)),
+            Object::Long(b) => b.to_i128(),
+            _ => None,
+        }
+    };
+    let as_f64 = |v: &Object| -> Option<f64> {
+        match v {
+            Object::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Object::Int(i) => Some(*i as f64),
+            Object::Long(b) => b.to_f64(),
+            Object::Float(f) => Some(*f),
+            _ => None,
+        }
+    };
+    let bad_type = || type_error(format!("memoryview: invalid type for format '{fmt}'"));
+    let bad_val = || value_error(format!("memoryview: invalid value for format '{fmt}'"));
+    macro_rules! pack_int {
+        ($t:ty) => {{
+            let v = as_i128(value).ok_or_else(bad_type)?;
+            if v < <$t>::MIN as i128 || v > <$t>::MAX as i128 {
+                return Err(bad_val());
+            }
+            let n = std::mem::size_of::<$t>();
+            out[..n].copy_from_slice(&(v as $t).to_ne_bytes());
+        }};
+    }
+    match fmt {
+        'b' => pack_int!(i8),
+        'B' => pack_int!(u8),
+        'h' => pack_int!(i16),
+        'H' => pack_int!(u16),
+        'i' => pack_int!(i32),
+        'I' => pack_int!(u32),
+        'l' | 'q' | 'n' => pack_int!(i64),
+        'L' | 'Q' | 'N' | 'P' => pack_int!(u64),
+        '?' => out[0] = u8::from(value.is_truthy()),
+        'c' => match value {
+            Object::Bytes(b) if b.len() == 1 => out[0] = b[0],
+            _ => return Err(bad_type()),
+        },
+        'f' => {
+            let v = as_f64(value).ok_or_else(bad_type)?;
+            out[..4].copy_from_slice(&(v as f32).to_ne_bytes());
+        }
+        'd' => {
+            let v = as_f64(value).ok_or_else(bad_type)?;
+            out[..8].copy_from_slice(&v.to_ne_bytes());
+        }
+        _ => {
+            return Err(type_error(
+                "memoryview: format not supported for element access",
+            ))
+        }
+    }
+    Ok(())
 }
 
 /// Map a `bool` to the equivalent `Int` (`True`→1, `False`→0), leaving any

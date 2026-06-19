@@ -194,6 +194,22 @@ fn swap_remove_handle(vec: &mut Vec<Arc<TrackedHandle>>, slot: usize) {
     }
 }
 
+/// Correctness fallback for [`GcState::untrack_id`]: when a handle's cached
+/// `slot` no longer points at it (a concurrent `swap_remove`/promotion on
+/// another OS thread moved it before this thread acquired the vector lock),
+/// locate it by pointer identity and `swap_remove` it. Returns `true` if the
+/// handle was found and removed. O(n) in the generation length, but only ever
+/// taken on the rare stale-cache path — the common case stays O(1).
+#[inline]
+fn remove_handle_by_ptr(vec: &mut Vec<Arc<TrackedHandle>>, handle: &Arc<TrackedHandle>) -> bool {
+    if let Some(pos) = vec.iter().position(|h| Arc::ptr_eq(h, handle)) {
+        swap_remove_handle(vec, pos);
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Default)]
 struct Generation {
     /// All tracked handles in this generation. Append-only
@@ -408,28 +424,42 @@ impl GcState {
         // its `slot`/`generation`/`color` pinpoint its position without a
         // per-generation scan (which made drop-heavy large heaps
         // quadratic — RFC 0039 WS4).
-        let slot = handle.slot.load(Ordering::Acquire);
+        //
+        // The cached `slot`/`generation` are *only* valid while the owning
+        // generation/frozen lock is held: a `swap_remove` elsewhere updates a
+        // moved handle's `slot` under that same lock. So we must acquire the
+        // vector lock *before* reading the cached position, and — because the
+        // GC is process-global and shared across OS threads — fall back to a
+        // pointer search if the cached slot is stale, rather than corrupting
+        // the vector with a wrong `swap_remove` (the bug behind the
+        // "generation slot index out of sync" panic under threaded GC).
         if handle.color.load(Ordering::Acquire) == color::Frozen {
             let mut frozen = self.frozen.borrow_mut();
-            debug_assert!(
-                frozen.get(slot).is_some_and(|h| Arc::ptr_eq(h, &handle)),
-                "frozen slot index out of sync"
-            );
-            swap_remove_handle(&mut frozen, slot);
+            let slot = handle.slot.load(Ordering::Acquire);
+            if frozen.get(slot).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
+                swap_remove_handle(&mut frozen, slot);
+            } else {
+                remove_handle_by_ptr(&mut frozen, &handle);
+            }
         } else {
+            let mut gens = self.generations.borrow_mut();
             let g = handle
                 .generation
                 .load(Ordering::Acquire)
                 .min(N_GENERATIONS - 1);
-            let mut gens = self.generations.borrow_mut();
-            debug_assert!(
-                gens[g]
-                    .handles
-                    .get(slot)
-                    .is_some_and(|h| Arc::ptr_eq(h, &handle)),
-                "generation slot index out of sync"
-            );
-            swap_remove_handle(&mut gens[g].handles, slot);
+            let slot = handle.slot.load(Ordering::Acquire);
+            if gens[g].handles.get(slot).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
+                swap_remove_handle(&mut gens[g].handles, slot);
+            } else if !remove_handle_by_ptr(&mut gens[g].handles, &handle) {
+                // Declared generation was wrong too (e.g. a concurrent
+                // promotion landed between the `generation` and `slot`
+                // reads). Search the rest before giving up.
+                for gg in 0..N_GENERATIONS {
+                    if gg != g && remove_handle_by_ptr(&mut gens[gg].handles, &handle) {
+                        break;
+                    }
+                }
+            }
         }
         self.tracked_count.fetch_sub(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
