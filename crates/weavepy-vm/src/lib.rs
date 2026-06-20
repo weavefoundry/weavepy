@@ -1034,6 +1034,26 @@ impl Interpreter {
         if !Self::is_refcount_dead(&dropped, 1) {
             return;
         }
+        self.reap_dead_subgraph(dropped);
+    }
+
+    /// The dead-acyclic-subgraph cascade — the shared tail of
+    /// [`Self::prompt_reap_dropped`], split out so a call site that has
+    /// already established `dropped` is refcount-dead and anchors
+    /// finalizable/tracked children, yet is itself an untracked,
+    /// non-finalizable *leaf* the fast-path early-return in
+    /// `prompt_reap_dropped` would skip, can drive the cascade directly.
+    /// The motivating case is a handled exception cleared at `POP_EXCEPT`:
+    /// an `AttributeError` carries no `__del__` and is not GC-tracked, but
+    /// it anchors `AttributeError.obj` (and values reachable only through
+    /// its saved `__traceback__` frames) whose `__del__` must run at
+    /// handler exit, matching CPython's refcount timing. Every node is
+    /// independently refcount-guarded, so anything that stays externally
+    /// reachable is left to the cycle collector.
+    fn reap_dead_subgraph(&mut self, dropped: Object) {
+        if !Self::is_refcount_dead(&dropped, 1) {
+            return;
+        }
         // RFC 0039 (WS4): cascade through the dead *acyclic* subgraph,
         // emulating CPython's refcount-driven `tp_dealloc` chain. Freeing
         // `dropped` drops the last reference to its tracked children,
@@ -1174,7 +1194,7 @@ impl Interpreter {
         // Class/module bodies keep their names in a namespace dict, not in
         // fast locals, so this is a no-op for them; only real function
         // activations (incl. comprehensions/lambdas) carry fast locals.
-        if frame.locals.is_empty() {
+        if frame.locals.is_empty() && frame.cells.is_empty() {
             return;
         }
         let _ = retval;
@@ -1188,10 +1208,52 @@ impl Interpreter {
             // leave it alone without paying for the full refcount/weakref
             // test or a cascade. Keeps the hot return path of scalar-only
             // frames free.
-            if Self::local_needs_prompt_reap(&frame.locals[i])
-                && Self::looks_reapable_temporary(&frame.locals[i])
-            {
+            //
+            // A *closure function* local is reaped here too: it is GC-tracked
+            // (`MakeFunction`), so merely dropping the frame's `Rc` leaves it
+            // pinned by its own GC handle — and still holding its captured
+            // cells — until the next cyclic collection. Routing a
+            // uniquely-held (non-escaped) function through the cascade
+            // untracks and frees it now, releasing its share of this frame's
+            // cells so the cellvar sweep below can reclaim a captured-but-
+            // unescaped finalizable (`test_tempfile.test_writelines_rollover`).
+            let needs = Self::local_needs_prompt_reap(&frame.locals[i])
+                || matches!(frame.locals[i], Object::Function(_));
+            if needs && Self::looks_reapable_temporary(&frame.locals[i]) {
                 let v = std::mem::replace(&mut frame.locals[i], Object::Unbound);
+                self.prompt_reap_dropped(v);
+            }
+        }
+        // A value captured by a nested closure does not live in a fast local
+        // — it lives in one of this frame's *cell variables*, and that cell is
+        // shared with the closure object(s) that closed over it. CPython
+        // decrefs the frame's cells together with those closures when the
+        // frame is torn down, so a captured-but-unescaped finalizable dies
+        // promptly. The locals sweep above has already reaped the dying
+        // closures (functions, and generators/coroutines via
+        // `local_needs_prompt_reap`), dropping their share of the cells; now
+        // reap any *own* cellvar (never a freevar, which belongs to an
+        // enclosing frame) that is left uniquely held by this frame and whose
+        // contents are a dead finalizable.
+        let ncellvars = frame.code.cellvars.len();
+        if ncellvars == 0 || ncellvars > frame.cells.len() {
+            return;
+        }
+        for idx in 0..ncellvars {
+            let cell = frame.cells[idx].clone();
+            // Only a cell uniquely held by this frame can have its contents
+            // die with the frame; one still shared with an escaped closure
+            // (returned/stored) keeps `strong_count > 1` (our local `cell`
+            // clone is the +1 we account for).
+            if Rc::strong_count(&cell) > 2 {
+                continue;
+            }
+            let reapable = {
+                let guard = cell.borrow();
+                Self::local_needs_prompt_reap(&guard) && Self::looks_reapable_temporary(&guard)
+            };
+            if reapable {
+                let v = std::mem::replace(&mut *cell.borrow_mut(), Object::Unbound);
                 self.prompt_reap_dropped(v);
             }
         }
@@ -1383,6 +1445,50 @@ impl Interpreter {
             }
             _ => false,
         }
+    }
+
+    /// Cheap, allocation-free pre-check for the `POP_EXCEPT` reap: does the
+    /// acyclic subgraph rooted at `obj` contain a finalizable object
+    /// (`__del__` / an unfinished generator) reachable through value
+    /// containers and user instances, up to `depth` links? The
+    /// overwhelmingly common handled exception — `ValueError(i)`,
+    /// `KeyError(k)`, scalar/`str` args, no `__del__` anywhere — returns
+    /// `false` here in pure recursion (no heap traffic, no weakref-registry
+    /// work), so the hot handler-exit path stays at baseline cost and only
+    /// an exception that actually anchors a destructor pays for the full
+    /// [`Self::reap_dead_subgraph`] cascade. Tracebacks/frames are
+    /// deliberately *not* traversed: walking the captured call stack on
+    /// every caught exception would dominate the path, and a finalizable
+    /// pinned only by a traceback frame is left to the cycle collector
+    /// (CPython's own traceback-clearing is likewise lazy here).
+    fn exc_has_finalizable(obj: &Object, depth: u8) -> bool {
+        if Self::object_is_finalizable(obj) {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        if matches!(
+            obj,
+            Object::Tuple(_)
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Set(_)
+                | Object::FrozenSet(_)
+                | Object::Instance(_)
+                | Object::Cell(_)
+                | Object::MappingProxy(_)
+                | Object::SimpleNamespace(_)
+        ) {
+            let mut found = false;
+            crate::gc_trace::traverse_object(obj, &mut |c| {
+                if !found && Self::exc_has_finalizable(c, depth - 1) {
+                    found = true;
+                }
+            });
+            return found;
+        }
+        false
     }
 
     /// Is `obj` dead in refcount terms — does the caller hold its last
@@ -4767,8 +4873,39 @@ impl Interpreter {
                 }
             }
             OpCode::PopExcept => {
-                frame.exc_handlers.pop();
-                self.exc_info_stack.borrow_mut().pop();
+                let popped = frame.exc_handlers.pop();
+                // Drop the interpreter-wide `sys.exc_info()` entry first so
+                // its clone of the instance is gone before we test liveness.
+                drop(self.exc_info_stack.borrow_mut().pop());
+                // CPython clears the just-handled exception at the end of an
+                // `except` block (the implicit `del` of the bound name plus
+                // the per-frame exc-state pop). When that exception held the
+                // last reference to a finalizable object — `AttributeError.obj`,
+                // or an exception wrapping a file/process/lock in its args —
+                // its `__del__` must run *now*, matching CPython's refcount
+                // timing rather than waiting for the next cyclic collection
+                // (RFC 0040 deterministic-finalization arc: `test_io` /
+                // `test_subprocess` destructor-timing cases).
+                if let Some((_, pe)) = popped {
+                    // A handled exception is itself an untracked,
+                    // non-finalizable leaf, so it slips past the fast-path
+                    // early-return in `prompt_reap_dropped`; when it anchors a
+                    // finalizable object (`AttributeError.obj`, an exception
+                    // wrapping a file/process) drive the cascade directly so
+                    // that `__del__` runs at handler exit like CPython.
+                    //
+                    // The `exc_has_finalizable` pre-check keeps the hot path
+                    // cheap: the overwhelmingly common scalar-arg exception
+                    // has nothing to finalize and skips the allocating
+                    // cascade entirely. Binding the exception to an outer name
+                    // (`except E as e: saved = e`) or a pending re-raise keeps
+                    // its refcount above the dead threshold, and every cascade
+                    // node is independently refcount-guarded, so the reap is a
+                    // no-op in those cases too.
+                    if Self::exc_has_finalizable(&pe.instance, 6) {
+                        self.reap_dead_subgraph(pe.instance);
+                    }
+                }
             }
             OpCode::PrepReraiseStar => {
                 // [excs_list, orig] -> [result]

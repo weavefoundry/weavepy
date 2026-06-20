@@ -355,14 +355,16 @@ def lookup(encoding):
         encode_fn = getattr(_codecs, enc_name)
         decode_fn = getattr(_codecs, dec_name)
         return _make_codec(encoding, encode_fn, decode_fn)
-    # Generic fall-through via the engine's own lookup.
+    # Generic fall-through via the engine's own lookup. `_codecs.lookup`
+    # raises `LookupError` for an unknown name (CPython parity; some older
+    # engines raised `ValueError`, so tolerate both). On a miss, defer to
+    # any user-registered search functions (CPython's `codecs.register`
+    # protocol — the search is called with the normalised name and returns
+    # a `CodecInfo`/4-tuple or `None`). Builtins keep precedence; user
+    # codecs like the test suite's `test_decoder`/`test_rot13` fill gaps.
     try:
         canonical = _codecs.lookup(encoding)
-    except ValueError:
-        # The built-in engine doesn't know this name; defer to any
-        # user-registered search functions (CPython's `codecs.register`
-        # protocol — the search is called with the normalised name and
-        # returns a `CodecInfo`/4-tuple or `None`).
+    except (LookupError, ValueError):
         info = _search_registered(_normalise(encoding))
         if info is not None:
             return info
