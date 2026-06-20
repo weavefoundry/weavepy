@@ -300,6 +300,22 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("MSG_DONTWAIT")),
             Object::Int(128),
         );
+        // Ancillary-data control-message types. `SCM_RIGHTS` carries file
+        // descriptors over an AF_UNIX socket via `sendmsg`/`recvmsg`; it is
+        // what `multiprocessing.reduction.send_handle`/`recv_handle` (and so
+        // the `forkserver` start method, `resource_sharer`, and Connection fd
+        // handoff) require. Its presence here is what makes
+        // `reduction.HAVE_SEND_HANDLE` true.
+        #[cfg(unix)]
+        d.insert(
+            DictKey(Object::from_static("SCM_RIGHTS")),
+            Object::Int(i64::from(libc::SCM_RIGHTS)),
+        );
+        #[cfg(target_os = "linux")]
+        d.insert(
+            DictKey(Object::from_static("SCM_CREDENTIALS")),
+            Object::Int(i64::from(libc::SCM_CREDENTIALS)),
+        );
 
         // shutdown(how) — match CPython numbering.
         d.insert(DictKey(Object::from_static("SHUT_RD")), Object::Int(0));
@@ -460,6 +476,8 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
         m!("recv", sock_recv),
         m!("recv_into", sock_recv_into),
         m!("recvfrom", sock_recvfrom),
+        m!("sendmsg", sock_sendmsg),
+        m!("recvmsg", sock_recvmsg),
         m!("setblocking", sock_setblocking),
         m!("getblocking", sock_getblocking),
         m!("settimeout", sock_settimeout),
@@ -937,6 +955,274 @@ fn sock_recvfrom(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::new_bytes(initialised),
         sockaddr_to_tuple(&addr, family),
     ]))
+}
+
+/// `socket.sendmsg(buffers[, ancdata[, flags[, address]]])` — send normal
+/// data plus ancillary data (control messages) on a connected socket.
+///
+/// WeavePy uses this for `multiprocessing`'s `SCM_RIGHTS` file-descriptor
+/// hand-off (`reduction.sendfds`): the `forkserver` start method, the
+/// `resource_sharer`, and `Connection` fd transfer all push fds through an
+/// AF_UNIX socket this way. The `address` argument (unconnected send) is not
+/// supported — every WeavePy caller uses a connected pair.
+#[cfg(unix)]
+fn sock_sendmsg(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::os::raw::c_void;
+    let state = state_of(args)?;
+    let buffers = extract_iov_buffers(args.get(1))?;
+    let ancdata = extract_ancdata(args.get(2))?;
+    let flags: libc::c_int = match args.get(3) {
+        None | Some(Object::None) => 0,
+        Some(Object::Int(n)) => *n as libc::c_int,
+        _ => return Err(type_error("sendmsg: flags must be an integer")),
+    };
+    if matches!(args.get(4), Some(o) if !matches!(o, Object::None)) {
+        return Err(os_error("sendmsg: address argument is not supported"));
+    }
+
+    let mut iovecs: Vec<libc::iovec> = buffers
+        .iter()
+        .map(|b| libc::iovec {
+            iov_base: b.as_ptr() as *mut c_void,
+            iov_len: b.len(),
+        })
+        .collect();
+
+    let controllen: usize = ancdata
+        .iter()
+        .map(|(_, _, d)| unsafe { libc::CMSG_SPACE(d.len() as u32) } as usize)
+        .sum();
+    let mut control: Vec<u8> = vec![0u8; controllen];
+
+    let fd = snapshot_raw_fd(&state)?;
+    let iov_ptr = iovecs.as_mut_ptr();
+    let iov_len = iovecs.len();
+    let ctrl_ptr = if controllen > 0 {
+        control.as_mut_ptr()
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let sent = crate::gil::allow_threads_then(move || unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = iov_ptr;
+        msg.msg_iovlen = iov_len as _;
+        if controllen > 0 {
+            msg.msg_control = ctrl_ptr as *mut c_void;
+            msg.msg_controllen = controllen as _;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            for (level, ctype, data) in &ancdata {
+                if cmsg.is_null() {
+                    break;
+                }
+                (*cmsg).cmsg_level = *level;
+                (*cmsg).cmsg_type = *ctype;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(data.len() as u32) as _;
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    libc::CMSG_DATA(cmsg).cast::<u8>(),
+                    data.len(),
+                );
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+        libc::sendmsg(fd, &msg, flags)
+    });
+    if sent < 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::Int(sent as i64))
+}
+
+/// `socket.recvmsg(bufsize[, ancbufsize[, flags]])` — receive normal data
+/// plus ancillary data, returning `(data, ancdata, msg_flags, address)`.
+/// `ancdata` is a list of `(cmsg_level, cmsg_type, cmsg_data)` triples (the
+/// shape `multiprocessing.reduction.recvfds` decodes). `address` is `None`
+/// (the WeavePy callers all use connected sockets).
+#[cfg(unix)]
+fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::os::raw::c_void;
+    let state = state_of(args)?;
+    let bufsize = match args.get(1) {
+        Some(Object::Int(n)) if *n >= 0 => *n as usize,
+        Some(Object::Int(_)) => return Err(value_error("negative buffersize in recvmsg")),
+        _ => return Err(type_error("recvmsg: bufsize must be an integer")),
+    };
+    let ancbufsize = match args.get(2) {
+        None | Some(Object::None) => 0usize,
+        Some(Object::Int(n)) if *n >= 0 => *n as usize,
+        Some(Object::Int(_)) => return Err(value_error("negative ancillary data buffer size")),
+        _ => return Err(type_error("recvmsg: ancbufsize must be an integer")),
+    };
+    let flags: libc::c_int = match args.get(3) {
+        None | Some(Object::None) => 0,
+        Some(Object::Int(n)) => *n as libc::c_int,
+        _ => return Err(type_error("recvmsg: flags must be an integer")),
+    };
+
+    let mut databuf = vec![0u8; bufsize];
+    let mut control = vec![0u8; ancbufsize];
+    let fd = snapshot_raw_fd(&state)?;
+
+    let mut iov = [libc::iovec {
+        iov_base: databuf.as_mut_ptr() as *mut c_void,
+        iov_len: bufsize,
+    }];
+    let iov_ptr = iov.as_mut_ptr();
+    let ctrl_ptr = if ancbufsize > 0 {
+        control.as_mut_ptr()
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let (n, msg_flags, used_controllen) = crate::gil::allow_threads_then(move || unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = iov_ptr;
+        msg.msg_iovlen = 1 as _;
+        if ancbufsize > 0 {
+            msg.msg_control = ctrl_ptr as *mut c_void;
+            msg.msg_controllen = ancbufsize as _;
+        }
+        let n = libc::recvmsg(fd, &mut msg, flags);
+        (n, i64::from(msg.msg_flags), msg.msg_controllen as usize)
+    });
+    if n < 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    databuf.truncate(n as usize);
+
+    let mut ancdata_items: Vec<Object> = Vec::new();
+    if ancbufsize > 0 && used_controllen > 0 {
+        unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_control = control.as_mut_ptr() as *mut c_void;
+            msg.msg_controllen = used_controllen as _;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                let level = (*cmsg).cmsg_level;
+                let ctype = (*cmsg).cmsg_type;
+                let cmsg_len = (*cmsg).cmsg_len as usize;
+                let data_ptr = libc::CMSG_DATA(cmsg);
+                // Payload length = cmsg_len minus the (aligned) header up to
+                // CMSG_DATA — never `CMSG_LEN(0)`, which omits the alignment.
+                let data_offset = (data_ptr as usize).saturating_sub(cmsg as usize);
+                let data_len = cmsg_len.saturating_sub(data_offset);
+                let data = std::slice::from_raw_parts(data_ptr.cast::<u8>(), data_len).to_vec();
+                ancdata_items.push(Object::new_tuple(vec![
+                    Object::Int(i64::from(level)),
+                    Object::Int(i64::from(ctype)),
+                    Object::new_bytes(data),
+                ]));
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+    }
+
+    Ok(Object::new_tuple(vec![
+        Object::new_bytes(databuf),
+        Object::new_list(ancdata_items),
+        Object::Int(msg_flags),
+        Object::None,
+    ]))
+}
+
+#[cfg(not(unix))]
+fn sock_sendmsg(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(os_error("sendmsg is not supported on this platform"))
+}
+
+#[cfg(not(unix))]
+fn sock_recvmsg(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(os_error("recvmsg is not supported on this platform"))
+}
+
+/// Snapshot the raw fd of `state`, dropping the borrow before the syscall
+/// (a peer thread may legitimately `close()` it; we then see `EBADF`).
+#[cfg(unix)]
+fn snapshot_raw_fd(state: &Rc<RefCell<SocketState>>) -> Result<libc::c_int, RuntimeError> {
+    let b = state.borrow();
+    let sock = b.inner.as_ref().ok_or_else(|| os_error("socket closed"))?;
+    let fd = raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?;
+    Ok(fd as libc::c_int)
+}
+
+/// Extract the `sendmsg` iovec list — an iterable of bytes-like objects.
+fn extract_iov_buffers(arg: Option<&Object>) -> Result<Vec<Vec<u8>>, RuntimeError> {
+    let items: Vec<Object> = match arg {
+        Some(Object::List(l)) => l.borrow().clone(),
+        Some(Object::Tuple(t)) => t.to_vec(),
+        _ => {
+            return Err(type_error(
+                "sendmsg(): argument 1 must be an iterable of bytes-like objects",
+            ))
+        }
+    };
+    items.iter().map(|o| extract_bytes(Some(o))).collect()
+}
+
+/// Extract `sendmsg` ancillary data: an iterable of `(cmsg_level, cmsg_type,
+/// cmsg_data)` triples. `cmsg_data` may be any bytes-like object, including
+/// the `array.array('i', fds)` `multiprocessing.reduction.sendfds` passes.
+#[cfg(unix)]
+fn extract_ancdata(
+    arg: Option<&Object>,
+) -> Result<Vec<(libc::c_int, libc::c_int, Vec<u8>)>, RuntimeError> {
+    let items: Vec<Object> = match arg {
+        None | Some(Object::None) => return Ok(Vec::new()),
+        Some(Object::List(l)) => l.borrow().clone(),
+        Some(Object::Tuple(t)) => t.to_vec(),
+        _ => {
+            return Err(type_error(
+                "sendmsg(): ancillary data must be an iterable of zero or more triples",
+            ))
+        }
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let triple = match &item {
+            Object::Tuple(t) if t.len() == 3 => t.to_vec(),
+            Object::List(l) if l.borrow().len() == 3 => l.borrow().clone(),
+            _ => {
+                return Err(type_error(
+                    "sendmsg(): ancillary data items must be (cmsg_level, cmsg_type, cmsg_data) triples",
+                ))
+            }
+        };
+        let level = match &triple[0] {
+            Object::Int(n) => *n as libc::c_int,
+            _ => return Err(type_error("sendmsg(): an integer is required (cmsg_level)")),
+        };
+        let ctype = match &triple[1] {
+            Object::Int(n) => *n as libc::c_int,
+            _ => return Err(type_error("sendmsg(): an integer is required (cmsg_type)")),
+        };
+        let data = cmsg_data_bytes(&triple[2])?;
+        out.push((level, ctype, data));
+    }
+    Ok(out)
+}
+
+/// Bytes of a control-message payload. Falls back to the buffer protocol via
+/// `obj.tobytes()` for objects that aren't native bytes/bytearray/memoryview
+/// — notably `array.array`, which `multiprocessing` uses for the fd array.
+#[cfg(unix)]
+fn cmsg_data_bytes(obj: &Object) -> Result<Vec<u8>, RuntimeError> {
+    if let Ok(b) = extract_bytes(Some(obj)) {
+        return Ok(b);
+    }
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the active builtin call on this thread; the
+        // interpreter outlives this call.
+        let interp = unsafe { &mut *ptr };
+        if let Ok(method) = interp.load_attr_public(obj, "tobytes") {
+            if let Object::Bytes(b) = interp.call_object(method, &[], &[])? {
+                return Ok(b.to_vec());
+            }
+        }
+    }
+    Err(type_error(
+        "sendmsg(): ancillary data must be a bytes-like object",
+    ))
 }
 
 fn sock_setblocking(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1653,7 +1939,48 @@ fn module_functions() -> &'static [(&'static str, fn(&[Object]) -> Result<Object
         ("ntohl", mod_htonl),
         ("getdefaulttimeout", mod_getdefaulttimeout),
         ("setdefaulttimeout", mod_setdefaulttimeout),
+        // Ancillary-data sizing helpers (functions, not constants, exactly
+        // like CPython's `socket` module). Needed by `reduction.recvfds`.
+        ("CMSG_LEN", mod_cmsg_len),
+        ("CMSG_SPACE", mod_cmsg_space),
     ]
+}
+
+/// `socket.CMSG_LEN(length)` — bytes an ancillary-data item of `length`
+/// payload occupies, including the `cmsghdr` (but not the trailing pad).
+fn mod_cmsg_len(args: &[Object]) -> Result<Object, RuntimeError> {
+    let length = cmsg_size_arg(args.first())?;
+    #[cfg(unix)]
+    {
+        Ok(Object::Int(unsafe { libc::CMSG_LEN(length) } as i64))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(os_error("CMSG_LEN is not supported on this platform"))
+    }
+}
+
+/// `socket.CMSG_SPACE(length)` — bytes to allocate in a control buffer for
+/// one ancillary-data item of `length` payload, including alignment pad.
+fn mod_cmsg_space(args: &[Object]) -> Result<Object, RuntimeError> {
+    let length = cmsg_size_arg(args.first())?;
+    #[cfg(unix)]
+    {
+        Ok(Object::Int(unsafe { libc::CMSG_SPACE(length) } as i64))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(os_error("CMSG_SPACE is not supported on this platform"))
+    }
+}
+
+#[allow(dead_code)]
+fn cmsg_size_arg(arg: Option<&Object>) -> Result<u32, RuntimeError> {
+    match arg {
+        Some(Object::Int(n)) if *n >= 0 => Ok(*n as u32),
+        Some(Object::Int(_)) => Err(value_error("CMSG_LEN() argument out of range")),
+        _ => Err(type_error("an integer is required")),
+    }
 }
 
 fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1851,11 +2178,83 @@ fn mod_create_server(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(inst_obj)
 }
 
-fn mod_socketpair(_args: &[Object]) -> Result<Object, RuntimeError> {
-    // Build a loopback-connected pair via a temporary listener.
-    // This avoids needing OS-level `socketpair(2)` (which doesn't exist
-    // on Windows) and `AF_UNIX` (which isn't always available), at the
-    // cost of using TCP/IPv4 for both halves.
+fn mod_socketpair(args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython signature: socketpair(family=AF_UNIX, type=SOCK_STREAM, proto=0).
+    // The AF_UNIX default is load-bearing: `multiprocessing`'s `Connection`
+    // pipes and the `forkserver` control channel both rely on a real
+    // `socketpair(2)` over which `SCM_RIGHTS` fd passing works (a TCP
+    // loopback pair cannot carry ancillary data).
+    let family = match args.first() {
+        None | Some(Object::None) => default_socketpair_family(),
+        Some(Object::Int(n)) => *n as i32,
+        _ => return Err(type_error("socketpair: family must be an integer")),
+    };
+    let sock_type = match args.get(1) {
+        None | Some(Object::None) => libc_sock_stream() as i32,
+        Some(Object::Int(n)) => *n as i32,
+        _ => return Err(type_error("socketpair: type must be an integer")),
+    };
+    let proto = match args.get(2) {
+        None | Some(Object::None) => 0,
+        Some(Object::Int(n)) => *n as i32,
+        _ => return Err(type_error("socketpair: proto must be an integer")),
+    };
+
+    #[cfg(unix)]
+    if family == 1 {
+        return unix_socketpair(family, sock_type, proto);
+    }
+
+    inet_socketpair_emulation()
+}
+
+/// Default `socketpair` family — AF_UNIX on POSIX (CPython parity), AF_INET
+/// where AF_UNIX is unavailable.
+fn default_socketpair_family() -> i32 {
+    #[cfg(unix)]
+    {
+        1 // AF_UNIX
+    }
+    #[cfg(not(unix))]
+    {
+        libc_af_inet() as i32
+    }
+}
+
+/// A genuine `socketpair(2)` — the connected AF_UNIX pair that carries
+/// `SCM_RIGHTS` ancillary data for fd passing.
+#[cfg(unix)]
+fn unix_socketpair(family: i32, sock_type: i32, proto: i32) -> Result<Object, RuntimeError> {
+    use std::os::unix::io::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    let rc = unsafe { libc::socketpair(family, sock_type, proto, fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    let make = |fd: libc::c_int| -> Object {
+        // SAFETY: `fd` is a fresh, owned descriptor from `socketpair(2)`.
+        let sock = unsafe { Socket::from_raw_fd(fd) };
+        let state = Rc::new(RefCell::new(SocketState {
+            inner: Some(sock),
+            family,
+            kind: sock_type,
+            proto,
+            timeout: None,
+            blocking: true,
+        }));
+        let h = next_handle(state);
+        let inst = Rc::new(PyInstance::new(socket_class()));
+        inst.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("_handle")), Object::Int(h));
+        Object::Instance(inst)
+    };
+    Ok(Object::new_tuple(vec![make(fds[0]), make(fds[1])]))
+}
+
+/// Loopback-TCP emulation for the AF_INET case (and platforms without
+/// `AF_UNIX`). Builds a connected pair via a transient listener.
+fn inet_socketpair_emulation() -> Result<Object, RuntimeError> {
     use socket2::{Domain, Socket, Type};
     let listener = Socket::new(Domain::IPV4, Type::STREAM, None).map_err(|e| io_error_to_py(&e))?;
     listener

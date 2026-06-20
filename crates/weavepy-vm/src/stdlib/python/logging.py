@@ -409,6 +409,28 @@ class StreamHandler(Handler):
         return result
 
 
+class _StderrHandler(StreamHandler):
+    """A StreamHandler that always writes to whatever ``sys.stderr`` is
+    *currently* bound to, rather than the value captured at construction
+    time. Used for ``lastResort`` so output follows redirections such as
+    ``test.support.captured_stderr`` (CPython 3.2+)."""
+
+    def __init__(self, level=NOTSET):
+        Handler.__init__(self, level)
+
+    @property
+    def stream(self):
+        return sys.stderr
+
+
+# The handler used when a record propagates to the root and *no* handler is
+# configured anywhere in the hierarchy. CPython 3.2+ writes such records to
+# stderr at WARNING level instead of the legacy "No handlers could be found"
+# message; `callHandlers` consults this global.
+_defaultLastResort = _StderrHandler(WARNING)
+lastResort = _defaultLastResort
+
+
 class FileHandler(StreamHandler):
     def __init__(self, filename, mode="a", encoding=None, delay=False, errors=None):
         self.baseFilename = filename
@@ -633,9 +655,21 @@ class Logger(Filterer):
             if not c.propagate:
                 break
             c = c.parent
-        if found == 0 and root.handlers == []:
-            # Last-ditch path matching CPython behaviour.
-            sys.stderr.write(f"No handlers could be found for logger '{self.name}'\n")
+        if found == 0:
+            # CPython 3.2+: a record that reaches here with no configured
+            # handler is emitted via `lastResort` (a stderr handler at
+            # WARNING level) so exception tracebacks from e.g.
+            # `concurrent.futures` callbacks still surface. Only when
+            # `lastResort` has been cleared do we fall back to the legacy
+            # one-shot "No handlers could be found" warning.
+            if lastResort:
+                if record.levelno >= lastResort.level:
+                    lastResort.handle(record)
+            elif (raiseExceptions and self.manager
+                    and not self.manager.emittedNoHandlerWarning):
+                sys.stderr.write(
+                    'No handlers could be found for logger "%s"\n' % self.name)
+                self.manager.emittedNoHandlerWarning = True
 
     def handle(self, record):
         if self.disabled:

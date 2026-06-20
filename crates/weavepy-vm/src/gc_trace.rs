@@ -721,6 +721,20 @@ impl GcState {
         self.collect_impl(upto, true)
     }
 
+    /// Run the cycle collector's mark phase across all generations and fire
+    /// the weakref callbacks of every unreachable, non-finalizable object,
+    /// *without* the destructive teardown of a real collection. See
+    /// [`Self::collect_generation`]'s `weakref_only` discussion. The
+    /// re-entrancy guard applies, so this is a no-op inside a collection.
+    pub fn fire_dead_weakrefs(&self) {
+        if self.collecting.load(Ordering::Acquire) {
+            return;
+        }
+        self.collecting.store(true, Ordering::Release);
+        self.collect_generation(N_GENERATIONS - 1, true);
+        self.collecting.store(false, Ordering::Release);
+    }
+
     /// Shared collection body. `exact` selects between the two cost/precision
     /// profiles:
     ///
@@ -768,7 +782,7 @@ impl GcState {
         let passes = if exact { MAX_COLLECT_PASSES } else { 1 };
         let mut collected = 0usize;
         for _ in 0..passes {
-            let n = self.collect_generation(gen);
+            let n = self.collect_generation(gen, false);
             collected += n;
             if n == 0 {
                 break;
@@ -797,7 +811,20 @@ impl GcState {
     }
 
     /// Collect a specific generation. Used by [`Self::collect`].
-    fn collect_generation(&self, gen: usize) -> usize {
+    ///
+    /// `weakref_only` runs the identical mark phase but stops once the
+    /// unreachable set is known: it fires the weakref callbacks of the dead,
+    /// non-finalizable objects (flipping `weakref.ref(obj)()` to `None`) and
+    /// returns *without* running finalizers, clearing fields, untracking, or
+    /// rebuilding generations. It is used from a blocking `Thread.join` to
+    /// fire a reference-count-dead `ThreadPoolExecutor`'s `weakref_cb` (which
+    /// signals its idle workers to exit) without the destructive teardown of a
+    /// full collection — which, run while a worker holds an in-flight
+    /// `_WorkItem` in a frame the collector can't see as a root, would clear
+    /// that live work item mid-use (RFC 0040: `test_shutdown`). Because it
+    /// never mutates object contents, such a misclassification is harmless
+    /// here (a `_WorkItem` has no weakref, so its `notify_clear` is a no-op).
+    fn collect_generation(&self, gen: usize, weakref_only: bool) -> usize {
         // Phase 1: snapshot the handles in this generation, plus
         // any younger ones (collecting gen N also collects all
         // gens 0..N). We treat gens 0..=gen as the candidate set.
@@ -971,6 +998,79 @@ impl GcState {
             .cloned()
             .collect();
 
+        if std::env::var_os("WP_REAP_DBG").is_some() {
+            for h in &candidate_set {
+                if let Object::Instance(i) = &h.object {
+                    if i.cls().name.contains("Executor") {
+                        let exec_id = h.id;
+                        let mut referrers: Vec<String> = Vec::new();
+                        for c in &scan_all {
+                            if c.id == exec_id {
+                                continue;
+                            }
+                            let mut hit = false;
+                            traverse_object(&c.object, &mut |child| {
+                                if id_of(child) == exec_id {
+                                    hit = true;
+                                }
+                            });
+                            if hit {
+                                let nm = match &c.object {
+                                    Object::Instance(ci) => format!("Instance({})", ci.cls().name),
+                                    other => other.type_name().to_string(),
+                                };
+                                referrers.push(nm);
+                            }
+                        }
+                        eprintln!(
+                            "[mark wronly={}] Executor sc={} clones={} gc_refs={} white={} tracked_referrers={:?}",
+                            weakref_only,
+                            strong_count_for(&h.object),
+                            crate::weakref_registry::strong_clone_count(h.id),
+                            h.gc_refs.load(Ordering::Acquire),
+                            h.color.load(Ordering::Acquire) == color::White,
+                            referrers,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Weakref-only pass: fire the dead objects' weakref callbacks and
+        // stop. We deliberately skip everything destructive below (finalizer
+        // execution, field clearing, untracking, generation rebuild) so a
+        // frame-rooted live object the mark mis-coloured White is left fully
+        // intact — only its (absent) weakrefs would be touched. A genuinely
+        // dead, weakref-watched object (the `del`'d `ThreadPoolExecutor`) gets
+        // its `weakref_cb` queued, which is all a blocking `join` needs to
+        // unblock its idle workers. Finalizable objects are left for a real
+        // collection so `tp_finalize` ordering is preserved.
+        if weakref_only {
+            let mut weakref_callbacks = Vec::new();
+            for h in &unreachable {
+                if has_finalizer(&h.object) && !h.finalized.load(Ordering::Acquire) {
+                    continue;
+                }
+                for (slot, cb) in crate::weakref_registry::notify_clear(h.id) {
+                    if let Some(cb) = cb {
+                        weakref_callbacks.push((slot, cb));
+                    }
+                }
+            }
+            for (slot, cb) in weakref_callbacks {
+                let wr = slot
+                    .py_ref
+                    .borrow()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .map(crate::object::Object::Instance);
+                if let Some(wr) = wr {
+                    crate::vm_singletons::push_pending_weakref_callback(cb, wr);
+                }
+            }
+            return 0;
+        }
+
         // Split the unreachable set into objects whose `__del__` hasn't run
         // yet ("deferred") and the rest. A deferred object is queued for
         // finalization and kept tracked: its finalizer (drained right after
@@ -993,28 +1093,82 @@ impl GcState {
             }
         }
 
-        // Queue each deferred object's finalizer (once) and recolor it Black so
-        // the reachability walk below can treat it as a protected root.
-        let mut protect_stack: Vec<Arc<TrackedHandle>> = Vec::new();
+        // Run each deferred object's finalizer (once). A finalizer is arbitrary
+        // Python: it can execute bytecode, hit a `periodic_gil_checkpoint`, and
+        // hand the GIL to another OS thread — which may then *resurrect* an
+        // object the mark phase just classified unreachable (store it somewhere
+        // reachable, or, in the threaded queue reproducers, pull it off a buffer
+        // into a live frame local). Every mark color computed above predates
+        // these finalizers, so it is stale the instant any finalizer runs.
         for h in &deferred {
             if !h.finalize_queued.swap(true, Ordering::AcqRel) {
                 run_finalizer(&h.object);
             }
+        }
+
+        // CPython's `handle_resurrected_objects`: after `finalize_garbage` runs
+        // every `tp_finalize`, it re-derives reachability and moves any object
+        // that came back to life out of the to-be-cleared set. Mirror that — but
+        // only when a finalizer actually ran, since that is the sole point in
+        // this routine where the GIL can be released and the object graph can
+        // change underneath us. Re-seed `gc_refs` from a *fresh* strong-count
+        // snapshot (so a reference a concurrent thread or a finalizer added is
+        // counted), re-subtract internal edges, and re-propagate reachability.
+        // Without this, a live object reachable only through an untraversed root
+        // (a running thread's frame locals) that a finalizer's GIL hand-off
+        // revived is cleared mid-use — emptying its `__dict__` while another
+        // thread pickles it (RFC 0040: `ProcessPoolExecutor` / multiprocessing
+        // `Queue` feeder dropping a `_CallItem` into a worker's pipe).
+        if !deferred.is_empty() {
+            for handle in &scan_all {
+                let weak_clones = crate::weakref_registry::strong_clone_count(handle.id) as i64;
+                let outer = strong_count_for(&handle.object)
+                    .saturating_sub(1)
+                    .saturating_sub(weak_clones as usize) as i64;
+                handle.gc_refs.store(outer, Ordering::Release);
+                handle.color.store(color::White, Ordering::Release);
+            }
+            for handle in &scan_all {
+                traverse_object(&handle.object, &mut |child| {
+                    if let Some(target) = by_id.get(&id_of(child)) {
+                        target.gc_refs.fetch_sub(1, Ordering::AcqRel);
+                    }
+                });
+            }
+            let mut grey: Vec<Arc<TrackedHandle>> = Vec::new();
+            for handle in &scan_all {
+                if handle.gc_refs.load(Ordering::Acquire) > 0 {
+                    handle.color.store(color::Grey, Ordering::Release);
+                    grey.push(handle.clone());
+                }
+            }
+            while let Some(h) = grey.pop() {
+                h.color.store(color::Black, Ordering::Release);
+                traverse_object(&h.object, &mut |child| {
+                    if let Some(target) = by_id.get(&id_of(child)) {
+                        if target.color.load(Ordering::Acquire) == color::White {
+                            target.color.store(color::Grey, Ordering::Release);
+                            grey.push(target.clone());
+                        }
+                    }
+                });
+            }
+        }
+
+        // Recolor the deferred roots Black and protect their whole reachable
+        // subgraph. CPython runs `finalize_garbage` *before* `delete_garbage`, so
+        // a pending finalizer always sees its own class, closure cells, and
+        // referents intact — even when those are themselves unreachable cyclic
+        // garbage (a locally-defined class whose only instance is dying, the
+        // `__del__` function closing over the cycle, …). Those objects are
+        // reclaimed by a later pass once the owning finalizer has run and they,
+        // too, are plain garbage. Re-applied here so it survives the resurrection
+        // re-mark above (which reset every color from the fresh refcounts).
+        let mut protect_stack: Vec<Arc<TrackedHandle>> = Vec::new();
+        for h in &deferred {
             h.color.store(color::Black, Ordering::Release);
             protect_stack.push(h.clone());
         }
-
-        // CPython runs `finalize_garbage` *before* `delete_garbage`, so a
-        // pending finalizer always sees its own class, closure cells, and
-        // referents intact — even when those are themselves unreachable cyclic
-        // garbage (a locally-defined class whose only instance is dying, the
-        // `__del__` function closing over the cycle, …). Reproduce that by
-        // protecting the whole finalizer-reachable subgraph: starting from the
-        // deferred roots, recolor every reachable White candidate Black so it
-        // survives this pass. Those objects are reclaimed by a later pass once
-        // the owning finalizer has run and they, too, are plain garbage.
-        // Without this, clearing the class/`__del__` mid-cycle left the queued
-        // finalizer running against a torn-down namespace (its writes no-oped).
         while let Some(h) = protect_stack.pop() {
             traverse_object(&h.object, &mut |child| {
                 if let Some(target) = by_id.get(&id_of(child)) {
@@ -1026,8 +1180,8 @@ impl GcState {
             });
         }
 
-        // Whatever stayed White after protecting the finalizer subgraph is
-        // genuinely dead this pass.
+        // Whatever stayed White after the resurrection re-mark and the finalizer
+        // subgraph protection is genuinely dead this pass.
         let dead: Vec<Arc<TrackedHandle>> = maybe_dead
             .into_iter()
             .filter(|h| h.color.load(Ordering::Acquire) == color::White)
@@ -1767,6 +1921,16 @@ pub fn collect_upto(upto: usize) -> usize {
     let n = with_state(|s| s.collect(upto));
     sweep_weakref_only_targets();
     n
+}
+
+/// Convenience: fire dead objects' weakref callbacks via a non-destructive
+/// mark pass on the shared GC (see [`GcState::fire_dead_weakrefs`]), then
+/// sweep the untracked weakref-only targets. Used from a blocking
+/// `Thread.join` to unblock idle `ThreadPoolExecutor` workers without the
+/// teardown risk of a full collection.
+pub fn fire_dead_weakrefs() {
+    with_state(|s| s.fire_dead_weakrefs());
+    sweep_weakref_only_targets();
 }
 
 /// Clear weakrefs whose referent isn't in the tracked set and whose

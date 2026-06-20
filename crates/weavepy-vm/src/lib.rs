@@ -235,7 +235,7 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
 /// `__del__`). Captured *before* `close()` tears the frame down so
 /// the caller can emulate CPython's prompt refcount-driven
 /// finalization afterwards.
-fn frame_finalizables(g: &Rc<PyGenerator>) -> Vec<Object> {
+fn frame_reapables(g: &Rc<PyGenerator>) -> Vec<Object> {
     let Ok(state) = g.state.try_borrow() else {
         return Vec::new();
     };
@@ -246,16 +246,33 @@ fn frame_finalizables(g: &Rc<PyGenerator>) -> Vec<Object> {
     let Some(frame) = boxed.downcast_ref::<Frame>() else {
         return Vec::new();
     };
-    let finalizable = |o: &&Object| -> bool {
-        matches!(o, Object::Instance(i) if i.cls().lookup("__del__").is_some())
-    };
-    frame
-        .locals
-        .iter()
-        .filter(finalizable)
-        .chain(frame.stack.iter().filter(finalizable))
-        .cloned()
-        .collect()
+    // CPython clears a generator's frame the instant it finishes/closes
+    // (`gen_send`/`gen_close` → `_PyFrame_ClearExceptCode`), so every
+    // local and value-stack entry is decref'd promptly. WeavePy mirrors
+    // that by running each prompt-reapable entry through the cascade
+    // after the frame is torn down — not just `__del__`-bearing
+    // instances but anything that anchors a finalizable acyclic
+    // subgraph *or* whose only surviving reference (once the frame is
+    // gone) is a weakref slot's strong clone in our registry. The
+    // latter is what lets `weakref.ref(obj)` zero out by refcount the
+    // way CPython's does: without it a suspended generator that
+    // referenced `obj` would keep `obj` pinned through the registry's
+    // clone until the next cyclic collection (RFC 0040:
+    // `test_concurrent_futures.test_init` leaked semaphores because the
+    // `_assert_logged`/`sleeping_retry` generators pinned the test
+    // instance → its `multiprocessing.Queue` → SemLocks).
+    let mut out: Vec<Object> = Vec::new();
+    let mut seen: std::collections::HashSet<crate::weakref_registry::ObjectId> =
+        std::collections::HashSet::new();
+    for o in frame.locals.iter().chain(frame.stack.iter()) {
+        if (Interpreter::local_needs_prompt_reap(o)
+            || crate::weakref_registry::count_for(crate::weakref_registry::id_of(o)) > 0)
+            && seen.insert(crate::weakref_registry::id_of(o))
+        {
+            out.push(o.clone());
+        }
+    }
+    out
 }
 
 /// RFC 0032 — render the tier-2 JIT's counters as a markdown block for
@@ -305,6 +322,14 @@ pub struct InterpreterFlags {
     pub xoptions: Vec<String>,
     pub warning_filters: Vec<String>,
     pub hash_seed: Option<u32>,
+    /// `PYTHONIOENCODING=encoding[:errors]` — the codec name applied to
+    /// `sys.stdin`/`sys.stdout`/`sys.stderr` at startup. `None` keeps the
+    /// UTF-8 default. CPython honours the env var (and `-E`/`-I` suppress
+    /// it); see [`Interpreter::apply_run_options`].
+    pub io_encoding: Option<String>,
+    /// The `errors` half of `PYTHONIOENCODING`. `None` keeps each stream's
+    /// default handler (`strict`).
+    pub io_errors: Option<String>,
 }
 
 /// The top-level entry point for executing WeavePy bytecode.
@@ -620,6 +645,28 @@ impl Interpreter {
                 crate::object::DictKey(Object::from_static("_xoptions")),
                 Object::Dict(crate::sync::Rc::new(crate::sync::RefCell::new(xopts))),
             );
+            // `PYTHONIOENCODING=encoding[:errors]` — retarget the standard
+            // streams' text codec, matching CPython's startup
+            // (`config_init_stdio`). The encoding part alone is enough to
+            // make `sys.stdout.encoding` report e.g. `ascii`, which is what
+            // codec-aware helpers (`tarfile._safe_print`,
+            // `traceback`/`print` redirection) key off. We only mutate when
+            // the env var is set so the UTF-8 default — and `-E`/`-I`
+            // isolation — are untouched.
+            if flags.io_encoding.is_some() || flags.io_errors.is_some() {
+                for name in ["stdin", "stdout", "stderr"] {
+                    if let Some(Object::File(f)) =
+                        d.get(&crate::object::DictKey(Object::from_static(name)))
+                    {
+                        if let Some(enc) = &flags.io_encoding {
+                            f.set_encoding(enc);
+                        }
+                        if let Some(errs) = &flags.io_errors {
+                            f.set_errors(errs);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -945,6 +992,29 @@ impl Interpreter {
             }
             return;
         }
+        // A `BoundMethod` is itself untracked and carries no finalizer, so
+        // the fast-path early-return below would merely `Rc`-drop it —
+        // reclaiming the method object but leaving a *tracked* receiver
+        // pinned by its own GC handle (the early-return only accounts for
+        // *untracked* children a value anchors). Release the method's hold
+        // and run the receiver through the cascade, exactly as
+        // `reap_call_receiver` does for call temporaries. CPython decrefs a
+        // `method`'s `__self__` the instant the method object dies; this is
+        // what reaps a stored bound `__exit__` — the compiler's `.with_exit`
+        // synthetic local, dropped by `DeleteFast` on every `with` exit path
+        // — when the context manager is a plain instance that anchors
+        // resources. `unittest._AssertRaisesContext` holds the test case,
+        // which in `test_concurrent_futures.test_init` pinned the log
+        // `Queue` and its SemLocks until the next cyclic collection
+        // (RFC 0040: resource-tracker exited nonzero on leaked semaphores).
+        if let Object::BoundMethod(bm) = &dropped {
+            let recv = bm.receiver.clone();
+            drop(dropped);
+            if Self::local_needs_prompt_reap(&recv) && Self::looks_reapable_temporary(&recv) {
+                self.prompt_reap_dropped(recv);
+            }
+            return;
+        }
         let id0 = crate::weakref_registry::id_of(&dropped);
         // Nothing parked on this object needs prompt handling: no
         // finalizer to run, no weakref to clear, and no cycle-GC strong
@@ -1015,13 +1085,52 @@ impl Interpreter {
             // Snapshot the tracked children before `obj` is freed: those
             // are the only ones a strong GC handle would otherwise pin
             // (untracked children are reclaimed by ordinary `Rc` drop).
+            //
+            // Crucially, recurse *through* untracked containers to reach the
+            // tracked descendants hidden behind them. A container is left
+            // GC-untracked either because it was built all-scalar
+            // (`BuildTuple`/`BuildSet`) or — the subtler case — because it was
+            // created *empty* (so `container_can_cycle` saw nothing to track)
+            // and only later populated with objects: a dict literal `{}` grown
+            // by `d[k] = obj` is the canonical example, and
+            // `pickle._Unpickler.memo` (`self.memo = {}`, then memoized objects
+            // stuffed in) is exactly that. When such a container is the sole
+            // holder of a tracked, finalizable object, freeing the container by
+            // refcount drops that object to "GC handle only" — refcount-dead,
+            // but pinned by its own handle and so invisible to the next link of
+            // this cascade unless we walk into the container here. RFC 0040:
+            // `test_concurrent_futures.test_ressources_gced_in_workers` submits
+            // an object whose `__del__` signals a `Manager` event; the worker
+            // unpickles it (memoized in `_Unpickler.memo`), runs the job, and
+            // `del`s the `_CallItem`, expecting the argument's `__del__` to have
+            // fired — which only happens if dropping the call item (and the
+            // unpickler temporary holding the memo) cascades through the
+            // untracked `memo` dict to the tracked argument. The refcount guard
+            // below still filters anything that stays externally reachable.
             let mut child_ids: Vec<crate::weakref_registry::ObjectId> = Vec::new();
-            gc_trace::traverse_object(&obj, &mut |c| {
-                let cid = crate::weakref_registry::id_of(c);
-                if gc_trace::is_tracked(cid) {
-                    child_ids.push(cid);
-                }
-            });
+            let mut scan_through: Vec<Object> = vec![obj.clone()];
+            let mut scanned: std::collections::HashSet<crate::weakref_registry::ObjectId> =
+                std::collections::HashSet::new();
+            while let Some(parent) = scan_through.pop() {
+                gc_trace::traverse_object(&parent, &mut |c| {
+                    let cid = crate::weakref_registry::id_of(c);
+                    if gc_trace::is_tracked(cid) {
+                        child_ids.push(cid);
+                    } else if matches!(
+                        c,
+                        Object::Tuple(_)
+                            | Object::FrozenSet(_)
+                            | Object::Dict(_)
+                            | Object::List(_)
+                            | Object::Set(_)
+                            | Object::MappingProxy(_)
+                            | Object::SimpleNamespace(_)
+                    ) && scanned.insert(cid)
+                    {
+                        scan_through.push(c.clone());
+                    }
+                });
+            }
             // Drop the GC's strong handle, then our own reference: `obj`
             // is reclaimed by `Rc` here and its children lose a reference.
             if gc_trace::is_tracked(id) {
@@ -1036,12 +1145,230 @@ impl Interpreter {
                     // `h.object` is the GC's own strong reference; the
                     // child is dead iff nothing beyond that handle and its
                     // weakref clones still points at it.
-                    if gc_trace::strong_count_for(&h.object) <= 1 + weak {
+                    let sc = gc_trace::strong_count_for(&h.object);
+                    if sc <= 1 + weak {
                         work.push(h.object.clone());
                     }
                 }
             }
         }
+    }
+
+    /// CPython finalizes a frame's locals by refcount the instant the
+    /// frame is torn down: a local holding the *last* reference to a
+    /// finalizable object runs its `__del__` / weakref callback promptly
+    /// on `return`, not at the next cycle collection. WeavePy otherwise
+    /// only reaps on an explicit rebind (`STORE_FAST` over a live slot,
+    /// `del`), so a function that lets a finalizable local fall out of
+    /// scope by *returning* (`tempfile.NamedTemporaryFile` with
+    /// `delete=True`, `test_tempfile.test_del_by_finalizer`) leaked the
+    /// reclamation to the tracing GC. Move each interesting local out and
+    /// run it through the prompt-reap cascade; the refcount guard inside
+    /// leaves anything still reachable (including the return value, which
+    /// the caller still holds) untouched.
+    ///
+    /// Gated to the object kinds that can carry a finalizer (or anchor a
+    /// finalizable acyclic subgraph) so the common all-scalars frame pays
+    /// nothing on the hot return path.
+    fn reap_frame_locals_on_exit(&mut self, frame: &mut Frame, retval: Option<&Object>) {
+        // Class/module bodies keep their names in a namespace dict, not in
+        // fast locals, so this is a no-op for them; only real function
+        // activations (incl. comprehensions/lambdas) carry fast locals.
+        if frame.locals.is_empty() {
+            return;
+        }
+        let _ = retval;
+        for i in 0..frame.locals.len() {
+            // Cheap pre-filter: a local holding the *last* program reference
+            // has `strong_count == locals-slot (1) + GC handle (<=1)`, plus
+            // any weakref slots' strong clones (which the cascade discounts,
+            // so an object reachable *only* through `weakref.ref(obj)` is
+            // still dead). Anything larger means the value escaped (it was
+            // returned, stored on an instance, captured by a closure, …), so
+            // leave it alone without paying for the full refcount/weakref
+            // test or a cascade. Keeps the hot return path of scalar-only
+            // frames free.
+            if Self::local_needs_prompt_reap(&frame.locals[i])
+                && Self::looks_reapable_temporary(&frame.locals[i])
+            {
+                let v = std::mem::replace(&mut frame.locals[i], Object::Unbound);
+                self.prompt_reap_dropped(v);
+            }
+        }
+    }
+
+    /// Reap a generator/coroutine frame the instant it *finishes* (a
+    /// normal return, an exhausting `next()`, or an exception escaping
+    /// the body). CPython clears the frame on completion, so a local or
+    /// value-stack entry holding the last reference to a finalizable
+    /// object dies promptly — and, in WeavePy's `Rc`-rooted model, an
+    /// object whose only other reference is a weakref slot's strong
+    /// clone in the registry becomes refcount-dead, which clears its
+    /// weakref (so `weakref.ref(obj)()` zeroes out without waiting for a
+    /// cyclic collection). The reapables are moved *out* of the frame
+    /// first so the frame no longer counts toward their refcount when
+    /// the cascade's deadness test runs; the frame is dropped (now
+    /// holding `Unbound` placeholders) by the caller. Mirrors
+    /// [`Self::reap_frame_locals_on_exit`] for the suspended-frame world.
+    fn reap_dead_frame(&mut self, frame: &mut Frame) {
+        let mut reap: Vec<Object> = Vec::new();
+        for slot in &mut frame.locals {
+            if Self::local_needs_prompt_reap(slot)
+                || crate::weakref_registry::count_for(crate::weakref_registry::id_of(slot)) > 0
+            {
+                reap.push(std::mem::replace(slot, Object::Unbound));
+            }
+        }
+        for slot in &mut frame.stack {
+            if Self::local_needs_prompt_reap(slot)
+                || crate::weakref_registry::count_for(crate::weakref_registry::id_of(slot)) > 0
+            {
+                reap.push(std::mem::replace(slot, Object::Unbound));
+            }
+        }
+        for v in reap {
+            self.prompt_reap_dropped(v);
+        }
+    }
+
+    /// After a bound-method call returns, give the receiver a prompt-reap
+    /// chance. While the call executed, the `BoundMethod` object held a
+    /// strong reference to its receiver, so the callee's frame-exit reaping
+    /// of the `self` local saw the receiver as still-referenced and left it
+    /// to the cycle collector. Now that the method object is being
+    /// discarded, a receiver that was only a *temporary* — `Maker().make()`,
+    /// or `_Unpickler(buf).load()` inside `pickle.loads` — becomes
+    /// refcount-dead and must run its (or its referents') finalizers
+    /// immediately, mirroring CPython decref'ing a `method`'s `__self__` the
+    /// instant the call frame is torn down. RFC 0040:
+    /// `test_concurrent_futures.test_ressources_gced_in_workers` submits an
+    /// object whose `__del__` signals a `Manager` event; the worker unpickles
+    /// its `_CallItem`, runs it, and `del`s it expecting the argument's
+    /// `__del__` to have fired — but the unpickler's `memo` (pinned by the
+    /// unpickler temporary, in turn pinned only by the GC handle once the
+    /// `loads` bound-method call returns) kept the argument alive until the
+    /// next cyclic collection.
+    ///
+    /// Cheap on the hot path: only `BoundMethod` callables pay anything, and
+    /// a receiver still bound elsewhere (the overwhelmingly common `self`)
+    /// fails the `strong_count` pre-check without touching the GC's maps.
+    fn reap_call_receiver(&mut self, callable: Object) {
+        let recv = match &callable {
+            Object::BoundMethod(bm) => bm.receiver.clone(),
+            _ => return,
+        };
+        // End the borrow and release the BoundMethod's hold on the receiver
+        // so `strong_count` reflects only real bindings + the GC handle.
+        drop(callable);
+        // `recv` (1) + the GC's tracking handle (<=1) + any weakref clones is
+        // the fingerprint of a dead temporary; anything larger means a live
+        // binding still holds it. The authoritative refcount/weakref test
+        // lives in `prompt_reap_dropped`; this is just a cheap pre-filter.
+        if Self::local_needs_prompt_reap(&recv) && Self::looks_reapable_temporary(&recv) {
+            self.prompt_reap_dropped(recv);
+        }
+    }
+
+    /// After a call returns, give each *argument temporary* a prompt-reap
+    /// chance. While the call executed, the caller's argument vector held a
+    /// strong reference to every argument, so the callee's frame-exit reaping
+    /// of the corresponding parameter local saw the value as still-referenced
+    /// and left it to the cycle collector. Now that the caller is dropping its
+    /// argument vector, an argument that was only a *temporary* — `f(Make())`,
+    /// `runner.run(test_class('m'))` — becomes refcount-dead and must run its
+    /// (or its referents') finalizers immediately, mirroring CPython clearing
+    /// a call's stack slots the instant the call returns. RFC 0040:
+    /// `test_concurrent_futures.test_init` runs a child test inline as
+    /// `runner.run(test_class(...))`; the test case is never bound to a name,
+    /// so without reaping it here its `ProcessPoolExecutor` (and the log
+    /// `Queue`'s SemLocks) lingered to the next cyclic collection and the
+    /// resource tracker reported leaked semaphores. Moves each dead-looking
+    /// argument *out* of the vector before reaping so the vector slot no
+    /// longer inflates its refcount.
+    fn reap_call_args(&mut self, args: &mut [Object]) {
+        for a in args {
+            if Self::local_needs_prompt_reap(a) && Self::looks_reapable_temporary(a) {
+                let v = std::mem::replace(a, Object::Unbound);
+                self.prompt_reap_dropped(v);
+            }
+        }
+    }
+
+    /// Prompt-reap the value an assignment just displaced. CPython decrefs
+    /// the previous attribute/subscript value the instant a store
+    /// overwrites it (`self.x = y` decrefs the old `self.x`); a value whose
+    /// last program-visible binding was that slot dies immediately, running
+    /// its `__del__`/weakref callbacks rather than waiting for the next
+    /// cyclic collection. The crucial case is a slot holding the only
+    /// strong reference to an object that *itself* anchors a weakref false
+    /// cycle: `ExecutorMixin.tearDown` does `self.executor = None` after
+    /// `shutdown()`, and the `ProcessPoolExecutor`↔`_ExecutorManagerThread`
+    /// pair is only kept reachable by the thread's `weakref.ref(executor)`
+    /// (a registry strong-clone in WeavePy's `Rc` model). Reaping the
+    /// displaced executor clears that weakref, breaks the cycle, and
+    /// cascades through the manager thread into the call/result queues so
+    /// their SemLocks unlink before the test stops the resource tracker
+    /// (RFC 0040: `test_concurrent_futures.test_init`
+    /// `FailingInitializerResourcesTest`). The cheap `local_needs_prompt_reap`
+    /// gate keeps scalar stores (`self.n = i` in a loop) off this path.
+    fn maybe_prompt_reap_replaced(&mut self, old: Object) {
+        if std::env::var_os("WP_NO_STORE_REAP").is_some() {
+            return;
+        }
+        if Self::local_needs_prompt_reap(&old) && Self::looks_reapable_temporary(&old) {
+            self.prompt_reap_dropped(old);
+        }
+    }
+
+    /// Cheap "looks like a dead temporary" pre-filter shared by the
+    /// prompt-reap call sites. An object holding the single program reference
+    /// about to be dropped has `strong_count == that reference (1) + the GC's
+    /// tracking handle (<=1)`. A live weakref additionally keeps one strong
+    /// *clone* per slot in the registry (see [`crate::weakref_registry`]);
+    /// the cascade discounts those (an object reachable only through
+    /// `weakref.ref(obj)` is dead in CPython too), so they must not veto the
+    /// reap here. Anything beyond `2 + weak_clones` is a live binding. The
+    /// registry lookup is skipped on the common `strong_count <= 2` fast path.
+    fn looks_reapable_temporary(o: &Object) -> bool {
+        let sc = gc_trace::strong_count_for(o);
+        if sc <= 2 {
+            return true;
+        }
+        let id = crate::weakref_registry::id_of(o);
+        sc <= 2 + crate::weakref_registry::strong_clone_count(id)
+    }
+
+    /// Whether a frame local is worth running through the prompt-reap
+    /// cascade on frame exit. Mirrors the `PopTop` discard gate: instances
+    /// (possible `__del__` / weakref finalizer), and live
+    /// generators/coroutines/async-generators (their `close()` delivers
+    /// `GeneratorExit`). Kept deliberately narrow so the hot return path of
+    /// scalar-only frames pays a single cheap `matches!` per local.
+    fn local_needs_prompt_reap(o: &Object) -> bool {
+        matches!(
+            o,
+            Object::Instance(_)
+                | Object::Generator(_)
+                | Object::Coroutine(_)
+                | Object::AsyncGenerator(_)
+                | Object::AsyncGenAwait(_)
+                // A container local can anchor a finalizable acyclic subgraph
+                // that dies with the frame: pickle's `_dict_op` builds
+                // `items = [key, value]` via `_pop_to_mark`, stuffs it into a
+                // dict, and lets `items` fall out of scope at return — leaving
+                // the only non-GC reference to a freshly-unpickled, finalizable
+                // `value` on a dead list local. CPython frees it by refcount on
+                // return; reap it here so its `__del__` runs promptly instead of
+                // lingering to the next cyclic collection (RFC 0040:
+                // `test_concurrent_futures.test_ressources_gced_in_workers`).
+                // The `strong_count` pre-filter at the call site keeps escaped
+                // containers off the cascade.
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Set(_)
+                | Object::Tuple(_)
+                | Object::FrozenSet(_)
+        )
     }
 
     /// Does `obj` carry a finalizer that prompt reclamation must run
@@ -1903,7 +2230,10 @@ impl Interpreter {
 
     fn run_frame(&mut self, frame: &mut Frame) -> Result<Object, RuntimeError> {
         match self.run_until_yield_or_return(frame, None)? {
-            FrameOutcome::Returned(v) => Ok(v),
+            FrameOutcome::Returned(v) => {
+                self.reap_frame_locals_on_exit(frame, Some(&v));
+                Ok(v)
+            }
             FrameOutcome::Yielded(_) => Err(RuntimeError::Internal(
                 "generator frame yielded to a non-generator caller".to_owned(),
             )),
@@ -2409,7 +2739,7 @@ impl Interpreter {
                     // refcount-driven dealloc. Drop the snapshot's own
                     // strong clones (mirror, materialised dict) *first*
                     // so the reap sees the true remaining refcount.
-                    let caps = frame_finalizables(&g);
+                    let caps = frame_reapables(&g);
                     *g.state.borrow_mut() = GeneratorState::Finished;
                     if let Some(mirror) = py.locals_mirror.borrow().as_ref() {
                         mirror.borrow_mut().clear();
@@ -3563,11 +3893,17 @@ impl Interpreter {
                 let split_kw_at = frame.stack.len().saturating_sub(kwc);
                 let kw_values: Vec<Object> = frame.stack.split_off(split_kw_at);
                 let split_pos_at = frame.stack.len().saturating_sub(argc);
-                let pos_args: Vec<Object> = frame.stack.split_off(split_pos_at);
+                let mut pos_args: Vec<Object> = frame.stack.split_off(split_pos_at);
                 let callable = frame.pop()?;
-                let kw_pairs: Vec<(String, Object)> = names.into_iter().zip(kw_values).collect();
+                let mut kw_pairs: Vec<(String, Object)> =
+                    names.into_iter().zip(kw_values).collect();
                 let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
                 frame.push(r);
+                self.reap_call_receiver(callable);
+                self.reap_call_args(&mut pos_args);
+                for (_, v) in &mut kw_pairs {
+                    self.reap_call_args(std::slice::from_mut(v));
+                }
             }
             OpCode::CallEx => {
                 // CALL_FUNCTION_EX: `arg = 0` → stack has (callable,
@@ -3577,7 +3913,7 @@ impl Interpreter {
                 let kwargs_obj = if has_kwargs { Some(frame.pop()?) } else { None };
                 let args_obj = frame.pop()?;
                 let callable = frame.pop()?;
-                let pos_args: Vec<Object> = match args_obj {
+                let mut pos_args: Vec<Object> = match args_obj {
                     Object::Tuple(items) => items.iter().cloned().collect(),
                     Object::List(items) => items.borrow().clone(),
                     other => {
@@ -3587,7 +3923,7 @@ impl Interpreter {
                         )))
                     }
                 };
-                let kw_pairs: Vec<(String, Object)> = match kwargs_obj {
+                let mut kw_pairs: Vec<(String, Object)> = match kwargs_obj {
                     None => Vec::new(),
                     Some(Object::Dict(d)) => d
                         .borrow()
@@ -3603,6 +3939,11 @@ impl Interpreter {
                 };
                 let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
                 frame.push(r);
+                self.reap_call_receiver(callable);
+                self.reap_call_args(&mut pos_args);
+                for (_, v) in &mut kw_pairs {
+                    self.reap_call_args(std::slice::from_mut(v));
+                }
             }
             OpCode::ReturnValue => {
                 return Ok(StepOutcome::Return(frame.pop()?));
@@ -7776,6 +8117,36 @@ impl Interpreter {
         self.emit_runtime_warning(message)
     }
 
+    /// Public shim letting Rust stdlib builtins raise a `ResourceWarning`
+    /// through the live `warnings` machinery (so `catch_warnings` /
+    /// `assertWarns` see it). Used by `os.scandir`'s iterator finaliser for
+    /// the "unclosed scandir iterator" case, mirroring CPython's
+    /// `PyErr_ResourceWarning`.
+    pub(crate) fn warn_resource_from_builtin(
+        &mut self,
+        message: String,
+    ) -> Result<(), RuntimeError> {
+        let Some(warn) = self.module_attr("warnings", "warn") else {
+            return Ok(());
+        };
+        let category = Object::Type(crate::builtin_types::builtin_types().resource_warning.clone());
+        let globals = self.builtins.clone();
+        self.call(&warn, &[Object::from_str(message), category], &[], &globals)
+            .map(|_| ())
+    }
+
+    /// Public shim letting Rust stdlib builtins raise a `DeprecationWarning`
+    /// through the live `warnings` machinery (so `catch_warnings` /
+    /// `assertWarns` see it, and an escalating filter turns it into a raised
+    /// exception). Used by `os.fork()` for the multi-threaded-fork case,
+    /// mirroring CPython's `warn_about_fork_with_threads`.
+    pub(crate) fn warn_deprecation_from_builtin(
+        &mut self,
+        message: String,
+    ) -> Result<(), RuntimeError> {
+        self.emit_deprecation_warning(message)
+    }
+
     /// Emit a `RuntimeWarning` through the live `warnings` machinery so
     /// filters / `catch_warnings` apply. Used for "coroutine … was
     /// never awaited" at finalization.
@@ -11680,13 +12051,13 @@ impl Interpreter {
     /// `finally` blocks run; we mirror that by routing through
     /// `generator_throw` and absorbing the resulting StopIteration.
     fn gen_method_close(&mut self, receiver: &Object) -> Result<Object, RuntimeError> {
-        // Snapshot finalizable locals before the frame is torn down:
-        // CPython's refcounting runs their `__del__` the moment
-        // `close()` drops the frame (gh-142766), and tests assert on
-        // that promptness.
+        // Snapshot reapable locals/stack before the frame is torn down:
+        // CPython's refcounting runs their `__del__` (and clears their
+        // weakrefs) the moment `close()` drops the frame (gh-142766),
+        // and tests assert on that promptness.
         let frame_caps = match receiver {
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
-                frame_finalizables(g)
+                frame_reapables(g)
             }
             _ => Vec::new(),
         };
@@ -12025,6 +12396,7 @@ impl Interpreter {
                 // string we get from `from_builtin("StopIteration",
                 // "")`.
                 *gen.state.borrow_mut() = GeneratorState::Finished;
+                self.reap_dead_frame(&mut frame);
                 Err(stop_iteration_with(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -12035,7 +12407,9 @@ impl Interpreter {
             }
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                Err(self.pep479_escape(gen, err))
+                let escaped = self.pep479_escape(gen, err);
+                self.reap_dead_frame(&mut frame);
+                Err(escaped)
             }
         }
     }
@@ -13174,22 +13548,28 @@ impl Interpreter {
                         if dict_len > key_idx as usize {
                             frame.pop()?;
                             let val = frame.pop()?;
-                            // The slot still exists; reach in by
-                            // index and overwrite. We rebuild the
-                            // mutable borrow here because the
-                            // earlier read-only check has been
-                            // dropped.
-                            if let Some((_, slot)) =
-                                inst.dict.borrow_mut().get_index_mut(key_idx as usize)
-                            {
-                                // Mirror the slow path: a bound method stored
-                                // on the instance must join the cycle collector
-                                // (see `generic_setattr_instance`).
-                                if matches!(val, Object::BoundMethod(_)) {
-                                    gc_trace::track(val.clone());
-                                }
-                                *slot = val;
+                            // Mirror the slow path: a bound method stored
+                            // on the instance must join the cycle collector
+                            // (see `generic_setattr_instance`).
+                            if matches!(val, Object::BoundMethod(_)) {
+                                gc_trace::track(val.clone());
+                            }
+                            // The slot still exists; reach in by index and
+                            // overwrite, recovering the displaced value. We
+                            // rebuild the mutable borrow here because the
+                            // earlier read-only check has been dropped, and
+                            // scope it tightly so it is released before the
+                            // prompt-reap cascade (which can run `__del__`).
+                            let old = inst
+                                .dict
+                                .borrow_mut()
+                                .get_index_mut(key_idx as usize)
+                                .map(|(_, slot)| std::mem::replace(slot, val));
+                            if let Some(old) = old {
                                 specialize::record_hit(op_idx);
+                                // CPython decrefs the overwritten value now;
+                                // reap it if this was its last live binding.
+                                self.maybe_prompt_reap_replaced(old);
                                 return Ok(());
                             }
                         }
@@ -14296,9 +14676,16 @@ impl Interpreter {
         if matches!(value, Object::BoundMethod(_)) {
             gc_trace::track(value.clone());
         }
-        inst.dict
+        // `insert` returns the value this store displaces; reap it if the
+        // slot held its last live binding, mirroring CPython's decref of the
+        // previous attribute value (see `maybe_prompt_reap_replaced`).
+        let old = inst
+            .dict
             .borrow_mut()
             .insert(DictKey(Object::from_str(name)), value);
+        if let Some(old) = old {
+            self.maybe_prompt_reap_replaced(old);
+        }
         Ok(())
     }
 
@@ -14540,20 +14927,47 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         match obj {
             Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
-            _ => match instance_method(obj, "__fspath__") {
-                Some(method) => {
-                    let res = self.call(&method, &[], &[], globals)?;
-                    match res {
-                        Object::Str(_) | Object::Bytes(_) => Ok(res),
-                        other => Err(type_error(format!(
-                            "expected {}.__fspath__() to return str or bytes, not {}",
-                            obj.type_name(),
-                            other.type_name()
-                        ))),
+            _ => {
+                // A type whose `__fspath__` is `None` is *explicitly* not
+                // path-like (CPython treats `__fspath__ = None` like
+                // `__hash__ = None`). Look up the raw attribute so we can tell
+                // a real method from a `None` sentinel and from "absent"; both
+                // of the latter leave `obj` unchanged so the caller raises the
+                // canonical "expected str, bytes or os.PathLike" TypeError
+                // instead of "'NoneType' object is not callable"
+                // (`test_os.TestPEP519.test_fspath_set_to_None`).
+                let raw = match obj {
+                    Object::Instance(i) => i.cls().lookup("__fspath__"),
+                    _ => None,
+                };
+                match raw {
+                    Some(m) if !matches!(m, Object::None) => {
+                        let method =
+                            Object::BoundMethod(Rc::new(BoundMethod::dispatch(obj.clone(), m)));
+                        let res = self.call(&method, &[], &[], globals)?;
+                        match res {
+                            Object::Str(_) | Object::Bytes(_) => Ok(res),
+                            other => Err(type_error(format!(
+                                "expected {}.__fspath__() to return str or bytes, not {}",
+                                obj.type_name_owned(),
+                                other.type_name_owned()
+                            ))),
+                        }
                     }
+                    // `__fspath__` explicitly set to `None` means "not
+                    // path-like" — raise the canonical message here (covers
+                    // both `open(obj)` and `os.fspath(obj)`) rather than
+                    // letting a `None()` call surface "'NoneType' object is
+                    // not callable" (`test_os.test_fspath_set_to_None`).
+                    Some(_) => Err(type_error(format!(
+                        "expected str, bytes or os.PathLike object, not {}",
+                        obj.type_name_owned()
+                    ))),
+                    // Truly absent `__fspath__`: leave `obj` unchanged so the
+                    // caller's own converter raises with its own wording.
+                    None => Ok(obj.clone()),
                 }
-                None => Ok(obj.clone()),
-            },
+            }
         }
     }
 
@@ -19391,8 +19805,16 @@ impl Interpreter {
             }
         }
         let cache = frame.code.caches.get(cache_pc);
+        // The Python-fast paths *move* `args` into the callee frame (which
+        // reaps its own locals on exit), so they leave `args` empty and the
+        // shared tail's argument reap is a no-op for them. Every other path
+        // keeps `args` borrowed for the duration of the call and falls
+        // through to the tail, where dead argument temporaries — and the
+        // bound-method receiver — are reaped (CPython decrefs a call's
+        // operands the instant it returns; see [`Self::reap_call_args`]).
         match cache {
             IC::CallPyExactNoFree { func_id, argc: ca } => {
+                let mut took_fast = false;
                 if ca as usize == argc {
                     if let Object::Function(f) = &callable {
                         // `func_id` is a raw pointer fingerprint and can
@@ -19415,15 +19837,18 @@ impl Interpreter {
                         {
                             specialize::record_hit(op_idx);
                             let f = f.clone();
-                            let r = self.run_py_exact_nofree(&f, args)?;
+                            let r = self.run_py_exact_nofree(&f, std::mem::take(&mut args))?;
                             frame.push(r);
-                            return Ok(());
+                            took_fast = true;
                         }
                     }
                 }
-                self.deopt_call_generic(frame, cache_pc, &callable, &args)
+                if !took_fast {
+                    self.deopt_call_generic(frame, cache_pc, &callable, &args)?;
+                }
             }
             IC::CallPyExact { func_id, argc: ca } => {
+                let mut took_fast = false;
                 if ca as usize == argc {
                     if let Object::Function(f) = &callable {
                         // Same ABA guard as above: confirm exact arity
@@ -19439,13 +19864,15 @@ impl Interpreter {
                         {
                             specialize::record_hit(op_idx);
                             let f = f.clone();
-                            let r = self.run_py_exact_with_cells(&f, args)?;
+                            let r = self.run_py_exact_with_cells(&f, std::mem::take(&mut args))?;
                             frame.push(r);
-                            return Ok(());
+                            took_fast = true;
                         }
                     }
                 }
-                self.deopt_call_generic(frame, cache_pc, &callable, &args)
+                if !took_fast {
+                    self.deopt_call_generic(frame, cache_pc, &callable, &args)?;
+                }
             }
             IC::Empty => {
                 specialize::record_specialize_attempt(op_idx);
@@ -19458,7 +19885,6 @@ impl Interpreter {
                 }
                 let r = self.call(&callable, &args, &[], &frame.globals)?;
                 frame.push(r);
-                Ok(())
             }
             IC::Cooldown(n) => {
                 let next = if n > 0 {
@@ -19469,14 +19895,18 @@ impl Interpreter {
                 frame.code.caches.set(cache_pc, next);
                 let r = self.call(&callable, &args, &[], &frame.globals)?;
                 frame.push(r);
-                Ok(())
             }
             _ => {
                 let r = self.call(&callable, &args, &[], &frame.globals)?;
                 frame.push(r);
-                Ok(())
             }
         }
+        // Shared tail (skipped via early `?` only on error): reap the
+        // bound-method receiver and any dead argument temporaries now that
+        // the call has returned and the operands are about to be dropped.
+        self.reap_call_receiver(callable);
+        self.reap_call_args(&mut args);
+        Ok(())
     }
 
     /// Deopt a `CALL` cache (guard miss): cool the slot down and run the
@@ -20506,6 +20936,22 @@ impl Interpreter {
         }
         if let Some(factory) = self.cache.builtin_factory(full) {
             let module = factory(&self.cache);
+            // RFC 0040 — attribute every native builtin in the freshly built
+            // module to that module so `fn.__module__` reports the module
+            // rather than the default `"builtins"`. CPython's C functions
+            // carry their defining module (`os.getpid.__module__ == 'posix'`);
+            // without this a bare `os.*` / `math.*` submitted to a `spawn` /
+            // `forkserver` `ProcessPoolExecutor` worker fails to pickle by
+            // reference ("Can't pickle <built-in function getpid>: it's not
+            // found as builtins.getpid"). The cache hands back its `&'static`
+            // key so nothing is leaked per import.
+            if let Some(static_name) = self.cache.builtin_static_name(full) {
+                for (_k, v) in module.dict.borrow().iter() {
+                    if matches!(v, Object::Builtin(_)) {
+                        crate::descr_registry::register_module(v, static_name);
+                    }
+                }
+            }
             let obj = Object::Module(module);
             self.cache.insert(full, obj.clone());
             // CPython's `os` re-exports the platform path module: `import

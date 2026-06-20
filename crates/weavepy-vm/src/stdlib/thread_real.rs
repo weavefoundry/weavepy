@@ -837,6 +837,97 @@ fn rlock_acquire_interruptible(
     }
 }
 
+/// Grace period a `join()` blocks normally before it begins running
+/// finalization passes between waits. The overwhelmingly common case —
+/// a worker that finishes promptly — acquires within the grace wait and
+/// never pays any GC cost.
+const JOIN_GC_GRACE: Duration = Duration::from_millis(50);
+/// Upper bound on the back-off between finalization passes once a join is
+/// genuinely stuck, so a permanently-blocked join (a real program bug)
+/// collects at most ~10×/s rather than spinning.
+const JOIN_GC_SLICE_MAX: Duration = Duration::from_millis(100);
+
+/// Run one finalization pass on the current thread: fire the weakref
+/// callbacks of any reference-count-dead, weakref-watched object (queueing
+/// their callbacks), then invoke the queued weakref callbacks and `__del__`s
+/// here.
+///
+/// This runs the cycle collector's **mark phase only** ([`fire_dead_weakrefs`]
+/// (crate::gc_trace::fire_dead_weakrefs)): it reuses the accurate reachability
+/// analysis to find a `del`'d, weakref-watched `ThreadPoolExecutor` and fire
+/// its `weakref_cb`, but skips every destructive step (finalizer execution,
+/// field clearing, untracking). A full cyclic mark-*sweep* run here is unsafe:
+/// while a worker holds an in-flight `_WorkItem` in a frame the collector
+/// can't see as a root, the sweep would clear that live object mid-use
+/// (`_WorkItem` losing its `future`). The mark-only pass mis-colours the same
+/// work item White but, touching no contents, leaves it intact — and a
+/// `_WorkItem` has no weakref, so it is a no-op for this pass regardless.
+fn join_finalization_pass() {
+    crate::gc_trace::fire_dead_weakrefs();
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: the interpreter pointer was published by the active
+        // `join()` builtin call on this thread and outlives this call.
+        let interp = unsafe { &mut *ptr };
+        interp.run_pending_finalizers();
+    }
+}
+
+/// Block on a thread's `join_lock` until the target thread releases it,
+/// running a finalization pass from this (otherwise-idle) thread between
+/// waits once the grace period elapses. Returns `true` once acquired,
+/// `false` on timeout.
+///
+/// RFC 0025/0040: with the heap `Arc`-rooted and shared across threads, a
+/// value such as a `ThreadPoolExecutor` can become reference-count dead
+/// while every thread is parked (its last drop racing a worker's transient
+/// `executor = executor_reference()`), so no drop event observes its death
+/// and the weakref callback that posts each worker's shutdown sentinel
+/// never fires — `del executor; t.join()` would deadlock. CPython's
+/// refcounting reclaims the executor at the `del`; we approximate that by
+/// letting the joining thread drive a collection, which clears the dead
+/// executor's weakrefs and runs `weakref_cb`
+/// (`test_concurrent_futures.test_del_shutdown`).
+fn join_wait_collecting(lock: &RealLock, me: u64, timeout: Option<Duration>) -> bool {
+    if lock.try_acquire(me) {
+        return true;
+    }
+    let deadline = timeout.map(|d| Instant::now() + d);
+    // Grace wait — keeps the prompt-finish case GC-free.
+    let grace = match deadline {
+        Some(dl) => {
+            let now = Instant::now();
+            if now >= dl {
+                return false;
+            }
+            (dl - now).min(JOIN_GC_GRACE)
+        }
+        None => JOIN_GC_GRACE,
+    };
+    if crate::gil::allow_threads_then(|| lock.acquire_timeout(me, grace)) {
+        return true;
+    }
+    // Still blocked after the grace period: alternate finalization passes
+    // with bounded, backing-off waits until the target releases.
+    let mut slice = Duration::from_millis(1);
+    loop {
+        join_finalization_pass();
+        let wait = match deadline {
+            Some(dl) => {
+                let now = Instant::now();
+                if now >= dl {
+                    return false;
+                }
+                (dl - now).min(slice)
+            }
+            None => slice,
+        };
+        if crate::gil::allow_threads_then(|| lock.acquire_timeout(me, wait)) {
+            return true;
+        }
+        slice = (slice * 2).min(JOIN_GC_SLICE_MAX);
+    }
+}
+
 /// Reentrant counterpart to [`lock_acquire_blocking`]. A re-entrant
 /// re-acquire by the owning thread (or an uncontended first
 /// acquire) succeeds via `try_acquire` without touching the GIL;
@@ -1305,10 +1396,9 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
         // reaches us, so `None`/absent means "block forever".
         match args.first() {
             None | Some(Object::None) => {
-                crate::gil::allow_threads_then(|| {
-                    join_state.join_lock.acquire(me);
+                if join_wait_collecting(&join_state.join_lock, me, None) {
                     let _ = join_state.join_lock.release();
-                });
+                }
             }
             other => match parse_timeout(other) {
                 Some(Duration::ZERO) => {
@@ -1317,18 +1407,14 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
                     }
                 }
                 Some(d) => {
-                    let got = crate::gil::allow_threads_then(|| {
-                        join_state.join_lock.acquire_timeout(me, d)
-                    });
-                    if got {
+                    if join_wait_collecting(&join_state.join_lock, me, Some(d)) {
                         let _ = join_state.join_lock.release();
                     }
                 }
                 None => {
-                    crate::gil::allow_threads_then(|| {
-                        join_state.join_lock.acquire(me);
+                    if join_wait_collecting(&join_state.join_lock, me, None) {
                         let _ = join_state.join_lock.release();
-                    });
+                    }
                 }
             },
         }

@@ -422,6 +422,20 @@ class EnvironmentVarGuard:
             return default[0]
         raise KeyError(envvar)
 
+    def update(self, other=(), /, **kwds):
+        # `collections.abc.MutableMapping.update`: accept a mapping (with
+        # `keys()`), an iterable of key/value pairs, or keyword arguments,
+        # routing every assignment through `__setitem__` so it's recorded for
+        # restore on exit (`test_os.test_execve_env_concurrent_mutation*`).
+        if hasattr(other, "keys"):
+            for key in other.keys():
+                self[key] = other[key]
+        else:
+            for key, value in other:
+                self[key] = value
+        for key, value in kwds.items():
+            self[key] = value
+
     def copy(self):
         return dict(self._environ)
 

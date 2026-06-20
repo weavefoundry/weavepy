@@ -131,9 +131,17 @@ impl WeakRefSlot {
 /// so the GC can iterate efficiently and dead slots can be
 /// pruned in place.
 ///
-/// Lives in a `thread_local!` because each interpreter has its
-/// own object heap (sub-interpreter-per-thread) — weak references
-/// don't cross interpreter boundaries.
+/// **Process-global** (see [`REGISTRY`]), mirroring the cycle
+/// collector ([`crate::gc_trace`]). RFC 0025 made the whole VM heap
+/// `Arc`-rooted: an `Object` allocated on one OS thread can be
+/// referenced — and weakly referenced — from another (a
+/// `ThreadPoolExecutor` shared with its worker threads is the
+/// canonical case). A per-thread registry could therefore never
+/// account for, or clear, a weakref whose referent dies on a thread
+/// other than the one that created the weakref, so cross-thread
+/// finalizers (e.g. `weakref.ref(executor, cb)` → `cb` posting a
+/// shutdown sentinel) would never fire. Every mutation happens under
+/// the GIL, so the shared map's `GilCell` is effectively uncontended.
 #[derive(Default)]
 #[allow(missing_debug_implementations)]
 pub struct WeakRefRegistry {
@@ -275,14 +283,21 @@ impl WeakRefRegistry {
     }
 }
 
-thread_local! {
-    static REGISTRY: WeakRefRegistry = WeakRefRegistry::new();
-}
+/// The process-global weakref registry. Shared across every OS
+/// thread, exactly like [`crate::gc_trace`]'s `GC_STATE`: weak
+/// references must observe and clear referents regardless of which
+/// thread allocated the weakref or which thread drops the referent's
+/// last strong reference (RFC 0025's `Arc`-rooted, thread-shared
+/// heap). The interior `GilCell` makes each borrow memory-safe; the
+/// GIL serializes mutations so the lock is effectively uncontended.
+/// Never dropped (statics have no drop glue).
+static REGISTRY: std::sync::LazyLock<WeakRefRegistry> =
+    std::sync::LazyLock::new(WeakRefRegistry::new);
 
-/// Run a closure with the per-thread weakref registry. Used by
+/// Run a closure with the process-global weakref registry. Used by
 /// helper free functions in this module.
 pub fn with_registry<R>(f: impl FnOnce(&WeakRefRegistry) -> R) -> R {
-    REGISTRY.with(|r| f(r))
+    f(&REGISTRY)
 }
 
 /// Convenience: register a slot in the current thread's

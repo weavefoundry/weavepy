@@ -64,23 +64,43 @@ class _PythonRunResult(collections.namedtuple(
             % (self.rc, cmd_line, out, err))
 
 
-def _assert_python(expected_success, /, *args, **env_vars):
-    quiet = env_vars.pop('__quiet__', False)
-    isolated = env_vars.pop('__isolated__', True)
-    cleanenv = env_vars.pop('__cleanenv__', None)
-    cwd = env_vars.pop('__cwd__', None)
+def run_python_until_end(*args, **env_vars):
+    """Run ``weavepy *args`` to completion; return ``(result, cmd_line)``.
 
-    env = None
-    if cleanenv or env_vars or isolated:
-        env = dict(os.environ)
-        for k in list(env_vars):
-            env[k] = env_vars[k]
+    Faithful to CPython's ``script_helper``: the child is launched in
+    *isolated* mode (``-I``) only when there are no environment overrides
+    to honour. As soon as a caller passes an env var (e.g.
+    ``PYTHONIOENCODING='ascii'``) the launch is neither ``-I`` nor ``-E``,
+    so the child actually *sees* that variable. Passing ``__isolated`` /
+    ``__cleanenv`` / ``__cwd`` overrides the defaults, exactly like CPython
+    (note: no trailing underscores — those are the real keyword names the
+    vendored tests use).
+    """
+    env_required = interpreter_requires_environment()
+    cwd = env_vars.pop('__cwd', None)
+    if '__isolated' in env_vars:
+        isolated = env_vars.pop('__isolated')
+    else:
+        isolated = not env_vars and not env_required
     cmd_line = [sys.executable]
     if isolated:
-        # weavepy accepts (and ignores) -I/-E flags; keep CPython shape.
+        # Isolated mode: ignore PYTHON* env vars and the user site dir.
         cmd_line.append('-I')
-    elif '__isolated__' not in env_vars:
+    elif not env_vars and not env_required:
+        # No overrides to honour: scrub the environment.
         cmd_line.append('-E')
+
+    if env_vars.pop('__cleanenv', None):
+        # Caller supplies the full environment.
+        env = {}
+    else:
+        # Preserve the parent environment so the child can start, then
+        # layer the requested overrides on top.
+        env = dict(os.environ)
+    # set TERM='' unless passed explicitly (CPython issues #11390/#18300)
+    if 'TERM' not in env_vars:
+        env['TERM'] = ''
+    env.update(env_vars)
     cmd_line.extend(args)
     try:
         proc = subprocess.run(cmd_line,
@@ -95,30 +115,35 @@ def _assert_python(expected_success, /, *args, **env_vars):
         import unittest
         raise unittest.SkipTest(
             f"cannot spawn the interpreter ({sys.executable!r}): {exc}")
-    res = _PythonRunResult(rc, out, err)
-    if (rc and expected_success) or (not rc and not expected_success):
-        if not quiet:
-            res.fail(cmd_line)
-    return res, cmd_line
+    return _PythonRunResult(rc, out, err), cmd_line
+
+
+def _assert_python(expected_success, /, *args, **env_vars):
+    res, cmd_line = run_python_until_end(*args, **env_vars)
+    if (res.rc and expected_success) or (not res.rc and not expected_success):
+        res.fail(cmd_line)
+    return res
 
 
 def assert_python_ok(*args, **env_vars):
     """Run ``weavepy *args`` and assert it exits 0."""
-    res, _cmd = _assert_python(True, *args, **env_vars)
-    return res
+    return _assert_python(True, *args, **env_vars)
 
 
 def assert_python_failure(*args, **env_vars):
     """Run ``weavepy *args`` and assert it exits non-zero."""
-    res, _cmd = _assert_python(False, *args, **env_vars)
-    return res
+    return _assert_python(False, *args, **env_vars)
 
 
 def spawn_python(*args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                  **kw):
     """``Popen`` the interpreter for streaming/interactive tests."""
-    cmd_line = [sys.executable, '-E']
+    cmd_line = [sys.executable]
+    if not interpreter_requires_environment():
+        cmd_line.append('-E')
     cmd_line.extend(args)
+    env = kw.setdefault('env', dict(os.environ))
+    env['TERM'] = 'vt100'
     return subprocess.Popen(cmd_line, stdin=subprocess.PIPE,
                             stdout=stdout, stderr=stderr, **kw)
 
@@ -130,10 +155,6 @@ def kill_python(p):
     p.stdout.close()
     p.wait()
     return data
-
-
-def run_python_until_end(*args, **env_vars):
-    return _assert_python(None, *args, __quiet__=True, **env_vars)
 
 
 # ---------------------------------------------------------------------------

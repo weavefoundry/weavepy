@@ -204,6 +204,27 @@ impl ThreadRegistry {
         self.next_synthetic.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Reset the registry after `fork()` in the *child*.
+    ///
+    /// `fork(2)` clones only the calling thread; every other thread in
+    /// the parent ceases to exist in the child, yet the child inherits a
+    /// byte-for-byte copy of this registry — including the `JoinHandle`s
+    /// for those vanished threads. If the child later joins them at
+    /// interpreter shutdown (`join_non_daemon`), `pthread_join` returns
+    /// `ESRCH` ("No such process") and Rust's std aborts the process.
+    ///
+    /// We drop every entry from the map. Dropping a `JoinHandle` without
+    /// calling `.join()` simply *detaches* the (already-dead) OS thread —
+    /// no `pthread_join` syscall, no abort. `main_native_id` is re-pointed
+    /// at the surviving thread, which is the child's de-facto main thread.
+    /// Mirrors CPython's `PyOS_AfterFork_Child` thread-state reset, which
+    /// runs before the Python-level `threading._after_fork` handler.
+    pub fn reset_after_fork_in_child(&self, current_native_id: u64) {
+        self.entries.write().clear();
+        self.main_native_id
+            .store(current_native_id, Ordering::Release);
+    }
+
     /// Joins all non-daemon threads. Called at interpreter
     /// shutdown so user-visible work runs to completion before
     /// the process exits.

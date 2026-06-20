@@ -105,6 +105,17 @@ impl ModuleCache {
         self.builtins.borrow().get(name).copied()
     }
 
+    /// The `&'static` registration name for a built-in module, if one is
+    /// registered under `name`. Lets the loader attribute a freshly built
+    /// module's functions to it (`fn.__module__`) without leaking a new
+    /// `&'static str` on every import.
+    pub fn builtin_static_name(&self, name: &str) -> Option<&'static str> {
+        self.builtins
+            .borrow()
+            .get_key_value(name)
+            .map(|(k, _)| *k)
+    }
+
     /// Register a Python-source module that ships inside the binary.
     /// The loader compiles and executes it lazily on first import.
     pub fn register_frozen(&self, source: FrozenSource) {

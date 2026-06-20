@@ -633,3 +633,46 @@ pub fn io_error_to_py_named2(
     }
     runtime
 }
+
+/// Overwrite an already-built `OSError`'s `.filename` (and optionally
+/// `.filename2`) attribute with a specific object, *preserving its identity*.
+/// CPython's `path_error`/`path_error2` stash the exact `PyObject*` path
+/// argument, so `err.filename is path` holds even for a `str` subclass or a
+/// `bytes` path (`test_os.test_oserror_filename`). Cloning an `Rc`-backed
+/// [`Object`] keeps the same allocation, so the `is` check passes.
+fn set_oserror_filename_obj(rt: &mut RuntimeError, filename: Object, filename2: Option<Object>) {
+    use crate::object::{DictKey, Object};
+    if let RuntimeError::PyException(exc) = rt {
+        if let Object::Instance(inst) = &exc.instance {
+            let mut dict = inst.dict.borrow_mut();
+            dict.insert(DictKey(Object::from_static("filename")), filename);
+            if let Some(f2) = filename2 {
+                dict.insert(DictKey(Object::from_static("filename2")), f2);
+            }
+        }
+    }
+}
+
+/// Like [`io_error_to_py_named`], but keeps the *identity* of the original
+/// path argument as `.filename`. `display` is the textual form used only for
+/// the `[Errno N] strerror: 'name'` message (unchanged from the string path).
+pub fn io_error_to_py_path(err: &std::io::Error, path: &Object, display: &str) -> RuntimeError {
+    let mut rt = io_error_to_py_named2(err, Some(display), None);
+    set_oserror_filename_obj(&mut rt, path.clone(), None);
+    rt
+}
+
+/// Two-path variant ([`io_error_to_py_named2`]) that preserves the identity of
+/// the first path argument as `.filename` (the only one CPython's
+/// `test_oserror_filename` checks for `rename`/`replace`/`link`). `.filename2`
+/// keeps its textual form.
+pub fn io_error_to_py_path2(
+    err: &std::io::Error,
+    path: &Object,
+    display: &str,
+    display2: &str,
+) -> RuntimeError {
+    let mut rt = io_error_to_py_named2(err, Some(display), Some(display2));
+    set_oserror_filename_obj(&mut rt, path.clone(), None);
+    rt
+}

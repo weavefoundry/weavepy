@@ -252,16 +252,85 @@ fn build_envp(
             }
         }
         None => {
-            let items = crate::stdlib::os::sequence_items(env)
-                .ok_or_else(|| type_error(format!("{what}: env must be a dict or sequence")))?;
-            for it in &items {
-                owned.push(obj_to_cstring(it, what)?);
+            // A generic mapping (anything exposing `keys()`/`values()`):
+            // CPython's `parse_envlist` calls `PyMapping_Keys`/`PyMapping_Values`
+            // and zips them, fs-encoding each via `PyUnicode_FSConverter` (so
+            // `os.PathLike` keys/values are honoured). We snapshot both lists up
+            // front, so a `__fspath__` that mutates the original mapping mid-parse
+            // can't corrupt the walk (`test_os.test_execve_env_concurrent_mutation*`).
+            if let Some((keys, values)) = mapping_keys_values(env)? {
+                for (k, v) in keys.iter().zip(values.iter()) {
+                    let mut kv = obj_to_env_bytes(k, what)?;
+                    if kv.contains(&b'=') {
+                        return Err(value_error("illegal environment variable name"));
+                    }
+                    kv.push(b'=');
+                    kv.extend_from_slice(&obj_to_env_bytes(v, what)?);
+                    owned.push(CString::new(kv).map_err(|_| value_error("embedded null byte"))?);
+                }
+            } else {
+                let items = crate::stdlib::os::sequence_items(env)
+                    .ok_or_else(|| type_error(format!("{what}: env must be a dict or sequence")))?;
+                for it in &items {
+                    owned.push(obj_to_cstring(it, what)?);
+                }
             }
         }
     }
     let mut ptrs: Vec<*const libc::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     Ok((owned, ptrs))
+}
+
+/// Materialise a generic environment *mapping* into snapshotted key/value
+/// lists by calling its `keys()` and `values()` (CPython's
+/// `PyMapping_Keys`/`PyMapping_Values`). Returns `None` for a non-mapping (no
+/// `keys()`/`values()`), so the caller can fall back to the sequence form.
+#[cfg(unix)]
+fn mapping_keys_values(env: &Object) -> Result<Option<(Vec<Object>, Vec<Object>)>, RuntimeError> {
+    // Plain dicts and `_Environ` are resolved earlier; only instances reach
+    // here as candidate mappings.
+    if !matches!(env, Object::Instance(_)) {
+        return Ok(None);
+    }
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Ok(None);
+    };
+    // SAFETY: published by the live VM driving this call; GIL-exclusive.
+    let interp = unsafe { &mut *ptr };
+    let (Ok(keys_m), Ok(vals_m)) = (
+        interp.load_attr_public(env, "keys"),
+        interp.load_attr_public(env, "values"),
+    ) else {
+        return Ok(None);
+    };
+    let keys = interp.call_object(keys_m, &[], &[])?;
+    let vals = interp.call_object(vals_m, &[], &[])?;
+    Ok(Some((iterate_to_vec(&keys)?, iterate_to_vec(&vals)?)))
+}
+
+/// Eagerly drain a Python iterable into a `Vec<Object>` snapshot.
+#[cfg(unix)]
+fn iterate_to_vec(obj: &Object) -> Result<Vec<Object>, RuntimeError> {
+    let mut it = obj
+        .make_iter()
+        .map_err(|_| type_error(format!("{} object is not iterable", obj.type_name())))?;
+    let mut out = Vec::new();
+    while let Some(v) = it.next_value() {
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// Fs-encode an environment key/value to bytes: `str`/`bytes`/`bytearray`
+/// verbatim, else honour `os.PathLike` via `__fspath__` (CPython's
+/// `PyUnicode_FSConverter`).
+#[cfg(unix)]
+fn obj_to_env_bytes(o: &Object, what: &str) -> Result<Vec<u8>, RuntimeError> {
+    if let Some(b) = bytes_of(o) {
+        return Ok(b);
+    }
+    Ok(crate::stdlib::os::path_to_string(o, what)?.into_bytes())
 }
 
 /// Resolve an environment argument to its backing key/value `dict`.
@@ -310,6 +379,35 @@ fn last_os_err() -> RuntimeError {
 
 #[cfg(unix)]
 fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython refuses to fork once the interpreter is tearing down (a
+    // `__del__`/`atexit` that forks): `os.fork()` raises
+    // `RuntimeError: can't fork at interpreter shutdown`
+    // (`test_os.test_fork_at_finalization`, `test_subprocess.test_preexec_at_exit`).
+    if crate::vm_singletons::is_finalizing() {
+        return Err(crate::error::runtime_error(
+            "can't fork at interpreter shutdown",
+        ));
+    }
+    // CPython 3.12+ (`Modules/posixmodule.c: warn_about_fork_with_threads`):
+    // forking a multi-threaded process is hazardous, so `os.fork()` issues a
+    // `DeprecationWarning` before the syscall. The thread registry tracks only
+    // spawned worker threads (`_thread._count()` semantics — the main thread
+    // is not an entry), so a non-zero running count means another thread is
+    // live. Emitted in the parent before `fork(2)`; if warnings are escalated
+    // to errors the fork is aborted (`?`), matching CPython.
+    if crate::thread_registry::registry().running_count() > 0 {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by the active builtin call on this thread; the
+            // interpreter outlives this synchronous re-entrant call.
+            let interp = unsafe { &mut *ptr };
+            // SAFETY: `getpid(2)` is always safe.
+            let pid = unsafe { libc::getpid() };
+            interp.warn_deprecation_from_builtin(format!(
+                "This process (pid={pid}) is multi-threaded, \
+                 use of fork() may lead to deadlocks in the child."
+            ))?;
+        }
+    }
     run_atfork(AtForkPhase::Before);
     // SAFETY: `fork(2)`. In the child only this thread survives; we run the
     // registered after-in-child handlers (CPython's `PyOS_AfterFork_Child`).
@@ -319,6 +417,14 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(last_os_err());
     }
     if pid == 0 {
+        // C-level after-fork (before the Python `_after_fork` handlers):
+        // only this thread survived the fork, so drop the inherited
+        // `JoinHandle`s for the parent's now-vanished threads. Otherwise
+        // the child's shutdown join would `pthread_join` a dead thread and
+        // abort with ESRCH (the multiprocessing fork start method spawns
+        // workers via `os.fork()` while a queue-feeder thread is live).
+        let cur = crate::vm_singletons::current_worker_thread_id();
+        crate::thread_registry::registry().reset_after_fork_in_child(cur);
         run_atfork(AtForkPhase::Child);
     } else {
         run_atfork(AtForkPhase::Parent);

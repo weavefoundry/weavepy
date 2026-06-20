@@ -178,6 +178,22 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("getpid")),
             builtin("getpid", os_getpid),
         );
+        // RFC 0040 WS1 — `os.sysconf(name)` + `os.sysconf_names`. asyncio's
+        // `selector_events` probes `SC_IOV_MAX` the moment it sees
+        // `socket.sendmsg`, and `concurrent.futures.ProcessPoolExecutor.
+        // _check_system_limits` probes `SC_SEM_NSEMS_MAX`. Values are
+        // platform-correct (the `_SC_*` ids differ between Linux and macOS).
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("sysconf")),
+                builtin("sysconf", os_sysconf),
+            );
+            d.insert(
+                DictKey(Object::from_static("sysconf_names")),
+                build_sysconf_names(),
+            );
+        }
         d.insert(
             DictKey(Object::from_static("remove")),
             builtin("remove", os_remove),
@@ -216,7 +232,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("open")),
-            builtin("open", os_open_stub),
+            builtin_kw("open", os_open_stub),
         );
         d.insert(
             DictKey(Object::from_static("fdopen")),
@@ -943,9 +959,134 @@ fn os_getpid(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(i64::from(std::process::id())))
 }
 
+/// The `SC_*` names WeavePy maps to libc `_SC_*` ids. The id values differ
+/// per platform, so we let libc supply them (e.g. `_SC_IOV_MAX` is 56 on
+/// macOS but 60 on Linux). This subset covers the names CPython's stdlib
+/// (asyncio, multiprocessing) and common scripts query.
+#[cfg(unix)]
+fn sysconf_name_table() -> &'static [(&'static str, libc::c_int)] {
+    &[
+        ("SC_ARG_MAX", libc::_SC_ARG_MAX),
+        ("SC_CHILD_MAX", libc::_SC_CHILD_MAX),
+        ("SC_CLK_TCK", libc::_SC_CLK_TCK),
+        ("SC_NGROUPS_MAX", libc::_SC_NGROUPS_MAX),
+        ("SC_OPEN_MAX", libc::_SC_OPEN_MAX),
+        ("SC_STREAM_MAX", libc::_SC_STREAM_MAX),
+        ("SC_TZNAME_MAX", libc::_SC_TZNAME_MAX),
+        ("SC_JOB_CONTROL", libc::_SC_JOB_CONTROL),
+        ("SC_SAVED_IDS", libc::_SC_SAVED_IDS),
+        ("SC_VERSION", libc::_SC_VERSION),
+        ("SC_PAGESIZE", libc::_SC_PAGESIZE),
+        ("SC_PAGE_SIZE", libc::_SC_PAGESIZE),
+        ("SC_LINE_MAX", libc::_SC_LINE_MAX),
+        ("SC_HOST_NAME_MAX", libc::_SC_HOST_NAME_MAX),
+        ("SC_LOGIN_NAME_MAX", libc::_SC_LOGIN_NAME_MAX),
+        ("SC_TTY_NAME_MAX", libc::_SC_TTY_NAME_MAX),
+        ("SC_NPROCESSORS_CONF", libc::_SC_NPROCESSORS_CONF),
+        ("SC_NPROCESSORS_ONLN", libc::_SC_NPROCESSORS_ONLN),
+        ("SC_PHYS_PAGES", libc::_SC_PHYS_PAGES),
+        ("SC_IOV_MAX", libc::_SC_IOV_MAX),
+        ("SC_SEM_NSEMS_MAX", libc::_SC_SEM_NSEMS_MAX),
+        ("SC_SEM_VALUE_MAX", libc::_SC_SEM_VALUE_MAX),
+        ("SC_AIO_MAX", libc::_SC_AIO_MAX),
+        ("SC_THREAD_THREADS_MAX", libc::_SC_THREAD_THREADS_MAX),
+    ]
+}
+
+/// `os.sysconf_names` — the `{name: id}` mapping CPython exposes.
+#[cfg(unix)]
+fn build_sysconf_names() -> Object {
+    let mut d = DictData::new();
+    for (name, id) in sysconf_name_table() {
+        d.insert(
+            DictKey(Object::from_static(name)),
+            Object::Int(i64::from(*id)),
+        );
+    }
+    Object::Dict(Rc::new(RefCell::new(d)))
+}
+
+#[cfg(unix)]
+fn sysconf_name_to_id(name: &str) -> Option<libc::c_int> {
+    sysconf_name_table()
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, id)| *id)
+}
+
+/// errno is thread-local; the accessor symbol differs across platforms.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+/// `os.sysconf(name)` — query a runtime system limit. `name` is either a
+/// key of `os.sysconf_names` or a raw integer id. Mirrors CPython: a `-1`
+/// return with a clean errno means "indeterminate/unlimited" and is returned
+/// as `-1`; a `-1` with errno set raises `OSError`.
+#[cfg(unix)]
+fn os_sysconf(args: &[Object]) -> Result<Object, RuntimeError> {
+    let id: libc::c_int = match args.first() {
+        Some(Object::Int(n)) => *n as libc::c_int,
+        Some(Object::Str(s)) => sysconf_name_to_id(s)
+            .ok_or_else(|| value_error("unrecognized configuration name"))?,
+        _ => {
+            return Err(type_error(
+                "configuration names must be strings or integers",
+            ))
+        }
+    };
+    // SAFETY: errno is a valid thread-local int; `sysconf` is async-signal-safe
+    // and only reads `id`.
+    unsafe {
+        *errno_location() = 0;
+    }
+    let val = unsafe { libc::sysconf(id) };
+    if val == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error().unwrap_or(0) != 0 {
+            return Err(crate::error::io_error_to_py(&err));
+        }
+    }
+    Ok(Object::Int(val as i64))
+}
+
+/// Build an `OSError` for a failed single-path syscall, preserving the
+/// *identity* of the caller's original path object as `.filename` when one was
+/// passed positionally (`test_os.test_oserror_filename` asserts
+/// `err.filename is name`, even for a `str` subclass or `bytes`). `display` is
+/// the textual path used only in the `[Errno N] strerror: 'name'` message, so
+/// the rendered text is unchanged from the string-path helper.
+fn path_io_err(e: &std::io::Error, path_obj: Option<&Object>, display: &str) -> RuntimeError {
+    match path_obj {
+        Some(o) => crate::error::io_error_to_py_path(e, o, display),
+        None => crate::error::io_error_to_py_named(e, Some(display)),
+    }
+}
+
+/// Two-path counterpart of [`path_io_err`] for `rename`/`replace`/`link`,
+/// keeping the identity of the *first* path object as `.filename` (the one
+/// CPython's `test_oserror_filename` checks).
+fn path_io_err2(
+    e: &std::io::Error,
+    path_obj: Option<&Object>,
+    display: &str,
+    display2: &str,
+) -> RuntimeError {
+    match path_obj {
+        Some(o) => crate::error::io_error_to_py_path2(e, o, display, display2),
+        None => crate::error::io_error_to_py_named2(e, Some(display), Some(display2)),
+    }
+}
+
 fn os_remove(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "remove")?;
-    std::fs::remove_file(&p).map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+    std::fs::remove_file(&p).map_err(|e| path_io_err(&e, args.first(), &p))?;
     Ok(Object::None)
 }
 
@@ -997,11 +1138,11 @@ fn os_makedirs_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
     for (k, v) in kwargs {
         match k.as_str() {
             "exist_ok" => {
-                exist_ok = matches!(v, Object::Bool(true) | Object::Int(_));
+                exist_ok =
+                    matches!(v, Object::Bool(true)) || matches!(v, Object::Int(n) if *n != 0);
             }
-            // `mode` is accepted but ignored — Rust's `create_dir_all`
-            // doesn't expose POSIX mode bits portably. Matching
-            // CPython on the call surface is what matters here.
+            // `mode` is consumed below (applied to the leaf `mkdir`); accept
+            // it here so it isn't rejected as an unexpected keyword.
             "mode" => {}
             other => {
                 return Err(crate::error::type_error(format!(
@@ -1010,26 +1151,97 @@ fn os_makedirs_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
             }
         }
     }
-    // CPython's `makedirs` ends with a bare `mkdir(name)` on the leaf, so an
-    // already-existing target raises `FileExistsError` unless `exist_ok=True`
-    // (`shutil.copytree(dirs_exist_ok=False)` relies on this). Rust's
-    // `create_dir_all` is happy when the leaf exists, so reproduce the check
-    // ourselves before delegating.
-    if !exist_ok && std::fs::symlink_metadata(&p).is_ok() {
-        // EEXIST is 17 on Linux/macOS/Windows; spelled as a literal so this
-        // (non-`cfg`-gated) helper stays portable.
-        return Err(crate::error::io_error_to_py_named(
-            &std::io::Error::from_raw_os_error(17),
-            Some(&p),
-        ));
-    }
-    match std::fs::create_dir_all(&p) {
-        Ok(()) => Ok(Object::None),
-        Err(e) => {
-            if exist_ok && std::path::Path::new(&p).is_dir() {
-                Ok(Object::None)
+    // `mode` is honoured for the *leaf* directory only, exactly like CPython:
+    // the recursive call that materialises intermediate parents uses the
+    // default `0o777` (`test_os.MakedirTests.test_mode` asserts the parent is
+    // `0o775` under umask `0o002` while the leaf is `0o555`).
+    let mode = args
+        .get(1)
+        .and_then(Object::as_i64)
+        .or_else(|| {
+            kwargs
+                .iter()
+                .find(|(k, _)| k == "mode")
+                .and_then(|(_, v)| v.as_i64())
+        })
+        .map(|m| m as u32)
+        .unwrap_or(0o777);
+    // Faithful port of CPython's `os.makedirs` recursion (Lib/os.py): split
+    // off the leaf, recurse to create the parent chain (skipping the work
+    // when the head already exists), and special-case a trailing `os.curdir`
+    // component (`xxx/newdir/.` is satisfied once `xxx/newdir` exists). Rust's
+    // `create_dir_all` collapses a trailing `/.` incorrectly and ignores the
+    // mode, so we don't use it (`test_os.MakedirTests.test_makedir`).
+    makedirs_recursive(&p, mode, exist_ok)
+        .map_err(|(e, path)| crate::error::io_error_to_py_named(&e, Some(&path)))?;
+    Ok(Object::None)
+}
+
+/// `os.path.split` for a POSIX path string: returns `(head, tail)` where
+/// `tail` is the last component and `head` keeps its trailing separators
+/// stripped (unless it is all separators). Mirrors `posixpath.split`.
+fn posix_split(p: &str) -> (&str, &str) {
+    match p.rfind('/') {
+        Some(i) => {
+            let (head_with_sep, tail) = p.split_at(i + 1);
+            let trimmed = head_with_sep.trim_end_matches('/');
+            let head = if trimmed.is_empty() {
+                head_with_sep
             } else {
-                Err(crate::error::io_error_to_py_named(&e, Some(&p)))
+                trimmed
+            };
+            (head, tail)
+        }
+        None => ("", p),
+    }
+}
+
+/// Create a single directory with `mode` (umask still applies via `mkdir(2)`).
+#[cfg(unix)]
+fn mkdir_one(path: &str, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(mode).create(path)
+}
+
+#[cfg(not(unix))]
+fn mkdir_one(path: &str, _mode: u32) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+/// Faithful port of `os.makedirs(name, mode, exist_ok)`. Returns the failing
+/// path alongside the error so the caller can set `OSError.filename`.
+fn makedirs_recursive(
+    name: &str,
+    mode: u32,
+    exist_ok: bool,
+) -> Result<(), (std::io::Error, String)> {
+    let (mut head, mut tail) = posix_split(name);
+    if tail.is_empty() {
+        let (h, t) = posix_split(head);
+        head = h;
+        tail = t;
+    }
+    if !head.is_empty() && !tail.is_empty() && !std::path::Path::new(head).exists() {
+        match makedirs_recursive(head, 0o777, exist_ok) {
+            Ok(()) => {}
+            // A concurrently-created parent is fine (CPython's `except
+            // FileExistsError: pass`).
+            Err((e, _)) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        // `xxx/newdir/.` — the curdir leaf already exists now that the parent
+        // does, so don't try to `mkdir` it.
+        if tail == "." {
+            return Ok(());
+        }
+    }
+    match mkdir_one(name, mode) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if !exist_ok || !std::path::Path::new(name).is_dir() {
+                Err((e, name.to_owned()))
+            } else {
+                Ok(())
             }
         }
     }
@@ -1037,15 +1249,14 @@ fn os_makedirs_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
 
 fn os_rmdir(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "rmdir")?;
-    std::fs::remove_dir(&p).map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+    std::fs::remove_dir(&p).map_err(|e| path_io_err(&e, args.first(), &p))?;
     Ok(Object::None)
 }
 
 fn os_rename(args: &[Object]) -> Result<Object, RuntimeError> {
     let src = first_path(args, "rename")?;
     let dst = nth_path(args, 1, "rename")?;
-    std::fs::rename(&src, &dst)
-        .map_err(|e| crate::error::io_error_to_py_named2(&e, Some(&src), Some(&dst)))?;
+    std::fs::rename(&src, &dst).map_err(|e| path_io_err2(&e, args.first(), &src, &dst))?;
     Ok(Object::None)
 }
 
@@ -1067,10 +1278,9 @@ fn os_listdir(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(other) => (path_to_string(other, "listdir")?, false),
     };
     let mut out = Vec::new();
-    let iter =
-        std::fs::read_dir(&p).map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+    let iter = std::fs::read_dir(&p).map_err(|e| path_io_err(&e, args.first(), &p))?;
     for entry in iter {
-        let entry = entry.map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+        let entry = entry.map_err(|e| path_io_err(&e, args.first(), &p))?;
         let name = entry.file_name();
         if want_bytes {
             out.push(Object::new_bytes(
@@ -1148,21 +1358,27 @@ fn os_close_fd(_fd: i64) -> Result<Object, RuntimeError> {
 /// module's own `O_*` constants (translated to `OpenOptions` here, so
 /// the values never reach the host libc, whose constants may differ).
 #[cfg(unix)]
-fn os_open_stub(args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_open_stub(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::IntoRawFd;
-    let p = first_path(args, "open")?;
-    let flags = args
-        .get(1)
-        .and_then(crate::object::Object::as_i64)
+    // CPython: `os.open(path, flags, mode=0o777, *, dir_fd=None)` — every
+    // parameter is also accepted by keyword (`test_os.test_open_keywords`).
+    let p = path_arg_or_kw(args, 0, "path", kwargs, "open")?;
+    let flags = int_arg_or_kw(args, 1, "flags", kwargs)
         .ok_or_else(|| crate::error::type_error("open() flags must be an int".to_owned()))?;
+    // `dir_fd` (keyword-only) is unsupported beyond the default; reject a
+    // non-`None` value rather than silently ignoring it.
+    if let Some((_, v)) = kwargs.iter().find(|(k, _)| k == "dir_fd") {
+        if !matches!(v, Object::None) {
+            return Err(crate::error::not_implemented_error(
+                "os.open() dir_fd is not supported in WeavePy",
+            ));
+        }
+    }
     // `open(path, flags, mode=0o777)` — `mode` only matters when `O_CREAT`
     // creates the file; the kernel masks it with the umask, so
     // `Path.touch(0o444)` lands `0o444 & ~umask` (test_pathlib.test_touch_mode).
-    let mode = args
-        .get(2)
-        .and_then(crate::object::Object::as_i64)
-        .unwrap_or(0o777) as u32;
+    let mode = int_arg_or_kw(args, 2, "mode", kwargs).unwrap_or(0o777) as u32;
     // Interpret the flag bits with the *host* platform's `libc` values, matching
     // the `O_*` constants the `os` module exposes — on macOS these differ from
     // Linux, so hard-coding Linux numbers here mis-decoded macOS flag masks.
@@ -1192,14 +1408,22 @@ fn os_open_stub(args: &[Object]) -> Result<Object, RuntimeError> {
             oo.create(true);
         }
     }
+    // Preserve the identity of the original `path` argument (positional or the
+    // `path=` keyword) as `.filename` (`test_os.test_oserror_filename`).
+    let path_obj = args.first().cloned().or_else(|| {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == "path")
+            .map(|(_, v)| v.clone())
+    });
     let f = oo
         .open(&p)
-        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+        .map_err(|e| path_io_err(&e, path_obj.as_ref(), &p))?;
     Ok(Object::Int(i64::from(f.into_raw_fd())))
 }
 
 #[cfg(not(unix))]
-fn os_open_stub(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn os_open_stub(_args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     Err(crate::error::not_implemented_error(
         "os.open(): raw fd interface is not implemented in WeavePy yet",
     ))
@@ -1296,10 +1520,28 @@ fn os_fcopyfile(args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_fdopen(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     use crate::object::{FileBackend, PyFile};
     use std::os::unix::io::FromRawFd;
+    // CPython 3.12+: a `bool` fd raises a `RuntimeWarning` before anything
+    // else (`test_os.TestInvalidFD.test_fdopen` runs the bool check under
+    // `simplefilter("error", RuntimeWarning)`).
+    if matches!(args.first(), Some(Object::Bool(_))) {
+        warn_bool_as_fd()?;
+    }
     let fd = args
         .first()
         .and_then(crate::object::Object::as_i64)
         .ok_or_else(|| crate::error::type_error("fdopen() fd must be an int".to_owned()))?;
+    // CPython implements `os.fdopen` as `io.open(fd, ...)`, which `fstat`s the
+    // descriptor and raises `OSError(EBADF)` for an invalid fd
+    // (`test_os.test_fdopen`'s `check`). Validate before wrapping so a bad fd
+    // surfaces immediately rather than on first I/O.
+    {
+        let rc = unsafe { libc::fcntl(fd as i32, libc::F_GETFD) };
+        if rc < 0 {
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
+        }
+    }
     let mode = match args.get(1) {
         Some(Object::Str(s)) => s.to_string(),
         None => "r".to_owned(),
@@ -1360,7 +1602,7 @@ fn os_stat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     } else {
         std::fs::symlink_metadata(&p)
     }
-    .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+    .map_err(|e| path_io_err(&e, args.first(), &p))?;
     Ok(stat_result_from_meta(&meta))
 }
 
@@ -1436,8 +1678,7 @@ fn os_fstat(args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_lstat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     reject_dir_fd(kwargs, "lstat")?;
     let p = first_path(args, "lstat")?;
-    let meta = std::fs::symlink_metadata(&p)
-        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+    let meta = std::fs::symlink_metadata(&p).map_err(|e| path_io_err(&e, args.first(), &p))?;
     Ok(stat_result_from_meta(&meta))
 }
 
@@ -1627,8 +1868,7 @@ fn os_readlink(args: &[Object]) -> Result<Object, RuntimeError> {
     if pstr.as_bytes().contains(&0) {
         return Err(value_error("embedded null byte"));
     }
-    let t = std::fs::read_link(&pstr)
-        .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&pstr)))?;
+    let t = std::fs::read_link(&pstr).map_err(|e| path_io_err(&e, args.first(), &pstr))?;
     if want_bytes {
         use std::os::unix::ffi::OsStringExt;
         return Ok(Object::new_bytes(t.into_os_string().into_vec()));
@@ -1651,29 +1891,34 @@ fn resolve_fspath_obj(obj: &Object, func: &str) -> Result<Object, RuntimeError> 
             let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
                 type_error(format!(
                     "{func}: path should be string, bytes or os.PathLike, not {}",
-                    obj.type_name()
+                    obj.type_name_owned()
                 ))
             })?;
             // SAFETY: published by the enclosing VM frame on this thread.
             let interp = unsafe { &mut *ptr };
-            let fspath = interp.load_attr_public(obj, "__fspath__").map_err(|_| {
-                type_error(format!(
-                    "{func}: path should be string, bytes or os.PathLike, not {}",
-                    obj.type_name()
-                ))
-            })?;
+            // `__fspath__` absent or explicitly `None` ⇒ not path-like.
+            let fspath = match interp.load_attr_public(obj, "__fspath__") {
+                Ok(Object::None) | Err(_) => {
+                    return Err(type_error(format!(
+                        "{func}: path should be string, bytes or os.PathLike, not {}",
+                        obj.type_name_owned()
+                    )))
+                }
+                Ok(m) => m,
+            };
             match interp.call_object(fspath, &[], &[])? {
                 r @ (Object::Str(_) | Object::Bytes(_)) => Ok(r),
                 Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
                 other => Err(type_error(format!(
-                    "expected {func}.__fspath__() to return str or bytes, not {}",
-                    other.type_name()
+                    "expected {}.__fspath__() to return str or bytes, not {}",
+                    obj.type_name_owned(),
+                    other.type_name_owned()
                 ))),
             }
         }
         other => Err(type_error(format!(
             "{func}: path should be string, bytes or os.PathLike, not {}",
-            other.type_name()
+            other.type_name_owned()
         ))),
     }
 }
@@ -1683,7 +1928,7 @@ fn os_chdir(args: &[Object]) -> Result<Object, RuntimeError> {
     // Attach the offending path so the raised OSError carries `.filename`
     // (CPython does this for path syscalls; subprocess's bad-cwd tests compare
     // `os.chdir(bad).filename` against the error surfaced from the child).
-    std::env::set_current_dir(&p).map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+    std::env::set_current_dir(&p).map_err(|e| path_io_err(&e, args.first(), &p))?;
     Ok(Object::None)
 }
 
@@ -1710,18 +1955,26 @@ fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
             })?;
             // SAFETY: published by the enclosing VM frame on this thread.
             let interp = unsafe { &mut *ptr };
-            let fspath = interp.load_attr_public(obj, "__fspath__").map_err(|_| {
-                type_error(format!(
-                    "expected str, bytes or os.PathLike object, not {}",
-                    obj.type_name()
-                ))
-            })?;
+            // A type whose `__fspath__` is `None` is *explicitly* not
+            // path-like (CPython treats `__fspath__ = None` like
+            // `__hash__ = None`): raise the "expected str, bytes …" message
+            // rather than letting the `None()` call surface a "NoneType is
+            // not callable" (`test_os.TestPEP519.test_fspath_set_to_None`).
+            let fspath = match interp.load_attr_public(obj, "__fspath__") {
+                Ok(Object::None) | Err(_) => {
+                    return Err(type_error(format!(
+                        "expected str, bytes or os.PathLike object, not {}",
+                        obj.type_name_owned()
+                    )))
+                }
+                Ok(f) => f,
+            };
             match interp.call_object(fspath, &[], &[])? {
                 r @ (Object::Str(_) | Object::Bytes(_)) => Ok(r),
                 other => Err(type_error(format!(
                     "expected {}.__fspath__() to return str or bytes, not {}",
-                    obj.type_name(),
-                    other.type_name()
+                    obj.type_name_owned(),
+                    other.type_name_owned()
                 ))),
             }
         }
@@ -1823,11 +2076,14 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
     // argument (`.`). The *type* of the argument flows through to the
     // `DirEntry.name`/`.path` it yields — `bytes` in, `bytes` out — which the
     // verbatim `glob`/`fnmatch` bytes paths depend on.
+    // NB: unlike a generic path converter, CPython's `os.scandir` rejects
+    // `bytearray`/`memoryview` (`test_os.test_bytes_like` expects `TypeError`):
+    // only `str`, `bytes`, and `os.PathLike` flow through. `bytearray` is
+    // therefore *not* matched here and lands in the catch-all `TypeError` arm.
     let (dir_path, bytes_mode) = match args.first() {
         None | Some(Object::None) => (".".to_owned(), false),
         Some(Object::Str(s)) => (s.to_string(), false),
         Some(Object::Bytes(b)) => (String::from_utf8_lossy(b).into_owned(), true),
-        Some(Object::ByteArray(b)) => (String::from_utf8_lossy(&b.borrow()).into_owned(), true),
         Some(other @ Object::Instance(_)) => (path_to_string(other, "scandir")?, false),
         Some(other) => {
             return Err(type_error(format!(
@@ -1854,7 +2110,11 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
                     Object::from_str(fs_path.clone()),
                 )
             };
-            build_dir_entry(name_obj, path_obj, fs_path)
+            // CPython caches the inode from the directory read, so
+            // `DirEntry.inode()` keeps working after the entry is unlinked
+            // (`test_os.TestScandir.test_removed_{file,dir}`).
+            let cached_inode = dir_entry_cached_inode(&entry);
+            build_dir_entry(name_obj, path_obj, fs_path, cached_inode)
         })
         .collect();
     Ok(build_scandir_iterator(entries))
@@ -1872,6 +2132,22 @@ fn dir_entry_name_bytes(entry: &std::fs::DirEntry) -> Object {
     #[cfg(not(unix))]
     {
         Object::Bytes(Rc::from(entry.file_name().to_string_lossy().as_bytes()))
+    }
+}
+
+/// The inode number straight from the directory read (no `stat(2)` call), so
+/// it survives the entry being removed. `None` off Unix (the
+/// `inode()`/`stat()` accessors then fall back to a live `lstat`).
+fn dir_entry_cached_inode(entry: &std::fs::DirEntry) -> Option<i64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirEntryExt;
+        Some(entry.ino() as i64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = entry;
+        None
     }
 }
 
@@ -1943,6 +2219,18 @@ fn build_scandir_iterator(entries: Vec<Object>) -> Object {
         scandir_method(&mut dict, "__enter__", scandir_self);
         scandir_method(&mut dict, "__exit__", scandir_exit);
         scandir_method(&mut dict, "close", scandir_exit);
+        // CPython's `ScandirIterator` keeps an open `DIR*`; if it is dropped
+        // without being exhausted or closed, `__del__` emits a
+        // `ResourceWarning` (`test_os.TestScandir.test_resource_warning`).
+        scandir_method(&mut dict, "__del__", scandir_del);
+        // The iterator is only minted by `os.scandir`; calling its type
+        // raises `TypeError` (`test_os.TestScandir.test_uninstantiable`).
+        dict.insert(
+            DictKey(Object::from_static("__new__")),
+            builtin("__new__", |_args| {
+                Err(type_error("cannot create 'posix.ScandirIterator' instances"))
+            }),
+        );
         let cls = TypeObject::new_user("posix.ScandirIterator", vec![bt.object_.clone()], dict)
             .expect("ScandirIterator type");
         *slot.borrow_mut() = Some(cls.clone());
@@ -1982,7 +2270,12 @@ fn scandir_next(args: &[Object]) -> Result<Object, RuntimeError> {
         if let Some(Object::Iter(it)) = &inst.native {
             return match it.borrow_mut().next_value() {
                 Some(v) => Ok(v),
-                None => Err(crate::error::stop_iteration()),
+                None => {
+                    // Exhaustion closes the underlying directory handle in
+                    // CPython, so a fully consumed iterator never warns.
+                    scandir_mark_closed(inst);
+                    Err(crate::error::stop_iteration())
+                }
             };
         }
     }
@@ -1991,7 +2284,53 @@ fn scandir_next(args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
-fn scandir_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn scandir_exit(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(Object::Instance(inst)) = args.first() {
+        scandir_mark_closed(inst);
+    }
+    Ok(Object::None)
+}
+
+/// Sentinel key marking a `ScandirIterator` as closed/exhausted so its
+/// `__del__` stays silent. Mirrors CPython closing the `DIR*` on `close()`,
+/// `__exit__`, or exhaustion.
+const SCANDIR_CLOSED_KEY: &str = "__weavepy_scandir_closed__";
+
+fn scandir_mark_closed(inst: &crate::types::PyInstance) {
+    inst.dict.borrow_mut().insert(
+        DictKey(Object::from_static(SCANDIR_CLOSED_KEY)),
+        Object::Bool(true),
+    );
+}
+
+fn scandir_is_closed(inst: &crate::types::PyInstance) -> bool {
+    matches!(
+        inst.dict
+            .borrow()
+            .get(&DictKey(Object::from_static(SCANDIR_CLOSED_KEY))),
+        Some(Object::Bool(true))
+    )
+}
+
+/// `ScandirIterator.__del__`: warn if the iterator was never closed or
+/// exhausted, matching CPython's `ResourceWarning` (`test_resource_warning`).
+fn scandir_del(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(Object::Instance(inst)) = args.first() {
+        if !scandir_is_closed(inst) {
+            // Latch closed first so a re-entrant finalisation can't double-warn.
+            scandir_mark_closed(inst);
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by the live VM driving this finaliser; the
+                // GIL keeps the pointer exclusive on this thread.
+                let interp = unsafe { &mut *ptr };
+                return interp
+                    .warn_resource_from_builtin(
+                        "unclosed scandir iterator".to_owned(),
+                    )
+                    .map(|()| Object::None);
+            }
+        }
+    }
     Ok(Object::None)
 }
 
@@ -2047,7 +2386,56 @@ pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let dict = DictData::new();
+        let mut dict = DictData::new();
+        // `os.DirEntry` is only ever minted by `scandir` (CPython's type has
+        // no `tp_new`): `os.DirEntry()` raises `TypeError`
+        // (`test_os.TestDirEntry.test_uninstantiable`). Internal construction
+        // goes through `PyInstance::new`, which bypasses `__new__`.
+        dict.insert(
+            DictKey(Object::from_static("__new__")),
+            builtin("__new__", |_args| {
+                Err(type_error("cannot create 'posix.DirEntry' instances"))
+            }),
+        );
+        // `repr(entry)` → `<DirEntry 'file.txt'>`. Dunders are resolved on the
+        // *type*, so this lives here (not per-instance) and reads `self.name`
+        // (`test_os.TestScandir.test_repr`).
+        dict.insert(
+            DictKey(Object::from_static("__repr__")),
+            Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                name: "__repr__",
+                binds_instance: true,
+                call: Box::new(|args| {
+                    let name = match args.first() {
+                        Some(Object::Instance(i)) => i
+                            .dict
+                            .borrow()
+                            .get(&DictKey(Object::from_static("name")))
+                            .cloned()
+                            .unwrap_or(Object::None),
+                        _ => Object::None,
+                    };
+                    Ok(Object::from_str(format!("<DirEntry {}>", name.repr())))
+                }),
+                call_kw: None,
+            })),
+        );
+        // CPython's `DirEntry` is unpicklable — `pickle.dumps(entry)` raises
+        // `TypeError` (`test_os.TestDirEntry.test_unpickable`). Surface that
+        // from `__reduce_ex__`/`__reduce__` (pickle calls `__reduce_ex__`).
+        for hook in ["__reduce_ex__", "__reduce__"] {
+            dict.insert(
+                DictKey(Object::from_static(hook)),
+                Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                    name: hook,
+                    binds_instance: true,
+                    call: Box::new(|_args| {
+                        Err(type_error("cannot pickle 'posix.DirEntry' object"))
+                    }),
+                    call_kw: None,
+                })),
+            );
+        }
         let cls = TypeObject::new_user("DirEntry", vec![bt.object_.clone()], dict)
             .expect("DirEntry type");
         *slot.borrow_mut() = Some(cls.clone());
@@ -2055,7 +2443,12 @@ pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
     })
 }
 
-fn build_dir_entry(name: Object, path: Object, fs_path: String) -> Object {
+fn build_dir_entry(
+    name: Object,
+    path: Object,
+    fs_path: String,
+    cached_inode: Option<i64>,
+) -> Object {
     use crate::object::BuiltinFn;
     use crate::types::PyInstance;
     let class = dir_entry_type();
@@ -2118,14 +2511,20 @@ fn build_dir_entry(name: Object, path: Object, fs_path: String) -> Object {
                 call_kw: None,
             })),
         );
-        // `inode()` — the entry's inode number (CPython `DirEntry.inode`).
+        // `inode()` — the entry's inode number (CPython `DirEntry.inode`),
+        // taken from the cached readdir value so it survives the entry being
+        // unlinked; falls back to a live `lstat` only when no cache exists.
         let p_ino = fs_path.clone();
         d.insert(
             DictKey(Object::from_static("inode")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "inode",
                 binds_instance: false,
-                call: Box::new(move |_args| Ok(Object::Int(dir_entry_inode(&p_ino)))),
+                call: Box::new(move |_args| {
+                    Ok(Object::Int(
+                        cached_inode.unwrap_or_else(|| dir_entry_inode(&p_ino)),
+                    ))
+                }),
                 call_kw: None,
             })),
         );
@@ -2551,9 +2950,10 @@ fn os_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
             .map_err(|_| value_error("embedded null character in path"))?;
         let rc = unsafe { libc::truncate(cpath.as_ptr(), length as libc::off_t) };
         if rc != 0 {
-            return Err(crate::error::io_error_to_py_named(
+            return Err(path_io_err(
                 &std::io::Error::last_os_error(),
-                Some(&p),
+                args.first(),
+                &p,
             ));
         }
         Ok(Object::None)
@@ -2570,7 +2970,13 @@ fn os_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
 fn os_ftruncate(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = match args.first() {
         Some(Object::Int(i)) => *i as i32,
-        Some(Object::Bool(b)) => i32::from(*b),
+        Some(Object::Bool(b)) => {
+            // CPython 3.12+: a `bool` where an fd is expected raises a
+            // `RuntimeWarning` (`test_os.TestInvalidFD.test_ftruncate` runs
+            // under `simplefilter("error", RuntimeWarning)`).
+            warn_bool_as_fd()?;
+            i32::from(*b)
+        }
         _ => return Err(type_error("ftruncate() fd must be int")),
     };
     let length = match args.get(1) {
@@ -3151,11 +3557,12 @@ fn os_umask(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn os_symlink(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    let src = first_path(args, "symlink")?;
-    // `dst` is positional index 1, or the `dst`/`target`-less form; CPython's
-    // signature is `symlink(src, dst, target_is_directory=False, *, dir_fd=None)`.
-    // Both ends accept `os.PathLike` (`pathlib.Path`), str, or bytes.
-    let dst = nth_path(args, 1, "symlink")?;
+    // CPython's signature is `symlink(src, dst, target_is_directory=False, *,
+    // dir_fd=None)`; `src`/`dst` are accepted positionally *or* by keyword
+    // (`test_os.test_symlink_keywords`). Both ends accept `os.PathLike`
+    // (`pathlib.Path`), str, or bytes.
+    let src = path_arg_or_kw(args, 0, "src", kwargs, "symlink")?;
+    let dst = path_arg_or_kw(args, 1, "dst", kwargs, "symlink")?;
     // `dir_fd` (keyword-only) is unsupported; reject a non-`None` value rather
     // than silently ignoring it. `target_is_directory` is a Windows-only hint
     // and is accepted-and-ignored on POSIX, exactly like CPython.
@@ -3184,8 +3591,7 @@ fn os_symlink(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
 fn os_link(args: &[Object]) -> Result<Object, RuntimeError> {
     let src = first_path(args, "link")?;
     let dst = nth_path(args, 1, "link")?;
-    std::fs::hard_link(&src, &dst)
-        .map_err(|e| crate::error::io_error_to_py_named2(&e, Some(&src), Some(&dst)))?;
+    std::fs::hard_link(&src, &dst).map_err(|e| path_io_err2(&e, args.first(), &src, &dst))?;
     Ok(Object::None)
 }
 
@@ -3255,19 +3661,19 @@ fn os_chmod(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runt
                 )
             };
             if rc != 0 {
-                return Err(crate::error::io_error_to_py_named(
+                return Err(path_io_err(
                     &std::io::Error::last_os_error(),
-                    Some(&p),
+                    args.first(),
+                    &p,
                 ));
             }
             return Ok(Object::None);
         }
         let mut perms = std::fs::metadata(&p)
-            .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?
+            .map_err(|e| path_io_err(&e, args.first(), &p))?
             .permissions();
         perms.set_mode(mode);
-        std::fs::set_permissions(&p, perms)
-            .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&p)))?;
+        std::fs::set_permissions(&p, perms).map_err(|e| path_io_err(&e, args.first(), &p))?;
         Ok(Object::None)
     }
     #[cfg(not(unix))]
@@ -3447,7 +3853,30 @@ fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
             call_kw: None,
         })))),
     );
-    TypeObject::new_with_flags(
+    // `os.PathLike[bytes]` → `types.GenericAlias`, exactly CPython's
+    // `__class_getitem__ = classmethod(GenericAlias)` (`test_pathlike_class_getitem`).
+    dict.insert(
+        DictKey(Object::from_static("__class_getitem__")),
+        Object::ClassMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
+            name: "__class_getitem__",
+            binds_instance: true,
+            call: Box::new(|args| {
+                let origin = args.first().cloned().unwrap_or(Object::None);
+                let params = args.get(1).cloned().unwrap_or(Object::None);
+                Ok(crate::make_generic_alias_public(origin, params))
+            }),
+            call_kw: None,
+        })))),
+    );
+    // CPython's `os.PathLike` declares `__slots__ = ()`, so it contributes no
+    // instance `__dict__`. Mirror that attribute *and* the `forbids_dict`
+    // bookkeeping below so a faithful subclass `class A(os.PathLike):
+    // __slots__ = ()` stays dict-less (`test_pathlike_subclass_slots`).
+    dict.insert(
+        DictKey(Object::from_static("__slots__")),
+        Object::Tuple(Rc::from(Vec::new())),
+    );
+    let ty = TypeObject::new_with_flags(
         Box::leak(name.to_owned().into_boxed_str()),
         vec![bt.object_.clone()],
         dict,
@@ -3456,7 +3885,17 @@ fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
             is_builtin: true,
         },
     )
-    .expect("os.PathLike")
+    .expect("os.PathLike");
+    // `os.PathLike` carries an empty `__slots__` and so forbids an instance
+    // dict; a `__slots__ = ()` subclass therefore inherits "no dict" (the
+    // class-creation path only propagates `forbids_dict` from bases). We are
+    // the sole owner of this freshly built `Rc` before it is memoised, so the
+    // in-place mutation is sound.
+    // SAFETY: no other reference to `ty` exists yet (see comment above).
+    unsafe {
+        (*Rc::as_ptr(&ty).cast_mut()).forbids_dict = true;
+    }
+    ty
 }
 
 /// The "visible" struct-sequence members of `os.stat_result`, in index order
@@ -3535,6 +3974,28 @@ pub(crate) fn struct_seq_type(
         });
         struct_seq_method(&mut dict, "__len__", move |_args| {
             Ok(Object::Int(fields.len() as i64))
+        });
+        // CPython struct sequences expose their members as read-only getset
+        // descriptors and carry no instance `__dict__`, so *any* attribute
+        // assignment raises `AttributeError` (`test_os.test_stat_attributes`
+        // checks `st.st_mode = 1`, `st.st_rdev = 1`, and `st.parrot = 1` all
+        // raise). The fields themselves are populated through `inst.dict`
+        // directly in Rust (`struct_seq_init` / the `*_from_meta` builders),
+        // which bypasses this guard.
+        struct_seq_method(&mut dict, "__setattr__", move |args| {
+            let attr = match args.get(1) {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            if fields.contains(&attr.as_str()) {
+                Err(crate::error::attribute_error(format!(
+                    "attribute '{attr}' of '{name}' objects is not writable"
+                )))
+            } else {
+                Err(crate::error::attribute_error(format!(
+                    "'{name}' object has no attribute '{attr}'"
+                )))
+            }
         });
         // CPython struct sequences subclass `tuple`, so `==`/`!=`/`hash()`
         // compare the visible fields by value (e.g. `os.stat(a) == os.stat(a)`
@@ -4287,6 +4748,45 @@ fn nth_path(args: &[Object], n: usize, func: &str) -> Result<String, RuntimeErro
     }
 }
 
+/// Resolve a path argument CPython exposes as either positional or keyword
+/// (`os.open(path=...)`, `os.symlink(src=..., dst=...)`). The positional slot
+/// wins; otherwise the named keyword is consulted. CPython's argument-clinic
+/// signatures all accept these by name.
+fn path_arg_or_kw(
+    args: &[Object],
+    pos: usize,
+    kw_name: &str,
+    kwargs: &[(String, Object)],
+    func: &str,
+) -> Result<String, RuntimeError> {
+    if let Some(obj) = args.get(pos) {
+        return path_to_string(obj, func);
+    }
+    if let Some((_, v)) = kwargs.iter().find(|(k, _)| k == kw_name) {
+        return path_to_string(v, func);
+    }
+    Err(type_error(format!(
+        "{func}() missing required argument: '{kw_name}' (pos {})",
+        pos + 1
+    )))
+}
+
+/// Fetch an integer argument from the positional slot or a keyword.
+fn int_arg_or_kw(
+    args: &[Object],
+    pos: usize,
+    kw_name: &str,
+    kwargs: &[(String, Object)],
+) -> Option<i64> {
+    if let Some(v) = args.get(pos).and_then(Object::as_i64) {
+        return Some(v);
+    }
+    kwargs
+        .iter()
+        .find(|(k, _)| k == kw_name)
+        .and_then(|(_, v)| v.as_i64())
+}
+
 /// Reduce a path argument to a `str`, accepting `str`, `bytes`/`bytearray`,
 /// and `os.PathLike` objects (resolved through `__fspath__`) — matching
 /// CPython's `path_converter`. Shared by the `os.*` filesystem entry points.
@@ -4295,28 +4795,47 @@ pub(crate) fn path_to_string(obj: &Object, func: &str) -> Result<String, Runtime
         Object::Str(s) => s.to_string(),
         Object::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         Object::ByteArray(b) => String::from_utf8_lossy(&b.borrow()).into_owned(),
+        // A `str`/`bytes` *subclass* instance is itself the path: CPython's
+        // `path_converter` treats `PyUnicode_Check`/`PyBytes_Check` subclasses
+        // as the string *before* consulting `__fspath__` (`test_oserror_filename`
+        // passes a `class Str(str)` instance).
+        Object::Instance(_) if matches!(obj.native_value(), Some(Object::Str(_) | Object::Bytes(_))) => {
+            match obj.native_value() {
+                Some(Object::Str(s)) => s.to_string(),
+                Some(Object::Bytes(b)) => String::from_utf8_lossy(&b).into_owned(),
+                _ => unreachable!("guarded by the match arm above"),
+            }
+        }
         Object::Instance(_) => {
             let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
                 type_error(format!(
                     "{func}: path should be string, bytes or os.PathLike, not {}",
-                    obj.type_name()
+                    obj.type_name_owned()
                 ))
             })?;
             // SAFETY: published by the enclosing VM frame on this thread.
             let interp = unsafe { &mut *ptr };
-            let fspath = interp.load_attr_public(obj, "__fspath__").map_err(|_| {
-                type_error(format!(
-                    "{func}: path should be string, bytes or os.PathLike, not {}",
-                    obj.type_name()
-                ))
-            })?;
+            // A missing `__fspath__` *or* one explicitly set to `None`
+            // (`class Foo: __fspath__ = None`) means "not path-like": CPython's
+            // `path_converter` raises the canonical TypeError rather than trying
+            // to call `None` (`test_os.test_fspath_set_to_None`).
+            let fspath = match interp.load_attr_public(obj, "__fspath__") {
+                Ok(Object::None) | Err(_) => {
+                    return Err(type_error(format!(
+                        "{func}: path should be string, bytes or os.PathLike, not {}",
+                        obj.type_name_owned()
+                    )))
+                }
+                Ok(m) => m,
+            };
             match interp.call_object(fspath, &[], &[])? {
                 Object::Str(s) => s.to_string(),
                 Object::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
                 other => {
                     return Err(type_error(format!(
-                        "expected {func}.__fspath__() to return str or bytes, not {}",
-                        other.type_name()
+                        "expected {}.__fspath__() to return str or bytes, not {}",
+                        obj.type_name_owned(),
+                        other.type_name_owned()
                     )))
                 }
             }

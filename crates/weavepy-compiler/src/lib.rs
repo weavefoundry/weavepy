@@ -2793,6 +2793,13 @@ impl Compiler {
                 self.emit(OpCode::LoadConst, none_idx);
                 self.emit(OpCode::Call, 3);
                 self.emit(OpCode::PopTop, 0);
+                // A `return`/`break`/`continue` out of the `with` leaves the
+                // block for good; drop the synthetic `.with_exit` local (the
+                // `.with_cm` was already dropped right after `__enter__`) so a
+                // generator that yields afterwards — e.g. `break` out of a
+                // `with` inside a loop — doesn't keep the manager alive. The
+                // local is always bound here (set before the body ran).
+                self.emit(OpCode::DeleteFast, *exit_idx);
                 Ok(())
             }
             FinallyKind::AsyncWithExit { aexit_idx } => {
@@ -2806,6 +2813,11 @@ impl Compiler {
                 self.emit(OpCode::Call, 3);
                 self.compile_await_dance(3);
                 self.emit(OpCode::PopTop, 0);
+                // `return`/`break`/`continue` leaves the `async with` for
+                // good; drop the synthetic `.aexit` local so an async
+                // generator that yields afterwards doesn't pin the manager.
+                // Always bound here (set before the body ran).
+                self.emit(OpCode::DeleteFast, *aexit_idx);
                 Ok(())
             }
         }
@@ -3476,6 +3488,18 @@ impl Compiler {
         // `LoadAttr` would route through `__getattribute__` (test_descr
         // test_special_method_lookup).
         self.emit(OpCode::StoreFast, exit_idx);
+        // The context-manager object is dead once `__enter__` has run and
+        // the bound `__exit__` is captured; drop the synthetic `.with_cm`
+        // local now. CPython keeps these transient values on the operand
+        // stack, which is unwound at scope exit; we stash them in fast
+        // locals instead, so without this an unfinished generator (or any
+        // frame that yields after the `with`) keeps the manager — and
+        // everything it references — alive. `test_as_completed`'s
+        // `_yield_finished_futures` is yielded out of `as_completed` while
+        // `with _AcquireFutures(fs):` is still on a suspended frame, and
+        // `_AcquireFutures` holds every future (`test_free_reference_*`).
+        // `DeleteFast` also prompt-reaps the manager.
+        self.emit(OpCode::DeleteFast, cm_idx);
 
         // Push a synthetic finally frame so `return`, `break`, and
         // `continue` from inside the body run `cm.__exit__(None, None, None)`
@@ -3566,6 +3590,11 @@ impl Compiler {
         // recorded for the re-raise site.
         self.emit(OpCode::Swap, 2);
         self.emit(OpCode::PopTop, 0);
+        // Drop the synthetic `.with_exit` local before propagating, so a
+        // generator that survives this exception (caught by an enclosing
+        // handler in the same frame) doesn't keep the bound `__exit__`
+        // and its context manager alive across a later `yield`.
+        self.emit(OpCode::DeleteFast, exit_idx);
         self.emit(OpCode::Reraise, 0);
         let swallow_target = self.next_offset();
         self.patch_jump(swallow, swallow_target);
@@ -3575,6 +3604,11 @@ impl Compiler {
         self.emit(OpCode::PopTop, 0);
         self.emit(OpCode::PopTop, 0);
         let end = self.next_offset();
+        // Normal exit (`end_jump`) and a suppressed exception both converge
+        // here; drop the synthetic `.with_exit` local (the bound `__exit__`,
+        // which also pins its context manager) so a `yield` later in the
+        // same frame can't keep them alive. See `DeleteFast cm_idx` above.
+        self.emit(OpCode::DeleteFast, exit_idx);
         self.patch_jump(end_jump, end);
         // Tag the active-handler entry with the pc just past the handler
         // so the unwinder drops it if `__exit__` raises and the new
@@ -4631,6 +4665,9 @@ impl Compiler {
         // original traceback (no entry for the re-raise site).
         self.emit(OpCode::Swap, 2);
         self.emit(OpCode::PopTop, 0);
+        // Drop the synthetic `.aexit` local before propagating, so an async
+        // generator surviving this exception doesn't pin the manager.
+        self.emit(OpCode::DeleteFast, slot_idx);
         self.emit(OpCode::Reraise, 0);
         let swallow_target = self.next_offset();
         self.patch_jump(swallow, swallow_target);
@@ -4640,6 +4677,11 @@ impl Compiler {
         self.emit(OpCode::PopTop, 0);
         self.emit(OpCode::PopTop, 0);
         let end = self.next_offset();
+        // Drop the synthetic `.aexit` local on the normal/suppressed exit
+        // paths (which converge here) so a later `yield`/`await` in the same
+        // async generator frame can't keep the bound `__aexit__` and its
+        // context manager alive. Mirrors the sync `with` fix.
+        self.emit(OpCode::DeleteFast, slot_idx);
         self.patch_jump(end_jump, end);
         // Tag the active-handler entry with the pc just past the handler
         // so the unwinder drops it if `__aexit__` raises a new exception.

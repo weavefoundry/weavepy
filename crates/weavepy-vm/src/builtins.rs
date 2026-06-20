@@ -2023,7 +2023,8 @@ fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     let o = one(args, "__getstate__")?;
     if let Object::Instance(inst) = o {
         let slots = inst.slots_snapshot();
-        let dict_state = if inst.dict.borrow().is_empty() {
+        let dict_is_empty = inst.dict.borrow().is_empty();
+        let dict_state = if dict_is_empty {
             Object::None
         } else {
             Object::Dict(inst.dict.clone())
@@ -2817,7 +2818,14 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
         Object::Code(c) => code_synthetic_attr(c, name),
         Object::Builtin(b) => match name {
             "__name__" | "__qualname__" => Some(Object::from_static(b.name)),
-            "__module__" => Some(Object::from_static("builtins")),
+            // Mirror the LOAD_ATTR fast path (`Vm::load_attr`): a native
+            // module's functions report their module (`os.getpid.__module__
+            // == "os"`), falling back to `"builtins"` for un-attributed
+            // builtins. Keeps `getattr(fn, "__module__")` / `hasattr` /
+            // `pickle` agreeing with direct attribute access.
+            "__module__" => Some(Object::from_static(
+                crate::descr_registry::module_of(obj).unwrap_or("builtins"),
+            )),
             "__doc__" => Some(Object::None),
             "__self__" => Some(Object::None),
             "__objclass__" => crate::builtin_types::builtin_fn_objclass(b).map(Object::Type),
@@ -6034,7 +6042,7 @@ pub fn class_matches_classinfo_named(
         return class_matches_classinfo(cls, &origin);
     }
     match info {
-        Object::Type(t) => Ok(cls.is_subclass_of(t)),
+        Object::Type(t) => Ok(type_subclass_match(cls, t)),
         // `None` inside a union means `type(None)` — match by class
         // name. The `NoneType` class is the unique class with that
         // name (we don't allow user code to redefine it).
@@ -6052,7 +6060,7 @@ pub fn class_matches_classinfo_named(
                         return Ok(true);
                     }
                 } else if let Object::Type(t) = it {
-                    if cls.is_subclass_of(t) {
+                    if type_subclass_match(cls, t) {
                         return Ok(true);
                     }
                 } else if matches!(it, Object::None) && cls.name == "NoneType" {
@@ -6065,6 +6073,23 @@ pub fn class_matches_classinfo_named(
             "issubclass() arg 2 must be a class or tuple of classes",
         )),
     }
+}
+
+/// `issubclass(cls, t)` for a single class target, honouring the one
+/// structural ABC we expose natively: `os.PathLike`. CPython's
+/// `PathLike.__subclasshook__` returns `True` for *any* class that has a
+/// non-`None` `__fspath__` in its MRO — even without explicit subclassing
+/// (the `FakePath` in `test_os`). Crucially this only fires when the target
+/// is *exactly* `os.PathLike`: a user subclass `class A(os.PathLike)` inherits
+/// the hook, which returns `NotImplemented` for `cls is not PathLike`, so it
+/// falls back to a normal MRO check (`test_pathlike_subclasshook`).
+fn type_subclass_match(cls: &crate::types::TypeObject, t: &Rc<crate::types::TypeObject>) -> bool {
+    if Rc::ptr_eq(t, &crate::stdlib::os::path_like_type()) {
+        return cls
+            .lookup("__fspath__")
+            .is_some_and(|m| !matches!(m, Object::None));
+    }
+    cls.is_subclass_of(t)
 }
 
 /// Return the `__origin__` of a PEP 585 generic alias (or PEP 604

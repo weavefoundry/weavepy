@@ -581,6 +581,8 @@ fn build_flags(cli: &Cli, env: &EnvOverrides) -> InterpreterFlags {
             v
         },
         hash_seed: env.hash_seed,
+        io_encoding: env.io_encoding.clone(),
+        io_errors: env.io_errors.clone(),
     };
     if cli.optimize == 0 && env.optimize > 0 {
         flags.optimize = env.optimize;
@@ -604,6 +606,10 @@ struct EnvOverrides {
     safe_path: bool,
     warning_filters: Vec<String>,
     hash_seed: Option<u32>,
+    /// `PYTHONIOENCODING=encoding[:errors]`, split into its halves. Either
+    /// part may be empty (`:errors` sets only the handler).
+    io_encoding: Option<String>,
+    io_errors: Option<String>,
 }
 
 impl EnvOverrides {
@@ -649,6 +655,23 @@ impl EnvOverrides {
                 o.hash_seed = Some(0);
             } else if let Ok(n) = seed.parse::<u32>() {
                 o.hash_seed = Some(n);
+            }
+        }
+        // `PYTHONIOENCODING=encoding[:errors]` (CPython): the first `:`
+        // splits the codec from the error handler; either side may be
+        // empty (`utf-8`, `:strict`, `ascii:backslashreplace`).
+        if let Ok(spec) = env::var("PYTHONIOENCODING") {
+            let (enc, errs) = match spec.split_once(':') {
+                Some((e, h)) => (e, Some(h)),
+                None => (spec.as_str(), None),
+            };
+            if !enc.is_empty() {
+                o.io_encoding = Some(enc.to_owned());
+            }
+            if let Some(h) = errs {
+                if !h.is_empty() {
+                    o.io_errors = Some(h.to_owned());
+                }
             }
         }
         o

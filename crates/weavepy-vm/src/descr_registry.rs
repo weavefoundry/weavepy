@@ -21,6 +21,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::object::Object;
 use crate::sync::Rc;
@@ -46,30 +47,40 @@ pub struct DescrMeta {
 
 thread_local! {
     static DESCR_META: RefCell<HashMap<usize, DescrMeta>> = RefCell::new(HashMap::new());
-    /// `__module__` attribution for native builtin functions that do *not*
-    /// live in `builtins` (e.g. the `_operator` accelerator). Keyed by the
-    /// same pointer identity as [`DESCR_META`]. A builtin absent from this
-    /// table reports `__module__ == "builtins"` (CPython's default for an
-    /// un-attributed `builtin_function_or_method`). `pickle` relies on the
-    /// right answer: `operator.pow.__module__ == "_operator"` so
-    /// `getattr(_operator, "pow") is operator.pow`.
-    static BUILTIN_MODULE: RefCell<HashMap<usize, &'static str>> = RefCell::new(HashMap::new());
 }
+
+/// `__module__` attribution for native builtin functions that do *not*
+/// live in `builtins` (e.g. the `_operator` accelerator, every `os.*` /
+/// `math.*` module function). Keyed by the same pointer identity as
+/// [`DESCR_META`]. A builtin absent from this table reports
+/// `__module__ == "builtins"` (CPython's default for an un-attributed
+/// `builtin_function_or_method`). `pickle` relies on the right answer:
+/// `operator.pow.__module__ == "_operator"` so `getattr(_operator, "pow")
+/// is operator.pow`, and `os.getpid.__module__ == "os"` so a bare `os.*`
+/// submitted to a `spawn`/`forkserver` `ProcessPoolExecutor` worker is
+/// picklable by reference.
+///
+/// PROCESS-GLOBAL (not thread-local): native module objects — and thus the
+/// `Rc<BuiltinFn>` they hold — are *shared* across every OS thread through
+/// the shared [`crate::import::ModuleCache`]. A module built on the main
+/// thread must still report the right `__module__` when pickled on a
+/// `multiprocessing.Queue` feeder thread. The `Rc` pointer key is stable for
+/// the process lifetime and the value is `&'static str`, so sharing is sound.
+static BUILTIN_MODULE: LazyLock<parking_lot::RwLock<HashMap<usize, &'static str>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
 
 /// Attribute `obj` (a native builtin function) to module `module`, so its
 /// `__module__` reports that instead of the default `"builtins"`.
 pub fn register_module(obj: &Object, module: &'static str) {
     let Some(k) = key(obj) else { return };
-    BUILTIN_MODULE.with(|m| {
-        m.borrow_mut().insert(k, module);
-    });
+    BUILTIN_MODULE.write().insert(k, module);
 }
 
 /// The module a builtin function was attributed to via [`register_module`],
 /// or `None` (→ caller uses `"builtins"`).
 pub fn module_of(obj: &Object) -> Option<&'static str> {
     let k = key(obj)?;
-    BUILTIN_MODULE.with(|m| m.borrow().get(&k).copied())
+    BUILTIN_MODULE.read().get(&k).copied()
 }
 
 /// As [`module_of`] but keyed directly off a `BuiltinFn` handle — used by the
@@ -78,7 +89,7 @@ pub fn module_of(obj: &Object) -> Option<&'static str> {
 /// not hit the 3-arg modular `pow` fast-path).
 pub fn module_of_builtin(b: &Rc<crate::object::BuiltinFn>) -> Option<&'static str> {
     let k = Rc::as_ptr(b).cast::<()>() as usize;
-    BUILTIN_MODULE.with(|m| m.borrow().get(&k).copied())
+    BUILTIN_MODULE.read().get(&k).copied()
 }
 
 /// The pointer key for a descriptor object, or `None` if `obj` is not a

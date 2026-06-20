@@ -693,6 +693,13 @@ class Popen:
         else:
             env_list = None
 
+        # CPython's `_posixsubprocess.fork_exec` refuses to run a `preexec_fn`
+        # once the interpreter is tearing down (a `__del__`/`atexit` that spawns
+        # a child): the forked child can't safely call back into Python. Mirror
+        # that guard here (`test_subprocess.test_preexec_at_exit`).
+        if preexec_fn is not None and sys.is_finalizing():
+            raise RuntimeError("preexec_fn not supported at interpreter shutdown")
+
         fds_to_keep = set(int(fd) for fd in pass_fds)
         errpipe_read, errpipe_write = os.pipe()
         fds_to_keep.add(errpipe_write)
