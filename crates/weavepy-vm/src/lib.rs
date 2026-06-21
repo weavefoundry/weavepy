@@ -20567,6 +20567,30 @@ impl Interpreter {
         if matches!(recv, Object::Iter(_)) {
             return self.iter_reduce(recv, globals);
         }
+        // `range` and `slice` carry their state in the constructor args, not
+        // in `__new__`; CPython's `range_reduce`/`slice_reduce` return
+        // `(type, (start, stop, step))`. The default newobj reduction would
+        // call `range.__new__(range)` / `slice.__new__(slice)` with no args
+        // and fail to round-trip (manager-proxy pickling of a list holding a
+        // `range`/`slice`: test_multiprocessing test_list*).
+        match recv {
+            Object::Range(r) => {
+                let type_obj = crate::builtins::class_of(recv);
+                let args = Object::new_tuple(vec![
+                    crate::object::int_from_i128(r.start),
+                    crate::object::int_from_i128(r.stop),
+                    crate::object::int_from_i128(r.step),
+                ]);
+                return Ok(Object::new_tuple(vec![Object::Type(type_obj), args]));
+            }
+            Object::Slice(s) => {
+                let type_obj = crate::builtins::class_of(recv);
+                let args =
+                    Object::new_tuple(vec![s.start.clone(), s.stop.clone(), s.step.clone()]);
+                return Ok(Object::new_tuple(vec![Object::Type(type_obj), args]));
+            }
+            _ => {}
+        }
         // `set`/`frozenset` and their subclasses reduce as
         // `(type, (list(elements),), state)` — CPython `set_reduce`. The
         // default newobj reduction rebuilds an *empty* set because a set's

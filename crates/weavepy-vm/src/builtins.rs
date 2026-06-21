@@ -1008,7 +1008,7 @@ fn iter_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
         PyIterator::ByteArray { data, index } => {
             *index = clamp(data.borrow().len());
         }
-        PyIterator::DictKeys { keys, index } => *index = clamp(keys.len()),
+        PyIterator::DictKeys { keys, index, .. } => *index = clamp(keys.len()),
         PyIterator::Reversed { index, .. } => *index = state.max(-1),
         _ => {}
     }

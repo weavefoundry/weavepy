@@ -50,8 +50,14 @@ fn run_multiprocessing_child(raw: &[String]) -> ExitCode {
     // `_run_spawn_child` runs the worker target via `spawn._main` and returns
     // its exit code; `_multiprocessing._exit(code)` then `std::process::exit`s
     // directly, so the `Ok(())` arm is only reached on a clean fall-through.
-    let snippet = "import multiprocessing, _multiprocessing\n\
+    // CPython's `spawn_main` ends in `sys.exit(exitcode)`, whose interpreter
+    // finalization runs `atexit` handlers (the worker may register its own,
+    // e.g. gh-83856 / `test_atexit`, plus `multiprocessing.util._exit_function`).
+    // Our `_multiprocessing._exit` is a hard `std::process::exit` that bypasses
+    // the CLI's normal shutdown drain, so run the exit funcs explicitly first.
+    let snippet = "import multiprocessing, _multiprocessing, atexit as _atexit\n\
                    _mp_code = multiprocessing._run_spawn_child()\n\
+                   _atexit._run_exitfuncs()\n\
                    _multiprocessing._exit(int(_mp_code) if _mp_code is not None else 0)\n";
     let argv = if raw.is_empty() {
         vec!["weavepy".to_owned()]

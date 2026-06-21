@@ -952,7 +952,10 @@ fn get_ident(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn get_native_id(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Int(crate::gil::current_native_thread_id() as i64))
+    // The kernel TID (not the `pthread_self` pointer): unique across
+    // processes, so a spawned child's main thread reports a different
+    // `native_id` than its parent (test_process_mainthread_native_id).
+    Ok(Object::Int(crate::gil::current_os_native_id() as i64))
 }
 
 /// The stack size configured for new threads (0 = platform default).

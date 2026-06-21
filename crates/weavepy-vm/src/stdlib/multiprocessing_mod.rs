@@ -695,8 +695,8 @@ fn sem_release(inner: &Arc<SemInner>) -> Result<Object, RuntimeError> {
             return Ok(Object::None);
         }
     }
-    // Bounded check where sem_getvalue is available (refuse to
-    // over-release), matching CPython's "released too many times".
+    // Refuse to over-release, matching CPython's "semaphore or lock
+    // released too many times" (`_multiprocessing/semaphore.c`).
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let mut v: libc::c_int = 0;
@@ -704,6 +704,27 @@ fn sem_release(inner: &Arc<SemInner>) -> Result<Object, RuntimeError> {
             && i64::from(v) >= inner.maxvalue
         {
             return Err(value_error("semaphore or lock released too many times"));
+        }
+    }
+    // Darwin's `sem_getvalue` is broken (HAVE_BROKEN_SEM_GETVALUE), so
+    // CPython only validates the `maxvalue == 1` (Lock) case there: a
+    // non-blocking `sem_trywait` that *succeeds* proves the lock was not
+    // held, i.e. an over-release — undo it and raise. `EAGAIN` means it
+    // was held as expected and the release proceeds.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        if inner.maxvalue == 1 {
+            let r = unsafe { libc::sem_trywait(inner.handle) };
+            if r == 0 {
+                if unsafe { libc::sem_post(inner.handle) } != 0 {
+                    return Err(io_error_to_py(&std::io::Error::last_os_error()));
+                }
+                return Err(value_error("semaphore or lock released too many times"));
+            }
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EAGAIN) {
+                return Err(io_error_to_py(&e));
+            }
         }
     }
     if unsafe { libc::sem_post(inner.handle) } != 0 {
@@ -1615,7 +1636,7 @@ pub fn build_posixshmem(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("shm_open")),
-            b("shm_open", shm_open_py),
+            b_dyn_kw("shm_open", |args, kwargs| shm_open_py(args, kwargs)),
         );
         d.insert(
             DictKey(Object::from_static("shm_unlink")),
@@ -1643,20 +1664,26 @@ pub fn build_posixshmem(_cache: &ModuleCache) -> Rc<PyModule> {
     })
 }
 
-/// `_posixshmem.shm_open(path, flags, mode=0o600)` → fd.
+/// `_posixshmem.shm_open(path, flags, mode=0o777)` → fd.
+///
+/// CPython's `_posixshmem.shm_open` accepts `path`, `flags`, and `mode`
+/// positionally *or* by keyword (`shared_memory.py` passes `mode=` by
+/// keyword), so this is a kwargs-aware builtin.
 #[cfg(unix)]
-fn shm_open_py(args: &[Object]) -> Result<Object, RuntimeError> {
-    let path = match args.first() {
+fn shm_open_py(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let kw = |name: &str| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let path_obj = args.first().or_else(|| kw("path"));
+    let path = match path_obj {
         Some(Object::Str(s)) => s.to_string(),
         _ => return Err(type_error("shm_open() path must be a str")),
     };
-    let flags = match args.get(1) {
+    let flags = match args.get(1).or_else(|| kw("flags")) {
         Some(Object::Int(n)) => *n as libc::c_int,
         _ => return Err(type_error("shm_open() flags must be an int")),
     };
-    let mode = match args.get(2) {
+    let mode = match args.get(2).or_else(|| kw("mode")) {
         Some(Object::Int(n)) => *n as libc::c_uint,
-        _ => 0o600,
+        _ => 0o777,
     };
     let cpath = std::ffi::CString::new(path).map_err(|_| value_error("embedded null byte"))?;
     // `shm_open` is variadic; the mode arg must be promoted to c_uint

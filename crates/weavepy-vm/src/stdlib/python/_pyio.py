@@ -12,7 +12,7 @@ import sys
 from _thread import allocate_lock as _allocate_lock, get_ident as _get_ident
 
 
-class Lock:
+class _Lock:
     """A buffered-stream lock that detects same-thread reentry.
 
     CPython's C ``_io`` guards every buffered operation with ``ENTER_BUFFERED``,
@@ -1092,7 +1092,7 @@ class BufferedReader(_BufferedIOMixin):
             raise ValueError("invalid buffer size")
         self.buffer_size = buffer_size
         self._reset_read_buf()
-        self._read_lock = Lock()
+        self._read_lock = _Lock()
 
     def readable(self):
         return self.raw.readable()
@@ -1300,7 +1300,7 @@ class BufferedWriter(_BufferedIOMixin):
             raise ValueError("invalid buffer size")
         self.buffer_size = buffer_size
         self._write_buf = bytearray()
-        self._write_lock = Lock()
+        self._write_lock = _Lock()
 
     def writable(self):
         return self.raw.writable()

@@ -675,6 +675,49 @@ pub fn current_native_thread_id() -> u64 {
     current_thread_id()
 }
 
+/// The kernel-level thread id of the calling thread, as reported by
+/// `threading.get_native_id()` / `Thread.native_id`.
+///
+/// This differs from [`current_thread_id`]: that returns a
+/// `pthread_self()` pointer, which is only unique *within* a process and
+/// — on macOS — is frequently the *same* address for the main thread of
+/// every process (the main thread's `pthread_t` lives at a fixed slot).
+/// CPython's `native_id` is instead the OS scheduler's thread id
+/// (Linux `gettid(2)`, macOS `pthread_threadid_np`), which is globally
+/// unique and therefore differs across `fork`/`spawn` children — exactly
+/// what `test_multiprocessing`'s `test_process_mainthread_native_id`
+/// asserts (`assertNotEqual(parent_tid, child_tid)`).
+pub fn current_os_native_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::syscall(libc::SYS_gettid) as u64
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        let mut tid: u64 = 0;
+        // Current thread's kernel id. Passing our own `pthread_self()`
+        // (rather than NULL) keeps the `pthread_t` argument well-typed.
+        libc::pthread_threadid_np(libc::pthread_self(), &mut tid);
+        tid
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        extern "system" {
+            fn GetCurrentThreadId() -> u32;
+        }
+        u64::from(GetCurrentThreadId())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "windows"
+    )))]
+    {
+        current_thread_id()
+    }
+}
+
 /// Snapshot of pending eval-breaker actions, drained as a unit
 /// so the dispatch loop can decide what to do.
 #[derive(Debug, Clone, Copy, Default)]

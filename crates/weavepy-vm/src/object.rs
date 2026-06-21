@@ -3465,6 +3465,15 @@ pub enum PyIterator {
     DictKeys {
         keys: Vec<DictKey>,
         index: usize,
+        /// The source dict, watched for size changes between `__next__`
+        /// calls (CPython's `dictiter_iternext` compares `di_used` to
+        /// `ma_used` and raises `RuntimeError: dictionary changed size
+        /// during iteration`). `None` for sources with no single live
+        /// dict to watch (so the trip-wire is skipped).
+        dict: Option<Rc<RefCell<DictData>>>,
+        /// `len()` of `dict` at iterator creation; a later mismatch trips
+        /// the "changed size during iteration" error.
+        len: usize,
     },
     Bytes {
         data: Rc<[u8]>,
@@ -3604,7 +3613,7 @@ impl PyIterator {
                 *current += *step;
                 Some(int_from_i128(v))
             }
-            PyIterator::DictKeys { keys, index } => {
+            PyIterator::DictKeys { keys, index, .. } => {
                 let k = keys.get(*index)?.clone();
                 *index += 1;
                 Some(k.0)
@@ -3732,9 +3741,17 @@ impl PyIterator {
                     visit(v);
                 }
             }
-            PyIterator::DictKeys { keys, .. } => {
+            PyIterator::DictKeys { keys, dict, .. } => {
+                // The `keys` snapshot is a private buffer of cloned key Rcs,
+                // so its elements are visited directly (transient-promotion
+                // accounts the `-> keys` edges). When a live `dict` is also
+                // held (the size trip-wire), subtract the `iter -> dict` edge
+                // too; the dict's own `tp_traverse` accounts `dict -> items`.
                 for k in keys {
                     visit(&k.0);
+                }
+                if let Some(d) = dict {
+                    visit(&Object::Dict(d.clone()));
                 }
             }
             PyIterator::Set { set, .. } => {
@@ -3776,6 +3793,19 @@ impl PyIterator {
                 return Err(runtime_error("Set changed size during iteration"));
             }
         }
+        if let PyIterator::DictKeys {
+            dict: Some(d), len, ..
+        } = self
+        {
+            // `dictiter_iternext`: a size change since creation is fatal,
+            // mirroring CPython's `di_used != ma_used` guard. Triggers even
+            // on the step that would otherwise raise StopIteration.
+            if d.borrow().len() != *len {
+                return Err(runtime_error(
+                    "dictionary changed size during iteration",
+                ));
+            }
+        }
         if let PyIterator::File { file } = self {
             // Surface read errors (OSError, decode errors) at the
             // user-visible `__next__` boundary instead of swallowing them.
@@ -3804,7 +3834,7 @@ impl PyIterator {
             PyIterator::List { items, index } => Some(items.borrow().len().saturating_sub(*index)),
             PyIterator::Tuple { items, index } => Some(items.len().saturating_sub(*index)),
             PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
-            PyIterator::DictKeys { keys, index } => Some(keys.len().saturating_sub(*index)),
+            PyIterator::DictKeys { keys, index, .. } => Some(keys.len().saturating_sub(*index)),
             PyIterator::Bytes { data, index } => Some(data.len().saturating_sub(*index)),
             PyIterator::ByteArray { data, index } => {
                 Some(data.borrow().len().saturating_sub(*index))
@@ -3874,7 +3904,7 @@ impl PyIterator {
                     .map(|c| Object::Str(Rc::from(c.to_string().as_str())))
                     .collect()
             }
-            PyIterator::DictKeys { keys, index } => keys
+            PyIterator::DictKeys { keys, index, .. } => keys
                 .get(*index..)
                 .map(|rest| rest.iter().map(|k| k.0.clone()).collect())
                 .unwrap_or_default(),
@@ -4528,8 +4558,16 @@ impl Object {
                 },
             ),
             Object::Dict(d) => {
-                let keys: Vec<DictKey> = d.borrow().keys().cloned().collect();
-                Ok(PyIterator::DictKeys { keys, index: 0 })
+                let (keys, len) = {
+                    let b = d.borrow();
+                    (b.keys().cloned().collect::<Vec<DictKey>>(), b.len())
+                };
+                Ok(PyIterator::DictKeys {
+                    keys,
+                    index: 0,
+                    dict: Some(d.clone()),
+                    len,
+                })
             }
             Object::Set(s) => {
                 // A *live* iterator (not a snapshot): keep the set alive for
@@ -4570,7 +4608,13 @@ impl Object {
                 match v.kind {
                     DictViewKind::Keys => {
                         let keys: Vec<DictKey> = d.keys().cloned().collect();
-                        Ok(PyIterator::DictKeys { keys, index: 0 })
+                        let len = d.len();
+                        Ok(PyIterator::DictKeys {
+                            keys,
+                            index: 0,
+                            dict: Some(v.dict.clone()),
+                            len,
+                        })
                     }
                     DictViewKind::Values => {
                         let vs: Vec<Object> = d.values().cloned().collect();
@@ -4592,8 +4636,16 @@ impl Object {
                 }
             }
             Object::MappingProxy(d) => {
-                let keys: Vec<DictKey> = d.borrow().keys().cloned().collect();
-                Ok(PyIterator::DictKeys { keys, index: 0 })
+                let (keys, len) = {
+                    let b = d.borrow();
+                    (b.keys().cloned().collect::<Vec<DictKey>>(), b.len())
+                };
+                Ok(PyIterator::DictKeys {
+                    keys,
+                    index: 0,
+                    dict: Some(d.clone()),
+                    len,
+                })
             }
             Object::File(file) => {
                 // CPython's file object is its own iterator: each step calls
