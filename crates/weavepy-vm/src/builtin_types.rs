@@ -111,6 +111,7 @@ pub struct BuiltinTypes {
     pub not_implemented_error: Rc<TypeObject>,
     pub os_error: Rc<TypeObject>,
     pub overflow_error: Rc<TypeObject>,
+    pub floating_point_error: Rc<TypeObject>,
     pub runtime_error: Rc<TypeObject>,
     pub stop_iteration: Rc<TypeObject>,
     pub stop_async_iteration: Rc<TypeObject>,
@@ -364,6 +365,7 @@ impl BuiltinTypes {
         let not_implemented_error = exc("NotImplementedError", runtime_error.clone());
         let recursion_error = exc("RecursionError", runtime_error.clone());
         let overflow_error = exc("OverflowError", arithmetic_error.clone());
+        let floating_point_error = exc("FloatingPointError", arithmetic_error.clone());
         let zero_division_error = exc("ZeroDivisionError", arithmetic_error.clone());
         let stop_iteration = exc("StopIteration", exception.clone());
         // PEP 525: `StopAsyncIteration` is a sibling of `StopIteration`
@@ -527,6 +529,7 @@ impl BuiltinTypes {
             not_implemented_error,
             os_error,
             overflow_error,
+            floating_point_error,
             runtime_error,
             stop_iteration,
             stop_async_iteration,
@@ -650,6 +653,7 @@ impl BuiltinTypes {
             pair!(not_implemented_error, "NotImplementedError"),
             pair!(os_error, "OSError"),
             pair!(overflow_error, "OverflowError"),
+            pair!(floating_point_error, "FloatingPointError"),
             pair!(runtime_error, "RuntimeError"),
             pair!(stop_iteration, "StopIteration"),
             pair!(stop_async_iteration, "StopAsyncIteration"),
@@ -748,6 +752,7 @@ impl BuiltinTypes {
             "NotImplementedError" => Some(self.not_implemented_error.clone()),
             "OSError" => Some(self.os_error.clone()),
             "OverflowError" => Some(self.overflow_error.clone()),
+            "FloatingPointError" => Some(self.floating_point_error.clone()),
             "RuntimeError" => Some(self.runtime_error.clone()),
             "StopIteration" => Some(self.stop_iteration.clone()),
             "StopAsyncIteration" => Some(self.stop_async_iteration.clone()),
@@ -2290,6 +2295,32 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         if let Object::Instance(inst_rc) = inst {
             let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
             let mut dict = inst_rc.dict.borrow_mut();
+            // CPython `oserror_init` special case: a `BlockingIOError` (and
+            // subclasses) built with *exactly three* positional args treats
+            // the third as `characters_written` rather than `filename`, keeps
+            // the full 3-tuple as `.args`, and leaves `filename` unset. With
+            // any other arity it parses as a plain `OSError`
+            // (`test_io.test_write_non_blocking` relies on
+            // `BlockingIOError(EAGAIN, msg, written).characters_written`).
+            let is_blocking = inst_rc
+                .cls()
+                .is_subclass_of(&builtin_types().blocking_io_error);
+            if is_blocking && rest.len() == 3 {
+                dict.insert(
+                    DictKey(Object::from_static("args")),
+                    Object::new_tuple(rest.to_vec()),
+                );
+                dict.insert(DictKey(Object::from_static("errno")), rest[0].clone());
+                dict.insert(DictKey(Object::from_static("strerror")), rest[1].clone());
+                dict.insert(
+                    DictKey(Object::from_static("characters_written")),
+                    rest[2].clone(),
+                );
+                dict.insert(DictKey(Object::from_static("filename")), Object::None);
+                dict.insert(DictKey(Object::from_static("winerror")), Object::None);
+                dict.insert(DictKey(Object::from_static("filename2")), Object::None);
+                return Ok(Object::None);
+            }
             // CPython `oserror_init`: the named fields populate only
             // for the 2..5-positional forms, and `.args` keeps just
             // `(errno, strerror)` in those forms; otherwise the full

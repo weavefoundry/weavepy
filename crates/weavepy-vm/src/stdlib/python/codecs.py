@@ -7,6 +7,7 @@ shells, and the `BOM_*` constants.
 """
 
 import _codecs
+import sys
 
 BOM = _codecs.BOM
 BOM_UTF8 = _codecs.BOM_UTF8
@@ -149,11 +150,85 @@ def _hex_decode(b, errors="strict"):
     return bytes.fromhex(b), len(b)
 
 
+# CPython's `encodings/base64_codec.py` — a bytes→bytes "transform" codec.
+def _base64_encode(input, errors="strict"):
+    assert errors == "strict"
+    import base64 as _b64
+
+    return (_b64.encodebytes(bytes(input)), len(input))
+
+
+def _base64_decode(input, errors="strict"):
+    assert errors == "strict"
+    import base64 as _b64
+
+    return (_b64.decodebytes(bytes(input)), len(input))
+
+
+# CPython's `encodings/quopri_codec.py` (implemented over `binascii` since the
+# pure-Python `quopri` module isn't vendored). `quopri.encode(..., quotetabs=1)`
+# is equivalent to `binascii.b2a_qp(quotetabs=True)`.
+def _quopri_encode(input, errors="strict"):
+    assert errors == "strict"
+    import binascii
+
+    return (binascii.b2a_qp(bytes(input), quotetabs=True), len(input))
+
+
+def _quopri_decode(input, errors="strict"):
+    assert errors == "strict"
+    import binascii
+
+    return (binascii.a2b_qp(bytes(input)), len(input))
+
+
+# CPython's `encodings/zlib_codec.py`.
+def _zlib_encode(input, errors="strict"):
+    assert errors == "strict"
+    import zlib
+
+    return (zlib.compress(bytes(input)), len(input))
+
+
+def _zlib_decode(input, errors="strict"):
+    assert errors == "strict"
+    import zlib
+
+    return (zlib.decompress(bytes(input)), len(input))
+
+
+# CPython's `encodings/bz2_codec.py`.
+def _bz2_encode(input, errors="strict"):
+    assert errors == "strict"
+    import bz2
+
+    return (bz2.compress(bytes(input)), len(input))
+
+
+def _bz2_decode(input, errors="strict"):
+    assert errors == "strict"
+    import bz2
+
+    return (bz2.decompress(bytes(input)), len(input))
+
+
 _PURE_CODECS = {
     "rot_13": (_rot13_encode, _rot13_decode),
     "rot13": (_rot13_encode, _rot13_decode),
     "hex": (_hex_encode, _hex_decode),
     "hex_codec": (_hex_encode, _hex_decode),
+    "base64": (_base64_encode, _base64_decode),
+    "base64_codec": (_base64_encode, _base64_decode),
+    "base_64": (_base64_encode, _base64_decode),
+    "quopri": (_quopri_encode, _quopri_decode),
+    "quopri_codec": (_quopri_encode, _quopri_decode),
+    "quotedprintable": (_quopri_encode, _quopri_decode),
+    "quoted_printable": (_quopri_encode, _quopri_decode),
+    "zlib": (_zlib_encode, _zlib_decode),
+    "zlib_codec": (_zlib_encode, _zlib_decode),
+    "zip": (_zlib_encode, _zlib_decode),
+    "bz2": (_bz2_encode, _bz2_decode),
+    "bz2_codec": (_bz2_encode, _bz2_decode),
 }
 
 
@@ -337,18 +412,146 @@ def _utf_8_sig_codecinfo(name="utf-8-sig"):
     )
 
 
+class _Utf16IncrementalEncoder(IncrementalEncoder):
+    """utf-16 (auto-BOM) incremental encoder, ported from CPython's
+    ``encodings/utf_16.py``. The BOM is emitted exactly once (in native byte
+    order) on the first non-deferred ``encode``; every subsequent call uses the
+    matching LE/BE encoder so the byte-order mark is never repeated. ``setstate``
+    is how ``TextIOWrapper`` suppresses the BOM when appending/seeking into a
+    non-empty stream (``test_io.test_seek_bom``/``test_encoded_writes``)."""
+
+    def __init__(self, errors="strict"):
+        super().__init__(errors)
+        self.encoder = None
+
+    def encode(self, input, final=False):
+        if self.encoder is None:
+            result = _codecs.utf_16_encode(input, self.errors)[0]
+            if sys.byteorder == "little":
+                self.encoder = _codecs.utf_16_le_encode
+            else:
+                self.encoder = _codecs.utf_16_be_encode
+            return result
+        return self.encoder(input, self.errors)[0]
+
+    def reset(self):
+        super().reset()
+        self.encoder = None
+
+    def getstate(self):
+        # 2: byte order not yet emitted (BOM still pending); 0: BOM already out.
+        return 2 if self.encoder is None else 0
+
+    def setstate(self, state):
+        if state:
+            self.encoder = None
+        elif sys.byteorder == "little":
+            self.encoder = _codecs.utf_16_le_encode
+        else:
+            self.encoder = _codecs.utf_16_be_encode
+
+
+class _Utf32IncrementalEncoder(IncrementalEncoder):
+    """utf-32 (auto-BOM) incremental encoder, ported from CPython's
+    ``encodings/utf_32.py`` — the utf-16 logic with the 4-byte codec."""
+
+    def __init__(self, errors="strict"):
+        super().__init__(errors)
+        self.encoder = None
+
+    def encode(self, input, final=False):
+        if self.encoder is None:
+            result = _codecs.utf_32_encode(input, self.errors)[0]
+            if sys.byteorder == "little":
+                self.encoder = _codecs.utf_32_le_encode
+            else:
+                self.encoder = _codecs.utf_32_be_encode
+            return result
+        return self.encoder(input, self.errors)[0]
+
+    def reset(self):
+        super().reset()
+        self.encoder = None
+
+    def getstate(self):
+        return 2 if self.encoder is None else 0
+
+    def setstate(self, state):
+        if state:
+            self.encoder = None
+        elif sys.byteorder == "little":
+            self.encoder = _codecs.utf_32_le_encode
+        else:
+            self.encoder = _codecs.utf_32_be_encode
+
+
+def _utf_16_codecinfo(name="utf-16"):
+    dec = _codecs.utf_16_decode
+    return CodecInfo(
+        encode=_codecs.utf_16_encode,
+        decode=dec,
+        incrementalencoder=_Utf16IncrementalEncoder,
+        incrementaldecoder=lambda errors="strict": _FuncIncrementalDecoder(dec, errors),
+        name=name,
+        _is_text_encoding=True,
+    )
+
+
+def _utf_32_codecinfo(name="utf-32"):
+    dec = _codecs.utf_32_decode
+    return CodecInfo(
+        encode=_codecs.utf_32_encode,
+        decode=dec,
+        incrementalencoder=_Utf32IncrementalEncoder,
+        incrementaldecoder=lambda errors="strict": _FuncIncrementalDecoder(dec, errors),
+        name=name,
+        _is_text_encoding=True,
+    )
+
+
+# CPython's codec registry caches every successful lookup keyed by the
+# normalised name (`interp->codec_search_cache`). Returning the *same*
+# `CodecInfo` object across calls is observable: `test_io.test_illegal_decoder`
+# mutates a looked-up codec (`swap_attr(quopri, 'incrementaldecoder', …)`) and
+# relies on `TextIOWrapper`'s internal re-lookup seeing the change.
+_CODEC_CACHE = {}
+
+
 def lookup(encoding):
     encoding = encoding.lower()
+    # Explicit user/Rust-side registrations win and are always read fresh.
     if encoding in _USER_CODECS:
         return _USER_CODECS[encoding]
     if _normalise(encoding) in _USER_CODECS:
         return _USER_CODECS[_normalise(encoding)]
-    if _normalise(encoding) == "utf_8_sig":
+    cache_key = _normalise(encoding)
+    cached = _CODEC_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    info = _lookup_uncached(encoding)
+    _CODEC_CACHE[cache_key] = info
+    return info
+
+
+def _lookup_uncached(encoding):
+    norm = _normalise(encoding)
+    if norm == "utf_8_sig":
         return _utf_8_sig_codecinfo(encoding)
+    # The auto-BOM utf-16/utf-32 variants need a stateful incremental encoder
+    # (BOM emitted once); the explicit `_le`/`_be` variants are BOM-free and use
+    # the generic builtin path below.
+    if norm in ("utf_16", "utf16", "u16"):
+        return _utf_16_codecinfo(encoding)
+    if norm in ("utf_32", "utf32", "u32"):
+        return _utf_32_codecinfo(encoding)
     if encoding in _PURE_CODECS or _normalise(encoding) in _PURE_CODECS:
         key = encoding if encoding in _PURE_CODECS else _normalise(encoding)
         encode_fn, decode_fn = _PURE_CODECS[key]
-        return _make_codec(encoding, encode_fn, decode_fn)
+        # `rot_13`/`hex`/… are binary "transform" codecs: CPython marks them
+        # `_is_text_encoding=False`, so `io.TextIOWrapper(b, encoding="hex")`
+        # raises `LookupError("… is not a text encoding")`
+        # (`test_io.test_non_text_encoding_codecs_are_rejected`).
+        return _make_codec(encoding, encode_fn, decode_fn, _is_text_encoding=False)
     if encoding in _BUILTIN_NAMES or _normalise(encoding) in _BUILTIN_NAMES:
         key = encoding if encoding in _BUILTIN_NAMES else _normalise(encoding)
         enc_name, dec_name = _BUILTIN_NAMES[key]

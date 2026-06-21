@@ -2345,7 +2345,7 @@ fn os_chdir(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
-fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
     let obj = match args.first() {
         Some(o) => o,
         None => return Err(type_error("fspath() takes exactly one argument")),
@@ -3868,14 +3868,12 @@ fn os_write(args: &[Object]) -> Result<Object, RuntimeError> {
         // and hands the resulting memoryview straight to `os.write`; CPython
         // accepts any buffer-protocol object here, so materialise the view.
         Some(Object::MemoryView(mv)) => mv.to_bytes(),
-        // CPython's `os.write` requires a bytes-like object and rejects `str`
-        // (`test_os.FileTests.test_write`) — only the buffer protocol applies.
-        Some(other) => {
-            return Err(type_error(format!(
-                "a bytes-like object is required, not '{}'",
-                other.type_name()
-            )))
-        }
+        // CPython's `os.write` accepts *any* buffer-protocol object and rejects
+        // only non-buffers like `str` (`test_os.FileTests.test_write`). Route
+        // `array.array`, PEP 688 `__buffer__` exporters, and bytes/bytearray
+        // subclasses through the shared buffer-view extractor
+        // (`test_io.test_array_writes`).
+        Some(other) => crate::builtins::bytes_argview(other)?,
         None => return Err(type_error("write() takes exactly 2 positional arguments")),
     };
     #[cfg(unix)]

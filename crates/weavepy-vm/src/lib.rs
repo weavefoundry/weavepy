@@ -1165,6 +1165,26 @@ impl Interpreter {
                             | Object::Set(_)
                             | Object::MappingProxy(_)
                             | Object::SimpleNamespace(_)
+                            // An *untracked instance* (and `Cell`/`BoundMethod`
+                            // hop) can sit between `obj` and a tracked
+                            // finalizable just like an untracked container does.
+                            // The canonical case: a caught exception stashed on
+                            // an instance attribute — `unittest`'s
+                            // `_AssertRaisesContext.exception` — where the
+                            // `AttributeError` is itself untracked yet anchors
+                            // `AttributeError.obj` (a finalizable io temporary).
+                            // When the context manager is the sole holder,
+                            // dropping it frees the exception by `Rc`, which
+                            // drops the temporary to "GC handle only" —
+                            // refcount-dead but pinned by its own handle, and
+                            // invisible to the next cascade link unless we walk
+                            // into the untracked instance here
+                            // (`test_io.test_error_through_destructor`). The
+                            // refcount guard below still filters anything that
+                            // stays externally reachable.
+                            | Object::Instance(_)
+                            | Object::Cell(_)
+                            | Object::BoundMethod(_)
                     ) && scanned.insert(cid)
                     {
                         scan_through.push(c.clone());
@@ -2616,6 +2636,16 @@ impl Interpreter {
                             if exc.context.is_some() {
                                 Self::sync_exc_attrs(&exc);
                             }
+                        } else if exc.traceback.is_empty()
+                            && (exc.cause.is_some() || exc.context.is_some())
+                        {
+                            // A fresh Rust-raised error that already carries an
+                            // explicit `cause`/`context` (e.g. `_io` chaining a
+                            // misbehaving raw `readinto`'s `TypeError` into an
+                            // `OSError`, `test_bad_readinto_type`) must still
+                            // mirror those onto the instance dict so Python's
+                            // `except` sees `e.__cause__`.
+                            Self::sync_exc_attrs(&exc);
                         }
                         if crate::trace::any_observers_active() {
                             self.fire_exception_event(&py_frame, &exc)?;
@@ -2643,6 +2673,30 @@ impl Interpreter {
             }
         };
         self.pop_py_frame();
+        // A normally-returning frame is dead: CPython deallocates it the
+        // instant it returns, releasing every local by refcount. Drop the
+        // live-locals mirror (and any materialised `f_locals`) so a
+        // `PyFrame` snapshot that outlives the frame — even one reachable
+        // only through an *untracked* native edge the cycle collector
+        // can't see as garbage (a discarded exception's traceback, a
+        // not-yet-swept sibling) — can't pin the frame's locals. Holding
+        // them would inflate refcounts and, worse, defeat the prompt,
+        // refcount-driven finalization CPython guarantees: e.g. a worker's
+        // returned `executor.map`/`submit` frame whose `self` slot keeps a
+        // `del`'d `ThreadPoolExecutor` alive past its last binding, so the
+        // weakref callback that signals idle workers to exit never fires
+        // and `del executor; t.join()` deadlocks (RFC 0040
+        // `test_concurrent_futures.test_del_shutdown`). A *generator*
+        // suspension (`Yielded`) and the generator-creation bootstrap
+        // (`StartGenerator`) keep their mirror — the frame lives on and is
+        // re-entered — and an *exceptional* exit (`Err`) keeps it so the
+        // frame's `f_locals` stays readable while it sits in a traceback.
+        if matches!(result, Ok(FrameOutcome::Returned(_))) {
+            if let Some(mirror) = py_frame.locals_mirror.borrow().as_ref() {
+                mirror.borrow_mut().clear();
+            }
+            py_frame.invalidate_locals();
+        }
         // Reconcile the interpreter-wide handled-exception stack. When
         // control leaves an `except` / `finally` block *early* — a
         // `return` out of an `except`, or an exception propagating
@@ -3727,21 +3781,50 @@ impl Interpreter {
                 frame.push(Object::Cell(cell));
             }
             OpCode::LoadAttr => {
-                // `f().cr_frame`: the receiver temporary dies when the
-                // attribute load pops it — finalize promptly so a
-                // never-awaited coroutine warns here (bpo-45813).
-                let reap = match frame.stack.last() {
+                // The receiver temporary dies when the attribute load pops it,
+                // so finalize it promptly (CPython decrefs the receiver after
+                // the load, on *both* the success and failure paths). This
+                // makes `f().cr_frame` warn on a never-awaited coroutine
+                // (bpo-45813) and — crucially for a *failing* load like
+                // `io.BufferedReader(raw).xyzzy` — flushes/closes the discarded
+                // io temporary, routing a failing `close()` to
+                // `sys.unraisablehook` even though the receiver was already
+                // popped (`test_io.test_error_through_destructor`). Only
+                // finalizable receiver kinds are captured so the hot path pays
+                // at most one `Rc` bump.
+                let receiver = match frame.stack.last() {
                     Some(
                         o @ (Object::Generator(_)
                         | Object::Coroutine(_)
-                        | Object::AsyncGenerator(_)),
+                        | Object::AsyncGenerator(_)
+                        | Object::Instance(_)),
                     ) => Some(o.clone()),
                     _ => None,
                 };
-                let v = self.specialized_load_attr(frame, cache_pc, ins.arg)?;
-                frame.push(v);
-                if let Some(r) = reap {
-                    self.prompt_reap_dropped(r);
+                match self.specialized_load_attr(frame, cache_pc, ins.arg) {
+                    Ok(v) => {
+                        frame.push(v);
+                        if let Some(r) = receiver {
+                            // On success only the cheap gen/coro warning case
+                            // needs prompt finalization; `prompt_reap_dropped`
+                            // early-outs when the receiver is still live (the
+                            // common `self.attr` case keeps `self` alive).
+                            if matches!(
+                                r,
+                                Object::Generator(_)
+                                    | Object::Coroutine(_)
+                                    | Object::AsyncGenerator(_)
+                            ) {
+                                self.prompt_reap_dropped(r);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(r) = receiver {
+                            self.prompt_reap_dropped(r);
+                        }
+                        return Err(e);
+                    }
                 }
             }
             OpCode::StoreAttr => {
@@ -5906,12 +5989,31 @@ impl Interpreter {
                     // Only callables bind; plain values (`__doc__`
                     // strings, sentinels stored in a base's dict) are
                     // returned as-is, like CPython's generic getattr.
-                    return Ok(match f {
+                    match f {
                         Object::Function(_) | Object::Builtin(_) => {
-                            Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), f)))
+                            return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                                obj.clone(),
+                                f,
+                            ))));
                         }
-                        other => other,
-                    });
+                        // A property / getset surfaced from a *builtin base's
+                        // own type dict* was already consulted by the instance
+                        // lookup, which walks the full MRO and applies the
+                        // descriptor protocol. Reaching this rescue therefore
+                        // means the getter itself raised `AttributeError`;
+                        // propagate that (fall through to `result`) instead of
+                        // handing back the raw descriptor object. Without this,
+                        // `TextIOWrapper(BytesIO()).name` and the
+                        // `Buffered*.name` / `.mode` getsets leak a
+                        // `<property object>` over a nameless buffer, breaking
+                        // `tempfile.SpooledTemporaryFile.name`'s
+                        // `try: return self._file.name; except AttributeError:
+                        // return None` (and `repr`'s `name=` probe). Restricted
+                        // to instance receivers — class-level access
+                        // (`load_attr_type`) still returns the descriptor.
+                        Object::Property(_) if matches!(obj, Object::Instance(_)) => {}
+                        other => return Ok(other),
+                    }
                 }
             }
             // CPython's `PyObject_GetAttr` augments *any* propagating
@@ -6711,6 +6813,38 @@ impl Interpreter {
                             if !f.binary {
                                 return Ok(f.newlines_obj());
                             }
+                        }
+                        "_CHUNK_SIZE" => {
+                            // CPython's `TextIOWrapper._CHUNK_SIZE` (default
+                            // 8192) — the text read-chunk size. Only a real
+                            // text wrapper has one; binary streams and
+                            // `StringIO` raise `AttributeError`. A user-set
+                            // value (in `extra_attrs`) wins; else the default.
+                            // `test_io`'s `_default_chunk_size()` reads it off a
+                            // plain `open(path, "r")` (a monolithic text file).
+                            if f.io_kind.get() == crate::object::IoKind::Text {
+                                if let Some(v) = f.get_extra_attr(name) {
+                                    return Ok(v);
+                                }
+                                return Ok(Object::Int(8192));
+                            }
+                        }
+                        "__dict__" => {
+                            // CPython's concrete io objects (`FileIO`,
+                            // `BytesIO`, `StringIO`, `Buffered*`,
+                            // `TextIOWrapper`) carry an instance `__dict__` and
+                            // accept arbitrary attribute assignment. We keep
+                            // per-instance attributes in `extra_attrs`; surface
+                            // them as a dict so `hasattr(f, "__dict__")` and
+                            // `vars(f)` behave (`test_io.test_types_have_dict`).
+                            let mut d = crate::object::DictData::new();
+                            for (k, v) in f.extra_attrs.borrow().iter() {
+                                d.insert(
+                                    crate::object::DictKey(Object::from_str(k.clone())),
+                                    v.clone(),
+                                );
+                            }
+                            return Ok(Object::Dict(Rc::new(RefCell::new(d))));
                         }
                         _ => {}
                     }
@@ -10748,6 +10882,16 @@ impl Interpreter {
                     )))
                 }
             }
+            // A file *is* its own iterator (CPython `file.__next__`): `next(f)`
+            // yields the next line and raises `ValueError` on a closed stream
+            // (`test_io.test_io_after_close`).
+            Object::File(_) => match crate::builtins::file_next(std::slice::from_ref(iter)) {
+                Ok(v) => Ok(Some(v)),
+                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            },
             _ => Err(type_error(format!(
                 "'{}' object is not an iterator",
                 iter.type_name_owned()
@@ -14989,6 +15133,24 @@ impl Interpreter {
                         name
                     )))
                 }
+            }
+            // `del f.attr` on a file removes a per-instance attribute set via
+            // `setattr` (CPython files carry a `__dict__`). A user-assigned
+            // `f.name` override is likewise removable; intrinsic file names and
+            // unknown attributes raise `AttributeError` (never `TypeError`), so
+            // `test.support.swap_attr`'s `except AttributeError` cleanup works.
+            Object::File(f) => {
+                if f.delete_extra_attr(name) {
+                    return Ok(());
+                }
+                if name == "name" && f.clear_name_override() {
+                    return Ok(());
+                }
+                Err(attribute_error(format!(
+                    "'{}' object has no attribute '{}'",
+                    obj.type_name(),
+                    name
+                )))
             }
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
@@ -20629,6 +20791,15 @@ impl Interpreter {
             Object::File(f) => f.clone(),
             _ => return Err(type_error("writelines() requires a file receiver")),
         };
+        // `writelines([])` on a closed stream raises `ValueError` *before*
+        // inspecting the (empty) iterable (`test_io.test_io_after_close`);
+        // CPython's `CHECK_CLOSED` runs first.
+        crate::builtins::file_check_open(&file)?;
+        // A read-only stream raises `io.UnsupportedOperation` on `writelines`
+        // (`test_io.test_invalid_operations`), just like `write`.
+        if !file.writable() {
+            return Err(crate::stdlib::io::unsupported_op("write"));
+        }
         let iterable = args
             .first()
             .ok_or_else(|| type_error("writelines() takes exactly one argument"))?;
@@ -20640,6 +20811,12 @@ impl Interpreter {
                 }
                 Object::Bytes(b) => {
                     file.write_bytes(&b)?;
+                }
+                // A binary stream accepts any buffer-protocol item
+                // (`array.array`, `memoryview`, a PEP 688 `__buffer__`
+                // exporter), like CPython's `writelines`.
+                other if file.binary => {
+                    file.write_bytes(&crate::builtins::bytes_argview(&other)?)?;
                 }
                 other => {
                     return Err(type_error(format!(

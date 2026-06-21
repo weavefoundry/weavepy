@@ -684,19 +684,27 @@ pub fn run_one_with(
 /// since the `if __name__ == '__main__'` guard never fires on import.
 ///
 /// Returns `None` for bundled tests, which keep script semantics.
+/// The external CPython `Lib` directory for a vendored test file: the
+/// ancestor whose child is the `test` package the file lives in. This is
+/// the directory that must be on `sys.path` (and exported via
+/// `WEAVEPY_CPYTHON_LIB` so spawned child interpreters inherit it) for
+/// `import test.<name>` to resolve.
+fn cpython_lib_dir(file: &RegrtestFile) -> Option<String> {
+    file.label.strip_prefix("cpython/Lib/test/")?;
+    let mut lib_dir = file.path.parent()?;
+    while lib_dir.file_name().and_then(|n| n.to_str()) != Some("test") {
+        lib_dir = lib_dir.parent()?;
+    }
+    Some(lib_dir.parent()?.display().to_string())
+}
+
 fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
     let name = file
         .label
         .strip_prefix("cpython/Lib/test/")?
         .trim_end_matches(".py")
         .to_owned();
-    // `Lib` is the ancestor whose child is the `test` directory the
-    // file (or its package) lives in.
-    let mut lib_dir = file.path.parent()?;
-    while lib_dir.file_name().and_then(|n| n.to_str()) != Some("test") {
-        lib_dir = lib_dir.parent()?;
-    }
-    let lib_dir = lib_dir.parent()?.display().to_string();
+    let lib_dir = cpython_lib_dir(file)?;
     let path = file.path.display().to_string();
     Some(format!(
         r#"
@@ -818,6 +826,13 @@ fn run_subprocess(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.env("WEAVEPY_REGRTEST_CHILD", "1");
+    // Export the external CPython `Lib` dir so child interpreters spawned
+    // by the test (`assert_python_ok`, `multiprocessing` spawn,
+    // `subprocess` re-execs) inherit it on their default `sys.path` even
+    // under `-I`/`-E` (which strip `PYTHON*` but not this).
+    if let Some(lib_dir) = cpython_lib_dir(file) {
+        cmd.env("WEAVEPY_CPYTHON_LIB", lib_dir);
+    }
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

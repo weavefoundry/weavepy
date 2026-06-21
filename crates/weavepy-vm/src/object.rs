@@ -1156,6 +1156,69 @@ pub fn int_from_i128(v: i128) -> Object {
     }
 }
 
+/// Run any tripped Python signal handler on the main thread, mirroring
+/// `os::service_pending_signals`. Used by the buffered-write flush so an
+/// `EINTR` from a blocking `write(2)` runs the handler before retrying
+/// (PEP 475). A handler that raises (e.g. a `SIGALRM` doing `1/0`) returns
+/// that error here, so the flush abandons the write instead of looping.
+#[cfg(unix)]
+fn service_pending_signals_io() -> Result<(), RuntimeError> {
+    if !crate::gil::is_main_thread() || !crate::stdlib::signal_mod::signals_pending() {
+        return Ok(());
+    }
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the active builtin call on this (main) thread;
+        // the interpreter outlives this synchronous re-entrant call, matching
+        // the `os`/`select`/`_thread` blocking-signal pattern.
+        let interp = unsafe { &mut *ptr };
+        interp.run_pending_signals_public()?;
+    }
+    Ok(())
+}
+
+/// Write all of `data` to a raw descriptor, looping over partial writes and
+/// honouring PEP 475: release the GIL across each (possibly blocking)
+/// `write(2)` so peers run, and on `EINTR` run any tripped Python signal
+/// handler before retrying. A `SIGALRM` handler that raises then abandons a
+/// write blocked on a full pipe instead of looping forever — exactly what
+/// `test_io`'s `SignalsTest.test_interrupted_write_buffered` exercises (a
+/// buffered flush is one big `write` to a saturated pipe). The descriptor is
+/// borrowed, not owned, so the backing `File` must outlive the call.
+#[cfg(unix)]
+fn write_all_fd_intr(fd: std::os::unix::io::RawFd, data: &[u8]) -> Result<(), RuntimeError> {
+    let mut off = 0usize;
+    while off < data.len() {
+        let chunk = &data[off..];
+        let r = crate::gil::allow_threads_then(|| unsafe {
+            libc::write(fd, chunk.as_ptr().cast(), chunk.len())
+        });
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                service_pending_signals_io()?;
+                continue;
+            }
+            return Err(crate::error::io_error_to_py(&err));
+        }
+        // A 0-length `write` only happens for empty `chunk`, which the loop
+        // guard already excludes; treat a defensive 0 as completion.
+        if r == 0 {
+            break;
+        }
+        off += r as usize;
+        // Run pending Python signal handlers after *every* partial write, not
+        // just on `EINTR`. When a reader frees one byte of a saturated pipe,
+        // the blocked `write` returns a successful *partial* result rather
+        // than `EINTR` (see `test_io` `check_interrupted_write`); the buffered
+        // layer must still check signals so a `SIGALRM` handler that raises
+        // (`1/0`) surfaces here instead of re-blocking on the full pipe
+        // forever. A handler that raises returns its error and abandons the
+        // remaining write, exactly like CPython's buffered-writer flush.
+        service_pending_signals_io()?;
+    }
+    Ok(())
+}
+
 /// A loaded Python module: a name, an optional source filename, and
 /// a dict that doubles as `module.__dict__` and the globals namespace
 /// of code that runs *inside* the module.
@@ -2020,6 +2083,20 @@ pub struct PyFile {
     /// The buffer-full threshold for [`PyFile::write_buf`] (`open(...,
     /// buffering=N)`; `DEFAULT_BUFFER_SIZE` otherwise).
     pub buf_size: crate::sync::Cell<usize>,
+    /// BOM-once bookkeeping for a text stream using a BOM-prefixing codec
+    /// (`utf-16`/`utf-32`/`utf-8-sig`): `true` while the encoder is at the
+    /// start of the stream and the next write must emit the BOM. Cleared by the
+    /// first write (and re-set by `seek(0)`), so the BOM is written exactly once
+    /// — CPython's `encoding_start_of_stream` (`test_io` BOM/seek cases).
+    pub text_start_of_stream: crate::sync::Cell<bool>,
+    /// CPython `TextIOWrapper`'s `telling` flag. `next(f)` / `for line in f`
+    /// drives `__next__`, which disables `tell()` (it would otherwise have to
+    /// unwind the readahead snapshot): `tell()` raises
+    /// `OSError("telling position disabled by next() call")` until the iterator
+    /// is exhausted or an explicit `seek()` re-enables it. Text streams only —
+    /// a binary stream's `tell()` stays live during iteration
+    /// (`test_io.test_telling`). Defaults to `true`.
+    pub telling: crate::sync::Cell<bool>,
 }
 
 impl PyFile {
@@ -2047,6 +2124,8 @@ impl PyFile {
             seennl: crate::sync::Cell::new(0),
             write_buf: RefCell::new(Vec::new()),
             buf_size: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE),
+            text_start_of_stream: crate::sync::Cell::new(true),
+            telling: crate::sync::Cell::new(true),
         }
     }
 
@@ -2071,6 +2150,23 @@ impl PyFile {
             }
             std::mem::take(&mut *wb)
         };
+        // On Unix, drain to the descriptor through the PEP 475-aware loop:
+        // snapshot the raw fd under a *short* borrow, release it, then do the
+        // (possibly blocking, GIL-released) write. Holding `backend` across the
+        // write would deadlock a signal handler that touches the same file, and
+        // `write_all` would silently retry `EINTR` — never letting a `SIGALRM`
+        // handler raise — which is the `test_interrupted_write_buffered` hang.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let raw_fd = match &*self.backend.borrow() {
+                FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                _ => None,
+            };
+            if let Some(fd) = raw_fd {
+                return write_all_fd_intr(fd, &pending);
+            }
+        }
         let mut backend = self.backend.borrow_mut();
         if let FileBackend::Disk(f) = &mut *backend {
             use std::io::Write;
@@ -2109,6 +2205,32 @@ impl PyFile {
         } else {
             attrs.push((name.to_owned(), value));
         }
+    }
+
+    /// Delete a per-instance attribute (`del f.attr`); returns whether the
+    /// name was present. CPython's file objects carry a `__dict__`, so an
+    /// attribute set via `setattr` is removable again — `test.support.swap_attr`
+    /// relies on `delattr` succeeding (or raising `AttributeError`, never
+    /// `TypeError`) when restoring a monkeypatched method/`name`.
+    pub fn delete_extra_attr(&self, name: &str) -> bool {
+        let mut attrs = self.extra_attrs.borrow_mut();
+        if let Some(pos) = attrs.iter().position(|(k, _)| k == name) {
+            attrs.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a user-assigned `f.name` override (`del f.name`); returns whether
+    /// an override was present. Only the *user* override is cleared — a real
+    /// `FileIO`'s intrinsic path/fd name is not user-deletable (CPython's
+    /// `FileIO.name` getset has no deleter), so this leaves intrinsic names in
+    /// place and the caller raises `AttributeError`.
+    pub fn clear_name_override(&self) -> bool {
+        let had = self.name_override.borrow().is_some();
+        *self.name_override.borrow_mut() = None;
+        had
     }
 
     /// Reassign the Python-visible `name` (`f.name = ...`). Accepts any
@@ -2204,6 +2326,12 @@ impl PyFile {
                     *bf.name_override.borrow_mut() = Some(n.clone());
                 }
                 bf.name_is_bytes.set(self.name_is_bytes.get());
+                // `f.buffer.raw.closefd` must report the same ownership flag as
+                // the text wrapper it came from (`test_io.test_closefd_attr`):
+                // a stream opened `open(fd, ..., closefd=False)` does not own
+                // its descriptor.
+                bf.closefd.set(self.closefd.get());
+                bf.name_is_fd.set(self.name_is_fd.get());
                 Object::File(Rc::new(bf))
             }),
             _ => None,
@@ -2330,13 +2458,30 @@ impl PyFile {
         }
     }
 
-    /// `f.seekable()` — disk files and in-memory buffers support random
-    /// access; the live std streams do not.
+    /// `f.seekable()` — in-memory buffers always support random access; a
+    /// disk-backed stream is seekable only if the underlying descriptor is
+    /// (a regular file is, a pipe/FIFO/socket is not). CPython's `FileIO`
+    /// probes this with `lseek(fd, 0, SEEK_CUR)` and treats `ESPIPE` as
+    /// "not seekable" (`test_io.test_optional_abilities` over `os.pipe()`).
     pub fn seekable(&self) -> bool {
-        matches!(
-            &*self.backend.borrow(),
-            FileBackend::Disk(_) | FileBackend::MemBytes { .. } | FileBackend::MemText { .. }
-        )
+        match &*self.backend.borrow() {
+            FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => true,
+            FileBackend::Disk(_f) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = _f.as_raw_fd();
+                    // SEEK_CUR with a zero offset reports the position without
+                    // moving it, so this is a side-effect-free probe.
+                    unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) >= 0 }
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Set the text-mode codec. UTF-8 spellings collapse to the
@@ -2446,11 +2591,22 @@ impl PyFile {
     pub fn encode_text(&self, s: &str) -> Result<Vec<u8>, RuntimeError> {
         let translated = self.translate_newlines_write(s);
         let errors = self.errors_name();
-        match &*self.encoding.borrow() {
-            Some(enc) => crate::stdlib::codecs_mod::encode_str(&translated, enc, &errors),
-            None if errors == "strict" => Ok(translated.into_bytes()),
-            None => crate::stdlib::codecs_mod::encode_str(&translated, "utf-8", &errors),
-        }
+        let enc = match &*self.encoding.borrow() {
+            Some(enc) => enc.clone(),
+            None if errors == "strict" => return Ok(translated.into_bytes()),
+            None => "utf-8".to_owned(),
+        };
+        // BOM-once: a BOM-prefixing codec emits the BOM only on the first write
+        // to a stream positioned at its start; subsequent writes (and any write
+        // to a stream seeked off byte 0, e.g. append mode) use the BOM-less
+        // continuation codec (CPython `encoding_start_of_stream`).
+        let effective = match crate::stdlib::codecs_mod::bom_continuation(&enc) {
+            Some(cont) if !self.text_start_of_stream.get() => cont.to_owned(),
+            _ => enc.clone(),
+        };
+        let out = crate::stdlib::codecs_mod::encode_str(&translated, &effective, &errors)?;
+        self.text_start_of_stream.set(false);
+        Ok(out)
     }
 
     /// Decode a text-mode read through the file's codec, honouring the
@@ -2465,6 +2621,46 @@ impl PyFile {
             None => crate::stdlib::codecs_mod::decode_bytes(&bytes, "utf-8", &errors)?,
         };
         Ok(self.translate_newlines_read(decoded))
+    }
+
+    /// Read up to `n` Unicode *characters* from a text-mode stream (CPython
+    /// `TextIOWrapper.read(size)` / `StringIO.read(size)` count code points,
+    /// not bytes). In-memory text is already code-point addressed, so a single
+    /// sized `read_bytes` returns exactly `n` chars' worth of bytes; a byte
+    /// descriptor (`open(p)` over disk, stdin) is decoded one code point at a
+    /// time so a multibyte character is never split across the `n`-char
+    /// boundary — `open(p, encoding="utf-8").read(2)` over "héllo" yields "hé",
+    /// not a half-decoded 2-byte slice that raises a UTF-8 error.
+    pub fn read_text_n(&self, n: usize) -> Result<String, RuntimeError> {
+        if matches!(&*self.backend.borrow(), FileBackend::MemText { .. }) {
+            let bytes = self.read_bytes(Some(n))?;
+            return self.decode_text(bytes);
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut chars = 0usize;
+        while chars < n {
+            let lead = self.read_bytes(Some(1))?;
+            let Some(&b0) = lead.first() else {
+                break; // EOF
+            };
+            // UTF-8 lead byte → number of trailing continuation bytes. A stray
+            // continuation/invalid lead is taken as a lone byte; `decode_text`
+            // then applies the stream's configured error handler.
+            let extra = match b0 {
+                0x00..=0x7F => 0,
+                0xC0..=0xDF => 1,
+                0xE0..=0xEF => 2,
+                0xF0..=0xF7 => 3,
+                _ => 0,
+            };
+            bytes.extend_from_slice(&lead);
+            if extra > 0 {
+                let cont = self.read_bytes(Some(extra))?;
+                bytes.extend_from_slice(&cont);
+            }
+            chars += 1;
+        }
+        self.decode_text(bytes)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -2527,6 +2723,25 @@ impl PyFile {
                 }
             }
         }
+    }
+
+    /// Re-initialise a `FileIO` in place over a new descriptor. CPython's
+    /// `FileIO.__init__` may be called again on a live object to re-point it
+    /// at another fd (`test_io.test_fileio_closefd`). We first release the
+    /// current descriptor honouring the *current* `closefd` (so a
+    /// `closefd=False` stream never closes a borrowed fd), then adopt
+    /// `new_backend` under the supplied `closefd`. `mode`/`binary` are fixed
+    /// at construction, so a re-init that changes the access mode keeps the
+    /// original mode string (FileIO is always binary, so this only matters for
+    /// the rare read↔write re-init, which CPython itself rejects mid-stream).
+    pub fn reinit_fileio(&self, new_backend: FileBackend, closefd: bool) {
+        self.close();
+        *self.backend.borrow_mut() = new_backend;
+        self.closefd.set(closefd);
+        *self.closed.borrow_mut() = false;
+        self.write_buf.borrow_mut().clear();
+        self.text_start_of_stream.set(true);
+        *self.binary_buffer_cache.borrow_mut() = None;
     }
 
     /// Read up to `n` bytes from the backend; `None` reads everything.
@@ -2802,52 +3017,78 @@ impl PyFile {
         }
     }
 
+    /// `f.tell()` — like [`position`](Self::position) but surfaces the OS error
+    /// instead of swallowing it. CPython's `FileIO.tell` does an `lseek` and a
+    /// pipe/FIFO descriptor raises `OSError(ESPIPE)`, which
+    /// `test_io.test_optional_abilities` asserts for a non-seekable stream.
+    pub fn tell(&self) -> Result<usize, RuntimeError> {
+        let pending = self.write_buf.borrow().len();
+        match &mut *self.backend.borrow_mut() {
+            FileBackend::MemBytes { pos, .. } | FileBackend::MemText { pos, .. } => Ok(*pos),
+            FileBackend::Disk(f) => {
+                use std::io::Seek;
+                let p = f
+                    .stream_position()
+                    .map_err(|e| crate::error::io_error_to_py(&e))?;
+                Ok(p as usize + pending)
+            }
+            _ => Ok(0),
+        }
+    }
+
     /// Seek to absolute position. Returns the new position.
     pub fn seek(&self, offset: isize, whence: i32) -> Result<usize, RuntimeError> {
         self.check_open()?;
         // CPython's `BufferedWriter.seek` flushes the write buffer first so the
         // descriptor offset the seek is relative to is current.
         self.flush_write_buf()?;
-        let mut backend = self.backend.borrow_mut();
-        match &mut *backend {
-            FileBackend::MemBytes { data, pos } => {
-                let dlen = data.borrow().len();
-                let new_pos = match whence {
-                    0 => offset.max(0) as usize,
-                    1 => (*pos as isize + offset).max(0) as usize,
-                    2 => (dlen as isize + offset).max(0) as usize,
-                    _ => return Err(value_error("invalid whence")),
-                };
-                // CPython's in-memory streams allow seeking *past* the end
-                // (the next write zero-fills the gap); don't clamp to `dlen`.
-                *pos = new_pos;
-                Ok(*pos)
+        let result = {
+            let mut backend = self.backend.borrow_mut();
+            match &mut *backend {
+                FileBackend::MemBytes { data, pos } => {
+                    let dlen = data.borrow().len();
+                    let new_pos = match whence {
+                        0 => offset.max(0) as usize,
+                        1 => (*pos as isize + offset).max(0) as usize,
+                        2 => (dlen as isize + offset).max(0) as usize,
+                        _ => return Err(value_error("invalid whence")),
+                    };
+                    // CPython's in-memory streams allow seeking *past* the end
+                    // (the next write zero-fills the gap); don't clamp to `dlen`.
+                    *pos = new_pos;
+                    *pos
+                }
+                FileBackend::MemText { data, pos } => {
+                    let new_pos = match whence {
+                        0 => offset.max(0) as usize,
+                        1 => (*pos as isize + offset).max(0) as usize,
+                        2 => (data.len() as isize + offset).max(0) as usize,
+                        _ => return Err(value_error("invalid whence")),
+                    };
+                    *pos = new_pos.min(data.len());
+                    *pos
+                }
+                FileBackend::Disk(f) => {
+                    use std::io::Seek;
+                    let whence_pos = match whence {
+                        0 => std::io::SeekFrom::Start(offset.max(0) as u64),
+                        1 => std::io::SeekFrom::Current(offset as i64),
+                        2 => std::io::SeekFrom::End(offset as i64),
+                        _ => return Err(value_error("invalid whence")),
+                    };
+                    f.seek(whence_pos)
+                        .map_err(|e| os_error(format!("seek: {e}")))? as usize
+                }
+                _ => return Err(os_error("stream is not seekable")),
             }
-            FileBackend::MemText { data, pos } => {
-                let new_pos = match whence {
-                    0 => offset.max(0) as usize,
-                    1 => (*pos as isize + offset).max(0) as usize,
-                    2 => (data.len() as isize + offset).max(0) as usize,
-                    _ => return Err(value_error("invalid whence")),
-                };
-                *pos = new_pos.min(data.len());
-                Ok(*pos)
-            }
-            FileBackend::Disk(f) => {
-                use std::io::Seek;
-                let whence_pos = match whence {
-                    0 => std::io::SeekFrom::Start(offset.max(0) as u64),
-                    1 => std::io::SeekFrom::Current(offset as i64),
-                    2 => std::io::SeekFrom::End(offset as i64),
-                    _ => return Err(value_error("invalid whence")),
-                };
-                let n = f
-                    .seek(whence_pos)
-                    .map_err(|e| os_error(format!("seek: {e}")))?;
-                Ok(n as usize)
-            }
-            _ => Err(os_error("stream is not seekable")),
+        };
+        // BOM-once: seeking back to byte 0 returns a BOM-prefixing text encoder
+        // to the start of the stream (so the next write re-emits the BOM); any
+        // other position suppresses it (CPython's seek `encoding_start_of_stream`).
+        if !self.binary {
+            self.text_start_of_stream.set(result == 0);
         }
+        Ok(result)
     }
 
     /// `truncate(size=None)` — resize the stream to `size` bytes (or the
@@ -3402,7 +3643,17 @@ impl PyIterator {
             // Lazy file line. The error channel is `next_value_checked`
             // (used by FOR_ITER / `next()`); the rare internal drain that
             // calls `next_value` treats a read error as end-of-stream.
-            PyIterator::File { file } => file.readline_obj().ok().flatten(),
+            PyIterator::File { file } => {
+                let is_text = !file.binary;
+                if is_text {
+                    file.telling.set(false);
+                }
+                let line = file.readline_obj().ok().flatten();
+                if is_text && line.is_none() {
+                    file.telling.set(file.seekable());
+                }
+                line
+            }
             PyIterator::Set { set, index, .. } => {
                 let v = set.borrow().get_index(*index).map(|k| k.0.clone());
                 match v {
@@ -3528,7 +3779,18 @@ impl PyIterator {
         if let PyIterator::File { file } = self {
             // Surface read errors (OSError, decode errors) at the
             // user-visible `__next__` boundary instead of swallowing them.
-            return file.readline_obj();
+            // CPython's `TextIOWrapper.__next__` disables `tell()` for the
+            // duration of the iteration and restores it (to `seekable`) at
+            // EOF (`test_io.test_telling`); binary streams keep `tell()` live.
+            let is_text = !file.binary;
+            if is_text {
+                file.telling.set(false);
+            }
+            let line = file.readline_obj()?;
+            if is_text && line.is_none() {
+                file.telling.set(file.seekable());
+            }
+            return Ok(line);
         }
         Ok(self.next_value())
     }
@@ -4641,16 +4903,57 @@ impl Object {
                 "frozenset",
                 Rc::as_ptr(s).cast::<()>() as usize,
             ),
-            Object::File(file) => format!(
-                "<_io.{} name='{}' mode='{}'>",
-                if file.binary {
-                    "BufferedReader"
-                } else {
-                    "TextIOWrapper"
-                },
-                file.name,
-                file.mode
-            ),
+            Object::File(file) => {
+                // Faithful CPython `tp_repr` per io layer (`IoKind`):
+                //   BytesIO/StringIO  -> `<_io.BytesIO object at 0x..>` (no name)
+                //   FileIO            -> `<_io.FileIO name=.. mode='rb' closefd=True>`
+                //   Buffered*         -> `<_io.BufferedReader name=..>`
+                //   TextIOWrapper     -> `<_io.TextIOWrapper name=.. mode='r' encoding='..'>`
+                // The name is formatted with `repr` (`%R`): an fd is an
+                // unquoted int (`name=6`), a path a quoted str (`name='f'`).
+                match file.io_kind.get() {
+                    IoKind::BytesIO => {
+                        format!("<_io.BytesIO object at 0x{:x}>", Rc::as_ptr(file) as usize)
+                    }
+                    IoKind::StringIO => {
+                        format!("<_io.StringIO object at 0x{:x}>", Rc::as_ptr(file) as usize)
+                    }
+                    kind => {
+                        let name = file
+                            .name_obj()
+                            .map(|o| o.repr())
+                            .unwrap_or_else(|| format!("'{}'", file.name));
+                        match kind {
+                            IoKind::Raw => format!(
+                                "<_io.FileIO name={} mode='{}' closefd={}>",
+                                name,
+                                file.reported_mode(),
+                                if file.closefd.get() { "True" } else { "False" }
+                            ),
+                            IoKind::BufferedReader => {
+                                format!("<_io.BufferedReader name={name}>")
+                            }
+                            IoKind::BufferedWriter => {
+                                format!("<_io.BufferedWriter name={name}>")
+                            }
+                            IoKind::BufferedRandom => {
+                                format!("<_io.BufferedRandom name={name}>")
+                            }
+                            _ => {
+                                let enc = file
+                                    .encoding
+                                    .borrow()
+                                    .clone()
+                                    .unwrap_or_else(|| "utf-8".to_owned());
+                                format!(
+                                    "<_io.TextIOWrapper name={} mode='{}' encoding='{}'>",
+                                    name, file.mode, enc
+                                )
+                            }
+                        }
+                    }
+                }
+            }
             Object::Instance(inst) => {
                 // The `Ellipsis` / `NotImplemented` singletons render as
                 // fixed text — CPython's `ellipsis`/`NotImplementedType`

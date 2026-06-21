@@ -517,6 +517,23 @@ fn real_main() -> Result<ExitCode> {
         .map(PathBuf::from)
         .collect();
 
+    // `WEAVEPY_CPYTHON_LIB` points at an external stdlib `Lib` directory
+    // (the vendored CPython tree). Like a real interpreter that finds its
+    // stdlib relative to the executable, this is part of the *default*
+    // module search path: it is honoured even under `-I`/`-E` (it is not a
+    // `PYTHON*` variable, so isolation does not strip it) so child
+    // interpreters spawned via `sys.executable` — e.g. `assert_python_ok`,
+    // `multiprocessing` spawn, `subprocess` re-execs — can still import the
+    // stdlib and the `test` package. Unset in normal use, so this is a
+    // no-op outside the conformance harness.
+    if let Some(lib) = env::var_os("WEAVEPY_CPYTHON_LIB") {
+        for part in env::split_paths(&lib) {
+            if !part.as_os_str().is_empty() {
+                extra_path.push(part);
+            }
+        }
+    }
+
     if let Some(source) = cli.command.clone() {
         let mut argv = vec!["-c".to_owned()];
         argv.extend(cli.args.iter().cloned());

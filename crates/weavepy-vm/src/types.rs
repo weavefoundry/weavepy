@@ -472,6 +472,31 @@ impl TypeObject {
             {
                 bits |= HAVE_GC;
             }
+            // gh-89653: the `_io` classes were converted to *immutable heap
+            // types* (`PyType_FromModuleAndSpec`) in CPython 3.11+, so they
+            // report `HEAPTYPE` in addition to `IMMUTABLETYPE`. This is
+            // observable: `copyreg._reduce_ex` walks `__mro__` until a
+            // non-heap base, so without `HEAPTYPE` an `_io` subclass with
+            // `__getstate__`/`__setstate__` cannot pickle at protocols 0/1
+            // (`test_io.test_pickling_subclass`).
+            if matches!(
+                self.name.as_str(),
+                "FileIO"
+                    | "BytesIO"
+                    | "StringIO"
+                    | "BufferedReader"
+                    | "BufferedWriter"
+                    | "BufferedRandom"
+                    | "BufferedRWPair"
+                    | "TextIOWrapper"
+                    | "IncrementalNewlineDecoder"
+                    | "IOBase"
+                    | "RawIOBase"
+                    | "BufferedIOBase"
+                    | "TextIOBase"
+            ) {
+                bits |= HEAPTYPE;
+            }
         } else {
             bits |= HEAPTYPE | BASETYPE | HAVE_GC | MANAGED_WEAKREF;
             if self.has_managed_dict() {

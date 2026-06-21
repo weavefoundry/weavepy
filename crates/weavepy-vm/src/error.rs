@@ -459,6 +459,45 @@ pub fn blocking_io_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("BlockingIOError", message))
 }
 
+/// Construct the three-arg `BlockingIOError(errno, strerror, characters_written)`
+/// form whose third positional sets `.characters_written` (and leaves
+/// `.filename` unset), matching CPython's `oserror_init` special case. This is
+/// what `_io.BufferedWriter` raises on a partial non-blocking flush
+/// (`test_io.test_write_non_blocking`).
+pub fn blocking_io_error_written(
+    errno: i32,
+    strerror: &str,
+    characters_written: i64,
+) -> RuntimeError {
+    use crate::object::{DictKey, Object};
+    let pe = PyException::from_builtin("BlockingIOError", strerror.to_owned());
+    if let Object::Instance(inst) = &pe.instance {
+        let mut dict = inst.dict.borrow_mut();
+        dict.insert(
+            DictKey(Object::from_static("errno")),
+            Object::Int(i64::from(errno)),
+        );
+        dict.insert(
+            DictKey(Object::from_static("strerror")),
+            Object::from_str(strerror.to_owned()),
+        );
+        dict.insert(
+            DictKey(Object::from_static("characters_written")),
+            Object::Int(characters_written),
+        );
+        dict.insert(DictKey(Object::from_static("filename")), Object::None);
+        dict.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![
+                Object::Int(i64::from(errno)),
+                Object::from_str(strerror.to_owned()),
+                Object::Int(characters_written),
+            ]),
+        );
+    }
+    RuntimeError::PyException(pe)
+}
+
 pub fn broken_pipe_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("BrokenPipeError", message))
 }

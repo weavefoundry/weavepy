@@ -33,7 +33,6 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("__name__")),
             Object::from_static("_io"),
         );
-        let bt = crate::builtin_types::builtin_types();
 
         // Share the user-facing `io` module's IOBase hierarchy (RFC 0038) so
         // `_io.IOBase` carries the same working mixin methods
@@ -46,24 +45,32 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         let text_iobase = fam.text.clone();
         let fileio = fam.fileio.clone();
         install_closed_getset(&fileio);
-        // Functional buffered wrappers (shared with the user-facing `io`
-        // module): `_io.BufferedWriter(_io.BytesIO())` actually wraps and
-        // delegates, so the stdlib's `from _io import BufferedWriter` paths
-        // (and stream-capture helpers built on them) work.
-        let buffered_reader =
-            crate::stdlib::io::make_buffered("BufferedReader", buffered_iobase.clone());
-        let buffered_writer =
-            crate::stdlib::io::make_buffered("BufferedWriter", buffered_iobase.clone());
-        let buffered_random =
-            crate::stdlib::io::make_buffered("BufferedRandom", buffered_iobase.clone());
+        // Buffered wrappers and `TextIOWrapper`: take the *memoised* family
+        // objects (the same ones `class_of` reports for a native `Object::File`
+        // and the user-facing `io` module exports). This is load-bearing for
+        // identity — `io.BufferedReader is _io.BufferedReader` and, crucially,
+        // `type(open(p,'rb')) is io.BufferedReader` (the frozen `io.py`
+        // re-exports these `_io` names, and a native file's `class_of` must land
+        // on the very same object). `BufferedRWPair` has no native `Object::File`
+        // mapping, so it is still minted fresh.
+        let buffered_reader = fam.buffered_reader.clone();
+        let buffered_writer = fam.buffered_writer.clone();
+        let buffered_random = fam.buffered_random.clone();
         let buffered_rw =
             crate::stdlib::io::make_buffered("BufferedRWPair", buffered_iobase.clone());
-        // Functional `TextIOWrapper` (text layer over a binary buffer), shared
-        // with the user-facing `io` module so `from _io import TextIOWrapper`
-        // — used by CPython's `io.py` and the stdlib test harness — works.
-        let text_io_wrapper = crate::stdlib::io::make_text_io_wrapper(text_iobase.clone());
-        let incremental_newline =
-            make_protocol("IncrementalNewlineDecoder", vec![bt.object_.clone()]);
+        crate::stdlib::io::set_type_module(&buffered_rw, "_io");
+        let text_io_wrapper = fam.text_io_wrapper.clone();
+        // `BytesIO`/`StringIO` must be reachable as `_io.BytesIO`/`_io.StringIO`
+        // (the same memoised objects `class_of` reports), so `pickle` — which
+        // serialises an in-memory stream by reference to `_io.BytesIO` — can
+        // resolve the class on load. `io.BytesIO is _io.BytesIO` then holds too.
+        let bytes_io = fam.bytes_io.clone();
+        let string_io = fam.string_io.clone();
+        // A functional `IncrementalNewlineDecoder` (native port of
+        // `_pyio.IncrementalNewlineDecoder`): `decode`/`getstate`/`setstate`/
+        // `reset`/`newlines` all work, matching CPython's C accelerator so
+        // `CIncrementalNewlineDecoderTest` passes alongside the `Py` twin.
+        let incremental_newline = crate::stdlib::io::make_incremental_newline_decoder();
         // Use the *canonical* `io.UnsupportedOperation` type (the memoised one
         // raised by the native IO methods via `io::unsupported_op`), so that
         // `isinstance(exc, io.UnsupportedOperation)` holds for errors raised by
@@ -78,6 +85,8 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             ("BufferedIOBase", &buffered_iobase),
             ("TextIOBase", &text_iobase),
             ("FileIO", &fileio),
+            ("BytesIO", &bytes_io),
+            ("StringIO", &string_io),
             ("BufferedReader", &buffered_reader),
             ("BufferedWriter", &buffered_writer),
             ("BufferedRandom", &buffered_random),
@@ -168,6 +177,10 @@ fn install_closed_getset(ty: &Rc<TypeObject>) {
         .insert(DictKey(Object::from_static("closed")), prop);
 }
 
+// Retained for symmetry with the other `_io` ABC stubs even though every
+// concrete `_io` type is now built with real methods; kept so re-adding a
+// protocol-only class stays a one-liner.
+#[allow(dead_code)]
 fn make_protocol(name: &'static str, bases: Vec<Rc<TypeObject>>) -> Rc<TypeObject> {
     let mut td = DictData::new();
     // Default abstract methods — concrete impls supply real bodies.
@@ -351,20 +364,35 @@ fn file_from_fd(fd_obj: &Object, mode: &str, name: String) -> Result<Object, Run
         use crate::object::{FileBackend, PyFile};
         use std::os::unix::io::FromRawFd;
         let fd = i32::try_from(fd).map_err(|_| value_error("file descriptor out of range"))?;
+        // CPython's `FileIO.__init__` `fstat()`s the descriptor and raises
+        // `OSError(EBADF)` when it is not a live fd. This is how a custom
+        // `opener` that returns a stale/closed descriptor is rejected
+        // (`test_io.test_opener_invalid_fd`) instead of silently wrapping a
+        // dead fd. Do this *before* `from_raw_fd` so we never take ownership
+        // of (and later `close(2)`) a descriptor we don't own.
+        {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                return Err(crate::error::io_error_to_py(
+                    &std::io::Error::last_os_error(),
+                ));
+            }
+        }
         // SAFETY: ownership of the fd transfers to the new File; the
         // descriptor came from `os.open`/`opener` and is closed exactly
         // once when the PyFile drops.
         let f = unsafe { std::fs::File::from_raw_fd(fd) };
-        let display = if name.is_empty() {
-            fd.to_string()
-        } else {
-            name
-        };
-        Ok(Object::File(Rc::new(PyFile::new(
-            display,
-            mode,
-            FileBackend::Disk(f),
-        ))))
+        let from_bare_fd = name.is_empty();
+        let display = if from_bare_fd { fd.to_string() } else { name };
+        let pyfile = PyFile::new(display, mode, FileBackend::Disk(f));
+        // A file opened over a bare integer descriptor reports the fd *as an
+        // int* for `f.name` (CPython's `FileIO.name` is the original argument):
+        // `open(fd, ...).name == fd` (`test_io.test_attributes`). A path-opened
+        // file keeps its string name.
+        if from_bare_fd {
+            pyfile.name_is_fd.set(true);
+        }
+        Ok(Object::File(Rc::new(pyfile)))
     }
     #[cfg(not(unix))]
     {
@@ -404,6 +432,12 @@ fn apply_text_config(
         f.set_errors(err);
     }
     if let Some(Object::Str(nl)) = newline {
+        // CPython validates the newline argument eagerly in `open()`/the
+        // `TextIOWrapper` constructor: only `''`, `'\n'`, `'\r'`, `'\r\n'`
+        // (and `None`) are legal.
+        if !matches!(nl.as_ref(), "" | "\n" | "\r" | "\r\n") {
+            return Err(value_error(format!("illegal newline value: {}", nl.as_ref())));
+        }
         f.set_newline(Some(nl));
     }
     Ok(())
@@ -430,14 +464,26 @@ pub(crate) fn validate_text_encoding(encoding: &str) -> Result<(), RuntimeError>
     let Ok(lookup) = interp.load_attr_public(&codecs, "lookup") else {
         return Ok(());
     };
-    interp.call_object(lookup, &[Object::from_str(encoding)], &[])?;
+    let info = interp.call_object(lookup, &[Object::from_str(encoding)], &[])?;
+    // CPython opens text streams through `_PyCodec_LookupTextEncoding`, which
+    // rejects a codec whose `CodecInfo._is_text_encoding` is `False` (the
+    // binary transforms `hex`/`base64`/`quopri`/`bz2`): `LookupError("<name> is
+    // not a text encoding; use codecs.open() to handle arbitrary codecs")`
+    // (`test_io.test_non_text_encoding_codecs_are_rejected`).
+    if let Ok(flag) = interp.load_attr_public(&info, "_is_text_encoding") {
+        if !flag.is_truthy() {
+            return Err(crate::error::lookup_error(format!(
+                "{encoding} is not a text encoding; use codecs.open() to handle arbitrary codecs"
+            )));
+        }
+    }
     Ok(())
 }
 
 /// Parse the `buffering` argument (`open()` positional index 2). A missing
 /// or non-integer slot is the default policy (`-1`), matching how the rest of
 /// `io_open` tolerates absent/`None` slots.
-fn buffering_arg(arg: Option<&Object>) -> i64 {
+pub(crate) fn buffering_arg(arg: Option<&Object>) -> i64 {
     match arg {
         Some(Object::Int(n)) => *n,
         Some(Object::Bool(b)) => i64::from(*b),
@@ -451,7 +497,11 @@ fn buffering_arg(arg: Option<&Object>) -> i64 {
 /// mode is *not* line buffering, so `open()` warns and falls back to the
 /// default block buffer (`_pyio.open`, `test_subprocess`
 /// `test_bufsize_equal_one_binary_mode` / `test_io_unbuffered_works`).
-fn apply_buffering(file: &Object, buffering: i64, binary: bool) -> Result<(), RuntimeError> {
+pub(crate) fn apply_buffering(
+    file: &Object,
+    buffering: i64,
+    binary: bool,
+) -> Result<(), RuntimeError> {
     if buffering == 0 {
         if !binary {
             return Err(value_error("can't have unbuffered text I/O"));
@@ -479,6 +529,31 @@ fn apply_buffering(file: &Object, buffering: i64, binary: bool) -> Result<(), Ru
         }
     }
     Ok(())
+}
+
+/// Resolve an `open()` path argument to a filesystem `String`, mirroring
+/// CPython's `os.fspath()` (str/bytes pass through, an `os.PathLike` has its
+/// `__fspath__()` called, anything else is a `TypeError`, and `__fspath__`
+/// raising propagates) plus the embedded-NUL guard CPython applies before
+/// touching the OS (`ValueError: embedded null byte`). A `bytes` path is
+/// decoded with the filesystem encoding (UTF-8 here).
+fn coerce_open_path(obj: &Object) -> Result<String, RuntimeError> {
+    let resolved = crate::stdlib::os::os_fspath(std::slice::from_ref(obj))?;
+    let s = match resolved {
+        Object::Str(s) => s.to_string(),
+        Object::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        // `os_fspath` only ever returns `str`/`bytes`.
+        other => {
+            return Err(type_error(format!(
+                "expected str, bytes or os.PathLike object, not {}",
+                other.type_name()
+            )))
+        }
+    };
+    if s.as_bytes().contains(&0) {
+        return Err(value_error("embedded null byte"));
+    }
+    Ok(s)
 }
 
 pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -512,13 +587,7 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         return Ok(file);
     }
     let path = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
-        Some(other) => {
-            return Err(type_error(format!(
-                "open: path must be str, not '{}'",
-                other.type_name()
-            )))
-        }
+        Some(obj) => coerce_open_path(obj)?,
         None => return Err(type_error("open() requires a path")),
     };
     let mode = match args.get(1) {
@@ -532,6 +601,19 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     crate::builtins::validate_open_mode(&mode)?;
+    // `closefd=False` (positional slot 6) is only meaningful for the
+    // `open(fd, …)` form handled above; with a *path* CPython's `FileIO`
+    // raises `ValueError` before touching the filesystem (`test_io`'s
+    // `test_closefd` / `test_no_closefd_with_filename`).
+    let closefd = match args.get(6) {
+        None | Some(Object::None) => true,
+        Some(Object::Bool(b)) => *b,
+        Some(Object::Int(n)) => *n != 0,
+        _ => true,
+    };
+    if !closefd {
+        return Err(value_error("Cannot use closefd=False with file name"));
+    }
     // PEP 578 — `open(file, mode, flags)` audit event.
     crate::stdlib::sys::audit_event(
         "open",
@@ -562,6 +644,16 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
     let backend = FileBackend::Disk(f);
     let file = Object::File(Rc::new(PyFile::new(path, mode, backend)));
+    // CPython's `FileIO` explicitly seeks an append-mode stream to the end at
+    // open (`fileio.c`), so `tell()` reports the file size immediately. This is
+    // what makes a BOM-prefixing encoder over a *non-empty* file opened in `'a'`
+    // skip re-emitting the BOM (`test_io.test_append_bom`): the seek sets the
+    // text start-of-stream flag from the resulting non-zero position.
+    if appending {
+        if let Object::File(f) = &file {
+            let _ = f.seek(0, 2);
+        }
+    }
     // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
     apply_text_config(&file, args.get(3), args.get(4), args.get(5))?;
     apply_buffering(&file, buffering_arg(args.get(2)), binary)?;

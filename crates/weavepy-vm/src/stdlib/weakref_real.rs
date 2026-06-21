@@ -251,9 +251,18 @@ fn ref_type_hash(args: &[Object]) -> Result<Object, RuntimeError> {
             "descriptor '__hash__' requires a 'weakref' object",
         ));
     };
-    let cache_key = DictKey(Object::from_static("__hash_cache__"));
-    if let Some(h) = inst.dict.borrow().get(&cache_key).cloned() {
-        return Ok(h);
+    // Consult the *same* memo the `DictKey` fast path uses
+    // (`weakref_native_hash`, which caches the referent hash in
+    // `inst.hash_cache`). This is what keeps a ref hashable across OS
+    // threads: `ref_type()` is thread-local, so a ref minted on one thread
+    // fails the native path's `Rc::ptr_eq(cls, ref_type())` identity check
+    // on another and falls through to this method. Without sharing the
+    // `Cell` here it would re-hash a now-dead referent and spuriously raise
+    // "weak object has gone away" — exactly `WeakSet._remove`'s
+    // `data.discard(ref)` firing on the executor / manager thread during
+    // `ProcessPoolExecutor`/`Manager` teardown.
+    if let Some(h) = inst.hash_cache.get() {
+        return Ok(Object::Int(h));
     }
     let target = wrapper_referent(me)
         .flatten()
@@ -266,7 +275,12 @@ fn ref_type_hash(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         crate::builtins::hash_object(&target)?
     };
-    inst.dict.borrow_mut().insert(cache_key, h.clone());
+    // Memoise in the native `Cell` (shared with `weakref_native_hash`) so
+    // every later probe — on any thread, via either hash path — agrees on
+    // the bucket and a dead ref stays discardable.
+    if let Some(hv) = h.as_i64() {
+        inst.hash_cache.set(Some(hv));
+    }
     Ok(h)
 }
 
@@ -502,7 +516,7 @@ fn new_ref(args: &[Object]) -> Result<Object, RuntimeError> {
     if !supports_weakref(&target) {
         return Err(type_error(format!(
             "cannot create weak reference to '{}' object",
-            target.type_name()
+            target.type_name_owned()
         )));
     }
     let callback = extract_callback(args.get(1));
@@ -539,7 +553,7 @@ fn new_proxy(args: &[Object]) -> Result<Object, RuntimeError> {
     if !supports_weakref(&target) {
         return Err(type_error(format!(
             "cannot create weak reference to '{}' object",
-            target.type_name()
+            target.type_name_owned()
         )));
     }
     let callback = extract_callback(args.get(1));
@@ -698,6 +712,19 @@ pub(crate) fn supports_weakref(target: &Object) -> bool {
     // them). They're builtin types with an all-builtin MRO, so the loop
     // below would otherwise reject them.
     if matches!(cls.name.as_str(), "lock" | "RLock" | "_ThreadHandle") {
+        return true;
+    }
+    // CPython's `_io._IOBase` carries a `tp_weaklistoffset`, so every io
+    // object — `FileIO`/`Buffered*`/`TextIOWrapper` and any user subclass —
+    // is weakly referenceable (`test_io` gc/`test_weakref_clearing`). The
+    // whole io tower is rooted at one of these (immutable, all-builtin) ABCs,
+    // so checking the MRO names covers both the native types and subclasses.
+    if cls.mro.borrow().iter().any(|t| {
+        matches!(
+            t.name.as_str(),
+            "IOBase" | "RawIOBase" | "BufferedIOBase" | "TextIOBase"
+        )
+    }) {
         return true;
     }
     let mro = cls.mro.borrow().clone();

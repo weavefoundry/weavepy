@@ -750,10 +750,37 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         },
         Object::File(f) => match name {
             "read" => Some(method("read", file_read)),
+            // `read1` is a *buffered* method (`BufferedReader`/`BufferedWriter`/
+            // `BufferedRandom` all expose it via `BufferedIOBase`; a raw `FileIO`
+            // genuinely lacks it). Route File-backed buffered streams to
+            // `file_read` so a closed stream raises `ValueError` rather than the
+            // class-dict `bw_read1` rejecting the `Object::File` receiver
+            // (`test_io.test_io_after_close`).
+            "read1"
+                if matches!(
+                    f.io_kind.get(),
+                    crate::object::IoKind::BufferedReader
+                        | crate::object::IoKind::BufferedWriter
+                        | crate::object::IoKind::BufferedRandom
+                ) =>
+            {
+                Some(method("read1", file_read))
+            }
             // Binary streams only — CPython text files genuinely lack the
             // attribute (it lives on RawIOBase/BufferedIOBase).
             "readinto" if f.binary => Some(method("readinto", file_readinto)),
             "readinto1" if f.binary => Some(method("readinto1", file_readinto)),
+            // `peek` is a buffered-reader method (CPython exposes it on
+            // `BufferedReader`/`BufferedRandom` only — a raw `FileIO`, a
+            // write-only `BufferedWriter`, or a text stream genuinely lacks it).
+            "peek"
+                if matches!(
+                    f.io_kind.get(),
+                    crate::object::IoKind::BufferedReader | crate::object::IoKind::BufferedRandom
+                ) =>
+            {
+                Some(method("peek", file_peek))
+            }
             "truncate" => Some(method("truncate", file_truncate)),
             "readline" => Some(method("readline", file_readline)),
             "readlines" => Some(method("readlines", file_readlines)),
@@ -778,25 +805,22 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             // `RawIOBase.readall` (binary only) — `_pyio.BufferedReader` uses it
             // for a full read of the wrapped native raw.
             "readall" if f.binary => Some(method("readall", file_readall)),
-            // In-memory `BytesIO`/`StringIO` are copyable in CPython (real file
-            // streams are not). `copy.deepcopy(x)` looks up `__deepcopy__` on the
-            // *instance*, so exposing it here lets `copy.copy`/`copy.deepcopy`
-            // (e.g. `test_tarfile`'s `NoneInfoTests`, which deep-copies a TarInfo
-            // carrying a `BytesIO`) produce an independent buffer at the same
-            // stream position instead of raising `cannot pickle`.
-            "__copy__" | "__deepcopy__"
-                if matches!(
-                    &*f.backend.borrow(),
-                    crate::object::FileBackend::MemBytes { .. }
-                        | crate::object::FileBackend::MemText { .. }
-                ) =>
-            {
-                Some(method("__deepcopy__", file_copy_mem))
+            // In-memory `BytesIO`/`StringIO` streams are picklable and copyable;
+            // `file_reduce_mem`/`file_getstate_mem` fall back to the forbidding
+            // reducer for file-backed streams, which CPython refuses to pickle
+            // (`TypeError: cannot pickle '_io.X' object`). `copy.copy`/
+            // `copy.deepcopy` deliberately route through `__reduce_ex__` too
+            // (no `__copy__`/`__deepcopy__` shortcut): the reduce path mints a
+            // fresh, independent buffer via `cls()` + `__setstate__` and — for a
+            // subclass — preserves the user's type and `__dict__` (the
+            // native-method binding loses the instance wrapper, so a `__copy__`
+            // shortcut would silently downcast to a bare `BytesIO`).
+            "__reduce__" => Some(method("__reduce__", file_reduce_mem)),
+            "__reduce_ex__" => Some(method("__reduce_ex__", file_reduce_mem)),
+            "__getstate__" => Some(method("__getstate__", file_getstate_mem)),
+            "__setstate__" if f.is_memory() => {
+                Some(method("__setstate__", file_setstate_mem))
             }
-            // Real file streams are unpicklable (CPython raises TypeError).
-            "__reduce__" => Some(method("__reduce__", file_reduce_forbidden)),
-            "__reduce_ex__" => Some(method("__reduce_ex__", file_reduce_forbidden)),
-            "__getstate__" => Some(method("__getstate__", file_reduce_forbidden)),
             "seek" => Some(method("seek", file_seek)),
             "tell" => Some(method("tell", file_tell)),
             "getvalue" => Some(method("getvalue", file_getvalue)),
@@ -808,7 +832,14 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             // A file is its own iterator (CPython): `iter(f) is f`, and
             // each `next(f)` returns the next line, raising StopIteration
             // at EOF.
-            "__iter__" => Some(method("__iter__", |args| file_self(args).map(Object::File))),
+            "__iter__" => Some(method("__iter__", |args| {
+                let f = file_self(args)?;
+                // Iterating a closed stream raises (`test_io.test_io_after_close`).
+                if *f.closed.borrow() {
+                    return Err(value_error("I/O operation on closed file."));
+                }
+                Ok(Object::File(f))
+            })),
             "__next__" => Some(method("__next__", file_next)),
             _ => None,
         },
@@ -5424,9 +5455,11 @@ pub(crate) fn validate_open_mode(mode: &str) -> Result<bool, RuntimeError> {
         return Err(value_error("can't have text and binary mode at once"));
     }
     if u8::from(creating) + u8::from(reading) + u8::from(writing) + u8::from(appending) > 1 {
-        return Err(value_error(
-            "can't have read/write/create/append mode at once",
-        ));
+        // CPython's `_io.open` (and `_pyio.open`) word this exactly as
+        // "can't have read/write/append mode at once" — `test_io`
+        // (`test_fspath_support`) matches the message against
+        // `'read/write/append mode'`.
+        return Err(value_error("can't have read/write/append mode at once"));
     }
     if !(creating || reading || writing || appending) {
         return Err(value_error(
@@ -5491,7 +5524,18 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
                 file.set_newline(Some(nl));
             }
         }
-        return Ok(Object::File(Rc::new(file)));
+        let binary = file.binary;
+        let file_obj = Object::File(Rc::new(file));
+        // CPython's `open` *is* `io.open`, so the buffering policy applies here
+        // too: `buffering=0` downgrades a binary stream to the raw `FileIO`
+        // layer (and rejects unbuffered text), `buffering=1` on a binary stream
+        // warns, and `buffering>N` sizes the buffer.
+        crate::stdlib::io_full::apply_buffering(
+            &file_obj,
+            crate::stdlib::io_full::buffering_arg(args.get(2)),
+            binary,
+        )?;
+        return Ok(file_obj);
     }
     let (path, name_is_bytes) = open_path_arg(&args[0])?;
     let mut opts = OpenOptions::new();
@@ -5552,7 +5596,16 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
             file.set_newline(Some(nl));
         }
     }
-    Ok(Object::File(Rc::new(file)))
+    let binary = file.binary;
+    let file_obj = Object::File(Rc::new(file));
+    // `buffering` policy (see the fd path above): `0` → raw `FileIO`
+    // (binary only), `1` on binary warns, `>1` sizes the buffer.
+    crate::stdlib::io_full::apply_buffering(
+        &file_obj,
+        crate::stdlib::io_full::buffering_arg(args.get(2)),
+        binary,
+    )?;
+    Ok(file_obj)
 }
 
 pub(crate) fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -6220,7 +6273,27 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Module(_) => bt.module_.clone(),
         Object::SlotDescriptor(_) => bt.member_descriptor_.clone(),
         Object::Code(_) => bt.code_.clone(),
-        Object::Cell(_) | Object::File(_) => bt.object_.clone(),
+        Object::Cell(_) => bt.object_.clone(),
+        // A native stream reports the faithful CPython io layer for its
+        // `IoKind` (`type(open(p,'rb')) is io.BufferedReader`,
+        // `type(io.BytesIO()) is io.BytesIO`). These are the very type objects
+        // the `io` module exports (both come from the memoised `IoFamily`), so
+        // identity and `isinstance`-via-MRO hold. Attribute access on a file is
+        // resolved by its own `Object::File` arm, *not* this class's dict, so
+        // reporting a rich type here never changes method resolution.
+        Object::File(f) => {
+            use crate::object::IoKind;
+            let fam = crate::stdlib::io::build_iobase_family();
+            match f.io_kind.get() {
+                IoKind::Raw => fam.fileio.clone(),
+                IoKind::BufferedReader => fam.buffered_reader.clone(),
+                IoKind::BufferedWriter => fam.buffered_writer.clone(),
+                IoKind::BufferedRandom => fam.buffered_random.clone(),
+                IoKind::Text => fam.text_io_wrapper.clone(),
+                IoKind::BytesIO => fam.bytes_io.clone(),
+                IoKind::StringIO => fam.string_io.clone(),
+            }
+        }
         Object::Frame(_) => bt.frame_.clone(),
         Object::Traceback(_) => bt.traceback_.clone(),
     }
@@ -6921,6 +6994,20 @@ fn b_next(args: &[Object]) -> Result<Object, RuntimeError> {
         match it.borrow_mut().next_value_checked()? {
             Some(v) => Ok(v),
             None => default.ok_or_else(stop_iteration),
+        }
+    } else if matches!(it, Object::File(_)) {
+        // A file *is* its own iterator in CPython (`file.__next__` yields the
+        // next line); `next(f)` must drive `__next__` directly, including the
+        // `ValueError` on a closed stream (`test_io.test_io_after_close`). The
+        // optional default still suppresses the EOF `StopIteration`.
+        match file_next(std::slice::from_ref(it)) {
+            Ok(v) => Ok(v),
+            Err(RuntimeError::PyException(pe))
+                if default.is_some() && pe.type_name() == "StopIteration" =>
+            {
+                Ok(default.unwrap())
+            }
+            Err(e) => Err(e),
         }
     } else {
         Err(type_error(format!(
@@ -9133,7 +9220,7 @@ fn with_bytes_data<R>(
     }
 }
 
-fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
+pub(crate) fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
     match arg {
         Object::Bytes(b) => Ok(b.to_vec()),
         Object::ByteArray(b) => Ok(b.borrow().clone()),
@@ -10783,18 +10870,96 @@ pub(crate) fn file_self(args: &[Object]) -> Result<Rc<crate::object::PyFile>, Ru
     }
 }
 
+/// CPython's `CHECK_CLOSED`: an I/O method on a closed stream raises
+/// `ValueError("I/O operation on closed file.")` (`test_io.test_io_after_close`).
+pub(crate) fn file_check_open(f: &Rc<crate::object::PyFile>) -> Result<(), RuntimeError> {
+    if *f.closed.borrow() {
+        return Err(value_error("I/O operation on closed file."));
+    }
+    Ok(())
+}
+
 pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    // A stream opened write-only (`'w'`, `'a'`, `'x'`, `'wb'`, …) raises
+    // `io.UnsupportedOperation` on `read`, not a raw `OSError(EBADF)` from the
+    // kernel (`test_io.test_invalid_operations`). CPython gates this in the
+    // buffered/raw layer before touching the fd.
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("read"));
+    }
     let n = match args.get(1) {
         Some(Object::Int(i)) if *i >= 0 => Some(*i as usize),
         None | Some(Object::None) | Some(Object::Int(-1)) => None,
         _ => return Err(type_error("read() argument must be int")),
     };
-    let bytes = f.read_bytes(n)?;
     if f.binary {
-        Ok(Object::new_bytes(bytes))
+        Ok(Object::new_bytes(f.read_bytes(n)?))
+    } else if let Some(count) = n {
+        // Text `read(size)` counts *characters*, not bytes (CPython
+        // `TextIOWrapper`/`StringIO`); read code-point-wise so a multibyte
+        // char is never split at the size boundary.
+        Ok(Object::from_str(f.read_text_n(count)?))
     } else {
-        Ok(Object::from_str(f.decode_text(bytes)?))
+        Ok(Object::from_str(f.decode_text(f.read_bytes(None)?)?))
+    }
+}
+
+/// `BufferedReader.peek([size])` — return buffered bytes without advancing the
+/// stream position. CPython returns "an arbitrary amount of data, at least one
+/// byte unless EOF, possibly more than requested"; for WeavePy's OS-buffered
+/// file-backed reader we materialise up to a buffer's worth, then restore the
+/// position. Only reachable on binary buffered readers (`peek` is in the file
+/// method table only for `f.binary` readers).
+pub(crate) fn file_peek(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    file_check_open(&f)?;
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("peek"));
+    }
+    let pos = f.tell()?;
+    let chunk = f.read_bytes(Some(crate::object::DEFAULT_BUFFER_SIZE))?;
+    f.seek(pos as isize, 0)?;
+    Ok(Object::new_bytes(chunk))
+}
+
+/// The native `bytearray` backing an instance (a `bytearray` subclass), if
+/// any — used to prefer the direct-mutation path over `__buffer__`.
+fn inst_native_bytearray(obj: &Object) -> Option<crate::sync::Rc<RefCell<Vec<u8>>>> {
+    match obj {
+        Object::ByteArray(b) => Some(b.clone()),
+        Object::Instance(inst) => match &inst.native {
+            Some(Object::ByteArray(b)) => Some(b.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Acquire a writable `memoryview` over a PEP 688 buffer exporter by calling
+/// its `__buffer__` (the writable request flag). Returns `Ok(None)` when the
+/// object has no `__buffer__` so the caller can fall through to its
+/// "must be read-write bytes-like" error.
+fn acquire_writable_view(
+    obj: &Object,
+) -> Result<Option<crate::sync::Rc<crate::object::PyMemoryView>>, RuntimeError> {
+    let Some(method) = crate::instance_method(obj, "__buffer__") else {
+        return Ok(None);
+    };
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Ok(None);
+    };
+    // SAFETY: published by an enclosing VM frame still live on this thread;
+    // the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    // `inspect.BufferFlags.WRITABLE` is `0x200`; an exporter that can't
+    // satisfy a writable request raises, which propagates as CPython's does.
+    let r = interp.call_object_with_globals(&method, &[Object::Int(0x200)], &[], &globals)?;
+    match r {
+        Object::MemoryView(mv) => Ok(Some(mv)),
+        _ => Ok(None),
     }
 }
 
@@ -10803,6 +10968,10 @@ pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
 /// on binary-mode files (the method table gates on `f.binary`).
 pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("read"));
+    }
     // A writable `memoryview` is a valid target (CPython's `readinto`
     // accepts any read-write buffer). asyncio's `_sock_sendfile_fallback`
     // hands `file.readinto` a `memoryview(bytearray(...))`.
@@ -10831,6 +11000,35 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         return Ok(Object::Int(n as i64));
     }
+    // A buffer-protocol object (`array.array`, `mmap`, any PEP 688
+    // `__buffer__` exporter) whose `__buffer__` yields a writable memoryview is
+    // a valid `readinto` target — the write must propagate to its storage.
+    if let Some(obj @ Object::Instance(_)) = args.get(1) {
+        if inst_native_bytearray(obj).is_none() {
+            if let Some(mv) = acquire_writable_view(obj)? {
+                if mv.readonly.get() || !mv.is_c_contiguous() {
+                    return Err(type_error(format!(
+                        "readinto() argument must be read-write bytes-like object, not {}",
+                        obj.type_name()
+                    )));
+                }
+                let capacity = mv.len.get();
+                let bytes = f.read_bytes(Some(capacity))?;
+                let n = bytes.len();
+                let start = mv.start.get();
+                let wrote = mv
+                    .buffer
+                    .with_write(|d| d[start..start + n].copy_from_slice(&bytes));
+                if wrote.is_none() {
+                    return Err(type_error(format!(
+                        "readinto() argument must be read-write bytes-like object, not {}",
+                        obj.type_name()
+                    )));
+                }
+                return Ok(Object::Int(n as i64));
+            }
+        }
+    }
     let target = match args.get(1) {
         Some(Object::ByteArray(b)) => b.clone(),
         Some(Object::Instance(inst)) => match &inst.native {
@@ -10858,8 +11056,34 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
 
 pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("read"));
+    }
+    // `readline(size)` caps the bytes read (CPython `IOBase.readline`): a
+    // non-negative `size` stops after that many bytes even without a newline.
+    // A negative size (or `None`) means "no limit"; a non-integer (e.g. the
+    // `5.3` in `test_io.test_readline`) is a `TypeError`, matching CPython's
+    // `__index__`-based argument coercion.
+    let limit = match args.get(1) {
+        None | Some(Object::None) => None,
+        Some(Object::Bool(b)) => Some(usize::from(*b)),
+        Some(Object::Int(n)) if *n >= 0 => Some(*n as usize),
+        Some(Object::Int(_)) => None,
+        Some(other) => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                other.type_name()
+            )))
+        }
+    };
     let mut out: Vec<u8> = Vec::new();
     loop {
+        if let Some(lim) = limit {
+            if out.len() >= lim {
+                break;
+            }
+        }
         let b = f.read_bytes(Some(1))?;
         if b.is_empty() {
             break;
@@ -10879,6 +11103,14 @@ pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `next(file)` — return the next line, or raise StopIteration at EOF.
 /// Backs both the `__next__` method and the VM's native file iteration.
 pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    // CPython's `TextIOWrapper.__next__` disables `tell()` for the duration of
+    // the iteration (the readahead snapshot makes the position ambiguous); a
+    // binary stream keeps `tell()` live (`test_io.test_telling`).
+    let is_text = !f.binary;
+    if is_text {
+        f.telling.set(false);
+    }
     let line = file_readline(args)?;
     let empty = match &line {
         Object::Str(s) => s.is_empty(),
@@ -10886,6 +11118,11 @@ pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => true,
     };
     if empty {
+        // Iterator exhausted: CPython restores `telling` to `seekable` and
+        // raises `StopIteration`.
+        if is_text {
+            f.telling.set(f.seekable());
+        }
         Err(stop_iteration())
     } else {
         Ok(line)
@@ -10894,6 +11131,7 @@ pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
 
 pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
     let mut lines: Vec<Object> = Vec::new();
     loop {
         let line = file_readline(&[Object::File(f.clone())])?;
@@ -10912,6 +11150,13 @@ pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
 
 pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    // A read-only stream raises `io.UnsupportedOperation` on `write`
+    // (`test_io.test_invalid_operations`), before any type-checking of the
+    // argument.
+    if !f.writable() {
+        return Err(crate::stdlib::io::unsupported_op("write"));
+    }
     let data = args
         .get(1)
         .ok_or_else(|| type_error("write() expected 1 arg"))?;
@@ -10946,13 +11191,28 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
             }
             f.write_bytes(&mv.to_bytes())?
         }
-        _ => return Err(type_error("write() argument must be str or bytes")),
+        other => {
+            // A text stream only accepts `str`; a binary stream accepts any
+            // buffer-protocol object (`array.array`, `mmap`, a PEP 688
+            // `__buffer__` exporter), matching CPython's `FileIO`/`BytesIO`.
+            if !f.binary {
+                return Err(type_error(format!(
+                    "write() argument must be str, not {}",
+                    other.type_name()
+                )));
+            }
+            f.write_bytes(&bytes_argview(other)?)?
+        }
     };
     Ok(Object::Int(n as i64))
 }
 
 pub(crate) fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    if !f.writable() {
+        return Err(crate::stdlib::io::unsupported_op("write"));
+    }
     let it = args
         .get(1)
         .ok_or_else(|| type_error("writelines() expected 1 arg"))?;
@@ -10965,27 +11225,66 @@ pub(crate) fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Bytes(b) => {
                 f.write_bytes(&b)?;
             }
-            _ => return Err(type_error("writelines() item must be str or bytes")),
+            // A binary stream accepts any buffer-protocol item (`array.array`,
+            // `memoryview`, …), mirroring CPython's `writelines`.
+            other if f.binary => {
+                f.write_bytes(&bytes_argview(&other)?)?;
+            }
+            other => {
+                return Err(type_error(format!(
+                    "writelines() argument must be a list of strings, not '{}'",
+                    other.type_name()
+                )))
+            }
         }
     }
     Ok(Object::None)
 }
 
 pub(crate) fn file_flush(args: &[Object]) -> Result<Object, RuntimeError> {
-    file_self(args)?.flush()?;
+    let f = file_self(args)?;
+    // CPython's `IOBase.flush` is a no-op error on a closed stream
+    // (`test_io.test_io_after_close`): flush after close raises `ValueError`.
+    file_check_open(&f)?;
+    f.flush()?;
     Ok(Object::None)
 }
 
 pub(crate) fn file_close(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    // CPython's `IOBase.close` calls `self.flush()` *virtually*, so a
+    // monkeypatched instance-level `flush` runs at close time. `test_io`'s
+    // `test_flush_error_on_close` patches `f.flush` to raise `OSError` and
+    // asserts `close()` re-raises it *and* still leaves the file closed (the
+    // descriptor is released even when the flush fails). Honour an override by
+    // running it, then closing without the native flush.
+    if !*f.closed.borrow() {
+        if let Some(flush_fn) = f.get_extra_attr("flush") {
+            let flush_res = (|| -> Result<Object, RuntimeError> {
+                let ptr = crate::vm_singletons::current_interpreter_ptr()
+                    .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+                // SAFETY: published by the enclosing VM frame on this thread.
+                let interp = unsafe { &mut *ptr };
+                interp.call_object(flush_fn, &[], &[])
+            })();
+            f.close();
+            flush_res?;
+            return Ok(Object::None);
+        }
+    }
     // `close()` flushes the staged write buffer first; a flush failure (broken
     // pipe) propagates while the descriptor is still released (CPython
     // `BufferedWriter.close`).
-    file_self(args)?.close_with_flush()?;
+    f.close_with_flush()?;
     Ok(Object::None)
 }
 
 pub(crate) fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    // An explicit seek re-enables `tell()` after an iteration disabled it
+    // (CPython restores `telling = seekable` in `textiowrapper_seek`).
+    f.telling.set(true);
     let offset = match args.get(1) {
         Some(Object::Int(i)) => *i as isize,
         _ => return Err(type_error("seek() expected int")),
@@ -10995,16 +11294,36 @@ pub(crate) fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
         None => 0,
         _ => return Err(type_error("seek() whence must be int")),
     };
+    // A text stream (CPython's `TextIOWrapper`) only supports absolute seeks to
+    // opaque cookies; a non-zero current- or end-relative seek raises
+    // `io.UnsupportedOperation` (`test_io.test_invalid_operations`).
+    if !f.binary && offset != 0 && (whence == 1 || whence == 2) {
+        let msg = if whence == 1 {
+            "can't do nonzero cur-relative seeks"
+        } else {
+            "can't do nonzero end-relative seeks"
+        };
+        return Err(crate::stdlib::io::unsupported_op(msg));
+    }
     Ok(Object::Int(f.seek(offset, whence)? as i64))
 }
 
 pub(crate) fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
-    Ok(Object::Int(f.position() as i64))
+    file_check_open(&f)?;
+    // A text stream mid-iteration has `tell()` disabled (CPython
+    // `textiowrapper_tell`: `telling` cleared by `__next__`).
+    if !f.binary && !f.telling.get() {
+        return Err(crate::error::os_error(
+            "telling position disabled by next() call",
+        ));
+    }
+    Ok(Object::Int(f.tell()? as i64))
 }
 
 pub(crate) fn file_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
     let size = match args.get(1) {
         None | Some(Object::None) => None,
         Some(Object::Bool(b)) => Some(u64::from(*b)),
@@ -11016,7 +11335,12 @@ pub(crate) fn file_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 pub(crate) fn file_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Bool(file_self(args)?.isatty()))
+    let f = file_self(args)?;
+    // `isatty()` on a closed stream raises (`test_io.test_io_after_close`).
+    if *f.closed.borrow() {
+        return Err(value_error("I/O operation on closed file"));
+    }
+    Ok(Object::Bool(f.isatty()))
 }
 
 pub(crate) fn file_fileno(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -11095,45 +11419,219 @@ pub(crate) fn file_readall(args: &[Object]) -> Result<Object, RuntimeError> {
     file_read(std::slice::from_ref(&self_arg))
 }
 
-/// `BytesIO.__copy__` / `__deepcopy__` — produce an *independent* in-memory
-/// stream with the same contents and stream position. CPython's `BytesIO` and
-/// `StringIO` are copyable & pickleable (real file streams are not), so
-/// `copy.copy`/`copy.deepcopy` of one yields a fresh buffer positioned
-/// identically. The contents are immutable atoms (`bytes`/`str`), so a shallow
-/// clone of the backing buffer is already a correct deep copy.
-pub(crate) fn file_copy_mem(args: &[Object]) -> Result<Object, RuntimeError> {
+/// The PEP-307 instance-`__dict__` slot for an in-memory stream's pickle
+/// state. For a *subclass* (`Object::Instance` wrapping the native stream) the
+/// attributes live in the instance dict; for the base `Object::File` they live
+/// in `extra_attrs`. CPython's base streams expose `None` until an attribute is
+/// set, so an empty store reads back as `None`.
+fn mem_dict_slot(receiver: &Object) -> Object {
+    match receiver {
+        Object::Instance(inst) => {
+            let d = inst.dict.borrow();
+            if d.is_empty() {
+                Object::None
+            } else {
+                Object::Dict(Rc::new(RefCell::new(d.clone())))
+            }
+        }
+        Object::File(f) => {
+            let attrs = f.extra_attrs.borrow();
+            if attrs.is_empty() {
+                Object::None
+            } else {
+                let mut d = crate::object::DictData::new();
+                for (k, v) in attrs.iter() {
+                    d.insert(DictKey(Object::from_str(k.clone())), v.clone());
+                }
+                Object::Dict(Rc::new(RefCell::new(d)))
+            }
+        }
+        _ => Object::None,
+    }
+}
+
+/// Restore the instance-`__dict__` slot from a pickle state onto the receiver
+/// (subclass instance dict, or base stream `extra_attrs`).
+fn mem_apply_dict(receiver: &Object, dict: &Rc<RefCell<DictData>>) {
+    match receiver {
+        Object::Instance(inst) => {
+            let mut inst_dict = inst.dict.borrow_mut();
+            for (k, v) in dict.borrow().iter() {
+                inst_dict.insert(k.clone(), v.clone());
+            }
+        }
+        Object::File(f) => {
+            for (k, v) in dict.borrow().iter() {
+                if let Object::Str(name) = &k.0 {
+                    f.set_extra_attr(name, v.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `BytesIO.__getstate__` / `StringIO.__getstate__`. Unlike file-backed
+/// streams, CPython's in-memory streams *are* picklable; the state tuple
+/// mirrors `Modules/_io/{bytesio,stringio}.c`:
+///   * `BytesIO`  → `(buffer: bytes, pos: int, dict | None)`
+///   * `StringIO` → `(value: str, newline: str, pos: int, dict | None)`
+/// The trailing slot is the instance `__dict__` (or `None` when empty). A
+/// closed stream raises `ValueError`, exactly like CPython.
+pub(crate) fn file_getstate_mem(args: &[Object]) -> Result<Object, RuntimeError> {
     use crate::object::FileBackend;
+    let receiver = args
+        .first()
+        .ok_or_else(|| type_error("__getstate__ requires a stream"))?;
     let f = file_self(args)?;
-    let pos = f.position();
-    let new_file = match &*f.backend.borrow() {
-        FileBackend::MemBytes { data, .. } => {
-            let cloned = data.borrow().clone();
-            let nf = crate::object::PyFile::new(
-                "<bytes>",
-                "rb+",
-                FileBackend::MemBytes {
-                    data: Rc::new(crate::sync::RefCell::new(cloned)),
-                    pos,
-                },
-            );
-            nf.no_name.set(true);
-            nf
+    if !f.is_memory() {
+        // File-backed streams stay unpicklable (`file_reduce_forbidden`).
+        return file_reduce_forbidden(args);
+    }
+    if *f.closed.borrow() {
+        return Err(value_error("__getstate__ on closed file"));
+    }
+    let pos = f.position() as i64;
+    let dict_slot = mem_dict_slot(receiver);
+    let value = f
+        .getvalue()
+        .ok_or_else(|| type_error("not an in-memory stream"))?;
+    let is_text = matches!(&*f.backend.borrow(), FileBackend::MemText { .. });
+    if is_text {
+        // StringIO's writer-newline (default `'\n'`, like CPython).
+        let nl = f.newline.borrow().clone().unwrap_or_else(|| "\n".to_owned());
+        Ok(Object::new_tuple(vec![
+            value,
+            Object::from_str(nl),
+            Object::Int(pos),
+            dict_slot,
+        ]))
+    } else {
+        Ok(Object::new_tuple(vec![value, Object::Int(pos), dict_slot]))
+    }
+}
+
+/// `BytesIO.__reduce__` / `__reduce_ex__` / `StringIO.__reduce__` for the *base*
+/// `Object::File` stream — reconstruct via `(cls, (), state)`: `cls()` mints an
+/// empty stream and `__setstate__` refills it. `cls` pickles by reference now
+/// that the concrete types report `__module__ == "_io"`, so
+/// `pickle.loads(pickle.dumps(BytesIO(...)))` and `copy.copy`/`copy.deepcopy`
+/// round-trip. (Subclass instances go through `object.__reduce_ex__`'s
+/// `__newobj__` path instead, since their `__init__` may require arguments.)
+/// File-backed streams fall back to the forbidding reducer.
+pub(crate) fn file_reduce_mem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    if !f.is_memory() {
+        return file_reduce_forbidden(args);
+    }
+    let cls = Object::Type(class_of(&Object::File(f.clone())));
+    // `__reduce_ex__(self, protocol)` carries the protocol in `args[1]`; the
+    // reconstruction tuple is protocol-independent, so it is ignored. Reuse the
+    // same `self` slot for `__getstate__`.
+    let state = file_getstate_mem(&args[..1])?;
+    Ok(Object::new_tuple(vec![
+        cls,
+        Object::new_tuple(Vec::new()),
+        state,
+    ]))
+}
+
+/// Validate a `StringIO` newline value (pickle state slot 1). CPython accepts
+/// `None` / `""` / `"\n"` / `"\r"` / `"\r\n"`, raising `ValueError` for any
+/// other string and `TypeError` for a non-string.
+fn validate_stringio_newline(value: &Object) -> Result<Option<String>, RuntimeError> {
+    match value {
+        Object::None => Ok(None),
+        Object::Str(s) => match s.as_ref() {
+            "" | "\n" | "\r" | "\r\n" => Ok(Some(s.to_string())),
+            other => Err(value_error(format!("illegal newline value: '{other}'"))),
+        },
+        _ => Err(type_error("newline must be str or None")),
+    }
+}
+
+/// `BytesIO.__setstate__` / `StringIO.__setstate__` — restore buffer, position,
+/// newline (StringIO), and instance dict from a `__getstate__` tuple. The
+/// validation order and error types mirror `bytesio.c`/`stringio.c` exactly
+/// (test_memoryio `test_setstate`): closed → `ValueError`; non-tuple / short
+/// tuple / wrong-typed buffer/newline/position / non-dict slot → `TypeError`;
+/// negative position or illegal newline → `ValueError`. All inputs are
+/// validated *before* any mutation.
+pub(crate) fn file_setstate_mem(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::object::FileBackend;
+    let receiver = args
+        .first()
+        .ok_or_else(|| type_error("__setstate__ requires a stream"))?;
+    let f = file_self(args)?;
+    let is_text = matches!(&*f.backend.borrow(), FileBackend::MemText { .. });
+    let kind = if is_text { "StringIO" } else { "BytesIO" };
+    let want = if is_text { 4 } else { 3 };
+    // (1) A closed stream rejects setstate with ValueError.
+    if *f.closed.borrow() {
+        return Err(value_error(format!("__setstate__ on closed {kind}")));
+    }
+    // (2) The state must be a tuple of the right arity.
+    let items: &[Object] = match args.get(1) {
+        Some(Object::Tuple(t)) if t.len() >= want => t,
+        _ => {
+            return Err(type_error(format!(
+                "{kind}.__setstate__ argument should be a {want}-tuple, got something else"
+            )))
         }
-        FileBackend::MemText { data, .. } => {
-            let nf = crate::object::PyFile::new(
-                "<string>",
-                "r+",
-                FileBackend::MemText {
-                    data: data.clone(),
-                    pos,
-                },
-            );
-            nf.no_name.set(true);
-            nf
-        }
-        _ => return Err(type_error("cannot copy a non-memory stream")),
     };
-    Ok(Object::File(Rc::new(new_file)))
+    // (3) The instance-dict slot (last element) must be a dict or None.
+    let dict_to_apply = match &items[want - 1] {
+        Object::None => None,
+        Object::Dict(d) => Some(d.clone()),
+        _ => {
+            return Err(type_error(format!(
+                "{} item of state should be a dict",
+                if is_text { "fourth" } else { "third" }
+            )))
+        }
+    };
+    if is_text {
+        // (4) value: str; (5) newline: valid str/None; (6) pos: non-negative int.
+        let txt = match &items[0] {
+            Object::Str(s) => s.to_string(),
+            _ => return Err(type_error("initial_value must be str or None")),
+        };
+        let newline = validate_stringio_newline(&items[1])?;
+        let pos = pos_from_state(&items[2], "third")?;
+        if let FileBackend::MemText { data, pos: tpos } = &mut *f.backend.borrow_mut() {
+            *data = txt;
+            *tpos = pos;
+        }
+        f.set_newline(newline.as_deref());
+    } else {
+        // (4) buffer: bytes-like; (5) pos: non-negative int.
+        let buf = match &items[0] {
+            Object::Bytes(b) => b.to_vec(),
+            Object::ByteArray(b) => b.borrow().clone(),
+            _ => return Err(type_error("a bytes-like object is required")),
+        };
+        let pos = pos_from_state(&items[1], "second")?;
+        if let FileBackend::MemBytes { data, pos: bpos } = &mut *f.backend.borrow_mut() {
+            *data.borrow_mut() = buf;
+            *bpos = pos;
+        }
+    }
+    if let Some(d) = dict_to_apply {
+        mem_apply_dict(receiver, &d);
+    }
+    Ok(Object::None)
+}
+
+/// Decode a pickle-state position slot: must be a non-negative int
+/// (`TypeError` otherwise, `ValueError` if negative — matching CPython).
+fn pos_from_state(slot: &Object, ordinal: &str) -> Result<usize, RuntimeError> {
+    match slot {
+        Object::Int(n) if *n >= 0 => Ok(*n as usize),
+        Object::Int(_) => Err(value_error("position value cannot be negative")),
+        _ => Err(type_error(format!(
+            "{ordinal} item of state must be an integer"
+        ))),
+    }
 }
 
 /// `IOBase.__getstate__` / `__reduce_ex__` — CPython forbids pickling stream

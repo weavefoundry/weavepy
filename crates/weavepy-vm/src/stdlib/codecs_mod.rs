@@ -262,20 +262,43 @@ fn check_error_handler(errors: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// For a BOM-prefixing encoding (byte-order-less `utf-16`/`utf-32`, or
+/// `utf-8-sig`), return the **continuation** codec used after the BOM has been
+/// emitted once — the BOM-less variant. CPython's incremental encoders write
+/// the BOM exactly once at the start of the stream, then switch to the native
+/// byte-order codec; both the native `PyFile` text path and `io.TextIOWrapper`
+/// reproduce that with a start-of-stream flag plus this mapping. Returns `None`
+/// for codecs that never emit a BOM (their writes are stateless).
+pub fn bom_continuation(encoding: &str) -> Option<&'static str> {
+    match encoding_key(encoding).as_str() {
+        // WeavePy encodes byte-order-less utf-16/utf-32 as little-endian (its
+        // x86_64/aarch64 targets), so the continuation is the LE codec.
+        "utf16" => Some("utf-16-le"),
+        "utf32" => Some("utf-32-le"),
+        "utf8sig" => Some("utf-8"),
+        _ => None,
+    }
+}
+
 pub fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
     check_error_handler(errors)?;
     if let Some(out) = encode_special(s, encoding, errors)? {
         return Ok(out);
     }
-    let enc = lookup_encoding(encoding)
-        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {encoding}")))?;
-    let (bytes, _, has_replacements) = enc.encode(s);
-    if has_replacements && errors == "strict" {
-        return Err(value_error(format!(
-            "'{encoding}' codec can't encode input"
-        )));
+    if let Some(enc) = lookup_encoding(encoding) {
+        let (bytes, _, has_replacements) = enc.encode(s);
+        if has_replacements && errors == "strict" {
+            return Err(value_error(format!("'{encoding}' codec can't encode input")));
+        }
+        return Ok(bytes.into_owned());
     }
-    Ok(bytes.into_owned())
+    // Native fast path doesn't know this encoding — consult the Python codec
+    // registry (custom `codecs.register` codecs and the `encodings/*.py`
+    // modules), mirroring CPython's C-fast-path/Python-registry split.
+    if let Some(out) = encode_via_registry(s, encoding, errors)? {
+        return Ok(out);
+    }
+    Err(crate::error::lookup_error(format!("unknown encoding: {encoding}")))
 }
 
 pub fn decode_bytes(bytes: &[u8], encoding: &str, errors: &str) -> Result<String, RuntimeError> {
@@ -283,15 +306,148 @@ pub fn decode_bytes(bytes: &[u8], encoding: &str, errors: &str) -> Result<String
     if let Some(out) = decode_special(bytes, encoding, errors)? {
         return Ok(out);
     }
-    let enc = lookup_encoding(encoding)
-        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {encoding}")))?;
-    let (text, _, had_errors) = enc.decode(bytes);
-    if had_errors && errors == "strict" {
-        return Err(value_error(format!(
-            "'{encoding}' codec can't decode input"
-        )));
+    if let Some(enc) = lookup_encoding(encoding) {
+        let (text, _, had_errors) = enc.decode(bytes);
+        if had_errors && errors == "strict" {
+            return Err(value_error(format!("'{encoding}' codec can't decode input")));
+        }
+        return Ok(text.into_owned());
     }
-    Ok(text.into_owned())
+    if let Some(out) = decode_via_registry(bytes, encoding, errors)? {
+        return Ok(out);
+    }
+    Err(crate::error::lookup_error(format!("unknown encoding: {encoding}")))
+}
+
+// `REGISTRY_INFLIGHT`: encodings currently being resolved through the Python
+// registry on this thread. Guards against a pathological codec whose
+// `decode`/`encode` re-enters the native engine for the *same* encoding (which
+// would loop); a re-entry returns `None` so the caller raises the normal
+// `LookupError`.
+thread_local! {
+    static REGISTRY_INFLIGHT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Resolve `encoding` through the live `codecs` registry and run its stateless
+/// `decode`. Returns `Ok(None)` when there is no interpreter, the encoding is
+/// already in flight (recursion guard), `codecs.lookup` raised `LookupError`,
+/// or the result isn't a `str` — in every such case the caller falls back to
+/// its own `LookupError`.
+fn decode_via_registry(
+    bytes: &[u8],
+    encoding: &str,
+    errors: &str,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(codec) = registry_codec_attr(encoding, "decode")? else {
+        return Ok(None);
+    };
+    let key = encoding.to_owned();
+    REGISTRY_INFLIGHT.with(|s| s.borrow_mut().push(key.clone()));
+    let res = with_interp(|interp| {
+        interp.call_object(
+            codec,
+            &[Object::new_bytes(bytes.to_vec()), Object::from_str(errors)],
+            &[],
+        )
+    });
+    REGISTRY_INFLIGHT.with(|s| s.borrow_mut().retain(|e| e != &key));
+    let out = res?;
+    let first = match &out {
+        Object::Tuple(t) if !t.is_empty() => t[0].clone(),
+        other => other.clone(),
+    };
+    match first {
+        Object::Str(s) => Ok(Some(s.to_string())),
+        // A codec was found and run, but returned a non-`str` result. This is
+        // the `io.TextIOWrapper` read path consuming a binary-transform codec
+        // (`quopri`/`hex`) whose `_is_text_encoding` guard was bypassed: CPython
+        // raises `TypeError` from `textio.c`, not a `LookupError`
+        // (`test_io.test_illegal_decoder`).
+        other => Err(type_error(format!(
+            "decoder should return a string result, not '{}'",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `encode` counterpart to [`decode_via_registry`].
+fn encode_via_registry(
+    s: &str,
+    encoding: &str,
+    errors: &str,
+) -> Result<Option<Vec<u8>>, RuntimeError> {
+    let Some(codec) = registry_codec_attr(encoding, "encode")? else {
+        return Ok(None);
+    };
+    let key = encoding.to_owned();
+    REGISTRY_INFLIGHT.with(|st| st.borrow_mut().push(key.clone()));
+    let res = with_interp(|interp| {
+        interp.call_object(
+            codec,
+            &[Object::from_str(s), Object::from_str(errors)],
+            &[],
+        )
+    });
+    REGISTRY_INFLIGHT.with(|st| st.borrow_mut().retain(|e| e != &key));
+    let out = res?;
+    let first = match &out {
+        Object::Tuple(t) if !t.is_empty() => t[0].clone(),
+        other => other.clone(),
+    };
+    match first.as_bytes_view() {
+        Some(b) => Ok(Some(b)),
+        // Codec found and run, but returned a non-bytes result — the
+        // `io.TextIOWrapper` write path over a binary-transform codec
+        // (`rot13`) whose `_is_text_encoding` guard was bypassed. CPython's
+        // `textio.c` raises `TypeError` (`test_io.test_illegal_encoder`).
+        None => Err(type_error(format!(
+            "encoder should return a bytes object, not '{}'",
+            first.type_name()
+        ))),
+    }
+}
+
+/// Shared front half of the registry fallbacks: bail out (→ `Ok(None)`) when
+/// there is no interpreter or the encoding is already being resolved, then
+/// `codecs.lookup(encoding)` and return its `attr` (`"encode"`/`"decode"`)
+/// callable. A `LookupError` from `lookup` is swallowed (→ `Ok(None)`).
+fn registry_codec_attr(encoding: &str, attr: &str) -> Result<Option<Object>, RuntimeError> {
+    if crate::vm_singletons::current_interpreter_ptr().is_none() {
+        return Ok(None);
+    }
+    let reentrant = REGISTRY_INFLIGHT.with(|s| s.borrow().iter().any(|e| e == encoding));
+    if reentrant {
+        return Ok(None);
+    }
+    with_interp(|interp| {
+        let Ok(codecs) = interp.import_path("codecs") else {
+            return Ok(None);
+        };
+        let Ok(lookup) = interp.load_attr_public(&codecs, "lookup") else {
+            return Ok(None);
+        };
+        let info = match interp.call_object(lookup, &[Object::from_str(encoding)], &[]) {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
+        match interp.load_attr_public(&info, attr) {
+            Ok(c) => Ok(Some(c)),
+            Err(_) => Ok(None),
+        }
+    })
+}
+
+/// Run `f` with the current interpreter. The pointer is published by an
+/// enclosing VM frame on this thread and the GIL keeps the reentrant access
+/// exclusive (same contract as `io_full::validate_text_encoding`).
+fn with_interp<T>(
+    f: impl FnOnce(&mut crate::Interpreter) -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+    // SAFETY: see doc comment.
+    let interp = unsafe { &mut *ptr };
+    f(interp)
 }
 
 /// Handle special-case encodings whose semantics don't quite match

@@ -156,13 +156,29 @@ fn reader_call(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Some(Object::File(file)) => {
-            // Read the whole backing object as a string and split.
-            let snapshot = match &*file.backend.borrow() {
-                crate::object::FileBackend::MemBytes { data, .. } => {
-                    String::from_utf8_lossy(&data.borrow()).into_owned()
+            // Snapshot the backing stream as text and split into lines. An
+            // in-memory stream exposes its whole buffer directly; a real
+            // descriptor (disk file, stdin) is *read* from its current
+            // position — CPython's `csv.reader` consumes the file via the
+            // iteration protocol, and reading the remaining bytes matches that
+            // for the common "fresh open" case. (A previous `_ => String::new()`
+            // here silently yielded no rows for every disk-backed file.)
+            let in_mem = {
+                let backend = file.backend.borrow();
+                match &*backend {
+                    crate::object::FileBackend::MemBytes { data, .. } => {
+                        Some(String::from_utf8_lossy(&data.borrow()).into_owned())
+                    }
+                    crate::object::FileBackend::MemText { data, .. } => Some(data.clone()),
+                    _ => None,
                 }
-                crate::object::FileBackend::MemText { data, .. } => data.clone(),
-                _ => String::new(),
+            };
+            let snapshot = match in_mem {
+                Some(s) => s,
+                None => {
+                    let bytes = file.read_bytes(None).unwrap_or_default();
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
             };
             for line in snapshot.lines() {
                 lines.push(line.to_string());
