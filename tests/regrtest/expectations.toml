@@ -265,7 +265,7 @@ reason = "measured (RFC 0040 WS7): native baseline 330 pass / 209 fail / 88 erro
 
 [tests."cpython/Lib/test/test_os.py"]
 status = "fail"
-reason = "measured (RFC 0038 WS-B): 73 pass, 29 fail, 63 error (172 skip). Spread across missing `os` surface — `os.environb`, `os.device_encoding`, plus stat_result/scandir edges — rather than one root cause. The `os.scandir` OSError.filename fix landed this wave (it cleared the cross-cutting tempfile/shutil cleanup errors); the residual breadth gap is deferred."
+reason = "measured (RFC 0040 WS1): 338 pass / 1 fail / 3 error / 128 skip (was 73 pass / 29F / 63E in RFC 0038). The `dir_fd`/fd filesystem surface landed this wave: `os.open`/`stat`/`lstat`/`unlink`/`rmdir`/`mkdir` honour `dir_fd=` via `*at(2)`, `os.scandir(fd)`/`os.listdir(fd)` iterate via `fdopendir`+`rewinddir` (the `DirEntry` lazily `fstatat`s the parent fd, CPython-identically), `os.supports_dir_fd`/`supports_fd` are populated with the real function objects (so `shutil.rmtree` takes its hardened `_rmtree_safe_fd` path — verified deleting a tree deeper than PATH_MAX), `test.support.os_helper.open_dir_fd` was added, and `os.urandom` is now fd-free over `getentropy`/`getrandom` with the matching `HAVE_GETENTROPY`/`HAVE_GETRANDOM` sysconfig vars (so `URandomFDTests` skips exactly as CPython does). The 4 residuals are both deferred arcs: 3 are `Pep383Tests` (undecodable/lone-surrogate filenames — the WTF-8 str-storage Non-goal), and 1 is `ForkTests.test_fork_warns_when_non_python_thread_exists` (needs a `_testcapi` raw-`pthread` spawner + mach `task_threads` OS-thread counting + emitting the multi-threaded-fork `DeprecationWarning` parent-side post-`fork`)."
 
 [tests."cpython/Lib/test/test_posixpath.py"]
 status = "fail"

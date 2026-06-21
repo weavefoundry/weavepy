@@ -314,6 +314,7 @@ pub(crate) fn io_open_kw(
             slots[4].as_ref(),
             slots[5].as_ref(),
         )?;
+        apply_buffering(&file, buffering_arg(slots[2].as_ref()), mode.contains('b'))?;
         return Ok(file);
     }
 
@@ -433,6 +434,53 @@ pub(crate) fn validate_text_encoding(encoding: &str) -> Result<(), RuntimeError>
     Ok(())
 }
 
+/// Parse the `buffering` argument (`open()` positional index 2). A missing
+/// or non-integer slot is the default policy (`-1`), matching how the rest of
+/// `io_open` tolerates absent/`None` slots.
+fn buffering_arg(arg: Option<&Object>) -> i64 {
+    match arg {
+        Some(Object::Int(n)) => *n,
+        Some(Object::Bool(b)) => i64::from(*b),
+        _ => -1,
+    }
+}
+
+/// Apply CPython's `buffering` selection to a freshly built stream:
+/// `buffering == 0` downgrades to the raw `FileIO` layer (binary only — an
+/// unbuffered text stream is a `ValueError`), and `buffering == 1` in binary
+/// mode is *not* line buffering, so `open()` warns and falls back to the
+/// default block buffer (`_pyio.open`, `test_subprocess`
+/// `test_bufsize_equal_one_binary_mode` / `test_io_unbuffered_works`).
+fn apply_buffering(file: &Object, buffering: i64, binary: bool) -> Result<(), RuntimeError> {
+    if buffering == 0 {
+        if !binary {
+            return Err(value_error("can't have unbuffered text I/O"));
+        }
+        if let Object::File(f) = file {
+            f.set_io_kind(crate::object::IoKind::Raw);
+        }
+    } else if buffering == 1 && binary {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            interp.warn_runtime_from_builtin(
+                "line buffering (buffering=1) isn't supported in binary \
+                 mode, the default buffer size will be used"
+                    .to_owned(),
+            )?;
+        }
+    } else if buffering > 1 {
+        // An explicit buffer size: CPython sizes the `Buffered*` layer to
+        // `buffering` bytes. Only the binary buffered-writer path actually
+        // stages writes, but recording it keeps `tell()`/flush thresholds
+        // faithful for any future buffered layer.
+        if let Object::File(f) = file {
+            f.buf_size.set(buffering as usize);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
     use crate::object::{FileBackend, PyFile};
     // `open(fd, mode, ...)` — adopt an already-open OS descriptor, exactly
@@ -460,6 +508,7 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
             f.closefd.set(false);
         }
         apply_text_config(&file, args.get(3), args.get(4), args.get(5))?;
+        apply_buffering(&file, buffering_arg(args.get(2)), mode.contains('b'))?;
         return Ok(file);
     }
     let path = match args.first() {
@@ -513,9 +562,9 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&path)))?;
     let backend = FileBackend::Disk(f);
     let file = Object::File(Rc::new(PyFile::new(path, mode, backend)));
-    let _ = binary; // text decoding is handled by PyFile itself.
-                    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
+    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
     apply_text_config(&file, args.get(3), args.get(4), args.get(5))?;
+    apply_buffering(&file, buffering_arg(args.get(2)), binary)?;
     Ok(file)
 }
 

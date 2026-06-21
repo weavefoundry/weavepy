@@ -55,6 +55,30 @@ except ImportError:
 _USE_POSIX_SPAWN = False
 _USE_VFORK = True
 
+
+def _text_encoding():
+    # Return the default text encoding and emit an EncodingWarning when
+    # sys.flags.warn_default_encoding is set (PEP 597). The stacklevel is
+    # walked past every subprocess.py frame so the warning is attributed to
+    # the caller's `run(...)`/`Popen(...)` line, not to this module.
+    if sys.flags.warn_default_encoding:
+        f = sys._getframe()
+        filename = f.f_code.co_filename
+        stacklevel = 2
+        while f := f.f_back:
+            if f.f_code.co_filename != filename:
+                break
+            stacklevel += 1
+        warnings.warn("'encoding' argument not specified.",
+                      EncodingWarning, stacklevel)
+
+    if sys.flags.utf8_mode:
+        return "utf-8"
+    else:
+        import locale
+        return locale.getencoding()
+
+
 try:
     import _subprocess
 except ImportError:
@@ -419,6 +443,8 @@ class Popen:
                 "supplied but different. Pass one or the other."
             )
         self.text_mode = encoding or errors or text or universal_newlines
+        if self.text_mode and encoding is None:
+            self.encoding = encoding = _text_encoding()
         self.args = args
 
         if not _mswindows:
@@ -1263,20 +1289,12 @@ class Popen:
 
     def __exit__(self, exc_type, value, traceback):
         if self.stdout:
-            try:
-                self.stdout.close()
-            except OSError:
-                pass
+            self.stdout.close()
         if self.stderr:
-            try:
-                self.stderr.close()
-            except OSError:
-                pass
+            self.stderr.close()
         try:  # Flushing a BufferedWriter may raise an error.
             if self.stdin:
                 self.stdin.close()
-        except OSError:
-            pass
         finally:
             if exc_type == KeyboardInterrupt:
                 # bpo-25942: on ^C we assume the child also got the SIGINT and

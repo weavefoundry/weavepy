@@ -1899,10 +1899,61 @@ impl fmt::Debug for AsyncGenAwait {
 /// the same wrapper can talk to a real file, an in-memory buffer
 /// (`io.StringIO`/`io.BytesIO`), or the interpreter's stdout/stderr
 /// sinks.
+/// Default Python-level buffer size for a buffered file stream
+/// (`io.DEFAULT_BUFFER_SIZE`).
+pub const DEFAULT_BUFFER_SIZE: usize = 8192;
+
+/// The CPython io-stack layer a [`PyFile`] presents to Python: its
+/// `type()` identity and which `io` ABC it answers `isinstance` for.
+/// WeavePy backs every file with one monolithic `PyFile`, but reports the
+/// faithful layered class (`FileIO`/`BufferedReader`/…/`TextIOWrapper`,
+/// `BytesIO`/`StringIO`) so `type(open(p,'rb')) is io.BufferedReader` and
+/// `isinstance(io.FileIO(fd), io.RawIOBase)` hold like CPython.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IoKind {
+    /// Unbuffered raw binary file — `io.FileIO` (a `RawIOBase`).
+    Raw,
+    /// Buffered binary reader — `io.BufferedReader`.
+    BufferedReader,
+    /// Buffered binary writer — `io.BufferedWriter`.
+    BufferedWriter,
+    /// Buffered binary read+write — `io.BufferedRandom`.
+    BufferedRandom,
+    /// Text stream — `io.TextIOWrapper`.
+    Text,
+    /// In-memory bytes — `io.BytesIO`.
+    BytesIO,
+    /// In-memory text — `io.StringIO`.
+    StringIO,
+}
+
+impl IoKind {
+    /// Derive the default layer for a freshly opened file from its mode
+    /// string (CPython's `open()` buffering rules: text → `TextIOWrapper`,
+    /// binary read → `BufferedReader`, binary write/append →
+    /// `BufferedWriter`, binary update (`+`) → `BufferedRandom`).
+    pub fn from_mode(mode: &str) -> Self {
+        if mode.contains('b') {
+            if mode.contains('+') {
+                IoKind::BufferedRandom
+            } else if mode.contains('w') || mode.contains('a') || mode.contains('x') {
+                IoKind::BufferedWriter
+            } else {
+                IoKind::BufferedReader
+            }
+        } else {
+            IoKind::Text
+        }
+    }
+}
+
 pub struct PyFile {
     pub name: String,
     pub mode: String,
     pub binary: bool,
+    /// The faithful CPython io layer this stream presents (`type()` and
+    /// `isinstance` identity); see [`IoKind`].
+    pub io_kind: crate::sync::Cell<IoKind>,
     pub backend: RefCell<FileBackend>,
     pub closed: RefCell<bool>,
     /// Text-mode codec (`open(..., encoding=...)`); `None` means the
@@ -1958,16 +2009,29 @@ pub struct PyFile {
     /// `2`=`\n`, `4`=`\r\n`. Updated on every text-mode read (regardless of the
     /// `newline=` translation policy); `0` reads back as `None`.
     pub seennl: crate::sync::Cell<u8>,
+    /// Pending bytes for a binary [`IoKind::BufferedWriter`] over a real
+    /// descriptor: CPython's `BufferedWriter` holds writes in a Python-level
+    /// buffer until it fills, an explicit `flush()`, or `close()` — *not*
+    /// `fileno()`. This is what lets `os.close(f.fileno())` discard unflushed
+    /// data (`test_subprocess.test_bufsize_equal_one_binary_mode`) and a
+    /// large buffered write surface its `BrokenPipeError` only at flush
+    /// (`test_broken_pipe_cleanup`). Empty for every other stream kind.
+    pub write_buf: RefCell<Vec<u8>>,
+    /// The buffer-full threshold for [`PyFile::write_buf`] (`open(...,
+    /// buffering=N)`; `DEFAULT_BUFFER_SIZE` otherwise).
+    pub buf_size: crate::sync::Cell<usize>,
 }
 
 impl PyFile {
     pub fn new(name: impl Into<String>, mode: impl Into<String>, backend: FileBackend) -> Self {
         let mode_s = mode.into();
         let binary = mode_s.contains('b');
+        let io_kind = IoKind::from_mode(&mode_s);
         Self {
             name: name.into(),
             mode: mode_s,
             binary,
+            io_kind: crate::sync::Cell::new(io_kind),
             backend: RefCell::new(backend),
             closed: RefCell::new(false),
             encoding: RefCell::new(None),
@@ -1981,7 +2045,51 @@ impl PyFile {
             extra_attrs: RefCell::new(Vec::new()),
             binary_buffer_cache: RefCell::new(None),
             seennl: crate::sync::Cell::new(0),
+            write_buf: RefCell::new(Vec::new()),
+            buf_size: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE),
         }
+    }
+
+    /// Whether writes are held in [`PyFile::write_buf`] rather than going
+    /// straight to the OS: a binary `BufferedWriter` backed by a real
+    /// descriptor. Append/random and text streams write through (unchanged
+    /// behaviour); in-memory streams are their own buffer.
+    pub fn is_write_buffered(&self) -> bool {
+        self.io_kind.get() == IoKind::BufferedWriter
+            && matches!(&*self.backend.borrow(), FileBackend::Disk(_))
+    }
+
+    /// Flush the pending [`PyFile::write_buf`] to the backing descriptor.
+    /// Drains the buffer first so a failed write (e.g. `EPIPE` to a child
+    /// that already exited) leaves nothing to re-flush, then surfaces the
+    /// error like CPython's `BufferedWriter._flush_unlocked`.
+    pub fn flush_write_buf(&self) -> Result<(), RuntimeError> {
+        let pending = {
+            let mut wb = self.write_buf.borrow_mut();
+            if wb.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *wb)
+        };
+        let mut backend = self.backend.borrow_mut();
+        if let FileBackend::Disk(f) = &mut *backend {
+            use std::io::Write;
+            f.write_all(&pending)
+                .map_err(|e| crate::error::io_error_to_py(&e))?;
+        }
+        Ok(())
+    }
+
+    /// `close()` that first flushes the write buffer, mirroring `_pyio`'s
+    /// `try: self.flush() finally: self.raw.close()`: the descriptor is
+    /// always released, but a flush error (a broken pipe) still propagates.
+    pub fn close_with_flush(&self) -> Result<(), RuntimeError> {
+        if *self.closed.borrow() {
+            return Ok(());
+        }
+        let flush_res = self.flush_write_buf();
+        self.close();
+        flush_res
     }
 
     /// Read a monkeypatched per-instance attribute, if set.
@@ -2008,6 +2116,12 @@ impl PyFile {
     /// rewrites `raw.name` to the fd for anonymous temp files).
     pub fn set_name(&self, name: Object) {
         *self.name_override.borrow_mut() = Some(name);
+    }
+
+    /// Override the presented io layer (`io.FileIO(fd)` → `Raw`,
+    /// `io.BytesIO()` → `BytesIO`, `open(..., buffering=0)` → `Raw`).
+    pub fn set_io_kind(&self, kind: IoKind) {
+        self.io_kind.set(kind);
     }
 
     /// The Python-visible `name` *object*: `str` normally, `bytes` when the
@@ -2420,6 +2534,10 @@ impl PyFile {
     /// to wrap them as `str` (text mode) or `bytes` (binary mode).
     pub fn read_bytes(&self, n: Option<usize>) -> Result<Vec<u8>, RuntimeError> {
         self.check_open()?;
+        // Any staged writes must reach the descriptor before a read observes
+        // the stream position (defensive; a pure `BufferedWriter` is not
+        // readable, but keeps read-after-write coherent).
+        self.flush_write_buf()?;
         let mut backend = self.backend.borrow_mut();
         let mut buf = Vec::new();
         match (&mut *backend, n) {
@@ -2565,6 +2683,21 @@ impl PyFile {
 
     pub fn write_bytes(&self, data: &[u8]) -> Result<usize, RuntimeError> {
         self.check_open()?;
+        // Binary `BufferedWriter`: stage the write in the Python-level buffer
+        // and only push to the descriptor once it fills (CPython
+        // `BufferedWriter.write`). The bytes are *not* on the fd yet, so
+        // `os.close(fileno())` discards them and a flush to a broken pipe
+        // raises only here / at close.
+        if self.is_write_buffered() {
+            {
+                let mut wb = self.write_buf.borrow_mut();
+                wb.extend_from_slice(data);
+            }
+            if self.write_buf.borrow().len() >= self.buf_size.get() {
+                self.flush_write_buf()?;
+            }
+            return Ok(data.len());
+        }
         let mut backend = self.backend.borrow_mut();
         let n = match &mut *backend {
             FileBackend::Disk(f) => f
@@ -2621,6 +2754,8 @@ impl PyFile {
 
     pub fn flush(&self) -> Result<(), RuntimeError> {
         self.check_open()?;
+        // Drain the staged `BufferedWriter` bytes to the descriptor first.
+        self.flush_write_buf()?;
         let mut backend = self.backend.borrow_mut();
         match &mut *backend {
             FileBackend::Disk(f) => f.flush().map_err(|e| crate::error::io_error_to_py(&e))?,
@@ -2653,11 +2788,15 @@ impl PyFile {
 
     /// Current position. Works for both in-memory buffers and disk files.
     pub fn position(&self) -> usize {
+        // Staged `BufferedWriter` bytes sit logically after the descriptor
+        // offset, so `tell()` counts them (CPython's `BufferedWriter.tell`
+        // returns `raw.tell() + len(buffer)`).
+        let pending = self.write_buf.borrow().len();
         match &mut *self.backend.borrow_mut() {
             FileBackend::MemBytes { pos, .. } | FileBackend::MemText { pos, .. } => *pos,
             FileBackend::Disk(f) => {
                 use std::io::Seek;
-                f.stream_position().map(|n| n as usize).unwrap_or(0)
+                f.stream_position().map(|n| n as usize).unwrap_or(0) + pending
             }
             _ => 0,
         }
@@ -2666,6 +2805,9 @@ impl PyFile {
     /// Seek to absolute position. Returns the new position.
     pub fn seek(&self, offset: isize, whence: i32) -> Result<usize, RuntimeError> {
         self.check_open()?;
+        // CPython's `BufferedWriter.seek` flushes the write buffer first so the
+        // descriptor offset the seek is relative to is current.
+        self.flush_write_buf()?;
         let mut backend = self.backend.borrow_mut();
         match &mut *backend {
             FileBackend::MemBytes { data, pos } => {
@@ -2805,6 +2947,10 @@ impl Drop for PyFile {
         // `EBADF`, so we close the raw fd and swallow the error. If `close()`
         // already ran the backend is an in-memory buffer (no-op here);
         // `closefd=False` detaches without closing.
+        // Best-effort flush of any staged `BufferedWriter` bytes before the
+        // descriptor is dropped, so data written but never explicitly flushed
+        // still reaches disk (CPython relies on the buffer's deallocator).
+        let _ = self.flush_write_buf();
         #[cfg(unix)]
         {
             let Ok(mut backend) = self.backend.try_borrow_mut() else {

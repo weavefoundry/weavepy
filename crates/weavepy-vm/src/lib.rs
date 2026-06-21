@@ -570,10 +570,18 @@ impl Interpreter {
             .get(&crate::object::DictKey(Object::from_static("sys")))
         {
             let mut d = m.dict.borrow_mut();
-            if let Some(Object::Dict(fl)) = d
+            // `sys.flags` is a struct-sequence — modelled as a
+            // `SimpleNamespace` — so the CLI flag values reach attribute
+            // access (`sys.flags.optimize`, `.warn_default_encoding`); accept
+            // either backing so this update isn't silently a no-op.
+            let flags_inner = match d
                 .get(&crate::object::DictKey(Object::from_static("flags")))
                 .cloned()
             {
+                Some(Object::Dict(fl) | Object::SimpleNamespace(fl)) => Some(fl),
+                _ => None,
+            };
+            if let Some(fl) = flags_inner {
                 let mut fld = fl.borrow_mut();
                 let set = |fld: &mut crate::object::DictData, k: &'static str, v: i64| {
                     fld.insert(
@@ -614,7 +622,19 @@ impl Interpreter {
                     Object::Bool(dev_mode),
                 );
                 set(&mut fld, "int_max_str_digits", 4300);
-                set(&mut fld, "warn_default_encoding", 0);
+                // `-X warn_default_encoding` / `PYTHONWARNDEFAULTENCODING`
+                // (PEP 597): turns on the `EncodingWarning` that `open()` /
+                // `subprocess` raise when a text stream takes the default
+                // locale encoding implicitly.
+                let warn_default_encoding = flags.xoptions.iter().any(|x| {
+                    x == "warn_default_encoding" || x.starts_with("warn_default_encoding=")
+                }) || (!flags.ignore_environment
+                    && std::env::var_os("PYTHONWARNDEFAULTENCODING").is_some());
+                set(
+                    &mut fld,
+                    "warn_default_encoding",
+                    i64::from(warn_default_encoding),
+                );
             }
             d.insert(
                 crate::object::DictKey(Object::from_static("dont_write_bytecode")),
@@ -3518,7 +3538,23 @@ impl Interpreter {
                 let v = frame.pop()?;
                 let slot = ins.arg as usize;
                 if slot < frame.locals.len() {
-                    frame.locals[slot] = v;
+                    let old = std::mem::replace(&mut frame.locals[slot], v);
+                    // CPython decrefs the value previously bound to the local;
+                    // when that was the last reference to a finalizable object
+                    // its `__del__` runs at the rebind, not at frame exit
+                    // (`p = None` dropping a `Popen`,
+                    // `test_subprocess.test_zombie_fast_process_del`). Mirror
+                    // that for the object kinds that can carry a finalizer (or
+                    // anchor a finalizable acyclic subgraph); the
+                    // overwhelmingly common scalar/`str`/`None` rebind — loop
+                    // counters, accumulators, first binding over `Unbound` —
+                    // matches out on the cheap variant check and pays nothing
+                    // more. `prompt_reap_dropped` then refcount-guards, so a
+                    // value still live through another binding is left alone.
+                    if Self::local_needs_prompt_reap(&old) {
+                        self.sync_py_locals(frame);
+                        self.prompt_reap_dropped(old);
+                    }
                 }
             }
             OpCode::DeleteFast => {
@@ -3552,25 +3588,44 @@ impl Interpreter {
                 }
                 if let Some(ns_obj) = frame.class_namespace_obj.clone() {
                     // PEP 3115: a custom class namespace observes the binding
-                    // through its `__setitem__` (e.g. `enum._EnumDict`).
+                    // through its `__setitem__` (e.g. `enum._EnumDict`); the old
+                    // value is the namespace's to manage, so no reap here.
                     let g = frame.globals.clone();
                     self.class_ns_store(&ns_obj, &name, v, &g)?;
-                } else if let Some(ns) = &frame.class_namespace {
-                    ns.borrow_mut().insert(DictKey(Object::from_str(name)), v);
                 } else {
-                    frame
-                        .globals
-                        .borrow_mut()
-                        .insert(DictKey(Object::from_str(name)), v);
+                    // Class-body and module/top-level bindings both land in a
+                    // plain dict; rebinding one that uniquely held a finalizable
+                    // runs its `__del__` now (CPython decref-on-store).
+                    let old = if let Some(ns) = &frame.class_namespace {
+                        ns.borrow_mut().insert(DictKey(Object::from_str(name)), v)
+                    } else {
+                        frame
+                            .globals
+                            .borrow_mut()
+                            .insert(DictKey(Object::from_str(name)), v)
+                    };
+                    if let Some(old) = old {
+                        if Self::local_needs_prompt_reap(&old) {
+                            self.prompt_reap_dropped(old);
+                        }
+                    }
                 }
             }
             OpCode::StoreGlobal => {
                 let v = frame.pop()?;
                 let name = self.name_at(&frame.code, ins.arg)?;
-                frame
+                let old = frame
                     .globals
                     .borrow_mut()
                     .insert(DictKey(Object::from_str(name)), v);
+                // Rebinding a global that uniquely held a finalizable runs its
+                // `__del__` now, matching the `DeleteGlobal` path and CPython's
+                // decref-on-store (module-scope `handle = None`).
+                if let Some(old) = old {
+                    if Self::local_needs_prompt_reap(&old) {
+                        self.prompt_reap_dropped(old);
+                    }
+                }
             }
             OpCode::DeleteName => {
                 let mut name = self.name_at(&frame.code, ins.arg)?;
@@ -3630,7 +3685,15 @@ impl Interpreter {
                     .get(ins.arg as usize)
                     .cloned()
                     .ok_or_else(|| RuntimeError::Internal("bad cell index".to_owned()))?;
-                *cell.borrow_mut() = v;
+                let old = std::mem::replace(&mut *cell.borrow_mut(), v);
+                // Rebinding a closure cell that uniquely held a finalizable runs
+                // its `__del__` now, matching `DeleteDeref` and `StoreFast`. The
+                // cell already holds the new value, so a re-entrant finalizer
+                // observing this free var through the closure sees the rebind.
+                if Self::local_needs_prompt_reap(&old) {
+                    self.sync_py_locals(frame);
+                    self.prompt_reap_dropped(old);
+                }
             }
             OpCode::DeleteDeref => {
                 // `del NAME` for a cell/free var empties the cell WITHOUT

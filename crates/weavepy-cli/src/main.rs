@@ -404,6 +404,20 @@ fn split_argv(raw: Vec<String>) -> (Vec<String>, Option<(&'static str, String)>,
             let rest: Vec<String> = iter.collect();
             return (wp, Some(("m", m)), rest);
         }
+        // Attached `-Xkey[=value]` / `-Wfilter` (CPython's own spelling —
+        // `test_subprocess.test_encoding_warning` spawns `-Xwarn_default_encoding`):
+        // normalise to the separate `-X key` form clap parses, so the option
+        // reaches `sys._xoptions` / `sys.warnoptions`.
+        if let Some(rest) = arg.strip_prefix("-X").filter(|r| !r.is_empty()) {
+            wp.push("-X".to_owned());
+            wp.push(rest.to_owned());
+            continue;
+        }
+        if let Some(rest) = arg.strip_prefix("-W").filter(|r| !r.is_empty()) {
+            wp.push("-W".to_owned());
+            wp.push(rest.to_owned());
+            continue;
+        }
         // Clustered single-letter options where `-c`/`-m` follows some boolean
         // flags, e.g. `-uc CMD` == `-u -c CMD` and `-uIcCMD` == `-u -I -c CMD`
         // (CPython accepts this; `test_subprocess` spawns children as `-uc`).

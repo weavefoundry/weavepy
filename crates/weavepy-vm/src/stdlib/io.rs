@@ -449,6 +449,7 @@ fn bytesio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
             },
         )
     };
+    file.set_io_kind(crate::object::IoKind::BytesIO);
     Ok(wrap_memory_stream(&cls, file))
 }
 
@@ -471,6 +472,7 @@ fn stringio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
             },
         )
     };
+    file.set_io_kind(crate::object::IoKind::StringIO);
     Ok(wrap_memory_stream(&cls, file))
 }
 
@@ -573,6 +575,8 @@ fn fileio_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     match raw {
         Object::File(f) => {
             f.closefd.set(closefd);
+            // `io.FileIO` is the raw, unbuffered layer (a `RawIOBase`).
+            f.set_io_kind(crate::object::IoKind::Raw);
             Ok(wrap_memory_stream(&cls, f))
         }
         other => Ok(other),
@@ -992,21 +996,31 @@ pub(crate) fn file_io_abc_match(
     file: &crate::object::PyFile,
     info: &Rc<crate::types::TypeObject>,
 ) -> Option<bool> {
+    use crate::object::IoKind;
     let fam = build_iobase_family();
     let is = |t: &Rc<crate::types::TypeObject>| Rc::ptr_eq(t, info);
+    let kind = file.io_kind.get();
     if is(&fam.iobase) {
         return Some(true);
     }
+    if is(&fam.raw) || is(&fam.fileio) {
+        // Only an unbuffered `FileIO` (`open(..., buffering=0)`,
+        // `io.FileIO(fd)`) is a `RawIOBase`; the buffered/text layers are not.
+        return Some(kind == IoKind::Raw);
+    }
     if is(&fam.buffered) {
-        return Some(file.binary);
+        // `BufferedIOBase`: the buffered binary layers and `BytesIO`.
+        return Some(matches!(
+            kind,
+            IoKind::BufferedReader
+                | IoKind::BufferedWriter
+                | IoKind::BufferedRandom
+                | IoKind::BytesIO
+        ));
     }
     if is(&fam.text) {
-        return Some(!file.binary);
-    }
-    if is(&fam.raw) || is(&fam.fileio) {
-        // We can't distinguish a raw `FileIO` from a buffered `open('rb')`
-        // stream at the `Object::File` level; treat native streams as buffered.
-        return Some(false);
+        // `TextIOBase`: `TextIOWrapper` and `StringIO`.
+        return Some(matches!(kind, IoKind::Text | IoKind::StringIO));
     }
     None
 }

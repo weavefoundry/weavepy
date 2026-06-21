@@ -196,15 +196,15 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         }
         d.insert(
             DictKey(Object::from_static("remove")),
-            builtin("remove", os_remove),
+            builtin_kw("remove", os_remove_kw),
         );
         d.insert(
             DictKey(Object::from_static("unlink")),
-            builtin("unlink", os_remove),
+            builtin_kw("unlink", os_remove_kw),
         );
         d.insert(
             DictKey(Object::from_static("mkdir")),
-            builtin("mkdir", os_mkdir),
+            builtin_kw("mkdir", os_mkdir_kw),
         );
         d.insert(
             DictKey(Object::from_static("makedirs")),
@@ -212,7 +212,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("rmdir")),
-            builtin("rmdir", os_rmdir),
+            builtin_kw("rmdir", os_rmdir_kw),
         );
         d.insert(
             DictKey(Object::from_static("rename")),
@@ -599,14 +599,25 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             );
         }
 
-        // NOTE: `os.pathconf`/`os.fpathconf`/`os.pathconf_names` are
-        // intentionally deferred to the WS1 (os/posix) `dir_fd` work. Exposing
-        // `PC_PATH_MAX` alone lets `tarfile`'s `test_realpath_limit_attack`
-        // (CVE-2025-4517 regression) build a near-PATH_MAX symlink/dir tree
-        // that WeavePy can only clean up once `shutil.rmtree` can take its
-        // fd-based path (`os.{open,stat,unlink,rmdir}` with `dir_fd` +
-        // `os.scandir(fd)`); until then it would leave un-removable debris that
-        // cascades into other tests. Land `pathconf` together with `dir_fd`.
+        // RFC 0040 WS1 — `os.pathconf(path, name)` / `os.fpathconf(fd, name)`
+        // and the `os.pathconf_names` mapping. `tarfile`'s
+        // `test_realpath_limit_attack` (CVE-2025-4517 regression) sizes its
+        // near-`PATH_MAX` symlink tree via `os.pathconf(parent, "PC_PATH_MAX")`.
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("pathconf")),
+                builtin("pathconf", os_pathconf),
+            );
+            d.insert(
+                DictKey(Object::from_static("fpathconf")),
+                builtin("fpathconf", os_fpathconf),
+            );
+            d.insert(
+                DictKey(Object::from_static("pathconf_names")),
+                build_pathconf_names(),
+            );
+        }
 
         // `os.supports_follow_symlinks` must hold the *function objects* that
         // honour `follow_symlinks=` — `shutil.copystat`/`copy2` and `tempfile`
@@ -623,6 +634,34 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("supports_follow_symlinks")),
             Object::new_set_from(follow_objs),
         );
+        // RFC 0040 WS1 — advertise the functions whose `dir_fd=`/`fd` keywords
+        // WeavePy genuinely honours (via `*at(2)`/`fdopendir`). `shutil.rmtree`
+        // gates its hardened, symlink-race-free `_rmtree_safe_fd` path on
+        // `{open, stat, unlink, rmdir} <= os.supports_dir_fd` *and*
+        // `os.scandir in os.supports_fd`, so membership must hold the very same
+        // function objects (set membership is by identity). `tarfile`'s
+        // `test_realpath_limit_attack` cleanup deletes a near-`PATH_MAX` tree,
+        // which only the fd path can do without `ENAMETOOLONG`.
+        #[cfg(unix)]
+        {
+            let dir_fd_objs: Vec<Object> =
+                ["open", "stat", "lstat", "unlink", "remove", "rmdir", "mkdir"]
+                    .iter()
+                    .filter_map(|n| d.get(&DictKey(Object::from_static(n))).cloned())
+                    .collect();
+            d.insert(
+                DictKey(Object::from_static("supports_dir_fd")),
+                Object::new_set_from(dir_fd_objs),
+            );
+            let fd_objs: Vec<Object> = ["scandir", "listdir"]
+                .iter()
+                .filter_map(|n| d.get(&DictKey(Object::from_static(n))).cloned())
+                .collect();
+            d.insert(
+                DictKey(Object::from_static("supports_fd")),
+                Object::new_set_from(fd_objs),
+            );
+        }
     }
     Rc::new(PyModule {
         name: "os".to_owned(),
@@ -1056,6 +1095,121 @@ fn os_sysconf(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(val as i64))
 }
 
+/// The POSIX `pathconf`/`fpathconf` name → `_PC_*` id table. Only the
+/// portable POSIX.1 set is exposed (identical ids would differ per platform,
+/// so each maps through the `libc` constant). `PC_PATH_MAX` is the one
+/// `tarfile`'s `test_realpath_limit_attack` (CVE-2025-4517 regression) needs
+/// to size its near-`PATH_MAX` symlink tree.
+#[cfg(unix)]
+fn pathconf_name_table() -> &'static [(&'static str, libc::c_int)] {
+    &[
+        ("PC_LINK_MAX", libc::_PC_LINK_MAX),
+        ("PC_MAX_CANON", libc::_PC_MAX_CANON),
+        ("PC_MAX_INPUT", libc::_PC_MAX_INPUT),
+        ("PC_NAME_MAX", libc::_PC_NAME_MAX),
+        ("PC_PATH_MAX", libc::_PC_PATH_MAX),
+        ("PC_PIPE_BUF", libc::_PC_PIPE_BUF),
+        ("PC_CHOWN_RESTRICTED", libc::_PC_CHOWN_RESTRICTED),
+        ("PC_NO_TRUNC", libc::_PC_NO_TRUNC),
+        ("PC_VDISABLE", libc::_PC_VDISABLE),
+    ]
+}
+
+/// `os.pathconf_names` — the `{name: id}` mapping CPython exposes.
+#[cfg(unix)]
+fn build_pathconf_names() -> Object {
+    let mut d = DictData::new();
+    for (name, id) in pathconf_name_table() {
+        d.insert(
+            DictKey(Object::from_static(name)),
+            Object::Int(i64::from(*id)),
+        );
+    }
+    Object::Dict(Rc::new(RefCell::new(d)))
+}
+
+#[cfg(unix)]
+fn pathconf_name_to_id(name: &str) -> Option<libc::c_int> {
+    pathconf_name_table()
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, id)| *id)
+}
+
+/// Resolve a `pathconf`/`fpathconf` configuration name argument (a key of
+/// `os.pathconf_names` or a raw integer id) to its `_PC_*` id, matching
+/// CPython's `conv_confname` error messages.
+#[cfg(unix)]
+fn pathconf_arg_id(arg: Option<&Object>) -> Result<libc::c_int, RuntimeError> {
+    match arg {
+        Some(Object::Int(n)) => Ok(*n as libc::c_int),
+        Some(Object::Str(s)) => pathconf_name_to_id(s)
+            .ok_or_else(|| value_error("unrecognized configuration name")),
+        _ => Err(type_error(
+            "configuration names must be strings or integers",
+        )),
+    }
+}
+
+/// `os.pathconf(path, name)` — query a path-scoped POSIX limit. As with
+/// `sysconf`, a `-1` return with a clean errno means "indeterminate/unlimited"
+/// and is returned as-is; a `-1` with errno set raises `OSError`. CPython's
+/// `path_t(allow_fd=True)` also accepts an integer descriptor, transparently
+/// using `fpathconf` semantics (`test_os.TestInvalidFD`).
+#[cfg(unix)]
+fn os_pathconf(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `os.pathconf(fd, name)` with an int path delegates to `fpathconf`.
+    if matches!(args.first(), Some(Object::Int(_) | Object::Bool(_))) {
+        return os_fpathconf(args);
+    }
+    let path = first_path(args, "pathconf")?;
+    let id = pathconf_arg_id(args.get(1))?;
+    let cpath = std::ffi::CString::new(path.as_bytes())
+        .map_err(|_| value_error("embedded null byte"))?;
+    // SAFETY: errno is a valid thread-local int; `pathconf` only reads the
+    // (NUL-terminated) path and id.
+    unsafe {
+        *errno_location() = 0;
+    }
+    let val = unsafe { libc::pathconf(cpath.as_ptr(), id) };
+    if val == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error().unwrap_or(0) != 0 {
+            return Err(path_io_err(&err, args.first(), &path));
+        }
+    }
+    Ok(Object::Int(val as i64))
+}
+
+/// `os.fpathconf(fd, name)` — the descriptor-relative counterpart of
+/// [`os_pathconf`].
+#[cfg(unix)]
+fn os_fpathconf(args: &[Object]) -> Result<Object, RuntimeError> {
+    let fd = match args.first() {
+        // A `bool` descriptor warns ("bool is used as a file descriptor"),
+        // matching CPython's `_PyLong_FileDescriptor_Converter`
+        // (`test_os.TestInvalidFD.check_bool`).
+        Some(Object::Bool(b)) => {
+            warn_bool_as_fd()?;
+            libc::c_int::from(*b)
+        }
+        Some(Object::Int(n)) => *n as libc::c_int,
+        _ => return Err(type_error("fpathconf() argument 'fd' must be an int")),
+    };
+    let id = pathconf_arg_id(args.get(1))?;
+    unsafe {
+        *errno_location() = 0;
+    }
+    let val = unsafe { libc::fpathconf(fd, id) };
+    if val == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error().unwrap_or(0) != 0 {
+            return Err(crate::error::io_error_to_py(&err));
+        }
+    }
+    Ok(Object::Int(val as i64))
+}
+
 /// Build an `OSError` for a failed single-path syscall, preserving the
 /// *identity* of the caller's original path object as `.filename` when one was
 /// passed positionally (`test_os.test_oserror_filename` asserts
@@ -1090,6 +1244,53 @@ fn os_remove(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `os.unlink(path, *, dir_fd=None)` / `os.remove`. With `dir_fd` set the
+/// removal is `unlinkat`-relative (RFC 0040 WS1; `shutil.rmtree`'s safe path
+/// unlinks each entry relative to its parent directory's descriptor).
+fn os_remove_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    if let Some(dfd) = dir_fd_arg(kwargs)? {
+        let p = first_path(args, "unlink")?;
+        let cpath = std::ffi::CString::new(p.as_bytes())
+            .map_err(|_| value_error("embedded null byte"))?;
+        let rc = unsafe { libc::unlinkat(dfd, cpath.as_ptr(), 0) };
+        if rc != 0 {
+            return Err(path_io_err(
+                &std::io::Error::last_os_error(),
+                args.first(),
+                &p,
+            ));
+        }
+        return Ok(Object::None);
+    }
+    #[cfg(not(unix))]
+    reject_dir_fd(kwargs, "unlink")?;
+    os_remove(args)
+}
+
+/// `os.rmdir(path, *, dir_fd=None)`. With `dir_fd` set the removal is
+/// `unlinkat(..., AT_REMOVEDIR)`-relative (RFC 0040 WS1).
+fn os_rmdir_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    if let Some(dfd) = dir_fd_arg(kwargs)? {
+        let p = first_path(args, "rmdir")?;
+        let cpath = std::ffi::CString::new(p.as_bytes())
+            .map_err(|_| value_error("embedded null byte"))?;
+        let rc = unsafe { libc::unlinkat(dfd, cpath.as_ptr(), libc::AT_REMOVEDIR) };
+        if rc != 0 {
+            return Err(path_io_err(
+                &std::io::Error::last_os_error(),
+                args.first(),
+                &p,
+            ));
+        }
+        return Ok(Object::None);
+    }
+    #[cfg(not(unix))]
+    reject_dir_fd(kwargs, "rmdir")?;
+    os_rmdir(args)
+}
+
 fn os_mkdir(args: &[Object]) -> Result<Object, RuntimeError> {
     let p = first_path(args, "mkdir")?;
     // CPython: `mkdir(path, mode=0o777)`. The kernel masks `mode` with the
@@ -1101,6 +1302,34 @@ fn os_mkdir(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     mkdir_with_mode(&p, mode)?;
     Ok(Object::None)
+}
+
+/// `os.mkdir(path, mode=0o777, *, dir_fd=None)`. With `dir_fd` set the
+/// directory is created `mkdirat`-relative (RFC 0040 WS1) — the descent
+/// primitive for building/walking trees deeper than `PATH_MAX`.
+fn os_mkdir_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    if let Some(dfd) = dir_fd_arg(kwargs)? {
+        let p = first_path(args, "mkdir")?;
+        let mode = match args.get(1) {
+            Some(m) => mode_arg(m, "mkdir")?,
+            None => 0o777,
+        };
+        let cpath = std::ffi::CString::new(p.as_bytes())
+            .map_err(|_| value_error("embedded null byte"))?;
+        let rc = unsafe { libc::mkdirat(dfd, cpath.as_ptr(), mode as libc::mode_t) };
+        if rc != 0 {
+            return Err(path_io_err(
+                &std::io::Error::last_os_error(),
+                args.first(),
+                &p,
+            ));
+        }
+        return Ok(Object::None);
+    }
+    #[cfg(not(unix))]
+    reject_dir_fd(kwargs, "mkdir")?;
+    os_mkdir(args)
 }
 
 /// Extract a POSIX permission-bits argument (`int`, or an `int` subclass
@@ -1261,6 +1490,18 @@ fn os_rename(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn os_listdir(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `os.listdir(fd)` — list a directory referred to by an open descriptor
+    // (RFC 0040 WS1). `test_shutil`'s `_use_fd_functions` recomputation probes
+    // `os.listdir in os.supports_fd`, so this and `os.scandir(fd)` must agree.
+    #[cfg(unix)]
+    match args.first() {
+        Some(Object::Bool(b)) => {
+            warn_bool_as_fd()?;
+            return listdir_fd(libc::c_int::from(*b));
+        }
+        Some(Object::Int(n)) => return listdir_fd(*n as libc::c_int),
+        _ => {}
+    }
     // CPython: `listdir(path='.')`. `path` may be str, bytes, or any
     // `os.PathLike` (a `pathlib.Path`, which is what `Path.walk()` passes).
     // A `bytes` path yields `bytes` names; everything else yields `str`.
@@ -1293,24 +1534,79 @@ fn os_listdir(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(out))
 }
 
+/// Fill `buf` with cryptographically-strong OS randomness *without using a
+/// file descriptor* — `getentropy` on macOS/BSD, the `getrandom` syscall on
+/// Linux — falling back to `/dev/urandom` only where neither exists. The
+/// fd-free path is what lets `os.urandom` keep working under a depleted
+/// `RLIMIT_NOFILE` (and matches the `HAVE_GETENTROPY`/`HAVE_GETRANDOM`
+/// `sysconfig` vars WeavePy advertises).
+#[cfg(unix)]
+fn fill_os_random(buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    {
+        // `getentropy(2)` caps each request at 256 bytes (GETENTROPY_MAX).
+        for chunk in buf.chunks_mut(256) {
+            let rc =
+                unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let rc = unsafe {
+                libc::getrandom(
+                    buf[filled..].as_mut_ptr().cast(),
+                    buf.len() - filled,
+                    0,
+                )
+            };
+            if rc < 0 {
+                let e = std::io::Error::last_os_error();
+                // PEP 475: retry an interrupted syscall.
+                if e.raw_os_error() == Some(libc::EINTR) {
+                    service_pending_signals().map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::Interrupted, "interrupted")
+                    })?;
+                    continue;
+                }
+                return Err(e);
+            }
+            filled += rc as usize;
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    {
+        // Other Unix: read the kernel CSPRNG device.
+        use std::io::Read;
+        let mut f = std::fs::File::open("/dev/urandom")?;
+        f.read_exact(buf)?;
+        Ok(())
+    }
+}
+
 fn os_urandom(args: &[Object]) -> Result<Object, RuntimeError> {
-    let n = match args.first() {
-        Some(Object::Int(n)) => *n as usize,
-        _ => return Err(type_error("urandom() arg must be int")),
+    let n = match args.first().and_then(Object::as_i64) {
+        // CPython rejects a negative size with `ValueError`.
+        Some(n) if n < 0 => return Err(value_error("negative argument not allowed")),
+        Some(n) => n as usize,
+        None => return Err(type_error("urandom() argument must be int")),
     };
     #[cfg(unix)]
     {
-        use std::io::Read;
         let mut out = vec![0u8; n];
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            if f.read_exact(&mut out).is_ok() {
-                return Ok(Object::new_bytes(out));
-            }
-        }
-        // Fallback if /dev/urandom isn't readable.
-        for b in out.iter_mut() {
-            *b = (std::process::id() as u8).wrapping_add(*b);
-        }
+        fill_os_random(&mut out).map_err(|e| crate::error::io_error_to_py(&e))?;
         Ok(Object::new_bytes(out))
     }
     #[cfg(not(unix))]
@@ -1366,19 +1662,25 @@ fn os_open_stub(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let p = path_arg_or_kw(args, 0, "path", kwargs, "open")?;
     let flags = int_arg_or_kw(args, 1, "flags", kwargs)
         .ok_or_else(|| crate::error::type_error("open() flags must be an int".to_owned()))?;
-    // `dir_fd` (keyword-only) is unsupported beyond the default; reject a
-    // non-`None` value rather than silently ignoring it.
-    if let Some((_, v)) = kwargs.iter().find(|(k, _)| k == "dir_fd") {
-        if !matches!(v, Object::None) {
-            return Err(crate::error::not_implemented_error(
-                "os.open() dir_fd is not supported in WeavePy",
-            ));
-        }
-    }
     // `open(path, flags, mode=0o777)` — `mode` only matters when `O_CREAT`
     // creates the file; the kernel masks it with the umask, so
     // `Path.touch(0o444)` lands `0o444 & ~umask` (test_pathlib.test_touch_mode).
     let mode = int_arg_or_kw(args, 2, "mode", kwargs).unwrap_or(0o777) as u32;
+    // RFC 0040 WS1 — `dir_fd=`-relative open via `openat`. `shutil.rmtree`'s
+    // fd-based safe path (`_rmtree_safe_fd`) opens each subdirectory relative
+    // to its parent's descriptor; the flag bits are already the host `O_*`
+    // values, so they pass straight to `openat`.
+    if let Some(dfd) = dir_fd_arg(kwargs)? {
+        let cpath = std::ffi::CString::new(p.as_bytes())
+            .map_err(|_| value_error("embedded null byte"))?;
+        let fd = unsafe { libc::openat(dfd, cpath.as_ptr(), flags as libc::c_int, mode) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            let path_obj = args.first();
+            return Err(path_io_err(&e, path_obj, &p));
+        }
+        return Ok(Object::Int(i64::from(fd)));
+    }
     // Interpret the flag bits with the *host* platform's `libc` values, matching
     // the `O_*` constants the `os` module exposes — on macOS these differ from
     // Linux, so hard-coding Linux numbers here mis-decoded macOS flag masks.
@@ -1570,6 +1872,15 @@ fn os_fdopen(_args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, R
 /// makes it an `lstat` (the link itself); `shutil.copystat`/`copy2` and
 /// `pathlib`/`tempfile` pass the keyword. `dir_fd` is unsupported (only `None`).
 fn os_stat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // RFC 0040 WS1 — `os.stat(path, dir_fd=fd, follow_symlinks=…)` via
+    // `fstatat`. `shutil.rmtree`'s safe path and `os.supports_dir_fd`
+    // membership depend on this.
+    #[cfg(unix)]
+    if let Some(dfd) = dir_fd_arg(kwargs)? {
+        let p = first_path(args, "stat")?;
+        return fstatat_stat_result(dfd, &p, dir_entry_follow(kwargs), args.first());
+    }
+    #[cfg(not(unix))]
     reject_dir_fd(kwargs, "stat")?;
     // `os.stat(fd)` (an int) is `fstat`; `os.stat(path)` hits the filesystem.
     // `genericpath.exists`/`isfile`/… lean on the fd form when handed a
@@ -1676,6 +1987,12 @@ fn os_fstat(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `os.lstat(path, *, dir_fd=None)` — `stat` on the link itself. `dir_fd` is
 /// unsupported (only `None`).
 fn os_lstat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    if let Some(dfd) = dir_fd_arg(kwargs)? {
+        let p = first_path(args, "lstat")?;
+        return fstatat_stat_result(dfd, &p, false, args.first());
+    }
+    #[cfg(not(unix))]
     reject_dir_fd(kwargs, "lstat")?;
     let p = first_path(args, "lstat")?;
     let meta = std::fs::symlink_metadata(&p).map_err(|e| path_io_err(&e, args.first(), &p))?;
@@ -1850,6 +2167,102 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     }
     drop(d);
     Object::Instance(Rc::new(inst))
+}
+
+/// Build a `stat_result` from a raw `libc::stat`, for the `*at` syscalls
+/// (`fstatat`) that back `dir_fd=`-relative `os.stat`/`os.lstat` and the
+/// `os.scandir(fd)` `DirEntry` methods. Mirrors [`stat_result_from_meta`]'s
+/// Unix branch field-for-field so a `dir_fd` stat is indistinguishable from a
+/// path stat.
+#[cfg(unix)]
+fn stat_result_from_libc_stat(st: &libc::stat) -> Object {
+    use crate::types::PyInstance;
+    let ty = stat_result_type();
+    let inst = PyInstance::new(ty);
+    {
+        let mut d = inst.dict.borrow_mut();
+        let ns = |s: i64, n: i64| (s as f64) + (n as f64) * 1e-9;
+        let atime = ns(st.st_atime as i64, st.st_atime_nsec as i64);
+        let mtime = ns(st.st_mtime as i64, st.st_mtime_nsec as i64);
+        let ctime = ns(st.st_ctime as i64, st.st_ctime_nsec as i64);
+        for (k, v) in [
+            ("st_mode", i64::from(st.st_mode)),
+            ("st_ino", st.st_ino as i64),
+            ("st_dev", st.st_dev as i64),
+            ("st_nlink", st.st_nlink as i64),
+            ("st_uid", i64::from(st.st_uid)),
+            ("st_gid", i64::from(st.st_gid)),
+            ("st_size", st.st_size as i64),
+            ("st_rdev", st.st_rdev as i64),
+            ("st_blocks", st.st_blocks as i64),
+            ("st_blksize", st.st_blksize as i64),
+            (
+                "st_mtime_ns",
+                st.st_mtime as i64 * 1_000_000_000 + st.st_mtime_nsec as i64,
+            ),
+            (
+                "st_atime_ns",
+                st.st_atime as i64 * 1_000_000_000 + st.st_atime_nsec as i64,
+            ),
+            (
+                "st_ctime_ns",
+                st.st_ctime as i64 * 1_000_000_000 + st.st_ctime_nsec as i64,
+            ),
+        ] {
+            d.insert(DictKey(Object::from_static(k)), Object::Int(v));
+        }
+        for (k, v) in [
+            ("st_mtime", mtime),
+            ("st_atime", atime),
+            ("st_ctime", ctime),
+        ] {
+            d.insert(DictKey(Object::from_static(k)), Object::Float(v));
+        }
+    }
+    Object::Instance(Rc::new(inst))
+}
+
+/// Resolve an optional `dir_fd=` keyword. Returns `None` when absent or `None`
+/// (the caller then takes its plain path-relative path), `Some(fd)` for an
+/// integer descriptor. A non-int, non-`None` value is a `TypeError` like
+/// CPython's `dir_fd` converter.
+#[cfg(unix)]
+fn dir_fd_arg(kwargs: &[(String, Object)]) -> Result<Option<libc::c_int>, RuntimeError> {
+    match kwargs.iter().find(|(k, _)| k == "dir_fd").map(|(_, v)| v) {
+        None | Some(Object::None) => Ok(None),
+        Some(Object::Int(n)) => Ok(Some(*n as libc::c_int)),
+        Some(other) => Err(type_error(format!(
+            "argument should be integer or None, not {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `fstatat(dir_fd, path, follow_symlinks)` → `stat_result`, the engine behind
+/// `dir_fd=`-relative `os.stat`/`os.lstat` and the `os.scandir(fd)` entries.
+#[cfg(unix)]
+fn fstatat_stat_result(
+    dir_fd: libc::c_int,
+    path: &str,
+    follow: bool,
+    path_obj: Option<&Object>,
+) -> Result<Object, RuntimeError> {
+    let cpath =
+        std::ffi::CString::new(path.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
+    let flags = if follow {
+        0
+    } else {
+        libc::AT_SYMLINK_NOFOLLOW
+    };
+    // SAFETY: `st` is fully initialised by a successful `fstatat`; the path is
+    // NUL-terminated and only read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(dir_fd, cpath.as_ptr(), &mut st, flags) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(path_io_err(&e, path_obj, path));
+    }
+    Ok(stat_result_from_libc_stat(&st))
 }
 
 fn os_readlink(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -2080,6 +2493,19 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
     // `bytearray`/`memoryview` (`test_os.test_bytes_like` expects `TypeError`):
     // only `str`, `bytes`, and `os.PathLike` flow through. `bytearray` is
     // therefore *not* matched here and lands in the catch-all `TypeError` arm.
+    // `os.scandir(fd)` — iterate a directory referred to by an open file
+    // descriptor (RFC 0040 WS1). `shutil.rmtree`'s safe path (`_rmtree_safe_fd`,
+    // taken when `os.scandir in os.supports_fd`) opens each subdirectory and
+    // scandirs it by fd to sidestep symlink races and `PATH_MAX`.
+    #[cfg(unix)]
+    match args.first() {
+        Some(Object::Bool(b)) => {
+            warn_bool_as_fd()?;
+            return scandir_fd(libc::c_int::from(*b));
+        }
+        Some(Object::Int(n)) => return scandir_fd(*n as libc::c_int),
+        _ => {}
+    }
     let (dir_path, bytes_mode) = match args.first() {
         None | Some(Object::None) => (".".to_owned(), false),
         Some(Object::Str(s)) => (s.to_string(), false),
@@ -2538,6 +2964,233 @@ fn build_dir_entry(
                 call: Box::new(move |_args| dir_entry_stat(&p_stat_pos, true)),
                 call_kw: Some(Box::new(move |_args, kwargs| {
                     dir_entry_stat(&p_stat_kw, dir_entry_follow(kwargs))
+                })),
+            })),
+        );
+    }
+    Object::Instance(Rc::new(inst))
+}
+
+/// Read every entry of the directory referred to by `fd` as `(name, inode)`
+/// pairs (`.`/`..` filtered out), the shared engine behind `os.scandir(fd)`
+/// and `os.listdir(fd)`. The DIR* stream gets its own `dup` (which `closedir`
+/// reclaims) so the caller's fd survives — exactly like CPython.
+#[cfg(unix)]
+fn readdir_entries_fd(fd: libc::c_int) -> Result<Vec<(String, i64)>, RuntimeError> {
+    // `fdopendir` takes ownership of the fd it is handed and `closedir` closes
+    // it; dup first so the caller's fd survives (CPython dups for this reason).
+    let dup_fd = unsafe { libc::dup(fd) };
+    if dup_fd < 0 {
+        return Err(crate::error::io_error_to_py(
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    let dirp = unsafe { libc::fdopendir(dup_fd) };
+    if dirp.is_null() {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(dup_fd) };
+        return Err(crate::error::io_error_to_py(&e));
+    }
+    // `dup(2)` shares the open file description — and thus the directory read
+    // position — with the caller's fd, so a second `scandir(fd)` on the same
+    // descriptor would start at EOF. Rewind to the start so each call yields
+    // the full listing (the shared position is reset to 0, which is harmless
+    // for the `openat`-relative descent `rmtree` performs next).
+    unsafe { libc::rewinddir(dirp) };
+    let mut out: Vec<(String, i64)> = Vec::new();
+    loop {
+        let ent = unsafe { libc::readdir(dirp) };
+        if ent.is_null() {
+            break;
+        }
+        // SAFETY: `readdir` returned a live entry; `d_name` is NUL-terminated.
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let name_str = String::from_utf8_lossy(bytes).into_owned();
+        // Cache the inode from the directory read so `DirEntry.inode()` keeps
+        // working after the entry is unlinked (the `rmtree` case).
+        let ino = unsafe { (*ent).d_ino } as i64;
+        out.push((name_str, ino));
+    }
+    unsafe { libc::closedir(dirp) };
+    Ok(out)
+}
+
+/// `os.scandir(fd)` — list a directory referred to by an open descriptor.
+/// The materialised entries `fstatat` against the *original* fd, exactly like
+/// CPython's `DirEntry` (which stores the passed `dir_fd` and relies on the
+/// caller keeping it open across the entries' lazy `stat`/`is_dir`).
+#[cfg(unix)]
+fn scandir_fd(fd: libc::c_int) -> Result<Object, RuntimeError> {
+    let entries: Vec<Object> = readdir_entries_fd(fd)?
+        .into_iter()
+        .map(|(name, ino)| build_dir_entry_fd(name, fd, Some(ino)))
+        .collect();
+    Ok(build_scandir_iterator(entries))
+}
+
+/// `os.listdir(fd)` — the bare entry names (always `str`) of the directory
+/// referred to by an open descriptor (RFC 0040 WS1; `os.listdir in
+/// os.supports_fd`). CPython `fsdecode`s the names; we use the lossy form.
+#[cfg(unix)]
+fn listdir_fd(fd: libc::c_int) -> Result<Object, RuntimeError> {
+    let names: Vec<Object> = readdir_entries_fd(fd)?
+        .into_iter()
+        .map(|(name, _)| Object::from_str(name))
+        .collect();
+    Ok(Object::new_list(names))
+}
+
+/// `fstatat(dir_fd, name, follow_symlinks)` → raw `libc::stat`, the engine
+/// behind the `os.scandir(fd)` entries' lazy `stat`/`is_*`/`inode`.
+#[cfg(unix)]
+fn fstatat_raw(dir_fd: libc::c_int, name: &str, follow: bool) -> std::io::Result<libc::stat> {
+    let cpath = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedded null byte")
+    })?;
+    let flags = if follow {
+        0
+    } else {
+        libc::AT_SYMLINK_NOFOLLOW
+    };
+    // SAFETY: `st` is fully written by a successful `fstatat`; `cpath` is a
+    // NUL-terminated buffer that is only read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(dir_fd, cpath.as_ptr(), &mut st, flags) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// `st_mode` of an `fstatat`-relative entry (helper for the `is_*` predicates).
+#[cfg(unix)]
+fn fstatat_mode(dir_fd: libc::c_int, name: &str, follow: bool) -> std::io::Result<libc::mode_t> {
+    fstatat_raw(dir_fd, name, follow).map(|st| st.st_mode)
+}
+
+/// The `fstatat`-relative twin of [`dir_entry_typecheck`] for `os.scandir(fd)`
+/// entries: `is_dir`/`is_file` resolved against the parent's descriptor,
+/// `follow_symlinks`-aware (default `True`, matching CPython).
+#[cfg(unix)]
+fn dir_entry_fd_typecheck(
+    name: &'static str,
+    dir_fd: libc::c_int,
+    ent: String,
+    want_dir: bool,
+) -> Object {
+    let ent_pos = ent.clone();
+    let classify = move |ent: &str, follow: bool| -> bool {
+        fstatat_mode(dir_fd, ent, follow)
+            .map(|m| {
+                let fmt = m & libc::S_IFMT;
+                if want_dir {
+                    fmt == libc::S_IFDIR
+                } else {
+                    fmt == libc::S_IFREG
+                }
+            })
+            .unwrap_or(false)
+    };
+    let classify_pos = classify;
+    Object::Builtin(Rc::new(crate::object::BuiltinFn {
+        name,
+        binds_instance: false,
+        call: Box::new(move |_args| Ok(Object::Bool(classify_pos(&ent_pos, true)))),
+        call_kw: Some(Box::new(move |_args, kwargs| {
+            Ok(Object::Bool(classify(&ent, dir_entry_follow(kwargs))))
+        })),
+    }))
+}
+
+/// Build an `os.DirEntry` for an `os.scandir(fd)` listing: `name`/`path` are
+/// the bare entry name (no directory to join) and every lazy accessor resolves
+/// `fstatat`-relative to `dir_fd` (RFC 0040 WS1).
+#[cfg(unix)]
+fn build_dir_entry_fd(name: String, dir_fd: libc::c_int, cached_inode: Option<i64>) -> Object {
+    use crate::object::BuiltinFn;
+    use crate::types::PyInstance;
+    let class = dir_entry_type();
+    let inst = PyInstance::new(class);
+    let name_obj = Object::from_str(name.clone());
+    {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(DictKey(Object::from_static("name")), name_obj.clone());
+        // For an fd-relative scandir CPython sets `.path` to the bare entry name
+        // (there is no directory path to join onto).
+        d.insert(DictKey(Object::from_static("path")), name_obj.clone());
+        let fspath = name_obj;
+        d.insert(
+            DictKey(Object::from_static("__fspath__")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__fspath__",
+                binds_instance: false,
+                call: Box::new(move |_args| Ok(fspath.clone())),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_dir")),
+            dir_entry_fd_typecheck("is_dir", dir_fd, name.clone(), true),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_file")),
+            dir_entry_fd_typecheck("is_file", dir_fd, name.clone(), false),
+        );
+        let sym_name = name.clone();
+        d.insert(
+            DictKey(Object::from_static("is_symlink")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "is_symlink",
+                binds_instance: false,
+                call: Box::new(move |_args| {
+                    Ok(Object::Bool(
+                        fstatat_mode(dir_fd, &sym_name, false)
+                            .map(|m| (m & libc::S_IFMT) == libc::S_IFLNK)
+                            .unwrap_or(false),
+                    ))
+                }),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("is_junction")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "is_junction",
+                binds_instance: false,
+                call: Box::new(move |_args| Ok(Object::Bool(false))),
+                call_kw: None,
+            })),
+        );
+        let ino_name = name.clone();
+        d.insert(
+            DictKey(Object::from_static("inode")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "inode",
+                binds_instance: false,
+                call: Box::new(move |_args| {
+                    Ok(Object::Int(cached_inode.unwrap_or_else(|| {
+                        fstatat_raw(dir_fd, &ino_name, false)
+                            .map(|st| st.st_ino as i64)
+                            .unwrap_or(0)
+                    })))
+                }),
+                call_kw: None,
+            })),
+        );
+        let stat_name_pos = name.clone();
+        let stat_name_kw = name;
+        d.insert(
+            DictKey(Object::from_static("stat")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "stat",
+                binds_instance: false,
+                call: Box::new(move |_args| fstatat_stat_result(dir_fd, &stat_name_pos, true, None)),
+                call_kw: Some(Box::new(move |_args, kwargs| {
+                    fstatat_stat_result(dir_fd, &stat_name_kw, dir_entry_follow(kwargs), None)
                 })),
             })),
         );

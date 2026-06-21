@@ -266,6 +266,20 @@ def temp_cwd(name='tempcwd', quiet=False):
 
 
 @contextlib.contextmanager
+def open_dir_fd(path):
+    """Open a file descriptor to a directory (for ``dir_fd=``/``scandir(fd)``)."""
+    assert os.path.isdir(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    dir_fd = os.open(path, flags)
+    try:
+        yield dir_fd
+    finally:
+        os.close(dir_fd)
+
+
+@contextlib.contextmanager
 def temp_umask(umask):
     """Temporarily set the process umask (no-op where unsupported)."""
     old = None

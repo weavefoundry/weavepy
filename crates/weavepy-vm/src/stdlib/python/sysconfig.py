@@ -86,6 +86,19 @@ def _init_config_vars():
             'platlibdir': 'lib',
             'userbase': os.path.expanduser('~/.local'),
         }
+        # Randomness source capability flags, matching the host platform.
+        # `os.urandom` is implemented fd-free over `getentropy`/`getrandom`
+        # (see `os.rs`), so report the same capability CPython's configure
+        # probe would: `getentropy` on macOS/BSD/modern glibc, the
+        # `getrandom` syscall on Linux. `test_os.URandomFDTests` skips when
+        # either is set (the fd-exhaustion path can't be hit).
+        _plat = getattr(sys, 'platform', '')
+        if _plat == 'darwin' or _plat.startswith(('freebsd', 'openbsd', 'netbsd')):
+            _CONFIG_VARS['HAVE_GETENTROPY'] = 1
+        elif _plat.startswith('linux'):
+            _CONFIG_VARS['HAVE_GETRANDOM_SYSCALL'] = 1
+            _CONFIG_VARS['HAVE_GETRANDOM'] = 1
+            _CONFIG_VARS['HAVE_GETENTROPY'] = 1
     return _CONFIG_VARS
 
 

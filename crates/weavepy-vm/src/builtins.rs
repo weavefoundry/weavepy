@@ -10977,7 +10977,10 @@ pub(crate) fn file_flush(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 pub(crate) fn file_close(args: &[Object]) -> Result<Object, RuntimeError> {
-    file_self(args)?.close();
+    // `close()` flushes the staged write buffer first; a flush failure (broken
+    // pipe) propagates while the descriptor is still released (CPython
+    // `BufferedWriter.close`).
+    file_self(args)?.close_with_flush()?;
     Ok(Object::None)
 }
 
@@ -11193,7 +11196,7 @@ pub(crate) fn file_exit(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
     }
-    file_self(args)?.close();
+    file_self(args)?.close_with_flush()?;
     Ok(Object::None)
 }
 
