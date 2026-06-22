@@ -131,8 +131,8 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "open_code",
                 binds_instance: false,
-                call: Box::new(io_open),
-                call_kw: Some(Box::new(io_open_kw)),
+                call: Box::new(io_open_code),
+                call_kw: Some(Box::new(io_open_code_kw)),
             })),
         );
     }
@@ -558,6 +558,53 @@ fn coerce_open_path(obj: &Object) -> Result<String, RuntimeError> {
         return Err(value_error("embedded null byte"));
     }
     Ok(s)
+}
+
+/// `io.open_code(path)` — open a file for reading executable code (PEP
+/// 578). CPython opens it unconditionally in binary mode (`open(path,
+/// 'rb')`); WeavePy has no audit-hook layer, so this is exactly that.
+/// Forcing `'rb'` is load-bearing: `runpy._get_code_from_file` /
+/// `pkgutil.read_code` read a `.pyc`'s 16-byte header as raw bytes, and a
+/// text-mode stream would choke decoding the non-UTF-8 magic
+/// (`importlib.util.MAGIC_NUMBER`).
+pub(crate) fn io_open_code(args: &[Object]) -> Result<Object, RuntimeError> {
+    let path = match args.first() {
+        Some(obj) => obj.clone(),
+        None => {
+            return Err(type_error(
+                "open_code() missing required argument 'path' (pos 1)",
+            ))
+        }
+    };
+    io_open(&[path, Object::from_static("rb")])
+}
+
+/// Keyword face of [`io_open_code`]: accepts `open_code(path=...)`.
+pub(crate) fn io_open_code_kw(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let mut path = args.first().cloned();
+    for (k, v) in kwargs {
+        if k == "path" {
+            if path.is_some() {
+                return Err(type_error(
+                    "open_code() got multiple values for argument 'path'",
+                ));
+            }
+            path = Some(v.clone());
+        } else {
+            return Err(type_error(format!(
+                "open_code() got an unexpected keyword argument '{k}'"
+            )));
+        }
+    }
+    match path {
+        Some(p) => io_open(&[p, Object::from_static("rb")]),
+        None => Err(type_error(
+            "open_code() missing required argument 'path' (pos 1)",
+        )),
+    }
 }
 
 pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {

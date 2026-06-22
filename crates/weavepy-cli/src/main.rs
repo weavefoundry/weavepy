@@ -778,25 +778,34 @@ fn run_module(
     flags: &InterpreterFlags,
     extra_path: &[PathBuf],
 ) -> Result<()> {
-    // First look on the filesystem for a `<name>.py` / `<name>/__init__.py`.
-    // If we find one, run it directly so the filename / __file__ honour
-    // the host. Otherwise fall back to `runpy.run_module(...)` which can
-    // resolve frozen built-in modules (`venv`, `pip`, `pdb`, …).
+    // First look on the filesystem for a top-level `<name>.py`. A single-file
+    // module has no `__main__` redirect and no parent package to initialise,
+    // so we can run it directly and let the filename / `__file__` honour the
+    // host source. Packages are deliberately NOT short-circuited here: CPython's
+    // `python -m pkg` never executes `pkg/__init__.py` as `__main__`, it
+    // redirects to `pkg.__main__` (importing `pkg` first so the target's
+    // relative imports resolve). Running `__init__.py` directly breaks any
+    // `from . import ...` in the package body (e.g. `zipfile`). So packages —
+    // and everything else — fall through to the `runpy` path below, which
+    // performs that redirect faithfully and also resolves frozen modules.
     let mut argv = vec![name.to_owned()];
     argv.extend(args.iter().cloned());
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let rel: PathBuf = name.split('.').collect();
     let mut search: Vec<PathBuf> = vec![cwd.clone()];
     search.extend(extra_path.iter().cloned());
-    let on_disk = search.into_iter().find_map(|dir| {
-        let m = dir.join(&rel).with_extension("py");
-        if m.is_file() {
-            return Some((m, false));
-        }
-        let init = dir.join(&rel).join("__init__.py");
-        init.is_file().then_some((init, true))
-    });
-    if let Some((source_path, _)) = on_disk {
+    // Only a top-level, non-dotted name with a matching `<name>.py` takes the
+    // fast path; a dotted `-m pkg.mod` needs `runpy` to import the parent
+    // package first, and a package directory must redirect to `__main__`.
+    let on_disk_module = if name.contains('.') {
+        None
+    } else {
+        search.iter().find_map(|dir| {
+            let m = dir.join(&rel).with_extension("py");
+            m.is_file().then_some(m)
+        })
+    };
+    if let Some(source_path) = on_disk_module {
         let bytes = fs::read(&source_path)
             .with_context(|| format!("failed to read {}", source_path.display()))?;
         let filename = source_path.display().to_string();
@@ -858,8 +867,22 @@ fn run_path(
     flags: &InterpreterFlags,
     extra_path: &[PathBuf],
 ) -> Result<()> {
+    // A directory or zipfile argument is executed as a module: CPython's
+    // `pymain_run_module` adds the path itself to `sys.path[0]` and runs
+    // `runpy._run_module_as_main("__main__")`, so `<dir>/__main__.py` (or the
+    // zip's top-level `__main__`) becomes the program. (`python <dir>` /
+    // `python app.zip`.)
+    if path.is_dir() || path_is_zipfile(path) {
+        return run_main_module_from_path(path, extra, flags, extra_path);
+    }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let filename = path.display().to_string();
+    // A compiled-bytecode file (`.pyc`) given directly: CPython's
+    // `pymain_run_file` detects the magic and runs the unmarshalled code
+    // object as `__main__` (rather than trying to decode it as source).
+    if is_pyc_bytes(&bytes) {
+        return run_pyc_as_main(path, extra, flags, extra_path);
+    }
     let source = decode_script_source(&bytes, &filename);
     let mut argv = vec![filename.clone()];
     argv.extend(extra);
@@ -873,6 +896,92 @@ fn run_path(
         .with_script_dir(script_dir)
         .with_flags(flags.clone());
     run_source_with_options(&source, &opts)
+}
+
+/// CPython's `__pycache__`/legacy-`.pyc` magic (kept in sync with
+/// `crates/weavepy-vm/src/pycache.rs` and `importlib.machinery.MAGIC_NUMBER`).
+const PYC_MAGIC: [u8; 4] = [0xf3, 0x0d, 0x0d, 0x0a];
+
+/// Whether `bytes` begins with the WeavePy bytecode magic + the 16-byte
+/// `.pyc` header CPython writes (4 magic, 4 bit-field, 8 mtime/size or hash).
+fn is_pyc_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= 16 && bytes[..4] == PYC_MAGIC
+}
+
+/// Whether `path` is a zip archive (local-file/empty/spanned signatures).
+/// `python app.zip` runs the zip's top-level `__main__` via `zipimport`.
+fn path_is_zipfile(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    if f.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    matches!(
+        magic,
+        [b'P', b'K', 0x03, 0x04] | [b'P', b'K', 0x05, 0x06] | [b'P', b'K', 0x07, 0x08]
+    )
+}
+
+/// Run a directory or zipfile's top-level `__main__` as the program, with
+/// `path` prepended to `sys.path` (CPython's directory/zipapp launch).
+fn run_main_module_from_path(
+    path: &Path,
+    extra: Vec<String>,
+    flags: &InterpreterFlags,
+    extra_path: &[PathBuf],
+) -> Result<()> {
+    let path_str = path.display().to_string();
+    let mut argv = vec![path_str.clone()];
+    argv.extend(extra);
+    // `alter_argv=False`: keep `sys.argv[0]` as the dir/zip path (CPython does
+    // not rewrite it to the located `__main__` for directory/zip execution).
+    let bootstrap =
+        String::from("import runpy\nrunpy._run_module_as_main('__main__', alter_argv=False)\n");
+    let opts = RunOptions::new(path_str)
+        .with_argv(argv)
+        .with_extra_path(extra_path.to_vec())
+        .with_script_dir(path.to_path_buf())
+        .with_flags(flags.clone());
+    run_source_with_options(&bootstrap, &opts)
+}
+
+/// Run a `.pyc` file's marshalled code object as `__main__`, mirroring
+/// CPython's `run_pyc_file`: `__main__.__file__` is the `.pyc` path and
+/// `__spec__` stays `None` (a directly-run file is not an importable module),
+/// so `multiprocessing` spawn reconstructs the child via `init_main_from_path`.
+fn run_pyc_as_main(
+    path: &Path,
+    extra: Vec<String>,
+    flags: &InterpreterFlags,
+    extra_path: &[PathBuf],
+) -> Result<()> {
+    let path_str = path.display().to_string();
+    let mut argv = vec![path_str.clone()];
+    argv.extend(extra);
+    let script_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let quoted = quote_py_string(&path_str);
+    let mut bootstrap = String::from("import sys, marshal\n");
+    bootstrap.push_str(&format!("with open({quoted}, 'rb') as _f:\n"));
+    bootstrap.push_str("    _data = _f.read()\n");
+    bootstrap.push_str("_code = marshal.loads(_data[16:])\n");
+    bootstrap.push_str("_g = sys.modules['__main__'].__dict__\n");
+    bootstrap.push_str(&format!("_g['__file__'] = {quoted}\n"));
+    bootstrap.push_str("_g['__cached__'] = None\n");
+    bootstrap.push_str("_g['__spec__'] = None\n");
+    bootstrap.push_str("del sys, marshal, _f, _data\n");
+    bootstrap.push_str("exec(_code, _g)\n");
+    let opts = RunOptions::new(path_str)
+        .with_argv(argv)
+        .with_extra_path(extra_path.to_vec())
+        .with_script_dir(script_dir)
+        .with_flags(flags.clone());
+    run_source_with_options(&bootstrap, &opts)
 }
 
 fn run_stdin(extra: Vec<String>, flags: &InterpreterFlags, extra_path: &[PathBuf]) -> Result<()> {

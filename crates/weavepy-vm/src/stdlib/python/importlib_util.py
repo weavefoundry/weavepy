@@ -32,7 +32,7 @@ __all__ = [
 
 def _cache_tag():
     impl = sys.implementation
-    return getattr(impl, 'cache_tag', 'weavepy-3.13')
+    return getattr(impl, 'cache_tag', 'weavepy-313')
 
 
 def cache_from_source(path, debug_override=None, *, optimization=None):
@@ -68,8 +68,12 @@ def source_from_cache(path):
     if not path.endswith('.pyc'):
         raise ValueError("not a .pyc path: {!r}".format(path))
     head, tail = os.path.split(path)
-    name = tail[:-4]  # strip .pyc
-    base = name.rsplit('.', 1)[0]
+    # PEP 3147 names a cache file ``<name>.<tag>[.opt-N].pyc``; the source
+    # base is everything before the *first* dot (the cache tag never contains
+    # a dot, so this is unambiguous). Taking the first component — as CPython's
+    # ``source_from_cache`` does (``partition('.')[0]``) — is what keeps a
+    # multi-dotted tag from leaking into the recovered ``<name>.py``.
+    base = tail.partition('.')[0]
     if os.path.basename(head) == '__pycache__':
         parent = os.path.dirname(head)
     else:

@@ -285,6 +285,19 @@ impl MarshalWriter {
             Object::Code(co) => {
                 self.write_code(co)?;
             }
+            // `Ellipsis` (the value of `...`) is a singleton instance of the
+            // registry `ellipsis` type. CPython marshals it as `TYPE_ELLIPSIS`;
+            // it shows up as a code constant in any module using `...` (stub
+            // bodies, typing, the many `test` fixtures `PyZipFile.writepy`
+            // compiles). The load side already reconstructs the singleton.
+            Object::Instance(inst)
+                if Rc::ptr_eq(
+                    &inst.cls(),
+                    &crate::builtin_types::builtin_types().ellipsis_,
+                ) =>
+            {
+                self.write_byte(TYPE_ELLIPSIS);
+            }
             other => {
                 return Err(value_error(format!(
                     "marshal: unsupported value type '{}'",

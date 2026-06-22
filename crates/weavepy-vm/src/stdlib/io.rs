@@ -53,17 +53,26 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // `io.open(...)` (often aliased `import io as _io`) with keyword
         // arguments. Share the `_io` implementation so both module faces
         // behave identically.
-        for name in ["open", "open_code"] {
-            d.insert(
-                DictKey(Object::from_static(name)),
-                Object::Builtin(Rc::new(BuiltinFn {
-                    name,
-                    binds_instance: false,
-                    call: Box::new(crate::stdlib::io_full::io_open),
-                    call_kw: Some(Box::new(crate::stdlib::io_full::io_open_kw)),
-                })),
-            );
-        }
+        d.insert(
+            DictKey(Object::from_static("open")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "open",
+                binds_instance: false,
+                call: Box::new(crate::stdlib::io_full::io_open),
+                call_kw: Some(Box::new(crate::stdlib::io_full::io_open_kw)),
+            })),
+        );
+        // `io.open_code(path)` forces binary mode (`open(path, 'rb')`) so
+        // `runpy`/`pkgutil.read_code` can read a `.pyc`'s raw magic header.
+        d.insert(
+            DictKey(Object::from_static("open_code")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "open_code",
+                binds_instance: false,
+                call: Box::new(crate::stdlib::io_full::io_open_code),
+                call_kw: Some(Box::new(crate::stdlib::io_full::io_open_code_kw)),
+            })),
+        );
         // CPython's `io.__all__`; consumers (and `test_io`) read it directly.
         d.insert(
             DictKey(Object::from_static("__all__")),

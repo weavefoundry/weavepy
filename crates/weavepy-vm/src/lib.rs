@@ -21565,7 +21565,26 @@ impl Interpreter {
             // Distinct per-module pseudo-filenames (`<frozen contextlib>`)
             // let tracebacks resolve source lines through `linecache`'s
             // frozen-source hook (backed by `_imp.find_frozen`).
-            let display = format!("<frozen {full}>");
+            let mut display = format!("<frozen {full}>");
+            // A frozen *package* that is also present on disk (the usual case
+            // under a vendored CPython `Lib/`) should be indistinguishable from
+            // an on-disk import: compile its body with the *real* source path as
+            // `co_filename`, matching the real-path `__file__`/`__path__` that
+            // `run_frozen_compiled` sets for such packages. Otherwise the code
+            // object's frames carry `<frozen pkg>` while `__file__` points at
+            // disk, and any consumer that bridges the two breaks — notably
+            // `warnings.warn(..., skip_file_prefixes=(os.path.dirname(__file__),))`
+            // (zipfile's "Overlapped entries" warning must blame the caller, not
+            // zipfile's own frame). Real-path code is never written to the
+            // process-global frozen cache (the cache key is the `<frozen …>`
+            // shape), so we also bypass the cache fast-path here.
+            let mut frozen_cacheable = true;
+            if frozen.is_package {
+                if let Some((path, true)) = self.cache.find_source(full) {
+                    display = path.to_string_lossy().into_owned();
+                    frozen_cacheable = false;
+                }
+            }
             // RFC 0021 — frozen modules pay a parse + compile cost
             // on every fresh `Interpreter::new()` (tests, the REPL,
             // and the bench harness all spin up many). A
@@ -21573,8 +21592,10 @@ impl Interpreter {
             // the *second* and subsequent interpreters skip both
             // stages and go straight from `&'static str` source to
             // a fully-compiled `CodeObject`.
-            if let Some(code) = frozen_code_cache::get(full) {
-                return self.run_frozen_compiled(full, code, frozen.is_package, &display);
+            if frozen_cacheable {
+                if let Some(code) = frozen_code_cache::get(full) {
+                    return self.run_frozen_compiled(full, code, frozen.is_package, &display);
+                }
             }
             return self.load_from_source(full, frozen.source, frozen.is_package, &display);
         }
@@ -21666,9 +21687,120 @@ impl Interpreter {
             self.cache.insert(full, module_obj.clone());
             return Ok(module_obj);
         }
+        // Last resort: hand off to the Python `sys.meta_path` finders for
+        // module kinds the native loader doesn't understand — modules inside
+        // ZIP archives on `sys.path` (`zipimport`) and sourceless `.pyc`
+        // files reached through a custom finder. CPython's `__import__` *is*
+        // the meta-path machinery; this bridges WeavePy's Rust loader to it
+        // (RFC 0040 WS5: `python app.zip`, `-m pkg.mod` from a zip, and the
+        // `multiprocessing` spawn re-import of a zip/`.pyc` `__main__`).
+        if let Some(module) = self.try_meta_path_import(full)? {
+            return Ok(module);
+        }
         let err = module_not_found_error(format!("No module named '{full}'"));
         crate::error::set_exception_attr(&err, "name", Object::from_str(full.to_owned()));
         Err(err)
+    }
+
+    /// Resolve `full` through the Python `sys.meta_path` finders, loading the
+    /// located spec via `importlib._bootstrap._load`. Returns `Ok(None)` when
+    /// no finder claims the name (the caller then raises
+    /// `ModuleNotFoundError`); load-time errors of a *found* module
+    /// propagate. The parent package is already imported and bound by
+    /// [`Self::import_path`] before the child reaches here, so the helper can
+    /// scope the search to `sys.modules[parent].__path__`.
+    fn try_meta_path_import(&mut self, full: &str) -> Result<Option<Object>, RuntimeError> {
+        // Re-entrancy guard. The fallback itself imports its dependency
+        // closure (`importlib.machinery`, `zipimport`, `zipfile`, …); those
+        // resolve natively, but guard against a pathological cycle in which
+        // resolving `full` recursively asks for `full` again.
+        thread_local! {
+            static IN_PROGRESS: RefCell<std::collections::HashSet<String>> =
+                RefCell::new(std::collections::HashSet::new());
+        }
+        if !IN_PROGRESS.with(|s| s.borrow_mut().insert(full.to_owned())) {
+            return Ok(None);
+        }
+        let result = self.meta_path_import_inner(full);
+        IN_PROGRESS.with(|s| {
+            s.borrow_mut().remove(full);
+        });
+        result
+    }
+
+    fn meta_path_import_inner(&mut self, full: &str) -> Result<Option<Object>, RuntimeError> {
+        let helper = match self.import_path("_weave_import_fallback") {
+            Ok(Object::Module(m)) => m,
+            _ => return Ok(None),
+        };
+        let func = helper
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("import_via_finders")))
+            .cloned();
+        let Some(func) = func else {
+            return Ok(None);
+        };
+        let helper_globals = helper.dict.clone();
+        // The helper returns `None` (not found / namespace / no code) or the
+        // tuple `(code, is_package, filename, locations, loader, spec)`. We
+        // build the module *natively* from the code object so it is a true
+        // `Object::Module` — dotted-import binding and `IMPORT_FROM` only
+        // recognise native modules, not `types.ModuleType` instances.
+        let payload =
+            match self.call(&func, &[Object::from_str(full.to_owned())], &[], &helper_globals)? {
+                Object::Tuple(t) => t,
+                _ => return Ok(None),
+            };
+        let Some(Object::Code(code_rc)) = payload.first().cloned() else {
+            return Ok(None);
+        };
+        let is_package = matches!(payload.get(1), Some(Object::Bool(true)));
+        let filename = match payload.get(2) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => format!("<{full}>"),
+        };
+        let locations = payload.get(3).cloned().unwrap_or(Object::None);
+        let loader = payload.get(4).cloned().unwrap_or(Object::None);
+        let spec = payload.get(5).cloned().unwrap_or(Object::None);
+
+        let package_owned = if is_package {
+            full.to_owned()
+        } else {
+            full.rsplit_once('.')
+                .map_or(String::new(), |(p, _)| p.to_owned())
+        };
+        let pkg_for_globals = (!package_owned.is_empty()).then_some(package_owned.as_str());
+        let globals = self.build_module_globals(full, Some(&filename), pkg_for_globals);
+        {
+            let mut g = globals.borrow_mut();
+            g.insert(DictKey(Object::from_static("__loader__")), loader);
+            g.insert(DictKey(Object::from_static("__spec__")), spec);
+            if is_package {
+                // A package's `__path__` (the finder's search locations) is
+                // what lets the Rust loader's parent-`__path__` walk and the
+                // meta-path fallback resolve `pkg.sub` against the archive.
+                let path_list = match locations {
+                    Object::List(_) => locations,
+                    _ => Object::new_list(Vec::new()),
+                };
+                g.insert(DictKey(Object::from_static("__path__")), path_list);
+            }
+        }
+        let module_obj = Object::Module(Rc::new(PyModule {
+            name: full.to_owned(),
+            filename: Some(filename),
+            dict: globals.clone(),
+        }));
+        // Register before executing so circular imports observe the partial
+        // module (CPython's `_load` contract).
+        self.cache.insert(full, module_obj.clone());
+        let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
+        if let Err(e) = self.run_frame(&mut frame) {
+            self.cache.remove(full);
+            return Err(e);
+        }
+        Ok(Some(module_obj))
     }
 
     /// Compile and execute Python source provided as a string. Used
@@ -25891,6 +26023,18 @@ fn object_to_constant(o: &Object) -> Constant {
             Constant::Tuple(s.iter().map(|k| object_to_constant(&k.0)).collect())
         }
         Object::Code(c) => Constant::Code(Box::new((**c).clone())),
+        // `Ellipsis` (`...`) is a singleton instance of the registry
+        // `ellipsis` type; fold it back to `Constant::Ellipsis` so a `.pyc`
+        // (or `marshal.loads`) round-trips it instead of silently losing it
+        // to `None`. Mirrors `constant_to_object`'s forward mapping.
+        Object::Instance(inst)
+            if crate::sync::Rc::ptr_eq(
+                &inst.cls(),
+                &crate::builtin_types::builtin_types().ellipsis_,
+            ) =>
+        {
+            Constant::Ellipsis
+        }
         _ => Constant::None,
     }
 }

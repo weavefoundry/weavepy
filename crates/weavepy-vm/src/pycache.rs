@@ -48,8 +48,14 @@ use crate::stdlib::marshal_mod;
 pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 
 /// Cache tag — appears in `__pycache__/<name>.<tag>.pyc` and on
-/// `sys.implementation.cache_tag`. Mirrors CPython's `cpython-313`.
-pub const CACHE_TAG: &str = "weavepy-3.13";
+/// `sys.implementation.cache_tag`. Mirrors CPython's `cpython-313`
+/// shape: `<impl>-<major><minor>` with **no dot** in the tag itself
+/// (PEP 3147's `<name>.<tag>.pyc` parsing — e.g. `source_from_cache`,
+/// which `runpy`/`make_legacy_pyc` rely on — keys off the first dot, so
+/// a dotted tag like `weavepy-3.13` would corrupt the recovered source
+/// name). Distinct from CPython's `cpython-313` so the artifacts never
+/// collide.
+pub const CACHE_TAG: &str = "weavepy-313";
 
 const HEADER_LEN: usize = 16;
 

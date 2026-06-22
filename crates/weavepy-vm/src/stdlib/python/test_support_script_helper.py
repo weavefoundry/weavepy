@@ -184,8 +184,16 @@ def make_zip_script(zip_dir, zip_basename, script_name, name_in_zip=None):
         if name_in_zip is None:
             parts = script_name.split(os.sep)
             if len(parts) >= 2 and parts[-2] == '__pycache__':
-                legacy_pyc = os.path.basename(script_name)
-                name_in_zip = legacy_pyc
+                # A PEP 3147/488 ``__pycache__/<name>.<tag>.pyc`` is moved to
+                # its legacy ``<name>.pyc`` location first, so the archived
+                # entry is importable as ``<name>`` (CPython's behaviour —
+                # ``test_zipfile_compiled``). Just archiving the cache-tagged
+                # basename would leave no ``<name>.pyc`` for zipimport to find.
+                from test.support.import_helper import make_legacy_pyc
+                from importlib.util import source_from_cache
+                legacy_pyc = make_legacy_pyc(source_from_cache(script_name))
+                name_in_zip = os.path.basename(legacy_pyc)
+                script_name = legacy_pyc
             else:
                 name_in_zip = os.path.basename(script_name)
         zip_file.write(script_name, name_in_zip)
@@ -201,6 +209,11 @@ def make_zip_pkg(zip_dir, zip_basename, pkg_name, script_basename,
     init_basename = os.path.basename(init_name)
     script_name = make_script(zip_dir, script_basename, source)
     unlink.append(script_name)
+    if compiled:
+        import py_compile
+        init_name = py_compile.compile(init_name, doraise=True)
+        script_name = py_compile.compile(script_name, doraise=True)
+        unlink.extend((init_name, script_name))
     pkg_names = [os.sep.join([pkg_name] * i) for i in range(1, depth + 1)]
     script_name_in_zip = os.path.join(pkg_names[-1],
                                       os.path.basename(script_name))

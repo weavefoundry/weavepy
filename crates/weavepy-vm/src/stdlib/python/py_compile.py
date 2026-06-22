@@ -6,7 +6,7 @@ Compiles a single ``.py`` file to a ``.pyc`` bytecode archive that
 The framing matches CPython's PEP-552 magic-tag-based layout: a
 16-byte header followed by a ``marshal.dumps`` of the code object.
 RFC 0033 adopts CPython 3.13's magic number; WeavePy's distinct
-cache tag (``weavepy-3.13``) keeps its ``.pyc`` files from colliding
+cache tag (``weavepy-313``) keeps its ``.pyc`` files from colliding
 with CPython's ``cpython-313`` artifacts.
 
 Layout (little-endian):
@@ -37,9 +37,11 @@ def _cache_from_source(path, optimization=""):
     head, tail = os.path.split(path)
     if tail.endswith(".py"):
         tail = tail[:-3]
-    suffix = "" if not optimization else "." + str(optimization)
+    suffix = "" if not optimization else ".opt-" + str(optimization)
     cache_dir = os.path.join(head, "__pycache__")
-    return os.path.join(cache_dir, "%s.weavepy-3.13%s.pyc" % (tail, suffix))
+    # The cache tag mirrors `sys.implementation.cache_tag` (no dot — see
+    # `importlib.util.source_from_cache`), distinct from CPython's.
+    return os.path.join(cache_dir, "%s.weavepy-313%s.pyc" % (tail, suffix))
 
 
 def cache_from_source(path, optimization=""):
@@ -63,8 +65,14 @@ def compile(file, cfile=None, dfile=None, doraise=False, optimize=-1,
         else:
             cfile = _cache_from_source(file)
     try:
-        with open(file, "r", encoding="utf-8") as f:
-            source = f.read()
+        # Read the source as *bytes*, exactly as CPython's
+        # `SourceFileLoader.get_data` does — the encoding is then resolved by
+        # the compiler from the PEP 263 coding cookie / BOM. Decoding as UTF-8
+        # up front would choke on the many non-UTF-8 fixtures CPython compiles
+        # (e.g. `test`'s Latin-1 / `coding`-cookie modules under
+        # `PyZipFile.writepy`).
+        with open(file, "rb") as f:
+            source_bytes = f.read()
         st = os.stat(file)
         mtime = int(st.st_mtime)
         size = int(st.st_size)
@@ -75,11 +83,12 @@ def compile(file, cfile=None, dfile=None, doraise=False, optimize=-1,
             print("py_compile: skipping %r: %s" % (file, e))
         return None
     # The real compile step is the interpreter's built-in `compile`, exactly
-    # as CPython's `SourceFileLoader.source_to_code` ultimately calls. A
+    # as CPython's `SourceFileLoader.source_to_code` ultimately calls. Passing
+    # the raw bytes lets `compile` honour the source's declared encoding. A
     # SyntaxError (etc.) is reported as a PyCompileError so callers like
     # `zipfile.PyZipFile` can fall back to shipping the raw `.py`.
     try:
-        code = builtins.compile(source, dfile or file, "exec", optimize=optimize)
+        code = builtins.compile(source_bytes, dfile or file, "exec", optimize=optimize)
     except Exception as err:
         py_exc = PyCompileError(
             type(err).__name__,

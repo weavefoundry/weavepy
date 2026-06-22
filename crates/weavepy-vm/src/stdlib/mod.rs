@@ -1201,6 +1201,23 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/runpy.py"),
             is_package: false,
         },
+        // RFC 0040 WS5 — import modules from ZIP archives on `sys.path`
+        // (PEP 273). Self-contained reimplementation over the frozen
+        // `zipfile`; plugs into `sys.path_hooks` for the Python `find_spec`
+        // path and is reached by the Rust loader's meta-path fallback below.
+        FrozenSource {
+            name: "zipimport",
+            source: include_str!("python/zipimport.py"),
+            is_package: false,
+        },
+        // RFC 0040 WS5 — bridge the Rust import loader to `sys.meta_path`
+        // for module kinds it doesn't resolve natively (zip archives,
+        // sourceless `.pyc` via a custom finder). Called from `load_one`.
+        FrozenSource {
+            name: "_weave_import_fallback",
+            source: include_str!("python/_weave_import_fallback.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "codeop",
             source: include_str!("python/codeop.py"),

@@ -15,13 +15,72 @@ __all__ = [
     'ModuleInfo',
     'iter_modules',
     'walk_packages',
+    'get_importer',
+    'iter_importers',
     'get_loader',
     'find_loader',
     'get_data',
+    'read_code',
     'extend_path',
     'resolve_name',
     'ImpImporter',
 ]
+
+
+def read_code(stream):
+    # This helper is needed in order for the PEP 302 emulation to
+    # correctly handle compiled files (mirrors CPython's pkgutil.read_code).
+    import marshal
+    import importlib.machinery
+
+    magic = stream.read(4)
+    if magic != importlib.machinery.MAGIC_NUMBER:
+        return None
+
+    stream.read(12)  # Skip rest of the header
+    return marshal.load(stream)
+
+
+def get_importer(path_item):
+    """Retrieve a finder for the given path item.
+
+    The returned finder is cached in ``sys.path_importer_cache`` if it was
+    newly created by a path hook. ``None`` means the path item is not a valid
+    ``sys.path`` entry (e.g. a plain file rather than a directory/zipfile)."""
+    path_item = os.fsdecode(path_item)
+    try:
+        importer = sys.path_importer_cache[path_item]
+    except KeyError:
+        for path_hook in sys.path_hooks:
+            try:
+                importer = path_hook(path_item)
+                sys.path_importer_cache.setdefault(path_item, importer)
+                break
+            except ImportError:
+                pass
+        else:
+            importer = None
+    return importer
+
+
+def iter_importers(fullname=""):
+    """Yield finders for ``fullname`` on ``sys.meta_path`` and ``sys.path``."""
+    if fullname.startswith('.'):
+        msg = "Relative module name {!r} not supported".format(fullname)
+        raise ImportError(msg)
+    if '.' in fullname:
+        # Get the containing package's __path__
+        import importlib
+        pkg_name = fullname.rpartition(".")[0]
+        pkg = importlib.import_module(pkg_name)
+        path = getattr(pkg, '__path__', None)
+        if path is None:
+            return
+    else:
+        yield from sys.meta_path
+        path = sys.path
+    for item in path:
+        yield get_importer(item)
 
 ModuleInfo = collections.namedtuple('ModuleInfo', 'module_finder name ispkg')
 
