@@ -71,6 +71,14 @@ pub struct TypeObject {
     /// Invalidated (reset to `0`) for the type and its subclasses whenever
     /// `__getattribute__` is assigned to / deleted from a type's dict.
     pub getattribute_kind: Cell<u8>,
+    /// Cached "do instances of this type carry a `__del__` finalizer
+    /// anywhere in their MRO?" answer, so [`crate::object::PyInstance`]'s
+    /// `Drop` safety net can skip an MRO walk on the hot per-instance drop
+    /// path: `0` = not yet computed, `1` = no finalizer, `2` = has one.
+    /// Invalidated (reset to `0`) for the type and its subclasses whenever
+    /// `__del__` is assigned to / deleted from a type's dict or the MRO is
+    /// recomputed (`__bases__` assignment).
+    pub has_del: Cell<u8>,
 }
 
 impl std::fmt::Debug for TypeObject {
@@ -287,6 +295,7 @@ impl TypeObject {
             forbids_dict: false,
             subclasses: RefCell::new(Vec::new()),
             getattribute_kind: Cell::new(0),
+            has_del: Cell::new(0),
         });
         let mro = compute_c3(&ty, &bases, name)?;
         *ty.mro.borrow_mut() = mro;
@@ -574,6 +583,70 @@ impl TypeObject {
         }
     }
 
+    /// Do instances of this type carry a `__del__` finalizer anywhere in
+    /// their MRO? Cached (see [`TypeObject::has_del`]) so the per-instance
+    /// `Drop` safety net pays an MRO walk at most once per type, then a
+    /// single `Cell` read. The result only changes when `__del__` is
+    /// assigned to / deleted from a class in the MRO, or the MRO itself is
+    /// reshaped — both of which reset the cache via
+    /// [`Self::invalidate_finalizer_cache`].
+    ///
+    /// **Drop-safe.** This is called from [`crate::object::PyInstance`]'s
+    /// `Drop`, which can fire at *any* moment — including while this very
+    /// type's `dict`/`mro` is mutably borrowed (a class attribute that is an
+    /// instance of its own class, evicted mid-`__setattr__`). It therefore
+    /// probes with `try_borrow` and never re-enters Python (the `__del__`
+    /// key is an interned `str`, so dict lookup is pure), falling back to a
+    /// conservative `true` on any borrow conflict: a spurious resurrection
+    /// is harmless because `Vm::invoke_finalizer` simply no-ops when the
+    /// instance turns out to have no `__del__`.
+    pub fn instances_need_finalize(&self) -> bool {
+        match self.has_del.get() {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+        let Ok(mro) = self.mro.try_borrow() else {
+            return true;
+        };
+        let key = DictKey(Object::from_static("__del__"));
+        for ty in mro.iter() {
+            match ty.dict.try_borrow() {
+                Ok(d) => {
+                    if d.get(&key).is_some() {
+                        self.has_del.set(2);
+                        return true;
+                    }
+                }
+                // The type is mid-mutation; don't risk a panic, and don't
+                // poison the cache — assume finalizable for this one drop.
+                Err(_) => return true,
+            }
+        }
+        self.has_del.set(1);
+        false
+    }
+
+    /// Reset the cached `__del__` classification for this type and every
+    /// (transitive) subclass. Called when `__del__` is assigned to / deleted
+    /// from a type's dict, or when the MRO is recomputed — either can change
+    /// which `__del__` (if any) an instance resolves. Mirrors
+    /// [`Self::invalidate_getattribute_cache`]'s acyclic-with-visited walk.
+    pub fn invalidate_finalizer_cache(&self) {
+        let mut visited: Vec<*const TypeObject> = vec![std::ptr::from_ref::<TypeObject>(self)];
+        self.has_del.set(0);
+        let mut queue: Vec<Rc<TypeObject>> = self.subclasses();
+        while let Some(t) = queue.pop() {
+            let ptr = Rc::as_ptr(&t);
+            if visited.contains(&ptr) {
+                continue;
+            }
+            visited.push(ptr);
+            t.has_del.set(0);
+            queue.extend(t.subclasses());
+        }
+    }
+
     /// Live direct subclasses, in registration order. Dead weak refs
     /// (subclasses that have been dropped) are pruned as a side effect.
     pub fn subclasses(&self) -> Vec<Rc<TypeObject>> {
@@ -756,6 +829,19 @@ pub struct PyInstance {
     /// `__hash__` (test_dict's `BadHash`) wraps no native value and is
     /// never cached here, so it is re-invoked on every probe like CPython.
     pub hash_cache: Cell<Option<i64>>,
+    /// One-shot "has `__del__` already run for this instance?" guard,
+    /// mirroring [`crate::object::PyGenerator::finalize_ran`] and CPython's
+    /// `_PyGC_FINALIZED` bit. Set by `Vm::invoke_finalizer` the moment the
+    /// finalizer is dispatched; read by [`PyInstance`]'s `Drop` to decide
+    /// whether the dying instance still needs its `__del__` resurrected onto
+    /// the pending-finalizer queue. Without this, an acyclic finalizable
+    /// instance whose last `Arc` is dropped on a code path that *didn't*
+    /// route through the prompt-reap cascade (e.g. a cross-thread handoff
+    /// where a transient clone briefly inflated the refcount so the reap
+    /// bailed) is freed silently, skipping `__del__` (RFC 0040:
+    /// `test_multiprocessing_*` `test_release_task_refs` leaked one
+    /// `CountedObject` per race).
+    pub finalize_ran: Cell<bool>,
 }
 
 impl PyInstance {
@@ -767,6 +853,7 @@ impl PyInstance {
             inline_values: Cell::new(true),
             slots: RefCell::new(None),
             hash_cache: Cell::new(None),
+            finalize_ran: Cell::new(false),
         }
     }
 
@@ -780,6 +867,7 @@ impl PyInstance {
             inline_values: Cell::new(true),
             slots: RefCell::new(None),
             hash_cache: Cell::new(None),
+            finalize_ran: Cell::new(false),
         }
     }
 
@@ -834,5 +922,52 @@ impl PyInstance {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+impl Drop for PyInstance {
+    /// Last-resort finalizer safety net, mirroring
+    /// [`crate::object::PyGenerator`]'s `Drop`. WeavePy normally runs an
+    /// instance's `__del__` through the prompt-reap cascade the instant its
+    /// last program reference is dropped (matching CPython's refcount
+    /// timing). But that cascade is driven from specific eval-loop sites and
+    /// is gated on a refcount-dead test; when the final `Arc` is released
+    /// somewhere else — most often a cross-thread object handoff where a
+    /// transient clone on another thread briefly inflated the strong count so
+    /// the reap conservatively bailed — the instance would otherwise be freed
+    /// by a plain `Arc` drop with its `__del__` silently skipped (the cycle
+    /// collector never revisits acyclic objects). Catch that here: resurrect
+    /// a shallow copy that shares the dying instance's `__dict__`/slots/native
+    /// value onto the VM's pending-finalizer queue so `__del__` still runs.
+    fn drop(&mut self) {
+        // Already finalized (cascade/GC/this net's resurrected copy): the
+        // common case for finalizable instances and the *only* path for the
+        // overwhelmingly common finalizer-free instance — a single `Cell`
+        // read keeps the hot drop path cheap.
+        if self.finalize_ran.get() {
+            return;
+        }
+        // No `__del__` anywhere in the MRO ⇒ nothing to do. Cached on the
+        // type, so this is one more `Cell` read after the first instance.
+        if !self.cls().instances_need_finalize() {
+            return;
+        }
+        // CPython runs `tp_finalize` once: claim it so the resurrected copy
+        // (and any re-drop after the finalizer completes) can't loop.
+        self.finalize_ran.set(true);
+        // Can't run Python from `Drop`; resurrect onto the pending queue. The
+        // copy shares `dict`/`slots`/`native` (cloning the `Arc`s/contents),
+        // so `__del__` observes the same attributes; `try_*` tolerates TLS
+        // teardown and re-entrant borrows by dropping the request.
+        let resurrected = Object::Instance(Rc::new(PyInstance {
+            class: RefCell::new(self.cls()),
+            dict: self.dict.clone(),
+            native: self.native.clone(),
+            inline_values: Cell::new(self.inline_values.get()),
+            slots: RefCell::new(self.slots.borrow().clone()),
+            hash_cache: Cell::new(self.hash_cache.get()),
+            finalize_ran: Cell::new(true),
+        }));
+        crate::vm_singletons::try_push_pending_finalizer(resurrected);
     }
 }

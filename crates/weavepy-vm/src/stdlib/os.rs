@@ -2230,7 +2230,23 @@ fn stat_result_from_libc_stat(st: &libc::stat) -> Object {
 fn dir_fd_arg(kwargs: &[(String, Object)]) -> Result<Option<libc::c_int>, RuntimeError> {
     match kwargs.iter().find(|(k, _)| k == "dir_fd").map(|(_, v)| v) {
         None | Some(Object::None) => Ok(None),
-        Some(Object::Int(n)) => Ok(Some(*n as libc::c_int)),
+        // A `bool` descriptor warns ("bool is used as a file descriptor"),
+        // then is used as 0/1 — CPython's `dir_fd` converter calls the same
+        // `_PyLong_FileDescriptor_Converter` path (`test_posix.test_stat_dir_fd`).
+        Some(Object::Bool(b)) => {
+            warn_bool_as_fd()?;
+            Ok(Some(libc::c_int::from(*b)))
+        }
+        // An in-range `int` fits; an out-of-range one (or any bignum `int`,
+        // which is by definition past `i64` let alone `c_int`) raises
+        // `OverflowError`, matching CPython's `PyLong_AsInt` — *not* `TypeError`
+        // (`posix.stat(name, dir_fd=10**20)` → OverflowError).
+        Some(Object::Int(n)) => libc::c_int::try_from(*n).map(Some).map_err(|_| {
+            crate::error::overflow_error("Python int too large to convert to C int")
+        }),
+        Some(Object::Long(_)) => Err(crate::error::overflow_error(
+            "Python int too large to convert to C int",
+        )),
         Some(other) => Err(type_error(format!(
             "argument should be integer or None, not {}",
             other.type_name()

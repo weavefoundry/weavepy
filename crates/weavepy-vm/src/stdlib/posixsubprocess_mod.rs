@@ -265,10 +265,21 @@ fn fork_exec(args: &[Object]) -> Result<Object, RuntimeError> {
 
     // ---- Child (pid == 0) ----
     unsafe {
-        // Reset the signal mask so the child starts with everything unblocked.
-        let mut empty: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&raw mut empty);
-        libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut());
+        // Do NOT reset the signal mask here. CPython's `child_exec`
+        // (`_posixsubprocess.c`) leaves the inherited mask untouched, and
+        // `multiprocessing.resource_tracker._launch` relies on exactly that:
+        // it `pthread_sigmask(SIG_BLOCK, {SIGINT, SIGTERM})` *right before*
+        // forking so the tracker child inherits those blocked (bpo-33613).
+        // That keeps a signal racing in during the child's startup *pending*
+        // until `resource_tracker.main()` installs `SIG_IGN` and unblocks —
+        // without it, an early `SIGINT`/`SIGTERM` (still `SIG_DFL` until the
+        // VM arms its dispositions) kills the tracker, and the test's
+        // `os.kill(tracker_pid, SIGINT)` (`test_resource_tracker_sigint`,
+        // `should_die=False`) would then leak a REGISTER and surface a
+        // spurious "resource_tracker: process died unexpectedly" warning.
+        // The child inherits the forking (VM) thread's mask, which the VM
+        // restored to the process's inherited mask at startup, so a plain
+        // `subprocess.Popen` child still starts with the usual (empty) mask.
 
         // make_inheritable: clear CLOEXEC on every fd we promised to keep
         // (pass_fds + the std pipe ends) so they survive the coming exec.

@@ -428,6 +428,20 @@ impl Default for Interpreter {
             excepthook.clone(),
             unraisable_hook.clone(),
         );
+        // Attribute `sys`'s native functions to the `sys` module so
+        // `sys.exit.__module__ == "sys"` (CPython). `pickle` resolves a
+        // builtin function by `getattr(sys.modules[__module__], __qualname__)`
+        // and checks identity, so without this `multiprocessing.Process(
+        // target=sys.exit)` — which pickles the target by reference for a
+        // `spawn` child — fails with "Can't pickle <built-in function exit>:
+        // it's not found as builtins.exit". `sys` is constructed here, before
+        // the generic `load_one` factory path that tags every other native
+        // module's functions, so it must be tagged explicitly.
+        for (_k, v) in sys_module.dict.borrow().iter() {
+            if matches!(v, Object::Builtin(_)) {
+                crate::descr_registry::register_module(v, "sys");
+            }
+        }
         cache.insert("sys", Object::Module(sys_module));
         let interp = Self {
             stdout,
@@ -1969,6 +1983,10 @@ impl Interpreter {
         let Object::Instance(inst) = obj else {
             return;
         };
+        // Claim the one-shot finalizer (CPython's `_PyGC_FINALIZED` bit)
+        // before dispatch, so [`crate::types::PyInstance`]'s `Drop` net never
+        // re-resurrects an instance whose `__del__` already ran here.
+        inst.finalize_ran.set(true);
         let Some(del) = inst.cls().lookup("__del__") else {
             return;
         };
@@ -4209,15 +4227,28 @@ impl Interpreter {
                 let v = frame.pop()?;
                 // Discarding the last reference to a temporary mirrors
                 // CPython's refcount-driven finalization (`f()` as a
-                // statement finalizes the result immediately).
-                if matches!(
-                    v,
-                    Object::Generator(_)
-                        | Object::Coroutine(_)
-                        | Object::AsyncGenerator(_)
-                        | Object::Instance(_)
-                        | Object::AsyncGenAwait(_)
-                ) {
+                // statement finalizes the result immediately). This covers
+                // not just directly-finalizable values (instances with
+                // `__del__`, live generators/coroutines) but *containers*
+                // that anchor a dead finalizable acyclic subgraph: a
+                // discarded `pool.map(...)` returns a `list` of unpickled,
+                // GC-tracked result copies, and if it isn't reaped here the
+                // copies linger as dead-but-tracked garbage until *some*
+                // thread's next collection finalizes them — which, across the
+                // statement's trailing `del`/`sleep`, is frequently a
+                // background pool thread, so the copies' `__del__` then races
+                // the main thread's (CPython runs every one on the thread that
+                // dropped the ref). The `local_needs_prompt_reap` kinds match
+                // `reap_frame_locals_on_exit`; `prompt_reap_dropped`'s refcount
+                // guard leaves anything still referenced elsewhere alone
+                // (RFC 0040: `test_multiprocessing_*` `test_release_task_refs`).
+                // No `sync_py_locals` is needed: a discarded statement result
+                // is an operand-stack temporary that was never a frame local,
+                // so the live-locals mirror cannot hold a stale clone of it,
+                // and `frame.locals` always reflects live bindings — the
+                // refcount guard therefore cannot false-positive on a value
+                // still bound to a local.
+                if Self::local_needs_prompt_reap(&v) {
                     self.prompt_reap_dropped(v);
                 }
             }
@@ -5146,15 +5177,32 @@ impl Interpreter {
                     // wrapping a file/process) drive the cascade directly so
                     // that `__del__` runs at handler exit like CPython.
                     //
-                    // The `exc_has_finalizable` pre-check keeps the hot path
-                    // cheap: the overwhelmingly common scalar-arg exception
-                    // has nothing to finalize and skips the allocating
-                    // cascade entirely. Binding the exception to an outer name
-                    // (`except E as e: saved = e`) or a pending re-raise keeps
-                    // its refcount above the dead threshold, and every cascade
-                    // node is independently refcount-guarded, so the reap is a
-                    // no-op in those cases too.
-                    if Self::exc_has_finalizable(&pe.instance, 6) {
+                    // A *weakref* to the exception (or, equivalently, to a
+                    // value reachable only through it) must likewise observe
+                    // the death now: CPython frees the just-handled exception
+                    // by refcount the instant the `except` block ends, so
+                    // `weakref.ref(e)()` is already `None` on the next line —
+                    // even with the cycle GC disabled. `test_multiprocessing`'s
+                    // `TestManagerExceptions` (bpo-106558, "Manager exceptions
+                    // avoid creating cyclic references") asserts exactly this
+                    // under `gc.disable()` with a *non-finalizable* `Empty()`
+                    // /`RemoteError`, which the finalizable-only pre-check would
+                    // leave pinned on its GC handle until the next collection.
+                    //
+                    // Both pre-checks keep the hot path cheap: the
+                    // overwhelmingly common scalar-arg exception that nothing
+                    // weakly references and has nothing to finalize skips the
+                    // allocating cascade entirely (the O(1) `count_for` probe
+                    // short-circuits before the depth-bounded
+                    // `exc_has_finalizable` walk). Binding the exception to an
+                    // outer name (`except E as e: saved = e`) or a pending
+                    // re-raise keeps its refcount above the dead threshold, and
+                    // every cascade node is independently refcount-guarded, so
+                    // the reap is a no-op in those cases too.
+                    let weakly_observed = crate::weakref_registry::count_for(
+                        crate::weakref_registry::id_of(&pe.instance),
+                    ) > 0;
+                    if weakly_observed || Self::exc_has_finalizable(&pe.instance, 6) {
                         self.reap_dead_subgraph(pe.instance);
                     }
                 }
@@ -14585,6 +14633,11 @@ impl Interpreter {
         if name == "__getattribute__" {
             ty.invalidate_getattribute_cache();
         }
+        // Likewise, assigning `__del__` flips whether instances need a
+        // finalizer; refresh the cache `PyInstance::drop` consults.
+        if name == "__del__" {
+            ty.invalidate_finalizer_cache();
+        }
         Ok(())
     }
 
@@ -14627,6 +14680,9 @@ impl Interpreter {
         }
         if name == "__getattribute__" {
             ty.invalidate_getattribute_cache();
+        }
+        if name == "__del__" {
+            ty.invalidate_finalizer_cache();
         }
         Ok(())
     }
@@ -18400,6 +18456,7 @@ impl Interpreter {
             Ok(mro) => {
                 *ty.mro.borrow_mut() = mro;
                 ty.invalidate_getattribute_cache();
+                ty.invalidate_finalizer_cache();
                 Ok(())
             }
             Err(e) => {
@@ -18572,6 +18629,7 @@ impl Interpreter {
             }
         }
         ty.invalidate_getattribute_cache();
+        ty.invalidate_finalizer_cache();
         Ok(())
     }
 
@@ -21316,10 +21374,35 @@ impl Interpreter {
                 .ok_or_else(|| module_not_found_error(format!("import of '{top_name}' failed")));
         }
         if let Object::Tuple(items) = fromlist {
+            // The source module for the hasattr check below: re-read from
+            // sys.modules so a module that replaced itself during execution
+            // (`decimal` → `_pydecimal`) is the one we consult.
+            let source = self.cache.get(&absolute);
             for item in items.iter() {
                 if let Object::Str(s) = item {
                     if s.as_ref() == "*" {
                         continue;
+                    }
+                    // CPython's `_handle_fromlist` only imports `pkg.<name>`
+                    // when `name` is *not already an attribute* of the
+                    // package. A name the package re-exports from its
+                    // `__init__` must win over a like-named submodule file:
+                    // `multiprocessing.__init__` copies `Pool`/`Queue`/… off
+                    // the default context (`globals().update(...)`), and
+                    // importing the `multiprocessing.Pool` submodule would
+                    // both shadow that attribute and — on a case-insensitive
+                    // filesystem — resolve `Pool` → `pool.py`, leaving
+                    // `from multiprocessing import Pool` bound to a
+                    // non-callable module object (`_test_multiprocessing`
+                    // `WithProcessesTestPoolWorkerLifetime`).
+                    if let Some(Object::Module(m)) = &source {
+                        if m.dict
+                            .borrow()
+                            .get(&DictKey(Object::from_str(s.as_ref())))
+                            .is_some()
+                        {
+                            continue;
+                        }
                     }
                     let sub_name = format!("{absolute}.{s}");
                     let _ = self.import_path(&sub_name);
@@ -21643,24 +21726,41 @@ impl Interpreter {
         let globals = self.build_module_globals(full, Some(filename), pkg_for_globals);
         // Frozen packages, like on-disk ones, expose a `__path__` so
         // package-detection (`runpy` package → `__main__` redirect,
-        // `pkgutil`, `importlib`) treats them as packages. There is no
-        // backing directory, so the list is empty — submodules resolve
-        // through the frozen registry, not a filesystem walk.
+        // `pkgutil`, `importlib`) treats them as packages.
         if is_package {
+            // When the *same* package is also reachable on `sys.path` (the
+            // usual case under a real CPython `Lib/`), report its filesystem
+            // `__file__`/`__path__` — CPython does, and introspective code
+            // depends on it: `_test_multiprocessing._TestImportStar` globs
+            // `os.path.dirname(multiprocessing.__file__)/*.py` to enumerate
+            // submodules, and `pkgutil.iter_modules(pkg.__path__)` walks the
+            // directory. Execution still runs the frozen bytecode (the code
+            // object's `co_filename` stays `<frozen pkg>` so tracebacks and
+            // `linecache` resolve through the frozen-source hook); only the
+            // module's metadata points at disk. With no on-disk copy (a
+            // from-binary-only run) fall back to the synthetic
+            // `<frozen pkg>/__init__.py` shape, whose `os.path.dirname` is
+            // still the bare `<frozen pkg>` other code keys off of (e.g.
+            // `zipfile`'s `skip_file_prefixes` overlap warning).
+            let (file_attr, path_list) = match self.cache.find_source(full) {
+                Some((init_path, true)) => {
+                    let dir = init_path
+                        .parent()
+                        .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+                    (
+                        init_path.to_string_lossy().into_owned(),
+                        vec![Object::from_str(dir)],
+                    )
+                }
+                _ => (format!("{filename}/__init__.py"), Vec::new()),
+            };
             globals.borrow_mut().insert(
                 DictKey(Object::from_static("__path__")),
-                Object::new_list(Vec::new()),
+                Object::new_list(path_list),
             );
-            // A real package's `__file__` ends in `/__init__.py`, so
-            // `os.path.dirname(__file__)` is the package directory. Code
-            // relies on that shape — e.g. `zipfile`'s overlap-warning passes
-            // `skip_file_prefixes=(os.path.dirname(__file__),)` to attribute
-            // the warning to its caller. Keep the code object's `co_filename`
-            // as the bare `<frozen pkg>` for tracebacks, but give `__file__`
-            // the faithful `<frozen pkg>/__init__.py` form.
             globals.borrow_mut().insert(
                 DictKey(Object::from_static("__file__")),
-                Object::from_str(format!("{filename}/__init__.py")),
+                Object::from_str(file_attr),
             );
         }
         let module_obj = Object::Module(Rc::new(PyModule {

@@ -5894,6 +5894,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
+        finalize_ran: crate::sync::Cell::new(false),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -5962,6 +5963,7 @@ pub(crate) fn build_super_proxy(
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
+        finalize_ran: crate::sync::Cell::new(false),
     };
     Object::Instance(Rc::new(inst))
 }

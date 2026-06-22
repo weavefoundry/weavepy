@@ -523,6 +523,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
+        finalize_ran: crate::sync::Cell::new(false),
     });
     Object::Instance(inst)
 }
@@ -691,6 +692,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
+        finalize_ran: crate::sync::Cell::new(false),
     });
     Object::Instance(inst)
 }
@@ -1190,6 +1192,19 @@ fn spawn_python_worker(
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_interp.run_thread_local_death_cleanup(synth_id as i64);
             }));
+            // Run any `__del__`/weakref-callback finalizers this worker
+            // deferred onto its *thread-local* pending queue (the prompt-reap
+            // cascade and the `PyInstance` `Drop` safety net both enqueue
+            // there). A blocked pool handler thread — `_handle_results`
+            // parked in `outqueue.get()` — never reaches an eval-loop tick
+            // to drain its own queue, so without this flush an object whose
+            // last reference died on that thread (e.g. a `test_release_task_refs`
+            // result copy) would be freed silently at thread teardown with its
+            // `__del__` skipped, leaking it. Drain while the GIL and the
+            // worker interpreter are both still live; isolate panics.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_interp.run_pending_finalizers();
+            }));
             // Drop the guard before marking finished so the parent's
             // join (which blocks on the released join lock) sees the
             // released GIL — without this the parent could re-acquire
@@ -1470,6 +1485,7 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
+        finalize_ran: crate::sync::Cell::new(false),
     });
     Object::Instance(inst)
 }

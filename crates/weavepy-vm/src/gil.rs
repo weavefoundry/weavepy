@@ -355,6 +355,10 @@ impl GilGuard {
         let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =
             unsafe { std::mem::transmute(new_guard) };
         self._lock_guard = Some(static_guard);
+        // Returning from a blocking release is a fresh contiguous hold:
+        // restart the switch-interval clock (CPython gives a thread that
+        // just took the GIL the full interval before the next hand-off).
+        note_gil_acquired();
         debug_assert_eq!(saved, self.state.depth.load(Ordering::Acquire));
         result
     }
@@ -484,6 +488,9 @@ pub fn allow_threads_then<R>(f: impl FnOnce() -> R) -> R {
         fresh.push(gil.acquire());
     }
     GIL_GUARD_STACK.with(|cell| *cell.borrow_mut() = fresh);
+    // Returning from a blocking release is a fresh contiguous hold:
+    // restart the switch-interval clock.
+    note_gil_acquired();
     result
 }
 
@@ -496,6 +503,25 @@ const GIL_CHECK_INTERVAL: u32 = 128;
 std::thread_local! {
     static YIELD_COUNTDOWN: std::cell::Cell<u32> =
         const { std::cell::Cell::new(GIL_CHECK_INTERVAL) };
+
+    /// Wall-clock instant at which this thread last (re)acquired the GIL
+    /// for a contiguous run. [`maybe_yield_gil`] reads it to enforce
+    /// CPython's *time-based* switch interval: a thread that has held the
+    /// GIL for less than `sys.setswitchinterval()` (default 5ms) keeps it
+    /// even when another thread is waiting, instead of handing off every
+    /// [`GIL_CHECK_INTERVAL`] opcodes.
+    ///
+    /// Without this gate WeavePy switched threads ~1000× more often than
+    /// CPython (every 128 opcodes vs every 5ms), which widened the window
+    /// for the inherently-non-atomic Python-level `x += 1` / `x -= 1` on a
+    /// shared object to the point where `test_multiprocessing`'s
+    /// `test_release_task_refs` (a `CountedObject.n_instances -= 1` in
+    /// `__del__` racing an unpickle's `__new__` increment across the pool's
+    /// result-handler thread and the main thread) lost an update ~1 run in
+    /// 3. CPython's GIL holds for the full interval between switches, so the
+    /// two bytecode triples never interleave in practice; this matches that.
+    static GIL_HELD_SINCE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
 
     /// Depth of nested "no cooperative GIL hand-off" critical sections
     /// on this thread. While `> 0`, [`maybe_yield_gil`] refuses to drop
@@ -533,6 +559,30 @@ pub fn no_gil_handoff() -> NoYieldGuard {
 #[inline]
 fn no_yield_active() -> bool {
     NO_YIELD_DEPTH.with(std::cell::Cell::get) > 0
+}
+
+/// Record that the calling thread has just (re)acquired the GIL for a
+/// fresh contiguous run, resetting the [`GIL_HELD_SINCE`] switch-interval
+/// clock. Called from the paths that retake the GIL after a release: the
+/// cooperative hand-off re-acquire in [`maybe_yield_gil`] and the
+/// blocking-release re-acquire in [`GilGuard::allow_threads`].
+#[inline]
+pub fn note_gil_acquired() {
+    GIL_HELD_SINCE.with(|c| c.set(Some(std::time::Instant::now())));
+}
+
+/// Whether this thread has held the GIL long enough (≥ the configured
+/// `sys.setswitchinterval`) that a cooperative hand-off to a waiter is due.
+/// A thread holding for less than the interval keeps the GIL — CPython's
+/// timer-driven `gil_drop_request` semantics. The first checkpoint after a
+/// thread starts (no recorded acquire instant) is treated as "due" so a
+/// brand-new holder doesn't starve an already-waiting thread.
+#[inline]
+fn switch_interval_elapsed() -> bool {
+    GIL_HELD_SINCE.with(|c| match c.get() {
+        Some(since) => since.elapsed() >= global_gil().breaker.switch_interval(),
+        None => true,
+    })
 }
 
 /// RAII guard returned by [`no_gil_handoff`]. Decrements the
@@ -595,6 +645,18 @@ fn maybe_yield_gil() {
     if gil.breaker.waiter_count() == 0 {
         return;
     }
+    // CPython hands the GIL off on a wall-clock interval, not an opcode
+    // count: the holder runs for ≥ `sys.setswitchinterval()` (default 5ms)
+    // before a waiter's `gil_drop_request` takes effect. Honour that here so
+    // a short burst of bytecode between checkpoints — e.g. a finalizer's
+    // `n_instances -= 1` or an unpickle's `__new__` increment — completes
+    // without another thread slipping in mid-`LOAD`/`STORE` and clobbering a
+    // shared counter (the `test_release_task_refs` race). A thread that has
+    // held the GIL for less than the interval keeps running; the next
+    // checkpoint after the interval elapses performs the hand-off.
+    if !switch_interval_elapsed() {
+        return;
+    }
     let popped: Vec<GilGuard> =
         GIL_GUARD_STACK.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     if popped.is_empty() {
@@ -627,6 +689,9 @@ fn maybe_yield_gil() {
         fresh.push(gil.acquire());
     }
     GIL_GUARD_STACK.with(|cell| *cell.borrow_mut() = fresh);
+    // Fresh contiguous hold: restart the switch-interval clock so this
+    // thread now runs for the full interval before yielding again.
+    note_gil_acquired();
 }
 
 /// Best-effort current-thread native id. Returns the OS thread

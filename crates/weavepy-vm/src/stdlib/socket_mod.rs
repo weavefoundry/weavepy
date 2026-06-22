@@ -588,24 +588,85 @@ fn fd_to_socket_view(fd: i64) -> std::mem::ManuallyDrop<Socket> {
 /// [`allow_threads_then`]. Peers can run — and may even legitimately
 /// `close()` this fd to interrupt us, in which case the syscall fails
 /// with `EBADF`, exactly as on CPython.
+/// One blocking attempt of `f` with the GIL released and *without* holding the
+/// `SocketState` cell borrow. Returns the raw syscall result so the caller can
+/// decide whether to retry (e.g. on `EINTR`). See [`blocking_socket_io`] for
+/// the GIL/borrow rationale.
 #[cfg(any(unix, windows))]
-fn blocking_socket_io<R>(
+fn socket_call_once<R>(
     state: &Rc<RefCell<SocketState>>,
-    f: impl FnOnce(&Socket) -> std::io::Result<R>,
-) -> Result<R, RuntimeError> {
+    f: &mut dyn FnMut(&Socket) -> std::io::Result<R>,
+) -> Result<std::io::Result<R>, RuntimeError> {
     let fd = {
         let b = state.borrow();
         let sock = b.inner.as_ref().ok_or_else(|| os_error("socket closed"))?;
         raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?
     };
     let view = fd_to_socket_view(fd);
-    crate::gil::allow_threads_then(|| f(&view)).map_err(|e| io_error_to_py(&e))
+    Ok(crate::gil::allow_threads_then(|| f(&view)))
+}
+
+/// Run the Python signal handlers a just-observed `EINTR` may have tripped,
+/// now that the GIL is re-acquired (PEP 475). A handler that raises (e.g.
+/// `KeyboardInterrupt` from the default `SIGINT` handler) propagates and
+/// aborts the surrounding retry loop, exactly like CPython's `sock_call_ex`.
+#[cfg(unix)]
+fn run_pending_signals_after_eintr() -> Result<(), RuntimeError> {
+    if crate::stdlib::signal_mod::signals_pending() {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: the GIL is held (we just returned from `allow_threads_then`),
+            // so the interpreter pointer is exclusively ours.
+            unsafe { (*ptr).run_pending_signals_public()? };
+        }
+    }
+    Ok(())
+}
+
+/// Drive a blocking *single-syscall* socket op, retrying on `EINTR` after
+/// running pending Python signal handlers (PEP 475 — "Retry system calls
+/// failing with EINTR"). A signal that interrupts a blocking `accept`/`recv`/
+/// `send` no longer surfaces as `InterruptedError`; instead the handler runs
+/// and the call resumes, matching CPython.
+/// `_test_multiprocessing`'s `TestIgnoreEINTR.test_ignore_listener` relies on
+/// a `SIGUSR1` interrupting a child's blocking `accept()` and the accept then
+/// resuming so the parent can connect.
+///
+/// Only ops that map to a *single* syscall route through here, so a plain retry
+/// resumes correctly — `sendall` loops per-chunk in its caller (re-sending
+/// committed bytes would corrupt the stream) and `connect` uses
+/// [`socket_call_once`] directly (a signal-interrupted blocking connect
+/// completes asynchronously, so re-issuing `connect(2)` would return
+/// `EISCONN`/`EALREADY`).
+#[cfg(any(unix, windows))]
+fn blocking_socket_io<R>(
+    state: &Rc<RefCell<SocketState>>,
+    mut f: impl FnMut(&Socket) -> std::io::Result<R>,
+) -> Result<R, RuntimeError> {
+    loop {
+        match socket_call_once(state, &mut f)? {
+            Ok(v) => return Ok(v),
+            #[cfg(unix)]
+            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => {
+                run_pending_signals_after_eintr()?;
+                continue;
+            }
+            Err(e) => return Err(io_error_to_py(&e)),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn socket_call_once<R>(
+    _state: &Rc<RefCell<SocketState>>,
+    _f: &mut dyn FnMut(&Socket) -> std::io::Result<R>,
+) -> Result<std::io::Result<R>, RuntimeError> {
+    Err(os_error("sockets are not supported on this platform"))
 }
 
 #[cfg(not(any(unix, windows)))]
 fn blocking_socket_io<R>(
     _state: &Rc<RefCell<SocketState>>,
-    _f: impl FnOnce(&Socket) -> std::io::Result<R>,
+    _f: impl FnMut(&Socket) -> std::io::Result<R>,
 ) -> Result<R, RuntimeError> {
     Err(os_error("sockets are not supported on this platform"))
 }
@@ -773,7 +834,23 @@ fn sock_listen(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
-    let (new_sock, addr) = blocking_socket_io(&state, |sock| sock.accept())?;
+    // Use `accept_raw` (a bare `accept(2)`) rather than socket2's `accept`,
+    // which on Apple platforms *also* runs `setsockopt(SO_NOSIGPIPE)` on the
+    // freshly accepted fd. When the peer connected and then *closed* (and its
+    // process exited) before we accept, the new connection's protocol control
+    // block is already torn down and that post-accept setsockopt fails with
+    // EINVAL — turning a perfectly valid accept (the bytes the peer sent are
+    // still queued and readable) into an error. CPython issues a plain
+    // `accept(2)`, never setting NOSIGPIPE at accept time (SIGPIPE is ignored
+    // process-wide; see the `signal` init), so it returns the connection and a
+    // subsequent `recv()` drains the buffered data then sees EOF.
+    // `_test_multiprocessing`'s `WithProcessesTestListenerClient.test_issue14725`
+    // exercises exactly this race (child writes, closes, exits; parent accepts).
+    let (new_sock, addr) = blocking_socket_io(&state, |sock| sock.accept_raw())?;
+    // PEP 446: accepted descriptors are non-inheritable. `F_SETFD` acts on the
+    // descriptor-table entry (not the connection), so it succeeds even for a
+    // peer-closed connection; ignore any error to stay non-fatal regardless.
+    let _ = new_sock.set_cloexec(true);
     let (family, kind, proto) = {
         let s = state.borrow();
         (s.family, s.kind, s.proto)
@@ -816,7 +893,7 @@ fn sock_connect(args: &[Object]) -> Result<Object, RuntimeError> {
         (b.family, b.timeout)
     };
     let sockaddr = parse_sockaddr2(args.get(1), family)?;
-    blocking_socket_io(&state, move |sock| match timeout {
+    let mut connect_fn = move |sock: &Socket| match timeout {
         // A strictly-positive timeout means "timeout mode": bound the
         // connect with `connect_timeout`.
         Some(t) if !t.is_zero() => sock.connect_timeout(&sockaddr, t),
@@ -826,8 +903,15 @@ fn sock_connect(args: &[Object]) -> Result<Object, RuntimeError> {
         // non-blocking fd it surfaces `EINPROGRESS`/`EWOULDBLOCK`, exactly
         // like CPython, instead of being mis-read as a 0-second deadline.
         _ => sock.connect(&sockaddr),
-    })?;
-    Ok(Object::None)
+    };
+    // Single attempt — *no* EINTR retry: a signal-interrupted blocking
+    // connect continues asynchronously, so a second `connect(2)` would return
+    // `EISCONN`/`EALREADY` rather than completing it. Surface the syscall
+    // result directly (a handled signal still ran via the eval breaker).
+    match socket_call_once(&state, &mut connect_fn)? {
+        Ok(()) => Ok(Object::None),
+        Err(e) => Err(io_error_to_py(&e)),
+    }
 }
 
 fn sock_connect_ex(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -871,17 +955,20 @@ fn sock_send(args: &[Object]) -> Result<Object, RuntimeError> {
 fn sock_sendall(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let data = extract_bytes(args.get(1))?;
-    blocking_socket_io(&state, |sock| {
-        let mut offset = 0;
-        while offset < data.len() {
-            let n = sock.send(&data[offset..])?;
-            if n == 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-            }
-            offset += n;
+    // Loop per chunk in the caller (not inside one `blocking_socket_io`
+    // closure) so a PEP 475 `EINTR` retry resumes from the current `offset`
+    // instead of re-running the whole send and duplicating already-committed
+    // bytes. Each individual `send` is the single retryable syscall.
+    let mut offset = 0;
+    while offset < data.len() {
+        let n = blocking_socket_io(&state, |sock| sock.send(&data[offset..]))?;
+        if n == 0 {
+            return Err(io_error_to_py(&std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            )));
         }
-        Ok(())
-    })?;
+        offset += n;
+    }
     Ok(Object::None)
 }
 
@@ -1845,12 +1932,19 @@ fn sockaddr_unix_path(addr: &SockAddr) -> Option<String> {
     // SAFETY: `sun_path` holds at least `path_len` initialised bytes.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(su.sun_path.as_ptr().cast::<u8>(), path_len) };
+    // Linux abstract namespace: a leading NUL is significant and the rest is
+    // *not* NUL-terminated, so surface the whole window. This convention does
+    // not exist on the BSDs/macOS, where `sun_path` is an ordinary
+    // NUL-terminated C string — a leading NUL there just means the empty
+    // (unnamed) address, which CPython decodes to `""` (and which the kernel
+    // hands back for an autobind/unnamed peer that `accept(2)` reports with a
+    // zeroed, full-width `sun_path`).
+    #[cfg(target_os = "linux")]
     if bytes.first() == Some(&0) {
-        Some(String::from_utf8_lossy(bytes).into_owned())
-    } else {
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+        return Some(String::from_utf8_lossy(bytes).into_owned());
     }
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
 /// Resolve a Python socket-address argument into a `socket2::SockAddr`,
