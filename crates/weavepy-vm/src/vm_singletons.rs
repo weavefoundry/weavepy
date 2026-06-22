@@ -393,6 +393,18 @@ pub fn dev_mode() -> bool {
     DEV_MODE.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// PEP 540 UTF-8 mode. WeavePy stores `str` as UTF-8 so this defaults to
+/// `true`; the CLI lowers it for `-X utf8=0` (read by `io.text_encoding`).
+static UTF8_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_utf8_mode(value: bool) {
+    UTF8_MODE.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn utf8_mode() -> bool {
+    UTF8_MODE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Publish `interp` as the live VM pointer for the duration of
 /// the returned guard. Re-entrant calls produce a stack so the
 /// most recent guard wins on `current_interpreter_ptr` lookups.

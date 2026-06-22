@@ -579,6 +579,11 @@ impl Interpreter {
                 .cloned()
             {
                 Some(Object::Dict(fl) | Object::SimpleNamespace(fl)) => Some(fl),
+                // `sys.flags` is now a `PyStructSequence` instance; its field
+                // values live in `inst.dict`, which we mutate directly (the
+                // struct-sequence `__setattr__` guard is bypassed, exactly as
+                // the Rust-side builders do).
+                Some(Object::Instance(inst)) => Some(inst.dict.clone()),
                 _ => None,
             };
             if let Some(fl) = flags_inner {
@@ -615,7 +620,26 @@ impl Interpreter {
                     "hash_randomization",
                     flags.hash_seed.map_or(1, |_| 0),
                 );
-                set(&mut fld, "utf8_mode", 1);
+                // UTF-8 mode: on by default (WeavePy str is UTF-8), but
+                // honour an explicit `-X utf8=0`/`-X utf8=1` (PEP 540) so
+                // `io.text_encoding(None)` reports "locale" vs "utf-8" and
+                // `test_io.test_text_encoding` round-trips.
+                let utf8_mode = flags
+                    .xoptions
+                    .iter()
+                    .rev()
+                    .find_map(|x| {
+                        if x == "utf8" || x == "utf8=1" {
+                            Some(1)
+                        } else if x == "utf8=0" {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(1);
+                set(&mut fld, "utf8_mode", utf8_mode);
+                crate::vm_singletons::set_utf8_mode(utf8_mode != 0);
                 // The lone bool field on CPython's `sys.flags`.
                 fld.insert(
                     crate::object::DictKey(Object::from_static("dev_mode")),

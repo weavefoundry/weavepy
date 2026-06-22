@@ -87,11 +87,16 @@ def get_command_line(**kwds):
     # WeavePy: the `weavepy` CLI intercepts `--multiprocessing-fork` and runs
     # `multiprocessing._run_spawn_child()` directly (the Rust
     # `run_multiprocessing_child` bridge) rather than re-entering through
-    # `-c "from multiprocessing.spawn import spawn_main; ..."`. So we always
-    # emit CPython's "frozen" command line — `[exe, '--multiprocessing-fork',
-    # 'name=value', ...]` — which keeps `sys.argv[1] == '--multiprocessing-fork'`
-    # so `is_forking(sys.argv)` holds in the child.
-    return ([sys.executable, '--multiprocessing-fork'] +
+    # `-c "from multiprocessing.spawn import spawn_main; ..."`. We emit the
+    # interpreter-flag opts *before* `--multiprocessing-fork` (exactly as
+    # CPython's non-frozen `get_command_line` does for the `-c` form) so the
+    # child inherits `-O`/`-S`/`-E`/`-I`/`-X dev`/… (gh-... `test_flags`). The
+    # CLI launcher consumes those leading opts as interpreter flags and rebuilds
+    # `sys.argv` so that `sys.argv[1] == '--multiprocessing-fork'` still holds
+    # and `is_forking(sys.argv)` stays true.
+    from . import util
+    return ([sys.executable] + util._args_from_interpreter_flags() +
+            ['--multiprocessing-fork'] +
             ['%s=%r' % item for item in kwds.items()])
 
 

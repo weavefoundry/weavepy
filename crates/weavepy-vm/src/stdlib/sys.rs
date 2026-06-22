@@ -1055,40 +1055,52 @@ fn sys_getsizeof(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(size))
 }
 
+/// CPython 3.13 `sys.flags` struct-sequence field order. `tuple(sys.flags)`
+/// must yield these in exactly this order (`test_multiprocessing` /
+/// `test_sys` compare `sys.flags` across a spawned child via the tuple form).
+pub(crate) const SYS_FLAGS_FIELDS: &[&str] = &[
+    "debug",
+    "inspect",
+    "interactive",
+    "optimize",
+    "dont_write_bytecode",
+    "no_user_site",
+    "no_site",
+    "ignore_environment",
+    "verbose",
+    "bytes_warning",
+    "quiet",
+    "hash_randomization",
+    "isolated",
+    "dev_mode",
+    "utf8_mode",
+    "warn_default_encoding",
+    "safe_path",
+    "int_max_str_digits",
+];
+
 fn sys_flags_value() -> Object {
-    let mut d = DictData::new();
-    for name in [
-        "debug",
-        "inspect",
-        "interactive",
-        "optimize",
-        "dont_write_bytecode",
-        "no_user_site",
-        "no_site",
-        "ignore_environment",
-        "verbose",
-        "bytes_warning",
-        "quiet",
-        "hash_randomization",
-        "isolated",
-        "dev_mode",
-        "utf8_mode",
-        "safe_path",
-        "warn_default_encoding",
-    ] {
-        d.insert(DictKey(Object::from_static(name)), Object::Int(0));
-    }
-    // CPython's default cap on int<->str conversion size (PEP 0467 /
-    // `-X int_max_str_digits`). test_int reads this off `sys.flags`.
-    d.insert(
-        DictKey(Object::from_static("int_max_str_digits")),
-        Object::Int(4300),
-    );
-    // CPython exposes `sys.flags` as a struct-sequence answering attribute
-    // access (`sys.flags.optimize`, `sys.flags.bytes_warning`, …), used by
-    // test_descr / test_bytes / test_collections. A SimpleNamespace gives
-    // us that attribute surface (mirrors `sys.float_info` above).
-    Object::SimpleNamespace(Rc::new(RefCell::new(d)))
+    // CPython exposes `sys.flags` as a real `PyStructSequence` (a `tuple`
+    // subclass): addressable by attribute (`sys.flags.optimize`) *and* by
+    // index, with `len()`/iteration over the field values. `tuple(sys.flags)`
+    // is used by `test_multiprocessing` to round-trip flags through a spawned
+    // child, so a plain namespace (not iterable) is insufficient.
+    let ty = crate::stdlib::os::struct_seq_type("flags", "sys", SYS_FLAGS_FIELDS);
+    let values: Vec<Object> = SYS_FLAGS_FIELDS
+        .iter()
+        .map(|f| match *f {
+            // CPython's default cap on int<->str conversion size (PEP 0467 /
+            // `-X int_max_str_digits`). test_int reads this off `sys.flags`.
+            "int_max_str_digits" => Object::Int(4300),
+            // WeavePy stores `str` as UTF-8, so UTF-8 mode is on unless the
+            // CLI explicitly passes `-X utf8=0` (applied in apply_run_options).
+            "utf8_mode" => Object::Int(1),
+            // The lone bool field on CPython's `sys.flags`.
+            "dev_mode" => Object::Bool(false),
+            _ => Object::Int(0),
+        })
+        .collect();
+    crate::stdlib::os::struct_seq_instance(ty, SYS_FLAGS_FIELDS, values)
 }
 
 fn sys_float_info() -> Object {

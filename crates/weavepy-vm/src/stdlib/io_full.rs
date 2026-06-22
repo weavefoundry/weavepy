@@ -429,6 +429,10 @@ fn apply_text_config(
         f.set_encoding(enc);
     }
     if let Some(Object::Str(err)) = errors {
+        // CPython's TextIOWrapper validates the error handler eagerly under
+        // `-X dev` (the `_CHECK_ERRORS` path), so `open(..., errors='Boom')`
+        // raises `LookupError` at construction time.
+        crate::stdlib::codecs_mod::check_text_errors(err)?;
         f.set_errors(err);
     }
     if let Some(Object::Str(nl)) = newline {

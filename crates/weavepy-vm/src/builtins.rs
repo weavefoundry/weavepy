@@ -5515,12 +5515,17 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
         file.closefd.set(closefd);
         if !file.binary {
             if let Some(Object::Str(enc)) = args.get(3) {
+                crate::stdlib::io_full::validate_text_encoding(enc)?;
                 file.set_encoding(enc);
             }
             if let Some(Object::Str(err)) = args.get(4) {
+                crate::stdlib::codecs_mod::check_text_errors(err)?;
                 file.set_errors(err);
             }
             if let Some(Object::Str(nl)) = args.get(5) {
+                if !matches!(nl.as_ref(), "" | "\n" | "\r" | "\r\n") {
+                    return Err(value_error(format!("illegal newline value: {}", nl.as_ref())));
+                }
                 file.set_newline(Some(nl));
             }
         }
@@ -5587,12 +5592,17 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
     if !file.binary {
         if let Some(Object::Str(enc)) = args.get(3) {
+            crate::stdlib::io_full::validate_text_encoding(enc)?;
             file.set_encoding(enc);
         }
         if let Some(Object::Str(err)) = args.get(4) {
+            crate::stdlib::codecs_mod::check_text_errors(err)?;
             file.set_errors(err);
         }
         if let Some(Object::Str(nl)) = args.get(5) {
+            if !matches!(nl.as_ref(), "" | "\n" | "\r" | "\r\n") {
+                return Err(value_error(format!("illegal newline value: {}", nl.as_ref())));
+            }
             file.set_newline(Some(nl));
         }
     }

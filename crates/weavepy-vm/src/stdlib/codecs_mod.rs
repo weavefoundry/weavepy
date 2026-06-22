@@ -262,6 +262,14 @@ fn check_error_handler(errors: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Public wrapper used by the `io` text layer: CPython's `TextIOWrapper`
+/// validates the `errors=` handler eagerly when `_CHECK_ERRORS` is set
+/// (debug builds or `-X dev`), so `open(..., errors='Boom')` raises
+/// `LookupError` at construction (`test_io.test_check_encoding_errors`).
+pub(crate) fn check_text_errors(errors: &str) -> Result<(), RuntimeError> {
+    check_error_handler(errors)
+}
+
 /// For a BOM-prefixing encoding (byte-order-less `utf-16`/`utf-32`, or
 /// `utf-8-sig`), return the **continuation** codec used after the BOM has been
 /// emitted once — the BOM-less variant. CPython's incremental encoders write

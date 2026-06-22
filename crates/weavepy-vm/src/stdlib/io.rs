@@ -247,13 +247,20 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 }
 
 /// `io.text_encoding(encoding, stacklevel=2)` — return a usable encoding
-/// name, defaulting `None` to `"utf-8"`. CPython returns the sentinel
-/// `"locale"` here, but WeavePy's text layer always operates in UTF-8, so
-/// we resolve straight to it. `tempfile` and many stdlib call sites pass
-/// the result of this through to `TextIOWrapper`.
+/// name. CPython (PEP 597 / bpo-47000) returns the sentinel `"locale"` for a
+/// `None` argument unless UTF-8 mode is active, in which case it returns
+/// `"utf-8"`. The `"locale"` sentinel is resolved by the text layer through
+/// `resolve_locale_encoding` (→ the host locale encoding). `tempfile` and many
+/// stdlib call sites pass the result straight through to `TextIOWrapper`.
 pub(crate) fn io_text_encoding(args: &[Object]) -> Result<Object, RuntimeError> {
     match args.first() {
-        None | Some(Object::None) => Ok(Object::from_static("utf-8")),
+        None | Some(Object::None) => {
+            if crate::vm_singletons::utf8_mode() {
+                Ok(Object::from_static("utf-8"))
+            } else {
+                Ok(Object::from_static("locale"))
+            }
+        }
         Some(Object::Str(s)) => Ok(Object::Str(s.clone())),
         Some(_) => Err(type_error("text_encoding() argument must be str or None")),
     }
@@ -2601,6 +2608,9 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
             if s.contains('\0') {
                 return Err(value_error("embedded null character"));
             }
+            // Under `-X dev` CPython's TextIOWrapper validates the handler
+            // eagerly (`test_check_encoding_errors`).
+            crate::stdlib::codecs_mod::check_text_errors(s.as_ref())?;
             s.to_string()
         }
         Some(Object::None) | None => "strict".to_owned(),

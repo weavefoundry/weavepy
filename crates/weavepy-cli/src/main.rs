@@ -59,14 +59,26 @@ fn run_multiprocessing_child(raw: &[String]) -> ExitCode {
                    _mp_code = multiprocessing._run_spawn_child()\n\
                    _atexit._run_exitfuncs()\n\
                    _multiprocessing._exit(int(_mp_code) if _mp_code is not None else 0)\n";
-    let argv = if raw.is_empty() {
-        vec!["weavepy".to_owned()]
-    } else {
-        raw.to_vec()
-    };
+    // The parent's `spawn.get_command_line()` emits
+    // `[exe, <interp opts...>, "--multiprocessing-fork", "name=value", ...]`,
+    // mirroring CPython so the child inherits `-O`/`-S`/`-E`/`-I`/`-X dev`/…
+    // (`test_multiprocessing.TestFlags.test_flags`). Split at the
+    // `--multiprocessing-fork` marker: everything before it is interpreter
+    // flags we must apply to the child; the marker plus the `name=value` kwds
+    // become `sys.argv[1:]` so `spawn.is_forking(sys.argv)` still holds.
+    let exe = raw.first().cloned().unwrap_or_else(|| "weavepy".to_owned());
+    let fork_idx = raw
+        .iter()
+        .position(|a| a == "--multiprocessing-fork")
+        .unwrap_or(if raw.is_empty() { 0 } else { 1 });
+    let opt_args = if fork_idx > 1 { &raw[1..fork_idx] } else { &[][..] };
+    let tail = if fork_idx < raw.len() { &raw[fork_idx..] } else { &[][..] };
+    let flags = child_flags_from_opts(&exe, opt_args);
+    let mut argv = vec![exe];
+    argv.extend(tail.iter().cloned());
     let opts = RunOptions::new("<multiprocessing-fork>")
         .with_argv(argv)
-        .with_flags(InterpreterFlags::default());
+        .with_flags(flags);
     match weavepy::run_source_with_options(snippet, &opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -74,6 +86,28 @@ fn run_multiprocessing_child(raw: &[String]) -> ExitCode {
             let _ = writeln!(stderr, "{}", err.format(snippet, "<multiprocessing-fork>"));
             ExitCode::from(1)
         }
+    }
+}
+
+/// Build the child interpreter flags for a `--multiprocessing-fork` re-exec by
+/// re-parsing the interpreter-flag opts the parent placed before the marker
+/// (`-O`/`-S`/`-E`/`-I`/`-X dev`/…) through the same clap table + env overrides
+/// the normal launch path uses. Falls back to defaults if the opts don't parse
+/// (they always should — they come from `_args_from_interpreter_flags()`).
+fn child_flags_from_opts(exe: &str, opt_args: &[String]) -> InterpreterFlags {
+    let parse_argv: Vec<String> = std::iter::once(exe.to_owned())
+        .chain(opt_args.iter().cloned())
+        .collect();
+    match Cli::try_parse_from(&parse_argv) {
+        Ok(cli) => {
+            let env = if cli.isolated || cli.ignore_env {
+                EnvOverrides::ignored()
+            } else {
+                EnvOverrides::from_env()
+            };
+            build_flags(&cli, &env)
+        }
+        Err(_) => InterpreterFlags::default(),
     }
 }
 
