@@ -41,6 +41,7 @@ pub mod os;
 pub mod os_process;
 pub mod posixsubprocess_mod;
 pub mod resource_mod;
+pub mod pyexpat_mod;
 pub mod secrets_mod;
 pub mod select_mod;
 pub mod shutil_mod;
@@ -140,6 +141,9 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_weakref", weakref_real::build);
     cache.register_builtin("gc", gc_real::build);
     cache.register_builtin("_multiprocessing", multiprocessing_mod::build);
+    // RFC 0040 WS5 — native XML parser behind `xml.parsers.expat`; drives the
+    // `xmlrpc` serializer the `multiprocessing.managers` server process uses.
+    cache.register_builtin("pyexpat", pyexpat_mod::build);
     // RFC 0040 (WS5): shm_open/shm_unlink core for `multiprocessing`'s
     // resource_tracker + shared_memory.
     cache.register_builtin("_posixshmem", multiprocessing_mod::build_posixshmem);

@@ -1600,6 +1600,47 @@ impl Interpreter {
     /// finalizer are routed through `sys.unraisablehook` (the
     /// default hook prints `Exception ignored in: …` to stderr,
     /// exactly like CPython) so they don't propagate.
+    /// Prompt (deterministic) finalization driver — the interpreter half of
+    /// RFC 0040's GC arc. CPython runs an object's `__del__` the instant its
+    /// refcount reaches zero; weavepy's tracing collector pins every tracked
+    /// object on a strong handle, so a refcount-dead finalizable object would
+    /// otherwise linger until the next cyclic collection. This closes that gap
+    /// by, at each reference-drop safe point, running `__del__` for objects
+    /// whose last *program* reference just dropped (`strong_count <= 1`).
+    ///
+    /// Drives a small fixpoint loop: queue the dead finalizables' `__del__`,
+    /// run them, reclaim the (non-resurrected) corpses — which cascades the
+    /// refcount drop into their referents and can expose the next layer of
+    /// now-dead finalizables — and repeat until quiescent. Bounded by
+    /// `MAX_COLLECT_PASSES` against a pathological `__del__` that keeps
+    /// resurrecting and re-killing objects.
+    ///
+    /// Gated by [`gc_trace::has_any_finalizable`] at every call site, so when
+    /// no `__del__`-bearing object is live (the common case) it costs one
+    /// relaxed atomic load. Re-entrancy is suppressed via a thread-local: a
+    /// `__del__` body re-enters the eval loop, whose own safe points would
+    /// otherwise recurse here.
+    pub fn drain_prompt_finalizers(&mut self) {
+        thread_local! {
+            static IN_PROMPT_FINALIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if IN_PROMPT_FINALIZE.with(std::cell::Cell::get) {
+            return;
+        }
+        IN_PROMPT_FINALIZE.with(|c| c.set(true));
+        for _ in 0..gc_trace::MAX_COLLECT_PASSES {
+            let progressed = gc_trace::reap_dead_finalizable();
+            if progressed == 0 {
+                break;
+            }
+            // Run the `__del__`s and weakref callbacks just queued. They may
+            // drop the last reference to — or resurrect — other finalizables,
+            // which the next pass re-evaluates.
+            self.run_pending_finalizers();
+        }
+        IN_PROMPT_FINALIZE.with(|c| c.set(false));
+    }
+
     pub fn run_pending_finalizers(&mut self) -> usize {
         // Finalizers run arbitrary Python (`__del__` → traceback →
         // native islice, …), so the interpreter pointer must be
@@ -2542,6 +2583,18 @@ impl Interpreter {
             // thread is blocked waiting for it, so compute-bound
             // threads can't starve the rest.
             crate::gil::periodic_gil_checkpoint();
+            // RFC 0040 (GC arc): prompt finalization. Between bytecodes — a
+            // safe point with no outstanding container borrows — run `__del__`
+            // and fire callback-weakrefs for any object whose last reference
+            // dropped during the previous instruction, matching CPython's
+            // refcount-driven `tp_dealloc` timing. Two gates keep this free in
+            // the common case: a finalizable object must be live *and* the
+            // previous instruction must have dropped a reference (`take_maybe_
+            // _dead`), so a hot loop that neither allocates `__del__` objects
+            // nor drops references pays only two relaxed atomic loads.
+            if gc_trace::has_any_finalizable() && gc_trace::take_maybe_dead() {
+                self.drain_prompt_finalizers();
+            }
             // Mirror the live `pc` into the snapshot so `f_lineno`
             // reads correctly when user code introspects via
             // `sys._getframe`.
@@ -2592,6 +2645,21 @@ impl Interpreter {
             // always — stays free. Feeding any handler-raised error
             // through the same arm as `step`'s `Err` keeps it catchable
             // by a surrounding `try/except`, exactly as CPython.
+            // RFC 0040 (GC arc): note whether this instruction can drop the
+            // last reference to a finalizable object, so the next safe point's
+            // prompt-finalization sweep runs only when warranted. Gated on a
+            // live finalizable so non-`__del__` workloads pay nothing. A
+            // dropped reference shows up either as the operand stack shrinking
+            // (`POP_TOP`, every `STORE_*`/`*_SUBSCR`, `POP_EXCEPT`, `END_FOR`,
+            // a net-consuming `CALL`, …) or as one of the stack-neutral
+            // `DELETE_*`-name opcodes.
+            let watch_drops = gc_trace::has_any_finalizable();
+            let stack_before = if watch_drops { frame.stack.len() } else { 0 };
+            let op_before = if watch_drops {
+                frame.code.instructions.get(frame.pc as usize).map(|i| i.op)
+            } else {
+                None
+            };
             let stepped =
                 if crate::stdlib::signal_mod::signals_pending() && crate::gil::is_main_thread() {
                     match self.run_pending_signals(&py_frame) {
@@ -2601,6 +2669,20 @@ impl Interpreter {
                 } else {
                     self.step(frame)
                 };
+            if watch_drops
+                && (frame.stack.len() < stack_before
+                    || matches!(
+                        op_before,
+                        Some(
+                            OpCode::DeleteFast
+                                | OpCode::DeleteName
+                                | OpCode::DeleteGlobal
+                                | OpCode::DeleteDeref
+                        )
+                    ))
+            {
+                gc_trace::mark_maybe_dead();
+            }
             match stepped {
                 Ok(StepOutcome::Continue) => {}
                 Ok(StepOutcome::Return(v)) => {

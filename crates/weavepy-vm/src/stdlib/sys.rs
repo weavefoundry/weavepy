@@ -386,6 +386,7 @@ pub fn build_with_state(
                     "json",
                     "math",
                     "os",
+                    "pyexpat",
                     "random",
                     "re",
                     "secrets",

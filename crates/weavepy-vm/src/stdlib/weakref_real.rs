@@ -579,6 +579,16 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
     ));
     register(slot.clone());
 
+    // RFC 0040 (GC arc): a weakref *with a callback* (`weakref.ref(obj, cb)`,
+    // `weakref.finalize`, `multiprocessing.util.Finalize`) must fire that
+    // callback the instant the referent's last strong reference drops, not at
+    // the next cyclic collection. Enroll the (tracked) referent in the cycle
+    // GC's prompt-finalization index so a refcount-death between bytecodes
+    // fires it — matching CPython's `tp_dealloc` weakref clear.
+    if callback.is_some() {
+        crate::gc_trace::note_weakref_finalizable(target_id);
+    }
+
     let dict = Rc::new(RefCell::new(DictData::new()));
 
     let class = match kind_tag {
