@@ -56,6 +56,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn obj_bytes(o: &Object) -> Option<Vec<u8>> {
     match o {
         Object::Str(s) => Some(s.as_bytes().to_vec()),
+        // PEP 383: a surrogate-bearing `str` (args/executable/env entry) is
+        // encoded with the filesystem codec (UTF-8) + `surrogateescape`, so a
+        // value round-tripped from an undecodable env byte (0x80..0xFF →
+        // U+DC80..U+DCFF) re-encodes to that exact byte
+        // (test_subprocess.test_undecodable_env).
+        Object::WStr(cps) => {
+            crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogateescape").ok()
+        }
         Object::Bytes(b) => Some(b.to_vec()),
         Object::ByteArray(b) => Some(b.borrow().clone()),
         _ => None,

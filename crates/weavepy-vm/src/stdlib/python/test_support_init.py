@@ -870,27 +870,72 @@ def catch_unraisable_exception():
         catcher.unraisable = None
 
 
-@contextlib.contextmanager
-def infinite_recursion(max_depth=None):
-    """Raise the recursion limit so tests can recurse (nearly) without
-    bound — CPython's helper sets 20 000 by default and relies on the
-    C-stack guard underneath; callers pass a small ``max_depth`` when
-    they *want* a quick ``RecursionError``."""
-    if max_depth is None:
-        max_depth = 20_000
-    elif max_depth < 3:
-        raise ValueError("max_depth must be at least 3")
-    get_limit = getattr(sys, 'getrecursionlimit', None)
-    set_limit = getattr(sys, 'setrecursionlimit', None)
-    if get_limit is None or set_limit is None:
-        yield
-        return
-    original_depth = get_limit()
+def get_recursion_depth():
+    """Get the recursion depth of the caller function.
+
+    In the __main__ module, at the module level, it should be 1.
+    """
     try:
-        set_limit(max_depth)
+        import _testinternalcapi
+        depth = _testinternalcapi.get_recursion_depth()
+    except (ImportError, AttributeError, RecursionError):
+        # `_testinternalcapi` is a partial stub under WeavePy (it exists but
+        # does not expose `get_recursion_depth`), so tolerate `AttributeError`
+        # alongside CPython's `ImportError`/`RecursionError` and fall back to
+        # the portable `sys._getframe()` + `frame.f_back` walk.
+        try:
+            depth = 0
+            frame = sys._getframe()
+            while frame is not None:
+                depth += 1
+                frame = frame.f_back
+        finally:
+            # Break any reference cycles.
+            frame = None
+
+    # Ignore get_recursion_depth() frame.
+    return max(depth - 1, 1)
+
+
+def get_recursion_available():
+    """Get the number of available frames before RecursionError.
+
+    It depends on the current recursion depth of the caller function and
+    sys.getrecursionlimit().
+    """
+    limit = sys.getrecursionlimit()
+    depth = get_recursion_depth()
+    return limit - depth
+
+
+@contextlib.contextmanager
+def set_recursion_limit(limit):
+    """Temporarily change the recursion limit."""
+    original_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(limit)
         yield
     finally:
-        set_limit(original_depth)
+        sys.setrecursionlimit(original_limit)
+
+
+def infinite_recursion(max_depth=None):
+    """Set a recursion limit just *above* the current depth so callers can
+    drive themselves into ``RecursionError`` predictably. ``max_depth`` is
+    headroom *relative to the current depth* — matching CPython's helper —
+    not an absolute limit, so a small value like 25 leaves the existing
+    call stack intact instead of tripping the guard immediately."""
+    if max_depth is None:
+        # Pick a number large enough to cause problems
+        # but not take too long for code that can handle
+        # very deep recursion.
+        max_depth = 20_000
+    elif max_depth < 3:
+        raise ValueError(f"max_depth must be at least 3, got {max_depth}")
+    depth = get_recursion_depth()
+    depth = max(depth - 1, 1)  # Ignore infinite_recursion() frame.
+    limit = depth + max_depth
+    return set_recursion_limit(limit)
 
 
 def no_tracing(func):

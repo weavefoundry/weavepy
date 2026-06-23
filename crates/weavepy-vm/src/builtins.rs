@@ -2128,6 +2128,14 @@ pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
     if let Some(v) = o.as_i64() {
         return Ok(v);
     }
+    // A big integer is a valid `__index__` value, but it can't fit the C
+    // ssize_t the caller wants → `OverflowError`, matching CPython
+    // (`test_io.test_reconfigure_errors`: `line_buffering=2**1000`).
+    if matches!(o, Object::Long(_)) {
+        return Err(crate::error::overflow_error(
+            "cannot fit 'int' into an index-sized integer",
+        ));
+    }
     if let Object::Instance(_) = o {
         if let Some(method) = crate::instance_method(o, "__index__") {
             if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
@@ -2138,6 +2146,13 @@ pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
                 let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
                 if let Some(v) = r.as_i64() {
                     return Ok(v);
+                }
+                // `__index__` returned an int too large for an index-sized C
+                // integer (CPython raises `OverflowError`, not `TypeError`).
+                if matches!(r, Object::Long(_)) {
+                    return Err(crate::error::overflow_error(
+                        "cannot fit 'int' into an index-sized integer",
+                    ));
                 }
             }
         }
@@ -5513,39 +5528,18 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
         let file = PyFile::new(fd.to_string(), mode, FileBackend::Disk(f));
         file.name_is_fd.set(true);
         file.closefd.set(closefd);
-        if !file.binary {
-            // PEP 597: a text stream with no explicit `encoding` warns under
-            // `-X warn_default_encoding` (builtins.open is io.open in CPython).
-            if matches!(args.get(3), None | Some(Object::None)) {
-                crate::stdlib::io_full::warn_open_default_encoding()?;
-            }
-            if let Some(Object::Str(enc)) = args.get(3) {
-                crate::stdlib::io_full::validate_text_encoding(enc)?;
-                file.set_encoding(enc);
-            }
-            if let Some(Object::Str(err)) = args.get(4) {
-                crate::stdlib::codecs_mod::check_text_errors(err)?;
-                file.set_errors(err);
-            }
-            if let Some(Object::Str(nl)) = args.get(5) {
-                if !matches!(nl.as_ref(), "" | "\n" | "\r" | "\r\n") {
-                    return Err(value_error(format!("illegal newline value: {}", nl.as_ref())));
-                }
-                file.set_newline(Some(nl));
-            }
-        }
         let binary = file.binary;
-        let file_obj = Object::File(Rc::new(file));
-        // CPython's `open` *is* `io.open`, so the buffering policy applies here
-        // too: `buffering=0` downgrades a binary stream to the raw `FileIO`
-        // layer (and rejects unbuffered text), `buffering=1` on a binary stream
-        // warns, and `buffering>N` sizes the buffer.
-        crate::stdlib::io_full::apply_buffering(
-            &file_obj,
-            crate::stdlib::io_full::buffering_arg(args.get(2)),
+        // CPython's `open` *is* `io.open`: validate the text config / buffering
+        // and close the adopted descriptor on any rejection rather than leaking
+        // it (and emitting a spurious unclosed-file `ResourceWarning`).
+        return crate::stdlib::io_full::finish_open(
+            Object::File(Rc::new(file)),
+            args.get(2),
+            args.get(3),
+            args.get(4),
+            args.get(5),
             binary,
-        )?;
-        return Ok(file_obj);
+        );
     }
     let (path, name_is_bytes) = open_path_arg(&args[0])?;
     let mut opts = OpenOptions::new();
@@ -5594,38 +5588,21 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     if name_is_bytes {
         file.name_is_bytes.set(true);
     }
-    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
-    if !file.binary {
-        // PEP 597: a text stream with no explicit `encoding` warns under
-        // `-X warn_default_encoding` (builtins.open is io.open in CPython).
-        if matches!(args.get(3), None | Some(Object::None)) {
-            crate::stdlib::io_full::warn_open_default_encoding()?;
-        }
-        if let Some(Object::Str(enc)) = args.get(3) {
-            crate::stdlib::io_full::validate_text_encoding(enc)?;
-            file.set_encoding(enc);
-        }
-        if let Some(Object::Str(err)) = args.get(4) {
-            crate::stdlib::codecs_mod::check_text_errors(err)?;
-            file.set_errors(err);
-        }
-        if let Some(Object::Str(nl)) = args.get(5) {
-            if !matches!(nl.as_ref(), "" | "\n" | "\r" | "\r\n") {
-                return Err(value_error(format!("illegal newline value: {}", nl.as_ref())));
-            }
-            file.set_newline(Some(nl));
-        }
-    }
     let binary = file.binary;
-    let file_obj = Object::File(Rc::new(file));
-    // `buffering` policy (see the fd path above): `0` → raw `FileIO`
-    // (binary only), `1` on binary warns, `>1` sizes the buffer.
-    crate::stdlib::io_full::apply_buffering(
-        &file_obj,
-        crate::stdlib::io_full::buffering_arg(args.get(2)),
+    // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
+    // Validate the text config / buffering and, on any rejection (illegal
+    // `newline`, unbuffered text, unknown encoding/errors), close the
+    // freshly-opened file before propagating so we never leak the descriptor or
+    // emit a spurious unclosed-file `ResourceWarning` — CPython's `open` *is*
+    // `io.open`, which validates before opening.
+    crate::stdlib::io_full::finish_open(
+        Object::File(Rc::new(file)),
+        args.get(2),
+        args.get(3),
+        args.get(4),
+        args.get(5),
         binary,
-    )?;
-    Ok(file_obj)
+    )
 }
 
 pub(crate) fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -6197,6 +6174,8 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Float(_) => bt.float_.clone(),
         Object::Complex(_) => bt.complex_.clone(),
         Object::Str(_) => bt.str_.clone(),
+        // A surrogate-bearing string is a `str`.
+        Object::WStr(_) => bt.str_.clone(),
         Object::Tuple(_) => bt.tuple_.clone(),
         Object::List(_) => bt.list_.clone(),
         Object::Dict(_) => bt.dict_.clone(),
@@ -6389,6 +6368,7 @@ fn object_identity(obj: &Object) -> i64 {
     }
     match obj {
         Object::Str(s) => rc_str_ptr(s),
+        Object::WStr(cps) => cps.as_ptr() as usize as i64,
         Object::Bytes(b) => rc_bytes_ptr(b),
         Object::ByteArray(b) => Rc::as_ptr(b) as usize as i64,
         Object::List(l) => Rc::as_ptr(l) as usize as i64,
@@ -6714,9 +6694,16 @@ fn b_bin(args: &[Object]) -> Result<Object, RuntimeError> {
 fn b_chr(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "chr")? {
         Object::Int(i) => {
-            let ch = char::from_u32(*i as u32)
-                .ok_or_else(|| value_error("chr() arg not in range(0x110000)"))?;
-            Ok(Object::from_str(ch.to_string()))
+            let n = *i;
+            if !(0..=0x10_FFFF).contains(&n) {
+                return Err(value_error("chr() arg not in range(0x110000)"));
+            }
+            let n = n as u32;
+            // CPython's `chr` accepts lone surrogates (U+D800..U+DFFF) and
+            // returns a length-1 `str` holding the surrogate. `char::from_u32`
+            // rejects them, so route through the WTF-8 constructor, which yields
+            // a `WStr` for the surrogate range and a plain `Str` otherwise.
+            Ok(Object::str_from_codepoints(vec![n]))
         }
         _ => Err(type_error("chr() expected int")),
     }
@@ -6738,6 +6725,16 @@ fn b_ord(args: &[Object]) -> Result<Object, RuntimeError> {
                 )));
             }
             Ok(Object::Int(i64::from(u32::from(c))))
+        }
+        // A length-1 surrogate-bearing string: `ord(chr(0xD800)) == 0xD800`.
+        Object::WStr(cps) => {
+            if cps.len() != 1 {
+                return Err(type_error(format!(
+                    "ord() expected a character, but string of length {} found",
+                    cps.len()
+                )));
+            }
+            Ok(Object::Int(i64::from(cps[0])))
         }
         Object::Bytes(b) if b.len() == 1 => Ok(Object::Int(i64::from(b[0]))),
         Object::Bytes(b) => Err(type_error(format!(
@@ -7248,23 +7245,123 @@ fn double_round(x: f64, ndigits: i64) -> Result<f64, RuntimeError> {
 
 // ---------- str methods ----------
 
-fn str_self(args: &[Object]) -> Result<&str, RuntimeError> {
+/// Plane-16 PUA window (U+10F800..U+10FFFF, 2048 code points) used to
+/// *bridge* lone surrogates (U+D800..U+DFFF) through the `&str`-based string
+/// algorithms: a `WStr` receiver/argument is mapped into this window so the
+/// existing UTF-8 method bodies run unchanged, then mapped back on output.
+///
+/// Bridging only activates when a `WStr` actually participates in the call
+/// (see [`str_result`]); a plain `str` — even one containing genuine
+/// plane-16 PUA characters — takes the untouched fast path. The only
+/// (astronomically rare) caveat is mixing a genuine U+10F800..U+10FFFF
+/// character into the *same* method call as a lone-surrogate string.
+pub(crate) const BRIDGE_BASE: u32 = 0x10_F800;
+
+/// Map a code-point sequence to a Rust `String`, shifting lone surrogates
+/// into the [`BRIDGE_BASE`] PUA window. Non-surrogate code points are kept.
+pub(crate) fn bridge_encode_cps(cps: &[u32]) -> String {
+    let mut s = String::with_capacity(cps.len());
+    for &cp in cps {
+        let mapped = if (0xD800..=0xDFFF).contains(&cp) {
+            BRIDGE_BASE + (cp - 0xD800)
+        } else {
+            cp
+        };
+        s.push(char::from_u32(mapped).unwrap_or('\u{FFFD}'));
+    }
+    s
+}
+
+/// Bridge a `str`/`WStr` object to a Rust `String` whose lone surrogates are
+/// shifted into the PUA window; `None` for non-string objects. A plain `str`
+/// is returned verbatim (it has no surrogates to shift).
+pub(crate) fn bridge_str_of(obj: &Object) -> Option<String> {
+    match obj {
+        Object::Str(s) => Some(s.to_string()),
+        Object::WStr(cps) => Some(bridge_encode_cps(cps)),
+        _ => None,
+    }
+}
+
+#[inline]
+pub(crate) fn bridge_window(cp: u32) -> bool {
+    (BRIDGE_BASE..=BRIDGE_BASE + 0x7FF).contains(&cp)
+}
+
+/// Inverse of [`bridge_encode_cps`] over a (possibly bridged) string,
+/// canonicalising to a `str` (no surrogates) or `WStr` (some surrogates).
+pub(crate) fn bridge_to_object(s: &str) -> Object {
+    if !s.chars().any(|ch| bridge_window(ch as u32)) {
+        return Object::from_str(s);
+    }
+    let cps: Vec<u32> = s
+        .chars()
+        .map(|ch| {
+            let cp = ch as u32;
+            if bridge_window(cp) {
+                0xD800 + (cp - BRIDGE_BASE)
+            } else {
+                cp
+            }
+        })
+        .collect();
+    Object::str_from_codepoints(cps)
+}
+
+/// A `str`/`WStr` method receiver as a Rust string: a plain `str` borrows;
+/// a `WStr` is bridged (lone surrogates → PUA) into an owned string.
+fn str_self(args: &[Object]) -> Result<std::borrow::Cow<'_, str>, RuntimeError> {
     match args.first() {
-        Some(Object::Str(s)) => Ok(s),
+        Some(Object::Str(s)) => Ok(std::borrow::Cow::Borrowed(s)),
+        Some(Object::WStr(cps)) => Ok(std::borrow::Cow::Owned(bridge_encode_cps(cps))),
         _ => Err(type_error("expected str method receiver")),
     }
 }
 
+/// A `str`/`WStr` *argument* (not the receiver) as a bridged Rust string;
+/// `None` for any non-string object so callers can raise their own
+/// method-specific `TypeError`.
+fn str_arg_bridged(obj: &Object) -> Option<std::borrow::Cow<'_, str>> {
+    match obj {
+        Object::Str(s) => Some(std::borrow::Cow::Borrowed(s)),
+        Object::WStr(cps) => Some(std::borrow::Cow::Owned(bridge_encode_cps(cps))),
+        _ => None,
+    }
+}
+
+/// Wrap a string-valued method result, mapping bridged surrogates back to a
+/// `WStr` *only* when a `WStr` participated in the call (so plain-`str`
+/// results — including genuine plane-16 PUA — are never disturbed).
+fn str_result(args: &[Object], result: String) -> Object {
+    if args.iter().any(|o| matches!(o, Object::WStr(_))) {
+        bridge_to_object(&result)
+    } else {
+        Object::from_str(result)
+    }
+}
+
 fn str_upper(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_str(str_self(args)?.to_uppercase()))
+    let up = str_self(args)?.to_uppercase();
+    Ok(str_result(args, up))
 }
 
 fn str_lower(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_str(str_self(args)?.to_lowercase()))
+    let lo = str_self(args)?.to_lowercase();
+    Ok(str_result(args, lo))
 }
 
 fn str_strip(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_str(str_self(args)?.trim().to_owned()))
+    let s = str_self(args)?;
+    let out = match args.get(1) {
+        None | Some(Object::None) => s.trim().to_owned(),
+        Some(arg) => {
+            let chars =
+                str_arg_bridged(arg).ok_or_else(|| type_error("strip() argument must be str"))?;
+            let set: Vec<char> = chars.chars().collect();
+            s.trim_matches(|c| set.contains(&c)).to_owned()
+        }
+    };
+    Ok(str_result(args, out))
 }
 
 fn split_maxsplit(o: Option<&Object>) -> Result<i64, RuntimeError> {
@@ -7314,35 +7411,57 @@ fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     let s = str_self(args)?;
     let sep = arg_or_kw(args, 1, kwargs, "sep");
     let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
+    // Bridge field results back to surrogates when a `WStr` was involved
+    // (receiver or separator).
+    let wrap = |out: Vec<Object>| -> Vec<Object> {
+        if args.iter().any(|o| matches!(o, Object::WStr(_)))
+            || matches!(sep, Some(Object::WStr(_)))
+        {
+            out.into_iter()
+                .map(|o| match o {
+                    Object::Str(piece) => bridge_to_object(&piece),
+                    other => other,
+                })
+                .collect()
+        } else {
+            out
+        }
+    };
     let out: Vec<Object> = match sep {
-        None | Some(Object::None) => str_split_whitespace(s, maxsplit),
-        Some(Object::Str(sep)) => {
+        None | Some(Object::None) => str_split_whitespace(&s, maxsplit),
+        Some(sep_obj) => {
+            let sep = str_arg_bridged(sep_obj)
+                .ok_or_else(|| type_error("must be str or None, not other"))?;
             if sep.is_empty() {
                 return Err(value_error("empty separator"));
             }
             if maxsplit < 0 {
-                s.split(&**sep).map(Object::from_str).collect()
+                s.split(&*sep).map(Object::from_str).collect()
             } else {
-                s.splitn((maxsplit as usize).saturating_add(1), &**sep)
+                s.splitn((maxsplit as usize).saturating_add(1), &*sep)
                     .map(Object::from_str)
                     .collect()
             }
         }
-        Some(_) => return Err(type_error("must be str or None, not other")),
     };
-    Ok(Object::new_list(out))
+    Ok(Object::new_list(wrap(out)))
 }
 
 fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
-    let sep = str_self(args)?.to_owned();
+    let sep = str_self(args)?.into_owned();
     if args.len() != 2 {
         return Err(type_error("join() expected 1 argument"));
     }
     let mut it = args[1].make_iter()?;
     let mut parts = Vec::new();
+    let mut saw_surrogate = matches!(args.first(), Some(Object::WStr(_)));
     while let Some(v) = it.next_value() {
-        match v {
+        match &v {
             Object::Str(s) => parts.push(s.to_string()),
+            Object::WStr(cps) => {
+                saw_surrogate = true;
+                parts.push(bridge_encode_cps(cps));
+            }
             other => {
                 return Err(type_error(format!(
                     "sequence item: expected str instance, {} found",
@@ -7351,7 +7470,12 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
     }
-    Ok(Object::from_str(parts.join(&sep)))
+    let joined = parts.join(&sep);
+    Ok(if saw_surrogate {
+        bridge_to_object(&joined)
+    } else {
+        Object::from_str(joined)
+    })
 }
 
 fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7361,7 +7485,7 @@ fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(obj) => obj,
         None => return Err(type_error("startswith() takes at least 1 argument")),
     };
-    let slice = str_apply_start_end(s, args.get(2), args.get(3))?;
+    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3))?;
     Ok(Object::Bool(str_match_prefix_suffix(slice, target, true)?))
 }
 
@@ -7371,7 +7495,7 @@ fn str_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(obj) => obj,
         None => return Err(type_error("endswith() takes at least 1 argument")),
     };
-    let slice = str_apply_start_end(s, args.get(2), args.get(3))?;
+    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3))?;
     Ok(Object::Bool(str_match_prefix_suffix(slice, target, false)?))
 }
 
@@ -7420,16 +7544,19 @@ fn str_match_prefix_suffix(
         }
     };
     match target {
-        Object::Str(s) => Ok(test(s)),
+        Object::Str(_) | Object::WStr(_) => {
+            let needle = str_arg_bridged(target).expect("str/WStr");
+            Ok(test(&needle))
+        }
         Object::Tuple(parts) => {
             for item in parts.iter() {
-                match item {
-                    Object::Str(s) => {
-                        if test(s) {
+                match str_arg_bridged(item) {
+                    Some(needle) => {
+                        if test(&needle) {
                             return Ok(true);
                         }
                     }
-                    _ => {
+                    None => {
                         return Err(type_error(
                             "startswith/endswith first arg must be str or tuple of str",
                         ));
@@ -7446,14 +7573,15 @@ fn str_match_prefix_suffix(
 
 fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let from = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("replace() expected str")),
+    let from = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("replace() expected str")),
     };
-    let to = match args.get(2) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("replace() expected str")),
+    let to = match args.get(2).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("replace() expected str")),
     };
+    let (from, to) = (from.as_ref(), to.as_ref());
     let mut count_obj = args.get(3).cloned();
     for (k, v) in kwargs {
         match k.as_str() {
@@ -7470,10 +7598,10 @@ fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
         Some(o) => coerce_index_i64(&o)?,
     };
     if count == 0 {
-        return Ok(Object::from_str(s.to_string()));
+        return Ok(str_result(args, s.into_owned()));
     }
     let out = if count < 0 {
-        s.replace(&**from, to)
+        s.replace(from, to)
     } else if from.is_empty() {
         // `str::replacen` with an empty pattern matches between every
         // char and at both ends, same as CPython.
@@ -7492,9 +7620,9 @@ fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
         }
         out
     } else {
-        s.replacen(&**from, to, count as usize)
+        s.replacen(from, to, count as usize)
     };
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 /// `ADJUST_INDICES`: negative indices offset by length and floored at
@@ -7527,9 +7655,10 @@ fn str_search_window(args: &[Object], total_chars: i64) -> Option<(i64, i64)> {
 
 fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sub = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("find() expected str")),
+    let s = s.as_ref();
+    let sub = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("find() expected str")),
     };
     let total_chars = s.chars().count() as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
@@ -7538,7 +7667,7 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
-    match hay.find(&**sub) {
+    match hay.find(&*sub) {
         Some(byte_idx) => {
             let abs_byte = byte_idx + start_byte;
             Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
@@ -7574,7 +7703,7 @@ fn str_title(args: &[Object]) -> Result<Object, RuntimeError> {
             prev_alpha = false;
         }
     }
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7584,7 +7713,7 @@ fn str_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(c) => c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
         None => String::new(),
     };
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7598,33 +7727,35 @@ fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
             out.push(ch);
         }
     }
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let out = match args.get(1) {
         None | Some(Object::None) => s.trim_start().to_owned(),
-        Some(Object::Str(chars)) => {
+        Some(arg) => {
+            let chars = str_arg_bridged(arg)
+                .ok_or_else(|| type_error("lstrip() argument must be str"))?;
             let set: Vec<char> = chars.chars().collect();
             s.trim_start_matches(|c| set.contains(&c)).to_owned()
         }
-        _ => return Err(type_error("lstrip() argument must be str")),
     };
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let out = match args.get(1) {
         None | Some(Object::None) => s.trim_end().to_owned(),
-        Some(Object::Str(chars)) => {
+        Some(arg) => {
+            let chars = str_arg_bridged(arg)
+                .ok_or_else(|| type_error("rstrip() argument must be str"))?;
             let set: Vec<char> = chars.chars().collect();
             s.trim_end_matches(|c| set.contains(&c)).to_owned()
         }
-        _ => return Err(type_error("rstrip() argument must be str")),
     };
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 /// `str.rsplit` on runs of whitespace, honouring `maxsplit` from the
@@ -7664,28 +7795,44 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
 
 fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
+    let s = s.as_ref();
     let sep = arg_or_kw(args, 1, kwargs, "sep");
     let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
+    let wrap = |out: Vec<Object>| -> Vec<Object> {
+        if args.iter().any(|o| matches!(o, Object::WStr(_)))
+            || matches!(sep, Some(Object::WStr(_)))
+        {
+            out.into_iter()
+                .map(|o| match o {
+                    Object::Str(piece) => bridge_to_object(&piece),
+                    other => other,
+                })
+                .collect()
+        } else {
+            out
+        }
+    };
     let out: Vec<Object> = match sep {
         None | Some(Object::None) => str_rsplit_whitespace(s, maxsplit),
-        Some(Object::Str(sep)) => {
+        Some(sep_obj) => {
+            let sep = str_arg_bridged(sep_obj)
+                .ok_or_else(|| type_error("must be str or None, not other"))?;
             if sep.is_empty() {
                 return Err(value_error("empty separator"));
             }
             let mut pieces: Vec<&str> = if maxsplit < 0 {
-                s.split(&**sep).collect()
+                s.split(&*sep).collect()
             } else {
                 let mut v: Vec<&str> = s
-                    .rsplitn((maxsplit as usize).saturating_add(1), &**sep)
+                    .rsplitn((maxsplit as usize).saturating_add(1), &*sep)
                     .collect();
                 v.reverse();
                 v
             };
             pieces.drain(..).map(Object::from_str).collect()
         }
-        Some(_) => return Err(type_error("must be str or None, not other")),
     };
-    Ok(Object::new_list(out))
+    Ok(Object::new_list(wrap(out)))
 }
 
 fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -7709,7 +7856,7 @@ fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
             } else {
                 &s[start..end_no_eol]
             };
-            out.push(Object::from_str(line.to_owned()));
+            out.push(str_result(args, line.to_owned()));
             start = end;
             i = end;
         } else {
@@ -7717,16 +7864,17 @@ fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
         }
     }
     if start < bytes.len() {
-        out.push(Object::from_str(s[start..].to_owned()));
+        out.push(str_result(args, s[start..].to_owned()));
     }
     Ok(Object::new_list(out))
 }
 
 fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sub = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("rfind() expected str")),
+    let s = s.as_ref();
+    let sub = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("rfind() expected str")),
     };
     let total_chars = s.chars().count() as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
@@ -7735,7 +7883,7 @@ fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
-    match hay.rfind(&**sub) {
+    match hay.rfind(&*sub) {
         Some(byte_idx) => {
             let abs_byte = byte_idx + start_byte;
             Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
@@ -7762,9 +7910,10 @@ fn str_rindex(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sub = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("count() expected str")),
+    let s = s.as_ref();
+    let sub = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("count() expected str")),
     };
     let total_chars = s.chars().count() as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
@@ -7772,54 +7921,59 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
+    // An empty needle matches at every code-point boundary (CPython counts
+    // `len+1`); Rust's `matches("")` already yields that, but on the bridged
+    // string each PUA char is one boundary, matching code-point semantics.
     Ok(Object::Int(
-        s[start_byte..end_byte].matches(&**sub).count() as i64
+        s[start_byte..end_byte].matches(&*sub).count() as i64
     ))
 }
 
 fn str_partition(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sep = match args.get(1) {
-        Some(Object::Str(p)) => p.to_string(),
-        _ => return Err(type_error("partition() expected str")),
+    let s = s.as_ref();
+    let sep = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("partition() expected str")),
     };
-    let (head, tail) = match s.find(&sep) {
+    let (head, tail) = match s.find(&*sep) {
         Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
         None => {
             return Ok(Object::new_tuple(vec![
-                Object::from_str(s.to_owned()),
+                str_result(args, s.to_owned()),
                 Object::from_static(""),
                 Object::from_static(""),
             ]))
         }
     };
     Ok(Object::new_tuple(vec![
-        Object::from_str(head),
-        Object::from_str(sep),
-        Object::from_str(tail),
+        str_result(args, head),
+        str_result(args, sep.into_owned()),
+        str_result(args, tail),
     ]))
 }
 
 fn str_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sep = match args.get(1) {
-        Some(Object::Str(p)) => p.to_string(),
-        _ => return Err(type_error("rpartition() expected str")),
+    let s = s.as_ref();
+    let sep = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("rpartition() expected str")),
     };
-    let (head, tail) = match s.rfind(&sep) {
+    let (head, tail) = match s.rfind(&*sep) {
         Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
         None => {
             return Ok(Object::new_tuple(vec![
                 Object::from_static(""),
                 Object::from_static(""),
-                Object::from_str(s.to_owned()),
+                str_result(args, s.to_owned()),
             ]))
         }
     };
     Ok(Object::new_tuple(vec![
-        Object::from_str(head),
-        Object::from_str(sep),
-        Object::from_str(tail),
+        str_result(args, head),
+        str_result(args, sep.into_owned()),
+        str_result(args, tail),
     ]))
 }
 
@@ -7902,6 +8056,7 @@ fn str_isprintable(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
+    let s = s.as_ref();
     let width = match args.get(1) {
         // A negative width is a no-op in CPython (`'x'.zfill(-3) == 'x'`);
         // clamp to 0 so `*i as usize` can't wrap to a gigantic pad count.
@@ -7911,7 +8066,7 @@ fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let len = s.chars().count();
     if len >= width {
-        return Ok(Object::from_str(s.to_owned()));
+        return Ok(str_result(args, s.to_owned()));
     }
     let pad = width - len;
     let (sign, rest) = if s.starts_with('+') || s.starts_with('-') {
@@ -7919,7 +8074,7 @@ fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         ("", s)
     };
-    Ok(Object::from_str(format!("{sign}{}{rest}", "0".repeat(pad))))
+    Ok(str_result(args, format!("{sign}{}{rest}", "0".repeat(pad))))
 }
 
 fn str_ljust(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7939,21 +8094,24 @@ fn pad_str(args: &[Object], right_align: bool) -> Result<Object, RuntimeError> {
         Some(Object::Bool(b)) => usize::from(*b),
         _ => return Err(type_error("expected int width")),
     };
-    let fill = match args.get(2) {
-        Some(Object::Str(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
+    let fill = match args.get(2).map(str_arg_bridged) {
+        Some(Some(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
         None => ' ',
         _ => return Err(type_error("fill must be single char")),
     };
     let len = s.chars().count();
     if len >= width {
-        return Ok(Object::from_str(s.to_owned()));
+        return Ok(str_result(args, s.into_owned()));
     }
     let pad: String = std::iter::repeat_n(fill, width - len).collect();
-    Ok(Object::from_str(if right_align {
-        format!("{pad}{s}")
-    } else {
-        format!("{s}{pad}")
-    }))
+    Ok(str_result(
+        args,
+        if right_align {
+            format!("{pad}{s}")
+        } else {
+            format!("{s}{pad}")
+        },
+    ))
 }
 
 fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7965,14 +8123,14 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Bool(b)) => usize::from(*b),
         _ => return Err(type_error("center() expected int")),
     };
-    let fill = match args.get(2) {
-        Some(Object::Str(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
+    let fill = match args.get(2).map(str_arg_bridged) {
+        Some(Some(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
         None => ' ',
         _ => return Err(type_error("fill must be single char")),
     };
     let len = s.chars().count();
     if len >= width {
-        return Ok(Object::from_str(s.to_owned()));
+        return Ok(str_result(args, s.into_owned()));
     }
     let total = width - len;
     // CPython biases the extra pad to the *left* when both the margin and the
@@ -7982,7 +8140,7 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
     let right = total - left;
     let lpad: String = std::iter::repeat_n(fill, left).collect();
     let rpad: String = std::iter::repeat_n(fill, right).collect();
-    Ok(Object::from_str(format!("{lpad}{s}{rpad}")))
+    Ok(str_result(args, format!("{lpad}{s}{rpad}")))
 }
 
 fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8023,11 +8181,16 @@ fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
     }
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
-    let s = str_self(args)?;
+    // Accept both `str` and surrogate-bearing `WStr` receivers so
+    // `chr(0xD800).encode('utf-8', 'surrogatepass')` works.
+    let recv = args.first().ok_or_else(|| type_error("encode() missing receiver"))?;
+    if !recv.is_str() {
+        return Err(type_error("expected str method receiver"));
+    }
     let encoding = match args.get(1) {
         Some(Object::Str(e)) => e.to_string(),
         None => "utf-8".to_owned(),
@@ -8038,7 +8201,7 @@ fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
         None => "strict".to_owned(),
         _ => "strict".to_owned(),
     };
-    let bytes = crate::stdlib::codecs_mod::encode_str(s, &encoding, &errors)?;
+    let bytes = crate::stdlib::codecs_mod::encode_obj(recv, &encoding, &errors)?;
     Ok(Object::new_bytes(bytes))
 }
 
@@ -8050,12 +8213,13 @@ fn str_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let s = str_self(args)?;
-    let prefix = match args.get(1) {
-        Some(Object::Str(p)) => p.to_string(),
-        _ => return Err(type_error("removeprefix() expected str")),
+    let s = s.as_ref();
+    let prefix = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("removeprefix() expected str")),
     };
-    let out = s.strip_prefix(&prefix).unwrap_or(s).to_owned();
-    Ok(Object::from_str(out))
+    let out = s.strip_prefix(&*prefix).unwrap_or(s).to_owned();
+    Ok(str_result(args, out))
 }
 
 fn str_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8066,28 +8230,29 @@ fn str_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let s = str_self(args)?;
-    let suffix = match args.get(1) {
-        Some(Object::Str(p)) => p.to_string(),
-        _ => return Err(type_error("removesuffix() expected str")),
+    let s = s.as_ref();
+    let suffix = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("removesuffix() expected str")),
     };
-    let out = s.strip_suffix(&suffix).unwrap_or(s).to_owned();
-    Ok(Object::from_str(out))
+    let out = s.strip_suffix(&*suffix).unwrap_or(s).to_owned();
+    Ok(str_result(args, out))
 }
 
 fn str_format(args: &[Object]) -> Result<Object, RuntimeError> {
-    let template = str_self(args)?.to_owned();
+    let template = str_self(args)?.into_owned();
     let rest = &args[1..];
     let kwargs: Vec<(String, Object)> = Vec::new();
-    crate::str_format_impl(&template, rest, &kwargs).map(Object::from_str)
+    crate::str_format_impl(&template, rest, &kwargs).map(|s| str_result(args, s))
 }
 
 fn str_format_map(args: &[Object]) -> Result<Object, RuntimeError> {
-    let template = str_self(args)?.to_owned();
+    let template = str_self(args)?.into_owned();
     let mapping = match args.get(1) {
         Some(Object::Dict(d)) => d.clone(),
         _ => return Err(type_error("format_map() argument must be a mapping")),
     };
-    crate::str_format_map_impl(&template, &mapping).map(Object::from_str)
+    crate::str_format_map_impl(&template, &mapping).map(|s| str_result(args, s))
 }
 
 fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8097,20 +8262,46 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("translate() argument must be a dict")),
     };
     let mut out = String::new();
+    let mut saw_surrogate = matches!(args.first(), Some(Object::WStr(_)));
+    // Push a translation target code point, bridging a surrogate so it
+    // round-trips through `str_result`.
+    let push_cp = |out: &mut String, cp: u32, saw: &mut bool| {
+        let mapped = if (0xD800..=0xDFFF).contains(&cp) {
+            *saw = true;
+            BRIDGE_BASE + (cp - 0xD800)
+        } else {
+            cp
+        };
+        if let Some(ch) = char::from_u32(mapped) {
+            out.push(ch);
+        }
+    };
     for c in s.chars() {
-        let key = DictKey(Object::Int(i64::from(u32::from(c))));
-        match table.borrow().get(&key) {
+        // Recover the real code point of a bridged surrogate for the lookup.
+        let cp = c as u32;
+        let real_cp = if bridge_window(cp) {
+            0xD800 + (cp - BRIDGE_BASE)
+        } else {
+            cp
+        };
+        let key = DictKey(Object::Int(i64::from(real_cp)));
+        let entry = table.borrow().get(&key).cloned();
+        match entry {
             Some(Object::None) => {}
-            Some(Object::Int(i)) => {
-                if let Some(ch) = char::from_u32(*i as u32) {
-                    out.push(ch);
-                }
+            Some(Object::Int(i)) => push_cp(&mut out, i as u32, &mut saw_surrogate),
+            Some(Object::Str(v)) => out.push_str(&v),
+            Some(Object::WStr(cps)) => {
+                saw_surrogate = true;
+                out.push_str(&bridge_encode_cps(&cps));
             }
-            Some(Object::Str(s)) => out.push_str(s),
             _ => out.push(c),
         }
     }
-    Ok(Object::from_str(out))
+    Ok(if saw_surrogate {
+        bridge_to_object(&out)
+    } else {
+        Object::from_str(out)
+    })
 }
 
 fn str_maketrans(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -9356,8 +9547,8 @@ fn bytes_decode_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
         Some(Object::Str(e)) => e.to_string(),
         _ => "strict".to_owned(),
     };
-    let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;
-    Ok(Object::from_str(s))
+    // Produces a surrogate-bearing `WStr` for `surrogateescape`/`surrogatepass`.
+    crate::stdlib::codecs_mod::decode_bytes_obj(&data, &encoding, &errors)
 }
 
 fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -10901,6 +11092,19 @@ pub(crate) fn file_check_open(f: &Rc<crate::object::PyFile>) -> Result<(), Runti
     Ok(())
 }
 
+/// Convert decoded stream text into a `str` Object, un-bridging the PUA
+/// surrogate window for an in-memory `StringIO` (whose buffer stores lone
+/// surrogates as bridged PUA code points so a Rust `String` can hold them).
+/// File-backed text streams never contain bridge-window code points, so they
+/// take the plain `Object::Str` path.
+fn stream_text_object(f: &Rc<crate::object::PyFile>, s: String) -> Object {
+    if matches!(&*f.backend.borrow(), crate::object::FileBackend::MemText { .. }) {
+        bridge_to_object(&s)
+    } else {
+        Object::from_str(s)
+    }
+}
+
 pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     file_check_open(&f)?;
@@ -10925,14 +11129,20 @@ pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
             Some(data) => Ok(Object::new_bytes(data)),
             None => Ok(Object::None),
         }
+    } else if f.text_incr_active_gate() {
+        // A custom incremental-only codec (its one-shot `decode` is `None`,
+        // e.g. test_io's `test_decoder`): drive the faithful CPython
+        // `TextIOWrapper` incremental machinery. `n` is `None` for a full
+        // read, `Some(size)` for a character-counted read.
+        Ok(stream_text_object(&f, f.read_text_incr(n)?))
     } else if let Some(count) = n {
         // Text `read(size)` counts *characters*, not bytes (CPython
         // `TextIOWrapper`/`StringIO`); read code-point-wise so a multibyte
         // char is never split at the size boundary.
-        Ok(Object::from_str(f.read_text_n(count)?))
+        Ok(stream_text_object(&f, f.read_text_n(count)?))
     } else {
         match f.read_bytes_opt(None)? {
-            Some(data) => Ok(Object::from_str(f.decode_text(data)?)),
+            Some(data) => Ok(stream_text_object(&f, f.decode_text(data)?)),
             None => Ok(Object::None),
         }
     }
@@ -11128,7 +11338,7 @@ pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     if f.binary {
         Ok(Object::new_bytes(out))
     } else {
-        Ok(Object::from_str(f.decode_text(out)?))
+        Ok(stream_text_object(&f, f.decode_text(out)?))
     }
 }
 
@@ -11146,6 +11356,8 @@ pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
     let line = file_readline(args)?;
     let empty = match &line {
         Object::Str(s) => s.is_empty(),
+        // A `WStr` always holds >= 1 lone surrogate, so it is never empty.
+        Object::WStr(_) => false,
         Object::Bytes(b) => b.is_empty(),
         _ => true,
     };
@@ -11169,6 +11381,7 @@ pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
         let line = file_readline(&[Object::File(f.clone())])?;
         let is_empty = match &line {
             Object::Str(s) => s.is_empty(),
+            Object::WStr(_) => false,
             Object::Bytes(b) => b.is_empty(),
             _ => true,
         };
@@ -11200,6 +11413,22 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
                 return Err(type_error("a bytes-like object is required, not 'str'"));
             }
             f.write_bytes(&f.encode_text(s)?)?
+        }
+        // A surrogate-bearing `str`. For an in-memory `StringIO` the lone
+        // surrogates ride through the PUA bridge so they round-trip; a real
+        // encoded text stream encodes the *actual* code points through its
+        // codec + error handler (so strict UTF-8 raises `UnicodeEncodeError`
+        // on a lone surrogate, `surrogateescape`/`surrogatepass` round-trip).
+        Object::WStr(cps) => {
+            if f.binary {
+                return Err(type_error("a bytes-like object is required, not 'str'"));
+            }
+            if matches!(&*f.backend.borrow(), crate::object::FileBackend::MemText { .. }) {
+                let bridged = bridge_encode_cps(cps);
+                f.write_bytes(&f.encode_text(&bridged)?)?
+            } else {
+                f.write_bytes(&f.encode_text_codepoints(cps)?)?
+            }
         }
         Object::Bytes(b) => {
             if !f.binary {
@@ -11317,14 +11546,22 @@ pub(crate) fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
     // An explicit seek re-enables `tell()` after an iteration disabled it
     // (CPython restores `telling = seekable` in `textiowrapper_seek`).
     f.telling.set(true);
-    let offset = match args.get(1) {
-        Some(Object::Int(i)) => *i as isize,
-        _ => return Err(type_error("seek() expected int")),
-    };
     let whence = match args.get(2) {
         Some(Object::Int(i)) => *i as i32,
         None => 0,
         _ => return Err(type_error("seek() whence must be int")),
+    };
+    // Incremental text cookie path (a custom decode=None codec): the seek
+    // argument is an opaque `TextIOWrapper` cookie — a Python int that can
+    // exceed 64 bits (`Object::Long`) — not a byte offset, so it must be
+    // handled before the byte-offset parse below.
+    if f.text_incr_active_gate() && f.readable() {
+        let cookie = args.get(1).cloned().unwrap_or(Object::Int(0));
+        return f.seek_text(&cookie, whence);
+    }
+    let offset = match args.get(1) {
+        Some(Object::Int(i)) => *i as isize,
+        _ => return Err(type_error("seek() expected int")),
     };
     // A text stream (CPython's `TextIOWrapper`) only supports absolute seeks to
     // opaque cookies; a non-zero current- or end-relative seek raises
@@ -11349,6 +11586,11 @@ pub(crate) fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(crate::error::os_error(
             "telling position disabled by next() call",
         ));
+    }
+    // Incremental text cookie path (a custom decode=None codec): `tell()`
+    // returns an opaque decoder-state cookie, not a byte offset.
+    if f.text_incr_active_gate() && f.readable() {
+        return f.tell_text_incr();
     }
     Ok(Object::Int(f.tell()? as i64))
 }
@@ -11626,6 +11868,8 @@ pub(crate) fn file_setstate_mem(args: &[Object]) -> Result<Object, RuntimeError>
         // (4) value: str; (5) newline: valid str/None; (6) pos: non-negative int.
         let txt = match &items[0] {
             Object::Str(s) => s.to_string(),
+            // Restore a surrogate-bearing buffer through the PUA bridge.
+            Object::WStr(cps) => bridge_encode_cps(cps),
             _ => return Err(type_error("initial_value must be str or None")),
         };
         let newline = validate_stringio_newline(&items[1])?;

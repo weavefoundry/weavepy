@@ -390,24 +390,14 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
     }
     // CPython 3.12+ (`Modules/posixmodule.c: warn_about_fork_with_threads`):
     // forking a multi-threaded process is hazardous, so `os.fork()` issues a
-    // `DeprecationWarning` before the syscall. The thread registry tracks only
-    // spawned worker threads (`_thread._count()` semantics — the main thread
-    // is not an entry), so a non-zero running count means another thread is
-    // live. Emitted in the parent before `fork(2)`; if warnings are escalated
-    // to errors the fork is aborted (`?`), matching CPython.
-    if crate::thread_registry::registry().running_count() > 0 {
-        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
-            // SAFETY: published by the active builtin call on this thread; the
-            // interpreter outlives this synchronous re-entrant call.
-            let interp = unsafe { &mut *ptr };
-            // SAFETY: `getpid(2)` is always safe.
-            let pid = unsafe { libc::getpid() };
-            interp.warn_deprecation_from_builtin(format!(
-                "This process (pid={pid}) is multi-threaded, \
-                 use of fork() may lead to deadlocks in the child."
-            ))?;
-        }
-    }
+    // `DeprecationWarning`. We must sample the parent's thread state *now*
+    // (only the calling thread survives `fork(2)`, so the count is gone in
+    // the child) but emit the warning *after* the fork, in the parent branch
+    // only — exactly like `os_fork_impl`, whose `warn_about_fork_with_threads`
+    // runs after `PyOS_AfterFork_Parent`. The child therefore inherits the
+    // pre-fork `warnings` state (an empty `catch_warnings(record=True)` list),
+    // which is what `test_fork_warns_when_non_python_thread_exists` asserts.
+    let multithreaded = process_is_multithreaded();
     run_atfork(AtForkPhase::Before);
     // SAFETY: `fork(2)`. In the child only this thread survives; we run the
     // registered after-in-child handlers (CPython's `PyOS_AfterFork_Child`).
@@ -425,11 +415,136 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
         // workers via `os.fork()` while a queue-feeder thread is live).
         let cur = crate::vm_singletons::current_worker_thread_id();
         crate::thread_registry::registry().reset_after_fork_in_child(cur);
+        // Every other OS thread vanished with the fork, so the infra-thread
+        // baseline shrinks to this lone survivor. Re-sample it so a *nested*
+        // fork in the child judges "multi-threaded" against the right floor.
+        capture_thread_baseline();
         run_atfork(AtForkPhase::Child);
     } else {
         run_atfork(AtForkPhase::Parent);
+        if multithreaded {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by the active builtin call on this thread;
+                // the interpreter outlives this synchronous re-entrant call.
+                let interp = unsafe { &mut *ptr };
+                // SAFETY: `getpid(2)` is always safe.
+                let pid_self = unsafe { libc::getpid() };
+                interp.warn_deprecation_from_builtin(format!(
+                    "This process (pid={pid_self}) is multi-threaded, \
+                     use of fork() may lead to deadlocks in the child."
+                ))?;
+            }
+        }
     }
     Ok(Object::Int(i64::from(pid)))
+}
+
+/// Baseline count of WeavePy *infrastructure* OS threads — the parked
+/// process-initial thread, the `weavepy-main` VM thread, and any runtime
+/// threads spun up before user code runs. Captured once at interpreter
+/// startup (`capture_thread_baseline`) so a later `os.fork()` can tell
+/// whether the process has since acquired *additional* threads — Python
+/// `threading` workers *or* raw non-Python `pthread`s created by C/Rust
+/// extensions — and therefore must emit the multi-threaded-fork
+/// `DeprecationWarning`. `0` until captured (treated as "unknown").
+static THREAD_BASELINE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static THREAD_BASELINE_SET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Count the live OS threads in this process, or `None` when the platform
+/// query is unavailable. macOS uses the mach `task_threads` task port
+/// introspection (CPython's `warn_about_fork_with_threads` does the same);
+/// Linux counts the kernel thread directories under `/proc/self/task`.
+#[cfg(target_os = "macos")]
+pub fn count_os_threads() -> Option<usize> {
+    use std::os::raw::c_uint;
+    // `mach_port_t` / `thread_act_t` are `c_uint`; `kern_return_t` is `i32`.
+    // `mach_task_self_` is the global the `mach_task_self()` macro expands to.
+    extern "C" {
+        static mach_task_self_: c_uint;
+        fn task_threads(
+            target_task: c_uint,
+            act_list: *mut *mut c_uint,
+            act_list_cnt: *mut c_uint,
+        ) -> i32;
+        fn mach_port_deallocate(task: c_uint, name: c_uint) -> i32;
+        fn vm_deallocate(target_task: c_uint, address: usize, size: usize) -> i32;
+    }
+    const KERN_SUCCESS: i32 = 0;
+    // SAFETY: the canonical mach task-introspection sequence. `task_threads`
+    // allocates the `acts` array (freed with `vm_deallocate`) and hands back a
+    // send right per thread (each released with `mach_port_deallocate`),
+    // mirroring CPython's `warn_about_fork_with_threads` cleanup.
+    unsafe {
+        let task = mach_task_self_;
+        let mut acts: *mut c_uint = std::ptr::null_mut();
+        let mut count: c_uint = 0;
+        if task_threads(task, &raw mut acts, &raw mut count) != KERN_SUCCESS {
+            return None;
+        }
+        let n = count as usize;
+        if !acts.is_null() {
+            for i in 0..n {
+                mach_port_deallocate(task, *acts.add(i));
+            }
+            vm_deallocate(task, acts as usize, n * std::mem::size_of::<c_uint>());
+        }
+        Some(n)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn count_os_threads() -> Option<usize> {
+    // Each live kernel thread has a `/proc/self/task/<tid>` directory.
+    std::fs::read_dir("/proc/self/task")
+        .ok()
+        .map(|d| d.filter_map(Result::ok).count())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn count_os_threads() -> Option<usize> {
+    None
+}
+
+/// Record the current OS-thread count as the infrastructure baseline. Call
+/// once at interpreter startup, before any user code can spawn threads, and
+/// again in a fork child (where only the calling thread survives). Idempotent
+/// in the sense that the latest call wins.
+pub fn capture_thread_baseline() {
+    if let Some(n) = count_os_threads() {
+        THREAD_BASELINE.store(n, std::sync::atomic::Ordering::Release);
+        THREAD_BASELINE_SET.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Capture the baseline only if it has never been set. Used as a safety net on
+/// the first `os` import for entry points that don't call
+/// [`capture_thread_baseline`] at startup (embedders, the in-process
+/// conformance runner). The authoritative early capture on the CLI VM thread
+/// always wins because it runs first; this never overwrites it with a
+/// later — possibly thread-contaminated — sample.
+pub fn capture_thread_baseline_if_unset() {
+    if !THREAD_BASELINE_SET.load(std::sync::atomic::Ordering::Acquire) {
+        capture_thread_baseline();
+    }
+}
+
+/// Whether the process currently runs more than the lone interpreter thread —
+/// i.e. it has Python `threading` workers *or* raw non-Python OS threads. This
+/// is the signal that gates CPython's multi-threaded-`fork()`
+/// `DeprecationWarning`. Python threads are authoritative via the registry
+/// even when the OS query is unavailable; foreign threads are detected by the
+/// live OS count exceeding the captured infrastructure baseline.
+pub fn process_is_multithreaded() -> bool {
+    if crate::thread_registry::registry().running_count() > 0 {
+        return true;
+    }
+    if THREAD_BASELINE_SET.load(std::sync::atomic::Ordering::Acquire) {
+        if let Some(now) = count_os_threads() {
+            return now > THREAD_BASELINE.load(std::sync::atomic::Ordering::Acquire);
+        }
+    }
+    false
 }
 
 #[cfg(not(unix))]

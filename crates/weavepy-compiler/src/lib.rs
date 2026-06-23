@@ -323,6 +323,19 @@ fn format_constant(c: &Constant) -> String {
             }
         }
         Constant::Str(s) => format!("'{s}'"),
+        Constant::WStr(cps) => {
+            // Surrogate-bearing literal; render lone surrogates as `\uXXXX`
+            // and scalar code points verbatim (best-effort, for disassembly).
+            let mut s = String::from("'");
+            for &cp in cps {
+                match char::from_u32(cp) {
+                    Some(ch) => s.push(ch),
+                    None => s.push_str(&format!("\\u{cp:04x}")),
+                }
+            }
+            s.push('\'');
+            s
+        }
         Constant::Bytes(_) => "b'...'".to_owned(),
         Constant::Tuple(items) => {
             let inner: Vec<_> = items.iter().map(format_constant).collect();
@@ -351,6 +364,11 @@ pub enum Constant {
     /// Complex literal `(real, imag)` (RFC 0019).
     Complex(f64, f64),
     Str(String),
+    /// A `str` constant carrying at least one lone surrogate, which a Rust
+    /// `String` cannot hold (see [`weavepy_parser::ast::Constant::WStr`]).
+    /// Lowered to an `Object::WStr` at materialisation time; disjoint from
+    /// [`Constant::Str`] (a surrogate-free value is always `Str`).
+    WStr(Vec<u32>),
     Bytes(Vec<u8>),
     Tuple(Vec<Constant>),
     Code(Box<CodeObject>),
@@ -370,6 +388,7 @@ impl PartialEq for Constant {
                 ar.to_bits() == br.to_bits() && ai.to_bits() == bi.to_bits()
             }
             (C::Str(a), C::Str(b)) => a == b,
+            (C::WStr(a), C::WStr(b)) => a == b,
             (C::Bytes(a), C::Bytes(b)) => a == b,
             (C::Tuple(a), C::Tuple(b)) => a == b,
             (C::Code(_), C::Code(_)) => false,
@@ -398,6 +417,7 @@ impl From<AstConstant> for Constant {
             AstConstant::Complex(real, imag) => Self::Complex(real, imag),
             AstConstant::Float(f) => Self::Float(f),
             AstConstant::Str(s) => Self::Str(s),
+            AstConstant::WStr(cps) => Self::WStr(cps),
             AstConstant::Bytes(b) => Self::Bytes(b),
             AstConstant::Tuple(xs) => Self::Tuple(xs.into_iter().map(Self::from).collect()),
             AstConstant::Ellipsis => Self::Ellipsis,

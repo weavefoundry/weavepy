@@ -920,6 +920,7 @@ fn constant(c: &past::Constant) -> Object {
         C::Float(f) => Object::Float(*f),
         C::Complex(re, im) => Object::new_complex(*re, *im),
         C::Str(s) => Object::from_str(s.clone()),
+        C::WStr(cps) => Object::str_from_codepoints(cps.clone()),
         C::Bytes(b) => Object::new_bytes(b.clone()),
         C::Tuple(items) => Object::new_tuple(items.iter().map(constant).collect()),
         C::Ellipsis => crate::vm_singletons::ellipsis(),

@@ -321,14 +321,14 @@ pub(crate) fn io_open_kw(
             _ => String::new(),
         };
         let file = file_from_fd(&fd_obj, &mode, name)?;
-        apply_text_config(
-            &file,
+        return finish_open(
+            file,
+            slots[2].as_ref(),
             slots[3].as_ref(),
             slots[4].as_ref(),
             slots[5].as_ref(),
-        )?;
-        apply_buffering(&file, buffering_arg(slots[2].as_ref()), mode.contains('b'))?;
-        return Ok(file);
+            mode.contains('b'),
+        );
     }
 
     let last = slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
@@ -656,12 +656,14 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         if let (Object::File(f), Some(Object::Bool(false))) = (&file, args.get(6)) {
             f.closefd.set(false);
         }
-        if !mode.contains('b') && encoding_arg_is_default(args.get(3)) {
-            warn_open_default_encoding()?;
-        }
-        apply_text_config(&file, args.get(3), args.get(4), args.get(5))?;
-        apply_buffering(&file, buffering_arg(args.get(2)), mode.contains('b'))?;
-        return Ok(file);
+        return finish_open(
+            file,
+            args.get(2),
+            args.get(3),
+            args.get(4),
+            args.get(5),
+            mode.contains('b'),
+        );
     }
     let path = match args.first() {
         Some(obj) => coerce_open_path(obj)?,
@@ -732,12 +734,46 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
-    if !binary && encoding_arg_is_default(args.get(3)) {
-        warn_open_default_encoding()?;
+    // CPython validates the text config / buffering *before* opening the fd, so
+    // an illegal `newline`/`errors`/`encoding` or unbuffered-text request never
+    // leaks a descriptor. We opened eagerly above, so mirror CPython's `_io.open`
+    // `error:` cleanup instead: close the freshly-opened stream on any config
+    // failure, so no unclosed-file `ResourceWarning` fires (`test_io`
+    // `test_invalid_newline` / `test_nonbuffered_textio` assert none does).
+    finish_open(file, args.get(2), args.get(3), args.get(4), args.get(5), binary)
+}
+
+/// Apply the post-open text config + buffering to a freshly built stream,
+/// closing it (so no descriptor leaks and no unclosed-file `ResourceWarning`
+/// fires) if any of the eager validations CPython runs *before* the open
+/// rejects the arguments. Shared by every `io_open*` path that opens/adopts a
+/// real descriptor — and by the builtin `open` (`builtins.rs`), which *is*
+/// `io.open` in CPython.
+pub(crate) fn finish_open(
+    file: Object,
+    buffering: Option<&Object>,
+    encoding: Option<&Object>,
+    errors: Option<&Object>,
+    newline: Option<&Object>,
+    binary: bool,
+) -> Result<Object, RuntimeError> {
+    let result = (|| -> Result<(), RuntimeError> {
+        if !binary && encoding_arg_is_default(encoding) {
+            warn_open_default_encoding()?;
+        }
+        apply_text_config(&file, encoding, errors, newline)?;
+        apply_buffering(&file, buffering_arg(buffering), binary)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(file),
+        Err(e) => {
+            if let Object::File(f) = &file {
+                f.close();
+            }
+            Err(e)
+        }
     }
-    apply_text_config(&file, args.get(3), args.get(4), args.get(5))?;
-    apply_buffering(&file, buffering_arg(args.get(2)), binary)?;
-    Ok(file)
 }
 
 /// Public entry: ensure the `_io` types exist even before module

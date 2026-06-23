@@ -13,6 +13,15 @@ The traceback conformance tests use two C hooks:
 import sys
 import traceback as _traceback
 
+# Raw-pthread spawn/join helpers, implemented natively in `_testinternalcapi`
+# (they create a genuine non-Python OS thread). `test_os` imports these from
+# `_testcapi` to verify `os.fork()` warns about a multi-threaded process even
+# when the extra thread isn't a Python thread.
+from _testinternalcapi import (  # noqa: F401
+    _spawn_pthread_waiter,
+    _end_spawned_pthread,
+)
+
 # CPython's test suite gates many tests on attributes of _testcapi;
 # expose the couple of constants commonly probed so `hasattr` checks
 # behave sensibly.

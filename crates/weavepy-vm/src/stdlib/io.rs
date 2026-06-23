@@ -486,6 +486,9 @@ fn stringio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFi
         .or_else(|| kw_get(kwargs, "initial_value"));
     let data = match initial {
         Some(Object::Str(s)) => s.to_string(),
+        // A surrogate-bearing initial value is stored bridged (lone surrogates
+        // → PUA window) so it round-trips through `getvalue`/`read`.
+        Some(Object::WStr(cps)) => crate::builtins::bridge_encode_cps(&cps),
         Some(Object::None) | None => String::new(),
         Some(_) => return Err(type_error("initial_value must be str or None, not int")),
     };
@@ -2613,6 +2616,13 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
             resolve_locale_encoding(s.as_ref())
         }
         Some(Object::None) | None => "utf-8".to_owned(),
+        // A lone-surrogate encoding name can't be UTF-8-encoded for the codec
+        // lookup, so CPython raises `UnicodeEncodeError` (not `TypeError`):
+        // `test_constructor`: `encoding='\udcfe'`.
+        Some(Object::WStr(cps)) => {
+            crate::stdlib::codecs_mod::encode_codepoints(&cps, "utf-8", "strict")?;
+            unreachable!("WStr always carries a lone surrogate")
+        }
         // The C `TextIOWrapper` raises `TypeError` for a non-str encoding
         // (`test_constructor`: `encoding=42`).
         Some(other) => {
@@ -2640,6 +2650,13 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
             s.to_string()
         }
         Some(Object::None) | None => "strict".to_owned(),
+        // A lone-surrogate error-handler name can't be UTF-8-encoded either, so
+        // the C constructor raises `UnicodeEncodeError` (`test_constructor`:
+        // `errors='\udcfe'`).
+        Some(Object::WStr(cps)) => {
+            crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "strict")?;
+            unreachable!("WStr always carries a lone surrogate")
+        }
         Some(other) => {
             return Err(type_error(format!(
                 "TextIOWrapper() argument 'errors' must be str or None, not {}",
@@ -2658,6 +2675,12 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
             }
         }
         Some(Object::None) | None => {}
+        // A lone-surrogate `newline` is a `str` (so not a `TypeError`) but never
+        // one of the five legal values → `ValueError` (`test_constructor`:
+        // `newline='\udcfe'`).
+        Some(Object::WStr(_)) => {
+            return Err(value_error("illegal newline value"));
+        }
         Some(other) => {
             return Err(type_error(format!(
                 "TextIOWrapper() argument 'newline' must be str or None, not {}",
@@ -2993,19 +3016,45 @@ fn tw_ensure_decoded(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeE
     };
     let encoding = tw_encoding(inst);
     let errors = tw_errors(inst);
-    let text = crate::stdlib::codecs_mod::decode_bytes(&raw, &encoding, &errors)?;
+    // Decode to an `Object` so lone surrogates from `surrogateescape`/
+    // `surrogatepass` survive as a `WStr` (PEP 383). The snapshot itself is
+    // stored as a Rust `String` with surrogates *bridged* into the PUA window
+    // so the existing char-offset slicing in `tw_read`/`tw_readline` keeps
+    // working; the output is un-bridged back to a `WStr` on the way out. A
+    // surrogate-free decode takes the verbatim fast path (`bridge_*` is
+    // identity), so non-surrogate streams are byte-for-byte unchanged.
+    let text_obj = crate::stdlib::codecs_mod::decode_bytes_obj(&raw, &encoding, &errors)?;
+    let is_wstr = matches!(text_obj, Object::WStr(_));
+    let text = crate::builtins::bridge_str_of(&text_obj).unwrap_or_default();
     tw_set(inst, "_dec_buf", Object::from_str(text));
+    tw_set(inst, "_dec_wstr", Object::Bool(is_wstr));
     tw_set(inst, "_dec_pos", Object::Int(0));
     tw_set(inst, "_dec_start", Object::Int(start));
     tw_set(inst, "_dec_done", Object::Bool(true));
     Ok(())
 }
 
+/// `True` when the active decode snapshot holds bridged lone surrogates, so
+/// read output must be un-bridged back into a `WStr`.
+fn tw_dec_is_wstr(inst: &crate::types::PyInstance) -> bool {
+    matches!(tw_get(inst, "_dec_wstr"), Some(Object::Bool(true)))
+}
+
+/// Canonicalise a (possibly bridged) decoded-snapshot slice to a `str`/`WStr`
+/// output object, honouring whether the snapshot carries bridged surrogates.
+fn tw_dec_output(inst: &crate::types::PyInstance, s: String) -> Object {
+    if tw_dec_is_wstr(inst) {
+        crate::builtins::bridge_to_object(&s)
+    } else {
+        Object::from_str(s)
+    }
+}
+
 /// Drop the decoded-snapshot cache so the next read re-materialises from the
 /// (newly repositioned) underlying buffer.
 fn tw_reset_decoded(inst: &crate::types::PyInstance) {
     let mut d = inst.dict.borrow_mut();
-    for k in ["_dec_buf", "_dec_pos", "_dec_done", "_dec_start"] {
+    for k in ["_dec_buf", "_dec_pos", "_dec_done", "_dec_start", "_dec_wstr"] {
         d.shift_remove(&DictKey(Object::from_static(k)));
     }
 }
@@ -3040,8 +3089,22 @@ fn tw_byte_position(inst: &crate::types::PyInstance) -> Result<i64, RuntimeError
                 _ => 0,
             };
             let errors = tw_errors(inst);
-            let consumed =
-                crate::stdlib::codecs_mod::encode_str(&buf[..pos], &encoding, &errors)?.len();
+            // A bridged snapshot must be un-bridged before re-encoding so the
+            // byte cookie reflects the *original* surrogate bytes, not the PUA
+            // stand-ins.
+            let consumed = if tw_dec_is_wstr(inst) {
+                match crate::builtins::bridge_to_object(&buf[..pos]) {
+                    Object::WStr(cps) => {
+                        crate::stdlib::codecs_mod::encode_codepoints(&cps, &encoding, &errors)?.len()
+                    }
+                    other => {
+                        crate::stdlib::codecs_mod::encode_str(&other.to_str(), &encoding, &errors)?
+                            .len()
+                    }
+                }
+            } else {
+                crate::stdlib::codecs_mod::encode_str(&buf[..pos], &encoding, &errors)?.len()
+            };
             return Ok(start + consumed as i64);
         }
     }
@@ -3249,7 +3312,7 @@ fn tw_read(args: &[Object]) -> Result<Object, RuntimeError> {
         tw_record_newlines(&inst, &remaining[..consumed]);
     }
     tw_set(&inst, "_dec_pos", Object::Int((pos + consumed) as i64));
-    Ok(Object::from_str(out))
+    Ok(tw_dec_output(&inst, out))
 }
 
 fn tw_readline(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3273,7 +3336,7 @@ fn tw_readline(args: &[Object]) -> Result<Object, RuntimeError> {
         tw_record_newlines(&inst, &remaining[..consumed]);
     }
     tw_set(&inst, "_dec_pos", Object::Int((pos + consumed) as i64));
-    Ok(Object::from_str(out))
+    Ok(tw_dec_output(&inst, out))
 }
 
 fn tw_flush(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3583,7 +3646,28 @@ fn tw_reconfigure_kw(
     // --- validate types up front (CPython validates before applying) ---
     let new_encoding: Option<String> = match &encoding {
         None | Some(Object::None) => None,
-        Some(Object::Str(s)) => Some(resolve_locale_encoding(s.as_ref())),
+        Some(Object::Str(s)) => {
+            // Unlike the constructor (explicit embedded-NUL `ValueError`),
+            // CPython's `reconfigure` looks the name up as a C string, so an
+            // embedded NUL truncates it: `'locale\0'` → look up `'locale'`,
+            // which is not a registered codec → `LookupError`
+            // (`test_reconfigure_errors`). The `'locale'` pseudo-encoding is
+            // only special in the constructor path.
+            match s.find('\0') {
+                Some(i) => {
+                    let truncated = &s[..i];
+                    crate::stdlib::io_full::validate_text_encoding(truncated)?;
+                    Some(truncated.to_owned())
+                }
+                None => Some(resolve_locale_encoding(s.as_ref())),
+            }
+        }
+        // Lone-surrogate codec name → `UnicodeEncodeError` (not `TypeError`),
+        // matching CPython (`test_reconfigure_errors`: `encoding='\udcfe'`).
+        Some(Object::WStr(cps)) => {
+            crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "strict")?;
+            unreachable!("WStr always carries a lone surrogate")
+        }
         Some(other) => {
             return Err(type_error(format!(
                 "reconfigure() argument 'encoding' must be str or None, not {}",
@@ -3594,6 +3678,12 @@ fn tw_reconfigure_kw(
     let new_errors: Option<String> = match &errors {
         None | Some(Object::None) => None,
         Some(Object::Str(s)) => Some(s.to_string()),
+        // Lone-surrogate error-handler name → `UnicodeEncodeError`
+        // (`test_reconfigure_errors`: `errors='\udcfe'`).
+        Some(Object::WStr(cps)) => {
+            crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "strict")?;
+            unreachable!("WStr always carries a lone surrogate")
+        }
         Some(other) => {
             return Err(type_error(format!(
                 "reconfigure() argument 'errors' must be str or None, not {}",
@@ -3610,6 +3700,11 @@ fn tw_reconfigure_kw(
                 return Err(value_error(format!("illegal newline value: {}", s.as_ref())));
             }
             Some(Some(s.to_string()))
+        }
+        // A lone-surrogate `newline` is a `str`, never legal → `ValueError`
+        // (`test_reconfigure_errors`: `newline='\udcfe'`).
+        Some(Object::WStr(_)) => {
+            return Err(value_error("illegal newline value"));
         }
         Some(other) => {
             return Err(type_error(format!(
@@ -3917,6 +4012,92 @@ fn bw_check_open(inst: &crate::types::PyInstance) -> Result<(), RuntimeError> {
 
 const BW_CHUNK: usize = 8192;
 
+// ---------------------------------------------------------------------------
+// Per-instance buffered lock (CPython's `self->lock` / `_pyio`'s
+// `_write_lock`).
+//
+// CPython's `Buffered*` serialise every operation on a per-stream lock so a
+// `write` racing a `close` from another thread can't corrupt the buffer.
+// The observable contract `test_io.test_slow_close_from_thread` pins: a
+// `close()` whose slow `raw.close()` is mid-flight on one thread holds the
+// lock the whole time, so a concurrent `write()` blocks on it and — once the
+// close completes and the raw is shut — wakes to see the stream closed and
+// raises `ValueError` (rather than scribbling into a half-closed buffer).
+//
+// WeavePy's buffered wrappers are generic `PyInstance`s, so the lock lives in
+// a side table keyed by the instance's stable `Rc` address rather than a
+// struct field. `bw_init` installs a *fresh* lock (overwriting any stale entry
+// left by a since-freed instance that happened to reuse the address, so the
+// table can never hand back a foreign lock), and `bw_close`/`bw_detach` evict
+// it. The lock is a non-reentrant [`crate::sync::RealLock`]; `bw_close`
+// mirrors `_pyio.BufferedWriter.close` by dropping it across the nested
+// `self.flush()` (which re-takes it) and re-taking it only around the slow
+// `raw.close()`.
+fn buffered_write_locks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<crate::sync::RealLock>>>
+{
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<crate::sync::RealLock>>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Stable identity key for a buffered wrapper instance.
+fn bw_lock_key(inst: &Rc<crate::types::PyInstance>) -> usize {
+    Rc::as_ptr(inst) as usize
+}
+
+/// Install a fresh write lock for a freshly `__init__`-ed buffered wrapper,
+/// discarding any stale entry an earlier (now-freed) instance left at this
+/// address.
+fn bw_install_write_lock(inst: &Rc<crate::types::PyInstance>) {
+    let key = bw_lock_key(inst);
+    buffered_write_locks()
+        .lock()
+        .unwrap()
+        .insert(key, std::sync::Arc::new(crate::sync::RealLock::new()));
+}
+
+/// Fetch (or lazily create) the write lock backing `inst`.
+fn bw_write_lock_handle(inst: &Rc<crate::types::PyInstance>) -> std::sync::Arc<crate::sync::RealLock> {
+    let key = bw_lock_key(inst);
+    let mut m = buffered_write_locks().lock().unwrap();
+    m.entry(key)
+        .or_insert_with(|| std::sync::Arc::new(crate::sync::RealLock::new()))
+        .clone()
+}
+
+/// Evict a buffered wrapper's write lock once it is closed/detached.
+fn bw_remove_write_lock(inst: &Rc<crate::types::PyInstance>) {
+    let key = bw_lock_key(inst);
+    buffered_write_locks().lock().unwrap().remove(&key);
+}
+
+/// RAII guard for the per-instance buffered write lock. Releasing on drop
+/// matches `_pyio`'s `with self._write_lock:` blocks.
+struct BwWriteGuard {
+    lock: std::sync::Arc<crate::sync::RealLock>,
+}
+
+impl Drop for BwWriteGuard {
+    fn drop(&mut self) {
+        let _ = self.lock.release();
+    }
+}
+
+/// Acquire the buffered write lock, dropping the GIL across a contended wait
+/// so the thread currently holding it (e.g. a slow `close()`) can run to
+/// completion. An uncontended/first acquire takes the lock without touching
+/// the GIL (CPython's fast path).
+fn bw_acquire_write_lock(inst: &Rc<crate::types::PyInstance>) -> BwWriteGuard {
+    let lock = bw_write_lock_handle(inst);
+    let me = crate::gil::current_thread_id();
+    if !lock.try_acquire(me) {
+        crate::gil::allow_threads_then(|| lock.acquire(me));
+    }
+    BwWriteGuard { lock }
+}
+
 /// Call `obj.<name>()` and return its truthiness; absent method → treat as
 /// `false` for the capability probes during construction.
 fn bw_raw_capable(raw: &Object, name: &str) -> bool {
@@ -4021,6 +4202,9 @@ fn bw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
     tw_set(&inst, "raw", raw);
     rdbuf_set(&inst, Vec::new());
     wrbuf_set(&inst, Vec::new());
+    // Install a fresh per-instance lock (CPython's `self->lock`). Done last so
+    // a re-`__init__` of a live wrapper resets the lock to a clean state.
+    bw_install_write_lock(&inst);
     tw_set(&inst, "_ok", Object::Bool(true));
     Ok(Object::None)
 }
@@ -4165,6 +4349,12 @@ fn bw_write(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("can't write str to binary stream"));
     }
     let data = bw_bytes_arg(args.get(1))?;
+    // Serialise against a concurrent `close`/`flush` on the per-instance lock,
+    // exactly like `_pyio.BufferedWriter.write`'s `with self._write_lock:`. The
+    // closed-check happens *after* the lock is held so a write that loses the
+    // race to a slow cross-thread `close()` blocks here, then wakes to see the
+    // stream shut and raises `ValueError` (`test_slow_close_from_thread`).
+    let _wlock = bw_acquire_write_lock(&inst);
     if clsname == "BufferedRandom" {
         bw_random_undo_readahead(&inst)?;
     }
@@ -4648,12 +4838,17 @@ fn bw_flush(args: &[Object]) -> Result<Object, RuntimeError> {
     let clsname = bw_typename(&inst);
     bw_check_init(&inst)?;
     if bw_is_writer(&clsname) {
+        // `_pyio.BufferedWriter.flush`: `with self._write_lock: _flush_unlocked()`.
+        // CPython's `BufferedWriter.flush` drains its own buffer into the raw via
+        // `raw.write` and deliberately does *not* call `raw.flush()` — doing so
+        // would surface a slow raw flush outside the close lock and break
+        // `test_slow_close_from_thread`.
+        let _wlock = bw_acquire_write_lock(&inst);
         let target = bw_writer_target(&inst)?;
         if bw_raw_closed(&target) {
             return Err(value_error("flush on closed file"));
         }
         bw_flush_unlocked(&inst, &target)?;
-        bw_raw_flush(&target)?;
     } else {
         // Reader: delegate flush to the raw stream (`_BufferedIOMixin.flush`).
         match bw_target(&inst) {
@@ -4752,19 +4947,34 @@ fn bw_close(args: &[Object]) -> Result<Object, RuntimeError> {
             (None, None) => Ok(Object::None),
         };
     }
-    let reader = match bw_target(&inst) {
-        Ok(t) => t,
-        Err(_) => return Ok(Object::None),
+    // Quick "already closed / detached?" probe under the lock, mirroring
+    // `_pyio.BufferedWriter.close`'s `with self._write_lock: if ...: return`.
+    let reader = {
+        let _wlock = bw_acquire_write_lock(&inst);
+        match bw_target(&inst) {
+            Ok(t) if !bw_raw_closed(&t) => Some(t),
+            _ => None,
+        }
     };
-    if bw_raw_closed(&reader) {
+    let Some(reader) = reader else {
+        bw_remove_write_lock(&inst);
         return Ok(Object::None);
-    }
-    // 1. `self.flush()` — honour a monkeypatched/overridden flush, and capture
-    //    any error so it can be re-raised (or chained) after the raw is closed.
+    };
+    // 1. `self.flush()` — run *without* the lock held so a monkeypatched or
+    //    overridden flush can re-take it (CPython does the same), capturing any
+    //    error to re-raise/chain after the raw is closed.
     let flush_err = py_call(&args[0], "flush", &[]).err();
-    // 2. Close the underlying raw stream.
-    let close_err = bw_raw_close(&reader).err();
-    rdbuf_set(&inst, Vec::new());
+    // 2. Close the underlying raw stream *while holding the lock*: a slow
+    //    cross-thread `raw.close()` here is exactly what a concurrent `write()`
+    //    blocks behind before waking to see the stream shut
+    //    (`test_slow_close_from_thread`).
+    let close_err = {
+        let _wlock = bw_acquire_write_lock(&inst);
+        let e = bw_raw_close(&reader).err();
+        rdbuf_set(&inst, Vec::new());
+        e
+    };
+    bw_remove_write_lock(&inst);
     match (close_err, flush_err) {
         (Some(ce), Some(fe)) => Err(chain_context(ce, fe)),
         (Some(ce), None) => Err(ce),

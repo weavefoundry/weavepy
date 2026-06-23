@@ -3229,10 +3229,7 @@ impl<'src> Parser<'src> {
                 _ => unreachable!(),
             }
         } else {
-            match self.decode_string(&first)? {
-                Constant::Str(s) => AccumString::Plain(s),
-                _ => unreachable!(),
-            }
+            AccumString::Plain(constant_str_cps(self.decode_string(&first)?))
         };
         self.bump();
         while matches!(self.peek(), TokenKind::String) {
@@ -3261,19 +3258,14 @@ impl<'src> Parser<'src> {
                     });
                 }
                 (AccumString::Plain(mut a), false, false) => {
-                    match self.decode_string(&next_tok)? {
-                        Constant::Str(s) => {
-                            a.push_str(&s);
-                            AccumString::Plain(a)
-                        }
-                        _ => unreachable!(),
-                    }
+                    a.extend(constant_str_cps(self.decode_string(&next_tok)?));
+                    AccumString::Plain(a)
                 }
                 (AccumString::Plain(a), true, false) => {
                     let mut parts: Vec<Expr> = Vec::new();
                     if !a.is_empty() {
                         parts.push(Expr {
-                            kind: ExprKind::Constant(Constant::Str(a)),
+                            kind: ExprKind::Constant(cps_to_constant(a)),
                             span: first.span,
                         });
                     }
@@ -3281,19 +3273,21 @@ impl<'src> Parser<'src> {
                     AccumString::Joined(parts)
                 }
                 (AccumString::Joined(mut parts), false, false) => {
-                    match self.decode_string(&next_tok)? {
-                        Constant::Str(s) => {
-                            join_str_into_parts(&mut parts, s, next_tok.span);
-                            AccumString::Joined(parts)
-                        }
-                        _ => unreachable!(),
-                    }
+                    join_str_into_parts(
+                        &mut parts,
+                        self.decode_string(&next_tok)?,
+                        next_tok.span,
+                    );
+                    AccumString::Joined(parts)
                 }
                 (AccumString::Joined(mut parts), true, false) => {
                     let new_parts = self.fstring_parts_for(&next_tok)?;
                     for p in new_parts {
-                        if let ExprKind::Constant(Constant::Str(s)) = p.kind {
-                            join_str_into_parts(&mut parts, s, p.span);
+                        if let ExprKind::Constant(
+                            c @ (Constant::Str(_) | Constant::WStr(_)),
+                        ) = p.kind
+                        {
+                            join_str_into_parts(&mut parts, c, p.span);
                         } else {
                             parts.push(p);
                         }
@@ -3303,8 +3297,8 @@ impl<'src> Parser<'src> {
             };
         }
         match accum {
-            AccumString::Plain(s) => Ok(Expr {
-                kind: ExprKind::Constant(Constant::Str(s)),
+            AccumString::Plain(cps) => Ok(Expr {
+                kind: ExprKind::Constant(cps_to_constant(cps)),
                 span,
             }),
             AccumString::Bytes(b) => Ok(Expr {
@@ -3369,11 +3363,11 @@ impl<'src> Parser<'src> {
             })?;
             return Ok(Constant::Bytes(bytes));
         }
-        let s = decode_str_body(body, raw).map_err(|m| ParseError::Unexpected {
+        let c = decode_str_body(body, raw).map_err(|m| ParseError::Unexpected {
             span: tok.span,
             message: m,
         })?;
-        Ok(Constant::Str(s))
+        Ok(c)
     }
 
     /// Returns the prefix info for a string token without decoding the body.
@@ -3497,7 +3491,7 @@ impl<'src> Parser<'src> {
                             message: m,
                         })?;
                     parts.push(Expr {
-                        kind: ExprKind::Constant(Constant::Str(decoded)),
+                        kind: ExprKind::Constant(decoded),
                         span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
                     });
                     literal.clear();
@@ -3561,7 +3555,7 @@ impl<'src> Parser<'src> {
                 message: m,
             })?;
             parts.push(Expr {
-                kind: ExprKind::Constant(Constant::Str(decoded)),
+                kind: ExprKind::Constant(decoded),
                 span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
             });
         }
@@ -4505,19 +4499,41 @@ fn strip_fstring_field_comments(s: &str) -> String {
     out
 }
 
-/// Working state while concatenating adjacent string tokens.
+/// Working state while concatenating adjacent string tokens. The `Plain`
+/// arm accumulates *code points* (not a `String`) so that a lone surrogate
+/// from any fragment survives implicit concatenation; the final value is
+/// canonicalised to `Str`/`WStr` by [`cps_to_constant`].
 enum AccumString {
-    Plain(String),
+    Plain(Vec<u32>),
     Bytes(Vec<u8>),
     Joined(Vec<Expr>),
 }
 
+/// Code points of a string [`Constant`] (`Str` or `WStr`); panics on a
+/// non-string constant, which the callers structurally exclude.
+fn constant_str_cps(c: Constant) -> Vec<u32> {
+    match c {
+        Constant::Str(s) => s.chars().map(|ch| ch as u32).collect(),
+        Constant::WStr(cps) => cps,
+        _ => unreachable!("constant_str_cps on non-string constant"),
+    }
+}
+
 /// Append a literal string onto the tail of a JoinedStr parts list.
-/// Merges with the trailing `Constant::Str` part if there is one.
-fn join_str_into_parts(parts: &mut Vec<Expr>, s: String, span: Span) {
+/// Merges with the trailing string part (`Str` or `WStr`) if there is one,
+/// re-canonicalising the merged value.
+fn join_str_into_parts(parts: &mut Vec<Expr>, c: Constant, span: Span) {
     if let Some(last) = parts.last_mut() {
-        if let ExprKind::Constant(Constant::Str(existing)) = &mut last.kind {
-            existing.push_str(&s);
+        let merged = match &last.kind {
+            ExprKind::Constant(existing @ (Constant::Str(_) | Constant::WStr(_))) => {
+                let mut cps = constant_str_cps(existing.clone());
+                cps.extend(constant_str_cps(c.clone()));
+                Some(cps)
+            }
+            _ => None,
+        };
+        if let Some(cps) = merged {
+            last.kind = ExprKind::Constant(cps_to_constant(cps));
             // The merged literal spans from the first fragment's start
             // to the last fragment's end (CPython's implicit-concat AST
             // positions cross the token boundary).
@@ -4526,7 +4542,7 @@ fn join_str_into_parts(parts: &mut Vec<Expr>, s: String, span: Span) {
         }
     }
     parts.push(Expr {
-        kind: ExprKind::Constant(Constant::Str(s)),
+        kind: ExprKind::Constant(c),
         span,
     });
 }
@@ -4604,9 +4620,26 @@ fn strip_quotes(s: &str) -> &str {
 /// `SyntaxWarning` (unrecognised escapes and octal escapes `> \377`).
 /// Each diagnostic carries the byte offset of its backslash *within the
 /// body* so the caller can map it back to an absolute source position.
-fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
+/// Canonicalise a decoded code-point sequence into a string [`Constant`]:
+/// [`Constant::Str`] when every code point is a Unicode scalar value, or
+/// [`Constant::WStr`] when at least one lone surrogate is present.
+fn cps_to_constant(cps: Vec<u32>) -> Constant {
+    if cps.iter().any(|&c| (0xD800..=0xDFFF).contains(&c)) {
+        Constant::WStr(cps)
+    } else {
+        let mut s = String::with_capacity(cps.len());
+        for c in cps {
+            if let Some(ch) = char::from_u32(c) {
+                s.push(ch);
+            }
+        }
+        Constant::Str(s)
+    }
+}
+
+fn decode_str_body(s: &str, raw: bool) -> Result<Constant, String> {
     if raw {
-        return Ok(s.to_owned());
+        return Ok(Constant::Str(s.to_owned()));
     }
     // CPython surfaces escape-decoding failures as the unicodeescape
     // codec's error, with byte positions of the failed escape within the
@@ -4620,24 +4653,28 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
         )
     };
     let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    // Accumulate code points (each a scalar value *or* a lone surrogate) so a
+    // `\udxxx`/`\uXXXX`/`\xXX`/`\N{}` escape that resolves to a surrogate
+    // survives to runtime as an `Object::WStr` (canonicalised by
+    // `cps_to_constant`). Pure-UTF-8 literals fold straight back to `Str`.
+    let mut out: Vec<u32> = Vec::with_capacity(s.len());
     let mut chars = s.char_indices().peekable();
     while let Some((bs, c)) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            out.push(c as u32);
             continue;
         }
         let Some((_, esc)) = chars.next() else {
-            out.push('\\');
+            out.push('\\' as u32);
             break;
         };
         match esc {
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            '\\' => out.push('\\'),
-            '\'' => out.push('\''),
-            '"' => out.push('"'),
+            'n' => out.push('\n' as u32),
+            'r' => out.push('\r' as u32),
+            't' => out.push('\t' as u32),
+            '\\' => out.push('\\' as u32),
+            '\'' => out.push('\'' as u32),
+            '"' => out.push('"' as u32),
             // Octal escape `\ooo`: 1–3 octal digits (CPython accepts up
             // to `\777` = 511 in a str literal). `\0` is just the
             // zero-length-tail case of this rule. Values above `\377`
@@ -4653,12 +4690,12 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                         _ => break,
                     }
                 }
-                out.push(char::from_u32(val).unwrap_or('\u{FFFD}'));
+                out.push(val);
             }
-            'a' => out.push('\x07'),
-            'b' => out.push('\x08'),
-            'f' => out.push('\x0c'),
-            'v' => out.push('\x0b'),
+            'a' => out.push('\x07' as u32),
+            'b' => out.push('\x08' as u32),
+            'f' => out.push('\x0c' as u32),
+            'v' => out.push('\x0b' as u32),
             // Line continuation inside the string (`\` + newline). A
             // `\<CR>` (optionally `\<CR><LF>`) continues too.
             '\n' => {}
@@ -4700,7 +4737,9 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                 if n > 0x0010_FFFF {
                     return Err(unicode_err(bs, end, "illegal Unicode character"));
                 }
-                out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
+                // Preserve lone surrogates verbatim (CPython allows them in str
+                // literals); `cps_to_constant` decides Str vs WStr.
+                out.push(n);
             }
             'N' => {
                 // `\N{UNICODE CHARACTER NAME}` — resolve the name against
@@ -4718,7 +4757,7 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                             let ch = unicode_names2::character(&name).ok_or_else(|| {
                                 unicode_err(bs, i + 1, "unknown Unicode character name")
                             })?;
-                            out.push(ch);
+                            out.push(ch as u32);
                             break;
                         }
                         Some((_, c)) => name.push(c),
@@ -4735,12 +4774,12 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
             other => {
                 // CPython issues a `SyntaxWarning` for unknown escapes (the
                 // lexer records it) but emits both characters literally.
-                out.push('\\');
-                out.push(other);
+                out.push('\\' as u32);
+                out.push(other as u32);
             }
         }
     }
-    Ok(out)
+    Ok(cps_to_constant(out))
 }
 
 /// Decode a bytes-literal body. Like [`decode_str_body`] but bytes-valued

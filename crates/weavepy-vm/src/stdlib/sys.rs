@@ -830,7 +830,11 @@ fn sys_getfilesystemencoding(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn sys_getfilesystemencodeerrors(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_static("surrogatepass"))
+    // POSIX (Linux/macOS) uses `surrogateescape` for the filesystem error
+    // handler (CPython `Py_FileSystemDefaultEncodeErrors`); only Windows uses
+    // `surrogatepass`. WeavePy targets POSIX, so report `surrogateescape` —
+    // this is what PEP 383 round-tripping (`os.fsdecode`/`fsencode`) relies on.
+    Ok(Object::from_static("surrogateescape"))
 }
 
 fn sys_getframe(

@@ -59,6 +59,19 @@ pub enum Object {
     /// Complex number with rectangular components (RFC 0019).
     Complex(Rc<PyComplex>),
     Str(Rc<str>),
+    /// A `str` containing at least one lone surrogate (U+D800..U+DFFF), which
+    /// Rust's `str`/UTF-8 cannot represent. Stored as a sequence of code
+    /// points — each a Unicode scalar value *or* a lone surrogate. Produced by
+    /// `chr(surrogate)`, `'\udxxx'` escapes, and `surrogateescape`/
+    /// `surrogatepass` decoding; consumed by the surrogate-aware encoders,
+    /// `os.fsencode`, and `repr`. The invariant ">= 1 lone surrogate" keeps it
+    /// disjoint from [`Object::Str`]: the two never compare equal, and any
+    /// operation whose result is pure UTF-8 canonicalises back to `Str` (see
+    /// [`Object::str_from_codepoints`]). This is WeavePy's WTF-8 string arc
+    /// (RFC 0040) — CPython stores lone surrogates natively, so PEP 383
+    /// `surrogateescape` filenames, `surrogatepass`, and `chr(0xD800)` all
+    /// round-trip.
+    WStr(Rc<[u32]>),
     Tuple(Rc<[Object]>),
     List(Rc<RefCell<Vec<Object>>>),
     Dict(Rc<RefCell<DictData>>),
@@ -171,6 +184,7 @@ impl fmt::Debug for Object {
             Object::Complex(c) => write!(f, "complex({}, {})", c.real, c.imag),
             Object::Float(x) => write!(f, "{x}"),
             Object::Str(s) => write!(f, "{s:?}"),
+            Object::WStr(cps) => write!(f, "WStr({} code points)", cps.len()),
             Object::Tuple(items) => f.debug_list().entries(items.iter()).finish(),
             Object::List(items) => f.debug_list().entries(items.borrow().iter()).finish(),
             Object::Dict(d) => {
@@ -2159,6 +2173,147 @@ impl IoKind {
     }
 }
 
+/// Faithful incremental text-decode state for a text stream whose codec
+/// demands CPython's `TextIOWrapper` incremental machinery (its one-shot
+/// `decode` is `None` — a custom incremental-only codec, e.g. test_io's
+/// `test_decoder`). The common stateless codecs (utf-8/ascii/latin-1/
+/// euc_jp/…) keep the fast one-shot path and never allocate this.
+///
+/// Mirrors the `_decoder`/`_decoded_chars`/`_snapshot`/`_b2cratio`
+/// ADT in `_pyio.TextIOWrapper`: the decoder is driven a chunk at a
+/// time, decoded characters are buffered here until the client consumes
+/// them, and `_snapshot = (dec_flags, next_input)` records a point where
+/// the decoder's input buffer was empty so `tell()`/`seek()` can pack and
+/// replay an opaque cookie.
+#[derive(Debug)]
+pub struct TextIncr {
+    /// The (newline-wrapped) Python `IncrementalDecoder` instance.
+    pub decoder: Object,
+    /// Decoded characters buffered from the last chunk (`_decoded_chars`),
+    /// held as a `char` vector so the `_get_decoded_chars(n)` ADT can slice
+    /// by *character* count exactly like CPython.
+    pub decoded: Vec<char>,
+    /// How many of [`TextIncr::decoded`] characters have been handed to the
+    /// client (`_decoded_chars_used`).
+    pub decoded_used: usize,
+    /// `(_snapshot)` — the decoder flags and the not-yet-decoded input
+    /// bytes at the last empty-buffer snapshot point. `None` until the
+    /// first chunk is read.
+    pub snapshot: Option<(Object, Vec<u8>)>,
+    /// Running bytes-to-chars ratio used to seed the `tell()` decoder walk
+    /// (`_b2cratio`).
+    pub b2cratio: f64,
+}
+
+// --- Reentrant interpreter bridge for the incremental text-decode path -----
+//
+// The incremental `TextIOWrapper` machinery drives a *Python* decoder object
+// (its `decode`/`getstate`/`setstate`/`reset` methods) and reaches for the
+// frozen `codecs`/`_io` modules. Like the rest of `object.rs`'s reentrant
+// callbacks (`current_interp_hash`, the `__repr__` bridge), these borrow the
+// thread's published interpreter pointer.
+
+fn pf_with_interp<T>(
+    f: impl FnOnce(&mut crate::Interpreter) -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| value_error("no running interpreter for text decode"))?;
+    // SAFETY: published by the enclosing VM frame on this thread; the GIL keeps
+    // the reentrant access exclusive (same contract as `current_interp_hash`).
+    let interp = unsafe { &mut *ptr };
+    f(interp)
+}
+
+/// Call `<module>.<func>(*args)` through the running interpreter.
+fn pf_mod_call(module: &str, func: &str, args: &[Object]) -> Result<Object, RuntimeError> {
+    pf_with_interp(|interp| {
+        let m = interp.import_path(module)?;
+        let f = interp.load_attr_public(&m, func)?;
+        interp.call_object(f, args, &[])
+    })
+}
+
+/// Call a plain callable `callable(*args)`.
+fn pf_call_value(callable: &Object, args: &[Object]) -> Result<Object, RuntimeError> {
+    pf_with_interp(|interp| interp.call_object(callable.clone(), args, &[]))
+}
+
+/// Call `obj.<name>(*args)` (a bound method) through the running interpreter.
+fn pf_call_method(obj: &Object, name: &str, args: &[Object]) -> Result<Object, RuntimeError> {
+    pf_with_interp(|interp| {
+        let m = interp.load_attr_public(obj, name)?;
+        interp.call_object(m, args, &[])
+    })
+}
+
+/// Split a decoder `getstate()` result `(bytes, flags)` into its parts.
+fn decoder_state_parts(state: &Object) -> Result<(Vec<u8>, Object), RuntimeError> {
+    if let Object::Tuple(items) = state {
+        if items.len() == 2 {
+            let buf = match &items[0] {
+                Object::Bytes(b) => b.to_vec(),
+                Object::ByteArray(b) => b.borrow().clone(),
+                _ => Vec::new(),
+            };
+            return Ok((buf, items[1].clone()));
+        }
+    }
+    Err(type_error("illegal decoder state"))
+}
+
+/// Coerce an int-like `Object` to a `BigInt` (decoder flags / cookie input).
+fn obj_to_bigint(o: &Object) -> BigInt {
+    match o {
+        Object::Int(i) => BigInt::from(*i),
+        Object::Long(b) => (**b).clone(),
+        Object::Bool(b) => BigInt::from(i64::from(*b)),
+        _ => BigInt::from(0),
+    }
+}
+
+/// Build the `(b'', dec_flags)` tuple a decoder `setstate` expects.
+fn make_state_tuple(dec_flags: &BigInt) -> Object {
+    Object::new_tuple(vec![
+        Object::new_bytes(Vec::new()),
+        Object::int_from_bigint(dec_flags.clone()),
+    ])
+}
+
+/// Pack a `TextIOWrapper` cookie, matching CPython's bit layout exactly:
+/// `position | (dec_flags<<64) | (bytes_to_feed<<128) | (chars_to_skip<<192)
+/// | (need_eof<<256)`.
+fn pack_text_cookie(
+    position: u64,
+    dec_flags: &BigInt,
+    bytes_to_feed: u64,
+    need_eof: bool,
+    chars_to_skip: u64,
+) -> Object {
+    let mut c = BigInt::from(position);
+    c = c | (dec_flags.clone() << 64usize);
+    c = c | (BigInt::from(bytes_to_feed) << 128usize);
+    c = c | (BigInt::from(chars_to_skip) << 192usize);
+    if need_eof {
+        c = c | (BigInt::from(1u64) << 256usize);
+    }
+    Object::int_from_bigint(c)
+}
+
+/// Inverse of [`pack_text_cookie`].
+fn unpack_text_cookie(cookie: &BigInt) -> (u64, BigInt, u64, bool, u64) {
+    let mask: BigInt = (BigInt::from(1u64) << 64usize) - 1;
+    let position = (cookie & &mask).to_u64().unwrap_or(0);
+    let rest = cookie >> 64usize;
+    let dec_flags = &rest & &mask;
+    let rest = rest >> 64usize;
+    let bytes_to_feed = (&rest & &mask).to_u64().unwrap_or(0);
+    let rest = rest >> 64usize;
+    let chars_to_skip = (&rest & &mask).to_u64().unwrap_or(0);
+    let rest = rest >> 64usize;
+    let need_eof = !(&rest & &mask).is_zero();
+    (position, dec_flags, bytes_to_feed, need_eof, chars_to_skip)
+}
+
 pub struct PyFile {
     pub name: String,
     pub mode: String,
@@ -2246,6 +2401,16 @@ pub struct PyFile {
     /// a binary stream's `tell()` stays live during iteration
     /// (`test_io.test_telling`). Defaults to `true`.
     pub telling: crate::sync::Cell<bool>,
+    /// Tri-state gate for the faithful incremental text-decode path:
+    /// `None` = undecided (compute on first text read), `Some(false)` =
+    /// the codec has a one-shot `decode` so the fast path is used,
+    /// `Some(true)` = the codec is incremental-only and reads/seeks route
+    /// through [`PyFile::text_incr`]. Decided once and cached so the hot
+    /// read path never re-probes `codecs.lookup`.
+    pub text_incr_gate: crate::sync::Cell<Option<bool>>,
+    /// Lazily-built incremental decoder + cookie state (see [`TextIncr`]).
+    /// `None` until the incremental path activates.
+    pub text_incr: RefCell<Option<TextIncr>>,
 }
 
 impl PyFile {
@@ -2275,6 +2440,8 @@ impl PyFile {
             buf_size: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE),
             text_start_of_stream: crate::sync::Cell::new(true),
             telling: crate::sync::Cell::new(true),
+            text_incr_gate: crate::sync::Cell::new(None),
+            text_incr: RefCell::new(None),
         }
     }
 
@@ -2544,6 +2711,48 @@ impl PyFile {
         .to_string()
     }
 
+    /// The CPython `tp_repr` string for this stream — the `<_io.… >` form keyed
+    /// on the presented io layer ([`IoKind`]). Shared by [`Object::repr`] and
+    /// the unclosed-file `ResourceWarning` emitted from [`Drop`], so the two
+    /// render byte-identically (`test_io.test_warn_on_dealloc` checks that the
+    /// pre-drop `repr(f)` is a substring of the warning message). `self_addr`
+    /// supplies the object address for the in-memory (`BytesIO`/`StringIO`)
+    /// variants that render `at 0x…`; OS-backed streams ignore it.
+    pub fn repr_with_addr(&self, self_addr: usize) -> String {
+        match self.io_kind.get() {
+            IoKind::BytesIO => format!("<_io.BytesIO object at 0x{self_addr:x}>"),
+            IoKind::StringIO => format!("<_io.StringIO object at 0x{self_addr:x}>"),
+            kind => {
+                let name = self
+                    .name_obj()
+                    .map(|o| o.repr())
+                    .unwrap_or_else(|| format!("'{}'", self.name));
+                match kind {
+                    IoKind::Raw => format!(
+                        "<_io.FileIO name={} mode='{}' closefd={}>",
+                        name,
+                        self.reported_mode(),
+                        if self.closefd.get() { "True" } else { "False" }
+                    ),
+                    IoKind::BufferedReader => format!("<_io.BufferedReader name={name}>"),
+                    IoKind::BufferedWriter => format!("<_io.BufferedWriter name={name}>"),
+                    IoKind::BufferedRandom => format!("<_io.BufferedRandom name={name}>"),
+                    _ => {
+                        let enc = self
+                            .encoding
+                            .borrow()
+                            .clone()
+                            .unwrap_or_else(|| "utf-8".to_owned());
+                        format!(
+                            "<_io.TextIOWrapper name={} mode='{}' encoding='{}'>",
+                            name, self.mode, enc
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether this stream is an in-memory `BytesIO`/`StringIO` buffer rather
     /// than a real disk file or standard stream. CPython's in-memory streams
     /// do not carry the `mode`/`name` attributes that OS-backed file objects
@@ -2773,6 +2982,22 @@ impl PyFile {
         Ok(out)
     }
 
+    /// Encode a surrogate-bearing `str` (code points, possibly containing lone
+    /// surrogates) for a text-mode write, honouring the file's codec and
+    /// `errors=` handler. Mirrors [`Self::encode_text`] for the `WStr` case:
+    /// a strict UTF-8 stream raises `UnicodeEncodeError` on a lone surrogate,
+    /// while `surrogateescape`/`surrogatepass` round-trip it. Newline
+    /// translation is skipped — `\n`/`\r` are scalar values unaffected by the
+    /// surrogate payload, and a `WStr` only exists because of the surrogates.
+    pub fn encode_text_codepoints(&self, cps: &[u32]) -> Result<Vec<u8>, RuntimeError> {
+        let errors = self.errors_name();
+        let enc = match &*self.encoding.borrow() {
+            Some(enc) => enc.clone(),
+            None => "utf-8".to_owned(),
+        };
+        crate::stdlib::codecs_mod::encode_codepoints(cps, &enc, &errors)
+    }
+
     /// Decode a text-mode read through the file's codec, honouring the
     /// configured `errors=` handler and universal-newline translation.
     pub fn decode_text(&self, bytes: Vec<u8>) -> Result<String, RuntimeError> {
@@ -2825,6 +3050,465 @@ impl PyFile {
             chars += 1;
         }
         self.decode_text(bytes)
+    }
+
+    // -- Faithful incremental text-decode path (CPython `TextIOWrapper`) -----
+    //
+    // WeavePy's fast text read path one-shot-decodes the common stateless
+    // codecs. CPython's `TextIOWrapper`, by contrast, *always* drives an
+    // `IncrementalDecoder` and exposes opaque `tell()`/`seek()` cookies that
+    // snapshot the decoder's state. The two behave identically for stateless
+    // codecs (a cookie is just a byte offset), so the fast path stays. But a
+    // custom incremental-only codec — one whose one-shot `decode` is `None`,
+    // e.g. test_io's `test_decoder`/`StatefulIncrementalDecoder` — can only be
+    // read through the incremental machinery. These methods port
+    // `_pyio.TextIOWrapper`'s `_read_chunk`/`read`/`tell`/`seek` ADT, driving
+    // the Python decoder object, and activate only when the gate below trips.
+
+    /// `_CHUNK_SIZE` for the incremental reader — honours a user-set
+    /// `f._CHUNK_SIZE` (test_io pokes it directly) and otherwise uses the
+    /// default buffer size.
+    fn text_chunk_size(&self) -> usize {
+        for (k, v) in self.extra_attrs.borrow().iter() {
+            if k == "_CHUNK_SIZE" {
+                if let Object::Int(n) = v {
+                    if *n > 0 {
+                        return *n as usize;
+                    }
+                }
+            }
+        }
+        DEFAULT_BUFFER_SIZE
+    }
+
+    /// Decide — once, lazily, and cached — whether this text stream must use
+    /// the incremental decoder path. True iff the configured codec's one-shot
+    /// `decode` is `None` (a custom incremental-only codec). For every normal
+    /// codec this is `false` and the fast one-shot path is taken.
+    pub fn text_incr_active_gate(&self) -> bool {
+        if self.binary {
+            return false;
+        }
+        if matches!(&*self.backend.borrow(), FileBackend::MemText { .. }) {
+            // In-memory `StringIO` is already code-point addressed; the
+            // incremental machinery is only for byte-backed text streams.
+            return false;
+        }
+        if let Some(decided) = self.text_incr_gate.get() {
+            return decided;
+        }
+        // The overwhelmingly common case — a stream opened without an explicit
+        // `encoding=` (the UTF-8 default) — always has a one-shot decoder, so
+        // skip the `codecs.lookup` probe entirely and pin the fast path.
+        let decided = match &*self.encoding.borrow() {
+            None => false,
+            Some(enc) => crate::stdlib::codecs_mod::codec_one_shot_decode_is_none(enc),
+        };
+        self.text_incr_gate.set(Some(decided));
+        decided
+    }
+
+    /// Lazily build the (newline-wrapped) Python `IncrementalDecoder` and the
+    /// [`TextIncr`] state. Mirrors `_pyio.TextIOWrapper._get_decoder`.
+    fn ensure_text_decoder(&self) -> Result<(), RuntimeError> {
+        if self.text_incr.borrow().is_some() {
+            return Ok(());
+        }
+        let enc = self
+            .encoding
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "utf-8".to_owned());
+        let errors = self.errors_name();
+        let factory = pf_mod_call(
+            "codecs",
+            "getincrementaldecoder",
+            &[Object::from_str(&enc)],
+        )?;
+        let raw = pf_call_value(&factory, &[Object::from_str(&errors)])?;
+        // Universal-newline wrapping, exactly like `_get_decoder`:
+        // `newline=None` → recognise + translate; `newline=''` → recognise
+        // only; an explicit ending → no wrapping.
+        let newline = self.newline.borrow().clone();
+        let readuniversal = matches!(newline.as_deref(), None | Some(""));
+        let translate = newline.is_none();
+        let decoder = if readuniversal {
+            pf_mod_call(
+                "_io",
+                "IncrementalNewlineDecoder",
+                &[raw, Object::Bool(translate)],
+            )?
+        } else {
+            raw
+        };
+        *self.text_incr.borrow_mut() = Some(TextIncr {
+            decoder,
+            decoded: Vec::new(),
+            decoded_used: 0,
+            snapshot: None,
+            b2cratio: 0.0,
+        });
+        Ok(())
+    }
+
+    /// Clone the live decoder handle (cheap — it's an `Rc`-backed `Object`).
+    fn text_decoder(&self) -> Result<Object, RuntimeError> {
+        self.text_incr
+            .borrow()
+            .as_ref()
+            .map(|t| t.decoder.clone())
+            .ok_or_else(|| value_error("no decoder"))
+    }
+
+    /// `_get_decoded_chars(n)` — advance into the decoded-char buffer.
+    fn text_get_decoded_chars(&self, n: Option<usize>) -> String {
+        let mut guard = self.text_incr.borrow_mut();
+        let Some(t) = guard.as_mut() else {
+            return String::new();
+        };
+        let offset = t.decoded_used.min(t.decoded.len());
+        let end = match n {
+            None => t.decoded.len(),
+            Some(n) => offset.saturating_add(n).min(t.decoded.len()),
+        };
+        let chars: String = t.decoded[offset..end].iter().collect();
+        t.decoded_used = end;
+        chars
+    }
+
+    /// `_read_chunk` — read and decode the next raw chunk, replacing the
+    /// decoded-char buffer and (when telling) recording a snapshot point.
+    /// Returns `false` at EOF.
+    fn text_read_chunk(&self) -> Result<bool, RuntimeError> {
+        let decoder = self.text_decoder()?;
+        let telling = self.telling.get();
+
+        // Snapshot prep: a point where the decoder's input buffer is empty.
+        let (dec_buffer, dec_flags) = if telling {
+            let st = pf_call_method(&decoder, "getstate", &[])?;
+            let (b, f) = decoder_state_parts(&st)?;
+            (b, f)
+        } else {
+            (Vec::new(), Object::None)
+        };
+
+        let chunk_size = self.text_chunk_size();
+        let input_chunk = self.read_bytes(Some(chunk_size))?;
+        let eof = input_chunk.is_empty();
+        let decoded_obj = pf_call_method(
+            &decoder,
+            "decode",
+            &[Object::new_bytes(input_chunk.clone()), Object::Bool(eof)],
+        )?;
+        let decoded: Vec<char> = decoded_obj.to_str().chars().collect();
+        let b2cratio = if decoded.is_empty() {
+            0.0
+        } else {
+            input_chunk.len() as f64 / decoded.len() as f64
+        };
+
+        let mut guard = self.text_incr.borrow_mut();
+        let t = guard
+            .as_mut()
+            .ok_or_else(|| value_error("no decoder"))?;
+        t.decoded = decoded;
+        t.decoded_used = 0;
+        t.b2cratio = b2cratio;
+        if telling {
+            let mut next_input = dec_buffer;
+            next_input.extend_from_slice(&input_chunk);
+            t.snapshot = Some((dec_flags, next_input));
+        }
+        Ok(!eof)
+    }
+
+    /// `TextIOWrapper.read(size)` over the incremental decoder. `None` size
+    /// reads to EOF.
+    pub fn read_text_incr(&self, size: Option<usize>) -> Result<String, RuntimeError> {
+        self.ensure_text_decoder()?;
+        match size {
+            None => {
+                // Read everything: drain the buffer then decode the rest
+                // with `final=True`.
+                let decoder = self.text_decoder()?;
+                let mut result = self.text_get_decoded_chars(None);
+                let rest = self.read_bytes(None)?;
+                let tail = pf_call_method(
+                    &decoder,
+                    "decode",
+                    &[Object::new_bytes(rest), Object::Bool(true)],
+                )?;
+                result.push_str(&tail.to_str());
+                let mut guard = self.text_incr.borrow_mut();
+                if let Some(t) = guard.as_mut() {
+                    if t.snapshot.is_some() {
+                        t.decoded.clear();
+                        t.decoded_used = 0;
+                        t.snapshot = None;
+                    }
+                }
+                Ok(result)
+            }
+            Some(size) => {
+                let mut result = self.text_get_decoded_chars(Some(size));
+                let mut eof = false;
+                while result.chars().count() < size && !eof {
+                    eof = !self.text_read_chunk()?;
+                    let need = size - result.chars().count();
+                    result.push_str(&self.text_get_decoded_chars(Some(need)));
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    /// `TextIOWrapper.tell()` over the incremental decoder — packs the opaque
+    /// cookie (a direct port of `_pyio.TextIOWrapper.tell`). The cookie's only
+    /// contract is that `seek(tell())` round-trips, but we match CPython's bit
+    /// layout exactly so it is indistinguishable from the reference.
+    pub fn tell_text_incr(&self) -> Result<Object, RuntimeError> {
+        self.flush()?;
+        let mut position = self.tell()? as u64;
+
+        // No snapshot yet → the decoder hasn't consumed anything; the cookie
+        // is just the byte position.
+        let (dec_flags, next_input, chars_to_skip) = {
+            let guard = self.text_incr.borrow();
+            match guard.as_ref().and_then(|t| {
+                t.snapshot
+                    .as_ref()
+                    .map(|(f, n)| (f.clone(), n.clone(), t.decoded_used))
+            }) {
+                Some(v) => v,
+                None => return Ok(Object::int_from_i128(i128::from(position))),
+            }
+        };
+        let decoder = self.text_decoder()?;
+
+        // Skip back to the snapshot point.
+        position -= next_input.len() as u64;
+        let dec_flags_bi = obj_to_bigint(&dec_flags);
+        let mut chars_to_skip = chars_to_skip;
+        if chars_to_skip == 0 {
+            return Ok(pack_text_cookie(position, &dec_flags_bi, 0, false, 0));
+        }
+
+        // Walk the decoder forward from the snapshot to the current location,
+        // tracking the nearest safe (empty-buffer) start point.
+        let saved_state = pf_call_method(&decoder, "getstate", &[])?;
+        let result = (|| -> Result<Object, RuntimeError> {
+            let mut dec_flags_bi = dec_flags_bi.clone();
+            // Fast search: seed `skip_bytes` from the running byte/char ratio.
+            let b2cratio = self
+                .text_incr
+                .borrow()
+                .as_ref()
+                .map(|t| t.b2cratio)
+                .unwrap_or(0.0);
+            let mut skip_bytes = (b2cratio * chars_to_skip as f64) as i64;
+            let mut skip_back = 1i64;
+            if skip_bytes > next_input.len() as i64 {
+                // Defensive clamp (CPython asserts this holds).
+                skip_bytes = next_input.len() as i64;
+            }
+            let mut broke = false;
+            while skip_bytes > 0 {
+                pf_call_method(
+                    &decoder,
+                    "setstate",
+                    &[make_state_tuple(&dec_flags_bi)],
+                )?;
+                let upto = &next_input[..skip_bytes as usize];
+                let dec = pf_call_method(
+                    &decoder,
+                    "decode",
+                    &[Object::new_bytes(upto.to_vec())],
+                )?;
+                let n = dec.to_str().chars().count();
+                if n <= chars_to_skip {
+                    let st = pf_call_method(&decoder, "getstate", &[])?;
+                    let (b, d) = decoder_state_parts(&st)?;
+                    if b.is_empty() {
+                        dec_flags_bi = obj_to_bigint(&d);
+                        chars_to_skip -= n;
+                        broke = true;
+                        break;
+                    }
+                    skip_bytes -= b.len() as i64;
+                    skip_back = 1;
+                } else {
+                    skip_bytes -= skip_back;
+                    skip_back *= 2;
+                }
+            }
+            if !broke {
+                skip_bytes = 0;
+                pf_call_method(
+                    &decoder,
+                    "setstate",
+                    &[make_state_tuple(&dec_flags_bi)],
+                )?;
+            }
+
+            let mut start_pos = position + skip_bytes as u64;
+            let mut start_flags = dec_flags_bi.clone();
+            if chars_to_skip == 0 {
+                return Ok(pack_text_cookie(start_pos, &start_flags, 0, false, 0));
+            }
+
+            // Feed one byte at a time, noting safe restart points.
+            let mut bytes_fed = 0u64;
+            let mut need_eof = false;
+            let mut chars_decoded = 0usize;
+            let mut reached = false;
+            for i in (skip_bytes as usize)..next_input.len() {
+                bytes_fed += 1;
+                let dec = pf_call_method(
+                    &decoder,
+                    "decode",
+                    &[Object::new_bytes(next_input[i..i + 1].to_vec())],
+                )?;
+                chars_decoded += dec.to_str().chars().count();
+                let st = pf_call_method(&decoder, "getstate", &[])?;
+                let (b, d) = decoder_state_parts(&st)?;
+                if b.is_empty() && chars_decoded <= chars_to_skip {
+                    start_pos += bytes_fed;
+                    chars_to_skip -= chars_decoded;
+                    start_flags = obj_to_bigint(&d);
+                    bytes_fed = 0;
+                    chars_decoded = 0;
+                }
+                if chars_decoded >= chars_to_skip {
+                    reached = true;
+                    break;
+                }
+            }
+            if !reached {
+                // Need EOF to surface the remaining characters.
+                let dec = pf_call_method(
+                    &decoder,
+                    "decode",
+                    &[Object::new_bytes(Vec::new()), Object::Bool(true)],
+                )?;
+                chars_decoded += dec.to_str().chars().count();
+                need_eof = true;
+                if chars_decoded < chars_to_skip {
+                    return Err(os_error("can't reconstruct logical file position"));
+                }
+            }
+            Ok(pack_text_cookie(
+                start_pos,
+                &start_flags,
+                bytes_fed,
+                need_eof,
+                chars_to_skip as u64,
+            ))
+        })();
+        // Always restore the decoder's live state.
+        pf_call_method(&decoder, "setstate", &[saved_state])?;
+        result
+    }
+
+    /// `TextIOWrapper.seek(cookie)` over the incremental decoder — unpacks the
+    /// cookie and replays `read(chars_to_skip)` from the safe start point
+    /// (a direct port of `_pyio.TextIOWrapper.seek`, absolute `whence=0`).
+    pub fn seek_text_incr(&self, cookie: &Object) -> Result<Object, RuntimeError> {
+        let cookie_bi = obj_to_bigint(cookie);
+        if cookie_bi.is_negative() {
+            return Err(value_error("negative seek position"));
+        }
+        self.flush()?;
+        let (start_pos, dec_flags, bytes_to_feed, need_eof, chars_to_skip) =
+            unpack_text_cookie(&cookie_bi);
+
+        // Seek the underlying buffer to the safe start point and reset state.
+        self.seek(start_pos as isize, 0)?;
+        {
+            let mut guard = self.text_incr.borrow_mut();
+            if let Some(t) = guard.as_mut() {
+                t.decoded.clear();
+                t.decoded_used = 0;
+                t.snapshot = None;
+            }
+        }
+
+        let zero = num_bigint::BigInt::from(0u32);
+        let has_incr = self.text_incr.borrow().is_some();
+        if cookie_bi == zero {
+            self.ensure_text_decoder()?;
+            let decoder = self.text_decoder()?;
+            pf_call_method(&decoder, "reset", &[])?;
+        } else if has_incr || dec_flags != zero || chars_to_skip != 0 {
+            self.ensure_text_decoder()?;
+            let decoder = self.text_decoder()?;
+            pf_call_method(&decoder, "setstate", &[make_state_tuple(&dec_flags)])?;
+            if let Some(t) = self.text_incr.borrow_mut().as_mut() {
+                t.snapshot = Some((Object::int_from_bigint(dec_flags.clone()), Vec::new()));
+            }
+        }
+
+        if chars_to_skip != 0 {
+            let decoder = self.text_decoder()?;
+            let input_chunk = self.read_bytes(Some(bytes_to_feed as usize))?;
+            let decoded_obj = pf_call_method(
+                &decoder,
+                "decode",
+                &[Object::new_bytes(input_chunk.clone()), Object::Bool(need_eof)],
+            )?;
+            let decoded: Vec<char> = decoded_obj.to_str().chars().collect();
+            if decoded.len() < chars_to_skip as usize {
+                return Err(os_error("can't restore logical file position"));
+            }
+            if let Some(t) = self.text_incr.borrow_mut().as_mut() {
+                t.decoded = decoded;
+                t.decoded_used = chars_to_skip as usize;
+                t.snapshot =
+                    Some((Object::int_from_bigint(dec_flags.clone()), input_chunk));
+            }
+        }
+        Ok(cookie.clone())
+    }
+
+    /// `TextIOWrapper.seek(cookie, whence)` over the incremental decoder,
+    /// dispatching the three whence modes exactly like CPython: absolute
+    /// (cookie replay), current (only `0` → re-sync to `tell()`), and end
+    /// (only `0` → reset to EOF).
+    pub fn seek_text(&self, cookie: &Object, whence: i32) -> Result<Object, RuntimeError> {
+        match whence {
+            0 => self.seek_text_incr(cookie),
+            1 => {
+                if !obj_to_bigint(cookie).is_zero() {
+                    return Err(crate::stdlib::io::unsupported_op(
+                        "can't do nonzero cur-relative seeks",
+                    ));
+                }
+                let cur = self.tell_text_incr()?;
+                self.seek_text_incr(&cur)
+            }
+            2 => {
+                if !obj_to_bigint(cookie).is_zero() {
+                    return Err(crate::stdlib::io::unsupported_op(
+                        "can't do nonzero end-relative seeks",
+                    ));
+                }
+                self.flush()?;
+                let pos = self.seek(0, 2)?;
+                {
+                    let mut guard = self.text_incr.borrow_mut();
+                    if let Some(t) = guard.as_mut() {
+                        t.decoded.clear();
+                        t.decoded_used = 0;
+                        t.snapshot = None;
+                    }
+                }
+                if self.text_incr.borrow().is_some() {
+                    let decoder = self.text_decoder()?;
+                    pf_call_method(&decoder, "reset", &[])?;
+                }
+                Ok(Object::int_from_i128(pos as i128))
+            }
+            _ => Err(value_error("invalid whence")),
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -3381,7 +4065,10 @@ impl PyFile {
             FileBackend::MemBytes { data, .. } => {
                 Some(Object::Bytes(Rc::from(data.borrow().as_slice())))
             }
-            FileBackend::MemText { data, .. } => Some(Object::from_str(data.clone())),
+            // The buffer stores lone surrogates as bridged PUA code points
+            // (so a Rust `String` can hold them); map them back to a `str`/
+            // `WStr` here. A surrogate-free buffer canonicalises to `Str`.
+            FileBackend::MemText { data, .. } => Some(crate::builtins::bridge_to_object(data)),
             _ => None,
         }
     }
@@ -3409,6 +4096,35 @@ impl fmt::Debug for PyFile {
 
 impl Drop for PyFile {
     fn drop(&mut self) {
+        // CPython's fileio/buffered/textio deallocators emit a
+        // `ResourceWarning("unclosed file %R")` when an *open*, fd-backed
+        // stream is reclaimed without an explicit `close()`/`with`
+        // (`test_io.test_warn_on_dealloc{,_fd}`). Mirror it here, since a
+        // leaked `PyFile`'s last `Rc` drop *is* its deallocation. Gates:
+        //   * not finalizing — the interpreter-shutdown sweep tears down the
+        //     `warnings` machinery and would otherwise re-enter a half-dead VM;
+        //   * `!closed` — an explicit `close()` latches `closed=true` (and
+        //     swaps the backend to an in-memory buffer), so a properly closed
+        //     stream stays silent;
+        //   * `closefd` — a borrowed descriptor (`FileIO(fd, closefd=False)`)
+        //     is not ours to warn about;
+        //   * a live `Disk` backend — in-memory `BytesIO`/`StringIO` and the
+        //     std streams never carry an OS fd to leak.
+        // The `closed`/backend gates also make this idempotent against the
+        // fd close below and any re-entrant drop. The message is *enqueued*,
+        // not emitted in place: a destructor runs at an arbitrary point (an
+        // `Rc` can hit zero mid-instruction while a container is borrowed), so
+        // synthesising the Python warning here would re-enter `warnings.warn`
+        // and panic with `BorrowMutError`. The eval loop drains the queue at
+        // its between-bytecodes safe point, matching CPython's dealloc timing.
+        if !crate::vm_singletons::is_finalizing()
+            && !*self.closed.borrow()
+            && self.closefd.get()
+            && matches!(&*self.backend.borrow(), FileBackend::Disk(_))
+        {
+            let repr = self.repr_with_addr(std::ptr::from_ref(self) as usize);
+            crate::vm_singletons::push_pending_resource_warning(format!("unclosed file {repr}"));
+        }
         // Close any still-open OS descriptor *ourselves* rather than letting
         // Rust's `File` (an `OwnedFd`) run its checked drop. User code can
         // close the fd out from under us (`os.close(f.fileno())`), and Rust's
@@ -4274,6 +4990,9 @@ impl Object {
             Object::Complex(c) => c.real != 0.0 || c.imag != 0.0,
             Object::Float(f) => *f != 0.0 && !f.is_nan(),
             Object::Str(s) => !s.is_empty(),
+            // A `WStr` always holds >= 1 code point (the surrogate), so it is
+            // never the empty string and is always truthy.
+            Object::WStr(_) => true,
             Object::Tuple(items) => !items.is_empty(),
             Object::List(items) => !items.borrow().is_empty(),
             Object::Dict(d) => !d.borrow().is_empty(),
@@ -4361,6 +5080,7 @@ impl Object {
             }
             (Object::Float(a), Object::Float(b)) => a.to_bits() == b.to_bits(),
             (Object::Str(a), Object::Str(b)) => Rc::ptr_eq(a, b),
+            (Object::WStr(a), Object::WStr(b)) => Rc::ptr_eq(a, b),
             (Object::Tuple(a), Object::Tuple(b)) => Rc::ptr_eq(a, b),
             (Object::List(a), Object::List(b)) => Rc::ptr_eq(a, b),
             (Object::Dict(a), Object::Dict(b)) => Rc::ptr_eq(a, b),
@@ -4448,6 +5168,11 @@ impl Object {
                 c.imag == 0.0 && bigint_eq_f64(b, c.real)
             }
             (Object::Str(a), Object::Str(b)) => a == b,
+            // Two surrogate-bearing strings compare code-point-wise. A `WStr`
+            // never equals a plain `Str`: the invariant guarantees a `WStr`
+            // holds >= 1 lone surrogate that no UTF-8 `Str` can contain, so the
+            // mixed pair correctly falls through to the `_ => false` tail.
+            (Object::WStr(a), Object::WStr(b)) => a == b,
             // Sequence comparison is element-wise `PyObject_RichCompareBool`,
             // which is identity-first — so `[nan] == [nan]` (same nan) is true.
             (Object::Tuple(a), Object::Tuple(b)) => {
@@ -4605,6 +5330,16 @@ impl Object {
                 .partial_cmp(&(i64::from(*b) as f64))
                 .ok_or_else(|| value_error("cannot order with NaN"))?),
             (O::Str(a), O::Str(b)) => Ok(a.cmp(b)),
+            // Any comparison involving a surrogate-bearing string orders by
+            // code point (CPython compares `str` by code point; UTF-8 byte
+            // order already matches that for the pure-`Str` fast path above).
+            // A lone surrogate (U+D800..U+DFFF) thus sorts between U+D7FF and
+            // U+E000, exactly as in CPython.
+            (O::Str(_), O::WStr(_)) | (O::WStr(_), O::Str(_)) | (O::WStr(_), O::WStr(_)) => {
+                let a = self.str_codepoints().unwrap();
+                let b = other.str_codepoints().unwrap();
+                Ok(a.cmp(&b))
+            }
             // bytes/bytearray order lexicographically by byte value;
             // the four mixed combinations all compare (CPython's
             // shared `bytes_richcompare` buffer path).
@@ -4658,6 +5393,21 @@ impl Object {
             }
             Object::Str(haystack) => match item {
                 Object::Str(needle) => Ok(haystack.contains(&**needle)),
+                // `"..." in wstr`: a surrogate-bearing needle can never be a
+                // substring of a pure-UTF-8 haystack, so this is always false.
+                Object::WStr(_) => Ok(false),
+                _ => Err(type_error(
+                    "'in <string>' requires string as left operand".to_owned(),
+                )),
+            },
+            // Substring search over a surrogate-bearing haystack works on code
+            // points so a lone surrogate matches itself.
+            Object::WStr(_) => match item {
+                Object::Str(_) | Object::WStr(_) => {
+                    let hay = self.str_codepoints().unwrap();
+                    let needle = item.str_codepoints().unwrap();
+                    Ok(codepoint_subslice_contains(&hay, &needle))
+                }
                 _ => Err(type_error(
                     "'in <string>' requires string as left operand".to_owned(),
                 )),
@@ -4760,6 +5510,16 @@ impl Object {
             }),
             Object::Str(s) => Ok(PyIterator::Str {
                 s: s.clone(),
+                index: 0,
+            }),
+            // Iterating a surrogate-bearing string yields one length-1 string
+            // per code point (a lone surrogate becomes a length-1 `WStr`).
+            Object::WStr(cps) => Ok(PyIterator::List {
+                items: Rc::new(RefCell::new(
+                    cps.iter()
+                        .map(|&c| Object::str_from_codepoints(vec![c]))
+                        .collect(),
+                )),
                 index: 0,
             }),
             Object::Range(r) => Ok(
@@ -4908,6 +5668,8 @@ impl Object {
             Object::Complex(_) => "complex",
             Object::Float(_) => "float",
             Object::Str(_) => "str",
+            // A surrogate-bearing string is still a `str` to Python.
+            Object::WStr(_) => "str",
             Object::Tuple(_) => "tuple",
             Object::List(_) => "list",
             Object::Dict(_) => "dict",
@@ -4995,6 +5757,44 @@ impl Object {
                         // \UNNNNNNNN depending on the code-point width.
                         c => {
                             let n = c as u32;
+                            if n <= 0xff {
+                                out.push_str(&format!("\\x{n:02x}"));
+                            } else if n <= 0xffff {
+                                out.push_str(&format!("\\u{n:04x}"));
+                            } else {
+                                out.push_str(&format!("\\U{n:08x}"));
+                            }
+                        }
+                    }
+                }
+                out.push(quote);
+                out
+            }
+            Object::WStr(cps) => {
+                // Same algorithm as the `Str` arm, but over raw code points so
+                // lone surrogates (which cannot be a Rust `char`) round-trip as
+                // `\udXXX`. CPython's `unicode_repr` shows lone surrogates with
+                // the same `\uXXXX` escape used for any non-printable BMP point.
+                let has_single = cps.contains(&0x27);
+                let has_double = cps.contains(&0x22);
+                let quote: char = if has_single && !has_double { '"' } else { '\'' };
+                let quote_cp = quote as u32;
+                let mut out = String::with_capacity(cps.len() + 2);
+                out.push(quote);
+                for &n in cps.iter() {
+                    match char::from_u32(n) {
+                        Some('\\') => out.push_str("\\\\"),
+                        Some('\n') => out.push_str("\\n"),
+                        Some('\r') => out.push_str("\\r"),
+                        Some('\t') => out.push_str("\\t"),
+                        _ if n == quote_cp => {
+                            out.push('\\');
+                            out.push(quote);
+                        }
+                        Some(c) if char_is_printable(c) => out.push(c),
+                        // Both lone surrogates (`from_u32` == None) and
+                        // non-printable scalars escape by code-point width.
+                        _ => {
                             if n <= 0xff {
                                 out.push_str(&format!("\\x{n:02x}"));
                             } else if n <= 0xffff {
@@ -5192,48 +5992,8 @@ impl Object {
                 //   TextIOWrapper     -> `<_io.TextIOWrapper name=.. mode='r' encoding='..'>`
                 // The name is formatted with `repr` (`%R`): an fd is an
                 // unquoted int (`name=6`), a path a quoted str (`name='f'`).
-                match file.io_kind.get() {
-                    IoKind::BytesIO => {
-                        format!("<_io.BytesIO object at 0x{:x}>", Rc::as_ptr(file) as usize)
-                    }
-                    IoKind::StringIO => {
-                        format!("<_io.StringIO object at 0x{:x}>", Rc::as_ptr(file) as usize)
-                    }
-                    kind => {
-                        let name = file
-                            .name_obj()
-                            .map(|o| o.repr())
-                            .unwrap_or_else(|| format!("'{}'", file.name));
-                        match kind {
-                            IoKind::Raw => format!(
-                                "<_io.FileIO name={} mode='{}' closefd={}>",
-                                name,
-                                file.reported_mode(),
-                                if file.closefd.get() { "True" } else { "False" }
-                            ),
-                            IoKind::BufferedReader => {
-                                format!("<_io.BufferedReader name={name}>")
-                            }
-                            IoKind::BufferedWriter => {
-                                format!("<_io.BufferedWriter name={name}>")
-                            }
-                            IoKind::BufferedRandom => {
-                                format!("<_io.BufferedRandom name={name}>")
-                            }
-                            _ => {
-                                let enc = file
-                                    .encoding
-                                    .borrow()
-                                    .clone()
-                                    .unwrap_or_else(|| "utf-8".to_owned());
-                                format!(
-                                    "<_io.TextIOWrapper name={} mode='{}' encoding='{}'>",
-                                    name, file.mode, enc
-                                )
-                            }
-                        }
-                    }
-                }
+                // Shared with the `Drop` unclosed-file `ResourceWarning`.
+                file.repr_with_addr(Rc::as_ptr(file) as usize)
             }
             Object::Instance(inst) => {
                 // The `Ellipsis` / `NotImplemented` singletons render as
@@ -5406,6 +6166,14 @@ impl Object {
     pub fn to_str(&self) -> String {
         match self {
             Object::Str(s) => s.to_string(),
+            // A `String` cannot hold lone surrogates, so this lossy view maps
+            // them to U+FFFD. Fidelity-critical consumers (encoders,
+            // `os.fsencode`, `repr`) take [`Object::str_codepoints`] instead;
+            // `to_str` is for display/diagnostic text where loss is acceptable.
+            Object::WStr(cps) => cps
+                .iter()
+                .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                .collect(),
             _ => self.repr(),
         }
     }
@@ -5414,6 +6182,9 @@ impl Object {
     pub fn len(&self) -> Result<usize, RuntimeError> {
         match self {
             Object::Str(s) => Ok(s.chars().count()),
+            // Length in code points: a lone surrogate counts as one, matching
+            // CPython where `len(chr(0xD800)) == 1`.
+            Object::WStr(cps) => Ok(cps.len()),
             Object::Tuple(items) => Ok(items.len()),
             Object::List(items) => Ok(items.borrow().len()),
             Object::Dict(d) => Ok(d.borrow().len()),
@@ -5457,6 +6228,18 @@ impl Object {
 
 fn sets_equal(a: &SetData, b: &SetData) -> bool {
     a.len() == b.len() && a.iter().all(|k| b.contains(k))
+}
+
+/// Substring test over code-point sequences (the WTF-8 analogue of
+/// `str::contains`). The empty needle matches anywhere (`"" in s` is `True`).
+pub(crate) fn codepoint_subslice_contains(haystack: &[u32], needle: &[u32]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Compare a BigInt against a float.  Mirrors CPython: `inf` always
@@ -5816,6 +6599,17 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
     match obj {
         Object::None => Some(PY_HASH_NONE),
         Object::Str(s) => Some(py_hash_bytes_slice(s.as_bytes())),
+        // Surrogate-bearing string: hash the code-point sequence. Need only be
+        // deterministic and self-consistent — a `WStr` never equals a `Str`
+        // (disjoint by invariant), so cross-representation hash agreement is
+        // unnecessary; collisions only cost a probe, never correctness.
+        Object::WStr(cps) => {
+            let mut bytes = Vec::with_capacity(cps.len() * 4);
+            for &c in cps.iter() {
+                bytes.extend_from_slice(&c.to_le_bytes());
+            }
+            Some(py_hash_bytes_slice(&bytes))
+        }
         Object::Bytes(b) => Some(py_hash_bytes_slice(b)),
         Object::Tuple(items) => {
             // CPython 3.13 `tuplehash` (Objects/tupleobject.c), bit-exact:
@@ -6203,6 +6997,47 @@ fn seq_cmp(a: &[Object], b: &[Object]) -> Result<Ordering, RuntimeError> {
 impl Object {
     pub fn from_str(s: impl Into<String>) -> Self {
         Object::Str(Rc::from(s.into().as_str()))
+    }
+
+    /// Build a `str` from a sequence of code points, each a Unicode scalar
+    /// value *or* a lone surrogate (U+D800..U+DFFF). Canonicalises: if no lone
+    /// surrogate is present the result is a normal [`Object::Str`] (so the
+    /// common path keeps the compact `Rc<str>` representation and ordinary
+    /// `str` fast paths); only a genuinely surrogate-bearing string becomes an
+    /// [`Object::WStr`]. This is the single chokepoint that preserves the
+    /// "`WStr` always holds >= 1 surrogate" invariant.
+    pub fn str_from_codepoints(cps: Vec<u32>) -> Self {
+        if cps.iter().any(|&c| (0xD800..=0xDFFF).contains(&c)) {
+            Object::WStr(Rc::from(cps.into_boxed_slice()))
+        } else {
+            // No surrogates: every code point is a valid scalar value.
+            let mut s = String::with_capacity(cps.len());
+            for c in cps {
+                // Safe: the surrogate range was just excluded, and code points
+                // are produced by `char`-range-checked callers.
+                if let Some(ch) = char::from_u32(c) {
+                    s.push(ch);
+                }
+            }
+            Object::Str(Rc::from(s.as_str()))
+        }
+    }
+
+    /// Code points of a `str`/`WStr` as `u32`s (scalar values, plus lone
+    /// surrogates for `WStr`). Returns `None` for non-string objects.
+    pub fn str_codepoints(&self) -> Option<Vec<u32>> {
+        match self {
+            Object::Str(s) => Some(s.chars().map(|c| c as u32).collect()),
+            Object::WStr(cps) => Some(cps.to_vec()),
+            _ => None,
+        }
+    }
+
+    /// True for either string representation (`str` or surrogate-bearing
+    /// `WStr`). Use at "is this a str?" dispatch points so a `WStr` is treated
+    /// as the `str` it is.
+    pub fn is_str(&self) -> bool {
+        matches!(self, Object::Str(_) | Object::WStr(_))
     }
 
     /// Identity-stable string: repeated calls with the same text return

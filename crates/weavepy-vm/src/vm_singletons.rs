@@ -353,6 +353,50 @@ impl Drop for InterpreterGuard {
     }
 }
 
+thread_local! {
+    /// Deferred `ResourceWarning` messages produced by object destructors
+    /// (`impl Drop for PyFile`, …). A destructor cannot synthesise a Python
+    /// warning *in place*: an `Rc` can hit zero references mid-instruction,
+    /// while a container the VM is iterating is still borrowed, so re-entering
+    /// `warnings.warn` from `drop` panics with `BorrowMutError`. Instead the
+    /// destructor enqueues the message and the eval loop drains it at the same
+    /// between-bytecodes safe point it uses for prompt `__del__` finalization
+    /// (and `gc.collect()` drains it after a collection), giving CPython's
+    /// "unclosed file" warning the right timing without the reentrancy hazard.
+    static PENDING_RESOURCE_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Cheap "is the deferred-warning queue non-empty?" probe set whenever a
+/// destructor enqueues. A relaxed atomic so the eval-loop safe point pays a
+/// single load in the common (empty) case rather than a thread-local borrow.
+static PENDING_RW_FLAG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enqueue a deferred `ResourceWarning` message from a destructor. Drained by
+/// [`crate::Interpreter::drain_pending_resource_warnings`] at the next safe
+/// point. Silently dropped once shutdown has begun (the `warnings` machinery
+/// is being torn down and CPython likewise suppresses dealloc warnings then).
+pub fn push_pending_resource_warning(message: String) {
+    if is_finalizing() {
+        return;
+    }
+    PENDING_RESOURCE_WARNINGS.with(|cell| cell.borrow_mut().push(message));
+    PENDING_RW_FLAG.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Cheap probe for the eval-loop safe point: are any deferred resource
+/// warnings queued on this thread?
+pub fn has_pending_resource_warnings() -> bool {
+    PENDING_RW_FLAG.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Drain and return all queued deferred resource-warning messages on this
+/// thread, clearing the fast-path flag.
+pub fn take_pending_resource_warnings() -> Vec<String> {
+    PENDING_RW_FLAG.store(false, std::sync::atomic::Ordering::Release);
+    PENDING_RESOURCE_WARNINGS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
 /// `True` once interpreter shutdown (finalizer sweep) has begun —
 /// CPython's `_Py_IsFinalizing()`. Fresh imports are refused while
 /// set (already-imported modules keep working), and

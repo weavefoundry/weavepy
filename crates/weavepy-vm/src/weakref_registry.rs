@@ -373,6 +373,7 @@ pub fn id_of(obj: &Object) -> ObjectId {
         Object::Int(n) => 0x1000_0000_0000_0000u64 ^ (*n as u64),
         Object::Float(f) => 0x2000_0000_0000_0000u64 ^ f.to_bits(),
         Object::Str(s) => Rc::as_ptr(s).cast::<()>() as usize as u64,
+        Object::WStr(cps) => Rc::as_ptr(cps).cast::<()>() as usize as u64,
         Object::Bytes(b) => Rc::as_ptr(b).cast::<()>() as usize as u64,
         Object::Tuple(t) => Rc::as_ptr(t).cast::<()>() as usize as u64,
         Object::List(l) => Rc::as_ptr(l) as usize as u64,

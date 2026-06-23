@@ -388,6 +388,11 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // RFC 0040 WS1: POSIX process & fd primitives (fork/exec*/
         // posix_spawn/wait*/W*/closerange/setsid/register_at_fork/…).
         crate::stdlib::os_process::register(&mut d);
+        // Safety net for entry points that don't snapshot the OS-thread
+        // baseline at startup (embedders, the in-process conformance runner):
+        // capture it on first `os` import if it's still unset. Never clobbers
+        // the CLI's authoritative early capture.
+        crate::stdlib::os_process::capture_thread_baseline_if_unset();
         d.insert(
             DictKey(Object::from_static("get_exec_path")),
             builtin("get_exec_path", os_get_exec_path),
@@ -899,10 +904,33 @@ pub(super) fn sequence_items(o: &Object) -> Option<Vec<Object>> {
     }
 }
 
+/// Decode an OS string (env var, in PEP 383 terms) to a `str`/`WStr` using the
+/// filesystem codec (UTF-8) + `surrogateescape`, so an undecodable byte
+/// (0x80..0xFF) becomes a lone surrogate (U+DC80..U+DCFF) that `_weave_envinit`
+/// can re-encode back to the exact original byte. `std::env::vars()` would
+/// instead *panic* on a non-UTF-8 value, so the `_os`-level snapshot must go
+/// through the byte-faithful `*_os` APIs.
+fn fsdecode_osstr(s: &std::ffi::OsStr) -> Object {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        crate::stdlib::codecs_mod::decode_bytes_obj(s.as_bytes(), "utf-8", "surrogateescape")
+            .unwrap_or_else(|_| Object::from_str(s.to_string_lossy().into_owned()))
+    }
+    #[cfg(not(unix))]
+    {
+        Object::from_str(s.to_string_lossy().into_owned())
+    }
+}
+
 fn initial_environ() -> Object {
     let mut d = DictData::new();
-    for (k, v) in std::env::vars() {
-        d.insert(DictKey(Object::from_str(k)), Object::from_str(v));
+    // `vars_os` (not `vars`) so an undecodable env value doesn't panic; each
+    // entry is fsdecoded with `surrogateescape` (PEP 383) for a faithful
+    // round-trip through `os.environ` / `os.environb`
+    // (test_subprocess.test_undecodable_env).
+    for (k, v) in std::env::vars_os() {
+        d.insert(DictKey(fsdecode_osstr(&k)), fsdecode_osstr(&v));
     }
     Object::Dict(Rc::new(RefCell::new(d)))
 }
@@ -1914,7 +1942,7 @@ fn os_stat_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     // eagerly with CPython's "or integer" wording
     // (`test_posix.test_stat`/`test_fstat`).
     match args.first() {
-        Some(Object::Str(_) | Object::Bytes(_) | Object::Instance(_)) => {}
+        Some(Object::Str(_) | Object::WStr(_) | Object::Bytes(_) | Object::Instance(_)) => {}
         other => {
             let tn = other.map_or("NoneType".to_string(), |o| o.type_name().to_string());
             return Err(type_error(format!(
@@ -2327,6 +2355,18 @@ fn os_readlink(args: &[Object]) -> Result<Object, RuntimeError> {
 fn resolve_fspath_obj(obj: &Object, func: &str) -> Result<Object, RuntimeError> {
     match obj {
         Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
+        // PEP 383: a lone-surrogate `str` path keeps its `str` flavour, but is
+        // fsencoded (`surrogateescape`) for validation — a non-escapable
+        // surrogate raises `UnicodeEncodeError` here, exactly like CPython's
+        // `path_converter` (escapable U+DC80..U+DCFF survives lossily pending
+        // the byte-faithful OsString syscall rewrite).
+        Object::WStr(cps) => {
+            let bytes =
+                crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogateescape")?;
+            Ok(Object::from_str(
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ))
+        }
         Object::ByteArray(b) => Ok(Object::new_bytes(b.borrow().clone())),
         Object::Instance(_) => {
             if let Some(n @ (Object::Str(_) | Object::Bytes(_))) = obj.native_value() {
@@ -2382,11 +2422,14 @@ pub(crate) fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
         None => return Err(type_error("fspath() takes exactly one argument")),
     };
     match obj {
-        Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
+        // A surrogate-bearing `WStr` is a `str` for path purposes (PEP 383).
+        Object::Str(_) | Object::WStr(_) | Object::Bytes(_) => Ok(obj.clone()),
         Object::Instance(_) => {
             // A `str`/`bytes` subclass reduces to its native value (CPython
             // `os.fspath` returns those directly).
-            if let Some(n @ (Object::Str(_) | Object::Bytes(_))) = obj.native_value() {
+            if let Some(n @ (Object::Str(_) | Object::WStr(_) | Object::Bytes(_))) =
+                obj.native_value()
+            {
                 return Ok(n);
             }
             // Otherwise honour the `os.PathLike` protocol: call `__fspath__`
@@ -2435,9 +2478,9 @@ pub(crate) fn os_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `fsencode` (which themselves only special-case the str/bytes split).
 fn fspath_to_str_or_bytes(obj: &Object, func: &str) -> Result<Object, RuntimeError> {
     match obj {
-        Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
+        Object::Str(_) | Object::WStr(_) | Object::Bytes(_) => Ok(obj.clone()),
         Object::Instance(_) => match obj.native_value() {
-            Some(n @ (Object::Str(_) | Object::Bytes(_))) => Ok(n),
+            Some(n @ (Object::Str(_) | Object::WStr(_) | Object::Bytes(_))) => Ok(n),
             _ => Err(type_error(format!(
                 "expected str, bytes or os.PathLike object, not {}",
                 obj.type_name()
@@ -2458,8 +2501,11 @@ fn os_fsdecode(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .ok_or_else(|| type_error("fsdecode() takes exactly one argument (0 given)"))?;
     match fspath_to_str_or_bytes(obj, "fsdecode")? {
-        s @ Object::Str(_) => Ok(s),
-        Object::Bytes(b) => Ok(Object::from_str(String::from_utf8_lossy(&b).into_owned())),
+        s @ (Object::Str(_) | Object::WStr(_)) => Ok(s),
+        // PEP 383: decode with the filesystem encoding (UTF-8) and the
+        // `surrogateescape` handler, so undecodable bytes become lone
+        // surrogates that `fsencode` can map back to the original bytes.
+        Object::Bytes(b) => crate::stdlib::codecs_mod::decode_bytes_obj(&b, "utf-8", "surrogateescape"),
         _ => unreachable!("fspath_to_str_or_bytes returns only str/bytes"),
     }
 }
@@ -2472,6 +2518,12 @@ fn os_fsencode(args: &[Object]) -> Result<Object, RuntimeError> {
         .ok_or_else(|| type_error("fsencode() takes exactly one argument (0 given)"))?;
     match fspath_to_str_or_bytes(obj, "fsencode")? {
         Object::Str(s) => Ok(Object::Bytes(Rc::from(s.as_bytes()))),
+        // PEP 383: a surrogate-bearing path encodes with `surrogateescape`,
+        // mapping U+DC80..U+DCFF back to the original raw bytes.
+        w @ Object::WStr(_) => {
+            let bytes = crate::stdlib::codecs_mod::encode_obj(&w, "utf-8", "surrogateescape")?;
+            Ok(Object::Bytes(Rc::from(bytes.as_slice())))
+        }
         b @ Object::Bytes(_) => Ok(b),
         _ => unreachable!("fspath_to_str_or_bytes returns only str/bytes"),
     }
@@ -2541,7 +2593,12 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
         None | Some(Object::None) => (".".to_owned(), false),
         Some(Object::Str(s)) => (s.to_string(), false),
         Some(Object::Bytes(b)) => (String::from_utf8_lossy(b).into_owned(), true),
-        Some(other @ Object::Instance(_)) => (path_to_string(other, "scandir")?, false),
+        // A lone-surrogate `str` path (PEP 383) routes through the shared
+        // converter, which fsencodes it (`surrogateescape`) and raises
+        // `UnicodeEncodeError` for a non-escapable surrogate.
+        Some(other @ (Object::WStr(_) | Object::Instance(_))) => {
+            (path_to_string(other, "scandir")?, false)
+        }
         Some(other) => {
             return Err(type_error(format!(
                 "scandir: path should be string, bytes, os.PathLike or integer, not {}",
@@ -5475,6 +5532,20 @@ fn int_arg_or_kw(
 pub(crate) fn path_to_string(obj: &Object, func: &str) -> Result<String, RuntimeError> {
     let s = match obj {
         Object::Str(s) => s.to_string(),
+        // PEP 383 path converter: a surrogate-bearing `str` path is encoded
+        // with the filesystem codec (UTF-8) + `surrogateescape`. A
+        // non-escapable lone surrogate (e.g. U+D800) raises
+        // `UnicodeEncodeError` exactly like CPython's `path_converter`
+        // (test_tarfile.test_extract_unencodable). An escapable surrogate
+        // (U+DC80..U+DCFF) maps back to its raw byte; the byte-faithful
+        // syscall path is the deferred OsString rewrite, so a non-UTF-8 result
+        // is surfaced lossily here.
+        Object::WStr(cps) => {
+            let bytes =
+                crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogateescape")?;
+            String::from_utf8(bytes)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+        }
         Object::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         Object::ByteArray(b) => String::from_utf8_lossy(&b.borrow()).into_owned(),
         // A `str`/`bytes` *subclass* instance is itself the path: CPython's

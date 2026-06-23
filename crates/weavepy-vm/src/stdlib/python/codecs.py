@@ -509,6 +509,14 @@ def _utf_32_codecinfo(name="utf-32"):
     )
 
 
+def _euc_jis_2004_codecinfo():
+    # The codec's ~70 KB of packed tables are unpacked once at module import;
+    # keep that cold until something actually asks for `euc_jis_2004`.
+    import _codec_euc_jis_2004 as _ejis
+
+    return _ejis.getregentry("euc_jis_2004")
+
+
 # CPython's codec registry caches every successful lookup keyed by the
 # normalised name (`interp->codec_search_cache`). Returning the *same*
 # `CodecInfo` object across calls is observable: `test_io.test_illegal_decoder`
@@ -526,11 +534,11 @@ def lookup(encoding):
     # ``test_io.test_constructor`` / ``test_reconfigure_errors``).
     #
     # CPython also raises ``UnicodeEncodeError`` for a name containing a lone
-    # surrogate (it can't be UTF-8-encoded for the C string). WeavePy can't
-    # reproduce that: lone surrogates are replaced with U+FFFD at string-storage
-    # time (WTF-8 storage is an explicit RFC 0040 non-goal), so such a name
-    # never reaches here intact and instead surfaces as a ``LookupError`` for
-    # the replacement-char name.
+    # surrogate (it can't be UTF-8-encoded for the C string). With WTF-8 ``str``
+    # storage WeavePy now reproduces this faithfully: the lone-surrogate name
+    # survives ``isinstance``/``.lower()``/``_normalise`` intact and the native
+    # ``_codecs.lookup`` raises ``UnicodeEncodeError`` when it strict-UTF-8
+    # encodes the codec name.
     if not isinstance(encoding, str):
         raise TypeError(
             f"lookup() argument must be str, not {type(encoding).__name__}"
@@ -563,6 +571,12 @@ def _lookup_uncached(encoding):
         return _utf_16_codecinfo(encoding)
     if norm in ("utf_32", "utf32", "u32"):
         return _utf_32_codecinfo(encoding)
+    # The JIS X 0213:2004 `euc_jis_2004` CJK codec (and its aliases) — a faithful
+    # port whose combining sequences make the incremental *encoder* stateful.
+    # `encoding_rs` (the engine's CJK backend) doesn't carry it, so it lives in a
+    # dedicated frozen module loaded on first use.
+    if norm in ("euc_jis_2004", "euc_jis2004", "eucjis2004", "jisx0213"):
+        return _euc_jis_2004_codecinfo()
     if encoding in _PURE_CODECS or _normalise(encoding) in _PURE_CODECS:
         key = encoding if encoding in _PURE_CODECS else _normalise(encoding)
         encode_fn, decode_fn = _PURE_CODECS[key]
@@ -586,6 +600,12 @@ def _lookup_uncached(encoding):
     # codecs like the test suite's `test_decoder`/`test_rot13` fill gaps.
     try:
         canonical = _codecs.lookup(encoding)
+    except UnicodeError:
+        # A codec name that can't be UTF-8-encoded (a lone surrogate) raises
+        # ``UnicodeEncodeError`` (a ``ValueError`` subclass) — propagate it
+        # rather than masking it as ``LookupError`` (``test_io.test_constructor``
+        # ``encoding='\udcfe'`` for the ``_pyio`` variant).
+        raise
     except (LookupError, ValueError):
         info = _search_registered(_normalise(encoding))
         if info is not None:

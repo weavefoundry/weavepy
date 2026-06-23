@@ -55,7 +55,23 @@ pub const MAGIC: &[u8; 4] = b"\xf3\x0d\x0d\x0a";
 /// a dotted tag like `weavepy-3.13` would corrupt the recovered source
 /// name). Distinct from CPython's `cpython-313` so the artifacts never
 /// collide.
-pub const CACHE_TAG: &str = "weavepy-313";
+///
+/// The trailing `-<rev>` is WeavePy's **bytecode-format revision**, our
+/// only lever for invalidating stale `.pyc` on a compiler change: we pin
+/// [`MAGIC`] to CPython 3.13's value (so `importlib.util.MAGIC_NUMBER` /
+/// `_imp.get_magic()` match for `test_importlib.test_magic_number` and
+/// external-tool interop), which means we *cannot* bump the magic the way
+/// CPython does. Bumping the tag changes the `.pyc` *filename*, so both
+/// readers that key off `cache_tag` — the native [`cache_path_for`] and
+/// the frozen `importlib._bootstrap_external` — uniformly miss the old
+/// artifact and recompile from source. Both hyphens keep the tag dotless,
+/// so PEP 3147 source recovery still resolves `<name>.py`.
+///
+/// - rev `2`: WTF-8 string constants. Pre-rev `.pyc` compiled lone
+///   surrogates in literals (`'\udfff'`) lossily to U+FFFD; rev 2 stores
+///   them faithfully (`test_posixpath.test_realpath_invalid_paths`,
+///   `test_os`/`test_tarfile` surrogate paths).
+pub const CACHE_TAG: &str = "weavepy-313-2";
 
 const HEADER_LEN: usize = 16;
 

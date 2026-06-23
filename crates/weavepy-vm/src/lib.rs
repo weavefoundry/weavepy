@@ -736,6 +736,16 @@ impl Interpreter {
     /// `site.main()`. Errors are intentionally swallowed — a broken
     /// `.pth` file shouldn't kill the whole interpreter.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
+        // Publish this interpreter for the duration of startup so native
+        // code reached *during* the site/stdlib preimport (e.g.
+        // `object.__setattr__` while a frozen module builds a `__slots__`
+        // class such as `operator.itemgetter` for `functools._CacheInfo`)
+        // takes the same VM-aware path it does at runtime. Without this the
+        // pointer is unpublished here and the fallback strands slot writes
+        // in the instance `__dict__`, where the slot descriptor can't read
+        // them — breaking every namedtuple built during bootstrap.
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let site = match self.import_path("site") {
             Ok(m) => m,
             Err(_) => return Ok(()),
@@ -2639,6 +2649,13 @@ impl Interpreter {
             // nor drops references pays only two relaxed atomic loads.
             if gc_trace::has_any_finalizable() && gc_trace::take_maybe_dead() {
                 self.drain_prompt_finalizers();
+            }
+            // RFC 0040 (WS7): surface any "unclosed file" `ResourceWarning`
+            // queued by a `PyFile` destructor since the previous instruction.
+            // Same between-bytecodes safe point as prompt finalization; gated on
+            // a single relaxed atomic load so the common (empty) case is free.
+            if crate::vm_singletons::has_pending_resource_warnings() {
+                self.drain_pending_resource_warnings();
             }
             // Mirror the live `pc` into the snapshot so `f_lineno`
             // reads correctly when user code introspects via
@@ -4554,12 +4571,27 @@ impl Interpreter {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let parts = frame.stack.split_off(split);
-                let mut s = String::new();
-                for p in parts {
-                    s.push_str(&p.to_str());
+                // If any fragment carries lone surrogates (`WStr`), join at the
+                // code-point level so they survive concatenation; otherwise take
+                // the plain UTF-8 fast path.
+                if parts.iter().any(|p| matches!(p, Object::WStr(_))) {
+                    let mut cps: Vec<u32> = Vec::new();
+                    for p in &parts {
+                        match p.str_codepoints() {
+                            Some(c) => cps.extend(c),
+                            None => cps.extend(p.to_str().chars().map(|ch| ch as u32)),
+                        }
+                    }
+                    self.record_alloc(frame, 49 + cps.len() as u64);
+                    frame.push(Object::str_from_codepoints(cps));
+                } else {
+                    let mut s = String::new();
+                    for p in parts {
+                        s.push_str(&p.to_str());
+                    }
+                    self.record_alloc(frame, 49 + s.len() as u64);
+                    frame.push(Object::from_str(s));
                 }
-                self.record_alloc(frame, 49 + s.len() as u64);
-                frame.push(Object::from_str(s));
             }
             OpCode::ListAppend => {
                 let v = frame.pop()?;
@@ -5376,7 +5408,14 @@ impl Interpreter {
                 let value = frame.pop()?;
                 let globals = frame.globals.clone();
                 let formatted = self.format_value(&value, conversion, spec.as_ref(), &globals)?;
-                frame.push(Object::from_str(formatted));
+                // A surrogate-bearing value formats into bridged PUA code
+                // points; map them back so the f-string fragment is a faithful
+                // `WStr`. Non-`WStr` values never produce bridge-window output.
+                if matches!(value, Object::WStr(_)) {
+                    frame.push(crate::builtins::bridge_to_object(&formatted));
+                } else {
+                    frame.push(Object::from_str(formatted));
+                }
             }
             OpCode::YieldValue => {
                 let v = frame.pop()?;
@@ -7945,14 +7984,32 @@ impl Interpreter {
         // the borrow window tight and lets us route the result either
         // to the native stdout sink or — when `file=` is supplied —
         // through that object's `write` method, exactly like CPython.
+        // Build the line preserving lone surrogates: a `WStr` argument is
+        // bridged (surrogates → PUA window) into the working `String`, then the
+        // whole line is canonicalised back to a `str`/`WStr` so a surrogate
+        // survives to the destination (`stringify`/Rust `String` would
+        // otherwise flatten it to U+FFFD).
         let mut text = String::new();
+        let mut saw_surrogate = false;
         for (i, a) in args.iter().enumerate() {
             if i > 0 {
                 text.push_str(&sep);
             }
-            text.push_str(&self.stringify(a, globals)?);
+            match a {
+                Object::WStr(cps) => {
+                    saw_surrogate = true;
+                    text.push_str(&crate::builtins::bridge_encode_cps(cps));
+                }
+                Object::Str(s) => text.push_str(s),
+                _ => text.push_str(&self.stringify(a, globals)?),
+            }
         }
         text.push_str(&end);
+        let line_obj = if saw_surrogate {
+            crate::builtins::bridge_to_object(&text)
+        } else {
+            Object::from_str(text)
+        };
 
         match file {
             // `print(..., file=f)` calls `f.write(...)` so any
@@ -7960,11 +8017,15 @@ impl Interpreter {
             // `io.StringIO`, or a user type with a `write` method.
             Some(f) => {
                 let write = self.load_attr(&f, "write")?;
-                self.call(&write, &[Object::from_str(text)], &[], globals)?;
+                self.call(&write, &[line_obj], &[], globals)?;
             }
-            None => {
-                self.write_to_stdout(&text, globals)?;
-            }
+            None => match &line_obj {
+                Object::Str(s) => self.write_to_stdout(s, globals)?,
+                // Surrogate line to the default sink: route the actual code
+                // points through the current `sys.stdout` so its encoding +
+                // error handler decide the bytes (CPython behaviour).
+                _ => self.write_codepoints_to_stdout(&line_obj, globals)?,
+            },
         }
         Ok(Object::None)
     }
@@ -8010,6 +8071,35 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Write a surrogate-bearing line (a `str`/`WStr`) to the current
+    /// `sys.stdout`. A reassigned stream receives the object directly so its
+    /// own encoding / error handler applies; the default host sink emits
+    /// lossless WTF-8 (UTF-8 + `surrogatepass`), the closest faithful encoding
+    /// for a lone surrogate when no Python-level error handler is in play.
+    fn write_codepoints_to_stdout(
+        &mut self,
+        line: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(target) = self.current_sys_attr("stdout") {
+            let is_default_sink = matches!(
+                &target,
+                Object::File(f) if matches!(&*f.backend.borrow(), FileBackend::Stdout(_))
+            );
+            if !is_default_sink {
+                let write = self.load_attr(&target, "write")?;
+                self.call(&write, &[line.clone()], &[], globals)?;
+                return Ok(());
+            }
+        }
+        let cps = line.str_codepoints().unwrap_or_default();
+        let bytes = crate::stdlib::codecs_mod::encode_codepoints(&cps, "utf-8", "surrogatepass")
+            .unwrap_or_default();
+        let mut sink = self.stdout.borrow_mut();
+        let _ = sink.write_all(&bytes);
+        Ok(())
+    }
+
     /// CPython `PRINT_EXPR`: route a top-level expression-statement value
     /// through `sys.displayhook`. A user-installed hook is called as-is;
     /// the default hook skips `None`, echoes `repr(value)` to the current
@@ -8050,6 +8140,12 @@ impl Interpreter {
         v: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // `str(x)` on an exact `str` is the identity (CPython returns the same
+        // object); for a `WStr` that identity is what preserves its lone
+        // surrogates — `stringify` would otherwise flatten them to U+FFFD.
+        if matches!(v, Object::Str(_) | Object::WStr(_)) {
+            return Ok(v.clone());
+        }
         Ok(Object::from_str(self.stringify(v, globals)?))
     }
 
@@ -8156,7 +8252,12 @@ impl Interpreter {
                 // A conversion always yields a `str`; the spec then
                 // applies to that string.
                 let converted = match c {
-                    's' => self.stringify(&value, globals)?,
+                    // `!s` of a lone-surrogate string is the string itself
+                    // (bridged); `stringify` would otherwise lose surrogates.
+                    's' => match &value {
+                        Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
+                        _ => self.stringify(&value, globals)?,
+                    },
                     'r' => self.repr_of(&value, globals)?,
                     'a' => self.ascii_of(&value, globals)?,
                     other => {
@@ -8624,6 +8725,23 @@ impl Interpreter {
         let globals = self.builtins.clone();
         self.call(&warn, &[Object::from_str(message), category], &[], &globals)
             .map(|_| ())
+    }
+
+    /// Drain the thread-local deferred-`ResourceWarning` queue, emitting each
+    /// message through the live `warnings` machinery. Destructors
+    /// (`impl Drop for PyFile`) enqueue "unclosed file …" messages here rather
+    /// than warning in place — an `Rc` can drop to zero mid-instruction while a
+    /// container is borrowed, so re-entering `warnings.warn` from the drop would
+    /// panic. The eval loop and `gc.collect()` call this at safe points where no
+    /// container borrow is held, giving the warnings CPython's dealloc timing.
+    /// A warning raised by an escalating filter can't propagate out of a
+    /// finalizer, so per-message errors are swallowed (CPython writes them via
+    /// `PyErr_WriteUnraisable`; surfacing them here would corrupt the active
+    /// frame's error state at an unrelated bytecode boundary).
+    pub(crate) fn drain_pending_resource_warnings(&mut self) {
+        for message in crate::vm_singletons::take_pending_resource_warnings() {
+            let _ = self.warn_resource_from_builtin(message);
+        }
     }
 
     /// Public shim letting Rust stdlib builtins raise a `DeprecationWarning`
@@ -11948,9 +12066,14 @@ impl Interpreter {
         // mini-language) get a crack at the spec.
         let converted = match conversion {
             0 => None,
-            1 => Some(self.stringify(value, globals)?), // !s
-            2 => Some(self.repr_of(value, globals)?),   // !r
-            3 => Some(ascii_repr(value)),               // !a
+            // !s — `str(value)`. A `WStr` *is* its own `str`, so bridge its
+            // surrogates rather than going through the lossy `stringify`.
+            1 => Some(match value {
+                Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
+                _ => self.stringify(value, globals)?,
+            }),
+            2 => Some(self.repr_of(value, globals)?), // !r
+            3 => Some(ascii_repr(value)),             // !a
             _ => {
                 return Err(RuntimeError::Internal(format!(
                     "unknown f-string conversion {conversion}"
@@ -13358,8 +13481,15 @@ impl Interpreter {
         // (in bytes mode) `%b`/`%s` dispatch `__bytes__`. Other `%` operand
         // types fall through to the pure `binary_op` path.
         if matches!(op, BinOpKind::Mod) {
-            if let Object::Str(template) = a {
-                let template = template.clone();
+            if a.is_str() {
+                // Surrogate-aware printf: a `WStr` template (and any `WStr`
+                // argument resolved via `%s`) bridges its lone surrogates into
+                // the PUA window for the UTF-8 engine, then maps them back.
+                let template = match a {
+                    Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
+                    _ => a.to_str(),
+                };
+                let bridged = matches!(a, Object::WStr(_)) || percent_args_have_wstr(b);
                 let mut resolve =
                     |obj: &Object, kind: char| -> Result<Option<String>, RuntimeError> {
                         // Classes also need dispatch: a metaclass `__repr__`
@@ -13372,16 +13502,24 @@ impl Interpreter {
                                 _ => return Ok(None),
                             };
                             Ok(Some(s))
+                        } else if let Object::WStr(cps) = obj {
+                            // `%s` of a lone-surrogate string is itself; `%r`/`%a`
+                            // fall through to the (ASCII-escaping) default.
+                            match kind {
+                                's' => Ok(Some(crate::builtins::bridge_encode_cps(cps))),
+                                _ => Ok(None),
+                            }
                         } else {
                             Ok(None)
                         }
                     };
-                return Ok(Object::from_str(percent_format_with(
-                    &template,
-                    b,
-                    PercentMode::Str,
-                    &mut resolve,
-                )?));
+                let rendered =
+                    percent_format_with(&template, b, PercentMode::Str, &mut resolve)?;
+                return Ok(if bridged {
+                    crate::builtins::bridge_to_object(&rendered)
+                } else {
+                    Object::from_str(rendered)
+                });
             }
             if matches!(a, Object::Bytes(_) | Object::ByteArray(_)) {
                 return self.bytes_percent_format(a, b, globals);
@@ -15504,7 +15642,8 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         match obj {
-            Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
+            // A surrogate-bearing `WStr` is a `str` for path purposes (PEP 383).
+            Object::Str(_) | Object::WStr(_) | Object::Bytes(_) => Ok(obj.clone()),
             _ => {
                 // A type whose `__fspath__` is `None` is *explicitly* not
                 // path-like (CPython treats `__fspath__ = None` like
@@ -15524,7 +15663,7 @@ impl Interpreter {
                             Object::BoundMethod(Rc::new(BoundMethod::dispatch(obj.clone(), m)));
                         let res = self.call(&method, &[], &[], globals)?;
                         match res {
-                            Object::Str(_) | Object::Bytes(_) => Ok(res),
+                            Object::Str(_) | Object::WStr(_) | Object::Bytes(_) => Ok(res),
                             other => Err(type_error(format!(
                                 "expected {}.__fspath__() to return str or bytes, not {}",
                                 obj.type_name_owned(),
@@ -15602,6 +15741,7 @@ impl Interpreter {
             Object::List(_)
                 | Object::Tuple(_)
                 | Object::Str(_)
+                | Object::WStr(_)
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
                 | Object::Range(_)
@@ -15642,6 +15782,10 @@ impl Interpreter {
                 let idx = normalize_index(*i, chars.len())?;
                 Ok(Object::from_str(chars[idx].to_string()))
             }
+            (Object::WStr(cps), Object::Int(i)) => {
+                let idx = normalize_index(*i, cps.len())?;
+                Ok(Object::str_from_codepoints(vec![cps[idx]]))
+            }
             (Object::Dict(d), key) => {
                 crate::builtins::ensure_hashable(key)?;
                 let d = d.borrow();
@@ -15668,6 +15812,20 @@ impl Interpreter {
                 let sliced = slice_seq(&obj_chars, slc)?;
                 let s: String = sliced.iter().map(|o| o.to_str()).collect();
                 Ok(Object::from_str(s))
+            }
+            (Object::WStr(cps), Object::Slice(slc)) => {
+                // Slice over code points, then canonicalise: a slice that drops
+                // every surrogate becomes a plain `Str` again.
+                let items: Vec<Object> = cps.iter().map(|&c| Object::Int(i64::from(c))).collect();
+                let sliced = slice_seq(&items, slc)?;
+                let out: Vec<u32> = sliced
+                    .iter()
+                    .map(|o| match o {
+                        Object::Int(n) => *n as u32,
+                        _ => unreachable!("slice of int vec yields ints"),
+                    })
+                    .collect();
+                Ok(Object::str_from_codepoints(out))
             }
             (Object::Range(r), Object::Int(i)) => {
                 let len = container.len()? as i64;
@@ -17020,18 +17178,32 @@ impl Interpreter {
                     // the interpreter-aware engine so nested specs,
                     // conversions and user `__format__` all work.
                     if b.name == ".format" {
-                        let template = match args.first() {
+                        let recv = args.first();
+                        let template = match recv {
                             Some(Object::Str(s)) => s.to_string(),
+                            // A lone-surrogate template bridges into the PUA
+                            // window so the UTF-8 engine can walk it.
+                            Some(Object::WStr(cps)) => crate::builtins::bridge_encode_cps(cps),
                             _ => return Err(type_error("str.format requires a 'str' receiver")),
                         };
                         let rest = &args[1..];
-                        return self
-                            .do_str_format(&template, rest, kwargs, outer_globals)
-                            .map(Object::from_str);
+                        // Bridging participated if the template or any argument
+                        // (positional or keyword) is a lone-surrogate string.
+                        let bridged = matches!(recv, Some(Object::WStr(_)))
+                            || rest.iter().any(|o| matches!(o, Object::WStr(_)))
+                            || kwargs.iter().any(|(_, v)| matches!(v, Object::WStr(_)));
+                        let out = self.do_str_format(&template, rest, kwargs, outer_globals)?;
+                        return Ok(if bridged {
+                            crate::builtins::bridge_to_object(&out)
+                        } else {
+                            Object::from_str(out)
+                        });
                     }
                     if b.name == ".format_map" {
-                        let template = match args.first() {
+                        let recv = args.first();
+                        let template = match recv {
                             Some(Object::Str(s)) => s.to_string(),
+                            Some(Object::WStr(cps)) => crate::builtins::bridge_encode_cps(cps),
                             _ => {
                                 return Err(type_error("str.format_map requires a 'str' receiver"))
                             }
@@ -17042,9 +17214,17 @@ impl Interpreter {
                                 return Err(type_error("format_map() argument must be a mapping"))
                             }
                         };
-                        return self
-                            .do_str_format_map(&template, &mapping, outer_globals)
-                            .map(Object::from_str);
+                        let bridged = matches!(recv, Some(Object::WStr(_)))
+                            || mapping
+                                .borrow()
+                                .iter()
+                                .any(|(_, v)| matches!(v, Object::WStr(_)));
+                        let out = self.do_str_format_map(&template, &mapping, outer_globals)?;
+                        return Ok(if bridged {
+                            crate::builtins::bridge_to_object(&out)
+                        } else {
+                            Object::from_str(out)
+                        });
                     }
                     // Global `format(value[, spec])` builtin — dispatches to
                     // `value.__format__(spec)` (interpreter-aware).
@@ -17054,14 +17234,18 @@ impl Interpreter {
                         }
                         let spec = match args.get(1) {
                             Some(Object::Str(s)) => s.to_string(),
+                            Some(Object::WStr(cps)) => crate::builtins::bridge_encode_cps(cps),
                             None => String::new(),
                             Some(_) => return Err(type_error("format() spec must be a string")),
                         };
-                        return Ok(Object::from_str(self.format_obj_str(
-                            &args[0],
-                            &spec,
-                            outer_globals,
-                        )?));
+                        let bridged = matches!(args.first(), Some(Object::WStr(_)))
+                            || matches!(args.get(1), Some(Object::WStr(_)));
+                        let out = self.format_obj_str(&args[0], &spec, outer_globals)?;
+                        return Ok(if bridged {
+                            crate::builtins::bridge_to_object(&out)
+                        } else {
+                            Object::from_str(out)
+                        });
                     }
                     // PathLike (`__fspath__`) coercion for the path-accepting
                     // builtins. Our Rust `open`/`os.fspath`/`os.fsdecode`/
@@ -19988,7 +20172,21 @@ impl Interpreter {
         );
         dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
         drop(dict);
-        Object::Instance(Rc::new(inst))
+        let obj = Object::Instance(Rc::new(inst));
+        // CPython makes every exception GC-tracked (`BaseException` is
+        // `Py_TPFLAGS_HAVE_GC`), so a reference cycle routed through an
+        // exception's `args` or attributes is reclaimable and weakrefs to its
+        // members clear on collection (`test_io.test_blockingioerror`:
+        // `b = BlockingIOError(1, c); c.b = b; b.c = c`). WeavePy's exceptions
+        // were untracked, so such cycles leaked. Track when the exception can
+        // actually anchor a cycle — it holds a non-atomic referent — so the
+        // overwhelmingly common atomic-only exception (`ValueError("msg")`,
+        // `KeyError('k')`, every internal `raise`) stays off the GC books,
+        // matching the container-untracking fast path used for list/dict/set.
+        if exception_holds_nonatomic(&obj) {
+            crate::gc_trace::track(obj.clone());
+        }
+        obj
     }
 
     /// Look up the existing built-in callable that mirrors `cls`'s
@@ -23553,6 +23751,29 @@ fn exception_value(instance: &Object) -> Object {
 /// the sort key is a user instance whose class defines a real Python
 /// `__lt__` (`functools.cmp_to_key`'s `K`, rich-comparable dataclasses,
 /// …). Everything else keeps the native `Object::cmp` fast path.
+/// True when a freshly-built exception instance holds at least one non-atomic
+/// referent (in `args` or a named slot) and could therefore anchor a reference
+/// cycle. Mirrors the container-untracking optimization: an exception whose
+/// every value is a scalar leaf (`ValueError("msg")`, `KeyError('k')`) can
+/// never close a cycle, so the collector skips it; one carrying an object
+/// (`OSError(1, obj)`) is tracked so the cycle is reclaimable.
+fn exception_holds_nonatomic(obj: &Object) -> bool {
+    let Object::Instance(inst) = obj else {
+        return false;
+    };
+    let Ok(dict) = inst.dict.try_borrow() else {
+        // Borrowed elsewhere (shouldn't happen on a just-built instance); err
+        // toward tracking rather than silently leaking a potential cycle.
+        return true;
+    };
+    dict.iter().any(|(_, v)| match v {
+        // `args` is always a tuple; inspect its elements so an all-scalar
+        // tuple like `("msg",)` doesn't force tracking.
+        Object::Tuple(t) => t.iter().any(|x| !crate::gc_trace::is_atomic(x)),
+        other => !crate::gc_trace::is_atomic(other),
+    })
+}
+
 /// PEP 3151 errno → `OSError` subclass dispatch. Returns the subclass type
 /// to use when *exactly* `OSError` is being instantiated with a recognised
 /// errno; otherwise returns `cls` unchanged.
@@ -23760,6 +23981,7 @@ fn supports_format_spec(value: &Object) -> bool {
     matches!(
         value,
         Object::Str(_)
+            | Object::WStr(_)
             | Object::Int(_)
             | Object::Long(_)
             | Object::Bool(_)
@@ -23955,7 +24177,13 @@ fn format_via_spec_impl(
     spec: &str,
     allow_int_precision: bool,
 ) -> Result<String, RuntimeError> {
-    let plain = value.to_str();
+    // A surrogate-bearing `WStr` bridges its lone surrogates into the PUA
+    // window so the (UTF-8-only) spec engine can pad/slice it; the Object
+    // boundary (`FormatValue`/`str.format` via `str_result`) maps them back.
+    let plain = match value {
+        Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
+        _ => value.to_str(),
+    };
     if spec.is_empty() {
         return Ok(plain);
     }
@@ -24325,6 +24553,20 @@ pub(crate) enum PercentMode {
 pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, RuntimeError> {
     let mut noop = |_: &Object, _: char| Ok(None);
     percent_format_with(template, value, PercentMode::Str, &mut noop)
+}
+
+/// `true` when a `%`-format argument pack contains a lone-surrogate string,
+/// so the result must be re-canonicalised through the PUA bridge.
+fn percent_args_have_wstr(b: &Object) -> bool {
+    match b {
+        Object::WStr(_) => true,
+        Object::Tuple(items) => items.iter().any(|x| matches!(x, Object::WStr(_))),
+        Object::Dict(d) => d
+            .borrow()
+            .iter()
+            .any(|(_, v)| matches!(v, Object::WStr(_))),
+        _ => false,
+    }
 }
 
 /// `true` for any value `%d`/`%f` accept as a real number.
@@ -26046,6 +26288,7 @@ fn constant_to_object(c: Constant) -> Object {
         Constant::Float(f) => Object::Float(f),
         Constant::Complex(real, imag) => Object::new_complex(real, imag),
         Constant::Str(s) => Object::from_str(s),
+        Constant::WStr(cps) => Object::str_from_codepoints(cps),
         Constant::Bytes(b) => Object::new_bytes(b),
         Constant::Tuple(xs) => Object::new_tuple(xs.into_iter().map(constant_to_object).collect()),
         Constant::Code(c) => Object::Code(Rc::from(*c)),
@@ -26071,6 +26314,7 @@ fn object_to_constant(o: &Object) -> Constant {
         Object::Float(f) => Constant::Float(*f),
         Object::Complex(c) => Constant::Complex(c.real, c.imag),
         Object::Str(s) => Constant::Str(s.to_string()),
+        Object::WStr(cps) => Constant::WStr(cps.to_vec()),
         Object::Bytes(b) => Constant::Bytes(b.to_vec()),
         Object::Tuple(xs) => Constant::Tuple(xs.iter().map(object_to_constant).collect()),
         Object::FrozenSet(s) => {
@@ -26165,6 +26409,31 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             out.push_str(y);
             Ok(Object::from_str(out))
         }
+        // Concatenation where at least one side carries a lone surrogate:
+        // splice the code-point sequences and canonicalise. Adjacent
+        // surrogate halves are *not* combined into an astral character
+        // (CPython keeps surrogates distinct), so the result stays a `WStr`.
+        (O::Str(_) | O::WStr(_), O::Str(_) | O::WStr(_), B::Add)
+            if matches!(a, O::WStr(_)) || matches!(b, O::WStr(_)) =>
+        {
+            let mut cps = a.str_codepoints().unwrap();
+            cps.extend_from_slice(&b.str_codepoints().unwrap());
+            Ok(Object::str_from_codepoints(cps))
+        }
+        // `wstr * n` / `n * wstr`.
+        (O::WStr(_), O::Int(n), B::Mult) | (O::Int(n), O::WStr(_), B::Mult) => {
+            let cps = if matches!(a, O::WStr(_)) {
+                a.str_codepoints().unwrap()
+            } else {
+                b.str_codepoints().unwrap()
+            };
+            let times = checked_repeat_count(cps.len(), *n, "string")?;
+            let mut out = Vec::with_capacity(cps.len().saturating_mul(times));
+            for _ in 0..times {
+                out.extend_from_slice(&cps);
+            }
+            Ok(Object::str_from_codepoints(out))
+        }
         (O::Str(x), O::Int(n), B::Mult) | (O::Int(n), O::Str(x), B::Mult) => {
             let times = checked_repeat_count(x.len(), *n, "string")?;
             let mut out = String::new();
@@ -26178,7 +26447,32 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             Ok(Object::from_str(out))
         }
-        (O::Str(template), v, B::Mod) => Ok(Object::from_str(percent_format(template, v)?)),
+        (O::Str(template), v, B::Mod) => {
+            if percent_args_have_wstr(v) {
+                let mut resolve = |obj: &Object, kind: char| match (obj, kind) {
+                    (Object::WStr(cps), 's') => {
+                        Ok(Some(crate::builtins::bridge_encode_cps(cps)))
+                    }
+                    _ => Ok(None),
+                };
+                let rendered =
+                    percent_format_with(template, v, PercentMode::Str, &mut resolve)?;
+                Ok(crate::builtins::bridge_to_object(&rendered))
+            } else {
+                Ok(Object::from_str(percent_format(template, v)?))
+            }
+        }
+        // A lone-surrogate (`WStr`) template: bridge it (and any `WStr` arg)
+        // through the PUA window, then canonicalise the rendered result.
+        (O::WStr(cps), v, B::Mod) => {
+            let template = crate::builtins::bridge_encode_cps(cps);
+            let mut resolve = |obj: &Object, kind: char| match (obj, kind) {
+                (Object::WStr(c), 's') => Ok(Some(crate::builtins::bridge_encode_cps(c))),
+                _ => Ok(None),
+            };
+            let rendered = percent_format_with(&template, v, PercentMode::Str, &mut resolve)?;
+            Ok(crate::builtins::bridge_to_object(&rendered))
+        }
         (O::Bytes(template), v, B::Mod) => {
             // PEP 461: ``bytes % args`` reuses the text ``%``-engine in
             // bytes mode over a latin-1 (raw byte → 1:1 codepoint) view,

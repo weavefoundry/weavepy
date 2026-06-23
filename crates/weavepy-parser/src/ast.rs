@@ -458,6 +458,13 @@ pub enum Constant {
     /// numeric body here.
     Complex(f64, f64),
     Str(String),
+    /// A `str` literal containing at least one lone surrogate
+    /// (U+D800..U+DFFF), which Rust's UTF-8 `String` cannot represent —
+    /// produced by `'\udxxx'`/`\uXXXX`/`\xXX`/`\N{}` escapes that resolve to a
+    /// surrogate. Stored as code points; the compiler lowers it to an
+    /// `Object::WStr` constant. Disjoint from [`Constant::Str`]: a value with
+    /// no surrogate always canonicalises back to `Str`.
+    WStr(Vec<u32>),
     Bytes(Vec<u8>),
     Tuple(Vec<Constant>),
     Ellipsis,
@@ -1540,6 +1547,23 @@ fn dump_constant(out: &mut String, c: &Constant) {
                     '\r' => out.push_str("\\r"),
                     '\t' => out.push_str("\\t"),
                     c => out.push(c),
+                }
+            }
+            out.push('\'');
+        }
+        Constant::WStr(cps) => {
+            // A str literal carrying lone surrogates; escape surrogates as
+            // `\uXXXX` and dump scalar code points like `Constant::Str`.
+            out.push('\'');
+            for &cp in cps {
+                match char::from_u32(cp) {
+                    Some('\\') => out.push_str("\\\\"),
+                    Some('\'') => out.push_str("\\'"),
+                    Some('\n') => out.push_str("\\n"),
+                    Some('\r') => out.push_str("\\r"),
+                    Some('\t') => out.push_str("\\t"),
+                    Some(c) => out.push(c),
+                    None => out.push_str(&format!("\\u{cp:04x}")),
                 }
             }
             out.push('\'');

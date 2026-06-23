@@ -1242,6 +1242,28 @@ impl GcState {
             return 0;
         }
 
+        // CPython clears weakrefs to the *entire* unreachable set
+        // (`handle_weakrefs`) BEFORE running any finalizer (`finalize_garbage`)
+        // and before resurrection handling. So a weakref watching an object a
+        // finalizer later revives stays cleared even though the object itself
+        // survives — e.g. `_pyio.FileIO.__del__` recording a
+        // `ResourceWarning(source=self)` into a live `catch_warnings` log
+        // resurrects the file, yet `weakref.ref(f)()` must read `None`
+        // (`test_io.test_garbage_collection`). Mirror that ordering: clear and
+        // queue callbacks for every unreachable object now, regardless of
+        // whether the resurrection re-mark or a finalizer keeps it alive below.
+        // (Counting still tracks only objects actually reclaimed — `dead` — so
+        // a resurrected object is uncounted but its weakref is gone, exactly as
+        // in CPython.)
+        let mut weakref_callbacks = Vec::new();
+        for h in &unreachable {
+            for (slot, cb) in crate::weakref_registry::notify_clear(h.id) {
+                if let Some(cb) = cb {
+                    weakref_callbacks.push((slot, cb));
+                }
+            }
+        }
+
         // Split the unreachable set into objects whose `__del__` hasn't run
         // yet ("deferred") and the rest. A deferred object is queued for
         // finalization and kept tracked: its finalizer (drained right after
@@ -1380,18 +1402,10 @@ impl GcState {
             }
         }
 
-        // 5a: clear weakrefs for the reclaimed objects, queueing callbacks for
-        // invocation in 5d. Deferred (possibly-resurrected) objects keep their
-        // weakrefs until a later pass confirms they're dead.
-        let mut weakref_callbacks = Vec::new();
-        for h in &dead {
-            let cleared = crate::weakref_registry::notify_clear(h.id);
-            for (slot, cb) in cleared {
-                if let Some(cb) = cb {
-                    weakref_callbacks.push((slot, cb));
-                }
-            }
-        }
+        // 5a: weakrefs for the unreachable set were already cleared above (the
+        // CPython `handle_weakrefs`-before-`finalize_garbage` ordering), so the
+        // `dead` objects' weakrefs are gone and their callbacks are already
+        // queued in `weakref_callbacks` for invocation in 5d.
 
         // 5b (RFC 0039 WS5): before tearing the dead objects down, record the
         // children they referenced *outside* this collection's candidate set.

@@ -211,19 +211,52 @@ pub fn attempt_specialize_load_global(
 pub fn attempt_specialize_store_attr(obj: &Object, name: &str) -> InlineCache {
     match obj {
         Object::Instance(inst) => {
-            if type_has_attr_override(&inst.cls()) {
+            let cls = inst.cls();
+            if type_has_attr_override(&cls) {
+                return InlineCache::Cooldown(COOLDOWN);
+            }
+            // Never specialize a name that resolves to a class-level data
+            // descriptor — a `__slots__` member, a `property`, or any
+            // object exposing `__set__`/`__delete__`. Those writes must
+            // route through the generic `STORE_ATTR` so the slot side
+            // table / property setter fires; the dict-index fast path can
+            // only service *plain* instance-dict attributes. (CPython does
+            // the same: it uses a distinct `STORE_ATTR_SLOT` for slots and
+            // refuses `STORE_ATTR_INSTANCE_VALUE` when a data descriptor
+            // shadows the name.) Without this guard a `__slots__` class
+            // whose attribute happens to share an index with the dict
+            // layout (e.g. `operator.itemgetter` built during interpreter
+            // bootstrap) silently writes slot values into `__dict__`,
+            // stranding them where the slot descriptor can't read them.
+            if name_is_data_descriptor(&cls, name) {
                 return InlineCache::Cooldown(COOLDOWN);
             }
             let dict = inst.dict.borrow();
             if let Some(idx) = dict.index_of_key_str(name) {
                 return InlineCache::StoreAttrInstance {
-                    type_id: rc_id(&inst.cls()),
+                    type_id: rc_id(&cls),
                     key_idx: idx,
                 };
             }
             InlineCache::Cooldown(COOLDOWN)
         }
         _ => InlineCache::Cooldown(COOLDOWN),
+    }
+}
+
+/// True when `name` resolves to a class-level *data descriptor* on
+/// `ty`'s MRO: a `__slots__` member, a `property`, or any user
+/// descriptor exposing `__set__`/`__delete__`. Such names own their
+/// storage (slot side table / setter) and must not be serviced by the
+/// instance-dict-index `STORE_ATTR` fast path.
+fn name_is_data_descriptor(ty: &Rc<TypeObject>, name: &str) -> bool {
+    match ty.lookup(name) {
+        Some(Object::SlotDescriptor(_) | Object::Property(_)) => true,
+        Some(Object::Instance(desc)) => {
+            let dcls = desc.cls();
+            dcls.lookup("__set__").is_some() || dcls.lookup("__delete__").is_some()
+        }
+        _ => false,
     }
 }
 

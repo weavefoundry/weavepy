@@ -337,6 +337,14 @@ fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
         // interpreter init), so even scripts that never `import signal` raise
         // KeyboardInterrupt on ^C instead of being killed by the kernel default.
         weavepy::vm::stdlib::signal_mod::install_startup_dispositions();
+        // Snapshot the OS-thread count *now* — on the VM thread, before any
+        // user code can spawn `threading` workers or raw pthreads — so that a
+        // later `os.fork()` can tell "single-threaded" (no warning) from
+        // "multi-threaded" (CPython's fork `DeprecationWarning`). WeavePy runs
+        // the interpreter off the parked process-initial thread, so the
+        // quiescent process already has >1 OS thread; this baseline is what the
+        // fork-warning check measures additional threads against.
+        weavepy::vm::stdlib::os_process::capture_thread_baseline();
         entry()
     };
 
@@ -352,6 +360,7 @@ fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
         Err(_) => {
             weavepy::vm::stdlib::signal_mod::unblock_async_signals_current_thread();
             weavepy::vm::stdlib::signal_mod::install_startup_dispositions();
+            weavepy::vm::stdlib::os_process::capture_thread_baseline();
             entry()
         }
     }

@@ -1693,6 +1693,13 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                     // live on this thread; the GIL keeps access exclusive.
                     let interp = unsafe { &mut *ptr };
                     interp.generic_setattr_instance(inst, &args[0], &name, args[2].clone())?;
+                } else if matches!(inst.cls().lookup(&name), Some(Object::SlotDescriptor(_))) {
+                    // No VM frame on this thread (e.g. a bare C-API embed):
+                    // we can't run a Python property setter, but a
+                    // `__slots__` member is pure-native and must still land
+                    // in the slot side table — never the instance `__dict__`,
+                    // where the slot descriptor would not find it.
+                    inst.slot_set(&name, args[2].clone());
                 } else {
                     inst.dict
                         .borrow_mut()
@@ -1736,11 +1743,15 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                     interp.generic_delattr_instance(inst, &args[0], &name)?;
                     return Ok(Object::None);
                 }
-                let removed = inst
-                    .dict
-                    .borrow_mut()
-                    .shift_remove(&DictKey(Object::from_str(&name)))
-                    .is_some();
+                // No VM frame: a `__slots__` member lives in the side table,
+                // so try it before the instance `__dict__` (mirrors the
+                // slot-aware `object.__setattr__` fallback above).
+                let removed = inst.slot_del(&name)
+                    || inst
+                        .dict
+                        .borrow_mut()
+                        .shift_remove(&DictKey(Object::from_str(&name)))
+                        .is_some();
                 if !removed {
                     return Err(crate::error::attribute_error(format!(
                         "'{}' object has no attribute '{}'",

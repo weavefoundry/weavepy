@@ -968,6 +968,17 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/codecs.py"),
             is_package: false,
         },
+        // RFC 0040 WS7 — the JIS X 0213:2004 `euc_jis_2004` CJK codec, ported
+        // faithfully (incl. its 25 stateful combining sequences) so the codec's
+        // incremental *encoder* is stateful — exercised by
+        // `test_io.test_seek_with_encoder_state`. Loaded lazily by
+        // `codecs._lookup_uncached` (its 70 KB of packed tables stay cold until
+        // the encoding is first used).
+        FrozenSource {
+            name: "_codec_euc_jis_2004",
+            source: include_str!("python/_codec_euc_jis_2004.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "weakref",
             source: include_str!("python/weakref.py"),
