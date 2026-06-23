@@ -819,6 +819,14 @@ fn run_module(
             .with_context(|| format!("failed to read {}", source_path.display()))?;
         let filename = source_path.display().to_string();
         let source = decode_script_source(&bytes, &filename);
+        // CPython's `python -m mod` runs through `runpy._run_module_as_main`,
+        // which sets `sys.argv[0]` to the module's resolved *file path*, not the
+        // bare module name. Programs derive identity from it — e.g. argparse's
+        // default `prog` is `os.path.basename(sys.argv[0])`, so `-m calendar -h`
+        // must report `calendar.py`, not `calendar`. Mirror that here on the
+        // single-file fast path (the `runpy` path below already does so via
+        // `alter_sys=True`).
+        argv[0] = filename.clone();
         let opts = RunOptions::new(filename.clone())
             .with_argv(argv)
             .with_extra_path(extra_path.to_vec())

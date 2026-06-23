@@ -22,6 +22,7 @@ pub mod codecs_mod;
 pub mod csv_mod;
 pub mod datetime_mod;
 pub mod errno_mod;
+pub mod faulthandler_mod;
 pub mod fcntl_mod;
 pub mod functools_mod;
 pub mod gc_mod;
@@ -102,6 +103,12 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("time", time::build);
     cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
+    // RFC 0040 WS6 — CPython's C `faulthandler`. Its private crash
+    // primitives (`_sigsegv`, `_sigabrt`, …) are what
+    // `test_concurrent_futures.test_deadlock` fires inside pool workers to
+    // verify `BrokenProcessPool` recovery; without the module those cases
+    // hung until `LONG_TIMEOUT`.
+    cache.register_builtin("faulthandler", faulthandler_mod::build);
     cache.register_builtin("_testinternalcapi", testinternalcapi_mod::build);
     // RFC 0040 WS4 — the native core is `_signal`; the frozen `signal.py`
     // (CPython's) layers the `Signals`/`Handlers`/`Sigmasks` IntEnums and

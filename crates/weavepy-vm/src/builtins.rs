@@ -3469,6 +3469,18 @@ pub(crate) fn b_int_compat(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
         Object::Str(s) => parse_int_string(&args[0], s, &args[1..]),
+        // A WTF-8 `str` (lone surrogates, stored as code points): decode to
+        // text with each lone surrogate rendered as U+FFFD, which is not a
+        // digit, so parsing fails with `ValueError` — and the error's `repr`
+        // is taken from the original `WStr` (so it shows `'1\ud800'`), exactly
+        // like CPython, rather than the `TypeError` of the non-string fallback.
+        Object::WStr(cps) => {
+            let text: String = cps
+                .iter()
+                .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                .collect();
+            parse_int_string(&args[0], &text, &args[1..])
+        }
         // bytes-like: each byte maps to one Latin-1 code point so non-ASCII
         // bytes (and embedded NULs) become non-digit characters that fail to
         // parse — with the original `b'…'` repr in the error, like CPython.
@@ -4443,12 +4455,24 @@ fn b_float(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Object::Bool(b) => Ok(Object::Float(f64::from(*b))),
         Object::Float(f) => Ok(Object::Float(*f)),
-        Object::Str(_) | Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {
+        Object::Str(_)
+        | Object::WStr(_)
+        | Object::Bytes(_)
+        | Object::ByteArray(_)
+        | Object::MemoryView(_) => {
             // str / bytes-like: bytes-like buffers are decoded as ASCII-ish
             // text; non-UTF-8 input simply fails to parse (CPython raises the
-            // same ValueError).
+            // same ValueError). A WTF-8 `str` (lone surrogates) decodes with
+            // each surrogate as U+FFFD, which never parses as a float, so
+            // `float('\ud8f0')` raises `ValueError` (repr from the original
+            // `WStr`) instead of the non-string `TypeError`.
             let text: Option<String> = match &args[0] {
                 Object::Str(s) => Some(s.to_string()),
+                Object::WStr(cps) => Some(
+                    cps.iter()
+                        .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                        .collect(),
+                ),
                 Object::Bytes(b) => String::from_utf8(b.to_vec()).ok(),
                 Object::ByteArray(b) => String::from_utf8(b.borrow().to_vec()).ok(),
                 Object::MemoryView(mv) => String::from_utf8(mv.to_bytes()).ok(),
@@ -4582,15 +4606,27 @@ pub(crate) fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
     // sole argument; a string `imag` is never valid. Both checks precede the
     // numeric coercion (so e.g. `complex({}, '1')` reports the string, not the
     // dict).
-    if let Object::Str(s) = &args[0] {
+    // A WTF-8 `str` (lone surrogates, stored as `WStr`) counts as a string
+    // here just like `Str`: `complex('\ud800')` is a malformed-string
+    // `ValueError`, not a `TypeError`, matching CPython.
+    let str_first: Option<String> = match &args[0] {
+        Object::Str(s) => Some(s.to_string()),
+        Object::WStr(cps) => Some(
+            cps.iter()
+                .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                .collect(),
+        ),
+        _ => None,
+    };
+    if let Some(s) = str_first {
         if has_second {
             return Err(type_error(
                 "complex() can't take second arg if first is a string",
             ));
         }
-        return parse_complex_string(s).map(|(r, i)| Object::new_complex(r, i));
+        return parse_complex_string(&s).map(|(r, i)| Object::new_complex(r, i));
     }
-    if has_second && matches!(&args[1], Object::Str(_)) {
+    if has_second && matches!(&args[1], Object::Str(_) | Object::WStr(_)) {
         return Err(type_error("complex() second arg can't be a string"));
     }
     let real = match &args[0] {

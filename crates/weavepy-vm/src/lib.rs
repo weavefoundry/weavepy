@@ -1406,19 +1406,54 @@ impl Interpreter {
     /// a receiver still bound elsewhere (the overwhelmingly common `self`)
     /// fails the `strong_count` pre-check without touching the GC's maps.
     fn reap_call_receiver(&mut self, callable: Object) {
-        let recv = match &callable {
-            Object::BoundMethod(bm) => bm.receiver.clone(),
-            _ => return,
-        };
-        // End the borrow and release the BoundMethod's hold on the receiver
-        // so `strong_count` reflects only real bindings + the GC handle.
-        drop(callable);
-        // `recv` (1) + the GC's tracking handle (<=1) + any weakref clones is
-        // the fingerprint of a dead temporary; anything larger means a live
-        // binding still holds it. The authoritative refcount/weakref test
-        // lives in `prompt_reap_dropped`; this is just a cheap pre-filter.
-        if Self::local_needs_prompt_reap(&recv) && Self::looks_reapable_temporary(&recv) {
-            self.prompt_reap_dropped(recv);
+        match &callable {
+            Object::BoundMethod(bm) => {
+                let recv = bm.receiver.clone();
+                // End the borrow and release the BoundMethod's hold on the
+                // receiver so `strong_count` reflects only real bindings + the
+                // GC handle.
+                drop(callable);
+                // `recv` (1) + the GC's tracking handle (<=1) + any weakref
+                // clones is the fingerprint of a dead temporary; anything
+                // larger means a live binding still holds it. The
+                // authoritative refcount/weakref test lives in
+                // `prompt_reap_dropped`; this is just a cheap pre-filter.
+                if Self::local_needs_prompt_reap(&recv) && Self::looks_reapable_temporary(&recv) {
+                    self.prompt_reap_dropped(recv);
+                }
+            }
+            // A *function* built as a call temporary — the canonical case is a
+            // comprehension's anonymous `<listcomp>`/`<setcomp>`/`<dictcomp>`/
+            // `<genexpr>`, emitted by `MakeFunction` and consumed by the very
+            // next `Call` — is GC-tracked when it captures cells (its closure).
+            // A plain `Rc` drop then leaves it pinned by its own GC handle,
+            // still holding those cells and, through them, the enclosing locals
+            // it closed over (e.g. `self` in `[self.submit(x) for x in it]`,
+            // promoted to a cell). That defers the finalization of anything
+            // uniquely reachable through the capture until the next cyclic
+            // collection. RFC 0040: `ThreadPoolExecutor.map`'s `result_iterator`
+            // closes over the list comprehension's `self`, so each `map` call
+            // leaked one reference to the executor — `del executor` then never
+            // dropped its refcount to zero, so the weakref callback that wakes
+            // idle workers never fired and `test_concurrent_futures`
+            // `test_del_shutdown` (and the other prompt-finalization shutdown
+            // cases) hung. Route a uniquely-held (non-escaped) function through
+            // the same cascade the frame-exit locals sweep uses for
+            // closure-function *locals*, so its cells — and any finalizable they
+            // uniquely hold — are released now, matching CPython's refcount
+            // timing. A function still bound elsewhere (a global `foo` in
+            // `foo()`, an escaped/returned closure) keeps `strong_count` above
+            // the dead threshold and fails the cheap pre-filter untouched, so
+            // the hot path of ordinary named-function calls pays only a single
+            // `strong_count` read. `prompt_reap_dropped` early-returns for an
+            // untracked function (no cells to leak), so it is reclaimed by the
+            // ordinary `Rc` drop of `callable` here.
+            Object::Function(_) => {
+                if Self::looks_reapable_temporary(&callable) {
+                    self.prompt_reap_dropped(callable);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -8933,6 +8968,11 @@ impl Interpreter {
             | Object::Bool(_)
             | Object::Float(_)
             | Object::Str(_)
+            // A WTF-8 `str` (one holding lone surrogates, stored as `WStr`) is
+            // still a `str`: `int('1\ud800')` must parse its text and raise
+            // `ValueError`, exactly like CPython, not the `TypeError` the
+            // non-string fallback below would give.
+            | Object::WStr(_)
             | Object::Bytes(_)
             | Object::ByteArray(_) => builtins::b_int_compat(args),
             // `int(buffer)` parses the buffer's bytes as an int literal
@@ -9101,6 +9141,10 @@ impl Interpreter {
             | Object::Bool(_)
             | Object::Float(_)
             | Object::Str(_)
+            // A WTF-8 `str` (lone surrogates, stored as `WStr`) is still a
+            // `str`: `float('\ud8f0')` must parse its text and raise
+            // `ValueError`, not the non-string `TypeError` below.
+            | Object::WStr(_)
             | Object::Bytes(_)
             | Object::ByteArray(_) => builtins::b_float_compat(args),
             Object::MemoryView(_) => builtins::b_float_compat(args),
