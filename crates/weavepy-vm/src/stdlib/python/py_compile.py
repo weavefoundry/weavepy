@@ -34,14 +34,21 @@ class PyCompileError(Exception):
 
 
 def _cache_from_source(path, optimization=""):
+    import sys
     head, tail = os.path.split(path)
     if tail.endswith(".py"):
         tail = tail[:-3]
     suffix = "" if not optimization else ".opt-" + str(optimization)
     cache_dir = os.path.join(head, "__pycache__")
-    # The cache tag mirrors `sys.implementation.cache_tag` (no dot — see
-    # `importlib.util.source_from_cache`), distinct from CPython's.
-    return os.path.join(cache_dir, "%s.weavepy-313%s.pyc" % (tail, suffix))
+    # The cache tag must mirror `sys.implementation.cache_tag` *exactly* (it is
+    # bumped whenever the bytecode/marshal format changes — e.g. `weavepy-313-2`
+    # for the WTF-8 arc — to invalidate stale `.pyc`s). Hardcoding the tag here
+    # silently desynchronised `py_compile` from `importlib.util.cache_from_source`
+    # after such a bump, so the `.pyc` was written under the old name and any
+    # consumer keying off the current tag (e.g. `test.support.make_legacy_pyc`)
+    # raised `FileNotFoundError`. Read it dynamically instead.
+    tag = getattr(sys.implementation, "cache_tag", None) or "weavepy-313"
+    return os.path.join(cache_dir, "%s.%s%s.pyc" % (tail, tag, suffix))
 
 
 def cache_from_source(path, optimization=""):

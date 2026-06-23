@@ -1499,7 +1499,7 @@ impl<'src> Parser<'src> {
             });
         }
         self.bump();
-        let pattern = self.parse_pattern()?;
+        let pattern = self.parse_patterns()?;
         let guard = if self.at_keyword(Keyword::If) {
             self.bump();
             Some(self.parse_expression(false)?)
@@ -1515,6 +1515,29 @@ impl<'src> Parser<'src> {
             body,
             span: case_tok.span.merge(span_end),
         })
+    }
+
+    /// A case clause's patterns: CPython's `patterns` rule, which is an
+    /// `open_sequence_pattern` (`maybe_star_pattern ',' …`) *or* a single
+    /// `pattern`. The bracket-less, comma-separated form — `case 0, *x:` or
+    /// `case a, b:` — is a sequence pattern exactly like `case (0, *x):`; a
+    /// lone trailing comma (`case x,:`) is still a one-element sequence. Only a
+    /// top-level comma (not one inside `[...]`/`(...)`) triggers this, so a
+    /// plain `case 0:` stays a value pattern.
+    fn parse_patterns(&mut self) -> Result<Pattern, ParseError> {
+        let first = self.parse_pattern()?;
+        if !self.check(&TokenKind::Comma) {
+            return Ok(first);
+        }
+        let mut items = vec![first];
+        while self.eat(&TokenKind::Comma) {
+            // A trailing comma before the guard/colon ends the sequence.
+            if self.check(&TokenKind::Colon) || self.at_keyword(Keyword::If) {
+                break;
+            }
+            items.push(self.parse_pattern()?);
+        }
+        Ok(Pattern::Sequence(items))
     }
 
     /// Top-level pattern: `or_pattern ('as' NAME)?`.

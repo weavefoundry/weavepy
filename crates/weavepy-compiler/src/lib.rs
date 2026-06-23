@@ -1880,15 +1880,23 @@ impl Compiler {
             self.emit(OpCode::CopyTop, 0);
             match pat {
                 Pattern::Star(name) => {
-                    let tail = items.len() - i - 1;
-                    self.emit_pattern_subscript_slice(i, tail);
                     if let Some(n) = name {
+                        let tail = items.len() - i - 1;
+                        self.emit_pattern_subscript_slice(i, tail);
+                        // A `*name` capture must always bind a `list`, even when the
+                        // matched subject is a `tuple` (PEP 634 / `UNPACK_EX`
+                        // semantics). Slicing a tuple subject yields a tuple, so the
+                        // slice is re-boxed into a fresh list here.
+                        self.wrap_tos_in_list();
                         let name_expr = Expr {
                             kind: ExprKind::Name(n.clone()),
                             span: weavepy_lexer::Span::new(0, 0),
                         };
                         self.compile_assign(&name_expr)?;
                     } else {
+                        // Anonymous `*_` binds nothing; just drop the working copy of
+                        // the subject pushed by the enclosing `CopyTop` (no slice
+                        // needed, matching CPython, which never materialises it).
                         self.emit(OpCode::PopTop, 0);
                     }
                 }
@@ -1911,6 +1919,27 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Re-box the iterable on top of the stack into a fresh `list`,
+    /// leaving `list(TOS)` in its place. Used by `*name` sequence-pattern
+    /// captures, which must always bind a `list` even for tuple subjects.
+    ///
+    /// Implemented with the `list.extend` idiom over pure stack ops so it
+    /// never depends on the `list` builtin name (which user code may
+    /// shadow). Stack walk (top on the right):
+    /// `[it] → BuildList → [it, L] → CopyTop → [it, L, L] →
+    ///  LoadAttr extend → [it, L, L.extend] → Swap 2 → [it, L.extend, L]
+    ///  → Swap 3 → [L, L.extend, it] → Call 1 → [L, None] → PopTop → [L]`.
+    fn wrap_tos_in_list(&mut self) {
+        self.emit(OpCode::BuildList, 0);
+        self.emit(OpCode::CopyTop, 0);
+        let extend = self.co.intern_name("extend");
+        self.emit(OpCode::LoadAttr, extend);
+        self.emit(OpCode::Swap, 2);
+        self.emit(OpCode::Swap, 3);
+        self.emit(OpCode::Call, 1);
+        self.emit(OpCode::PopTop, 0);
     }
 
     /// Emit a slice subscription `subject[head:len-tail]` for a `*name`
