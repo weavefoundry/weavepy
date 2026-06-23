@@ -418,9 +418,13 @@ impl<'src> Parser<'src> {
             | Some(TokenKind::DoubleStarEqual)
             | Some(TokenKind::AtEqual)
             | Some(TokenKind::ColonEqual)
-            | Some(TokenKind::Dot)
-            | Some(TokenKind::LPar)
-            | Some(TokenKind::LSqb) => return false,
+            | Some(TokenKind::Dot) => return false,
+            // NB: `(` and `[` are *not* early-rejected — `match (subject):` and
+            // `match [a, b]:` (parenthesised / list subjects, incl. the empty
+            // tuple `match ():`) are valid match statements. The depth-aware
+            // scan below disambiguates them from a `match(...)` call or a
+            // `match[...]: T` annotation by requiring a depth-0 `:` followed by
+            // NEWLINE INDENT `case`.
             None => return false,
             _ => {}
         }
@@ -1000,7 +1004,7 @@ impl<'src> Parser<'src> {
                     let n = self.bump();
                     args.vararg = Some(Arg {
                         name: self.ident(n.span),
-                        annotation: self.try_arg_annotation(allow_annotation)?,
+                        annotation: self.try_arg_annotation(allow_annotation, true)?,
                         span: n.span,
                     });
                 } else {
@@ -1017,7 +1021,7 @@ impl<'src> Parser<'src> {
                 let n = self.expect(&TokenKind::Name, "kwarg name")?;
                 args.kwarg = Some(Arg {
                     name: self.ident(n.span),
-                    annotation: self.try_arg_annotation(allow_annotation)?,
+                    annotation: self.try_arg_annotation(allow_annotation, false)?,
                     span: n.span,
                 });
                 if !self.eat(&TokenKind::Comma) {
@@ -1037,7 +1041,7 @@ impl<'src> Parser<'src> {
 
             let n = self.expect(&TokenKind::Name, "parameter name")?;
             let name = self.ident(n.span);
-            let annotation = self.try_arg_annotation(allow_annotation)?;
+            let annotation = self.try_arg_annotation(allow_annotation, false)?;
             let default = if self.eat(&TokenKind::Equal) {
                 Some(self.parse_expression(false)?)
             } else {
@@ -1103,8 +1107,26 @@ impl<'src> Parser<'src> {
         Ok(args)
     }
 
-    fn try_arg_annotation(&mut self, allow: bool) -> Result<Option<Box<Expr>>, ParseError> {
+    fn try_arg_annotation(
+        &mut self,
+        allow: bool,
+        star_ok: bool,
+    ) -> Result<Option<Box<Expr>>, ParseError> {
         if allow && self.eat(&TokenKind::Colon) {
+            // PEP 646: a `*args` parameter may carry an unpacked annotation —
+            // `def f(*args: *Ts)`, `*args: *tuple[int, ...]`. Only the vararg
+            // position permits this (`star_ok`); the compiler lowers the
+            // `Starred` to `(*X,)[0]`, i.e. `Unpack[X]`.
+            if star_ok && self.check(&TokenKind::Star) {
+                let star_span = self.peek_token().span;
+                self.bump();
+                let inner = self.parse_expression(false)?;
+                let span = star_span.merge(inner.span);
+                return Ok(Some(Box::new(Expr {
+                    kind: ExprKind::Starred(Box::new(inner)),
+                    span,
+                })));
+            }
             Ok(Some(Box::new(self.parse_expression(false)?)))
         } else {
             Ok(None)
@@ -1599,6 +1621,60 @@ impl<'src> Parser<'src> {
     /// pattern. Restricted to numbers, strings, and unary `-` on
     /// numerics — matching PEP 634.
     fn parse_literal_pattern_expr(&mut self) -> Result<Expr, ParseError> {
+        let left = self.parse_signed_number_or_atom_pattern()?;
+        // PEP 634 complex-number literal pattern: a signed real number summed
+        // with (or differenced from) an imaginary number — `case 1 + 2j`,
+        // `case -3 - 4j`, `case 0 + 0j`. Only a *numeric* left-hand side
+        // begins one, so strings/singletons are returned untouched.
+        let left_is_number = matches!(
+            left.kind,
+            ExprKind::Constant(
+                Constant::Int(_)
+                    | Constant::Float(_)
+                    | Constant::BigInt(_)
+                    | Constant::Complex(..)
+            )
+        );
+        if left_is_number && matches!(self.peek(), TokenKind::Plus | TokenKind::Minus) {
+            let op_tok = self.bump();
+            let op = if matches!(op_tok.kind, TokenKind::Plus) {
+                BinOp::Add
+            } else {
+                BinOp::Sub
+            };
+            let num = self.peek_token().clone();
+            if !matches!(num.kind, TokenKind::Number) {
+                return Err(ParseError::Unexpected {
+                    span: num.span,
+                    message: "expected an imaginary number in complex literal pattern".to_owned(),
+                });
+            }
+            self.bump();
+            let value = parse_number(self.lexeme(num.span)).map_err(|m| ParseError::Unexpected {
+                span: num.span,
+                message: m,
+            })?;
+            let right = Expr {
+                kind: ExprKind::Constant(value),
+                span: num.span,
+            };
+            let span = left.span.merge(num.span);
+            return Ok(Expr {
+                kind: ExprKind::BinOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                },
+                span,
+            });
+        }
+        Ok(left)
+    }
+
+    /// The `signed_number | atom` core of a literal pattern (a negative
+    /// numeric literal, or a plain number/string/etc.). Used on its own and
+    /// as the left operand of a complex-number literal pattern.
+    fn parse_signed_number_or_atom_pattern(&mut self) -> Result<Expr, ParseError> {
         if self.check(&TokenKind::Minus) {
             let minus = self.bump();
             let tok = self.peek_token().clone();
@@ -2647,6 +2723,17 @@ impl<'src> Parser<'src> {
         // loop after this call returns.
         let first = self.parse_subscript_single()?;
         if !self.check(&TokenKind::Comma) {
+            // PEP 646: a lone starred element still forms a one-element tuple
+            // index — `a[*b]` is `a[(*b,)]` (CPython parses the slice as
+            // `Tuple(elts=[Starred(b)])`). Wrapping it here lets the existing
+            // starred-tuple codegen build the index with unpacking.
+            if matches!(first.kind, ExprKind::Starred(_)) {
+                let span = first.span;
+                return Ok(Expr {
+                    kind: ExprKind::Tuple(vec![first]),
+                    span,
+                });
+            }
             return Ok(first);
         }
         // Multi-element subscript: collect into a tuple. Used by
@@ -2670,6 +2757,19 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_subscript_single(&mut self) -> Result<Expr, ParseError> {
+        // PEP 646: a subscript element may be a starred expression —
+        // `tuple[int, *Ts]`, `A[float, *tuple[int, ...]]`. A star can't begin a
+        // slice, so parse the unpacked expression and stop; the surrounding
+        // index tuple is built with unpacking by the compiler.
+        if self.check(&TokenKind::Star) {
+            let span = self.peek_token().span;
+            self.bump();
+            let value = self.parse_ternary()?;
+            return Ok(Expr {
+                kind: ExprKind::Starred(Box::new(value)),
+                span,
+            });
+        }
         // Slice grammar: `lower? ':' upper? (':' step?)?` or plain expr.
         if self.check(&TokenKind::Colon) {
             self.bump();

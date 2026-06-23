@@ -16,10 +16,13 @@ What works:
   :func:`get_origin`, :func:`get_args`
 - :class:`Protocol` (structural via ``runtime_checkable``)
 
-What we do *not* implement: PEP 695 syntax, ``TypeAlias``-style
-runtime enforcement, ``ParamSpec``/``TypeVarTuple`` semantics
-(they're present as no-op markers), and bound checking on
-``TypeVar``.
+``TypeVarTuple`` implements PEP 646 iteration (``iter(Ts)`` yields
+``Unpack[Ts]`` once), enough for ``tuple[int, *Ts]`` index tuples and
+``*args: *Ts`` annotations to evaluate.
+
+What we do *not* implement: ``TypeAlias``-style runtime enforcement,
+the remaining ``ParamSpec``/``TypeVarTuple`` semantics (variance,
+substitution), and bound checking on ``TypeVar``.
 """
 
 
@@ -149,7 +152,14 @@ class ParamSpec(TypeVar):
 
 
 class TypeVarTuple(TypeVar):
-    pass
+    # PEP 646: iterating a ``TypeVarTuple`` yields its unpacked form exactly
+    # once — ``Unpack[self]`` (a.k.a. ``*Ts``). This is what lets ``*Ts``
+    # appear inside an index tuple (``tuple[int, *Ts]`` builds ``(int, *Ts)``
+    # by unpacking ``Ts``) and as a ``*args: *Ts`` annotation (the compiler
+    # lowers it to a one-element ``UNPACK_SEQUENCE``). Mirrors CPython's
+    # ``typevartuple_iter`` in ``Objects/typevarobject.c``.
+    def __iter__(self):
+        yield Unpack[self]
 
 
 # ---- generic alias ----------------------------------------------------------

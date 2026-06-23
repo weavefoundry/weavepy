@@ -405,6 +405,22 @@ pub fn utf8_mode() -> bool {
     UTF8_MODE.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// PEP 597 `-X warn_default_encoding` / `PYTHONWARNDEFAULTENCODING`. When set,
+/// the native `io.open` / `io.text_encoding` text paths emit an
+/// `EncodingWarning` for an implicit (locale) encoding, mirroring CPython's
+/// `_PyInterpreterState_GetConfig(interp)->warn_default_encoding` gate. Cached
+/// here so Rust call sites avoid reading `sys.flags` on every open.
+static WARN_DEFAULT_ENCODING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_warn_default_encoding(value: bool) {
+    WARN_DEFAULT_ENCODING.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn warn_default_encoding() -> bool {
+    WARN_DEFAULT_ENCODING.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Publish `interp` as the live VM pointer for the duration of
 /// the returned guard. Re-entrant calls produce a stack so the
 /// most recent guard wins on `current_interpreter_ptr` lookups.

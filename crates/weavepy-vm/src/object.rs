@@ -1176,34 +1176,58 @@ fn service_pending_signals_io() -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Write all of `data` to a raw descriptor, looping over partial writes and
-/// honouring PEP 475: release the GIL across each (possibly blocking)
+/// Drain `pending` to a raw descriptor, removing the written prefix in place,
+/// and honouring PEP 475: release the GIL across each (possibly blocking)
 /// `write(2)` so peers run, and on `EINTR` run any tripped Python signal
 /// handler before retrying. A `SIGALRM` handler that raises then abandons a
 /// write blocked on a full pipe instead of looping forever — exactly what
 /// `test_io`'s `SignalsTest.test_interrupted_write_buffered` exercises (a
-/// buffered flush is one big `write` to a saturated pipe). The descriptor is
-/// borrowed, not owned, so the backing `File` must outlive the call.
+/// buffered flush is one big `write` to a saturated pipe).
+///
+/// On a non-blocking would-block (`EAGAIN`/`EWOULDBLOCK`) it stops, leaves the
+/// unwritten remainder in `pending`, and returns the canonical
+/// `BlockingIOError(EAGAIN, …, 0)`; the caller restores the remainder and
+/// reports `characters_written` (`_pyio.BufferedWriter._flush_unlocked` →
+/// `BufferedWriter.write`, `test_io.test_nonblock_pipe_write_*`). The written
+/// prefix is always drained from `pending` first — including when a signal
+/// handler raises mid-flush — so the remainder is never double-written. The
+/// descriptor is borrowed, not owned, so the backing `File` must outlive it.
 #[cfg(unix)]
-fn write_all_fd_intr(fd: std::os::unix::io::RawFd, data: &[u8]) -> Result<(), RuntimeError> {
+fn write_drain_fd_intr(
+    fd: std::os::unix::io::RawFd,
+    pending: &mut Vec<u8>,
+) -> Result<(), RuntimeError> {
     let mut off = 0usize;
-    while off < data.len() {
-        let chunk = &data[off..];
+    let res = loop {
+        if off >= pending.len() {
+            break Ok(());
+        }
+        let chunk = &pending[off..];
         let r = crate::gil::allow_threads_then(|| unsafe {
             libc::write(fd, chunk.as_ptr().cast(), chunk.len())
         });
         if r < 0 {
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                service_pending_signals_io()?;
+            let code = err.raw_os_error();
+            if code == Some(libc::EINTR) {
+                if let Err(e) = service_pending_signals_io() {
+                    break Err(e);
+                }
                 continue;
             }
-            return Err(crate::error::io_error_to_py(&err));
+            if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
+                break Err(crate::error::blocking_io_error_written(
+                    libc::EAGAIN,
+                    "write could not complete without blocking",
+                    0,
+                ));
+            }
+            break Err(crate::error::io_error_to_py(&err));
         }
-        // A 0-length `write` only happens for empty `chunk`, which the loop
+        // A 0-length `write` only happens for an empty `chunk`, which the loop
         // guard already excludes; treat a defensive 0 as completion.
         if r == 0 {
-            break;
+            break Ok(());
         }
         off += r as usize;
         // Run pending Python signal handlers after *every* partial write, not
@@ -1214,9 +1238,134 @@ fn write_all_fd_intr(fd: std::os::unix::io::RawFd, data: &[u8]) -> Result<(), Ru
         // (`1/0`) surfaces here instead of re-blocking on the full pipe
         // forever. A handler that raises returns its error and abandons the
         // remaining write, exactly like CPython's buffered-writer flush.
-        service_pending_signals_io()?;
+        if let Err(e) = service_pending_signals_io() {
+            break Err(e);
+        }
+    };
+    pending.drain(..off.min(pending.len()));
+    res
+}
+
+/// EAGAIN value to default to when a `BlockingIOError` lacks an explicit
+/// `errno` (it never should — the flush always sets it — but be defensive).
+#[cfg(unix)]
+const EAGAIN_FALLBACK: i32 = libc::EAGAIN;
+#[cfg(not(unix))]
+const EAGAIN_FALLBACK: i32 = 11;
+
+/// True when `err` is a `BlockingIOError` instance (so the buffered-writer
+/// `write` can mirror `_pyio.BufferedWriter.write`'s `except BlockingIOError`
+/// partial-write accounting).
+fn runtime_err_is_blocking(err: &RuntimeError) -> bool {
+    if let RuntimeError::PyException(pe) = err {
+        if let Object::Instance(inst) = &pe.instance {
+            return inst
+                .cls()
+                .is_subclass_of(&crate::builtin_types::builtin_types().blocking_io_error);
+        }
     }
-    Ok(())
+    false
+}
+
+/// Read `e.errno` / `e.strerror` off a `BlockingIOError` so a re-raised
+/// 3-arg `BlockingIOError(errno, strerror, characters_written)` preserves them.
+fn runtime_err_eagain_info(err: &RuntimeError) -> (i32, String) {
+    if let RuntimeError::PyException(pe) = err {
+        if let Object::Instance(inst) = &pe.instance {
+            let dict = inst.dict.borrow();
+            let errno = dict
+                .get(&DictKey(Object::from_static("errno")))
+                .and_then(Object::as_i64)
+                .unwrap_or(i64::from(EAGAIN_FALLBACK)) as i32;
+            let strerror = match dict.get(&DictKey(Object::from_static("strerror"))) {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => "write could not complete without blocking".to_owned(),
+            };
+            return (errno, strerror);
+        }
+    }
+    (
+        EAGAIN_FALLBACK,
+        "write could not complete without blocking".to_owned(),
+    )
+}
+
+/// Whether a descriptor is in non-blocking mode (`O_NONBLOCK`). Used to keep
+/// the common blocking-file read path untouched: only a non-blocking fd needs
+/// the would-block → `None` handling below.
+#[cfg(unix)]
+fn fd_is_nonblocking(fd: std::os::unix::io::RawFd) -> bool {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && (flags & libc::O_NONBLOCK) != 0
+}
+
+/// Read from a *non-blocking* descriptor, mapping a would-block
+/// (`EAGAIN`/`EWOULDBLOCK`) to CPython's raw-`read` semantics: `Ok(None)` when
+/// nothing could be read yet, `Ok(Some(data))` for a (possibly partial) read,
+/// and `Ok(Some(b""))` at EOF. PEP 475: a tripped signal handler runs on
+/// `EINTR` / after each chunk and may abandon the read by raising.
+/// (`test_io.test_nonblock_pipe_write_*` reads a saturated pipe to drain it,
+/// then relies on `iter(rf.read, None)` terminating on the would-block `None`.)
+#[cfg(unix)]
+fn read_fd_nonblock(
+    fd: std::os::unix::io::RawFd,
+    n: Option<usize>,
+) -> Result<Option<Vec<u8>>, RuntimeError> {
+    match n {
+        Some(want) => {
+            if want == 0 {
+                return Ok(Some(Vec::new()));
+            }
+            let mut buf = vec![0u8; want];
+            loop {
+                let r = crate::gil::allow_threads_then(|| unsafe {
+                    libc::read(fd, buf.as_mut_ptr().cast(), want)
+                });
+                if r < 0 {
+                    let err = std::io::Error::last_os_error();
+                    let code = err.raw_os_error();
+                    if code == Some(libc::EINTR) {
+                        service_pending_signals_io()?;
+                        continue;
+                    }
+                    if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
+                        return Ok(None);
+                    }
+                    return Err(os_error(format!("read: {err}")));
+                }
+                buf.truncate(r as usize);
+                return Ok(Some(buf));
+            }
+        }
+        None => {
+            // read-all: drain until EOF or would-block, returning the bytes
+            // gathered so far (or `None` if the very first read would block).
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let r = crate::gil::allow_threads_then(|| unsafe {
+                    libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len())
+                });
+                if r < 0 {
+                    let err = std::io::Error::last_os_error();
+                    let code = err.raw_os_error();
+                    if code == Some(libc::EINTR) {
+                        service_pending_signals_io()?;
+                        continue;
+                    }
+                    if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
+                        return Ok(if out.is_empty() { None } else { Some(out) });
+                    }
+                    return Err(os_error(format!("read: {err}")));
+                }
+                if r == 0 {
+                    return Ok(Some(out));
+                }
+                out.extend_from_slice(&chunk[..r as usize]);
+                service_pending_signals_io()?;
+            }
+        }
+    }
 }
 
 /// A loaded Python module: a name, an optional source filename, and
@@ -2143,7 +2292,7 @@ impl PyFile {
     /// that already exited) leaves nothing to re-flush, then surfaces the
     /// error like CPython's `BufferedWriter._flush_unlocked`.
     pub fn flush_write_buf(&self) -> Result<(), RuntimeError> {
-        let pending = {
+        let mut pending = {
             let mut wb = self.write_buf.borrow_mut();
             if wb.is_empty() {
                 return Ok(());
@@ -2164,7 +2313,22 @@ impl PyFile {
                 _ => None,
             };
             if let Some(fd) = raw_fd {
-                return write_all_fd_intr(fd, &pending);
+                let res = write_drain_fd_intr(fd, &mut pending);
+                // A partial / would-block flush (or a signal-handler raise)
+                // leaves the unwritten remainder in `pending`; put it back into
+                // `write_buf` so it isn't lost and a later flush can finish it.
+                // Re-prepend it ahead of any bytes a reentrant `write()` staged
+                // while the GIL was released during the drain.
+                if !pending.is_empty() {
+                    let mut wb = self.write_buf.borrow_mut();
+                    if wb.is_empty() {
+                        *wb = pending;
+                    } else {
+                        pending.extend_from_slice(&wb);
+                        *wb = pending;
+                    }
+                }
+                return res;
             }
         }
         let mut backend = self.backend.borrow_mut();
@@ -2747,6 +2911,31 @@ impl PyFile {
     /// Read up to `n` bytes from the backend; `None` reads everything.
     /// Returns bytes regardless of mode — the caller decides whether
     /// to wrap them as `str` (text mode) or `bytes` (binary mode).
+    /// Non-blocking-aware variant of [`PyFile::read_bytes`] for the file
+    /// `read()` method: a would-block on a non-blocking descriptor returns
+    /// `Ok(None)` (so `BufferedReader.read()` yields `None` instead of raising
+    /// `OSError(EAGAIN)`), while blocking descriptors and in-memory streams
+    /// keep the exact `read_bytes` behaviour. Only descriptor-backed streams in
+    /// `O_NONBLOCK` mode take the special path.
+    pub fn read_bytes_opt(&self, n: Option<usize>) -> Result<Option<Vec<u8>>, RuntimeError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.check_open()?;
+            self.flush_write_buf()?;
+            let raw_fd = match &*self.backend.borrow() {
+                FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                _ => None,
+            };
+            if let Some(fd) = raw_fd {
+                if fd_is_nonblocking(fd) {
+                    return read_fd_nonblock(fd, n);
+                }
+            }
+        }
+        self.read_bytes(n).map(Some)
+    }
+
     pub fn read_bytes(&self, n: Option<usize>) -> Result<Vec<u8>, RuntimeError> {
         self.check_open()?;
         // Any staged writes must reach the descriptor before a read observes
@@ -2904,14 +3093,54 @@ impl PyFile {
         // `os.close(fileno())` discards them and a flush to a broken pipe
         // raises only here / at close.
         if self.is_write_buffered() {
+            let bufsize = self.buf_size.get();
+            // Pre-flush if the buffer is already over size (a prior partial
+            // non-blocking flush left it full). A `BlockingIOError` here means
+            // none of `data` has been accepted yet, so it re-raises with
+            // `characters_written == 0` (`_pyio.BufferedWriter.write`).
+            if self.write_buf.borrow().len() > bufsize {
+                if let Err(e) = self.flush_write_buf() {
+                    if runtime_err_is_blocking(&e) {
+                        let (errno, strerror) = runtime_err_eagain_info(&e);
+                        return Err(crate::error::blocking_io_error_written(
+                            errno, &strerror, 0,
+                        ));
+                    }
+                    return Err(e);
+                }
+            }
+            let before = self.write_buf.borrow().len();
             {
                 let mut wb = self.write_buf.borrow_mut();
                 wb.extend_from_slice(data);
             }
-            if self.write_buf.borrow().len() >= self.buf_size.get() {
-                self.flush_write_buf()?;
+            let mut written = (self.write_buf.borrow().len() - before) as i64;
+            if self.write_buf.borrow().len() >= bufsize {
+                if let Err(e) = self.flush_write_buf() {
+                    if runtime_err_is_blocking(&e) {
+                        // Partial non-blocking write. If the (partially drained)
+                        // buffer still exceeds the buffer size, accept what fits,
+                        // discard the overage, and report `characters_written`;
+                        // otherwise everything in `data` is committed and will be
+                        // flushed later, so swallow the error and report the full
+                        // write (`_pyio.BufferedWriter.write`,
+                        // `test_io.test_nonblock_pipe_write_*`).
+                        let cur = self.write_buf.borrow().len();
+                        if cur > bufsize {
+                            let overage = (cur - bufsize) as i64;
+                            written -= overage;
+                            self.write_buf.borrow_mut().truncate(bufsize);
+                            let (errno, strerror) = runtime_err_eagain_info(&e);
+                            return Err(crate::error::blocking_io_error_written(
+                                errno, &strerror, written,
+                            ));
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                }
             }
-            return Ok(data.len());
+            return Ok(written.max(0) as usize);
         }
         let mut backend = self.backend.borrow_mut();
         let n = match &mut *backend {

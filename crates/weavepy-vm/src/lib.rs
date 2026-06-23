@@ -673,6 +673,9 @@ impl Interpreter {
                     "warn_default_encoding",
                     i64::from(warn_default_encoding),
                 );
+                // Mirror into the Rust-side cache the native `io.open` /
+                // `io.text_encoding` text paths consult (PEP 597).
+                crate::vm_singletons::set_warn_default_encoding(warn_default_encoding);
             }
             d.insert(
                 crate::object::DictKey(Object::from_static("dont_write_bytecode")),
@@ -8635,6 +8638,43 @@ impl Interpreter {
         self.emit_deprecation_warning(message)
     }
 
+    /// Public shim emitting PEP 597's `EncodingWarning("'encoding' argument
+    /// not specified.")` through the live `warnings` machinery, gated on the
+    /// `-X warn_default_encoding` flag. `stacklevel` is forwarded to
+    /// `warnings.warn` so the warning is attributed to the user's call site
+    /// (CPython's `PyErr_WarnEx(PyExc_EncodingWarning, …, stacklevel)` inside
+    /// the C `_io.text_encoding` / `_io.open`). Used by the native
+    /// `io.text_encoding` and `io.open` text paths. A no-op when the flag is
+    /// off or `warnings` is unavailable.
+    pub(crate) fn warn_encoding_default_from_builtin(
+        &mut self,
+        stacklevel: i64,
+    ) -> Result<(), RuntimeError> {
+        if !crate::vm_singletons::warn_default_encoding() {
+            return Ok(());
+        }
+        let Some(warn) = self.module_attr("warnings", "warn") else {
+            return Ok(());
+        };
+        let category = Object::Type(
+            crate::builtin_types::builtin_types()
+                .encoding_warning
+                .clone(),
+        );
+        let globals = self.builtins.clone();
+        self.call(
+            &warn,
+            &[
+                Object::from_str("'encoding' argument not specified."),
+                category,
+                Object::Int(stacklevel),
+            ],
+            &[],
+            &globals,
+        )
+        .map(|_| ())
+    }
+
     /// Emit a `RuntimeWarning` through the live `warnings` machinery so
     /// filters / `catch_warnings` apply. Used for "coroutine … was
     /// never awaited" at finalization.
@@ -15332,6 +15372,20 @@ impl Interpreter {
         obj: &Object,
         name: &str,
     ) -> Result<(), RuntimeError> {
+        // `io.TextIOWrapper._CHUNK_SIZE` is a getset descriptor in CPython: it
+        // can be read and reassigned, but `del t._CHUNK_SIZE` runs the setter
+        // with a NULL value, which raises `AttributeError("cannot delete
+        // attribute")`. WeavePy backs the slot with an instance-dict entry for
+        // the get/set fast paths, so a plain delete would silently succeed —
+        // guard it explicitly to match the descriptor
+        // (`test_io.test_del__CHUNK_SIZE_SystemError`).
+        if name == "_CHUNK_SIZE"
+            && inst.cls().mro.borrow().iter().any(|t| {
+                Rc::ptr_eq(t, &crate::stdlib::io::build_iobase_family().text_io_wrapper)
+            })
+        {
+            return Err(attribute_error("cannot delete attribute".to_owned()));
+        }
         // BaseException getsets: the core exception attributes can be
         // reassigned but never deleted (CPython `BaseException_*`
         // setters reject NULL).

@@ -261,9 +261,26 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 /// `"utf-8"`. The `"locale"` sentinel is resolved by the text layer through
 /// `resolve_locale_encoding` (→ the host locale encoding). `tempfile` and many
 /// stdlib call sites pass the result straight through to `TextIOWrapper`.
+///
+/// When the argument is `None` and `-X warn_default_encoding` is active, this
+/// also emits an `EncodingWarning`, exactly like the C `_io.text_encoding`
+/// (`PyErr_WarnEx(PyExc_EncodingWarning, …, stacklevel)`). The `stacklevel`
+/// (second positional argument, default `2`) is forwarded so a wrapper such as
+/// `pathlib.Path.read_text` attributes the warning to *its* caller's line
+/// (`test_io.test_check_encoding_warning`).
 pub(crate) fn io_text_encoding(args: &[Object]) -> Result<Object, RuntimeError> {
     match args.first() {
         None | Some(Object::None) => {
+            let stacklevel = match args.get(1) {
+                Some(Object::Int(n)) => *n,
+                _ => 2,
+            };
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by the enclosing VM frame on this thread;
+                // the GIL keeps the pointer exclusive.
+                let interp = unsafe { &mut *ptr };
+                interp.warn_encoding_default_from_builtin(stacklevel)?;
+            }
             if crate::vm_singletons::utf8_mode() {
                 Ok(Object::from_static("utf-8"))
             } else {
@@ -3130,6 +3147,15 @@ fn tw_write(args: &[Object]) -> Result<Object, RuntimeError> {
     } else if pending.len() + bytes_len > chunk {
         tw_pending_set(&inst, pending);
         tw_writeflush(&inst)?;
+        // A reentrant `write()` invoked from inside `buffer.write()` during the
+        // flush above (a buffer whose `write` calls back into the text layer)
+        // repopulates `_pending`. That reentrant data is logically *earlier*
+        // than the new bytes, so flush it out before installing them — otherwise
+        // `tw_pending_set(bytes)` would clobber it and drop the reentrant write
+        // (CPython's gh-119506 fix; `test_io.test_issue119506`).
+        while !tw_pending_get(&inst).is_empty() {
+            tw_writeflush(&inst)?;
+        }
         tw_pending_set(&inst, bytes);
         bytes_len
     } else {

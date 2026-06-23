@@ -484,6 +484,29 @@ pub(crate) fn validate_text_encoding(encoding: &str) -> Result<(), RuntimeError>
     Ok(())
 }
 
+/// PEP 597: emit `EncodingWarning` when `open()` opens a *text* stream with no
+/// explicit `encoding` and `-X warn_default_encoding` is active, mirroring the
+/// C `_io.open`. `stacklevel = 1` points at the user's `open(...)` line because
+/// the native builtin pushes no Python frame of its own. A no-op when the flag
+/// is off. Call only on the text path (`!binary`) with an absent/`None`
+/// `encoding` argument.
+pub(crate) fn warn_open_default_encoding() -> Result<(), RuntimeError> {
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the enclosing VM frame on this thread; the GIL
+        // keeps the pointer exclusive.
+        let interp = unsafe { &mut *ptr };
+        return interp.warn_encoding_default_from_builtin(1);
+    }
+    Ok(())
+}
+
+/// `True` when `open()`'s text path took no explicit `encoding`, i.e. the slot
+/// is absent or `None` (a `str` would be an explicit choice). Used to gate the
+/// PEP 597 `EncodingWarning`.
+fn encoding_arg_is_default(encoding: Option<&Object>) -> bool {
+    matches!(encoding, None | Some(Object::None))
+}
+
 /// Parse the `buffering` argument (`open()` positional index 2). A missing
 /// or non-integer slot is the default policy (`-1`), matching how the rest of
 /// `io_open` tolerates absent/`None` slots.
@@ -633,6 +656,9 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         if let (Object::File(f), Some(Object::Bool(false))) = (&file, args.get(6)) {
             f.closefd.set(false);
         }
+        if !mode.contains('b') && encoding_arg_is_default(args.get(3)) {
+            warn_open_default_encoding()?;
+        }
         apply_text_config(&file, args.get(3), args.get(4), args.get(5))?;
         apply_buffering(&file, buffering_arg(args.get(2)), mode.contains('b'))?;
         return Ok(file);
@@ -706,6 +732,9 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
+    if !binary && encoding_arg_is_default(args.get(3)) {
+        warn_open_default_encoding()?;
+    }
     apply_text_config(&file, args.get(3), args.get(4), args.get(5))?;
     apply_buffering(&file, buffering_arg(args.get(2)), binary)?;
     Ok(file)

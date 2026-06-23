@@ -5514,6 +5514,11 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
         file.name_is_fd.set(true);
         file.closefd.set(closefd);
         if !file.binary {
+            // PEP 597: a text stream with no explicit `encoding` warns under
+            // `-X warn_default_encoding` (builtins.open is io.open in CPython).
+            if matches!(args.get(3), None | Some(Object::None)) {
+                crate::stdlib::io_full::warn_open_default_encoding()?;
+            }
             if let Some(Object::Str(enc)) = args.get(3) {
                 crate::stdlib::io_full::validate_text_encoding(enc)?;
                 file.set_encoding(enc);
@@ -5591,6 +5596,11 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
     if !file.binary {
+        // PEP 597: a text stream with no explicit `encoding` warns under
+        // `-X warn_default_encoding` (builtins.open is io.open in CPython).
+        if matches!(args.get(3), None | Some(Object::None)) {
+            crate::stdlib::io_full::warn_open_default_encoding()?;
+        }
         if let Some(Object::Str(enc)) = args.get(3) {
             crate::stdlib::io_full::validate_text_encoding(enc)?;
             file.set_encoding(enc);
@@ -10907,14 +10917,24 @@ pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("read() argument must be int")),
     };
     if f.binary {
-        Ok(Object::new_bytes(f.read_bytes(n)?))
+        // `read_bytes_opt` yields `None` for a would-block on a non-blocking
+        // descriptor, mirroring CPython's `BufferedReader.read()` (which can
+        // return `None`); `iter(f.read, None)` relies on that sentinel
+        // (`test_io.test_nonblock_pipe_write_*`).
+        match f.read_bytes_opt(n)? {
+            Some(data) => Ok(Object::new_bytes(data)),
+            None => Ok(Object::None),
+        }
     } else if let Some(count) = n {
         // Text `read(size)` counts *characters*, not bytes (CPython
         // `TextIOWrapper`/`StringIO`); read code-point-wise so a multibyte
         // char is never split at the size boundary.
         Ok(Object::from_str(f.read_text_n(count)?))
     } else {
-        Ok(Object::from_str(f.decode_text(f.read_bytes(None)?)?))
+        match f.read_bytes_opt(None)? {
+            Some(data) => Ok(Object::from_str(f.decode_text(data)?)),
+            None => Ok(Object::None),
+        }
     }
 }
 

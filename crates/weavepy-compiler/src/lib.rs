@@ -3651,6 +3651,17 @@ impl Compiler {
                 return Ok(());
             }
         }
+        // PEP 646: an unpacked `*args` annotation — `def f(*args: *Ts)`,
+        // `*args: *tuple[int, ...]`. CPython evaluates it as the single
+        // element of `iter(value)` (a `TypeVarTuple` yields `Unpack[Ts]`,
+        // an unpacked `tuple[...]` alias yields itself), i.e. it compiles
+        // the inner value then `UNPACK_SEQUENCE 1`. A bare `Starred` is
+        // otherwise rejected by `compile_expr`, so we special-case it here.
+        if let ExprKind::Starred(inner) = &annotation.kind {
+            self.compile_expr(inner)?;
+            self.emit(OpCode::UnpackSequence, 1);
+            return Ok(());
+        }
         self.compile_expr(annotation)
     }
 

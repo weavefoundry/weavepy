@@ -551,6 +551,21 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("O_CLOEXEC")),
             Object::Int(i64::from(libc::O_CLOEXEC)),
         );
+        // `O_DIRECTORY` (open only if the target is a directory) and
+        // `O_NOFOLLOW` (fail on a trailing symlink) exist on Linux and the
+        // BSDs/macOS. `test_glob` opens a `dir_fd` with
+        // `os.open(dir, O_RDONLY | O_DIRECTORY)` in `setUp`, so their absence
+        // turned every dir_fd-based glob test into an `AttributeError`.
+        #[cfg(unix)]
+        d.insert(
+            DictKey(Object::from_static("O_DIRECTORY")),
+            Object::Int(i64::from(libc::O_DIRECTORY)),
+        );
+        #[cfg(unix)]
+        d.insert(
+            DictKey(Object::from_static("O_NOFOLLOW")),
+            Object::Int(i64::from(libc::O_NOFOLLOW)),
+        );
         #[cfg(target_os = "linux")]
         d.insert(
             DictKey(Object::from_static("O_DIRECT")),

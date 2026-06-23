@@ -518,6 +518,25 @@ _CODEC_CACHE = {}
 
 
 def lookup(encoding):
+    # CPython's `_codecs.lookup` receives the name as a C string (the `s`
+    # format code), which (1) requires ``str`` and (2) rejects an embedded NUL
+    # with ``ValueError`` before any registry lookup — so e.g.
+    # ``codecs.lookup('utf-8\0')`` / ``TextIOWrapper(b, encoding='utf-8\0')``
+    # raise ``ValueError`` rather than ``LookupError`` (CPython
+    # ``test_io.test_constructor`` / ``test_reconfigure_errors``).
+    #
+    # CPython also raises ``UnicodeEncodeError`` for a name containing a lone
+    # surrogate (it can't be UTF-8-encoded for the C string). WeavePy can't
+    # reproduce that: lone surrogates are replaced with U+FFFD at string-storage
+    # time (WTF-8 storage is an explicit RFC 0040 non-goal), so such a name
+    # never reaches here intact and instead surfaces as a ``LookupError`` for
+    # the replacement-char name.
+    if not isinstance(encoding, str):
+        raise TypeError(
+            f"lookup() argument must be str, not {type(encoding).__name__}"
+        )
+    if "\0" in encoding:
+        raise ValueError("embedded null character")
     encoding = encoding.lower()
     # Explicit user/Rust-side registrations win and are always read fresh.
     if encoding in _USER_CODECS:
