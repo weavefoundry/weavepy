@@ -387,6 +387,76 @@ pub fn global_gil() -> Arc<GilState> {
     GLOBAL.get_or_init(|| Arc::new(GilState::new())).clone()
 }
 
+/// CPython `_PyEval_ReInitThreads` / `PyOS_AfterFork_Child`: rebuild the
+/// GIL in a `fork(2)` child.
+///
+/// After a fork from a multi-threaded process only the forking thread
+/// survives, but the GIL's `parking_lot` primitives were duplicated
+/// mid-flight. The GIL `ReentrantMutex` carries the PARKED bit for the
+/// sibling threads that were blocked in [`GilState::acquire`] at fork
+/// time, the eval breaker still counts them as waiters, and
+/// `parking_lot`'s process-global parking-lot table references their
+/// now-gone `ThreadParker`s. The first hand-off in the child
+/// ([`maybe_yield_gil`] / [`allow_threads_then`] releasing the lock) then
+/// walks `parking_lot`'s unpark path into a vanished peer and the child
+/// wedges forever — `test_threading.test_reinit_tls_after_fork` forks
+/// from 16 threads, and any child that loses this race never reaches its
+/// `os._exit`, so the parent's `waitpid` times out.
+///
+/// Rebuild from scratch: abandon the inherited guard stack *without*
+/// unlocking the poisoned lock, overwrite the lock and hand-off
+/// primitives with fresh ones, zero the breaker, and re-take the fresh
+/// lock for this lone surviving thread.
+pub fn reinit_after_fork_in_child() {
+    let gil = global_gil();
+    // 1. Abandon the inherited guards without running their `Drop`:
+    //    dropping a `GilGuard` unlocks the inherited (poisoned)
+    //    `ReentrantMutex`, and `parking_lot`'s unlock-slow path would try
+    //    to hand the lock to one of the vanished peers. `mem::forget`
+    //    leaks one `Arc<GilState>` refcount per held guard — negligible,
+    //    and the alternative (unlocking) deadlocks.
+    let held: Vec<GilGuard> =
+        GIL_GUARD_STACK.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    let depth = held.len();
+    for g in held {
+        std::mem::forget(g);
+    }
+    // 2. Replace the `parking_lot` primitives in place with pristine ones.
+    //    The child is single-threaded here, so nothing races this write;
+    //    every live `Arc<GilState>` clone shares this allocation, so the
+    //    swap is observed consistently. `ptr::write` deliberately does not
+    //    drop the old (poisoned) values.
+    // SAFETY: sole surviving thread post-fork; the `Arc` keeps the
+    // allocation alive for the duration of the writes.
+    let p = Arc::as_ptr(&gil).cast_mut();
+    unsafe {
+        std::ptr::write(&raw mut (*p).lock, GilLock::new());
+        std::ptr::write(&raw mut (*p).switch_mutex, Mutex::new(()));
+        std::ptr::write(&raw mut (*p).switch_cond, Condvar::new());
+        std::ptr::write(&raw mut (*p).pending, Mutex::new(Vec::new()));
+    }
+    // 3. Reset the hand-off bookkeeping. No peers remain: no waiters, no
+    //    queued pending calls, no drop request.
+    gil.breaker.waiters.store(0, Ordering::Release);
+    gil.breaker.pending_calls.store(0, Ordering::Release);
+    gil.breaker.flags.store(0, Ordering::Release);
+    gil.holder.store(0, Ordering::Release);
+    gil.depth.store(0, Ordering::Release);
+    gil.switch_number.store(0, Ordering::Release);
+    // 4. The forking thread is now this process's only — and therefore
+    //    main — thread, so signal handling must run here (CPython resets
+    //    the runtime's main thread in the child).
+    MAIN_THREAD_ID.store(current_thread_id(), Ordering::Release);
+    // 5. Re-take the fresh GIL, restoring the guard-stack depth the caller
+    //    held before the fork so the unwinding eval loop stays balanced.
+    let mut fresh = Vec::with_capacity(depth.max(1));
+    for _ in 0..depth {
+        fresh.push(gil.acquire());
+    }
+    GIL_GUARD_STACK.with(|cell| *cell.borrow_mut() = fresh);
+    note_gil_acquired();
+}
+
 // ---------------------------------------------------------------------------
 // Main-thread identification — RFC 0039.
 //

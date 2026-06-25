@@ -220,7 +220,26 @@ impl ThreadRegistry {
     /// Mirrors CPython's `PyOS_AfterFork_Child` thread-state reset, which
     /// runs before the Python-level `threading._after_fork` handler.
     pub fn reset_after_fork_in_child(&self, current_native_id: u64) {
-        self.entries.write().clear();
+        // `fork(2)` may have cloned this registry mid-mutation: a sibling
+        // thread that vanished in the fork could have held `entries` (a
+        // `parking_lot::RwLock`, which is not fork-safe) at the instant of
+        // the fork — the 16 threads of `test_reinit_tls_after_fork` are
+        // still registering/unregistering as the first of them forks. The
+        // inherited lock would then be permanently "held" in the child, so
+        // calling `.write()` here would deadlock. Overwrite the whole lock
+        // with a fresh, empty one instead. The child is single-threaded at
+        // this point, so nothing races this write; `ptr::write` skips
+        // dropping the poisoned lock and its map — abandoning the
+        // now-defunct `JoinHandle`s for the parent's dead threads, which is
+        // exactly the detach we want (no `pthread_join`/`ESRCH` at the
+        // child's shutdown).
+        // SAFETY: sole surviving thread post-fork; `&self.entries` points at
+        // a live, initialised `RwLock` for the duration of the write.
+        unsafe {
+            let p =
+                std::ptr::addr_of!(self.entries).cast_mut();
+            std::ptr::write(p, RwLock::new(BTreeMap::new()));
+        }
         self.main_native_id
             .store(current_native_id, Ordering::Release);
     }

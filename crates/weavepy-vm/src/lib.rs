@@ -2871,10 +2871,38 @@ impl Interpreter {
         // re-entered — and an *exceptional* exit (`Err`) keeps it so the
         // frame's `f_locals` stays readable while it sits in a traceback.
         if matches!(result, Ok(FrameOutcome::Returned(_))) {
-            if let Some(mirror) = py_frame.locals_mirror.borrow().as_ref() {
-                mirror.borrow_mut().clear();
+            // `pop_py_frame` above already dropped the call stack's clone,
+            // so `strong_count == 1` means *this* local is the only owner:
+            // the frame object dies here and clearing the mirror lets its
+            // locals finalize promptly. `> 1` means the frame object
+            // genuinely outlives the activation — a live traceback whose
+            // exception was caught and `return`ed/stored, or an explicit
+            // `sys._getframe`/`gi_frame` handle. CPython keeps such a
+            // frame's locals readable (`take_ownership`); a frame reachable
+            // only through the about-to-drop stack or untracked garbage is
+            // *not* externally referenced and still gets cleared.
+            if Rc::strong_count(&py_frame) > 1 {
+                // Bring the mirror to the final post-return state first: the
+                // loop syncs lazily, so an `except ... as e:` target that
+                // the implicit handler-exit `del`s, or any late
+                // `STORE_FAST`/`DELETE_FAST`, may not be mirrored yet. We
+                // can't call `sync_py_locals` (it targets the stack top,
+                // now the caller), so copy this frame's live locals across.
+                if let Some(mirror) = py_frame.locals_mirror.borrow().as_ref() {
+                    let mut slot = mirror.borrow_mut();
+                    if slot.len() == frame.locals.len() {
+                        slot.clone_from(&frame.locals);
+                    } else {
+                        *slot = frame.locals.clone();
+                    }
+                }
+                py_frame.take_ownership_of_locals();
+            } else {
+                if let Some(mirror) = py_frame.locals_mirror.borrow().as_ref() {
+                    mirror.borrow_mut().clear();
+                }
+                py_frame.invalidate_locals();
             }
-            py_frame.invalidate_locals();
         }
         // Reconcile the interpreter-wide handled-exception stack. When
         // control leaves an `except` / `finally` block *early* — a

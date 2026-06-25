@@ -389,6 +389,44 @@ impl GcState {
         }
     }
 
+    /// Reinitialise the collector's locks in a `fork(2)` child, preserving the
+    /// inherited tracked-object state. The collector is process-global and its
+    /// `GilCell` fields are normally serialised by the GIL, but an `Object`
+    /// whose last `Arc` is released on a peer thread can drop — and run through
+    /// the collector's prompt-reap bookkeeping — without that thread holding
+    /// the GIL. If such a peer vanishes mid-`borrow` in the fork, the inherited
+    /// `parking_lot` lock would wedge the child's very first allocation
+    /// (`test_threading.test_reinit_tls_after_fork` forks from 16 threads; the
+    /// child deadlocks in `threading._after_fork`'s `set(_enumerate())`).
+    /// Rebuild every field's lock in place and clear the re-entrancy guard —
+    /// CPython's `PyOS_AfterFork_Child` reinitialises the runtime's locks for
+    /// the same reason.
+    ///
+    /// Takes a raw `*mut Self` so each field's lock rebuild is driven from a
+    /// laundered raw pointer rather than a `&self` cast (see
+    /// [`crate::sync::GilCell::reinit_lock_after_fork`]).
+    ///
+    /// SAFETY: `this` must point at the process-global collector on the lone
+    /// surviving thread of a fork child, so the in-place lock rebuilds cannot
+    /// race and the payloads (last mutated under the GIL the forking thread
+    /// holds) are consistent.
+    pub unsafe fn reinit_after_fork_in_child(this: *mut Self) {
+        unsafe {
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).generations));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).index));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).thresholds));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).counts));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).frozen));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).garbage));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).callbacks));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).stats));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).finalized_ids));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).finalizable));
+            // A peer may have vanished mid-collection with this set.
+            (*this).collecting.store(false, Ordering::Release);
+        }
+    }
+
     /// Record that `id`'s finalizer has been run (or queued). Survives the
     /// handle's removal from the tracked set so `gc.is_finalized` keeps
     /// answering `True` for a resurrected object.
@@ -1969,6 +2007,19 @@ pub fn with_state<R>(f: impl FnOnce(&GcState) -> R) -> R {
 /// Convenience: track `obj` in the shared, process-global GC.
 pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
+}
+
+/// Reinitialise the process-global cycle collector's locks in a `fork(2)`
+/// child. See [`GcState::reinit_after_fork_in_child`].
+///
+/// SAFETY: must run only on the lone surviving thread of a fork child.
+pub unsafe fn reinit_after_fork_in_child() {
+    // Launder the static's address into a raw `*mut` (forcing init via the
+    // deref) so the field rebuilds don't go through a `&T -> *mut T` cast.
+    let state: &GcState = &GC_STATE;
+    unsafe {
+        GcState::reinit_after_fork_in_child(std::ptr::from_ref(state).cast_mut());
+    }
 }
 
 /// A value that can never (transitively) hold a reference back to a

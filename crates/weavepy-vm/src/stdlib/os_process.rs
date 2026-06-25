@@ -407,8 +407,28 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(last_os_err());
     }
     if pid == 0 {
-        // C-level after-fork (before the Python `_after_fork` handlers):
-        // only this thread survived the fork, so drop the inherited
+        // C-level after-fork (before the Python `_after_fork` handlers).
+        // FIRST rebuild the GIL: only this thread survived, but the GIL's
+        // `parking_lot` lock/condvars were copied with the vanished peers'
+        // parked state still recorded. Any later GIL hand-off (the eval
+        // loop's periodic checkpoint, `allow_threads` around blocking I/O,
+        // or the Python `_after_fork` handlers below) would walk
+        // `parking_lot`'s unpark path into a now-gone thread and wedge the
+        // child — CPython's `PyOS_AfterFork_Child` does the same
+        // `_PyEval_ReInitThreads` reset before anything else runs
+        // (`test_threading.test_reinit_tls_after_fork`).
+        crate::gil::reinit_after_fork_in_child();
+        // The process-global cycle collector's `parking_lot`-backed locks are
+        // not fork-safe either: a peer thread that dropped the last `Arc` to a
+        // tracked object off-GIL could have vanished mid-`borrow`, leaving the
+        // collector's lock held in the child. Rebuild them (preserving the
+        // tracked set) before any allocation — `threading._after_fork` builds
+        // `set(_enumerate())` immediately, which would otherwise wedge.
+        // SAFETY: sole surviving post-fork thread.
+        unsafe {
+            crate::gc_trace::reinit_after_fork_in_child();
+        }
+        // Only this thread survived the fork, so drop the inherited
         // `JoinHandle`s for the parent's now-vanished threads. Otherwise
         // the child's shutdown join would `pthread_join` a dead thread and
         // abort with ESRCH (the multiprocessing fork start method spawns
@@ -419,6 +439,17 @@ fn os_fork(_args: &[Object]) -> Result<Object, RuntimeError> {
         // baseline shrinks to this lone survivor. Re-sample it so a *nested*
         // fork in the child judges "multi-threaded" against the right floor.
         capture_thread_baseline();
+        // gh-110395: a `kqueue` control descriptor is not inherited across
+        // `fork(2)`. Close every live kqueue object in the child (before the
+        // Python `after_in_child` handlers run) so it observes `kq.closed`,
+        // exactly like CPython's `PyOS_AfterFork_Child` (`test_kqueue.test_fork`).
+        crate::stdlib::select_mod::close_kqueues_after_fork_in_child();
+        // CPython's `_PyThread_AfterFork`: the forking thread is the child's
+        // new main thread, and every other thread vanished — re-seed the main
+        // ident and mark the orphaned thread handles done so `Thread.is_alive()`
+        // / `threading._after_fork` see them dead. Runs before the Python
+        // `after_in_child` handlers (`threading._after_fork`) below.
+        crate::stdlib::thread_real::after_fork_in_child();
         run_atfork(AtForkPhase::Child);
     } else {
         run_atfork(AtForkPhase::Parent);

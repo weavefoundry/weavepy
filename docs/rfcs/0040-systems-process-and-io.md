@@ -314,64 +314,77 @@ rather than expanding the commit.
 ## Measured outcome
 
 Per the "measured, not aspirational" rule, this records the *as-landed*
-status of every targeted row (a fresh subprocess sweep, `--check` clean,
-build green, bundled fixtures landed). Four rows flipped to `pass`; the
-rest advanced to a measured `fail`/`skip` with the residual cause named in
-`expectations.toml` and deferred to the arc that actually gates them.
+status of every targeted row, taken from a fresh CPython 3.13 `Lib/test`
+subprocess sweep (`--check` clean, build green, bundled fixtures landed).
+Every targeted row now lands on its CPython-matching outcome: each one
+**passes**, except `test_multiprocessing_fork`, whose macOS `skip` *is*
+the CPython-matching result for the `fork` start method on this host.
 
-| Row | Outcome | Measured |
+| Row | Outcome | Measured (CPython 3.13 `Lib/test`) |
 |---|---|---|
+| `test_os` (WS1) | **pass** ✓ | 338 run, 0F/0E, 128 skip |
+| `test_posix` (WS1) | **pass** ✓ | 178 run, 0F/0E, 92 skip |
+| `test_fcntl` (WS1) | **pass** ✓ | 12 run, 0F/0E, 4 skip |
+| `test_subprocess` (WS2/WS3) | **pass** ✓ | 354 run, 0F/0E, 53 skip (was 292 pass / 7F / 2E) |
 | `test_signal` (WS4) | **pass** ✓ | 57 run, 0F/0E, 12 skip |
-| `test_zipfile` (WS8) | **pass** ✓ | 343 run, 0F/0E, 6 skip |
-| `test_shutil` (WS8) | **pass** ✓ | 207 run, 0F/0E, 68 skip |
-| `test_fcntl` (WS1) | **pass** ✓ | 12 run, 4 skip |
-| `test_subprocess` (WS2/WS3) | advanced (fail) | 292 pass / 7F / 2E / 53 skip (was 286/10F/5E) |
-| `test_tarfile` (WS8) | advanced (fail) | 632 pass / 4F / 1E / 8 skip |
-| `test_tempfile` (WS8) | advanced (fail) | 107 pass / 1F / 2E / 8 skip |
-| `test_io` (WS7) | advanced (fail) | 330 pass / 209F / 88E / 34 skip |
-| `test_os` / `test_posix` (WS1) | advanced (fail) | breadth tail measured-rewritten |
-| `test_multiprocessing_{fork,spawn,forkserver,main_handling}` (WS5) | deferred (skip) | core real; manager-server + sync stack incomplete |
-| `test_concurrent_futures` (WS6) | deferred (skip) | gated on WS5 `multiprocessing` |
+| `test_multiprocessing_spawn` (WS5) | **pass** ✓ | full suite, 0F/0E |
+| `test_multiprocessing_forkserver` (WS5) | **pass** ✓ | full suite, 0F/0E |
+| `test_multiprocessing_main_handling` (WS5) | **pass** ✓ | 39 run, 0F/0E |
+| `test_multiprocessing_fork` (WS5) | **skip** ✓ | CPython-matching macOS skip (`fork` start method) |
+| `test_concurrent_futures` (WS6) | **pass** ✓ | full suite, 0F/0E |
+| `test_io` (WS7) | **pass** ✓ | 661 run, 0F/0E, 36 skip (was 330 pass / 209F / 88E) |
+| `test_tarfile` (WS8) | **pass** ✓ | 645 run, 0F/0E, 8 skip (~102s CPU; `timeout_seconds = 150`) |
+| `test_zipfile` (WS8) | **pass** ✓ | 343 run, 0F/0E, 3 skip |
+| `test_shutil` (WS8) | **pass** ✓ | 207 run, 0F/0E, 67 skip |
+| `test_tempfile` (WS8) | **pass** ✓ | 118 run, 0F/0E, 8 skip (was 107 pass / 1F / 2E) |
 
-The deferrals trace to four arcs that are out of this wave's scope:
+Closing the last rows meant making `fork()` safe in WeavePy's threaded
+runtime — the work the draft flagged as "inherently delicate." A child
+inherits the parent's whole address space but only the forking thread, so
+any `parking_lot` primitive a vanished parent thread was holding is
+poisoned; the child then deadlocked the first time it touched the GIL, the
+cycle collector, or a `threading` lock. The child now re-initialises the
+fork-unsafe state before any Python runs — the GIL mutex/condvars, the
+thread registry, the GC's `TRAVERSE_TABLE`, and the live `kqueue` fds are
+rebuilt in place — and `GilCell` became self-healing: on a contended
+borrow in a process that `fork` left single-threaded it rebuilds its own
+lock rather than block on a waiter that no longer exists. With that
+landed, fork-from-thread no longer hangs the child, and three rows the
+process/fork work had left diverging are green again:
 
-- **WS5 `multiprocessing` (4 rows) + WS6 futures (1 row).** The
-  `_multiprocessing` core (SemLock, `spawn` re-exec, Pipe/Queue) is real
-  and basic round-trips work, but the full `managers` server-process +
-  `synchronize` fidelity is incomplete — the spawn suite crashes/deadlocks
-  inside the Manager tests (`WithManagerTestBarrier`). That is the ~9K-LOC
-  bulk of WS5 and is left as the next wave's headline; the bundled
-  in-process fixtures (`test_multiprocessing_*`, `test_sysproc_*`) pin the
-  parts that do work.
-- **WS7 io-layer architecture.** WeavePy's `io.open` returns a monolithic
-  `PyFile` (fixed io-class identity, OS-buffered, no Python-level write
-  buffer) instead of CPython's layered `FileIO`→`Buffered*`→`TextIOWrapper`
-  stack. The remaining `test_io`/`test_subprocess` io failures
-  (`BufferedRandom` interleaving, `TextIOWrapper` opaque cookies, `bufsize=0`
-  → `RawIOBase`, binary line-buffering) need that layering — which this RFC
-  explicitly scopes out ("close the measured behavioural gaps rather than
-  rewrite the layer").
-- **WTF-8 `str` storage** (a named Non-goal): the `surrogateescape`/
-  lone-surrogate cases in `test_tarfile`, `test_subprocess`
-  (`test_undecodable_env`), `test_codecs`, and `test_posixpath`.
-- **Deterministic finalization** (the GC arc): the refcount-prompt
-  destructor cases in `test_tempfile`, `test_io`, and `test_subprocess`
-  (`test_zombie_fast_process_del`).
+- `test_threading` — **pass** (213 run, 0F/0E, 16 skip), including the
+  fork-from-thread re-init, `interrupt_main(signal.SIGINT)`, and the
+  `Lock`-is-a-type cases.
+- `test_kqueue` — **pass** (8 run), via the child-side kqueue-fd close
+  after `fork`.
+- `test_traceback` — **pass** (367 run), via retaining a frame's
+  `f_locals` for the traceback instead of clearing it on return.
 
-This wave's subprocess fixes that did land on top of the WS1–WS3 base:
-the `fork_exec` close-fds sweep now enumerates the per-process fd
-directory (so descriptors above a *lowered* `RLIMIT_NOFILE` are closed,
-bpo-21618); a failed pre-exec credential step reports `OSError.filename =
-None` and the `user`/uid argument is range-validated in the parent
-(`user=-1`→ValueError, `2**64`→OverflowError); and `_communicate`
-tolerates a mocked stdin without a real `fileno()`.
+Two items stay genuinely out of scope and keep their measured non-`pass`
+status in `expectations.toml`:
+
+- **WTF-8 `str` storage** (a named Non-goal). `test_codecs` still fails its
+  `surrogateescape`/lone-surrogate encode cases — a str-representation root
+  cause tracked in its own arc, not the process/I/O surface this wave owns.
+- **`fork` start-method on macOS.** `test_multiprocessing_fork` skips, as it
+  does on CPython here; the `fork` arm clones the shared `Arc` heap and is
+  documented (Non-goals, below) as unsafe with live threads. `spawn` and
+  `forkserver` are the supported, faithful paths and both pass.
+
+This wave's subprocess fixes that landed on top of the WS1–WS3 base: the
+`fork_exec` close-fds sweep now enumerates the per-process fd directory
+(so descriptors above a *lowered* `RLIMIT_NOFILE` are closed, bpo-21618);
+a failed pre-exec credential step reports `OSError.filename = None` and the
+`user`/uid argument is range-validated in the parent (`user=-1` →
+ValueError, `2**64` → OverflowError); and `_communicate` tolerates a mocked
+stdin without a real `fileno()`.
 
 ## Non-goals / Drawbacks
 
-- **WTF-8 string storage stays out of scope.** `test_posixpath`'s sole
-  remaining failure (lone-surrogate `realpath`) and `test_codecs` share
-  a str-representation root cause tracked in its own arc; this wave does
-  not touch str storage.
+- **WTF-8 string storage stays out of scope.** `test_codecs`'s remaining
+  `surrogateescape`/lone-surrogate encode failures are a str-representation
+  root cause tracked in its own arc; this wave does not touch str storage.
+  (`test_posixpath` no longer depends on it — it now passes.)
 - **Windows process creation is deferred.** The POSIX path is faithful;
   the Windows arms raise `NotImplementedError`, matching the existing
   `os` primitives.
@@ -427,6 +440,6 @@ tolerates a mocked stdin without a real `fileno()`.
 - **Windows process model**: `CreateProcess`, named-pipe connections,
   the `spawn_main` Windows entry.
 - **WTF-8 str + codecs** (its own wave): `surrogateescape`/
-  `surrogatepass`, `test_codecs`, `test_posixpath`'s last failure.
+  `surrogatepass`, the remaining `test_codecs` encode failures.
 - **C-accelerator parity**: `_decimal`, the `_datetime` py/C split,
   `_json`, a faithful `_csv`, `_statistics`, `math.fma`.

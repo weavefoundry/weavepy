@@ -117,6 +117,16 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("LockType")),
             Object::Type(lock_type()),
         );
+        // CPython 3.13 exposes the lock type under its bare `__qualname__`
+        // (`_thread.lock`) too, not just `LockType`. `threading.Lock` is bound
+        // to this type, and `pickle` saves a type by `__module__.__qualname__`
+        // — so `pickle.dumps(threading.Lock)` resolves `_thread.lock`. Without
+        // this alias the lookup fails (`SyncManager.register('Lock', ...)` over
+        // `spawn` pickles the registry).
+        d.insert(
+            DictKey(Object::from_static("lock")),
+            Object::Type(lock_type()),
+        );
         d.insert(
             DictKey(Object::from_static("RLockType")),
             Object::Type(rlock_type()),
@@ -182,8 +192,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     }
     // `build()` runs on the main OS thread the first time `_thread` is
     // imported during interpreter startup, so the calling thread's id is
-    // the main-thread ident `threading._MainThread` will report.
-    let _ = MAIN_THREAD_IDENT.set(main_thread_ident_now());
+    // the main-thread ident `threading._MainThread` will report. Only the
+    // first (main-thread) import seeds it; a fork child re-seeds via
+    // `after_fork_in_child`.
+    let _ = MAIN_THREAD_IDENT.compare_exchange(
+        0,
+        main_thread_ident_now(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
     // RFC 0040 WS4: register the main thread's pthread_t under its ident so
     // `signal.pthread_kill(get_ident(), sig)` from the main thread resolves.
     #[cfg(unix)]
@@ -1252,13 +1269,12 @@ fn interrupt_main(args: &[Object]) -> Result<Object, RuntimeError> {
     // signal numbers raise `ValueError`, matching CPython.
     let signum = match args.first() {
         None => 2, // SIGINT
-        Some(Object::Int(n)) => *n as i32,
-        Some(Object::Bool(b)) => i32::from(*b),
-        Some(_) => {
-            return Err(type_error(
-                "interrupt_main() argument must be an int, not a different type",
-            ))
-        }
+        // `as_i64` accepts `int`, `bool`, and int subclasses (e.g. the
+        // `signal.Signals` IntEnum that `test_interrupt_main_noerror` passes),
+        // matching CPython's Argument Clinic `int` converter.
+        Some(o) => o.as_i64().ok_or_else(|| {
+            type_error("interrupt_main() argument must be an int, not a different type")
+        })? as i32,
     };
     if signum < 1 || signum >= crate::stdlib::signal_mod::nsig() {
         return Err(value_error("signal number out of range"));
@@ -1314,16 +1330,41 @@ fn main_thread_ident_now() -> u64 {
     crate::vm_singletons::current_worker_thread_id()
 }
 
-/// Captured the first time `_thread` is imported (on the main thread).
-static MAIN_THREAD_IDENT: OnceLock<u64> = OnceLock::new();
+/// The ident of the runtime's main thread. Seeded the first time `_thread` is
+/// imported (on the main OS thread) and re-seeded in a `fork(2)` child, where
+/// the forking thread becomes the new main thread — CPython's
+/// `_get_main_thread_ident()` tracks the runtime's *current* main thread, so a
+/// frozen value would mislead `threading._after_fork` when the fork happens off
+/// a non-main thread (`test_main_thread_after_fork_from_foreign_thread`).
+/// `0` means "not yet seeded".
+static MAIN_THREAD_IDENT: AtomicU64 = AtomicU64::new(0);
 
 /// `_thread._get_main_thread_ident()`.
 fn get_main_thread_ident(_args: &[Object]) -> Result<Object, RuntimeError> {
-    let id = MAIN_THREAD_IDENT
-        .get()
-        .copied()
-        .unwrap_or_else(main_thread_ident_now);
+    let id = match MAIN_THREAD_IDENT.load(Ordering::Acquire) {
+        0 => main_thread_ident_now(),
+        id => id,
+    };
     Ok(Object::Int(id as i64))
+}
+
+/// Re-seed the main-thread ident after `fork(2)`: the lone surviving (forking)
+/// thread is the child's main thread, and mark every *other* thread's handle
+/// done — those threads vanished in the fork, so `_ThreadHandle.is_done()`
+/// (hence `threading.Thread.is_alive()`) must report them dead. This is
+/// WeavePy's analogue of CPython's `_PyThread_AfterFork`
+/// (`test_threading.test_is_alive_after_fork`).
+pub fn after_fork_in_child() {
+    let surviving = main_thread_ident_now();
+    MAIN_THREAD_IDENT.store(surviving, Ordering::Release);
+    for state in handle_registry().lock().values() {
+        let id = state.ident.load(Ordering::Acquire);
+        // ident 0 = an unstarted handle; leave it. The surviving thread's own
+        // handle stays alive; everything else is now dead.
+        if id != 0 && id != surviving {
+            state.done.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// `_thread._shutdown()` — block (GIL released) until every non-daemon

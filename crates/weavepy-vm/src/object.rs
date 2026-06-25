@@ -393,6 +393,36 @@ impl PyFrame {
     pub fn invalidate_locals(&self) {
         self.refresh_locals();
     }
+
+    /// CPython `take_ownership`: when a frame returns but its frame object
+    /// outlives the activation (a live traceback or an explicit
+    /// `sys._getframe`/`gi_frame` handle still references it), the
+    /// running fast-locals are *moved into* the frame object so
+    /// `frame.f_locals` stays readable for as long as that reference
+    /// lives (`traceback.TracebackException(..., capture_locals=True)`).
+    ///
+    /// We materialise the current live mirror into the `f_locals` cache,
+    /// then sever the live mirror/provider so the cache is the
+    /// authoritative, stable snapshot. The cache pins only what the frame
+    /// genuinely captured and dies together with the frame object — so a
+    /// frame referenced only by the (about-to-be-dropped) call stack, or
+    /// by garbage, is *not* given ownership (the caller keeps clearing the
+    /// mirror there) and prompt refcount finalization is preserved.
+    pub fn take_ownership_of_locals(&self) {
+        let provider = self.locals_provider.borrow().clone();
+        let Some(provider) = provider else {
+            // Already detached (or never had a provider): nothing to own.
+            return;
+        };
+        let dict = provider();
+        *self.locals_cache.borrow_mut() = Some(dict);
+        // Sever the live links: future reads return the frozen snapshot
+        // (`refresh_locals` early-returns once the provider is `None`), and
+        // dropping the provider releases its captured clones of the frame's
+        // locals mirror and cell handles.
+        *self.locals_provider.borrow_mut() = None;
+        *self.locals_mirror.borrow_mut() = None;
+    }
 }
 
 /// Internal payload for [`Object::Traceback`]. Built lazily by the
