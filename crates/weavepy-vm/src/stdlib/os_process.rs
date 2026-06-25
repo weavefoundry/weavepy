@@ -821,8 +821,7 @@ fn posix_spawn_impl(
     // these eagerly (`test_posix.test_scheduler_wrong_type`,
     // `test_setsigdef_wrong_type`, `test_setsigmask_wrong_type`).
     if let Some(sched) = kw("scheduler") {
-        let ok = matches!(sched, Object::None)
-            || matches!(sched, Object::Tuple(t) if t.len() == 2);
+        let ok = matches!(sched, Object::None) || matches!(sched, Object::Tuple(t) if t.len() == 2);
         if !ok {
             return Err(type_error("scheduler must be a tuple or None"));
         }
@@ -1102,7 +1101,9 @@ fn os_wait4(args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(unix)]
 fn build_rusage(ru: &libc::rusage) -> Object {
-    let tv = |t: libc::timeval| t.tv_sec as f64 + f64::from(t.tv_usec) / 1_000_000.0;
+    // `tv_usec` is `i64` on Linux (`__suseconds_t`) and `i32` on macOS, so
+    // coerce with `as` rather than `f64::from` (no `From<i64>` for `f64`).
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0;
     Object::new_tuple(vec![
         Object::Float(tv(ru.ru_utime)),
         Object::Float(tv(ru.ru_stime)),

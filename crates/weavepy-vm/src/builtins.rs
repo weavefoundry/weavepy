@@ -818,9 +818,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "__reduce__" => Some(method("__reduce__", file_reduce_mem)),
             "__reduce_ex__" => Some(method("__reduce_ex__", file_reduce_mem)),
             "__getstate__" => Some(method("__getstate__", file_getstate_mem)),
-            "__setstate__" if f.is_memory() => {
-                Some(method("__setstate__", file_setstate_mem))
-            }
+            "__setstate__" if f.is_memory() => Some(method("__setstate__", file_setstate_mem)),
             "seek" => Some(method("seek", file_seek)),
             "tell" => Some(method("tell", file_tell)),
             "getvalue" => Some(method("getvalue", file_getvalue)),
@@ -7450,8 +7448,7 @@ fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     // Bridge field results back to surrogates when a `WStr` was involved
     // (receiver or separator).
     let wrap = |out: Vec<Object>| -> Vec<Object> {
-        if args.iter().any(|o| matches!(o, Object::WStr(_)))
-            || matches!(sep, Some(Object::WStr(_)))
+        if args.iter().any(|o| matches!(o, Object::WStr(_))) || matches!(sep, Some(Object::WStr(_)))
         {
             out.into_iter()
                 .map(|o| match o {
@@ -7771,8 +7768,8 @@ fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let out = match args.get(1) {
         None | Some(Object::None) => s.trim_start().to_owned(),
         Some(arg) => {
-            let chars = str_arg_bridged(arg)
-                .ok_or_else(|| type_error("lstrip() argument must be str"))?;
+            let chars =
+                str_arg_bridged(arg).ok_or_else(|| type_error("lstrip() argument must be str"))?;
             let set: Vec<char> = chars.chars().collect();
             s.trim_start_matches(|c| set.contains(&c)).to_owned()
         }
@@ -7785,8 +7782,8 @@ fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let out = match args.get(1) {
         None | Some(Object::None) => s.trim_end().to_owned(),
         Some(arg) => {
-            let chars = str_arg_bridged(arg)
-                .ok_or_else(|| type_error("rstrip() argument must be str"))?;
+            let chars =
+                str_arg_bridged(arg).ok_or_else(|| type_error("rstrip() argument must be str"))?;
             let set: Vec<char> = chars.chars().collect();
             s.trim_end_matches(|c| set.contains(&c)).to_owned()
         }
@@ -7835,8 +7832,7 @@ fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     let sep = arg_or_kw(args, 1, kwargs, "sep");
     let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
     let wrap = |out: Vec<Object>| -> Vec<Object> {
-        if args.iter().any(|o| matches!(o, Object::WStr(_)))
-            || matches!(sep, Some(Object::WStr(_)))
+        if args.iter().any(|o| matches!(o, Object::WStr(_))) || matches!(sep, Some(Object::WStr(_)))
         {
             out.into_iter()
                 .map(|o| match o {
@@ -8223,7 +8219,9 @@ fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
 fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
     // Accept both `str` and surrogate-bearing `WStr` receivers so
     // `chr(0xD800).encode('utf-8', 'surrogatepass')` works.
-    let recv = args.first().ok_or_else(|| type_error("encode() missing receiver"))?;
+    let recv = args
+        .first()
+        .ok_or_else(|| type_error("encode() missing receiver"))?;
     if !recv.is_str() {
         return Err(type_error("expected str method receiver"));
     }
@@ -11134,7 +11132,10 @@ pub(crate) fn file_check_open(f: &Rc<crate::object::PyFile>) -> Result<(), Runti
 /// File-backed text streams never contain bridge-window code points, so they
 /// take the plain `Object::Str` path.
 fn stream_text_object(f: &Rc<crate::object::PyFile>, s: String) -> Object {
-    if matches!(&*f.backend.borrow(), crate::object::FileBackend::MemText { .. }) {
+    if matches!(
+        &*f.backend.borrow(),
+        crate::object::FileBackend::MemText { .. }
+    ) {
         bridge_to_object(&s)
     } else {
         Object::from_str(s)
@@ -11459,7 +11460,10 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
             if f.binary {
                 return Err(type_error("a bytes-like object is required, not 'str'"));
             }
-            if matches!(&*f.backend.borrow(), crate::object::FileBackend::MemText { .. }) {
+            if matches!(
+                &*f.backend.borrow(),
+                crate::object::FileBackend::MemText { .. }
+            ) {
                 let bridged = bridge_encode_cps(cps);
                 f.write_bytes(&f.encode_text(&bridged)?)?
             } else {
@@ -11809,7 +11813,11 @@ pub(crate) fn file_getstate_mem(args: &[Object]) -> Result<Object, RuntimeError>
     let is_text = matches!(&*f.backend.borrow(), FileBackend::MemText { .. });
     if is_text {
         // StringIO's writer-newline (default `'\n'`, like CPython).
-        let nl = f.newline.borrow().clone().unwrap_or_else(|| "\n".to_owned());
+        let nl = f
+            .newline
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "\n".to_owned());
         Ok(Object::new_tuple(vec![
             value,
             Object::from_str(nl),
@@ -11954,7 +11962,10 @@ pub(crate) fn file_reduce_forbidden(args: &[Object]) -> Result<Object, RuntimeEr
     let f = file_self(args)?;
     let name = if !f.binary {
         "_io.TextIOWrapper"
-    } else if matches!(&*f.backend.borrow(), crate::object::FileBackend::MemBytes { .. }) {
+    } else if matches!(
+        &*f.backend.borrow(),
+        crate::object::FileBackend::MemBytes { .. }
+    ) {
         "_io.BytesIO"
     } else if f.writable() && f.readable() {
         "_io.BufferedRandom"

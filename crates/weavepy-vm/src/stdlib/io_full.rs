@@ -440,7 +440,10 @@ fn apply_text_config(
         // `TextIOWrapper` constructor: only `''`, `'\n'`, `'\r'`, `'\r\n'`
         // (and `None`) are legal.
         if !matches!(nl.as_ref(), "" | "\n" | "\r" | "\r\n") {
-            return Err(value_error(format!("illegal newline value: {}", nl.as_ref())));
+            return Err(value_error(format!(
+                "illegal newline value: {}",
+                nl.as_ref()
+            )));
         }
         f.set_newline(Some(nl));
     }
@@ -740,7 +743,14 @@ pub(crate) fn io_open(args: &[Object]) -> Result<Object, RuntimeError> {
     // `error:` cleanup instead: close the freshly-opened stream on any config
     // failure, so no unclosed-file `ResourceWarning` fires (`test_io`
     // `test_invalid_newline` / `test_nonbuffered_textio` assert none does).
-    finish_open(file, args.get(2), args.get(3), args.get(4), args.get(5), binary)
+    finish_open(
+        file,
+        args.get(2),
+        args.get(3),
+        args.get(4),
+        args.get(5),
+        binary,
+    )
 }
 
 /// Apply the post-open text config + buffering to a freshly built stream,

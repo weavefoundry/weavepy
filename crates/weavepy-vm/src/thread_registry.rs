@@ -236,8 +236,7 @@ impl ThreadRegistry {
         // SAFETY: sole surviving thread post-fork; `&self.entries` points at
         // a live, initialised `RwLock` for the duration of the write.
         unsafe {
-            let p =
-                std::ptr::addr_of!(self.entries).cast_mut();
+            let p = std::ptr::addr_of!(self.entries).cast_mut();
             std::ptr::write(p, RwLock::new(BTreeMap::new()));
         }
         self.main_native_id

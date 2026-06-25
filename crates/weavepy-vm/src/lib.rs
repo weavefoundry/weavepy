@@ -4912,12 +4912,13 @@ impl Interpreter {
                         let mut pairs = Vec::with_capacity(keys.len());
                         for k in keys {
                             let value =
-                                self.subscr_via_protocol(&other, &k, &globals).map_err(|_| {
-                                    type_error(format!(
-                                        "cannot access key in {} for ** spread",
-                                        other.type_name()
-                                    ))
-                                })?;
+                                self.subscr_via_protocol(&other, &k, &globals)
+                                    .map_err(|_| {
+                                        type_error(format!(
+                                            "cannot access key in {} for ** spread",
+                                            other.type_name()
+                                        ))
+                                    })?;
                             pairs.push((k, value));
                         }
                         let mut t = target.borrow_mut();
@@ -8784,7 +8785,11 @@ impl Interpreter {
         let Some(warn) = self.module_attr("warnings", "warn") else {
             return Ok(());
         };
-        let category = Object::Type(crate::builtin_types::builtin_types().resource_warning.clone());
+        let category = Object::Type(
+            crate::builtin_types::builtin_types()
+                .resource_warning
+                .clone(),
+        );
         let globals = self.builtins.clone();
         self.call(&warn, &[Object::from_str(message), category], &[], &globals)
             .map(|_| ())
@@ -9978,7 +9983,9 @@ impl Interpreter {
         let reg = cls
             .dict
             .borrow()
-            .get(&crate::object::DictKey(Object::from_static("_abc_registry")))
+            .get(&crate::object::DictKey(Object::from_static(
+                "_abc_registry",
+            )))
             .cloned();
         if let Some(Object::Set(s)) = reg {
             for k in s.borrow().iter() {
@@ -13585,8 +13592,7 @@ impl Interpreter {
                             Ok(None)
                         }
                     };
-                let rendered =
-                    percent_format_with(&template, b, PercentMode::Str, &mut resolve)?;
+                let rendered = percent_format_with(&template, b, PercentMode::Str, &mut resolve)?;
                 return Ok(if bridged {
                     crate::builtins::bridge_to_object(&rendered)
                 } else {
@@ -15590,9 +15596,12 @@ impl Interpreter {
         // guard it explicitly to match the descriptor
         // (`test_io.test_del__CHUNK_SIZE_SystemError`).
         if name == "_CHUNK_SIZE"
-            && inst.cls().mro.borrow().iter().any(|t| {
-                Rc::ptr_eq(t, &crate::stdlib::io::build_iobase_family().text_io_wrapper)
-            })
+            && inst
+                .cls()
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| Rc::ptr_eq(t, &crate::stdlib::io::build_iobase_family().text_io_wrapper))
         {
             return Err(attribute_error("cannot delete attribute".to_owned()));
         }
@@ -21073,8 +21082,7 @@ impl Interpreter {
             }
             Object::Slice(s) => {
                 let type_obj = crate::builtins::class_of(recv);
-                let args =
-                    Object::new_tuple(vec![s.start.clone(), s.stop.clone(), s.step.clone()]);
+                let args = Object::new_tuple(vec![s.start.clone(), s.stop.clone(), s.step.clone()]);
                 return Ok(Object::new_tuple(vec![Object::Type(type_obj), args]));
             }
             _ => {}
@@ -22071,11 +22079,15 @@ impl Interpreter {
         // build the module *natively* from the code object so it is a true
         // `Object::Module` — dotted-import binding and `IMPORT_FROM` only
         // recognise native modules, not `types.ModuleType` instances.
-        let payload =
-            match self.call(&func, &[Object::from_str(full.to_owned())], &[], &helper_globals)? {
-                Object::Tuple(t) => t,
-                _ => return Ok(None),
-            };
+        let payload = match self.call(
+            &func,
+            &[Object::from_str(full.to_owned())],
+            &[],
+            &helper_globals,
+        )? {
+            Object::Tuple(t) => t,
+            _ => return Ok(None),
+        };
         let Some(Object::Code(code_rc)) = payload.first().cloned() else {
             return Ok(None);
         };
@@ -23222,7 +23234,7 @@ pub(crate) fn mv_pack_single(
     macro_rules! pack_int {
         ($t:ty) => {{
             let v = as_i128(value).ok_or_else(bad_type)?;
-            if v < <$t>::MIN as i128 || v > <$t>::MAX as i128 {
+            if v < i128::from(<$t>::MIN) || v > i128::from(<$t>::MAX) {
                 return Err(bad_val());
             }
             let n = std::mem::size_of::<$t>();
@@ -24633,10 +24645,7 @@ fn percent_args_have_wstr(b: &Object) -> bool {
     match b {
         Object::WStr(_) => true,
         Object::Tuple(items) => items.iter().any(|x| matches!(x, Object::WStr(_))),
-        Object::Dict(d) => d
-            .borrow()
-            .iter()
-            .any(|(_, v)| matches!(v, Object::WStr(_))),
+        Object::Dict(d) => d.borrow().iter().any(|(_, v)| matches!(v, Object::WStr(_))),
         _ => false,
     }
 }
@@ -26522,13 +26531,10 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         (O::Str(template), v, B::Mod) => {
             if percent_args_have_wstr(v) {
                 let mut resolve = |obj: &Object, kind: char| match (obj, kind) {
-                    (Object::WStr(cps), 's') => {
-                        Ok(Some(crate::builtins::bridge_encode_cps(cps)))
-                    }
+                    (Object::WStr(cps), 's') => Ok(Some(crate::builtins::bridge_encode_cps(cps))),
                     _ => Ok(None),
                 };
-                let rendered =
-                    percent_format_with(template, v, PercentMode::Str, &mut resolve)?;
+                let rendered = percent_format_with(template, v, PercentMode::Str, &mut resolve)?;
                 Ok(crate::builtins::bridge_to_object(&rendered))
             } else {
                 Ok(Object::from_str(percent_format(template, v)?))

@@ -181,43 +181,6 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     })
 }
 
-/// Build a protocol-only TypeObject for one of the `io.*` ABCs. This
-/// returns the same shape as `_io.IOBase` etc. so the two surface
-/// imports resolve to identical class identity. (We don't try to
-/// share `Rc<TypeObject>` instances across module builds because
-/// `io.IOBase` and `_io.IOBase` are recreated per-VM.)
-fn make_io_protocol(name: &'static str) -> Rc<crate::types::TypeObject> {
-    use crate::builtin_types::builtin_types;
-    use crate::object::MethodWrapper;
-    use crate::types::{TypeFlags, TypeObject};
-    let bt = builtin_types();
-    let mut dict = DictData::new();
-    // CPython's io ABCs are ABCMeta-based and expose `register` for
-    // virtual-subclass registration; the Python `_pyio` shim calls
-    // `io.IOBase.register(IOBase)` at import time. Provide a `register`
-    // classmethod (the class binds first) so that import — and the ABC
-    // registration idiom generally — works.
-    dict.insert(
-        DictKey(Object::from_static("register")),
-        Object::ClassMethod(MethodWrapper::new(Object::Builtin(Rc::new(BuiltinFn {
-            name: "register",
-            binds_instance: true,
-            call: Box::new(io_abc_register),
-            call_kw: None,
-        })))),
-    );
-    TypeObject::new_with_flags(
-        name,
-        vec![bt.object_.clone()],
-        dict,
-        TypeFlags {
-            is_exception: name == "UnsupportedOperation",
-            is_builtin: true,
-        },
-    )
-    .expect("io protocol type")
-}
-
 /// `IOBase.register(subclass)` — ABC virtual-subclass registration. The
 /// class binds first (classmethod); we record the subclass in the class's
 /// `_abc_registry` set and return it so `register` also works as a
@@ -1147,7 +1110,9 @@ fn ind_check_init(inst: &crate::types::PyInstance) -> Result<(), RuntimeError> {
     if matches!(tw_get(inst, "_ind_init"), Some(Object::Bool(true))) {
         Ok(())
     } else {
-        Err(value_error("IncrementalNewlineDecoder.__init__() not called"))
+        Err(value_error(
+            "IncrementalNewlineDecoder.__init__() not called",
+        ))
     }
 }
 
@@ -2005,7 +1970,11 @@ fn rawiobase_read(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::None => return Ok(Object::None),
         Object::Int(n) => n,
         Object::Bool(b) => i64::from(b),
-        _ => return Err(type_error("readinto() should return a non-negative integer")),
+        _ => {
+            return Err(type_error(
+                "readinto() should return a non-negative integer",
+            ))
+        }
     };
     // gh-129830: a `readinto` whose return falls outside `[0, len(buffer)]` is a
     // `ValueError`, not a silent buffer overrun or a `TypeError`
@@ -2079,7 +2048,10 @@ fn iobase_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
                 Object::ByteArray(b) => b.borrow().len() as i64,
                 other => {
                     let lenf = interp.load_attr_public(other, "__len__").map_err(|_| {
-                        type_error(format!("object of type '{}' has no len()", other.type_name()))
+                        type_error(format!(
+                            "object of type '{}' has no len()",
+                            other.type_name()
+                        ))
                     })?;
                     match interp.call_object(lenf, &[], &[])? {
                         Object::Int(n) => n,
@@ -2671,7 +2643,10 @@ fn tw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
     match &newline {
         Some(Object::Str(s)) => {
             if !matches!(s.as_ref(), "" | "\n" | "\r" | "\r\n") {
-                return Err(value_error(format!("illegal newline value: {}", s.as_ref())));
+                return Err(value_error(format!(
+                    "illegal newline value: {}",
+                    s.as_ref()
+                )));
             }
         }
         Some(Object::None) | None => {}
@@ -3054,7 +3029,13 @@ fn tw_dec_output(inst: &crate::types::PyInstance, s: String) -> Object {
 /// (newly repositioned) underlying buffer.
 fn tw_reset_decoded(inst: &crate::types::PyInstance) {
     let mut d = inst.dict.borrow_mut();
-    for k in ["_dec_buf", "_dec_pos", "_dec_done", "_dec_start", "_dec_wstr"] {
+    for k in [
+        "_dec_buf",
+        "_dec_pos",
+        "_dec_done",
+        "_dec_start",
+        "_dec_wstr",
+    ] {
         d.shift_remove(&DictKey(Object::from_static(k)));
     }
 }
@@ -3095,7 +3076,8 @@ fn tw_byte_position(inst: &crate::types::PyInstance) -> Result<i64, RuntimeError
             let consumed = if tw_dec_is_wstr(inst) {
                 match crate::builtins::bridge_to_object(&buf[..pos]) {
                     Object::WStr(cps) => {
-                        crate::stdlib::codecs_mod::encode_codepoints(&cps, &encoding, &errors)?.len()
+                        crate::stdlib::codecs_mod::encode_codepoints(&cps, &encoding, &errors)?
+                            .len()
                     }
                     other => {
                         crate::stdlib::codecs_mod::encode_str(&other.to_str(), &encoding, &errors)?
@@ -3530,7 +3512,7 @@ fn tw_repr(args: &[Object]) -> Result<Object, RuntimeError> {
     tw_require_init(&inst)?;
     let typename = format!("_io.{}", inst.cls().name);
     let id = match &args[0] {
-        Object::Instance(i) => Rc::as_ptr(i) as *const () as usize,
+        Object::Instance(i) => Rc::as_ptr(i).cast::<()>() as usize,
         _ => 0,
     };
     if TW_REPR_ACTIVE.with(|s| s.borrow().contains(&id)) {
@@ -3626,10 +3608,7 @@ fn tw_reconfigure(args: &[Object]) -> Result<Object, RuntimeError> {
 ///   * `line_buffering`/`write_through` accept any `__index__`-able value and
 ///     `None` keeps the current setting;
 ///   * an implicit `flush()` runs before the new settings take effect.
-fn tw_reconfigure_kw(
-    args: &[Object],
-    kwargs: &[(String, Object)],
-) -> Result<Object, RuntimeError> {
+fn tw_reconfigure_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let inst = tw_self(args)?;
     let kwget = |name: &str| {
         kwargs
@@ -3697,7 +3676,10 @@ fn tw_reconfigure_kw(
         Some(Object::None) => Some(None),
         Some(Object::Str(s)) => {
             if !matches!(s.as_ref(), "" | "\n" | "\r" | "\r\n") {
-                return Err(value_error(format!("illegal newline value: {}", s.as_ref())));
+                return Err(value_error(format!(
+                    "illegal newline value: {}",
+                    s.as_ref()
+                )));
             }
             Some(Some(s.to_string()))
         }
@@ -3773,11 +3755,7 @@ fn tw_reconfigure_kw(
         tw_set(&inst, "errors", Object::from_str(err.clone()));
     }
     if let Some(nl) = new_newline {
-        tw_set(
-            &inst,
-            "newline",
-            nl.map_or(Object::None, Object::from_str),
-        );
+        tw_set(&inst, "newline", nl.map_or(Object::None, Object::from_str));
     }
     if let Some(lb) = new_lb {
         tw_set(&inst, "line_buffering", Object::Bool(lb));
@@ -4033,9 +4011,9 @@ const BW_CHUNK: usize = 8192;
 // mirrors `_pyio.BufferedWriter.close` by dropping it across the nested
 // `self.flush()` (which re-takes it) and re-taking it only around the slow
 // `raw.close()`.
-fn buffered_write_locks(
-) -> &'static std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<crate::sync::RealLock>>>
-{
+fn buffered_write_locks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<usize, std::sync::Arc<crate::sync::RealLock>>,
+> {
     static M: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<crate::sync::RealLock>>>,
     > = std::sync::OnceLock::new();
@@ -4059,7 +4037,9 @@ fn bw_install_write_lock(inst: &Rc<crate::types::PyInstance>) {
 }
 
 /// Fetch (or lazily create) the write lock backing `inst`.
-fn bw_write_lock_handle(inst: &Rc<crate::types::PyInstance>) -> std::sync::Arc<crate::sync::RealLock> {
+fn bw_write_lock_handle(
+    inst: &Rc<crate::types::PyInstance>,
+) -> std::sync::Arc<crate::sync::RealLock> {
     let key = bw_lock_key(inst);
     let mut m = buffered_write_locks().lock().unwrap();
     m.entry(key)
@@ -4103,7 +4083,9 @@ fn bw_acquire_write_lock(inst: &Rc<crate::types::PyInstance>) -> BwWriteGuard {
 fn bw_raw_capable(raw: &Object, name: &str) -> bool {
     match raw_target(raw) {
         Ok(RawTarget::Native(_)) => true,
-        Ok(RawTarget::Py(o)) => py_call(&o, name, &[]).map(|r| r.is_truthy()).unwrap_or(false),
+        Ok(RawTarget::Py(o)) => py_call(&o, name, &[])
+            .map(|r| r.is_truthy())
+            .unwrap_or(false),
         Err(_) => false,
     }
 }
@@ -4154,14 +4136,18 @@ fn bw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
         if positional.len() > 3 {
             return Err(type_error("BufferedRWPair() takes at most 3 arguments"));
         }
-        (Some(writer), positional.get(2).cloned().or_else(|| kw("buffer_size")))
+        (
+            Some(writer),
+            positional.get(2).cloned().or_else(|| kw("buffer_size")),
+        )
     } else {
         if positional.len() > 2 {
-            return Err(type_error(format!(
-                "{clsname}() takes at most 2 arguments"
-            )));
+            return Err(type_error(format!("{clsname}() takes at most 2 arguments")));
         }
-        (None, positional.get(1).cloned().or_else(|| kw("buffer_size")))
+        (
+            None,
+            positional.get(1).cloned().or_else(|| kw("buffer_size")),
+        )
     };
     if let Some(ref bs) = bufsize {
         let n = crate::builtins::coerce_index_i64(bs)?;
@@ -4189,14 +4175,10 @@ fn bw_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runti
         tw_set(&inst, "_writer", writer.unwrap());
     } else {
         if bw_is_reader(&clsname) && !bw_raw_capable(&raw, "readable") {
-            return Err(crate::error::os_error(
-                "\"raw\" argument must be readable.",
-            ));
+            return Err(crate::error::os_error("\"raw\" argument must be readable."));
         }
         if bw_is_writer(&clsname) && !bw_raw_capable(&raw, "writable") {
-            return Err(crate::error::os_error(
-                "\"raw\" argument must be writable.",
-            ));
+            return Err(crate::error::os_error("\"raw\" argument must be writable."));
         }
     }
     tw_set(&inst, "raw", raw);
@@ -4314,7 +4296,10 @@ fn blocking_errno_strerror(err: &RuntimeError) -> (i32, String) {
             return (errno, strerror);
         }
     }
-    (eagain(), "write could not complete without blocking".to_owned())
+    (
+        eagain(),
+        "write could not complete without blocking".to_owned(),
+    )
 }
 
 /// `BufferedRandom.write` first undoes any read-ahead so the raw position
@@ -4330,7 +4315,11 @@ fn bw_random_undo_readahead(inst: &crate::types::PyInstance) -> Result<(), Runti
                 raw.seek(-(buffered.len() as isize), 1)?;
             }
             RawTarget::Py(raw) => {
-                py_call(raw, "seek", &[Object::Int(-(buffered.len() as i64)), Object::Int(1)])?;
+                py_call(
+                    raw,
+                    "seek",
+                    &[Object::Int(-(buffered.len() as i64)), Object::Int(1)],
+                )?;
             }
         }
     }
@@ -5212,7 +5201,7 @@ fn bw_repr(args: &[Object]) -> Result<Object, RuntimeError> {
         return Ok(Object::from_str(format!("<{typename}>")));
     };
     let id = match &args[0] {
-        Object::Instance(i) => Rc::as_ptr(i) as *const () as usize,
+        Object::Instance(i) => Rc::as_ptr(i).cast::<()>() as usize,
         _ => 0,
     };
     if BW_REPR_ACTIVE.with(|s| s.borrow().contains(&id)) {

@@ -217,8 +217,9 @@ struct MmapState {
 /// serialised by the GIL; the `parking_lot::Mutex` only guards the table
 /// itself, mirroring `socket_mod`'s registry.
 fn registry() -> &'static parking_lot::Mutex<HashMap<usize, Rc<RefCell<MmapState>>>> {
-    static REGISTRY: std::sync::OnceLock<parking_lot::Mutex<HashMap<usize, Rc<RefCell<MmapState>>>>> =
-        std::sync::OnceLock::new();
+    static REGISTRY: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<usize, Rc<RefCell<MmapState>>>>,
+    > = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
@@ -242,7 +243,9 @@ fn with_state<R>(
     // closure may itself touch the registry (e.g. exporting a memoryview).
     let cell = {
         let map = registry().lock();
-        map.get(&id).cloned().ok_or_else(|| value_error("mmap: closed"))?
+        map.get(&id)
+            .cloned()
+            .ok_or_else(|| value_error("mmap: closed"))?
     };
     let mut state = cell.borrow_mut();
     Ok(f(&mut state))

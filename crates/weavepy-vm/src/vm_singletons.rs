@@ -21,23 +21,23 @@ use crate::sync::{Rc, RefCell};
 use crate::object::Object;
 use crate::types::{PyInstance, TypeObject};
 
-/// `NotImplemented` / `Ellipsis` are **process-global** singletons, not
-/// per-thread: CPython's `x is NotImplemented` identity test must hold no
-/// matter which OS thread minted the value. A thread-local here was a real
-/// bug — `object.__subclasshook__` (and every `return NotImplemented`
-/// site) handed back the *current thread's* instance, so an ABC
-/// `issubclass()` running on a worker thread saw `ok is not NotImplemented`
-/// and tripped `_py_abc`'s `assert isinstance(ok, bool)` (e.g. importing
-/// `decimal`/`numbers` on a `multiprocessing.managers` accepter thread).
-/// `Object` is `Send + Sync` (it is `Arc`/`GilCell`-backed), so a single
-/// shared instance is safe to serve everywhere.
-///
-/// These are stored as a plain [`OnceLock<Object>`] (not a `Mutex`): they are
-/// read on *every* `return NotImplemented` rich-compare/binop fallback and on
-/// every `...`/`Ellipsis` reference — one of the hottest paths in the VM. A
-/// per-call `Mutex::lock()` there serialised the path and measurably slowed
-/// io/comparison-heavy suites (test_io/test_tarfile/test_zipfile ran ~3-5×
-/// slower). `OnceLock` is a one-time atomic init, then a lock-free read.
+// `NotImplemented` / `Ellipsis` are **process-global** singletons, not
+// per-thread: CPython's `x is NotImplemented` identity test must hold no
+// matter which OS thread minted the value. A thread-local here was a real
+// bug — `object.__subclasshook__` (and every `return NotImplemented`
+// site) handed back the *current thread's* instance, so an ABC
+// `issubclass()` running on a worker thread saw `ok is not NotImplemented`
+// and tripped `_py_abc`'s `assert isinstance(ok, bool)` (e.g. importing
+// `decimal`/`numbers` on a `multiprocessing.managers` accepter thread).
+// `Object` is `Send + Sync` (it is `Arc`/`GilCell`-backed), so a single
+// shared instance is safe to serve everywhere.
+//
+// These are stored as a plain `OnceLock<Object>` (not a `Mutex`): they are
+// read on *every* `return NotImplemented` rich-compare/binop fallback and on
+// every `...`/`Ellipsis` reference — one of the hottest paths in the VM. A
+// per-call `Mutex::lock()` there serialised the path and measurably slowed
+// io/comparison-heavy suites (test_io/test_tarfile/test_zipfile ran ~3-5×
+// slower). `OnceLock` is a one-time atomic init, then a lock-free read.
 
 thread_local! {
     /// Pending `__del__` finalizer invocations queued by the cycle
@@ -369,8 +369,7 @@ thread_local! {
 /// Cheap "is the deferred-warning queue non-empty?" probe set whenever a
 /// destructor enqueues. A relaxed atomic so the eval-loop safe point pays a
 /// single load in the common (empty) case rather than a thread-local borrow.
-static PENDING_RW_FLAG: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static PENDING_RW_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Enqueue a deferred `ResourceWarning` message from a destructor. Drained by
 /// [`crate::Interpreter::drain_pending_resource_warnings`] at the next safe

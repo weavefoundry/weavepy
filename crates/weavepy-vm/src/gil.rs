@@ -415,8 +415,7 @@ pub fn reinit_after_fork_in_child() {
     //    to hand the lock to one of the vanished peers. `mem::forget`
     //    leaks one `Arc<GilState>` refcount per held guard — negligible,
     //    and the alternative (unlocking) deadlocks.
-    let held: Vec<GilGuard> =
-        GIL_GUARD_STACK.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    let held: Vec<GilGuard> = GIL_GUARD_STACK.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     let depth = held.len();
     for g in held {
         std::mem::forget(g);

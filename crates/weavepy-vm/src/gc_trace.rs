@@ -406,7 +406,9 @@ impl GcState {
     /// laundered raw pointer rather than a `&self` cast (see
     /// [`crate::sync::GilCell::reinit_lock_after_fork`]).
     ///
-    /// SAFETY: `this` must point at the process-global collector on the lone
+    /// # Safety
+    ///
+    /// `this` must point at the process-global collector on the lone
     /// surviving thread of a fork child, so the in-place lock rebuilds cannot
     /// race and the payloads (last mutated under the GIL the forking thread
     /// holds) are consistent.
@@ -529,7 +531,11 @@ impl GcState {
                 .load(Ordering::Acquire)
                 .min(N_GENERATIONS - 1);
             let slot = handle.slot.load(Ordering::Acquire);
-            if gens[g].handles.get(slot).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
+            if gens[g]
+                .handles
+                .get(slot)
+                .is_some_and(|h| Arc::ptr_eq(h, &handle))
+            {
                 swap_remove_handle(&mut gens[g].handles, slot);
             } else if !remove_handle_by_ptr(&mut gens[g].handles, &handle) {
                 // Declared generation was wrong too (e.g. a concurrent
@@ -2012,7 +2018,9 @@ pub fn track(obj: Object) {
 /// Reinitialise the process-global cycle collector's locks in a `fork(2)`
 /// child. See [`GcState::reinit_after_fork_in_child`].
 ///
-/// SAFETY: must run only on the lone surviving thread of a fork child.
+/// # Safety
+///
+/// Must run only on the lone surviving thread of a fork child.
 pub unsafe fn reinit_after_fork_in_child() {
     // Launder the static's address into a raw `*mut` (forcing init via the
     // deref) so the field rebuilds don't go through a `&T -> *mut T` cast.

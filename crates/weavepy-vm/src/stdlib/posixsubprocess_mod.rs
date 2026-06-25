@@ -581,7 +581,10 @@ unsafe fn close_open_fds_via_dir(start: i32, keep: &[i32]) -> bool {
             // potentially-unaligned u16 pointer load.
             let reclen_lo = unsafe { *ent.add(RECLEN_OFF) };
             let reclen_hi = unsafe { *ent.add(RECLEN_OFF + 1) };
-            let reclen = isize::from(u16::from_ne_bytes([reclen_lo, reclen_hi]));
+            // `isize: From<u16>` is not provided (isize may be 16-bit), so
+            // widen with `as` — a `u16` always fits the `isize` of every target
+            // WeavePy builds for.
+            let reclen = u16::from_ne_bytes([reclen_lo, reclen_hi]) as isize;
             if reclen <= 0 {
                 break;
             }

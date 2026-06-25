@@ -119,7 +119,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Int(0),
         );
         d.insert(
-            DictKey(Object::from_static("XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE")),
+            DictKey(Object::from_static(
+                "XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE",
+            )),
             Object::Int(1),
         );
         d.insert(
@@ -217,15 +219,31 @@ const ERR_CODES: &[(i64, &str, &str)] = &[
     (1, "XML_ERROR_NO_MEMORY", "out of memory"),
     (2, "XML_ERROR_SYNTAX", "syntax error"),
     (3, "XML_ERROR_NO_ELEMENTS", "no element found"),
-    (4, "XML_ERROR_INVALID_TOKEN", "not well-formed (invalid token)"),
+    (
+        4,
+        "XML_ERROR_INVALID_TOKEN",
+        "not well-formed (invalid token)",
+    ),
     (5, "XML_ERROR_UNCLOSED_TOKEN", "unclosed token"),
     (6, "XML_ERROR_PARTIAL_CHAR", "partial character"),
     (7, "XML_ERROR_TAG_MISMATCH", "mismatched tag"),
     (8, "XML_ERROR_DUPLICATE_ATTRIBUTE", "duplicate attribute"),
-    (9, "XML_ERROR_JUNK_AFTER_DOC_ELEMENT", "junk after document element"),
-    (10, "XML_ERROR_PARAM_ENTITY_REF", "illegal parameter entity reference"),
+    (
+        9,
+        "XML_ERROR_JUNK_AFTER_DOC_ELEMENT",
+        "junk after document element",
+    ),
+    (
+        10,
+        "XML_ERROR_PARAM_ENTITY_REF",
+        "illegal parameter entity reference",
+    ),
     (11, "XML_ERROR_UNDEFINED_ENTITY", "undefined entity"),
-    (12, "XML_ERROR_RECURSIVE_ENTITY_REF", "recursive entity reference"),
+    (
+        12,
+        "XML_ERROR_RECURSIVE_ENTITY_REF",
+        "recursive entity reference",
+    ),
     (13, "XML_ERROR_ASYNC_ENTITY", "asynchronous entity"),
     (
         14,
@@ -253,7 +271,11 @@ const ERR_CODES: &[(i64, &str, &str)] = &[
         "XML_ERROR_INCORRECT_ENCODING",
         "encoding specified in XML declaration is incorrect",
     ),
-    (20, "XML_ERROR_UNCLOSED_CDATA_SECTION", "unclosed CDATA section"),
+    (
+        20,
+        "XML_ERROR_UNCLOSED_CDATA_SECTION",
+        "unclosed CDATA section",
+    ),
     (
         21,
         "XML_ERROR_EXTERNAL_ENTITY_HANDLING",
@@ -294,8 +316,14 @@ fn errors_submodule() -> Rc<PyModule> {
                     DictKey(Object::from_static(name)),
                     Object::from_str((*msg).to_owned()),
                 );
-                c.insert(DictKey(Object::from_str((*msg).to_owned())), Object::Int(*code));
-                m.insert(DictKey(Object::Int(*code)), Object::from_str((*msg).to_owned()));
+                c.insert(
+                    DictKey(Object::from_str((*msg).to_owned())),
+                    Object::Int(*code),
+                );
+                m.insert(
+                    DictKey(Object::Int(*code)),
+                    Object::from_str((*msg).to_owned()),
+                );
             }
         }
         d.insert(DictKey(Object::from_static("codes")), Object::Dict(codes));
@@ -358,9 +386,17 @@ fn parser_type() -> Rc<TypeObject> {
         method(&mut d, "SetBase", set_base_method);
         method(&mut d, "GetBase", get_base_method);
         method(&mut d, "GetInputContext", get_input_context_method);
-        method(&mut d, "SetParamEntityParsing", set_param_entity_parsing_method);
+        method(
+            &mut d,
+            "SetParamEntityParsing",
+            set_param_entity_parsing_method,
+        );
         method(&mut d, "UseForeignDTD", use_foreign_dtd_method);
-        method(&mut d, "ExternalEntityParserCreate", external_entity_parser_create);
+        method(
+            &mut d,
+            "ExternalEntityParserCreate",
+            external_entity_parser_create,
+        );
         method(
             &mut d,
             "GetReparseDeferralEnabled",
@@ -411,7 +447,9 @@ fn parser_create(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     // expat requires the namespace separator to be a single character.
     if let Some(s) = &namespace_sep {
         if s.chars().count() > 1 {
-            return Err(value_error("namespace_separator must be at most one character, omitted, or None"));
+            return Err(value_error(
+                "namespace_separator must be at most one character, omitted, or None",
+            ));
         }
     }
     let parser = make_parser(encoding, namespace_sep);
@@ -459,7 +497,10 @@ fn make_parser(encoding: Option<String>, namespace_sep: Option<String>) -> Objec
             DictKey(Object::from_static("namespace_prefixes")),
             Object::Bool(false),
         );
-        d.insert(DictKey(Object::from_static("buffer_size")), Object::Int(8192));
+        d.insert(
+            DictKey(Object::from_static("buffer_size")),
+            Object::Int(8192),
+        );
         d.insert(DictKey(Object::from_static("buffer_used")), Object::Int(0));
         d.insert(
             DictKey(Object::from_static("CurrentLineNumber")),
@@ -574,7 +615,13 @@ fn parse_method(args: &[Object]) -> Result<Object, RuntimeError> {
     {
         let mut st = state.borrow_mut();
         if st.finished {
-            return Err(make_expat_error(&inst, 9, st.line_starts.len() as i64, 0, st.buffer.len() as i64));
+            return Err(make_expat_error(
+                &inst,
+                9,
+                st.line_starts.len() as i64,
+                0,
+                st.buffer.len() as i64,
+            ));
         }
         st.buffer.extend_from_slice(&data);
         if !isfinal {
@@ -606,7 +653,14 @@ fn parse_method(args: &[Object]) -> Result<Object, RuntimeError> {
         st.line_starts = line_starts.clone();
     }
 
-    run_parse(&inst, &buffer, &line_starts, namespace_sep.as_deref(), buffer_text, ordered)?;
+    run_parse(
+        &inst,
+        &buffer,
+        &line_starts,
+        namespace_sep.as_deref(),
+        buffer_text,
+        ordered,
+    )?;
     Ok(Object::Int(1))
 }
 
@@ -628,7 +682,11 @@ fn parse_file_method(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Str(s) => s.as_bytes().to_vec(),
         _ => return Err(type_error("read() must return bytes")),
     };
-    parse_method(&[Object::Instance(inst), Object::new_bytes(bytes), Object::Bool(true)])
+    parse_method(&[
+        Object::Instance(inst),
+        Object::new_bytes(bytes),
+        Object::Bool(true),
+    ])
 }
 
 fn parse_args(rest: &[Object]) -> Result<(Vec<u8>, bool), RuntimeError> {
@@ -721,10 +779,7 @@ fn make_expat_error(
         );
         d.insert(DictKey(Object::from_static("code")), Object::Int(code));
         d.insert(DictKey(Object::from_static("lineno")), Object::Int(lineno));
-        d.insert(
-            DictKey(Object::from_static("offset")),
-            Object::Int(colno),
-        );
+        d.insert(DictKey(Object::from_static("offset")), Object::Int(colno));
     }
     RuntimeError::PyException(PyException::new(Object::Instance(Rc::new(einst))))
 }
@@ -795,12 +850,28 @@ fn run_parse(
             Ok(Event::Start(e)) => {
                 flush_text(inst, &mut pending_text)?;
                 update_position(inst, line_starts, event_pos);
-                handle_start(inst, &reader, &e, namespace_sep, ordered, &mut ns_stack, false)?;
+                handle_start(
+                    inst,
+                    &reader,
+                    &e,
+                    namespace_sep,
+                    ordered,
+                    &mut ns_stack,
+                    false,
+                )?;
             }
             Ok(Event::Empty(e)) => {
                 flush_text(inst, &mut pending_text)?;
                 update_position(inst, line_starts, event_pos);
-                handle_start(inst, &reader, &e, namespace_sep, ordered, &mut ns_stack, true)?;
+                handle_start(
+                    inst,
+                    &reader,
+                    &e,
+                    namespace_sep,
+                    ordered,
+                    &mut ns_stack,
+                    true,
+                )?;
             }
             Ok(Event::End(e)) => {
                 flush_text(inst, &mut pending_text)?;
@@ -898,11 +969,19 @@ fn flush_text(inst: &Rc<PyInstance>, pending: &mut Option<String>) -> Result<(),
 }
 
 fn emit_char_data(inst: &Rc<PyInstance>, text: &str) -> Result<(), RuntimeError> {
-    let fired = call_handler(inst, "CharacterDataHandler", &[Object::from_str(text.to_owned())])?;
+    let fired = call_handler(
+        inst,
+        "CharacterDataHandler",
+        &[Object::from_str(text.to_owned())],
+    )?;
     if !fired {
         // expat routes unhandled data through the Default handlers.
         if handler_of(inst, "DefaultHandlerExpand").is_some() {
-            call_handler(inst, "DefaultHandlerExpand", &[Object::from_str(text.to_owned())])?;
+            call_handler(
+                inst,
+                "DefaultHandlerExpand",
+                &[Object::from_str(text.to_owned())],
+            )?;
         } else {
             call_handler(inst, "DefaultHandler", &[Object::from_str(text.to_owned())])?;
         }

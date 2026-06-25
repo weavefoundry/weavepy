@@ -1652,10 +1652,7 @@ impl<'src> Parser<'src> {
         let left_is_number = matches!(
             left.kind,
             ExprKind::Constant(
-                Constant::Int(_)
-                    | Constant::Float(_)
-                    | Constant::BigInt(_)
-                    | Constant::Complex(..)
+                Constant::Int(_) | Constant::Float(_) | Constant::BigInt(_) | Constant::Complex(..)
             )
         );
         if left_is_number && matches!(self.peek(), TokenKind::Plus | TokenKind::Minus) {
@@ -1673,10 +1670,11 @@ impl<'src> Parser<'src> {
                 });
             }
             self.bump();
-            let value = parse_number(self.lexeme(num.span)).map_err(|m| ParseError::Unexpected {
-                span: num.span,
-                message: m,
-            })?;
+            let value =
+                parse_number(self.lexeme(num.span)).map_err(|m| ParseError::Unexpected {
+                    span: num.span,
+                    message: m,
+                })?;
             let right = Expr {
                 kind: ExprKind::Constant(value),
                 span: num.span,
@@ -3296,19 +3294,14 @@ impl<'src> Parser<'src> {
                     AccumString::Joined(parts)
                 }
                 (AccumString::Joined(mut parts), false, false) => {
-                    join_str_into_parts(
-                        &mut parts,
-                        self.decode_string(&next_tok)?,
-                        next_tok.span,
-                    );
+                    join_str_into_parts(&mut parts, self.decode_string(&next_tok)?, next_tok.span);
                     AccumString::Joined(parts)
                 }
                 (AccumString::Joined(mut parts), true, false) => {
                     let new_parts = self.fstring_parts_for(&next_tok)?;
                     for p in new_parts {
-                        if let ExprKind::Constant(
-                            c @ (Constant::Str(_) | Constant::WStr(_)),
-                        ) = p.kind
+                        if let ExprKind::Constant(c @ (Constant::Str(_) | Constant::WStr(_))) =
+                            p.kind
                         {
                             join_str_into_parts(&mut parts, c, p.span);
                         } else {

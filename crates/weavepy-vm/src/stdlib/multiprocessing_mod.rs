@@ -82,8 +82,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use crate::error::{
-    assertion_error, broken_pipe_error, io_error_to_py, not_implemented_error, runtime_error,
-    type_error, value_error, RuntimeError,
+    assertion_error, broken_pipe_error, io_error_to_py, runtime_error, type_error, value_error,
+    RuntimeError,
 };
 #[cfg(unix)]
 use crate::object::BuiltinFn;
@@ -750,7 +750,9 @@ fn sem_get_value(inner: &Arc<SemInner>) -> Result<Object, RuntimeError> {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let _ = inner;
-        Err(not_implemented_error(
+        // `not_implemented_error` is only referenced on this macOS/iOS arm, so
+        // qualify it here rather than import it (unused on other unixes).
+        Err(crate::error::not_implemented_error(
             "sem_getvalue is not implemented on this system",
         ))
     }

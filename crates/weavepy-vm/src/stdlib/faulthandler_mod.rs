@@ -61,8 +61,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
 
         // State management.
-        d.insert(DictKey(Object::from_static("enable")), builtin_kw("enable", fh_enable));
-        d.insert(DictKey(Object::from_static("disable")), builtin("disable", fh_disable));
+        d.insert(
+            DictKey(Object::from_static("enable")),
+            builtin_kw("enable", fh_enable),
+        );
+        d.insert(
+            DictKey(Object::from_static("disable")),
+            builtin("disable", fh_disable),
+        );
         d.insert(
             DictKey(Object::from_static("is_enabled")),
             builtin("is_enabled", fh_is_enabled),
@@ -77,7 +83,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("cancel_dump_traceback_later")),
-            builtin("cancel_dump_traceback_later", fh_cancel_dump_traceback_later),
+            builtin(
+                "cancel_dump_traceback_later",
+                fh_cancel_dump_traceback_later,
+            ),
         );
         d.insert(
             DictKey(Object::from_static("register")),
@@ -89,11 +98,26 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
 
         // Private crash primitives (the test-suite entry points).
-        d.insert(DictKey(Object::from_static("_sigsegv")), builtin("_sigsegv", fh_sigsegv));
-        d.insert(DictKey(Object::from_static("_sigabrt")), builtin("_sigabrt", fh_sigabrt));
-        d.insert(DictKey(Object::from_static("_sigfpe")), builtin("_sigfpe", fh_sigfpe));
-        d.insert(DictKey(Object::from_static("_sigbus")), builtin("_sigbus", fh_sigbus));
-        d.insert(DictKey(Object::from_static("_sigill")), builtin("_sigill", fh_sigill));
+        d.insert(
+            DictKey(Object::from_static("_sigsegv")),
+            builtin("_sigsegv", fh_sigsegv),
+        );
+        d.insert(
+            DictKey(Object::from_static("_sigabrt")),
+            builtin("_sigabrt", fh_sigabrt),
+        );
+        d.insert(
+            DictKey(Object::from_static("_sigfpe")),
+            builtin("_sigfpe", fh_sigfpe),
+        );
+        d.insert(
+            DictKey(Object::from_static("_sigbus")),
+            builtin("_sigbus", fh_sigbus),
+        );
+        d.insert(
+            DictKey(Object::from_static("_sigill")),
+            builtin("_sigill", fh_sigill),
+        );
         d.insert(
             DictKey(Object::from_static("_fatal_error")),
             builtin("_fatal_error", fh_fatal_error),
@@ -266,7 +290,7 @@ fn signum_arg(obj: Option<&Object>) -> Result<i32, RuntimeError> {
     let n = obj
         .and_then(Object::as_i64)
         .ok_or_else(|| type_error("signum must be an integer"))?;
-    if n < 1 || n >= 65 {
+    if !(1..65).contains(&n) {
         return Err(value_error("signal number out of range"));
     }
     Ok(n as i32)

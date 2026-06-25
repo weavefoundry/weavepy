@@ -231,11 +231,8 @@ impl MarshalWriter {
                 // A str carrying lone surrogates. CPython marshals unicode
                 // through a surrogatepass UTF-8 encode, so the WTF-8 bytes
                 // round-trip via `TYPE_UNICODE` (RFC 0033 parity).
-                let bytes = crate::stdlib::codecs_mod::encode_codepoints(
-                    cps,
-                    "utf-8",
-                    "surrogatepass",
-                )?;
+                let bytes =
+                    crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogatepass")?;
                 self.write_byte(TYPE_UNICODE);
                 self.write_int(bytes.len() as i32);
                 self.buf.extend_from_slice(&bytes);

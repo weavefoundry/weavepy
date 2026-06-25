@@ -546,7 +546,10 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             d.insert(DictKey(Object::from_static("O_EXCL")), Object::Int(128));
             d.insert(DictKey(Object::from_static("O_TRUNC")), Object::Int(512));
             d.insert(DictKey(Object::from_static("O_APPEND")), Object::Int(1024));
-            d.insert(DictKey(Object::from_static("O_NONBLOCK")), Object::Int(2048));
+            d.insert(
+                DictKey(Object::from_static("O_NONBLOCK")),
+                Object::Int(2048),
+            );
         }
         // `O_CLOEXEC` is platform-specific (and `O_DIRECT` is Linux-only), so
         // source them from `libc` — `os.pipe2`/`os.open` callers and
@@ -664,11 +667,12 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
         // which only the fd path can do without `ENAMETOOLONG`.
         #[cfg(unix)]
         {
-            let dir_fd_objs: Vec<Object> =
-                ["open", "stat", "lstat", "unlink", "remove", "rmdir", "mkdir"]
-                    .iter()
-                    .filter_map(|n| d.get(&DictKey(Object::from_static(n))).cloned())
-                    .collect();
+            let dir_fd_objs: Vec<Object> = [
+                "open", "stat", "lstat", "unlink", "remove", "rmdir", "mkdir",
+            ]
+            .iter()
+            .filter_map(|n| d.get(&DictKey(Object::from_static(n))).cloned())
+            .collect();
             d.insert(
                 DictKey(Object::from_static("supports_dir_fd")),
                 Object::new_set_from(dir_fd_objs),
@@ -1115,8 +1119,9 @@ unsafe fn errno_location() -> *mut libc::c_int {
 fn os_sysconf(args: &[Object]) -> Result<Object, RuntimeError> {
     let id: libc::c_int = match args.first() {
         Some(Object::Int(n)) => *n as libc::c_int,
-        Some(Object::Str(s)) => sysconf_name_to_id(s)
-            .ok_or_else(|| value_error("unrecognized configuration name"))?,
+        Some(Object::Str(s)) => {
+            sysconf_name_to_id(s).ok_or_else(|| value_error("unrecognized configuration name"))?
+        }
         _ => {
             return Err(type_error(
                 "configuration names must be strings or integers",
@@ -1186,8 +1191,9 @@ fn pathconf_name_to_id(name: &str) -> Option<libc::c_int> {
 fn pathconf_arg_id(arg: Option<&Object>) -> Result<libc::c_int, RuntimeError> {
     match arg {
         Some(Object::Int(n)) => Ok(*n as libc::c_int),
-        Some(Object::Str(s)) => pathconf_name_to_id(s)
-            .ok_or_else(|| value_error("unrecognized configuration name")),
+        Some(Object::Str(s)) => {
+            pathconf_name_to_id(s).ok_or_else(|| value_error("unrecognized configuration name"))
+        }
         _ => Err(type_error(
             "configuration names must be strings or integers",
         )),
@@ -1207,8 +1213,8 @@ fn os_pathconf(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let path = first_path(args, "pathconf")?;
     let id = pathconf_arg_id(args.get(1))?;
-    let cpath = std::ffi::CString::new(path.as_bytes())
-        .map_err(|_| value_error("embedded null byte"))?;
+    let cpath =
+        std::ffi::CString::new(path.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
     // SAFETY: errno is a valid thread-local int; `pathconf` only reads the
     // (NUL-terminated) path and id.
     unsafe {
@@ -1294,8 +1300,8 @@ fn os_remove_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     #[cfg(unix)]
     if let Some(dfd) = dir_fd_arg(kwargs)? {
         let p = first_path(args, "unlink")?;
-        let cpath = std::ffi::CString::new(p.as_bytes())
-            .map_err(|_| value_error("embedded null byte"))?;
+        let cpath =
+            std::ffi::CString::new(p.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
         let rc = unsafe { libc::unlinkat(dfd, cpath.as_ptr(), 0) };
         if rc != 0 {
             return Err(path_io_err(
@@ -1317,8 +1323,8 @@ fn os_rmdir_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     #[cfg(unix)]
     if let Some(dfd) = dir_fd_arg(kwargs)? {
         let p = first_path(args, "rmdir")?;
-        let cpath = std::ffi::CString::new(p.as_bytes())
-            .map_err(|_| value_error("embedded null byte"))?;
+        let cpath =
+            std::ffi::CString::new(p.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
         let rc = unsafe { libc::unlinkat(dfd, cpath.as_ptr(), libc::AT_REMOVEDIR) };
         if rc != 0 {
             return Err(path_io_err(
@@ -1358,8 +1364,8 @@ fn os_mkdir_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
             Some(m) => mode_arg(m, "mkdir")?,
             None => 0o777,
         };
-        let cpath = std::ffi::CString::new(p.as_bytes())
-            .map_err(|_| value_error("embedded null byte"))?;
+        let cpath =
+            std::ffi::CString::new(p.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
         let rc = unsafe { libc::mkdirat(dfd, cpath.as_ptr(), mode as libc::mode_t) };
         if rc != 0 {
             return Err(path_io_err(
@@ -1595,8 +1601,7 @@ fn fill_os_random(buf: &mut [u8]) -> std::io::Result<()> {
     {
         // `getentropy(2)` caps each request at 256 bytes (GETENTROPY_MAX).
         for chunk in buf.chunks_mut(256) {
-            let rc =
-                unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) };
+            let rc = unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) };
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1608,11 +1613,7 @@ fn fill_os_random(buf: &mut [u8]) -> std::io::Result<()> {
         let mut filled = 0usize;
         while filled < buf.len() {
             let rc = unsafe {
-                libc::getrandom(
-                    buf[filled..].as_mut_ptr().cast(),
-                    buf.len() - filled,
-                    0,
-                )
+                libc::getrandom(buf[filled..].as_mut_ptr().cast(), buf.len() - filled, 0)
             };
             if rc < 0 {
                 let e = std::io::Error::last_os_error();
@@ -1714,8 +1715,8 @@ fn os_open_stub(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     // to its parent's descriptor; the flag bits are already the host `O_*`
     // values, so they pass straight to `openat`.
     if let Some(dfd) = dir_fd_arg(kwargs)? {
-        let cpath = std::ffi::CString::new(p.as_bytes())
-            .map_err(|_| value_error("embedded null byte"))?;
+        let cpath =
+            std::ffi::CString::new(p.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
         let fd = unsafe { libc::openat(dfd, cpath.as_ptr(), flags as libc::c_int, mode) };
         if fd < 0 {
             let e = std::io::Error::last_os_error();
@@ -2284,9 +2285,9 @@ fn dir_fd_arg(kwargs: &[(String, Object)]) -> Result<Option<libc::c_int>, Runtim
         // which is by definition past `i64` let alone `c_int`) raises
         // `OverflowError`, matching CPython's `PyLong_AsInt` — *not* `TypeError`
         // (`posix.stat(name, dir_fd=10**20)` → OverflowError).
-        Some(Object::Int(n)) => libc::c_int::try_from(*n).map(Some).map_err(|_| {
-            crate::error::overflow_error("Python int too large to convert to C int")
-        }),
+        Some(Object::Int(n)) => libc::c_int::try_from(*n)
+            .map(Some)
+            .map_err(|_| crate::error::overflow_error("Python int too large to convert to C int")),
         Some(Object::Long(_)) => Err(crate::error::overflow_error(
             "Python int too large to convert to C int",
         )),
@@ -2308,11 +2309,7 @@ fn fstatat_stat_result(
 ) -> Result<Object, RuntimeError> {
     let cpath =
         std::ffi::CString::new(path.as_bytes()).map_err(|_| value_error("embedded null byte"))?;
-    let flags = if follow {
-        0
-    } else {
-        libc::AT_SYMLINK_NOFOLLOW
-    };
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
     // SAFETY: `st` is fully initialised by a successful `fstatat`; the path is
     // NUL-terminated and only read.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -2505,7 +2502,9 @@ fn os_fsdecode(args: &[Object]) -> Result<Object, RuntimeError> {
         // PEP 383: decode with the filesystem encoding (UTF-8) and the
         // `surrogateescape` handler, so undecodable bytes become lone
         // surrogates that `fsencode` can map back to the original bytes.
-        Object::Bytes(b) => crate::stdlib::codecs_mod::decode_bytes_obj(&b, "utf-8", "surrogateescape"),
+        Object::Bytes(b) => {
+            crate::stdlib::codecs_mod::decode_bytes_obj(&b, "utf-8", "surrogateescape")
+        }
         _ => unreachable!("fspath_to_str_or_bytes returns only str/bytes"),
     }
 }
@@ -2742,7 +2741,9 @@ fn build_scandir_iterator(entries: Vec<Object>) -> Object {
         dict.insert(
             DictKey(Object::from_static("__new__")),
             builtin("__new__", |_args| {
-                Err(type_error("cannot create 'posix.ScandirIterator' instances"))
+                Err(type_error(
+                    "cannot create 'posix.ScandirIterator' instances",
+                ))
             }),
         );
         let cls = TypeObject::new_user("posix.ScandirIterator", vec![bt.object_.clone()], dict)
@@ -2838,9 +2839,7 @@ fn scandir_del(args: &[Object]) -> Result<Object, RuntimeError> {
                 // GIL keeps the pointer exclusive on this thread.
                 let interp = unsafe { &mut *ptr };
                 return interp
-                    .warn_resource_from_builtin(
-                        "unclosed scandir iterator".to_owned(),
-                    )
+                    .warn_resource_from_builtin("unclosed scandir iterator".to_owned())
                     .map(|()| Object::None);
             }
         }
@@ -3136,14 +3135,9 @@ fn listdir_fd(fd: libc::c_int) -> Result<Object, RuntimeError> {
 /// behind the `os.scandir(fd)` entries' lazy `stat`/`is_*`/`inode`.
 #[cfg(unix)]
 fn fstatat_raw(dir_fd: libc::c_int, name: &str, follow: bool) -> std::io::Result<libc::stat> {
-    let cpath = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedded null byte")
-    })?;
-    let flags = if follow {
-        0
-    } else {
-        libc::AT_SYMLINK_NOFOLLOW
-    };
+    let cpath = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedded null byte"))?;
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
     // SAFETY: `st` is fully written by a successful `fstatat`; `cpath` is a
     // NUL-terminated buffer that is only read.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -3276,7 +3270,9 @@ fn build_dir_entry_fd(name: String, dir_fd: libc::c_int, cached_inode: Option<i6
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "stat",
                 binds_instance: false,
-                call: Box::new(move |_args| fstatat_stat_result(dir_fd, &stat_name_pos, true, None)),
+                call: Box::new(move |_args| {
+                    fstatat_stat_result(dir_fd, &stat_name_pos, true, None)
+                }),
                 call_kw: Some(Box::new(move |_args, kwargs| {
                     fstatat_stat_result(dir_fd, &stat_name_kw, dir_entry_follow(kwargs), None)
                 })),
@@ -3558,7 +3554,9 @@ fn os_dup(args: &[Object]) -> Result<Object, RuntimeError> {
         if new < 0 {
             // Preserve the real errno (`EBADF` for a closed/invalid fd) so
             // `os.dup(bad).errno == errno.EBADF` — `test_os.TestInvalidFD`.
-            return Err(crate::error::io_error_to_py(&std::io::Error::last_os_error()));
+            return Err(crate::error::io_error_to_py(
+                &std::io::Error::last_os_error(),
+            ));
         }
         // PEP 446: `os.dup` returns a *non-inheritable* descriptor (FD_CLOEXEC
         // set), unlike the raw `dup(2)`. `test_os.FDInheritanceTests.test_dup`
@@ -4086,7 +4084,6 @@ fn os_times(args: &[Object]) -> Result<Object, RuntimeError> {
         vec![zero(), zero(), zero(), zero(), zero()],
     ))
 }
-
 
 /// `os.get_terminal_size(fd=STDOUT_FILENO)` — query the controlling tty's
 /// window size via `TIOCGWINSZ`, returning an `os.terminal_size`. CPython
@@ -4921,8 +4918,7 @@ fn struct_seq_reduce(
                 Object::Str(s) => {
                     let ks = s.to_string();
                     let ks = ks.as_str();
-                    !fields.contains(&ks)
-                        || matches!(ks, "st_atime" | "st_mtime" | "st_ctime")
+                    !fields.contains(&ks) || matches!(ks, "st_atime" | "st_mtime" | "st_ctime")
                 }
                 _ => true,
             };
@@ -5552,7 +5548,9 @@ pub(crate) fn path_to_string(obj: &Object, func: &str) -> Result<String, Runtime
         // `path_converter` treats `PyUnicode_Check`/`PyBytes_Check` subclasses
         // as the string *before* consulting `__fspath__` (`test_oserror_filename`
         // passes a `class Str(str)` instance).
-        Object::Instance(_) if matches!(obj.native_value(), Some(Object::Str(_) | Object::Bytes(_))) => {
+        Object::Instance(_)
+            if matches!(obj.native_value(), Some(Object::Str(_) | Object::Bytes(_))) =>
+        {
             match obj.native_value() {
                 Some(Object::Str(s)) => s.to_string(),
                 Some(Object::Bytes(b)) => String::from_utf8_lossy(&b).into_owned(),

@@ -110,10 +110,7 @@ impl ModuleCache {
     /// module's functions to it (`fn.__module__`) without leaking a new
     /// `&'static str` on every import.
     pub fn builtin_static_name(&self, name: &str) -> Option<&'static str> {
-        self.builtins
-            .borrow()
-            .get_key_value(name)
-            .map(|(k, _)| *k)
+        self.builtins.borrow().get_key_value(name).map(|(k, _)| *k)
     }
 
     /// Register a Python-source module that ships inside the binary.

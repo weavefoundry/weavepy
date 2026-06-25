@@ -321,7 +321,9 @@ pub fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, Runt
     if let Some(enc) = lookup_encoding(encoding) {
         let (bytes, _, has_replacements) = enc.encode(s);
         if has_replacements && errors == "strict" {
-            return Err(value_error(format!("'{encoding}' codec can't encode input")));
+            return Err(value_error(format!(
+                "'{encoding}' codec can't encode input"
+            )));
         }
         return Ok(bytes.into_owned());
     }
@@ -331,7 +333,9 @@ pub fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, Runt
     if let Some(out) = encode_via_registry(s, encoding, errors)? {
         return Ok(out);
     }
-    Err(crate::error::lookup_error(format!("unknown encoding: {encoding}")))
+    Err(crate::error::lookup_error(format!(
+        "unknown encoding: {encoding}"
+    )))
 }
 
 /// Encode any string-bearing `Object` (`str` or surrogate-bearing `WStr`).
@@ -411,9 +415,7 @@ pub fn encode_codepoints(
                         "backslashreplace" => {
                             out.extend_from_slice(format!("\\u{cp:04x}").as_bytes())
                         }
-                        "xmlcharrefreplace" => {
-                            out.extend_from_slice(format!("&#{cp};").as_bytes())
-                        }
+                        "xmlcharrefreplace" => out.extend_from_slice(format!("&#{cp};").as_bytes()),
                         _ => return Err(surrogate_encode_error(encoding, cps, i)),
                     }
                 }
@@ -567,13 +569,7 @@ fn surrogate_encode_error(encoding: &str, cps: &[u32], pos: usize) -> RuntimeErr
         .iter()
         .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
         .collect();
-    crate::error::unicode_encode_error(
-        encoding,
-        &lossy,
-        pos,
-        pos + 1,
-        "surrogates not allowed",
-    )
+    crate::error::unicode_encode_error(encoding, &lossy, pos, pos + 1, "surrogates not allowed")
 }
 
 /// Decode bytes to a string `Object`, producing a surrogate-bearing [`WStr`]
@@ -708,8 +704,7 @@ fn decode_utf8_surrogatepass_codepoints(bytes: &[u8]) -> Result<Vec<u32>, Runtim
                 Err(e) => {
                     let valid = e.valid_up_to();
                     if valid > 0 {
-                        let good =
-                            unsafe { std::str::from_utf8_unchecked(&bytes[i..i + valid]) };
+                        let good = unsafe { std::str::from_utf8_unchecked(&bytes[i..i + valid]) };
                         out.extend(good.chars().map(|c| c as u32));
                         i += valid;
                     } else {
@@ -853,14 +848,18 @@ pub fn decode_bytes(bytes: &[u8], encoding: &str, errors: &str) -> Result<String
     if let Some(enc) = lookup_encoding(encoding) {
         let (text, _, had_errors) = enc.decode(bytes);
         if had_errors && errors == "strict" {
-            return Err(value_error(format!("'{encoding}' codec can't decode input")));
+            return Err(value_error(format!(
+                "'{encoding}' codec can't decode input"
+            )));
         }
         return Ok(text.into_owned());
     }
     if let Some(out) = decode_via_registry(bytes, encoding, errors)? {
         return Ok(out);
     }
-    Err(crate::error::lookup_error(format!("unknown encoding: {encoding}")))
+    Err(crate::error::lookup_error(format!(
+        "unknown encoding: {encoding}"
+    )))
 }
 
 // `REGISTRY_INFLIGHT`: encodings currently being resolved through the Python
@@ -926,11 +925,7 @@ fn encode_via_registry(
     let key = encoding.to_owned();
     REGISTRY_INFLIGHT.with(|st| st.borrow_mut().push(key.clone()));
     let res = with_interp(|interp| {
-        interp.call_object(
-            codec,
-            &[Object::from_str(s), Object::from_str(errors)],
-            &[],
-        )
+        interp.call_object(codec, &[Object::from_str(s), Object::from_str(errors)], &[])
     });
     REGISTRY_INFLIGHT.with(|st| st.borrow_mut().retain(|e| e != &key));
     let out = res?;

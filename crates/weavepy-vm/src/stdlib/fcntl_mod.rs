@@ -516,5 +516,3 @@ const LOCK_TYPES: &[(&str, i64)] = &[("F_RDLCK", 1), ("F_UNLCK", 2), ("F_WRLCK",
 
 #[cfg(not(target_os = "macos"))]
 const LOCK_TYPES: &[(&str, i64)] = &[("F_RDLCK", 0), ("F_WRLCK", 1), ("F_UNLCK", 2)];
-
-

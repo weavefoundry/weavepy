@@ -71,8 +71,16 @@ fn run_multiprocessing_child(raw: &[String]) -> ExitCode {
         .iter()
         .position(|a| a == "--multiprocessing-fork")
         .unwrap_or(if raw.is_empty() { 0 } else { 1 });
-    let opt_args = if fork_idx > 1 { &raw[1..fork_idx] } else { &[][..] };
-    let tail = if fork_idx < raw.len() { &raw[fork_idx..] } else { &[][..] };
+    let opt_args = if fork_idx > 1 {
+        &raw[1..fork_idx]
+    } else {
+        &[][..]
+    };
+    let tail = if fork_idx < raw.len() {
+        &raw[fork_idx..]
+    } else {
+        &[][..]
+    };
     let flags = child_flags_from_opts(&exe, opt_args);
     let mut argv = vec![exe];
     argv.extend(tail.iter().cloned());

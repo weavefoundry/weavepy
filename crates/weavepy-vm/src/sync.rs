@@ -177,7 +177,9 @@ impl<T> GilCell<T> {
     /// child (e.g. the cycle collector's `GcState`). Equivalent to the lazy
     /// recovery [`borrow`](Self::borrow) now performs on demand, but eager.
     ///
-    /// SAFETY: `this` must point at a live `GilCell<T>` on the lone surviving
+    /// # Safety
+    ///
+    /// `this` must point at a live `GilCell<T>` on the lone surviving
     /// thread of a fork child, where nothing else can be touching the cell — so
     /// the in-place rebuild cannot race, and the payload, last mutated under
     /// the GIL the forking thread now holds, is in a consistent state.

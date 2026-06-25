@@ -2320,11 +2320,11 @@ fn pack_text_cookie(
     chars_to_skip: u64,
 ) -> Object {
     let mut c = BigInt::from(position);
-    c = c | (dec_flags.clone() << 64usize);
-    c = c | (BigInt::from(bytes_to_feed) << 128usize);
-    c = c | (BigInt::from(chars_to_skip) << 192usize);
+    c |= dec_flags.clone() << 64usize;
+    c |= BigInt::from(bytes_to_feed) << 128usize;
+    c |= BigInt::from(chars_to_skip) << 192usize;
     if need_eof {
-        c = c | (BigInt::from(1u64) << 256usize);
+        c |= BigInt::from(1u64) << 256usize;
     }
     Object::int_from_bigint(c)
 }
@@ -2869,17 +2869,18 @@ impl PyFile {
     pub fn seekable(&self) -> bool {
         match &*self.backend.borrow() {
             FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => true,
-            FileBackend::Disk(_f) => {
+            FileBackend::Disk(f) => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::io::AsRawFd;
-                    let fd = _f.as_raw_fd();
+                    let fd = f.as_raw_fd();
                     // SEEK_CUR with a zero offset reports the position without
                     // moving it, so this is a side-effect-free probe.
                     unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) >= 0 }
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = f;
                     true
                 }
             }
@@ -3150,11 +3151,7 @@ impl PyFile {
             .clone()
             .unwrap_or_else(|| "utf-8".to_owned());
         let errors = self.errors_name();
-        let factory = pf_mod_call(
-            "codecs",
-            "getincrementaldecoder",
-            &[Object::from_str(&enc)],
-        )?;
+        let factory = pf_mod_call("codecs", "getincrementaldecoder", &[Object::from_str(&enc)])?;
         let raw = pf_call_value(&factory, &[Object::from_str(&errors)])?;
         // Universal-newline wrapping, exactly like `_get_decoder`:
         // `newline=None` → recognise + translate; `newline=''` → recognise
@@ -3238,9 +3235,7 @@ impl PyFile {
         };
 
         let mut guard = self.text_incr.borrow_mut();
-        let t = guard
-            .as_mut()
-            .ok_or_else(|| value_error("no decoder"))?;
+        let t = guard.as_mut().ok_or_else(|| value_error("no decoder"))?;
         t.decoded = decoded;
         t.decoded_used = 0;
         t.b2cratio = b2cratio;
@@ -3343,17 +3338,9 @@ impl PyFile {
             }
             let mut broke = false;
             while skip_bytes > 0 {
-                pf_call_method(
-                    &decoder,
-                    "setstate",
-                    &[make_state_tuple(&dec_flags_bi)],
-                )?;
+                pf_call_method(&decoder, "setstate", &[make_state_tuple(&dec_flags_bi)])?;
                 let upto = &next_input[..skip_bytes as usize];
-                let dec = pf_call_method(
-                    &decoder,
-                    "decode",
-                    &[Object::new_bytes(upto.to_vec())],
-                )?;
+                let dec = pf_call_method(&decoder, "decode", &[Object::new_bytes(upto.to_vec())])?;
                 let n = dec.to_str().chars().count();
                 if n <= chars_to_skip {
                     let st = pf_call_method(&decoder, "getstate", &[])?;
@@ -3373,11 +3360,7 @@ impl PyFile {
             }
             if !broke {
                 skip_bytes = 0;
-                pf_call_method(
-                    &decoder,
-                    "setstate",
-                    &[make_state_tuple(&dec_flags_bi)],
-                )?;
+                pf_call_method(&decoder, "setstate", &[make_state_tuple(&dec_flags_bi)])?;
             }
 
             let mut start_pos = position + skip_bytes as u64;
@@ -3396,7 +3379,7 @@ impl PyFile {
                 let dec = pf_call_method(
                     &decoder,
                     "decode",
-                    &[Object::new_bytes(next_input[i..i + 1].to_vec())],
+                    &[Object::new_bytes(next_input[i..=i].to_vec())],
                 )?;
                 chars_decoded += dec.to_str().chars().count();
                 let st = pf_call_method(&decoder, "getstate", &[])?;
@@ -3483,7 +3466,10 @@ impl PyFile {
             let decoded_obj = pf_call_method(
                 &decoder,
                 "decode",
-                &[Object::new_bytes(input_chunk.clone()), Object::Bool(need_eof)],
+                &[
+                    Object::new_bytes(input_chunk.clone()),
+                    Object::Bool(need_eof),
+                ],
             )?;
             let decoded: Vec<char> = decoded_obj.to_str().chars().collect();
             if decoded.len() < chars_to_skip as usize {
@@ -3492,8 +3478,7 @@ impl PyFile {
             if let Some(t) = self.text_incr.borrow_mut().as_mut() {
                 t.decoded = decoded;
                 t.decoded_used = chars_to_skip as usize;
-                t.snapshot =
-                    Some((Object::int_from_bigint(dec_flags.clone()), input_chunk));
+                t.snapshot = Some((Object::int_from_bigint(dec_flags.clone()), input_chunk));
             }
         }
         Ok(cookie.clone())
@@ -3816,9 +3801,7 @@ impl PyFile {
                 if let Err(e) = self.flush_write_buf() {
                     if runtime_err_is_blocking(&e) {
                         let (errno, strerror) = runtime_err_eagain_info(&e);
-                        return Err(crate::error::blocking_io_error_written(
-                            errno, &strerror, 0,
-                        ));
+                        return Err(crate::error::blocking_io_error_written(errno, &strerror, 0));
                     }
                     return Err(e);
                 }
@@ -4776,9 +4759,7 @@ impl PyIterator {
             // mirroring CPython's `di_used != ma_used` guard. Triggers even
             // on the step that would otherwise raise StopIteration.
             if d.borrow().len() != *len {
-                return Err(runtime_error(
-                    "dictionary changed size during iteration",
-                ));
+                return Err(runtime_error("dictionary changed size during iteration"));
             }
         }
         if let PyIterator::File { file } = self {
