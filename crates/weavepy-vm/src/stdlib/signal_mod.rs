@@ -25,7 +25,9 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{type_error, value_error, RuntimeError};

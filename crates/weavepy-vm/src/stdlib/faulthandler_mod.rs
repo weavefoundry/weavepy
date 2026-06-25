@@ -267,9 +267,7 @@ fn fh_dump_traceback_later(
         // another thread's frames, so emit the timeout banner straight to
         // the real stderr (fd 2), then optionally hard-exit.
         let banner = format!("Timeout ({secs:.6}s)!\n");
-        unsafe {
-            libc::write(2, banner.as_ptr().cast(), banner.len());
-        }
+        write_fd(2, banner.as_bytes());
         if do_exit {
             unsafe { libc::_exit(1) };
         }
@@ -319,6 +317,19 @@ fn flush_std_streams() {
     let _ = std::io::stderr().flush();
 }
 
+/// Raw `write(2)` straight to a descriptor for the crash/timeout banners. The
+/// byte-count parameter is `size_t` on POSIX but `c_uint` on Windows; narrow it
+/// per platform so the call site compiles on every target.
+fn write_fd(fd: libc::c_int, bytes: &[u8]) {
+    #[cfg(unix)]
+    let count = bytes.len();
+    #[cfg(not(unix))]
+    let count = bytes.len() as libc::c_uint;
+    unsafe {
+        libc::write(fd, bytes.as_ptr().cast(), count);
+    }
+}
+
 fn fh_sigsegv(_args: &[Object]) -> Result<Object, RuntimeError> {
     flush_std_streams();
     unsafe {
@@ -346,8 +357,14 @@ fn fh_sigfpe(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn fh_sigbus(_args: &[Object]) -> Result<Object, RuntimeError> {
     flush_std_streams();
+    // `SIGBUS` is POSIX-only; on Windows raise `SIGSEGV` so the crash primitive
+    // still terminates the process.
+    #[cfg(unix)]
+    let sig = libc::SIGBUS;
+    #[cfg(not(unix))]
+    let sig = libc::SIGSEGV;
     unsafe {
-        libc::raise(libc::SIGBUS);
+        libc::raise(sig);
     }
     Ok(Object::None)
 }
@@ -363,9 +380,7 @@ fn fh_sigill(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn fh_fatal_error(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(Object::Str(msg)) = args.first() {
         let line = format!("Fatal Python error: {msg}\n");
-        unsafe {
-            libc::write(2, line.as_ptr().cast(), line.len());
-        }
+        write_fd(2, line.as_bytes());
     }
     flush_std_streams();
     unsafe { libc::abort() }

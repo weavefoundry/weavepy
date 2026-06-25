@@ -13,7 +13,9 @@
 #![allow(clippy::unnecessary_wraps)]
 
 use super::os::{builtin, builtin_kw};
-use crate::error::{type_error, value_error, RuntimeError};
+#[cfg(unix)]
+use crate::error::value_error;
+use crate::error::{type_error, RuntimeError};
 use crate::object::{DictData, DictKey, Object};
 use crate::sync::{Rc, RefCell};
 use parking_lot::Mutex;
@@ -125,14 +127,17 @@ pub(super) fn register(d: &mut DictData) {
     // `sys.setdlopenflags`. Values are platform-specific, so source them from
     // `libc` rather than hardcoding (`test_posix.test_rtld_constants` asserts
     // the four canonical names exist).
-    con!("RTLD_LAZY", i64::from(libc::RTLD_LAZY));
-    con!("RTLD_NOW", i64::from(libc::RTLD_NOW));
-    con!("RTLD_GLOBAL", i64::from(libc::RTLD_GLOBAL));
-    con!("RTLD_LOCAL", i64::from(libc::RTLD_LOCAL));
-    con!("RTLD_NODELETE", i64::from(libc::RTLD_NODELETE));
-    con!("RTLD_NOLOAD", i64::from(libc::RTLD_NOLOAD));
-    #[cfg(target_os = "linux")]
-    con!("RTLD_DEEPBIND", i64::from(libc::RTLD_DEEPBIND));
+    #[cfg(unix)]
+    {
+        con!("RTLD_LAZY", i64::from(libc::RTLD_LAZY));
+        con!("RTLD_NOW", i64::from(libc::RTLD_NOW));
+        con!("RTLD_GLOBAL", i64::from(libc::RTLD_GLOBAL));
+        con!("RTLD_LOCAL", i64::from(libc::RTLD_LOCAL));
+        con!("RTLD_NODELETE", i64::from(libc::RTLD_NODELETE));
+        con!("RTLD_NOLOAD", i64::from(libc::RTLD_NOLOAD));
+        #[cfg(target_os = "linux")]
+        con!("RTLD_DEEPBIND", i64::from(libc::RTLD_DEEPBIND));
+    }
 
     // --- sysexits-style exit codes (CPython exposes these) ---
     con!("EX_OK", 0);
@@ -161,7 +166,12 @@ pub(super) fn register(d: &mut DictData) {
     );
 }
 
+#[cfg(unix)]
 const WUNTRACED: libc::c_int = libc::WUNTRACED;
+// `WUNTRACED` is a POSIX `wait`-option flag with no Windows analogue; expose the
+// canonical value so `os.WUNTRACED` still resolves (mirrors `WCONTINUED`).
+#[cfg(not(unix))]
+const WUNTRACED: libc::c_int = 0x2;
 #[cfg(target_os = "linux")]
 const WCONTINUED: libc::c_int = libc::WCONTINUED;
 #[cfg(not(target_os = "linux"))]
@@ -1318,7 +1328,7 @@ mod nonunix_pg {
     use super::{Object, RuntimeError};
     macro_rules! ni {
         ($n:ident) => {
-            pub fn $n(_a: &[Object]) -> Result<Object, RuntimeError> {
+            pub(super) fn $n(_a: &[Object]) -> Result<Object, RuntimeError> {
                 Err(crate::error::not_implemented_error("requires POSIX"))
             }
         };
@@ -1384,7 +1394,7 @@ mod nonunix_ids {
     use super::{Object, RuntimeError};
     macro_rules! ni {
         ($n:ident) => {
-            pub fn $n(_a: &[Object]) -> Result<Object, RuntimeError> {
+            pub(super) fn $n(_a: &[Object]) -> Result<Object, RuntimeError> {
                 Err(crate::error::not_implemented_error("requires POSIX"))
             }
         };
@@ -1484,13 +1494,13 @@ fn os_pipe2(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 #[cfg(target_os = "linux")]
 fn os_sched_getaffinity(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _pid = args
+    let pid = args
         .first()
         .map_or(Ok(0), |o| obj_to_int(o, "sched_getaffinity"))?;
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     if unsafe {
         libc::sched_getaffinity(
-            _pid as libc::pid_t,
+            pid as libc::pid_t,
             std::mem::size_of::<libc::cpu_set_t>(),
             &raw mut set,
         )

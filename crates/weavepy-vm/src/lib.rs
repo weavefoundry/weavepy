@@ -8817,6 +8817,7 @@ impl Interpreter {
     /// `assertWarns` see it, and an escalating filter turns it into a raised
     /// exception). Used by `os.fork()` for the multi-threaded-fork case,
     /// mirroring CPython's `warn_about_fork_with_threads`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn warn_deprecation_from_builtin(
         &mut self,
         message: String,

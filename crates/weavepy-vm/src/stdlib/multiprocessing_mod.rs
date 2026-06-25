@@ -1639,7 +1639,7 @@ pub fn build_posixshmem(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         d.insert(
             DictKey(Object::from_static("shm_open")),
-            b_dyn_kw("shm_open", |args, kwargs| shm_open_py(args, kwargs)),
+            b_dyn_kw("shm_open", shm_open_py),
         );
         d.insert(
             DictKey(Object::from_static("shm_unlink")),

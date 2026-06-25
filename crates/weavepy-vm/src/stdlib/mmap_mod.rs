@@ -163,8 +163,8 @@ impl MmapRegion {
             // `as_ptr` is `&self`-only on both Mmap and MmapMut; the cast to
             // `*mut` is sound for a writable (`MmapMut`) mapping and never
             // dereferenced mutably for a read-only (`Mmap`) one.
-            MmapBacking::Read(m) => m.as_ptr() as *mut u8,
-            MmapBacking::Write(m) => m.as_ptr() as *mut u8,
+            MmapBacking::Read(m) => m.as_ptr().cast_mut(),
+            MmapBacking::Write(m) => m.as_ptr().cast_mut(),
         }
     }
     fn byte_len(&self) -> usize {
@@ -339,6 +339,9 @@ fn mmap_bytes(state: &MmapState) -> &[u8] {
     state.region.as_slice()
 }
 
+// Interior mutability is GIL-serialised: the `&mut [u8]` aliases a region whose
+// writes are guarded by the GIL, so deriving it from `&MmapState` is sound here.
+#[allow(clippy::mut_from_ref)]
 fn mmap_bytes_mut(state: &MmapState) -> Option<&mut [u8]> {
     if state.region.writable() {
         // SAFETY: GIL-serialised, region confirmed writable.

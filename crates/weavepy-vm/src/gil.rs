@@ -831,7 +831,7 @@ pub fn current_os_native_id() -> u64 {
         let mut tid: u64 = 0;
         // Current thread's kernel id. Passing our own `pthread_self()`
         // (rather than NULL) keeps the `pthread_t` argument well-typed.
-        libc::pthread_threadid_np(libc::pthread_self(), &mut tid);
+        libc::pthread_threadid_np(libc::pthread_self(), &raw mut tid);
         tid
     }
     #[cfg(target_os = "windows")]

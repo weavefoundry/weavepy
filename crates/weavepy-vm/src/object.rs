@@ -2489,6 +2489,9 @@ impl PyFile {
     /// that already exited) leaves nothing to re-flush, then surfaces the
     /// error like CPython's `BufferedWriter._flush_unlocked`.
     pub fn flush_write_buf(&self) -> Result<(), RuntimeError> {
+        // `pending` is mutated only on the Unix drain path below; off Unix it is
+        // write-only-once, so suppress the spurious `unused_mut` there.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut pending = {
             let mut wb = self.write_buf.borrow_mut();
             if wb.is_empty() {

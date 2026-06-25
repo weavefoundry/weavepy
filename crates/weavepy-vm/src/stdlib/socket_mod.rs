@@ -850,6 +850,9 @@ fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
     // PEP 446: accepted descriptors are non-inheritable. `F_SETFD` acts on the
     // descriptor-table entry (not the connection), so it succeeds even for a
     // peer-closed connection; ignore any error to stay non-fatal regardless.
+    // `set_cloexec` is a POSIX (`FD_CLOEXEC`) helper; non-inheritability is
+    // handled differently on Windows, so the call is Unix-only.
+    #[cfg(unix)]
     let _ = new_sock.set_cloexec(true);
     let (family, kind, proto) = {
         let s = state.borrow();
@@ -1095,9 +1098,9 @@ fn sock_sendmsg(args: &[Object]) -> Result<Object, RuntimeError> {
         msg.msg_iov = iov_ptr;
         msg.msg_iovlen = iov_len as _;
         if controllen > 0 {
-            msg.msg_control = ctrl_ptr as *mut c_void;
+            msg.msg_control = ctrl_ptr.cast::<c_void>();
             msg.msg_controllen = controllen as _;
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
             for (level, ctype, data) in &ancdata {
                 if cmsg.is_null() {
                     break;
@@ -1110,10 +1113,10 @@ fn sock_sendmsg(args: &[Object]) -> Result<Object, RuntimeError> {
                     libc::CMSG_DATA(cmsg).cast::<u8>(),
                     data.len(),
                 );
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
             }
         }
-        libc::sendmsg(fd, &msg, flags)
+        libc::sendmsg(fd, &raw const msg, flags)
     });
     if sent < 0 {
         return Err(io_error_to_py(&std::io::Error::last_os_error()));
@@ -1152,7 +1155,7 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
     let fd = snapshot_raw_fd(&state)?;
 
     let mut iov = [libc::iovec {
-        iov_base: databuf.as_mut_ptr() as *mut c_void,
+        iov_base: databuf.as_mut_ptr().cast::<c_void>(),
         iov_len: bufsize,
     }];
     let iov_ptr = iov.as_mut_ptr();
@@ -1167,10 +1170,10 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
         msg.msg_iov = iov_ptr;
         msg.msg_iovlen = 1 as _;
         if ancbufsize > 0 {
-            msg.msg_control = ctrl_ptr as *mut c_void;
+            msg.msg_control = ctrl_ptr.cast::<c_void>();
             msg.msg_controllen = ancbufsize as _;
         }
-        let n = libc::recvmsg(fd, &mut msg, flags);
+        let n = libc::recvmsg(fd, &raw mut msg, flags);
         (n, i64::from(msg.msg_flags), msg.msg_controllen as usize)
     });
     if n < 0 {
@@ -1182,9 +1185,9 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
     if ancbufsize > 0 && used_controllen > 0 {
         unsafe {
             let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_control = control.as_mut_ptr() as *mut c_void;
+            msg.msg_control = control.as_mut_ptr().cast::<c_void>();
             msg.msg_controllen = used_controllen as _;
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
             while !cmsg.is_null() {
                 let level = (*cmsg).cmsg_level;
                 let ctype = (*cmsg).cmsg_type;
@@ -1200,7 +1203,7 @@ fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
                     Object::Int(i64::from(ctype)),
                     Object::new_bytes(data),
                 ]));
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
             }
         }
     }
@@ -1234,6 +1237,7 @@ fn snapshot_raw_fd(state: &Rc<RefCell<SocketState>>) -> Result<libc::c_int, Runt
 }
 
 /// Extract the `sendmsg` iovec list — an iterable of bytes-like objects.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn extract_iov_buffers(arg: Option<&Object>) -> Result<Vec<Vec<u8>>, RuntimeError> {
     let items: Vec<Object> = match arg {
         Some(Object::List(l)) => l.borrow().clone(),
@@ -2043,13 +2047,14 @@ fn module_functions() -> &'static [(&'static str, fn(&[Object]) -> Result<Object
 /// `socket.CMSG_LEN(length)` — bytes an ancillary-data item of `length`
 /// payload occupies, including the `cmsghdr` (but not the trailing pad).
 fn mod_cmsg_len(args: &[Object]) -> Result<Object, RuntimeError> {
-    let length = cmsg_size_arg(args.first())?;
     #[cfg(unix)]
     {
-        Ok(Object::Int(unsafe { libc::CMSG_LEN(length) } as i64))
+        let length = cmsg_size_arg(args.first())?;
+        Ok(Object::Int(i64::from(unsafe { libc::CMSG_LEN(length) })))
     }
     #[cfg(not(unix))]
     {
+        let _ = args;
         Err(os_error("CMSG_LEN is not supported on this platform"))
     }
 }
@@ -2057,13 +2062,14 @@ fn mod_cmsg_len(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `socket.CMSG_SPACE(length)` — bytes to allocate in a control buffer for
 /// one ancillary-data item of `length` payload, including alignment pad.
 fn mod_cmsg_space(args: &[Object]) -> Result<Object, RuntimeError> {
-    let length = cmsg_size_arg(args.first())?;
     #[cfg(unix)]
     {
-        Ok(Object::Int(unsafe { libc::CMSG_SPACE(length) } as i64))
+        let length = cmsg_size_arg(args.first())?;
+        Ok(Object::Int(i64::from(unsafe { libc::CMSG_SPACE(length) })))
     }
     #[cfg(not(unix))]
     {
+        let _ = args;
         Err(os_error("CMSG_SPACE is not supported on this platform"))
     }
 }
@@ -2298,6 +2304,11 @@ fn mod_socketpair(args: &[Object]) -> Result<Object, RuntimeError> {
     if family == 1 {
         return unix_socketpair(family, sock_type, proto);
     }
+
+    // The AF_INET emulation ignores the requested family/type/proto; consume
+    // them so they don't read as unused on platforms without `unix_socketpair`.
+    #[cfg(not(unix))]
+    let _ = (family, sock_type, proto);
 
     inet_socketpair_emulation()
 }

@@ -12,7 +12,9 @@
 //!
 //! Tracks CPython 3.13's `Modules/_posixsubprocess.c`.
 
-use crate::error::{type_error, RuntimeError};
+#[cfg(unix)]
+use crate::error::type_error;
+use crate::error::RuntimeError;
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use crate::sync::Rc;

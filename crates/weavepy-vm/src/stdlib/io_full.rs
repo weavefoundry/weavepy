@@ -372,7 +372,7 @@ fn file_from_fd(fd_obj: &Object, mode: &str, name: String) -> Result<Object, Run
         // of (and later `close(2)`) a descriptor we don't own.
         {
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
                 return Err(crate::error::io_error_to_py(
                     &std::io::Error::last_os_error(),
                 ));

@@ -269,6 +269,7 @@ fn fcntl_lockf(_args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn optional_off(arg: Option<&Object>, name: &str) -> Result<i64, RuntimeError> {
     match arg {
         Some(Object::Int(n)) => Ok(*n),

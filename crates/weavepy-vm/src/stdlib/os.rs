@@ -898,6 +898,7 @@ pub(super) fn builtin_kw(
 /// the process primitives (`os_process`) to read `argv`, `file_actions`,
 /// and signal sets without re-implementing the sequence protocol. Returns
 /// `None` for non-sequence objects.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(super) fn sequence_items(o: &Object) -> Option<Vec<Object>> {
     match o {
         Object::Tuple(t) => Some(t.to_vec()),
@@ -2313,7 +2314,7 @@ fn fstatat_stat_result(
     // SAFETY: `st` is fully initialised by a successful `fstatat`; the path is
     // NUL-terminated and only read.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatat(dir_fd, cpath.as_ptr(), &mut st, flags) };
+    let rc = unsafe { libc::fstatat(dir_fd, cpath.as_ptr(), &raw mut st, flags) };
     if rc != 0 {
         let e = std::io::Error::last_os_error();
         return Err(path_io_err(&e, path_obj, path));
@@ -2339,8 +2340,17 @@ fn os_readlink(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let t = std::fs::read_link(&pstr).map_err(|e| path_io_err(&e, args.first(), &pstr))?;
     if want_bytes {
-        use std::os::unix::ffi::OsStringExt;
-        return Ok(Object::new_bytes(t.into_os_string().into_vec()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            return Ok(Object::new_bytes(t.into_os_string().into_vec()));
+        }
+        // No raw-bytes `OsString` view off Unix; fall back to the WTF-8
+        // encoded form so a bytes-flavoured `readlink` still yields `bytes`.
+        #[cfg(not(unix))]
+        {
+            return Ok(Object::new_bytes(t.into_os_string().into_encoded_bytes()));
+        }
     }
     Ok(Object::from_str(t.to_string_lossy().into_owned()))
 }
@@ -3141,7 +3151,7 @@ fn fstatat_raw(dir_fd: libc::c_int, name: &str, follow: bool) -> std::io::Result
     // SAFETY: `st` is fully written by a successful `fstatat`; `cpath` is a
     // NUL-terminated buffer that is only read.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatat(dir_fd, cpath.as_ptr(), &mut st, flags) };
+    let rc = unsafe { libc::fstatat(dir_fd, cpath.as_ptr(), &raw mut st, flags) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -5507,6 +5517,7 @@ fn path_arg_or_kw(
 }
 
 /// Fetch an integer argument from the positional slot or a keyword.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn int_arg_or_kw(
     args: &[Object],
     pos: usize,

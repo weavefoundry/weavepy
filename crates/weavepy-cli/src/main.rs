@@ -70,7 +70,7 @@ fn run_multiprocessing_child(raw: &[String]) -> ExitCode {
     let fork_idx = raw
         .iter()
         .position(|a| a == "--multiprocessing-fork")
-        .unwrap_or(if raw.is_empty() { 0 } else { 1 });
+        .unwrap_or(usize::from(!raw.is_empty()));
     let opt_args = if fork_idx > 1 {
         &raw[1..fork_idx]
     } else {
