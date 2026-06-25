@@ -373,12 +373,21 @@ class _AssertWarnsContext:
 
 
 class _CapturingHandler:
-    """Minimal logging handler used by ``assertLogs``."""
+    """Logging handler used by ``assertLogs``.
+
+    Records are rendered through a real ``logging.Formatter`` (matching
+    CPython's ``unittest._log._CapturingHandler``) rather than by hand-
+    interpolating ``levelname:name:message``. This is what appends an
+    ``exc_info`` traceback to the captured output, which callers assert on
+    (e.g. ``concurrent.futures`` logs ``'Exception in initializer:'`` with
+    ``exc_info=True`` and the test greps the captured text for the original
+    ``ValueError: ...`` line)."""
 
     def __init__(self):
         self.records = []
         self.output = []
         self.level = 0
+        self.formatter = None
 
     def flush(self):
         pass
@@ -386,13 +395,29 @@ class _CapturingHandler:
     def handle(self, record):
         self.emit(record)
 
+    def setLevel(self, level):
+        self.level = level
+
+    def setFormatter(self, fmt):
+        self.formatter = fmt
+
+    def format(self, record):
+        if self.formatter is None:
+            import logging
+            self.formatter = logging.Formatter(_AssertLogsContext.LOGGING_FORMAT)
+        return self.formatter.format(record)
+
     def emit(self, record):
         self.records.append(record)
         try:
-            msg = record.getMessage()
+            msg = self.format(record)
         except Exception:
-            msg = str(getattr(record, "msg", record))
-        self.output.append("%s:%s:%s" % (record.levelname, record.name, msg))
+            msg = "%s:%s:%s" % (
+                getattr(record, "levelname", "?"),
+                getattr(record, "name", "?"),
+                getattr(record, "msg", record),
+            )
+        self.output.append(msg)
 
 
 class _AssertLogsContext:
@@ -415,6 +440,8 @@ class _AssertLogsContext:
         else:
             logger = self.logger = logging.getLogger(self.logger_name)
         handler = _CapturingHandler()
+        handler.setLevel(self.level)
+        handler.setFormatter(logging.Formatter(self.LOGGING_FORMAT))
         self.watcher = handler
         self.old_handlers = logger.handlers[:]
         self.old_level = logger.level

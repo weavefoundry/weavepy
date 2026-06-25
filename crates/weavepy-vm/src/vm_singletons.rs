@@ -21,9 +21,25 @@ use crate::sync::{Rc, RefCell};
 use crate::object::Object;
 use crate::types::{PyInstance, TypeObject};
 
+// `NotImplemented` / `Ellipsis` are **process-global** singletons, not
+// per-thread: CPython's `x is NotImplemented` identity test must hold no
+// matter which OS thread minted the value. A thread-local here was a real
+// bug — `object.__subclasshook__` (and every `return NotImplemented`
+// site) handed back the *current thread's* instance, so an ABC
+// `issubclass()` running on a worker thread saw `ok is not NotImplemented`
+// and tripped `_py_abc`'s `assert isinstance(ok, bool)` (e.g. importing
+// `decimal`/`numbers` on a `multiprocessing.managers` accepter thread).
+// `Object` is `Send + Sync` (it is `Arc`/`GilCell`-backed), so a single
+// shared instance is safe to serve everywhere.
+//
+// These are stored as a plain `OnceLock<Object>` (not a `Mutex`): they are
+// read on *every* `return NotImplemented` rich-compare/binop fallback and on
+// every `...`/`Ellipsis` reference — one of the hottest paths in the VM. A
+// per-call `Mutex::lock()` there serialised the path and measurably slowed
+// io/comparison-heavy suites (test_io/test_tarfile/test_zipfile ran ~3-5×
+// slower). `OnceLock` is a one-time atomic init, then a lock-free read.
+
 thread_local! {
-    static NOT_IMPLEMENTED: RefCell<Option<Object>> = const { RefCell::new(None) };
-    static ELLIPSIS: RefCell<Option<Object>> = const { RefCell::new(None) };
     /// Pending `__del__` finalizer invocations queued by the cycle
     /// GC. Drained at the next eval-loop tick by the interpreter.
     /// See [`crate::gc_trace::run_finalizer`] for the producer side.
@@ -91,33 +107,25 @@ fn make_singleton(cls: Rc<TypeObject>) -> Object {
 /// `NotImplementedType` (an `object` subclass), so `type(NotImplemented)`
 /// and the MRO match CPython.
 pub fn not_implemented() -> Object {
-    NOT_IMPLEMENTED.with(|slot| {
-        let mut s = slot.borrow_mut();
-        if let Some(v) = s.as_ref() {
-            return v.clone();
-        }
+    static SLOT: OnceLock<Object> = OnceLock::new();
+    SLOT.get_or_init(|| {
         let cls = crate::builtin_types::builtin_types()
             .not_implemented_type_
             .clone();
-        let v = make_singleton(cls);
-        *s = Some(v.clone());
-        v
+        make_singleton(cls)
     })
+    .clone()
 }
 
 /// Same idea for `Ellipsis` (the value of `...`); its class is the
 /// registry's `ellipsis` type.
 pub fn ellipsis() -> Object {
-    ELLIPSIS.with(|slot| {
-        let mut s = slot.borrow_mut();
-        if let Some(v) = s.as_ref() {
-            return v.clone();
-        }
+    static SLOT: OnceLock<Object> = OnceLock::new();
+    SLOT.get_or_init(|| {
         let cls = crate::builtin_types::builtin_types().ellipsis_.clone();
-        let v = make_singleton(cls);
-        *s = Some(v.clone());
-        v
+        make_singleton(cls)
     })
+    .clone()
 }
 
 /// CPython's `help`/`copyright`/`license`/`credits` builtins are
@@ -345,6 +353,49 @@ impl Drop for InterpreterGuard {
     }
 }
 
+thread_local! {
+    /// Deferred `ResourceWarning` messages produced by object destructors
+    /// (`impl Drop for PyFile`, …). A destructor cannot synthesise a Python
+    /// warning *in place*: an `Rc` can hit zero references mid-instruction,
+    /// while a container the VM is iterating is still borrowed, so re-entering
+    /// `warnings.warn` from `drop` panics with `BorrowMutError`. Instead the
+    /// destructor enqueues the message and the eval loop drains it at the same
+    /// between-bytecodes safe point it uses for prompt `__del__` finalization
+    /// (and `gc.collect()` drains it after a collection), giving CPython's
+    /// "unclosed file" warning the right timing without the reentrancy hazard.
+    static PENDING_RESOURCE_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Cheap "is the deferred-warning queue non-empty?" probe set whenever a
+/// destructor enqueues. A relaxed atomic so the eval-loop safe point pays a
+/// single load in the common (empty) case rather than a thread-local borrow.
+static PENDING_RW_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enqueue a deferred `ResourceWarning` message from a destructor. Drained by
+/// [`crate::Interpreter::drain_pending_resource_warnings`] at the next safe
+/// point. Silently dropped once shutdown has begun (the `warnings` machinery
+/// is being torn down and CPython likewise suppresses dealloc warnings then).
+pub fn push_pending_resource_warning(message: String) {
+    if is_finalizing() {
+        return;
+    }
+    PENDING_RESOURCE_WARNINGS.with(|cell| cell.borrow_mut().push(message));
+    PENDING_RW_FLAG.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Cheap probe for the eval-loop safe point: are any deferred resource
+/// warnings queued on this thread?
+pub fn has_pending_resource_warnings() -> bool {
+    PENDING_RW_FLAG.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Drain and return all queued deferred resource-warning messages on this
+/// thread, clearing the fast-path flag.
+pub fn take_pending_resource_warnings() -> Vec<String> {
+    PENDING_RW_FLAG.store(false, std::sync::atomic::Ordering::Release);
+    PENDING_RESOURCE_WARNINGS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
 /// `True` once interpreter shutdown (finalizer sweep) has begun —
 /// CPython's `_Py_IsFinalizing()`. Fresh imports are refused while
 /// set (already-imported modules keep working), and
@@ -383,6 +434,34 @@ pub fn set_dev_mode(value: bool) {
 
 pub fn dev_mode() -> bool {
     DEV_MODE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// PEP 540 UTF-8 mode. WeavePy stores `str` as UTF-8 so this defaults to
+/// `true`; the CLI lowers it for `-X utf8=0` (read by `io.text_encoding`).
+static UTF8_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_utf8_mode(value: bool) {
+    UTF8_MODE.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn utf8_mode() -> bool {
+    UTF8_MODE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// PEP 597 `-X warn_default_encoding` / `PYTHONWARNDEFAULTENCODING`. When set,
+/// the native `io.open` / `io.text_encoding` text paths emit an
+/// `EncodingWarning` for an implicit (locale) encoding, mirroring CPython's
+/// `_PyInterpreterState_GetConfig(interp)->warn_default_encoding` gate. Cached
+/// here so Rust call sites avoid reading `sys.flags` on every open.
+static WARN_DEFAULT_ENCODING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_warn_default_encoding(value: bool) {
+    WARN_DEFAULT_ENCODING.store(value, std::sync::atomic::Ordering::Release);
+}
+
+pub fn warn_default_encoding() -> bool {
+    WARN_DEFAULT_ENCODING.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Publish `interp` as the live VM pointer for the duration of

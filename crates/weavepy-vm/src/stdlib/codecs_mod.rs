@@ -145,6 +145,29 @@ fn arg_str(args: &[Object], idx: usize, name: &str) -> Result<String, RuntimeErr
     }
 }
 
+/// Coerce a *codec-name* argument the way CPython's `s` argument parser does
+/// in `_codecs.lookup`/`encode`/`decode`: a `str` passes through, but a
+/// lone-surrogate `str` (WeavePy [`Object::WStr`]) cannot be UTF-8-encoded for
+/// the C codec name, so it raises `UnicodeEncodeError` rather than a
+/// `LookupError` for a replacement-char name (`test_io.test_constructor` /
+/// `test_reconfigure_errors`). Anything non-string is a `TypeError`.
+fn arg_codec_name(args: &[Object], idx: usize, name: &str) -> Result<String, RuntimeError> {
+    match args.get(idx) {
+        Some(Object::Str(s)) => Ok(s.to_string()),
+        Some(Object::WStr(cps)) => {
+            // A genuine `WStr` always carries a lone surrogate, so the strict
+            // UTF-8 encoder raises `UnicodeEncodeError`; propagate it. The
+            // trailing `Ok` is a defensive fallback that never runs in practice.
+            encode_codepoints(cps, "utf-8", "strict")?;
+            Ok(cps.iter().filter_map(|&c| char::from_u32(c)).collect())
+        }
+        _ => Err(type_error(format!(
+            "{name}() argument {} must be str",
+            idx + 1
+        ))),
+    }
+}
+
 fn arg_bytes(args: &[Object], idx: usize, name: &str) -> Result<Vec<u8>, RuntimeError> {
     match args.get(idx) {
         Some(o) => o
@@ -194,6 +217,10 @@ fn lookup_encoding(name: &str) -> Option<&'static Encoding> {
         "big5" | "csbig5" => Encoding::for_label(b"big5"),
         "euckr" | "ksc56011987" => Encoding::for_label(b"euc-kr"),
         "eucjp" | "ujis" => Encoding::for_label(b"euc-jp"),
+        // KOI8 Cyrillic — `encoding_rs` knows these, but only under the
+        // hyphenated WHATWG labels our normaliser strips.
+        "koi8r" | "cskoi8r" => Encoding::for_label(b"koi8-r"),
+        "koi8u" => Encoding::for_label(b"koi8-u"),
         _ => Encoding::for_label(normalised.as_bytes()),
     }
 }
@@ -201,13 +228,18 @@ fn lookup_encoding(name: &str) -> Option<&'static Encoding> {
 // ---------- generic encode/decode dispatcher ----------
 
 pub fn b_encode(args: &[Object]) -> Result<Object, RuntimeError> {
-    let s = arg_str(args, 0, "encode")?;
+    let obj = args
+        .first()
+        .ok_or_else(|| type_error("encode() missing argument 1"))?;
+    // Accept both string representations (and built-in str subclass instances)
+    // so a surrogate-bearing `WStr` encodes through the WTF-8 path.
     let encoding = arg_str(args, 1, "encode").unwrap_or_else(|_| "utf-8".to_owned());
     let errors = arg_errors(args, 2);
-    let bytes = encode_str(&s, &encoding, &errors)?;
+    let nchars = obj.len().unwrap_or(0) as i64;
+    let bytes = encode_obj(obj, &encoding, &errors)?;
     Ok(Object::new_tuple(vec![
         Object::new_bytes(bytes),
-        Object::Int(s.chars().count() as i64),
+        Object::Int(nchars),
     ]))
 }
 
@@ -215,16 +247,13 @@ pub fn b_decode(args: &[Object]) -> Result<Object, RuntimeError> {
     let bytes = arg_bytes(args, 0, "decode")?;
     let encoding = arg_str(args, 1, "decode").unwrap_or_else(|_| "utf-8".to_owned());
     let errors = arg_errors(args, 2);
-    let s = decode_bytes(&bytes, &encoding, &errors)?;
+    let s = decode_bytes_obj(&bytes, &encoding, &errors)?;
     let len = bytes.len() as i64;
-    Ok(Object::new_tuple(vec![
-        Object::from_str(s),
-        Object::Int(len),
-    ]))
+    Ok(Object::new_tuple(vec![s, Object::Int(len)]))
 }
 
 fn b_lookup(args: &[Object]) -> Result<Object, RuntimeError> {
-    let name = arg_str(args, 0, "lookup")?;
+    let name = arg_codec_name(args, 0, "lookup")?;
     let enc = lookup_encoding(&name)
         .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {name}")))?;
     let normalised = enc.name().to_lowercase();
@@ -258,20 +287,557 @@ fn check_error_handler(errors: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Public wrapper used by the `io` text layer: CPython's `TextIOWrapper`
+/// validates the `errors=` handler eagerly when `_CHECK_ERRORS` is set
+/// (debug builds or `-X dev`), so `open(..., errors='Boom')` raises
+/// `LookupError` at construction (`test_io.test_check_encoding_errors`).
+pub(crate) fn check_text_errors(errors: &str) -> Result<(), RuntimeError> {
+    check_error_handler(errors)
+}
+
+/// For a BOM-prefixing encoding (byte-order-less `utf-16`/`utf-32`, or
+/// `utf-8-sig`), return the **continuation** codec used after the BOM has been
+/// emitted once — the BOM-less variant. CPython's incremental encoders write
+/// the BOM exactly once at the start of the stream, then switch to the native
+/// byte-order codec; both the native `PyFile` text path and `io.TextIOWrapper`
+/// reproduce that with a start-of-stream flag plus this mapping. Returns `None`
+/// for codecs that never emit a BOM (their writes are stateless).
+pub fn bom_continuation(encoding: &str) -> Option<&'static str> {
+    match encoding_key(encoding).as_str() {
+        // WeavePy encodes byte-order-less utf-16/utf-32 as little-endian (its
+        // x86_64/aarch64 targets), so the continuation is the LE codec.
+        "utf16" => Some("utf-16-le"),
+        "utf32" => Some("utf-32-le"),
+        "utf8sig" => Some("utf-8"),
+        _ => None,
+    }
+}
+
 pub fn encode_str(s: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
     check_error_handler(errors)?;
     if let Some(out) = encode_special(s, encoding, errors)? {
         return Ok(out);
     }
-    let enc = lookup_encoding(encoding)
-        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {encoding}")))?;
-    let (bytes, _, has_replacements) = enc.encode(s);
-    if has_replacements && errors == "strict" {
-        return Err(value_error(format!(
-            "'{encoding}' codec can't encode input"
-        )));
+    if let Some(enc) = lookup_encoding(encoding) {
+        let (bytes, _, has_replacements) = enc.encode(s);
+        if has_replacements && errors == "strict" {
+            return Err(value_error(format!(
+                "'{encoding}' codec can't encode input"
+            )));
+        }
+        return Ok(bytes.into_owned());
     }
-    Ok(bytes.into_owned())
+    // Native fast path doesn't know this encoding — consult the Python codec
+    // registry (custom `codecs.register` codecs and the `encodings/*.py`
+    // modules), mirroring CPython's C-fast-path/Python-registry split.
+    if let Some(out) = encode_via_registry(s, encoding, errors)? {
+        return Ok(out);
+    }
+    Err(crate::error::lookup_error(format!(
+        "unknown encoding: {encoding}"
+    )))
+}
+
+/// Encode any string-bearing `Object` (`str` or surrogate-bearing `WStr`).
+/// The `WStr` path routes through [`encode_codepoints`] so lone surrogates are
+/// handled by `surrogateescape`/`surrogatepass`; a plain `Str` keeps the
+/// existing UTF-8 fast path.
+pub fn encode_obj(obj: &Object, encoding: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
+    match obj {
+        Object::WStr(cps) => encode_codepoints(cps, encoding, errors),
+        Object::Str(s) => encode_str(s, encoding, errors),
+        // Built-in str subclass instance, etc. — fall back to its text view.
+        other => encode_str(&other.to_str(), encoding, errors),
+    }
+}
+
+/// Encode a code-point sequence (each entry a Unicode scalar value *or* a lone
+/// surrogate) to bytes. This is the surrogate-aware counterpart of
+/// [`encode_str`]: it implements `surrogateescape`/`surrogatepass` natively for
+/// the UTF and charmap codecs so PEP 383 paths and `surrogatepass` round-trip.
+pub fn encode_codepoints(
+    cps: &[u32],
+    encoding: &str,
+    errors: &str,
+) -> Result<Vec<u8>, RuntimeError> {
+    check_error_handler(errors)?;
+    // No surrogate present (canonicalisation should normally prevent a `WStr`
+    // here, but a raw caller may pass scalars): reuse the `str` fast path.
+    if !cps.iter().any(|&c| (0xD800..=0xDFFF).contains(&c)) {
+        let s: String = cps.iter().filter_map(|&c| char::from_u32(c)).collect();
+        return encode_str(&s, encoding, errors);
+    }
+    let key = encoding_key(encoding);
+    let out = match key.as_str() {
+        "utf8" => {
+            let mut out = Vec::with_capacity(cps.len());
+            encode_utf8_codepoints(cps, errors, &mut out)?;
+            out
+        }
+        "utf8sig" => {
+            let mut out = vec![0xEF, 0xBB, 0xBF];
+            encode_utf8_codepoints(cps, errors, &mut out)?;
+            out
+        }
+        "ascii" => encode_charmap_codepoints(cps, errors, "ascii", 0x80)?,
+        "latin1" | "iso88591" => encode_charmap_codepoints(cps, errors, "latin-1", 0x100)?,
+        "utf16le" => encode_utf16_codepoints(cps, false, false, errors)?,
+        "utf16be" => encode_utf16_codepoints(cps, true, false, errors)?,
+        "utf16" => encode_utf16_codepoints(cps, false, true, errors)?,
+        "utf32le" => encode_utf32_codepoints(cps, false, false, errors)?,
+        "utf32be" => encode_utf32_codepoints(cps, true, false, errors)?,
+        "utf32" => encode_utf32_codepoints(cps, false, true, errors)?,
+        _ => {
+            // Any other codec: encode maximal scalar runs through the normal
+            // string engine and resolve each lone surrogate via the error
+            // handler (`surrogatepass` is invalid for non-UTF codecs, so it
+            // falls through to a `UnicodeEncodeError`, matching CPython).
+            let mut out = Vec::new();
+            let mut run = String::new();
+            let flush = |run: &mut String, out: &mut Vec<u8>| -> Result<(), RuntimeError> {
+                if !run.is_empty() {
+                    out.extend(encode_str(run, encoding, errors)?);
+                    run.clear();
+                }
+                Ok(())
+            };
+            for (i, &cp) in cps.iter().enumerate() {
+                if let Some(ch) = char::from_u32(cp) {
+                    run.push(ch);
+                } else {
+                    flush(&mut run, &mut out)?;
+                    match errors {
+                        "surrogateescape" if (0xDC80..=0xDCFF).contains(&cp) => {
+                            out.push((cp - 0xDC00) as u8);
+                        }
+                        "ignore" => {}
+                        "replace" => out.push(b'?'),
+                        "backslashreplace" => {
+                            out.extend_from_slice(format!("\\u{cp:04x}").as_bytes())
+                        }
+                        "xmlcharrefreplace" => out.extend_from_slice(format!("&#{cp};").as_bytes()),
+                        _ => return Err(surrogate_encode_error(encoding, cps, i)),
+                    }
+                }
+            }
+            flush(&mut run, &mut out)?;
+            out
+        }
+    };
+    Ok(out)
+}
+
+/// Encode code points as UTF-8, resolving lone surrogates per `errors`.
+fn encode_utf8_codepoints(
+    cps: &[u32],
+    errors: &str,
+    out: &mut Vec<u8>,
+) -> Result<(), RuntimeError> {
+    for (i, &cp) in cps.iter().enumerate() {
+        if let Some(ch) = char::from_u32(cp) {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        } else {
+            match errors {
+                // WTF-8 / CESU-8 three-byte form for the lone surrogate.
+                "surrogatepass" => {
+                    out.push(0xE0 | (cp >> 12) as u8);
+                    out.push(0x80 | ((cp >> 6) & 0x3F) as u8);
+                    out.push(0x80 | (cp & 0x3F) as u8);
+                }
+                // PEP 383: U+DC80..U+DCFF map back to the original 0x80..0xFF.
+                "surrogateescape" if (0xDC80..=0xDCFF).contains(&cp) => {
+                    out.push((cp - 0xDC00) as u8);
+                }
+                "ignore" => {}
+                "replace" => out.push(b'?'),
+                "backslashreplace" => out.extend_from_slice(format!("\\u{cp:04x}").as_bytes()),
+                "xmlcharrefreplace" => out.extend_from_slice(format!("&#{cp};").as_bytes()),
+                _ => return Err(surrogate_encode_error("utf-8", cps, i)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encode code points for a single-byte charmap codec (`ascii`, `latin-1`)
+/// where `limit` is the exclusive upper bound of directly-encodable code
+/// points (0x80 for ASCII, 0x100 for Latin-1). Lone surrogates resolve via
+/// `errors` (PEP 383 `surrogateescape` maps U+DC80..U+DCFF to a raw byte).
+fn encode_charmap_codepoints(
+    cps: &[u32],
+    errors: &str,
+    codec: &str,
+    limit: u32,
+) -> Result<Vec<u8>, RuntimeError> {
+    let mut out = Vec::with_capacity(cps.len());
+    for (i, &cp) in cps.iter().enumerate() {
+        if cp < limit {
+            out.push(cp as u8);
+        } else if (0xD800..=0xDFFF).contains(&cp) {
+            match errors {
+                "surrogateescape" if (0xDC80..=0xDCFF).contains(&cp) => {
+                    out.push((cp - 0xDC00) as u8);
+                }
+                "ignore" => {}
+                "replace" => out.push(b'?'),
+                "backslashreplace" => out.extend_from_slice(format!("\\u{cp:04x}").as_bytes()),
+                "xmlcharrefreplace" => out.extend_from_slice(format!("&#{cp};").as_bytes()),
+                _ => return Err(surrogate_encode_error(codec, cps, i)),
+            }
+        } else {
+            // A scalar above the charmap range: defer to the normal engine for
+            // the canonical error/handler behaviour over this single point.
+            let s: String = char::from_u32(cp).into_iter().collect();
+            out.extend(encode_str(&s, codec, errors)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Encode code points as UTF-16 (`big`-endian when set, BOM-prefixed when
+/// `bom`). Lone surrogates pass through as their own 16-bit code unit under
+/// `surrogatepass`; otherwise they raise.
+fn encode_utf16_codepoints(
+    cps: &[u32],
+    big: bool,
+    bom: bool,
+    errors: &str,
+) -> Result<Vec<u8>, RuntimeError> {
+    let mut out = Vec::with_capacity(cps.len() * 2 + 2);
+    let push_u16 = |out: &mut Vec<u8>, u: u16| {
+        if big {
+            out.extend_from_slice(&u.to_be_bytes());
+        } else {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+    };
+    if bom {
+        push_u16(&mut out, 0xFEFF);
+    }
+    for (i, &cp) in cps.iter().enumerate() {
+        if (0xD800..=0xDFFF).contains(&cp) {
+            if errors == "surrogatepass" {
+                push_u16(&mut out, cp as u16);
+            } else {
+                return Err(surrogate_encode_error("utf-16", cps, i));
+            }
+        } else if cp <= 0xFFFF {
+            push_u16(&mut out, cp as u16);
+        } else {
+            let v = cp - 0x1_0000;
+            push_u16(&mut out, 0xD800 + (v >> 10) as u16);
+            push_u16(&mut out, 0xDC00 + (v & 0x3FF) as u16);
+        }
+    }
+    Ok(out)
+}
+
+/// Encode code points as UTF-32. Lone surrogates pass through under
+/// `surrogatepass`; otherwise they raise.
+fn encode_utf32_codepoints(
+    cps: &[u32],
+    big: bool,
+    bom: bool,
+    errors: &str,
+) -> Result<Vec<u8>, RuntimeError> {
+    let mut out = Vec::with_capacity(cps.len() * 4 + 4);
+    let push_u32 = |out: &mut Vec<u8>, u: u32| {
+        if big {
+            out.extend_from_slice(&u.to_be_bytes());
+        } else {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+    };
+    if bom {
+        push_u32(&mut out, 0xFEFF);
+    }
+    for (i, &cp) in cps.iter().enumerate() {
+        if (0xD800..=0xDFFF).contains(&cp) && errors != "surrogatepass" {
+            return Err(surrogate_encode_error("utf-32", cps, i));
+        }
+        push_u32(&mut out, cp);
+    }
+    Ok(out)
+}
+
+/// `UnicodeEncodeError` for a lone surrogate at `pos` in a code-point sequence.
+/// The `.object` attribute uses a lossy text view (a Rust `String` cannot hold
+/// the surrogate); the type/positions/reason match CPython.
+fn surrogate_encode_error(encoding: &str, cps: &[u32], pos: usize) -> RuntimeError {
+    let lossy: String = cps
+        .iter()
+        .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+        .collect();
+    crate::error::unicode_encode_error(encoding, &lossy, pos, pos + 1, "surrogates not allowed")
+}
+
+/// Decode bytes to a string `Object`, producing a surrogate-bearing [`WStr`]
+/// when the codec + error handler yields lone surrogates (PEP 383
+/// `surrogateescape`, `surrogatepass`), or a plain [`Object::Str`] otherwise.
+pub fn decode_bytes_obj(
+    bytes: &[u8],
+    encoding: &str,
+    errors: &str,
+) -> Result<Object, RuntimeError> {
+    check_error_handler(errors)?;
+    if let Some(cps) = decode_special_codepoints(bytes, encoding, errors)? {
+        return Ok(Object::str_from_codepoints(cps));
+    }
+    // No surrogate-producing path applies: decode to a plain UTF-8 string.
+    Ok(Object::from_str(decode_bytes(bytes, encoding, errors)?))
+}
+
+/// Surrogate-producing decoders. Returns `Some(code points)` for the
+/// (encoding, errors) combinations that can yield lone surrogates, else `None`
+/// so [`decode_bytes_obj`] uses the plain string path.
+fn decode_special_codepoints(
+    bytes: &[u8],
+    encoding: &str,
+    errors: &str,
+) -> Result<Option<Vec<u32>>, RuntimeError> {
+    let key = encoding_key(encoding);
+    let cps = match (key.as_str(), errors) {
+        ("utf8" | "utf8sig", "surrogateescape") => {
+            let body = if key == "utf8sig" {
+                bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes)
+            } else {
+                bytes
+            };
+            decode_utf8_surrogateescape_codepoints(body)
+        }
+        ("utf8" | "utf8sig", "surrogatepass") => {
+            let body = if key == "utf8sig" {
+                bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes)
+            } else {
+                bytes
+            };
+            decode_utf8_surrogatepass_codepoints(body)?
+        }
+        ("ascii", "surrogateescape") => {
+            let mut out = Vec::with_capacity(bytes.len());
+            for &b in bytes {
+                if b < 0x80 {
+                    out.push(u32::from(b));
+                } else {
+                    out.push(0xDC00 + u32::from(b));
+                }
+            }
+            out
+        }
+        ("utf16le" | "utf16be" | "utf16", "surrogatepass") => {
+            let big = match key.as_str() {
+                "utf16be" => Some(true),
+                "utf16le" => Some(false),
+                _ => None,
+            };
+            decode_utf16_surrogatepass_codepoints(bytes, big)?
+        }
+        ("utf32le" | "utf32be" | "utf32", "surrogatepass") => {
+            let big = match key.as_str() {
+                "utf32be" => Some(true),
+                "utf32le" => Some(false),
+                _ => None,
+            };
+            decode_utf32_surrogatepass_codepoints(bytes, big)?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(cps))
+}
+
+/// UTF-8 `surrogateescape` decode to code points: each undecodable byte becomes
+/// the lone low surrogate U+DC00+byte (PEP 383).
+fn decode_utf8_surrogateescape_codepoints(bytes: &[u8]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match std::str::from_utf8(&bytes[i..]) {
+            Ok(rest) => {
+                out.extend(rest.chars().map(|c| c as u32));
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                let good = unsafe { std::str::from_utf8_unchecked(&bytes[i..i + valid]) };
+                out.extend(good.chars().map(|c| c as u32));
+                let bad_len = e.error_len().unwrap_or(1);
+                for j in 0..bad_len {
+                    out.push(0xDC00 + u32::from(bytes[i + valid + j]));
+                }
+                i += valid + bad_len;
+            }
+        }
+    }
+    out
+}
+
+/// UTF-8 `surrogatepass` decode to code points: like strict UTF-8 but the
+/// three-byte sequences `ED A0..BF 80..BF` decode to the encoded lone surrogate
+/// rather than raising.
+fn decode_utf8_surrogatepass_codepoints(bytes: &[u8]) -> Result<Vec<u32>, RuntimeError> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 {
+            out.push(u32::from(b));
+            i += 1;
+        } else if (0xED..=0xED).contains(&b)
+            && i + 2 < bytes.len()
+            && (0xA0..=0xBF).contains(&bytes[i + 1])
+            && (0x80..=0xBF).contains(&bytes[i + 2])
+        {
+            // Encoded lone surrogate (U+D800..U+DFFF).
+            let cp = ((u32::from(b) & 0x0F) << 12)
+                | ((u32::from(bytes[i + 1]) & 0x3F) << 6)
+                | (u32::from(bytes[i + 2]) & 0x3F);
+            out.push(cp);
+            i += 3;
+        } else {
+            // Decode a normal UTF-8 scalar starting here.
+            match std::str::from_utf8(&bytes[i..]) {
+                Ok(rest) => {
+                    out.extend(rest.chars().map(|c| c as u32));
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        let good = unsafe { std::str::from_utf8_unchecked(&bytes[i..i + valid]) };
+                        out.extend(good.chars().map(|c| c as u32));
+                        i += valid;
+                    } else {
+                        return Err(crate::error::unicode_decode_error(
+                            "utf-8",
+                            bytes,
+                            i,
+                            i + 1,
+                            "invalid start byte",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// UTF-16 `surrogatepass` decode: unpaired surrogates pass through as their own
+/// code point instead of raising.
+fn decode_utf16_surrogatepass_codepoints(
+    bytes: &[u8],
+    big: Option<bool>,
+) -> Result<Vec<u32>, RuntimeError> {
+    let (big, body) = resolve_utf16_bom(bytes, big);
+    if body.len() % 2 != 0 {
+        return Err(crate::error::unicode_decode_error(
+            "utf-16",
+            bytes,
+            body.len() - 1,
+            body.len(),
+            "truncated data",
+        ));
+    }
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|c| {
+            if big {
+                u16::from_be_bytes([c[0], c[1]])
+            } else {
+                u16::from_le_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    let mut out = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..=0xDBFF).contains(&u)
+            && i + 1 < units.len()
+            && (0xDC00..=0xDFFF).contains(&units[i + 1])
+        {
+            let hi = u32::from(u) - 0xD800;
+            let lo = u32::from(units[i + 1]) - 0xDC00;
+            out.push(0x1_0000 + (hi << 10) + lo);
+            i += 2;
+        } else {
+            // Scalar or lone surrogate — surrogatepass keeps it verbatim.
+            out.push(u32::from(u));
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// UTF-32 `surrogatepass` decode: 32-bit code units, surrogate values allowed.
+fn decode_utf32_surrogatepass_codepoints(
+    bytes: &[u8],
+    big: Option<bool>,
+) -> Result<Vec<u32>, RuntimeError> {
+    let (big, body) = resolve_utf32_bom(bytes, big);
+    if body.len() % 4 != 0 {
+        return Err(crate::error::unicode_decode_error(
+            "utf-32",
+            bytes,
+            body.len() - (body.len() % 4),
+            body.len(),
+            "truncated data",
+        ));
+    }
+    let mut out = Vec::with_capacity(body.len() / 4);
+    for c in body.chunks_exact(4) {
+        let v = if big {
+            u32::from_be_bytes([c[0], c[1], c[2], c[3]])
+        } else {
+            u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+        };
+        if v > 0x10_FFFF {
+            return Err(crate::error::unicode_decode_error(
+                "utf-32",
+                bytes,
+                0,
+                4,
+                "code point not in range(0x110000)",
+            ));
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// Resolve a UTF-16 byte-order: when `big` is `None`, consume a leading BOM
+/// (default little-endian if absent), returning the endianness and the body
+/// after any BOM.
+fn resolve_utf16_bom(bytes: &[u8], big: Option<bool>) -> (bool, &[u8]) {
+    match big {
+        Some(b) => (b, bytes),
+        None => {
+            if bytes.starts_with(&[0xFF, 0xFE]) {
+                (false, &bytes[2..])
+            } else if bytes.starts_with(&[0xFE, 0xFF]) {
+                (true, &bytes[2..])
+            } else {
+                (false, bytes)
+            }
+        }
+    }
+}
+
+/// Resolve a UTF-32 byte-order, consuming a leading BOM when `big` is `None`.
+fn resolve_utf32_bom(bytes: &[u8], big: Option<bool>) -> (bool, &[u8]) {
+    match big {
+        Some(b) => (b, bytes),
+        None => {
+            if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+                (false, &bytes[4..])
+            } else if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+                (true, &bytes[4..])
+            } else {
+                (false, bytes)
+            }
+        }
+    }
 }
 
 pub fn decode_bytes(bytes: &[u8], encoding: &str, errors: &str) -> Result<String, RuntimeError> {
@@ -279,15 +845,162 @@ pub fn decode_bytes(bytes: &[u8], encoding: &str, errors: &str) -> Result<String
     if let Some(out) = decode_special(bytes, encoding, errors)? {
         return Ok(out);
     }
-    let enc = lookup_encoding(encoding)
-        .ok_or_else(|| crate::error::lookup_error(format!("unknown encoding: {encoding}")))?;
-    let (text, _, had_errors) = enc.decode(bytes);
-    if had_errors && errors == "strict" {
-        return Err(value_error(format!(
-            "'{encoding}' codec can't decode input"
-        )));
+    if let Some(enc) = lookup_encoding(encoding) {
+        let (text, _, had_errors) = enc.decode(bytes);
+        if had_errors && errors == "strict" {
+            return Err(value_error(format!(
+                "'{encoding}' codec can't decode input"
+            )));
+        }
+        return Ok(text.into_owned());
     }
-    Ok(text.into_owned())
+    if let Some(out) = decode_via_registry(bytes, encoding, errors)? {
+        return Ok(out);
+    }
+    Err(crate::error::lookup_error(format!(
+        "unknown encoding: {encoding}"
+    )))
+}
+
+// `REGISTRY_INFLIGHT`: encodings currently being resolved through the Python
+// registry on this thread. Guards against a pathological codec whose
+// `decode`/`encode` re-enters the native engine for the *same* encoding (which
+// would loop); a re-entry returns `None` so the caller raises the normal
+// `LookupError`.
+thread_local! {
+    static REGISTRY_INFLIGHT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Resolve `encoding` through the live `codecs` registry and run its stateless
+/// `decode`. Returns `Ok(None)` when there is no interpreter, the encoding is
+/// already in flight (recursion guard), `codecs.lookup` raised `LookupError`,
+/// or the result isn't a `str` — in every such case the caller falls back to
+/// its own `LookupError`.
+fn decode_via_registry(
+    bytes: &[u8],
+    encoding: &str,
+    errors: &str,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(codec) = registry_codec_attr(encoding, "decode")? else {
+        return Ok(None);
+    };
+    let key = encoding.to_owned();
+    REGISTRY_INFLIGHT.with(|s| s.borrow_mut().push(key.clone()));
+    let res = with_interp(|interp| {
+        interp.call_object(
+            codec,
+            &[Object::new_bytes(bytes.to_vec()), Object::from_str(errors)],
+            &[],
+        )
+    });
+    REGISTRY_INFLIGHT.with(|s| s.borrow_mut().retain(|e| e != &key));
+    let out = res?;
+    let first = match &out {
+        Object::Tuple(t) if !t.is_empty() => t[0].clone(),
+        other => other.clone(),
+    };
+    match first {
+        Object::Str(s) => Ok(Some(s.to_string())),
+        // A codec was found and run, but returned a non-`str` result. This is
+        // the `io.TextIOWrapper` read path consuming a binary-transform codec
+        // (`quopri`/`hex`) whose `_is_text_encoding` guard was bypassed: CPython
+        // raises `TypeError` from `textio.c`, not a `LookupError`
+        // (`test_io.test_illegal_decoder`).
+        other => Err(type_error(format!(
+            "decoder should return a string result, not '{}'",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `encode` counterpart to [`decode_via_registry`].
+fn encode_via_registry(
+    s: &str,
+    encoding: &str,
+    errors: &str,
+) -> Result<Option<Vec<u8>>, RuntimeError> {
+    let Some(codec) = registry_codec_attr(encoding, "encode")? else {
+        return Ok(None);
+    };
+    let key = encoding.to_owned();
+    REGISTRY_INFLIGHT.with(|st| st.borrow_mut().push(key.clone()));
+    let res = with_interp(|interp| {
+        interp.call_object(codec, &[Object::from_str(s), Object::from_str(errors)], &[])
+    });
+    REGISTRY_INFLIGHT.with(|st| st.borrow_mut().retain(|e| e != &key));
+    let out = res?;
+    let first = match &out {
+        Object::Tuple(t) if !t.is_empty() => t[0].clone(),
+        other => other.clone(),
+    };
+    match first.as_bytes_view() {
+        Some(b) => Ok(Some(b)),
+        // Codec found and run, but returned a non-bytes result — the
+        // `io.TextIOWrapper` write path over a binary-transform codec
+        // (`rot13`) whose `_is_text_encoding` guard was bypassed. CPython's
+        // `textio.c` raises `TypeError` (`test_io.test_illegal_encoder`).
+        None => Err(type_error(format!(
+            "encoder should return a bytes object, not '{}'",
+            first.type_name()
+        ))),
+    }
+}
+
+/// Shared front half of the registry fallbacks: bail out (→ `Ok(None)`) when
+/// there is no interpreter or the encoding is already being resolved, then
+/// `codecs.lookup(encoding)` and return its `attr` (`"encode"`/`"decode"`)
+/// callable. A `LookupError` from `lookup` is swallowed (→ `Ok(None)`).
+/// Whether `codecs.lookup(encoding).decode` is `None` — i.e. the codec is
+/// *incremental-only* (its sole decoder is `incrementaldecoder`, e.g.
+/// test_io's `test_decoder`/`StatefulIncrementalDecoder`). Such a codec
+/// cannot be driven by WeavePy's one-shot text fast path; the native
+/// `TextIOWrapper` must fall back to the faithful incremental machinery
+/// (`PyFile::read_text_incr`/`tell_text_incr`/`seek_text_incr`). A lookup
+/// failure or a present one-shot decoder both report `false` (fast path).
+pub fn codec_one_shot_decode_is_none(encoding: &str) -> bool {
+    matches!(
+        registry_codec_attr(encoding, "decode"),
+        Ok(Some(Object::None))
+    )
+}
+
+fn registry_codec_attr(encoding: &str, attr: &str) -> Result<Option<Object>, RuntimeError> {
+    if crate::vm_singletons::current_interpreter_ptr().is_none() {
+        return Ok(None);
+    }
+    let reentrant = REGISTRY_INFLIGHT.with(|s| s.borrow().iter().any(|e| e == encoding));
+    if reentrant {
+        return Ok(None);
+    }
+    with_interp(|interp| {
+        let Ok(codecs) = interp.import_path("codecs") else {
+            return Ok(None);
+        };
+        let Ok(lookup) = interp.load_attr_public(&codecs, "lookup") else {
+            return Ok(None);
+        };
+        let info = match interp.call_object(lookup, &[Object::from_str(encoding)], &[]) {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
+        match interp.load_attr_public(&info, attr) {
+            Ok(c) => Ok(Some(c)),
+            Err(_) => Ok(None),
+        }
+    })
+}
+
+/// Run `f` with the current interpreter. The pointer is published by an
+/// enclosing VM frame on this thread and the GIL keeps the reentrant access
+/// exclusive (same contract as `io_full::validate_text_encoding`).
+fn with_interp<T>(
+    f: impl FnOnce(&mut crate::Interpreter) -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+    // SAFETY: see doc comment.
+    let interp = unsafe { &mut *ptr };
+    f(interp)
 }
 
 /// Handle special-case encodings whose semantics don't quite match
@@ -297,6 +1010,14 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
     let key = encoding_key(encoding);
     Ok(match key.as_str() {
         "utf8" => Some(encode_utf8(s, errors)?),
+        "utf8sig" => {
+            // UTF-8 with a leading BOM (CPython `utf_8_sig`). The stateless
+            // codec always prepends the BOM; the BOM-once-per-stream nuance
+            // lives in the incremental encoder (frozen `codecs.py`).
+            let mut out = vec![0xEF, 0xBB, 0xBF];
+            out.extend(encode_utf8(s, errors)?);
+            Some(out)
+        }
         "ascii" => Some(encode_ascii(s, errors)?),
         "latin1" | "iso88591" => Some(encode_latin1(s, errors)?),
         "utf16" => Some(encode_utf16(s, false, true)),
@@ -308,6 +1029,7 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
         "rawunicodeescape" => Some(encode_raw_unicode_escape(s)),
         "unicodeescape" => Some(encode_unicode_escape(s)),
         "cp437" | "437" | "ibm437" => Some(encode_cp437(s, errors)?),
+        "utf7" => Some(encode_utf7(s)),
         _ => None,
     })
 }
@@ -320,6 +1042,11 @@ fn decode_special(
     let key = encoding_key(encoding);
     Ok(match key.as_str() {
         "utf8" => Some(decode_utf8(bytes, errors)?),
+        "utf8sig" => {
+            // Strip a single leading UTF-8 BOM if present, then decode.
+            let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
+            Some(decode_utf8(body, errors)?)
+        }
         "ascii" => Some(decode_ascii(bytes, errors)?),
         "latin1" | "iso88591" => Some(decode_latin1(bytes)),
         "utf16" => Some(decode_utf16(bytes, None)?),
@@ -331,6 +1058,7 @@ fn decode_special(
         "rawunicodeescape" => Some(decode_raw_unicode_escape(bytes)?),
         "unicodeescape" => Some(decode_unicode_escape(bytes)?),
         "cp437" | "437" | "ibm437" => Some(decode_cp437(bytes)),
+        "utf7" => Some(decode_utf7(bytes, errors)?),
         _ => None,
     })
 }
@@ -393,6 +1121,261 @@ fn encode_cp437(s: &str, errors: &str) -> Result<Vec<u8>, RuntimeError> {
                 }
             }
         }
+    }
+    Ok(out)
+}
+
+// ---------- UTF-7 (RFC 2152) ----------
+//
+// `encoding_rs` has no UTF-7, but real code drives it (e.g. `tarfile` opened
+// with `encoding='utf7'`). Ported faithfully from CPython 3.13's
+// `_PyUnicode_EncodeUTF7` / `PyUnicode_DecodeUTF7Stateful`
+// (Objects/unicodeobject.c). The stateless codec encodes the modified-Base64
+// shifted sequences over UTF-16 code units. Because WeavePy's `str` is strict
+// UTF-8, lone surrogates produced by malformed input become U+FFFD (the same
+// concession the UTF-8 surrogateescape path makes).
+
+const UTF7_BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// CPython `utf7_category`: 0=Set D, 1=Set O, 2=whitespace, 3=must-base64.
+#[rustfmt::skip]
+const UTF7_CATEGORY: [u8; 128] = [
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 3, 3, 2, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    2, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 3, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 1, 1, 1,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 3, 3,
+];
+
+#[inline]
+fn utf7_is_base64(c: u32) -> bool {
+    if c > 127 {
+        return false;
+    }
+    let b = c as u8;
+    b.is_ascii_uppercase() || b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'+' || b == b'/'
+}
+
+#[inline]
+fn utf7_from_base64(c: u32) -> u64 {
+    let b = c as u8;
+    if b.is_ascii_uppercase() {
+        u64::from(b - b'A')
+    } else if b.is_ascii_lowercase() {
+        u64::from(b - b'a') + 26
+    } else if b.is_ascii_digit() {
+        u64::from(b - b'0') + 52
+    } else if b == b'+' {
+        62
+    } else {
+        63
+    }
+}
+
+#[inline]
+fn utf7_to_base64(n: u64) -> u8 {
+    UTF7_BASE64[(n & 0x3f) as usize]
+}
+
+/// `DECODE_DIRECT`: an ASCII byte (other than `+`) that decodes as itself.
+#[inline]
+fn utf7_decode_direct(c: u32) -> bool {
+    c <= 127 && c != u32::from(b'+')
+}
+
+/// `ENCODE_DIRECT(c, directO=1, directWS=1)` — the Python codec passes
+/// `base64SetO=0`/`base64WhiteSpace=0`, so every ASCII char outside category 3
+/// is emitted literally.
+#[inline]
+fn utf7_encode_direct(c: u32) -> bool {
+    c > 0 && c < 128 && UTF7_CATEGORY[c as usize] != 3
+}
+
+/// Push a (possibly surrogate) code point; WeavePy `str` can't hold lone
+/// surrogates, so they degrade to U+FFFD (see module note).
+#[inline]
+fn utf7_push(out: &mut String, cp: u32) {
+    out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+}
+
+fn encode_utf7(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut in_shift = false;
+    let mut base64bits: u32 = 0;
+    let mut base64buffer: u64 = 0;
+    for c in s.chars() {
+        let mut ch = c as u32;
+        if in_shift {
+            if utf7_encode_direct(ch) {
+                if base64bits > 0 {
+                    out.push(utf7_to_base64(base64buffer << (6 - base64bits)));
+                    base64buffer = 0;
+                    base64bits = 0;
+                }
+                in_shift = false;
+                if utf7_is_base64(ch) || ch == u32::from(b'-') {
+                    out.push(b'-');
+                }
+                out.push(ch as u8);
+                continue;
+            }
+            // else: fall through to encode_char.
+        } else if ch == u32::from(b'+') {
+            out.push(b'+');
+            out.push(b'-');
+            continue;
+        } else if utf7_encode_direct(ch) {
+            out.push(ch as u8);
+            continue;
+        } else {
+            out.push(b'+');
+            in_shift = true;
+            // fall through to encode_char.
+        }
+        // encode_char: accumulate UTF-16 code unit(s) into the base64 buffer.
+        if ch >= 0x10000 {
+            let v = ch - 0x10000;
+            let hi = 0xD800 + (v >> 10);
+            base64bits += 16;
+            base64buffer = (base64buffer << 16) | u64::from(hi);
+            while base64bits >= 6 {
+                out.push(utf7_to_base64(base64buffer >> (base64bits - 6)));
+                base64bits -= 6;
+            }
+            ch = 0xDC00 + (v & 0x3FF);
+        }
+        base64bits += 16;
+        base64buffer = (base64buffer << 16) | u64::from(ch);
+        while base64bits >= 6 {
+            out.push(utf7_to_base64(base64buffer >> (base64bits - 6)));
+            base64bits -= 6;
+        }
+    }
+    if base64bits > 0 {
+        out.push(utf7_to_base64(base64buffer << (6 - base64bits)));
+    }
+    if in_shift {
+        out.push(b'-');
+    }
+    out
+}
+
+fn decode_utf7(bytes: &[u8], errors: &str) -> Result<String, RuntimeError> {
+    let mut out = String::with_capacity(bytes.len());
+    let mut in_shift = false;
+    let mut base64bits: u32 = 0;
+    let mut base64buffer: u64 = 0;
+    let mut surrogate: u32 = 0;
+    let e = bytes.len();
+    let mut s = 0usize;
+
+    // Apply the configured error handler to a decode error spanning
+    // `start..end`. Returns `Err` for strict; otherwise substitutes
+    // (`replace`) or drops (`ignore`/others) and lets scanning continue.
+    macro_rules! utf7_error {
+        ($start:expr, $end:expr, $reason:expr) => {{
+            match errors {
+                "ignore" => {}
+                _ => {
+                    if errors == "strict" {
+                        return Err(crate::error::unicode_decode_error(
+                            "utf7", bytes, $start, $end, $reason,
+                        ));
+                    }
+                    // `replace`, `backslashreplace`, etc. — best-effort U+FFFD.
+                    out.push('\u{FFFD}');
+                }
+            }
+        }};
+    }
+
+    while s < e {
+        let ch = u32::from(bytes[s]);
+        if in_shift {
+            if utf7_is_base64(ch) {
+                base64buffer = (base64buffer << 6) | utf7_from_base64(ch);
+                base64bits += 6;
+                s += 1;
+                if base64bits >= 16 {
+                    let out_ch = ((base64buffer >> (base64bits - 16)) & 0xFFFF) as u32;
+                    base64bits -= 16;
+                    base64buffer &= (1u64 << base64bits) - 1;
+                    if surrogate != 0 {
+                        if (0xDC00..=0xDFFF).contains(&out_ch) {
+                            let joined = 0x10000 + ((surrogate - 0xD800) << 10) + (out_ch - 0xDC00);
+                            utf7_push(&mut out, joined);
+                            surrogate = 0;
+                            continue;
+                        }
+                        utf7_push(&mut out, surrogate);
+                        surrogate = 0;
+                    }
+                    if (0xD800..=0xDBFF).contains(&out_ch) {
+                        surrogate = out_ch;
+                    } else {
+                        utf7_push(&mut out, out_ch);
+                    }
+                }
+            } else {
+                // Leaving a base-64 section.
+                in_shift = false;
+                if base64bits >= 6 {
+                    let start = s;
+                    s += 1;
+                    utf7_error!(start, s, "partial character in shift sequence");
+                    base64bits = 0;
+                    base64buffer = 0;
+                    surrogate = 0;
+                    continue;
+                } else if base64bits > 0 && base64buffer != 0 {
+                    let start = s;
+                    s += 1;
+                    utf7_error!(start, s, "non-zero padding bits in shift sequence");
+                    base64bits = 0;
+                    base64buffer = 0;
+                    surrogate = 0;
+                    continue;
+                }
+                if surrogate != 0 && utf7_decode_direct(ch) {
+                    utf7_push(&mut out, surrogate);
+                }
+                surrogate = 0;
+                base64bits = 0;
+                base64buffer = 0;
+                if ch == u32::from(b'-') {
+                    s += 1;
+                }
+            }
+        } else if ch == u32::from(b'+') {
+            let start = s;
+            s += 1;
+            if s < e && bytes[s] == b'-' {
+                s += 1;
+                out.push('+');
+            } else if s < e && !utf7_is_base64(u32::from(bytes[s])) {
+                s += 1;
+                utf7_error!(start, s, "ill-formed sequence");
+            } else {
+                in_shift = true;
+                surrogate = 0;
+                base64bits = 0;
+                base64buffer = 0;
+            }
+        } else if utf7_decode_direct(ch) {
+            s += 1;
+            out.push(ch as u8 as char);
+        } else {
+            let start = s;
+            s += 1;
+            utf7_error!(start, s, "unexpected special character");
+        }
+    }
+
+    if in_shift && (surrogate != 0 || base64bits >= 6 || (base64bits > 0 && base64buffer != 0)) {
+        utf7_error!(s, e, "unterminated shift sequence");
     }
     Ok(out)
 }

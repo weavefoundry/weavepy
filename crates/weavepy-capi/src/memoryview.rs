@@ -94,6 +94,7 @@ fn clone_memoryview(other: &PyMemoryView) -> PyMemoryView {
         buffer: match &other.buffer {
             MemoryViewBuffer::Bytes(b) => MemoryViewBuffer::Bytes(b.clone()),
             MemoryViewBuffer::ByteArray(b) => MemoryViewBuffer::ByteArray(b.clone()),
+            MemoryViewBuffer::Shared(s) => MemoryViewBuffer::Shared(s.clone()),
         },
         start: Cell::new(other.start.get()),
         len: Cell::new(other.len.get()),
@@ -261,10 +262,7 @@ pub unsafe extern "C" fn PyMemoryView_GET_BUFFER(mv: *mut PyObject) -> *mut Py_b
     }
 
     // Materialise a fresh Py_buffer on the heap.
-    let bytes = match &view.buffer {
-        MemoryViewBuffer::Bytes(b) => b.to_vec(),
-        MemoryViewBuffer::ByteArray(b) => b.borrow().clone(),
-    };
+    let bytes = view.buffer.with_read(<[u8]>::to_vec);
     let len = view.len.get();
     let mut buf_box: Box<[u8]> = bytes.into_boxed_slice();
     let buf_ptr = buf_box.as_mut_ptr() as *mut std::ffi::c_void;

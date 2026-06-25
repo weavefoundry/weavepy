@@ -73,6 +73,18 @@ def create_server(address, *, family=None, backlog=None, reuse_port=False, duals
     return _impl.create_server(address, fam, backlog if backlog is not None else 100, reuse_port)
 
 
+def fromfd(fd, family, type, proto=0):
+    """Create a socket object from a *duplicate* of the given file
+    descriptor (CPython parity). The remaining arguments are the same as
+    for `socket()`. `multiprocessing.reduction.send_handle`/`recv_handle`
+    wrap a Connection's fd this way to push file descriptors over
+    `SCM_RIGHTS`.
+    """
+    import os
+    nfd = os.dup(fd)
+    return _impl.socket(family, type, proto, nfd)
+
+
 def getfqdn(name=""):
     return _impl.getfqdn(name)
 

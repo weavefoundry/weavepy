@@ -23,36 +23,69 @@ except ImportError:  # pragma: no cover - shutil ships frozen
 # TESTFN family
 # ---------------------------------------------------------------------------
 
-# A writable scratch name unique to this process. CPython derives it from
-# the running script; a pid-tagged name is good enough for our purposes
-# and keeps parallel workers from clobbering each other.
+# Whether we are running on an Apple platform (macOS / iOS). CPython reads
+# this from ``test.support.is_apple``, but importing ``test.support`` here
+# would be a circular import (``test.support`` imports this module), so derive
+# it locally from ``sys.platform`` — the only consumers are the TESTFN probes.
+is_apple = sys.platform == 'darwin' or sys.platform == 'ios'
+
+# Filename used for testing.
 TESTFN_ASCII = '@test'
 
-# Make it unique per process so parallel test workers do not collide.
-TESTFN = "{}_{}_tmp".format(TESTFN_ASCII, os.getpid())
+# Disambiguate TESTFN for parallel testing, while letting it remain a valid
+# module name.
+TESTFN_ASCII = "{}_{}_tmp".format(TESTFN_ASCII, os.getpid())
 
-# A non-ASCII variant. We keep it ASCII-safe-but-distinct if the platform
-# cannot represent the usual unicode payload, mirroring CPython's fallback.
-try:
-    TESTFN_UNICODE = TESTFN + "-\xe0\xf2\u0258\u0141\u011f"
-    TESTFN_UNICODE.encode(sys.getfilesystemencoding())
-except (ValueError, LookupError, AttributeError):
-    TESTFN_UNICODE = TESTFN + "-unicode"
+# TESTFN_UNICODE is a non-ascii filename
+TESTFN_UNICODE = TESTFN_ASCII + "-\xe0\xf2\u0258\u0141\u011f"
+if is_apple:
+    # On Apple's VFS API file names are, by definition, canonically
+    # decomposed Unicode, encoded using UTF-8. See QA1173:
+    # http://developer.apple.com/mac/library/qa/qa2001/qa1173.html
+    import unicodedata
+    TESTFN_UNICODE = unicodedata.normalize('NFD', TESTFN_UNICODE)
 
-# Filenames the platform cannot decode/encode. WeavePy does not model
-# undecodable bytes paths, so these are ``None`` and tests gate on them.
-TESTFN_UNDECODABLE = None
+# TESTFN_UNENCODABLE is a filename (str type) that should *not* be able to be
+# encoded by the filesystem encoding (in strict mode). It can be None if we
+# cannot generate such filename.
 TESTFN_UNENCODABLE = None
-TESTFN_NONASCII = TESTFN_UNICODE
+if os.name == 'nt':
+    # skip win32s (0) or Windows 9x/ME (1)
+    if sys.getwindowsversion().platform >= 2:
+        # Different kinds of characters from various languages to minimize the
+        # probability that the whole name is encodable to MBCS (issue #9819)
+        TESTFN_UNENCODABLE = TESTFN_ASCII + "-\u5171\u0141\u2661\u0363\uDC80"
+        try:
+            TESTFN_UNENCODABLE.encode(sys.getfilesystemencoding())
+        except UnicodeEncodeError:
+            pass
+        else:
+            print('WARNING: The filename %r CAN be encoded by the filesystem '
+                  'encoding (%s). Unicode filename tests may not be effective'
+                  % (TESTFN_UNENCODABLE, sys.getfilesystemencoding()))
+            TESTFN_UNENCODABLE = None
+# Apple and Emscripten deny unencodable filenames (invalid utf-8)
+elif not is_apple and sys.platform not in {"emscripten", "wasi"}:
+    try:
+        # ascii and utf-8 cannot encode the byte 0xff
+        b'\xff'.decode(sys.getfilesystemencoding())
+    except UnicodeDecodeError:
+        # 0xff will be encoded using the surrogate character u+DCFF
+        TESTFN_UNENCODABLE = TESTFN_ASCII \
+            + b'-\xff'.decode(sys.getfilesystemencoding(), 'surrogateescape')
+    else:
+        # File system encoding (eg. ISO-8859-* encodings) can encode
+        # the byte 0xff. Skip some unicode filename tests.
+        pass
 
 # Marker used by some tests; harmless default.
 TESTFN_UNICODE_UNENCODEABLE = None
 
-# A non-ASCII character that round-trips through the filesystem encoding,
-# or '' if none does. Verbatim port of CPython 3.13's os_helper probe;
-# `test_argparse`/`test_os` reach for it.
+# FS_NONASCII: non-ASCII character encodable by os.fsencode(),
+# or an empty string if there is no such character.
 FS_NONASCII = ''
 for character in (
+    # First try printable and common characters to have a readable filename.
     '\u00E6',
     '\u0130',
     '\u0141',
@@ -62,10 +95,14 @@ for character in (
     '\u060C',
     '\u062A',
     '\u0E01',
+    # Then try more "special" characters.
     '\u00A0',
     '\u20AC',
 ):
     try:
+        # If Python is set up to use the legacy 'mbcs' in Windows,
+        # 'replace' error mode is used, and encode() returns b'?'
+        # for characters missing in the ANSI codepage
         if os.fsdecode(os.fsencode(character)) != character:
             raise UnicodeError
     except UnicodeError:
@@ -73,9 +110,41 @@ for character in (
     else:
         FS_NONASCII = character
         break
-del character
 
+# Save the initial cwd
 SAVEDCWD = os.getcwd()
+
+# TESTFN_UNDECODABLE is a filename (bytes type) that should *not* be able to be
+# decoded from the filesystem encoding (in strict mode). It can be None if we
+# cannot generate such filename. On UNIX, TESTFN_UNDECODABLE can be decoded by
+# os.fsdecode() thanks to the surrogateescape error handler (PEP 383), but not
+# from the filesystem encoding in strict mode.
+TESTFN_UNDECODABLE = None
+for name in (
+    b'\xe7w\xf0',
+    # undecodable from ASCII, UTF-8
+    b'\xff',
+    b'\xae\xd5'
+    # undecodable from UTF-8 (UNIX and Mac OS X)
+    b'\xed\xb2\x80', b'\xed\xb4\x80',
+    b'\x81\x98',
+):
+    try:
+        name.decode(sys.getfilesystemencoding())
+    except UnicodeDecodeError:
+        try:
+            name.decode(sys.getfilesystemencoding(),
+                        sys.getfilesystemencodeerrors())
+        except UnicodeDecodeError:
+            continue
+        TESTFN_UNDECODABLE = os.fsencode(TESTFN_ASCII) + name
+        break
+
+if FS_NONASCII:
+    TESTFN_NONASCII = TESTFN_ASCII + FS_NONASCII
+else:
+    TESTFN_NONASCII = None
+TESTFN = TESTFN_NONASCII or TESTFN_ASCII
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +335,20 @@ def temp_cwd(name='tempcwd', quiet=False):
 
 
 @contextlib.contextmanager
+def open_dir_fd(path):
+    """Open a file descriptor to a directory (for ``dir_fd=``/``scandir(fd)``)."""
+    assert os.path.isdir(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    dir_fd = os.open(path, flags)
+    try:
+        yield dir_fd
+    finally:
+        os.close(dir_fd)
+
+
+@contextlib.contextmanager
 def temp_umask(umask):
     """Temporarily set the process umask (no-op where unsupported)."""
     old = None
@@ -421,6 +504,20 @@ class EnvironmentVarGuard:
         if default:
             return default[0]
         raise KeyError(envvar)
+
+    def update(self, other=(), /, **kwds):
+        # `collections.abc.MutableMapping.update`: accept a mapping (with
+        # `keys()`), an iterable of key/value pairs, or keyword arguments,
+        # routing every assignment through `__setitem__` so it's recorded for
+        # restore on exit (`test_os.test_execve_env_concurrent_mutation*`).
+        if hasattr(other, "keys"):
+            for key in other.keys():
+                self[key] = other[key]
+        else:
+            for key, value in other:
+                self[key] = value
+        for key, value in kwds.items():
+            self[key] = value
 
     def copy(self):
         return dict(self._environ)

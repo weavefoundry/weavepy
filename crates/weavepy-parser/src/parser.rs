@@ -418,9 +418,13 @@ impl<'src> Parser<'src> {
             | Some(TokenKind::DoubleStarEqual)
             | Some(TokenKind::AtEqual)
             | Some(TokenKind::ColonEqual)
-            | Some(TokenKind::Dot)
-            | Some(TokenKind::LPar)
-            | Some(TokenKind::LSqb) => return false,
+            | Some(TokenKind::Dot) => return false,
+            // NB: `(` and `[` are *not* early-rejected — `match (subject):` and
+            // `match [a, b]:` (parenthesised / list subjects, incl. the empty
+            // tuple `match ():`) are valid match statements. The depth-aware
+            // scan below disambiguates them from a `match(...)` call or a
+            // `match[...]: T` annotation by requiring a depth-0 `:` followed by
+            // NEWLINE INDENT `case`.
             None => return false,
             _ => {}
         }
@@ -1000,7 +1004,7 @@ impl<'src> Parser<'src> {
                     let n = self.bump();
                     args.vararg = Some(Arg {
                         name: self.ident(n.span),
-                        annotation: self.try_arg_annotation(allow_annotation)?,
+                        annotation: self.try_arg_annotation(allow_annotation, true)?,
                         span: n.span,
                     });
                 } else {
@@ -1017,7 +1021,7 @@ impl<'src> Parser<'src> {
                 let n = self.expect(&TokenKind::Name, "kwarg name")?;
                 args.kwarg = Some(Arg {
                     name: self.ident(n.span),
-                    annotation: self.try_arg_annotation(allow_annotation)?,
+                    annotation: self.try_arg_annotation(allow_annotation, false)?,
                     span: n.span,
                 });
                 if !self.eat(&TokenKind::Comma) {
@@ -1037,7 +1041,7 @@ impl<'src> Parser<'src> {
 
             let n = self.expect(&TokenKind::Name, "parameter name")?;
             let name = self.ident(n.span);
-            let annotation = self.try_arg_annotation(allow_annotation)?;
+            let annotation = self.try_arg_annotation(allow_annotation, false)?;
             let default = if self.eat(&TokenKind::Equal) {
                 Some(self.parse_expression(false)?)
             } else {
@@ -1103,8 +1107,26 @@ impl<'src> Parser<'src> {
         Ok(args)
     }
 
-    fn try_arg_annotation(&mut self, allow: bool) -> Result<Option<Box<Expr>>, ParseError> {
+    fn try_arg_annotation(
+        &mut self,
+        allow: bool,
+        star_ok: bool,
+    ) -> Result<Option<Box<Expr>>, ParseError> {
         if allow && self.eat(&TokenKind::Colon) {
+            // PEP 646: a `*args` parameter may carry an unpacked annotation —
+            // `def f(*args: *Ts)`, `*args: *tuple[int, ...]`. Only the vararg
+            // position permits this (`star_ok`); the compiler lowers the
+            // `Starred` to `(*X,)[0]`, i.e. `Unpack[X]`.
+            if star_ok && self.check(&TokenKind::Star) {
+                let star_span = self.peek_token().span;
+                self.bump();
+                let inner = self.parse_expression(false)?;
+                let span = star_span.merge(inner.span);
+                return Ok(Some(Box::new(Expr {
+                    kind: ExprKind::Starred(Box::new(inner)),
+                    span,
+                })));
+            }
             Ok(Some(Box::new(self.parse_expression(false)?)))
         } else {
             Ok(None)
@@ -1477,7 +1499,7 @@ impl<'src> Parser<'src> {
             });
         }
         self.bump();
-        let pattern = self.parse_pattern()?;
+        let pattern = self.parse_patterns()?;
         let guard = if self.at_keyword(Keyword::If) {
             self.bump();
             Some(self.parse_expression(false)?)
@@ -1493,6 +1515,29 @@ impl<'src> Parser<'src> {
             body,
             span: case_tok.span.merge(span_end),
         })
+    }
+
+    /// A case clause's patterns: CPython's `patterns` rule, which is an
+    /// `open_sequence_pattern` (`maybe_star_pattern ',' …`) *or* a single
+    /// `pattern`. The bracket-less, comma-separated form — `case 0, *x:` or
+    /// `case a, b:` — is a sequence pattern exactly like `case (0, *x):`; a
+    /// lone trailing comma (`case x,:`) is still a one-element sequence. Only a
+    /// top-level comma (not one inside `[...]`/`(...)`) triggers this, so a
+    /// plain `case 0:` stays a value pattern.
+    fn parse_patterns(&mut self) -> Result<Pattern, ParseError> {
+        let first = self.parse_pattern()?;
+        if !self.check(&TokenKind::Comma) {
+            return Ok(first);
+        }
+        let mut items = vec![first];
+        while self.eat(&TokenKind::Comma) {
+            // A trailing comma before the guard/colon ends the sequence.
+            if self.check(&TokenKind::Colon) || self.at_keyword(Keyword::If) {
+                break;
+            }
+            items.push(self.parse_pattern()?);
+        }
+        Ok(Pattern::Sequence(items))
     }
 
     /// Top-level pattern: `or_pattern ('as' NAME)?`.
@@ -1599,6 +1644,58 @@ impl<'src> Parser<'src> {
     /// pattern. Restricted to numbers, strings, and unary `-` on
     /// numerics — matching PEP 634.
     fn parse_literal_pattern_expr(&mut self) -> Result<Expr, ParseError> {
+        let left = self.parse_signed_number_or_atom_pattern()?;
+        // PEP 634 complex-number literal pattern: a signed real number summed
+        // with (or differenced from) an imaginary number — `case 1 + 2j`,
+        // `case -3 - 4j`, `case 0 + 0j`. Only a *numeric* left-hand side
+        // begins one, so strings/singletons are returned untouched.
+        let left_is_number = matches!(
+            left.kind,
+            ExprKind::Constant(
+                Constant::Int(_) | Constant::Float(_) | Constant::BigInt(_) | Constant::Complex(..)
+            )
+        );
+        if left_is_number && matches!(self.peek(), TokenKind::Plus | TokenKind::Minus) {
+            let op_tok = self.bump();
+            let op = if matches!(op_tok.kind, TokenKind::Plus) {
+                BinOp::Add
+            } else {
+                BinOp::Sub
+            };
+            let num = self.peek_token().clone();
+            if !matches!(num.kind, TokenKind::Number) {
+                return Err(ParseError::Unexpected {
+                    span: num.span,
+                    message: "expected an imaginary number in complex literal pattern".to_owned(),
+                });
+            }
+            self.bump();
+            let value =
+                parse_number(self.lexeme(num.span)).map_err(|m| ParseError::Unexpected {
+                    span: num.span,
+                    message: m,
+                })?;
+            let right = Expr {
+                kind: ExprKind::Constant(value),
+                span: num.span,
+            };
+            let span = left.span.merge(num.span);
+            return Ok(Expr {
+                kind: ExprKind::BinOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                },
+                span,
+            });
+        }
+        Ok(left)
+    }
+
+    /// The `signed_number | atom` core of a literal pattern (a negative
+    /// numeric literal, or a plain number/string/etc.). Used on its own and
+    /// as the left operand of a complex-number literal pattern.
+    fn parse_signed_number_or_atom_pattern(&mut self) -> Result<Expr, ParseError> {
         if self.check(&TokenKind::Minus) {
             let minus = self.bump();
             let tok = self.peek_token().clone();
@@ -2647,6 +2744,17 @@ impl<'src> Parser<'src> {
         // loop after this call returns.
         let first = self.parse_subscript_single()?;
         if !self.check(&TokenKind::Comma) {
+            // PEP 646: a lone starred element still forms a one-element tuple
+            // index — `a[*b]` is `a[(*b,)]` (CPython parses the slice as
+            // `Tuple(elts=[Starred(b)])`). Wrapping it here lets the existing
+            // starred-tuple codegen build the index with unpacking.
+            if matches!(first.kind, ExprKind::Starred(_)) {
+                let span = first.span;
+                return Ok(Expr {
+                    kind: ExprKind::Tuple(vec![first]),
+                    span,
+                });
+            }
             return Ok(first);
         }
         // Multi-element subscript: collect into a tuple. Used by
@@ -2670,6 +2778,19 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_subscript_single(&mut self) -> Result<Expr, ParseError> {
+        // PEP 646: a subscript element may be a starred expression —
+        // `tuple[int, *Ts]`, `A[float, *tuple[int, ...]]`. A star can't begin a
+        // slice, so parse the unpacked expression and stop; the surrounding
+        // index tuple is built with unpacking by the compiler.
+        if self.check(&TokenKind::Star) {
+            let span = self.peek_token().span;
+            self.bump();
+            let value = self.parse_ternary()?;
+            return Ok(Expr {
+                kind: ExprKind::Starred(Box::new(value)),
+                span,
+            });
+        }
         // Slice grammar: `lower? ':' upper? (':' step?)?` or plain expr.
         if self.check(&TokenKind::Colon) {
             self.bump();
@@ -3129,10 +3250,7 @@ impl<'src> Parser<'src> {
                 _ => unreachable!(),
             }
         } else {
-            match self.decode_string(&first)? {
-                Constant::Str(s) => AccumString::Plain(s),
-                _ => unreachable!(),
-            }
+            AccumString::Plain(constant_str_cps(self.decode_string(&first)?))
         };
         self.bump();
         while matches!(self.peek(), TokenKind::String) {
@@ -3161,19 +3279,14 @@ impl<'src> Parser<'src> {
                     });
                 }
                 (AccumString::Plain(mut a), false, false) => {
-                    match self.decode_string(&next_tok)? {
-                        Constant::Str(s) => {
-                            a.push_str(&s);
-                            AccumString::Plain(a)
-                        }
-                        _ => unreachable!(),
-                    }
+                    a.extend(constant_str_cps(self.decode_string(&next_tok)?));
+                    AccumString::Plain(a)
                 }
                 (AccumString::Plain(a), true, false) => {
                     let mut parts: Vec<Expr> = Vec::new();
                     if !a.is_empty() {
                         parts.push(Expr {
-                            kind: ExprKind::Constant(Constant::Str(a)),
+                            kind: ExprKind::Constant(cps_to_constant(a)),
                             span: first.span,
                         });
                     }
@@ -3181,19 +3294,16 @@ impl<'src> Parser<'src> {
                     AccumString::Joined(parts)
                 }
                 (AccumString::Joined(mut parts), false, false) => {
-                    match self.decode_string(&next_tok)? {
-                        Constant::Str(s) => {
-                            join_str_into_parts(&mut parts, s, next_tok.span);
-                            AccumString::Joined(parts)
-                        }
-                        _ => unreachable!(),
-                    }
+                    join_str_into_parts(&mut parts, self.decode_string(&next_tok)?, next_tok.span);
+                    AccumString::Joined(parts)
                 }
                 (AccumString::Joined(mut parts), true, false) => {
                     let new_parts = self.fstring_parts_for(&next_tok)?;
                     for p in new_parts {
-                        if let ExprKind::Constant(Constant::Str(s)) = p.kind {
-                            join_str_into_parts(&mut parts, s, p.span);
+                        if let ExprKind::Constant(c @ (Constant::Str(_) | Constant::WStr(_))) =
+                            p.kind
+                        {
+                            join_str_into_parts(&mut parts, c, p.span);
                         } else {
                             parts.push(p);
                         }
@@ -3203,8 +3313,8 @@ impl<'src> Parser<'src> {
             };
         }
         match accum {
-            AccumString::Plain(s) => Ok(Expr {
-                kind: ExprKind::Constant(Constant::Str(s)),
+            AccumString::Plain(cps) => Ok(Expr {
+                kind: ExprKind::Constant(cps_to_constant(cps)),
                 span,
             }),
             AccumString::Bytes(b) => Ok(Expr {
@@ -3269,11 +3379,11 @@ impl<'src> Parser<'src> {
             })?;
             return Ok(Constant::Bytes(bytes));
         }
-        let s = decode_str_body(body, raw).map_err(|m| ParseError::Unexpected {
+        let c = decode_str_body(body, raw).map_err(|m| ParseError::Unexpected {
             span: tok.span,
             message: m,
         })?;
-        Ok(Constant::Str(s))
+        Ok(c)
     }
 
     /// Returns the prefix info for a string token without decoding the body.
@@ -3397,7 +3507,7 @@ impl<'src> Parser<'src> {
                             message: m,
                         })?;
                     parts.push(Expr {
-                        kind: ExprKind::Constant(Constant::Str(decoded)),
+                        kind: ExprKind::Constant(decoded),
                         span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
                     });
                     literal.clear();
@@ -3461,7 +3571,7 @@ impl<'src> Parser<'src> {
                 message: m,
             })?;
             parts.push(Expr {
-                kind: ExprKind::Constant(Constant::Str(decoded)),
+                kind: ExprKind::Constant(decoded),
                 span: Span::new(body_abs + lit_start as u32, body_abs + i as u32),
             });
         }
@@ -4405,19 +4515,41 @@ fn strip_fstring_field_comments(s: &str) -> String {
     out
 }
 
-/// Working state while concatenating adjacent string tokens.
+/// Working state while concatenating adjacent string tokens. The `Plain`
+/// arm accumulates *code points* (not a `String`) so that a lone surrogate
+/// from any fragment survives implicit concatenation; the final value is
+/// canonicalised to `Str`/`WStr` by [`cps_to_constant`].
 enum AccumString {
-    Plain(String),
+    Plain(Vec<u32>),
     Bytes(Vec<u8>),
     Joined(Vec<Expr>),
 }
 
+/// Code points of a string [`Constant`] (`Str` or `WStr`); panics on a
+/// non-string constant, which the callers structurally exclude.
+fn constant_str_cps(c: Constant) -> Vec<u32> {
+    match c {
+        Constant::Str(s) => s.chars().map(|ch| ch as u32).collect(),
+        Constant::WStr(cps) => cps,
+        _ => unreachable!("constant_str_cps on non-string constant"),
+    }
+}
+
 /// Append a literal string onto the tail of a JoinedStr parts list.
-/// Merges with the trailing `Constant::Str` part if there is one.
-fn join_str_into_parts(parts: &mut Vec<Expr>, s: String, span: Span) {
+/// Merges with the trailing string part (`Str` or `WStr`) if there is one,
+/// re-canonicalising the merged value.
+fn join_str_into_parts(parts: &mut Vec<Expr>, c: Constant, span: Span) {
     if let Some(last) = parts.last_mut() {
-        if let ExprKind::Constant(Constant::Str(existing)) = &mut last.kind {
-            existing.push_str(&s);
+        let merged = match &last.kind {
+            ExprKind::Constant(existing @ (Constant::Str(_) | Constant::WStr(_))) => {
+                let mut cps = constant_str_cps(existing.clone());
+                cps.extend(constant_str_cps(c.clone()));
+                Some(cps)
+            }
+            _ => None,
+        };
+        if let Some(cps) = merged {
+            last.kind = ExprKind::Constant(cps_to_constant(cps));
             // The merged literal spans from the first fragment's start
             // to the last fragment's end (CPython's implicit-concat AST
             // positions cross the token boundary).
@@ -4426,7 +4558,7 @@ fn join_str_into_parts(parts: &mut Vec<Expr>, s: String, span: Span) {
         }
     }
     parts.push(Expr {
-        kind: ExprKind::Constant(Constant::Str(s)),
+        kind: ExprKind::Constant(c),
         span,
     });
 }
@@ -4504,9 +4636,26 @@ fn strip_quotes(s: &str) -> &str {
 /// `SyntaxWarning` (unrecognised escapes and octal escapes `> \377`).
 /// Each diagnostic carries the byte offset of its backslash *within the
 /// body* so the caller can map it back to an absolute source position.
-fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
+/// Canonicalise a decoded code-point sequence into a string [`Constant`]:
+/// [`Constant::Str`] when every code point is a Unicode scalar value, or
+/// [`Constant::WStr`] when at least one lone surrogate is present.
+fn cps_to_constant(cps: Vec<u32>) -> Constant {
+    if cps.iter().any(|&c| (0xD800..=0xDFFF).contains(&c)) {
+        Constant::WStr(cps)
+    } else {
+        let mut s = String::with_capacity(cps.len());
+        for c in cps {
+            if let Some(ch) = char::from_u32(c) {
+                s.push(ch);
+            }
+        }
+        Constant::Str(s)
+    }
+}
+
+fn decode_str_body(s: &str, raw: bool) -> Result<Constant, String> {
     if raw {
-        return Ok(s.to_owned());
+        return Ok(Constant::Str(s.to_owned()));
     }
     // CPython surfaces escape-decoding failures as the unicodeescape
     // codec's error, with byte positions of the failed escape within the
@@ -4520,24 +4669,28 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
         )
     };
     let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    // Accumulate code points (each a scalar value *or* a lone surrogate) so a
+    // `\udxxx`/`\uXXXX`/`\xXX`/`\N{}` escape that resolves to a surrogate
+    // survives to runtime as an `Object::WStr` (canonicalised by
+    // `cps_to_constant`). Pure-UTF-8 literals fold straight back to `Str`.
+    let mut out: Vec<u32> = Vec::with_capacity(s.len());
     let mut chars = s.char_indices().peekable();
     while let Some((bs, c)) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            out.push(c as u32);
             continue;
         }
         let Some((_, esc)) = chars.next() else {
-            out.push('\\');
+            out.push('\\' as u32);
             break;
         };
         match esc {
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            '\\' => out.push('\\'),
-            '\'' => out.push('\''),
-            '"' => out.push('"'),
+            'n' => out.push('\n' as u32),
+            'r' => out.push('\r' as u32),
+            't' => out.push('\t' as u32),
+            '\\' => out.push('\\' as u32),
+            '\'' => out.push('\'' as u32),
+            '"' => out.push('"' as u32),
             // Octal escape `\ooo`: 1–3 octal digits (CPython accepts up
             // to `\777` = 511 in a str literal). `\0` is just the
             // zero-length-tail case of this rule. Values above `\377`
@@ -4553,12 +4706,12 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                         _ => break,
                     }
                 }
-                out.push(char::from_u32(val).unwrap_or('\u{FFFD}'));
+                out.push(val);
             }
-            'a' => out.push('\x07'),
-            'b' => out.push('\x08'),
-            'f' => out.push('\x0c'),
-            'v' => out.push('\x0b'),
+            'a' => out.push('\x07' as u32),
+            'b' => out.push('\x08' as u32),
+            'f' => out.push('\x0c' as u32),
+            'v' => out.push('\x0b' as u32),
             // Line continuation inside the string (`\` + newline). A
             // `\<CR>` (optionally `\<CR><LF>`) continues too.
             '\n' => {}
@@ -4600,7 +4753,9 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                 if n > 0x0010_FFFF {
                     return Err(unicode_err(bs, end, "illegal Unicode character"));
                 }
-                out.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
+                // Preserve lone surrogates verbatim (CPython allows them in str
+                // literals); `cps_to_constant` decides Str vs WStr.
+                out.push(n);
             }
             'N' => {
                 // `\N{UNICODE CHARACTER NAME}` — resolve the name against
@@ -4618,7 +4773,7 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
                             let ch = unicode_names2::character(&name).ok_or_else(|| {
                                 unicode_err(bs, i + 1, "unknown Unicode character name")
                             })?;
-                            out.push(ch);
+                            out.push(ch as u32);
                             break;
                         }
                         Some((_, c)) => name.push(c),
@@ -4635,12 +4790,12 @@ fn decode_str_body(s: &str, raw: bool) -> Result<String, String> {
             other => {
                 // CPython issues a `SyntaxWarning` for unknown escapes (the
                 // lexer records it) but emits both characters literally.
-                out.push('\\');
-                out.push(other);
+                out.push('\\' as u32);
+                out.push(other as u32);
             }
         }
     }
-    Ok(out)
+    Ok(cps_to_constant(out))
 }
 
 /// Decode a bytes-literal body. Like [`decode_str_body`] but bytes-valued

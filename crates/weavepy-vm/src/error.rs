@@ -104,6 +104,20 @@ impl PyException {
         }
     }
 
+    /// `true` when this exception is a `KeyboardInterrupt` (or a
+    /// subclass). The CLI uses it to reproduce CPython's `exit_sigint()`:
+    /// an unhandled `KeyboardInterrupt` at the top level re-raises
+    /// `SIGINT` under `SIG_DFL` so the process dies *by the signal*
+    /// (`returncode == -SIGINT`), not with a plain code 1
+    /// (`test_signal.PosixTests.test_keyboard_interrupt_exit_code`).
+    pub fn is_keyboard_interrupt(&self) -> bool {
+        let Object::Instance(inst) = &self.instance else {
+            return false;
+        };
+        inst.cls()
+            .is_subclass_of(&crate::builtin_types::builtin_types().keyboard_interrupt)
+    }
+
     /// When this exception is a `SystemExit` (or a subclass), return
     /// its exit `code`: the explicit `.code` attribute, falling back to
     /// the single `args` element (`()` → `None`, `(x,)` → `x`,
@@ -445,6 +459,45 @@ pub fn blocking_io_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("BlockingIOError", message))
 }
 
+/// Construct the three-arg `BlockingIOError(errno, strerror, characters_written)`
+/// form whose third positional sets `.characters_written` (and leaves
+/// `.filename` unset), matching CPython's `oserror_init` special case. This is
+/// what `_io.BufferedWriter` raises on a partial non-blocking flush
+/// (`test_io.test_write_non_blocking`).
+pub fn blocking_io_error_written(
+    errno: i32,
+    strerror: &str,
+    characters_written: i64,
+) -> RuntimeError {
+    use crate::object::{DictKey, Object};
+    let pe = PyException::from_builtin("BlockingIOError", strerror.to_owned());
+    if let Object::Instance(inst) = &pe.instance {
+        let mut dict = inst.dict.borrow_mut();
+        dict.insert(
+            DictKey(Object::from_static("errno")),
+            Object::Int(i64::from(errno)),
+        );
+        dict.insert(
+            DictKey(Object::from_static("strerror")),
+            Object::from_str(strerror.to_owned()),
+        );
+        dict.insert(
+            DictKey(Object::from_static("characters_written")),
+            Object::Int(characters_written),
+        );
+        dict.insert(DictKey(Object::from_static("filename")), Object::None);
+        dict.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![
+                Object::Int(i64::from(errno)),
+                Object::from_str(strerror.to_owned()),
+                Object::Int(characters_written),
+            ]),
+        );
+    }
+    RuntimeError::PyException(pe)
+}
+
 pub fn broken_pipe_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("BrokenPipeError", message))
 }
@@ -504,6 +557,17 @@ pub fn io_error_to_py(err: &std::io::Error) -> RuntimeError {
 /// reads like CPython's: `[Errno 2] No such file or directory: 'name'`, with
 /// `.errno` / `.strerror` / `.filename` populated to match.
 pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> RuntimeError {
+    io_error_to_py_named2(err, filename, None)
+}
+
+/// As [`io_error_to_py_named`], but for two-path syscalls (`rename`, `link`,
+/// `symlink`, `replace`): populates `.filename` *and* `.filename2` and renders
+/// `[Errno N] strerror: 'src' -> 'dst'`, matching CPython's `OSError.__str__`.
+pub fn io_error_to_py_named2(
+    err: &std::io::Error,
+    filename: Option<&str>,
+    filename2: Option<&str>,
+) -> RuntimeError {
     use std::io::ErrorKind::{
         AlreadyExists, BrokenPipe, ConnectionAborted, ConnectionRefused, ConnectionReset,
         Interrupted, NotFound, PermissionDenied, TimedOut, WouldBlock,
@@ -516,12 +580,15 @@ pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> Run
         Some(i) => raw[..i].to_string(),
         None => raw,
     };
-    // Mirror `OSError.__str__`: "[Errno N] strerror: 'filename'".
-    let message = match (errno, filename) {
-        (Some(n), Some(f)) => format!("[Errno {n}] {strerror}: '{f}'"),
-        (Some(n), None) => format!("[Errno {n}] {strerror}"),
-        (None, Some(f)) => format!("{strerror}: '{f}'"),
-        (None, None) => strerror.clone(),
+    // Mirror `OSError.__str__`: "[Errno N] strerror: 'filename'[ -> 'filename2']".
+    let suffix = match (filename, filename2) {
+        (Some(f), Some(f2)) => format!(": '{f}' -> '{f2}'"),
+        (Some(f), None) => format!(": '{f}'"),
+        (None, _) => String::new(),
+    };
+    let message = match errno {
+        Some(n) => format!("[Errno {n}] {strerror}{suffix}"),
+        None => format!("{strerror}{suffix}"),
     };
     // Dispatch on the raw `errno` first (via `libc`, so the numbers are
     // correct per-platform): `std::io::ErrorKind` collapses or omits
@@ -595,7 +662,56 @@ pub fn io_error_to_py_named(err: &std::io::Error, filename: Option<&str>) -> Run
                     Object::from_str(f.to_owned()),
                 );
             }
+            if let Some(f2) = filename2 {
+                dict.insert(
+                    DictKey(Object::from_static("filename2")),
+                    Object::from_str(f2.to_owned()),
+                );
+            }
         }
     }
     runtime
+}
+
+/// Overwrite an already-built `OSError`'s `.filename` (and optionally
+/// `.filename2`) attribute with a specific object, *preserving its identity*.
+/// CPython's `path_error`/`path_error2` stash the exact `PyObject*` path
+/// argument, so `err.filename is path` holds even for a `str` subclass or a
+/// `bytes` path (`test_os.test_oserror_filename`). Cloning an `Rc`-backed
+/// [`Object`] keeps the same allocation, so the `is` check passes.
+fn set_oserror_filename_obj(rt: &mut RuntimeError, filename: Object, filename2: Option<Object>) {
+    use crate::object::{DictKey, Object};
+    if let RuntimeError::PyException(exc) = rt {
+        if let Object::Instance(inst) = &exc.instance {
+            let mut dict = inst.dict.borrow_mut();
+            dict.insert(DictKey(Object::from_static("filename")), filename);
+            if let Some(f2) = filename2 {
+                dict.insert(DictKey(Object::from_static("filename2")), f2);
+            }
+        }
+    }
+}
+
+/// Like [`io_error_to_py_named`], but keeps the *identity* of the original
+/// path argument as `.filename`. `display` is the textual form used only for
+/// the `[Errno N] strerror: 'name'` message (unchanged from the string path).
+pub fn io_error_to_py_path(err: &std::io::Error, path: &Object, display: &str) -> RuntimeError {
+    let mut rt = io_error_to_py_named2(err, Some(display), None);
+    set_oserror_filename_obj(&mut rt, path.clone(), None);
+    rt
+}
+
+/// Two-path variant ([`io_error_to_py_named2`]) that preserves the identity of
+/// the first path argument as `.filename` (the only one CPython's
+/// `test_oserror_filename` checks for `rename`/`replace`/`link`). `.filename2`
+/// keeps its textual form.
+pub fn io_error_to_py_path2(
+    err: &std::io::Error,
+    path: &Object,
+    display: &str,
+    display2: &str,
+) -> RuntimeError {
+    let mut rt = io_error_to_py_named2(err, Some(display), Some(display2));
+    set_oserror_filename_obj(&mut rt, path.clone(), None);
+    rt
 }

@@ -21,9 +21,80 @@ use crate::error::RuntimeError;
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
+use parking_lot::{Condvar, Mutex};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
 /// CPython's `SHARED_KEYS_MAX_SIZE`: instances whose dict outgrows the
 /// shared-keys capacity stop using inline values.
 const INLINE_CAPACITY: usize = 30;
+
+/// A raw, non-Python OS thread spawned by `_spawn_pthread_waiter` that simply
+/// blocks until `_end_spawned_pthread` releases it. It deliberately bypasses
+/// WeavePy's `_thread`/`threading` machinery so it is invisible to
+/// `threading.enumerate()`/`active_count()` — exactly like the raw `pthread`
+/// CPython's `_testcapi._spawn_pthread_waiter` creates. Its sole observable
+/// effect is bumping the live OS-thread count, which `os.fork()` detects to
+/// emit the multi-threaded-fork `DeprecationWarning`
+/// (`test_os.ForkTests.test_fork_warns_when_non_python_thread_exists`).
+struct PthreadWaiter {
+    handle: JoinHandle<()>,
+    stop: Arc<WaiterGate>,
+}
+
+struct WaiterGate {
+    flag: Mutex<bool>,
+    cv: Condvar,
+}
+
+/// The currently-live raw waiter, if any. A process-global `parking_lot::Mutex`
+/// (not the VM's `Rc`-based cells) so the spawn/end pair can stash and reclaim
+/// the `JoinHandle` across calls.
+static WAITER: Mutex<Option<PthreadWaiter>> = Mutex::new(None);
+
+/// `_testcapi._spawn_pthread_waiter()` — create one raw OS thread that parks
+/// until `_end_spawned_pthread()`. Spawning a second without ending the first
+/// raises, matching the C helper's single-slot contract.
+fn spawn_pthread_waiter(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let mut slot = WAITER.lock();
+    if slot.is_some() {
+        return Err(crate::error::runtime_error(
+            "_spawn_pthread_waiter: a waiter thread is already running",
+        ));
+    }
+    let gate = Arc::new(WaiterGate {
+        flag: Mutex::new(false),
+        cv: Condvar::new(),
+    });
+    let gate_for_thread = gate.clone();
+    let handle = std::thread::Builder::new()
+        .name("testcapi-pthread-waiter".to_owned())
+        .spawn(move || {
+            let mut stopped = gate_for_thread.flag.lock();
+            while !*stopped {
+                gate_for_thread.cv.wait(&mut stopped);
+            }
+        })
+        .map_err(|e| crate::error::runtime_error(format!("_spawn_pthread_waiter: {e}")))?;
+    *slot = Some(PthreadWaiter { handle, stop: gate });
+    Ok(Object::None)
+}
+
+/// `_testcapi._end_spawned_pthread()` — signal the parked waiter to exit and
+/// join it. A no-op if no waiter is live (so a `finally:` cleanup is safe even
+/// when spawning failed).
+fn end_spawned_pthread(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let waiter = WAITER.lock().take();
+    if let Some(w) = waiter {
+        {
+            let mut flag = w.stop.flag.lock();
+            *flag = true;
+            w.stop.cv.notify_all();
+        }
+        let _ = w.handle.join();
+    }
+    Ok(Object::None)
+}
 
 fn has_inline_values(args: &[Object]) -> Result<Object, RuntimeError> {
     let inline = match args.first() {
@@ -56,6 +127,29 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 name: "has_inline_values",
                 binds_instance: false,
                 call: Box::new(has_inline_values),
+                call_kw: None,
+            })),
+        );
+        // Raw-`pthread` spawn/join helpers re-exported by the frozen
+        // `_testcapi` shim. These create a genuine non-Python OS thread so
+        // `os.fork()`'s multi-threaded-fork `DeprecationWarning` fires even
+        // though `threading` never sees the thread
+        // (`test_os.test_fork_warns_when_non_python_thread_exists`).
+        d.insert(
+            DictKey(Object::from_static("_spawn_pthread_waiter")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_spawn_pthread_waiter",
+                binds_instance: false,
+                call: Box::new(spawn_pthread_waiter),
+                call_kw: None,
+            })),
+        );
+        d.insert(
+            DictKey(Object::from_static("_end_spawned_pthread")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_end_spawned_pthread",
+                binds_instance: false,
+                call: Box::new(end_spawned_pthread),
                 call_kw: None,
             })),
         );

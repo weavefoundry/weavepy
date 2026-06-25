@@ -37,7 +37,7 @@
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 
-use weavepy_vm::object::{MemoryViewBuffer, Object};
+use weavepy_vm::object::Object;
 
 use crate::buffer_format::{format_string_for, ByteOrder, FormatKind};
 use crate::object::{PyObject, PySsizeT};
@@ -229,10 +229,7 @@ fn fill_native_buffer(
                 crate::errors::set_value_error("memoryview: released");
                 return -1;
             }
-            let bytes = match &mv.buffer {
-                MemoryViewBuffer::Bytes(b) => b.to_vec(),
-                MemoryViewBuffer::ByteArray(b) => b.borrow().clone(),
-            };
+            let bytes = mv.buffer.with_read(<[u8]>::to_vec);
             let len = mv.len.get();
             let start = mv.start.get();
             let slice = bytes[start..start + len].to_vec();

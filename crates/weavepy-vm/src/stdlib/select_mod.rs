@@ -978,6 +978,15 @@ mod kqueue_impl {
         }
     }
 
+    /// Live `select.kqueue` objects, tracked weakly so the after-fork
+    /// child hook can close them (gh-110395: a kqueue descriptor is *not*
+    /// inherited across `fork(2)` — the child's copy is stale and must be
+    /// closed, matching CPython's `kqueue_queue_traverse`/at-fork sweep).
+    /// `Rc` is `Arc` here (the RFC 0025 shared heap), so a process-global
+    /// registry of `Weak<PyInstance>` is sound.
+    static LIVE_KQUEUES: std::sync::Mutex<Vec<std::sync::Weak<PyInstance>>> =
+        std::sync::Mutex::new(Vec::new());
+
     fn store_kqueue(inst: &Rc<PyInstance>, fd: libc::c_int) {
         let mut d = inst.dict.borrow_mut();
         d.insert(
@@ -985,6 +994,48 @@ mod kqueue_impl {
             Object::Int(i64::from(fd)),
         );
         d.insert(DictKey(Object::from_static("closed")), Object::Bool(false));
+        drop(d);
+        // Register for the after-fork-in-child close sweep. Prune any
+        // already-dead weak handles while we hold the lock so the registry
+        // can't grow without bound across many short-lived kqueues.
+        if let Ok(mut reg) = LIVE_KQUEUES.lock() {
+            reg.retain(|w| w.strong_count() > 0);
+            reg.push(Rc::downgrade(inst));
+        }
+    }
+
+    /// After-fork (child): close every live kqueue object. A kqueue fd is
+    /// not inherited across `fork(2)`, so the child's inherited copy is
+    /// invalid; CPython closes them in `PyOS_AfterFork_Child` so the child
+    /// observes `kq.closed == True` and `kq.fileno()` raising. We mirror
+    /// that here (`test_kqueue.test_fork`).
+    pub(super) fn close_all_in_child() {
+        let drained: Vec<std::sync::Weak<PyInstance>> = match LIVE_KQUEUES.lock() {
+            Ok(mut reg) => reg.drain(..).collect(),
+            // A poisoned lock can't happen across `fork` (single thread in
+            // the child), but recover defensively rather than panic.
+            Err(poison) => poison.into_inner().drain(..).collect(),
+        };
+        for weak in drained {
+            let Some(inst) = weak.upgrade() else { continue };
+            let mut d = inst.dict.borrow_mut();
+            let already_closed = matches!(
+                d.get(&DictKey(Object::from_static("closed"))),
+                Some(Object::Bool(true))
+            );
+            if already_closed {
+                continue;
+            }
+            if let Some(Object::Int(fd)) = d.get(&DictKey(Object::from_static("_fd"))) {
+                let fd = *fd as libc::c_int;
+                // SAFETY: `close(2)` on a (possibly already-invalid) fd is
+                // safe; an EBADF here is benign.
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+            d.insert(DictKey(Object::from_static("closed")), Object::Bool(true));
+        }
     }
 
     /// Return `(self, fd, closed)` for a kqueue method receiver.
@@ -1171,4 +1222,14 @@ mod kqueue_impl {
 mod kqueue_impl {
     use crate::object::DictData;
     pub(super) fn install(_d: &mut DictData) {}
+    pub(super) fn close_all_in_child() {}
+}
+
+/// Close every live `select.kqueue` in the current process — the
+/// after-`fork(2)`-in-child hook. A kqueue control descriptor is not
+/// inherited across `fork`, so the child's inherited copy is invalid;
+/// CPython closes them in `PyOS_AfterFork_Child` (gh-110395) so the child
+/// observes `kq.closed`. A no-op on platforms without kqueue.
+pub fn close_kqueues_after_fork_in_child() {
+    kqueue_impl::close_all_in_child();
 }

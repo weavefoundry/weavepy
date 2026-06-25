@@ -227,6 +227,16 @@ impl MarshalWriter {
                     self.buf.extend_from_slice(bytes);
                 }
             }
+            Object::WStr(cps) => {
+                // A str carrying lone surrogates. CPython marshals unicode
+                // through a surrogatepass UTF-8 encode, so the WTF-8 bytes
+                // round-trip via `TYPE_UNICODE` (RFC 0033 parity).
+                let bytes =
+                    crate::stdlib::codecs_mod::encode_codepoints(cps, "utf-8", "surrogatepass")?;
+                self.write_byte(TYPE_UNICODE);
+                self.write_int(bytes.len() as i32);
+                self.buf.extend_from_slice(&bytes);
+            }
             Object::Bytes(data) => {
                 self.write_byte(TYPE_STRING);
                 self.write_int(data.len() as i32);
@@ -284,6 +294,19 @@ impl MarshalWriter {
             }
             Object::Code(co) => {
                 self.write_code(co)?;
+            }
+            // `Ellipsis` (the value of `...`) is a singleton instance of the
+            // registry `ellipsis` type. CPython marshals it as `TYPE_ELLIPSIS`;
+            // it shows up as a code constant in any module using `...` (stub
+            // bodies, typing, the many `test` fixtures `PyZipFile.writepy`
+            // compiles). The load side already reconstructs the singleton.
+            Object::Instance(inst)
+                if Rc::ptr_eq(
+                    &inst.cls(),
+                    &crate::builtin_types::builtin_types().ellipsis_,
+                ) =>
+            {
+                self.write_byte(TYPE_ELLIPSIS);
             }
             other => {
                 return Err(value_error(format!(
@@ -547,8 +570,11 @@ impl<'a> MarshalReader<'a> {
             TYPE_UNICODE | TYPE_INTERNED | TYPE_ASCII | TYPE_ASCII_INTERNED => {
                 let len = self.read_int()? as usize;
                 let bytes = self.read_n_bytes(len)?;
-                let s = String::from_utf8(bytes).map_err(|_| value_error("bad marshal string"))?;
-                Ok(Object::from_str(s))
+                // CPython reads unicode with surrogatepass, so WTF-8 bytes
+                // carrying lone surrogates rebuild an `Object::WStr`; pure
+                // UTF-8 folds back to `Object::Str`.
+                crate::stdlib::codecs_mod::decode_bytes_obj(&bytes, "utf-8", "surrogatepass")
+                    .map_err(|_| value_error("bad marshal string"))
             }
             TYPE_SHORT_ASCII | TYPE_SHORT_ASCII_INTERNED => {
                 let len = self.read_byte()? as usize;

@@ -269,20 +269,31 @@ class SourcelessFileLoader(_LoaderBase):
     def get_source(self, fullname=None):
         return None
 
-    def exec_module(self, module):
-        try:
-            with open(self.path, 'rb') as f:
-                data = f.read()
-        except OSError as exc:
-            raise ImportError("cannot read {!r}: {}".format(self.path, exc),
-                              name=self.name, path=self.path)
+    def _read_code(self):
+        with open(self.path, 'rb') as f:
+            data = f.read()
         if len(data) < 16 or data[:4] != MAGIC_NUMBER:
             raise ImportError("bad magic in {!r}".format(self.path),
                               name=self.name, path=self.path)
         try:
-            code = marshal.loads(data[16:])
+            return marshal.loads(data[16:])
         except Exception as exc:
             raise ImportError("bad marshal in {!r}: {}".format(self.path, exc),
+                              name=self.name, path=self.path)
+
+    def get_code(self, fullname=None):
+        # Unmarshal the `.pyc`'s code object without executing it
+        # (`runpy`/`pkgutil` need this to run a sourceless `__main__`).
+        try:
+            return self._read_code()
+        except OSError:
+            return None
+
+    def exec_module(self, module):
+        try:
+            code = self._read_code()
+        except OSError as exc:
+            raise ImportError("cannot read {!r}: {}".format(self.path, exc),
                               name=self.name, path=self.path)
         exec(code, module.__dict__)
 
@@ -609,16 +620,23 @@ def _is_frozen(name):
 
 
 def _is_frozen_package(name):
-    """Heuristic — a frozen module is a package if its source
-    looks package-y. CPython has a richer signal; ours is close
-    enough.
+    """True if frozen module *name* is a package.
+
+    Authoritative signal: the VM's frozen registry via
+    ``_imp.is_frozen_package`` (the ``FrozenSource.is_package`` flag). This is
+    load-bearing for ``runpy``'s ``-m <pkg>`` redirect to ``<pkg>.__main__``:
+    a frozen package whose ``__init__`` source never literally mentions
+    ``__path__`` (e.g. ``zipfile``) must still report as a package, or runpy
+    would execute its ``__init__`` as ``__main__`` and break relative imports.
+    Falls back to a source heuristic only on builds predating the helper.
     """
     if not _is_frozen(name):
         return False
-    # Names with a dot are necessarily inside a package; treat
-    # the top-level names that ship with us as packages if their
-    # frozen source mentions ``__path__`` (the conventional
-    # marker).
+    try:
+        import _imp
+        return bool(_imp.is_frozen_package(name))
+    except (ImportError, AttributeError, TypeError):
+        pass
     src = None
     try:
         src = sys._get_frozen_source(name)
@@ -652,9 +670,35 @@ def _bootstrap_meta_path():
             if cls not in sys.meta_path:
                 sys.meta_path.append(cls)
     if not getattr(sys, 'path_hooks', None):
-        sys.path_hooks = [FileFinder.path_hook(*_LOADER_DETAILS)]
+        sys.path_hooks = [_zip_path_hook,
+                          FileFinder.path_hook(*_LOADER_DETAILS)]
+    else:
+        if _zip_path_hook not in sys.path_hooks:
+            sys.path_hooks.insert(0, _zip_path_hook)
     if not isinstance(getattr(sys, 'path_importer_cache', None), dict):
         sys.path_importer_cache = {}
+
+
+def _zip_path_hook(path):
+    """``sys.path_hooks`` entry for ZIP archives (PEP 273).
+
+    Imports ``zipimport`` lazily, and only after a cheap filesystem probe
+    confirms *path* could be an archive (a real file, or a sub-path whose
+    head is one) — so a normal program made entirely of directory entries
+    never pays the cost of importing ``zipimport``/``zipfile``. Raises
+    ``ImportError`` for anything else, signalling ``PathFinder`` to fall
+    through to the next hook (``FileFinder``).
+    """
+    probe = path
+    while True:
+        if os.path.isfile(probe):
+            break
+        head = os.path.dirname(probe)
+        if not head or head == probe:
+            raise ImportError("not a Zip file", path=path)
+        probe = head
+    import zipimport
+    return zipimport.zipimporter(path)
 
 
 # Run the bootstrap eagerly on first import so the very first

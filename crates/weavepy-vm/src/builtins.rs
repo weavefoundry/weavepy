@@ -750,9 +750,38 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         },
         Object::File(f) => match name {
             "read" => Some(method("read", file_read)),
+            // `read1` is a *buffered* method (`BufferedReader`/`BufferedWriter`/
+            // `BufferedRandom` all expose it via `BufferedIOBase`; a raw `FileIO`
+            // genuinely lacks it). Route File-backed buffered streams to
+            // `file_read` so a closed stream raises `ValueError` rather than the
+            // class-dict `bw_read1` rejecting the `Object::File` receiver
+            // (`test_io.test_io_after_close`).
+            "read1"
+                if matches!(
+                    f.io_kind.get(),
+                    crate::object::IoKind::BufferedReader
+                        | crate::object::IoKind::BufferedWriter
+                        | crate::object::IoKind::BufferedRandom
+                ) =>
+            {
+                Some(method("read1", file_read))
+            }
             // Binary streams only — CPython text files genuinely lack the
             // attribute (it lives on RawIOBase/BufferedIOBase).
             "readinto" if f.binary => Some(method("readinto", file_readinto)),
+            "readinto1" if f.binary => Some(method("readinto1", file_readinto)),
+            // `peek` is a buffered-reader method (CPython exposes it on
+            // `BufferedReader`/`BufferedRandom` only — a raw `FileIO`, a
+            // write-only `BufferedWriter`, or a text stream genuinely lacks it).
+            "peek"
+                if matches!(
+                    f.io_kind.get(),
+                    crate::object::IoKind::BufferedReader | crate::object::IoKind::BufferedRandom
+                ) =>
+            {
+                Some(method("peek", file_peek))
+            }
+            "truncate" => Some(method("truncate", file_truncate)),
             "readline" => Some(method("readline", file_readline)),
             "readlines" => Some(method("readlines", file_readlines)),
             "write" => Some(method("write", file_write)),
@@ -767,15 +796,48 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "readable" => Some(method("readable", file_readable)),
             "writable" => Some(method("writable", file_writable)),
             "seekable" => Some(method("seekable", file_seekable)),
+            // `IOBase` private protocol helpers the layered `_pyio` Buffered*/
+            // TextIOWrapper classes call on the raw stream they wrap.
+            "_checkReadable" => Some(method("_checkReadable", file_check_readable)),
+            "_checkWritable" => Some(method("_checkWritable", file_check_writable)),
+            "_checkSeekable" => Some(method("_checkSeekable", file_check_seekable)),
+            "_checkClosed" => Some(method("_checkClosed", file_check_closed)),
+            // `RawIOBase.readall` (binary only) — `_pyio.BufferedReader` uses it
+            // for a full read of the wrapped native raw.
+            "readall" if f.binary => Some(method("readall", file_readall)),
+            // In-memory `BytesIO`/`StringIO` streams are picklable and copyable;
+            // `file_reduce_mem`/`file_getstate_mem` fall back to the forbidding
+            // reducer for file-backed streams, which CPython refuses to pickle
+            // (`TypeError: cannot pickle '_io.X' object`). `copy.copy`/
+            // `copy.deepcopy` deliberately route through `__reduce_ex__` too
+            // (no `__copy__`/`__deepcopy__` shortcut): the reduce path mints a
+            // fresh, independent buffer via `cls()` + `__setstate__` and — for a
+            // subclass — preserves the user's type and `__dict__` (the
+            // native-method binding loses the instance wrapper, so a `__copy__`
+            // shortcut would silently downcast to a bare `BytesIO`).
+            "__reduce__" => Some(method("__reduce__", file_reduce_mem)),
+            "__reduce_ex__" => Some(method("__reduce_ex__", file_reduce_mem)),
+            "__getstate__" => Some(method("__getstate__", file_getstate_mem)),
+            "__setstate__" if f.is_memory() => Some(method("__setstate__", file_setstate_mem)),
             "seek" => Some(method("seek", file_seek)),
             "tell" => Some(method("tell", file_tell)),
             "getvalue" => Some(method("getvalue", file_getvalue)),
+            // `BytesIO.getbuffer()` — binary in-memory streams only (CPython
+            // text `StringIO` genuinely lacks the attribute).
+            "getbuffer" if f.binary => Some(method("getbuffer", file_getbuffer)),
             "__enter__" => Some(method("__enter__", file_enter)),
             "__exit__" => Some(method("__exit__", file_exit)),
             // A file is its own iterator (CPython): `iter(f) is f`, and
             // each `next(f)` returns the next line, raising StopIteration
             // at EOF.
-            "__iter__" => Some(method("__iter__", |args| file_self(args).map(Object::File))),
+            "__iter__" => Some(method("__iter__", |args| {
+                let f = file_self(args)?;
+                // Iterating a closed stream raises (`test_io.test_io_after_close`).
+                if *f.closed.borrow() {
+                    return Err(value_error("I/O operation on closed file."));
+                }
+                Ok(Object::File(f))
+            })),
             "__next__" => Some(method("__next__", file_next)),
             _ => None,
         },
@@ -944,7 +1006,7 @@ fn iter_setstate(args: &[Object]) -> Result<Object, RuntimeError> {
         PyIterator::ByteArray { data, index } => {
             *index = clamp(data.borrow().len());
         }
-        PyIterator::DictKeys { keys, index } => *index = clamp(keys.len()),
+        PyIterator::DictKeys { keys, index, .. } => *index = clamp(keys.len()),
         PyIterator::Reversed { index, .. } => *index = state.max(-1),
         _ => {}
     }
@@ -1990,7 +2052,8 @@ fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
     let o = one(args, "__getstate__")?;
     if let Object::Instance(inst) = o {
         let slots = inst.slots_snapshot();
-        let dict_state = if inst.dict.borrow().is_empty() {
+        let dict_is_empty = inst.dict.borrow().is_empty();
+        let dict_state = if dict_is_empty {
             Object::None
         } else {
             Object::Dict(inst.dict.clone())
@@ -2063,6 +2126,14 @@ pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
     if let Some(v) = o.as_i64() {
         return Ok(v);
     }
+    // A big integer is a valid `__index__` value, but it can't fit the C
+    // ssize_t the caller wants → `OverflowError`, matching CPython
+    // (`test_io.test_reconfigure_errors`: `line_buffering=2**1000`).
+    if matches!(o, Object::Long(_)) {
+        return Err(crate::error::overflow_error(
+            "cannot fit 'int' into an index-sized integer",
+        ));
+    }
     if let Object::Instance(_) = o {
         if let Some(method) = crate::instance_method(o, "__index__") {
             if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
@@ -2073,6 +2144,13 @@ pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
                 let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
                 if let Some(v) = r.as_i64() {
                     return Ok(v);
+                }
+                // `__index__` returned an int too large for an index-sized C
+                // integer (CPython raises `OverflowError`, not `TypeError`).
+                if matches!(r, Object::Long(_)) {
+                    return Err(crate::error::overflow_error(
+                        "cannot fit 'int' into an index-sized integer",
+                    ));
                 }
             }
         }
@@ -2784,7 +2862,14 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
         Object::Code(c) => code_synthetic_attr(c, name),
         Object::Builtin(b) => match name {
             "__name__" | "__qualname__" => Some(Object::from_static(b.name)),
-            "__module__" => Some(Object::from_static("builtins")),
+            // Mirror the LOAD_ATTR fast path (`Vm::load_attr`): a native
+            // module's functions report their module (`os.getpid.__module__
+            // == "os"`), falling back to `"builtins"` for un-attributed
+            // builtins. Keeps `getattr(fn, "__module__")` / `hasattr` /
+            // `pickle` agreeing with direct attribute access.
+            "__module__" => Some(Object::from_static(
+                crate::descr_registry::module_of(obj).unwrap_or("builtins"),
+            )),
             "__doc__" => Some(Object::None),
             "__self__" => Some(Object::None),
             "__objclass__" => crate::builtin_types::builtin_fn_objclass(b).map(Object::Type),
@@ -3382,6 +3467,18 @@ pub(crate) fn b_int_compat(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
         Object::Str(s) => parse_int_string(&args[0], s, &args[1..]),
+        // A WTF-8 `str` (lone surrogates, stored as code points): decode to
+        // text with each lone surrogate rendered as U+FFFD, which is not a
+        // digit, so parsing fails with `ValueError` — and the error's `repr`
+        // is taken from the original `WStr` (so it shows `'1\ud800'`), exactly
+        // like CPython, rather than the `TypeError` of the non-string fallback.
+        Object::WStr(cps) => {
+            let text: String = cps
+                .iter()
+                .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                .collect();
+            parse_int_string(&args[0], &text, &args[1..])
+        }
         // bytes-like: each byte maps to one Latin-1 code point so non-ASCII
         // bytes (and embedded NULs) become non-digit characters that fail to
         // parse — with the original `b'…'` repr in the error, like CPython.
@@ -4356,12 +4453,24 @@ fn b_float(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Object::Bool(b) => Ok(Object::Float(f64::from(*b))),
         Object::Float(f) => Ok(Object::Float(*f)),
-        Object::Str(_) | Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {
+        Object::Str(_)
+        | Object::WStr(_)
+        | Object::Bytes(_)
+        | Object::ByteArray(_)
+        | Object::MemoryView(_) => {
             // str / bytes-like: bytes-like buffers are decoded as ASCII-ish
             // text; non-UTF-8 input simply fails to parse (CPython raises the
-            // same ValueError).
+            // same ValueError). A WTF-8 `str` (lone surrogates) decodes with
+            // each surrogate as U+FFFD, which never parses as a float, so
+            // `float('\ud8f0')` raises `ValueError` (repr from the original
+            // `WStr`) instead of the non-string `TypeError`.
             let text: Option<String> = match &args[0] {
                 Object::Str(s) => Some(s.to_string()),
+                Object::WStr(cps) => Some(
+                    cps.iter()
+                        .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                        .collect(),
+                ),
                 Object::Bytes(b) => String::from_utf8(b.to_vec()).ok(),
                 Object::ByteArray(b) => String::from_utf8(b.borrow().to_vec()).ok(),
                 Object::MemoryView(mv) => String::from_utf8(mv.to_bytes()).ok(),
@@ -4495,15 +4604,27 @@ pub(crate) fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
     // sole argument; a string `imag` is never valid. Both checks precede the
     // numeric coercion (so e.g. `complex({}, '1')` reports the string, not the
     // dict).
-    if let Object::Str(s) = &args[0] {
+    // A WTF-8 `str` (lone surrogates, stored as `WStr`) counts as a string
+    // here just like `Str`: `complex('\ud800')` is a malformed-string
+    // `ValueError`, not a `TypeError`, matching CPython.
+    let str_first: Option<String> = match &args[0] {
+        Object::Str(s) => Some(s.to_string()),
+        Object::WStr(cps) => Some(
+            cps.iter()
+                .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                .collect(),
+        ),
+        _ => None,
+    };
+    if let Some(s) = str_first {
         if has_second {
             return Err(type_error(
                 "complex() can't take second arg if first is a string",
             ));
         }
-        return parse_complex_string(s).map(|(r, i)| Object::new_complex(r, i));
+        return parse_complex_string(&s).map(|(r, i)| Object::new_complex(r, i));
     }
-    if has_second && matches!(&args[1], Object::Str(_)) {
+    if has_second && matches!(&args[1], Object::Str(_) | Object::WStr(_)) {
         return Err(type_error("complex() second arg can't be a string"));
     }
     let real = match &args[0] {
@@ -5296,8 +5417,15 @@ fn b_open_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
             "encoding" => set_slot(&mut combined, 3, v.clone()),
             "errors" => set_slot(&mut combined, 4, v.clone()),
             "newline" => set_slot(&mut combined, 5, v.clone()),
-            "closefd" | "opener" => {
-                // Accepted but not plumbed further yet.
+            // `closefd` *is* honoured (positional slot 6): `open(fd, ...,
+            // closefd=False)` must hand back a stream that releases the
+            // descriptor without closing it. `multiprocessing.popen_spawn_posix`
+            // writes the child's pickle through `open(parent_w, 'wb',
+            // closefd=False)` and then closes that fd itself via a `Finalize`,
+            // so dropping the flag double-closes `parent_w` (EBADF).
+            "closefd" => set_slot(&mut combined, 6, v.clone()),
+            "opener" => {
+                // Accepted but not plumbed through the positional builtin path.
             }
             other => {
                 return Err(type_error(format!(
@@ -5376,9 +5504,11 @@ pub(crate) fn validate_open_mode(mode: &str) -> Result<bool, RuntimeError> {
         return Err(value_error("can't have text and binary mode at once"));
     }
     if u8::from(creating) + u8::from(reading) + u8::from(writing) + u8::from(appending) > 1 {
-        return Err(value_error(
-            "can't have read/write/create/append mode at once",
-        ));
+        // CPython's `_io.open` (and `_pyio.open`) word this exactly as
+        // "can't have read/write/append mode at once" — `test_io`
+        // (`test_fspath_support`) matches the message against
+        // `'read/write/append mode'`.
+        return Err(value_error("can't have read/write/append mode at once"));
     }
     if !(creating || reading || writing || appending) {
         return Err(value_error(
@@ -5403,6 +5533,20 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(_) => return Err(type_error("open() mode must be str")),
     };
     validate_open_mode(&mode)?;
+    // `closefd` (positional slot 6, default True). When False the caller
+    // keeps ownership of the descriptor — closing the stream detaches the fd
+    // without `close(2)`. Only meaningful for the `open(fd, …)` form; CPython
+    // raises `ValueError` for `closefd=False` with a path.
+    let closefd = match args.get(6) {
+        None | Some(Object::None) => true,
+        Some(Object::Bool(b)) => *b,
+        Some(Object::Int(n)) => *n != 0,
+        Some(_) => true,
+    };
+    let is_fd = matches!(&args[0], Object::Int(_));
+    if !closefd && !is_fd {
+        return Err(value_error("Cannot use closefd=False with file name"));
+    }
     // `open(fd, …)` adopts an already-open raw file descriptor
     // (produced by `os.open`); the file's `name` is the fd itself.
     #[cfg(unix)]
@@ -5412,13 +5556,24 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
             .map_err(|_| crate::error::value_error("file descriptor out of range"))?;
         // SAFETY: ownership of the fd transfers to the new File; it was
         // handed out by os.open (or dup) and is closed exactly once when
-        // the PyFile drops.
+        // the PyFile drops — unless `closefd=False`, in which case the
+        // PyFile detaches the fd on close instead of running `close(2)`.
         let f = unsafe { std::fs::File::from_raw_fd(fd) };
-        return Ok(Object::File(Rc::new(PyFile::new(
-            fd.to_string(),
-            mode,
-            FileBackend::Disk(f),
-        ))));
+        let file = PyFile::new(fd.to_string(), mode, FileBackend::Disk(f));
+        file.name_is_fd.set(true);
+        file.closefd.set(closefd);
+        let binary = file.binary;
+        // CPython's `open` *is* `io.open`: validate the text config / buffering
+        // and close the adopted descriptor on any rejection rather than leaking
+        // it (and emitting a spurious unclosed-file `ResourceWarning`).
+        return crate::stdlib::io_full::finish_open(
+            Object::File(Rc::new(file)),
+            args.get(2),
+            args.get(3),
+            args.get(4),
+            args.get(5),
+            binary,
+        );
     }
     let (path, name_is_bytes) = open_path_arg(&args[0])?;
     let mut opts = OpenOptions::new();
@@ -5467,19 +5622,21 @@ pub(crate) fn b_open(args: &[Object]) -> Result<Object, RuntimeError> {
     if name_is_bytes {
         file.name_is_bytes.set(true);
     }
+    let binary = file.binary;
     // Positional `open(file, mode, buffering, encoding, errors, newline, …)`.
-    if !file.binary {
-        if let Some(Object::Str(enc)) = args.get(3) {
-            file.set_encoding(enc);
-        }
-        if let Some(Object::Str(err)) = args.get(4) {
-            file.set_errors(err);
-        }
-        if let Some(Object::Str(nl)) = args.get(5) {
-            file.set_newline(Some(nl));
-        }
-    }
-    Ok(Object::File(Rc::new(file)))
+    // Validate the text config / buffering and, on any rejection (illegal
+    // `newline`, unbuffered text, unknown encoding/errors), close the
+    // freshly-opened file before propagating so we never leak the descriptor or
+    // emit a spurious unclosed-file `ResourceWarning` — CPython's `open` *is*
+    // `io.open`, which validates before opening.
+    crate::stdlib::io_full::finish_open(
+        Object::File(Rc::new(file)),
+        args.get(2),
+        args.get(3),
+        args.get(4),
+        args.get(5),
+        binary,
+    )
 }
 
 pub(crate) fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5758,6 +5915,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
+        finalize_ran: crate::sync::Cell::new(false),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -5826,6 +5984,7 @@ pub(crate) fn build_super_proxy(
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
+        finalize_ran: crate::sync::Cell::new(false),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -5969,7 +6128,7 @@ pub fn class_matches_classinfo_named(
         return class_matches_classinfo(cls, &origin);
     }
     match info {
-        Object::Type(t) => Ok(cls.is_subclass_of(t)),
+        Object::Type(t) => Ok(type_subclass_match(cls, t)),
         // `None` inside a union means `type(None)` — match by class
         // name. The `NoneType` class is the unique class with that
         // name (we don't allow user code to redefine it).
@@ -5987,7 +6146,7 @@ pub fn class_matches_classinfo_named(
                         return Ok(true);
                     }
                 } else if let Object::Type(t) = it {
-                    if cls.is_subclass_of(t) {
+                    if type_subclass_match(cls, t) {
                         return Ok(true);
                     }
                 } else if matches!(it, Object::None) && cls.name == "NoneType" {
@@ -6000,6 +6159,23 @@ pub fn class_matches_classinfo_named(
             "issubclass() arg 2 must be a class or tuple of classes",
         )),
     }
+}
+
+/// `issubclass(cls, t)` for a single class target, honouring the one
+/// structural ABC we expose natively: `os.PathLike`. CPython's
+/// `PathLike.__subclasshook__` returns `True` for *any* class that has a
+/// non-`None` `__fspath__` in its MRO — even without explicit subclassing
+/// (the `FakePath` in `test_os`). Crucially this only fires when the target
+/// is *exactly* `os.PathLike`: a user subclass `class A(os.PathLike)` inherits
+/// the hook, which returns `NotImplemented` for `cls is not PathLike`, so it
+/// falls back to a normal MRO check (`test_pathlike_subclasshook`).
+fn type_subclass_match(cls: &crate::types::TypeObject, t: &Rc<crate::types::TypeObject>) -> bool {
+    if Rc::ptr_eq(t, &crate::stdlib::os::path_like_type()) {
+        return cls
+            .lookup("__fspath__")
+            .is_some_and(|m| !matches!(m, Object::None));
+    }
+    cls.is_subclass_of(t)
 }
 
 /// Return the `__origin__` of a PEP 585 generic alias (or PEP 604
@@ -6032,6 +6208,8 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Float(_) => bt.float_.clone(),
         Object::Complex(_) => bt.complex_.clone(),
         Object::Str(_) => bt.str_.clone(),
+        // A surrogate-bearing string is a `str`.
+        Object::WStr(_) => bt.str_.clone(),
         Object::Tuple(_) => bt.tuple_.clone(),
         Object::List(_) => bt.list_.clone(),
         Object::Dict(_) => bt.dict_.clone(),
@@ -6130,7 +6308,27 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         Object::Module(_) => bt.module_.clone(),
         Object::SlotDescriptor(_) => bt.member_descriptor_.clone(),
         Object::Code(_) => bt.code_.clone(),
-        Object::Cell(_) | Object::File(_) => bt.object_.clone(),
+        Object::Cell(_) => bt.object_.clone(),
+        // A native stream reports the faithful CPython io layer for its
+        // `IoKind` (`type(open(p,'rb')) is io.BufferedReader`,
+        // `type(io.BytesIO()) is io.BytesIO`). These are the very type objects
+        // the `io` module exports (both come from the memoised `IoFamily`), so
+        // identity and `isinstance`-via-MRO hold. Attribute access on a file is
+        // resolved by its own `Object::File` arm, *not* this class's dict, so
+        // reporting a rich type here never changes method resolution.
+        Object::File(f) => {
+            use crate::object::IoKind;
+            let fam = crate::stdlib::io::build_iobase_family();
+            match f.io_kind.get() {
+                IoKind::Raw => fam.fileio.clone(),
+                IoKind::BufferedReader => fam.buffered_reader.clone(),
+                IoKind::BufferedWriter => fam.buffered_writer.clone(),
+                IoKind::BufferedRandom => fam.buffered_random.clone(),
+                IoKind::Text => fam.text_io_wrapper.clone(),
+                IoKind::BytesIO => fam.bytes_io.clone(),
+                IoKind::StringIO => fam.string_io.clone(),
+            }
+        }
         Object::Frame(_) => bt.frame_.clone(),
         Object::Traceback(_) => bt.traceback_.clone(),
     }
@@ -6204,6 +6402,7 @@ fn object_identity(obj: &Object) -> i64 {
     }
     match obj {
         Object::Str(s) => rc_str_ptr(s),
+        Object::WStr(cps) => cps.as_ptr() as usize as i64,
         Object::Bytes(b) => rc_bytes_ptr(b),
         Object::ByteArray(b) => Rc::as_ptr(b) as usize as i64,
         Object::List(l) => Rc::as_ptr(l) as usize as i64,
@@ -6529,9 +6728,16 @@ fn b_bin(args: &[Object]) -> Result<Object, RuntimeError> {
 fn b_chr(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "chr")? {
         Object::Int(i) => {
-            let ch = char::from_u32(*i as u32)
-                .ok_or_else(|| value_error("chr() arg not in range(0x110000)"))?;
-            Ok(Object::from_str(ch.to_string()))
+            let n = *i;
+            if !(0..=0x10_FFFF).contains(&n) {
+                return Err(value_error("chr() arg not in range(0x110000)"));
+            }
+            let n = n as u32;
+            // CPython's `chr` accepts lone surrogates (U+D800..U+DFFF) and
+            // returns a length-1 `str` holding the surrogate. `char::from_u32`
+            // rejects them, so route through the WTF-8 constructor, which yields
+            // a `WStr` for the surrogate range and a plain `Str` otherwise.
+            Ok(Object::str_from_codepoints(vec![n]))
         }
         _ => Err(type_error("chr() expected int")),
     }
@@ -6553,6 +6759,16 @@ fn b_ord(args: &[Object]) -> Result<Object, RuntimeError> {
                 )));
             }
             Ok(Object::Int(i64::from(u32::from(c))))
+        }
+        // A length-1 surrogate-bearing string: `ord(chr(0xD800)) == 0xD800`.
+        Object::WStr(cps) => {
+            if cps.len() != 1 {
+                return Err(type_error(format!(
+                    "ord() expected a character, but string of length {} found",
+                    cps.len()
+                )));
+            }
+            Ok(Object::Int(i64::from(cps[0])))
         }
         Object::Bytes(b) if b.len() == 1 => Ok(Object::Int(i64::from(b[0]))),
         Object::Bytes(b) => Err(type_error(format!(
@@ -6802,6 +7018,16 @@ pub fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Bytes(b) => crate::object::PyMemoryView::from_bytes(b.clone()),
         Object::ByteArray(b) => crate::object::PyMemoryView::from_bytearray(b.clone()),
         Object::MemoryView(mv) => mv.shallow_clone(),
+        // `mmap.mmap` (and, through it, `multiprocessing` shared-memory
+        // arenas) exports the buffer protocol over its raw mapping.
+        Object::Instance(inst)
+            if inst.cls().name == "mmap"
+                && crate::stdlib::mmap_mod::shared_buffer(inst).is_some() =>
+        {
+            let buf = crate::stdlib::mmap_mod::shared_buffer(inst)
+                .expect("shared_buffer present per guard");
+            crate::object::PyMemoryView::from_shared(buf)
+        }
         other => {
             return Err(type_error(format!(
                 "memoryview: a bytes-like object is required, not '{}'",
@@ -6821,6 +7047,20 @@ fn b_next(args: &[Object]) -> Result<Object, RuntimeError> {
         match it.borrow_mut().next_value_checked()? {
             Some(v) => Ok(v),
             None => default.ok_or_else(stop_iteration),
+        }
+    } else if matches!(it, Object::File(_)) {
+        // A file *is* its own iterator in CPython (`file.__next__` yields the
+        // next line); `next(f)` must drive `__next__` directly, including the
+        // `ValueError` on a closed stream (`test_io.test_io_after_close`). The
+        // optional default still suppresses the EOF `StopIteration`.
+        match file_next(std::slice::from_ref(it)) {
+            Ok(v) => Ok(v),
+            Err(RuntimeError::PyException(pe))
+                if default.is_some() && pe.type_name() == "StopIteration" =>
+            {
+                Ok(default.unwrap())
+            }
+            Err(e) => Err(e),
         }
     } else {
         Err(type_error(format!(
@@ -7039,23 +7279,123 @@ fn double_round(x: f64, ndigits: i64) -> Result<f64, RuntimeError> {
 
 // ---------- str methods ----------
 
-fn str_self(args: &[Object]) -> Result<&str, RuntimeError> {
+/// Plane-16 PUA window (U+10F800..U+10FFFF, 2048 code points) used to
+/// *bridge* lone surrogates (U+D800..U+DFFF) through the `&str`-based string
+/// algorithms: a `WStr` receiver/argument is mapped into this window so the
+/// existing UTF-8 method bodies run unchanged, then mapped back on output.
+///
+/// Bridging only activates when a `WStr` actually participates in the call
+/// (see [`str_result`]); a plain `str` — even one containing genuine
+/// plane-16 PUA characters — takes the untouched fast path. The only
+/// (astronomically rare) caveat is mixing a genuine U+10F800..U+10FFFF
+/// character into the *same* method call as a lone-surrogate string.
+pub(crate) const BRIDGE_BASE: u32 = 0x10_F800;
+
+/// Map a code-point sequence to a Rust `String`, shifting lone surrogates
+/// into the [`BRIDGE_BASE`] PUA window. Non-surrogate code points are kept.
+pub(crate) fn bridge_encode_cps(cps: &[u32]) -> String {
+    let mut s = String::with_capacity(cps.len());
+    for &cp in cps {
+        let mapped = if (0xD800..=0xDFFF).contains(&cp) {
+            BRIDGE_BASE + (cp - 0xD800)
+        } else {
+            cp
+        };
+        s.push(char::from_u32(mapped).unwrap_or('\u{FFFD}'));
+    }
+    s
+}
+
+/// Bridge a `str`/`WStr` object to a Rust `String` whose lone surrogates are
+/// shifted into the PUA window; `None` for non-string objects. A plain `str`
+/// is returned verbatim (it has no surrogates to shift).
+pub(crate) fn bridge_str_of(obj: &Object) -> Option<String> {
+    match obj {
+        Object::Str(s) => Some(s.to_string()),
+        Object::WStr(cps) => Some(bridge_encode_cps(cps)),
+        _ => None,
+    }
+}
+
+#[inline]
+pub(crate) fn bridge_window(cp: u32) -> bool {
+    (BRIDGE_BASE..=BRIDGE_BASE + 0x7FF).contains(&cp)
+}
+
+/// Inverse of [`bridge_encode_cps`] over a (possibly bridged) string,
+/// canonicalising to a `str` (no surrogates) or `WStr` (some surrogates).
+pub(crate) fn bridge_to_object(s: &str) -> Object {
+    if !s.chars().any(|ch| bridge_window(ch as u32)) {
+        return Object::from_str(s);
+    }
+    let cps: Vec<u32> = s
+        .chars()
+        .map(|ch| {
+            let cp = ch as u32;
+            if bridge_window(cp) {
+                0xD800 + (cp - BRIDGE_BASE)
+            } else {
+                cp
+            }
+        })
+        .collect();
+    Object::str_from_codepoints(cps)
+}
+
+/// A `str`/`WStr` method receiver as a Rust string: a plain `str` borrows;
+/// a `WStr` is bridged (lone surrogates → PUA) into an owned string.
+fn str_self(args: &[Object]) -> Result<std::borrow::Cow<'_, str>, RuntimeError> {
     match args.first() {
-        Some(Object::Str(s)) => Ok(s),
+        Some(Object::Str(s)) => Ok(std::borrow::Cow::Borrowed(s)),
+        Some(Object::WStr(cps)) => Ok(std::borrow::Cow::Owned(bridge_encode_cps(cps))),
         _ => Err(type_error("expected str method receiver")),
     }
 }
 
+/// A `str`/`WStr` *argument* (not the receiver) as a bridged Rust string;
+/// `None` for any non-string object so callers can raise their own
+/// method-specific `TypeError`.
+fn str_arg_bridged(obj: &Object) -> Option<std::borrow::Cow<'_, str>> {
+    match obj {
+        Object::Str(s) => Some(std::borrow::Cow::Borrowed(s)),
+        Object::WStr(cps) => Some(std::borrow::Cow::Owned(bridge_encode_cps(cps))),
+        _ => None,
+    }
+}
+
+/// Wrap a string-valued method result, mapping bridged surrogates back to a
+/// `WStr` *only* when a `WStr` participated in the call (so plain-`str`
+/// results — including genuine plane-16 PUA — are never disturbed).
+fn str_result(args: &[Object], result: String) -> Object {
+    if args.iter().any(|o| matches!(o, Object::WStr(_))) {
+        bridge_to_object(&result)
+    } else {
+        Object::from_str(result)
+    }
+}
+
 fn str_upper(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_str(str_self(args)?.to_uppercase()))
+    let up = str_self(args)?.to_uppercase();
+    Ok(str_result(args, up))
 }
 
 fn str_lower(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_str(str_self(args)?.to_lowercase()))
+    let lo = str_self(args)?.to_lowercase();
+    Ok(str_result(args, lo))
 }
 
 fn str_strip(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::from_str(str_self(args)?.trim().to_owned()))
+    let s = str_self(args)?;
+    let out = match args.get(1) {
+        None | Some(Object::None) => s.trim().to_owned(),
+        Some(arg) => {
+            let chars =
+                str_arg_bridged(arg).ok_or_else(|| type_error("strip() argument must be str"))?;
+            let set: Vec<char> = chars.chars().collect();
+            s.trim_matches(|c| set.contains(&c)).to_owned()
+        }
+    };
+    Ok(str_result(args, out))
 }
 
 fn split_maxsplit(o: Option<&Object>) -> Result<i64, RuntimeError> {
@@ -7105,35 +7445,56 @@ fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
     let s = str_self(args)?;
     let sep = arg_or_kw(args, 1, kwargs, "sep");
     let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
+    // Bridge field results back to surrogates when a `WStr` was involved
+    // (receiver or separator).
+    let wrap = |out: Vec<Object>| -> Vec<Object> {
+        if args.iter().any(|o| matches!(o, Object::WStr(_))) || matches!(sep, Some(Object::WStr(_)))
+        {
+            out.into_iter()
+                .map(|o| match o {
+                    Object::Str(piece) => bridge_to_object(&piece),
+                    other => other,
+                })
+                .collect()
+        } else {
+            out
+        }
+    };
     let out: Vec<Object> = match sep {
-        None | Some(Object::None) => str_split_whitespace(s, maxsplit),
-        Some(Object::Str(sep)) => {
+        None | Some(Object::None) => str_split_whitespace(&s, maxsplit),
+        Some(sep_obj) => {
+            let sep = str_arg_bridged(sep_obj)
+                .ok_or_else(|| type_error("must be str or None, not other"))?;
             if sep.is_empty() {
                 return Err(value_error("empty separator"));
             }
             if maxsplit < 0 {
-                s.split(&**sep).map(Object::from_str).collect()
+                s.split(&*sep).map(Object::from_str).collect()
             } else {
-                s.splitn((maxsplit as usize).saturating_add(1), &**sep)
+                s.splitn((maxsplit as usize).saturating_add(1), &*sep)
                     .map(Object::from_str)
                     .collect()
             }
         }
-        Some(_) => return Err(type_error("must be str or None, not other")),
     };
-    Ok(Object::new_list(out))
+    Ok(Object::new_list(wrap(out)))
 }
 
 fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
-    let sep = str_self(args)?.to_owned();
+    let sep = str_self(args)?.into_owned();
     if args.len() != 2 {
         return Err(type_error("join() expected 1 argument"));
     }
     let mut it = args[1].make_iter()?;
     let mut parts = Vec::new();
+    let mut saw_surrogate = matches!(args.first(), Some(Object::WStr(_)));
     while let Some(v) = it.next_value() {
-        match v {
+        match &v {
             Object::Str(s) => parts.push(s.to_string()),
+            Object::WStr(cps) => {
+                saw_surrogate = true;
+                parts.push(bridge_encode_cps(cps));
+            }
             other => {
                 return Err(type_error(format!(
                     "sequence item: expected str instance, {} found",
@@ -7142,7 +7503,12 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
     }
-    Ok(Object::from_str(parts.join(&sep)))
+    let joined = parts.join(&sep);
+    Ok(if saw_surrogate {
+        bridge_to_object(&joined)
+    } else {
+        Object::from_str(joined)
+    })
 }
 
 fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7152,7 +7518,7 @@ fn str_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(obj) => obj,
         None => return Err(type_error("startswith() takes at least 1 argument")),
     };
-    let slice = str_apply_start_end(s, args.get(2), args.get(3))?;
+    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3))?;
     Ok(Object::Bool(str_match_prefix_suffix(slice, target, true)?))
 }
 
@@ -7162,7 +7528,7 @@ fn str_endswith(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(obj) => obj,
         None => return Err(type_error("endswith() takes at least 1 argument")),
     };
-    let slice = str_apply_start_end(s, args.get(2), args.get(3))?;
+    let slice = str_apply_start_end(s.as_ref(), args.get(2), args.get(3))?;
     Ok(Object::Bool(str_match_prefix_suffix(slice, target, false)?))
 }
 
@@ -7211,16 +7577,19 @@ fn str_match_prefix_suffix(
         }
     };
     match target {
-        Object::Str(s) => Ok(test(s)),
+        Object::Str(_) | Object::WStr(_) => {
+            let needle = str_arg_bridged(target).expect("str/WStr");
+            Ok(test(&needle))
+        }
         Object::Tuple(parts) => {
             for item in parts.iter() {
-                match item {
-                    Object::Str(s) => {
-                        if test(s) {
+                match str_arg_bridged(item) {
+                    Some(needle) => {
+                        if test(&needle) {
                             return Ok(true);
                         }
                     }
-                    _ => {
+                    None => {
                         return Err(type_error(
                             "startswith/endswith first arg must be str or tuple of str",
                         ));
@@ -7237,14 +7606,15 @@ fn str_match_prefix_suffix(
 
 fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let from = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("replace() expected str")),
+    let from = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("replace() expected str")),
     };
-    let to = match args.get(2) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("replace() expected str")),
+    let to = match args.get(2).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("replace() expected str")),
     };
+    let (from, to) = (from.as_ref(), to.as_ref());
     let mut count_obj = args.get(3).cloned();
     for (k, v) in kwargs {
         match k.as_str() {
@@ -7261,10 +7631,10 @@ fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
         Some(o) => coerce_index_i64(&o)?,
     };
     if count == 0 {
-        return Ok(Object::from_str(s.to_string()));
+        return Ok(str_result(args, s.into_owned()));
     }
     let out = if count < 0 {
-        s.replace(&**from, to)
+        s.replace(from, to)
     } else if from.is_empty() {
         // `str::replacen` with an empty pattern matches between every
         // char and at both ends, same as CPython.
@@ -7283,9 +7653,9 @@ fn str_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
         }
         out
     } else {
-        s.replacen(&**from, to, count as usize)
+        s.replacen(from, to, count as usize)
     };
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 /// `ADJUST_INDICES`: negative indices offset by length and floored at
@@ -7318,9 +7688,10 @@ fn str_search_window(args: &[Object], total_chars: i64) -> Option<(i64, i64)> {
 
 fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sub = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("find() expected str")),
+    let s = s.as_ref();
+    let sub = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("find() expected str")),
     };
     let total_chars = s.chars().count() as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
@@ -7329,7 +7700,7 @@ fn str_find(args: &[Object]) -> Result<Object, RuntimeError> {
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
-    match hay.find(&**sub) {
+    match hay.find(&*sub) {
         Some(byte_idx) => {
             let abs_byte = byte_idx + start_byte;
             Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
@@ -7365,7 +7736,7 @@ fn str_title(args: &[Object]) -> Result<Object, RuntimeError> {
             prev_alpha = false;
         }
     }
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7375,7 +7746,7 @@ fn str_capitalize(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(c) => c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
         None => String::new(),
     };
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7389,33 +7760,35 @@ fn str_swapcase(args: &[Object]) -> Result<Object, RuntimeError> {
             out.push(ch);
         }
     }
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let out = match args.get(1) {
         None | Some(Object::None) => s.trim_start().to_owned(),
-        Some(Object::Str(chars)) => {
+        Some(arg) => {
+            let chars =
+                str_arg_bridged(arg).ok_or_else(|| type_error("lstrip() argument must be str"))?;
             let set: Vec<char> = chars.chars().collect();
             s.trim_start_matches(|c| set.contains(&c)).to_owned()
         }
-        _ => return Err(type_error("lstrip() argument must be str")),
     };
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     let out = match args.get(1) {
         None | Some(Object::None) => s.trim_end().to_owned(),
-        Some(Object::Str(chars)) => {
+        Some(arg) => {
+            let chars =
+                str_arg_bridged(arg).ok_or_else(|| type_error("rstrip() argument must be str"))?;
             let set: Vec<char> = chars.chars().collect();
             s.trim_end_matches(|c| set.contains(&c)).to_owned()
         }
-        _ => return Err(type_error("rstrip() argument must be str")),
     };
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 /// `str.rsplit` on runs of whitespace, honouring `maxsplit` from the
@@ -7455,28 +7828,43 @@ fn str_rsplit_whitespace(s: &str, maxsplit: i64) -> Vec<Object> {
 
 fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
+    let s = s.as_ref();
     let sep = arg_or_kw(args, 1, kwargs, "sep");
     let maxsplit = split_maxsplit(arg_or_kw(args, 2, kwargs, "maxsplit"))?;
+    let wrap = |out: Vec<Object>| -> Vec<Object> {
+        if args.iter().any(|o| matches!(o, Object::WStr(_))) || matches!(sep, Some(Object::WStr(_)))
+        {
+            out.into_iter()
+                .map(|o| match o {
+                    Object::Str(piece) => bridge_to_object(&piece),
+                    other => other,
+                })
+                .collect()
+        } else {
+            out
+        }
+    };
     let out: Vec<Object> = match sep {
         None | Some(Object::None) => str_rsplit_whitespace(s, maxsplit),
-        Some(Object::Str(sep)) => {
+        Some(sep_obj) => {
+            let sep = str_arg_bridged(sep_obj)
+                .ok_or_else(|| type_error("must be str or None, not other"))?;
             if sep.is_empty() {
                 return Err(value_error("empty separator"));
             }
             let mut pieces: Vec<&str> = if maxsplit < 0 {
-                s.split(&**sep).collect()
+                s.split(&*sep).collect()
             } else {
                 let mut v: Vec<&str> = s
-                    .rsplitn((maxsplit as usize).saturating_add(1), &**sep)
+                    .rsplitn((maxsplit as usize).saturating_add(1), &*sep)
                     .collect();
                 v.reverse();
                 v
             };
             pieces.drain(..).map(Object::from_str).collect()
         }
-        Some(_) => return Err(type_error("must be str or None, not other")),
     };
-    Ok(Object::new_list(out))
+    Ok(Object::new_list(wrap(out)))
 }
 
 fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -7500,7 +7888,7 @@ fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
             } else {
                 &s[start..end_no_eol]
             };
-            out.push(Object::from_str(line.to_owned()));
+            out.push(str_result(args, line.to_owned()));
             start = end;
             i = end;
         } else {
@@ -7508,16 +7896,17 @@ fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
         }
     }
     if start < bytes.len() {
-        out.push(Object::from_str(s[start..].to_owned()));
+        out.push(str_result(args, s[start..].to_owned()));
     }
     Ok(Object::new_list(out))
 }
 
 fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sub = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("rfind() expected str")),
+    let s = s.as_ref();
+    let sub = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("rfind() expected str")),
     };
     let total_chars = s.chars().count() as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
@@ -7526,7 +7915,7 @@ fn str_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
     let hay = &s[start_byte..end_byte];
-    match hay.rfind(&**sub) {
+    match hay.rfind(&*sub) {
         Some(byte_idx) => {
             let abs_byte = byte_idx + start_byte;
             Ok(Object::Int(byte_offset_to_char(s, abs_byte) as i64))
@@ -7553,9 +7942,10 @@ fn str_rindex(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sub = match args.get(1) {
-        Some(Object::Str(p)) => p,
-        _ => return Err(type_error("count() expected str")),
+    let s = s.as_ref();
+    let sub = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("count() expected str")),
     };
     let total_chars = s.chars().count() as i64;
     let Some((start, end)) = str_search_window(args, total_chars) else {
@@ -7563,54 +7953,59 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let start_byte = char_offset_to_byte(s, start as usize);
     let end_byte = char_offset_to_byte(s, end as usize);
+    // An empty needle matches at every code-point boundary (CPython counts
+    // `len+1`); Rust's `matches("")` already yields that, but on the bridged
+    // string each PUA char is one boundary, matching code-point semantics.
     Ok(Object::Int(
-        s[start_byte..end_byte].matches(&**sub).count() as i64
+        s[start_byte..end_byte].matches(&*sub).count() as i64
     ))
 }
 
 fn str_partition(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sep = match args.get(1) {
-        Some(Object::Str(p)) => p.to_string(),
-        _ => return Err(type_error("partition() expected str")),
+    let s = s.as_ref();
+    let sep = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("partition() expected str")),
     };
-    let (head, tail) = match s.find(&sep) {
+    let (head, tail) = match s.find(&*sep) {
         Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
         None => {
             return Ok(Object::new_tuple(vec![
-                Object::from_str(s.to_owned()),
+                str_result(args, s.to_owned()),
                 Object::from_static(""),
                 Object::from_static(""),
             ]))
         }
     };
     Ok(Object::new_tuple(vec![
-        Object::from_str(head),
-        Object::from_str(sep),
-        Object::from_str(tail),
+        str_result(args, head),
+        str_result(args, sep.into_owned()),
+        str_result(args, tail),
     ]))
 }
 
 fn str_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
-    let sep = match args.get(1) {
-        Some(Object::Str(p)) => p.to_string(),
-        _ => return Err(type_error("rpartition() expected str")),
+    let s = s.as_ref();
+    let sep = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("rpartition() expected str")),
     };
-    let (head, tail) = match s.rfind(&sep) {
+    let (head, tail) = match s.rfind(&*sep) {
         Some(i) => (s[..i].to_owned(), s[i + sep.len()..].to_owned()),
         None => {
             return Ok(Object::new_tuple(vec![
                 Object::from_static(""),
                 Object::from_static(""),
-                Object::from_str(s.to_owned()),
+                str_result(args, s.to_owned()),
             ]))
         }
     };
     Ok(Object::new_tuple(vec![
-        Object::from_str(head),
-        Object::from_str(sep),
-        Object::from_str(tail),
+        str_result(args, head),
+        str_result(args, sep.into_owned()),
+        str_result(args, tail),
     ]))
 }
 
@@ -7693,6 +8088,7 @@ fn str_isprintable(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
+    let s = s.as_ref();
     let width = match args.get(1) {
         // A negative width is a no-op in CPython (`'x'.zfill(-3) == 'x'`);
         // clamp to 0 so `*i as usize` can't wrap to a gigantic pad count.
@@ -7702,7 +8098,7 @@ fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let len = s.chars().count();
     if len >= width {
-        return Ok(Object::from_str(s.to_owned()));
+        return Ok(str_result(args, s.to_owned()));
     }
     let pad = width - len;
     let (sign, rest) = if s.starts_with('+') || s.starts_with('-') {
@@ -7710,7 +8106,7 @@ fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         ("", s)
     };
-    Ok(Object::from_str(format!("{sign}{}{rest}", "0".repeat(pad))))
+    Ok(str_result(args, format!("{sign}{}{rest}", "0".repeat(pad))))
 }
 
 fn str_ljust(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7730,21 +8126,24 @@ fn pad_str(args: &[Object], right_align: bool) -> Result<Object, RuntimeError> {
         Some(Object::Bool(b)) => usize::from(*b),
         _ => return Err(type_error("expected int width")),
     };
-    let fill = match args.get(2) {
-        Some(Object::Str(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
+    let fill = match args.get(2).map(str_arg_bridged) {
+        Some(Some(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
         None => ' ',
         _ => return Err(type_error("fill must be single char")),
     };
     let len = s.chars().count();
     if len >= width {
-        return Ok(Object::from_str(s.to_owned()));
+        return Ok(str_result(args, s.into_owned()));
     }
     let pad: String = std::iter::repeat_n(fill, width - len).collect();
-    Ok(Object::from_str(if right_align {
-        format!("{pad}{s}")
-    } else {
-        format!("{s}{pad}")
-    }))
+    Ok(str_result(
+        args,
+        if right_align {
+            format!("{pad}{s}")
+        } else {
+            format!("{s}{pad}")
+        },
+    ))
 }
 
 fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7756,14 +8155,14 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Bool(b)) => usize::from(*b),
         _ => return Err(type_error("center() expected int")),
     };
-    let fill = match args.get(2) {
-        Some(Object::Str(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
+    let fill = match args.get(2).map(str_arg_bridged) {
+        Some(Some(f)) if f.chars().count() == 1 => f.chars().next().unwrap(),
         None => ' ',
         _ => return Err(type_error("fill must be single char")),
     };
     let len = s.chars().count();
     if len >= width {
-        return Ok(Object::from_str(s.to_owned()));
+        return Ok(str_result(args, s.into_owned()));
     }
     let total = width - len;
     // CPython biases the extra pad to the *left* when both the margin and the
@@ -7773,7 +8172,7 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
     let right = total - left;
     let lpad: String = std::iter::repeat_n(fill, left).collect();
     let rpad: String = std::iter::repeat_n(fill, right).collect();
-    Ok(Object::from_str(format!("{lpad}{s}{rpad}")))
+    Ok(str_result(args, format!("{lpad}{s}{rpad}")))
 }
 
 fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7814,11 +8213,18 @@ fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
     }
-    Ok(Object::from_str(out))
+    Ok(str_result(args, out))
 }
 
 fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
-    let s = str_self(args)?;
+    // Accept both `str` and surrogate-bearing `WStr` receivers so
+    // `chr(0xD800).encode('utf-8', 'surrogatepass')` works.
+    let recv = args
+        .first()
+        .ok_or_else(|| type_error("encode() missing receiver"))?;
+    if !recv.is_str() {
+        return Err(type_error("expected str method receiver"));
+    }
     let encoding = match args.get(1) {
         Some(Object::Str(e)) => e.to_string(),
         None => "utf-8".to_owned(),
@@ -7829,7 +8235,7 @@ fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
         None => "strict".to_owned(),
         _ => "strict".to_owned(),
     };
-    let bytes = crate::stdlib::codecs_mod::encode_str(s, &encoding, &errors)?;
+    let bytes = crate::stdlib::codecs_mod::encode_obj(recv, &encoding, &errors)?;
     Ok(Object::new_bytes(bytes))
 }
 
@@ -7841,12 +8247,13 @@ fn str_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let s = str_self(args)?;
-    let prefix = match args.get(1) {
-        Some(Object::Str(p)) => p.to_string(),
-        _ => return Err(type_error("removeprefix() expected str")),
+    let s = s.as_ref();
+    let prefix = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("removeprefix() expected str")),
     };
-    let out = s.strip_prefix(&prefix).unwrap_or(s).to_owned();
-    Ok(Object::from_str(out))
+    let out = s.strip_prefix(&*prefix).unwrap_or(s).to_owned();
+    Ok(str_result(args, out))
 }
 
 fn str_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7857,28 +8264,29 @@ fn str_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let s = str_self(args)?;
-    let suffix = match args.get(1) {
-        Some(Object::Str(p)) => p.to_string(),
-        _ => return Err(type_error("removesuffix() expected str")),
+    let s = s.as_ref();
+    let suffix = match args.get(1).and_then(str_arg_bridged) {
+        Some(p) => p,
+        None => return Err(type_error("removesuffix() expected str")),
     };
-    let out = s.strip_suffix(&suffix).unwrap_or(s).to_owned();
-    Ok(Object::from_str(out))
+    let out = s.strip_suffix(&*suffix).unwrap_or(s).to_owned();
+    Ok(str_result(args, out))
 }
 
 fn str_format(args: &[Object]) -> Result<Object, RuntimeError> {
-    let template = str_self(args)?.to_owned();
+    let template = str_self(args)?.into_owned();
     let rest = &args[1..];
     let kwargs: Vec<(String, Object)> = Vec::new();
-    crate::str_format_impl(&template, rest, &kwargs).map(Object::from_str)
+    crate::str_format_impl(&template, rest, &kwargs).map(|s| str_result(args, s))
 }
 
 fn str_format_map(args: &[Object]) -> Result<Object, RuntimeError> {
-    let template = str_self(args)?.to_owned();
+    let template = str_self(args)?.into_owned();
     let mapping = match args.get(1) {
         Some(Object::Dict(d)) => d.clone(),
         _ => return Err(type_error("format_map() argument must be a mapping")),
     };
-    crate::str_format_map_impl(&template, &mapping).map(Object::from_str)
+    crate::str_format_map_impl(&template, &mapping).map(|s| str_result(args, s))
 }
 
 fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -7888,20 +8296,46 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => return Err(type_error("translate() argument must be a dict")),
     };
     let mut out = String::new();
+    let mut saw_surrogate = matches!(args.first(), Some(Object::WStr(_)));
+    // Push a translation target code point, bridging a surrogate so it
+    // round-trips through `str_result`.
+    let push_cp = |out: &mut String, cp: u32, saw: &mut bool| {
+        let mapped = if (0xD800..=0xDFFF).contains(&cp) {
+            *saw = true;
+            BRIDGE_BASE + (cp - 0xD800)
+        } else {
+            cp
+        };
+        if let Some(ch) = char::from_u32(mapped) {
+            out.push(ch);
+        }
+    };
     for c in s.chars() {
-        let key = DictKey(Object::Int(i64::from(u32::from(c))));
-        match table.borrow().get(&key) {
+        // Recover the real code point of a bridged surrogate for the lookup.
+        let cp = c as u32;
+        let real_cp = if bridge_window(cp) {
+            0xD800 + (cp - BRIDGE_BASE)
+        } else {
+            cp
+        };
+        let key = DictKey(Object::Int(i64::from(real_cp)));
+        let entry = table.borrow().get(&key).cloned();
+        match entry {
             Some(Object::None) => {}
-            Some(Object::Int(i)) => {
-                if let Some(ch) = char::from_u32(*i as u32) {
-                    out.push(ch);
-                }
+            Some(Object::Int(i)) => push_cp(&mut out, i as u32, &mut saw_surrogate),
+            Some(Object::Str(v)) => out.push_str(&v),
+            Some(Object::WStr(cps)) => {
+                saw_surrogate = true;
+                out.push_str(&bridge_encode_cps(&cps));
             }
-            Some(Object::Str(s)) => out.push_str(s),
             _ => out.push(c),
         }
     }
-    Ok(Object::from_str(out))
+    Ok(if saw_surrogate {
+        bridge_to_object(&out)
+    } else {
+        Object::from_str(out)
+    })
 }
 
 fn str_maketrans(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8348,6 +8782,13 @@ fn dict_self(args: &[Object]) -> Result<Rc<RefCell<DictData>>, RuntimeError> {
 
 fn dict_get(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    // `dict.get(key[, default])` — CPython rejects a third positional.
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "get expected at most 2 arguments, got {}",
+            args.len() - 1
+        )));
+    }
     let key = args
         .get(1)
         .ok_or_else(|| type_error("dict.get() expected at least 1 argument"))?;
@@ -8398,8 +8839,22 @@ fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `dict.keys()`/`values()`/`items()` take no positional arguments beyond
+/// `self`; CPython raises `TypeError` for any extra (`mapping_tests` checks
+/// `d.keys(None)`).
+fn dict_view_no_args(args: &[Object], name: &str) -> Result<(), RuntimeError> {
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "{name}() takes no arguments ({} given)",
+            args.len() - 1
+        )));
+    }
+    Ok(())
+}
+
 fn dict_keys(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    dict_view_no_args(args, "keys")?;
     Ok(Object::DictView(Rc::new(crate::object::PyDictView {
         dict: d,
         kind: crate::object::DictViewKind::Keys,
@@ -8408,6 +8863,7 @@ fn dict_keys(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn dict_values(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    dict_view_no_args(args, "values")?;
     Ok(Object::DictView(Rc::new(crate::object::PyDictView {
         dict: d,
         kind: crate::object::DictViewKind::Values,
@@ -8416,6 +8872,7 @@ fn dict_values(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn dict_items(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
+    dict_view_no_args(args, "items")?;
     Ok(Object::DictView(Rc::new(crate::object::PyDictView {
         dict: d,
         kind: crate::object::DictViewKind::Items,
@@ -9010,7 +9467,7 @@ fn with_bytes_data<R>(
     }
 }
 
-fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
+pub(crate) fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
     match arg {
         Object::Bytes(b) => Ok(b.to_vec()),
         Object::ByteArray(b) => Ok(b.borrow().clone()),
@@ -9124,8 +9581,8 @@ fn bytes_decode_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
         Some(Object::Str(e)) => e.to_string(),
         _ => "strict".to_owned(),
     };
-    let s = crate::stdlib::codecs_mod::decode_bytes(&data, &encoding, &errors)?;
-    Ok(Object::from_str(s))
+    // Produces a surrogate-bearing `WStr` for `surrogateescape`/`surrogatepass`.
+    crate::stdlib::codecs_mod::decode_bytes_obj(&data, &encoding, &errors)
 }
 
 fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -10551,6 +11008,39 @@ fn bytearray_extend(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         _ => {}
     }
+    // Buffer protocol (PEP 3118 / PEP 688): a `memoryview` or any object that
+    // exports a buffer (`array.array`, mmap, …) extends with its *raw bytes*,
+    // not its iterated items — matching CPython's `bytearray.extend`, which
+    // routes any `PyObject_CheckBuffer` argument through `bytearray_setslice`
+    // before the integer-iteration fallback. Without this, e.g.
+    // `bytearray().extend(array('I', [1000]))` — exactly what
+    // `_pyio.BufferedWriter.write` does for `gzip`/`bz2` array writes — would
+    // iterate the out-of-range int items and raise.
+    if matches!(other, Object::MemoryView(_)) {
+        let bytes = other.as_bytes_view().unwrap_or_default();
+        if !bytes.is_empty() {
+            crate::object::bytearray_check_resizable(&b)?;
+        }
+        b.borrow_mut().extend_from_slice(&bytes);
+        return Ok(Object::None);
+    }
+    if let Some(method) = crate::instance_method(other, "__buffer__") {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: published by an enclosing VM frame still live on this
+            // thread; the GIL keeps the access exclusive.
+            let interp = unsafe { &mut *ptr };
+            let globals = interp.builtins_dict();
+            let view =
+                interp.call_object_with_globals(&method, &[Object::Int(0)], &[], &globals)?;
+            if let Some(bytes) = view.as_bytes_view() {
+                if !bytes.is_empty() {
+                    crate::object::bytearray_check_resizable(&b)?;
+                }
+                b.borrow_mut().extend_from_slice(&bytes);
+                return Ok(Object::None);
+            }
+        }
+    }
     // General protocol: any iterable of ints (each through `__index__`,
     // as CPython's `bytearray_extend` does via `_getbytevalue`).
     // Generators and user-`__iter__` objects were materialised by the
@@ -10627,18 +11117,128 @@ pub(crate) fn file_self(args: &[Object]) -> Result<Rc<crate::object::PyFile>, Ru
     }
 }
 
+/// CPython's `CHECK_CLOSED`: an I/O method on a closed stream raises
+/// `ValueError("I/O operation on closed file.")` (`test_io.test_io_after_close`).
+pub(crate) fn file_check_open(f: &Rc<crate::object::PyFile>) -> Result<(), RuntimeError> {
+    if *f.closed.borrow() {
+        return Err(value_error("I/O operation on closed file."));
+    }
+    Ok(())
+}
+
+/// Convert decoded stream text into a `str` Object, un-bridging the PUA
+/// surrogate window for an in-memory `StringIO` (whose buffer stores lone
+/// surrogates as bridged PUA code points so a Rust `String` can hold them).
+/// File-backed text streams never contain bridge-window code points, so they
+/// take the plain `Object::Str` path.
+fn stream_text_object(f: &Rc<crate::object::PyFile>, s: String) -> Object {
+    if matches!(
+        &*f.backend.borrow(),
+        crate::object::FileBackend::MemText { .. }
+    ) {
+        bridge_to_object(&s)
+    } else {
+        Object::from_str(s)
+    }
+}
+
 pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    // A stream opened write-only (`'w'`, `'a'`, `'x'`, `'wb'`, …) raises
+    // `io.UnsupportedOperation` on `read`, not a raw `OSError(EBADF)` from the
+    // kernel (`test_io.test_invalid_operations`). CPython gates this in the
+    // buffered/raw layer before touching the fd.
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("read"));
+    }
     let n = match args.get(1) {
         Some(Object::Int(i)) if *i >= 0 => Some(*i as usize),
         None | Some(Object::None) | Some(Object::Int(-1)) => None,
         _ => return Err(type_error("read() argument must be int")),
     };
-    let bytes = f.read_bytes(n)?;
     if f.binary {
-        Ok(Object::new_bytes(bytes))
+        // `read_bytes_opt` yields `None` for a would-block on a non-blocking
+        // descriptor, mirroring CPython's `BufferedReader.read()` (which can
+        // return `None`); `iter(f.read, None)` relies on that sentinel
+        // (`test_io.test_nonblock_pipe_write_*`).
+        match f.read_bytes_opt(n)? {
+            Some(data) => Ok(Object::new_bytes(data)),
+            None => Ok(Object::None),
+        }
+    } else if f.text_incr_active_gate() {
+        // A custom incremental-only codec (its one-shot `decode` is `None`,
+        // e.g. test_io's `test_decoder`): drive the faithful CPython
+        // `TextIOWrapper` incremental machinery. `n` is `None` for a full
+        // read, `Some(size)` for a character-counted read.
+        Ok(stream_text_object(&f, f.read_text_incr(n)?))
+    } else if let Some(count) = n {
+        // Text `read(size)` counts *characters*, not bytes (CPython
+        // `TextIOWrapper`/`StringIO`); read code-point-wise so a multibyte
+        // char is never split at the size boundary.
+        Ok(stream_text_object(&f, f.read_text_n(count)?))
     } else {
-        Ok(Object::from_str(f.decode_text(bytes)?))
+        match f.read_bytes_opt(None)? {
+            Some(data) => Ok(stream_text_object(&f, f.decode_text(data)?)),
+            None => Ok(Object::None),
+        }
+    }
+}
+
+/// `BufferedReader.peek([size])` — return buffered bytes without advancing the
+/// stream position. CPython returns "an arbitrary amount of data, at least one
+/// byte unless EOF, possibly more than requested"; for WeavePy's OS-buffered
+/// file-backed reader we materialise up to a buffer's worth, then restore the
+/// position. Only reachable on binary buffered readers (`peek` is in the file
+/// method table only for `f.binary` readers).
+pub(crate) fn file_peek(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    file_check_open(&f)?;
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("peek"));
+    }
+    let pos = f.tell()?;
+    let chunk = f.read_bytes(Some(crate::object::DEFAULT_BUFFER_SIZE))?;
+    f.seek(pos as isize, 0)?;
+    Ok(Object::new_bytes(chunk))
+}
+
+/// The native `bytearray` backing an instance (a `bytearray` subclass), if
+/// any — used to prefer the direct-mutation path over `__buffer__`.
+fn inst_native_bytearray(obj: &Object) -> Option<crate::sync::Rc<RefCell<Vec<u8>>>> {
+    match obj {
+        Object::ByteArray(b) => Some(b.clone()),
+        Object::Instance(inst) => match &inst.native {
+            Some(Object::ByteArray(b)) => Some(b.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Acquire a writable `memoryview` over a PEP 688 buffer exporter by calling
+/// its `__buffer__` (the writable request flag). Returns `Ok(None)` when the
+/// object has no `__buffer__` so the caller can fall through to its
+/// "must be read-write bytes-like" error.
+fn acquire_writable_view(
+    obj: &Object,
+) -> Result<Option<crate::sync::Rc<crate::object::PyMemoryView>>, RuntimeError> {
+    let Some(method) = crate::instance_method(obj, "__buffer__") else {
+        return Ok(None);
+    };
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Ok(None);
+    };
+    // SAFETY: published by an enclosing VM frame still live on this thread;
+    // the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    // `inspect.BufferFlags.WRITABLE` is `0x200`; an exporter that can't
+    // satisfy a writable request raises, which propagates as CPython's does.
+    let r = interp.call_object_with_globals(&method, &[Object::Int(0x200)], &[], &globals)?;
+    match r {
+        Object::MemoryView(mv) => Ok(Some(mv)),
+        _ => Ok(None),
     }
 }
 
@@ -10647,6 +11247,10 @@ pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
 /// on binary-mode files (the method table gates on `f.binary`).
 pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("read"));
+    }
     // A writable `memoryview` is a valid target (CPython's `readinto`
     // accepts any read-write buffer). asyncio's `_sock_sendfile_fallback`
     // hands `file.readinto` a `memoryview(bytearray(...))`.
@@ -10664,18 +11268,45 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
         let capacity = mv.len.get();
         let bytes = f.read_bytes(Some(capacity))?;
         let n = bytes.len();
-        match &mv.buffer {
-            crate::object::MemoryViewBuffer::ByteArray(b) => {
-                let start = mv.start.get();
-                b.borrow_mut()[start..start + n].copy_from_slice(&bytes);
-            }
-            crate::object::MemoryViewBuffer::Bytes(_) => {
-                return Err(type_error(
-                    "readinto() argument must be read-write bytes-like object, not memoryview",
-                ));
-            }
+        let start = mv.start.get();
+        let wrote = mv
+            .buffer
+            .with_write(|d| d[start..start + n].copy_from_slice(&bytes));
+        if wrote.is_none() {
+            return Err(type_error(
+                "readinto() argument must be read-write bytes-like object, not memoryview",
+            ));
         }
         return Ok(Object::Int(n as i64));
+    }
+    // A buffer-protocol object (`array.array`, `mmap`, any PEP 688
+    // `__buffer__` exporter) whose `__buffer__` yields a writable memoryview is
+    // a valid `readinto` target — the write must propagate to its storage.
+    if let Some(obj @ Object::Instance(_)) = args.get(1) {
+        if inst_native_bytearray(obj).is_none() {
+            if let Some(mv) = acquire_writable_view(obj)? {
+                if mv.readonly.get() || !mv.is_c_contiguous() {
+                    return Err(type_error(format!(
+                        "readinto() argument must be read-write bytes-like object, not {}",
+                        obj.type_name()
+                    )));
+                }
+                let capacity = mv.len.get();
+                let bytes = f.read_bytes(Some(capacity))?;
+                let n = bytes.len();
+                let start = mv.start.get();
+                let wrote = mv
+                    .buffer
+                    .with_write(|d| d[start..start + n].copy_from_slice(&bytes));
+                if wrote.is_none() {
+                    return Err(type_error(format!(
+                        "readinto() argument must be read-write bytes-like object, not {}",
+                        obj.type_name()
+                    )));
+                }
+                return Ok(Object::Int(n as i64));
+            }
+        }
     }
     let target = match args.get(1) {
         Some(Object::ByteArray(b)) => b.clone(),
@@ -10704,8 +11335,34 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
 
 pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("read"));
+    }
+    // `readline(size)` caps the bytes read (CPython `IOBase.readline`): a
+    // non-negative `size` stops after that many bytes even without a newline.
+    // A negative size (or `None`) means "no limit"; a non-integer (e.g. the
+    // `5.3` in `test_io.test_readline`) is a `TypeError`, matching CPython's
+    // `__index__`-based argument coercion.
+    let limit = match args.get(1) {
+        None | Some(Object::None) => None,
+        Some(Object::Bool(b)) => Some(usize::from(*b)),
+        Some(Object::Int(n)) if *n >= 0 => Some(*n as usize),
+        Some(Object::Int(_)) => None,
+        Some(other) => {
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                other.type_name()
+            )))
+        }
+    };
     let mut out: Vec<u8> = Vec::new();
     loop {
+        if let Some(lim) = limit {
+            if out.len() >= lim {
+                break;
+            }
+        }
         let b = f.read_bytes(Some(1))?;
         if b.is_empty() {
             break;
@@ -10718,20 +11375,35 @@ pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     if f.binary {
         Ok(Object::new_bytes(out))
     } else {
-        Ok(Object::from_str(f.decode_text(out)?))
+        Ok(stream_text_object(&f, f.decode_text(out)?))
     }
 }
 
 /// `next(file)` — return the next line, or raise StopIteration at EOF.
 /// Backs both the `__next__` method and the VM's native file iteration.
 pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    // CPython's `TextIOWrapper.__next__` disables `tell()` for the duration of
+    // the iteration (the readahead snapshot makes the position ambiguous); a
+    // binary stream keeps `tell()` live (`test_io.test_telling`).
+    let is_text = !f.binary;
+    if is_text {
+        f.telling.set(false);
+    }
     let line = file_readline(args)?;
     let empty = match &line {
         Object::Str(s) => s.is_empty(),
+        // A `WStr` always holds >= 1 lone surrogate, so it is never empty.
+        Object::WStr(_) => false,
         Object::Bytes(b) => b.is_empty(),
         _ => true,
     };
     if empty {
+        // Iterator exhausted: CPython restores `telling` to `seekable` and
+        // raises `StopIteration`.
+        if is_text {
+            f.telling.set(f.seekable());
+        }
         Err(stop_iteration())
     } else {
         Ok(line)
@@ -10740,11 +11412,13 @@ pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
 
 pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
     let mut lines: Vec<Object> = Vec::new();
     loop {
         let line = file_readline(&[Object::File(f.clone())])?;
         let is_empty = match &line {
             Object::Str(s) => s.is_empty(),
+            Object::WStr(_) => false,
             Object::Bytes(b) => b.is_empty(),
             _ => true,
         };
@@ -10758,6 +11432,13 @@ pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
 
 pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    // A read-only stream raises `io.UnsupportedOperation` on `write`
+    // (`test_io.test_invalid_operations`), before any type-checking of the
+    // argument.
+    if !f.writable() {
+        return Err(crate::stdlib::io::unsupported_op("write"));
+    }
     let data = args
         .get(1)
         .ok_or_else(|| type_error("write() expected 1 arg"))?;
@@ -10769,6 +11450,25 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
                 return Err(type_error("a bytes-like object is required, not 'str'"));
             }
             f.write_bytes(&f.encode_text(s)?)?
+        }
+        // A surrogate-bearing `str`. For an in-memory `StringIO` the lone
+        // surrogates ride through the PUA bridge so they round-trip; a real
+        // encoded text stream encodes the *actual* code points through its
+        // codec + error handler (so strict UTF-8 raises `UnicodeEncodeError`
+        // on a lone surrogate, `surrogateescape`/`surrogatepass` round-trip).
+        Object::WStr(cps) => {
+            if f.binary {
+                return Err(type_error("a bytes-like object is required, not 'str'"));
+            }
+            if matches!(
+                &*f.backend.borrow(),
+                crate::object::FileBackend::MemText { .. }
+            ) {
+                let bridged = bridge_encode_cps(cps);
+                f.write_bytes(&f.encode_text(&bridged)?)?
+            } else {
+                f.write_bytes(&f.encode_text_codepoints(cps)?)?
+            }
         }
         Object::Bytes(b) => {
             if !f.binary {
@@ -10792,13 +11492,28 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
             }
             f.write_bytes(&mv.to_bytes())?
         }
-        _ => return Err(type_error("write() argument must be str or bytes")),
+        other => {
+            // A text stream only accepts `str`; a binary stream accepts any
+            // buffer-protocol object (`array.array`, `mmap`, a PEP 688
+            // `__buffer__` exporter), matching CPython's `FileIO`/`BytesIO`.
+            if !f.binary {
+                return Err(type_error(format!(
+                    "write() argument must be str, not {}",
+                    other.type_name()
+                )));
+            }
+            f.write_bytes(&bytes_argview(other)?)?
+        }
     };
     Ok(Object::Int(n as i64))
 }
 
 pub(crate) fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
+    file_check_open(&f)?;
+    if !f.writable() {
+        return Err(crate::stdlib::io::unsupported_op("write"));
+    }
     let it = args
         .get(1)
         .ok_or_else(|| type_error("writelines() expected 1 arg"))?;
@@ -10811,43 +11526,135 @@ pub(crate) fn file_writelines(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Bytes(b) => {
                 f.write_bytes(&b)?;
             }
-            _ => return Err(type_error("writelines() item must be str or bytes")),
+            // A binary stream accepts any buffer-protocol item (`array.array`,
+            // `memoryview`, …), mirroring CPython's `writelines`.
+            other if f.binary => {
+                f.write_bytes(&bytes_argview(&other)?)?;
+            }
+            other => {
+                return Err(type_error(format!(
+                    "writelines() argument must be a list of strings, not '{}'",
+                    other.type_name()
+                )))
+            }
         }
     }
     Ok(Object::None)
 }
 
 pub(crate) fn file_flush(args: &[Object]) -> Result<Object, RuntimeError> {
-    file_self(args)?.flush()?;
+    let f = file_self(args)?;
+    // CPython's `IOBase.flush` is a no-op error on a closed stream
+    // (`test_io.test_io_after_close`): flush after close raises `ValueError`.
+    file_check_open(&f)?;
+    f.flush()?;
     Ok(Object::None)
 }
 
 pub(crate) fn file_close(args: &[Object]) -> Result<Object, RuntimeError> {
-    file_self(args)?.close();
+    let f = file_self(args)?;
+    // CPython's `IOBase.close` calls `self.flush()` *virtually*, so a
+    // monkeypatched instance-level `flush` runs at close time. `test_io`'s
+    // `test_flush_error_on_close` patches `f.flush` to raise `OSError` and
+    // asserts `close()` re-raises it *and* still leaves the file closed (the
+    // descriptor is released even when the flush fails). Honour an override by
+    // running it, then closing without the native flush.
+    if !*f.closed.borrow() {
+        if let Some(flush_fn) = f.get_extra_attr("flush") {
+            let flush_res = (|| -> Result<Object, RuntimeError> {
+                let ptr = crate::vm_singletons::current_interpreter_ptr()
+                    .ok_or_else(|| crate::error::runtime_error("no running interpreter"))?;
+                // SAFETY: published by the enclosing VM frame on this thread.
+                let interp = unsafe { &mut *ptr };
+                interp.call_object(flush_fn, &[], &[])
+            })();
+            f.close();
+            flush_res?;
+            return Ok(Object::None);
+        }
+    }
+    // `close()` flushes the staged write buffer first; a flush failure (broken
+    // pipe) propagates while the descriptor is still released (CPython
+    // `BufferedWriter.close`).
+    f.close_with_flush()?;
     Ok(Object::None)
 }
 
 pub(crate) fn file_seek(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
-    let offset = match args.get(1) {
-        Some(Object::Int(i)) => *i as isize,
-        _ => return Err(type_error("seek() expected int")),
-    };
+    file_check_open(&f)?;
+    // An explicit seek re-enables `tell()` after an iteration disabled it
+    // (CPython restores `telling = seekable` in `textiowrapper_seek`).
+    f.telling.set(true);
     let whence = match args.get(2) {
         Some(Object::Int(i)) => *i as i32,
         None => 0,
         _ => return Err(type_error("seek() whence must be int")),
     };
+    // Incremental text cookie path (a custom decode=None codec): the seek
+    // argument is an opaque `TextIOWrapper` cookie — a Python int that can
+    // exceed 64 bits (`Object::Long`) — not a byte offset, so it must be
+    // handled before the byte-offset parse below.
+    if f.text_incr_active_gate() && f.readable() {
+        let cookie = args.get(1).cloned().unwrap_or(Object::Int(0));
+        return f.seek_text(&cookie, whence);
+    }
+    let offset = match args.get(1) {
+        Some(Object::Int(i)) => *i as isize,
+        _ => return Err(type_error("seek() expected int")),
+    };
+    // A text stream (CPython's `TextIOWrapper`) only supports absolute seeks to
+    // opaque cookies; a non-zero current- or end-relative seek raises
+    // `io.UnsupportedOperation` (`test_io.test_invalid_operations`).
+    if !f.binary && offset != 0 && (whence == 1 || whence == 2) {
+        let msg = if whence == 1 {
+            "can't do nonzero cur-relative seeks"
+        } else {
+            "can't do nonzero end-relative seeks"
+        };
+        return Err(crate::stdlib::io::unsupported_op(msg));
+    }
     Ok(Object::Int(f.seek(offset, whence)? as i64))
 }
 
 pub(crate) fn file_tell(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
-    Ok(Object::Int(f.position() as i64))
+    file_check_open(&f)?;
+    // A text stream mid-iteration has `tell()` disabled (CPython
+    // `textiowrapper_tell`: `telling` cleared by `__next__`).
+    if !f.binary && !f.telling.get() {
+        return Err(crate::error::os_error(
+            "telling position disabled by next() call",
+        ));
+    }
+    // Incremental text cookie path (a custom decode=None codec): `tell()`
+    // returns an opaque decoder-state cookie, not a byte offset.
+    if f.text_incr_active_gate() && f.readable() {
+        return f.tell_text_incr();
+    }
+    Ok(Object::Int(f.tell()? as i64))
+}
+
+pub(crate) fn file_truncate(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    file_check_open(&f)?;
+    let size = match args.get(1) {
+        None | Some(Object::None) => None,
+        Some(Object::Bool(b)) => Some(u64::from(*b)),
+        Some(Object::Int(i)) if *i >= 0 => Some(*i as u64),
+        Some(Object::Int(_)) => return Err(value_error("Negative size value not allowed")),
+        Some(o) => Some(coerce_index_i64(o)?.max(0) as u64),
+    };
+    Ok(Object::Int(f.truncate(size)? as i64))
 }
 
 pub(crate) fn file_isatty(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::Bool(file_self(args)?.isatty()))
+    let f = file_self(args)?;
+    // `isatty()` on a closed stream raises (`test_io.test_io_after_close`).
+    if *f.closed.borrow() {
+        return Err(value_error("I/O operation on closed file"));
+    }
+    Ok(Object::Bool(f.isatty()))
 }
 
 pub(crate) fn file_fileno(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -10875,6 +11682,306 @@ pub(crate) fn file_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(file_self(args)?.seekable()))
 }
 
+// `IOBase._checkReadable/_checkWritable/_checkSeekable/_checkClosed` — the
+// private protocol helpers CPython's `io` objects expose. The layered `_pyio`
+// Buffered*/TextIOWrapper classes call these on the raw stream they wrap (e.g.
+// `BufferedRandom.__init__` does `raw._checkSeekable()`); native `Object::File`
+// raws must answer them, raising `io.UnsupportedOperation`/`ValueError` exactly
+// as CPython's `_io._IOBase` does.
+pub(crate) fn file_check_readable(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !file_self(args)?.readable() {
+        return Err(crate::stdlib::io::unsupported_op(
+            "File or stream is not readable.",
+        ));
+    }
+    Ok(Object::None)
+}
+
+pub(crate) fn file_check_writable(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !file_self(args)?.writable() {
+        return Err(crate::stdlib::io::unsupported_op(
+            "File or stream is not writable.",
+        ));
+    }
+    Ok(Object::None)
+}
+
+pub(crate) fn file_check_seekable(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !file_self(args)?.seekable() {
+        return Err(crate::stdlib::io::unsupported_op(
+            "File or stream is not seekable.",
+        ));
+    }
+    Ok(Object::None)
+}
+
+pub(crate) fn file_check_closed(args: &[Object]) -> Result<Object, RuntimeError> {
+    if *file_self(args)?.closed.borrow() {
+        return Err(value_error("I/O operation on closed file."));
+    }
+    Ok(Object::None)
+}
+
+/// `RawIOBase.readall()` — read and return all bytes until EOF. CPython's
+/// `_pyio.BufferedReader` falls back to `raw.readall()` for a full read; a
+/// native binary `Object::File` answers it as a sizeless `read()`.
+pub(crate) fn file_readall(args: &[Object]) -> Result<Object, RuntimeError> {
+    let self_arg = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("readall() requires a file"))?;
+    file_read(std::slice::from_ref(&self_arg))
+}
+
+/// The PEP-307 instance-`__dict__` slot for an in-memory stream's pickle
+/// state. For a *subclass* (`Object::Instance` wrapping the native stream) the
+/// attributes live in the instance dict; for the base `Object::File` they live
+/// in `extra_attrs`. CPython's base streams expose `None` until an attribute is
+/// set, so an empty store reads back as `None`.
+fn mem_dict_slot(receiver: &Object) -> Object {
+    match receiver {
+        Object::Instance(inst) => {
+            let d = inst.dict.borrow();
+            if d.is_empty() {
+                Object::None
+            } else {
+                Object::Dict(Rc::new(RefCell::new(d.clone())))
+            }
+        }
+        Object::File(f) => {
+            let attrs = f.extra_attrs.borrow();
+            if attrs.is_empty() {
+                Object::None
+            } else {
+                let mut d = crate::object::DictData::new();
+                for (k, v) in attrs.iter() {
+                    d.insert(DictKey(Object::from_str(k.clone())), v.clone());
+                }
+                Object::Dict(Rc::new(RefCell::new(d)))
+            }
+        }
+        _ => Object::None,
+    }
+}
+
+/// Restore the instance-`__dict__` slot from a pickle state onto the receiver
+/// (subclass instance dict, or base stream `extra_attrs`).
+fn mem_apply_dict(receiver: &Object, dict: &Rc<RefCell<DictData>>) {
+    match receiver {
+        Object::Instance(inst) => {
+            let mut inst_dict = inst.dict.borrow_mut();
+            for (k, v) in dict.borrow().iter() {
+                inst_dict.insert(k.clone(), v.clone());
+            }
+        }
+        Object::File(f) => {
+            for (k, v) in dict.borrow().iter() {
+                if let Object::Str(name) = &k.0 {
+                    f.set_extra_attr(name, v.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `BytesIO.__getstate__` / `StringIO.__getstate__`. Unlike file-backed
+/// streams, CPython's in-memory streams *are* picklable; the state tuple
+/// mirrors `Modules/_io/{bytesio,stringio}.c`:
+///   * `BytesIO`  → `(buffer: bytes, pos: int, dict | None)`
+///   * `StringIO` → `(value: str, newline: str, pos: int, dict | None)`
+/// The trailing slot is the instance `__dict__` (or `None` when empty). A
+/// closed stream raises `ValueError`, exactly like CPython.
+pub(crate) fn file_getstate_mem(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::object::FileBackend;
+    let receiver = args
+        .first()
+        .ok_or_else(|| type_error("__getstate__ requires a stream"))?;
+    let f = file_self(args)?;
+    if !f.is_memory() {
+        // File-backed streams stay unpicklable (`file_reduce_forbidden`).
+        return file_reduce_forbidden(args);
+    }
+    if *f.closed.borrow() {
+        return Err(value_error("__getstate__ on closed file"));
+    }
+    let pos = f.position() as i64;
+    let dict_slot = mem_dict_slot(receiver);
+    let value = f
+        .getvalue()
+        .ok_or_else(|| type_error("not an in-memory stream"))?;
+    let is_text = matches!(&*f.backend.borrow(), FileBackend::MemText { .. });
+    if is_text {
+        // StringIO's writer-newline (default `'\n'`, like CPython).
+        let nl = f
+            .newline
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "\n".to_owned());
+        Ok(Object::new_tuple(vec![
+            value,
+            Object::from_str(nl),
+            Object::Int(pos),
+            dict_slot,
+        ]))
+    } else {
+        Ok(Object::new_tuple(vec![value, Object::Int(pos), dict_slot]))
+    }
+}
+
+/// `BytesIO.__reduce__` / `__reduce_ex__` / `StringIO.__reduce__` for the *base*
+/// `Object::File` stream — reconstruct via `(cls, (), state)`: `cls()` mints an
+/// empty stream and `__setstate__` refills it. `cls` pickles by reference now
+/// that the concrete types report `__module__ == "_io"`, so
+/// `pickle.loads(pickle.dumps(BytesIO(...)))` and `copy.copy`/`copy.deepcopy`
+/// round-trip. (Subclass instances go through `object.__reduce_ex__`'s
+/// `__newobj__` path instead, since their `__init__` may require arguments.)
+/// File-backed streams fall back to the forbidding reducer.
+pub(crate) fn file_reduce_mem(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    if !f.is_memory() {
+        return file_reduce_forbidden(args);
+    }
+    let cls = Object::Type(class_of(&Object::File(f.clone())));
+    // `__reduce_ex__(self, protocol)` carries the protocol in `args[1]`; the
+    // reconstruction tuple is protocol-independent, so it is ignored. Reuse the
+    // same `self` slot for `__getstate__`.
+    let state = file_getstate_mem(&args[..1])?;
+    Ok(Object::new_tuple(vec![
+        cls,
+        Object::new_tuple(Vec::new()),
+        state,
+    ]))
+}
+
+/// Validate a `StringIO` newline value (pickle state slot 1). CPython accepts
+/// `None` / `""` / `"\n"` / `"\r"` / `"\r\n"`, raising `ValueError` for any
+/// other string and `TypeError` for a non-string.
+fn validate_stringio_newline(value: &Object) -> Result<Option<String>, RuntimeError> {
+    match value {
+        Object::None => Ok(None),
+        Object::Str(s) => match s.as_ref() {
+            "" | "\n" | "\r" | "\r\n" => Ok(Some(s.to_string())),
+            other => Err(value_error(format!("illegal newline value: '{other}'"))),
+        },
+        _ => Err(type_error("newline must be str or None")),
+    }
+}
+
+/// `BytesIO.__setstate__` / `StringIO.__setstate__` — restore buffer, position,
+/// newline (StringIO), and instance dict from a `__getstate__` tuple. The
+/// validation order and error types mirror `bytesio.c`/`stringio.c` exactly
+/// (test_memoryio `test_setstate`): closed → `ValueError`; non-tuple / short
+/// tuple / wrong-typed buffer/newline/position / non-dict slot → `TypeError`;
+/// negative position or illegal newline → `ValueError`. All inputs are
+/// validated *before* any mutation.
+pub(crate) fn file_setstate_mem(args: &[Object]) -> Result<Object, RuntimeError> {
+    use crate::object::FileBackend;
+    let receiver = args
+        .first()
+        .ok_or_else(|| type_error("__setstate__ requires a stream"))?;
+    let f = file_self(args)?;
+    let is_text = matches!(&*f.backend.borrow(), FileBackend::MemText { .. });
+    let kind = if is_text { "StringIO" } else { "BytesIO" };
+    let want = if is_text { 4 } else { 3 };
+    // (1) A closed stream rejects setstate with ValueError.
+    if *f.closed.borrow() {
+        return Err(value_error(format!("__setstate__ on closed {kind}")));
+    }
+    // (2) The state must be a tuple of the right arity.
+    let items: &[Object] = match args.get(1) {
+        Some(Object::Tuple(t)) if t.len() >= want => t,
+        _ => {
+            return Err(type_error(format!(
+                "{kind}.__setstate__ argument should be a {want}-tuple, got something else"
+            )))
+        }
+    };
+    // (3) The instance-dict slot (last element) must be a dict or None.
+    let dict_to_apply = match &items[want - 1] {
+        Object::None => None,
+        Object::Dict(d) => Some(d.clone()),
+        _ => {
+            return Err(type_error(format!(
+                "{} item of state should be a dict",
+                if is_text { "fourth" } else { "third" }
+            )))
+        }
+    };
+    if is_text {
+        // (4) value: str; (5) newline: valid str/None; (6) pos: non-negative int.
+        let txt = match &items[0] {
+            Object::Str(s) => s.to_string(),
+            // Restore a surrogate-bearing buffer through the PUA bridge.
+            Object::WStr(cps) => bridge_encode_cps(cps),
+            _ => return Err(type_error("initial_value must be str or None")),
+        };
+        let newline = validate_stringio_newline(&items[1])?;
+        let pos = pos_from_state(&items[2], "third")?;
+        if let FileBackend::MemText { data, pos: tpos } = &mut *f.backend.borrow_mut() {
+            *data = txt;
+            *tpos = pos;
+        }
+        f.set_newline(newline.as_deref());
+    } else {
+        // (4) buffer: bytes-like; (5) pos: non-negative int.
+        let buf = match &items[0] {
+            Object::Bytes(b) => b.to_vec(),
+            Object::ByteArray(b) => b.borrow().clone(),
+            _ => return Err(type_error("a bytes-like object is required")),
+        };
+        let pos = pos_from_state(&items[1], "second")?;
+        if let FileBackend::MemBytes { data, pos: bpos } = &mut *f.backend.borrow_mut() {
+            *data.borrow_mut() = buf;
+            *bpos = pos;
+        }
+    }
+    if let Some(d) = dict_to_apply {
+        mem_apply_dict(receiver, &d);
+    }
+    Ok(Object::None)
+}
+
+/// Decode a pickle-state position slot: must be a non-negative int
+/// (`TypeError` otherwise, `ValueError` if negative — matching CPython).
+fn pos_from_state(slot: &Object, ordinal: &str) -> Result<usize, RuntimeError> {
+    match slot {
+        Object::Int(n) if *n >= 0 => Ok(*n as usize),
+        Object::Int(_) => Err(value_error("position value cannot be negative")),
+        _ => Err(type_error(format!(
+            "{ordinal} item of state must be an integer"
+        ))),
+    }
+}
+
+/// `IOBase.__getstate__` / `__reduce_ex__` — CPython forbids pickling stream
+/// objects (`TypeError: cannot pickle '_io.X' object`). Native `Object::File`
+/// streams mirror that so `test_io`'s `test_pickling` (which asserts the
+/// TypeError) passes.
+pub(crate) fn file_reduce_forbidden(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    let name = if !f.binary {
+        "_io.TextIOWrapper"
+    } else if matches!(
+        &*f.backend.borrow(),
+        crate::object::FileBackend::MemBytes { .. }
+    ) {
+        "_io.BytesIO"
+    } else if f.writable() && f.readable() {
+        "_io.BufferedRandom"
+    } else if f.writable() {
+        "_io.BufferedWriter"
+    } else {
+        "_io.BufferedReader"
+    };
+    Err(type_error(format!("cannot pickle '{name}' object")))
+}
+
+pub(crate) fn file_getbuffer(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    f.getbuffer()
+}
+
 pub(crate) fn file_getvalue(args: &[Object]) -> Result<Object, RuntimeError> {
     let f = file_self(args)?;
     f.getvalue()
@@ -10882,7 +11989,14 @@ pub(crate) fn file_getvalue(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 pub(crate) fn file_enter(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::File(file_self(args)?))
+    // CPython's `IOBase.__enter__` runs `self._checkClosed()` first, so
+    // re-entering a closed file (e.g. `with already_closed_tempfile:`) raises
+    // `ValueError` rather than silently succeeding.
+    let f = file_self(args)?;
+    if f.is_closed() {
+        return Err(value_error("I/O operation on closed file"));
+    }
+    Ok(Object::File(f))
 }
 
 pub(crate) fn file_exit(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -10903,7 +12017,7 @@ pub(crate) fn file_exit(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
     }
-    file_self(args)?.close();
+    file_self(args)?.close_with_flush()?;
     Ok(Object::None)
 }
 

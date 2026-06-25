@@ -355,6 +355,10 @@ impl GilGuard {
         let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =
             unsafe { std::mem::transmute(new_guard) };
         self._lock_guard = Some(static_guard);
+        // Returning from a blocking release is a fresh contiguous hold:
+        // restart the switch-interval clock (CPython gives a thread that
+        // just took the GIL the full interval before the next hand-off).
+        note_gil_acquired();
         debug_assert_eq!(saved, self.state.depth.load(Ordering::Acquire));
         result
     }
@@ -381,6 +385,75 @@ pub fn global_gil() -> Arc<GilState> {
     use std::sync::OnceLock;
     static GLOBAL: OnceLock<Arc<GilState>> = OnceLock::new();
     GLOBAL.get_or_init(|| Arc::new(GilState::new())).clone()
+}
+
+/// CPython `_PyEval_ReInitThreads` / `PyOS_AfterFork_Child`: rebuild the
+/// GIL in a `fork(2)` child.
+///
+/// After a fork from a multi-threaded process only the forking thread
+/// survives, but the GIL's `parking_lot` primitives were duplicated
+/// mid-flight. The GIL `ReentrantMutex` carries the PARKED bit for the
+/// sibling threads that were blocked in [`GilState::acquire`] at fork
+/// time, the eval breaker still counts them as waiters, and
+/// `parking_lot`'s process-global parking-lot table references their
+/// now-gone `ThreadParker`s. The first hand-off in the child
+/// ([`maybe_yield_gil`] / [`allow_threads_then`] releasing the lock) then
+/// walks `parking_lot`'s unpark path into a vanished peer and the child
+/// wedges forever — `test_threading.test_reinit_tls_after_fork` forks
+/// from 16 threads, and any child that loses this race never reaches its
+/// `os._exit`, so the parent's `waitpid` times out.
+///
+/// Rebuild from scratch: abandon the inherited guard stack *without*
+/// unlocking the poisoned lock, overwrite the lock and hand-off
+/// primitives with fresh ones, zero the breaker, and re-take the fresh
+/// lock for this lone surviving thread.
+pub fn reinit_after_fork_in_child() {
+    let gil = global_gil();
+    // 1. Abandon the inherited guards without running their `Drop`:
+    //    dropping a `GilGuard` unlocks the inherited (poisoned)
+    //    `ReentrantMutex`, and `parking_lot`'s unlock-slow path would try
+    //    to hand the lock to one of the vanished peers. `mem::forget`
+    //    leaks one `Arc<GilState>` refcount per held guard — negligible,
+    //    and the alternative (unlocking) deadlocks.
+    let held: Vec<GilGuard> = GIL_GUARD_STACK.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    let depth = held.len();
+    for g in held {
+        std::mem::forget(g);
+    }
+    // 2. Replace the `parking_lot` primitives in place with pristine ones.
+    //    The child is single-threaded here, so nothing races this write;
+    //    every live `Arc<GilState>` clone shares this allocation, so the
+    //    swap is observed consistently. `ptr::write` deliberately does not
+    //    drop the old (poisoned) values.
+    // SAFETY: sole surviving thread post-fork; the `Arc` keeps the
+    // allocation alive for the duration of the writes.
+    let p = Arc::as_ptr(&gil).cast_mut();
+    unsafe {
+        std::ptr::write(&raw mut (*p).lock, GilLock::new());
+        std::ptr::write(&raw mut (*p).switch_mutex, Mutex::new(()));
+        std::ptr::write(&raw mut (*p).switch_cond, Condvar::new());
+        std::ptr::write(&raw mut (*p).pending, Mutex::new(Vec::new()));
+    }
+    // 3. Reset the hand-off bookkeeping. No peers remain: no waiters, no
+    //    queued pending calls, no drop request.
+    gil.breaker.waiters.store(0, Ordering::Release);
+    gil.breaker.pending_calls.store(0, Ordering::Release);
+    gil.breaker.flags.store(0, Ordering::Release);
+    gil.holder.store(0, Ordering::Release);
+    gil.depth.store(0, Ordering::Release);
+    gil.switch_number.store(0, Ordering::Release);
+    // 4. The forking thread is now this process's only — and therefore
+    //    main — thread, so signal handling must run here (CPython resets
+    //    the runtime's main thread in the child).
+    MAIN_THREAD_ID.store(current_thread_id(), Ordering::Release);
+    // 5. Re-take the fresh GIL, restoring the guard-stack depth the caller
+    //    held before the fork so the unwinding eval loop stays balanced.
+    let mut fresh = Vec::with_capacity(depth.max(1));
+    for _ in 0..depth {
+        fresh.push(gil.acquire());
+    }
+    GIL_GUARD_STACK.with(|cell| *cell.borrow_mut() = fresh);
+    note_gil_acquired();
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +557,9 @@ pub fn allow_threads_then<R>(f: impl FnOnce() -> R) -> R {
         fresh.push(gil.acquire());
     }
     GIL_GUARD_STACK.with(|cell| *cell.borrow_mut() = fresh);
+    // Returning from a blocking release is a fresh contiguous hold:
+    // restart the switch-interval clock.
+    note_gil_acquired();
     result
 }
 
@@ -496,6 +572,25 @@ const GIL_CHECK_INTERVAL: u32 = 128;
 std::thread_local! {
     static YIELD_COUNTDOWN: std::cell::Cell<u32> =
         const { std::cell::Cell::new(GIL_CHECK_INTERVAL) };
+
+    /// Wall-clock instant at which this thread last (re)acquired the GIL
+    /// for a contiguous run. [`maybe_yield_gil`] reads it to enforce
+    /// CPython's *time-based* switch interval: a thread that has held the
+    /// GIL for less than `sys.setswitchinterval()` (default 5ms) keeps it
+    /// even when another thread is waiting, instead of handing off every
+    /// [`GIL_CHECK_INTERVAL`] opcodes.
+    ///
+    /// Without this gate WeavePy switched threads ~1000× more often than
+    /// CPython (every 128 opcodes vs every 5ms), which widened the window
+    /// for the inherently-non-atomic Python-level `x += 1` / `x -= 1` on a
+    /// shared object to the point where `test_multiprocessing`'s
+    /// `test_release_task_refs` (a `CountedObject.n_instances -= 1` in
+    /// `__del__` racing an unpickle's `__new__` increment across the pool's
+    /// result-handler thread and the main thread) lost an update ~1 run in
+    /// 3. CPython's GIL holds for the full interval between switches, so the
+    /// two bytecode triples never interleave in practice; this matches that.
+    static GIL_HELD_SINCE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
 
     /// Depth of nested "no cooperative GIL hand-off" critical sections
     /// on this thread. While `> 0`, [`maybe_yield_gil`] refuses to drop
@@ -533,6 +628,30 @@ pub fn no_gil_handoff() -> NoYieldGuard {
 #[inline]
 fn no_yield_active() -> bool {
     NO_YIELD_DEPTH.with(std::cell::Cell::get) > 0
+}
+
+/// Record that the calling thread has just (re)acquired the GIL for a
+/// fresh contiguous run, resetting the [`GIL_HELD_SINCE`] switch-interval
+/// clock. Called from the paths that retake the GIL after a release: the
+/// cooperative hand-off re-acquire in [`maybe_yield_gil`] and the
+/// blocking-release re-acquire in [`GilGuard::allow_threads`].
+#[inline]
+pub fn note_gil_acquired() {
+    GIL_HELD_SINCE.with(|c| c.set(Some(std::time::Instant::now())));
+}
+
+/// Whether this thread has held the GIL long enough (≥ the configured
+/// `sys.setswitchinterval`) that a cooperative hand-off to a waiter is due.
+/// A thread holding for less than the interval keeps the GIL — CPython's
+/// timer-driven `gil_drop_request` semantics. The first checkpoint after a
+/// thread starts (no recorded acquire instant) is treated as "due" so a
+/// brand-new holder doesn't starve an already-waiting thread.
+#[inline]
+fn switch_interval_elapsed() -> bool {
+    GIL_HELD_SINCE.with(|c| match c.get() {
+        Some(since) => since.elapsed() >= global_gil().breaker.switch_interval(),
+        None => true,
+    })
 }
 
 /// RAII guard returned by [`no_gil_handoff`]. Decrements the
@@ -595,6 +714,18 @@ fn maybe_yield_gil() {
     if gil.breaker.waiter_count() == 0 {
         return;
     }
+    // CPython hands the GIL off on a wall-clock interval, not an opcode
+    // count: the holder runs for ≥ `sys.setswitchinterval()` (default 5ms)
+    // before a waiter's `gil_drop_request` takes effect. Honour that here so
+    // a short burst of bytecode between checkpoints — e.g. a finalizer's
+    // `n_instances -= 1` or an unpickle's `__new__` increment — completes
+    // without another thread slipping in mid-`LOAD`/`STORE` and clobbering a
+    // shared counter (the `test_release_task_refs` race). A thread that has
+    // held the GIL for less than the interval keeps running; the next
+    // checkpoint after the interval elapses performs the hand-off.
+    if !switch_interval_elapsed() {
+        return;
+    }
     let popped: Vec<GilGuard> =
         GIL_GUARD_STACK.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     if popped.is_empty() {
@@ -627,6 +758,9 @@ fn maybe_yield_gil() {
         fresh.push(gil.acquire());
     }
     GIL_GUARD_STACK.with(|cell| *cell.borrow_mut() = fresh);
+    // Fresh contiguous hold: restart the switch-interval clock so this
+    // thread now runs for the full interval before yielding again.
+    note_gil_acquired();
 }
 
 /// Best-effort current-thread native id. Returns the OS thread
@@ -673,6 +807,49 @@ pub fn current_thread_id() -> u64 {
 #[inline]
 pub fn current_native_thread_id() -> u64 {
     current_thread_id()
+}
+
+/// The kernel-level thread id of the calling thread, as reported by
+/// `threading.get_native_id()` / `Thread.native_id`.
+///
+/// This differs from [`current_thread_id`]: that returns a
+/// `pthread_self()` pointer, which is only unique *within* a process and
+/// — on macOS — is frequently the *same* address for the main thread of
+/// every process (the main thread's `pthread_t` lives at a fixed slot).
+/// CPython's `native_id` is instead the OS scheduler's thread id
+/// (Linux `gettid(2)`, macOS `pthread_threadid_np`), which is globally
+/// unique and therefore differs across `fork`/`spawn` children — exactly
+/// what `test_multiprocessing`'s `test_process_mainthread_native_id`
+/// asserts (`assertNotEqual(parent_tid, child_tid)`).
+pub fn current_os_native_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::syscall(libc::SYS_gettid) as u64
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        let mut tid: u64 = 0;
+        // Current thread's kernel id. Passing our own `pthread_self()`
+        // (rather than NULL) keeps the `pthread_t` argument well-typed.
+        libc::pthread_threadid_np(libc::pthread_self(), &raw mut tid);
+        tid
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        extern "system" {
+            fn GetCurrentThreadId() -> u32;
+        }
+        u64::from(GetCurrentThreadId())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "windows"
+    )))]
+    {
+        current_thread_id()
+    }
 }
 
 /// Snapshot of pending eval-breaker actions, drained as a unit

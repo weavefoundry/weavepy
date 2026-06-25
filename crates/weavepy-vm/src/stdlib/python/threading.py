@@ -117,6 +117,12 @@ def gettrace():
 
 # Synchronization classes
 
+# CPython 3.13 binds `threading.Lock` to the lock *type* (`_thread.LockType`),
+# not the `allocate_lock` factory it used through 3.12. The type is callable
+# with no args (so `Lock()` still mints a lock and `Lock(1)` raises TypeError),
+# supports `Lock | None` (PEP 604), and pickles by reference via the
+# `_thread.lock` alias. `test_threading.test_lock_no_args` / `test_lock_or_none`
+# assert exactly this.
 Lock = _LockType
 
 def RLock(*args, **kwargs):

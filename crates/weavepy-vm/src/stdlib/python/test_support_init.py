@@ -870,27 +870,72 @@ def catch_unraisable_exception():
         catcher.unraisable = None
 
 
-@contextlib.contextmanager
-def infinite_recursion(max_depth=None):
-    """Raise the recursion limit so tests can recurse (nearly) without
-    bound — CPython's helper sets 20 000 by default and relies on the
-    C-stack guard underneath; callers pass a small ``max_depth`` when
-    they *want* a quick ``RecursionError``."""
-    if max_depth is None:
-        max_depth = 20_000
-    elif max_depth < 3:
-        raise ValueError("max_depth must be at least 3")
-    get_limit = getattr(sys, 'getrecursionlimit', None)
-    set_limit = getattr(sys, 'setrecursionlimit', None)
-    if get_limit is None or set_limit is None:
-        yield
-        return
-    original_depth = get_limit()
+def get_recursion_depth():
+    """Get the recursion depth of the caller function.
+
+    In the __main__ module, at the module level, it should be 1.
+    """
     try:
-        set_limit(max_depth)
+        import _testinternalcapi
+        depth = _testinternalcapi.get_recursion_depth()
+    except (ImportError, AttributeError, RecursionError):
+        # `_testinternalcapi` is a partial stub under WeavePy (it exists but
+        # does not expose `get_recursion_depth`), so tolerate `AttributeError`
+        # alongside CPython's `ImportError`/`RecursionError` and fall back to
+        # the portable `sys._getframe()` + `frame.f_back` walk.
+        try:
+            depth = 0
+            frame = sys._getframe()
+            while frame is not None:
+                depth += 1
+                frame = frame.f_back
+        finally:
+            # Break any reference cycles.
+            frame = None
+
+    # Ignore get_recursion_depth() frame.
+    return max(depth - 1, 1)
+
+
+def get_recursion_available():
+    """Get the number of available frames before RecursionError.
+
+    It depends on the current recursion depth of the caller function and
+    sys.getrecursionlimit().
+    """
+    limit = sys.getrecursionlimit()
+    depth = get_recursion_depth()
+    return limit - depth
+
+
+@contextlib.contextmanager
+def set_recursion_limit(limit):
+    """Temporarily change the recursion limit."""
+    original_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(limit)
         yield
     finally:
-        set_limit(original_depth)
+        sys.setrecursionlimit(original_limit)
+
+
+def infinite_recursion(max_depth=None):
+    """Set a recursion limit just *above* the current depth so callers can
+    drive themselves into ``RecursionError`` predictably. ``max_depth`` is
+    headroom *relative to the current depth* — matching CPython's helper —
+    not an absolute limit, so a small value like 25 leaves the existing
+    call stack intact instead of tripping the guard immediately."""
+    if max_depth is None:
+        # Pick a number large enough to cause problems
+        # but not take too long for code that can handle
+        # very deep recursion.
+        max_depth = 20_000
+    elif max_depth < 3:
+        raise ValueError(f"max_depth must be at least 3, got {max_depth}")
+    depth = get_recursion_depth()
+    depth = max(depth - 1, 1)  # Ignore infinite_recursion() frame.
+    limit = depth + max_depth
+    return set_recursion_limit(limit)
 
 
 def no_tracing(func):
@@ -1092,6 +1137,11 @@ _4G = 4 * _1G
 
 Py_DEBUG = hasattr(sys, 'gettotalrefcount')
 
+# Profile-guided-optimization build flags. WeavePy is never a PGO build, so
+# both are False (tests gate slow/extra assertions on these).
+PGO = False
+PGO_EXTENDED = False
+
 # Directory holding the test package. Resolved against the on-disk
 # `Lib/test` (the frozen package's `__file__` is synthetic — see
 # `_test_home_dir`), so `STDLIB_DIR` correctly points at `Lib` for
@@ -1174,6 +1224,34 @@ def precisionbigmemtest(size, memuse, dry_run=True):
     return bigmemtest(size, memuse, dry_run)
 
 
+def flush_std_streams():
+    if sys.stdout is not None:
+        sys.stdout.flush()
+    if sys.stderr is not None:
+        sys.stderr.flush()
+
+
+def print_warning(msg):
+    # bpo-45410: Explicitly flush stdout to keep logs in order
+    flush_std_streams()
+    stream = print_warning.orig_stderr
+    for line in msg.splitlines():
+        print(f"Warning -- {line}", file=stream)
+    stream.flush()
+
+
+# bpo-39983: Store the original sys.stderr at Python startup to be able to
+# log warnings even if sys.stderr is captured temporarily by a test.
+print_warning.orig_stderr = sys.stderr
+
+
+# Flag used by saved_test_environment of test.libregrtest.save_env, to check if
+# a test modified the environment. threading_helper.threading_cleanup() sets it
+# when it fails to cleanup threads, and the multiprocessing test teardowns read
+# it. Reset to False before running a new test.
+environment_altered = False
+
+
 def reap_children():
     """Best-effort reap of any leaked child processes (no-op on success)."""
     if not hasattr(os, 'waitpid') or not hasattr(os, 'WNOHANG'):
@@ -1185,6 +1263,73 @@ def reap_children():
             break
         if pid == 0:
             break
+
+
+def skip_if_broken_multiprocessing_synchronize():
+    """Skip tests if the multiprocessing.synchronize module is missing, if
+    there is no available semaphore implementation, or if creating a lock
+    raises an OSError (on Linux only).
+
+    Faithful port of CPython 3.13's ``test.support`` helper; the
+    ``test_multiprocessing_*`` packages call it at import time.
+    """
+    # Skip tests if the _multiprocessing extension is missing.
+    import_module('_multiprocessing')
+    # Skip tests if there is no available semaphore implementation:
+    # multiprocessing.synchronize requires _multiprocessing.SemLock.
+    synchronize = import_module('multiprocessing.synchronize')
+    if sys.platform == "linux":
+        try:
+            # bpo-38377: On Linux, creating a semaphore fails with OSError
+            # if the current user does not have the permission to create
+            # a file in /dev/shm/ directory.
+            synchronize.Lock(ctx=None)
+        except OSError as exc:
+            raise unittest.SkipTest(f"broken multiprocessing SemLock: {exc!r}")
+
+
+def wait_process(pid, *, exitcode, timeout=None):
+    """Wait until process *pid* completes and assert its exit code.
+
+    Mirrors `test.support.wait_process`: poll `waitpid(WNOHANG)` until the
+    child is reaped (or *timeout* elapses, in which case it is killed and an
+    AssertionError raised), then compare the decoded exit status to
+    *exitcode*.
+    """
+    if os.name == "nt":
+        pid2, status = os.waitpid(pid, 0)
+        if status != exitcode:
+            raise AssertionError(
+                f"process {pid} exit code {status} != {exitcode}")
+        return
+
+    if timeout is None:
+        timeout = SHORT_TIMEOUT
+    deadline = time.monotonic() + timeout
+    while True:
+        pid2, status = os.waitpid(pid, os.WNOHANG)
+        if pid2 != 0:
+            break
+        if time.monotonic() > deadline:
+            try:
+                import signal
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            raise AssertionError(
+                f"process {pid} not terminated after {timeout} seconds")
+        time.sleep(0.01)
+
+    if os.WIFSIGNALED(status):
+        exit_status = -os.WTERMSIG(status)
+    elif os.WIFEXITED(status):
+        exit_status = os.WEXITSTATUS(status)
+    else:
+        raise AssertionError(f"unknown wait status: {status!r}")
+    if exit_status != exitcode:
+        raise AssertionError(
+            f"process {pid} exit code {exit_status} != {exitcode}")
 
 
 def maybe_get_event_loop_policy():

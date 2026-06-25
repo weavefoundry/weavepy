@@ -6,7 +6,7 @@ Compiles a single ``.py`` file to a ``.pyc`` bytecode archive that
 The framing matches CPython's PEP-552 magic-tag-based layout: a
 16-byte header followed by a ``marshal.dumps`` of the code object.
 RFC 0033 adopts CPython 3.13's magic number; WeavePy's distinct
-cache tag (``weavepy-3.13``) keeps its ``.pyc`` files from colliding
+cache tag (``weavepy-313``) keeps its ``.pyc`` files from colliding
 with CPython's ``cpython-313`` artifacts.
 
 Layout (little-endian):
@@ -34,12 +34,21 @@ class PyCompileError(Exception):
 
 
 def _cache_from_source(path, optimization=""):
+    import sys
     head, tail = os.path.split(path)
     if tail.endswith(".py"):
         tail = tail[:-3]
-    suffix = "" if not optimization else "." + str(optimization)
+    suffix = "" if not optimization else ".opt-" + str(optimization)
     cache_dir = os.path.join(head, "__pycache__")
-    return os.path.join(cache_dir, "%s.weavepy-3.13%s.pyc" % (tail, suffix))
+    # The cache tag must mirror `sys.implementation.cache_tag` *exactly* (it is
+    # bumped whenever the bytecode/marshal format changes — e.g. `weavepy-313-2`
+    # for the WTF-8 arc — to invalidate stale `.pyc`s). Hardcoding the tag here
+    # silently desynchronised `py_compile` from `importlib.util.cache_from_source`
+    # after such a bump, so the `.pyc` was written under the old name and any
+    # consumer keying off the current tag (e.g. `test.support.make_legacy_pyc`)
+    # raised `FileNotFoundError`. Read it dynamically instead.
+    tag = getattr(sys.implementation, "cache_tag", None) or "weavepy-313"
+    return os.path.join(cache_dir, "%s.%s%s.pyc" % (tail, tag, suffix))
 
 
 def cache_from_source(path, optimization=""):
@@ -48,27 +57,58 @@ def cache_from_source(path, optimization=""):
 
 def compile(file, cfile=None, dfile=None, doraise=False, optimize=-1,
             invalidation_mode=None, quiet=0):
-    """Byte-compile *file* into a ``.pyc`` next to it (or in cfile)."""
+    """Byte-compile *file* into a ``.pyc`` next to it (or in cfile).
+
+    Mirrors CPython's ``py_compile.compile``: read the source, compile it
+    with the built-in compiler at the requested optimization level (wrapping
+    any compile error in :class:`PyCompileError`), then write the PEP-552
+    timestamp ``.pyc`` framing the WeavePy loader understands.
+    """
+    import builtins
     if cfile is None:
-        cfile = _cache_from_source(file)
+        if optimize >= 0:
+            opt = "" if optimize == 0 else optimize
+            cfile = _cache_from_source(file, optimization=opt)
+        else:
+            cfile = _cache_from_source(file)
     try:
-        with open(file, "r", encoding="utf-8") as f:
-            source = f.read()
+        # Read the source as *bytes*, exactly as CPython's
+        # `SourceFileLoader.get_data` does — the encoding is then resolved by
+        # the compiler from the PEP 263 coding cookie / BOM. Decoding as UTF-8
+        # up front would choke on the many non-UTF-8 fixtures CPython compiles
+        # (e.g. `test`'s Latin-1 / `coding`-cookie modules under
+        # `PyZipFile.writepy`).
+        with open(file, "rb") as f:
+            source_bytes = f.read()
         st = os.stat(file)
         mtime = int(st.st_mtime)
         size = int(st.st_size)
-        # The actual compile step is provided by the CLI via the
-        # ``__weavepy_compile__`` builtin; we delegate when present
-        # and fall back to a stub when running under the standalone
-        # interpreter without a compile entrypoint.
-        compile_fn = globals().get("__weavepy_compile__")
-        if compile_fn is None:
-            raise PyCompileError(
-                "RuntimeError",
-                "py_compile requires the WeavePy CLI",
-                file,
-            )
-        code = compile_fn(source, file, "exec")
+    except OSError as e:
+        if doraise:
+            raise PyCompileError(type(e).__name__, e, file)
+        if quiet < 2:
+            print("py_compile: skipping %r: %s" % (file, e))
+        return None
+    # The real compile step is the interpreter's built-in `compile`, exactly
+    # as CPython's `SourceFileLoader.source_to_code` ultimately calls. Passing
+    # the raw bytes lets `compile` honour the source's declared encoding. A
+    # SyntaxError (etc.) is reported as a PyCompileError so callers like
+    # `zipfile.PyZipFile` can fall back to shipping the raw `.py`.
+    try:
+        code = builtins.compile(source_bytes, dfile or file, "exec", optimize=optimize)
+    except Exception as err:
+        py_exc = PyCompileError(
+            type(err).__name__,
+            err,
+            dfile or file,
+            "%s: %s" % (type(err).__name__, err),
+        )
+        if doraise:
+            raise py_exc
+        if quiet < 2:
+            print(py_exc.msg)
+        return None
+    try:
         os.makedirs(os.path.dirname(cfile), exist_ok=True)
         with open(cfile, "wb") as f:
             f.write(MAGIC_NUMBER)
@@ -76,13 +116,13 @@ def compile(file, cfile=None, dfile=None, doraise=False, optimize=-1,
             f.write(struct.pack("<I", mtime & 0xFFFFFFFF))
             f.write(struct.pack("<I", size & 0xFFFFFFFF))
             f.write(marshal.dumps(code))
-        return cfile
     except OSError as e:
         if doraise:
             raise PyCompileError(type(e).__name__, e, file)
         if quiet < 2:
             print("py_compile: skipping %r: %s" % (file, e))
         return None
+    return cfile
 
 
 def main(args=None):

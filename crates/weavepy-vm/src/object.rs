@@ -59,6 +59,19 @@ pub enum Object {
     /// Complex number with rectangular components (RFC 0019).
     Complex(Rc<PyComplex>),
     Str(Rc<str>),
+    /// A `str` containing at least one lone surrogate (U+D800..U+DFFF), which
+    /// Rust's `str`/UTF-8 cannot represent. Stored as a sequence of code
+    /// points — each a Unicode scalar value *or* a lone surrogate. Produced by
+    /// `chr(surrogate)`, `'\udxxx'` escapes, and `surrogateescape`/
+    /// `surrogatepass` decoding; consumed by the surrogate-aware encoders,
+    /// `os.fsencode`, and `repr`. The invariant ">= 1 lone surrogate" keeps it
+    /// disjoint from [`Object::Str`]: the two never compare equal, and any
+    /// operation whose result is pure UTF-8 canonicalises back to `Str` (see
+    /// [`Object::str_from_codepoints`]). This is WeavePy's WTF-8 string arc
+    /// (RFC 0040) — CPython stores lone surrogates natively, so PEP 383
+    /// `surrogateescape` filenames, `surrogatepass`, and `chr(0xD800)` all
+    /// round-trip.
+    WStr(Rc<[u32]>),
     Tuple(Rc<[Object]>),
     List(Rc<RefCell<Vec<Object>>>),
     Dict(Rc<RefCell<DictData>>),
@@ -171,6 +184,7 @@ impl fmt::Debug for Object {
             Object::Complex(c) => write!(f, "complex({}, {})", c.real, c.imag),
             Object::Float(x) => write!(f, "{x}"),
             Object::Str(s) => write!(f, "{s:?}"),
+            Object::WStr(cps) => write!(f, "WStr({} code points)", cps.len()),
             Object::Tuple(items) => f.debug_list().entries(items.iter()).finish(),
             Object::List(items) => f.debug_list().entries(items.borrow().iter()).finish(),
             Object::Dict(d) => {
@@ -379,6 +393,36 @@ impl PyFrame {
     pub fn invalidate_locals(&self) {
         self.refresh_locals();
     }
+
+    /// CPython `take_ownership`: when a frame returns but its frame object
+    /// outlives the activation (a live traceback or an explicit
+    /// `sys._getframe`/`gi_frame` handle still references it), the
+    /// running fast-locals are *moved into* the frame object so
+    /// `frame.f_locals` stays readable for as long as that reference
+    /// lives (`traceback.TracebackException(..., capture_locals=True)`).
+    ///
+    /// We materialise the current live mirror into the `f_locals` cache,
+    /// then sever the live mirror/provider so the cache is the
+    /// authoritative, stable snapshot. The cache pins only what the frame
+    /// genuinely captured and dies together with the frame object — so a
+    /// frame referenced only by the (about-to-be-dropped) call stack, or
+    /// by garbage, is *not* given ownership (the caller keeps clearing the
+    /// mirror there) and prompt refcount finalization is preserved.
+    pub fn take_ownership_of_locals(&self) {
+        let provider = self.locals_provider.borrow().clone();
+        let Some(provider) = provider else {
+            // Already detached (or never had a provider): nothing to own.
+            return;
+        };
+        let dict = provider();
+        *self.locals_cache.borrow_mut() = Some(dict);
+        // Sever the live links: future reads return the frozen snapshot
+        // (`refresh_locals` early-returns once the provider is `None`), and
+        // dropping the provider releases its captured clones of the frame's
+        // locals mirror and cell handles.
+        *self.locals_provider.borrow_mut() = None;
+        *self.locals_mirror.borrow_mut() = None;
+    }
 }
 
 /// Internal payload for [`Object::Traceback`]. Built lazily by the
@@ -503,6 +547,25 @@ impl Drop for ByteArrayExportGuard {
     }
 }
 
+/// A raw, externally-owned memory region a [`PyMemoryView`] can window
+/// over — an `mmap.mmap` mapping or a `multiprocessing.shared_memory`
+/// block. The region is kept alive by the `Arc` held in
+/// [`MemoryViewBuffer::Shared`]; access is by raw pointer because the
+/// memory is genuinely aliased (shared across OS threads, and across
+/// processes for a file/anon shared mapping), exactly like CPython's
+/// mmap/shared-memory buffer export. Writes through the view land in the
+/// shared region. Serialisation of concurrent access is the caller's job
+/// (the GIL plus, for `multiprocessing`, the heap/semaphore locks).
+pub trait SharedMemBuffer: std::fmt::Debug + Send + Sync {
+    /// Region length in bytes.
+    fn byte_len(&self) -> usize;
+    /// Pointer to the first byte of the region (stable for the region's
+    /// lifetime — `mmap`/shared memory never moves).
+    fn data_ptr(&self) -> *mut u8;
+    /// Whether the region is read-only (an `ACCESS_READ` mapping).
+    fn is_readonly(&self) -> bool;
+}
+
 /// Backing buffer for a [`PyMemoryView`].
 #[derive(Debug)]
 pub enum MemoryViewBuffer {
@@ -512,6 +575,46 @@ pub enum MemoryViewBuffer {
     /// shared-state semantics so writes through the view land in
     /// the underlying buffer.
     ByteArray(Rc<RefCell<Vec<u8>>>),
+    /// A raw shared-memory region (`mmap`, `shared_memory`). Writes land
+    /// in the region so other threads/processes mapping it observe them.
+    Shared(Rc<dyn SharedMemBuffer>),
+}
+
+impl MemoryViewBuffer {
+    /// A read-only slice over the *entire* backing region. For `Shared`
+    /// this aliases the live mapping; for `Bytes`/`ByteArray` it borrows
+    /// the owned buffer. The returned slice is valid for `'a` because the
+    /// backing is kept alive by `self`.
+    ///
+    /// # Safety / aliasing
+    /// For `Shared`, the region is intentionally aliased shared memory; do
+    /// not hold the returned slice across a write through the same view.
+    pub fn with_read<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        match self {
+            MemoryViewBuffer::Bytes(b) => f(b),
+            MemoryViewBuffer::ByteArray(b) => f(&b.borrow()),
+            MemoryViewBuffer::Shared(s) => {
+                let slice = unsafe { std::slice::from_raw_parts(s.data_ptr(), s.byte_len()) };
+                f(slice)
+            }
+        }
+    }
+
+    /// A mutable slice over the entire backing region, or `None` for a
+    /// read-only backing (`Bytes`, or an `ACCESS_READ` `Shared`).
+    pub fn with_write<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        match self {
+            MemoryViewBuffer::Bytes(_) => None,
+            MemoryViewBuffer::ByteArray(b) => Some(f(&mut b.borrow_mut())),
+            MemoryViewBuffer::Shared(s) => {
+                if s.is_readonly() {
+                    return None;
+                }
+                let slice = unsafe { std::slice::from_raw_parts_mut(s.data_ptr(), s.byte_len()) };
+                Some(f(slice))
+            }
+        }
+    }
 }
 
 /// `memoryview(obj)` — a thin window into another bytes-like object.
@@ -553,6 +656,24 @@ impl PyMemoryView {
             start: Cell::new(0),
             len: Cell::new(len),
             readonly: Cell::new(true),
+            released: Cell::new(false),
+            format: RefCell::new("B".to_owned()),
+            itemsize: Cell::new(1),
+            shape: RefCell::new(Vec::new()),
+            strides: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// `memoryview(mmap_or_shm)` — a window over a raw shared-memory
+    /// region. Writable unless the region is `ACCESS_READ`.
+    pub fn from_shared(buf: Rc<dyn SharedMemBuffer>) -> Self {
+        let len = buf.byte_len();
+        let readonly = buf.is_readonly();
+        Self {
+            buffer: MemoryViewBuffer::Shared(buf),
+            start: Cell::new(0),
+            len: Cell::new(len),
+            readonly: Cell::new(readonly),
             released: Cell::new(false),
             format: RefCell::new("B".to_owned()),
             itemsize: Cell::new(1),
@@ -616,6 +737,7 @@ impl PyMemoryView {
                 }
                 MemoryViewBuffer::ByteArray(b.clone())
             }
+            MemoryViewBuffer::Shared(s) => MemoryViewBuffer::Shared(s.clone()),
         };
         Self {
             buffer,
@@ -685,10 +807,7 @@ impl PyMemoryView {
         if self.is_c_contiguous() {
             let start = self.start.get();
             let end = start + self.len.get();
-            return match &self.buffer {
-                MemoryViewBuffer::Bytes(b) => b[start..end].to_vec(),
-                MemoryViewBuffer::ByteArray(b) => b.borrow()[start..end].to_vec(),
-            };
+            return self.buffer.with_read(|all| all[start..end].to_vec());
         }
         let shape = self.shape_dims();
         let strides = self.stride_bytes();
@@ -718,10 +837,7 @@ impl PyMemoryView {
                 }
             }
         };
-        match &self.buffer {
-            MemoryViewBuffer::Bytes(b) => gather(b, &mut out),
-            MemoryViewBuffer::ByteArray(b) => gather(&b.borrow(), &mut out),
-        }
+        self.buffer.with_read(|buf| gather(buf, &mut out));
         out
     }
 
@@ -1081,6 +1197,218 @@ pub fn int_from_i128(v: i128) -> Object {
     match i64::try_from(v) {
         Ok(x) => Object::Int(x),
         Err(_) => Object::Long(Rc::new(num_bigint::BigInt::from(v))),
+    }
+}
+
+/// Run any tripped Python signal handler on the main thread, mirroring
+/// `os::service_pending_signals`. Used by the buffered-write flush so an
+/// `EINTR` from a blocking `write(2)` runs the handler before retrying
+/// (PEP 475). A handler that raises (e.g. a `SIGALRM` doing `1/0`) returns
+/// that error here, so the flush abandons the write instead of looping.
+#[cfg(unix)]
+fn service_pending_signals_io() -> Result<(), RuntimeError> {
+    if !crate::gil::is_main_thread() || !crate::stdlib::signal_mod::signals_pending() {
+        return Ok(());
+    }
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the active builtin call on this (main) thread;
+        // the interpreter outlives this synchronous re-entrant call, matching
+        // the `os`/`select`/`_thread` blocking-signal pattern.
+        let interp = unsafe { &mut *ptr };
+        interp.run_pending_signals_public()?;
+    }
+    Ok(())
+}
+
+/// Drain `pending` to a raw descriptor, removing the written prefix in place,
+/// and honouring PEP 475: release the GIL across each (possibly blocking)
+/// `write(2)` so peers run, and on `EINTR` run any tripped Python signal
+/// handler before retrying. A `SIGALRM` handler that raises then abandons a
+/// write blocked on a full pipe instead of looping forever — exactly what
+/// `test_io`'s `SignalsTest.test_interrupted_write_buffered` exercises (a
+/// buffered flush is one big `write` to a saturated pipe).
+///
+/// On a non-blocking would-block (`EAGAIN`/`EWOULDBLOCK`) it stops, leaves the
+/// unwritten remainder in `pending`, and returns the canonical
+/// `BlockingIOError(EAGAIN, …, 0)`; the caller restores the remainder and
+/// reports `characters_written` (`_pyio.BufferedWriter._flush_unlocked` →
+/// `BufferedWriter.write`, `test_io.test_nonblock_pipe_write_*`). The written
+/// prefix is always drained from `pending` first — including when a signal
+/// handler raises mid-flush — so the remainder is never double-written. The
+/// descriptor is borrowed, not owned, so the backing `File` must outlive it.
+#[cfg(unix)]
+fn write_drain_fd_intr(
+    fd: std::os::unix::io::RawFd,
+    pending: &mut Vec<u8>,
+) -> Result<(), RuntimeError> {
+    let mut off = 0usize;
+    let res = loop {
+        if off >= pending.len() {
+            break Ok(());
+        }
+        let chunk = &pending[off..];
+        let r = crate::gil::allow_threads_then(|| unsafe {
+            libc::write(fd, chunk.as_ptr().cast(), chunk.len())
+        });
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            let code = err.raw_os_error();
+            if code == Some(libc::EINTR) {
+                if let Err(e) = service_pending_signals_io() {
+                    break Err(e);
+                }
+                continue;
+            }
+            if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
+                break Err(crate::error::blocking_io_error_written(
+                    libc::EAGAIN,
+                    "write could not complete without blocking",
+                    0,
+                ));
+            }
+            break Err(crate::error::io_error_to_py(&err));
+        }
+        // A 0-length `write` only happens for an empty `chunk`, which the loop
+        // guard already excludes; treat a defensive 0 as completion.
+        if r == 0 {
+            break Ok(());
+        }
+        off += r as usize;
+        // Run pending Python signal handlers after *every* partial write, not
+        // just on `EINTR`. When a reader frees one byte of a saturated pipe,
+        // the blocked `write` returns a successful *partial* result rather
+        // than `EINTR` (see `test_io` `check_interrupted_write`); the buffered
+        // layer must still check signals so a `SIGALRM` handler that raises
+        // (`1/0`) surfaces here instead of re-blocking on the full pipe
+        // forever. A handler that raises returns its error and abandons the
+        // remaining write, exactly like CPython's buffered-writer flush.
+        if let Err(e) = service_pending_signals_io() {
+            break Err(e);
+        }
+    };
+    pending.drain(..off.min(pending.len()));
+    res
+}
+
+/// EAGAIN value to default to when a `BlockingIOError` lacks an explicit
+/// `errno` (it never should — the flush always sets it — but be defensive).
+#[cfg(unix)]
+const EAGAIN_FALLBACK: i32 = libc::EAGAIN;
+#[cfg(not(unix))]
+const EAGAIN_FALLBACK: i32 = 11;
+
+/// True when `err` is a `BlockingIOError` instance (so the buffered-writer
+/// `write` can mirror `_pyio.BufferedWriter.write`'s `except BlockingIOError`
+/// partial-write accounting).
+fn runtime_err_is_blocking(err: &RuntimeError) -> bool {
+    if let RuntimeError::PyException(pe) = err {
+        if let Object::Instance(inst) = &pe.instance {
+            return inst
+                .cls()
+                .is_subclass_of(&crate::builtin_types::builtin_types().blocking_io_error);
+        }
+    }
+    false
+}
+
+/// Read `e.errno` / `e.strerror` off a `BlockingIOError` so a re-raised
+/// 3-arg `BlockingIOError(errno, strerror, characters_written)` preserves them.
+fn runtime_err_eagain_info(err: &RuntimeError) -> (i32, String) {
+    if let RuntimeError::PyException(pe) = err {
+        if let Object::Instance(inst) = &pe.instance {
+            let dict = inst.dict.borrow();
+            let errno = dict
+                .get(&DictKey(Object::from_static("errno")))
+                .and_then(Object::as_i64)
+                .unwrap_or(i64::from(EAGAIN_FALLBACK)) as i32;
+            let strerror = match dict.get(&DictKey(Object::from_static("strerror"))) {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => "write could not complete without blocking".to_owned(),
+            };
+            return (errno, strerror);
+        }
+    }
+    (
+        EAGAIN_FALLBACK,
+        "write could not complete without blocking".to_owned(),
+    )
+}
+
+/// Whether a descriptor is in non-blocking mode (`O_NONBLOCK`). Used to keep
+/// the common blocking-file read path untouched: only a non-blocking fd needs
+/// the would-block → `None` handling below.
+#[cfg(unix)]
+fn fd_is_nonblocking(fd: std::os::unix::io::RawFd) -> bool {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && (flags & libc::O_NONBLOCK) != 0
+}
+
+/// Read from a *non-blocking* descriptor, mapping a would-block
+/// (`EAGAIN`/`EWOULDBLOCK`) to CPython's raw-`read` semantics: `Ok(None)` when
+/// nothing could be read yet, `Ok(Some(data))` for a (possibly partial) read,
+/// and `Ok(Some(b""))` at EOF. PEP 475: a tripped signal handler runs on
+/// `EINTR` / after each chunk and may abandon the read by raising.
+/// (`test_io.test_nonblock_pipe_write_*` reads a saturated pipe to drain it,
+/// then relies on `iter(rf.read, None)` terminating on the would-block `None`.)
+#[cfg(unix)]
+fn read_fd_nonblock(
+    fd: std::os::unix::io::RawFd,
+    n: Option<usize>,
+) -> Result<Option<Vec<u8>>, RuntimeError> {
+    match n {
+        Some(want) => {
+            if want == 0 {
+                return Ok(Some(Vec::new()));
+            }
+            let mut buf = vec![0u8; want];
+            loop {
+                let r = crate::gil::allow_threads_then(|| unsafe {
+                    libc::read(fd, buf.as_mut_ptr().cast(), want)
+                });
+                if r < 0 {
+                    let err = std::io::Error::last_os_error();
+                    let code = err.raw_os_error();
+                    if code == Some(libc::EINTR) {
+                        service_pending_signals_io()?;
+                        continue;
+                    }
+                    if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
+                        return Ok(None);
+                    }
+                    return Err(os_error(format!("read: {err}")));
+                }
+                buf.truncate(r as usize);
+                return Ok(Some(buf));
+            }
+        }
+        None => {
+            // read-all: drain until EOF or would-block, returning the bytes
+            // gathered so far (or `None` if the very first read would block).
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let r = crate::gil::allow_threads_then(|| unsafe {
+                    libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len())
+                });
+                if r < 0 {
+                    let err = std::io::Error::last_os_error();
+                    let code = err.raw_os_error();
+                    if code == Some(libc::EINTR) {
+                        service_pending_signals_io()?;
+                        continue;
+                    }
+                    if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
+                        return Ok(if out.is_empty() { None } else { Some(out) });
+                    }
+                    return Err(os_error(format!("read: {err}")));
+                }
+                if r == 0 {
+                    return Ok(Some(out));
+                }
+                out.extend_from_slice(&chunk[..r as usize]);
+                service_pending_signals_io()?;
+            }
+        }
     }
 }
 
@@ -1827,10 +2155,202 @@ impl fmt::Debug for AsyncGenAwait {
 /// the same wrapper can talk to a real file, an in-memory buffer
 /// (`io.StringIO`/`io.BytesIO`), or the interpreter's stdout/stderr
 /// sinks.
+/// Default Python-level buffer size for a buffered file stream
+/// (`io.DEFAULT_BUFFER_SIZE`).
+pub const DEFAULT_BUFFER_SIZE: usize = 8192;
+
+/// The CPython io-stack layer a [`PyFile`] presents to Python: its
+/// `type()` identity and which `io` ABC it answers `isinstance` for.
+/// WeavePy backs every file with one monolithic `PyFile`, but reports the
+/// faithful layered class (`FileIO`/`BufferedReader`/…/`TextIOWrapper`,
+/// `BytesIO`/`StringIO`) so `type(open(p,'rb')) is io.BufferedReader` and
+/// `isinstance(io.FileIO(fd), io.RawIOBase)` hold like CPython.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IoKind {
+    /// Unbuffered raw binary file — `io.FileIO` (a `RawIOBase`).
+    Raw,
+    /// Buffered binary reader — `io.BufferedReader`.
+    BufferedReader,
+    /// Buffered binary writer — `io.BufferedWriter`.
+    BufferedWriter,
+    /// Buffered binary read+write — `io.BufferedRandom`.
+    BufferedRandom,
+    /// Text stream — `io.TextIOWrapper`.
+    Text,
+    /// In-memory bytes — `io.BytesIO`.
+    BytesIO,
+    /// In-memory text — `io.StringIO`.
+    StringIO,
+}
+
+impl IoKind {
+    /// Derive the default layer for a freshly opened file from its mode
+    /// string (CPython's `open()` buffering rules: text → `TextIOWrapper`,
+    /// binary read → `BufferedReader`, binary write/append →
+    /// `BufferedWriter`, binary update (`+`) → `BufferedRandom`).
+    pub fn from_mode(mode: &str) -> Self {
+        if mode.contains('b') {
+            if mode.contains('+') {
+                IoKind::BufferedRandom
+            } else if mode.contains('w') || mode.contains('a') || mode.contains('x') {
+                IoKind::BufferedWriter
+            } else {
+                IoKind::BufferedReader
+            }
+        } else {
+            IoKind::Text
+        }
+    }
+}
+
+/// Faithful incremental text-decode state for a text stream whose codec
+/// demands CPython's `TextIOWrapper` incremental machinery (its one-shot
+/// `decode` is `None` — a custom incremental-only codec, e.g. test_io's
+/// `test_decoder`). The common stateless codecs (utf-8/ascii/latin-1/
+/// euc_jp/…) keep the fast one-shot path and never allocate this.
+///
+/// Mirrors the `_decoder`/`_decoded_chars`/`_snapshot`/`_b2cratio`
+/// ADT in `_pyio.TextIOWrapper`: the decoder is driven a chunk at a
+/// time, decoded characters are buffered here until the client consumes
+/// them, and `_snapshot = (dec_flags, next_input)` records a point where
+/// the decoder's input buffer was empty so `tell()`/`seek()` can pack and
+/// replay an opaque cookie.
+#[derive(Debug)]
+pub struct TextIncr {
+    /// The (newline-wrapped) Python `IncrementalDecoder` instance.
+    pub decoder: Object,
+    /// Decoded characters buffered from the last chunk (`_decoded_chars`),
+    /// held as a `char` vector so the `_get_decoded_chars(n)` ADT can slice
+    /// by *character* count exactly like CPython.
+    pub decoded: Vec<char>,
+    /// How many of [`TextIncr::decoded`] characters have been handed to the
+    /// client (`_decoded_chars_used`).
+    pub decoded_used: usize,
+    /// `(_snapshot)` — the decoder flags and the not-yet-decoded input
+    /// bytes at the last empty-buffer snapshot point. `None` until the
+    /// first chunk is read.
+    pub snapshot: Option<(Object, Vec<u8>)>,
+    /// Running bytes-to-chars ratio used to seed the `tell()` decoder walk
+    /// (`_b2cratio`).
+    pub b2cratio: f64,
+}
+
+// --- Reentrant interpreter bridge for the incremental text-decode path -----
+//
+// The incremental `TextIOWrapper` machinery drives a *Python* decoder object
+// (its `decode`/`getstate`/`setstate`/`reset` methods) and reaches for the
+// frozen `codecs`/`_io` modules. Like the rest of `object.rs`'s reentrant
+// callbacks (`current_interp_hash`, the `__repr__` bridge), these borrow the
+// thread's published interpreter pointer.
+
+fn pf_with_interp<T>(
+    f: impl FnOnce(&mut crate::Interpreter) -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()
+        .ok_or_else(|| value_error("no running interpreter for text decode"))?;
+    // SAFETY: published by the enclosing VM frame on this thread; the GIL keeps
+    // the reentrant access exclusive (same contract as `current_interp_hash`).
+    let interp = unsafe { &mut *ptr };
+    f(interp)
+}
+
+/// Call `<module>.<func>(*args)` through the running interpreter.
+fn pf_mod_call(module: &str, func: &str, args: &[Object]) -> Result<Object, RuntimeError> {
+    pf_with_interp(|interp| {
+        let m = interp.import_path(module)?;
+        let f = interp.load_attr_public(&m, func)?;
+        interp.call_object(f, args, &[])
+    })
+}
+
+/// Call a plain callable `callable(*args)`.
+fn pf_call_value(callable: &Object, args: &[Object]) -> Result<Object, RuntimeError> {
+    pf_with_interp(|interp| interp.call_object(callable.clone(), args, &[]))
+}
+
+/// Call `obj.<name>(*args)` (a bound method) through the running interpreter.
+fn pf_call_method(obj: &Object, name: &str, args: &[Object]) -> Result<Object, RuntimeError> {
+    pf_with_interp(|interp| {
+        let m = interp.load_attr_public(obj, name)?;
+        interp.call_object(m, args, &[])
+    })
+}
+
+/// Split a decoder `getstate()` result `(bytes, flags)` into its parts.
+fn decoder_state_parts(state: &Object) -> Result<(Vec<u8>, Object), RuntimeError> {
+    if let Object::Tuple(items) = state {
+        if items.len() == 2 {
+            let buf = match &items[0] {
+                Object::Bytes(b) => b.to_vec(),
+                Object::ByteArray(b) => b.borrow().clone(),
+                _ => Vec::new(),
+            };
+            return Ok((buf, items[1].clone()));
+        }
+    }
+    Err(type_error("illegal decoder state"))
+}
+
+/// Coerce an int-like `Object` to a `BigInt` (decoder flags / cookie input).
+fn obj_to_bigint(o: &Object) -> BigInt {
+    match o {
+        Object::Int(i) => BigInt::from(*i),
+        Object::Long(b) => (**b).clone(),
+        Object::Bool(b) => BigInt::from(i64::from(*b)),
+        _ => BigInt::from(0),
+    }
+}
+
+/// Build the `(b'', dec_flags)` tuple a decoder `setstate` expects.
+fn make_state_tuple(dec_flags: &BigInt) -> Object {
+    Object::new_tuple(vec![
+        Object::new_bytes(Vec::new()),
+        Object::int_from_bigint(dec_flags.clone()),
+    ])
+}
+
+/// Pack a `TextIOWrapper` cookie, matching CPython's bit layout exactly:
+/// `position | (dec_flags<<64) | (bytes_to_feed<<128) | (chars_to_skip<<192)
+/// | (need_eof<<256)`.
+fn pack_text_cookie(
+    position: u64,
+    dec_flags: &BigInt,
+    bytes_to_feed: u64,
+    need_eof: bool,
+    chars_to_skip: u64,
+) -> Object {
+    let mut c = BigInt::from(position);
+    c |= dec_flags.clone() << 64usize;
+    c |= BigInt::from(bytes_to_feed) << 128usize;
+    c |= BigInt::from(chars_to_skip) << 192usize;
+    if need_eof {
+        c |= BigInt::from(1u64) << 256usize;
+    }
+    Object::int_from_bigint(c)
+}
+
+/// Inverse of [`pack_text_cookie`].
+fn unpack_text_cookie(cookie: &BigInt) -> (u64, BigInt, u64, bool, u64) {
+    let mask: BigInt = (BigInt::from(1u64) << 64usize) - 1;
+    let position = (cookie & &mask).to_u64().unwrap_or(0);
+    let rest = cookie >> 64usize;
+    let dec_flags = &rest & &mask;
+    let rest = rest >> 64usize;
+    let bytes_to_feed = (&rest & &mask).to_u64().unwrap_or(0);
+    let rest = rest >> 64usize;
+    let chars_to_skip = (&rest & &mask).to_u64().unwrap_or(0);
+    let rest = rest >> 64usize;
+    let need_eof = !(&rest & &mask).is_zero();
+    (position, dec_flags, bytes_to_feed, need_eof, chars_to_skip)
+}
+
 pub struct PyFile {
     pub name: String,
     pub mode: String,
     pub binary: bool,
+    /// The faithful CPython io layer this stream presents (`type()` and
+    /// `isinstance` identity); see [`IoKind`].
+    pub io_kind: crate::sync::Cell<IoKind>,
     pub backend: RefCell<FileBackend>,
     pub closed: RefCell<bool>,
     /// Text-mode codec (`open(..., encoding=...)`); `None` means the
@@ -1846,13 +2366,20 @@ pub struct PyFile {
     pub newline: RefCell<Option<String>>,
     /// Python-visible `name` override. Files opened from a descriptor
     /// start out named by their fd integer; `tempfile` (and user code)
-    /// reassign `f.name` to the real path. Stored separately so the
-    /// Rust-internal `name` (used for error messages, etc.) stays put.
-    pub name_override: RefCell<Option<String>>,
+    /// reassign `f.name` to the real path — or, for an anonymous temp file,
+    /// back to the integer fd. Stored as an arbitrary object so the override
+    /// faithfully round-trips `str`, `bytes`, and `int` (CPython's `FileIO`
+    /// exposes a plain writable `name`). The Rust-internal `name` (used for
+    /// error messages, etc.) stays put.
+    pub name_override: RefCell<Option<Object>>,
     /// The file was opened with a `bytes`/`bytearray` filename, so the
     /// Python-visible `f.name` must read back as `bytes` (CPython keeps the
     /// original object type).
     pub name_is_bytes: crate::sync::Cell<bool>,
+    /// The file was opened directly from an integer file descriptor
+    /// (`open(fd)`), so — absent a later override — `f.name` must read back as
+    /// that `int`, exactly like CPython's `FileIO` (`test_int_name_attribute`).
+    pub name_is_fd: crate::sync::Cell<bool>,
     /// The stream has no filesystem name (`io.BytesIO`/`io.StringIO`): reading
     /// `f.name` raises `AttributeError`, like CPython's in-memory streams.
     pub no_name: crate::sync::Cell<bool>,
@@ -1874,16 +2401,58 @@ pub struct PyFile {
     /// `.buffer` access; `None` until then and for streams that are their own
     /// buffer.
     pub binary_buffer_cache: RefCell<Option<Object>>,
+    /// Observed line endings, as CPython's `IncrementalNewlineDecoder` tracks
+    /// them for the text-mode `.newlines` attribute. Bit flags: `1`=`\r`,
+    /// `2`=`\n`, `4`=`\r\n`. Updated on every text-mode read (regardless of the
+    /// `newline=` translation policy); `0` reads back as `None`.
+    pub seennl: crate::sync::Cell<u8>,
+    /// Pending bytes for a binary [`IoKind::BufferedWriter`] over a real
+    /// descriptor: CPython's `BufferedWriter` holds writes in a Python-level
+    /// buffer until it fills, an explicit `flush()`, or `close()` — *not*
+    /// `fileno()`. This is what lets `os.close(f.fileno())` discard unflushed
+    /// data (`test_subprocess.test_bufsize_equal_one_binary_mode`) and a
+    /// large buffered write surface its `BrokenPipeError` only at flush
+    /// (`test_broken_pipe_cleanup`). Empty for every other stream kind.
+    pub write_buf: RefCell<Vec<u8>>,
+    /// The buffer-full threshold for [`PyFile::write_buf`] (`open(...,
+    /// buffering=N)`; `DEFAULT_BUFFER_SIZE` otherwise).
+    pub buf_size: crate::sync::Cell<usize>,
+    /// BOM-once bookkeeping for a text stream using a BOM-prefixing codec
+    /// (`utf-16`/`utf-32`/`utf-8-sig`): `true` while the encoder is at the
+    /// start of the stream and the next write must emit the BOM. Cleared by the
+    /// first write (and re-set by `seek(0)`), so the BOM is written exactly once
+    /// — CPython's `encoding_start_of_stream` (`test_io` BOM/seek cases).
+    pub text_start_of_stream: crate::sync::Cell<bool>,
+    /// CPython `TextIOWrapper`'s `telling` flag. `next(f)` / `for line in f`
+    /// drives `__next__`, which disables `tell()` (it would otherwise have to
+    /// unwind the readahead snapshot): `tell()` raises
+    /// `OSError("telling position disabled by next() call")` until the iterator
+    /// is exhausted or an explicit `seek()` re-enables it. Text streams only —
+    /// a binary stream's `tell()` stays live during iteration
+    /// (`test_io.test_telling`). Defaults to `true`.
+    pub telling: crate::sync::Cell<bool>,
+    /// Tri-state gate for the faithful incremental text-decode path:
+    /// `None` = undecided (compute on first text read), `Some(false)` =
+    /// the codec has a one-shot `decode` so the fast path is used,
+    /// `Some(true)` = the codec is incremental-only and reads/seeks route
+    /// through [`PyFile::text_incr`]. Decided once and cached so the hot
+    /// read path never re-probes `codecs.lookup`.
+    pub text_incr_gate: crate::sync::Cell<Option<bool>>,
+    /// Lazily-built incremental decoder + cookie state (see [`TextIncr`]).
+    /// `None` until the incremental path activates.
+    pub text_incr: RefCell<Option<TextIncr>>,
 }
 
 impl PyFile {
     pub fn new(name: impl Into<String>, mode: impl Into<String>, backend: FileBackend) -> Self {
         let mode_s = mode.into();
         let binary = mode_s.contains('b');
+        let io_kind = IoKind::from_mode(&mode_s);
         Self {
             name: name.into(),
             mode: mode_s,
             binary,
+            io_kind: crate::sync::Cell::new(io_kind),
             backend: RefCell::new(backend),
             closed: RefCell::new(false),
             encoding: RefCell::new(None),
@@ -1891,11 +2460,96 @@ impl PyFile {
             newline: RefCell::new(None),
             name_override: RefCell::new(None),
             name_is_bytes: crate::sync::Cell::new(false),
+            name_is_fd: crate::sync::Cell::new(false),
             no_name: crate::sync::Cell::new(false),
             closefd: crate::sync::Cell::new(true),
             extra_attrs: RefCell::new(Vec::new()),
             binary_buffer_cache: RefCell::new(None),
+            seennl: crate::sync::Cell::new(0),
+            write_buf: RefCell::new(Vec::new()),
+            buf_size: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE),
+            text_start_of_stream: crate::sync::Cell::new(true),
+            telling: crate::sync::Cell::new(true),
+            text_incr_gate: crate::sync::Cell::new(None),
+            text_incr: RefCell::new(None),
         }
+    }
+
+    /// Whether writes are held in [`PyFile::write_buf`] rather than going
+    /// straight to the OS: a binary `BufferedWriter` backed by a real
+    /// descriptor. Append/random and text streams write through (unchanged
+    /// behaviour); in-memory streams are their own buffer.
+    pub fn is_write_buffered(&self) -> bool {
+        self.io_kind.get() == IoKind::BufferedWriter
+            && matches!(&*self.backend.borrow(), FileBackend::Disk(_))
+    }
+
+    /// Flush the pending [`PyFile::write_buf`] to the backing descriptor.
+    /// Drains the buffer first so a failed write (e.g. `EPIPE` to a child
+    /// that already exited) leaves nothing to re-flush, then surfaces the
+    /// error like CPython's `BufferedWriter._flush_unlocked`.
+    pub fn flush_write_buf(&self) -> Result<(), RuntimeError> {
+        // `pending` is mutated only on the Unix drain path below; off Unix it is
+        // write-only-once, so suppress the spurious `unused_mut` there.
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut pending = {
+            let mut wb = self.write_buf.borrow_mut();
+            if wb.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *wb)
+        };
+        // On Unix, drain to the descriptor through the PEP 475-aware loop:
+        // snapshot the raw fd under a *short* borrow, release it, then do the
+        // (possibly blocking, GIL-released) write. Holding `backend` across the
+        // write would deadlock a signal handler that touches the same file, and
+        // `write_all` would silently retry `EINTR` — never letting a `SIGALRM`
+        // handler raise — which is the `test_interrupted_write_buffered` hang.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let raw_fd = match &*self.backend.borrow() {
+                FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                _ => None,
+            };
+            if let Some(fd) = raw_fd {
+                let res = write_drain_fd_intr(fd, &mut pending);
+                // A partial / would-block flush (or a signal-handler raise)
+                // leaves the unwritten remainder in `pending`; put it back into
+                // `write_buf` so it isn't lost and a later flush can finish it.
+                // Re-prepend it ahead of any bytes a reentrant `write()` staged
+                // while the GIL was released during the drain.
+                if !pending.is_empty() {
+                    let mut wb = self.write_buf.borrow_mut();
+                    if wb.is_empty() {
+                        *wb = pending;
+                    } else {
+                        pending.extend_from_slice(&wb);
+                        *wb = pending;
+                    }
+                }
+                return res;
+            }
+        }
+        let mut backend = self.backend.borrow_mut();
+        if let FileBackend::Disk(f) = &mut *backend {
+            use std::io::Write;
+            f.write_all(&pending)
+                .map_err(|e| crate::error::io_error_to_py(&e))?;
+        }
+        Ok(())
+    }
+
+    /// `close()` that first flushes the write buffer, mirroring `_pyio`'s
+    /// `try: self.flush() finally: self.raw.close()`: the descriptor is
+    /// always released, but a flush error (a broken pipe) still propagates.
+    pub fn close_with_flush(&self) -> Result<(), RuntimeError> {
+        if *self.closed.borrow() {
+            return Ok(());
+        }
+        let flush_res = self.flush_write_buf();
+        self.close();
+        flush_res
     }
 
     /// Read a monkeypatched per-instance attribute, if set.
@@ -1917,18 +2571,43 @@ impl PyFile {
         }
     }
 
-    /// The Python-visible `name`: the reassigned value if one was set,
-    /// otherwise the name the file was opened with.
-    pub fn display_name(&self) -> String {
-        self.name_override
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| self.name.clone())
+    /// Delete a per-instance attribute (`del f.attr`); returns whether the
+    /// name was present. CPython's file objects carry a `__dict__`, so an
+    /// attribute set via `setattr` is removable again — `test.support.swap_attr`
+    /// relies on `delattr` succeeding (or raising `AttributeError`, never
+    /// `TypeError`) when restoring a monkeypatched method/`name`.
+    pub fn delete_extra_attr(&self, name: &str) -> bool {
+        let mut attrs = self.extra_attrs.borrow_mut();
+        if let Some(pos) = attrs.iter().position(|(k, _)| k == name) {
+            attrs.remove(pos);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Reassign the Python-visible `name` (`f.name = ...`).
-    pub fn set_name(&self, name: String) {
+    /// Remove a user-assigned `f.name` override (`del f.name`); returns whether
+    /// an override was present. Only the *user* override is cleared — a real
+    /// `FileIO`'s intrinsic path/fd name is not user-deletable (CPython's
+    /// `FileIO.name` getset has no deleter), so this leaves intrinsic names in
+    /// place and the caller raises `AttributeError`.
+    pub fn clear_name_override(&self) -> bool {
+        let had = self.name_override.borrow().is_some();
+        *self.name_override.borrow_mut() = None;
+        had
+    }
+
+    /// Reassign the Python-visible `name` (`f.name = ...`). Accepts any
+    /// object so an fd integer round-trips faithfully (CPython's `tempfile`
+    /// rewrites `raw.name` to the fd for anonymous temp files).
+    pub fn set_name(&self, name: Object) {
         *self.name_override.borrow_mut() = Some(name);
+    }
+
+    /// Override the presented io layer (`io.FileIO(fd)` → `Raw`,
+    /// `io.BytesIO()` → `BytesIO`, `open(..., buffering=0)` → `Raw`).
+    pub fn set_io_kind(&self, kind: IoKind) {
+        self.io_kind.set(kind);
     }
 
     /// The Python-visible `name` *object*: `str` normally, `bytes` when the
@@ -1937,10 +2616,16 @@ impl PyFile {
     /// wins and is returned as `str`.
     pub fn name_obj(&self) -> Option<Object> {
         if let Some(n) = self.name_override.borrow().clone() {
-            return Some(Object::from_str(n));
+            return Some(n);
         }
         if self.no_name.get() {
             return None;
+        }
+        if self.name_is_fd.get() {
+            // Opened from a bare fd: `name` is the integer descriptor.
+            if let Ok(fd) = self.name.parse::<i64>() {
+                return Some(Object::Int(fd));
+            }
         }
         if self.name_is_bytes.get() {
             Some(Object::new_bytes(self.name.clone().into_bytes()))
@@ -1988,12 +2673,128 @@ impl PyFile {
                 "wb",
                 FileBackend::Stderr(w.clone()),
             )))),
+            // A *text* disk file (CPython's `TextIOWrapper`) exposes its binary
+            // underlayer (`BufferedRandom`). We collapse the buffer/raw layers
+            // into one `PyFile`, so mint a binary sibling over a `dup`-ed
+            // descriptor: a duplicated fd shares the OS file *description*, so
+            // the two stay in lock-step on the seek offset (which is what
+            // `SpooledTemporaryFile.rollover`'s `buffer.write` + `seek` relies
+            // on). `try_clone` failing simply means no `.buffer`.
+            FileBackend::Disk(file) => file.try_clone().ok().map(|dup| {
+                let mut binmode = self.mode.replace('t', "");
+                if !binmode.contains('b') {
+                    binmode.push('b');
+                }
+                let bf = PyFile::new(self.name.clone(), binmode, FileBackend::Disk(dup));
+                if let Some(n) = self.name_override.borrow().as_ref() {
+                    *bf.name_override.borrow_mut() = Some(n.clone());
+                }
+                bf.name_is_bytes.set(self.name_is_bytes.get());
+                // `f.buffer.raw.closefd` must report the same ownership flag as
+                // the text wrapper it came from (`test_io.test_closefd_attr`):
+                // a stream opened `open(fd, ..., closefd=False)` does not own
+                // its descriptor.
+                bf.closefd.set(self.closefd.get());
+                bf.name_is_fd.set(self.name_is_fd.get());
+                Object::File(Rc::new(bf))
+            }),
             _ => None,
         };
         if let Some(b) = &buf {
             *self.binary_buffer_cache.borrow_mut() = Some(b.clone());
         }
         buf
+    }
+
+    /// The stream's `mode` attribute as CPython reports it. A binary stream
+    /// (CPython `FileIO`/`Buffered*`) normalises to canonical form, so
+    /// `open(p, 'w+b').mode == 'rb+'` and `open(p, 'wb').mode == 'wb'`. A text
+    /// stream (`TextIOWrapper`) reports the mode string it was opened with.
+    pub fn reported_mode(&self) -> String {
+        if !self.binary {
+            return self.mode.clone();
+        }
+        let m = &self.mode;
+        let created = m.contains('x');
+        let appending = m.contains('a');
+        let plus = m.contains('+');
+        let readable = m.contains('r') || plus;
+        let writable = m.contains('w') || appending || created || plus;
+        if created {
+            if readable {
+                "xb+"
+            } else {
+                "xb"
+            }
+        } else if appending {
+            if readable {
+                "ab+"
+            } else {
+                "ab"
+            }
+        } else if readable {
+            if writable {
+                "rb+"
+            } else {
+                "rb"
+            }
+        } else {
+            "wb"
+        }
+        .to_string()
+    }
+
+    /// The CPython `tp_repr` string for this stream — the `<_io.… >` form keyed
+    /// on the presented io layer ([`IoKind`]). Shared by [`Object::repr`] and
+    /// the unclosed-file `ResourceWarning` emitted from [`Drop`], so the two
+    /// render byte-identically (`test_io.test_warn_on_dealloc` checks that the
+    /// pre-drop `repr(f)` is a substring of the warning message). `self_addr`
+    /// supplies the object address for the in-memory (`BytesIO`/`StringIO`)
+    /// variants that render `at 0x…`; OS-backed streams ignore it.
+    pub fn repr_with_addr(&self, self_addr: usize) -> String {
+        match self.io_kind.get() {
+            IoKind::BytesIO => format!("<_io.BytesIO object at 0x{self_addr:x}>"),
+            IoKind::StringIO => format!("<_io.StringIO object at 0x{self_addr:x}>"),
+            kind => {
+                let name = self
+                    .name_obj()
+                    .map(|o| o.repr())
+                    .unwrap_or_else(|| format!("'{}'", self.name));
+                match kind {
+                    IoKind::Raw => format!(
+                        "<_io.FileIO name={} mode='{}' closefd={}>",
+                        name,
+                        self.reported_mode(),
+                        if self.closefd.get() { "True" } else { "False" }
+                    ),
+                    IoKind::BufferedReader => format!("<_io.BufferedReader name={name}>"),
+                    IoKind::BufferedWriter => format!("<_io.BufferedWriter name={name}>"),
+                    IoKind::BufferedRandom => format!("<_io.BufferedRandom name={name}>"),
+                    _ => {
+                        let enc = self
+                            .encoding
+                            .borrow()
+                            .clone()
+                            .unwrap_or_else(|| "utf-8".to_owned());
+                        format!(
+                            "<_io.TextIOWrapper name={} mode='{}' encoding='{}'>",
+                            name, self.mode, enc
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether this stream is an in-memory `BytesIO`/`StringIO` buffer rather
+    /// than a real disk file or standard stream. CPython's in-memory streams
+    /// do not carry the `mode`/`name` attributes that OS-backed file objects
+    /// do, so callers gate those attributes on this.
+    pub fn is_memory(&self) -> bool {
+        matches!(
+            &*self.backend.borrow(),
+            FileBackend::MemBytes { .. } | FileBackend::MemText { .. }
+        )
     }
 
     /// Whether the stream is attached to a terminal (`f.isatty()`). The
@@ -2063,13 +2864,31 @@ impl PyFile {
         }
     }
 
-    /// `f.seekable()` — disk files and in-memory buffers support random
-    /// access; the live std streams do not.
+    /// `f.seekable()` — in-memory buffers always support random access; a
+    /// disk-backed stream is seekable only if the underlying descriptor is
+    /// (a regular file is, a pipe/FIFO/socket is not). CPython's `FileIO`
+    /// probes this with `lseek(fd, 0, SEEK_CUR)` and treats `ESPIPE` as
+    /// "not seekable" (`test_io.test_optional_abilities` over `os.pipe()`).
     pub fn seekable(&self) -> bool {
-        matches!(
-            &*self.backend.borrow(),
-            FileBackend::Disk(_) | FileBackend::MemBytes { .. } | FileBackend::MemText { .. }
-        )
+        match &*self.backend.borrow() {
+            FileBackend::MemBytes { .. } | FileBackend::MemText { .. } => true,
+            FileBackend::Disk(f) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = f.as_raw_fd();
+                    // SEEK_CUR with a zero offset reports the position without
+                    // moving it, so this is a side-effect-free probe.
+                    unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) >= 0 }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = f;
+                    true
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Set the text-mode codec. UTF-8 spellings collapse to the
@@ -2123,10 +2942,54 @@ impl PyFile {
     /// universal mode (`newline=None`) collapses `\r\n` and lone `\r` to
     /// `\n`. Any explicit `newline=` (including `''`) leaves input untouched.
     fn translate_newlines_read(&self, s: String) -> String {
+        // CPython's `IncrementalNewlineDecoder` records observed line endings
+        // on every read for the `.newlines` attribute, *independent* of whether
+        // translation is enabled — so update the tally before translating.
+        self.record_seen_newlines(&s);
         if self.newline.borrow().is_none() && s.as_bytes().contains(&b'\r') {
             s.replace("\r\n", "\n").replace('\r', "\n")
         } else {
             s
+        }
+    }
+
+    /// Fold the line endings present in a freshly decoded chunk into `seennl`.
+    fn record_seen_newlines(&self, s: &str) {
+        if !s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+            return;
+        }
+        let crlf = s.matches("\r\n").count();
+        let cr = s.as_bytes().iter().filter(|&&b| b == b'\r').count() - crlf;
+        let lf = s.as_bytes().iter().filter(|&&b| b == b'\n').count() - crlf;
+        let mut flags = self.seennl.get();
+        if cr > 0 {
+            flags |= 1;
+        }
+        if lf > 0 {
+            flags |= 2;
+        }
+        if crlf > 0 {
+            flags |= 4;
+        }
+        self.seennl.set(flags);
+    }
+
+    /// The Python-visible text-mode `.newlines`: `None` when nothing has been
+    /// read yet, a single string when one kind of ending was seen, or a tuple
+    /// of all kinds seen — matching CPython's `IncrementalNewlineDecoder`.
+    pub fn newlines_obj(&self) -> Object {
+        let tup = |parts: &[&'static str]| {
+            Object::new_tuple(parts.iter().map(|p| Object::from_static(p)).collect())
+        };
+        match self.seennl.get() {
+            1 => Object::from_static("\r"),
+            2 => Object::from_static("\n"),
+            3 => tup(&["\r", "\n"]),
+            4 => Object::from_static("\r\n"),
+            5 => tup(&["\r", "\r\n"]),
+            6 => tup(&["\n", "\r\n"]),
+            7 => tup(&["\r", "\n", "\r\n"]),
+            _ => Object::None,
         }
     }
 
@@ -2135,11 +2998,38 @@ impl PyFile {
     pub fn encode_text(&self, s: &str) -> Result<Vec<u8>, RuntimeError> {
         let translated = self.translate_newlines_write(s);
         let errors = self.errors_name();
-        match &*self.encoding.borrow() {
-            Some(enc) => crate::stdlib::codecs_mod::encode_str(&translated, enc, &errors),
-            None if errors == "strict" => Ok(translated.into_bytes()),
-            None => crate::stdlib::codecs_mod::encode_str(&translated, "utf-8", &errors),
-        }
+        let enc = match &*self.encoding.borrow() {
+            Some(enc) => enc.clone(),
+            None if errors == "strict" => return Ok(translated.into_bytes()),
+            None => "utf-8".to_owned(),
+        };
+        // BOM-once: a BOM-prefixing codec emits the BOM only on the first write
+        // to a stream positioned at its start; subsequent writes (and any write
+        // to a stream seeked off byte 0, e.g. append mode) use the BOM-less
+        // continuation codec (CPython `encoding_start_of_stream`).
+        let effective = match crate::stdlib::codecs_mod::bom_continuation(&enc) {
+            Some(cont) if !self.text_start_of_stream.get() => cont.to_owned(),
+            _ => enc.clone(),
+        };
+        let out = crate::stdlib::codecs_mod::encode_str(&translated, &effective, &errors)?;
+        self.text_start_of_stream.set(false);
+        Ok(out)
+    }
+
+    /// Encode a surrogate-bearing `str` (code points, possibly containing lone
+    /// surrogates) for a text-mode write, honouring the file's codec and
+    /// `errors=` handler. Mirrors [`Self::encode_text`] for the `WStr` case:
+    /// a strict UTF-8 stream raises `UnicodeEncodeError` on a lone surrogate,
+    /// while `surrogateescape`/`surrogatepass` round-trip it. Newline
+    /// translation is skipped — `\n`/`\r` are scalar values unaffected by the
+    /// surrogate payload, and a `WStr` only exists because of the surrogates.
+    pub fn encode_text_codepoints(&self, cps: &[u32]) -> Result<Vec<u8>, RuntimeError> {
+        let errors = self.errors_name();
+        let enc = match &*self.encoding.borrow() {
+            Some(enc) => enc.clone(),
+            None => "utf-8".to_owned(),
+        };
+        crate::stdlib::codecs_mod::encode_codepoints(cps, &enc, &errors)
     }
 
     /// Decode a text-mode read through the file's codec, honouring the
@@ -2154,6 +3044,489 @@ impl PyFile {
             None => crate::stdlib::codecs_mod::decode_bytes(&bytes, "utf-8", &errors)?,
         };
         Ok(self.translate_newlines_read(decoded))
+    }
+
+    /// Read up to `n` Unicode *characters* from a text-mode stream (CPython
+    /// `TextIOWrapper.read(size)` / `StringIO.read(size)` count code points,
+    /// not bytes). In-memory text is already code-point addressed, so a single
+    /// sized `read_bytes` returns exactly `n` chars' worth of bytes; a byte
+    /// descriptor (`open(p)` over disk, stdin) is decoded one code point at a
+    /// time so a multibyte character is never split across the `n`-char
+    /// boundary — `open(p, encoding="utf-8").read(2)` over "héllo" yields "hé",
+    /// not a half-decoded 2-byte slice that raises a UTF-8 error.
+    pub fn read_text_n(&self, n: usize) -> Result<String, RuntimeError> {
+        if matches!(&*self.backend.borrow(), FileBackend::MemText { .. }) {
+            let bytes = self.read_bytes(Some(n))?;
+            return self.decode_text(bytes);
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut chars = 0usize;
+        while chars < n {
+            let lead = self.read_bytes(Some(1))?;
+            let Some(&b0) = lead.first() else {
+                break; // EOF
+            };
+            // UTF-8 lead byte → number of trailing continuation bytes. A stray
+            // continuation/invalid lead is taken as a lone byte; `decode_text`
+            // then applies the stream's configured error handler.
+            let extra = match b0 {
+                0x00..=0x7F => 0,
+                0xC0..=0xDF => 1,
+                0xE0..=0xEF => 2,
+                0xF0..=0xF7 => 3,
+                _ => 0,
+            };
+            bytes.extend_from_slice(&lead);
+            if extra > 0 {
+                let cont = self.read_bytes(Some(extra))?;
+                bytes.extend_from_slice(&cont);
+            }
+            chars += 1;
+        }
+        self.decode_text(bytes)
+    }
+
+    // -- Faithful incremental text-decode path (CPython `TextIOWrapper`) -----
+    //
+    // WeavePy's fast text read path one-shot-decodes the common stateless
+    // codecs. CPython's `TextIOWrapper`, by contrast, *always* drives an
+    // `IncrementalDecoder` and exposes opaque `tell()`/`seek()` cookies that
+    // snapshot the decoder's state. The two behave identically for stateless
+    // codecs (a cookie is just a byte offset), so the fast path stays. But a
+    // custom incremental-only codec — one whose one-shot `decode` is `None`,
+    // e.g. test_io's `test_decoder`/`StatefulIncrementalDecoder` — can only be
+    // read through the incremental machinery. These methods port
+    // `_pyio.TextIOWrapper`'s `_read_chunk`/`read`/`tell`/`seek` ADT, driving
+    // the Python decoder object, and activate only when the gate below trips.
+
+    /// `_CHUNK_SIZE` for the incremental reader — honours a user-set
+    /// `f._CHUNK_SIZE` (test_io pokes it directly) and otherwise uses the
+    /// default buffer size.
+    fn text_chunk_size(&self) -> usize {
+        for (k, v) in self.extra_attrs.borrow().iter() {
+            if k == "_CHUNK_SIZE" {
+                if let Object::Int(n) = v {
+                    if *n > 0 {
+                        return *n as usize;
+                    }
+                }
+            }
+        }
+        DEFAULT_BUFFER_SIZE
+    }
+
+    /// Decide — once, lazily, and cached — whether this text stream must use
+    /// the incremental decoder path. True iff the configured codec's one-shot
+    /// `decode` is `None` (a custom incremental-only codec). For every normal
+    /// codec this is `false` and the fast one-shot path is taken.
+    pub fn text_incr_active_gate(&self) -> bool {
+        if self.binary {
+            return false;
+        }
+        if matches!(&*self.backend.borrow(), FileBackend::MemText { .. }) {
+            // In-memory `StringIO` is already code-point addressed; the
+            // incremental machinery is only for byte-backed text streams.
+            return false;
+        }
+        if let Some(decided) = self.text_incr_gate.get() {
+            return decided;
+        }
+        // The overwhelmingly common case — a stream opened without an explicit
+        // `encoding=` (the UTF-8 default) — always has a one-shot decoder, so
+        // skip the `codecs.lookup` probe entirely and pin the fast path.
+        let decided = match &*self.encoding.borrow() {
+            None => false,
+            Some(enc) => crate::stdlib::codecs_mod::codec_one_shot_decode_is_none(enc),
+        };
+        self.text_incr_gate.set(Some(decided));
+        decided
+    }
+
+    /// Lazily build the (newline-wrapped) Python `IncrementalDecoder` and the
+    /// [`TextIncr`] state. Mirrors `_pyio.TextIOWrapper._get_decoder`.
+    fn ensure_text_decoder(&self) -> Result<(), RuntimeError> {
+        if self.text_incr.borrow().is_some() {
+            return Ok(());
+        }
+        let enc = self
+            .encoding
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "utf-8".to_owned());
+        let errors = self.errors_name();
+        let factory = pf_mod_call("codecs", "getincrementaldecoder", &[Object::from_str(&enc)])?;
+        let raw = pf_call_value(&factory, &[Object::from_str(&errors)])?;
+        // Universal-newline wrapping, exactly like `_get_decoder`:
+        // `newline=None` → recognise + translate; `newline=''` → recognise
+        // only; an explicit ending → no wrapping.
+        let newline = self.newline.borrow().clone();
+        let readuniversal = matches!(newline.as_deref(), None | Some(""));
+        let translate = newline.is_none();
+        let decoder = if readuniversal {
+            pf_mod_call(
+                "_io",
+                "IncrementalNewlineDecoder",
+                &[raw, Object::Bool(translate)],
+            )?
+        } else {
+            raw
+        };
+        *self.text_incr.borrow_mut() = Some(TextIncr {
+            decoder,
+            decoded: Vec::new(),
+            decoded_used: 0,
+            snapshot: None,
+            b2cratio: 0.0,
+        });
+        Ok(())
+    }
+
+    /// Clone the live decoder handle (cheap — it's an `Rc`-backed `Object`).
+    fn text_decoder(&self) -> Result<Object, RuntimeError> {
+        self.text_incr
+            .borrow()
+            .as_ref()
+            .map(|t| t.decoder.clone())
+            .ok_or_else(|| value_error("no decoder"))
+    }
+
+    /// `_get_decoded_chars(n)` — advance into the decoded-char buffer.
+    fn text_get_decoded_chars(&self, n: Option<usize>) -> String {
+        let mut guard = self.text_incr.borrow_mut();
+        let Some(t) = guard.as_mut() else {
+            return String::new();
+        };
+        let offset = t.decoded_used.min(t.decoded.len());
+        let end = match n {
+            None => t.decoded.len(),
+            Some(n) => offset.saturating_add(n).min(t.decoded.len()),
+        };
+        let chars: String = t.decoded[offset..end].iter().collect();
+        t.decoded_used = end;
+        chars
+    }
+
+    /// `_read_chunk` — read and decode the next raw chunk, replacing the
+    /// decoded-char buffer and (when telling) recording a snapshot point.
+    /// Returns `false` at EOF.
+    fn text_read_chunk(&self) -> Result<bool, RuntimeError> {
+        let decoder = self.text_decoder()?;
+        let telling = self.telling.get();
+
+        // Snapshot prep: a point where the decoder's input buffer is empty.
+        let (dec_buffer, dec_flags) = if telling {
+            let st = pf_call_method(&decoder, "getstate", &[])?;
+            let (b, f) = decoder_state_parts(&st)?;
+            (b, f)
+        } else {
+            (Vec::new(), Object::None)
+        };
+
+        let chunk_size = self.text_chunk_size();
+        let input_chunk = self.read_bytes(Some(chunk_size))?;
+        let eof = input_chunk.is_empty();
+        let decoded_obj = pf_call_method(
+            &decoder,
+            "decode",
+            &[Object::new_bytes(input_chunk.clone()), Object::Bool(eof)],
+        )?;
+        let decoded: Vec<char> = decoded_obj.to_str().chars().collect();
+        let b2cratio = if decoded.is_empty() {
+            0.0
+        } else {
+            input_chunk.len() as f64 / decoded.len() as f64
+        };
+
+        let mut guard = self.text_incr.borrow_mut();
+        let t = guard.as_mut().ok_or_else(|| value_error("no decoder"))?;
+        t.decoded = decoded;
+        t.decoded_used = 0;
+        t.b2cratio = b2cratio;
+        if telling {
+            let mut next_input = dec_buffer;
+            next_input.extend_from_slice(&input_chunk);
+            t.snapshot = Some((dec_flags, next_input));
+        }
+        Ok(!eof)
+    }
+
+    /// `TextIOWrapper.read(size)` over the incremental decoder. `None` size
+    /// reads to EOF.
+    pub fn read_text_incr(&self, size: Option<usize>) -> Result<String, RuntimeError> {
+        self.ensure_text_decoder()?;
+        match size {
+            None => {
+                // Read everything: drain the buffer then decode the rest
+                // with `final=True`.
+                let decoder = self.text_decoder()?;
+                let mut result = self.text_get_decoded_chars(None);
+                let rest = self.read_bytes(None)?;
+                let tail = pf_call_method(
+                    &decoder,
+                    "decode",
+                    &[Object::new_bytes(rest), Object::Bool(true)],
+                )?;
+                result.push_str(&tail.to_str());
+                let mut guard = self.text_incr.borrow_mut();
+                if let Some(t) = guard.as_mut() {
+                    if t.snapshot.is_some() {
+                        t.decoded.clear();
+                        t.decoded_used = 0;
+                        t.snapshot = None;
+                    }
+                }
+                Ok(result)
+            }
+            Some(size) => {
+                let mut result = self.text_get_decoded_chars(Some(size));
+                let mut eof = false;
+                while result.chars().count() < size && !eof {
+                    eof = !self.text_read_chunk()?;
+                    let need = size - result.chars().count();
+                    result.push_str(&self.text_get_decoded_chars(Some(need)));
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    /// `TextIOWrapper.tell()` over the incremental decoder — packs the opaque
+    /// cookie (a direct port of `_pyio.TextIOWrapper.tell`). The cookie's only
+    /// contract is that `seek(tell())` round-trips, but we match CPython's bit
+    /// layout exactly so it is indistinguishable from the reference.
+    pub fn tell_text_incr(&self) -> Result<Object, RuntimeError> {
+        self.flush()?;
+        let mut position = self.tell()? as u64;
+
+        // No snapshot yet → the decoder hasn't consumed anything; the cookie
+        // is just the byte position.
+        let (dec_flags, next_input, chars_to_skip) = {
+            let guard = self.text_incr.borrow();
+            match guard.as_ref().and_then(|t| {
+                t.snapshot
+                    .as_ref()
+                    .map(|(f, n)| (f.clone(), n.clone(), t.decoded_used))
+            }) {
+                Some(v) => v,
+                None => return Ok(Object::int_from_i128(i128::from(position))),
+            }
+        };
+        let decoder = self.text_decoder()?;
+
+        // Skip back to the snapshot point.
+        position -= next_input.len() as u64;
+        let dec_flags_bi = obj_to_bigint(&dec_flags);
+        let mut chars_to_skip = chars_to_skip;
+        if chars_to_skip == 0 {
+            return Ok(pack_text_cookie(position, &dec_flags_bi, 0, false, 0));
+        }
+
+        // Walk the decoder forward from the snapshot to the current location,
+        // tracking the nearest safe (empty-buffer) start point.
+        let saved_state = pf_call_method(&decoder, "getstate", &[])?;
+        let result = (|| -> Result<Object, RuntimeError> {
+            let mut dec_flags_bi = dec_flags_bi.clone();
+            // Fast search: seed `skip_bytes` from the running byte/char ratio.
+            let b2cratio = self
+                .text_incr
+                .borrow()
+                .as_ref()
+                .map(|t| t.b2cratio)
+                .unwrap_or(0.0);
+            let mut skip_bytes = (b2cratio * chars_to_skip as f64) as i64;
+            let mut skip_back = 1i64;
+            if skip_bytes > next_input.len() as i64 {
+                // Defensive clamp (CPython asserts this holds).
+                skip_bytes = next_input.len() as i64;
+            }
+            let mut broke = false;
+            while skip_bytes > 0 {
+                pf_call_method(&decoder, "setstate", &[make_state_tuple(&dec_flags_bi)])?;
+                let upto = &next_input[..skip_bytes as usize];
+                let dec = pf_call_method(&decoder, "decode", &[Object::new_bytes(upto.to_vec())])?;
+                let n = dec.to_str().chars().count();
+                if n <= chars_to_skip {
+                    let st = pf_call_method(&decoder, "getstate", &[])?;
+                    let (b, d) = decoder_state_parts(&st)?;
+                    if b.is_empty() {
+                        dec_flags_bi = obj_to_bigint(&d);
+                        chars_to_skip -= n;
+                        broke = true;
+                        break;
+                    }
+                    skip_bytes -= b.len() as i64;
+                    skip_back = 1;
+                } else {
+                    skip_bytes -= skip_back;
+                    skip_back *= 2;
+                }
+            }
+            if !broke {
+                skip_bytes = 0;
+                pf_call_method(&decoder, "setstate", &[make_state_tuple(&dec_flags_bi)])?;
+            }
+
+            let mut start_pos = position + skip_bytes as u64;
+            let mut start_flags = dec_flags_bi.clone();
+            if chars_to_skip == 0 {
+                return Ok(pack_text_cookie(start_pos, &start_flags, 0, false, 0));
+            }
+
+            // Feed one byte at a time, noting safe restart points.
+            let mut bytes_fed = 0u64;
+            let mut need_eof = false;
+            let mut chars_decoded = 0usize;
+            let mut reached = false;
+            for i in (skip_bytes as usize)..next_input.len() {
+                bytes_fed += 1;
+                let dec = pf_call_method(
+                    &decoder,
+                    "decode",
+                    &[Object::new_bytes(next_input[i..=i].to_vec())],
+                )?;
+                chars_decoded += dec.to_str().chars().count();
+                let st = pf_call_method(&decoder, "getstate", &[])?;
+                let (b, d) = decoder_state_parts(&st)?;
+                if b.is_empty() && chars_decoded <= chars_to_skip {
+                    start_pos += bytes_fed;
+                    chars_to_skip -= chars_decoded;
+                    start_flags = obj_to_bigint(&d);
+                    bytes_fed = 0;
+                    chars_decoded = 0;
+                }
+                if chars_decoded >= chars_to_skip {
+                    reached = true;
+                    break;
+                }
+            }
+            if !reached {
+                // Need EOF to surface the remaining characters.
+                let dec = pf_call_method(
+                    &decoder,
+                    "decode",
+                    &[Object::new_bytes(Vec::new()), Object::Bool(true)],
+                )?;
+                chars_decoded += dec.to_str().chars().count();
+                need_eof = true;
+                if chars_decoded < chars_to_skip {
+                    return Err(os_error("can't reconstruct logical file position"));
+                }
+            }
+            Ok(pack_text_cookie(
+                start_pos,
+                &start_flags,
+                bytes_fed,
+                need_eof,
+                chars_to_skip as u64,
+            ))
+        })();
+        // Always restore the decoder's live state.
+        pf_call_method(&decoder, "setstate", &[saved_state])?;
+        result
+    }
+
+    /// `TextIOWrapper.seek(cookie)` over the incremental decoder — unpacks the
+    /// cookie and replays `read(chars_to_skip)` from the safe start point
+    /// (a direct port of `_pyio.TextIOWrapper.seek`, absolute `whence=0`).
+    pub fn seek_text_incr(&self, cookie: &Object) -> Result<Object, RuntimeError> {
+        let cookie_bi = obj_to_bigint(cookie);
+        if cookie_bi.is_negative() {
+            return Err(value_error("negative seek position"));
+        }
+        self.flush()?;
+        let (start_pos, dec_flags, bytes_to_feed, need_eof, chars_to_skip) =
+            unpack_text_cookie(&cookie_bi);
+
+        // Seek the underlying buffer to the safe start point and reset state.
+        self.seek(start_pos as isize, 0)?;
+        {
+            let mut guard = self.text_incr.borrow_mut();
+            if let Some(t) = guard.as_mut() {
+                t.decoded.clear();
+                t.decoded_used = 0;
+                t.snapshot = None;
+            }
+        }
+
+        let zero = num_bigint::BigInt::from(0u32);
+        let has_incr = self.text_incr.borrow().is_some();
+        if cookie_bi == zero {
+            self.ensure_text_decoder()?;
+            let decoder = self.text_decoder()?;
+            pf_call_method(&decoder, "reset", &[])?;
+        } else if has_incr || dec_flags != zero || chars_to_skip != 0 {
+            self.ensure_text_decoder()?;
+            let decoder = self.text_decoder()?;
+            pf_call_method(&decoder, "setstate", &[make_state_tuple(&dec_flags)])?;
+            if let Some(t) = self.text_incr.borrow_mut().as_mut() {
+                t.snapshot = Some((Object::int_from_bigint(dec_flags.clone()), Vec::new()));
+            }
+        }
+
+        if chars_to_skip != 0 {
+            let decoder = self.text_decoder()?;
+            let input_chunk = self.read_bytes(Some(bytes_to_feed as usize))?;
+            let decoded_obj = pf_call_method(
+                &decoder,
+                "decode",
+                &[
+                    Object::new_bytes(input_chunk.clone()),
+                    Object::Bool(need_eof),
+                ],
+            )?;
+            let decoded: Vec<char> = decoded_obj.to_str().chars().collect();
+            if decoded.len() < chars_to_skip as usize {
+                return Err(os_error("can't restore logical file position"));
+            }
+            if let Some(t) = self.text_incr.borrow_mut().as_mut() {
+                t.decoded = decoded;
+                t.decoded_used = chars_to_skip as usize;
+                t.snapshot = Some((Object::int_from_bigint(dec_flags.clone()), input_chunk));
+            }
+        }
+        Ok(cookie.clone())
+    }
+
+    /// `TextIOWrapper.seek(cookie, whence)` over the incremental decoder,
+    /// dispatching the three whence modes exactly like CPython: absolute
+    /// (cookie replay), current (only `0` → re-sync to `tell()`), and end
+    /// (only `0` → reset to EOF).
+    pub fn seek_text(&self, cookie: &Object, whence: i32) -> Result<Object, RuntimeError> {
+        match whence {
+            0 => self.seek_text_incr(cookie),
+            1 => {
+                if !obj_to_bigint(cookie).is_zero() {
+                    return Err(crate::stdlib::io::unsupported_op(
+                        "can't do nonzero cur-relative seeks",
+                    ));
+                }
+                let cur = self.tell_text_incr()?;
+                self.seek_text_incr(&cur)
+            }
+            2 => {
+                if !obj_to_bigint(cookie).is_zero() {
+                    return Err(crate::stdlib::io::unsupported_op(
+                        "can't do nonzero end-relative seeks",
+                    ));
+                }
+                self.flush()?;
+                let pos = self.seek(0, 2)?;
+                {
+                    let mut guard = self.text_incr.borrow_mut();
+                    if let Some(t) = guard.as_mut() {
+                        t.decoded.clear();
+                        t.decoded_used = 0;
+                        t.snapshot = None;
+                    }
+                }
+                if self.text_incr.borrow().is_some() {
+                    let decoder = self.text_decoder()?;
+                    pf_call_method(&decoder, "reset", &[])?;
+                }
+                Ok(Object::int_from_i128(pos as i128))
+            }
+            _ => Err(value_error("invalid whence")),
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -2181,32 +3554,96 @@ impl PyFile {
             let old = std::mem::replace(
                 &mut *backend,
                 FileBackend::MemBytes {
-                    data: Vec::new(),
+                    data: Rc::new(RefCell::new(Vec::new())),
                     pos: 0,
                 },
             );
-            // `FileIO(fd, closefd=False)`: the caller still owns the
-            // descriptor, so detach it without closing (CPython leaves the fd
-            // open). Otherwise dropping the `File` closes the fd as usual.
-            if !self.closefd.get() {
-                if let FileBackend::Disk(f) = old {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::io::IntoRawFd;
-                        let _ = f.into_raw_fd();
+            if let FileBackend::Disk(f) = old {
+                #[cfg(unix)]
+                {
+                    // Always detach the fd from Rust's `File` (an `OwnedFd`)
+                    // before closing. User code can legitimately close the
+                    // descriptor out from under us — e.g.
+                    // `os.close(f.fileno())` in CPython's
+                    // `test_subprocess` — and letting `File`'s checked drop
+                    // run `close(2)` on an already-closed fd aborts the whole
+                    // process ("IO Safety violation: owned file descriptor
+                    // already closed"). CPython models fds as plain ints, so a
+                    // double close is merely `EBADF`; we mirror that by
+                    // closing the raw fd ourselves and swallowing the error.
+                    //
+                    // `closefd=False` (`FileIO(fd, closefd=False)`): the caller
+                    // keeps ownership, so we detach without closing.
+                    use std::os::unix::io::IntoRawFd;
+                    let fd = f.into_raw_fd();
+                    if self.closefd.get() {
+                        unsafe {
+                            libc::close(fd);
+                        }
                     }
-                    #[cfg(not(unix))]
+                }
+                #[cfg(not(unix))]
+                {
+                    // No portable raw-fd detach here; closing is unavoidable.
                     drop(f);
                 }
             }
         }
     }
 
+    /// Re-initialise a `FileIO` in place over a new descriptor. CPython's
+    /// `FileIO.__init__` may be called again on a live object to re-point it
+    /// at another fd (`test_io.test_fileio_closefd`). We first release the
+    /// current descriptor honouring the *current* `closefd` (so a
+    /// `closefd=False` stream never closes a borrowed fd), then adopt
+    /// `new_backend` under the supplied `closefd`. `mode`/`binary` are fixed
+    /// at construction, so a re-init that changes the access mode keeps the
+    /// original mode string (FileIO is always binary, so this only matters for
+    /// the rare read↔write re-init, which CPython itself rejects mid-stream).
+    pub fn reinit_fileio(&self, new_backend: FileBackend, closefd: bool) {
+        self.close();
+        *self.backend.borrow_mut() = new_backend;
+        self.closefd.set(closefd);
+        *self.closed.borrow_mut() = false;
+        self.write_buf.borrow_mut().clear();
+        self.text_start_of_stream.set(true);
+        *self.binary_buffer_cache.borrow_mut() = None;
+    }
+
     /// Read up to `n` bytes from the backend; `None` reads everything.
     /// Returns bytes regardless of mode — the caller decides whether
     /// to wrap them as `str` (text mode) or `bytes` (binary mode).
+    /// Non-blocking-aware variant of [`PyFile::read_bytes`] for the file
+    /// `read()` method: a would-block on a non-blocking descriptor returns
+    /// `Ok(None)` (so `BufferedReader.read()` yields `None` instead of raising
+    /// `OSError(EAGAIN)`), while blocking descriptors and in-memory streams
+    /// keep the exact `read_bytes` behaviour. Only descriptor-backed streams in
+    /// `O_NONBLOCK` mode take the special path.
+    pub fn read_bytes_opt(&self, n: Option<usize>) -> Result<Option<Vec<u8>>, RuntimeError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.check_open()?;
+            self.flush_write_buf()?;
+            let raw_fd = match &*self.backend.borrow() {
+                FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                _ => None,
+            };
+            if let Some(fd) = raw_fd {
+                if fd_is_nonblocking(fd) {
+                    return read_fd_nonblock(fd, n);
+                }
+            }
+        }
+        self.read_bytes(n).map(Some)
+    }
+
     pub fn read_bytes(&self, n: Option<usize>) -> Result<Vec<u8>, RuntimeError> {
         self.check_open()?;
+        // Any staged writes must reach the descriptor before a read observes
+        // the stream position (defensive; a pure `BufferedWriter` is not
+        // readable, but keeps read-after-write coherent).
+        self.flush_write_buf()?;
         let mut backend = self.backend.borrow_mut();
         let mut buf = Vec::new();
         match (&mut *backend, n) {
@@ -2222,17 +3659,29 @@ impl PyFile {
                     .map_err(|e| os_error(format!("read: {e}")))?;
             }
             (FileBackend::MemBytes { data, pos }, None) => {
-                buf.extend_from_slice(&data[*pos..]);
-                *pos = data.len();
+                let d = data.borrow();
+                // The position can sit *past* the end after a seek beyond
+                // EOF (legal for BytesIO); reading there yields b'' and
+                // leaves the position untouched — never slice out of range.
+                if *pos < d.len() {
+                    buf.extend_from_slice(&d[*pos..]);
+                    *pos = d.len();
+                }
             }
             (FileBackend::MemBytes { data, pos }, Some(n)) => {
-                let end = (*pos + n).min(data.len());
-                buf.extend_from_slice(&data[*pos..end]);
-                *pos = end;
+                let d = data.borrow();
+                if *pos < d.len() {
+                    let end = (*pos + n).min(d.len());
+                    buf.extend_from_slice(&d[*pos..end]);
+                    *pos = end;
+                }
             }
             (FileBackend::MemText { data, pos }, None) => {
-                buf.extend_from_slice(&data.as_bytes()[*pos..]);
-                *pos = data.len();
+                let bytes = data.as_bytes();
+                if *pos < bytes.len() {
+                    buf.extend_from_slice(&bytes[*pos..]);
+                    *pos = bytes.len();
+                }
             }
             (FileBackend::MemText { data, pos }, Some(n)) => {
                 let bytes = data.as_bytes();
@@ -2312,19 +3761,110 @@ impl PyFile {
         self.decode_text(out)
     }
 
+    /// Read one line and return it as a `bytes` object (binary mode) or a
+    /// `str` (text mode), or `None` at EOF. Backs lazy file iteration
+    /// (`for line in f`) for *both* modes — CPython's file object is its
+    /// own iterator and a binary file yields `bytes` lines.
+    pub fn readline_obj(&self) -> Result<Option<Object>, RuntimeError> {
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let b = self.read_bytes(Some(1))?;
+            if b.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&b);
+            if b[0] == b'\n' {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Ok(None);
+        }
+        if self.binary {
+            Ok(Some(Object::new_bytes(out)))
+        } else {
+            Ok(Some(Object::from_str(self.decode_text(out)?)))
+        }
+    }
+
     pub fn write_bytes(&self, data: &[u8]) -> Result<usize, RuntimeError> {
         self.check_open()?;
+        // Binary `BufferedWriter`: stage the write in the Python-level buffer
+        // and only push to the descriptor once it fills (CPython
+        // `BufferedWriter.write`). The bytes are *not* on the fd yet, so
+        // `os.close(fileno())` discards them and a flush to a broken pipe
+        // raises only here / at close.
+        if self.is_write_buffered() {
+            let bufsize = self.buf_size.get();
+            // Pre-flush if the buffer is already over size (a prior partial
+            // non-blocking flush left it full). A `BlockingIOError` here means
+            // none of `data` has been accepted yet, so it re-raises with
+            // `characters_written == 0` (`_pyio.BufferedWriter.write`).
+            if self.write_buf.borrow().len() > bufsize {
+                if let Err(e) = self.flush_write_buf() {
+                    if runtime_err_is_blocking(&e) {
+                        let (errno, strerror) = runtime_err_eagain_info(&e);
+                        return Err(crate::error::blocking_io_error_written(errno, &strerror, 0));
+                    }
+                    return Err(e);
+                }
+            }
+            let before = self.write_buf.borrow().len();
+            {
+                let mut wb = self.write_buf.borrow_mut();
+                wb.extend_from_slice(data);
+            }
+            let mut written = (self.write_buf.borrow().len() - before) as i64;
+            if self.write_buf.borrow().len() >= bufsize {
+                if let Err(e) = self.flush_write_buf() {
+                    if runtime_err_is_blocking(&e) {
+                        // Partial non-blocking write. If the (partially drained)
+                        // buffer still exceeds the buffer size, accept what fits,
+                        // discard the overage, and report `characters_written`;
+                        // otherwise everything in `data` is committed and will be
+                        // flushed later, so swallow the error and report the full
+                        // write (`_pyio.BufferedWriter.write`,
+                        // `test_io.test_nonblock_pipe_write_*`).
+                        let cur = self.write_buf.borrow().len();
+                        if cur > bufsize {
+                            let overage = (cur - bufsize) as i64;
+                            written -= overage;
+                            self.write_buf.borrow_mut().truncate(bufsize);
+                            let (errno, strerror) = runtime_err_eagain_info(&e);
+                            return Err(crate::error::blocking_io_error_written(
+                                errno, &strerror, written,
+                            ));
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+            return Ok(written.max(0) as usize);
+        }
         let mut backend = self.backend.borrow_mut();
         let n = match &mut *backend {
-            FileBackend::Disk(f) => f.write(data).map_err(|e| os_error(format!("write: {e}")))?,
+            FileBackend::Disk(f) => f
+                .write(data)
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::MemBytes { data: buf, pos } => {
-                if *pos == buf.len() {
-                    buf.extend_from_slice(data);
+                // CPython's `bytesio.c` `write` runs `check_exports` first: a
+                // `BytesIO` with a live `getbuffer()` export refuses *any*
+                // write (it might re-size the shared buffer).
+                bytearray_check_resizable(buf)?;
+                let mut b = buf.borrow_mut();
+                if *pos > b.len() {
+                    // Seeked past EOF: writing zero-fills the gap (CPython
+                    // `BytesIO`/`FileIO` sparse-write semantics).
+                    b.resize(*pos, 0);
+                }
+                if *pos == b.len() {
+                    b.extend_from_slice(data);
                 } else {
-                    let end = (*pos + data.len()).min(buf.len());
-                    buf[*pos..end].copy_from_slice(&data[..end - *pos]);
+                    let end = (*pos + data.len()).min(b.len());
+                    b[*pos..end].copy_from_slice(&data[..end - *pos]);
                     if data.len() > end - *pos {
-                        buf.extend_from_slice(&data[end - *pos..]);
+                        b.extend_from_slice(&data[end - *pos..]);
                     }
                 }
                 *pos += data.len();
@@ -2346,11 +3886,11 @@ impl PyFile {
             FileBackend::Stdout(sink) => sink
                 .borrow_mut()
                 .write(data)
-                .map_err(|e| os_error(format!("write: {e}")))?,
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::Stderr(sink) => sink
                 .borrow_mut()
                 .write(data)
-                .map_err(|e| os_error(format!("write: {e}")))?,
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::Stdin => return Err(os_error("not writable")),
         };
         Ok(n)
@@ -2358,17 +3898,19 @@ impl PyFile {
 
     pub fn flush(&self) -> Result<(), RuntimeError> {
         self.check_open()?;
+        // Drain the staged `BufferedWriter` bytes to the descriptor first.
+        self.flush_write_buf()?;
         let mut backend = self.backend.borrow_mut();
         match &mut *backend {
-            FileBackend::Disk(f) => f.flush().map_err(|e| os_error(format!("flush: {e}")))?,
+            FileBackend::Disk(f) => f.flush().map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::Stdout(sink) => sink
                 .borrow_mut()
                 .flush()
-                .map_err(|e| os_error(format!("flush: {e}")))?,
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             FileBackend::Stderr(sink) => sink
                 .borrow_mut()
                 .flush()
-                .map_err(|e| os_error(format!("flush: {e}")))?,
+                .map_err(|e| crate::error::io_error_to_py(&e))?,
             _ => {}
         }
         Ok(())
@@ -2390,55 +3932,145 @@ impl PyFile {
 
     /// Current position. Works for both in-memory buffers and disk files.
     pub fn position(&self) -> usize {
+        // Staged `BufferedWriter` bytes sit logically after the descriptor
+        // offset, so `tell()` counts them (CPython's `BufferedWriter.tell`
+        // returns `raw.tell() + len(buffer)`).
+        let pending = self.write_buf.borrow().len();
         match &mut *self.backend.borrow_mut() {
             FileBackend::MemBytes { pos, .. } | FileBackend::MemText { pos, .. } => *pos,
             FileBackend::Disk(f) => {
                 use std::io::Seek;
-                f.stream_position().map(|n| n as usize).unwrap_or(0)
+                f.stream_position().map(|n| n as usize).unwrap_or(0) + pending
             }
             _ => 0,
+        }
+    }
+
+    /// `f.tell()` — like [`position`](Self::position) but surfaces the OS error
+    /// instead of swallowing it. CPython's `FileIO.tell` does an `lseek` and a
+    /// pipe/FIFO descriptor raises `OSError(ESPIPE)`, which
+    /// `test_io.test_optional_abilities` asserts for a non-seekable stream.
+    pub fn tell(&self) -> Result<usize, RuntimeError> {
+        let pending = self.write_buf.borrow().len();
+        match &mut *self.backend.borrow_mut() {
+            FileBackend::MemBytes { pos, .. } | FileBackend::MemText { pos, .. } => Ok(*pos),
+            FileBackend::Disk(f) => {
+                use std::io::Seek;
+                let p = f
+                    .stream_position()
+                    .map_err(|e| crate::error::io_error_to_py(&e))?;
+                Ok(p as usize + pending)
+            }
+            _ => Ok(0),
         }
     }
 
     /// Seek to absolute position. Returns the new position.
     pub fn seek(&self, offset: isize, whence: i32) -> Result<usize, RuntimeError> {
         self.check_open()?;
+        // CPython's `BufferedWriter.seek` flushes the write buffer first so the
+        // descriptor offset the seek is relative to is current.
+        self.flush_write_buf()?;
+        let result = {
+            let mut backend = self.backend.borrow_mut();
+            match &mut *backend {
+                FileBackend::MemBytes { data, pos } => {
+                    let dlen = data.borrow().len();
+                    let new_pos = match whence {
+                        0 => offset.max(0) as usize,
+                        1 => (*pos as isize + offset).max(0) as usize,
+                        2 => (dlen as isize + offset).max(0) as usize,
+                        _ => return Err(value_error("invalid whence")),
+                    };
+                    // CPython's in-memory streams allow seeking *past* the end
+                    // (the next write zero-fills the gap); don't clamp to `dlen`.
+                    *pos = new_pos;
+                    *pos
+                }
+                FileBackend::MemText { data, pos } => {
+                    let new_pos = match whence {
+                        0 => offset.max(0) as usize,
+                        1 => (*pos as isize + offset).max(0) as usize,
+                        2 => (data.len() as isize + offset).max(0) as usize,
+                        _ => return Err(value_error("invalid whence")),
+                    };
+                    *pos = new_pos.min(data.len());
+                    *pos
+                }
+                FileBackend::Disk(f) => {
+                    use std::io::Seek;
+                    let whence_pos = match whence {
+                        0 => std::io::SeekFrom::Start(offset.max(0) as u64),
+                        1 => std::io::SeekFrom::Current(offset as i64),
+                        2 => std::io::SeekFrom::End(offset as i64),
+                        _ => return Err(value_error("invalid whence")),
+                    };
+                    f.seek(whence_pos)
+                        .map_err(|e| os_error(format!("seek: {e}")))? as usize
+                }
+                _ => return Err(os_error("stream is not seekable")),
+            }
+        };
+        // BOM-once: seeking back to byte 0 returns a BOM-prefixing text encoder
+        // to the start of the stream (so the next write re-emits the BOM); any
+        // other position suppresses it (CPython's seek `encoding_start_of_stream`).
+        if !self.binary {
+            self.text_start_of_stream.set(result == 0);
+        }
+        Ok(result)
+    }
+
+    /// `truncate(size=None)` — resize the stream to `size` bytes (or the
+    /// current position when `None`), returning the new size. The stream
+    /// position is left unchanged, matching CPython's `IOBase.truncate`.
+    /// Growing only extends an in-memory buffer; on disk it delegates to
+    /// `ftruncate(2)` via `File::set_len`.
+    pub fn truncate(&self, size: Option<u64>) -> Result<u64, RuntimeError> {
+        self.check_open()?;
+        self.flush()?;
         let mut backend = self.backend.borrow_mut();
         match &mut *backend {
             FileBackend::MemBytes { data, pos } => {
-                let new_pos = match whence {
-                    0 => offset.max(0) as usize,
-                    1 => (*pos as isize + offset).max(0) as usize,
-                    2 => (data.len() as isize + offset).max(0) as usize,
-                    _ => return Err(value_error("invalid whence")),
-                };
-                *pos = new_pos.min(data.len());
-                Ok(*pos)
+                // `truncate` re-sizes; refused while a `getbuffer()` view is
+                // live (CPython `bytesio.c` `check_exports`).
+                bytearray_check_resizable(data)?;
+                let n = size.unwrap_or(*pos as u64) as usize;
+                let mut d = data.borrow_mut();
+                if n < d.len() {
+                    d.truncate(n);
+                } else {
+                    d.resize(n, 0);
+                }
+                Ok(n as u64)
             }
             FileBackend::MemText { data, pos } => {
-                let new_pos = match whence {
-                    0 => offset.max(0) as usize,
-                    1 => (*pos as isize + offset).max(0) as usize,
-                    2 => (data.len() as isize + offset).max(0) as usize,
-                    _ => return Err(value_error("invalid whence")),
-                };
-                *pos = new_pos.min(data.len());
-                Ok(*pos)
+                let n = size.unwrap_or(*pos as u64) as usize;
+                if n < data.len() {
+                    // Clamp to a char boundary so we never split a UTF-8
+                    // scalar (WeavePy's MemText position is a byte offset).
+                    let mut cut = n;
+                    while cut > 0 && !data.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    data.truncate(cut);
+                    Ok(cut as u64)
+                } else {
+                    Ok(data.len() as u64)
+                }
             }
             FileBackend::Disk(f) => {
                 use std::io::Seek;
-                let whence_pos = match whence {
-                    0 => std::io::SeekFrom::Start(offset.max(0) as u64),
-                    1 => std::io::SeekFrom::Current(offset as i64),
-                    2 => std::io::SeekFrom::End(offset as i64),
-                    _ => return Err(value_error("invalid whence")),
+                let n = match size {
+                    Some(s) => s,
+                    None => f
+                        .stream_position()
+                        .map_err(|e| os_error(format!("truncate: {e}")))?,
                 };
-                let n = f
-                    .seek(whence_pos)
-                    .map_err(|e| os_error(format!("seek: {e}")))?;
-                Ok(n as usize)
+                f.set_len(n)
+                    .map_err(|e| os_error(format!("truncate: {e}")))?;
+                Ok(n)
             }
-            _ => Err(os_error("stream is not seekable")),
+            _ => Err(os_error("File or stream is not seekable")),
         }
     }
 
@@ -2446,9 +4078,28 @@ impl PyFile {
     /// Used by `StringIO.getvalue()` / `BytesIO.getvalue()`.
     pub fn getvalue(&self) -> Option<Object> {
         match &*self.backend.borrow() {
-            FileBackend::MemBytes { data, .. } => Some(Object::Bytes(Rc::from(data.as_slice()))),
-            FileBackend::MemText { data, .. } => Some(Object::from_str(data.clone())),
+            FileBackend::MemBytes { data, .. } => {
+                Some(Object::Bytes(Rc::from(data.borrow().as_slice())))
+            }
+            // The buffer stores lone surrogates as bridged PUA code points
+            // (so a Rust `String` can hold them); map them back to a `str`/
+            // `WStr` here. A surrogate-free buffer canonicalises to `Str`.
+            FileBackend::MemText { data, .. } => Some(crate::builtins::bridge_to_object(data)),
             _ => None,
+        }
+    }
+
+    /// `BytesIO.getbuffer()` — a *writable* `memoryview` aliasing the
+    /// in-memory buffer (CPython's `bytesio_getbuffer`). Sharing the
+    /// `Rc<RefCell<Vec<u8>>>` means writes through the view land in the
+    /// stream, and the export keeps the buffer pinned (a subsequent
+    /// `write`/`truncate` raises `BufferError`) until the view is released.
+    pub fn getbuffer(&self) -> Result<Object, RuntimeError> {
+        match &*self.backend.borrow() {
+            FileBackend::MemBytes { data, .. } => Ok(Object::MemoryView(Rc::new(
+                PyMemoryView::from_bytearray(data.clone()),
+            ))),
+            _ => Err(type_error("getbuffer() requires a BytesIO")),
         }
     }
 }
@@ -2459,12 +4110,90 @@ impl fmt::Debug for PyFile {
     }
 }
 
+impl Drop for PyFile {
+    fn drop(&mut self) {
+        // CPython's fileio/buffered/textio deallocators emit a
+        // `ResourceWarning("unclosed file %R")` when an *open*, fd-backed
+        // stream is reclaimed without an explicit `close()`/`with`
+        // (`test_io.test_warn_on_dealloc{,_fd}`). Mirror it here, since a
+        // leaked `PyFile`'s last `Rc` drop *is* its deallocation. Gates:
+        //   * not finalizing — the interpreter-shutdown sweep tears down the
+        //     `warnings` machinery and would otherwise re-enter a half-dead VM;
+        //   * `!closed` — an explicit `close()` latches `closed=true` (and
+        //     swaps the backend to an in-memory buffer), so a properly closed
+        //     stream stays silent;
+        //   * `closefd` — a borrowed descriptor (`FileIO(fd, closefd=False)`)
+        //     is not ours to warn about;
+        //   * a live `Disk` backend — in-memory `BytesIO`/`StringIO` and the
+        //     std streams never carry an OS fd to leak.
+        // The `closed`/backend gates also make this idempotent against the
+        // fd close below and any re-entrant drop. The message is *enqueued*,
+        // not emitted in place: a destructor runs at an arbitrary point (an
+        // `Rc` can hit zero mid-instruction while a container is borrowed), so
+        // synthesising the Python warning here would re-enter `warnings.warn`
+        // and panic with `BorrowMutError`. The eval loop drains the queue at
+        // its between-bytecodes safe point, matching CPython's dealloc timing.
+        if !crate::vm_singletons::is_finalizing()
+            && !*self.closed.borrow()
+            && self.closefd.get()
+            && matches!(&*self.backend.borrow(), FileBackend::Disk(_))
+        {
+            let repr = self.repr_with_addr(std::ptr::from_ref(self) as usize);
+            crate::vm_singletons::push_pending_resource_warning(format!("unclosed file {repr}"));
+        }
+        // Close any still-open OS descriptor *ourselves* rather than letting
+        // Rust's `File` (an `OwnedFd`) run its checked drop. User code can
+        // close the fd out from under us (`os.close(f.fileno())`), and Rust's
+        // checked close aborts the whole process on a double close ("IO Safety
+        // violation"). CPython models fds as plain ints where that is just
+        // `EBADF`, so we close the raw fd and swallow the error. If `close()`
+        // already ran the backend is an in-memory buffer (no-op here);
+        // `closefd=False` detaches without closing.
+        // Best-effort flush of any staged `BufferedWriter` bytes before the
+        // descriptor is dropped, so data written but never explicitly flushed
+        // still reaches disk (CPython relies on the buffer's deallocator).
+        let _ = self.flush_write_buf();
+        #[cfg(unix)]
+        {
+            let Ok(mut backend) = self.backend.try_borrow_mut() else {
+                return;
+            };
+            if matches!(&*backend, FileBackend::Disk(_)) {
+                let old = std::mem::replace(
+                    &mut *backend,
+                    FileBackend::MemBytes {
+                        data: Rc::new(RefCell::new(Vec::new())),
+                        pos: 0,
+                    },
+                );
+                if let FileBackend::Disk(f) = old {
+                    use std::os::unix::io::IntoRawFd;
+                    let fd = f.into_raw_fd();
+                    if self.closefd.get() {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Concrete backing store for a [`PyFile`].
 pub enum FileBackend {
     /// A real file on disk.
     Disk(std::fs::File),
-    /// In-memory byte buffer (`io.BytesIO`).
-    MemBytes { data: Vec<u8>, pos: usize },
+    /// In-memory byte buffer (`io.BytesIO`). The data lives behind a shared
+    /// `Rc<RefCell<Vec<u8>>>` (the same store a `bytearray`/`memoryview`
+    /// uses) so `BytesIO.getbuffer()` can hand out a *writable* view that
+    /// aliases the buffer — and the export-tracking machinery
+    /// (`bytearray_is_exported`) makes resize-while-exported raise
+    /// `BufferError`, matching CPython's `bytesio.c` `check_exports`.
+    MemBytes {
+        data: Rc<RefCell<Vec<u8>>>,
+        pos: usize,
+    },
     /// In-memory UTF-8 buffer (`io.StringIO`).
     MemText { data: String, pos: usize },
     /// The interpreter's process stdout sink.
@@ -2697,6 +4426,15 @@ pub enum PyIterator {
     DictKeys {
         keys: Vec<DictKey>,
         index: usize,
+        /// The source dict, watched for size changes between `__next__`
+        /// calls (CPython's `dictiter_iternext` compares `di_used` to
+        /// `ma_used` and raises `RuntimeError: dictionary changed size
+        /// during iteration`). `None` for sources with no single live
+        /// dict to watch (so the trip-wire is skipped).
+        dict: Option<Rc<RefCell<DictData>>>,
+        /// `len()` of `dict` at iterator creation; a later mismatch trips
+        /// the "changed size during iteration" error.
+        len: usize,
     },
     Bytes {
         data: Rc<[u8]>,
@@ -2746,6 +4484,17 @@ pub enum PyIterator {
         /// `so->used` at iterator creation; a later mismatch is the
         /// "changed size during iteration" trip-wire.
         len: usize,
+    },
+    /// Lazy line iterator over an open file object. In CPython a file *is*
+    /// its own iterator and reads exactly one line per `__next__`, so we
+    /// hold the `PyFile` and stream line-by-line rather than draining the
+    /// whole stream up front. This is required for (a) pipes / growing
+    /// files / `sys.stdin` where eager draining would block until EOF, and
+    /// (b) binary-mode files, which must yield `bytes` lines (CPython makes
+    /// binary files iterable too — `multiprocessing.resource_tracker.main`
+    /// does `for line in open(fd, 'rb')`).
+    File {
+        file: Rc<PyFile>,
     },
 }
 
@@ -2825,7 +4574,7 @@ impl PyIterator {
                 *current += *step;
                 Some(int_from_i128(v))
             }
-            PyIterator::DictKeys { keys, index } => {
+            PyIterator::DictKeys { keys, index, .. } => {
                 let k = keys.get(*index)?.clone();
                 *index += 1;
                 Some(k.0)
@@ -2861,6 +4610,20 @@ impl PyIterator {
                 Some(Object::new_tuple(vec![Object::Int(i), v]))
             }
             PyIterator::Shared(inner) => inner.borrow_mut().next_value(),
+            // Lazy file line. The error channel is `next_value_checked`
+            // (used by FOR_ITER / `next()`); the rare internal drain that
+            // calls `next_value` treats a read error as end-of-stream.
+            PyIterator::File { file } => {
+                let is_text = !file.binary;
+                if is_text {
+                    file.telling.set(false);
+                }
+                let line = file.readline_obj().ok().flatten();
+                if is_text && line.is_none() {
+                    file.telling.set(file.seekable());
+                }
+                line
+            }
             PyIterator::Set { set, index, .. } => {
                 let v = set.borrow().get_index(*index).map(|k| k.0.clone());
                 match v {
@@ -2939,9 +4702,17 @@ impl PyIterator {
                     visit(v);
                 }
             }
-            PyIterator::DictKeys { keys, .. } => {
+            PyIterator::DictKeys { keys, dict, .. } => {
+                // The `keys` snapshot is a private buffer of cloned key Rcs,
+                // so its elements are visited directly (transient-promotion
+                // accounts the `-> keys` edges). When a live `dict` is also
+                // held (the size trip-wire), subtract the `iter -> dict` edge
+                // too; the dict's own `tp_traverse` accounts `dict -> items`.
                 for k in keys {
                     visit(&k.0);
+                }
+                if let Some(d) = dict {
+                    visit(&Object::Dict(d.clone()));
                 }
             }
             PyIterator::Set { set, .. } => {
@@ -2958,12 +4729,14 @@ impl PyIterator {
                     inner.gc_referents(visit);
                 }
             }
-            // No `Object` referents: the payload is plain bytes / scalars.
+            // No `Object` referents: the payload is plain bytes / scalars,
+            // or (for `File`) an OS handle that buffers no Python objects.
             PyIterator::Str { .. }
             | PyIterator::Bytes { .. }
             | PyIterator::ByteArray { .. }
             | PyIterator::Range { .. }
-            | PyIterator::RangeHuge { .. } => {}
+            | PyIterator::RangeHuge { .. }
+            | PyIterator::File { .. } => {}
         }
     }
 
@@ -2981,6 +4754,33 @@ impl PyIterator {
                 return Err(runtime_error("Set changed size during iteration"));
             }
         }
+        if let PyIterator::DictKeys {
+            dict: Some(d), len, ..
+        } = self
+        {
+            // `dictiter_iternext`: a size change since creation is fatal,
+            // mirroring CPython's `di_used != ma_used` guard. Triggers even
+            // on the step that would otherwise raise StopIteration.
+            if d.borrow().len() != *len {
+                return Err(runtime_error("dictionary changed size during iteration"));
+            }
+        }
+        if let PyIterator::File { file } = self {
+            // Surface read errors (OSError, decode errors) at the
+            // user-visible `__next__` boundary instead of swallowing them.
+            // CPython's `TextIOWrapper.__next__` disables `tell()` for the
+            // duration of the iteration and restores it (to `seekable`) at
+            // EOF (`test_io.test_telling`); binary streams keep `tell()` live.
+            let is_text = !file.binary;
+            if is_text {
+                file.telling.set(false);
+            }
+            let line = file.readline_obj()?;
+            if is_text && line.is_none() {
+                file.telling.set(file.seekable());
+            }
+            return Ok(line);
+        }
         Ok(self.next_value())
     }
 
@@ -2993,7 +4793,7 @@ impl PyIterator {
             PyIterator::List { items, index } => Some(items.borrow().len().saturating_sub(*index)),
             PyIterator::Tuple { items, index } => Some(items.len().saturating_sub(*index)),
             PyIterator::Str { s, index } => Some(s[(*index).min(s.len())..].chars().count()),
-            PyIterator::DictKeys { keys, index } => Some(keys.len().saturating_sub(*index)),
+            PyIterator::DictKeys { keys, index, .. } => Some(keys.len().saturating_sub(*index)),
             PyIterator::Bytes { data, index } => Some(data.len().saturating_sub(*index)),
             PyIterator::ByteArray { data, index } => {
                 Some(data.borrow().len().saturating_sub(*index))
@@ -3034,6 +4834,8 @@ impl PyIterator {
                     Some(0)
                 }
             }
+            // A stream's remaining length isn't known without reading it.
+            PyIterator::File { .. } => None,
         }
     }
 
@@ -3061,7 +4863,7 @@ impl PyIterator {
                     .map(|c| Object::Str(Rc::from(c.to_string().as_str())))
                     .collect()
             }
-            PyIterator::DictKeys { keys, index } => keys
+            PyIterator::DictKeys { keys, index, .. } => keys
                 .get(*index..)
                 .map(|rest| rest.iter().map(|k| k.0.clone()).collect())
                 .unwrap_or_default(),
@@ -3142,6 +4944,10 @@ impl PyIterator {
                 }
                 out
             }
+            // A file iterator can't be snapshotted without consuming the
+            // stream; file objects aren't picklable, so `__reduce__` never
+            // reaches here in practice. Empty keeps it side-effect-free.
+            PyIterator::File { .. } => Vec::new(),
         }
     }
 
@@ -3198,6 +5004,9 @@ impl Object {
             Object::Complex(c) => c.real != 0.0 || c.imag != 0.0,
             Object::Float(f) => *f != 0.0 && !f.is_nan(),
             Object::Str(s) => !s.is_empty(),
+            // A `WStr` always holds >= 1 code point (the surrogate), so it is
+            // never the empty string and is always truthy.
+            Object::WStr(_) => true,
             Object::Tuple(items) => !items.is_empty(),
             Object::List(items) => !items.borrow().is_empty(),
             Object::Dict(d) => !d.borrow().is_empty(),
@@ -3285,6 +5094,7 @@ impl Object {
             }
             (Object::Float(a), Object::Float(b)) => a.to_bits() == b.to_bits(),
             (Object::Str(a), Object::Str(b)) => Rc::ptr_eq(a, b),
+            (Object::WStr(a), Object::WStr(b)) => Rc::ptr_eq(a, b),
             (Object::Tuple(a), Object::Tuple(b)) => Rc::ptr_eq(a, b),
             (Object::List(a), Object::List(b)) => Rc::ptr_eq(a, b),
             (Object::Dict(a), Object::Dict(b)) => Rc::ptr_eq(a, b),
@@ -3372,6 +5182,11 @@ impl Object {
                 c.imag == 0.0 && bigint_eq_f64(b, c.real)
             }
             (Object::Str(a), Object::Str(b)) => a == b,
+            // Two surrogate-bearing strings compare code-point-wise. A `WStr`
+            // never equals a plain `Str`: the invariant guarantees a `WStr`
+            // holds >= 1 lone surrogate that no UTF-8 `Str` can contain, so the
+            // mixed pair correctly falls through to the `_ => false` tail.
+            (Object::WStr(a), Object::WStr(b)) => a == b,
             // Sequence comparison is element-wise `PyObject_RichCompareBool`,
             // which is identity-first — so `[nan] == [nan]` (same nan) is true.
             (Object::Tuple(a), Object::Tuple(b)) => {
@@ -3529,6 +5344,16 @@ impl Object {
                 .partial_cmp(&(i64::from(*b) as f64))
                 .ok_or_else(|| value_error("cannot order with NaN"))?),
             (O::Str(a), O::Str(b)) => Ok(a.cmp(b)),
+            // Any comparison involving a surrogate-bearing string orders by
+            // code point (CPython compares `str` by code point; UTF-8 byte
+            // order already matches that for the pure-`Str` fast path above).
+            // A lone surrogate (U+D800..U+DFFF) thus sorts between U+D7FF and
+            // U+E000, exactly as in CPython.
+            (O::Str(_), O::WStr(_)) | (O::WStr(_), O::Str(_)) | (O::WStr(_), O::WStr(_)) => {
+                let a = self.str_codepoints().unwrap();
+                let b = other.str_codepoints().unwrap();
+                Ok(a.cmp(&b))
+            }
             // bytes/bytearray order lexicographically by byte value;
             // the four mixed combinations all compare (CPython's
             // shared `bytes_richcompare` buffer path).
@@ -3582,6 +5407,21 @@ impl Object {
             }
             Object::Str(haystack) => match item {
                 Object::Str(needle) => Ok(haystack.contains(&**needle)),
+                // `"..." in wstr`: a surrogate-bearing needle can never be a
+                // substring of a pure-UTF-8 haystack, so this is always false.
+                Object::WStr(_) => Ok(false),
+                _ => Err(type_error(
+                    "'in <string>' requires string as left operand".to_owned(),
+                )),
+            },
+            // Substring search over a surrogate-bearing haystack works on code
+            // points so a lone surrogate matches itself.
+            Object::WStr(_) => match item {
+                Object::Str(_) | Object::WStr(_) => {
+                    let hay = self.str_codepoints().unwrap();
+                    let needle = item.str_codepoints().unwrap();
+                    Ok(codepoint_subslice_contains(&hay, &needle))
+                }
                 _ => Err(type_error(
                     "'in <string>' requires string as left operand".to_owned(),
                 )),
@@ -3686,6 +5526,16 @@ impl Object {
                 s: s.clone(),
                 index: 0,
             }),
+            // Iterating a surrogate-bearing string yields one length-1 string
+            // per code point (a lone surrogate becomes a length-1 `WStr`).
+            Object::WStr(cps) => Ok(PyIterator::List {
+                items: Rc::new(RefCell::new(
+                    cps.iter()
+                        .map(|&c| Object::str_from_codepoints(vec![c]))
+                        .collect(),
+                )),
+                index: 0,
+            }),
             Object::Range(r) => Ok(
                 match (
                     i64::try_from(r.start),
@@ -3711,8 +5561,16 @@ impl Object {
                 },
             ),
             Object::Dict(d) => {
-                let keys: Vec<DictKey> = d.borrow().keys().cloned().collect();
-                Ok(PyIterator::DictKeys { keys, index: 0 })
+                let (keys, len) = {
+                    let b = d.borrow();
+                    (b.keys().cloned().collect::<Vec<DictKey>>(), b.len())
+                };
+                Ok(PyIterator::DictKeys {
+                    keys,
+                    index: 0,
+                    dict: Some(d.clone()),
+                    len,
+                })
             }
             Object::Set(s) => {
                 // A *live* iterator (not a snapshot): keep the set alive for
@@ -3753,7 +5611,13 @@ impl Object {
                 match v.kind {
                     DictViewKind::Keys => {
                         let keys: Vec<DictKey> = d.keys().cloned().collect();
-                        Ok(PyIterator::DictKeys { keys, index: 0 })
+                        let len = d.len();
+                        Ok(PyIterator::DictKeys {
+                            keys,
+                            index: 0,
+                            dict: Some(v.dict.clone()),
+                            len,
+                        })
                     }
                     DictViewKind::Values => {
                         let vs: Vec<Object> = d.values().cloned().collect();
@@ -3775,28 +5639,25 @@ impl Object {
                 }
             }
             Object::MappingProxy(d) => {
-                let keys: Vec<DictKey> = d.borrow().keys().cloned().collect();
-                Ok(PyIterator::DictKeys { keys, index: 0 })
+                let (keys, len) = {
+                    let b = d.borrow();
+                    (b.keys().cloned().collect::<Vec<DictKey>>(), b.len())
+                };
+                Ok(PyIterator::DictKeys {
+                    keys,
+                    index: 0,
+                    dict: Some(d.clone()),
+                    len,
+                })
             }
             Object::File(file) => {
-                // CPython iterates a text-mode file by repeatedly
-                // invoking ``readline`` until it returns ``""``. We
-                // realise the buffer up front (for the in-memory
-                // backends; real OS handles read on demand inside
-                // ``readline``) and wrap the lines in a ``List``
-                // iterator — same observable behaviour.
-                let mut lines: Vec<Object> = Vec::new();
-                loop {
-                    let line = file.readline_unbounded()?;
-                    if line.is_empty() {
-                        break;
-                    }
-                    lines.push(Object::from_str(line));
-                }
-                Ok(PyIterator::List {
-                    items: Rc::new(RefCell::new(lines)),
-                    index: 0,
-                })
+                // CPython's file object is its own iterator: each step calls
+                // ``readline`` and yields the line, raising StopIteration at
+                // EOF. We stream lazily (one line per `next`) rather than
+                // draining up front — eager draining would block on pipes /
+                // `sys.stdin` until EOF and breaks binary-mode files, which
+                // must yield ``bytes`` lines.
+                Ok(PyIterator::File { file: file.clone() })
             }
             // A native iterator is its own iterable: `iter(it) is it` in
             // Python, and passing one to a plain builtin (`zip`,
@@ -3821,6 +5682,8 @@ impl Object {
             Object::Complex(_) => "complex",
             Object::Float(_) => "float",
             Object::Str(_) => "str",
+            // A surrogate-bearing string is still a `str` to Python.
+            Object::WStr(_) => "str",
             Object::Tuple(_) => "tuple",
             Object::List(_) => "list",
             Object::Dict(_) => "dict",
@@ -3908,6 +5771,44 @@ impl Object {
                         // \UNNNNNNNN depending on the code-point width.
                         c => {
                             let n = c as u32;
+                            if n <= 0xff {
+                                out.push_str(&format!("\\x{n:02x}"));
+                            } else if n <= 0xffff {
+                                out.push_str(&format!("\\u{n:04x}"));
+                            } else {
+                                out.push_str(&format!("\\U{n:08x}"));
+                            }
+                        }
+                    }
+                }
+                out.push(quote);
+                out
+            }
+            Object::WStr(cps) => {
+                // Same algorithm as the `Str` arm, but over raw code points so
+                // lone surrogates (which cannot be a Rust `char`) round-trip as
+                // `\udXXX`. CPython's `unicode_repr` shows lone surrogates with
+                // the same `\uXXXX` escape used for any non-printable BMP point.
+                let has_single = cps.contains(&0x27);
+                let has_double = cps.contains(&0x22);
+                let quote: char = if has_single && !has_double { '"' } else { '\'' };
+                let quote_cp = quote as u32;
+                let mut out = String::with_capacity(cps.len() + 2);
+                out.push(quote);
+                for &n in cps.iter() {
+                    match char::from_u32(n) {
+                        Some('\\') => out.push_str("\\\\"),
+                        Some('\n') => out.push_str("\\n"),
+                        Some('\r') => out.push_str("\\r"),
+                        Some('\t') => out.push_str("\\t"),
+                        _ if n == quote_cp => {
+                            out.push('\\');
+                            out.push(quote);
+                        }
+                        Some(c) if char_is_printable(c) => out.push(c),
+                        // Both lone surrogates (`from_u32` == None) and
+                        // non-printable scalars escape by code-point width.
+                        _ => {
                             if n <= 0xff {
                                 out.push_str(&format!("\\x{n:02x}"));
                             } else if n <= 0xffff {
@@ -4097,16 +5998,17 @@ impl Object {
                 "frozenset",
                 Rc::as_ptr(s).cast::<()>() as usize,
             ),
-            Object::File(file) => format!(
-                "<_io.{} name='{}' mode='{}'>",
-                if file.binary {
-                    "BufferedReader"
-                } else {
-                    "TextIOWrapper"
-                },
-                file.name,
-                file.mode
-            ),
+            Object::File(file) => {
+                // Faithful CPython `tp_repr` per io layer (`IoKind`):
+                //   BytesIO/StringIO  -> `<_io.BytesIO object at 0x..>` (no name)
+                //   FileIO            -> `<_io.FileIO name=.. mode='rb' closefd=True>`
+                //   Buffered*         -> `<_io.BufferedReader name=..>`
+                //   TextIOWrapper     -> `<_io.TextIOWrapper name=.. mode='r' encoding='..'>`
+                // The name is formatted with `repr` (`%R`): an fd is an
+                // unquoted int (`name=6`), a path a quoted str (`name='f'`).
+                // Shared with the `Drop` unclosed-file `ResourceWarning`.
+                file.repr_with_addr(Rc::as_ptr(file) as usize)
+            }
             Object::Instance(inst) => {
                 // The `Ellipsis` / `NotImplemented` singletons render as
                 // fixed text — CPython's `ellipsis`/`NotImplementedType`
@@ -4278,6 +6180,14 @@ impl Object {
     pub fn to_str(&self) -> String {
         match self {
             Object::Str(s) => s.to_string(),
+            // A `String` cannot hold lone surrogates, so this lossy view maps
+            // them to U+FFFD. Fidelity-critical consumers (encoders,
+            // `os.fsencode`, `repr`) take [`Object::str_codepoints`] instead;
+            // `to_str` is for display/diagnostic text where loss is acceptable.
+            Object::WStr(cps) => cps
+                .iter()
+                .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                .collect(),
             _ => self.repr(),
         }
     }
@@ -4286,6 +6196,9 @@ impl Object {
     pub fn len(&self) -> Result<usize, RuntimeError> {
         match self {
             Object::Str(s) => Ok(s.chars().count()),
+            // Length in code points: a lone surrogate counts as one, matching
+            // CPython where `len(chr(0xD800)) == 1`.
+            Object::WStr(cps) => Ok(cps.len()),
             Object::Tuple(items) => Ok(items.len()),
             Object::List(items) => Ok(items.borrow().len()),
             Object::Dict(d) => Ok(d.borrow().len()),
@@ -4329,6 +6242,18 @@ impl Object {
 
 fn sets_equal(a: &SetData, b: &SetData) -> bool {
     a.len() == b.len() && a.iter().all(|k| b.contains(k))
+}
+
+/// Substring test over code-point sequences (the WTF-8 analogue of
+/// `str::contains`). The empty needle matches anywhere (`"" in s` is `True`).
+pub(crate) fn codepoint_subslice_contains(haystack: &[u32], needle: &[u32]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Compare a BigInt against a float.  Mirrors CPython: `inf` always
@@ -4688,6 +6613,17 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
     match obj {
         Object::None => Some(PY_HASH_NONE),
         Object::Str(s) => Some(py_hash_bytes_slice(s.as_bytes())),
+        // Surrogate-bearing string: hash the code-point sequence. Need only be
+        // deterministic and self-consistent — a `WStr` never equals a `Str`
+        // (disjoint by invariant), so cross-representation hash agreement is
+        // unnecessary; collisions only cost a probe, never correctness.
+        Object::WStr(cps) => {
+            let mut bytes = Vec::with_capacity(cps.len() * 4);
+            for &c in cps.iter() {
+                bytes.extend_from_slice(&c.to_le_bytes());
+            }
+            Some(py_hash_bytes_slice(&bytes))
+        }
         Object::Bytes(b) => Some(py_hash_bytes_slice(b)),
         Object::Tuple(items) => {
             // CPython 3.13 `tuplehash` (Objects/tupleobject.c), bit-exact:
@@ -5075,6 +7011,47 @@ fn seq_cmp(a: &[Object], b: &[Object]) -> Result<Ordering, RuntimeError> {
 impl Object {
     pub fn from_str(s: impl Into<String>) -> Self {
         Object::Str(Rc::from(s.into().as_str()))
+    }
+
+    /// Build a `str` from a sequence of code points, each a Unicode scalar
+    /// value *or* a lone surrogate (U+D800..U+DFFF). Canonicalises: if no lone
+    /// surrogate is present the result is a normal [`Object::Str`] (so the
+    /// common path keeps the compact `Rc<str>` representation and ordinary
+    /// `str` fast paths); only a genuinely surrogate-bearing string becomes an
+    /// [`Object::WStr`]. This is the single chokepoint that preserves the
+    /// "`WStr` always holds >= 1 surrogate" invariant.
+    pub fn str_from_codepoints(cps: Vec<u32>) -> Self {
+        if cps.iter().any(|&c| (0xD800..=0xDFFF).contains(&c)) {
+            Object::WStr(Rc::from(cps.into_boxed_slice()))
+        } else {
+            // No surrogates: every code point is a valid scalar value.
+            let mut s = String::with_capacity(cps.len());
+            for c in cps {
+                // Safe: the surrogate range was just excluded, and code points
+                // are produced by `char`-range-checked callers.
+                if let Some(ch) = char::from_u32(c) {
+                    s.push(ch);
+                }
+            }
+            Object::Str(Rc::from(s.as_str()))
+        }
+    }
+
+    /// Code points of a `str`/`WStr` as `u32`s (scalar values, plus lone
+    /// surrogates for `WStr`). Returns `None` for non-string objects.
+    pub fn str_codepoints(&self) -> Option<Vec<u32>> {
+        match self {
+            Object::Str(s) => Some(s.chars().map(|c| c as u32).collect()),
+            Object::WStr(cps) => Some(cps.to_vec()),
+            _ => None,
+        }
+    }
+
+    /// True for either string representation (`str` or surrogate-bearing
+    /// `WStr`). Use at "is this a str?" dispatch points so a `WStr` is treated
+    /// as the `str` it is.
+    pub fn is_str(&self) -> bool {
+        matches!(self, Object::Str(_) | Object::WStr(_))
     }
 
     /// Identity-stable string: repeated calls with the same text return

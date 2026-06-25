@@ -153,6 +153,17 @@ pub struct TrackedHandle {
     /// may resurrect it, and CPython only counts objects that are actually
     /// reclaimed. Cleared once the finalizer completes (`finalized` is set).
     pub finalize_queued: AtomicBool,
+    /// Cached count of callback-bearing weakref clones the registry holds for
+    /// this object — refreshed by [`GcState::note_weakref_finalizable`]. The
+    /// prompt-finalization scan uses it as a fast-path liveness filter: an
+    /// object whose `strong_count` exceeds `1 (our handle) + weak_clones`
+    /// definitely still has a program reference, so the scan can skip it
+    /// without the (per-id) registry lookup that computes the exact clone
+    /// count. The cache is only ever an *upper bound* on the live clone count
+    /// (weakrefs can clear without notifying us), and an over-estimate only
+    /// makes the filter admit *more* objects to the precise check — never
+    /// fewer — so it can never cause a dead object to be missed.
+    pub weak_clones: AtomicUsize,
 }
 
 #[allow(non_upper_case_globals)]
@@ -174,6 +185,7 @@ impl TrackedHandle {
             slot: AtomicUsize::new(0),
             finalized: AtomicBool::new(false),
             finalize_queued: AtomicBool::new(false),
+            weak_clones: AtomicUsize::new(0),
         }
     }
 }
@@ -191,6 +203,22 @@ fn swap_remove_handle(vec: &mut Vec<Arc<TrackedHandle>>, slot: usize) {
     vec.swap_remove(slot);
     if let Some(moved) = vec.get(slot) {
         moved.slot.store(slot, Ordering::Release);
+    }
+}
+
+/// Correctness fallback for [`GcState::untrack_id`]: when a handle's cached
+/// `slot` no longer points at it (a concurrent `swap_remove`/promotion on
+/// another OS thread moved it before this thread acquired the vector lock),
+/// locate it by pointer identity and `swap_remove` it. Returns `true` if the
+/// handle was found and removed. O(n) in the generation length, but only ever
+/// taken on the rare stale-cache path — the common case stays O(1).
+#[inline]
+fn remove_handle_by_ptr(vec: &mut Vec<Arc<TrackedHandle>>, handle: &Arc<TrackedHandle>) -> bool {
+    if let Some(pos) = vec.iter().position(|h| Arc::ptr_eq(h, handle)) {
+        swap_remove_handle(vec, pos);
+        true
+    } else {
+        false
     }
 }
 
@@ -271,6 +299,21 @@ pub struct GcState {
     /// leaves the tracked set so `gc.is_finalized()` still answers `True`
     /// for an object its finalizer resurrected (PEP 442 / `test_is_finalized`).
     finalized_ids: RefCell<std::collections::HashSet<ObjectId>>,
+    /// Dedicated index over just the *finalizable* tracked objects —
+    /// instances whose class defines `__del__` and unfinished
+    /// generator-family objects. CPython runs `__del__` the instant an
+    /// object's refcount reaches zero; our tracing handle pins it until a
+    /// collection, so [`Self::reap_dead_finalizable`] emulates the prompt
+    /// path by scanning *this* small set (not the whole tracked
+    /// population) at the interpreter's reference-drop safe points. Keyed
+    /// by id like `index`; an object is in both while finalizable.
+    finalizable: RefCell<std::collections::HashMap<ObjectId, Arc<TrackedHandle>>>,
+    /// Live population of [`Self::finalizable`]. A relaxed load of this
+    /// atomic is the gate the interpreter checks before every prompt-
+    /// finalization sweep: when it is zero (the overwhelmingly common
+    /// case — most code never defines `__del__`) the sweep is skipped
+    /// entirely, so the feature costs one atomic load per safe point.
+    finalizable_count: AtomicUsize,
 }
 
 impl Default for GcState {
@@ -341,6 +384,48 @@ impl GcState {
             tracked_version: AtomicUsize::new(0),
             tracked_count: AtomicUsize::new(0),
             finalized_ids: RefCell::new(std::collections::HashSet::new()),
+            finalizable: RefCell::new(std::collections::HashMap::new()),
+            finalizable_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Reinitialise the collector's locks in a `fork(2)` child, preserving the
+    /// inherited tracked-object state. The collector is process-global and its
+    /// `GilCell` fields are normally serialised by the GIL, but an `Object`
+    /// whose last `Arc` is released on a peer thread can drop — and run through
+    /// the collector's prompt-reap bookkeeping — without that thread holding
+    /// the GIL. If such a peer vanishes mid-`borrow` in the fork, the inherited
+    /// `parking_lot` lock would wedge the child's very first allocation
+    /// (`test_threading.test_reinit_tls_after_fork` forks from 16 threads; the
+    /// child deadlocks in `threading._after_fork`'s `set(_enumerate())`).
+    /// Rebuild every field's lock in place and clear the re-entrancy guard —
+    /// CPython's `PyOS_AfterFork_Child` reinitialises the runtime's locks for
+    /// the same reason.
+    ///
+    /// Takes a raw `*mut Self` so each field's lock rebuild is driven from a
+    /// laundered raw pointer rather than a `&self` cast (see
+    /// [`crate::sync::GilCell::reinit_lock_after_fork`]).
+    ///
+    /// # Safety
+    ///
+    /// `this` must point at the process-global collector on the lone
+    /// surviving thread of a fork child, so the in-place lock rebuilds cannot
+    /// race and the payloads (last mutated under the GIL the forking thread
+    /// holds) are consistent.
+    pub unsafe fn reinit_after_fork_in_child(this: *mut Self) {
+        unsafe {
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).generations));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).index));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).thresholds));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).counts));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).frozen));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).garbage));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).callbacks));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).stats));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).finalized_ids));
+            RefCell::reinit_lock_after_fork(std::ptr::addr_of_mut!((*this).finalizable));
+            // A peer may have vanished mid-collection with this set.
+            (*this).collecting.store(false, Ordering::Release);
         }
     }
 
@@ -381,6 +466,15 @@ impl GcState {
             }
             let handle = Arc::new(TrackedHandle::new(obj, 0));
             index.insert(new_id, handle.clone());
+            // Enroll finalizable objects in the dedicated prompt-finalization
+            // index so the per-safe-point sweep scans only them, not the whole
+            // tracked population.
+            if has_finalizer(&handle.object) {
+                let mut fin = self.finalizable.borrow_mut();
+                if fin.insert(new_id, handle.clone()).is_none() {
+                    self.finalizable_count.fetch_add(1, Ordering::AcqRel);
+                }
+            }
             let mut gens = self.generations.borrow_mut();
             handle.slot.store(gens[0].handles.len(), Ordering::Release);
             gens[0].handles.push(handle);
@@ -403,33 +497,56 @@ impl GcState {
         let Some(handle) = self.index.borrow_mut().remove(&id) else {
             return;
         };
+        // Drop the finalizable-index entry in lock-step with the main index so
+        // the cheap prompt-finalization scan never sees a reclaimed object.
+        if self.finalizable.borrow_mut().remove(&id).is_some() {
+            self.finalizable_count.fetch_sub(1, Ordering::AcqRel);
+        }
         // O(1) removal via the handle's cached `slot`. The index is the
         // dedupe authority, so exactly one handle existed for `id`, and
         // its `slot`/`generation`/`color` pinpoint its position without a
         // per-generation scan (which made drop-heavy large heaps
         // quadratic — RFC 0039 WS4).
-        let slot = handle.slot.load(Ordering::Acquire);
+        //
+        // The cached `slot`/`generation` are *only* valid while the owning
+        // generation/frozen lock is held: a `swap_remove` elsewhere updates a
+        // moved handle's `slot` under that same lock. So we must acquire the
+        // vector lock *before* reading the cached position, and — because the
+        // GC is process-global and shared across OS threads — fall back to a
+        // pointer search if the cached slot is stale, rather than corrupting
+        // the vector with a wrong `swap_remove` (the bug behind the
+        // "generation slot index out of sync" panic under threaded GC).
         if handle.color.load(Ordering::Acquire) == color::Frozen {
             let mut frozen = self.frozen.borrow_mut();
-            debug_assert!(
-                frozen.get(slot).is_some_and(|h| Arc::ptr_eq(h, &handle)),
-                "frozen slot index out of sync"
-            );
-            swap_remove_handle(&mut frozen, slot);
+            let slot = handle.slot.load(Ordering::Acquire);
+            if frozen.get(slot).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
+                swap_remove_handle(&mut frozen, slot);
+            } else {
+                remove_handle_by_ptr(&mut frozen, &handle);
+            }
         } else {
+            let mut gens = self.generations.borrow_mut();
             let g = handle
                 .generation
                 .load(Ordering::Acquire)
                 .min(N_GENERATIONS - 1);
-            let mut gens = self.generations.borrow_mut();
-            debug_assert!(
-                gens[g]
-                    .handles
-                    .get(slot)
-                    .is_some_and(|h| Arc::ptr_eq(h, &handle)),
-                "generation slot index out of sync"
-            );
-            swap_remove_handle(&mut gens[g].handles, slot);
+            let slot = handle.slot.load(Ordering::Acquire);
+            if gens[g]
+                .handles
+                .get(slot)
+                .is_some_and(|h| Arc::ptr_eq(h, &handle))
+            {
+                swap_remove_handle(&mut gens[g].handles, slot);
+            } else if !remove_handle_by_ptr(&mut gens[g].handles, &handle) {
+                // Declared generation was wrong too (e.g. a concurrent
+                // promotion landed between the `generation` and `slot`
+                // reads). Search the rest before giving up.
+                for gg in 0..N_GENERATIONS {
+                    if gg != g && remove_handle_by_ptr(&mut gens[gg].handles, &handle) {
+                        break;
+                    }
+                }
+            }
         }
         self.tracked_count.fetch_sub(1, Ordering::AcqRel);
         self.tracked_version.fetch_add(1, Ordering::AcqRel);
@@ -491,6 +608,134 @@ impl GcState {
             }
         }
         reclaimed
+    }
+
+    /// True iff at least one finalizable object is currently tracked. A single
+    /// relaxed atomic load — the gate the interpreter checks at every
+    /// reference-drop safe point before deciding whether a prompt-finalization
+    /// sweep is even worth attempting.
+    #[inline]
+    pub fn has_any_finalizable(&self) -> bool {
+        self.finalizable_count.load(Ordering::Relaxed) > 0
+    }
+
+    /// Enroll a tracked object in the prompt-finalization index because a
+    /// weakref *with a callback* now watches it (`weakref.ref(obj, cb)`,
+    /// `weakref.finalize`, `multiprocessing.util.Finalize`). CPython fires
+    /// such a callback the instant the referent's last strong reference drops;
+    /// without this the callback would wait for the next cyclic collection.
+    /// No-op when the object isn't tracked (untracked weakref targets —
+    /// plain functions, bound methods — are handled by the collection-time
+    /// [`sweep_weakref_only_targets`] sweep instead).
+    pub fn note_weakref_finalizable(&self, id: ObjectId) {
+        let handle = self.index.borrow().get(&id).cloned();
+        if let Some(h) = handle {
+            // Refresh the cached clone count used by the prompt-finalization
+            // fast-path filter (see `TrackedHandle::weak_clones`).
+            let clones = crate::weakref_registry::strong_clone_count(id);
+            h.weak_clones.store(clones, Ordering::Release);
+            let mut fin = self.finalizable.borrow_mut();
+            if fin.insert(id, h).is_none() {
+                self.finalizable_count.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Drive one prompt-finalization pass over the dedicated finalizable index:
+    /// for every tracked finalizable object whose last *program* reference just
+    /// dropped, run its `__del__` and/or fire its weakref callbacks and reclaim
+    /// it. CPython does this by refcount the instant the count hits zero; our
+    /// tracing handle pins the object until a collection, so this emulates the
+    /// prompt path between bytecodes.
+    ///
+    /// "Dead" means the effective program refcount is zero:
+    /// `strong_count - 1 (our own GC handle) - (registry weakref clones)`.
+    /// A weakref slot keeps one strong clone of its target alive
+    /// ([`crate::weakref_registry::WeakRefSlot::target`]); discounting those is
+    /// what lets a `util.Finalize`-watched object — reachable now only through
+    /// the GC handle and the finalizer's own weakref — collapse to zero.
+    ///
+    /// Per dead object:
+    /// * If a `__del__` is still pending, queue it (set `finalize_queued`) and
+    ///   leave the object tracked — its finalizer might resurrect it, and any
+    ///   weakref callbacks must fire *after* `__del__` (CPython order). The
+    ///   driver's next pass re-checks death and, if it stuck, fires the
+    ///   weakrefs and reclaims.
+    /// * Otherwise (no `__del__`, or it already ran) fire the weakref callbacks
+    ///   (`notify_clear` → queued for the interpreter) and untrack the object —
+    ///   dropping the handle frees it and cascades the refcount into referents,
+    ///   exposing the next layer of dead finalizables on the following pass.
+    ///
+    /// Returns the number of objects that made progress (queued a finalizer or
+    /// were reclaimed); the driver loops until this is zero. Cheap: scans only
+    /// the finalizable index, which holds just the `__del__`/callback-weakref
+    /// objects (typically a handful).
+    pub fn reap_dead_finalizable(&self) -> usize {
+        if self.collecting.load(Ordering::Acquire) {
+            return 0;
+        }
+        // Borrow-only scan: collect just the dead handles. The common case —
+        // all finalizables still reachable — allocates nothing (an empty
+        // `Vec::new()` doesn't heap-allocate) and pays only a cheap
+        // `strong_count` atomic load per object, skipping the per-id registry
+        // lookup via the `weak_clones` fast-path filter.
+        let dead: Vec<Arc<TrackedHandle>> = {
+            let fin = self.finalizable.borrow();
+            let mut out: Vec<Arc<TrackedHandle>> = Vec::new();
+            for h in fin.values() {
+                let sc = strong_count_for(&h.object);
+                let cached = h.weak_clones.load(Ordering::Acquire);
+                // Fast reject: more strong refs than our handle plus all of its
+                // (cached, upper-bound) weakref clones ⇒ a program reference is
+                // still live. Skip without touching the registry.
+                if sc > 1 + cached {
+                    continue;
+                }
+                // Borderline: compute the exact live clone count and test for
+                // an effective program refcount of zero.
+                let clones = crate::weakref_registry::strong_clone_count(h.id);
+                if sc.saturating_sub(1).saturating_sub(clones) == 0 {
+                    out.push(h.clone());
+                }
+            }
+            out
+        };
+        if dead.is_empty() {
+            return 0;
+        }
+        let mut progressed = 0;
+        for h in dead {
+            // Re-validate under fresh counts: an earlier finalizer in this batch
+            // may have resurrected `h`.
+            let clones = crate::weakref_registry::strong_clone_count(h.id);
+            let effective = strong_count_for(&h.object)
+                .saturating_sub(1)
+                .saturating_sub(clones);
+            if effective != 0 {
+                continue; // resurrected between scan and now
+            }
+            let del_pending = has_finalizer(&h.object) && !h.finalized.load(Ordering::Acquire);
+            if del_pending {
+                // Queue `__del__`; defer weakref callbacks + reclamation to a
+                // later pass (after the finalizer has run and either resurrected
+                // the object or left it dead).
+                if !h.finalize_queued.swap(true, Ordering::AcqRel) {
+                    run_finalizer(&h.object);
+                    progressed += 1;
+                }
+            } else {
+                // No pending `__del__`: fire the (callback) weakrefs and
+                // reclaim. Weakref callbacks receive the weakref wrapper, not
+                // the target, so they cannot resurrect it — the object is
+                // definitively dead once they're queued.
+                crate::weakref_registry::queue_callbacks(crate::weakref_registry::notify_clear(
+                    h.id,
+                ));
+                self.untrack_id(h.id);
+                progressed += 1;
+            }
+        }
+        progressed
     }
 
     pub fn is_tracked(&self, id: ObjectId) -> bool {
@@ -691,6 +936,20 @@ impl GcState {
         self.collect_impl(upto, true)
     }
 
+    /// Run the cycle collector's mark phase across all generations and fire
+    /// the weakref callbacks of every unreachable, non-finalizable object,
+    /// *without* the destructive teardown of a real collection. See
+    /// [`Self::collect_generation`]'s `weakref_only` discussion. The
+    /// re-entrancy guard applies, so this is a no-op inside a collection.
+    pub fn fire_dead_weakrefs(&self) {
+        if self.collecting.load(Ordering::Acquire) {
+            return;
+        }
+        self.collecting.store(true, Ordering::Release);
+        self.collect_generation(N_GENERATIONS - 1, true);
+        self.collecting.store(false, Ordering::Release);
+    }
+
     /// Shared collection body. `exact` selects between the two cost/precision
     /// profiles:
     ///
@@ -738,7 +997,7 @@ impl GcState {
         let passes = if exact { MAX_COLLECT_PASSES } else { 1 };
         let mut collected = 0usize;
         for _ in 0..passes {
-            let n = self.collect_generation(gen);
+            let n = self.collect_generation(gen, false);
             collected += n;
             if n == 0 {
                 break;
@@ -767,7 +1026,20 @@ impl GcState {
     }
 
     /// Collect a specific generation. Used by [`Self::collect`].
-    fn collect_generation(&self, gen: usize) -> usize {
+    ///
+    /// `weakref_only` runs the identical mark phase but stops once the
+    /// unreachable set is known: it fires the weakref callbacks of the dead,
+    /// non-finalizable objects (flipping `weakref.ref(obj)()` to `None`) and
+    /// returns *without* running finalizers, clearing fields, untracking, or
+    /// rebuilding generations. It is used from a blocking `Thread.join` to
+    /// fire a reference-count-dead `ThreadPoolExecutor`'s `weakref_cb` (which
+    /// signals its idle workers to exit) without the destructive teardown of a
+    /// full collection — which, run while a worker holds an in-flight
+    /// `_WorkItem` in a frame the collector can't see as a root, would clear
+    /// that live work item mid-use (RFC 0040: `test_shutdown`). Because it
+    /// never mutates object contents, such a misclassification is harmless
+    /// here (a `_WorkItem` has no weakref, so its `notify_clear` is a no-op).
+    fn collect_generation(&self, gen: usize, weakref_only: bool) -> usize {
         // Phase 1: snapshot the handles in this generation, plus
         // any younger ones (collecting gen N also collects all
         // gens 0..N). We treat gens 0..=gen as the candidate set.
@@ -941,6 +1213,101 @@ impl GcState {
             .cloned()
             .collect();
 
+        if std::env::var_os("WP_REAP_DBG").is_some() {
+            for h in &candidate_set {
+                if let Object::Instance(i) = &h.object {
+                    if i.cls().name.contains("Executor") {
+                        let exec_id = h.id;
+                        let mut referrers: Vec<String> = Vec::new();
+                        for c in &scan_all {
+                            if c.id == exec_id {
+                                continue;
+                            }
+                            let mut hit = false;
+                            traverse_object(&c.object, &mut |child| {
+                                if id_of(child) == exec_id {
+                                    hit = true;
+                                }
+                            });
+                            if hit {
+                                let nm = match &c.object {
+                                    Object::Instance(ci) => format!("Instance({})", ci.cls().name),
+                                    other => other.type_name().to_string(),
+                                };
+                                referrers.push(nm);
+                            }
+                        }
+                        eprintln!(
+                            "[mark wronly={}] Executor sc={} clones={} gc_refs={} white={} tracked_referrers={:?}",
+                            weakref_only,
+                            strong_count_for(&h.object),
+                            crate::weakref_registry::strong_clone_count(h.id),
+                            h.gc_refs.load(Ordering::Acquire),
+                            h.color.load(Ordering::Acquire) == color::White,
+                            referrers,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Weakref-only pass: fire the dead objects' weakref callbacks and
+        // stop. We deliberately skip everything destructive below (finalizer
+        // execution, field clearing, untracking, generation rebuild) so a
+        // frame-rooted live object the mark mis-coloured White is left fully
+        // intact — only its (absent) weakrefs would be touched. A genuinely
+        // dead, weakref-watched object (the `del`'d `ThreadPoolExecutor`) gets
+        // its `weakref_cb` queued, which is all a blocking `join` needs to
+        // unblock its idle workers. Finalizable objects are left for a real
+        // collection so `tp_finalize` ordering is preserved.
+        if weakref_only {
+            let mut weakref_callbacks = Vec::new();
+            for h in &unreachable {
+                if has_finalizer(&h.object) && !h.finalized.load(Ordering::Acquire) {
+                    continue;
+                }
+                for (slot, cb) in crate::weakref_registry::notify_clear(h.id) {
+                    if let Some(cb) = cb {
+                        weakref_callbacks.push((slot, cb));
+                    }
+                }
+            }
+            for (slot, cb) in weakref_callbacks {
+                let wr = slot
+                    .py_ref
+                    .borrow()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .map(crate::object::Object::Instance);
+                if let Some(wr) = wr {
+                    crate::vm_singletons::push_pending_weakref_callback(cb, wr);
+                }
+            }
+            return 0;
+        }
+
+        // CPython clears weakrefs to the *entire* unreachable set
+        // (`handle_weakrefs`) BEFORE running any finalizer (`finalize_garbage`)
+        // and before resurrection handling. So a weakref watching an object a
+        // finalizer later revives stays cleared even though the object itself
+        // survives — e.g. `_pyio.FileIO.__del__` recording a
+        // `ResourceWarning(source=self)` into a live `catch_warnings` log
+        // resurrects the file, yet `weakref.ref(f)()` must read `None`
+        // (`test_io.test_garbage_collection`). Mirror that ordering: clear and
+        // queue callbacks for every unreachable object now, regardless of
+        // whether the resurrection re-mark or a finalizer keeps it alive below.
+        // (Counting still tracks only objects actually reclaimed — `dead` — so
+        // a resurrected object is uncounted but its weakref is gone, exactly as
+        // in CPython.)
+        let mut weakref_callbacks = Vec::new();
+        for h in &unreachable {
+            for (slot, cb) in crate::weakref_registry::notify_clear(h.id) {
+                if let Some(cb) = cb {
+                    weakref_callbacks.push((slot, cb));
+                }
+            }
+        }
+
         // Split the unreachable set into objects whose `__del__` hasn't run
         // yet ("deferred") and the rest. A deferred object is queued for
         // finalization and kept tracked: its finalizer (drained right after
@@ -963,28 +1330,82 @@ impl GcState {
             }
         }
 
-        // Queue each deferred object's finalizer (once) and recolor it Black so
-        // the reachability walk below can treat it as a protected root.
-        let mut protect_stack: Vec<Arc<TrackedHandle>> = Vec::new();
+        // Run each deferred object's finalizer (once). A finalizer is arbitrary
+        // Python: it can execute bytecode, hit a `periodic_gil_checkpoint`, and
+        // hand the GIL to another OS thread — which may then *resurrect* an
+        // object the mark phase just classified unreachable (store it somewhere
+        // reachable, or, in the threaded queue reproducers, pull it off a buffer
+        // into a live frame local). Every mark color computed above predates
+        // these finalizers, so it is stale the instant any finalizer runs.
         for h in &deferred {
             if !h.finalize_queued.swap(true, Ordering::AcqRel) {
                 run_finalizer(&h.object);
             }
+        }
+
+        // CPython's `handle_resurrected_objects`: after `finalize_garbage` runs
+        // every `tp_finalize`, it re-derives reachability and moves any object
+        // that came back to life out of the to-be-cleared set. Mirror that — but
+        // only when a finalizer actually ran, since that is the sole point in
+        // this routine where the GIL can be released and the object graph can
+        // change underneath us. Re-seed `gc_refs` from a *fresh* strong-count
+        // snapshot (so a reference a concurrent thread or a finalizer added is
+        // counted), re-subtract internal edges, and re-propagate reachability.
+        // Without this, a live object reachable only through an untraversed root
+        // (a running thread's frame locals) that a finalizer's GIL hand-off
+        // revived is cleared mid-use — emptying its `__dict__` while another
+        // thread pickles it (RFC 0040: `ProcessPoolExecutor` / multiprocessing
+        // `Queue` feeder dropping a `_CallItem` into a worker's pipe).
+        if !deferred.is_empty() {
+            for handle in &scan_all {
+                let weak_clones = crate::weakref_registry::strong_clone_count(handle.id) as i64;
+                let outer = strong_count_for(&handle.object)
+                    .saturating_sub(1)
+                    .saturating_sub(weak_clones as usize) as i64;
+                handle.gc_refs.store(outer, Ordering::Release);
+                handle.color.store(color::White, Ordering::Release);
+            }
+            for handle in &scan_all {
+                traverse_object(&handle.object, &mut |child| {
+                    if let Some(target) = by_id.get(&id_of(child)) {
+                        target.gc_refs.fetch_sub(1, Ordering::AcqRel);
+                    }
+                });
+            }
+            let mut grey: Vec<Arc<TrackedHandle>> = Vec::new();
+            for handle in &scan_all {
+                if handle.gc_refs.load(Ordering::Acquire) > 0 {
+                    handle.color.store(color::Grey, Ordering::Release);
+                    grey.push(handle.clone());
+                }
+            }
+            while let Some(h) = grey.pop() {
+                h.color.store(color::Black, Ordering::Release);
+                traverse_object(&h.object, &mut |child| {
+                    if let Some(target) = by_id.get(&id_of(child)) {
+                        if target.color.load(Ordering::Acquire) == color::White {
+                            target.color.store(color::Grey, Ordering::Release);
+                            grey.push(target.clone());
+                        }
+                    }
+                });
+            }
+        }
+
+        // Recolor the deferred roots Black and protect their whole reachable
+        // subgraph. CPython runs `finalize_garbage` *before* `delete_garbage`, so
+        // a pending finalizer always sees its own class, closure cells, and
+        // referents intact — even when those are themselves unreachable cyclic
+        // garbage (a locally-defined class whose only instance is dying, the
+        // `__del__` function closing over the cycle, …). Those objects are
+        // reclaimed by a later pass once the owning finalizer has run and they,
+        // too, are plain garbage. Re-applied here so it survives the resurrection
+        // re-mark above (which reset every color from the fresh refcounts).
+        let mut protect_stack: Vec<Arc<TrackedHandle>> = Vec::new();
+        for h in &deferred {
             h.color.store(color::Black, Ordering::Release);
             protect_stack.push(h.clone());
         }
-
-        // CPython runs `finalize_garbage` *before* `delete_garbage`, so a
-        // pending finalizer always sees its own class, closure cells, and
-        // referents intact — even when those are themselves unreachable cyclic
-        // garbage (a locally-defined class whose only instance is dying, the
-        // `__del__` function closing over the cycle, …). Reproduce that by
-        // protecting the whole finalizer-reachable subgraph: starting from the
-        // deferred roots, recolor every reachable White candidate Black so it
-        // survives this pass. Those objects are reclaimed by a later pass once
-        // the owning finalizer has run and they, too, are plain garbage.
-        // Without this, clearing the class/`__del__` mid-cycle left the queued
-        // finalizer running against a torn-down namespace (its writes no-oped).
         while let Some(h) = protect_stack.pop() {
             traverse_object(&h.object, &mut |child| {
                 if let Some(target) = by_id.get(&id_of(child)) {
@@ -996,8 +1417,8 @@ impl GcState {
             });
         }
 
-        // Whatever stayed White after protecting the finalizer subgraph is
-        // genuinely dead this pass.
+        // Whatever stayed White after the resurrection re-mark and the finalizer
+        // subgraph protection is genuinely dead this pass.
         let dead: Vec<Arc<TrackedHandle>> = maybe_dead
             .into_iter()
             .filter(|h| h.color.load(Ordering::Acquire) == color::White)
@@ -1025,18 +1446,10 @@ impl GcState {
             }
         }
 
-        // 5a: clear weakrefs for the reclaimed objects, queueing callbacks for
-        // invocation in 5d. Deferred (possibly-resurrected) objects keep their
-        // weakrefs until a later pass confirms they're dead.
-        let mut weakref_callbacks = Vec::new();
-        for h in &dead {
-            let cleared = crate::weakref_registry::notify_clear(h.id);
-            for (slot, cb) in cleared {
-                if let Some(cb) = cb {
-                    weakref_callbacks.push((slot, cb));
-                }
-            }
-        }
+        // 5a: weakrefs for the unreachable set were already cleared above (the
+        // CPython `handle_weakrefs`-before-`finalize_garbage` ordering), so the
+        // `dead` objects' weakrefs are gone and their callbacks are already
+        // queued in `weakref_callbacks` for invocation in 5d.
 
         // 5b (RFC 0039 WS5): before tearing the dead objects down, record the
         // children they referenced *outside* this collection's candidate set.
@@ -1171,6 +1584,7 @@ impl GcState {
         // opposite orders is a textbook deadlock (observed under
         // `test_weakref`'s background-collector loop — RFC 0039 WS4).
         let mut index = self.index.borrow_mut();
+        let mut fin = self.finalizable.borrow_mut();
         let mut gens = self.generations.borrow_mut();
         for g in 0..=upto.min(N_GENERATIONS - 1) {
             gens[g].handles.clear();
@@ -1179,6 +1593,9 @@ impl GcState {
             let color = h.color.load(Ordering::Acquire);
             if color == color::White {
                 index.remove(&h.id);
+                if fin.remove(&h.id).is_some() {
+                    self.finalizable_count.fetch_sub(1, Ordering::AcqRel);
+                }
                 continue;
             }
             let g = h.generation.load(Ordering::Acquire);
@@ -1598,6 +2015,21 @@ pub fn track(obj: Object) {
     with_state(|s| s.track(obj));
 }
 
+/// Reinitialise the process-global cycle collector's locks in a `fork(2)`
+/// child. See [`GcState::reinit_after_fork_in_child`].
+///
+/// # Safety
+///
+/// Must run only on the lone surviving thread of a fork child.
+pub unsafe fn reinit_after_fork_in_child() {
+    // Launder the static's address into a raw `*mut` (forcing init via the
+    // deref) so the field rebuilds don't go through a `&T -> *mut T` cast.
+    let state: &GcState = &GC_STATE;
+    unsafe {
+        GcState::reinit_after_fork_in_child(std::ptr::from_ref(state).cast_mut());
+    }
+}
+
 /// A value that can never (transitively) hold a reference back to a
 /// container, and therefore can never be part of a reference cycle.
 /// Mutable byte/scalar leaves qualify; everything else is treated as
@@ -1723,6 +2155,55 @@ pub fn reap_dead_acyclic() -> usize {
     with_state(|s| s.reap_dead_acyclic())
 }
 
+/// Convenience: is any finalizable object currently tracked in the shared GC?
+/// The interpreter's prompt-finalization gate (see
+/// [`GcState::has_any_finalizable`]).
+#[inline]
+pub fn has_any_finalizable() -> bool {
+    with_state(GcState::has_any_finalizable)
+}
+
+thread_local! {
+    /// Set whenever the interpreter executes an opcode that may have dropped
+    /// the last reference to an object (a `POP_*`/`STORE_*`/`DELETE_*`, a
+    /// frame teardown, …). The eval loop only runs a prompt-finalization sweep
+    /// when this is set *and* a finalizable object is live, so a hot loop that
+    /// never drops a reference pays nothing beyond the gate's atomic load.
+    /// Thread-local because each thread reclaims the objects whose last
+    /// reference *it* dropped, matching CPython's per-thread `tp_dealloc`.
+    static MAYBE_DEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Note that the current thread just executed a reference-dropping opcode, so a
+/// finalizable object may now be dead. Cheap (a thread-local `Cell` store); the
+/// actual sweep is deferred to the next eval-loop safe point.
+#[inline]
+pub fn mark_maybe_dead() {
+    MAYBE_DEAD.with(|c| c.set(true));
+}
+
+/// Consume the "a reference may have dropped" flag, returning whether it was
+/// set. The eval loop calls this to decide whether a prompt-finalization sweep
+/// is warranted this instruction.
+#[inline]
+pub fn take_maybe_dead() -> bool {
+    MAYBE_DEAD.with(|c| c.replace(false))
+}
+
+/// Convenience: drive one prompt-finalization pass over refcount-dead
+/// finalizable objects in the shared GC (see
+/// [`GcState::reap_dead_finalizable`]).
+pub fn reap_dead_finalizable() -> usize {
+    with_state(|s| s.reap_dead_finalizable())
+}
+
+/// Convenience: enroll a tracked object in the prompt-finalization index
+/// because a callback-bearing weakref now watches it (see
+/// [`GcState::note_weakref_finalizable`]).
+pub fn note_weakref_finalizable(id: ObjectId) {
+    with_state(|s| s.note_weakref_finalizable(id));
+}
+
 /// Convenience: run a full collection on the shared GC. Returns the
 /// number of objects collected.
 pub fn collect_all() -> usize {
@@ -1737,6 +2218,16 @@ pub fn collect_upto(upto: usize) -> usize {
     let n = with_state(|s| s.collect(upto));
     sweep_weakref_only_targets();
     n
+}
+
+/// Convenience: fire dead objects' weakref callbacks via a non-destructive
+/// mark pass on the shared GC (see [`GcState::fire_dead_weakrefs`]), then
+/// sweep the untracked weakref-only targets. Used from a blocking
+/// `Thread.join` to unblock idle `ThreadPoolExecutor` workers without the
+/// teardown risk of a full collection.
+pub fn fire_dead_weakrefs() {
+    with_state(|s| s.fire_dead_weakrefs());
+    sweep_weakref_only_targets();
 }
 
 /// Clear weakrefs whose referent isn't in the tracked set and whose

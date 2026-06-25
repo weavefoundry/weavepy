@@ -204,6 +204,45 @@ impl ThreadRegistry {
         self.next_synthetic.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Reset the registry after `fork()` in the *child*.
+    ///
+    /// `fork(2)` clones only the calling thread; every other thread in
+    /// the parent ceases to exist in the child, yet the child inherits a
+    /// byte-for-byte copy of this registry — including the `JoinHandle`s
+    /// for those vanished threads. If the child later joins them at
+    /// interpreter shutdown (`join_non_daemon`), `pthread_join` returns
+    /// `ESRCH` ("No such process") and Rust's std aborts the process.
+    ///
+    /// We drop every entry from the map. Dropping a `JoinHandle` without
+    /// calling `.join()` simply *detaches* the (already-dead) OS thread —
+    /// no `pthread_join` syscall, no abort. `main_native_id` is re-pointed
+    /// at the surviving thread, which is the child's de-facto main thread.
+    /// Mirrors CPython's `PyOS_AfterFork_Child` thread-state reset, which
+    /// runs before the Python-level `threading._after_fork` handler.
+    pub fn reset_after_fork_in_child(&self, current_native_id: u64) {
+        // `fork(2)` may have cloned this registry mid-mutation: a sibling
+        // thread that vanished in the fork could have held `entries` (a
+        // `parking_lot::RwLock`, which is not fork-safe) at the instant of
+        // the fork — the 16 threads of `test_reinit_tls_after_fork` are
+        // still registering/unregistering as the first of them forks. The
+        // inherited lock would then be permanently "held" in the child, so
+        // calling `.write()` here would deadlock. Overwrite the whole lock
+        // with a fresh, empty one instead. The child is single-threaded at
+        // this point, so nothing races this write; `ptr::write` skips
+        // dropping the poisoned lock and its map — abandoning the
+        // now-defunct `JoinHandle`s for the parent's dead threads, which is
+        // exactly the detach we want (no `pthread_join`/`ESRCH` at the
+        // child's shutdown).
+        // SAFETY: sole surviving thread post-fork; `&self.entries` points at
+        // a live, initialised `RwLock` for the duration of the write.
+        unsafe {
+            let p = std::ptr::addr_of!(self.entries).cast_mut();
+            std::ptr::write(p, RwLock::new(BTreeMap::new()));
+        }
+        self.main_native_id
+            .store(current_native_id, Ordering::Release);
+    }
+
     /// Joins all non-daemon threads. Called at interpreter
     /// shutdown so user-visible work runs to completion before
     /// the process exits.

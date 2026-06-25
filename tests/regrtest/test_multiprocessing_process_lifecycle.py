@@ -1,7 +1,8 @@
 """RFC 0026 — multiprocessing.Process lifecycle.
 
 Covers the boundary cases:
-- start() twice raises RuntimeError;
+- start() twice raises AssertionError (CPython's bare `assert self._popen
+  is None`);
 - terminate() on a not-yet-started Process is a no-op;
 - close() refuses to run while the worker is alive;
 - daemon flag handling;
@@ -31,7 +32,7 @@ def main():
     p.start()
     try:
         p.start()
-    except RuntimeError:
+    except AssertionError:
         pass
     else:
         raise AssertionError("second start() should raise")
@@ -58,7 +59,7 @@ def main():
     p.start()
     try:
         p.daemon = False
-    except RuntimeError:
+    except AssertionError:
         pass
     else:
         raise AssertionError("daemon setter after start should raise")

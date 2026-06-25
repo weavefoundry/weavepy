@@ -300,6 +300,22 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("MSG_DONTWAIT")),
             Object::Int(128),
         );
+        // Ancillary-data control-message types. `SCM_RIGHTS` carries file
+        // descriptors over an AF_UNIX socket via `sendmsg`/`recvmsg`; it is
+        // what `multiprocessing.reduction.send_handle`/`recv_handle` (and so
+        // the `forkserver` start method, `resource_sharer`, and Connection fd
+        // handoff) require. Its presence here is what makes
+        // `reduction.HAVE_SEND_HANDLE` true.
+        #[cfg(unix)]
+        d.insert(
+            DictKey(Object::from_static("SCM_RIGHTS")),
+            Object::Int(i64::from(libc::SCM_RIGHTS)),
+        );
+        #[cfg(target_os = "linux")]
+        d.insert(
+            DictKey(Object::from_static("SCM_CREDENTIALS")),
+            Object::Int(i64::from(libc::SCM_CREDENTIALS)),
+        );
 
         // shutdown(how) — match CPython numbering.
         d.insert(DictKey(Object::from_static("SHUT_RD")), Object::Int(0));
@@ -460,6 +476,8 @@ fn socket_methods() -> Vec<(&'static str, Object)> {
         m!("recv", sock_recv),
         m!("recv_into", sock_recv_into),
         m!("recvfrom", sock_recvfrom),
+        m!("sendmsg", sock_sendmsg),
+        m!("recvmsg", sock_recvmsg),
         m!("setblocking", sock_setblocking),
         m!("getblocking", sock_getblocking),
         m!("settimeout", sock_settimeout),
@@ -570,24 +588,85 @@ fn fd_to_socket_view(fd: i64) -> std::mem::ManuallyDrop<Socket> {
 /// [`allow_threads_then`]. Peers can run — and may even legitimately
 /// `close()` this fd to interrupt us, in which case the syscall fails
 /// with `EBADF`, exactly as on CPython.
+/// One blocking attempt of `f` with the GIL released and *without* holding the
+/// `SocketState` cell borrow. Returns the raw syscall result so the caller can
+/// decide whether to retry (e.g. on `EINTR`). See [`blocking_socket_io`] for
+/// the GIL/borrow rationale.
 #[cfg(any(unix, windows))]
-fn blocking_socket_io<R>(
+fn socket_call_once<R>(
     state: &Rc<RefCell<SocketState>>,
-    f: impl FnOnce(&Socket) -> std::io::Result<R>,
-) -> Result<R, RuntimeError> {
+    f: &mut dyn FnMut(&Socket) -> std::io::Result<R>,
+) -> Result<std::io::Result<R>, RuntimeError> {
     let fd = {
         let b = state.borrow();
         let sock = b.inner.as_ref().ok_or_else(|| os_error("socket closed"))?;
         raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?
     };
     let view = fd_to_socket_view(fd);
-    crate::gil::allow_threads_then(|| f(&view)).map_err(|e| io_error_to_py(&e))
+    Ok(crate::gil::allow_threads_then(|| f(&view)))
+}
+
+/// Run the Python signal handlers a just-observed `EINTR` may have tripped,
+/// now that the GIL is re-acquired (PEP 475). A handler that raises (e.g.
+/// `KeyboardInterrupt` from the default `SIGINT` handler) propagates and
+/// aborts the surrounding retry loop, exactly like CPython's `sock_call_ex`.
+#[cfg(unix)]
+fn run_pending_signals_after_eintr() -> Result<(), RuntimeError> {
+    if crate::stdlib::signal_mod::signals_pending() {
+        if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+            // SAFETY: the GIL is held (we just returned from `allow_threads_then`),
+            // so the interpreter pointer is exclusively ours.
+            unsafe { (*ptr).run_pending_signals_public()? };
+        }
+    }
+    Ok(())
+}
+
+/// Drive a blocking *single-syscall* socket op, retrying on `EINTR` after
+/// running pending Python signal handlers (PEP 475 — "Retry system calls
+/// failing with EINTR"). A signal that interrupts a blocking `accept`/`recv`/
+/// `send` no longer surfaces as `InterruptedError`; instead the handler runs
+/// and the call resumes, matching CPython.
+/// `_test_multiprocessing`'s `TestIgnoreEINTR.test_ignore_listener` relies on
+/// a `SIGUSR1` interrupting a child's blocking `accept()` and the accept then
+/// resuming so the parent can connect.
+///
+/// Only ops that map to a *single* syscall route through here, so a plain retry
+/// resumes correctly — `sendall` loops per-chunk in its caller (re-sending
+/// committed bytes would corrupt the stream) and `connect` uses
+/// [`socket_call_once`] directly (a signal-interrupted blocking connect
+/// completes asynchronously, so re-issuing `connect(2)` would return
+/// `EISCONN`/`EALREADY`).
+#[cfg(any(unix, windows))]
+fn blocking_socket_io<R>(
+    state: &Rc<RefCell<SocketState>>,
+    mut f: impl FnMut(&Socket) -> std::io::Result<R>,
+) -> Result<R, RuntimeError> {
+    loop {
+        match socket_call_once(state, &mut f)? {
+            Ok(v) => return Ok(v),
+            #[cfg(unix)]
+            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => {
+                run_pending_signals_after_eintr()?;
+                continue;
+            }
+            Err(e) => return Err(io_error_to_py(&e)),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn socket_call_once<R>(
+    _state: &Rc<RefCell<SocketState>>,
+    _f: &mut dyn FnMut(&Socket) -> std::io::Result<R>,
+) -> Result<std::io::Result<R>, RuntimeError> {
+    Err(os_error("sockets are not supported on this platform"))
 }
 
 #[cfg(not(any(unix, windows)))]
 fn blocking_socket_io<R>(
     _state: &Rc<RefCell<SocketState>>,
-    _f: impl FnOnce(&Socket) -> std::io::Result<R>,
+    _f: impl FnMut(&Socket) -> std::io::Result<R>,
 ) -> Result<R, RuntimeError> {
     Err(os_error("sockets are not supported on this platform"))
 }
@@ -727,14 +806,13 @@ fn sock_repr(args: &[Object]) -> Result<Object, RuntimeError> {
 fn sock_bind(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let family = state.borrow().family;
-    let addr = parse_socket_address(args.get(1), family)?;
+    let addr = parse_sockaddr2(args.get(1), family)?;
     let s_borrow = state.borrow();
     let sock = s_borrow
         .inner
         .as_ref()
         .ok_or_else(|| os_error("socket closed"))?;
-    sock.bind(&SockAddr::from(addr))
-        .map_err(|e| io_error_to_py(&e))?;
+    sock.bind(&addr).map_err(|e| io_error_to_py(&e))?;
     Ok(Object::None)
 }
 
@@ -756,7 +834,26 @@ fn sock_listen(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn sock_accept(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
-    let (new_sock, addr) = blocking_socket_io(&state, |sock| sock.accept())?;
+    // Use `accept_raw` (a bare `accept(2)`) rather than socket2's `accept`,
+    // which on Apple platforms *also* runs `setsockopt(SO_NOSIGPIPE)` on the
+    // freshly accepted fd. When the peer connected and then *closed* (and its
+    // process exited) before we accept, the new connection's protocol control
+    // block is already torn down and that post-accept setsockopt fails with
+    // EINVAL — turning a perfectly valid accept (the bytes the peer sent are
+    // still queued and readable) into an error. CPython issues a plain
+    // `accept(2)`, never setting NOSIGPIPE at accept time (SIGPIPE is ignored
+    // process-wide; see the `signal` init), so it returns the connection and a
+    // subsequent `recv()` drains the buffered data then sees EOF.
+    // `_test_multiprocessing`'s `WithProcessesTestListenerClient.test_issue14725`
+    // exercises exactly this race (child writes, closes, exits; parent accepts).
+    let (new_sock, addr) = blocking_socket_io(&state, |sock| sock.accept_raw())?;
+    // PEP 446: accepted descriptors are non-inheritable. `F_SETFD` acts on the
+    // descriptor-table entry (not the connection), so it succeeds even for a
+    // peer-closed connection; ignore any error to stay non-fatal regardless.
+    // `set_cloexec` is a POSIX (`FD_CLOEXEC`) helper; non-inheritability is
+    // handled differently on Windows, so the call is Unix-only.
+    #[cfg(unix)]
+    let _ = new_sock.set_cloexec(true);
     let (family, kind, proto) = {
         let s = state.borrow();
         (s.family, s.kind, s.proto)
@@ -798,9 +895,8 @@ fn sock_connect(args: &[Object]) -> Result<Object, RuntimeError> {
         let b = state.borrow();
         (b.family, b.timeout)
     };
-    let addr = parse_socket_address(args.get(1), family)?;
-    let sockaddr = SockAddr::from(addr);
-    blocking_socket_io(&state, move |sock| match timeout {
+    let sockaddr = parse_sockaddr2(args.get(1), family)?;
+    let mut connect_fn = move |sock: &Socket| match timeout {
         // A strictly-positive timeout means "timeout mode": bound the
         // connect with `connect_timeout`.
         Some(t) if !t.is_zero() => sock.connect_timeout(&sockaddr, t),
@@ -810,8 +906,15 @@ fn sock_connect(args: &[Object]) -> Result<Object, RuntimeError> {
         // non-blocking fd it surfaces `EINPROGRESS`/`EWOULDBLOCK`, exactly
         // like CPython, instead of being mis-read as a 0-second deadline.
         _ => sock.connect(&sockaddr),
-    })?;
-    Ok(Object::None)
+    };
+    // Single attempt — *no* EINTR retry: a signal-interrupted blocking
+    // connect continues asynchronously, so a second `connect(2)` would return
+    // `EISCONN`/`EALREADY` rather than completing it. Surface the syscall
+    // result directly (a handled signal still ran via the eval breaker).
+    match socket_call_once(&state, &mut connect_fn)? {
+        Ok(()) => Ok(Object::None),
+        Err(e) => Err(io_error_to_py(&e)),
+    }
 }
 
 fn sock_connect_ex(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -855,17 +958,20 @@ fn sock_send(args: &[Object]) -> Result<Object, RuntimeError> {
 fn sock_sendall(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = state_of(args)?;
     let data = extract_bytes(args.get(1))?;
-    blocking_socket_io(&state, |sock| {
-        let mut offset = 0;
-        while offset < data.len() {
-            let n = sock.send(&data[offset..])?;
-            if n == 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-            }
-            offset += n;
+    // Loop per chunk in the caller (not inside one `blocking_socket_io`
+    // closure) so a PEP 475 `EINTR` retry resumes from the current `offset`
+    // instead of re-running the whole send and duplicating already-committed
+    // bytes. Each individual `send` is the single retryable syscall.
+    let mut offset = 0;
+    while offset < data.len() {
+        let n = blocking_socket_io(&state, |sock| sock.send(&data[offset..]))?;
+        if n == 0 {
+            return Err(io_error_to_py(&std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            )));
         }
-        Ok(())
-    })?;
+        offset += n;
+    }
     Ok(Object::None)
 }
 
@@ -939,6 +1045,275 @@ fn sock_recvfrom(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::new_bytes(initialised),
         sockaddr_to_tuple(&addr, family),
     ]))
+}
+
+/// `socket.sendmsg(buffers[, ancdata[, flags[, address]]])` — send normal
+/// data plus ancillary data (control messages) on a connected socket.
+///
+/// WeavePy uses this for `multiprocessing`'s `SCM_RIGHTS` file-descriptor
+/// hand-off (`reduction.sendfds`): the `forkserver` start method, the
+/// `resource_sharer`, and `Connection` fd transfer all push fds through an
+/// AF_UNIX socket this way. The `address` argument (unconnected send) is not
+/// supported — every WeavePy caller uses a connected pair.
+#[cfg(unix)]
+fn sock_sendmsg(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::os::raw::c_void;
+    let state = state_of(args)?;
+    let buffers = extract_iov_buffers(args.get(1))?;
+    let ancdata = extract_ancdata(args.get(2))?;
+    let flags: libc::c_int = match args.get(3) {
+        None | Some(Object::None) => 0,
+        Some(Object::Int(n)) => *n as libc::c_int,
+        _ => return Err(type_error("sendmsg: flags must be an integer")),
+    };
+    if matches!(args.get(4), Some(o) if !matches!(o, Object::None)) {
+        return Err(os_error("sendmsg: address argument is not supported"));
+    }
+
+    let mut iovecs: Vec<libc::iovec> = buffers
+        .iter()
+        .map(|b| libc::iovec {
+            iov_base: b.as_ptr() as *mut c_void,
+            iov_len: b.len(),
+        })
+        .collect();
+
+    let controllen: usize = ancdata
+        .iter()
+        .map(|(_, _, d)| unsafe { libc::CMSG_SPACE(d.len() as u32) } as usize)
+        .sum();
+    let mut control: Vec<u8> = vec![0u8; controllen];
+
+    let fd = snapshot_raw_fd(&state)?;
+    let iov_ptr = iovecs.as_mut_ptr();
+    let iov_len = iovecs.len();
+    let ctrl_ptr = if controllen > 0 {
+        control.as_mut_ptr()
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let sent = crate::gil::allow_threads_then(move || unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = iov_ptr;
+        msg.msg_iovlen = iov_len as _;
+        if controllen > 0 {
+            msg.msg_control = ctrl_ptr.cast::<c_void>();
+            msg.msg_controllen = controllen as _;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+            for (level, ctype, data) in &ancdata {
+                if cmsg.is_null() {
+                    break;
+                }
+                (*cmsg).cmsg_level = *level;
+                (*cmsg).cmsg_type = *ctype;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(data.len() as u32) as _;
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    libc::CMSG_DATA(cmsg).cast::<u8>(),
+                    data.len(),
+                );
+                cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
+            }
+        }
+        libc::sendmsg(fd, &raw const msg, flags)
+    });
+    if sent < 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::Int(sent as i64))
+}
+
+/// `socket.recvmsg(bufsize[, ancbufsize[, flags]])` — receive normal data
+/// plus ancillary data, returning `(data, ancdata, msg_flags, address)`.
+/// `ancdata` is a list of `(cmsg_level, cmsg_type, cmsg_data)` triples (the
+/// shape `multiprocessing.reduction.recvfds` decodes). `address` is `None`
+/// (the WeavePy callers all use connected sockets).
+#[cfg(unix)]
+fn sock_recvmsg(args: &[Object]) -> Result<Object, RuntimeError> {
+    use std::os::raw::c_void;
+    let state = state_of(args)?;
+    let bufsize = match args.get(1) {
+        Some(Object::Int(n)) if *n >= 0 => *n as usize,
+        Some(Object::Int(_)) => return Err(value_error("negative buffersize in recvmsg")),
+        _ => return Err(type_error("recvmsg: bufsize must be an integer")),
+    };
+    let ancbufsize = match args.get(2) {
+        None | Some(Object::None) => 0usize,
+        Some(Object::Int(n)) if *n >= 0 => *n as usize,
+        Some(Object::Int(_)) => return Err(value_error("negative ancillary data buffer size")),
+        _ => return Err(type_error("recvmsg: ancbufsize must be an integer")),
+    };
+    let flags: libc::c_int = match args.get(3) {
+        None | Some(Object::None) => 0,
+        Some(Object::Int(n)) => *n as libc::c_int,
+        _ => return Err(type_error("recvmsg: flags must be an integer")),
+    };
+
+    let mut databuf = vec![0u8; bufsize];
+    let mut control = vec![0u8; ancbufsize];
+    let fd = snapshot_raw_fd(&state)?;
+
+    let mut iov = [libc::iovec {
+        iov_base: databuf.as_mut_ptr().cast::<c_void>(),
+        iov_len: bufsize,
+    }];
+    let iov_ptr = iov.as_mut_ptr();
+    let ctrl_ptr = if ancbufsize > 0 {
+        control.as_mut_ptr()
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let (n, msg_flags, used_controllen) = crate::gil::allow_threads_then(move || unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = iov_ptr;
+        msg.msg_iovlen = 1 as _;
+        if ancbufsize > 0 {
+            msg.msg_control = ctrl_ptr.cast::<c_void>();
+            msg.msg_controllen = ancbufsize as _;
+        }
+        let n = libc::recvmsg(fd, &raw mut msg, flags);
+        (n, i64::from(msg.msg_flags), msg.msg_controllen as usize)
+    });
+    if n < 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    databuf.truncate(n as usize);
+
+    let mut ancdata_items: Vec<Object> = Vec::new();
+    if ancbufsize > 0 && used_controllen > 0 {
+        unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_control = control.as_mut_ptr().cast::<c_void>();
+            msg.msg_controllen = used_controllen as _;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+            while !cmsg.is_null() {
+                let level = (*cmsg).cmsg_level;
+                let ctype = (*cmsg).cmsg_type;
+                let cmsg_len = (*cmsg).cmsg_len as usize;
+                let data_ptr = libc::CMSG_DATA(cmsg);
+                // Payload length = cmsg_len minus the (aligned) header up to
+                // CMSG_DATA — never `CMSG_LEN(0)`, which omits the alignment.
+                let data_offset = (data_ptr as usize).saturating_sub(cmsg as usize);
+                let data_len = cmsg_len.saturating_sub(data_offset);
+                let data = std::slice::from_raw_parts(data_ptr.cast::<u8>(), data_len).to_vec();
+                ancdata_items.push(Object::new_tuple(vec![
+                    Object::Int(i64::from(level)),
+                    Object::Int(i64::from(ctype)),
+                    Object::new_bytes(data),
+                ]));
+                cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
+            }
+        }
+    }
+
+    Ok(Object::new_tuple(vec![
+        Object::new_bytes(databuf),
+        Object::new_list(ancdata_items),
+        Object::Int(msg_flags),
+        Object::None,
+    ]))
+}
+
+#[cfg(not(unix))]
+fn sock_sendmsg(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(os_error("sendmsg is not supported on this platform"))
+}
+
+#[cfg(not(unix))]
+fn sock_recvmsg(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(os_error("recvmsg is not supported on this platform"))
+}
+
+/// Snapshot the raw fd of `state`, dropping the borrow before the syscall
+/// (a peer thread may legitimately `close()` it; we then see `EBADF`).
+#[cfg(unix)]
+fn snapshot_raw_fd(state: &Rc<RefCell<SocketState>>) -> Result<libc::c_int, RuntimeError> {
+    let b = state.borrow();
+    let sock = b.inner.as_ref().ok_or_else(|| os_error("socket closed"))?;
+    let fd = raw_fd_of(sock).ok_or_else(|| os_error("socket has no file descriptor"))?;
+    Ok(fd as libc::c_int)
+}
+
+/// Extract the `sendmsg` iovec list — an iterable of bytes-like objects.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn extract_iov_buffers(arg: Option<&Object>) -> Result<Vec<Vec<u8>>, RuntimeError> {
+    let items: Vec<Object> = match arg {
+        Some(Object::List(l)) => l.borrow().clone(),
+        Some(Object::Tuple(t)) => t.to_vec(),
+        _ => {
+            return Err(type_error(
+                "sendmsg(): argument 1 must be an iterable of bytes-like objects",
+            ))
+        }
+    };
+    items.iter().map(|o| extract_bytes(Some(o))).collect()
+}
+
+/// Extract `sendmsg` ancillary data: an iterable of `(cmsg_level, cmsg_type,
+/// cmsg_data)` triples. `cmsg_data` may be any bytes-like object, including
+/// the `array.array('i', fds)` `multiprocessing.reduction.sendfds` passes.
+#[cfg(unix)]
+fn extract_ancdata(
+    arg: Option<&Object>,
+) -> Result<Vec<(libc::c_int, libc::c_int, Vec<u8>)>, RuntimeError> {
+    let items: Vec<Object> = match arg {
+        None | Some(Object::None) => return Ok(Vec::new()),
+        Some(Object::List(l)) => l.borrow().clone(),
+        Some(Object::Tuple(t)) => t.to_vec(),
+        _ => {
+            return Err(type_error(
+                "sendmsg(): ancillary data must be an iterable of zero or more triples",
+            ))
+        }
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let triple = match &item {
+            Object::Tuple(t) if t.len() == 3 => t.to_vec(),
+            Object::List(l) if l.borrow().len() == 3 => l.borrow().clone(),
+            _ => {
+                return Err(type_error(
+                    "sendmsg(): ancillary data items must be (cmsg_level, cmsg_type, cmsg_data) triples",
+                ))
+            }
+        };
+        let level = match &triple[0] {
+            Object::Int(n) => *n as libc::c_int,
+            _ => return Err(type_error("sendmsg(): an integer is required (cmsg_level)")),
+        };
+        let ctype = match &triple[1] {
+            Object::Int(n) => *n as libc::c_int,
+            _ => return Err(type_error("sendmsg(): an integer is required (cmsg_type)")),
+        };
+        let data = cmsg_data_bytes(&triple[2])?;
+        out.push((level, ctype, data));
+    }
+    Ok(out)
+}
+
+/// Bytes of a control-message payload. Falls back to the buffer protocol via
+/// `obj.tobytes()` for objects that aren't native bytes/bytearray/memoryview
+/// — notably `array.array`, which `multiprocessing` uses for the fd array.
+#[cfg(unix)]
+fn cmsg_data_bytes(obj: &Object) -> Result<Vec<u8>, RuntimeError> {
+    if let Ok(b) = extract_bytes(Some(obj)) {
+        return Ok(b);
+    }
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by the active builtin call on this thread; the
+        // interpreter outlives this call.
+        let interp = unsafe { &mut *ptr };
+        if let Ok(method) = interp.load_attr_public(obj, "tobytes") {
+            if let Object::Bytes(b) = interp.call_object(method, &[], &[])? {
+                return Ok(b.to_vec());
+            }
+        }
+    }
+    Err(type_error(
+        "sendmsg(): ancillary data must be a bytes-like object",
+    ))
 }
 
 fn sock_setblocking(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1503,6 +1878,98 @@ fn parse_socket_address(arg: Option<&Object>, family: i32) -> Result<SocketAddr,
     Ok(parsed)
 }
 
+/// Build a `socket2::SockAddr` for an `AF_UNIX` path. Handles both
+/// pathname sockets (NUL-terminated on the wire) and Linux abstract-namespace
+/// sockets (a leading NUL, length-delimited, no terminator). `multiprocessing`
+/// (Manager/forkserver) and `socketserver`'s `UnixStreamServer` bind such
+/// addresses on POSIX, so `bind`/`connect` must accept a bare path here.
+#[cfg(unix)]
+fn sockaddr_unix_from_bytes(path: &[u8]) -> Result<SockAddr, RuntimeError> {
+    use std::mem;
+    let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    // SAFETY: `sockaddr_storage` is large enough to alias a `sockaddr_un`.
+    let su = unsafe { &mut *(std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_un>()) };
+    su.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let cap = su.sun_path.len();
+    let is_abstract = path.first() == Some(&0);
+    // Pathname sockets reserve one byte for the trailing NUL.
+    let max = if is_abstract {
+        cap
+    } else {
+        cap.saturating_sub(1)
+    };
+    if path.len() > max {
+        return Err(os_error("AF_UNIX path too long"));
+    }
+    for (i, &b) in path.iter().enumerate() {
+        su.sun_path[i] = b as libc::c_char;
+    }
+    // `offsetof(sockaddr_un, sun_path)` portably: total size minus the
+    // path array (2 on both Linux and macOS). Pathname sockets add the
+    // terminator to the length they report to the kernel.
+    let offset = mem::size_of::<libc::sockaddr_un>() - cap;
+    let len = if is_abstract {
+        offset + path.len()
+    } else {
+        offset + path.len() + 1
+    };
+    // SAFETY: `storage` holds a fully-initialised `sockaddr_un` of `len` bytes.
+    Ok(unsafe { SockAddr::new(storage, len as libc::socklen_t) })
+}
+
+/// Extract the path from an `AF_UNIX` `SockAddr`, or `None` if it isn't one.
+/// Pathname sockets are returned NUL-trimmed; abstract sockets keep their
+/// leading NUL (CPython surfaces them the same way).
+#[cfg(unix)]
+fn sockaddr_unix_path(addr: &SockAddr) -> Option<String> {
+    if addr.family() != libc::AF_UNIX as libc::sa_family_t {
+        return None;
+    }
+    // SAFETY: family is AF_UNIX, so the storage is a `sockaddr_un`.
+    let su: &libc::sockaddr_un = unsafe { &*(addr.as_ptr().cast::<libc::sockaddr_un>()) };
+    let total = addr.len() as usize;
+    let base = std::mem::size_of::<libc::sockaddr_un>() - su.sun_path.len();
+    if total <= base {
+        return Some(String::new()); // unnamed
+    }
+    let path_len = (total - base).min(su.sun_path.len());
+    // SAFETY: `sun_path` holds at least `path_len` initialised bytes.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(su.sun_path.as_ptr().cast::<u8>(), path_len) };
+    // Linux abstract namespace: a leading NUL is significant and the rest is
+    // *not* NUL-terminated, so surface the whole window. This convention does
+    // not exist on the BSDs/macOS, where `sun_path` is an ordinary
+    // NUL-terminated C string — a leading NUL there just means the empty
+    // (unnamed) address, which CPython decodes to `""` (and which the kernel
+    // hands back for an autobind/unnamed peer that `accept(2)` reports with a
+    // zeroed, full-width `sun_path`).
+    #[cfg(target_os = "linux")]
+    if bytes.first() == Some(&0) {
+        return Some(String::from_utf8_lossy(bytes).into_owned());
+    }
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
+/// Resolve a Python socket-address argument into a `socket2::SockAddr`,
+/// dispatching on the socket's address family: an `AF_UNIX` socket takes a
+/// `str`/`bytes` path, everything else the `(host, port[, …])` tuple parsed
+/// by [`parse_socket_address`].
+fn parse_sockaddr2(arg: Option<&Object>, family: i32) -> Result<SockAddr, RuntimeError> {
+    #[cfg(unix)]
+    if family == libc::AF_UNIX as i32 {
+        let path: Vec<u8> = match arg {
+            Some(Object::Str(s)) => s.as_bytes().to_vec(),
+            Some(Object::Bytes(b)) => b.to_vec(),
+            Some(Object::ByteArray(b)) => b.borrow().clone(),
+            _ => return Err(type_error("AF_UNIX address must be a str or bytes path")),
+        };
+        return sockaddr_unix_from_bytes(&path);
+    }
+    let addr = parse_socket_address(arg, family)?;
+    Ok(SockAddr::from(addr))
+}
+
 fn sockaddr_to_tuple(addr: &SockAddr, _family: i32) -> Object {
     if let Some(v4) = addr.as_socket_ipv4() {
         Object::new_tuple(vec![
@@ -1517,6 +1984,12 @@ fn sockaddr_to_tuple(addr: &SockAddr, _family: i32) -> Object {
             Object::Int(i64::from(v6.scope_id())),
         ])
     } else {
+        // `AF_UNIX` (and the unnamed/empty case): CPython returns the path
+        // as a plain `str`, not a `(host, port)` tuple.
+        #[cfg(unix)]
+        if let Some(path) = sockaddr_unix_path(addr) {
+            return Object::from_str(path);
+        }
         Object::new_tuple(vec![Object::from_static(""), Object::Int(0)])
     }
 }
@@ -1564,7 +2037,50 @@ fn module_functions() -> &'static [(&'static str, fn(&[Object]) -> Result<Object
         ("ntohl", mod_htonl),
         ("getdefaulttimeout", mod_getdefaulttimeout),
         ("setdefaulttimeout", mod_setdefaulttimeout),
+        // Ancillary-data sizing helpers (functions, not constants, exactly
+        // like CPython's `socket` module). Needed by `reduction.recvfds`.
+        ("CMSG_LEN", mod_cmsg_len),
+        ("CMSG_SPACE", mod_cmsg_space),
     ]
+}
+
+/// `socket.CMSG_LEN(length)` — bytes an ancillary-data item of `length`
+/// payload occupies, including the `cmsghdr` (but not the trailing pad).
+fn mod_cmsg_len(args: &[Object]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    {
+        let length = cmsg_size_arg(args.first())?;
+        Ok(Object::Int(i64::from(unsafe { libc::CMSG_LEN(length) })))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Err(os_error("CMSG_LEN is not supported on this platform"))
+    }
+}
+
+/// `socket.CMSG_SPACE(length)` — bytes to allocate in a control buffer for
+/// one ancillary-data item of `length` payload, including alignment pad.
+fn mod_cmsg_space(args: &[Object]) -> Result<Object, RuntimeError> {
+    #[cfg(unix)]
+    {
+        let length = cmsg_size_arg(args.first())?;
+        Ok(Object::Int(i64::from(unsafe { libc::CMSG_SPACE(length) })))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Err(os_error("CMSG_SPACE is not supported on this platform"))
+    }
+}
+
+#[allow(dead_code)]
+fn cmsg_size_arg(arg: Option<&Object>) -> Result<u32, RuntimeError> {
+    match arg {
+        Some(Object::Int(n)) if *n >= 0 => Ok(*n as u32),
+        Some(Object::Int(_)) => Err(value_error("CMSG_LEN() argument out of range")),
+        _ => Err(type_error("an integer is required")),
+    }
 }
 
 fn mod_gethostname(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1762,11 +2278,88 @@ fn mod_create_server(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(inst_obj)
 }
 
-fn mod_socketpair(_args: &[Object]) -> Result<Object, RuntimeError> {
-    // Build a loopback-connected pair via a temporary listener.
-    // This avoids needing OS-level `socketpair(2)` (which doesn't exist
-    // on Windows) and `AF_UNIX` (which isn't always available), at the
-    // cost of using TCP/IPv4 for both halves.
+fn mod_socketpair(args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython signature: socketpair(family=AF_UNIX, type=SOCK_STREAM, proto=0).
+    // The AF_UNIX default is load-bearing: `multiprocessing`'s `Connection`
+    // pipes and the `forkserver` control channel both rely on a real
+    // `socketpair(2)` over which `SCM_RIGHTS` fd passing works (a TCP
+    // loopback pair cannot carry ancillary data).
+    let family = match args.first() {
+        None | Some(Object::None) => default_socketpair_family(),
+        Some(Object::Int(n)) => *n as i32,
+        _ => return Err(type_error("socketpair: family must be an integer")),
+    };
+    let sock_type = match args.get(1) {
+        None | Some(Object::None) => libc_sock_stream() as i32,
+        Some(Object::Int(n)) => *n as i32,
+        _ => return Err(type_error("socketpair: type must be an integer")),
+    };
+    let proto = match args.get(2) {
+        None | Some(Object::None) => 0,
+        Some(Object::Int(n)) => *n as i32,
+        _ => return Err(type_error("socketpair: proto must be an integer")),
+    };
+
+    #[cfg(unix)]
+    if family == 1 {
+        return unix_socketpair(family, sock_type, proto);
+    }
+
+    // The AF_INET emulation ignores the requested family/type/proto; consume
+    // them so they don't read as unused on platforms without `unix_socketpair`.
+    #[cfg(not(unix))]
+    let _ = (family, sock_type, proto);
+
+    inet_socketpair_emulation()
+}
+
+/// Default `socketpair` family — AF_UNIX on POSIX (CPython parity), AF_INET
+/// where AF_UNIX is unavailable.
+fn default_socketpair_family() -> i32 {
+    #[cfg(unix)]
+    {
+        1 // AF_UNIX
+    }
+    #[cfg(not(unix))]
+    {
+        libc_af_inet() as i32
+    }
+}
+
+/// A genuine `socketpair(2)` — the connected AF_UNIX pair that carries
+/// `SCM_RIGHTS` ancillary data for fd passing.
+#[cfg(unix)]
+fn unix_socketpair(family: i32, sock_type: i32, proto: i32) -> Result<Object, RuntimeError> {
+    use std::os::unix::io::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    let rc = unsafe { libc::socketpair(family, sock_type, proto, fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    let make = |fd: libc::c_int| -> Object {
+        // SAFETY: `fd` is a fresh, owned descriptor from `socketpair(2)`.
+        let sock = unsafe { Socket::from_raw_fd(fd) };
+        let state = Rc::new(RefCell::new(SocketState {
+            inner: Some(sock),
+            family,
+            kind: sock_type,
+            proto,
+            timeout: None,
+            blocking: true,
+        }));
+        let h = next_handle(state);
+        let inst = Rc::new(PyInstance::new(socket_class()));
+        inst.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("_handle")), Object::Int(h));
+        Object::Instance(inst)
+    };
+    Ok(Object::new_tuple(vec![make(fds[0]), make(fds[1])]))
+}
+
+/// Loopback-TCP emulation for the AF_INET case (and platforms without
+/// `AF_UNIX`). Builds a connected pair via a transient listener.
+fn inet_socketpair_emulation() -> Result<Object, RuntimeError> {
     use socket2::{Domain, Socket, Type};
     let listener = Socket::new(Domain::IPV4, Type::STREAM, None).map_err(|e| io_error_to_py(&e))?;
     listener

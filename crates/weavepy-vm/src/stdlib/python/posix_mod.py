@@ -21,6 +21,17 @@ for _name in dir(_os):
     _names.append(_name)
 
 
+# macOS `fcopyfile(3)` fast-copy hooks live behind a leading underscore, so
+# the ``dir(_os)`` loop above skips them — re-export explicitly so the bundled
+# ``shutil`` (and ``test_shutil.TestZeroCopyMACOS``) find ``posix._fcopyfile``
+# and the ``_COPYFILE_*`` flag bits exactly where CPython's ``posix`` puts them.
+if hasattr(_os, "_fcopyfile"):
+    _fcopyfile = _os._fcopyfile
+    _COPYFILE_ACL = _os._COPYFILE_ACL
+    _COPYFILE_STAT = _os._COPYFILE_STAT
+    _COPYFILE_XATTR = _os._COPYFILE_XATTR
+    _COPYFILE_DATA = _os._COPYFILE_DATA
+
 # A couple of POSIX-only constants that ``os`` may not expose
 # explicitly (kept here so ``from posix import *`` matches CPython).
 F_OK = getattr(_os, "F_OK", 0)
@@ -64,7 +75,14 @@ for _candidate in ("fork", "forkpty", "wait", "waitpid", "wait3", "wait4",
         _names.append(_candidate)
 
 
-environ = _os.environ
+# CPython's ``posix.environ`` is a plain ``dict`` with *bytes* keys and values
+# on POSIX hosts (the raw environment block); ``os.environ`` is the decoded
+# ``str`` mapping layered on top. WeavePy keeps the bytes snapshot in
+# ``os.environb``, so mirror CPython by exposing that here (falling back to the
+# ``str`` mapping on platforms without ``environb``).
+environ = getattr(_os, "environb", None)
+if environ is None:
+    environ = _os.environ
 sep = _os.sep
 linesep = _os.linesep
 defpath = getattr(_os, "defpath", "/bin:/usr/bin")

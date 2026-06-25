@@ -81,7 +81,20 @@ pub struct GilCell<T: ?Sized> {
     /// the reentrant mutex lets us re-enter — the counter prevents
     /// undefined behaviour on nested `borrow_mut()`.
     borrow: AtomicIsize,
-    inner: ReentrantMutex<UnsafeCell<T>>,
+    /// The cross-thread lock, carrying *no* payload of its own. Kept
+    /// separate from `data` (rather than the more obvious
+    /// `ReentrantMutex<UnsafeCell<T>>`) for two reasons:
+    ///
+    /// 1. The `UnsafeCell` wrapper lets us rebuild the lock in place
+    ///    through a shared `&self` (sound interior mutability) — the
+    ///    [`fork(2)`][Self::lock_fork_safe] recovery path needs that.
+    /// 2. A unit payload means rebuilding never has to move `T`, so
+    ///    the recovery works even when `T: ?Sized`.
+    lock: UnsafeCell<ReentrantMutex<()>>,
+    /// The guarded payload. Access is gated by holding `lock`; the
+    /// borrow counter rules out aliasing `&mut T` within a thread.
+    /// Last field so `T: ?Sized` cells stay layout-legal.
+    data: UnsafeCell<T>,
 }
 
 // SAFETY: `GilCell<T>` is `Send` whenever `T: Send` — moving a cell
@@ -139,20 +152,109 @@ impl<T> GilCell<T> {
     pub const fn new(value: T) -> Self {
         Self {
             borrow: AtomicIsize::new(0),
-            inner: ReentrantMutex::new(UnsafeCell::new(value)),
+            lock: UnsafeCell::new(ReentrantMutex::new(())),
+            data: UnsafeCell::new(value),
         }
     }
 
     /// Move out the cell's payload, consuming the cell.
     pub fn into_inner(self) -> T {
-        // Drop the borrow counter; the mutex's `into_inner` returns
-        // the `UnsafeCell<T>`, whose `into_inner` extracts the
-        // payload.
-        self.inner.into_inner().into_inner()
+        // The lock carries no payload; the data cell's `into_inner`
+        // extracts the value.
+        self.data.into_inner()
+    }
+
+    /// Reinitialise the cell's lock in a `fork(2)` child, preserving the
+    /// payload. `parking_lot::ReentrantMutex` is not fork-safe: a sibling
+    /// thread that vanished in the fork may have held `inner` (or left
+    /// `borrow` non-zero), so the inherited lock would wedge the child's next
+    /// `borrow()` forever. Rebuild the mutex around the *existing* payload —
+    /// the exact analogue of CPython reinitialising a `pthread_mutex` in
+    /// `PyOS_AfterFork_Child`. `into_inner` extracts the payload by value
+    /// without taking the (possibly poisoned) lock, so this never blocks.
+    ///
+    /// Retained for callers that proactively reset specific cells in the fork
+    /// child (e.g. the cycle collector's `GcState`). Equivalent to the lazy
+    /// recovery [`borrow`](Self::borrow) now performs on demand, but eager.
+    ///
+    /// # Safety
+    ///
+    /// `this` must point at a live `GilCell<T>` on the lone surviving
+    /// thread of a fork child, where nothing else can be touching the cell — so
+    /// the in-place rebuild cannot race, and the payload, last mutated under
+    /// the GIL the forking thread now holds, is in a consistent state.
+    pub unsafe fn reinit_lock_after_fork(this: *mut Self) {
+        unsafe { (*this).rebuild_lock() }
     }
 }
 
 impl<T: ?Sized> GilCell<T> {
+    /// The payload-free cross-thread lock. `UnsafeCell::get` is the
+    /// blessed way to reach the interior through `&self`, so callers
+    /// (including the in-place [`rebuild_lock`](Self::rebuild_lock))
+    /// stay clear of `&T -> &mut T` aliasing UB.
+    #[inline]
+    fn lock_cell(&self) -> &ReentrantMutex<()> {
+        // SAFETY: `lock` is initialised in `new`/`rebuild_lock` and the
+        // shared reference we hand back never outlives `self`.
+        unsafe { &*self.lock.get() }
+    }
+
+    /// Acquire the cross-thread lock, recovering from a `fork(2)` that
+    /// orphaned it.
+    ///
+    /// Under the GIL only the GIL holder ever borrows a `GilCell`, so in a
+    /// healthy process `try_lock()` only fails when *another OS thread* holds
+    /// the lock. After `fork(2)` the child keeps just the forking thread, yet
+    /// inherits every lock byte exactly as it stood in the parent — including
+    /// cells a sibling thread (now vanished) was mid-`borrow()` on. That lock
+    /// can never be released, so a plain `lock()` would wedge the child
+    /// forever (the deadlock RFC 0040's fork/`_after_fork` path used to hit).
+    ///
+    /// Recovery rule: a contended lock in a process with exactly **one** live
+    /// OS thread cannot have a living owner — the owner died in the fork — so
+    /// rebuild the lock in place and proceed. With two or more live threads the
+    /// contention is genuine; block exactly as before. This never produces a
+    /// false reset (a single thread cannot concurrently contend its own
+    /// reentrant lock; same-thread re-entry returns `Some` from `try_lock`),
+    /// so it is a strict superset of the old blocking behaviour.
+    #[inline]
+    fn lock_fork_safe(&self) -> ReentrantMutexGuard<'_, ()> {
+        if let Some(guard) = self.lock_cell().try_lock() {
+            return guard;
+        }
+        self.recover_or_block()
+    }
+
+    #[cold]
+    fn recover_or_block(&self) -> ReentrantMutexGuard<'_, ()> {
+        if crate::stdlib::os_process::count_os_threads() == Some(1) {
+            // SAFETY: a single live OS thread means nothing else can be
+            // touching this cell, so the in-place rebuild cannot race.
+            unsafe { self.rebuild_lock() };
+        }
+        // Fresh lock after a rebuild (uncontended in a single-threaded
+        // child); otherwise a real peer holds it, so block until released.
+        self.lock_cell().lock()
+    }
+
+    /// Replace the cross-thread lock with a pristine one, leaving the payload
+    /// untouched. Resets the borrow counter too, since an orphaned lock may
+    /// have been left mid-borrow.
+    ///
+    /// SAFETY: the caller must guarantee no other thread can be touching this
+    /// cell for the duration of the call (the lone surviving thread of a
+    /// `fork(2)` child satisfies this). Sound through `&self` because `lock`
+    /// lives in an `UnsafeCell`; the unit payload needs no salvage, so the old
+    /// (possibly locked) mutex is simply overwritten without being dropped.
+    unsafe fn rebuild_lock(&self) {
+        self.borrow.store(0, Ordering::Release);
+        // SAFETY: see method contract — sole thread, `lock` is a live
+        // `UnsafeCell`. `write` does not drop the old `ReentrantMutex<()>`,
+        // which owns no resources beyond its own bytes.
+        unsafe { std::ptr::write(self.lock.get(), ReentrantMutex::new(())) };
+    }
+
     /// Borrow the cell immutably. Multiple immutable borrows can
     /// coexist on the same thread. Panics if a mutable borrow is
     /// already live (matches `std::cell::RefCell::borrow`).
@@ -173,7 +275,7 @@ impl<T: ?Sized> GilCell<T> {
     /// Non-panicking variant of [`borrow`](Self::borrow). Returns
     /// [`BorrowError`] if a mutable borrow is live.
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
-        let guard = self.inner.lock();
+        let guard = self.lock_fork_safe();
         // Bump the borrow counter. If we observed a negative value
         // (a mutable borrow is live on this thread — the reentrant
         // mutex let us in), unwind and refuse.
@@ -184,10 +286,10 @@ impl<T: ?Sized> GilCell<T> {
         }
         // SAFETY: we hold the reentrant mutex (so no other thread
         // can race) and the borrow counter is `>= 1` (so no `&mut T`
-        // to the inner exists). `UnsafeCell::raw_get` is itself a
-        // safe transmute; the surrounding `unsafe` covers the raw
-        // dereference into a shared reference.
-        let value: &T = unsafe { &*UnsafeCell::raw_get(self.inner.data_ptr()) };
+        // to the data exists). The raw dereference yields a shared
+        // reference valid for as long as the guard (and thus the
+        // lock) is held.
+        let value: &T = unsafe { &*self.data.get() };
         Ok(Ref {
             counter: &self.borrow,
             _guard: guard,
@@ -198,7 +300,7 @@ impl<T: ?Sized> GilCell<T> {
     /// Non-panicking variant of [`borrow_mut`](Self::borrow_mut).
     /// Returns [`BorrowMutError`] if any borrow is live.
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
-        let guard = self.inner.lock();
+        let guard = self.lock_fork_safe();
         // Only succeed if the counter is exactly zero — i.e. no
         // shared borrow and no nested mutable borrow.
         if self
@@ -209,9 +311,9 @@ impl<T: ?Sized> GilCell<T> {
             return Err(BorrowMutError);
         }
         // SAFETY: reentrant mutex held; borrow counter is `-1` so
-        // no other `&T` or `&mut T` to the inner exists. Safe to
-        // hand out an exclusive `&mut T`.
-        let value: &mut T = unsafe { &mut *UnsafeCell::raw_get(self.inner.data_ptr()) };
+        // no other `&T` or `&mut T` to the data exists. Safe to
+        // hand out an exclusive `&mut T` for the lock's lifetime.
+        let value: &mut T = unsafe { &mut *self.data.get() };
         Ok(RefMut {
             counter: &self.borrow,
             _guard: guard,
@@ -223,7 +325,7 @@ impl<T: ?Sized> GilCell<T> {
     /// borrow; the caller is responsible for ensuring the pointer
     /// isn't dereferenced concurrently with another borrow.
     pub fn as_ptr(&self) -> *mut T {
-        UnsafeCell::raw_get(self.inner.data_ptr())
+        self.data.get()
     }
 }
 
@@ -342,7 +444,7 @@ pub struct Ref<'a, T: ?Sized + 'a> {
     /// exclusion. Drop order: `value` is logically a view into the
     /// guarded data; we hold `_guard` so it lives at least as long
     /// as `value`.
-    _guard: ReentrantMutexGuard<'a, UnsafeCell<T>>,
+    _guard: ReentrantMutexGuard<'a, ()>,
     value: &'a T,
 }
 
@@ -375,7 +477,7 @@ impl<T: ?Sized> Drop for Ref<'_, T> {
 /// borrow counter on drop.
 pub struct RefMut<'a, T: ?Sized + 'a> {
     counter: &'a AtomicIsize,
-    _guard: ReentrantMutexGuard<'a, UnsafeCell<T>>,
+    _guard: ReentrantMutexGuard<'a, ()>,
     value: &'a mut T,
 }
 
@@ -506,6 +608,43 @@ impl RealLock {
     pub fn is_locked(&self) -> bool {
         self.state.lock().held
     }
+
+    /// Forcibly return the lock to the fresh, unlocked state, ignoring any
+    /// current holder. This backs `_thread.lock._at_fork_reinit()`: after a
+    /// `fork()` the child inherits the lock's *memory* but none of the other
+    /// threads, so a lock left `held` by a now-defunct thread would deadlock
+    /// forever. CPython reinitialises the underlying mutex here
+    /// (`pthread_mutex_init`); we do the exact equivalent below.
+    ///
+    /// We must NOT take `self.state.lock()` or call `self.cv.notify_all()` to
+    /// do this: `parking_lot`'s primitives are not `fork`-safe. A sibling
+    /// thread that vanished in the `fork(2)` may have held the inner `state`
+    /// mutex, or been parked in `cv.wait` — leaving a stale waiter entry (and
+    /// possibly a *held bucket lock*) in `parking_lot`'s process-global
+    /// parking-lot hash table. Locking `state` would then block on a holder
+    /// that no longer exists, and `notify_all` would walk the poisoned bucket;
+    /// either wedges the child forever (`test_threading.test_reinit_tls_after_fork`
+    /// forks from 16 threads — ~10% of children lost this race). Reinitialising
+    /// the primitives in place sidesteps the global table entirely: a fresh
+    /// `Condvar` has no registered waiters, and a fresh `Mutex` is unlocked, so
+    /// neither touches a bucket on its fast path.
+    ///
+    /// SAFETY: `_at_fork_reinit` only runs from the `after_in_child` fork
+    /// handlers, where this process has exactly one (the forking) thread, so
+    /// nothing can race this in-place write. `ptr::write` deliberately skips
+    /// dropping the old — possibly locked — primitives (dropping a locked
+    /// `parking_lot` mutex is a no-op anyway, but the inherited parked state
+    /// must not be touched).
+    pub fn force_reset(&self) {
+        unsafe {
+            let p = std::ptr::from_ref(self).cast_mut();
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*p).state),
+                Mutex::new(LockState::default()),
+            );
+            std::ptr::write(std::ptr::addr_of_mut!((*p).cv), Condvar::new());
+        }
+    }
 }
 
 /// A real cross-thread reentrant mutex with CPython
@@ -626,6 +765,25 @@ impl RealRLock {
 
     pub fn depth(&self) -> usize {
         self.state.lock().depth
+    }
+
+    /// Forcibly drop all ownership/recursion state, backing
+    /// `_thread.RLock._at_fork_reinit()`. See [`RealLock::force_reset`] for the
+    /// full rationale: `parking_lot` is not `fork`-safe, so we reinitialise the
+    /// inner `Mutex`/`Condvar` in place (CPython's `pthread_mutex_init`) rather
+    /// than locking/notifying the inherited — possibly poisoned — primitives.
+    ///
+    /// SAFETY: runs only on the lone surviving thread of a `fork(2)` child, so
+    /// nothing can race this write; `ptr::write` skips dropping the old state.
+    pub fn force_reset(&self) {
+        unsafe {
+            let p = std::ptr::from_ref(self).cast_mut();
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*p).state),
+                Mutex::new(RLockState::default()),
+            );
+            std::ptr::write(std::ptr::addr_of_mut!((*p).cv), Condvar::new());
+        }
     }
 }
 

@@ -1,3 +1,11 @@
+# subprocess — run / check_output / pipes / env.
+#
+# weavepy-skip: windows
+# WeavePy's subprocess runtime is built on POSIX primitives (os.pipe,
+# posix_spawn/fork+exec), which raise NotImplementedError on Windows, and
+# the fixture drives POSIX shell utilities (echo/tr/false/sh) that don't
+# exist there. Skipped on Windows until a Windows process backend lands.
+
 import subprocess
 
 print("--- run / check_output ---")

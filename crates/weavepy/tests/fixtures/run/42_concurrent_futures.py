@@ -1,4 +1,8 @@
-# `concurrent.futures` — synchronous Executor + Future API.
+# `concurrent.futures` — Executor + Future API.
+#
+# weavepy-skip: windows
+# ProcessPoolExecutor is backed by the real multiprocessing runtime (RFC 0040),
+# which is POSIX-only today, so this fixture is skipped on Windows.
 
 from concurrent.futures import (
     Future,
@@ -54,12 +58,9 @@ with ThreadPoolExecutor() as ex:
     print("wait done:", len(result.done), "not done:", len(result.not_done))
 
 
-# ProcessPoolExecutor is importable but unavailable in WeavePy's
-# single-process model (no multiprocessing runtime): constructing one
-# raises NotImplementedError, matching CPython on a platform without
-# multiprocessing. Use ThreadPoolExecutor instead.
-try:
-    ProcessPoolExecutor()
-    print("ProcessPoolExecutor: constructed")
-except NotImplementedError:
-    print("ProcessPoolExecutor: NotImplementedError")
+# ProcessPoolExecutor is now backed by WeavePy's real multiprocessing runtime
+# (RFC 0040), so constructing one succeeds on POSIX. Worker processes are
+# spawned lazily on the first submit, so build one and shut it down cleanly.
+ex = ProcessPoolExecutor(max_workers=2)
+ex.shutdown()
+print("ProcessPoolExecutor: constructed")

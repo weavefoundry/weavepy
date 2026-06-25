@@ -29,9 +29,20 @@ def forget(modname):
             unload(name)
 
 
-def make_legacy_pyc(source):  # pragma: no cover - compatibility stub
-    """No-op: WeavePy does not maintain legacy ``.pyc`` layouts."""
-    return source + 'c'
+def make_legacy_pyc(source):
+    """Move a PEP 3147/488 pyc file to its legacy pyc location.
+
+    :param source: The file system path to the source file.  The source file
+        does not need to exist, however the PEP 3147/488 pyc file must exist.
+    :return: The file system path to the legacy pyc file.
+    """
+    import importlib.util
+    import shutil
+    pyc_file = importlib.util.cache_from_source(source)
+    assert source.endswith('.py')
+    legacy_pyc = source + 'c'
+    shutil.move(pyc_file, legacy_pyc)
+    return legacy_pyc
 
 
 def import_module(name, deprecated=False, *, required_on=()):

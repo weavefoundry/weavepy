@@ -74,16 +74,21 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 #[cfg(unix)]
 use std::os::fd::RawFd;
 #[cfg(unix)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 #[cfg(unix)]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use crate::error::{
-    broken_pipe_error, io_error_to_py, runtime_error, type_error, value_error, RuntimeError,
+    assertion_error, broken_pipe_error, io_error_to_py, runtime_error, type_error, value_error,
+    RuntimeError,
 };
 #[cfg(unix)]
 use crate::object::BuiltinFn;
+#[cfg(unix)]
+use crate::types::{PyInstance, TypeFlags, TypeObject};
 
 #[cfg(unix)]
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
@@ -106,7 +111,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // Core primitives.
         d.insert(
             DictKey(Object::from_static("SemLock")),
-            b("SemLock", make_semlock),
+            Object::Type(semlock_type()),
         );
         d.insert(
             DictKey(Object::from_static("sem_unlink")),
@@ -181,115 +186,603 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 // SemLock
 // ---------------------------------------------------------------------
 
-/// `_multiprocessing.SemLock(kind, value, maxvalue, name=None,
-/// unlink=False)`. Returns a SimpleNamespace with `acquire`, `release`,
-/// `_get_value`, `_count`, `name` exposed. The implementation today is
-/// thread-shared (a real `Semaphore`); named semaphores are a no-op
-/// stub (the name is recorded but the kernel object is not opened).
+// A faithful port of CPython's `Modules/_multiprocessing/semaphore.c`:
+// a kernel semaphore opened with `sem_open(3)` (named, so it survives
+// `fork`/`exec` and is reachable by name from a `spawn`ed child via
+// `_rebuild`). `multiprocessing/synchronize.py` drives the full surface
+// — `acquire`/`release`/`_get_value`/`_count`/`_is_mine`/`_is_zero`/
+// `_after_fork`/`__enter__`/`__exit__`, the `handle`/`kind`/`maxvalue`/
+// `name` attributes, the `SEM_VALUE_MAX` class attribute, and the
+// `_rebuild` staticmethod.
+
+/// `RECURSIVE_MUTEX` kind (matches `multiprocessing/synchronize.py`).
 #[cfg(unix)]
-fn make_semlock(args: &[Object]) -> Result<Object, RuntimeError> {
-    let kind = match args.first() {
+const RECURSIVE_MUTEX_KIND: i64 = 0;
+
+/// `SemLock.SEM_VALUE_MAX` — the largest value a semaphore may hold.
+/// `INT_MAX` on Linux; the POSIX floor (`_POSIX_SEM_VALUE_MAX`, 32767)
+/// on Darwin/BSD, matching the C library.
+#[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
+const SEM_VALUE_MAX: i64 = 32767;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+const SEM_VALUE_MAX: i64 = 2_147_483_647;
+
+/// Poll slice for an interruptible blocking acquire (mirrors the lock
+/// subsystem in `thread_real`): short enough to service a tripped
+/// signal promptly, long enough that idle wakeups stay cheap.
+#[cfg(unix)]
+const SEM_POLL_SLICE: Duration = Duration::from_millis(20);
+
+/// `SEM_FAILED` is `NULL` on glibc but `(sem_t *)-1` on the BSDs/macOS.
+#[cfg(unix)]
+#[inline]
+fn sem_failed() -> *mut libc::sem_t {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        -1isize as *mut libc::sem_t
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        std::ptr::null_mut()
+    }
+}
+
+/// Shared state behind a `SemLock` instance. The `*mut sem_t` is valid
+/// across `fork` (the mapping is inherited) and re-opened by name in a
+/// `spawn`ed child (`_rebuild`). `count`/`last_tid` are per-process
+/// bookkeeping for the recursive-mutex fast path and `_is_mine`.
+#[cfg(unix)]
+struct SemInner {
+    handle: *mut libc::sem_t,
+    kind: i64,
+    maxvalue: i64,
+    name: Mutex<Option<String>>,
+    count: AtomicI64,
+    last_tid: AtomicU64,
+}
+
+// SAFETY: the raw `sem_t*` is a kernel handle; all access goes through
+// the atomic libc sem_* calls, and the count/owner bookkeeping is atomic.
+#[cfg(unix)]
+unsafe impl Send for SemInner {}
+#[cfg(unix)]
+unsafe impl Sync for SemInner {}
+
+#[cfg(unix)]
+thread_local! {
+    static SEMLOCK_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+}
+
+/// The `_multiprocessing.SemLock` type. Built lazily so
+/// `type(sl).__name__ == 'SemLock'` and the class attributes
+/// (`SEM_VALUE_MAX`, `_rebuild`) resolve.
+#[cfg(unix)]
+fn semlock_type() -> Rc<TypeObject> {
+    SEMLOCK_TYPE.with(|cell| {
+        if let Some(t) = cell.borrow().clone() {
+            return t;
+        }
+        let mut d = DictData::new();
+        d.insert(
+            DictKey(Object::from_static("__module__")),
+            Object::from_static("_multiprocessing"),
+        );
+        d.insert(
+            DictKey(Object::from_static("__new__")),
+            b("__new__", semlock_new),
+        );
+        d.insert(
+            DictKey(Object::from_static("__init__")),
+            b("__init__", semlock_init),
+        );
+        // Accessed via the class (`SemLock._rebuild(...)`), so a plain
+        // builtin behaves like a staticmethod (no instance binding).
+        d.insert(
+            DictKey(Object::from_static("_rebuild")),
+            b("_rebuild", semlock_rebuild),
+        );
+        d.insert(
+            DictKey(Object::from_static("SEM_VALUE_MAX")),
+            Object::Int(SEM_VALUE_MAX),
+        );
+        let t = TypeObject::new_with_flags(
+            "SemLock",
+            vec![crate::builtin_types::builtin_types().object_.clone()],
+            d,
+            TypeFlags {
+                is_exception: false,
+                is_builtin: true,
+            },
+        )
+        .expect("SemLock type");
+        *cell.borrow_mut() = Some(t.clone());
+        t
+    })
+}
+
+#[cfg(unix)]
+fn sem_arg_int(args: &[Object], idx: usize, what: &str) -> Result<i64, RuntimeError> {
+    match args.get(idx) {
+        Some(Object::Int(n)) => Ok(*n),
+        Some(Object::Bool(b)) => Ok(*b as i64),
+        _ => Err(type_error(format!("SemLock() {what} must be an int"))),
+    }
+}
+
+#[cfg(unix)]
+fn sem_cname(name: &str) -> Result<std::ffi::CString, RuntimeError> {
+    std::ffi::CString::new(name).map_err(|_| value_error("embedded null byte in semaphore name"))
+}
+
+/// `SemLock.__init__` — a no-op: `__new__` builds the fully-initialised
+/// instance (CPython's `semlock` does all its work in `tp_new`).
+#[cfg(unix)]
+fn semlock_init(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Ok(Object::None)
+}
+
+/// `_multiprocessing.SemLock(kind, value, maxvalue, name, unlink)` —
+/// `sem_open(3)` a fresh named semaphore (`O_CREAT|O_EXCL` so a name
+/// collision raises `FileExistsError`, which `synchronize.SemLock`
+/// retries). `unlink=True` (the fork start method / Windows) unlinks
+/// the name immediately and forgets it; otherwise the name is kept so a
+/// `spawn`ed child can re-open it and `resource_tracker` can clean up.
+#[cfg(unix)]
+fn semlock_new(args: &[Object]) -> Result<Object, RuntimeError> {
+    // args[0] is the class object (SemLock); the constructor params
+    // follow it.
+    let kind = sem_arg_int(args, 1, "kind")?;
+    let value = sem_arg_int(args, 2, "value")?;
+    let maxvalue = sem_arg_int(args, 3, "maxvalue")?;
+    if !(0..=SEM_VALUE_MAX).contains(&value) {
+        return Err(value_error("semaphore initial value out of range"));
+    }
+    let name = match args.get(4) {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("SemLock() name must be a str")),
+    };
+    let unlink = match args.get(5) {
+        Some(Object::Bool(b)) => *b,
+        Some(Object::Int(i)) => *i != 0,
+        _ => false,
+    };
+    let cname = sem_cname(&name)?;
+    let handle = unsafe {
+        libc::sem_open(
+            cname.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL,
+            0o600 as libc::c_uint,
+            value as libc::c_uint,
+        )
+    };
+    if handle == sem_failed() {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    let keep_name = if unlink {
+        unsafe { libc::sem_unlink(cname.as_ptr()) };
+        None
+    } else {
+        Some(name)
+    };
+    let inner = Arc::new(SemInner {
+        handle,
+        kind,
+        maxvalue,
+        name: Mutex::new(keep_name),
+        count: AtomicI64::new(0),
+        last_tid: AtomicU64::new(0),
+    });
+    Ok(make_semlock_instance(inner))
+}
+
+/// `SemLock._rebuild(handle, kind, maxvalue, name)` — reconstruct in a
+/// `spawn`ed child. On POSIX the inherited `handle` is meaningless, so
+/// when a `name` is present we re-`sem_open` it; the nameless (fork)
+/// path keeps the inherited handle.
+#[cfg(unix)]
+fn semlock_rebuild(args: &[Object]) -> Result<Object, RuntimeError> {
+    let handle_in = match args.first() {
         Some(Object::Int(n)) => *n,
         _ => 0,
     };
-    let value = match args.get(1) {
-        Some(Object::Int(n)) => *n as usize,
-        _ => 1,
-    };
-    let maxvalue = match args.get(2) {
-        Some(Object::Int(n)) => *n as usize,
-        _ => 1,
-    };
-    let name = match args.get(3) {
-        Some(Object::Str(s)) => Some(s.to_string()),
-        Some(Object::None) | None => None,
-        Some(other) => {
-            return Err(type_error(format!(
-                "SemLock name must be str or None, got {}",
-                other.type_name()
-            )))
+    let kind = sem_arg_int(args, 1, "kind")?;
+    let maxvalue = sem_arg_int(args, 2, "maxvalue")?;
+    let (handle, name) = match args.get(3) {
+        Some(Object::Str(s)) => {
+            let cname = sem_cname(s)?;
+            let h = unsafe { libc::sem_open(cname.as_ptr(), 0) };
+            if h == sem_failed() {
+                return Err(io_error_to_py(&std::io::Error::last_os_error()));
+            }
+            (h, Some(s.to_string()))
         }
+        _ => (handle_in as *mut libc::sem_t, None),
     };
+    let inner = Arc::new(SemInner {
+        handle,
+        kind,
+        maxvalue,
+        name: Mutex::new(name),
+        count: AtomicI64::new(0),
+        last_tid: AtomicU64::new(0),
+    });
+    Ok(make_semlock_instance(inner))
+}
+
+/// Build the Python-visible `SemLock` instance: attributes plus the
+/// method closures that capture the shared [`SemInner`].
+#[cfg(unix)]
+fn make_semlock_instance(inner: Arc<SemInner>) -> Object {
     let dict = Rc::new(RefCell::new(DictData::new()));
-    let lock = std::sync::Arc::new(crate::sync::RealSemaphore::new(value));
-    if let Some(ref n) = name {
-        let mut g = SHARED_SEM_NAMES.lock().unwrap();
-        g.push(n.clone());
-    }
     {
-        let l = lock.clone();
-        let acquire = move |args: &[Object]| -> Result<Object, RuntimeError> {
-            let blocking = match args.first() {
-                Some(Object::Bool(b)) => *b,
-                Some(Object::Int(i)) => *i != 0,
-                _ => true,
-            };
-            let timeout: Option<f64> = match args.get(1) {
-                Some(Object::Float(f)) => Some(*f),
-                Some(Object::Int(i)) => Some(*i as f64),
-                Some(Object::None) | None => None,
-                _ => None,
-            };
-            if !blocking {
-                return Ok(Object::Bool(l.try_acquire()));
-            }
-            if let Some(t) = timeout {
-                if t <= 0.0 {
-                    return Ok(Object::Bool(l.try_acquire()));
-                }
-                // Poll-based timeout — good enough for the small wait
-                // budgets multiprocessing uses; we can switch to
-                // `sem_timedwait` later for accuracy.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(t);
-                loop {
-                    if l.try_acquire() {
-                        return Ok(Object::Bool(true));
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(Object::Bool(false));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
-            l.acquire();
-            Ok(Object::Bool(true))
-        };
-        let l2 = lock.clone();
-        let release = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-            l2.release(1);
-            Ok(Object::None)
-        };
-        let l3 = lock.clone();
-        let get_value = move |_args: &[Object]| -> Result<Object, RuntimeError> {
-            Ok(Object::Int(l3.current() as i64))
-        };
         let mut d = dict.borrow_mut();
-        d.insert(DictKey(Object::from_static("kind")), Object::Int(kind));
+        d.insert(
+            DictKey(Object::from_static("handle")),
+            Object::Int(inner.handle as i64),
+        );
+        d.insert(
+            DictKey(Object::from_static("kind")),
+            Object::Int(inner.kind),
+        );
         d.insert(
             DictKey(Object::from_static("maxvalue")),
-            Object::Int(maxvalue as i64),
+            Object::Int(inner.maxvalue),
         );
         d.insert(
             DictKey(Object::from_static("name")),
-            match name {
-                Some(n) => Object::from_str(n),
+            match &*inner.name.lock().unwrap() {
+                Some(n) => Object::from_str(n.clone()),
                 None => Object::None,
             },
         );
+        let a = inner.clone();
         d.insert(
             DictKey(Object::from_static("acquire")),
-            b_dyn("acquire", acquire),
+            b_dyn_kw("acquire", move |args, kwargs| sem_acquire(&a, args, kwargs)),
         );
+        let r = inner.clone();
         d.insert(
             DictKey(Object::from_static("release")),
-            b_dyn("release", release),
+            b_dyn("release", move |_| sem_release(&r)),
         );
+        let gv = inner.clone();
         d.insert(
             DictKey(Object::from_static("_get_value")),
-            b_dyn("_get_value", get_value),
+            b_dyn("_get_value", move |_| sem_get_value(&gv)),
+        );
+        let ct = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("_count")),
+            b_dyn("_count", move |_| {
+                Ok(Object::Int(ct.count.load(Ordering::SeqCst)))
+            }),
+        );
+        let im = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("_is_mine")),
+            b_dyn("_is_mine", move |_| {
+                let me = crate::gil::current_thread_id();
+                Ok(Object::Bool(
+                    im.last_tid.load(Ordering::SeqCst) == me && im.count.load(Ordering::SeqCst) > 0,
+                ))
+            }),
+        );
+        let iz = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("_is_zero")),
+            b_dyn("_is_zero", move |_| sem_is_zero(&iz)),
+        );
+        let af = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("_after_fork")),
+            b_dyn("_after_fork", move |_| {
+                af.count.store(0, Ordering::SeqCst);
+                Ok(Object::None)
+            }),
+        );
+        let en = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("__enter__")),
+            b_dyn_kw("__enter__", move |args, kwargs| {
+                sem_acquire(&en, args, kwargs)
+            }),
+        );
+        let ex = inner.clone();
+        d.insert(
+            DictKey(Object::from_static("__exit__")),
+            b_dyn("__exit__", move |_| {
+                sem_release(&ex)?;
+                Ok(Object::None)
+            }),
         );
     }
-    Ok(Object::SimpleNamespace(dict))
+    let inst = Rc::new(PyInstance {
+        class: crate::sync::RefCell::new(semlock_type()),
+        dict,
+        native: None,
+        inline_values: crate::sync::Cell::new(true),
+        slots: crate::sync::RefCell::new(None),
+        hash_cache: crate::sync::Cell::new(None),
+        finalize_ran: crate::sync::Cell::new(false),
+    });
+    Object::Instance(inst)
+}
+
+/// `SemLock.acquire(block=True, timeout=None)`.
+#[cfg(unix)]
+fn sem_acquire(
+    inner: &Arc<SemInner>,
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
+    let mut block_obj = args.first().cloned();
+    let mut timeout_obj = args.get(1).cloned();
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "block" | "blocking" => block_obj = Some(v.clone()),
+            "timeout" => timeout_obj = Some(v.clone()),
+            other => {
+                return Err(type_error(format!(
+                    "acquire() got an unexpected keyword argument '{other}'"
+                )))
+            }
+        }
+    }
+    let block = match block_obj {
+        None | Some(Object::None) => true,
+        Some(Object::Bool(b)) => b,
+        Some(Object::Int(i)) => i != 0,
+        Some(_) => true,
+    };
+    let timeout: Option<f64> = match timeout_obj {
+        None | Some(Object::None) => None,
+        Some(Object::Float(f)) => Some(f),
+        Some(Object::Int(i)) => Some(i as f64),
+        Some(_) => None,
+    };
+    let me = crate::gil::current_thread_id();
+    // Recursive-mutex re-entry: already mine → just bump the count.
+    if inner.kind == RECURSIVE_MUTEX_KIND
+        && inner.last_tid.load(Ordering::SeqCst) == me
+        && inner.count.load(Ordering::SeqCst) > 0
+    {
+        inner.count.fetch_add(1, Ordering::SeqCst);
+        return Ok(Object::Bool(true));
+    }
+    if !block {
+        return match sem_trywait(inner) {
+            Ok(true) => {
+                inner.count.fetch_add(1, Ordering::SeqCst);
+                inner.last_tid.store(me, Ordering::SeqCst);
+                Ok(Object::Bool(true))
+            }
+            Ok(false) => Ok(Object::Bool(false)),
+            Err(e) => Err(io_error_to_py(&e)),
+        };
+    }
+    // Blocking (optionally timed). Drop the GIL across each wait slice
+    // and service signals between slices so KeyboardInterrupt works.
+    let deadline = timeout.map(|t| Instant::now() + Duration::from_secs_f64(t.max(0.0)));
+    loop {
+        let slice = match deadline {
+            Some(dl) => {
+                let now = Instant::now();
+                if now >= dl {
+                    // Final non-blocking attempt: POSIX takes an
+                    // immediately-available semaphore even past the
+                    // deadline (covers timeout=0).
+                    return match sem_trywait(inner) {
+                        Ok(true) => {
+                            inner.count.fetch_add(1, Ordering::SeqCst);
+                            inner.last_tid.store(me, Ordering::SeqCst);
+                            Ok(Object::Bool(true))
+                        }
+                        Ok(false) => Ok(Object::Bool(false)),
+                        Err(e) => Err(io_error_to_py(&e)),
+                    };
+                }
+                (dl - now).min(SEM_POLL_SLICE)
+            }
+            None => SEM_POLL_SLICE,
+        };
+        let h = inner.handle;
+        let res = crate::gil::allow_threads_then(|| sem_wait_slice(h, slice));
+        match res {
+            Ok(true) => {
+                inner.count.fetch_add(1, Ordering::SeqCst);
+                inner.last_tid.store(me, Ordering::SeqCst);
+                return Ok(Object::Bool(true));
+            }
+            Ok(false) => {}
+            Err(e) => return Err(io_error_to_py(&e)),
+        }
+        service_pending_signals()?;
+    }
+}
+
+/// Non-blocking acquire (`sem_trywait`), retrying `EINTR`.
+#[cfg(unix)]
+fn sem_trywait(inner: &SemInner) -> std::io::Result<bool> {
+    loop {
+        let r = unsafe { libc::sem_trywait(inner.handle) };
+        if r == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EAGAIN) => return Ok(false),
+            Some(libc::EINTR) => continue,
+            _ => return Err(e),
+        }
+    }
+}
+
+/// Wait up to `slice` for the semaphore. `Ok(true)` acquired, `Ok(false)`
+/// timed out. Uses `sem_timedwait` where available, polling on Darwin.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+fn sem_wait_slice(handle: *mut libc::sem_t, slice: Duration) -> std::io::Result<bool> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
+    let mut nsec = now.tv_nsec as i128 + i128::from(slice.subsec_nanos());
+    let mut sec = now.tv_sec as i128 + slice.as_secs() as i128;
+    sec += nsec / 1_000_000_000;
+    nsec %= 1_000_000_000;
+    let abs = libc::timespec {
+        tv_sec: sec as libc::time_t,
+        tv_nsec: nsec as _,
+    };
+    let r = unsafe { libc::sem_timedwait(handle, &abs) };
+    if r == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ETIMEDOUT) | Some(libc::EINTR) => Ok(false),
+        _ => Err(e),
+    }
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
+fn sem_wait_slice(handle: *mut libc::sem_t, slice: Duration) -> std::io::Result<bool> {
+    // Darwin has no sem_timedwait; poll sem_trywait until the slice ends.
+    let deadline = Instant::now() + slice;
+    loop {
+        let r = unsafe { libc::sem_trywait(handle) };
+        if r == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EAGAIN) | Some(libc::EINTR) => {}
+            _ => return Err(e),
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        unsafe { libc::usleep(500) };
+    }
+}
+
+/// `SemLock.release()`.
+#[cfg(unix)]
+fn sem_release(inner: &Arc<SemInner>) -> Result<Object, RuntimeError> {
+    let me = crate::gil::current_thread_id();
+    if inner.kind == RECURSIVE_MUTEX_KIND {
+        if !(inner.last_tid.load(Ordering::SeqCst) == me && inner.count.load(Ordering::SeqCst) > 0)
+        {
+            return Err(assertion_error(
+                "attempt to release recursive lock not owned by thread",
+            ));
+        }
+        if inner.count.load(Ordering::SeqCst) > 1 {
+            inner.count.fetch_sub(1, Ordering::SeqCst);
+            return Ok(Object::None);
+        }
+    }
+    // Refuse to over-release, matching CPython's "semaphore or lock
+    // released too many times" (`_multiprocessing/semaphore.c`).
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        let mut v: libc::c_int = 0;
+        if unsafe { libc::sem_getvalue(inner.handle, &mut v) } == 0
+            && i64::from(v) >= inner.maxvalue
+        {
+            return Err(value_error("semaphore or lock released too many times"));
+        }
+    }
+    // Darwin's `sem_getvalue` is broken (HAVE_BROKEN_SEM_GETVALUE), so
+    // CPython only validates the `maxvalue == 1` (Lock) case there: a
+    // non-blocking `sem_trywait` that *succeeds* proves the lock was not
+    // held, i.e. an over-release — undo it and raise. `EAGAIN` means it
+    // was held as expected and the release proceeds.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        if inner.maxvalue == 1 {
+            let r = unsafe { libc::sem_trywait(inner.handle) };
+            if r == 0 {
+                if unsafe { libc::sem_post(inner.handle) } != 0 {
+                    return Err(io_error_to_py(&std::io::Error::last_os_error()));
+                }
+                return Err(value_error("semaphore or lock released too many times"));
+            }
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EAGAIN) {
+                return Err(io_error_to_py(&e));
+            }
+        }
+    }
+    if unsafe { libc::sem_post(inner.handle) } != 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    inner.count.fetch_sub(1, Ordering::SeqCst);
+    Ok(Object::None)
+}
+
+/// `SemLock._get_value()` — `sem_getvalue`, raising on Darwin (which
+/// lacks it, exactly as CPython does).
+#[cfg(unix)]
+fn sem_get_value(inner: &Arc<SemInner>) -> Result<Object, RuntimeError> {
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        let mut v: libc::c_int = 0;
+        if unsafe { libc::sem_getvalue(inner.handle, &mut v) } != 0 {
+            return Err(io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        Ok(Object::Int(i64::from(v)))
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let _ = inner;
+        // `not_implemented_error` is only referenced on this macOS/iOS arm, so
+        // qualify it here rather than import it (unused on other unixes).
+        Err(crate::error::not_implemented_error(
+            "sem_getvalue is not implemented on this system",
+        ))
+    }
+}
+
+/// `SemLock._is_zero()` — value == 0. Probes with a non-blocking
+/// acquire/undo on Darwin (no `sem_getvalue`).
+#[cfg(unix)]
+fn sem_is_zero(inner: &Arc<SemInner>) -> Result<Object, RuntimeError> {
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        let mut v: libc::c_int = 0;
+        if unsafe { libc::sem_getvalue(inner.handle, &mut v) } != 0 {
+            return Err(io_error_to_py(&std::io::Error::last_os_error()));
+        }
+        Ok(Object::Bool(v == 0))
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let r = unsafe { libc::sem_trywait(inner.handle) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::EAGAIN) => Ok(Object::Bool(true)),
+                _ => Err(io_error_to_py(&e)),
+            };
+        }
+        unsafe { libc::sem_post(inner.handle) };
+        Ok(Object::Bool(false))
+    }
 }
 
 #[cfg(unix)]
@@ -304,15 +797,43 @@ fn sem_unlink_py(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         None => return Err(type_error("sem_unlink() requires a name")),
     };
-    let mut g = SHARED_SEM_NAMES.lock().unwrap();
-    g.retain(|n| n != &name);
+    let cname = sem_cname(&name)?;
+    if unsafe { libc::sem_unlink(cname.as_ptr()) } != 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
     Ok(Object::None)
 }
 
-/// Names of all known cross-process semaphores so `sem_unlink()` is
-/// idempotent and the test runner can audit leaks.
+/// Run any tripped OS-signal handlers on the main thread (CPython's
+/// `PyErr_CheckSignals` between blocking-acquire slices). Cheap no-op
+/// when nothing is pending or off the main thread.
 #[cfg(unix)]
-static SHARED_SEM_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+fn service_pending_signals() -> Result<(), RuntimeError> {
+    if !crate::stdlib::signal_mod::signals_pending() {
+        return Ok(());
+    }
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: the interpreter pointer was published by the active
+        // builtin call on this (main) thread and outlives this call.
+        let interp = unsafe { &mut *ptr };
+        interp.run_pending_signals_public()?;
+    }
+    Ok(())
+}
+
+/// Like [`b_dyn`] but kwargs-aware — `SemLock.acquire` accepts
+/// `block=`/`timeout=` by keyword.
+#[cfg(unix)]
+fn b_dyn_kw(
+    name: &'static str,
+    body: impl Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+) -> Object {
+    Object::Builtin(Rc::new(BuiltinFn::with_kwargs(name, body)))
+}
 
 // ---------------------------------------------------------------------
 // Connection (socketpair-backed byte channel)
@@ -841,10 +1362,22 @@ fn waitpid_py(args: &[Object]) -> Result<Object, RuntimeError> {
     let pid = arg_int(args, 0, 0)? as libc::pid_t;
     let options = arg_int(args, 1, 0)? as libc::c_int;
     let mut status: libc::c_int = 0;
-    let rc = unsafe { libc::waitpid(pid, &mut status, options) };
-    if rc < 0 {
-        return Err(io_error_to_py(&std::io::Error::last_os_error()));
-    }
+    let status_ptr: *mut libc::c_int = &mut status;
+    // Drop the GIL across the wait (blocking unless WNOHANG) so handler threads
+    // keep running; retry on EINTR after servicing signals.
+    let rc = loop {
+        let rc =
+            crate::gil::allow_threads_then(|| unsafe { libc::waitpid(pid, status_ptr, options) });
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                service_pending_signals()?;
+                continue;
+            }
+            return Err(io_error_to_py(&e));
+        }
+        break rc;
+    };
     let (signal, exitcode) = if libc::WIFSIGNALED(status) {
         (libc::WTERMSIG(status), -1)
     } else if libc::WIFEXITED(status) {
@@ -966,13 +1499,10 @@ fn read_msg(fd: RawFd, maxlen: Option<usize>) -> std::io::Result<Vec<u8>> {
 fn read_exact(fd: RawFd, buf: &mut [u8]) -> std::io::Result<()> {
     let mut filled = 0usize;
     while filled < buf.len() {
-        let n = unsafe {
-            libc::read(
-                fd,
-                buf.as_mut_ptr().add(filled) as *mut libc::c_void,
-                buf.len() - filled,
-            )
-        };
+        // Release the GIL across each blocking read so other threads run.
+        let ptr = unsafe { buf.as_mut_ptr().add(filled) } as *mut libc::c_void;
+        let want = buf.len() - filled;
+        let n = crate::gil::allow_threads_then(|| unsafe { libc::read(fd, ptr, want) });
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
@@ -1000,7 +1530,9 @@ fn poll_readable(fd: RawFd, timeout_secs: Option<f64>) -> std::io::Result<bool> 
         Some(t) => (t * 1000.0) as i32,
         None => -1,
     };
-    let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, timeout_ms) };
+    let pfd_ptr: *mut libc::pollfd = &mut pfd;
+    // Release the GIL across the (possibly indefinite) poll so peers run.
+    let rc = crate::gil::allow_threads_then(|| unsafe { libc::poll(pfd_ptr, 1, timeout_ms) });
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1085,4 +1617,97 @@ fn arg_bytes_obj(o: &Object, label: &str) -> Result<Vec<u8>, RuntimeError> {
             other.type_name()
         ))),
     }
+}
+
+// ---------------------------------------------------------------------
+// _posixshmem — shm_open(3) / shm_unlink(3) core (RFC 0040 WS5).
+//
+// `multiprocessing/resource_tracker.py` imports it unconditionally on
+// POSIX (for `shm_unlink`), and `multiprocessing/shared_memory.py` uses
+// `shm_open` to back `SharedMemory`. CPython ships it as
+// `Modules/_multiprocessing/posixshmem.c`.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+pub fn build_posixshmem(_cache: &ModuleCache) -> Rc<PyModule> {
+    let dict = Rc::new(RefCell::new(DictData::new()));
+    {
+        let mut d = dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("__name__")),
+            Object::from_static("_posixshmem"),
+        );
+        d.insert(
+            DictKey(Object::from_static("shm_open")),
+            b_dyn_kw("shm_open", shm_open_py),
+        );
+        d.insert(
+            DictKey(Object::from_static("shm_unlink")),
+            b("shm_unlink", shm_unlink_py),
+        );
+    }
+    Rc::new(PyModule {
+        name: "_posixshmem".to_owned(),
+        filename: None,
+        dict,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn build_posixshmem(_cache: &ModuleCache) -> Rc<PyModule> {
+    let dict = Rc::new(RefCell::new(DictData::new()));
+    dict.borrow_mut().insert(
+        DictKey(Object::from_static("__name__")),
+        Object::from_static("_posixshmem"),
+    );
+    Rc::new(PyModule {
+        name: "_posixshmem".to_owned(),
+        filename: None,
+        dict,
+    })
+}
+
+/// `_posixshmem.shm_open(path, flags, mode=0o777)` → fd.
+///
+/// CPython's `_posixshmem.shm_open` accepts `path`, `flags`, and `mode`
+/// positionally *or* by keyword (`shared_memory.py` passes `mode=` by
+/// keyword), so this is a kwargs-aware builtin.
+#[cfg(unix)]
+fn shm_open_py(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    let kw = |name: &str| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let path_obj = args.first().or_else(|| kw("path"));
+    let path = match path_obj {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("shm_open() path must be a str")),
+    };
+    let flags = match args.get(1).or_else(|| kw("flags")) {
+        Some(Object::Int(n)) => *n as libc::c_int,
+        _ => return Err(type_error("shm_open() flags must be an int")),
+    };
+    let mode = match args.get(2).or_else(|| kw("mode")) {
+        Some(Object::Int(n)) => *n as libc::c_uint,
+        _ => 0o777,
+    };
+    let cpath = std::ffi::CString::new(path).map_err(|_| value_error("embedded null byte"))?;
+    // `shm_open` is variadic; the mode arg must be promoted to c_uint
+    // (mode_t is u16 on Darwin, which can't cross a variadic boundary).
+    let fd = unsafe { libc::shm_open(cpath.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::Int(i64::from(fd)))
+}
+
+/// `_posixshmem.shm_unlink(path)`.
+#[cfg(unix)]
+fn shm_unlink_py(args: &[Object]) -> Result<Object, RuntimeError> {
+    let path = match args.first() {
+        Some(Object::Str(s)) => s.to_string(),
+        _ => return Err(type_error("shm_unlink() path must be a str")),
+    };
+    let cpath = std::ffi::CString::new(path).map_err(|_| value_error("embedded null byte"))?;
+    if unsafe { libc::shm_unlink(cpath.as_ptr()) } != 0 {
+        return Err(io_error_to_py(&std::io::Error::last_os_error()));
+    }
+    Ok(Object::None)
 }

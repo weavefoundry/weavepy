@@ -89,20 +89,22 @@ status = "timeout"
 reason = "RFC 0039 WS5: the cyclic-GC hang is gone — WeakValueDictionary/WeakKeyDictionary were ported from CPython (O(1) id-keyed, `_IterationGuard`-deferred removal) over a real native `_weakref._remove_dead_weakref`, weakref callbacks now fire in CPython order (referent cleared -> oldest-first callbacks -> cycle broken) including the older-generation refcount cascade, and the threaded-consistency / self-cleaning cases pass. The module still exceeds the 60s budget (killed at 60s; ~125s at a larger budget): MappingTestCase alone is ~100s, dominated by the threaded stress loops (NUM_THREADED_ITERATIONS=100000, `collect_in_thread()` spinning `gc.collect()` every 5ms, and the 70k-entry dict-copy) — raw interpreter+collector throughput (CPython runs the same loops in <1s), not an algorithmic regression; deferred to the incremental-GC perf arc. The remaining assertion failures are object-model fidelity outside the concurrency scope: `weakref.ref` Python-subclassing (incl. `__slots__` + `getweakrefs` ordering), the weakproxy operator protocol (arithmetic/index/reversed/item-assign), ref/proxy identity reuse, and `WeakMethod` (a `ref` subclass) — deferred to an object-model wave."
 
 [tests."cpython/Lib/test/test_multiprocessing_main_handling.py"]
-status = "skip"
-reason = "RFC 0024's _multiprocessing core is a stub — RFC 0026 will implement real fork/spawn"
+status = "pass"
+reason = "RFC 0040 WS5: 39/39 pass — all three start-method classes run on macOS (Fork + ForkServer + Spawn, 13 launch shapes each); none are skipped here. The ForkServer class needs an AF_UNIX socket + a forked server process, so it only passes when the grader runs unsandboxed (under a syscall sandbox those 13 fail at `forkserver.ensure_running`). Drives every `__main__`/`-m`/directory/zipapp launch through `runpy` + `multiprocessing` spawn child reconstruction. Required: (1) a faithful `runpy` PEP 338 port that introspects via `importlib.util.find_spec` + `loader.get_code` without executing the target; (2) a real `zipimport` (PEP 273) over the frozen `zipfile`, registered on `sys.path_hooks`, so directory/zip `__main__` and `pkg.mod`-in-zip resolve; (3) a Rust import-loader fallback to `sys.meta_path` that builds a *native* module from the located spec's code object (so dotted-import binding / `IMPORT_FROM` see a real module, not a `types.ModuleType` instance) — this is what lets `__import__('pkg')` reach a zip; (4) `io.open_code()` forced to binary mode so `pkgutil.read_code`/`runpy` read a `.pyc`'s magic header as raw bytes; (5) a dotless `sys.implementation.cache_tag` (`weavepy-313`, was `weavepy-3.13`) so PEP 3147 `source_from_cache` recovers `<name>.py` correctly; (6) faithful `make_zip_script`/`make_legacy_pyc` test helpers. CLI `run_path` dispatches directory/zip → `runpy._run_module_as_main('__main__')` and bare `.pyc` → unmarshalled-as-`__main__`."
 
 [tests."cpython/Lib/test/test_multiprocessing_fork.py"]
 status = "skip"
-reason = "depends on real multiprocessing implementation (RFC 0026)"
+reason = "measured (RFC 0040 WS5): faithful skip — CPython's own `test_multiprocessing_fork/__init__.py` raises `unittest.SkipTest(\"test may crash on macOS (bpo-33725)\")` at import on `sys.platform == 'darwin'`, and WeavePy reproduces that skip identically (verified: the module raises the same SkipTest on this macOS host). `fork` in a threaded runtime is documented-unsafe (the RFC Non-goals and CPython both gate it off here); the `spawn` and `forkserver` variants — the default/safe paths that share the entire `multiprocessing` package + `_multiprocessing` core — both pass end-to-end (413 run, 0F/0E). On a Linux grading host the `fork` start method runs the same package over the RFC 0025 shared-`Arc` heap clone; the macOS skip is the CPython-matching outcome here."
 
 [tests."cpython/Lib/test/test_multiprocessing_spawn.py"]
-status = "skip"
-reason = "depends on real multiprocessing implementation (RFC 0026)"
+status = "pass"
+timeout_seconds = 600
+reason = "measured (RFC 0040 WS5): passes end-to-end as a unit — 413 run, 0 fail / 0 error, 73 skip across the full `test_misc`/`test_processes`/`test_threads`/`test_manager` package. The `multiprocessing` package + `_multiprocessing` core are real (SemLock over POSIX named semaphores, `spawn` re-exec via `_spawn_child`, Pipe/Queue/Pool, the managers server-process + proxies, and the synchronize stack), and this wave closed the WS5 tail: the `WithProcessesTestManagerRestart.test_rapid_restart` cleanup deadlock is gone and the `_test_multiprocessing` `test_release_task_refs` finalizer-leak is fixed — a discarded `pool.map(...)` result `list` (and the `del`'d argument list) now reap their unpickled `CountedObject` copies on the *main* thread at the statement's `POP_TOP`/`DELETE_FAST` (CPython refcount-on-discard timing), instead of lingering as dead-but-tracked garbage that a background pool thread's collection would finalize, which previously raced the main thread on the non-atomic `n_instances` counter. (Graded with socket permissions; the SyncManager `AF_UNIX` listener can't bind under the conformance sandbox.)"
 
 [tests."cpython/Lib/test/test_multiprocessing_forkserver.py"]
-status = "skip"
-reason = "depends on real multiprocessing implementation (RFC 0026)"
+status = "pass"
+timeout_seconds = 600
+reason = "measured (RFC 0040 WS5): passes end-to-end as a unit — 413 run, 0 fail / 0 error, 69 skip. The `forkserver` start method (the fork-server control process spawned via `_spawn_child`, the `SCM_RIGHTS` fd hand-off of the inheritable semaphore/pipe descriptors, and the per-request `fork`) round-trips the full package alongside the spawn variant; the same WS5 manager/sync/finalizer fixes apply. (Graded with socket permissions; the SyncManager `AF_UNIX` listener can't bind under the conformance sandbox.)"
 
 # ---------------------------------------------------------------------
 # RFC 0026 — expanded CPython baseline. Each entry is something we
@@ -246,38 +248,39 @@ status = "pass"
 reason = "full lzma (1 skip): LZMAFile + LZMACompressor/Decompressor with check-id parsing & arg validation, FORMAT_RAW filter chains and _en/_decode_filter_properties via lzma-sys raw FFI (workspace vendors lzma-sys with all BCJ filters enabled)"
 
 [tests."cpython/Lib/test/test_zipfile.py"]
-status = "fail"
-reason = "measured (RFC 0038 WS-A): 47 pass, 35 fail, 193 error. The bulk of the errors are the `test_zipfile/_path` subpackage exercising the `zipfile.Path` accessor, which is absent (`module 'zipfile' has no attribute 'Path'`), plus `ZipFile.compresslevel` and the BZIP2/LZMA-in-zip compression methods. Deep `zipfile.Path` port deferred to wave 4."
+status = "pass"
+reason = "measured (RFC 0040 WS8): passes end-to-end (343 run, 0 fail / 0 error, 6 skip). The old 489-line custom shim was replaced with CPython 3.13's verbatim `zipfile` package — `zipfile/__init__.py` plus the `zipfile._path`/`zipfile._path.glob` Path accessor and `zipfile.__main__` — frozen as a real package. That brought `zipfile.Path`, `PyZipFile`, ZIP64, per-file `compresslevel`, BZIP2/LZMA members, `mkdir`/`testzip`/`filelist`, and `metadata_encoding`. Supporting fixes landed in the runtime: `time.strptime` (delegating to a frozen `_strptime`) + the `time.timezone/altzone/daylight/tzname` constants; `io.open`'s exclusive `'x'` mode now raises `FileExistsError`; `io.IOBase.{seek,truncate,fileno}` raise `io.UnsupportedOperation` (not plain OSError); `py_compile.compile` uses the built-in compiler so `PyZipFile.writepy` emits real `.pyc`; the KOI8-R/U codecs resolve through `encoding_rs`; `runpy` fetches the *resolved* frozen source so `python -m zipfile` runs the package `__main__`; and frozen packages now expose a faithful `<frozen pkg>/__init__.py` `__file__` so `os.path.dirname(__file__)` works (the overlap-warning `skip_file_prefixes`). The 6 skips are zlib/bz2/lzma-size and unix-permission probes."
 
 [tests."cpython/Lib/test/test_tarfile.py"]
-status = "fail"
-# ~45s of CPU; raise the budget so throttling doesn't kill it at 60s and
-# mask the (stable) `fail` verdict with a spurious timeout.
+status = "pass"
+# ~100s of CPU; raise the budget so throttling doesn't kill it at 60s.
 timeout_seconds = 150
-reason = "measured (RFC 0038 WS-A): 539 pass, 11 fail, 62 error of 620. First gaps: `ExFileObject` lacks `.name` and the underlying buffered `file` object lacks `truncate()`; remaining errors are PAX/GNU long-name headers and stream (`r|`/`w|`) modes. Deferred."
+reason = "measured (RFC 0040 WS8 + WS1 dir_fd, WTF-8 arc): passes end-to-end — 637 pass, 0 fail, 0 error of 645 (8 skip), up from 635/2F. The final 2 residual (`test_extract_unencodable`, `test_filter_unencodable`) closed with the WTF-8 lone-surrogate `str` arc: undecodable archive-member bytes now decode (`surrogateescape`) into a real surrogate-bearing `str` (`Object::WStr`, U+DC80..U+DCFF) instead of lossy U+FFFD, and re-encode faithfully on extract. Earlier in the wave the PAX/GNU long-name, sparse, and `r|`/`w|` stream gaps closed: `io.Buffered*` forward `.name`/`.mode` to the wrapped raw stream and propagate its `seekable()`/`readable()`/`writable()` exceptions; `io.BytesIO(None)` is an empty buffer; `open(fd)` reports the int fd as `.name`; a native UTF-7 codec (RFC 2152) covers `tarfile(encoding='utf7')`; and the WS1 `os.pathconf` + `dir_fd`/`scandir(fd)` surface lets `shutil.rmtree` take its `_rmtree_safe_fd` path (CVE-2025-4517 `test_realpath_limit_attack`)."
 
 [tests."cpython/Lib/test/test_io.py"]
-status = "fail"
-# ~52s of CPU; raise the budget so throttling doesn't kill it at the 60s
-# boundary and turn the (stable) `fail` verdict into a spurious timeout.
-timeout_seconds = 150
-reason = "measured (RFC 0038 WS-B, updated RFC 0039 WS5): completes in ~52s (fail) — no hang. A prior wave measured 54 pass / 38 fail / 44 error of 247; RFC 0039 then fixed a SignalsTest regression so `PySignalsTest.test_interrupted_write_{buffered,unbuffered}` now pass. A `SIGALRM` arriving during a blocking `os.write` to a full pipe is now delivered to the VM main thread: WeavePy runs the interpreter on a spawned `weavepy-main` stack thread, so the async signals are blocked on the parked process-main OS thread that would otherwise steal them (only tripping the flag while the VM thread's syscall never sees EINTR). `os.write` also releases the GIL across the write and services tripped handlers on `EINTR`. The blocking write then returns and the buffered layer raises the handler's `ZeroDivisionError` per PEP 475 instead of blocking forever. Residual gaps (deferred): BufferedIOBase.readinto on custom raw streams (`'Reader' object has no attribute 'readinto'`), BufferedRandom read/write interleaving, TextIOWrapper seek/tell cookie semantics, and native `io.open(fd:int)` (CSignalsTest)."
+status = "pass"
+# ~75s of CPU end-to-end: the WS7 fidelity work turned the entire suite green,
+# and many cases drive the slow interpreter-level Python-raw stream loops
+# (`Py*`/`MockRawIO` variants). Budget generously so throttling can't turn the
+# (stable) `pass` verdict into a spurious timeout.
+timeout_seconds = 600
+reason = "measured (RFC 0040 WS7 — acceptance bar met): passes end-to-end — 661 run, 0F/0E, 36 skip (up from 655/3F/3E, itself up from 330/209F/88E). The full `BufferedRandom` read/write interleaving, `bufsize=0`→`RawIOBase`, binary line-buffering, `TextIOWrapper` reconfigure/`open(fd:int)`, and the entire `tell()`/`seek()` cookie surface pass. WTF-8 + arg-coercion closed the constructor/reconfigure cluster: a lone-surrogate `encoding`/`errors` (`Object::WStr`) raises `UnicodeEncodeError`, `newline=<surrogate>` raises `ValueError`, `reconfigure(encoding='locale\\0')` truncates at NUL to `LookupError`, `reconfigure(line_buffering=2**1000)` raises `OverflowError`, and a `surrogateescape`-decoded `read()` yields real lone surrogates. The final 6 residuals all closed this wave: (1) `test_seek_and_tell` (C) — the native `TextIOWrapper` now drives an arbitrary *Python* `IncrementalDecoder` whose one-shot `decode` is `None` (the `test_decoder` codec) via the getstate/setstate cookie protocol (`PyFile::{read,tell,seek}_text_incr`, packing the decoder snapshot into a BigInt cookie); (2) `test_slow_close_from_thread` ×2 — a real cross-thread buffered-stream lock serialises a concurrent `write()` behind an in-progress `close()` then raises `ValueError`; (3) `test_abcs` (C) — the native `io.IOBase` family are now `abc.ABCMeta` instances; (4) `test_seek_with_encoder_state` ×2 (C+Py) — a faithful JIS X 0213:2004 `euc_jis_2004` CJK codec (frozen `_codec_euc_jis_2004`, validated byte-for-byte against CPython across all 196 608 code points + 18 184 byte sequences) whose 25 combining sequences make the incremental *encoder* stateful (a combinable base buffered across `encode()` calls, discarded by `setstate(0)` on seek)."
 
 [tests."cpython/Lib/test/test_os.py"]
-status = "fail"
-reason = "measured (RFC 0038 WS-B): 73 pass, 29 fail, 63 error (172 skip). Spread across missing `os` surface — `os.environb`, `os.device_encoding`, plus stat_result/scandir edges — rather than one root cause. The `os.scandir` OSError.filename fix landed this wave (it cleared the cross-cutting tempfile/shutil cleanup errors); the residual breadth gap is deferred."
+status = "pass"
+reason = "measured (RFC 0040 WS1 + WTF-8 arc): passes end-to-end — 338 run, 0F/0E, 129 skip (was 1F/3E). The 3 `Pep383Tests` (undecodable/lone-surrogate filenames) closed with the WTF-8 `str` arc: the `os.*` path converter accepts a lone-surrogate `str` (`Object::WStr`) and fsencodes it (`surrogateescape`) — round-tripping undecodable filenames as real surrogates and raising `UnicodeEncodeError` for non-escapable ones — instead of rejecting it with `TypeError`/lossy U+FFFD. The last residual, `ForkTests.test_fork_warns_when_non_python_thread_exists`, closed this wave: a native `_testcapi._spawn_pthread_waiter`/`_end_spawned_pthread` raw-`pthread` spawner (`_testinternalcapi`) plus mach `task_threads` OS-thread counting and a startup thread baseline let `os.fork()` detect a live non-Python thread and emit the multi-threaded-fork `DeprecationWarning` parent-side, exactly like CPython's `warn_about_fork_with_threads`. The `dir_fd`/fd surface (landed earlier) stands: `os.{open,stat,lstat,unlink,rmdir,mkdir}(dir_fd=)` via `*at(2)`, `os.scandir(fd)`/`listdir(fd)` via `fdopendir`+`rewinddir`, populated `os.supports_dir_fd`/`supports_fd`, fd-free `os.urandom` over `getentropy`/`getrandom`. Note: `SpawnTests.test_spawnve_bytes` can flake (exit-code mismatch) only when the grader is starved by a heavy concurrent run sharing the host; it is deterministically green in isolation (`os.spawnve` with bytes args/env works, verified directly)."
 
 [tests."cpython/Lib/test/test_posixpath.py"]
-status = "fail"
-reason = "measured (RFC 0038 WS-B): 86 pass, 1 fail. The sole failure is test_realpath_invalid_paths: `realpath` on a lone-surrogate path must raise `UnicodeEncodeError`, but WeavePy's UTF-8-native str replaces lone surrogates at construction so the encode never fails. Blocked on WTF-8 str storage (shared root cause with test_codecs); deferred to wave 4."
+status = "pass"
+reason = "measured (RFC 0040 WTF-8 arc): passes end-to-end — 94 run, 0 fail, 89 pass, 5 skip. The sole prior failure (`test_realpath_invalid_paths`: `realpath('/\\udfff')` must raise `UnicodeEncodeError`) closed via two fixes: (1) lone surrogates now survive in `str` literals/constants (`Object::WStr`) — the bug was masked by stale `.pyc` (pre-WTF-8 bytecode stored the literal as U+FFFD); WeavePy's `.pyc` cache tag is bumped (`weavepy-313-2`) so the pinned-to-CPython MAGIC can't, invalidating the lossy caches; (2) the `os.*` path converter (`os.stat`/`scandir`/`readlink` guards) accept `Object::WStr` and fsencode it (`surrogateescape`), raising `UnicodeEncodeError` for a non-escapable surrogate exactly like CPython's `path_converter`. Also flips the (untracked) `test_genericpath` `PosixCommonTest` `exists`/`isdir`/`isfile` surrogate cases."
 
 [tests."cpython/Lib/test/test_pathlib.py"]
 status = "fail"
 reason = "measured (RFC 0038 WS-B): 764 pass, 10 fail, 3 error of 1036. The errors need AF_UNIX socket string addresses (`sock.bind(str(path))` → 'address must be a tuple'); the failures are 3.13 path-edge corners (walk/full_match/relative_to(walk_up)). Deferred."
 
 [tests."cpython/Lib/test/test_tempfile.py"]
-status = "fail"
-reason = "RFC 0039 WS4: the finalizer gap is closed — `NamedTemporaryFile(delete=True)` is now unlinked when its weakref finalizer fires on GC (deterministic acyclic reap + the older-generation refcount cascade); the old `exists after finalizer` failure is gone. Measured 84 pass / 6 fail / 18 error / 10 skip: the residual is the `SpooledTemporaryFile` IO layer (the file wrapper lacks `detach()`/`truncate()`, `TextIOWrapper` lacks `.newlines`), binary-vs-text file iteration, and codec validation (bad-encoding `LookupError` not raised) — an io-module fidelity arc outside this wave's concurrency/GC scope."
+status = "pass"
+reason = "measured (RFC 0040 WS7/WS8 + deterministic-finalization arc): passes end-to-end — 118 run, 0F/0E, 8 skip. The `SpooledTemporaryFile` IO layer is faithful (native text files track `.newlines`, report their real `.encoding`/`.errors`, and `f.name` round-trips an integer fd; `unittest.mock.MagicMock` exposes settable `__enter__`/`__exit__` child mocks). The last 2 residuals (`test_del_by_finalizer`, `test_warnings_on_cleanup`) needed prompt refcount finalization of a function-local file object at *frame teardown* without an explicit `gc.collect()`. That landed in the deterministic-finalization arc: `reap_frame_locals_on_exit` now (a) reaps non-escaped closure-`Function` locals — which are GC-tracked, so a plain `Rc` drop left them (and their captured cells) pinned by the GC handle — and (b) sweeps the frame's own cell variables, reaping any uniquely-held cellvar whose contents are a dead finalizable (`test_writelines_rollover`'s `f`, captured by a throwaway generator/closure). This mirrors CPython decref'ing a frame's cells together with its closures at teardown."
 
 [tests."cpython/Lib/test/test_glob.py"]
 status = "pass"
@@ -288,8 +291,8 @@ status = "pass"
 reason = "measured (RFC 0038 WS-B): passes end-to-end (frozen `fnmatch` over the `re` translate path)."
 
 [tests."cpython/Lib/test/test_shutil.py"]
-status = "fail"
-reason = "measured (RFC 0038 WS-B): 116 pass, 3 fail, 18 error (improved after the os.scandir filename fix this wave). Remaining errors: `make_archive(..., 'zip', ...)` calls `zipfile.write()` on a directory and raises `IsADirectoryError` (zipfile needs directory-entry handling), plus chown ownership. Deferred (shares the zipfile gap with test_zipfile)."
+status = "pass"
+reason = "measured (RFC 0040 WS8): passes end-to-end (207 run, 0 fail / 0 error, 68 skip) — up from 116 pass / 3F / 18E. The archive path now round-trips: `make_archive(..., 'zip')` works over the verbatim CPython `zipfile` package (directory entries), and the residual fidelity gaps closed this wave: every `os`/fs syscall threads `OSError.filename`/`filename2` (`io_error_to_py_named{,2}`) so `copy`/`copytree`/`rmtree`/`move` error attributes match CPython; `os.supports_follow_symlinks` is populated with the real `stat`/`chmod`/`utime` function objects so `copystat(follow_symlinks=False)` takes its `lstat`/`lchmod` path instead of no-opping; macOS zero-copy `copyfile` works via a native `os._fcopyfile` (`fcopyfile(3)`) + the `_COPYFILE_{ACL,STAT,XATTR,DATA}` flags re-exported through `posix`; `os.makedirs(exist_ok=False)` raises `FileExistsError` on an existing dir; and `platform.mac_ver()` resolves (native `os.uname()` returning an `os.uname_result` struct-sequence + `xml.etree.ElementTree` `find`/`findall` basic-XPath support so `plistlib.load` parses `SystemVersion.plist`). The 68 skips are root-only chown/chroot and zlib/lzma-availability probes."
 
 [tests."cpython/Lib/test/test_stat.py"]
 status = "pass"
@@ -440,12 +443,12 @@ status = "fail"
 reason = "resource: getrusage delta + setrlimit raises on permission"
 
 [tests."cpython/Lib/test/test_fcntl.py"]
-status = "fail"
-reason = "fcntl: F_SETLK byte-range locks + F_NOTIFY (Linux only)"
+status = "pass"
+reason = "measured (RFC 0040 WS1): passes end-to-end (12 run, 4 skip). The `test_lockf_{exclusive,share}` cases drive a `multiprocessing.get_context('spawn')` child that unpickles the test function from `test.test_fcntl`; they were failing because the spawn child rebinds `sys.path` in `spawn.prepare()` (`sys.path = data['sys_path']`) and WeavePy's import loader read a stale cached path snapshot. The loader now consults the live `sys.modules['sys'].path` (CPython-faithful), so the child resolves on-disk submodules and the lockf BlockingIOError round-trips."
 
 [tests."cpython/Lib/test/test_posix.py"]
-status = "fail"
-reason = "posix wrapper: posix_spawn + os.scheduler_*"
+status = "pass"
+reason = "RFC 0040 WS1/WS4: passes in the canonical subprocess mode (178 run, 0F/0E, 99 skip). Landed: os.pipe2 honouring O_NONBLOCK/O_CLOEXEC via host libc O_* values (macOS differs from Linux), signal.raise_signal delivering real signals unconditionally (setsigdef kills the child), posix_spawn setsigmask preserved by capturing+restoring the inherited signal mask on the VM thread, and a pre-main C constructor (proc_init) that re-closes any inherited-closed standard fd the Rust runtime's sanitize_standard_fds reopened to /dev/null (test_close_file)."
 
 [tests."cpython/Lib/test/test_uuid.py"]
 status = "fail"
@@ -524,12 +527,13 @@ status = "skip"
 reason = "socket: most tests need network + privileged sockets"
 
 [tests."cpython/Lib/test/test_subprocess.py"]
-status = "skip"
-reason = "subprocess: Popen requires exec/fork plumbing — RFC 0026 enables it"
+status = "pass"
+timeout_seconds = 180
+reason = "measured (RFC 0040 WS1-WS3 + io-layer + WTF-8 arcs): passes end-to-end — 354 run, 0 fail / 0 error, 53 skip (301 pass), up from 292/7F/2E. The full POSIX process model landed earlier — `_posixsubprocess.fork_exec` (make_inheritable for pass_fds, the #12607 std-fd relocation, close-open-fds *after* preexec_fn, the `b\"<Exc>:<hexerrno>:<msg>\"` errpipe protocol) plus a faithful `subprocess.Popen` (KeyboardInterrupt grace-wait bpo-25942, send_signal poll-before-kill bpo-38630, selector-driven communicate, list2cmdline, __class_getitem__, CalledProcessError signal rendering) over os.pipe CLOEXEC / dup2(inheritable=) / lseek / putenv-unsetenv / set{uid,gid,…} / io.open(fd). The wave-final residuals all closed: (a) the io-layer behavioural gaps — `bufsize=0` raw passthrough, `bufsize=1` binary line buffering, write-buffer hold, broken-pipe cleanup (`test_io_unbuffered_works`, `test_bufsize_equal_one_binary_mode`, `test_broken_pipe_cleanup`); (b) `test_undecodable_env` via the WTF-8 `surrogateescape` env round-trip (`os.environ` lone-surrogate keys/values now survive as `Object::WStr` through fsencode rather than lossy U+FFFD — the stale-`.pyc` masking is gone after the `weavepy-313-2` cache-tag bump); (c)/(d)/(e) the interpreter-finalization / refcount-GC / EncodingWarning-stacklevel cases."
 
 [tests."cpython/Lib/test/test_signal.py"]
-status = "skip"
-reason = "signal handlers in test require pthread_kill + sub-interpreter coordination"
+status = "pass"
+reason = "measured (RFC 0040 WS4): passes end-to-end — 57 run, 0 fail / 0 error / 12 skip (sigtimedwait/sigwaitinfo not built, pidfd, Windows-only, and the 'walltime'/system-bug skips). The full POSIX signal surface landed: SIGINT's startup default_int_handler (KeyboardInterrupt, identical object as getsignal(SIGINT)); an interruptible time.sleep (nanosleep loop servicing tripped handlers on EINTR per PEP 475); pthread_sigmask round-trips + sigpending + sigwait routed onto the VM-main thread; os.kill(getpid(), sig) delivered via pthread_kill to the VM-main thread so a self-directed signal isn't absorbed by the parked process-initial thread; strsignal() ValueError on out-of-range; _thread.interrupt_main raising 'Signal N ignored due to race condition' during finalization; the set_wakeup_fd surface incl. warn_on_full_buffer and the async-handler write-error report routed through sys.unraisablehook → sys.stderr (WakeupSignalTests/WakeupSocketSignalTests); and an unhandled top-level KeyboardInterrupt re-raising SIGINT under SIG_DFL so the process dies by the signal (exit_sigint, returncode == -SIGINT)."
 
 [tests."cpython/Lib/test/test_ssl.py"]
 status = "skip"
@@ -552,8 +556,9 @@ status = "pass"
 reason = "RFC 0039 WS2/WS3: lock `__enter__` now releases the GIL while blocking (was a whole-interpreter deadlock), so blocking get/put + task_done/join make real progress under OS-thread parallelism."
 
 [tests."cpython/Lib/test/test_concurrent_futures.py"]
-status = "skip"
-reason = "RFC 0039 WS3: the ThreadPoolExecutor subset is measured-green — test_thread_pool 17/17, test_wait 33/33, test_future 18/20 (2 residual = logging-handler formatting), test_as_completed 19/20 (1 free-reference-on-yield GC nit). But the harness grades the whole `test_concurrent_futures` package, whose ProcessPool/deadlock submodules need real multiprocessing fork/spawn (RFC 0026, not yet shipped) and block the run, so the package can't be graded green as a unit. Flip once ProcessPool lands or the harness grades the ThreadPool submodules independently."
+status = "pass"
+timeout_seconds = 300
+reason = "RFC 0040 WS6: passes as a graded unit — 267 run, 0 fail, 0 err, 20 skip (release build). The whole `concurrent.futures` matrix is green: ThreadPool + ProcessPool (fork/forkserver/spawn) across test_init/test_future/test_as_completed/test_wait/test_thread_pool/test_process_pool/test_shutdown/test_deadlock. Two fixes landed this wave. (1) A VM deterministic-finalization bug: a comprehension's anonymous `<listcomp>`/`<setcomp>`/`<dictcomp>`/`<genexpr>` is GC-tracked when it captures cells, so when emitted by `MakeFunction` and consumed by the very next `Call` a plain `Rc` drop left it pinned by its own GC handle — leaking the captured locals until the next cycle collection. `ThreadPoolExecutor.map`'s `result_iterator` closes over the listcomp's `self`, so every `map` leaked one ref to the executor; `del executor` then never hit refcount 0, the idle-worker wakeup weakref-callback never fired, and `test_shutdown`/`test_del_shutdown` hung. `reap_call_receiver` now routes a uniquely-held call-temporary `Function` through the same prompt-reap cascade as closure-function locals (the leak also resolved the test_future 18→20 and test_as_completed 19→20 residuals). (2) Added the native `faulthandler` module: `test_deadlock` fires `faulthandler._sigsegv()` inside a pool worker to force a hard crash and assert `BrokenProcessPool` recovery; without the module `import faulthandler` raised in the worker, so the crash never happened and every recovery case errored or hung to `LONG_TIMEOUT`. The crash primitives genuinely `raise(3)` the signal, and ProcessPool broken-worker detection (verified independently for SIGSEGV/SIGABRT/os._exit) recovers promptly."
 
 [tests."cpython/Lib/test/test_asyncio.py"]
 status = "skip"

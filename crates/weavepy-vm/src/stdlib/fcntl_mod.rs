@@ -25,7 +25,7 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
-use crate::error::{os_error, type_error, value_error, RuntimeError};
+use crate::error::{io_error_to_py, overflow_error, type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
@@ -60,6 +60,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         }
         // lockf(3) constants.
         for (name, value) in LOCKF_FLAGS {
+            d.insert(DictKey(Object::from_static(name)), Object::Int(*value));
+        }
+        // struct flock lock types (F_RDLCK / F_WRLCK / F_UNLCK).
+        for (name, value) in LOCK_TYPES {
             d.insert(DictKey(Object::from_static(name)), Object::Int(*value));
         }
 
@@ -100,106 +104,226 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 // ---------------------------------------------------------------------
 // fcntl(2) wrapper.
 //
-// Signature mirrors CPython: `fcntl.fcntl(fd, op, arg=0)`. The third
-// argument may be an int or a buffer; we accept ints today and reject
-// buffers (the binary-flock case lives behind `struct flock`).
+// Signature mirrors CPython: `fcntl.fcntl(fd, op, arg=0)`. The `fd` may
+// be an int or any object with a `fileno()` method (file, socket, …).
+// The third argument may be an int or a bytes/bytearray buffer: CPython
+// copies the buffer into a fixed 1024-byte scratch area, runs the
+// syscall against it, and returns the (possibly mutated) prefix as
+// `bytes` — exactly what `F_SETLKW`/`F_GETPATH` rely on.
 // ---------------------------------------------------------------------
 fn fcntl_fcntl(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fd = extract_fd(args.first())?;
-    let op = extract_int(args.get(1), "op")?;
-    let arg = match args.get(2) {
-        Some(Object::Int(n)) => *n as i32,
-        Some(Object::None) | None => 0,
-        Some(other) => {
-            return Err(type_error(format!(
-                "fcntl() arg must be an int, got '{}'",
-                other.type_name()
-            )))
+    let fd = coerce_fd(args.first())?;
+    let op = extract_int(args.get(1), "op")? as i32;
+    match args.get(2) {
+        Some(Object::Bytes(b)) => fcntl_with_buffer(fd, op, &b[..]),
+        Some(Object::ByteArray(b)) => {
+            let data = b.borrow().clone();
+            fcntl_with_buffer(fd, op, &data)
         }
-    };
-    let ret = unsafe { libc_fcntl(fd, op as i32, arg) };
-    if ret < 0 {
-        return Err(os_error(format!(
-            "fcntl({fd}, {op}, {arg}) failed: errno={}",
-            last_os_error_code()
-        )));
+        Some(Object::Int(n)) => fcntl_with_int(fd, op, *n),
+        Some(Object::Bool(b)) => fcntl_with_int(fd, op, i64::from(*b)),
+        Some(Object::None) | None => fcntl_with_int(fd, op, 0),
+        Some(other) => Err(type_error(format!(
+            "fcntl() argument 3 must be an integer or bytes, not '{}'",
+            other.type_name()
+        ))),
     }
-    Ok(Object::Int(ret as i64))
+}
+
+fn fcntl_with_int(fd: i32, op: i32, arg: i64) -> Result<Object, RuntimeError> {
+    let ret = unsafe { libc_fcntl(fd, op, arg as std::os::raw::c_long) };
+    if ret < 0 {
+        return Err(last_os_err());
+    }
+    Ok(Object::Int(i64::from(ret)))
+}
+
+fn fcntl_with_buffer(fd: i32, op: i32, data: &[u8]) -> Result<Object, RuntimeError> {
+    const BUFSZ: usize = 1024;
+    if data.len() > BUFSZ {
+        return Err(value_error("fcntl bytes arg too long"));
+    }
+    let mut buf = [0u8; BUFSZ];
+    buf[..data.len()].copy_from_slice(data);
+    let ret = unsafe { libc_fcntl_ptr(fd, op, buf.as_mut_ptr()) };
+    if ret < 0 {
+        return Err(last_os_err());
+    }
+    Ok(Object::Bytes(Rc::from(&buf[..data.len()])))
 }
 
 fn fcntl_ioctl(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fd = extract_fd(args.first())?;
+    let fd = coerce_fd(args.first())?;
     let request = extract_int(args.get(1), "request")?;
-    let arg = match args.get(2) {
-        Some(Object::Int(n)) => *n,
-        Some(Object::None) | None => 0,
-        Some(other) => {
-            return Err(type_error(format!(
-                "ioctl() arg must be an int, got '{}'",
-                other.type_name()
-            )))
+    // The mutable-buffer form of `ioctl` mirrors `fcntl`: copy the buffer
+    // into scratch, run the syscall, return the mutated prefix.
+    match args.get(2) {
+        Some(Object::Bytes(b)) => ioctl_with_buffer(fd, request as u64, &b[..]),
+        Some(Object::ByteArray(b)) => {
+            let data = b.borrow().clone();
+            ioctl_with_buffer(fd, request as u64, &data)
         }
-    };
-    let ret = unsafe { libc_ioctl(fd, request as u64, arg) };
-    if ret < 0 {
-        return Err(os_error(format!(
-            "ioctl({fd}, {request}, {arg}) failed: errno={}",
-            last_os_error_code()
-        )));
+        Some(Object::Int(n)) => ioctl_with_int(fd, request as u64, *n),
+        Some(Object::Bool(b)) => ioctl_with_int(fd, request as u64, i64::from(*b)),
+        Some(Object::None) | None => ioctl_with_int(fd, request as u64, 0),
+        Some(other) => Err(type_error(format!(
+            "ioctl() argument 3 must be an integer or bytes, not '{}'",
+            other.type_name()
+        ))),
     }
-    Ok(Object::Int(ret as i64))
+}
+
+fn ioctl_with_int(fd: i32, request: u64, arg: i64) -> Result<Object, RuntimeError> {
+    let ret = unsafe { libc_ioctl(fd, request, arg) };
+    if ret < 0 {
+        return Err(last_os_err());
+    }
+    Ok(Object::Int(i64::from(ret)))
+}
+
+fn ioctl_with_buffer(fd: i32, request: u64, data: &[u8]) -> Result<Object, RuntimeError> {
+    const BUFSZ: usize = 1024;
+    if data.len() > BUFSZ {
+        return Err(value_error("ioctl bytes arg too long"));
+    }
+    let mut buf = [0u8; BUFSZ];
+    buf[..data.len()].copy_from_slice(data);
+    let ret = unsafe { libc_ioctl_ptr(fd, request, buf.as_mut_ptr()) };
+    if ret < 0 {
+        return Err(last_os_err());
+    }
+    Ok(Object::Bytes(Rc::from(&buf[..data.len()])))
 }
 
 fn fcntl_flock(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fd = extract_fd(args.first())?;
+    let fd = coerce_fd(args.first())?;
     let op = extract_int(args.get(1), "operation")?;
     let ret = unsafe { libc_flock(fd, op as i32) };
     if ret < 0 {
-        return Err(os_error(format!(
-            "flock({fd}, {op}) failed: errno={}",
-            last_os_error_code()
-        )));
+        return Err(last_os_err());
     }
     Ok(Object::None)
 }
 
+// CPython's `fcntl.lockf(fd, cmd, len=0, start=0, whence=0)` does *not*
+// call the C `lockf(3)`; it translates the `flock`-style `LOCK_*` flags
+// into a `struct flock` and runs `fcntl(F_SETLK | F_SETLKW)`. We mirror
+// that exactly so `LOCK_EX|LOCK_NB` doesn't reach the kernel as a bogus
+// `lockf` command (which returns EINVAL).
+#[cfg(unix)]
 fn fcntl_lockf(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fd = extract_fd(args.first())?;
-    let cmd = extract_int(args.get(1), "cmd")?;
-    let length = match args.get(2) {
+    const LOCK_SH: i64 = 1;
+    const LOCK_EX: i64 = 2;
+    const LOCK_NB: i64 = 4;
+    const LOCK_UN: i64 = 8;
+
+    let fd = coerce_fd(args.first())?;
+    let code = extract_int(args.get(1), "cmd")?;
+    let length = optional_off(args.get(2), "len")?;
+    let start = optional_off(args.get(3), "start")?;
+    let whence = match args.get(4) {
         Some(Object::Int(n)) => *n,
+        Some(Object::Bool(b)) => i64::from(*b),
         Some(Object::None) | None => 0,
         Some(other) => {
             return Err(type_error(format!(
-                "lockf() length must be an int, got '{}'",
+                "lockf() whence must be an int, got '{}'",
                 other.type_name()
             )))
         }
     };
-    let ret = unsafe { libc_lockf(fd, cmd as i32, length as i64) };
+
+    // SAFETY: zero-initialising a POD C struct is well-defined.
+    let mut l: libc::flock = unsafe { std::mem::zeroed() };
+    l.l_type = if code == LOCK_UN {
+        libc::F_UNLCK as _
+    } else if code & LOCK_SH != 0 {
+        libc::F_RDLCK as _
+    } else if code & LOCK_EX != 0 {
+        libc::F_WRLCK as _
+    } else {
+        return Err(value_error(
+            "unrecognized lock argument: pass one of LOCK_SH, LOCK_EX or LOCK_UN",
+        ));
+    };
+    l.l_start = start as _;
+    l.l_len = length as _;
+    l.l_whence = whence as _;
+
+    let cmd = if code & LOCK_NB != 0 {
+        libc::F_SETLK
+    } else {
+        libc::F_SETLKW
+    };
+    let ret = unsafe { libc::fcntl(fd, cmd, std::ptr::from_mut(&mut l)) };
     if ret < 0 {
-        return Err(os_error(format!(
-            "lockf({fd}, {cmd}, {length}) failed: errno={}",
-            last_os_error_code()
-        )));
+        return Err(last_os_err());
     }
     Ok(Object::None)
 }
 
-fn extract_fd(arg: Option<&Object>) -> Result<i32, RuntimeError> {
+#[cfg(not(unix))]
+fn fcntl_lockf(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(crate::error::os_error(
+        "lockf is not supported on this platform",
+    ))
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn optional_off(arg: Option<&Object>, name: &str) -> Result<i64, RuntimeError> {
     match arg {
-        Some(Object::Int(n)) => Ok(*n as i32),
-        Some(obj) => Err(type_error(format!(
-            "fd must be an int, got '{}'",
-            obj.type_name()
+        Some(Object::Int(n)) => Ok(*n),
+        Some(Object::Bool(b)) => Ok(i64::from(*b)),
+        Some(Object::None) | None => Ok(0),
+        Some(other) => Err(type_error(format!(
+            "lockf() {name} must be an int, got '{}'",
+            other.type_name()
         ))),
-        None => Err(type_error("missing fd")),
     }
+}
+
+/// CPython's `_PyObject_AsFileDescriptor`: accept an `int` directly, or
+/// any object exposing a `fileno()` method that returns one. A negative
+/// descriptor is a `ValueError`; an out-of-`int`-range one an
+/// `OverflowError`; anything else a `TypeError`.
+fn coerce_fd(arg: Option<&Object>) -> Result<i32, RuntimeError> {
+    let obj = arg.ok_or_else(|| type_error("function missing required argument 'fd'"))?;
+    let raw: i64 = match obj {
+        Object::Int(n) => *n,
+        Object::Bool(b) => i64::from(*b),
+        Object::File(f) => f
+            .fileno()
+            .ok_or_else(|| value_error("I/O operation on closed file"))?,
+        other => {
+            let ptr = crate::vm_singletons::current_interpreter_ptr()
+                .ok_or_else(|| type_error("argument must be an int, or have a fileno() method."))?;
+            // SAFETY: published by the enclosing VM frame on this thread.
+            let interp = unsafe { &mut *ptr };
+            let meth = interp
+                .load_attr_public(other, "fileno")
+                .map_err(|_| type_error("argument must be an int, or have a fileno() method."))?;
+            match interp.call_object(meth, &[], &[])? {
+                Object::Int(n) => n,
+                Object::Bool(b) => i64::from(b),
+                _ => return Err(type_error("fileno() returned a non-integer")),
+            }
+        }
+    };
+    if raw > i64::from(i32::MAX) || raw < i64::from(i32::MIN) {
+        return Err(overflow_error("Python int too large to convert to C int"));
+    }
+    if raw < 0 {
+        return Err(value_error(format!(
+            "file descriptor cannot be a negative integer ({raw})"
+        )));
+    }
+    Ok(raw as i32)
 }
 
 fn extract_int(arg: Option<&Object>, name: &str) -> Result<i64, RuntimeError> {
     match arg {
         Some(Object::Int(n)) => Ok(*n),
+        Some(Object::Bool(b)) => Ok(i64::from(*b)),
         Some(other) => Err(type_error(format!(
             "{name} must be an int, got '{}'",
             other.type_name()
@@ -208,8 +332,8 @@ fn extract_int(arg: Option<&Object>, name: &str) -> Result<i64, RuntimeError> {
     }
 }
 
-fn last_os_error_code() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+fn last_os_err() -> RuntimeError {
+    io_error_to_py(&std::io::Error::last_os_error())
 }
 
 // ---------------------------------------------------------------------
@@ -220,7 +344,17 @@ fn last_os_error_code() -> i32 {
 // crate so this module stays dependency-light.
 // ---------------------------------------------------------------------
 #[cfg(unix)]
-unsafe fn libc_fcntl(fd: i32, op: i32, arg: i32) -> i32 {
+unsafe fn libc_fcntl(fd: i32, op: i32, arg: std::os::raw::c_long) -> i32 {
+    unsafe {
+        extern "C" {
+            fn fcntl(fd: i32, op: i32, ...) -> i32;
+        }
+        fcntl(fd, op, arg)
+    }
+}
+
+#[cfg(unix)]
+unsafe fn libc_fcntl_ptr(fd: i32, op: i32, arg: *mut u8) -> i32 {
     unsafe {
         extern "C" {
             fn fcntl(fd: i32, op: i32, ...) -> i32;
@@ -230,7 +364,12 @@ unsafe fn libc_fcntl(fd: i32, op: i32, arg: i32) -> i32 {
 }
 
 #[cfg(not(unix))]
-unsafe fn libc_fcntl(_fd: i32, _op: i32, _arg: i32) -> i32 {
+unsafe fn libc_fcntl(_fd: i32, _op: i32, _arg: std::os::raw::c_long) -> i32 {
+    -1
+}
+
+#[cfg(not(unix))]
+unsafe fn libc_fcntl_ptr(_fd: i32, _op: i32, _arg: *mut u8) -> i32 {
     -1
 }
 
@@ -244,8 +383,23 @@ unsafe fn libc_ioctl(fd: i32, request: u64, arg: i64) -> i32 {
     }
 }
 
+#[cfg(unix)]
+unsafe fn libc_ioctl_ptr(fd: i32, request: u64, arg: *mut u8) -> i32 {
+    unsafe {
+        extern "C" {
+            fn ioctl(fd: i32, request: u64, ...) -> i32;
+        }
+        ioctl(fd, request, arg)
+    }
+}
+
 #[cfg(not(unix))]
 unsafe fn libc_ioctl(_fd: i32, _request: u64, _arg: i64) -> i32 {
+    -1
+}
+
+#[cfg(not(unix))]
+unsafe fn libc_ioctl_ptr(_fd: i32, _request: u64, _arg: *mut u8) -> i32 {
     -1
 }
 
@@ -261,21 +415,6 @@ unsafe fn libc_flock(fd: i32, op: i32) -> i32 {
 
 #[cfg(not(unix))]
 unsafe fn libc_flock(_fd: i32, _op: i32) -> i32 {
-    -1
-}
-
-#[cfg(unix)]
-unsafe fn libc_lockf(fd: i32, cmd: i32, length: i64) -> i32 {
-    unsafe {
-        extern "C" {
-            fn lockf(fd: i32, cmd: i32, length: i64) -> i32;
-        }
-        lockf(fd, cmd, length)
-    }
-}
-
-#[cfg(not(unix))]
-unsafe fn libc_lockf(_fd: i32, _cmd: i32, _length: i64) -> i32 {
     -1
 }
 
@@ -301,6 +440,7 @@ const FCNTL_COMMANDS: &[(&str, i64)] = &[
     ("F_DUPFD_CLOEXEC", 67),
     ("F_NOCACHE", 48),
     ("F_FULLFSYNC", 51),
+    ("F_GETPATH", 50),
 ];
 
 #[cfg(not(target_os = "macos"))]
@@ -369,3 +509,11 @@ const FLOCK_FLAGS: &[(&str, i64)] = &[
 ];
 
 const LOCKF_FLAGS: &[(&str, i64)] = &[("F_LOCK", 1), ("F_TLOCK", 2), ("F_ULOCK", 0), ("F_TEST", 3)];
+
+// `struct flock` lock types used by F_GETLK/F_SETLK[W] (packed by callers
+// via `struct`). Values differ between macOS (BSD) and Linux.
+#[cfg(target_os = "macos")]
+const LOCK_TYPES: &[(&str, i64)] = &[("F_RDLCK", 1), ("F_UNLCK", 2), ("F_WRLCK", 3)];
+
+#[cfg(not(target_os = "macos"))]
+const LOCK_TYPES: &[(&str, i64)] = &[("F_RDLCK", 0), ("F_WRLCK", 1), ("F_UNLCK", 2)];

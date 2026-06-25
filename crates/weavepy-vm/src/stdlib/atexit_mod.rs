@@ -1,8 +1,13 @@
 //! The `atexit` module — RFC 0023.
 //!
 //! Registers callables to run on interpreter shutdown. We keep the
-//! list in a thread-local; the CLI driver calls `run_handlers` at
-//! exit time after the main module returns.
+//! list in a thread-local. There are two drains, sharing the same
+//! `take_handlers` storage so a handler never runs twice:
+//!   * the CLI driver runs whatever remains at real interpreter exit
+//!     (after `__main__` returns), and
+//!   * `_run_exitfuncs()` runs them on demand — `test_atexit` and
+//!     `multiprocessing.popen_fork`'s forked child both call it
+//!     explicitly before `os._exit`.
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
@@ -82,9 +87,45 @@ fn a_unregister(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn a_run_exitfuncs(_args: &[Object]) -> Result<Object, RuntimeError> {
-    // We can't actually run the callables from this static fn because
-    // we don't have a Vm handle. The CLI driver harvests the list via
-    // `take_handlers` below and runs them with the interpreter state.
+    // CPython's `atexit._run_exitfuncs()` (`Modules/atexitmodule.c`
+    // `atexit_callfuncs`): invoke every registered callback in LIFO order,
+    // *clearing* the registry as it goes, and report any callback error
+    // through `sys.unraisablehook` rather than propagating it (so one bad
+    // handler can't abort the rest).
+    //
+    // This is reachable two ways and both depend on it actually running the
+    // callables — until now it was a silent no-op:
+    //   * `test_atexit` calls `atexit._run_exitfuncs()` directly;
+    //   * `multiprocessing.popen_fork`'s forked child calls it in a
+    //     `finally` immediately before `os._exit(code)`. That's what runs
+    //     the `Queue` feeder's `Finalize` (send-sentinel + join-thread), so
+    //     the daemon feeder flushes its buffer to the pipe before the child
+    //     dies. Without it the child `os._exit`s mid-flush and the parent's
+    //     `Queue.get()` sees nothing.
+    // The normal full-shutdown path still drains any *remaining* handlers
+    // via `take_handlers` in the CLI driver; `take_handlers` here makes the
+    // two paths share one drain so handlers never run twice.
+    let handlers = take_handlers();
+    if handlers.is_empty() {
+        return Ok(Object::None);
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+        crate::error::runtime_error("atexit._run_exitfuncs(): no running interpreter")
+    })?;
+    // SAFETY: the pointer was published by an enclosing VM frame still live
+    // on this thread (we were called through VM dispatch); the GIL keeps the
+    // access exclusive.
+    let interp = unsafe { &mut *ptr };
+    for (func, args, kwargs) in handlers {
+        if let Err(err) = interp.call_object(func.clone(), &args, &kwargs) {
+            let is_exit = matches!(&err,
+                RuntimeError::PyException(exc) if exc.system_exit_code().is_some());
+            if !is_exit {
+                let context_repr = func.repr();
+                interp.write_unraisable_msg(&err, &func, &context_repr, None);
+            }
+        }
+    }
     Ok(Object::None)
 }
 

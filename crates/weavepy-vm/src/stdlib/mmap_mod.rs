@@ -5,6 +5,8 @@
 //! offset=)`, with `read`, `read_byte`, `write`, `seek`, `tell`,
 //! `size`, `flush`, `close`, slicing, and `find`.
 
+use std::collections::HashMap;
+
 use crate::sync::Rc;
 use crate::sync::RefCell;
 
@@ -12,7 +14,7 @@ use memmap2::{Mmap, MmapMut};
 
 use crate::error::{type_error, value_error, RuntimeError};
 use crate::import::ModuleCache;
-use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule, SharedMemBuffer};
 use crate::types::{PyInstance, TypeFlags, TypeObject};
 
 pub const ACCESS_DEFAULT: i64 = 0;
@@ -43,6 +45,32 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         ] {
             d.insert(DictKey(Object::from_static(n)), Object::Int(v));
         }
+        // `mmap.PAGESIZE`/`ALLOCATIONGRANULARITY`: the live system page size
+        // (`multiprocessing.heap.Heap` uses it as its default arena size). On
+        // POSIX the allocation granularity equals the page size.
+        let pagesize: i64 = {
+            #[cfg(unix)]
+            {
+                let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if v > 0 {
+                    v as i64
+                } else {
+                    4096
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                4096
+            }
+        };
+        d.insert(
+            DictKey(Object::from_static("PAGESIZE")),
+            Object::Int(pagesize),
+        );
+        d.insert(
+            DictKey(Object::from_static("ALLOCATIONGRANULARITY")),
+            Object::Int(pagesize),
+        );
         d.insert(
             DictKey(Object::from_static("mmap")),
             Object::Type(mmap_type()),
@@ -111,25 +139,98 @@ enum MmapBacking {
     Write(MmapMut),
 }
 
-struct MmapState {
+/// The raw mapped region, shared (via `Rc` = `Arc`) between the `mmap`
+/// object and any `memoryview` exported over it. A memory mapping never
+/// moves, so the region's base pointer stays valid for as long as this
+/// `Arc` is held — which is exactly what lets a `memoryview` keep the
+/// mapping alive past `mmap.close()` (mirroring CPython's export count).
+pub struct MmapRegion {
     backing: MmapBacking,
+}
+
+impl std::fmt::Debug for MmapRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmapRegion")
+            .field("len", &self.byte_len())
+            .field("writable", &self.writable())
+            .finish()
+    }
+}
+
+impl MmapRegion {
+    fn base(&self) -> *mut u8 {
+        match &self.backing {
+            // `as_ptr` is `&self`-only on both Mmap and MmapMut; the cast to
+            // `*mut` is sound for a writable (`MmapMut`) mapping and never
+            // dereferenced mutably for a read-only (`Mmap`) one.
+            MmapBacking::Read(m) => m.as_ptr().cast_mut(),
+            MmapBacking::Write(m) => m.as_ptr().cast_mut(),
+        }
+    }
+    fn byte_len(&self) -> usize {
+        match &self.backing {
+            MmapBacking::Read(m) => m.len(),
+            MmapBacking::Write(m) => m.len(),
+        }
+    }
+    fn writable(&self) -> bool {
+        matches!(self.backing, MmapBacking::Write(_))
+    }
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: the mapping is live for `&self`; the GIL serialises all
+        // Python-level access so no concurrent `&mut` view exists.
+        unsafe { std::slice::from_raw_parts(self.base(), self.byte_len()) }
+    }
+    /// SAFETY: the caller holds the GIL (so no other thread is executing
+    /// Python and thus no concurrent borrow of the region exists) and the
+    /// region is `writable()`.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn as_mut_slice(&self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.base(), self.byte_len()) }
+    }
+}
+
+// SAFETY: `memmap2::{Mmap, MmapMut}` are already `Send + Sync`; the region
+// is genuinely shared memory whose pointer is stable, and every mutation
+// goes through the GIL.
+impl SharedMemBuffer for MmapRegion {
+    fn byte_len(&self) -> usize {
+        self.byte_len()
+    }
+    fn data_ptr(&self) -> *mut u8 {
+        self.base()
+    }
+    fn is_readonly(&self) -> bool {
+        !self.writable()
+    }
+}
+
+struct MmapState {
+    region: Rc<MmapRegion>,
     pos: usize,
 }
 
-thread_local! {
-    static MMAP_STATE: RefCell<std::collections::HashMap<usize, RefCell<MmapState>>> =
-        RefCell::new(std::collections::HashMap::new());
-    static MMAP_NEXT_ID: RefCell<usize> = const { RefCell::new(1) };
+/// Process-global mmap registry. Unlike the previous thread-local table,
+/// this lets an `mmap` created on one OS thread be used from another (a
+/// `multiprocessing` heap arena is allocated on the main thread but read
+/// and written by Queue feeder / pool worker threads). Access is
+/// serialised by the GIL; the `parking_lot::Mutex` only guards the table
+/// itself, mirroring `socket_mod`'s registry.
+fn registry() -> &'static parking_lot::Mutex<HashMap<usize, Rc<RefCell<MmapState>>>> {
+    static REGISTRY: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<usize, Rc<RefCell<MmapState>>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+fn next_id() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn alloc_state(state: MmapState) -> usize {
-    let id = MMAP_NEXT_ID.with(|n| {
-        let mut g = n.borrow_mut();
-        let id = *g;
-        *g += 1;
-        id
-    });
-    MMAP_STATE.with(|m| m.borrow_mut().insert(id, RefCell::new(state)));
+    let id = next_id();
+    registry().lock().insert(id, Rc::new(RefCell::new(state)));
     id
 }
 
@@ -138,12 +239,27 @@ fn with_state<R>(
     f: impl FnOnce(&mut MmapState) -> R,
 ) -> Result<R, RuntimeError> {
     let id = state_id(inst)?;
-    MMAP_STATE.with(|m| {
-        let map = m.borrow();
-        let cell = map.get(&id).ok_or_else(|| value_error("mmap: closed"))?;
-        let mut state = cell.borrow_mut();
-        Ok(f(&mut state))
-    })
+    // Clone the entry out and drop the table lock before running `f`, so the
+    // closure may itself touch the registry (e.g. exporting a memoryview).
+    let cell = {
+        let map = registry().lock();
+        map.get(&id)
+            .cloned()
+            .ok_or_else(|| value_error("mmap: closed"))?
+    };
+    let mut state = cell.borrow_mut();
+    Ok(f(&mut state))
+}
+
+/// Buffer-protocol export for `memoryview(mmap_obj)`: hands back the shared
+/// region so the view writes straight through to the mapping (and, for a
+/// `MAP_SHARED` file mapping, to every other process mapping it). Returns
+/// `None` for a closed mapping.
+pub fn shared_buffer(inst: &Rc<PyInstance>) -> Option<Rc<dyn SharedMemBuffer>> {
+    let id = state_id(inst).ok()?;
+    let cell = registry().lock().get(&id).cloned()?;
+    let region: Rc<dyn SharedMemBuffer> = cell.borrow().region.clone();
+    Some(region)
 }
 
 fn state_id(inst: &Rc<PyInstance>) -> Result<usize, RuntimeError> {
@@ -180,7 +296,9 @@ fn mm_init(args: &[Object]) -> Result<Object, RuntimeError> {
         let map = MmapMut::map_anon(length)
             .map_err(|e| crate::error::os_error(format!("mmap_anon: {e}")))?;
         let id = alloc_state(MmapState {
-            backing: MmapBacking::Write(map),
+            region: Rc::new(MmapRegion {
+                backing: MmapBacking::Write(map),
+            }),
             pos: 0,
         });
         inst.dict
@@ -207,7 +325,10 @@ fn mm_init(args: &[Object]) -> Result<Object, RuntimeError> {
             MmapBacking::Write(map)
         }
     };
-    let id = alloc_state(MmapState { backing, pos: 0 });
+    let id = alloc_state(MmapState {
+        region: Rc::new(MmapRegion { backing }),
+        pos: 0,
+    });
     inst.dict
         .borrow_mut()
         .insert(DictKey(Object::from_static("_id")), Object::Int(id as i64));
@@ -215,16 +336,18 @@ fn mm_init(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn mmap_bytes(state: &MmapState) -> &[u8] {
-    match &state.backing {
-        MmapBacking::Read(m) => &m[..],
-        MmapBacking::Write(m) => &m[..],
-    }
+    state.region.as_slice()
 }
 
-fn mmap_bytes_mut(state: &mut MmapState) -> Option<&mut [u8]> {
-    match &mut state.backing {
-        MmapBacking::Write(m) => Some(&mut m[..]),
-        MmapBacking::Read(_) => None,
+// Interior mutability is GIL-serialised: the `&mut [u8]` aliases a region whose
+// writes are guarded by the GIL, so deriving it from `&MmapState` is sound here.
+#[allow(clippy::mut_from_ref)]
+fn mmap_bytes_mut(state: &MmapState) -> Option<&mut [u8]> {
+    if state.region.writable() {
+        // SAFETY: GIL-serialised, region confirmed writable.
+        Some(unsafe { state.region.as_mut_slice() })
+    } else {
+        None
     }
 }
 
@@ -368,21 +491,21 @@ fn mm_size(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn mm_flush(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_arg(args)?;
-    with_state(&inst, |s| match &mut s.backing {
-        MmapBacking::Write(m) => {
+    with_state(&inst, |s| {
+        if let MmapBacking::Write(m) = &s.region.backing {
+            // `MmapMut::flush` takes `&self`, so a shared region can flush.
             let _ = m.flush();
-            Object::None
         }
-        MmapBacking::Read(_) => Object::None,
+        Object::None
     })
 }
 
 fn mm_close(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_arg(args)?;
     if let Ok(id) = state_id(&inst) {
-        MMAP_STATE.with(|m| {
-            m.borrow_mut().remove(&id);
-        });
+        // Drop the registry's reference. Any `memoryview` still exporting the
+        // region holds its own `Arc`, so the mapping survives until released.
+        registry().lock().remove(&id);
         inst.dict
             .borrow_mut()
             .insert(DictKey(Object::from_static("_id")), Object::Int(0));

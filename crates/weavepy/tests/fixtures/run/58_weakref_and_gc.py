@@ -26,7 +26,12 @@ print("callback fired:", released)
 
 s = weakref.WeakSet([b])
 print("in set:", b in s, len(s))
-s.add(Box("three"))
+# A WeakSet only retains members while something else holds a strong
+# reference, so adding a bare temporary makes len(s) depend on GC timing
+# (the entry can be reclaimed before the read, especially after earlier
+# fixtures churn the shared process heap). Pin it to keep size deterministic.
+third = Box("three")
+s.add(third)
 print("size:", len(s))
 
 

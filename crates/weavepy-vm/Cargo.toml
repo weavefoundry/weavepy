@@ -50,6 +50,7 @@ xz2              = { workspace = true }
 lzma-sys         = { workspace = true }
 rusqlite         = { workspace = true }
 rust_decimal     = { workspace = true }
+quick-xml        = { workspace = true }
 
 # RFC 0023 — drop-in stdlib parity + HTTPS.
 unicode-normalization = { workspace = true }

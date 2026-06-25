@@ -323,6 +323,19 @@ fn format_constant(c: &Constant) -> String {
             }
         }
         Constant::Str(s) => format!("'{s}'"),
+        Constant::WStr(cps) => {
+            // Surrogate-bearing literal; render lone surrogates as `\uXXXX`
+            // and scalar code points verbatim (best-effort, for disassembly).
+            let mut s = String::from("'");
+            for &cp in cps {
+                match char::from_u32(cp) {
+                    Some(ch) => s.push(ch),
+                    None => s.push_str(&format!("\\u{cp:04x}")),
+                }
+            }
+            s.push('\'');
+            s
+        }
         Constant::Bytes(_) => "b'...'".to_owned(),
         Constant::Tuple(items) => {
             let inner: Vec<_> = items.iter().map(format_constant).collect();
@@ -351,6 +364,11 @@ pub enum Constant {
     /// Complex literal `(real, imag)` (RFC 0019).
     Complex(f64, f64),
     Str(String),
+    /// A `str` constant carrying at least one lone surrogate, which a Rust
+    /// `String` cannot hold (see [`weavepy_parser::ast::Constant::WStr`]).
+    /// Lowered to an `Object::WStr` at materialisation time; disjoint from
+    /// [`Constant::Str`] (a surrogate-free value is always `Str`).
+    WStr(Vec<u32>),
     Bytes(Vec<u8>),
     Tuple(Vec<Constant>),
     Code(Box<CodeObject>),
@@ -370,6 +388,7 @@ impl PartialEq for Constant {
                 ar.to_bits() == br.to_bits() && ai.to_bits() == bi.to_bits()
             }
             (C::Str(a), C::Str(b)) => a == b,
+            (C::WStr(a), C::WStr(b)) => a == b,
             (C::Bytes(a), C::Bytes(b)) => a == b,
             (C::Tuple(a), C::Tuple(b)) => a == b,
             (C::Code(_), C::Code(_)) => false,
@@ -398,6 +417,7 @@ impl From<AstConstant> for Constant {
             AstConstant::Complex(real, imag) => Self::Complex(real, imag),
             AstConstant::Float(f) => Self::Float(f),
             AstConstant::Str(s) => Self::Str(s),
+            AstConstant::WStr(cps) => Self::WStr(cps),
             AstConstant::Bytes(b) => Self::Bytes(b),
             AstConstant::Tuple(xs) => Self::Tuple(xs.into_iter().map(Self::from).collect()),
             AstConstant::Ellipsis => Self::Ellipsis,
@@ -1860,15 +1880,23 @@ impl Compiler {
             self.emit(OpCode::CopyTop, 0);
             match pat {
                 Pattern::Star(name) => {
-                    let tail = items.len() - i - 1;
-                    self.emit_pattern_subscript_slice(i, tail);
                     if let Some(n) = name {
+                        let tail = items.len() - i - 1;
+                        self.emit_pattern_subscript_slice(i, tail);
+                        // A `*name` capture must always bind a `list`, even when the
+                        // matched subject is a `tuple` (PEP 634 / `UNPACK_EX`
+                        // semantics). Slicing a tuple subject yields a tuple, so the
+                        // slice is re-boxed into a fresh list here.
+                        self.wrap_tos_in_list();
                         let name_expr = Expr {
                             kind: ExprKind::Name(n.clone()),
                             span: weavepy_lexer::Span::new(0, 0),
                         };
                         self.compile_assign(&name_expr)?;
                     } else {
+                        // Anonymous `*_` binds nothing; just drop the working copy of
+                        // the subject pushed by the enclosing `CopyTop` (no slice
+                        // needed, matching CPython, which never materialises it).
                         self.emit(OpCode::PopTop, 0);
                     }
                 }
@@ -1891,6 +1919,27 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Re-box the iterable on top of the stack into a fresh `list`,
+    /// leaving `list(TOS)` in its place. Used by `*name` sequence-pattern
+    /// captures, which must always bind a `list` even for tuple subjects.
+    ///
+    /// Implemented with the `list.extend` idiom over pure stack ops so it
+    /// never depends on the `list` builtin name (which user code may
+    /// shadow). Stack walk (top on the right):
+    /// `[it] → BuildList → [it, L] → CopyTop → [it, L, L] →
+    ///  LoadAttr extend → [it, L, L.extend] → Swap 2 → [it, L.extend, L]
+    ///  → Swap 3 → [L, L.extend, it] → Call 1 → [L, None] → PopTop → [L]`.
+    fn wrap_tos_in_list(&mut self) {
+        self.emit(OpCode::BuildList, 0);
+        self.emit(OpCode::CopyTop, 0);
+        let extend = self.co.intern_name("extend");
+        self.emit(OpCode::LoadAttr, extend);
+        self.emit(OpCode::Swap, 2);
+        self.emit(OpCode::Swap, 3);
+        self.emit(OpCode::Call, 1);
+        self.emit(OpCode::PopTop, 0);
     }
 
     /// Emit a slice subscription `subject[head:len-tail]` for a `*name`
@@ -2793,6 +2842,13 @@ impl Compiler {
                 self.emit(OpCode::LoadConst, none_idx);
                 self.emit(OpCode::Call, 3);
                 self.emit(OpCode::PopTop, 0);
+                // A `return`/`break`/`continue` out of the `with` leaves the
+                // block for good; drop the synthetic `.with_exit` local (the
+                // `.with_cm` was already dropped right after `__enter__`) so a
+                // generator that yields afterwards — e.g. `break` out of a
+                // `with` inside a loop — doesn't keep the manager alive. The
+                // local is always bound here (set before the body ran).
+                self.emit(OpCode::DeleteFast, *exit_idx);
                 Ok(())
             }
             FinallyKind::AsyncWithExit { aexit_idx } => {
@@ -2806,6 +2862,11 @@ impl Compiler {
                 self.emit(OpCode::Call, 3);
                 self.compile_await_dance(3);
                 self.emit(OpCode::PopTop, 0);
+                // `return`/`break`/`continue` leaves the `async with` for
+                // good; drop the synthetic `.aexit` local so an async
+                // generator that yields afterwards doesn't pin the manager.
+                // Always bound here (set before the body ran).
+                self.emit(OpCode::DeleteFast, *aexit_idx);
                 Ok(())
             }
         }
@@ -3476,6 +3537,18 @@ impl Compiler {
         // `LoadAttr` would route through `__getattribute__` (test_descr
         // test_special_method_lookup).
         self.emit(OpCode::StoreFast, exit_idx);
+        // The context-manager object is dead once `__enter__` has run and
+        // the bound `__exit__` is captured; drop the synthetic `.with_cm`
+        // local now. CPython keeps these transient values on the operand
+        // stack, which is unwound at scope exit; we stash them in fast
+        // locals instead, so without this an unfinished generator (or any
+        // frame that yields after the `with`) keeps the manager — and
+        // everything it references — alive. `test_as_completed`'s
+        // `_yield_finished_futures` is yielded out of `as_completed` while
+        // `with _AcquireFutures(fs):` is still on a suspended frame, and
+        // `_AcquireFutures` holds every future (`test_free_reference_*`).
+        // `DeleteFast` also prompt-reaps the manager.
+        self.emit(OpCode::DeleteFast, cm_idx);
 
         // Push a synthetic finally frame so `return`, `break`, and
         // `continue` from inside the body run `cm.__exit__(None, None, None)`
@@ -3566,6 +3639,11 @@ impl Compiler {
         // recorded for the re-raise site.
         self.emit(OpCode::Swap, 2);
         self.emit(OpCode::PopTop, 0);
+        // Drop the synthetic `.with_exit` local before propagating, so a
+        // generator that survives this exception (caught by an enclosing
+        // handler in the same frame) doesn't keep the bound `__exit__`
+        // and its context manager alive across a later `yield`.
+        self.emit(OpCode::DeleteFast, exit_idx);
         self.emit(OpCode::Reraise, 0);
         let swallow_target = self.next_offset();
         self.patch_jump(swallow, swallow_target);
@@ -3575,6 +3653,11 @@ impl Compiler {
         self.emit(OpCode::PopTop, 0);
         self.emit(OpCode::PopTop, 0);
         let end = self.next_offset();
+        // Normal exit (`end_jump`) and a suppressed exception both converge
+        // here; drop the synthetic `.with_exit` local (the bound `__exit__`,
+        // which also pins its context manager) so a `yield` later in the
+        // same frame can't keep them alive. See `DeleteFast cm_idx` above.
+        self.emit(OpCode::DeleteFast, exit_idx);
         self.patch_jump(end_jump, end);
         // Tag the active-handler entry with the pc just past the handler
         // so the unwinder drops it if `__exit__` raises and the new
@@ -3616,6 +3699,17 @@ impl Compiler {
                 self.emit(OpCode::LoadConst, idx);
                 return Ok(());
             }
+        }
+        // PEP 646: an unpacked `*args` annotation — `def f(*args: *Ts)`,
+        // `*args: *tuple[int, ...]`. CPython evaluates it as the single
+        // element of `iter(value)` (a `TypeVarTuple` yields `Unpack[Ts]`,
+        // an unpacked `tuple[...]` alias yields itself), i.e. it compiles
+        // the inner value then `UNPACK_SEQUENCE 1`. A bare `Starred` is
+        // otherwise rejected by `compile_expr`, so we special-case it here.
+        if let ExprKind::Starred(inner) = &annotation.kind {
+            self.compile_expr(inner)?;
+            self.emit(OpCode::UnpackSequence, 1);
+            return Ok(());
         }
         self.compile_expr(annotation)
     }
@@ -4631,6 +4725,9 @@ impl Compiler {
         // original traceback (no entry for the re-raise site).
         self.emit(OpCode::Swap, 2);
         self.emit(OpCode::PopTop, 0);
+        // Drop the synthetic `.aexit` local before propagating, so an async
+        // generator surviving this exception doesn't pin the manager.
+        self.emit(OpCode::DeleteFast, slot_idx);
         self.emit(OpCode::Reraise, 0);
         let swallow_target = self.next_offset();
         self.patch_jump(swallow, swallow_target);
@@ -4640,6 +4737,11 @@ impl Compiler {
         self.emit(OpCode::PopTop, 0);
         self.emit(OpCode::PopTop, 0);
         let end = self.next_offset();
+        // Drop the synthetic `.aexit` local on the normal/suppressed exit
+        // paths (which converge here) so a later `yield`/`await` in the same
+        // async generator frame can't keep the bound `__aexit__` and its
+        // context manager alive. Mirrors the sync `with` fix.
+        self.emit(OpCode::DeleteFast, slot_idx);
         self.patch_jump(end_jump, end);
         // Tag the active-handler entry with the pc just past the handler
         // so the unwinder drops it if `__aexit__` raises a new exception.

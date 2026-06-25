@@ -101,6 +101,12 @@ lzma-sys    = "0.1"
 rusqlite    = { version = "0.31", features = ["bundled"] }
 rust_decimal = "1.36"
 
+# RFC 0040 WS5 — `pyexpat`: a real streaming XML parser behind the native
+# `pyexpat` module (CPython wraps the C `expat` library; we wrap `quick-xml`,
+# a mature pure-Rust streaming parser). Drives `xmlrpc` (the multiprocessing
+# manager serializer), `xml.sax`, `xml.dom.minidom`, and `xml.etree`.
+quick-xml   = { version = "0.36", features = ["encoding"] }
+
 # RFC 0020 — interactive REPL + CLI surface.
 rustyline   = { version = "14.0", default-features = false, features = ["with-file-history"] }
 dirs        = "5.0"

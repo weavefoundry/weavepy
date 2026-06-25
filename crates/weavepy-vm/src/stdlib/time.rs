@@ -8,7 +8,6 @@
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
@@ -71,8 +70,41 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             b("mktime", time_mktime),
         );
         d.insert(
+            DictKey(Object::from_static("strptime")),
+            b("strptime", time_strptime),
+        );
+        d.insert(
             DictKey(Object::from_static("struct_time")),
             Object::Type(struct_time_type()),
+        );
+        // Module-level timezone constants, computed from the local zone the
+        // way CPython's `init_timezone` derives them from the C library after
+        // `tzset()`. `_strptime` reads all four, and `email`/`http.cookiejar`
+        // read `time.timezone`/`time.tzname`.
+        let (timezone, altzone, daylight, std_name, dst_name) = compute_timezone();
+        d.insert(
+            DictKey(Object::from_static("timezone")),
+            Object::Int(timezone),
+        );
+        d.insert(
+            DictKey(Object::from_static("altzone")),
+            Object::Int(altzone),
+        );
+        d.insert(
+            DictKey(Object::from_static("daylight")),
+            Object::Int(daylight),
+        );
+        d.insert(
+            DictKey(Object::from_static("tzname")),
+            Object::new_tuple(vec![Object::from_str(std_name), Object::from_str(dst_name)]),
+        );
+        // `_strptime._strptime_time` slices its result to this many items
+        // before building a `struct_time`. Our `struct_time` exposes the 9
+        // visible `tm_*` fields (the hidden `tm_zone`/`tm_gmtoff` are set by
+        // name, not positionally), so 9 is the faithful count.
+        d.insert(
+            DictKey(Object::from_static("_STRUCT_TM_ITEMS")),
+            Object::Int(9),
         );
     }
     Rc::new(PyModule {
@@ -80,6 +112,35 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         filename: None,
         dict,
     })
+}
+
+/// Derive `(timezone, altzone, daylight, tzname[0], tzname[1])` from the
+/// host's local zone, matching CPython's `init_timezone`:
+/// `timezone`/`altzone` are seconds **west** of UTC for standard/DST time,
+/// `daylight` is nonzero when the zone observes DST, and `tzname` is the
+/// `(std, dst)` abbreviation pair. We sample January and July to find the
+/// standard (smaller east offset) and DST (larger) sides.
+fn compute_timezone() -> (i64, i64, i64, String, String) {
+    use chrono::{Datelike, Offset};
+    let year = Local::now().year();
+    let sample = |month: u32| -> Option<(i64, String)> {
+        let dt = Local.with_ymd_and_hms(year, month, 1, 12, 0, 0).single()?;
+        let east = i64::from(dt.offset().fix().local_minus_utc());
+        Some((east, dt.format("%Z").to_string()))
+    };
+    let Some((jan_east, jan_name)) = sample(1) else {
+        return (0, 0, 0, "UTC".to_owned(), "UTC".to_owned());
+    };
+    let (jul_east, jul_name) = sample(7).unwrap_or((jan_east, jan_name.clone()));
+    // Standard time is the side with the *smaller* east offset (clocks not
+    // moved forward); DST is the larger.
+    let (std_east, std_name, dst_east, dst_name) = if jan_east <= jul_east {
+        (jan_east, jan_name, jul_east, jul_name)
+    } else {
+        (jul_east, jul_name, jan_east, jan_name)
+    };
+    let daylight = i64::from(jan_east != jul_east);
+    (-std_east, -dst_east, daylight, std_name, dst_name)
 }
 
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
@@ -103,11 +164,42 @@ const STRUCT_TIME_FIELDS: [&str; 9] = [
 /// bare tuple (the old shape) broke them with `'tuple' object has no attribute
 /// 'tm_year'`.
 fn struct_time_type() -> Rc<crate::types::TypeObject> {
-    crate::stdlib::os::struct_seq_type("struct_time", &STRUCT_TIME_FIELDS)
+    crate::stdlib::os::struct_seq_type("struct_time", "time", &STRUCT_TIME_FIELDS)
 }
 
 fn make_struct_time(values: Vec<Object>) -> Object {
     crate::stdlib::os::struct_seq_instance(struct_time_type(), &STRUCT_TIME_FIELDS, values)
+}
+
+/// `time.strptime(string[, format])` — parse a time string to a
+/// `struct_time`. CPython's `timemodule.c` delegates to the pure-Python
+/// `_strptime._strptime_time`; we do the same so the full locale-aware
+/// directive set (`%a %b %Y %H:%M:%S …`) and error messages match.
+fn time_strptime(args: &[Object]) -> Result<Object, RuntimeError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(type_error(format!(
+            "strptime() takes 1 or 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+        crate::error::runtime_error("time.strptime requires a running interpreter")
+    })?;
+    // SAFETY: the per-thread interpreter pointer is published by the
+    // bytecode dispatch loop, the same bridge the `_thread`/C-API
+    // callbacks use; we re-enter synchronously to import + call `_strptime`.
+    let interp = unsafe { &mut *ptr };
+    let module = interp.import_path("_strptime")?;
+    let Object::Module(m) = &module else {
+        return Err(crate::error::runtime_error("_strptime is not a module"));
+    };
+    let func = m
+        .dict
+        .borrow()
+        .get(&DictKey(Object::from_static("_strptime_time")))
+        .cloned()
+        .ok_or_else(|| crate::error::runtime_error("_strptime._strptime_time missing"))?;
+    interp.call_object(func, args, &[])
 }
 
 fn time_time(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -205,9 +297,64 @@ fn time_sleep(args: &[Object]) -> Result<Object, RuntimeError> {
         // serialize the whole interpreter behind one sleeping thread —
         // e.g. a `threading.Barrier` peer that `time.sleep`s would stall
         // every other peer's timed `wait()`.
-        crate::gil::allow_threads_then(|| {
-            thread::sleep(Duration::from_secs_f64(secs));
-        });
+        //
+        // It is also a signal-delivery point: a SIGINT (or any handled
+        // signal) arriving mid-sleep must break the wait and run the Python
+        // handler, so `time.sleep(30)` raises `KeyboardInterrupt` promptly
+        // (test_subprocess.test_send_signal). On POSIX we loop over
+        // `nanosleep`, which returns `EINTR` with the unslept remainder when
+        // a signal interrupts it; we re-acquire the GIL, service pending
+        // handlers (which may raise), then resume for the remainder.
+        #[cfg(unix)]
+        {
+            let mut remaining = Duration::from_secs_f64(secs);
+            loop {
+                let leftover = crate::gil::allow_threads_then(|| {
+                    let req = libc::timespec {
+                        tv_sec: remaining.as_secs() as libc::time_t,
+                        tv_nsec: libc::c_long::from(remaining.subsec_nanos() as i32),
+                    };
+                    let mut rem = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    let rc = unsafe { libc::nanosleep(&raw const req, &raw mut rem) };
+                    if rc == 0 {
+                        None
+                    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                        Some(Duration::new(
+                            rem.tv_sec.max(0) as u64,
+                            rem.tv_nsec.clamp(0, 999_999_999) as u32,
+                        ))
+                    } else {
+                        // Any other error: stop sleeping (CPython would raise,
+                        // but nanosleep only fails with EINTR/EINVAL here).
+                        Some(Duration::ZERO)
+                    }
+                });
+                match leftover {
+                    None => break,
+                    Some(rem) => {
+                        // GIL re-acquired: run any handler the signal tripped.
+                        if crate::stdlib::signal_mod::signals_pending() {
+                            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                                unsafe { (*ptr).run_pending_signals_public()? };
+                            }
+                        }
+                        if rem.is_zero() {
+                            break;
+                        }
+                        remaining = rem;
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            crate::gil::allow_threads_then(|| {
+                std::thread::sleep(Duration::from_secs_f64(secs));
+            });
+        }
     }
     Ok(Object::None)
 }

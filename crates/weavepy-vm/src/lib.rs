@@ -35,6 +35,7 @@ pub mod gc_trace;
 pub mod gil;
 pub mod import;
 pub mod object;
+pub mod proc_init;
 pub mod pycache;
 pub mod recursion;
 pub mod specialize;
@@ -234,7 +235,7 @@ fn generator_frame_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
 /// `__del__`). Captured *before* `close()` tears the frame down so
 /// the caller can emulate CPython's prompt refcount-driven
 /// finalization afterwards.
-fn frame_finalizables(g: &Rc<PyGenerator>) -> Vec<Object> {
+fn frame_reapables(g: &Rc<PyGenerator>) -> Vec<Object> {
     let Ok(state) = g.state.try_borrow() else {
         return Vec::new();
     };
@@ -245,16 +246,33 @@ fn frame_finalizables(g: &Rc<PyGenerator>) -> Vec<Object> {
     let Some(frame) = boxed.downcast_ref::<Frame>() else {
         return Vec::new();
     };
-    let finalizable = |o: &&Object| -> bool {
-        matches!(o, Object::Instance(i) if i.cls().lookup("__del__").is_some())
-    };
-    frame
-        .locals
-        .iter()
-        .filter(finalizable)
-        .chain(frame.stack.iter().filter(finalizable))
-        .cloned()
-        .collect()
+    // CPython clears a generator's frame the instant it finishes/closes
+    // (`gen_send`/`gen_close` → `_PyFrame_ClearExceptCode`), so every
+    // local and value-stack entry is decref'd promptly. WeavePy mirrors
+    // that by running each prompt-reapable entry through the cascade
+    // after the frame is torn down — not just `__del__`-bearing
+    // instances but anything that anchors a finalizable acyclic
+    // subgraph *or* whose only surviving reference (once the frame is
+    // gone) is a weakref slot's strong clone in our registry. The
+    // latter is what lets `weakref.ref(obj)` zero out by refcount the
+    // way CPython's does: without it a suspended generator that
+    // referenced `obj` would keep `obj` pinned through the registry's
+    // clone until the next cyclic collection (RFC 0040:
+    // `test_concurrent_futures.test_init` leaked semaphores because the
+    // `_assert_logged`/`sleeping_retry` generators pinned the test
+    // instance → its `multiprocessing.Queue` → SemLocks).
+    let mut out: Vec<Object> = Vec::new();
+    let mut seen: std::collections::HashSet<crate::weakref_registry::ObjectId> =
+        std::collections::HashSet::new();
+    for o in frame.locals.iter().chain(frame.stack.iter()) {
+        if (Interpreter::local_needs_prompt_reap(o)
+            || crate::weakref_registry::count_for(crate::weakref_registry::id_of(o)) > 0)
+            && seen.insert(crate::weakref_registry::id_of(o))
+        {
+            out.push(o.clone());
+        }
+    }
+    out
 }
 
 /// RFC 0032 — render the tier-2 JIT's counters as a markdown block for
@@ -304,6 +322,14 @@ pub struct InterpreterFlags {
     pub xoptions: Vec<String>,
     pub warning_filters: Vec<String>,
     pub hash_seed: Option<u32>,
+    /// `PYTHONIOENCODING=encoding[:errors]` — the codec name applied to
+    /// `sys.stdin`/`sys.stdout`/`sys.stderr` at startup. `None` keeps the
+    /// UTF-8 default. CPython honours the env var (and `-E`/`-I` suppress
+    /// it); see [`Interpreter::apply_run_options`].
+    pub io_encoding: Option<String>,
+    /// The `errors` half of `PYTHONIOENCODING`. `None` keeps each stream's
+    /// default handler (`strict`).
+    pub io_errors: Option<String>,
 }
 
 /// The top-level entry point for executing WeavePy bytecode.
@@ -402,6 +428,20 @@ impl Default for Interpreter {
             excepthook.clone(),
             unraisable_hook.clone(),
         );
+        // Attribute `sys`'s native functions to the `sys` module so
+        // `sys.exit.__module__ == "sys"` (CPython). `pickle` resolves a
+        // builtin function by `getattr(sys.modules[__module__], __qualname__)`
+        // and checks identity, so without this `multiprocessing.Process(
+        // target=sys.exit)` — which pickles the target by reference for a
+        // `spawn` child — fails with "Can't pickle <built-in function exit>:
+        // it's not found as builtins.exit". `sys` is constructed here, before
+        // the generic `load_one` factory path that tags every other native
+        // module's functions, so it must be tagged explicitly.
+        for (_k, v) in sys_module.dict.borrow().iter() {
+            if matches!(v, Object::Builtin(_)) {
+                crate::descr_registry::register_module(v, "sys");
+            }
+        }
         cache.insert("sys", Object::Module(sys_module));
         let interp = Self {
             stdout,
@@ -544,10 +584,23 @@ impl Interpreter {
             .get(&crate::object::DictKey(Object::from_static("sys")))
         {
             let mut d = m.dict.borrow_mut();
-            if let Some(Object::Dict(fl)) = d
+            // `sys.flags` is a struct-sequence — modelled as a
+            // `SimpleNamespace` — so the CLI flag values reach attribute
+            // access (`sys.flags.optimize`, `.warn_default_encoding`); accept
+            // either backing so this update isn't silently a no-op.
+            let flags_inner = match d
                 .get(&crate::object::DictKey(Object::from_static("flags")))
                 .cloned()
             {
+                Some(Object::Dict(fl) | Object::SimpleNamespace(fl)) => Some(fl),
+                // `sys.flags` is now a `PyStructSequence` instance; its field
+                // values live in `inst.dict`, which we mutate directly (the
+                // struct-sequence `__setattr__` guard is bypassed, exactly as
+                // the Rust-side builders do).
+                Some(Object::Instance(inst)) => Some(inst.dict.clone()),
+                _ => None,
+            };
+            if let Some(fl) = flags_inner {
                 let mut fld = fl.borrow_mut();
                 let set = |fld: &mut crate::object::DictData, k: &'static str, v: i64| {
                     fld.insert(
@@ -581,14 +634,48 @@ impl Interpreter {
                     "hash_randomization",
                     flags.hash_seed.map_or(1, |_| 0),
                 );
-                set(&mut fld, "utf8_mode", 1);
+                // UTF-8 mode: on by default (WeavePy str is UTF-8), but
+                // honour an explicit `-X utf8=0`/`-X utf8=1` (PEP 540) so
+                // `io.text_encoding(None)` reports "locale" vs "utf-8" and
+                // `test_io.test_text_encoding` round-trips.
+                let utf8_mode = flags
+                    .xoptions
+                    .iter()
+                    .rev()
+                    .find_map(|x| {
+                        if x == "utf8" || x == "utf8=1" {
+                            Some(1)
+                        } else if x == "utf8=0" {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(1);
+                set(&mut fld, "utf8_mode", utf8_mode);
+                crate::vm_singletons::set_utf8_mode(utf8_mode != 0);
                 // The lone bool field on CPython's `sys.flags`.
                 fld.insert(
                     crate::object::DictKey(Object::from_static("dev_mode")),
                     Object::Bool(dev_mode),
                 );
                 set(&mut fld, "int_max_str_digits", 4300);
-                set(&mut fld, "warn_default_encoding", 0);
+                // `-X warn_default_encoding` / `PYTHONWARNDEFAULTENCODING`
+                // (PEP 597): turns on the `EncodingWarning` that `open()` /
+                // `subprocess` raise when a text stream takes the default
+                // locale encoding implicitly.
+                let warn_default_encoding = flags.xoptions.iter().any(|x| {
+                    x == "warn_default_encoding" || x.starts_with("warn_default_encoding=")
+                }) || (!flags.ignore_environment
+                    && std::env::var_os("PYTHONWARNDEFAULTENCODING").is_some());
+                set(
+                    &mut fld,
+                    "warn_default_encoding",
+                    i64::from(warn_default_encoding),
+                );
+                // Mirror into the Rust-side cache the native `io.open` /
+                // `io.text_encoding` text paths consult (PEP 597).
+                crate::vm_singletons::set_warn_default_encoding(warn_default_encoding);
             }
             d.insert(
                 crate::object::DictKey(Object::from_static("dont_write_bytecode")),
@@ -619,6 +706,28 @@ impl Interpreter {
                 crate::object::DictKey(Object::from_static("_xoptions")),
                 Object::Dict(crate::sync::Rc::new(crate::sync::RefCell::new(xopts))),
             );
+            // `PYTHONIOENCODING=encoding[:errors]` — retarget the standard
+            // streams' text codec, matching CPython's startup
+            // (`config_init_stdio`). The encoding part alone is enough to
+            // make `sys.stdout.encoding` report e.g. `ascii`, which is what
+            // codec-aware helpers (`tarfile._safe_print`,
+            // `traceback`/`print` redirection) key off. We only mutate when
+            // the env var is set so the UTF-8 default — and `-E`/`-I`
+            // isolation — are untouched.
+            if flags.io_encoding.is_some() || flags.io_errors.is_some() {
+                for name in ["stdin", "stdout", "stderr"] {
+                    if let Some(Object::File(f)) =
+                        d.get(&crate::object::DictKey(Object::from_static(name)))
+                    {
+                        if let Some(enc) = &flags.io_encoding {
+                            f.set_encoding(enc);
+                        }
+                        if let Some(errs) = &flags.io_errors {
+                            f.set_errors(errs);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -627,6 +736,16 @@ impl Interpreter {
     /// `site.main()`. Errors are intentionally swallowed — a broken
     /// `.pth` file shouldn't kill the whole interpreter.
     pub fn run_site(&mut self) -> Result<(), RuntimeError> {
+        // Publish this interpreter for the duration of startup so native
+        // code reached *during* the site/stdlib preimport (e.g.
+        // `object.__setattr__` while a frozen module builds a `__slots__`
+        // class such as `operator.itemgetter` for `functools._CacheInfo`)
+        // takes the same VM-aware path it does at runtime. Without this the
+        // pointer is unpublished here and the fallback strands slot writes
+        // in the instance `__dict__`, where the slot descriptor can't read
+        // them — breaking every namedtuple built during bootstrap.
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let site = match self.import_path("site") {
             Ok(m) => m,
             Err(_) => return Ok(()),
@@ -885,6 +1004,13 @@ impl Interpreter {
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
         let globals = self.build_module_globals(name, file, None);
+        // CPython's `__main__` always carries `__spec__` (None when run as a
+        // script, a real `ModuleSpec` under `-m`). `multiprocessing.spawn`'s
+        // `get_preparation_data` does `getattr(main_module.__spec__, ...)`, so
+        // the attribute must exist even for the plain `weavepy script.py` path.
+        globals
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("__spec__")), Object::None);
         // Insert the module into `sys.modules` so callers can introspect
         // `sys.modules["__main__"]` (pickle by qualified name and the
         // multiprocessing spawn helper both rely on this).
@@ -937,6 +1063,29 @@ impl Interpreter {
             }
             return;
         }
+        // A `BoundMethod` is itself untracked and carries no finalizer, so
+        // the fast-path early-return below would merely `Rc`-drop it —
+        // reclaiming the method object but leaving a *tracked* receiver
+        // pinned by its own GC handle (the early-return only accounts for
+        // *untracked* children a value anchors). Release the method's hold
+        // and run the receiver through the cascade, exactly as
+        // `reap_call_receiver` does for call temporaries. CPython decrefs a
+        // `method`'s `__self__` the instant the method object dies; this is
+        // what reaps a stored bound `__exit__` — the compiler's `.with_exit`
+        // synthetic local, dropped by `DeleteFast` on every `with` exit path
+        // — when the context manager is a plain instance that anchors
+        // resources. `unittest._AssertRaisesContext` holds the test case,
+        // which in `test_concurrent_futures.test_init` pinned the log
+        // `Queue` and its SemLocks until the next cyclic collection
+        // (RFC 0040: resource-tracker exited nonzero on leaked semaphores).
+        if let Object::BoundMethod(bm) = &dropped {
+            let recv = bm.receiver.clone();
+            drop(dropped);
+            if Self::local_needs_prompt_reap(&recv) && Self::looks_reapable_temporary(&recv) {
+                self.prompt_reap_dropped(recv);
+            }
+            return;
+        }
         let id0 = crate::weakref_registry::id_of(&dropped);
         // Nothing parked on this object needs prompt handling: no
         // finalizer to run, no weakref to clear, and no cycle-GC strong
@@ -953,6 +1102,26 @@ impl Interpreter {
         // (one reference), the GC may hold a handle, and weakrefs may
         // hold strong clones; anything beyond that is a live binding and
         // we must leave the object to the cycle collector.
+        if !Self::is_refcount_dead(&dropped, 1) {
+            return;
+        }
+        self.reap_dead_subgraph(dropped);
+    }
+
+    /// The dead-acyclic-subgraph cascade — the shared tail of
+    /// [`Self::prompt_reap_dropped`], split out so a call site that has
+    /// already established `dropped` is refcount-dead and anchors
+    /// finalizable/tracked children, yet is itself an untracked,
+    /// non-finalizable *leaf* the fast-path early-return in
+    /// `prompt_reap_dropped` would skip, can drive the cascade directly.
+    /// The motivating case is a handled exception cleared at `POP_EXCEPT`:
+    /// an `AttributeError` carries no `__del__` and is not GC-tracked, but
+    /// it anchors `AttributeError.obj` (and values reachable only through
+    /// its saved `__traceback__` frames) whose `__del__` must run at
+    /// handler exit, matching CPython's refcount timing. Every node is
+    /// independently refcount-guarded, so anything that stays externally
+    /// reachable is left to the cycle collector.
+    fn reap_dead_subgraph(&mut self, dropped: Object) {
         if !Self::is_refcount_dead(&dropped, 1) {
             return;
         }
@@ -1007,13 +1176,72 @@ impl Interpreter {
             // Snapshot the tracked children before `obj` is freed: those
             // are the only ones a strong GC handle would otherwise pin
             // (untracked children are reclaimed by ordinary `Rc` drop).
+            //
+            // Crucially, recurse *through* untracked containers to reach the
+            // tracked descendants hidden behind them. A container is left
+            // GC-untracked either because it was built all-scalar
+            // (`BuildTuple`/`BuildSet`) or — the subtler case — because it was
+            // created *empty* (so `container_can_cycle` saw nothing to track)
+            // and only later populated with objects: a dict literal `{}` grown
+            // by `d[k] = obj` is the canonical example, and
+            // `pickle._Unpickler.memo` (`self.memo = {}`, then memoized objects
+            // stuffed in) is exactly that. When such a container is the sole
+            // holder of a tracked, finalizable object, freeing the container by
+            // refcount drops that object to "GC handle only" — refcount-dead,
+            // but pinned by its own handle and so invisible to the next link of
+            // this cascade unless we walk into the container here. RFC 0040:
+            // `test_concurrent_futures.test_ressources_gced_in_workers` submits
+            // an object whose `__del__` signals a `Manager` event; the worker
+            // unpickles it (memoized in `_Unpickler.memo`), runs the job, and
+            // `del`s the `_CallItem`, expecting the argument's `__del__` to have
+            // fired — which only happens if dropping the call item (and the
+            // unpickler temporary holding the memo) cascades through the
+            // untracked `memo` dict to the tracked argument. The refcount guard
+            // below still filters anything that stays externally reachable.
             let mut child_ids: Vec<crate::weakref_registry::ObjectId> = Vec::new();
-            gc_trace::traverse_object(&obj, &mut |c| {
-                let cid = crate::weakref_registry::id_of(c);
-                if gc_trace::is_tracked(cid) {
-                    child_ids.push(cid);
-                }
-            });
+            let mut scan_through: Vec<Object> = vec![obj.clone()];
+            let mut scanned: std::collections::HashSet<crate::weakref_registry::ObjectId> =
+                std::collections::HashSet::new();
+            while let Some(parent) = scan_through.pop() {
+                gc_trace::traverse_object(&parent, &mut |c| {
+                    let cid = crate::weakref_registry::id_of(c);
+                    if gc_trace::is_tracked(cid) {
+                        child_ids.push(cid);
+                    } else if matches!(
+                        c,
+                        Object::Tuple(_)
+                            | Object::FrozenSet(_)
+                            | Object::Dict(_)
+                            | Object::List(_)
+                            | Object::Set(_)
+                            | Object::MappingProxy(_)
+                            | Object::SimpleNamespace(_)
+                            // An *untracked instance* (and `Cell`/`BoundMethod`
+                            // hop) can sit between `obj` and a tracked
+                            // finalizable just like an untracked container does.
+                            // The canonical case: a caught exception stashed on
+                            // an instance attribute — `unittest`'s
+                            // `_AssertRaisesContext.exception` — where the
+                            // `AttributeError` is itself untracked yet anchors
+                            // `AttributeError.obj` (a finalizable io temporary).
+                            // When the context manager is the sole holder,
+                            // dropping it frees the exception by `Rc`, which
+                            // drops the temporary to "GC handle only" —
+                            // refcount-dead but pinned by its own handle, and
+                            // invisible to the next cascade link unless we walk
+                            // into the untracked instance here
+                            // (`test_io.test_error_through_destructor`). The
+                            // refcount guard below still filters anything that
+                            // stays externally reachable.
+                            | Object::Instance(_)
+                            | Object::Cell(_)
+                            | Object::BoundMethod(_)
+                    ) && scanned.insert(cid)
+                    {
+                        scan_through.push(c.clone());
+                    }
+                });
+            }
             // Drop the GC's strong handle, then our own reference: `obj`
             // is reclaimed by `Rc` here and its children lose a reference.
             if gc_trace::is_tracked(id) {
@@ -1028,12 +1256,307 @@ impl Interpreter {
                     // `h.object` is the GC's own strong reference; the
                     // child is dead iff nothing beyond that handle and its
                     // weakref clones still points at it.
-                    if gc_trace::strong_count_for(&h.object) <= 1 + weak {
+                    let sc = gc_trace::strong_count_for(&h.object);
+                    if sc <= 1 + weak {
                         work.push(h.object.clone());
                     }
                 }
             }
         }
+    }
+
+    /// CPython finalizes a frame's locals by refcount the instant the
+    /// frame is torn down: a local holding the *last* reference to a
+    /// finalizable object runs its `__del__` / weakref callback promptly
+    /// on `return`, not at the next cycle collection. WeavePy otherwise
+    /// only reaps on an explicit rebind (`STORE_FAST` over a live slot,
+    /// `del`), so a function that lets a finalizable local fall out of
+    /// scope by *returning* (`tempfile.NamedTemporaryFile` with
+    /// `delete=True`, `test_tempfile.test_del_by_finalizer`) leaked the
+    /// reclamation to the tracing GC. Move each interesting local out and
+    /// run it through the prompt-reap cascade; the refcount guard inside
+    /// leaves anything still reachable (including the return value, which
+    /// the caller still holds) untouched.
+    ///
+    /// Gated to the object kinds that can carry a finalizer (or anchor a
+    /// finalizable acyclic subgraph) so the common all-scalars frame pays
+    /// nothing on the hot return path.
+    fn reap_frame_locals_on_exit(&mut self, frame: &mut Frame, retval: Option<&Object>) {
+        // Class/module bodies keep their names in a namespace dict, not in
+        // fast locals, so this is a no-op for them; only real function
+        // activations (incl. comprehensions/lambdas) carry fast locals.
+        if frame.locals.is_empty() && frame.cells.is_empty() {
+            return;
+        }
+        let _ = retval;
+        for i in 0..frame.locals.len() {
+            // Cheap pre-filter: a local holding the *last* program reference
+            // has `strong_count == locals-slot (1) + GC handle (<=1)`, plus
+            // any weakref slots' strong clones (which the cascade discounts,
+            // so an object reachable *only* through `weakref.ref(obj)` is
+            // still dead). Anything larger means the value escaped (it was
+            // returned, stored on an instance, captured by a closure, …), so
+            // leave it alone without paying for the full refcount/weakref
+            // test or a cascade. Keeps the hot return path of scalar-only
+            // frames free.
+            //
+            // A *closure function* local is reaped here too: it is GC-tracked
+            // (`MakeFunction`), so merely dropping the frame's `Rc` leaves it
+            // pinned by its own GC handle — and still holding its captured
+            // cells — until the next cyclic collection. Routing a
+            // uniquely-held (non-escaped) function through the cascade
+            // untracks and frees it now, releasing its share of this frame's
+            // cells so the cellvar sweep below can reclaim a captured-but-
+            // unescaped finalizable (`test_tempfile.test_writelines_rollover`).
+            let needs = Self::local_needs_prompt_reap(&frame.locals[i])
+                || matches!(frame.locals[i], Object::Function(_));
+            if needs && Self::looks_reapable_temporary(&frame.locals[i]) {
+                let v = std::mem::replace(&mut frame.locals[i], Object::Unbound);
+                self.prompt_reap_dropped(v);
+            }
+        }
+        // A value captured by a nested closure does not live in a fast local
+        // — it lives in one of this frame's *cell variables*, and that cell is
+        // shared with the closure object(s) that closed over it. CPython
+        // decrefs the frame's cells together with those closures when the
+        // frame is torn down, so a captured-but-unescaped finalizable dies
+        // promptly. The locals sweep above has already reaped the dying
+        // closures (functions, and generators/coroutines via
+        // `local_needs_prompt_reap`), dropping their share of the cells; now
+        // reap any *own* cellvar (never a freevar, which belongs to an
+        // enclosing frame) that is left uniquely held by this frame and whose
+        // contents are a dead finalizable.
+        let ncellvars = frame.code.cellvars.len();
+        if ncellvars == 0 || ncellvars > frame.cells.len() {
+            return;
+        }
+        for idx in 0..ncellvars {
+            let cell = frame.cells[idx].clone();
+            // Only a cell uniquely held by this frame can have its contents
+            // die with the frame; one still shared with an escaped closure
+            // (returned/stored) keeps `strong_count > 1` (our local `cell`
+            // clone is the +1 we account for).
+            if Rc::strong_count(&cell) > 2 {
+                continue;
+            }
+            let reapable = {
+                let guard = cell.borrow();
+                Self::local_needs_prompt_reap(&guard) && Self::looks_reapable_temporary(&guard)
+            };
+            if reapable {
+                let v = std::mem::replace(&mut *cell.borrow_mut(), Object::Unbound);
+                self.prompt_reap_dropped(v);
+            }
+        }
+    }
+
+    /// Reap a generator/coroutine frame the instant it *finishes* (a
+    /// normal return, an exhausting `next()`, or an exception escaping
+    /// the body). CPython clears the frame on completion, so a local or
+    /// value-stack entry holding the last reference to a finalizable
+    /// object dies promptly — and, in WeavePy's `Rc`-rooted model, an
+    /// object whose only other reference is a weakref slot's strong
+    /// clone in the registry becomes refcount-dead, which clears its
+    /// weakref (so `weakref.ref(obj)()` zeroes out without waiting for a
+    /// cyclic collection). The reapables are moved *out* of the frame
+    /// first so the frame no longer counts toward their refcount when
+    /// the cascade's deadness test runs; the frame is dropped (now
+    /// holding `Unbound` placeholders) by the caller. Mirrors
+    /// [`Self::reap_frame_locals_on_exit`] for the suspended-frame world.
+    fn reap_dead_frame(&mut self, frame: &mut Frame) {
+        let mut reap: Vec<Object> = Vec::new();
+        for slot in &mut frame.locals {
+            if Self::local_needs_prompt_reap(slot)
+                || crate::weakref_registry::count_for(crate::weakref_registry::id_of(slot)) > 0
+            {
+                reap.push(std::mem::replace(slot, Object::Unbound));
+            }
+        }
+        for slot in &mut frame.stack {
+            if Self::local_needs_prompt_reap(slot)
+                || crate::weakref_registry::count_for(crate::weakref_registry::id_of(slot)) > 0
+            {
+                reap.push(std::mem::replace(slot, Object::Unbound));
+            }
+        }
+        for v in reap {
+            self.prompt_reap_dropped(v);
+        }
+    }
+
+    /// After a bound-method call returns, give the receiver a prompt-reap
+    /// chance. While the call executed, the `BoundMethod` object held a
+    /// strong reference to its receiver, so the callee's frame-exit reaping
+    /// of the `self` local saw the receiver as still-referenced and left it
+    /// to the cycle collector. Now that the method object is being
+    /// discarded, a receiver that was only a *temporary* — `Maker().make()`,
+    /// or `_Unpickler(buf).load()` inside `pickle.loads` — becomes
+    /// refcount-dead and must run its (or its referents') finalizers
+    /// immediately, mirroring CPython decref'ing a `method`'s `__self__` the
+    /// instant the call frame is torn down. RFC 0040:
+    /// `test_concurrent_futures.test_ressources_gced_in_workers` submits an
+    /// object whose `__del__` signals a `Manager` event; the worker unpickles
+    /// its `_CallItem`, runs it, and `del`s it expecting the argument's
+    /// `__del__` to have fired — but the unpickler's `memo` (pinned by the
+    /// unpickler temporary, in turn pinned only by the GC handle once the
+    /// `loads` bound-method call returns) kept the argument alive until the
+    /// next cyclic collection.
+    ///
+    /// Cheap on the hot path: only `BoundMethod` callables pay anything, and
+    /// a receiver still bound elsewhere (the overwhelmingly common `self`)
+    /// fails the `strong_count` pre-check without touching the GC's maps.
+    fn reap_call_receiver(&mut self, callable: Object) {
+        match &callable {
+            Object::BoundMethod(bm) => {
+                let recv = bm.receiver.clone();
+                // End the borrow and release the BoundMethod's hold on the
+                // receiver so `strong_count` reflects only real bindings + the
+                // GC handle.
+                drop(callable);
+                // `recv` (1) + the GC's tracking handle (<=1) + any weakref
+                // clones is the fingerprint of a dead temporary; anything
+                // larger means a live binding still holds it. The
+                // authoritative refcount/weakref test lives in
+                // `prompt_reap_dropped`; this is just a cheap pre-filter.
+                if Self::local_needs_prompt_reap(&recv) && Self::looks_reapable_temporary(&recv) {
+                    self.prompt_reap_dropped(recv);
+                }
+            }
+            // A *function* built as a call temporary — the canonical case is a
+            // comprehension's anonymous `<listcomp>`/`<setcomp>`/`<dictcomp>`/
+            // `<genexpr>`, emitted by `MakeFunction` and consumed by the very
+            // next `Call` — is GC-tracked when it captures cells (its closure).
+            // A plain `Rc` drop then leaves it pinned by its own GC handle,
+            // still holding those cells and, through them, the enclosing locals
+            // it closed over (e.g. `self` in `[self.submit(x) for x in it]`,
+            // promoted to a cell). That defers the finalization of anything
+            // uniquely reachable through the capture until the next cyclic
+            // collection. RFC 0040: `ThreadPoolExecutor.map`'s `result_iterator`
+            // closes over the list comprehension's `self`, so each `map` call
+            // leaked one reference to the executor — `del executor` then never
+            // dropped its refcount to zero, so the weakref callback that wakes
+            // idle workers never fired and `test_concurrent_futures`
+            // `test_del_shutdown` (and the other prompt-finalization shutdown
+            // cases) hung. Route a uniquely-held (non-escaped) function through
+            // the same cascade the frame-exit locals sweep uses for
+            // closure-function *locals*, so its cells — and any finalizable they
+            // uniquely hold — are released now, matching CPython's refcount
+            // timing. A function still bound elsewhere (a global `foo` in
+            // `foo()`, an escaped/returned closure) keeps `strong_count` above
+            // the dead threshold and fails the cheap pre-filter untouched, so
+            // the hot path of ordinary named-function calls pays only a single
+            // `strong_count` read. `prompt_reap_dropped` early-returns for an
+            // untracked function (no cells to leak), so it is reclaimed by the
+            // ordinary `Rc` drop of `callable` here.
+            Object::Function(_) => {
+                if Self::looks_reapable_temporary(&callable) {
+                    self.prompt_reap_dropped(callable);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// After a call returns, give each *argument temporary* a prompt-reap
+    /// chance. While the call executed, the caller's argument vector held a
+    /// strong reference to every argument, so the callee's frame-exit reaping
+    /// of the corresponding parameter local saw the value as still-referenced
+    /// and left it to the cycle collector. Now that the caller is dropping its
+    /// argument vector, an argument that was only a *temporary* — `f(Make())`,
+    /// `runner.run(test_class('m'))` — becomes refcount-dead and must run its
+    /// (or its referents') finalizers immediately, mirroring CPython clearing
+    /// a call's stack slots the instant the call returns. RFC 0040:
+    /// `test_concurrent_futures.test_init` runs a child test inline as
+    /// `runner.run(test_class(...))`; the test case is never bound to a name,
+    /// so without reaping it here its `ProcessPoolExecutor` (and the log
+    /// `Queue`'s SemLocks) lingered to the next cyclic collection and the
+    /// resource tracker reported leaked semaphores. Moves each dead-looking
+    /// argument *out* of the vector before reaping so the vector slot no
+    /// longer inflates its refcount.
+    fn reap_call_args(&mut self, args: &mut [Object]) {
+        for a in args {
+            if Self::local_needs_prompt_reap(a) && Self::looks_reapable_temporary(a) {
+                let v = std::mem::replace(a, Object::Unbound);
+                self.prompt_reap_dropped(v);
+            }
+        }
+    }
+
+    /// Prompt-reap the value an assignment just displaced. CPython decrefs
+    /// the previous attribute/subscript value the instant a store
+    /// overwrites it (`self.x = y` decrefs the old `self.x`); a value whose
+    /// last program-visible binding was that slot dies immediately, running
+    /// its `__del__`/weakref callbacks rather than waiting for the next
+    /// cyclic collection. The crucial case is a slot holding the only
+    /// strong reference to an object that *itself* anchors a weakref false
+    /// cycle: `ExecutorMixin.tearDown` does `self.executor = None` after
+    /// `shutdown()`, and the `ProcessPoolExecutor`↔`_ExecutorManagerThread`
+    /// pair is only kept reachable by the thread's `weakref.ref(executor)`
+    /// (a registry strong-clone in WeavePy's `Rc` model). Reaping the
+    /// displaced executor clears that weakref, breaks the cycle, and
+    /// cascades through the manager thread into the call/result queues so
+    /// their SemLocks unlink before the test stops the resource tracker
+    /// (RFC 0040: `test_concurrent_futures.test_init`
+    /// `FailingInitializerResourcesTest`). The cheap `local_needs_prompt_reap`
+    /// gate keeps scalar stores (`self.n = i` in a loop) off this path.
+    fn maybe_prompt_reap_replaced(&mut self, old: Object) {
+        if std::env::var_os("WP_NO_STORE_REAP").is_some() {
+            return;
+        }
+        if Self::local_needs_prompt_reap(&old) && Self::looks_reapable_temporary(&old) {
+            self.prompt_reap_dropped(old);
+        }
+    }
+
+    /// Cheap "looks like a dead temporary" pre-filter shared by the
+    /// prompt-reap call sites. An object holding the single program reference
+    /// about to be dropped has `strong_count == that reference (1) + the GC's
+    /// tracking handle (<=1)`. A live weakref additionally keeps one strong
+    /// *clone* per slot in the registry (see [`crate::weakref_registry`]);
+    /// the cascade discounts those (an object reachable only through
+    /// `weakref.ref(obj)` is dead in CPython too), so they must not veto the
+    /// reap here. Anything beyond `2 + weak_clones` is a live binding. The
+    /// registry lookup is skipped on the common `strong_count <= 2` fast path.
+    fn looks_reapable_temporary(o: &Object) -> bool {
+        let sc = gc_trace::strong_count_for(o);
+        if sc <= 2 {
+            return true;
+        }
+        let id = crate::weakref_registry::id_of(o);
+        sc <= 2 + crate::weakref_registry::strong_clone_count(id)
+    }
+
+    /// Whether a frame local is worth running through the prompt-reap
+    /// cascade on frame exit. Mirrors the `PopTop` discard gate: instances
+    /// (possible `__del__` / weakref finalizer), and live
+    /// generators/coroutines/async-generators (their `close()` delivers
+    /// `GeneratorExit`). Kept deliberately narrow so the hot return path of
+    /// scalar-only frames pays a single cheap `matches!` per local.
+    fn local_needs_prompt_reap(o: &Object) -> bool {
+        matches!(
+            o,
+            Object::Instance(_)
+                | Object::Generator(_)
+                | Object::Coroutine(_)
+                | Object::AsyncGenerator(_)
+                | Object::AsyncGenAwait(_)
+                // A container local can anchor a finalizable acyclic subgraph
+                // that dies with the frame: pickle's `_dict_op` builds
+                // `items = [key, value]` via `_pop_to_mark`, stuffs it into a
+                // dict, and lets `items` fall out of scope at return — leaving
+                // the only non-GC reference to a freshly-unpickled, finalizable
+                // `value` on a dead list local. CPython frees it by refcount on
+                // return; reap it here so its `__del__` runs promptly instead of
+                // lingering to the next cyclic collection (RFC 0040:
+                // `test_concurrent_futures.test_ressources_gced_in_workers`).
+                // The `strong_count` pre-filter at the call site keeps escaped
+                // containers off the cascade.
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Set(_)
+                | Object::Tuple(_)
+                | Object::FrozenSet(_)
+        )
     }
 
     /// Does `obj` carry a finalizer that prompt reclamation must run
@@ -1048,6 +1571,50 @@ impl Interpreter {
             }
             _ => false,
         }
+    }
+
+    /// Cheap, allocation-free pre-check for the `POP_EXCEPT` reap: does the
+    /// acyclic subgraph rooted at `obj` contain a finalizable object
+    /// (`__del__` / an unfinished generator) reachable through value
+    /// containers and user instances, up to `depth` links? The
+    /// overwhelmingly common handled exception — `ValueError(i)`,
+    /// `KeyError(k)`, scalar/`str` args, no `__del__` anywhere — returns
+    /// `false` here in pure recursion (no heap traffic, no weakref-registry
+    /// work), so the hot handler-exit path stays at baseline cost and only
+    /// an exception that actually anchors a destructor pays for the full
+    /// [`Self::reap_dead_subgraph`] cascade. Tracebacks/frames are
+    /// deliberately *not* traversed: walking the captured call stack on
+    /// every caught exception would dominate the path, and a finalizable
+    /// pinned only by a traceback frame is left to the cycle collector
+    /// (CPython's own traceback-clearing is likewise lazy here).
+    fn exc_has_finalizable(obj: &Object, depth: u8) -> bool {
+        if Self::object_is_finalizable(obj) {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        if matches!(
+            obj,
+            Object::Tuple(_)
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Set(_)
+                | Object::FrozenSet(_)
+                | Object::Instance(_)
+                | Object::Cell(_)
+                | Object::MappingProxy(_)
+                | Object::SimpleNamespace(_)
+        ) {
+            let mut found = false;
+            crate::gc_trace::traverse_object(obj, &mut |c| {
+                if !found && Self::exc_has_finalizable(c, depth - 1) {
+                    found = true;
+                }
+            });
+            return found;
+        }
+        false
     }
 
     /// Is `obj` dead in refcount terms — does the caller hold its last
@@ -1119,6 +1686,47 @@ impl Interpreter {
     /// finalizer are routed through `sys.unraisablehook` (the
     /// default hook prints `Exception ignored in: …` to stderr,
     /// exactly like CPython) so they don't propagate.
+    /// Prompt (deterministic) finalization driver — the interpreter half of
+    /// RFC 0040's GC arc. CPython runs an object's `__del__` the instant its
+    /// refcount reaches zero; weavepy's tracing collector pins every tracked
+    /// object on a strong handle, so a refcount-dead finalizable object would
+    /// otherwise linger until the next cyclic collection. This closes that gap
+    /// by, at each reference-drop safe point, running `__del__` for objects
+    /// whose last *program* reference just dropped (`strong_count <= 1`).
+    ///
+    /// Drives a small fixpoint loop: queue the dead finalizables' `__del__`,
+    /// run them, reclaim the (non-resurrected) corpses — which cascades the
+    /// refcount drop into their referents and can expose the next layer of
+    /// now-dead finalizables — and repeat until quiescent. Bounded by
+    /// `MAX_COLLECT_PASSES` against a pathological `__del__` that keeps
+    /// resurrecting and re-killing objects.
+    ///
+    /// Gated by [`gc_trace::has_any_finalizable`] at every call site, so when
+    /// no `__del__`-bearing object is live (the common case) it costs one
+    /// relaxed atomic load. Re-entrancy is suppressed via a thread-local: a
+    /// `__del__` body re-enters the eval loop, whose own safe points would
+    /// otherwise recurse here.
+    pub fn drain_prompt_finalizers(&mut self) {
+        thread_local! {
+            static IN_PROMPT_FINALIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if IN_PROMPT_FINALIZE.with(std::cell::Cell::get) {
+            return;
+        }
+        IN_PROMPT_FINALIZE.with(|c| c.set(true));
+        for _ in 0..gc_trace::MAX_COLLECT_PASSES {
+            let progressed = gc_trace::reap_dead_finalizable();
+            if progressed == 0 {
+                break;
+            }
+            // Run the `__del__`s and weakref callbacks just queued. They may
+            // drop the last reference to — or resurrect — other finalizables,
+            // which the next pass re-evaluates.
+            self.run_pending_finalizers();
+        }
+        IN_PROMPT_FINALIZE.with(|c| c.set(false));
+    }
+
     pub fn run_pending_finalizers(&mut self) -> usize {
         // Finalizers run arbitrary Python (`__del__` → traceback →
         // native islice, …), so the interpreter pointer must be
@@ -1423,6 +2031,10 @@ impl Interpreter {
         let Object::Instance(inst) = obj else {
             return;
         };
+        // Claim the one-shot finalizer (CPython's `_PyGC_FINALIZED` bit)
+        // before dispatch, so [`crate::types::PyInstance`]'s `Drop` net never
+        // re-resurrects an instance whose `__del__` already ran here.
+        inst.finalize_ran.set(true);
         let Some(del) = inst.cls().lookup("__del__") else {
             return;
         };
@@ -1569,14 +2181,13 @@ impl Interpreter {
     /// `Exception ignored in: …` header, the traceback, and the
     /// exception line to stderr.
     fn print_unraisable_default(
-        &self,
+        &mut self,
         exc_value: &Object,
         traceback: &[crate::error::TracebackEntry],
         context_repr: &str,
         hook_failed: bool,
         err_msg: Option<&str>,
     ) {
-        use std::io::Write;
         let mut s = String::new();
         if hook_failed {
             s.push_str("Exception ignored in sys.unraisablehook: ");
@@ -1614,8 +2225,53 @@ impl Interpreter {
         } else {
             s.push_str(&format!("{kind}: {msg}\n"));
         }
+        self.write_text_to_sys_stderr(&s);
+    }
+
+    /// Write `text` to the interpreter's `sys.stderr` (the Python
+    /// object), so a test that redirects `sys.stderr` — e.g.
+    /// `test.support.captured_stderr()` swapping in a `StringIO` —
+    /// observes runtime-emitted diagnostics (unraisable-hook output,
+    /// the signal wakeup-fd write error). Falls back to the raw OS
+    /// `stderr` fd when `sys.stderr` is unavailable or its `write`
+    /// raises (early init / shutdown), matching CPython's
+    /// `_PyErr_WriteUnraisableMsg`, which targets `sys.stderr`.
+    fn write_text_to_sys_stderr(&mut self, text: &str) {
+        let stderr_obj = {
+            let sys_module = self
+                .cache
+                .modules
+                .borrow()
+                .get(&DictKey(Object::from_static("sys")))
+                .cloned();
+            match sys_module {
+                Some(Object::Module(m)) => m
+                    .dict
+                    .borrow()
+                    .get(&DictKey(Object::from_static("stderr")))
+                    .cloned(),
+                _ => None,
+            }
+        };
+        if let Some(stderr_obj) = stderr_obj {
+            if !matches!(stderr_obj, Object::None) {
+                if let Ok(write) = self.load_attr(&stderr_obj, "write") {
+                    let globals = self.builtins.clone();
+                    if self
+                        .call(&write, &[Object::from_str(text.to_owned())], &[], &globals)
+                        .is_ok()
+                    {
+                        if let Ok(flush) = self.load_attr(&stderr_obj, "flush") {
+                            let _ = self.call(&flush, &[], &[], &globals);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        use std::io::Write;
         let mut stderr = std::io::stderr().lock();
-        let _ = stderr.write_all(s.as_bytes());
+        let _ = stderr.write_all(text.as_bytes());
     }
 
     /// CPython `PyErr_Print` for an uncaught exception reaching the
@@ -1851,7 +2507,10 @@ impl Interpreter {
 
     fn run_frame(&mut self, frame: &mut Frame) -> Result<Object, RuntimeError> {
         match self.run_until_yield_or_return(frame, None)? {
-            FrameOutcome::Returned(v) => Ok(v),
+            FrameOutcome::Returned(v) => {
+                self.reap_frame_locals_on_exit(frame, Some(&v));
+                Ok(v)
+            }
             FrameOutcome::Yielded(_) => Err(RuntimeError::Internal(
                 "generator frame yielded to a non-generator caller".to_owned(),
             )),
@@ -2014,6 +2673,25 @@ impl Interpreter {
             // thread is blocked waiting for it, so compute-bound
             // threads can't starve the rest.
             crate::gil::periodic_gil_checkpoint();
+            // RFC 0040 (GC arc): prompt finalization. Between bytecodes — a
+            // safe point with no outstanding container borrows — run `__del__`
+            // and fire callback-weakrefs for any object whose last reference
+            // dropped during the previous instruction, matching CPython's
+            // refcount-driven `tp_dealloc` timing. Two gates keep this free in
+            // the common case: a finalizable object must be live *and* the
+            // previous instruction must have dropped a reference (`take_maybe_
+            // _dead`), so a hot loop that neither allocates `__del__` objects
+            // nor drops references pays only two relaxed atomic loads.
+            if gc_trace::has_any_finalizable() && gc_trace::take_maybe_dead() {
+                self.drain_prompt_finalizers();
+            }
+            // RFC 0040 (WS7): surface any "unclosed file" `ResourceWarning`
+            // queued by a `PyFile` destructor since the previous instruction.
+            // Same between-bytecodes safe point as prompt finalization; gated on
+            // a single relaxed atomic load so the common (empty) case is free.
+            if crate::vm_singletons::has_pending_resource_warnings() {
+                self.drain_pending_resource_warnings();
+            }
             // Mirror the live `pc` into the snapshot so `f_lineno`
             // reads correctly when user code introspects via
             // `sys._getframe`.
@@ -2064,6 +2742,21 @@ impl Interpreter {
             // always — stays free. Feeding any handler-raised error
             // through the same arm as `step`'s `Err` keeps it catchable
             // by a surrounding `try/except`, exactly as CPython.
+            // RFC 0040 (GC arc): note whether this instruction can drop the
+            // last reference to a finalizable object, so the next safe point's
+            // prompt-finalization sweep runs only when warranted. Gated on a
+            // live finalizable so non-`__del__` workloads pay nothing. A
+            // dropped reference shows up either as the operand stack shrinking
+            // (`POP_TOP`, every `STORE_*`/`*_SUBSCR`, `POP_EXCEPT`, `END_FOR`,
+            // a net-consuming `CALL`, …) or as one of the stack-neutral
+            // `DELETE_*`-name opcodes.
+            let watch_drops = gc_trace::has_any_finalizable();
+            let stack_before = if watch_drops { frame.stack.len() } else { 0 };
+            let op_before = if watch_drops {
+                frame.code.instructions.get(frame.pc as usize).map(|i| i.op)
+            } else {
+                None
+            };
             let stepped =
                 if crate::stdlib::signal_mod::signals_pending() && crate::gil::is_main_thread() {
                     match self.run_pending_signals(&py_frame) {
@@ -2073,6 +2766,20 @@ impl Interpreter {
                 } else {
                     self.step(frame)
                 };
+            if watch_drops
+                && (frame.stack.len() < stack_before
+                    || matches!(
+                        op_before,
+                        Some(
+                            OpCode::DeleteFast
+                                | OpCode::DeleteName
+                                | OpCode::DeleteGlobal
+                                | OpCode::DeleteDeref
+                        )
+                    ))
+            {
+                gc_trace::mark_maybe_dead();
+            }
             match stepped {
                 Ok(StepOutcome::Continue) => {}
                 Ok(StepOutcome::Return(v)) => {
@@ -2108,6 +2815,16 @@ impl Interpreter {
                             if exc.context.is_some() {
                                 Self::sync_exc_attrs(&exc);
                             }
+                        } else if exc.traceback.is_empty()
+                            && (exc.cause.is_some() || exc.context.is_some())
+                        {
+                            // A fresh Rust-raised error that already carries an
+                            // explicit `cause`/`context` (e.g. `_io` chaining a
+                            // misbehaving raw `readinto`'s `TypeError` into an
+                            // `OSError`, `test_bad_readinto_type`) must still
+                            // mirror those onto the instance dict so Python's
+                            // `except` sees `e.__cause__`.
+                            Self::sync_exc_attrs(&exc);
                         }
                         if crate::trace::any_observers_active() {
                             self.fire_exception_event(&py_frame, &exc)?;
@@ -2135,6 +2852,58 @@ impl Interpreter {
             }
         };
         self.pop_py_frame();
+        // A normally-returning frame is dead: CPython deallocates it the
+        // instant it returns, releasing every local by refcount. Drop the
+        // live-locals mirror (and any materialised `f_locals`) so a
+        // `PyFrame` snapshot that outlives the frame — even one reachable
+        // only through an *untracked* native edge the cycle collector
+        // can't see as garbage (a discarded exception's traceback, a
+        // not-yet-swept sibling) — can't pin the frame's locals. Holding
+        // them would inflate refcounts and, worse, defeat the prompt,
+        // refcount-driven finalization CPython guarantees: e.g. a worker's
+        // returned `executor.map`/`submit` frame whose `self` slot keeps a
+        // `del`'d `ThreadPoolExecutor` alive past its last binding, so the
+        // weakref callback that signals idle workers to exit never fires
+        // and `del executor; t.join()` deadlocks (RFC 0040
+        // `test_concurrent_futures.test_del_shutdown`). A *generator*
+        // suspension (`Yielded`) and the generator-creation bootstrap
+        // (`StartGenerator`) keep their mirror — the frame lives on and is
+        // re-entered — and an *exceptional* exit (`Err`) keeps it so the
+        // frame's `f_locals` stays readable while it sits in a traceback.
+        if matches!(result, Ok(FrameOutcome::Returned(_))) {
+            // `pop_py_frame` above already dropped the call stack's clone,
+            // so `strong_count == 1` means *this* local is the only owner:
+            // the frame object dies here and clearing the mirror lets its
+            // locals finalize promptly. `> 1` means the frame object
+            // genuinely outlives the activation — a live traceback whose
+            // exception was caught and `return`ed/stored, or an explicit
+            // `sys._getframe`/`gi_frame` handle. CPython keeps such a
+            // frame's locals readable (`take_ownership`); a frame reachable
+            // only through the about-to-drop stack or untracked garbage is
+            // *not* externally referenced and still gets cleared.
+            if Rc::strong_count(&py_frame) > 1 {
+                // Bring the mirror to the final post-return state first: the
+                // loop syncs lazily, so an `except ... as e:` target that
+                // the implicit handler-exit `del`s, or any late
+                // `STORE_FAST`/`DELETE_FAST`, may not be mirrored yet. We
+                // can't call `sync_py_locals` (it targets the stack top,
+                // now the caller), so copy this frame's live locals across.
+                if let Some(mirror) = py_frame.locals_mirror.borrow().as_ref() {
+                    let mut slot = mirror.borrow_mut();
+                    if slot.len() == frame.locals.len() {
+                        slot.clone_from(&frame.locals);
+                    } else {
+                        *slot = frame.locals.clone();
+                    }
+                }
+                py_frame.take_ownership_of_locals();
+            } else {
+                if let Some(mirror) = py_frame.locals_mirror.borrow().as_ref() {
+                    mirror.borrow_mut().clear();
+                }
+                py_frame.invalidate_locals();
+            }
+        }
         // Reconcile the interpreter-wide handled-exception stack. When
         // control leaves an `except` / `finally` block *early* — a
         // `return` out of an `except`, or an exception propagating
@@ -2357,7 +3126,7 @@ impl Interpreter {
                     // refcount-driven dealloc. Drop the snapshot's own
                     // strong clones (mirror, materialised dict) *first*
                     // so the reap sees the true remaining refcount.
-                    let caps = frame_finalizables(&g);
+                    let caps = frame_reapables(&g);
                     *g.state.borrow_mut() = GeneratorState::Finished;
                     if let Some(mirror) = py.locals_mirror.borrow().as_ref() {
                         mirror.borrow_mut().clear();
@@ -2625,7 +3394,23 @@ impl Interpreter {
     /// a Python handler is invoked `handler(signum, frame)`. Any
     /// exception it raises propagates through the dispatch loop's normal
     /// error path, so it stays catchable by a surrounding `try/except`.
+    /// Report a pending signal wakeup-fd write error (recorded by the
+    /// async-signal-safe trampoline when its `write()` failed) through
+    /// `sys.unraisablehook`, matching CPython's `report_wakeup_*_error`.
+    /// The OSError is built from the captured `errno`; the contextual
+    /// message becomes the unraisable header so `captured_stderr()` sees
+    /// `Exception ignored when trying to write to the signal wakeup fd:`
+    /// followed by `OSError: [Errno N] ...`.
+    fn report_signal_wakeup_error(&mut self) {
+        if let Some(errno) = crate::stdlib::signal_mod::take_wakeup_write_error() {
+            let err = crate::error::io_error_to_py(&std::io::Error::from_raw_os_error(errno));
+            let msg = "Exception ignored when trying to write to the signal wakeup fd";
+            self.write_unraisable_msg(&err, &Object::None, msg, Some(msg));
+        }
+    }
+
     fn run_pending_signals(&mut self, py_frame: &Rc<PyFrame>) -> Result<(), RuntimeError> {
+        self.report_signal_wakeup_error();
         for signum in crate::stdlib::signal_mod::take_tripped() {
             let handler = crate::stdlib::signal_mod::handler_for(signum);
             match handler {
@@ -2656,6 +3441,7 @@ impl Interpreter {
     pub fn run_pending_signals_public(&mut self) -> Result<(), RuntimeError> {
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        self.report_signal_wakeup_error();
         for signum in crate::stdlib::signal_mod::take_tripped() {
             let handler = crate::stdlib::signal_mod::handler_for(signum);
             if let Object::Int(_) = handler {
@@ -3013,7 +3799,23 @@ impl Interpreter {
                 let v = frame.pop()?;
                 let slot = ins.arg as usize;
                 if slot < frame.locals.len() {
-                    frame.locals[slot] = v;
+                    let old = std::mem::replace(&mut frame.locals[slot], v);
+                    // CPython decrefs the value previously bound to the local;
+                    // when that was the last reference to a finalizable object
+                    // its `__del__` runs at the rebind, not at frame exit
+                    // (`p = None` dropping a `Popen`,
+                    // `test_subprocess.test_zombie_fast_process_del`). Mirror
+                    // that for the object kinds that can carry a finalizer (or
+                    // anchor a finalizable acyclic subgraph); the
+                    // overwhelmingly common scalar/`str`/`None` rebind — loop
+                    // counters, accumulators, first binding over `Unbound` —
+                    // matches out on the cheap variant check and pays nothing
+                    // more. `prompt_reap_dropped` then refcount-guards, so a
+                    // value still live through another binding is left alone.
+                    if Self::local_needs_prompt_reap(&old) {
+                        self.sync_py_locals(frame);
+                        self.prompt_reap_dropped(old);
+                    }
                 }
             }
             OpCode::DeleteFast => {
@@ -3047,25 +3849,44 @@ impl Interpreter {
                 }
                 if let Some(ns_obj) = frame.class_namespace_obj.clone() {
                     // PEP 3115: a custom class namespace observes the binding
-                    // through its `__setitem__` (e.g. `enum._EnumDict`).
+                    // through its `__setitem__` (e.g. `enum._EnumDict`); the old
+                    // value is the namespace's to manage, so no reap here.
                     let g = frame.globals.clone();
                     self.class_ns_store(&ns_obj, &name, v, &g)?;
-                } else if let Some(ns) = &frame.class_namespace {
-                    ns.borrow_mut().insert(DictKey(Object::from_str(name)), v);
                 } else {
-                    frame
-                        .globals
-                        .borrow_mut()
-                        .insert(DictKey(Object::from_str(name)), v);
+                    // Class-body and module/top-level bindings both land in a
+                    // plain dict; rebinding one that uniquely held a finalizable
+                    // runs its `__del__` now (CPython decref-on-store).
+                    let old = if let Some(ns) = &frame.class_namespace {
+                        ns.borrow_mut().insert(DictKey(Object::from_str(name)), v)
+                    } else {
+                        frame
+                            .globals
+                            .borrow_mut()
+                            .insert(DictKey(Object::from_str(name)), v)
+                    };
+                    if let Some(old) = old {
+                        if Self::local_needs_prompt_reap(&old) {
+                            self.prompt_reap_dropped(old);
+                        }
+                    }
                 }
             }
             OpCode::StoreGlobal => {
                 let v = frame.pop()?;
                 let name = self.name_at(&frame.code, ins.arg)?;
-                frame
+                let old = frame
                     .globals
                     .borrow_mut()
                     .insert(DictKey(Object::from_str(name)), v);
+                // Rebinding a global that uniquely held a finalizable runs its
+                // `__del__` now, matching the `DeleteGlobal` path and CPython's
+                // decref-on-store (module-scope `handle = None`).
+                if let Some(old) = old {
+                    if Self::local_needs_prompt_reap(&old) {
+                        self.prompt_reap_dropped(old);
+                    }
+                }
             }
             OpCode::DeleteName => {
                 let mut name = self.name_at(&frame.code, ins.arg)?;
@@ -3125,7 +3946,15 @@ impl Interpreter {
                     .get(ins.arg as usize)
                     .cloned()
                     .ok_or_else(|| RuntimeError::Internal("bad cell index".to_owned()))?;
-                *cell.borrow_mut() = v;
+                let old = std::mem::replace(&mut *cell.borrow_mut(), v);
+                // Rebinding a closure cell that uniquely held a finalizable runs
+                // its `__del__` now, matching `DeleteDeref` and `StoreFast`. The
+                // cell already holds the new value, so a re-entrant finalizer
+                // observing this free var through the closure sees the rebind.
+                if Self::local_needs_prompt_reap(&old) {
+                    self.sync_py_locals(frame);
+                    self.prompt_reap_dropped(old);
+                }
             }
             OpCode::DeleteDeref => {
                 // `del NAME` for a cell/free var empties the cell WITHOUT
@@ -3159,21 +3988,50 @@ impl Interpreter {
                 frame.push(Object::Cell(cell));
             }
             OpCode::LoadAttr => {
-                // `f().cr_frame`: the receiver temporary dies when the
-                // attribute load pops it — finalize promptly so a
-                // never-awaited coroutine warns here (bpo-45813).
-                let reap = match frame.stack.last() {
+                // The receiver temporary dies when the attribute load pops it,
+                // so finalize it promptly (CPython decrefs the receiver after
+                // the load, on *both* the success and failure paths). This
+                // makes `f().cr_frame` warn on a never-awaited coroutine
+                // (bpo-45813) and — crucially for a *failing* load like
+                // `io.BufferedReader(raw).xyzzy` — flushes/closes the discarded
+                // io temporary, routing a failing `close()` to
+                // `sys.unraisablehook` even though the receiver was already
+                // popped (`test_io.test_error_through_destructor`). Only
+                // finalizable receiver kinds are captured so the hot path pays
+                // at most one `Rc` bump.
+                let receiver = match frame.stack.last() {
                     Some(
                         o @ (Object::Generator(_)
                         | Object::Coroutine(_)
-                        | Object::AsyncGenerator(_)),
+                        | Object::AsyncGenerator(_)
+                        | Object::Instance(_)),
                     ) => Some(o.clone()),
                     _ => None,
                 };
-                let v = self.specialized_load_attr(frame, cache_pc, ins.arg)?;
-                frame.push(v);
-                if let Some(r) = reap {
-                    self.prompt_reap_dropped(r);
+                match self.specialized_load_attr(frame, cache_pc, ins.arg) {
+                    Ok(v) => {
+                        frame.push(v);
+                        if let Some(r) = receiver {
+                            // On success only the cheap gen/coro warning case
+                            // needs prompt finalization; `prompt_reap_dropped`
+                            // early-outs when the receiver is still live (the
+                            // common `self.attr` case keeps `self` alive).
+                            if matches!(
+                                r,
+                                Object::Generator(_)
+                                    | Object::Coroutine(_)
+                                    | Object::AsyncGenerator(_)
+                            ) {
+                                self.prompt_reap_dropped(r);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(r) = receiver {
+                            self.prompt_reap_dropped(r);
+                        }
+                        return Err(e);
+                    }
                 }
             }
             OpCode::StoreAttr => {
@@ -3452,15 +4310,28 @@ impl Interpreter {
                 let v = frame.pop()?;
                 // Discarding the last reference to a temporary mirrors
                 // CPython's refcount-driven finalization (`f()` as a
-                // statement finalizes the result immediately).
-                if matches!(
-                    v,
-                    Object::Generator(_)
-                        | Object::Coroutine(_)
-                        | Object::AsyncGenerator(_)
-                        | Object::Instance(_)
-                        | Object::AsyncGenAwait(_)
-                ) {
+                // statement finalizes the result immediately). This covers
+                // not just directly-finalizable values (instances with
+                // `__del__`, live generators/coroutines) but *containers*
+                // that anchor a dead finalizable acyclic subgraph: a
+                // discarded `pool.map(...)` returns a `list` of unpickled,
+                // GC-tracked result copies, and if it isn't reaped here the
+                // copies linger as dead-but-tracked garbage until *some*
+                // thread's next collection finalizes them — which, across the
+                // statement's trailing `del`/`sleep`, is frequently a
+                // background pool thread, so the copies' `__del__` then races
+                // the main thread's (CPython runs every one on the thread that
+                // dropped the ref). The `local_needs_prompt_reap` kinds match
+                // `reap_frame_locals_on_exit`; `prompt_reap_dropped`'s refcount
+                // guard leaves anything still referenced elsewhere alone
+                // (RFC 0040: `test_multiprocessing_*` `test_release_task_refs`).
+                // No `sync_py_locals` is needed: a discarded statement result
+                // is an operand-stack temporary that was never a frame local,
+                // so the live-locals mirror cannot hold a stale clone of it,
+                // and `frame.locals` always reflects live bindings — the
+                // refcount guard therefore cannot false-positive on a value
+                // still bound to a local.
+                if Self::local_needs_prompt_reap(&v) {
                     self.prompt_reap_dropped(v);
                 }
             }
@@ -3494,11 +4365,17 @@ impl Interpreter {
                 let split_kw_at = frame.stack.len().saturating_sub(kwc);
                 let kw_values: Vec<Object> = frame.stack.split_off(split_kw_at);
                 let split_pos_at = frame.stack.len().saturating_sub(argc);
-                let pos_args: Vec<Object> = frame.stack.split_off(split_pos_at);
+                let mut pos_args: Vec<Object> = frame.stack.split_off(split_pos_at);
                 let callable = frame.pop()?;
-                let kw_pairs: Vec<(String, Object)> = names.into_iter().zip(kw_values).collect();
+                let mut kw_pairs: Vec<(String, Object)> =
+                    names.into_iter().zip(kw_values).collect();
                 let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
                 frame.push(r);
+                self.reap_call_receiver(callable);
+                self.reap_call_args(&mut pos_args);
+                for (_, v) in &mut kw_pairs {
+                    self.reap_call_args(std::slice::from_mut(v));
+                }
             }
             OpCode::CallEx => {
                 // CALL_FUNCTION_EX: `arg = 0` → stack has (callable,
@@ -3508,7 +4385,7 @@ impl Interpreter {
                 let kwargs_obj = if has_kwargs { Some(frame.pop()?) } else { None };
                 let args_obj = frame.pop()?;
                 let callable = frame.pop()?;
-                let pos_args: Vec<Object> = match args_obj {
+                let mut pos_args: Vec<Object> = match args_obj {
                     Object::Tuple(items) => items.iter().cloned().collect(),
                     Object::List(items) => items.borrow().clone(),
                     other => {
@@ -3518,7 +4395,7 @@ impl Interpreter {
                         )))
                     }
                 };
-                let kw_pairs: Vec<(String, Object)> = match kwargs_obj {
+                let mut kw_pairs: Vec<(String, Object)> = match kwargs_obj {
                     None => Vec::new(),
                     Some(Object::Dict(d)) => d
                         .borrow()
@@ -3534,6 +4411,11 @@ impl Interpreter {
                 };
                 let r = self.call(&callable, &pos_args, &kw_pairs, &frame.globals)?;
                 frame.push(r);
+                self.reap_call_receiver(callable);
+                self.reap_call_args(&mut pos_args);
+                for (_, v) in &mut kw_pairs {
+                    self.reap_call_args(std::slice::from_mut(v));
+                }
             }
             OpCode::ReturnValue => {
                 return Ok(StepOutcome::Return(frame.pop()?));
@@ -3752,12 +4634,27 @@ impl Interpreter {
                 let n = ins.arg as usize;
                 let split = frame.stack.len().saturating_sub(n);
                 let parts = frame.stack.split_off(split);
-                let mut s = String::new();
-                for p in parts {
-                    s.push_str(&p.to_str());
+                // If any fragment carries lone surrogates (`WStr`), join at the
+                // code-point level so they survive concatenation; otherwise take
+                // the plain UTF-8 fast path.
+                if parts.iter().any(|p| matches!(p, Object::WStr(_))) {
+                    let mut cps: Vec<u32> = Vec::new();
+                    for p in &parts {
+                        match p.str_codepoints() {
+                            Some(c) => cps.extend(c),
+                            None => cps.extend(p.to_str().chars().map(|ch| ch as u32)),
+                        }
+                    }
+                    self.record_alloc(frame, 49 + cps.len() as u64);
+                    frame.push(Object::str_from_codepoints(cps));
+                } else {
+                    let mut s = String::new();
+                    for p in parts {
+                        s.push_str(&p.to_str());
+                    }
+                    self.record_alloc(frame, 49 + s.len() as u64);
+                    frame.push(Object::from_str(s));
                 }
-                self.record_alloc(frame, 49 + s.len() as u64);
-                frame.push(Object::from_str(s));
             }
             OpCode::ListAppend => {
                 let v = frame.pop()?;
@@ -4004,14 +4901,28 @@ impl Interpreter {
                         })?;
                         let keys = self.call(&key_method, &[], &[], &globals)?;
                         let keys = self.collect_iterable(&keys, &globals)?;
-                        let mut t = target.borrow_mut();
+                        // Resolve each value through the *full* subscript protocol
+                        // (`subscr_via_protocol` honours a user-defined
+                        // `__getitem__`, which the raw `binary_subscr` skips) so
+                        // `{**mapping}` works for any `Mapping` — notably
+                        // `os._Environ`, the source of `{**os.environ}`. Collect
+                        // the pairs first: `__getitem__` re-enters the VM and the
+                        // target dict is a GC root on the stack, so we must not
+                        // hold its `borrow_mut` across the call.
+                        let mut pairs = Vec::with_capacity(keys.len());
                         for k in keys {
-                            let value = self.binary_subscr(&other, &k).map_err(|_| {
-                                type_error(format!(
-                                    "cannot access key in {} for ** spread",
-                                    other.type_name()
-                                ))
-                            })?;
+                            let value =
+                                self.subscr_via_protocol(&other, &k, &globals)
+                                    .map_err(|_| {
+                                        type_error(format!(
+                                            "cannot access key in {} for ** spread",
+                                            other.type_name()
+                                        ))
+                                    })?;
+                            pairs.push((k, value));
+                        }
+                        let mut t = target.borrow_mut();
+                        for (k, value) in pairs {
                             t.insert(crate::object::DictKey(k), value);
                         }
                     }
@@ -4344,8 +5255,56 @@ impl Interpreter {
                 }
             }
             OpCode::PopExcept => {
-                frame.exc_handlers.pop();
-                self.exc_info_stack.borrow_mut().pop();
+                let popped = frame.exc_handlers.pop();
+                // Drop the interpreter-wide `sys.exc_info()` entry first so
+                // its clone of the instance is gone before we test liveness.
+                drop(self.exc_info_stack.borrow_mut().pop());
+                // CPython clears the just-handled exception at the end of an
+                // `except` block (the implicit `del` of the bound name plus
+                // the per-frame exc-state pop). When that exception held the
+                // last reference to a finalizable object — `AttributeError.obj`,
+                // or an exception wrapping a file/process/lock in its args —
+                // its `__del__` must run *now*, matching CPython's refcount
+                // timing rather than waiting for the next cyclic collection
+                // (RFC 0040 deterministic-finalization arc: `test_io` /
+                // `test_subprocess` destructor-timing cases).
+                if let Some((_, pe)) = popped {
+                    // A handled exception is itself an untracked,
+                    // non-finalizable leaf, so it slips past the fast-path
+                    // early-return in `prompt_reap_dropped`; when it anchors a
+                    // finalizable object (`AttributeError.obj`, an exception
+                    // wrapping a file/process) drive the cascade directly so
+                    // that `__del__` runs at handler exit like CPython.
+                    //
+                    // A *weakref* to the exception (or, equivalently, to a
+                    // value reachable only through it) must likewise observe
+                    // the death now: CPython frees the just-handled exception
+                    // by refcount the instant the `except` block ends, so
+                    // `weakref.ref(e)()` is already `None` on the next line —
+                    // even with the cycle GC disabled. `test_multiprocessing`'s
+                    // `TestManagerExceptions` (bpo-106558, "Manager exceptions
+                    // avoid creating cyclic references") asserts exactly this
+                    // under `gc.disable()` with a *non-finalizable* `Empty()`
+                    // /`RemoteError`, which the finalizable-only pre-check would
+                    // leave pinned on its GC handle until the next collection.
+                    //
+                    // Both pre-checks keep the hot path cheap: the
+                    // overwhelmingly common scalar-arg exception that nothing
+                    // weakly references and has nothing to finalize skips the
+                    // allocating cascade entirely (the O(1) `count_for` probe
+                    // short-circuits before the depth-bounded
+                    // `exc_has_finalizable` walk). Binding the exception to an
+                    // outer name (`except E as e: saved = e`) or a pending
+                    // re-raise keeps its refcount above the dead threshold, and
+                    // every cascade node is independently refcount-guarded, so
+                    // the reap is a no-op in those cases too.
+                    let weakly_observed = crate::weakref_registry::count_for(
+                        crate::weakref_registry::id_of(&pe.instance),
+                    ) > 0;
+                    if weakly_observed || Self::exc_has_finalizable(&pe.instance, 6) {
+                        self.reap_dead_subgraph(pe.instance);
+                    }
+                }
             }
             OpCode::PrepReraiseStar => {
                 // [excs_list, orig] -> [result]
@@ -4513,7 +5472,14 @@ impl Interpreter {
                 let value = frame.pop()?;
                 let globals = frame.globals.clone();
                 let formatted = self.format_value(&value, conversion, spec.as_ref(), &globals)?;
-                frame.push(Object::from_str(formatted));
+                // A surrogate-bearing value formats into bridged PUA code
+                // points; map them back so the f-string fragment is a faithful
+                // `WStr`. Non-`WStr` values never produce bridge-window output.
+                if matches!(value, Object::WStr(_)) {
+                    frame.push(crate::builtins::bridge_to_object(&formatted));
+                } else {
+                    frame.push(Object::from_str(formatted));
+                }
             }
             OpCode::YieldValue => {
                 let v = frame.pop()?;
@@ -5283,12 +6249,31 @@ impl Interpreter {
                     // Only callables bind; plain values (`__doc__`
                     // strings, sentinels stored in a base's dict) are
                     // returned as-is, like CPython's generic getattr.
-                    return Ok(match f {
+                    match f {
                         Object::Function(_) | Object::Builtin(_) => {
-                            Object::BoundMethod(Rc::new(BoundMethod::new(obj.clone(), f)))
+                            return Ok(Object::BoundMethod(Rc::new(BoundMethod::new(
+                                obj.clone(),
+                                f,
+                            ))));
                         }
-                        other => other,
-                    });
+                        // A property / getset surfaced from a *builtin base's
+                        // own type dict* was already consulted by the instance
+                        // lookup, which walks the full MRO and applies the
+                        // descriptor protocol. Reaching this rescue therefore
+                        // means the getter itself raised `AttributeError`;
+                        // propagate that (fall through to `result`) instead of
+                        // handing back the raw descriptor object. Without this,
+                        // `TextIOWrapper(BytesIO()).name` and the
+                        // `Buffered*.name` / `.mode` getsets leak a
+                        // `<property object>` over a nameless buffer, breaking
+                        // `tempfile.SpooledTemporaryFile.name`'s
+                        // `try: return self._file.name; except AttributeError:
+                        // return None` (and `repr`'s `name=` probe). Restricted
+                        // to instance receivers — class-level access
+                        // (`load_attr_type`) still returns the descriptor.
+                        Object::Property(_) if matches!(obj, Object::Instance(_)) => {}
+                        other => return Ok(other),
+                    }
                 }
             }
             // CPython's `PyObject_GetAttr` augments *any* propagating
@@ -6007,7 +6992,22 @@ impl Interpreter {
                 // serve as its own buffer.
                 if let Object::File(f) = obj {
                     match name {
-                        "buffer" | "raw" => {
+                        "buffer" => {
+                            // Only a *text* stream exposes `.buffer` (its binary
+                            // underlayer). Binary streams (`BytesIO`,
+                            // `BufferedRandom`, `FileIO`) have none in CPython —
+                            // `SpooledTemporaryFile.rollover` switches on
+                            // `hasattr(f, 'buffer')` to tell a text rollover from
+                            // a binary one, so a binary file must fall through to
+                            // `AttributeError` here.
+                            if let Some(b) = f.binary_buffer() {
+                                return Ok(b);
+                            }
+                        }
+                        "raw" => {
+                            // `.raw` is the raw layer under a buffered binary
+                            // stream; our collapsed `PyFile` is its own raw layer
+                            // (and a text stream forwards to its binary buffer).
                             if let Some(b) = f.binary_buffer() {
                                 return Ok(b);
                             }
@@ -6021,23 +7021,91 @@ impl Interpreter {
                                 )),
                             }
                         }
-                        "mode" => return Ok(Object::from_str(&f.mode)),
+                        "mode" => {
+                            // In-memory `BytesIO`/`StringIO` carry no `.mode`
+                            // (CPython); OS-backed files and standard streams
+                            // do. `SpooledTemporaryFile.mode` relies on the
+                            // `BytesIO` `AttributeError` to fall back to the
+                            // requested mode string. Binary streams report the
+                            // canonical `FileIO` mode (`'w+b'` → `'rb+'`).
+                            if !f.is_memory() {
+                                return Ok(Object::from_str(f.reported_mode()));
+                            }
+                        }
                         "closed" => return Ok(Object::Bool(f.is_closed())),
+                        // `FileIO.closefd` (CPython): OS-backed streams expose
+                        // whether they own the descriptor; in-memory streams
+                        // have no such attribute.
+                        "closefd" => {
+                            if !f.is_memory() {
+                                return Ok(Object::Bool(f.closefd.get()));
+                            }
+                        }
                         "encoding" => {
-                            return Ok(if f.binary {
-                                Object::None
-                            } else {
-                                Object::from_static("utf-8")
-                            })
+                            // Only *text* OS-backed streams (CPython's
+                            // `TextIOWrapper`) expose `.encoding`; binary
+                            // streams and in-memory `BytesIO`/`StringIO` raise
+                            // `AttributeError`. Report the codec the stream was
+                            // actually opened with (defaulting to UTF-8).
+                            if !f.binary && !f.is_memory() {
+                                let enc = f
+                                    .encoding
+                                    .borrow()
+                                    .clone()
+                                    .unwrap_or_else(|| "utf-8".to_owned());
+                                return Ok(Object::from_str(enc));
+                            }
                         }
                         "errors" => {
-                            return Ok(if f.binary {
-                                Object::None
-                            } else {
-                                Object::from_static("strict")
-                            })
+                            if !f.binary && !f.is_memory() {
+                                let err = f
+                                    .errors
+                                    .borrow()
+                                    .clone()
+                                    .unwrap_or_else(|| "strict".to_owned());
+                                return Ok(Object::from_str(err));
+                            }
                         }
-                        "newlines" => return Ok(Object::None),
+                        "newlines" => {
+                            // Text streams (including `StringIO`) expose
+                            // `.newlines`; binary streams do not. The value
+                            // reflects the line endings seen so far.
+                            if !f.binary {
+                                return Ok(f.newlines_obj());
+                            }
+                        }
+                        "_CHUNK_SIZE" => {
+                            // CPython's `TextIOWrapper._CHUNK_SIZE` (default
+                            // 8192) — the text read-chunk size. Only a real
+                            // text wrapper has one; binary streams and
+                            // `StringIO` raise `AttributeError`. A user-set
+                            // value (in `extra_attrs`) wins; else the default.
+                            // `test_io`'s `_default_chunk_size()` reads it off a
+                            // plain `open(path, "r")` (a monolithic text file).
+                            if f.io_kind.get() == crate::object::IoKind::Text {
+                                if let Some(v) = f.get_extra_attr(name) {
+                                    return Ok(v);
+                                }
+                                return Ok(Object::Int(8192));
+                            }
+                        }
+                        "__dict__" => {
+                            // CPython's concrete io objects (`FileIO`,
+                            // `BytesIO`, `StringIO`, `Buffered*`,
+                            // `TextIOWrapper`) carry an instance `__dict__` and
+                            // accept arbitrary attribute assignment. We keep
+                            // per-instance attributes in `extra_attrs`; surface
+                            // them as a dict so `hasattr(f, "__dict__")` and
+                            // `vars(f)` behave (`test_io.test_types_have_dict`).
+                            let mut d = crate::object::DictData::new();
+                            for (k, v) in f.extra_attrs.borrow().iter() {
+                                d.insert(
+                                    crate::object::DictKey(Object::from_str(k.clone())),
+                                    v.clone(),
+                                );
+                            }
+                            return Ok(Object::Dict(Rc::new(RefCell::new(d))));
+                        }
                         _ => {}
                     }
                 }
@@ -6980,14 +8048,32 @@ impl Interpreter {
         // the borrow window tight and lets us route the result either
         // to the native stdout sink or — when `file=` is supplied —
         // through that object's `write` method, exactly like CPython.
+        // Build the line preserving lone surrogates: a `WStr` argument is
+        // bridged (surrogates → PUA window) into the working `String`, then the
+        // whole line is canonicalised back to a `str`/`WStr` so a surrogate
+        // survives to the destination (`stringify`/Rust `String` would
+        // otherwise flatten it to U+FFFD).
         let mut text = String::new();
+        let mut saw_surrogate = false;
         for (i, a) in args.iter().enumerate() {
             if i > 0 {
                 text.push_str(&sep);
             }
-            text.push_str(&self.stringify(a, globals)?);
+            match a {
+                Object::WStr(cps) => {
+                    saw_surrogate = true;
+                    text.push_str(&crate::builtins::bridge_encode_cps(cps));
+                }
+                Object::Str(s) => text.push_str(s),
+                _ => text.push_str(&self.stringify(a, globals)?),
+            }
         }
         text.push_str(&end);
+        let line_obj = if saw_surrogate {
+            crate::builtins::bridge_to_object(&text)
+        } else {
+            Object::from_str(text)
+        };
 
         match file {
             // `print(..., file=f)` calls `f.write(...)` so any
@@ -6995,11 +8081,15 @@ impl Interpreter {
             // `io.StringIO`, or a user type with a `write` method.
             Some(f) => {
                 let write = self.load_attr(&f, "write")?;
-                self.call(&write, &[Object::from_str(text)], &[], globals)?;
+                self.call(&write, &[line_obj], &[], globals)?;
             }
-            None => {
-                self.write_to_stdout(&text, globals)?;
-            }
+            None => match &line_obj {
+                Object::Str(s) => self.write_to_stdout(s, globals)?,
+                // Surrogate line to the default sink: route the actual code
+                // points through the current `sys.stdout` so its encoding +
+                // error handler decide the bytes (CPython behaviour).
+                _ => self.write_codepoints_to_stdout(&line_obj, globals)?,
+            },
         }
         Ok(Object::None)
     }
@@ -7045,6 +8135,35 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Write a surrogate-bearing line (a `str`/`WStr`) to the current
+    /// `sys.stdout`. A reassigned stream receives the object directly so its
+    /// own encoding / error handler applies; the default host sink emits
+    /// lossless WTF-8 (UTF-8 + `surrogatepass`), the closest faithful encoding
+    /// for a lone surrogate when no Python-level error handler is in play.
+    fn write_codepoints_to_stdout(
+        &mut self,
+        line: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(target) = self.current_sys_attr("stdout") {
+            let is_default_sink = matches!(
+                &target,
+                Object::File(f) if matches!(&*f.backend.borrow(), FileBackend::Stdout(_))
+            );
+            if !is_default_sink {
+                let write = self.load_attr(&target, "write")?;
+                self.call(&write, &[line.clone()], &[], globals)?;
+                return Ok(());
+            }
+        }
+        let cps = line.str_codepoints().unwrap_or_default();
+        let bytes = crate::stdlib::codecs_mod::encode_codepoints(&cps, "utf-8", "surrogatepass")
+            .unwrap_or_default();
+        let mut sink = self.stdout.borrow_mut();
+        let _ = sink.write_all(&bytes);
+        Ok(())
+    }
+
     /// CPython `PRINT_EXPR`: route a top-level expression-statement value
     /// through `sys.displayhook`. A user-installed hook is called as-is;
     /// the default hook skips `None`, echoes `repr(value)` to the current
@@ -7085,6 +8204,12 @@ impl Interpreter {
         v: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // `str(x)` on an exact `str` is the identity (CPython returns the same
+        // object); for a `WStr` that identity is what preserves its lone
+        // surrogates — `stringify` would otherwise flatten them to U+FFFD.
+        if matches!(v, Object::Str(_) | Object::WStr(_)) {
+            return Ok(v.clone());
+        }
         Ok(Object::from_str(self.stringify(v, globals)?))
     }
 
@@ -7191,7 +8316,12 @@ impl Interpreter {
                 // A conversion always yields a `str`; the spec then
                 // applies to that string.
                 let converted = match c {
-                    's' => self.stringify(&value, globals)?,
+                    // `!s` of a lone-surrogate string is the string itself
+                    // (bridged); `stringify` would otherwise lose surrogates.
+                    's' => match &value {
+                        Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
+                        _ => self.stringify(&value, globals)?,
+                    },
                     'r' => self.repr_of(&value, globals)?,
                     'a' => self.ascii_of(&value, globals)?,
                     other => {
@@ -7643,6 +8773,95 @@ impl Interpreter {
         self.emit_runtime_warning(message)
     }
 
+    /// Public shim letting Rust stdlib builtins raise a `ResourceWarning`
+    /// through the live `warnings` machinery (so `catch_warnings` /
+    /// `assertWarns` see it). Used by `os.scandir`'s iterator finaliser for
+    /// the "unclosed scandir iterator" case, mirroring CPython's
+    /// `PyErr_ResourceWarning`.
+    pub(crate) fn warn_resource_from_builtin(
+        &mut self,
+        message: String,
+    ) -> Result<(), RuntimeError> {
+        let Some(warn) = self.module_attr("warnings", "warn") else {
+            return Ok(());
+        };
+        let category = Object::Type(
+            crate::builtin_types::builtin_types()
+                .resource_warning
+                .clone(),
+        );
+        let globals = self.builtins.clone();
+        self.call(&warn, &[Object::from_str(message), category], &[], &globals)
+            .map(|_| ())
+    }
+
+    /// Drain the thread-local deferred-`ResourceWarning` queue, emitting each
+    /// message through the live `warnings` machinery. Destructors
+    /// (`impl Drop for PyFile`) enqueue "unclosed file …" messages here rather
+    /// than warning in place — an `Rc` can drop to zero mid-instruction while a
+    /// container is borrowed, so re-entering `warnings.warn` from the drop would
+    /// panic. The eval loop and `gc.collect()` call this at safe points where no
+    /// container borrow is held, giving the warnings CPython's dealloc timing.
+    /// A warning raised by an escalating filter can't propagate out of a
+    /// finalizer, so per-message errors are swallowed (CPython writes them via
+    /// `PyErr_WriteUnraisable`; surfacing them here would corrupt the active
+    /// frame's error state at an unrelated bytecode boundary).
+    pub(crate) fn drain_pending_resource_warnings(&mut self) {
+        for message in crate::vm_singletons::take_pending_resource_warnings() {
+            let _ = self.warn_resource_from_builtin(message);
+        }
+    }
+
+    /// Public shim letting Rust stdlib builtins raise a `DeprecationWarning`
+    /// through the live `warnings` machinery (so `catch_warnings` /
+    /// `assertWarns` see it, and an escalating filter turns it into a raised
+    /// exception). Used by `os.fork()` for the multi-threaded-fork case,
+    /// mirroring CPython's `warn_about_fork_with_threads`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn warn_deprecation_from_builtin(
+        &mut self,
+        message: String,
+    ) -> Result<(), RuntimeError> {
+        self.emit_deprecation_warning(message)
+    }
+
+    /// Public shim emitting PEP 597's `EncodingWarning("'encoding' argument
+    /// not specified.")` through the live `warnings` machinery, gated on the
+    /// `-X warn_default_encoding` flag. `stacklevel` is forwarded to
+    /// `warnings.warn` so the warning is attributed to the user's call site
+    /// (CPython's `PyErr_WarnEx(PyExc_EncodingWarning, …, stacklevel)` inside
+    /// the C `_io.text_encoding` / `_io.open`). Used by the native
+    /// `io.text_encoding` and `io.open` text paths. A no-op when the flag is
+    /// off or `warnings` is unavailable.
+    pub(crate) fn warn_encoding_default_from_builtin(
+        &mut self,
+        stacklevel: i64,
+    ) -> Result<(), RuntimeError> {
+        if !crate::vm_singletons::warn_default_encoding() {
+            return Ok(());
+        }
+        let Some(warn) = self.module_attr("warnings", "warn") else {
+            return Ok(());
+        };
+        let category = Object::Type(
+            crate::builtin_types::builtin_types()
+                .encoding_warning
+                .clone(),
+        );
+        let globals = self.builtins.clone();
+        self.call(
+            &warn,
+            &[
+                Object::from_str("'encoding' argument not specified."),
+                category,
+                Object::Int(stacklevel),
+            ],
+            &[],
+            &globals,
+        )
+        .map(|_| ())
+    }
+
     /// Emit a `RuntimeWarning` through the live `warnings` machinery so
     /// filters / `catch_warnings` apply. Used for "coroutine … was
     /// never awaited" at finalization.
@@ -7783,6 +9002,11 @@ impl Interpreter {
             | Object::Bool(_)
             | Object::Float(_)
             | Object::Str(_)
+            // A WTF-8 `str` (one holding lone surrogates, stored as `WStr`) is
+            // still a `str`: `int('1\ud800')` must parse its text and raise
+            // `ValueError`, exactly like CPython, not the `TypeError` the
+            // non-string fallback below would give.
+            | Object::WStr(_)
             | Object::Bytes(_)
             | Object::ByteArray(_) => builtins::b_int_compat(args),
             // `int(buffer)` parses the buffer's bytes as an int literal
@@ -7951,6 +9175,10 @@ impl Interpreter {
             | Object::Bool(_)
             | Object::Float(_)
             | Object::Str(_)
+            // A WTF-8 `str` (lone surrogates, stored as `WStr`) is still a
+            // `str`: `float('\ud8f0')` must parse its text and raise
+            // `ValueError`, not the non-string `TypeError` below.
+            | Object::WStr(_)
             | Object::Bytes(_)
             | Object::ByteArray(_) => builtins::b_float_compat(args),
             Object::MemoryView(_) => builtins::b_float_compat(args),
@@ -8733,7 +9961,43 @@ impl Interpreter {
                 Err(e) => return Err(e),
             }
         }
+        // Native ABCs (e.g. the `io` `IOBase`/`RawIOBase`/`BufferedIOBase`/
+        // `TextIOBase` family) record virtual subclasses in a `_abc_registry`
+        // set via `register()`. CPython's `ABCMeta.__subclasscheck__` honours
+        // that registry; the native isinstance path must too, otherwise
+        // `isinstance(_pyio.BufferedReader(...), io.IOBase)` — the layered `io`
+        // module's classes are the registered `_pyio` ones — wrongly returns
+        // False. Match if `real` is, or descends from, any registered class.
+        if Self::class_is_abc_registered(cls, &real) {
+            return Ok(Object::Bool(true));
+        }
         Ok(Object::Bool(false))
+    }
+
+    /// Whether `candidate` is registered against the native ABC `cls` via its
+    /// `_abc_registry` set (directly, or as a descendant of a registered
+    /// virtual subclass). Mirrors one level of CPython's
+    /// `ABCMeta.__subclasscheck__` registry walk — sufficient for the `io` ABC
+    /// family, where `_pyio` registers each of `IOBase`/`RawIOBase`/
+    /// `BufferedIOBase`/`TextIOBase`.
+    fn class_is_abc_registered(cls: &Rc<TypeObject>, candidate: &Rc<TypeObject>) -> bool {
+        let reg = cls
+            .dict
+            .borrow()
+            .get(&crate::object::DictKey(Object::from_static(
+                "_abc_registry",
+            )))
+            .cloned();
+        if let Some(Object::Set(s)) = reg {
+            for k in s.borrow().iter() {
+                if let Object::Type(r) = &k.0 {
+                    if Rc::ptr_eq(r, candidate) || candidate.is_subclass_of(r) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// `issubclass(cls, classinfo)` — same protocol as
@@ -10010,6 +11274,16 @@ impl Interpreter {
                     )))
                 }
             }
+            // A file *is* its own iterator (CPython `file.__next__`): `next(f)`
+            // yields the next line and raises `ValueError` on a closed stream
+            // (`test_io.test_io_after_close`).
+            Object::File(_) => match crate::builtins::file_next(std::slice::from_ref(iter)) {
+                Ok(v) => Ok(Some(v)),
+                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            },
             _ => Err(type_error(format!(
                 "'{}' object is not an iterator",
                 iter.type_name_owned()
@@ -10872,9 +12146,14 @@ impl Interpreter {
         // mini-language) get a crack at the spec.
         let converted = match conversion {
             0 => None,
-            1 => Some(self.stringify(value, globals)?), // !s
-            2 => Some(self.repr_of(value, globals)?),   // !r
-            3 => Some(ascii_repr(value)),               // !a
+            // !s — `str(value)`. A `WStr` *is* its own `str`, so bridge its
+            // surrogates rather than going through the lossy `stringify`.
+            1 => Some(match value {
+                Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
+                _ => self.stringify(value, globals)?,
+            }),
+            2 => Some(self.repr_of(value, globals)?), // !r
+            3 => Some(ascii_repr(value)),             // !a
             _ => {
                 return Err(RuntimeError::Internal(format!(
                     "unknown f-string conversion {conversion}"
@@ -11513,13 +12792,13 @@ impl Interpreter {
     /// `finally` blocks run; we mirror that by routing through
     /// `generator_throw` and absorbing the resulting StopIteration.
     fn gen_method_close(&mut self, receiver: &Object) -> Result<Object, RuntimeError> {
-        // Snapshot finalizable locals before the frame is torn down:
-        // CPython's refcounting runs their `__del__` the moment
-        // `close()` drops the frame (gh-142766), and tests assert on
-        // that promptness.
+        // Snapshot reapable locals/stack before the frame is torn down:
+        // CPython's refcounting runs their `__del__` (and clears their
+        // weakrefs) the moment `close()` drops the frame (gh-142766),
+        // and tests assert on that promptness.
         let frame_caps = match receiver {
             Object::Generator(g) | Object::Coroutine(g) | Object::AsyncGenerator(g) => {
-                frame_finalizables(g)
+                frame_reapables(g)
             }
             _ => Vec::new(),
         };
@@ -11858,6 +13137,7 @@ impl Interpreter {
                 // string we get from `from_builtin("StopIteration",
                 // "")`.
                 *gen.state.borrow_mut() = GeneratorState::Finished;
+                self.reap_dead_frame(&mut frame);
                 Err(stop_iteration_with(v))
             }
             Ok(FrameOutcome::StartGenerator) => {
@@ -11868,7 +13148,9 @@ impl Interpreter {
             }
             Err(err) => {
                 *gen.state.borrow_mut() = GeneratorState::Finished;
-                Err(self.pep479_escape(gen, err))
+                let escaped = self.pep479_escape(gen, err);
+                self.reap_dead_frame(&mut frame);
+                Err(escaped)
             }
         }
     }
@@ -12279,8 +13561,15 @@ impl Interpreter {
         // (in bytes mode) `%b`/`%s` dispatch `__bytes__`. Other `%` operand
         // types fall through to the pure `binary_op` path.
         if matches!(op, BinOpKind::Mod) {
-            if let Object::Str(template) = a {
-                let template = template.clone();
+            if a.is_str() {
+                // Surrogate-aware printf: a `WStr` template (and any `WStr`
+                // argument resolved via `%s`) bridges its lone surrogates into
+                // the PUA window for the UTF-8 engine, then maps them back.
+                let template = match a {
+                    Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
+                    _ => a.to_str(),
+                };
+                let bridged = matches!(a, Object::WStr(_)) || percent_args_have_wstr(b);
                 let mut resolve =
                     |obj: &Object, kind: char| -> Result<Option<String>, RuntimeError> {
                         // Classes also need dispatch: a metaclass `__repr__`
@@ -12293,16 +13582,23 @@ impl Interpreter {
                                 _ => return Ok(None),
                             };
                             Ok(Some(s))
+                        } else if let Object::WStr(cps) = obj {
+                            // `%s` of a lone-surrogate string is itself; `%r`/`%a`
+                            // fall through to the (ASCII-escaping) default.
+                            match kind {
+                                's' => Ok(Some(crate::builtins::bridge_encode_cps(cps))),
+                                _ => Ok(None),
+                            }
                         } else {
                             Ok(None)
                         }
                     };
-                return Ok(Object::from_str(percent_format_with(
-                    &template,
-                    b,
-                    PercentMode::Str,
-                    &mut resolve,
-                )?));
+                let rendered = percent_format_with(&template, b, PercentMode::Str, &mut resolve)?;
+                return Ok(if bridged {
+                    crate::builtins::bridge_to_object(&rendered)
+                } else {
+                    Object::from_str(rendered)
+                });
             }
             if matches!(a, Object::Bytes(_) | Object::ByteArray(_)) {
                 return self.bytes_percent_format(a, b, globals);
@@ -13007,22 +14303,28 @@ impl Interpreter {
                         if dict_len > key_idx as usize {
                             frame.pop()?;
                             let val = frame.pop()?;
-                            // The slot still exists; reach in by
-                            // index and overwrite. We rebuild the
-                            // mutable borrow here because the
-                            // earlier read-only check has been
-                            // dropped.
-                            if let Some((_, slot)) =
-                                inst.dict.borrow_mut().get_index_mut(key_idx as usize)
-                            {
-                                // Mirror the slow path: a bound method stored
-                                // on the instance must join the cycle collector
-                                // (see `generic_setattr_instance`).
-                                if matches!(val, Object::BoundMethod(_)) {
-                                    gc_trace::track(val.clone());
-                                }
-                                *slot = val;
+                            // Mirror the slow path: a bound method stored
+                            // on the instance must join the cycle collector
+                            // (see `generic_setattr_instance`).
+                            if matches!(val, Object::BoundMethod(_)) {
+                                gc_trace::track(val.clone());
+                            }
+                            // The slot still exists; reach in by index and
+                            // overwrite, recovering the displaced value. We
+                            // rebuild the mutable borrow here because the
+                            // earlier read-only check has been dropped, and
+                            // scope it tightly so it is released before the
+                            // prompt-reap cascade (which can run `__del__`).
+                            let old = inst
+                                .dict
+                                .borrow_mut()
+                                .get_index_mut(key_idx as usize)
+                                .map(|(_, slot)| std::mem::replace(slot, val));
+                            if let Some(old) = old {
                                 specialize::record_hit(op_idx);
+                                // CPython decrefs the overwritten value now;
+                                // reap it if this was its last live binding.
+                                self.maybe_prompt_reap_replaced(old);
                                 return Ok(());
                             }
                         }
@@ -13588,6 +14890,11 @@ impl Interpreter {
         if name == "__getattribute__" {
             ty.invalidate_getattribute_cache();
         }
+        // Likewise, assigning `__del__` flips whether instances need a
+        // finalizer; refresh the cache `PyInstance::drop` consults.
+        if name == "__del__" {
+            ty.invalidate_finalizer_cache();
+        }
         Ok(())
     }
 
@@ -13630,6 +14937,9 @@ impl Interpreter {
         }
         if name == "__getattribute__" {
             ty.invalidate_getattribute_cache();
+        }
+        if name == "__del__" {
+            ty.invalidate_finalizer_cache();
         }
         Ok(())
     }
@@ -13856,10 +15166,11 @@ impl Interpreter {
             // data attributes remain read-only.
             Object::File(f) => match name {
                 "name" => {
-                    match value {
-                        Object::Str(s) => f.set_name(s.to_string()),
-                        other => f.set_name(other.type_name().to_owned()),
-                    }
+                    // CPython's `FileIO.name` is a plain writable attribute: it
+                    // round-trips whatever object is assigned (str path, bytes
+                    // path, or the integer fd that `tempfile` rewrites it to for
+                    // anonymous temp files). Store the value verbatim.
+                    f.set_name(value.clone());
                     Ok(())
                 }
                 // CPython's file objects carry a `__dict__`, so user code can
@@ -14128,9 +15439,16 @@ impl Interpreter {
         if matches!(value, Object::BoundMethod(_)) {
             gc_trace::track(value.clone());
         }
-        inst.dict
+        // `insert` returns the value this store displaces; reap it if the
+        // slot held its last live binding, mirroring CPython's decref of the
+        // previous attribute value (see `maybe_prompt_reap_replaced`).
+        let old = inst
+            .dict
             .borrow_mut()
             .insert(DictKey(Object::from_str(name)), value);
+        if let Some(old) = old {
+            self.maybe_prompt_reap_replaced(old);
+        }
         Ok(())
     }
 
@@ -14235,6 +15553,24 @@ impl Interpreter {
                     )))
                 }
             }
+            // `del f.attr` on a file removes a per-instance attribute set via
+            // `setattr` (CPython files carry a `__dict__`). A user-assigned
+            // `f.name` override is likewise removable; intrinsic file names and
+            // unknown attributes raise `AttributeError` (never `TypeError`), so
+            // `test.support.swap_attr`'s `except AttributeError` cleanup works.
+            Object::File(f) => {
+                if f.delete_extra_attr(name) {
+                    return Ok(());
+                }
+                if name == "name" && f.clear_name_override() {
+                    return Ok(());
+                }
+                Err(attribute_error(format!(
+                    "'{}' object has no attribute '{}'",
+                    obj.type_name(),
+                    name
+                )))
+            }
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),
@@ -14253,6 +15589,23 @@ impl Interpreter {
         obj: &Object,
         name: &str,
     ) -> Result<(), RuntimeError> {
+        // `io.TextIOWrapper._CHUNK_SIZE` is a getset descriptor in CPython: it
+        // can be read and reassigned, but `del t._CHUNK_SIZE` runs the setter
+        // with a NULL value, which raises `AttributeError("cannot delete
+        // attribute")`. WeavePy backs the slot with an instance-dict entry for
+        // the get/set fast paths, so a plain delete would silently succeed —
+        // guard it explicitly to match the descriptor
+        // (`test_io.test_del__CHUNK_SIZE_SystemError`).
+        if name == "_CHUNK_SIZE"
+            && inst
+                .cls()
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| Rc::ptr_eq(t, &crate::stdlib::io::build_iobase_family().text_io_wrapper))
+        {
+            return Err(attribute_error("cannot delete attribute".to_owned()));
+        }
         // BaseException getsets: the core exception attributes can be
         // reassigned but never deleted (CPython `BaseException_*`
         // setters reject NULL).
@@ -14371,21 +15724,49 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         match obj {
-            Object::Str(_) | Object::Bytes(_) => Ok(obj.clone()),
-            _ => match instance_method(obj, "__fspath__") {
-                Some(method) => {
-                    let res = self.call(&method, &[], &[], globals)?;
-                    match res {
-                        Object::Str(_) | Object::Bytes(_) => Ok(res),
-                        other => Err(type_error(format!(
-                            "expected {}.__fspath__() to return str or bytes, not {}",
-                            obj.type_name(),
-                            other.type_name()
-                        ))),
+            // A surrogate-bearing `WStr` is a `str` for path purposes (PEP 383).
+            Object::Str(_) | Object::WStr(_) | Object::Bytes(_) => Ok(obj.clone()),
+            _ => {
+                // A type whose `__fspath__` is `None` is *explicitly* not
+                // path-like (CPython treats `__fspath__ = None` like
+                // `__hash__ = None`). Look up the raw attribute so we can tell
+                // a real method from a `None` sentinel and from "absent"; both
+                // of the latter leave `obj` unchanged so the caller raises the
+                // canonical "expected str, bytes or os.PathLike" TypeError
+                // instead of "'NoneType' object is not callable"
+                // (`test_os.TestPEP519.test_fspath_set_to_None`).
+                let raw = match obj {
+                    Object::Instance(i) => i.cls().lookup("__fspath__"),
+                    _ => None,
+                };
+                match raw {
+                    Some(m) if !matches!(m, Object::None) => {
+                        let method =
+                            Object::BoundMethod(Rc::new(BoundMethod::dispatch(obj.clone(), m)));
+                        let res = self.call(&method, &[], &[], globals)?;
+                        match res {
+                            Object::Str(_) | Object::WStr(_) | Object::Bytes(_) => Ok(res),
+                            other => Err(type_error(format!(
+                                "expected {}.__fspath__() to return str or bytes, not {}",
+                                obj.type_name_owned(),
+                                other.type_name_owned()
+                            ))),
+                        }
                     }
+                    // `__fspath__` explicitly set to `None` means "not
+                    // path-like" — raise the canonical message here (covers
+                    // both `open(obj)` and `os.fspath(obj)`) rather than
+                    // letting a `None()` call surface "'NoneType' object is
+                    // not callable" (`test_os.test_fspath_set_to_None`).
+                    Some(_) => Err(type_error(format!(
+                        "expected str, bytes or os.PathLike object, not {}",
+                        obj.type_name_owned()
+                    ))),
+                    // Truly absent `__fspath__`: leave `obj` unchanged so the
+                    // caller's own converter raises with its own wording.
+                    None => Ok(obj.clone()),
                 }
-                None => Ok(obj.clone()),
-            },
+            }
         }
     }
 
@@ -14442,6 +15823,7 @@ impl Interpreter {
             Object::List(_)
                 | Object::Tuple(_)
                 | Object::Str(_)
+                | Object::WStr(_)
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
                 | Object::Range(_)
@@ -14482,6 +15864,10 @@ impl Interpreter {
                 let idx = normalize_index(*i, chars.len())?;
                 Ok(Object::from_str(chars[idx].to_string()))
             }
+            (Object::WStr(cps), Object::Int(i)) => {
+                let idx = normalize_index(*i, cps.len())?;
+                Ok(Object::str_from_codepoints(vec![cps[idx]]))
+            }
             (Object::Dict(d), key) => {
                 crate::builtins::ensure_hashable(key)?;
                 let d = d.borrow();
@@ -14508,6 +15894,20 @@ impl Interpreter {
                 let sliced = slice_seq(&obj_chars, slc)?;
                 let s: String = sliced.iter().map(|o| o.to_str()).collect();
                 Ok(Object::from_str(s))
+            }
+            (Object::WStr(cps), Object::Slice(slc)) => {
+                // Slice over code points, then canonicalise: a slice that drops
+                // every surrogate becomes a plain `Str` again.
+                let items: Vec<Object> = cps.iter().map(|&c| Object::Int(i64::from(c))).collect();
+                let sliced = slice_seq(&items, slc)?;
+                let out: Vec<u32> = sliced
+                    .iter()
+                    .map(|o| match o {
+                        Object::Int(n) => *n as u32,
+                        _ => unreachable!("slice of int vec yields ints"),
+                    })
+                    .collect();
+                Ok(Object::str_from_codepoints(out))
             }
             (Object::Range(r), Object::Int(i)) => {
                 let len = container.len()? as i64;
@@ -14558,6 +15958,27 @@ impl Interpreter {
                 Ok(Object::ByteArray(Rc::new(RefCell::new(out))))
             }
             (Object::MemoryView(mv), Object::Int(i)) => {
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                let shape = mv.shape_dims();
+                if shape.len() == 1 {
+                    // 1-D: index by element, honouring stride + format so a
+                    // `cast('i')` view yields ints, `cast('d')` yields floats,
+                    // etc. (CPython `memory_subscript` -> `unpack_single`).
+                    let itemsize = mv.itemsize.get().max(1);
+                    let idx = normalize_index(*i, shape[0])?;
+                    let stride0 = mv.stride_bytes()[0];
+                    let off = (mv.start.get() as isize + idx as isize * stride0) as usize;
+                    let fmt = mv_format_char(&mv.format.borrow());
+                    return mv
+                        .buffer
+                        .with_read(|all| mv_unpack_single(fmt, &all[off..off + itemsize]));
+                }
+                // Multi-dimensional integer indexing is not yet a sub-view;
+                // fall back to the flat byte read used previously.
                 let bytes = mv.to_bytes();
                 let idx = normalize_index(*i, bytes.len())?;
                 Ok(Object::Int(i64::from(bytes[idx])))
@@ -14792,6 +16213,99 @@ impl Interpreter {
             }
             (Object::ByteArray(_), other) => Err(type_error(format!(
                 "bytearray indices must be integers or slices, not {}",
+                other.type_name()
+            ))),
+            (Object::MemoryView(mv), Object::Int(i)) => {
+                // `mv[i] = x` writes through to the backing buffer (only a
+                // writable `bytearray`-backed view is assignable; a `bytes`
+                // view is read-only). CPython: `memoryview_ass_sub`.
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                if mv.readonly.get() {
+                    return Err(type_error("cannot modify read-only memory"));
+                }
+                let shape = mv.shape_dims();
+                if shape.len() != 1 {
+                    return Err(type_error(
+                        "memoryview: assignment to multi-dimensional view is not supported",
+                    ));
+                }
+                let itemsize = mv.itemsize.get().max(1);
+                let idx = normalize_index(*i, shape[0])?;
+                let fmt = mv_format_char(&mv.format.borrow());
+                let mut packed = vec![0u8; itemsize];
+                mv_pack_single(fmt, &value, &mut packed)?;
+                let stride0 = mv.stride_bytes()[0];
+                let off = (mv.start.get() as isize + idx as isize * stride0) as usize;
+                mv.buffer
+                    .with_write(|all| all[off..off + itemsize].copy_from_slice(&packed))
+                    .ok_or_else(|| type_error("cannot modify read-only memory"))
+            }
+            (Object::MemoryView(mv), Object::Slice(slc)) => {
+                // `mv[i:j:k] = bytes-like` — the RHS must expose exactly
+                // `slicelen * itemsize` bytes; they are scattered into the
+                // backing buffer following the view's stride so a reversed /
+                // strided sub-view assigns correctly (CPython
+                // `memory_ass_sub` -> `memory_setitem_obj`). This is the path
+                // `_pyio.BufferedReader.readinto` drives (`buf[a:b] = data`).
+                if mv.released.get() {
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
+                }
+                if mv.readonly.get() {
+                    return Err(type_error("cannot modify read-only memory"));
+                }
+                let shape = mv.shape_dims();
+                if shape.len() != 1 {
+                    return Err(type_error(
+                        "memoryview: assignment to multi-dimensional view is not supported",
+                    ));
+                }
+                let itemsize = mv.itemsize.get();
+                let n = shape[0] as i64;
+                let (start_i, _stop, step, slicelen) = adjust_slice(n, slc)?;
+                let src: Vec<u8> = match &value {
+                    Object::Bytes(b) => b.to_vec(),
+                    Object::ByteArray(b) => b.borrow().clone(),
+                    Object::MemoryView(src) => {
+                        if src.released.get() {
+                            return Err(value_error(
+                                "operation forbidden on released memoryview object",
+                            ));
+                        }
+                        src.to_bytes()
+                    }
+                    other => {
+                        return Err(type_error(format!(
+                            "a bytes-like object is required, not '{}'",
+                            other.type_name()
+                        )))
+                    }
+                };
+                if src.len() != slicelen as usize * itemsize {
+                    return Err(value_error(
+                        "memoryview assignment: lvalue and rvalue have different structures",
+                    ));
+                }
+                let stride0 = mv.stride_bytes()[0];
+                let base = mv.start.get() as isize;
+                mv.buffer
+                    .with_write(|d| {
+                        for k in 0..slicelen {
+                            let elem = start_i + k * step;
+                            let off = (base + elem as isize * stride0) as usize;
+                            let s = k as usize * itemsize;
+                            d[off..off + itemsize].copy_from_slice(&src[s..s + itemsize]);
+                        }
+                    })
+                    .ok_or_else(|| type_error("cannot modify read-only memory"))
+            }
+            (Object::MemoryView(_), other) => Err(type_error(format!(
+                "memoryview: invalid slice key: {}",
                 other.type_name()
             ))),
             // A list *does* support assignment; a bad index type is the
@@ -15493,6 +17007,37 @@ impl Interpreter {
                     // underlying static builtins call `Object::make_iter`
                     // directly, which can't drive a Python frame. `dict.update`
                     // has its own richer protocol below, so it's excluded here.
+                    //
+                    // `bytearray.extend` over a buffer exporter (`array.array`,
+                    // `memoryview`, mmap, …) copies the raw bytes through the
+                    // buffer protocol rather than iterating items — matching
+                    // CPython, whose `bytearray.extend` routes any buffer object
+                    // through `bytearray_setslice` *before* the integer-iteration
+                    // fallback. Route those straight to the native method (which
+                    // handles `__buffer__`) so the materialiser below doesn't
+                    // first iterate them into out-of-range int items. `list.extend`
+                    // always iterates, so this is restricted to a bytearray
+                    // receiver.
+                    if b.name == "extend"
+                        && matches!(args.first(), Some(Object::ByteArray(_)))
+                        && args.get(1).is_some_and(|a| {
+                            // Only the materialiser below (gated on
+                            // `object_needs_vm_iter`) would wrongly iterate a
+                            // buffer exporter into ints — so the buffer fast-path
+                            // only matters for those. Short-circuit on the cheap
+                            // `needs_vm_iter` check *before* the `__buffer__` MRO
+                            // lookup, so the hot `bytearray.extend(bytes)` path
+                            // (bytes/bytearray/memoryview are all not vm-iter, and
+                            // the native method handles them directly) pays no
+                            // method-resolution cost. `array.array` is a frozen
+                            // Python class (an `Object::Instance`), so it is
+                            // caught here and routed to the buffer copy.
+                            object_needs_vm_iter(a)
+                                && crate::instance_method(a, "__buffer__").is_some()
+                        })
+                    {
+                        return (b.call)(args);
+                    }
                     if matches!(
                         b.name,
                         "join"
@@ -15715,18 +17260,32 @@ impl Interpreter {
                     // the interpreter-aware engine so nested specs,
                     // conversions and user `__format__` all work.
                     if b.name == ".format" {
-                        let template = match args.first() {
+                        let recv = args.first();
+                        let template = match recv {
                             Some(Object::Str(s)) => s.to_string(),
+                            // A lone-surrogate template bridges into the PUA
+                            // window so the UTF-8 engine can walk it.
+                            Some(Object::WStr(cps)) => crate::builtins::bridge_encode_cps(cps),
                             _ => return Err(type_error("str.format requires a 'str' receiver")),
                         };
                         let rest = &args[1..];
-                        return self
-                            .do_str_format(&template, rest, kwargs, outer_globals)
-                            .map(Object::from_str);
+                        // Bridging participated if the template or any argument
+                        // (positional or keyword) is a lone-surrogate string.
+                        let bridged = matches!(recv, Some(Object::WStr(_)))
+                            || rest.iter().any(|o| matches!(o, Object::WStr(_)))
+                            || kwargs.iter().any(|(_, v)| matches!(v, Object::WStr(_)));
+                        let out = self.do_str_format(&template, rest, kwargs, outer_globals)?;
+                        return Ok(if bridged {
+                            crate::builtins::bridge_to_object(&out)
+                        } else {
+                            Object::from_str(out)
+                        });
                     }
                     if b.name == ".format_map" {
-                        let template = match args.first() {
+                        let recv = args.first();
+                        let template = match recv {
                             Some(Object::Str(s)) => s.to_string(),
+                            Some(Object::WStr(cps)) => crate::builtins::bridge_encode_cps(cps),
                             _ => {
                                 return Err(type_error("str.format_map requires a 'str' receiver"))
                             }
@@ -15737,9 +17296,17 @@ impl Interpreter {
                                 return Err(type_error("format_map() argument must be a mapping"))
                             }
                         };
-                        return self
-                            .do_str_format_map(&template, &mapping, outer_globals)
-                            .map(Object::from_str);
+                        let bridged = matches!(recv, Some(Object::WStr(_)))
+                            || mapping
+                                .borrow()
+                                .iter()
+                                .any(|(_, v)| matches!(v, Object::WStr(_)));
+                        let out = self.do_str_format_map(&template, &mapping, outer_globals)?;
+                        return Ok(if bridged {
+                            crate::builtins::bridge_to_object(&out)
+                        } else {
+                            Object::from_str(out)
+                        });
                     }
                     // Global `format(value[, spec])` builtin — dispatches to
                     // `value.__format__(spec)` (interpreter-aware).
@@ -15749,14 +17316,18 @@ impl Interpreter {
                         }
                         let spec = match args.get(1) {
                             Some(Object::Str(s)) => s.to_string(),
+                            Some(Object::WStr(cps)) => crate::builtins::bridge_encode_cps(cps),
                             None => String::new(),
                             Some(_) => return Err(type_error("format() spec must be a string")),
                         };
-                        return Ok(Object::from_str(self.format_obj_str(
-                            &args[0],
-                            &spec,
-                            outer_globals,
-                        )?));
+                        let bridged = matches!(args.first(), Some(Object::WStr(_)))
+                            || matches!(args.get(1), Some(Object::WStr(_)));
+                        let out = self.format_obj_str(&args[0], &spec, outer_globals)?;
+                        return Ok(if bridged {
+                            crate::builtins::bridge_to_object(&out)
+                        } else {
+                            Object::from_str(out)
+                        });
                     }
                     // PathLike (`__fspath__`) coercion for the path-accepting
                     // builtins. Our Rust `open`/`os.fspath`/`os.fsdecode`/
@@ -17205,6 +18776,7 @@ impl Interpreter {
             Ok(mro) => {
                 *ty.mro.borrow_mut() = mro;
                 ty.invalidate_getattribute_cache();
+                ty.invalidate_finalizer_cache();
                 Ok(())
             }
             Err(e) => {
@@ -17377,6 +18949,7 @@ impl Interpreter {
             }
         }
         ty.invalidate_getattribute_cache();
+        ty.invalidate_finalizer_cache();
         Ok(())
     }
 
@@ -18681,7 +20254,21 @@ impl Interpreter {
         );
         dict.insert(DictKey(Object::from_static("__traceback__")), Object::None);
         drop(dict);
-        Object::Instance(Rc::new(inst))
+        let obj = Object::Instance(Rc::new(inst));
+        // CPython makes every exception GC-tracked (`BaseException` is
+        // `Py_TPFLAGS_HAVE_GC`), so a reference cycle routed through an
+        // exception's `args` or attributes is reclaimable and weakrefs to its
+        // members clear on collection (`test_io.test_blockingioerror`:
+        // `b = BlockingIOError(1, c); c.b = b; b.c = c`). WeavePy's exceptions
+        // were untracked, so such cycles leaked. Track when the exception can
+        // actually anchor a cycle — it holds a non-atomic referent — so the
+        // overwhelmingly common atomic-only exception (`ValueError("msg")`,
+        // `KeyError('k')`, every internal `raise`) stays off the GC books,
+        // matching the container-untracking fast path used for list/dict/set.
+        if exception_holds_nonatomic(&obj) {
+            crate::gc_trace::track(obj.clone());
+        }
+        obj
     }
 
     /// Look up the existing built-in callable that mirrors `cls`'s
@@ -19078,8 +20665,16 @@ impl Interpreter {
             }
         }
         let cache = frame.code.caches.get(cache_pc);
+        // The Python-fast paths *move* `args` into the callee frame (which
+        // reaps its own locals on exit), so they leave `args` empty and the
+        // shared tail's argument reap is a no-op for them. Every other path
+        // keeps `args` borrowed for the duration of the call and falls
+        // through to the tail, where dead argument temporaries — and the
+        // bound-method receiver — are reaped (CPython decrefs a call's
+        // operands the instant it returns; see [`Self::reap_call_args`]).
         match cache {
             IC::CallPyExactNoFree { func_id, argc: ca } => {
+                let mut took_fast = false;
                 if ca as usize == argc {
                     if let Object::Function(f) = &callable {
                         // `func_id` is a raw pointer fingerprint and can
@@ -19102,15 +20697,18 @@ impl Interpreter {
                         {
                             specialize::record_hit(op_idx);
                             let f = f.clone();
-                            let r = self.run_py_exact_nofree(&f, args)?;
+                            let r = self.run_py_exact_nofree(&f, std::mem::take(&mut args))?;
                             frame.push(r);
-                            return Ok(());
+                            took_fast = true;
                         }
                     }
                 }
-                self.deopt_call_generic(frame, cache_pc, &callable, &args)
+                if !took_fast {
+                    self.deopt_call_generic(frame, cache_pc, &callable, &args)?;
+                }
             }
             IC::CallPyExact { func_id, argc: ca } => {
+                let mut took_fast = false;
                 if ca as usize == argc {
                     if let Object::Function(f) = &callable {
                         // Same ABA guard as above: confirm exact arity
@@ -19126,13 +20724,15 @@ impl Interpreter {
                         {
                             specialize::record_hit(op_idx);
                             let f = f.clone();
-                            let r = self.run_py_exact_with_cells(&f, args)?;
+                            let r = self.run_py_exact_with_cells(&f, std::mem::take(&mut args))?;
                             frame.push(r);
-                            return Ok(());
+                            took_fast = true;
                         }
                     }
                 }
-                self.deopt_call_generic(frame, cache_pc, &callable, &args)
+                if !took_fast {
+                    self.deopt_call_generic(frame, cache_pc, &callable, &args)?;
+                }
             }
             IC::Empty => {
                 specialize::record_specialize_attempt(op_idx);
@@ -19145,7 +20745,6 @@ impl Interpreter {
                 }
                 let r = self.call(&callable, &args, &[], &frame.globals)?;
                 frame.push(r);
-                Ok(())
             }
             IC::Cooldown(n) => {
                 let next = if n > 0 {
@@ -19156,14 +20755,18 @@ impl Interpreter {
                 frame.code.caches.set(cache_pc, next);
                 let r = self.call(&callable, &args, &[], &frame.globals)?;
                 frame.push(r);
-                Ok(())
             }
             _ => {
                 let r = self.call(&callable, &args, &[], &frame.globals)?;
                 frame.push(r);
-                Ok(())
             }
         }
+        // Shared tail (skipped via early `?` only on error): reap the
+        // bound-method receiver and any dead argument temporaries now that
+        // the call has returned and the operands are about to be dropped.
+        self.reap_call_receiver(callable);
+        self.reap_call_args(&mut args);
+        Ok(())
     }
 
     /// Deopt a `CALL` cache (guard miss): cool the slot down and run the
@@ -19462,6 +21065,29 @@ impl Interpreter {
         if matches!(recv, Object::Iter(_)) {
             return self.iter_reduce(recv, globals);
         }
+        // `range` and `slice` carry their state in the constructor args, not
+        // in `__new__`; CPython's `range_reduce`/`slice_reduce` return
+        // `(type, (start, stop, step))`. The default newobj reduction would
+        // call `range.__new__(range)` / `slice.__new__(slice)` with no args
+        // and fail to round-trip (manager-proxy pickling of a list holding a
+        // `range`/`slice`: test_multiprocessing test_list*).
+        match recv {
+            Object::Range(r) => {
+                let type_obj = crate::builtins::class_of(recv);
+                let args = Object::new_tuple(vec![
+                    crate::object::int_from_i128(r.start),
+                    crate::object::int_from_i128(r.stop),
+                    crate::object::int_from_i128(r.step),
+                ]);
+                return Ok(Object::new_tuple(vec![Object::Type(type_obj), args]));
+            }
+            Object::Slice(s) => {
+                let type_obj = crate::builtins::class_of(recv);
+                let args = Object::new_tuple(vec![s.start.clone(), s.stop.clone(), s.step.clone()]);
+                return Ok(Object::new_tuple(vec![Object::Type(type_obj), args]));
+            }
+            _ => {}
+        }
         // `set`/`frozenset` and their subclasses reduce as
         // `(type, (list(elements),), state)` — CPython `set_reduce`. The
         // default newobj reduction rebuilds an *empty* set because a set's
@@ -19686,6 +21312,15 @@ impl Interpreter {
             Object::File(f) => f.clone(),
             _ => return Err(type_error("writelines() requires a file receiver")),
         };
+        // `writelines([])` on a closed stream raises `ValueError` *before*
+        // inspecting the (empty) iterable (`test_io.test_io_after_close`);
+        // CPython's `CHECK_CLOSED` runs first.
+        crate::builtins::file_check_open(&file)?;
+        // A read-only stream raises `io.UnsupportedOperation` on `writelines`
+        // (`test_io.test_invalid_operations`), just like `write`.
+        if !file.writable() {
+            return Err(crate::stdlib::io::unsupported_op("write"));
+        }
         let iterable = args
             .first()
             .ok_or_else(|| type_error("writelines() takes exactly one argument"))?;
@@ -19697,6 +21332,12 @@ impl Interpreter {
                 }
                 Object::Bytes(b) => {
                     file.write_bytes(&b)?;
+                }
+                // A binary stream accepts any buffer-protocol item
+                // (`array.array`, `memoryview`, a PEP 688 `__buffer__`
+                // exporter), like CPython's `writelines`.
+                other if file.binary => {
+                    file.write_bytes(&crate::builtins::bytes_argview(&other)?)?;
                 }
                 other => {
                     return Err(type_error(format!(
@@ -19876,9 +21517,25 @@ impl Interpreter {
             }
             _ => return Err(type_error("exec() locals must be a mapping")),
         };
-        let code_rc = match source {
-            Object::Code(c) => c,
-            Object::Str(src) => {
+        // Accept str, bytes/bytearray (decoded via the PEP 263 cookie, UTF-8
+        // default, like CPython), or an already-compiled code object.
+        let exec_src: Option<String> = match &source {
+            Object::Code(_) => None,
+            Object::Str(src) => Some(src.to_string()),
+            Object::Bytes(b) => Some(crate::decode_compile_source_bytes(b, "<string>")?),
+            Object::ByteArray(b) => {
+                Some(crate::decode_compile_source_bytes(&b.borrow(), "<string>")?)
+            }
+            other => {
+                return Err(type_error(format!(
+                    "exec() expected str or code, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        let code_rc = match (exec_src, source) {
+            (None, Object::Code(c)) => c,
+            (Some(src), _) => {
                 // A malformed source must surface as `SyntaxError` (with a
                 // location), exactly like `compile()` — CPython's `exec`
                 // never raises `ValueError` for bad syntax. Invalid-escape
@@ -19889,12 +21546,7 @@ impl Interpreter {
                         .map_err(|e| compile_error_to_syntax_error(&e, &src, "<string>"))?;
                 Rc::new(compiled)
             }
-            other => {
-                return Err(type_error(format!(
-                    "exec() expected str or code, got {}",
-                    other.type_name()
-                )))
-            }
+            _ => unreachable!(),
         };
         // Ensure the globals dict carries a `__builtins__` entry so
         // user code can reach `print`, `range`, etc. Mirrors how
@@ -19991,6 +21643,11 @@ impl Interpreter {
                 return self.run_frame(&mut frame);
             }
             Object::Str(s) => s.to_string(),
+            // CPython's `eval`/`exec` accept a bytes/bytearray source and
+            // decode it honouring a PEP 263 coding cookie (UTF-8 default).
+            // `test_subprocess` round-trips child stdout through `eval(...)`.
+            Object::Bytes(b) => crate::decode_compile_source_bytes(&b, "<string>")?,
+            Object::ByteArray(b) => crate::decode_compile_source_bytes(&b.borrow(), "<string>")?,
             other => {
                 return Err(type_error(format!(
                     "eval() expected str or code, got {}",
@@ -20050,10 +21707,35 @@ impl Interpreter {
                 .ok_or_else(|| module_not_found_error(format!("import of '{top_name}' failed")));
         }
         if let Object::Tuple(items) = fromlist {
+            // The source module for the hasattr check below: re-read from
+            // sys.modules so a module that replaced itself during execution
+            // (`decimal` → `_pydecimal`) is the one we consult.
+            let source = self.cache.get(&absolute);
             for item in items.iter() {
                 if let Object::Str(s) = item {
                     if s.as_ref() == "*" {
                         continue;
+                    }
+                    // CPython's `_handle_fromlist` only imports `pkg.<name>`
+                    // when `name` is *not already an attribute* of the
+                    // package. A name the package re-exports from its
+                    // `__init__` must win over a like-named submodule file:
+                    // `multiprocessing.__init__` copies `Pool`/`Queue`/… off
+                    // the default context (`globals().update(...)`), and
+                    // importing the `multiprocessing.Pool` submodule would
+                    // both shadow that attribute and — on a case-insensitive
+                    // filesystem — resolve `Pool` → `pool.py`, leaving
+                    // `from multiprocessing import Pool` bound to a
+                    // non-callable module object (`_test_multiprocessing`
+                    // `WithProcessesTestPoolWorkerLifetime`).
+                    if let Some(Object::Module(m)) = &source {
+                        if m.dict
+                            .borrow()
+                            .get(&DictKey(Object::from_str(s.as_ref())))
+                            .is_some()
+                        {
+                            continue;
+                        }
                     }
                     let sub_name = format!("{absolute}.{s}");
                     let _ = self.import_path(&sub_name);
@@ -20119,11 +21801,51 @@ impl Interpreter {
         self.cache.insert("os.path", path_mod);
     }
 
+    /// Install CPython's write-through `os.environ` / `os.environb`
+    /// (`_Environ` mappings) over the native snapshot, by importing the
+    /// `_weave_envinit` helper for its side effect (RFC 0040 WS1).
+    ///
+    /// Idempotent and self-healing: a successful import leaves
+    /// `_weave_envinit` in the module cache, which short-circuits future
+    /// calls. An early-startup failure (the `abc` machinery the mapping
+    /// subclasses isn't ready when `os` is first imported) is rolled back
+    /// out of the cache so the next `os` import retries — by then user code
+    /// is running and every dependency resolves. The `INSTALLING` guard
+    /// breaks the re-entrant `import os` the helper itself performs.
+    fn ensure_os_environ(&mut self) {
+        thread_local! {
+            static INSTALLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        // Already installed for this interpreter?
+        if self.cache.get("_weave_envinit").is_some() {
+            return;
+        }
+        if INSTALLING.with(std::cell::Cell::get) {
+            return;
+        }
+        INSTALLING.with(|c| c.set(true));
+        let result = self.import_path("_weave_envinit");
+        INSTALLING.with(|c| c.set(false));
+        if result.is_err() {
+            // Drop the half-initialised module so a later import retries.
+            self.cache.remove("_weave_envinit");
+        }
+    }
+
     /// Load a single fully-qualified module name. Honours the cache
     /// first, then the built-in registry, then frozen Python sources,
     /// then the filesystem.
     fn load_one(&mut self, full: &str) -> Result<Object, RuntimeError> {
         if let Some(cached) = self.cache.get(full) {
+            // RFC 0040 WS1 — `os` is imported extremely early in startup
+            // (before the `abc`/`collections.abc` machinery the `_Environ`
+            // mapping subclasses is ready), so the first attempt to install
+            // the write-through `environ`/`environb` can fail. Retry on every
+            // subsequent `os` import until it lands; once it does the
+            // `_weave_envinit` module is cached and this is a no-op.
+            if full == "os" {
+                self.ensure_os_environ();
+            }
             return Ok(cached);
         }
         // During interpreter shutdown only already-imported modules
@@ -20137,6 +21859,22 @@ impl Interpreter {
         }
         if let Some(factory) = self.cache.builtin_factory(full) {
             let module = factory(&self.cache);
+            // RFC 0040 — attribute every native builtin in the freshly built
+            // module to that module so `fn.__module__` reports the module
+            // rather than the default `"builtins"`. CPython's C functions
+            // carry their defining module (`os.getpid.__module__ == 'posix'`);
+            // without this a bare `os.*` / `math.*` submitted to a `spawn` /
+            // `forkserver` `ProcessPoolExecutor` worker fails to pickle by
+            // reference ("Can't pickle <built-in function getpid>: it's not
+            // found as builtins.getpid"). The cache hands back its `&'static`
+            // key so nothing is leaked per import.
+            if let Some(static_name) = self.cache.builtin_static_name(full) {
+                for (_k, v) in module.dict.borrow().iter() {
+                    if matches!(v, Object::Builtin(_)) {
+                        crate::descr_registry::register_module(v, static_name);
+                    }
+                }
+            }
             let obj = Object::Module(module);
             self.cache.insert(full, obj.clone());
             // CPython's `os` re-exports the platform path module: `import
@@ -20150,6 +21888,9 @@ impl Interpreter {
             // recursion. On any failure the Rust fallback stays in place.
             if full == "os" {
                 self.bind_os_path(&obj);
+                // RFC 0040 WS1 — replace the native snapshot `environ` with
+                // CPython's write-through `_Environ` (and add `environb`).
+                self.ensure_os_environ();
             }
             return Ok(obj);
         }
@@ -20157,7 +21898,26 @@ impl Interpreter {
             // Distinct per-module pseudo-filenames (`<frozen contextlib>`)
             // let tracebacks resolve source lines through `linecache`'s
             // frozen-source hook (backed by `_imp.find_frozen`).
-            let display = format!("<frozen {full}>");
+            let mut display = format!("<frozen {full}>");
+            // A frozen *package* that is also present on disk (the usual case
+            // under a vendored CPython `Lib/`) should be indistinguishable from
+            // an on-disk import: compile its body with the *real* source path as
+            // `co_filename`, matching the real-path `__file__`/`__path__` that
+            // `run_frozen_compiled` sets for such packages. Otherwise the code
+            // object's frames carry `<frozen pkg>` while `__file__` points at
+            // disk, and any consumer that bridges the two breaks — notably
+            // `warnings.warn(..., skip_file_prefixes=(os.path.dirname(__file__),))`
+            // (zipfile's "Overlapped entries" warning must blame the caller, not
+            // zipfile's own frame). Real-path code is never written to the
+            // process-global frozen cache (the cache key is the `<frozen …>`
+            // shape), so we also bypass the cache fast-path here.
+            let mut frozen_cacheable = true;
+            if frozen.is_package {
+                if let Some((path, true)) = self.cache.find_source(full) {
+                    display = path.to_string_lossy().into_owned();
+                    frozen_cacheable = false;
+                }
+            }
             // RFC 0021 — frozen modules pay a parse + compile cost
             // on every fresh `Interpreter::new()` (tests, the REPL,
             // and the bench harness all spin up many). A
@@ -20165,8 +21925,10 @@ impl Interpreter {
             // the *second* and subsequent interpreters skip both
             // stages and go straight from `&'static str` source to
             // a fully-compiled `CodeObject`.
-            if let Some(code) = frozen_code_cache::get(full) {
-                return self.run_frozen_compiled(full, code, frozen.is_package, &display);
+            if frozen_cacheable {
+                if let Some(code) = frozen_code_cache::get(full) {
+                    return self.run_frozen_compiled(full, code, frozen.is_package, &display);
+                }
             }
             return self.load_from_source(full, frozen.source, frozen.is_package, &display);
         }
@@ -20258,9 +22020,124 @@ impl Interpreter {
             self.cache.insert(full, module_obj.clone());
             return Ok(module_obj);
         }
+        // Last resort: hand off to the Python `sys.meta_path` finders for
+        // module kinds the native loader doesn't understand — modules inside
+        // ZIP archives on `sys.path` (`zipimport`) and sourceless `.pyc`
+        // files reached through a custom finder. CPython's `__import__` *is*
+        // the meta-path machinery; this bridges WeavePy's Rust loader to it
+        // (RFC 0040 WS5: `python app.zip`, `-m pkg.mod` from a zip, and the
+        // `multiprocessing` spawn re-import of a zip/`.pyc` `__main__`).
+        if let Some(module) = self.try_meta_path_import(full)? {
+            return Ok(module);
+        }
         let err = module_not_found_error(format!("No module named '{full}'"));
         crate::error::set_exception_attr(&err, "name", Object::from_str(full.to_owned()));
         Err(err)
+    }
+
+    /// Resolve `full` through the Python `sys.meta_path` finders, loading the
+    /// located spec via `importlib._bootstrap._load`. Returns `Ok(None)` when
+    /// no finder claims the name (the caller then raises
+    /// `ModuleNotFoundError`); load-time errors of a *found* module
+    /// propagate. The parent package is already imported and bound by
+    /// [`Self::import_path`] before the child reaches here, so the helper can
+    /// scope the search to `sys.modules[parent].__path__`.
+    fn try_meta_path_import(&mut self, full: &str) -> Result<Option<Object>, RuntimeError> {
+        // Re-entrancy guard. The fallback itself imports its dependency
+        // closure (`importlib.machinery`, `zipimport`, `zipfile`, …); those
+        // resolve natively, but guard against a pathological cycle in which
+        // resolving `full` recursively asks for `full` again.
+        thread_local! {
+            static IN_PROGRESS: RefCell<std::collections::HashSet<String>> =
+                RefCell::new(std::collections::HashSet::new());
+        }
+        if !IN_PROGRESS.with(|s| s.borrow_mut().insert(full.to_owned())) {
+            return Ok(None);
+        }
+        let result = self.meta_path_import_inner(full);
+        IN_PROGRESS.with(|s| {
+            s.borrow_mut().remove(full);
+        });
+        result
+    }
+
+    fn meta_path_import_inner(&mut self, full: &str) -> Result<Option<Object>, RuntimeError> {
+        let helper = match self.import_path("_weave_import_fallback") {
+            Ok(Object::Module(m)) => m,
+            _ => return Ok(None),
+        };
+        let func = helper
+            .dict
+            .borrow()
+            .get(&DictKey(Object::from_static("import_via_finders")))
+            .cloned();
+        let Some(func) = func else {
+            return Ok(None);
+        };
+        let helper_globals = helper.dict.clone();
+        // The helper returns `None` (not found / namespace / no code) or the
+        // tuple `(code, is_package, filename, locations, loader, spec)`. We
+        // build the module *natively* from the code object so it is a true
+        // `Object::Module` — dotted-import binding and `IMPORT_FROM` only
+        // recognise native modules, not `types.ModuleType` instances.
+        let payload = match self.call(
+            &func,
+            &[Object::from_str(full.to_owned())],
+            &[],
+            &helper_globals,
+        )? {
+            Object::Tuple(t) => t,
+            _ => return Ok(None),
+        };
+        let Some(Object::Code(code_rc)) = payload.first().cloned() else {
+            return Ok(None);
+        };
+        let is_package = matches!(payload.get(1), Some(Object::Bool(true)));
+        let filename = match payload.get(2) {
+            Some(Object::Str(s)) => s.to_string(),
+            _ => format!("<{full}>"),
+        };
+        let locations = payload.get(3).cloned().unwrap_or(Object::None);
+        let loader = payload.get(4).cloned().unwrap_or(Object::None);
+        let spec = payload.get(5).cloned().unwrap_or(Object::None);
+
+        let package_owned = if is_package {
+            full.to_owned()
+        } else {
+            full.rsplit_once('.')
+                .map_or(String::new(), |(p, _)| p.to_owned())
+        };
+        let pkg_for_globals = (!package_owned.is_empty()).then_some(package_owned.as_str());
+        let globals = self.build_module_globals(full, Some(&filename), pkg_for_globals);
+        {
+            let mut g = globals.borrow_mut();
+            g.insert(DictKey(Object::from_static("__loader__")), loader);
+            g.insert(DictKey(Object::from_static("__spec__")), spec);
+            if is_package {
+                // A package's `__path__` (the finder's search locations) is
+                // what lets the Rust loader's parent-`__path__` walk and the
+                // meta-path fallback resolve `pkg.sub` against the archive.
+                let path_list = match locations {
+                    Object::List(_) => locations,
+                    _ => Object::new_list(Vec::new()),
+                };
+                g.insert(DictKey(Object::from_static("__path__")), path_list);
+            }
+        }
+        let module_obj = Object::Module(Rc::new(PyModule {
+            name: full.to_owned(),
+            filename: Some(filename),
+            dict: globals.clone(),
+        }));
+        // Register before executing so circular imports observe the partial
+        // module (CPython's `_load` contract).
+        self.cache.insert(full, module_obj.clone());
+        let mut frame = self.make_frame(code_rc, Vec::new(), Vec::new(), globals, true);
+        if let Err(e) = self.run_frame(&mut frame) {
+            self.cache.remove(full);
+            return Err(e);
+        }
+        Ok(Some(module_obj))
     }
 
     /// Compile and execute Python source provided as a string. Used
@@ -20318,13 +22195,41 @@ impl Interpreter {
         let globals = self.build_module_globals(full, Some(filename), pkg_for_globals);
         // Frozen packages, like on-disk ones, expose a `__path__` so
         // package-detection (`runpy` package → `__main__` redirect,
-        // `pkgutil`, `importlib`) treats them as packages. There is no
-        // backing directory, so the list is empty — submodules resolve
-        // through the frozen registry, not a filesystem walk.
+        // `pkgutil`, `importlib`) treats them as packages.
         if is_package {
+            // When the *same* package is also reachable on `sys.path` (the
+            // usual case under a real CPython `Lib/`), report its filesystem
+            // `__file__`/`__path__` — CPython does, and introspective code
+            // depends on it: `_test_multiprocessing._TestImportStar` globs
+            // `os.path.dirname(multiprocessing.__file__)/*.py` to enumerate
+            // submodules, and `pkgutil.iter_modules(pkg.__path__)` walks the
+            // directory. Execution still runs the frozen bytecode (the code
+            // object's `co_filename` stays `<frozen pkg>` so tracebacks and
+            // `linecache` resolve through the frozen-source hook); only the
+            // module's metadata points at disk. With no on-disk copy (a
+            // from-binary-only run) fall back to the synthetic
+            // `<frozen pkg>/__init__.py` shape, whose `os.path.dirname` is
+            // still the bare `<frozen pkg>` other code keys off of (e.g.
+            // `zipfile`'s `skip_file_prefixes` overlap warning).
+            let (file_attr, path_list) = match self.cache.find_source(full) {
+                Some((init_path, true)) => {
+                    let dir = init_path
+                        .parent()
+                        .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+                    (
+                        init_path.to_string_lossy().into_owned(),
+                        vec![Object::from_str(dir)],
+                    )
+                }
+                _ => (format!("{filename}/__init__.py"), Vec::new()),
+            };
             globals.borrow_mut().insert(
                 DictKey(Object::from_static("__path__")),
-                Object::new_list(Vec::new()),
+                Object::new_list(path_list),
+            );
+            globals.borrow_mut().insert(
+                DictKey(Object::from_static("__file__")),
+                Object::from_str(file_attr),
             );
         }
         let module_obj = Object::Module(Rc::new(PyModule {
@@ -21263,6 +23168,111 @@ pub(crate) fn normalize_index(i: i64, len: usize) -> Result<usize, RuntimeError>
     Ok(idx as usize)
 }
 
+/// The significant single-character code of a memoryview/struct format,
+/// dropping a leading native/standard byte-order prefix. `memoryview.cast`
+/// only admits native single-char formats, so byte order is always native.
+pub(crate) fn mv_format_char(fmt: &str) -> char {
+    let s = fmt.strip_prefix(['@', '=', '<', '>', '!']).unwrap_or(fmt);
+    s.chars().next().unwrap_or('B')
+}
+
+/// Unpack one native-endian element (`bytes.len() == itemsize`) into a
+/// Python scalar, per CPython `memoryobject.c:unpack_single`. Integer
+/// formats yield `int`, `f`/`d` yield `float`, `?` yields `bool`, and `c`
+/// yields a length-1 `bytes`.
+pub(crate) fn mv_unpack_single(fmt: char, bytes: &[u8]) -> Result<Object, RuntimeError> {
+    let a2 = || -> [u8; 2] { bytes[..2].try_into().unwrap() };
+    let a4 = || -> [u8; 4] { bytes[..4].try_into().unwrap() };
+    let a8 = || -> [u8; 8] { bytes[..8].try_into().unwrap() };
+    Ok(match fmt {
+        'b' => Object::Int(i64::from(bytes[0] as i8)),
+        'B' => Object::Int(i64::from(bytes[0])),
+        '?' => Object::Bool(bytes[0] != 0),
+        'c' => Object::Bytes(Rc::from(&bytes[..1])),
+        'h' => Object::Int(i64::from(i16::from_ne_bytes(a2()))),
+        'H' => Object::Int(i64::from(u16::from_ne_bytes(a2()))),
+        'i' => Object::Int(i64::from(i32::from_ne_bytes(a4()))),
+        'I' => Object::Int(i64::from(u32::from_ne_bytes(a4()))),
+        'l' | 'q' | 'n' => Object::Int(i64::from_ne_bytes(a8())),
+        'L' | 'Q' | 'N' | 'P' => Object::int_from_i128(i128::from(u64::from_ne_bytes(a8()))),
+        'f' => Object::Float(f64::from(f32::from_ne_bytes(a4()))),
+        'd' => Object::Float(f64::from_ne_bytes(a8())),
+        _ => {
+            return Err(type_error(
+                "memoryview: format not supported for element access",
+            ))
+        }
+    })
+}
+
+/// Pack a Python scalar into `out` (`out.len() == itemsize`) in native byte
+/// order, per CPython `memoryobject.c:pack_single`. Wrong operand types
+/// raise `TypeError`, out-of-range integers raise `ValueError`.
+pub(crate) fn mv_pack_single(
+    fmt: char,
+    value: &Object,
+    out: &mut [u8],
+) -> Result<(), RuntimeError> {
+    let as_i128 = |v: &Object| -> Option<i128> {
+        match v {
+            Object::Bool(b) => Some(i128::from(*b)),
+            Object::Int(i) => Some(i128::from(*i)),
+            Object::Long(b) => b.to_i128(),
+            _ => None,
+        }
+    };
+    let as_f64 = |v: &Object| -> Option<f64> {
+        match v {
+            Object::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Object::Int(i) => Some(*i as f64),
+            Object::Long(b) => b.to_f64(),
+            Object::Float(f) => Some(*f),
+            _ => None,
+        }
+    };
+    let bad_type = || type_error(format!("memoryview: invalid type for format '{fmt}'"));
+    let bad_val = || value_error(format!("memoryview: invalid value for format '{fmt}'"));
+    macro_rules! pack_int {
+        ($t:ty) => {{
+            let v = as_i128(value).ok_or_else(bad_type)?;
+            if v < i128::from(<$t>::MIN) || v > i128::from(<$t>::MAX) {
+                return Err(bad_val());
+            }
+            let n = std::mem::size_of::<$t>();
+            out[..n].copy_from_slice(&(v as $t).to_ne_bytes());
+        }};
+    }
+    match fmt {
+        'b' => pack_int!(i8),
+        'B' => pack_int!(u8),
+        'h' => pack_int!(i16),
+        'H' => pack_int!(u16),
+        'i' => pack_int!(i32),
+        'I' => pack_int!(u32),
+        'l' | 'q' | 'n' => pack_int!(i64),
+        'L' | 'Q' | 'N' | 'P' => pack_int!(u64),
+        '?' => out[0] = u8::from(value.is_truthy()),
+        'c' => match value {
+            Object::Bytes(b) if b.len() == 1 => out[0] = b[0],
+            _ => return Err(bad_type()),
+        },
+        'f' => {
+            let v = as_f64(value).ok_or_else(bad_type)?;
+            out[..4].copy_from_slice(&(v as f32).to_ne_bytes());
+        }
+        'd' => {
+            let v = as_f64(value).ok_or_else(bad_type)?;
+            out[..8].copy_from_slice(&v.to_ne_bytes());
+        }
+        _ => {
+            return Err(type_error(
+                "memoryview: format not supported for element access",
+            ))
+        }
+    }
+    Ok(())
+}
+
 /// Map a `bool` to the equivalent `Int` (`True`→1, `False`→0), leaving any
 /// other object untouched. `bool` is an `int` subclass in Python, so a bool
 /// used as a sequence index must act as 0/1.
@@ -21826,6 +23836,29 @@ fn exception_value(instance: &Object) -> Object {
 /// the sort key is a user instance whose class defines a real Python
 /// `__lt__` (`functools.cmp_to_key`'s `K`, rich-comparable dataclasses,
 /// …). Everything else keeps the native `Object::cmp` fast path.
+/// True when a freshly-built exception instance holds at least one non-atomic
+/// referent (in `args` or a named slot) and could therefore anchor a reference
+/// cycle. Mirrors the container-untracking optimization: an exception whose
+/// every value is a scalar leaf (`ValueError("msg")`, `KeyError('k')`) can
+/// never close a cycle, so the collector skips it; one carrying an object
+/// (`OSError(1, obj)`) is tracked so the cycle is reclaimable.
+fn exception_holds_nonatomic(obj: &Object) -> bool {
+    let Object::Instance(inst) = obj else {
+        return false;
+    };
+    let Ok(dict) = inst.dict.try_borrow() else {
+        // Borrowed elsewhere (shouldn't happen on a just-built instance); err
+        // toward tracking rather than silently leaking a potential cycle.
+        return true;
+    };
+    dict.iter().any(|(_, v)| match v {
+        // `args` is always a tuple; inspect its elements so an all-scalar
+        // tuple like `("msg",)` doesn't force tracking.
+        Object::Tuple(t) => t.iter().any(|x| !crate::gc_trace::is_atomic(x)),
+        other => !crate::gc_trace::is_atomic(other),
+    })
+}
+
 /// PEP 3151 errno → `OSError` subclass dispatch. Returns the subclass type
 /// to use when *exactly* `OSError` is being instantiated with a recognised
 /// errno; otherwise returns `cls` unchanged.
@@ -22033,6 +24066,7 @@ fn supports_format_spec(value: &Object) -> bool {
     matches!(
         value,
         Object::Str(_)
+            | Object::WStr(_)
             | Object::Int(_)
             | Object::Long(_)
             | Object::Bool(_)
@@ -22228,7 +24262,13 @@ fn format_via_spec_impl(
     spec: &str,
     allow_int_precision: bool,
 ) -> Result<String, RuntimeError> {
-    let plain = value.to_str();
+    // A surrogate-bearing `WStr` bridges its lone surrogates into the PUA
+    // window so the (UTF-8-only) spec engine can pad/slice it; the Object
+    // boundary (`FormatValue`/`str.format` via `str_result`) maps them back.
+    let plain = match value {
+        Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
+        _ => value.to_str(),
+    };
     if spec.is_empty() {
         return Ok(plain);
     }
@@ -22598,6 +24638,17 @@ pub(crate) enum PercentMode {
 pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, RuntimeError> {
     let mut noop = |_: &Object, _: char| Ok(None);
     percent_format_with(template, value, PercentMode::Str, &mut noop)
+}
+
+/// `true` when a `%`-format argument pack contains a lone-surrogate string,
+/// so the result must be re-canonicalised through the PUA bridge.
+fn percent_args_have_wstr(b: &Object) -> bool {
+    match b {
+        Object::WStr(_) => true,
+        Object::Tuple(items) => items.iter().any(|x| matches!(x, Object::WStr(_))),
+        Object::Dict(d) => d.borrow().iter().any(|(_, v)| matches!(v, Object::WStr(_))),
+        _ => false,
+    }
 }
 
 /// `true` for any value `%d`/`%f` accept as a real number.
@@ -24319,6 +26370,7 @@ fn constant_to_object(c: Constant) -> Object {
         Constant::Float(f) => Object::Float(f),
         Constant::Complex(real, imag) => Object::new_complex(real, imag),
         Constant::Str(s) => Object::from_str(s),
+        Constant::WStr(cps) => Object::str_from_codepoints(cps),
         Constant::Bytes(b) => Object::new_bytes(b),
         Constant::Tuple(xs) => Object::new_tuple(xs.into_iter().map(constant_to_object).collect()),
         Constant::Code(c) => Object::Code(Rc::from(*c)),
@@ -24344,12 +26396,25 @@ fn object_to_constant(o: &Object) -> Constant {
         Object::Float(f) => Constant::Float(*f),
         Object::Complex(c) => Constant::Complex(c.real, c.imag),
         Object::Str(s) => Constant::Str(s.to_string()),
+        Object::WStr(cps) => Constant::WStr(cps.to_vec()),
         Object::Bytes(b) => Constant::Bytes(b.to_vec()),
         Object::Tuple(xs) => Constant::Tuple(xs.iter().map(object_to_constant).collect()),
         Object::FrozenSet(s) => {
             Constant::Tuple(s.iter().map(|k| object_to_constant(&k.0)).collect())
         }
         Object::Code(c) => Constant::Code(Box::new((**c).clone())),
+        // `Ellipsis` (`...`) is a singleton instance of the registry
+        // `ellipsis` type; fold it back to `Constant::Ellipsis` so a `.pyc`
+        // (or `marshal.loads`) round-trips it instead of silently losing it
+        // to `None`. Mirrors `constant_to_object`'s forward mapping.
+        Object::Instance(inst)
+            if crate::sync::Rc::ptr_eq(
+                &inst.cls(),
+                &crate::builtin_types::builtin_types().ellipsis_,
+            ) =>
+        {
+            Constant::Ellipsis
+        }
         _ => Constant::None,
     }
 }
@@ -24426,6 +26491,31 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             out.push_str(y);
             Ok(Object::from_str(out))
         }
+        // Concatenation where at least one side carries a lone surrogate:
+        // splice the code-point sequences and canonicalise. Adjacent
+        // surrogate halves are *not* combined into an astral character
+        // (CPython keeps surrogates distinct), so the result stays a `WStr`.
+        (O::Str(_) | O::WStr(_), O::Str(_) | O::WStr(_), B::Add)
+            if matches!(a, O::WStr(_)) || matches!(b, O::WStr(_)) =>
+        {
+            let mut cps = a.str_codepoints().unwrap();
+            cps.extend_from_slice(&b.str_codepoints().unwrap());
+            Ok(Object::str_from_codepoints(cps))
+        }
+        // `wstr * n` / `n * wstr`.
+        (O::WStr(_), O::Int(n), B::Mult) | (O::Int(n), O::WStr(_), B::Mult) => {
+            let cps = if matches!(a, O::WStr(_)) {
+                a.str_codepoints().unwrap()
+            } else {
+                b.str_codepoints().unwrap()
+            };
+            let times = checked_repeat_count(cps.len(), *n, "string")?;
+            let mut out = Vec::with_capacity(cps.len().saturating_mul(times));
+            for _ in 0..times {
+                out.extend_from_slice(&cps);
+            }
+            Ok(Object::str_from_codepoints(out))
+        }
         (O::Str(x), O::Int(n), B::Mult) | (O::Int(n), O::Str(x), B::Mult) => {
             let times = checked_repeat_count(x.len(), *n, "string")?;
             let mut out = String::new();
@@ -24439,7 +26529,29 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             Ok(Object::from_str(out))
         }
-        (O::Str(template), v, B::Mod) => Ok(Object::from_str(percent_format(template, v)?)),
+        (O::Str(template), v, B::Mod) => {
+            if percent_args_have_wstr(v) {
+                let mut resolve = |obj: &Object, kind: char| match (obj, kind) {
+                    (Object::WStr(cps), 's') => Ok(Some(crate::builtins::bridge_encode_cps(cps))),
+                    _ => Ok(None),
+                };
+                let rendered = percent_format_with(template, v, PercentMode::Str, &mut resolve)?;
+                Ok(crate::builtins::bridge_to_object(&rendered))
+            } else {
+                Ok(Object::from_str(percent_format(template, v)?))
+            }
+        }
+        // A lone-surrogate (`WStr`) template: bridge it (and any `WStr` arg)
+        // through the PUA window, then canonicalise the rendered result.
+        (O::WStr(cps), v, B::Mod) => {
+            let template = crate::builtins::bridge_encode_cps(cps);
+            let mut resolve = |obj: &Object, kind: char| match (obj, kind) {
+                (Object::WStr(c), 's') => Ok(Some(crate::builtins::bridge_encode_cps(c))),
+                _ => Ok(None),
+            };
+            let rendered = percent_format_with(&template, v, PercentMode::Str, &mut resolve)?;
+            Ok(crate::builtins::bridge_to_object(&rendered))
+        }
         (O::Bytes(template), v, B::Mod) => {
             // PEP 461: ``bytes % args`` reuses the text ``%``-engine in
             // bytes mode over a latin-1 (raw byte → 1:1 codepoint) view,
@@ -24484,6 +26596,25 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             out.extend_from_slice(x);
             out.extend_from_slice(&yb);
             Ok(Object::new_bytes(out))
+        }
+        // `bytes`/`bytearray` + any other buffer-protocol object
+        // (`memoryview`, …). CPython's `bytes_concat` calls
+        // `PyObject_GetBuffer` on *both* operands, so `b'x' + memoryview(...)`
+        // concatenates; the result type follows the left operand.
+        // `multiprocessing.connection._send_bytes` depends on this for
+        // `header + buf`, where `buf` is a `BytesIO.getbuffer()` view.
+        // (`memoryview` itself has no `__add__`, so there's no left-side arm.)
+        (O::Bytes(x), O::MemoryView(mv), B::Add) => {
+            let y = mv.to_bytes();
+            let mut out = Vec::with_capacity(x.len() + y.len());
+            out.extend_from_slice(x);
+            out.extend_from_slice(&y);
+            Ok(Object::new_bytes(out))
+        }
+        (O::ByteArray(x), O::MemoryView(mv), B::Add) => {
+            let mut out = x.borrow().clone();
+            out.extend_from_slice(&mv.to_bytes());
+            Ok(Object::new_bytearray(out))
         }
         (O::Bytes(x), O::Int(n), B::Mult) | (O::Int(n), O::Bytes(x), B::Mult) => {
             // `b * 1` returns the operand itself — bytes are immutable, so
