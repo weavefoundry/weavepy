@@ -342,14 +342,23 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("get_terminal_size")),
             builtin("get_terminal_size", os_get_terminal_size),
         );
-        d.insert(
-            DictKey(Object::from_static("uname")),
-            builtin("uname", os_uname),
-        );
-        d.insert(
-            DictKey(Object::from_static("uname_result")),
-            Object::Type(uname_result_type()),
-        );
+        // CPython only exposes `os.uname`/`os.uname_result` on POSIX. Code in
+        // the wild feature-detects with `hasattr(os, 'uname')` (e.g.
+        // `test.support` does `hasattr(os, 'uname') and os.uname()...`), so
+        // registering a stub that *raises* on Windows would make `hasattr`
+        // report `True` and then blow up on the call. Gate the registration to
+        // Unix so the attribute is simply absent on Windows, matching CPython.
+        #[cfg(unix)]
+        {
+            d.insert(
+                DictKey(Object::from_static("uname")),
+                builtin("uname", os_uname),
+            );
+            d.insert(
+                DictKey(Object::from_static("uname_result")),
+                Object::Type(uname_result_type()),
+            );
+        }
         d.insert(
             DictKey(Object::from_static("cpu_count")),
             builtin("cpu_count", os_cpu_count),
@@ -4039,13 +4048,6 @@ fn os_uname(args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
-#[cfg(not(unix))]
-fn os_uname(_args: &[Object]) -> Result<Object, RuntimeError> {
-    Err(crate::error::not_implemented_error(
-        "os.uname() is only available on POSIX in WeavePy",
-    ))
-}
-
 /// Field names of `os.times_result` (CPython `Modules/posixmodule.c`).
 const TIMES_FIELDS: [&str; 5] = [
     "user",
@@ -5031,10 +5033,12 @@ fn make_terminal_size(columns: i64, lines: i64) -> Object {
 }
 
 /// Field names for `os.uname_result` (CPython's `posix.uname_result`).
+#[cfg(unix)]
 const UNAME_FIELDS: [&str; 5] = ["sysname", "nodename", "release", "version", "machine"];
 
 /// `os.uname_result` — the 5-field struct sequence returned by `os.uname()`
 /// (`platform.uname`/`mac_ver` read `.machine`, `.release`, `.sysname`).
+#[cfg(unix)]
 fn uname_result_type() -> Rc<crate::types::TypeObject> {
     struct_seq_type("uname_result", "os", &UNAME_FIELDS)
 }
