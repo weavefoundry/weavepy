@@ -2176,7 +2176,16 @@ pub(crate) fn coerce_f64_opt(o: &Object) -> Result<Option<f64>, RuntimeError> {
         Object::Bool(b) => Ok(Some(if *b { 1.0 } else { 0.0 })),
         Object::Long(b) => {
             use num_traits::ToPrimitive;
-            Ok(Some(b.to_f64().unwrap_or(f64::INFINITY)))
+            // CPython's `float(int)` (PyLong_AsDouble) raises OverflowError when
+            // the magnitude exceeds the finite double range, rather than
+            // silently yielding inf — `math.dist((1, 10**313), …)` relies on
+            // this to reject coordinates that can't be represented.
+            match b.to_f64() {
+                Some(f) if f.is_finite() => Ok(Some(f)),
+                _ => Err(crate::error::overflow_error(
+                    "int too large to convert to float",
+                )),
+            }
         }
         Object::Instance(inst) => {
             if let Some(native) = &inst.native {

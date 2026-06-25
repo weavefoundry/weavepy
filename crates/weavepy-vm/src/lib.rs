@@ -9647,15 +9647,62 @@ impl Interpreter {
     fn do_sum_call(
         &mut self,
         args: &[Object],
+        kwargs: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         if args.is_empty() {
-            return Err(type_error("sum() expects at least one argument"));
+            return Err(type_error(
+                "sum() missing required argument 'iterable' (pos 1)",
+            ));
         }
-        let mut acc = args.get(1).cloned().unwrap_or(Object::Int(0));
+        if args.len() > 2 {
+            return Err(type_error(format!(
+                "sum() takes at most 2 positional arguments ({} given)",
+                args.len()
+            )));
+        }
+        // `start` is positional-or-keyword (CPython `sum(iterable, /, start=0)`).
+        let mut acc = args.get(1).cloned();
+        for (k, v) in kwargs {
+            if k == "start" {
+                if acc.is_some() {
+                    return Err(type_error("sum() got multiple values for argument 'start'"));
+                }
+                acc = Some(v.clone());
+            } else {
+                return Err(type_error(format!(
+                    "sum() got an unexpected keyword argument '{k}'"
+                )));
+            }
+        }
+        let mut acc = acc.unwrap_or(Object::Int(0));
+        // CPython forbids the concatenating types as `start`, steering callers
+        // to the dedicated `join` fast paths (`builtin_sum_impl`).
+        match &acc {
+            Object::Str(_) => {
+                return Err(type_error(
+                    "sum() can't sum strings [use ''.join(seq) instead]",
+                ))
+            }
+            Object::Bytes(_) => {
+                return Err(type_error(
+                    "sum() can't sum bytes [use b''.join(seq) instead]",
+                ))
+            }
+            Object::ByteArray(_) => {
+                return Err(type_error(
+                    "sum() can't sum bytearray [use b''.join(seq) instead]",
+                ))
+            }
+            _ => {}
+        }
+        // Accumulate through the interpreter's binary dispatch so reflected
+        // operands fire: `sum([Fraction(3,5), Fraction(4,5)])` starts at the
+        // int `0`, and `int.__add__(0, Fraction)` returns NotImplemented —
+        // only `Fraction.__radd__` (an interpreter reentry) yields the sum.
         let items = self.collect_iterable(&args[0], globals)?;
         for x in items {
-            acc = binary_op(&acc, &x, BinOpKind::Add)?;
+            acc = self.op_binary(&acc, &x, BinOpKind::Add)?;
         }
         Ok(acc)
     }
@@ -16722,7 +16769,7 @@ impl Interpreter {
                         }
                     }
                     if b.name == "sum" {
-                        return self.do_sum_call(args, outer_globals);
+                        return self.do_sum_call(args, kwargs, outer_globals);
                     }
                     if b.name == "map" && args.len() >= 2 {
                         return self.do_map_call(args, outer_globals);
@@ -27187,16 +27234,30 @@ fn i64_op(x: i64, y: i64, op: BinOpKind) -> Result<Option<Object>, RuntimeError>
             if y == 0 {
                 return Err(zero_division_error("integer division or modulo by zero"));
             }
-            let r = x % y;
-            let adjusted = if r != 0 && ((r < 0) != (y < 0)) {
-                r + y
+            // `i64::MIN % -1` overflows the remainder op (the value is 0);
+            // defer to the bignum path, mirroring the FloorDiv guard above.
+            if x == i64::MIN && y == -1 {
+                None
             } else {
-                r
-            };
-            Some(Object::Int(adjusted))
+                let r = x % y;
+                let adjusted = if r != 0 && ((r < 0) != (y < 0)) {
+                    r + y
+                } else {
+                    r
+                };
+                Some(Object::Int(adjusted))
+            }
         }
         B::Pow => {
             if y < 0 {
+                // `int ** negative` degrades to float pow (CPython routes
+                // through `float_pow`), which makes `0 ** -n` a division by
+                // zero rather than the IEEE `inf` that `powf` would yield.
+                if x == 0 {
+                    return Err(zero_division_error(
+                        "0.0 cannot be raised to a negative power",
+                    ));
+                }
                 return Ok(Some(Object::Float((x as f64).powf(y as f64))));
             }
             // Fall through to bignum if the exponent is wide or if
