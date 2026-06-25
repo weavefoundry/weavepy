@@ -60,7 +60,7 @@ chrono      = { version = "0.4", default-features = false, features = ["clock"] 
 clap        = { version = "4.5", features = ["derive", "wrap_help"] }
 indexmap    = "2.5"
 regex       = "1.10"
-fancy-regex = "0.13"
+fancy-regex = "0.18"
 serde       = { version = "1.0", features = ["derive"] }
 serde_json  = "1.0"
 thiserror   = "2.0"
@@ -71,13 +71,13 @@ walkdir     = "2.5"
 
 # RFC 0017 — OS interface, networking, subprocess.
 mio         = { version = "1.0", features = ["os-poll", "os-ext", "net"] }
-socket2     = { version = "0.5", features = ["all"] }
-sha2        = "0.10"
-sha1        = "0.10"
-sha3        = "0.10"
-md-5        = "0.10"
-digest      = "0.10"
-hmac        = "0.12"
+socket2     = { version = "0.6", features = ["all"] }
+sha2        = "0.11"
+sha1        = "0.11"
+sha3        = "0.12"
+md-5        = "0.11"
+digest      = "0.11"
+hmac        = "0.13"
 blake2b_simd = "1.0"
 blake2s_simd = "1.0"
 base64      = "0.22"
@@ -95,38 +95,38 @@ num-traits  = "0.2"
 num-rational = "0.4"
 byteorder   = "1.5"
 encoding_rs = "0.8"
-bzip2       = { version = "0.4", features = ["static"] }
+bzip2       = { version = "0.6", features = ["static"] }
 xz2         = "0.1"
 lzma-sys    = "0.1"
-rusqlite    = { version = "0.31", features = ["bundled"] }
+rusqlite    = { version = "0.40", features = ["bundled"] }
 rust_decimal = "1.36"
 
 # RFC 0040 WS5 — `pyexpat`: a real streaming XML parser behind the native
 # `pyexpat` module (CPython wraps the C `expat` library; we wrap `quick-xml`,
 # a mature pure-Rust streaming parser). Drives `xmlrpc` (the multiprocessing
 # manager serializer), `xml.sax`, `xml.dom.minidom`, and `xml.etree`.
-quick-xml   = { version = "0.36", features = ["encoding"] }
+quick-xml   = { version = "0.40", features = ["encoding"] }
 
 # RFC 0020 — interactive REPL + CLI surface.
-rustyline   = { version = "14.0", default-features = false, features = ["with-file-history"] }
-dirs        = "5.0"
+rustyline   = { version = "18.0", default-features = false, features = ["with-file-history"] }
+dirs        = "6.0"
 
 # RFC 0022 — C-API foundation (dlopen + cc-driven extension build harness).
-libloading  = "0.8"
+libloading  = "0.9"
 cc          = "1.0"
 
 # RFC 0023 — drop-in stdlib parity + HTTPS.
 unicode-normalization = "0.1"
 unicode-properties    = "0.1"
-unicode_names2        = "2.0"
+unicode_names2        = "3.1"
 memmap2               = "0.9"
 memchr                = "2.8"
 libc                  = "0.2"
 rustls                = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types      = "1.7"
 rustls-pemfile        = "2.1"
-rustls-native-certs   = "0.7"
-webpki-roots          = "0.26"
+rustls-native-certs   = "0.8"
+webpki-roots          = "1.0"
 
 # RFC 0024 — real OS threads, GIL, cycle GC, weakrefs.
 parking_lot           = "0.12"
@@ -136,11 +136,11 @@ crossbeam-utils       = "0.8"
 # RFC 0032 — tier-2 JIT backend (Cranelift). Only compiled when the
 # `jit` feature is enabled (off by default); CI exercises it via
 # `--all-features`. MSRV floor for these is Rust 1.93.
-cranelift-codegen     = "0.132"
-cranelift-frontend    = "0.132"
-cranelift-jit         = "0.132"
-cranelift-module      = "0.132"
-cranelift-native      = "0.132"
+cranelift-codegen     = "0.133"
+cranelift-frontend    = "0.133"
+cranelift-jit         = "0.133"
+cranelift-module      = "0.133"
+cranelift-native      = "0.133"
 
 # Test/bench-only.
 insta       = { version = "1.40", features = ["yaml"] }
