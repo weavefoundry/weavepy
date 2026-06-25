@@ -130,8 +130,8 @@ status = "fail"
 reason = "depends on full unicodedata DB + width handling"
 
 [tests."cpython/Lib/test/test_math.py"]
-status = "fail"
-reason = "measured (RFC 0038): completes in ~44s within the 60s budget and fails (86 ran, 48 fail, 300 error). Dominated by the 3.13 `math.fma` addition (`module 'math' has no attribute 'fma'`) plus gamma/lgamma domain edges. Was recorded `timeout` under the prior 30s budget; the committed 60s budget makes the true completes-and-fails status observable."
+status = "pass"
+reason = "RFC 0041 WS-math (C-accelerator numeric/data tower): passes end-to-end (86 ran, OK, 4 skipped) in ~13s. The math module was rebuilt as a faithful port of CPython 3.13 mathmodule.c: added math.fma/sumprod, rewrote gamma/lgamma (g=6.024 Lanczos + m_sinpi reflection), erf/erfc (series + continued fraction), pow/fmod/frexp/modf/ldexp/remainder/nextafter(steps=)/ulp with exact IEEE-754 domain+overflow semantics, fsum (Shewchuk msum) and hypot/dist (vector_norm with double-length compensated arithmetic), and comb/perm/factorial/gcd/lcm on arbitrary-precision BigInt; loghelper handles huge-int logs via bigint frexp. ceil/floor/trunc dispatch __ceil__/__floor__/__trunc__, gcd/lcm/isqrt and friends coerce via __index__, and hypot/dist accept __float__ elements (iterating tuple subclasses/generators through the VM). Also fixed three core-arithmetic gaps the suite depends on: builtin sum() now accumulates through the interpreter so reflected __radd__ fires (int + Fraction/Decimal), rejects str/bytes/bytearray start, and takes start= as a keyword; float coercion of an over-range int raises OverflowError instead of yielding inf; and 0 ** -negative raises ZeroDivisionError (plus an i64::MIN % -1 remainder-overflow guard)."
 
 [tests."cpython/Lib/test/test_int.py"]
 status = "pass"
