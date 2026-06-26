@@ -1372,10 +1372,61 @@ fn codeseq_to_vec(obj: &Object) -> Result<Vec<u32>, RuntimeError> {
 fn subject_to_vec(obj: &Object) -> Result<Vec<u32>, RuntimeError> {
     match obj {
         Object::Str(s) => Ok(s.chars().map(|c| c as u32).collect()),
+        // A `str` carrying lone surrogates is already a code-point vector;
+        // matching over it lets `re` operate on `surrogateescape` data and
+        // `chr(0xD800)` strings instead of raising `TypeError`.
+        Object::WStr(s) => Ok(s.to_vec()),
         Object::Bytes(b) => Ok(b.iter().map(|&x| u32::from(x)).collect()),
         Object::ByteArray(b) => Ok(b.borrow().iter().map(|&x| u32::from(x)).collect()),
         _ => Err(type_error("expected string or bytes-like object")),
     }
+}
+
+thread_local! {
+    /// One-entry decode cache for [`sre_exec`]. Regex-driven scanners
+    /// (`json`'s pure-Python decoder, `re.finditer`, tokenizers) repeatedly
+    /// call `match`/`search` on the *same* large subject at advancing
+    /// positions. Decoding the whole subject to code points on every call is
+    /// O(n), so a full scan degrades to O(n²) — the cause of `test_json`'s
+    /// deep-recursion cases taking minutes. Keying on the subject's heap
+    /// identity (and holding the source object so its pointer can't be
+    /// reused) makes repeated matches on one immutable subject O(1) after the
+    /// first decode.
+    static SUBJECT_CACHE: std::cell::RefCell<Option<(usize, Object, Rc<Vec<u32>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Stable heap-identity key for an immutable subject. Returns `None` for
+/// subjects that must never be cached because their contents can change
+/// behind the same pointer (mutable `bytearray`).
+fn subject_cache_key(obj: &Object) -> Option<usize> {
+    match obj {
+        Object::Str(s) => Some(Rc::as_ptr(s).cast::<u8>() as usize),
+        Object::WStr(s) => Some(Rc::as_ptr(s).cast::<u8>() as usize),
+        Object::Bytes(b) => Some(Rc::as_ptr(b).cast::<u8>() as usize),
+        _ => None,
+    }
+}
+
+/// Decode the subject into code points, reusing the thread-local cache when
+/// the same immutable subject is matched repeatedly.
+fn decode_subject_cached(obj: &Object) -> Result<Rc<Vec<u32>>, RuntimeError> {
+    let Some(key) = subject_cache_key(obj) else {
+        return Ok(Rc::new(subject_to_vec(obj)?));
+    };
+    let cached = SUBJECT_CACHE.with(|c| match &*c.borrow() {
+        Some((k, _, v)) if *k == key => Some(v.clone()),
+        _ => None,
+    });
+    if let Some(v) = cached {
+        return Ok(v);
+    }
+    let v = Rc::new(subject_to_vec(obj)?);
+    // Hold a clone of the source object so `key` (its heap pointer) stays
+    // valid — a freed allocation could otherwise be reused by a different
+    // string and alias this entry.
+    SUBJECT_CACHE.with(|c| *c.borrow_mut() = Some((key, obj.clone(), v.clone())));
+    Ok(v)
 }
 
 /// `_sre.compile(code, groups)` → an integer handle into the registry.
@@ -1402,7 +1453,8 @@ fn sre_exec(args: &[Object]) -> Result<Object, RuntimeError> {
     let handle = arg_i64(args, 0, "handle")? as usize;
     let cc = registry().lock().get(handle).cloned();
     let cc = cc.ok_or_else(|| value_error("_sre.exec: invalid pattern handle"))?;
-    let subject = subject_to_vec(args.get(1).ok_or_else(|| type_error("_sre.exec: string"))?)?;
+    let subject =
+        decode_subject_cached(args.get(1).ok_or_else(|| type_error("_sre.exec: string"))?)?;
     let slen = subject.len() as i64;
     let pos = arg_i64(args, 2, "pos")?.clamp(0, slen) as usize;
     let endpos = arg_i64(args, 3, "endpos")?.clamp(0, slen) as usize;
@@ -1416,7 +1468,7 @@ fn sre_exec(args: &[Object]) -> Result<Object, RuntimeError> {
         return Ok(Object::None);
     }
 
-    let mut m = Matcher::new(&subject, &cc.code, cc.groups);
+    let mut m = Matcher::new(&subject[..], &cc.code, cc.groups);
     m.end = endpos;
     m.start = pos;
     m.ptr = pos;

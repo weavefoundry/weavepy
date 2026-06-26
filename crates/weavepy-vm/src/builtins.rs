@@ -2650,6 +2650,13 @@ fn b_hasattr(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_vars(args: &[Object]) -> Result<Object, RuntimeError> {
     match args.first() {
+        // A `__slots__`-only instance (no implicit `__dict__` anywhere in its
+        // MRO) has no mapping for `vars()` to return — CPython raises here
+        // rather than handing back an empty dict (`test_statistics`
+        // `NormalDist.test_slots`).
+        Some(Object::Instance(inst)) if inst.cls().forbids_dict => {
+            Err(type_error("vars() argument must have __dict__ attribute"))
+        }
         Some(Object::Instance(inst)) => Ok(Object::Dict(inst.dict.clone())),
         Some(Object::Module(m)) => Ok(Object::Dict(m.dict.clone())),
         Some(Object::Type(t)) => Ok(Object::Dict(t.dict.clone())),
@@ -11365,22 +11372,13 @@ pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
     };
-    let mut out: Vec<u8> = Vec::new();
-    loop {
-        if let Some(lim) = limit {
-            if out.len() >= lim {
-                break;
-            }
-        }
-        let b = f.read_bytes(Some(1))?;
-        if b.is_empty() {
-            break;
-        }
-        out.extend_from_slice(&b);
-        if b[0] == b'\n' {
-            break;
-        }
-    }
+    // Where a line ends depends on the stream's newline policy; the shared
+    // `PyFile::read_line_bytes` scans raw bytes for the right terminator
+    // (binary/`\n`/`\r`/`\r\n`/universal) and `decode_text` then applies any
+    // newline *translation*. The VM's native file iteration
+    // (`PyIterator::File` → `readline_obj`) uses the same core, so explicit
+    // `readline()` and `for line in f` split identically.
+    let out = f.read_line_bytes(limit)?;
     if f.binary {
         Ok(Object::new_bytes(out))
     } else {

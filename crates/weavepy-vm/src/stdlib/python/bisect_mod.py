@@ -1,18 +1,42 @@
-"""Array bisection algorithms — WeavePy port of CPython's ``bisect``.
+"""Bisection algorithms."""
 
-The two public functions are :func:`bisect_left` and
-:func:`bisect_right` (with :func:`bisect` aliasing the latter). They
-return insertion points into a sorted sequence such that the
-sequence stays sorted. :func:`insort_left` / :func:`insort_right` /
-:func:`insort` perform the insertion in place.
-"""
+
+def insort_right(a, x, lo=0, hi=None, *, key=None):
+    """Insert item x in list a, and keep it sorted assuming a is sorted.
+
+    If x is already in a, insert it to the right of the rightmost x.
+
+    Optional args lo (default 0) and hi (default len(a)) bound the
+    slice of a to be searched.
+
+    A custom key function can be supplied to customize the sort order.
+    """
+    if key is None:
+        lo = bisect_right(a, x, lo, hi)
+    else:
+        lo = bisect_right(a, key(x), lo, hi, key=key)
+    a.insert(lo, x)
 
 
 def bisect_right(a, x, lo=0, hi=None, *, key=None):
+    """Return the index where to insert item x in list a, assuming a is sorted.
+
+    The return value i is such that all e in a[:i] have e <= x, and all e in
+    a[i:] have e > x.  So if x already appears in the list, a.insert(i, x) will
+    insert just after the rightmost x already there.
+
+    Optional args lo (default 0) and hi (default len(a)) bound the
+    slice of a to be searched.
+
+    A custom key function can be supplied to customize the sort order.
+    """
+
     if lo < 0:
-        raise ValueError("lo must be non-negative")
+        raise ValueError('lo must be non-negative')
     if hi is None:
         hi = len(a)
+    # Note, the comparison uses "<" to match the
+    # __lt__() logic in list.sort() and in heapq.
     if key is None:
         while lo < hi:
             mid = (lo + hi) // 2
@@ -30,14 +54,43 @@ def bisect_right(a, x, lo=0, hi=None, *, key=None):
     return lo
 
 
-bisect = bisect_right
+def insort_left(a, x, lo=0, hi=None, *, key=None):
+    """Insert item x in list a, and keep it sorted assuming a is sorted.
+
+    If x is already in a, insert it to the left of the leftmost x.
+
+    Optional args lo (default 0) and hi (default len(a)) bound the
+    slice of a to be searched.
+
+    A custom key function can be supplied to customize the sort order.
+    """
+
+    if key is None:
+        lo = bisect_left(a, x, lo, hi)
+    else:
+        lo = bisect_left(a, key(x), lo, hi, key=key)
+    a.insert(lo, x)
 
 
 def bisect_left(a, x, lo=0, hi=None, *, key=None):
+    """Return the index where to insert item x in list a, assuming a is sorted.
+
+    The return value i is such that all e in a[:i] have e < x, and all e in
+    a[i:] have e >= x.  So if x already appears in the list, a.insert(i, x) will
+    insert just before the leftmost x already there.
+
+    Optional args lo (default 0) and hi (default len(a)) bound the
+    slice of a to be searched.
+
+    A custom key function can be supplied to customize the sort order.
+    """
+
     if lo < 0:
-        raise ValueError("lo must be non-negative")
+        raise ValueError('lo must be non-negative')
     if hi is None:
         hi = len(a)
+    # Note, the comparison uses "<" to match the
+    # __lt__() logic in list.sort() and in heapq.
     if key is None:
         while lo < hi:
             mid = (lo + hi) // 2
@@ -55,28 +108,12 @@ def bisect_left(a, x, lo=0, hi=None, *, key=None):
     return lo
 
 
-def insort_right(a, x, lo=0, hi=None, *, key=None):
-    if key is None:
-        a.insert(bisect_right(a, x, lo, hi), x)
-    else:
-        a.insert(bisect_right(a, key(x), lo, hi, key=key), x)
+# Overwrite above definitions with a fast C implementation
+try:
+    from _bisect import *
+except ImportError:
+    pass
 
-
+# Create aliases
+bisect = bisect_right
 insort = insort_right
-
-
-def insort_left(a, x, lo=0, hi=None, *, key=None):
-    if key is None:
-        a.insert(bisect_left(a, x, lo, hi), x)
-    else:
-        a.insert(bisect_left(a, key(x), lo, hi, key=key), x)
-
-
-__all__ = [
-    "bisect",
-    "bisect_left",
-    "bisect_right",
-    "insort",
-    "insort_left",
-    "insort_right",
-]

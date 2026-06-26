@@ -6200,6 +6200,14 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
                 }
             }
         }
+        StmtKind::Match { cases, .. } => {
+            for case in cases {
+                collect_pattern_names(&case.pattern, out);
+                for s in &case.body {
+                    collect_assigned(s, out);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -6326,6 +6334,14 @@ fn collect_decls(
                 }
             }
         }
+        StmtKind::Match { cases, .. } => {
+            for case in cases {
+                collect_pattern_names(&case.pattern, assigned);
+                for s in &case.body {
+                    collect_decls(s, globals, nonlocals, assigned);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -6342,6 +6358,58 @@ fn collect_target_names(expr: &Expr, out: &mut HashSet<String>) {
         }
         ExprKind::Starred(inner) => collect_target_names(inner, out),
         _ => {}
+    }
+}
+
+/// Collect the names a `match` capture pattern binds (`case [x, *rest]:`,
+/// `case {…, **rest}:`, `case Cls(a, key=b):`, `pattern as name`). Like
+/// `collect_target_names` for `match` — without it, a name bound in a case
+/// body/pattern and read by a nested scope is never promoted to a cell, so
+/// the binding `STORE_FAST`s while the closure `LOAD_DEREF`s an empty cell
+/// (`test_statistics` `kde` kernels).
+fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
+    match pat {
+        Pattern::Value(_)
+        | Pattern::Singleton(_)
+        | Pattern::Capture(None)
+        | Pattern::Star(None) => {}
+        Pattern::Capture(Some(n)) | Pattern::Star(Some(n)) => {
+            out.insert(n.clone());
+        }
+        Pattern::Sequence(items) => {
+            for p in items {
+                collect_pattern_names(p, out);
+            }
+        }
+        Pattern::Mapping { patterns, rest, .. } => {
+            for p in patterns {
+                collect_pattern_names(p, out);
+            }
+            if let Some(Some(n)) = rest {
+                out.insert(n.clone());
+            }
+        }
+        Pattern::Class {
+            positionals,
+            keywords,
+            ..
+        } => {
+            for p in positionals {
+                collect_pattern_names(p, out);
+            }
+            for (_, p) in keywords {
+                collect_pattern_names(p, out);
+            }
+        }
+        Pattern::Or(alts) => {
+            for p in alts {
+                collect_pattern_names(p, out);
+            }
+        }
+        Pattern::As { pattern, name } => {
+            out.insert(name.clone());
+            collect_pattern_names(pattern, out);
+        }
     }
 }
 

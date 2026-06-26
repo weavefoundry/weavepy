@@ -16,7 +16,13 @@ import struct as _struct
 __all__ = ['array', 'ArrayType', 'typecodes', '_array_reconstructor']
 
 
-typecodes = 'bBuhHiIlLqQfd'
+typecodes = 'bBuwhHiIlLqQfd'
+
+# Unicode-valued typecodes: their items are length-1 ``str`` code points,
+# not numbers. ``'u'`` is the legacy ``wchar_t`` array (deprecated since
+# 3.3); ``'w'`` is the Py_UCS4 array added in 3.13 and is the recommended
+# spelling. Both pack the code point as an unsigned integer.
+_UNICODE_TYPECODES = ('u', 'w')
 
 
 # Map type code -> (struct format, default value, item size, doc).
@@ -24,6 +30,7 @@ _TYPECODES = {
     'b': ('b', 0, 1, 'signed char'),
     'B': ('B', 0, 1, 'unsigned char'),
     'u': ('H', '\u0000', 2, 'unicode char'),
+    'w': ('I', '\u0000', 4, 'unicode character (Py_UCS4)'),
     'h': ('h', 0, 2, 'signed short'),
     'H': ('H', 0, 2, 'unsigned short'),
     'i': ('i', 0, 4, 'signed int'),
@@ -41,7 +48,7 @@ class array:
     def __init__(self, typecode, initializer=None):
         if not isinstance(typecode, str) or typecode not in _TYPECODES:
             raise ValueError(
-                "bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f or d)"
+                "bad typecode (must be b, B, u, w, h, H, i, I, l, L, q, Q, f or d)"
             )
         self.typecode = typecode
         self._fmt = _TYPECODES[typecode][0]
@@ -50,7 +57,7 @@ class array:
         if initializer is None:
             return
         if isinstance(initializer, str):
-            if typecode == 'u':
+            if typecode in _UNICODE_TYPECODES:
                 self.fromunicode(initializer)
             else:
                 raise TypeError(
@@ -72,14 +79,14 @@ class array:
     # -- internal pack/unpack helpers ------------------------------------
 
     def _coerce(self, value):
-        if self.typecode == 'u':
+        if self.typecode in _UNICODE_TYPECODES:
             if isinstance(value, str) and len(value) == 1:
                 return value
             raise TypeError('array item must be a unicode character')
         return value
 
     def _pack(self, value):
-        if self.typecode == 'u':
+        if self.typecode in _UNICODE_TYPECODES:
             value = self._coerce(value)
             return _struct.pack(self._fmt, ord(value))
         return _struct.pack(self._fmt, value)
@@ -87,7 +94,7 @@ class array:
     def _unpack(self, index):
         off = index * self.itemsize
         value = _struct.unpack_from(self._fmt, self._buf, off)[0]
-        if self.typecode == 'u':
+        if self.typecode in _UNICODE_TYPECODES:
             return chr(value)
         return value
 
@@ -146,6 +153,20 @@ class array:
         items = [bytes(self._buf[i * size:(i + 1) * size]) for i in range(n)]
         items.reverse()
         self._buf[:] = b''.join(items)
+
+    def byteswap(self):
+        # Reverse the byte order of every item in place. CPython supports this
+        # for 1/2/4/8-byte items only (RuntimeError otherwise); it's how code
+        # reading big-endian binary data flips it to native order
+        # (`datetimetester`'s tzfile `ZoneInfo.fromfile`).
+        size = self.itemsize
+        if size not in (1, 2, 4, 8):
+            raise RuntimeError("don't know how to byteswap this array type")
+        if size == 1:
+            return
+        buf = self._buf
+        for off in range(0, len(buf), size):
+            buf[off:off + size] = buf[off:off + size][::-1]
 
     # -- non-mutating queries -------------------------------------------
 
@@ -215,14 +236,14 @@ class array:
         fp.write(self.tobytes())
 
     def fromunicode(self, s):
-        if self.typecode != 'u':
+        if self.typecode not in _UNICODE_TYPECODES:
             raise ValueError("fromunicode() may only be called on "
                              "unicode type arrays")
         for ch in s:
             self.append(ch)
 
     def tounicode(self):
-        if self.typecode != 'u':
+        if self.typecode not in _UNICODE_TYPECODES:
             raise ValueError("tounicode() may only be called on "
                              "unicode type arrays")
         return ''.join(self._unpack(i) for i in range(len(self)))
@@ -328,8 +349,8 @@ class array:
     def __repr__(self):
         if not len(self):
             return "array('%s')" % self.typecode
-        if self.typecode == 'u':
-            return "array('u', %r)" % self.tounicode()
+        if self.typecode in _UNICODE_TYPECODES:
+            return "array('%s', %r)" % (self.typecode, self.tounicode())
         return "array('%s', %r)" % (self.typecode, self.tolist())
 
     def __eq__(self, other):
@@ -381,7 +402,7 @@ class array:
                  self.tobytes()),
             )
         # Portable fallback: reconstruct via (typecode, list).
-        if self.typecode == 'u':
+        if self.typecode in _UNICODE_TYPECODES:
             initializer = self.tounicode()
         else:
             initializer = self.tolist()
@@ -436,6 +457,7 @@ _TYPECODE_TO_MFC = {
     'q': 12, 'Q': 10,
     'f': 14, 'd': 16,
     'u': 18,
+    'w': 20,  # UTF32_LE (Py_UCS4, 4 bytes)
 }
 
 

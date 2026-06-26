@@ -38,6 +38,48 @@ const _: () = {
     assert_sync::<Object>();
 };
 
+/// Number of slots in the per-thread code-point-length cache.
+const STR_LEN_CACHE_CAP: usize = 1024;
+
+thread_local! {
+    /// Direct-mapped cache of `Rc<str>` heap identity -> code-point length.
+    ///
+    /// WeavePy stores `str` as UTF-8, so counting code points — needed by
+    /// `len(s)`, index/slice bounds, and `re` span clamping — is O(n).
+    /// Scanners and tokenisers touch the *same* large string repeatedly, so
+    /// without memoisation an otherwise-linear pass degrades to O(n^2) (the
+    /// cause of `test_json`'s deep-recursion cases hanging). Each slot holds
+    /// the source `Rc` so a freed allocation cannot be reused at the same
+    /// address and alias a stale length; collisions simply recompute and
+    /// overwrite, so the cache is always correct and bounded to CAP entries.
+    static STR_LEN_CACHE: std::cell::RefCell<Vec<Option<(usize, Rc<str>, usize)>>> =
+        std::cell::RefCell::new(vec![None; STR_LEN_CACHE_CAP]);
+}
+
+/// Code-point length of a UTF-8 `str`, memoised by heap identity. O(1) on a
+/// cache hit; O(n) (and caches the result) on a miss. Strings of 0 or 1
+/// bytes are counted directly — they are necessarily 0 or 1 code points, so
+/// caching them would only evict useful entries.
+pub(crate) fn str_char_len(s: &Rc<str>) -> usize {
+    let bytes = s.len();
+    if bytes <= 1 {
+        return bytes;
+    }
+    let ptr = Rc::as_ptr(s).cast::<u8>() as usize;
+    let slot = (ptr / 8) % STR_LEN_CACHE_CAP;
+    STR_LEN_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some((p, _, n)) = &cache[slot] {
+            if *p == ptr {
+                return *n;
+            }
+        }
+        let n = s.chars().count();
+        cache[slot] = Some((ptr, s.clone(), n));
+        n
+    })
+}
+
 /// A Python value as seen by the interpreter.
 #[derive(Clone)]
 pub enum Object {
@@ -3765,18 +3807,96 @@ impl PyFile {
     /// `str` (text mode), or `None` at EOF. Backs lazy file iteration
     /// (`for line in f`) for *both* modes — CPython's file object is its
     /// own iterator and a binary file yields `bytes` lines.
-    pub fn readline_obj(&self) -> Result<Option<Object>, RuntimeError> {
+    /// Read one raw, *untranslated* line's bytes, honoring the stream's
+    /// `newline` policy for where a line ends — newline *translation* is
+    /// applied later by [`decode_text`](Self::decode_text). An optional
+    /// `limit` caps the bytes read (CPython `readline(size)`); a returned
+    /// empty `Vec` means end-of-stream.
+    ///
+    /// Binary streams (and text pinned to `\n`) split on `\n` only; an
+    /// explicit `\r`/`\r\n` newline pins that terminator; universal mode
+    /// (`newline=None`) and the no-translation mode (`newline=""`) both split
+    /// on `\r`, `\n`, *and* `\r\n` (CPython's `IncrementalNewlineDecoder`).
+    /// `\r`/`\n` are ASCII and never occur as UTF-8 continuation bytes, so
+    /// byte-level scanning never splits mid-character.
+    pub fn read_line_bytes(&self, limit: Option<usize>) -> Result<Vec<u8>, RuntimeError> {
+        enum Nl {
+            Lf,
+            Cr,
+            CrLf,
+            Universal,
+        }
+        let nl = if self.binary {
+            Nl::Lf
+        } else {
+            match self.newline.borrow().as_deref() {
+                Some("\n") => Nl::Lf,
+                Some("\r") => Nl::Cr,
+                Some("\r\n") => Nl::CrLf,
+                _ => Nl::Universal,
+            }
+        };
         let mut out: Vec<u8> = Vec::new();
         loop {
+            if let Some(lim) = limit {
+                if out.len() >= lim {
+                    break;
+                }
+            }
             let b = self.read_bytes(Some(1))?;
             if b.is_empty() {
                 break;
             }
-            out.extend_from_slice(&b);
-            if b[0] == b'\n' {
-                break;
+            let ch = b[0];
+            out.push(ch);
+            match nl {
+                Nl::Lf => {
+                    if ch == b'\n' {
+                        break;
+                    }
+                }
+                Nl::Cr => {
+                    if ch == b'\r' {
+                        break;
+                    }
+                }
+                Nl::CrLf => {
+                    if ch == b'\n' && out.len() >= 2 && out[out.len() - 2] == b'\r' {
+                        break;
+                    }
+                }
+                Nl::Universal => {
+                    if ch == b'\n' {
+                        break;
+                    }
+                    if ch == b'\r' {
+                        // A lone `\r` ends the line, but `\r\n` is a single
+                        // terminator — peek one byte to tell them apart, and
+                        // un-read it (seek back) when it belongs to the next
+                        // line. A non-seekable stream can't un-read, so a lone
+                        // `\r` simply ends the line there.
+                        if !self.seekable() {
+                            break;
+                        }
+                        let nb = self.read_bytes(Some(1))?;
+                        if nb.is_empty() {
+                            break;
+                        }
+                        if nb[0] == b'\n' {
+                            out.push(b'\n');
+                        } else {
+                            self.seek(-1, 1)?;
+                        }
+                        break;
+                    }
+                }
             }
         }
+        Ok(out)
+    }
+
+    pub fn readline_obj(&self) -> Result<Option<Object>, RuntimeError> {
+        let out = self.read_line_bytes(None)?;
         if out.is_empty() {
             return Ok(None);
         }
@@ -6195,7 +6315,7 @@ impl Object {
     /// Length, where defined. Returns `Err(TypeError)` otherwise.
     pub fn len(&self) -> Result<usize, RuntimeError> {
         match self {
-            Object::Str(s) => Ok(s.chars().count()),
+            Object::Str(s) => Ok(str_char_len(s)),
             // Length in code points: a lone surrogate counts as one, matching
             // CPython where `len(chr(0xD800)) == 1`.
             Object::WStr(cps) => Ok(cps.len()),

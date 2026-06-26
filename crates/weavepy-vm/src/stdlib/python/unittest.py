@@ -272,8 +272,14 @@ class TestResult:
             return "%s: %s\n" % (getattr(err[0], "__name__", err[0]), err[1])
 
     def __repr__(self):
+        # CPython uses `util.strclass(self.__class__)` → "module.qualname",
+        # so the result class reports its canonical location
+        # (`<unittest.runner.TextTestResult ...>`), which several stdlib
+        # doctests assert verbatim (e.g. `test_statistics` NumericTestCase).
+        cls = self.__class__
+        strclass = "%s.%s" % (cls.__module__, cls.__qualname__)
         return ("<%s run=%i errors=%i failures=%i>"
-                % (type(self).__name__, self.testsRun,
+                % (strclass, self.testsRun,
                    len(self.errors), len(self.failures)))
 
 
@@ -370,6 +376,42 @@ class _AssertWarnsContext:
             raise AssertionError("%r does not match %r"
                                  % (self.expected_regex, str(first_matching.message)))
         raise AssertionError("%s not triggered" % self._exc_name())
+
+
+class _AssertNotWarnsContext:
+    """Inverse of `_AssertWarnsContext`: fails if a matching warning fires.
+
+    Mirrors CPython's private `unittest.case._AssertNotWarnsContext`, used by
+    tests that assert an API path is *not* deprecated (e.g.
+    `datetimetester.test_strptime_leap_year`).
+    """
+
+    def __init__(self, expected, test_case=None):
+        self.expected = expected
+        self.test_case = test_case
+
+    def __enter__(self):
+        import warnings
+        self._cm = warnings.catch_warnings(record=True)
+        self._records = self._cm.__enter__()
+        self.warnings = self._records
+        warnings.simplefilter("always")
+        return self
+
+    def _exc_name(self):
+        try:
+            return self.expected.__name__
+        except AttributeError:
+            return str(self.expected)
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self._cm.__exit__(exc_type, exc_value, tb)
+        if exc_type is not None:
+            return False
+        for w in self._records:
+            if issubclass(w.category, self.expected):
+                raise AssertionError("%s triggered" % self._exc_name())
+        return False
 
 
 class _CapturingHandler:
@@ -978,6 +1020,14 @@ class TestCase:
         with context:
             callable_obj(*args[1:], **kwargs)
 
+    def _assertNotWarns(self, expected_warning=Warning, *args, **kwargs):
+        context = _AssertNotWarnsContext(expected_warning, self)
+        if not args:
+            return context
+        callable_obj = args[0]
+        with context:
+            callable_obj(*args[1:], **kwargs)
+
     def assertWarns(self, expected_warning, *args, **kwargs):
         context = _AssertWarnsContext(expected_warning, self)
         if not args:
@@ -1507,6 +1557,10 @@ def findTestCases(module, prefix="test", sortUsing=None, suiteClass=TestSuite):
 # --------------------------------------------------------------------------
 
 class TextTestResult(TestResult):
+    # CPython defines this class in the `unittest.runner` submodule; this
+    # single-file port keeps it in `unittest`, so pin `__module__` to the
+    # canonical location for `repr()` / `strclass` fidelity.
+    __module__ = "unittest.runner"
     separator1 = "=" * 70
     separator2 = "-" * 70
 

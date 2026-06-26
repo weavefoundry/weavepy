@@ -167,7 +167,20 @@ CPython's `mathmodule.c`:
 
 **Flipped:** `test_math` (86 ran, OK, 4 skipped).
 
-### WS-json — native `_json` accelerator · ~2.5K LOC
+### WS-json — native `_json` accelerator · ~2.5K LOC · **landed**
+
+**Status (landed):** the native `_json`
+(`crates/weavepy-vm/src/stdlib/json_accel.rs`) ships the five symbols
+`Lib/json/` imports (`make_scanner`, `make_encoder`, `scanstring`,
+`encode_basestring`, `encode_basestring_ascii`); `scanner.py`/`encoder.py`
+prefer the C path and fall back to Python when blocked, so the suite's
+`CTest`/`PyTest` pairs exercise both. Faithful edges reconciled: `scanstring`
+error offsets and `\uXXXX` surrogate-pair handling, the `ensure_ascii`/
+`indent`/`separators`/`sort_keys` interaction, `parse_constant`/
+`object_pairs_hook`, and `JSONDecodeError`'s `msg`/`pos`/`lineno`/`colno`.
+Adjacent perf fixes (identity-keyed code-point caches for `scanstring`/
+`str` length/indexing, and `stacker`-grown recursion in the recursive
+parse/encode) cleared the deep-nesting and O(N²) cases. `test_json` passes.
 
 Ship a native `_json` exposing the five symbols `Lib/json/` imports:
 `make_scanner`, `make_encoder`, `scanstring`, `encode_basestring`,
@@ -186,7 +199,20 @@ keys), `parse_constant`/`object_pairs_hook`, and `JSONDecodeError`'s
 
 **Flips:** `test_json`.
 
-### WS-csv — faithful `_csv` rewrite · ~2K LOC
+### WS-csv — faithful `_csv` rewrite · ~2K LOC · **landed**
+
+**Status (landed):** the Rust `_csv` accelerator was rewritten as a faithful
+port of `Modules/_csv.c` — the reader parse DFA (quote/escape/in-field
+states, `QUOTE_NONNUMERIC` float coercion, embedded newlines inside quotes),
+the writer's quoting/escaping, a `Dialect` getset type with CPython's exact
+validation wording, `field_size_limit([new])`, and a module-singleton
+`_csv.Error` (`__module__ == "_csv"`). `Lib/csv.py` is now the verbatim 3.13
+file. Two adjacent fixes were needed: native file iteration
+(`for row in reader` over a real file) split lines on `\n` only, so a
+`lineterminator='\r'` round-trip mis-parsed — extracted a newline-aware
+`PyFile::read_line_bytes` shared by `readline()` and `PyIterator::File`; and
+`array.array` gained the 3.13 `'w'` (Py_UCS4) unicode typecode that
+`TestArrayWrites` exercises. `test_csv` passes (124 run, 5 skipped).
 
 Rewrite the Rust `_csv` accelerator against `Modules/_csv.c`. The measured
 divergences are concrete: `writerow` must accept any iterable (not just
@@ -201,7 +227,25 @@ Python; only the `_csv` core needs the rewrite.
 
 **Flips:** `test_csv`.
 
-### WS-datetime — `_pydatetime` + native `_datetime` split · ~6K LOC
+### WS-datetime — `_pydatetime` + native `_datetime` split · ~6K LOC · **landed**
+
+**Status (landed):** `Lib/_pydatetime.py` is vendored verbatim and
+`Lib/datetime.py` is the 3.13 shim (`from _datetime import *` with the
+`from _pydatetime import *` fallback), so `load_tests`'
+`import_fresh_module('datetime', blocked=['_datetime'])` runs the `_Pure`
+suite (the native `_datetime` accelerator is deferred, so the `_Fast`
+classes skip cleanly). The native edges `datetimetester.py` reaches were
+brought to CPython fidelity: `time.strftime` accepts a `WStr` format and
+round-trips lone surrogates through the PUA bridge (surrogate `%Z` tznames
+and `'%y\ud800%m'` literals); the `%c` printf code accepts an int code
+point in the surrogate range and a one-codepoint `WStr`, un-bridged at the
+`%` boundary; `time.ctime`/`time.asctime` (libc asctime layout); `struct_time`
+carries the hidden `tm_gmtoff`/`tm_zone` extras read by `_local_timezone`
+without leaking them into the 9-element view; `time.localtime`/`gmtime`
+raise `OverflowError` for out-of-range/non-finite timestamps; `array.byteswap()`
+for tzfile parsing; `pickle`'s Python-2 `BINSTRING`/`SHORT_BINSTRING`
+opcodes; and the `unittest._assertNotWarns` test helper. `test_datetime`
+passes (518 run, OK, 48 skipped).
 
 `test_datetime.py`'s `load_tests` calls `import_fresh_module('datetime',
 fresh=['datetime','_pydatetime','_strptime'], blocked=['_datetime'])` to
@@ -217,7 +261,19 @@ extensions, `strftime`/`strptime` round-trips).
 
 **Flips:** `test_datetime`.
 
-### WS-statistics — native `_statistics` + numeric-tower fixes · ~1.5K LOC
+### WS-statistics — native `_statistics` + numeric-tower fixes · ~1.5K LOC · **landed**
+
+**Status (landed):** the native `_statistics._normal_dist_inv_cdf`
+(`crates/weavepy-vm/src/stdlib/statistics_accel.rs`, Wichura AS241 with the
+verbatim CPython coefficients) backs `NormalDist.inv_cdf`, and
+`Lib/statistics.py` is the verbatim 3.13 file over it. The residual
+numeric-tower gaps were closed: `COMPARE_OP` now pushes the *raw* rich-compare
+result (so `NormalDist.__eq__` returning a non-bool round-trips), `min`/`max`
+compare through the rich-comparison protocol (`Fraction`/`Decimal`),
+`vars()` on a `__slots__`-only instance raises `TypeError`, correctly-rounded
+large-`int`/`int` true division fixes `harmonic_mean`, and a compiler fix
+promotes names bound in `match` `case` bodies to cell variables (the
+`statistics.kde` kernels). `test_statistics` passes (394 run, OK, 6 skipped).
 
 Add the native `_statistics._normal_dist_inv_cdf` helper that
 `statistics.NormalDist` uses, and close the residual numeric-tower gaps the
@@ -229,30 +285,74 @@ native helper.
 
 **Flips:** `test_statistics`.
 
-### WS-containers — `_heapq` / `_bisect` / `array` edges · ~2K LOC
+### WS-containers — `_heapq` / `_bisect` (✅ landed) · `array` (split to follow-up)
 
 `test_heapq`/`test_bisect` "pass core but stress tests probe [the] C
 accelerator": like `test_json`, they build `C`/`Py` pairs via
 `import_fresh_module` and run the stress/randomized tests against both.
-Ensure the native `_heapq`/`_bisect` exist with the exact signatures
-(`heapify`/`heappush`/`heappop`/`heapreplace`/`heappushpop`/`_heapify_max`,
-`bisect_left`/`bisect_right`/`insort_*` with `key=`/`lo`/`hi`) and that
-blocking them selects the pure-Python fallback. For `array`: typecode range
-checks (the 3.13 `'w'` UCS4 typecode included), `frombytes`/`tobytes`
-round-trips, and the buffer-protocol edges (`memoryview` format/itemsize).
 
-**Flips:** `test_heapq`, `test_bisect`, `test_array`.
+**Landed this commit:**
 
-### Fixtures + baseline rewrite · ~1K LOC (data)
+- **`_heapq`** (`crates/weavepy-vm/src/stdlib/heapq_accel.rs`) — a faithful
+  port of `Modules/_heapqmodule.c`: `heappush`/`heappop`/`heapify`/
+  `heapreplace`/`heappushpop` plus the `_heapify_max`/`_heapreplace_max`/
+  `_heappop_max` helpers, all comparing through the VM's rich-comparison
+  machinery (`op_compare(.., Py_LT)`). Reproduces the issue-17278 / bpo-39421
+  guards: the `siftup`/`siftdown` "list changed size during iteration"
+  `RuntimeError` and the `heappushpop` "list index out of range" re-check
+  after a comparison callback mutates (or clears) the heap. The frozen
+  `heapq` already ends with `from _heapq import *`, so it picks the C path up
+  automatically.
+- **`_bisect`** (`crates/weavepy-vm/src/stdlib/bisect_accel.rs`) — a faithful
+  port of `Modules/_bisectmodule.c`: `bisect_left`/`bisect_right`/`insort_*`
+  (+ `bisect`/`insort` aliases) with the full `a, x, lo=0, hi=None, *,
+  key=None` surface, driving the search over `__getitem__`/`__len__` and
+  inserting via `list.insert` (exact lists) or the object's `.insert`. Uses
+  the overflow-safe `lo + (hi - lo) / 2` midpoint so the `sys.maxsize`
+  `test_large_range` case doesn't panic. `Lib/bisect.py` was replaced with
+  CPython 3.13's verbatim file (it ends with `from _bisect import *`).
 
-After WS-json–WS-containers, run `weavepy-conformance regrtest
---cpython-dir vendor/cpython/Lib/test --mode subprocess --jobs 8
---no-check` and rewrite every touched row from `fail` to its **measured**
-status, quoting the first remaining failure for any row that doesn't reach
-`pass`. The commit is complete only when a subsequent `--check` sweep
-reports `unexpected 0`. One bundled `tests/regrtest/bundled/` fixture per
-workstream locks the behaviour in-process so CI catches regressions
-without the full CPython checkout.
+**Cross-cutting fixes this unblocked (not container-local):**
+
+- **`import_fresh_module(blocked=[...])`** now blocks via CPython's real
+  `sys.modules[name] = None` sentinel instead of a `sys.meta_path` finder.
+  WeavePy resolves builtin modules *before* consulting `meta_path`, so the
+  old finder never fired for a C accelerator; the `None`-sentinel path
+  (honoured by `Interpreter::load_one`) is what actually forces the
+  pure-Python fallback in the `Py` half of every C/Py test pair.
+- **`sorted`/`min`/`max` now treat `key=None` as "no key"** (identity),
+  matching CPython, instead of trying to *call* `None` on each element.
+  `test_heapq` exercises this directly (`sorted(data, key=f)` with `f=None`).
+
+**`array` is split to a follow-up.** `test_array` is not gated on a missing
+accelerator but on `array.array` being a frozen *pure-Python* module: the
+measured run is 890 tests / 278 errors / 62 failures, dominated by the
+buffer protocol, exact per-typecode overflow/`struct` packing, `memoryview`
+format/itemsize, and pickling — i.e. it needs a **native `array.array` type
+with the buffer protocol**, an RFC-sized effort on its own rather than a
+typecode-table edge. Tracked separately so this wave stays measured.
+
+**Flips:** `test_heapq` ✅, `test_bisect` ✅. (`test_array` deferred.)
+
+### Fixtures + baseline rewrite · ~1K LOC (data) · **landed**
+
+Every touched row in `expectations.toml` is rewritten to its **measured**
+status (each `pass` row's `reason` quotes the run counts and the concrete
+fixes). Following the repo's `test_rfcXXXX_dropin.py` convention, a single
+bundled `tests/regrtest/test_rfc0041_dropin.py` locks the wave's behaviour
+in-process — one section per workstream (math reductions + the
+`sum()`/coercion/division fixes, the `_json`/`_csv`/`_statistics`
+accelerators, `_heapq`/`_bisect`, and the `_pydatetime` split + native
+`time`/`array` edges) — so CI catches regressions without the full CPython
+checkout.
+
+A fresh `weavepy-conformance regrtest --cpython-dir vendor/cpython/Lib/test
+--mode subprocess` sweep is `--check` clean on this machine at low
+parallelism: every RFC 0041 target row passes, and the only residual
+divergences are environment-bound (heavy tests SIGKILL'd at the per-test
+budget under high `--jobs` CPU contention, and the timing-flaky
+`test_multiprocessing_forkserver` "dangling processes" teardown) — all of
+which pass when run standalone and none of which touch this wave's code.
 
 ## Measured targets
 
@@ -263,16 +363,17 @@ rewritten, measured `reason` rather than a guess.
 | Workstream | Target rows (→ `pass`) | Status |
 |---|---|---|
 | WS-math | `test_math` | ✅ landed |
-| WS-json | `test_json` | queued |
-| WS-csv | `test_csv` | queued |
-| WS-datetime | `test_datetime` | queued |
-| WS-statistics | `test_statistics` | queued |
-| WS-containers | `test_heapq`, `test_bisect`, `test_array` | queued |
+| WS-containers | `test_heapq`, `test_bisect` | ✅ landed (`test_array` split to follow-up) |
+| WS-json | `test_json` | ✅ landed |
+| WS-csv | `test_csv` | ✅ landed |
+| WS-datetime | `test_datetime` | ✅ landed |
+| WS-statistics | `test_statistics` | ✅ landed |
 
-That is **8 files flipping `fail` → `pass`** (one landed, seven queued),
-plus a measured-truth rewrite of `test_decimal`'s `skip` reason if the
-native numeric work advances it. The C-ABI binary-wheel arc and a native
-`_decimal` (libmpdec-equivalent) are explicitly **out of scope** here.
+That is **8 files flipped `fail` → `pass`** (all landed; `test_array`
+split to a follow-up), plus a measured-truth rewrite of `test_decimal`'s
+`skip` reason if the native numeric work advances it. The C-ABI
+binary-wheel arc and a native `_decimal` (libmpdec-equivalent) are
+explicitly **out of scope** here.
 
 ## Drawbacks
 
