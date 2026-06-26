@@ -1009,6 +1009,63 @@ def run_with_locale(catstr, *locales):
                 pass
 
 
+def run_with_tz(tz):
+    """Decorator: run *func* with ``$TZ`` set to *tz*.
+
+    Skips (rather than fails) when the platform lacks ``time.tzset`` — which
+    is how `datetimetester`'s tz-sensitive cases degrade on builds without
+    POSIX tz support, matching CPython's `test.support.run_with_tz`.
+    """
+    def decorator(func):
+        def inner(*args, **kwds):
+            try:
+                tzset = time.tzset
+            except AttributeError:
+                raise unittest.SkipTest("tzset required")
+            if 'TZ' in os.environ:
+                orig_tz = os.environ['TZ']
+            else:
+                orig_tz = None
+            os.environ['TZ'] = tz
+            tzset()
+            try:
+                return func(*args, **kwds)
+            finally:
+                if orig_tz is None:
+                    del os.environ['TZ']
+                else:
+                    os.environ['TZ'] = orig_tz
+                time.tzset()
+
+        inner.__name__ = func.__name__
+        inner.__doc__ = func.__doc__
+        return inner
+    return decorator
+
+
+# Does strftime() support glibc extensions like '%4Y'? (datetimetester gates a
+# few strftime assertions on this.) Probe defensively so a strict strftime
+# can't break `import test.support`.
+has_strftime_extensions = False
+if sys.platform != "win32":
+    try:
+        has_strftime_extensions = time.strftime("%4Y") != "%4Y"
+    except Exception:
+        pass
+
+
+def run_in_subinterp_with_config(code, *, own_gil=None, **config):
+    """Run *code* in a configured subinterpreter; SkipTest when unsupported."""
+    try:
+        import _testinternalcapi
+    except ImportError:
+        raise unittest.SkipTest("requires _testinternalcapi")
+    if own_gil is not None:
+        config['gil'] = 'own' if own_gil else 'shared'
+    return _testinternalcapi.run_in_subinterp_with_config(
+        code, types.SimpleNamespace(**config))
+
+
 # ---------------------------------------------------------------------------
 # Comparison sentinels
 # ---------------------------------------------------------------------------

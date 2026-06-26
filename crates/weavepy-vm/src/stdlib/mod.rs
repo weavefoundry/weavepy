@@ -17,6 +17,7 @@ use crate::import::{FrozenSource, ModuleCache};
 
 pub mod ast_mod;
 pub mod binascii_mod;
+pub mod bisect_accel;
 pub mod bz2_mod;
 pub mod codecs_mod;
 pub mod csv_mod;
@@ -28,12 +29,13 @@ pub mod functools_mod;
 pub mod gc_mod;
 pub mod gzip_mod;
 pub mod hashlib_mod;
+pub mod heapq_accel;
 pub mod hmac_mod;
 pub mod imp_mod;
 pub mod interpreters_mod;
 pub mod io;
 pub mod itertools_mod;
-pub mod json;
+pub mod json_accel;
 pub mod lzma_mod;
 pub mod marshal_mod;
 pub mod math;
@@ -51,6 +53,7 @@ pub mod socket_mod;
 pub mod sqlite3_mod;
 pub mod sre_mod;
 pub mod ssl_mod;
+pub mod statistics_accel;
 pub mod struct_mod;
 pub mod subprocess_mod;
 pub mod symtable_mod;
@@ -99,7 +102,12 @@ pub fn register_all(cache: &ModuleCache) {
     // native classes live in `_io` (see `io_full::build`, which calls
     // `io::build` internally); `_pyio` is the separate pure-Python twin that
     // `test_io` imports directly as its "Py" variant.
-    cache.register_builtin("json", json::build);
+    // RFC 0041 WS-json — `json` is the verbatim CPython package
+    // (`stdlib/python/json/`) running over the native `_json` accelerator.
+    // The package's `scanner`/`decoder`/`encoder` `from _json import …` with
+    // a pure-Python fallback, exactly like CPython, so `test_json` can build
+    // its C-vs-Python test pairs (`import_fresh_module('json', blocked=['_json'])`).
+    cache.register_builtin("_json", json_accel::build);
     cache.register_builtin("time", time::build);
     cache.register_builtin("_thread", thread_real::build);
     cache.register_builtin("errno", errno_mod::build);
@@ -122,6 +130,11 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_posixsubprocess", posixsubprocess_mod::build);
     cache.register_builtin("hashlib", hashlib_mod::build);
     cache.register_builtin("_operator", operator_accel::build);
+    cache.register_builtin("_heapq", heapq_accel::build);
+    cache.register_builtin("_bisect", bisect_accel::build);
+    // RFC 0041 WS-statistics — native `_normal_dist_inv_cdf` (AS241) behind
+    // the verbatim `statistics` module's `try: from _statistics import …`.
+    cache.register_builtin("_statistics", statistics_accel::build);
     cache.register_builtin("binascii", binascii_mod::build);
     cache.register_builtin("secrets", secrets_mod::build);
     cache.register_builtin("uuid", uuid_mod::build);
@@ -154,7 +167,12 @@ pub fn register_all(cache: &ModuleCache) {
     // RFC 0040 (WS5): shm_open/shm_unlink core for `multiprocessing`'s
     // resource_tracker + shared_memory.
     cache.register_builtin("_posixshmem", multiprocessing_mod::build_posixshmem);
-    cache.register_builtin("_datetime", datetime_mod::build);
+    // RFC 0041 WS-datetime: `datetime` is now CPython's verbatim shim over the
+    // bundled pure-Python `_pydatetime`. The old constants-only native
+    // `_datetime` is intentionally NOT registered so `from _datetime import *`
+    // raises `ImportError` and the shim falls through to `_pydatetime` (and so
+    // `test_datetime`'s `import_fresh_module(..., blocked=['_pydatetime'])`
+    // _Fast pass is cleanly skipped rather than importing a half-built module).
     // RFC 0029 — `_imp` bridges the C-extension loader into the
     // frozen `importlib.machinery.ExtensionFileLoader`.
     cache.register_builtin("_imp", imp_mod::build);
@@ -363,6 +381,35 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "functools",
             source: include_str!("python/functools.py"),
+            is_package: false,
+        },
+        // RFC 0041 WS-json — the verbatim CPython `json` package. Each
+        // submodule prefers the native `_json` accelerator and falls back to
+        // its pure-Python twin, so blocking `_json` (the way `test_json`
+        // probes for the C build) transparently selects the Python path.
+        FrozenSource {
+            name: "json",
+            source: include_str!("python/json/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "json.decoder",
+            source: include_str!("python/json/decoder.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "json.encoder",
+            source: include_str!("python/json/encoder.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "json.scanner",
+            source: include_str!("python/json/scanner.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "json.tool",
+            source: include_str!("python/json/tool.py"),
             is_package: false,
         },
         // RFC 0037 WS8 verbatim/faithful module ports that gate import-time
@@ -994,6 +1041,14 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "datetime",
             source: include_str!("python/datetime.py"),
+            is_package: false,
+        },
+        // RFC 0041 WS-datetime: CPython's verbatim pure-Python datetime
+        // implementation, imported by the `datetime` shim above and exercised
+        // directly by `test_datetime`'s _Pure pass.
+        FrozenSource {
+            name: "_pydatetime",
+            source: include_str!("python/_pydatetime.py"),
             is_package: false,
         },
         FrozenSource {

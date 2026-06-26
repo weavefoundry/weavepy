@@ -908,6 +908,29 @@ impl Interpreter {
         self.obj_truthy(v, &globals)
     }
 
+    /// `container[index]` for native accelerators (`_bisect`), honouring the
+    /// `__getitem__` protocol — mirrors `BINARY_SUBSCR` / `PySequence_GetItem`.
+    pub(crate) fn accel_subscript(
+        &mut self,
+        container: &Object,
+        index: &Object,
+    ) -> Result<Object, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.subscr_via_protocol(container, index, &globals)
+    }
+
+    /// `len(container)` for native accelerators (`_bisect`).
+    pub(crate) fn accel_len(&mut self, container: &Object) -> Result<i64, RuntimeError> {
+        let globals = self.builtins.clone();
+        match self.do_len_call(container, &globals)? {
+            Object::Int(i) => Ok(i),
+            other => Err(type_error(format!(
+                "'__len__' should return int, not '{}'",
+                other.type_name()
+            ))),
+        }
+    }
+
     /// Public iterator-construction entry point. Mirrors `iter(o)`.
     /// Used by `PyObject_GetIter` in the C-API.
     pub fn iter_object(&mut self, value: Object) -> Result<Object, RuntimeError> {
@@ -4233,8 +4256,12 @@ impl Interpreter {
                 if !self.specialized_compare_op(frame, cache_pc, kind)? {
                     let b = frame.pop()?;
                     let a = frame.pop()?;
-                    let r = self.dispatch_compare_op(&a, &b, kind, &frame.globals)?;
-                    frame.push(Object::Bool(r));
+                    // Push the *raw* rich-compare result (CPython `COMPARE_OP`):
+                    // `x == y` is whatever `__eq__` returned, not its truthiness
+                    // (`NormalDist.__eq__` declines, so `nd == A()` yields `A`'s
+                    // `10`). Native/identity fallbacks already yield a bool.
+                    let r = self.rich_compare_obj(&a, &b, kind, &frame.globals)?;
+                    frame.push(r);
                 }
             }
             OpCode::IsOp => {
@@ -9718,9 +9745,12 @@ impl Interpreter {
         let default = kwargs
             .iter()
             .find_map(|(k, v)| (k == "default").then(|| v.clone()));
+        // `key=None` means "no key" (compare elements directly), exactly as in
+        // CPython — not "call `None` on each element". Drop the sentinel.
         let key_fn = kwargs
             .iter()
-            .find_map(|(k, v)| (k == "key").then(|| v.clone()));
+            .find_map(|(k, v)| (k == "key").then(|| v.clone()))
+            .filter(|v| !matches!(v, Object::None));
         let items: Vec<Object> = if args.len() == 1 {
             self.collect_iterable(&args[0], globals)?
         } else {
@@ -9741,11 +9771,15 @@ impl Interpreter {
         let mut best_key = key_of(self, &items[0])?;
         for item in &items[1..] {
             let candidate_key = key_of(self, item)?;
-            let order = candidate_key.cmp(&best_key)?;
+            // CPython's `min`/`max` use `PyObject_RichCompareBool` with
+            // `Py_LT`/`Py_GT` (not the native ordering), so user `__lt__` /
+            // `__gt__` — `Fraction`, `Decimal`, any rich-comparable type —
+            // drives selection (`test_statistics` `approx_equal`). Strict
+            // comparison keeps the *first* extremum on ties, as CPython does.
             let take = if want_max {
-                matches!(order, std::cmp::Ordering::Greater)
+                self.op_compare(&candidate_key, &best_key, CompareKind::Gt)?
             } else {
-                matches!(order, std::cmp::Ordering::Less)
+                self.op_compare(&candidate_key, &best_key, CompareKind::Lt)?
             };
             if take {
                 best_value = item.clone();
@@ -10641,6 +10675,14 @@ impl Interpreter {
         reverse: bool,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<(), RuntimeError> {
+        // `key=None` is CPython's spelling of "no key function" (sort by the
+        // elements themselves) — `sorted(xs, key=None)` and `xs.sort(key=None)`
+        // are identity sorts, not "call `None` on every element". Callers thread
+        // the raw kwarg through, so collapse the `None` sentinel here.
+        let key_fn = match key_fn {
+            Some(Object::None) => None,
+            other => other,
+        };
         // CPython's `reverse=True` is *tie-stable*: equal elements keep
         // their original relative order (list.sort reverses the slice
         // before and after sorting). A post-sort `.reverse()` alone would
@@ -13616,7 +13658,7 @@ impl Interpreter {
                     Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
                     _ => a.to_str(),
                 };
-                let bridged = matches!(a, Object::WStr(_)) || percent_args_have_wstr(b);
+                let bridged = matches!(a, Object::WStr(_)) || percent_args_need_bridge(b);
                 let mut resolve =
                     |obj: &Object, kind: char| -> Result<Option<String>, RuntimeError> {
                         // Classes also need dispatch: a metaclass `__repr__`
@@ -13649,6 +13691,31 @@ impl Interpreter {
             }
             if matches!(a, Object::Bytes(_) | Object::ByteArray(_)) {
                 return self.bytes_percent_format(a, b, globals);
+            }
+        }
+        // `dict_keys` / `dict_items` are set-like (they register as
+        // `collections.abc.Set`); their `|`/`&`/`-`/`^` operators accept
+        // *any* iterable on the other side. CPython's `dictviews_*` coerce
+        // `self` to a `set` and apply the matching update method, so mirror
+        // that by building `set(left)`/`set(right)` and reusing the native
+        // set algebra (which yields a fresh `set`). `dict_values` is not
+        // set-like and yields `None` here, falling through to the error path.
+        if matches!(
+            op,
+            BinOpKind::BitOr | BinOpKind::BitAnd | BinOpKind::Sub | BinOpKind::BitXor
+        ) {
+            let a_elems = dict_view_set_elems(a);
+            let b_elems = dict_view_set_elems(b);
+            if a_elems.is_some() || b_elems.is_some() {
+                let left = match a_elems {
+                    Some(e) => Object::new_set_from(e),
+                    None => Object::new_set_from(self.collect_iterable(a, globals)?),
+                };
+                let right = match b_elems {
+                    Some(e) => Object::new_set_from(e),
+                    None => Object::new_set_from(self.collect_iterable(b, globals)?),
+                };
+                return binary_op(&left, &right, op);
             }
         }
         binary_op(a, b, op)
@@ -13768,6 +13835,9 @@ impl Interpreter {
         }
     }
 
+    /// Bool-valued rich comparison — the truthiness of [`Self::rich_compare_obj`].
+    /// Used everywhere a comparison feeds control flow or a native algorithm
+    /// (`min`/`max`, `in`, sort merges, the `==` sentinel probes).
     fn dispatch_compare_op(
         &mut self,
         a: &Object,
@@ -13775,6 +13845,23 @@ impl Interpreter {
         op: CompareKind,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<bool, RuntimeError> {
+        Ok(self.rich_compare_obj(a, b, op, globals)?.is_truthy())
+    }
+
+    /// Rich comparison returning the *raw* object a dunder produced, as
+    /// CPython's `do_richcompare` / `COMPARE_OP` do — `a == b` yields
+    /// whatever `a.__eq__(b)` (or the reflected `b.__eq__(a)`) returns, even
+    /// a non-bool like `10` or a NumPy array (`test_statistics`
+    /// `NormalDist.test_equality`: `nd == A()` is `10`, not `True`). Only the
+    /// *fallbacks* (identity for `==`/`!=`, the `__eq__`-derived `!=`, and the
+    /// container/native defaults) are intrinsically boolean.
+    fn rich_compare_obj(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
         let (dunder, swapped) = cmp_dunder(op);
         // A reflected/forward dunder may decline by returning
         // `NotImplemented`; treating that sentinel as a truthy result is
@@ -13786,30 +13873,32 @@ impl Interpreter {
         if let Some(method) = self.cmp_method(a, dunder, globals) {
             let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
             if !r.is_same(&not_impl) {
-                return Ok(r.is_truthy());
+                return Ok(r);
             }
         }
         if let Some(method) = self.cmp_method(b, swapped, globals) {
             let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
             if !r.is_same(&not_impl) {
-                return Ok(r.is_truthy());
+                return Ok(r);
             }
         }
         // CPython's default `object.__ne__` inverts `__eq__`: a class that
         // defines only `__eq__` still compares with `!=`. When neither
         // operand supplied a usable `__ne__` above, derive the result from
         // `__eq__` (forward then reflected) before falling back to identity.
+        // `object.__ne__` returns a *bool* (`not result`), so this branch is
+        // intrinsically boolean even when `__eq__` returned a non-bool.
         if matches!(op, CompareKind::NotEq) {
             if let Some(method) = self.cmp_method(a, "__eq__", globals) {
                 let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
                 if !r.is_same(&not_impl) {
-                    return Ok(!r.is_truthy());
+                    return Ok(Object::Bool(!r.is_truthy()));
                 }
             }
             if let Some(method) = self.cmp_method(b, "__eq__", globals) {
                 let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
                 if !r.is_same(&not_impl) {
-                    return Ok(!r.is_truthy());
+                    return Ok(Object::Bool(!r.is_truthy()));
                 }
             }
         }
@@ -13827,12 +13916,12 @@ impl Interpreter {
                     CompareKind::Eq => rv,
                     _ => !rv,
                 };
-                return Ok(truth);
+                return Ok(Object::Bool(truth));
             }
         } else if let Some(rv) = self.deep_order_collection(a, b, op, globals)? {
-            return Ok(rv);
+            return Ok(Object::Bool(rv));
         }
-        compare_op(a, b, op)
+        Ok(Object::Bool(compare_op(a, b, op)?))
     }
 
     // ---------- RFC 0021 specialized fast paths ----------
@@ -15907,9 +15996,25 @@ impl Interpreter {
                 Ok(items[idx].clone())
             }
             (Object::Str(s), Object::Int(i)) => {
-                let chars: Vec<char> = s.chars().collect();
-                let idx = normalize_index(*i, chars.len())?;
-                Ok(Object::from_str(chars[idx].to_string()))
+                // A pure-ASCII string (code-point count == byte count, both
+                // cached) is byte-indexable in O(1) — the tokeniser hot path.
+                // Otherwise walk to the indexed code point; only negative
+                // indices need the (cached) length.
+                let blen = s.len();
+                let clen = crate::object::str_char_len(s);
+                let ch = if clen == blen {
+                    let idx = normalize_index(*i, clen)?;
+                    Some(s.as_bytes()[idx] as char)
+                } else if *i >= 0 {
+                    s.chars().nth(*i as usize)
+                } else {
+                    let idx = normalize_index(*i, clen)?;
+                    s.chars().nth(idx)
+                };
+                match ch {
+                    Some(c) => Ok(Object::from_str(c.to_string())),
+                    None => Err(index_error("string index out of range")),
+                }
             }
             (Object::WStr(cps), Object::Int(i)) => {
                 let idx = normalize_index(*i, cps.len())?;
@@ -15932,16 +16037,7 @@ impl Interpreter {
                 let sliced = slice_seq(&v, s)?;
                 Ok(Object::new_tuple(sliced))
             }
-            (Object::Str(s), Object::Slice(slc)) => {
-                let chars: Vec<char> = s.chars().collect();
-                let obj_chars: Vec<Object> = chars
-                    .iter()
-                    .map(|c| Object::from_str(c.to_string()))
-                    .collect();
-                let sliced = slice_seq(&obj_chars, slc)?;
-                let s: String = sliced.iter().map(|o| o.to_str()).collect();
-                Ok(Object::from_str(s))
-            }
+            (Object::Str(s), Object::Slice(slc)) => str_subscript_slice(s, slc),
             (Object::WStr(cps), Object::Slice(slc)) => {
                 // Slice over code points, then canonicalise: a slice that drops
                 // every surrogate becomes a plain `Str` again.
@@ -21884,6 +21980,20 @@ impl Interpreter {
     /// then the filesystem.
     fn load_one(&mut self, full: &str) -> Result<Object, RuntimeError> {
         if let Some(cached) = self.cache.get(full) {
+            // CPython: a `None` value in `sys.modules` is the "blocked"
+            // sentinel (`importlib._bootstrap._find_and_load_unlocked` raises
+            // `ModuleNotFoundError("import of {name} halted; None in
+            // sys.modules")`). `test.support.import_helper.import_fresh_module
+            // (blocked=[...])` relies on exactly this to force the pure-Python
+            // fallback of a C/Py accelerator pair (`_json`, `_heapq`,
+            // `_bisect`, `_datetime`, …). Without this check the cached `None`
+            // leaked through as the imported module, so blocking silently
+            // failed and the "Py" variant ran the C accelerator.
+            if matches!(cached, Object::None) {
+                return Err(module_not_found_error(format!(
+                    "import of {full} halted; None in sys.modules"
+                )));
+            }
             // RFC 0040 WS1 — `os` is imported extremely early in startup
             // (before the `abc`/`collections.abc` machinery the `_Environ`
             // mapping subclasses is ready), so the first attempt to install
@@ -23106,6 +23216,81 @@ fn apply_slice_deletion(data: &mut Vec<Object>, s: &PySlice) -> Result<(), Runti
         data.remove(idx);
     }
     Ok(())
+}
+
+/// Byte offsets of code points `start` and `stop` in a UTF-8 `str`, walking
+/// at most to `stop` (or the end). A `start`/`stop` past the end maps to
+/// `s.len()`, so an out-of-range slice naturally yields an empty span.
+fn str_byte_span(s: &str, start: usize, stop: Option<usize>) -> (usize, usize) {
+    let mut bstart = s.len();
+    let mut bstop = s.len();
+    for (cp_idx, (byte_idx, _)) in s.char_indices().enumerate() {
+        if cp_idx == start {
+            bstart = byte_idx;
+        }
+        if let Some(st) = stop {
+            if cp_idx == st {
+                bstop = byte_idx;
+                break;
+            }
+        }
+    }
+    (bstart, bstop)
+}
+
+/// `str` slicing without materialising the whole string as a `Vec<char>`.
+///
+/// The overwhelmingly common case in scanners (`s[end:end + 1]`,
+/// `s[start:]`) is a unit step with non-negative bounds; that path walks
+/// only as far as `stop` and slices the underlying UTF-8 directly, turning a
+/// full scan from O(n^2) into O(n). Negative bounds or a non-unit step fall
+/// back to the general code-point walk.
+pub(crate) fn str_subscript_slice(s: &Rc<str>, slc: &PySlice) -> Result<Object, RuntimeError> {
+    let step = match &slc.step {
+        Object::None => 1i64,
+        Object::Int(i) => *i,
+        _ => {
+            return Err(type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            ))
+        }
+    };
+    if step == 0 {
+        return Err(value_error("slice step cannot be zero"));
+    }
+    if step == 1 {
+        let start = match &slc.start {
+            Object::None => Some(0usize),
+            Object::Int(i) if *i >= 0 => Some(*i as usize),
+            _ => None,
+        };
+        let stop = match &slc.stop {
+            Object::None => Some(None),
+            Object::Int(i) if *i >= 0 => Some(Some(*i as usize)),
+            _ => None,
+        };
+        if let (Some(start), Some(stop)) = (start, stop) {
+            let blen = s.len();
+            // ASCII (code-point count == byte count): byte offset == code
+            // point index, so locate both ends in O(1) instead of walking.
+            let (bstart, bstop) = if crate::object::str_char_len(s) == blen {
+                (start.min(blen), stop.unwrap_or(blen).min(blen))
+            } else {
+                str_byte_span(s, start, stop)
+            };
+            if bstart >= bstop {
+                return Ok(Object::from_static(""));
+            }
+            return Ok(Object::from_str(s[bstart..bstop].to_string()));
+        }
+    }
+    // General path: negative bounds or non-unit step. Materialising the
+    // code points here is acceptable — these forms are rare and never the
+    // tokeniser hot path.
+    let obj_chars: Vec<Object> = s.chars().map(|c| Object::from_str(c.to_string())).collect();
+    let sliced = slice_seq(&obj_chars, slc)?;
+    let out: String = sliced.iter().map(|o| o.to_str()).collect();
+    Ok(Object::from_str(out))
 }
 
 pub(crate) fn slice_seq(seq: &[Object], s: &PySlice) -> Result<Vec<Object>, RuntimeError> {
@@ -24689,12 +24874,24 @@ pub(crate) fn percent_format(template: &str, value: &Object) -> Result<String, R
 
 /// `true` when a `%`-format argument pack contains a lone-surrogate string,
 /// so the result must be re-canonicalised through the PUA bridge.
-fn percent_args_have_wstr(b: &Object) -> bool {
+/// Whether a `%`-format result may need un-bridging back to lone surrogates:
+/// a `WStr` arg (whose `%s` is bridged) or an integer arg in the surrogate
+/// range (whose `%c` yields a bridged surrogate — `'%c' % 0xD800`). Flagging
+/// a use that doesn't actually emit a surrogate (e.g. `'%d' % 0xD800`) is
+/// harmless: [`bridge_to_object`] is a no-op when the rendered text carries
+/// no bridge-window code points.
+fn percent_args_need_bridge(b: &Object) -> bool {
+    fn needs(x: &Object) -> bool {
+        match x {
+            Object::WStr(_) => true,
+            Object::Int(v) => (0xD800..=0xDFFF).contains(v),
+            _ => false,
+        }
+    }
     match b {
-        Object::WStr(_) => true,
-        Object::Tuple(items) => items.iter().any(|x| matches!(x, Object::WStr(_))),
-        Object::Dict(d) => d.borrow().iter().any(|(_, v)| matches!(v, Object::WStr(_))),
-        _ => false,
+        Object::Tuple(items) => items.iter().any(needs),
+        Object::Dict(d) => d.borrow().iter().any(|(_, v)| needs(v)),
+        other => needs(other),
     }
 }
 
@@ -25097,19 +25294,34 @@ pub(crate) fn percent_format_with(
                     )?
                 }
                 'c' => {
-                    let ch = match &item {
-                        Object::Bool(b) => char::from_u32(u32::from(*b)).unwrap().to_string(),
-                        Object::Int(c) => u32::try_from(*c)
-                            .ok()
-                            .and_then(char::from_u32)
-                            .ok_or_else(|| overflow_error("%c arg not in range(0x110000)"))?
-                            .to_string(),
-                        Object::Str(s) if s.chars().count() == 1 => s.to_string(),
+                    // A single character: an int code point in range(0x110000)
+                    // — lone surrogates included — or a one-character string.
+                    // Build through `str_from_codepoints` so a surrogate yields
+                    // a `WStr` the spec engine bridges (exactly like `%s`),
+                    // rather than tripping `char::from_u32` (which rejects
+                    // surrogates) — `datetime.isoformat('\ud800')`.
+                    let cp: u32 = match &item {
+                        Object::Bool(b) => u32::from(*b),
+                        Object::Int(_) | Object::Long(_) => {
+                            match item.as_i64().filter(|n| (0..=0x10_FFFF).contains(n)) {
+                                Some(n) => n as u32,
+                                None => {
+                                    return Err(overflow_error("%c arg not in range(0x110000)"))
+                                }
+                            }
+                        }
+                        Object::Str(_) | Object::WStr(_) => match item.str_codepoints() {
+                            Some(cps) if cps.len() == 1 => cps[0],
+                            _ => return Err(type_error("%c requires int or char")),
+                        },
                         _ => return Err(type_error("%c requires int or char")),
                     };
                     // Apply width/alignment by routing through the string
                     // formatter (`%5c` right-justifies like `%5s`).
-                    format_via_spec_percent(&Object::from_str(ch), &spec.replace('c', "s"))?
+                    format_via_spec_percent(
+                        &Object::str_from_codepoints(vec![cp]),
+                        &spec.replace('c', "s"),
+                    )?
                 }
                 _ => return Err(unsupported_format_char(kind, kind_index)),
             };
@@ -26466,6 +26678,26 @@ fn object_to_constant(o: &Object) -> Constant {
     }
 }
 
+/// Elements of a *set-like* dict view (`dict_keys` / `dict_items`), or
+/// `None` for anything else (notably `dict_values`, which is not
+/// set-like). `dict_items` yields `(key, value)` tuples, matching how
+/// CPython's `dictviews_to_set` materialises an items view.
+fn dict_view_set_elems(obj: &Object) -> Option<Vec<Object>> {
+    let Object::DictView(v) = obj else {
+        return None;
+    };
+    let d = v.dict.borrow();
+    match v.kind {
+        crate::object::DictViewKind::Keys => Some(d.keys().map(|k| k.0.clone()).collect()),
+        crate::object::DictViewKind::Items => Some(
+            d.iter()
+                .map(|(k, val)| Object::new_tuple(vec![k.0.clone(), val.clone()]))
+                .collect(),
+        ),
+        crate::object::DictViewKind::Values => None,
+    }
+}
+
 fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeError> {
     use BinOpKind as B;
     use Object as O;
@@ -26577,7 +26809,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::from_str(out))
         }
         (O::Str(template), v, B::Mod) => {
-            if percent_args_have_wstr(v) {
+            if percent_args_need_bridge(v) {
                 let mut resolve = |obj: &Object, kind: char| match (obj, kind) {
                     (Object::WStr(cps), 's') => Ok(Some(crate::builtins::bridge_encode_cps(cps))),
                     _ => Ok(None),
@@ -27080,26 +27312,72 @@ fn scale_pow2(mant: f64, exp: i64) -> f64 {
 /// `y` must be non-zero. Avoids the `inf/inf == NaN` trap of dividing the
 /// two operands' (possibly overflowing) f64 approximations.
 fn bigint_true_div(x: &num_bigint::BigInt, y: &num_bigint::BigInt) -> f64 {
-    use num_bigint::Sign;
-    use num_traits::{ToPrimitive, Zero};
-    if x.is_zero() {
-        return 0.0;
-    }
+    use num_bigint::{BigInt, Sign};
+    use num_traits::{One, ToPrimitive, Zero};
     let negative = (x.sign() == Sign::Minus) ^ (y.sign() == Sign::Minus);
-    let xm = x.magnitude();
-    let ym = y.magnitude();
-    let la = xm.bits() as i64;
-    let lb = ym.bits() as i64;
-    // Pick a shift so the integer quotient retains ~64 significant bits.
-    let shift = 64 - la + lb;
-    let (num, den) = if shift >= 0 {
-        (xm.clone() << (shift as usize), ym.clone())
+    if x.is_zero() {
+        // Preserve the sign of zero: `0 / -d` is `-0.0` (CPython / IEEE 754,
+        // and what the i64 fast path's `0.0 / -y` already yields).
+        return if negative { -0.0 } else { 0.0 };
+    }
+    let a = BigInt::from(x.magnitude().clone());
+    let b = BigInt::from(y.magnitude().clone());
+    let abits = a.bits() as i64;
+    let bbits = b.bits() as i64;
+    // CPython's `long_true_divide` returns the *correctly rounded* (round
+    // half to even) double nearest to `a/b`; a naive `a.to_f64()/b.to_f64()`
+    // rounds each operand first and is wrong once either exceeds 2^53
+    // (`576460752303423488 / 12009599006321323` is `48.0`, not the
+    // `47.999…` you get from pre-rounding — `statistics.harmonic_mean`).
+    //
+    // Scale by a power of two so the floor quotient `q` carries 55–56
+    // significant bits (53 mantissa + guard + round), keep the division
+    // remainder as a sticky bit, then round `q` to a 53-bit mantissa.
+    let s = 55 - (abits - bbits);
+    let (num, den) = if s >= 0 {
+        (&a << (s as usize), b.clone())
     } else {
-        (xm.clone(), ym.clone() << ((-shift) as usize))
+        (a.clone(), &b << ((-s) as usize))
     };
-    let q = num / den;
-    let qf = q.to_f64().unwrap_or(f64::INFINITY);
-    let result = scale_pow2(qf, -shift);
+    let q = &num / &den;
+    let rem = &num - &(&q * &den);
+    let qbits = q.bits() as i64;
+    let drop = qbits - 53;
+    let result = if drop <= 0 {
+        // Quotient already fits the mantissa exactly (only reachable for
+        // degenerate tiny inputs); `q` is < 2^53 so the conversion is exact.
+        let m = q.to_f64().unwrap_or(f64::INFINITY);
+        scale_pow2(m, -s)
+    } else {
+        let high = &q >> (drop as usize);
+        let shifted_back = &high << (drop as usize);
+        let low = &q - &shifted_back;
+        let half = BigInt::one() << ((drop - 1) as usize);
+        let mut mant = high.to_i64().expect("53-bit mantissa fits i64");
+        let round_up = match low.cmp(&half) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            // Exactly half: a non-zero division remainder tips it over the
+            // halfway point; otherwise round to even (CPython's behaviour).
+            std::cmp::Ordering::Equal => {
+                if !rem.is_zero() {
+                    true
+                } else {
+                    (mant & 1) == 1
+                }
+            }
+        };
+        if round_up {
+            mant += 1;
+        }
+        // value = mant * 2^exp; a rounding carry to 2^53 renormalises.
+        let mut exp = drop - s;
+        if mant == (1i64 << 53) {
+            mant >>= 1;
+            exp += 1;
+        }
+        scale_pow2(mant as f64, exp)
+    };
     if negative {
         -result
     } else {
@@ -27210,7 +27488,17 @@ fn i64_op(x: i64, y: i64, op: BinOpKind) -> Result<Option<Object>, RuntimeError>
             if y == 0 {
                 return Err(zero_division_error("division by zero"));
             }
-            Some(Object::Float(x as f64 / y as f64))
+            // `x as f64 / y as f64` is correctly rounded only when both
+            // operands are exactly representable (|v| <= 2^53); beyond that
+            // the cast pre-rounds and the quotient drifts (e.g.
+            // `2**59 / 12009599006321323`). Defer those to the
+            // correctly-rounded bignum path by returning `None`.
+            const EXACT: u64 = 1 << 53;
+            if x.unsigned_abs() <= EXACT && y.unsigned_abs() <= EXACT {
+                Some(Object::Float(x as f64 / y as f64))
+            } else {
+                None
+            }
         }
         B::FloorDiv => {
             if y == 0 {

@@ -162,12 +162,12 @@ status = "fail"
 reason = "array ships (RFC 0023) and imports cleanly; full test_array.py conformance (typecode range checks + C-buffer protocol edges) unverified pending a local Lib/test checkout"
 
 [tests."cpython/Lib/test/test_heapq.py"]
-status = "fail"
-reason = "heapq passes core but stress tests probe C accelerator"
+status = "pass"
+reason = "RFC 0041 WS-containers: native `_heapq` accelerator (faithful port of Modules/_heapqmodule.c) wired into the frozen `heapq`; both the C and pure-Python (`import_fresh_module(blocked=['_heapq'])`) test classes pass, including the bpo-39421/issue-17278 heap-mutation-during-compare guards"
 
 [tests."cpython/Lib/test/test_bisect.py"]
-status = "fail"
-reason = "bisect passes core but stress tests probe C accelerator"
+status = "pass"
+reason = "RFC 0041 WS-containers: native `_bisect` accelerator (faithful port of Modules/_bisectmodule.c) wired into the frozen `bisect`; both C and pure-Python variants pass, including key= and the sys.maxsize `test_large_range` midpoint-overflow case"
 
 [tests."cpython/Lib/test/test_itertools.py"]
 status = "pass"
@@ -202,8 +202,14 @@ status = "fail"
 reason = "measured: completes in ~23s sequentially with a mixed F/E run (re engine gaps: Unicode property classes + atomic groups among them). NB: flips to 'timeout' under parallel contention (-j4+) — borderline on the 30s budget."
 
 [tests."cpython/Lib/test/test_json.py"]
-status = "fail"
-reason = "measured (RFC 0038 WS-A): import-crashes during collection (0 subtests run). `test.test_json` binds `cjson.JSONDecodeError = …` against the `_json` C accelerator, which WeavePy does not ship, so the package import raises `TypeError: 'NoneType' object has no attribute 'JSONDecodeError'`. Needs a `_json` accelerator (or a test-package shim); deferred to the C-accelerator arc (wave 4)."
+status = "pass"
+# RFC 0041 WS-json: `json` is now the verbatim CPython package
+# (`stdlib/python/json/`) layered over a native `_json` accelerator
+# (`json_accel.rs`, a port of `Modules/_json.c`). The C-vs-Python test pairs
+# (`import_fresh_module('json', blocked=['_json'])`) both pass — the scanner,
+# decoder, encoder, scanstring (incl. ssize_t OverflowError), and the
+# `json.tool` CLI all match CPython. Must be run in subprocess mode so the
+# `assert_python_ok('-m', 'json.tool', …)` tool tests spawn the weavepy binary.
 
 [tests."cpython/Lib/test/test_base64.py"]
 status = "pass"
@@ -463,8 +469,8 @@ status = "fail"
 reason = "random: Mersenne Twister state save/load + SystemRandom"
 
 [tests."cpython/Lib/test/test_statistics.py"]
-status = "fail"
-reason = "measured (RFC 0039): now completes well within the 60s budget (~12-16s) and fails rather than timing out — the heavy Counter/OrderedDict loops are no longer the wall-time bottleneck. Residual failures are numeric-tower gaps in the statistics module itself (NormalDist + weighted harmonic_mean forms, Fraction/Decimal interop edges). Revisit with the native _statistics/_decimal accelerator perf arc."
+status = "pass"
+reason = "RFC 0041 WS-statistics: ships CPython's verbatim statistics.py over a native _statistics._normal_dist_inv_cdf (Wichura AS241) accelerator. Fixes that unblocked it: (1) COMPARE_OP now pushes the raw rich-compare result instead of coercing to bool, so NormalDist.__eq__ returning a non-bool round-trips (test_equality); (2) min/max use the rich-comparison protocol so Fraction/Decimal keys work; (3) the compiler promotes names bound in match-case bodies to cell vars (statistics.kde closures); (4) vars() raises TypeError on __slots__-only instances (NormalDist test_slots); (5) int/int true division is correctly rounded (round-half-even via a sticky bignum quotient) so float(Fraction) matches CPython (harmonic_mean -> 48.0); (6) unittest TextTestResult repr reports unittest.runner.* (assertApproxEqual doctest). 394 pass, 6 skip."
 
 [tests."cpython/Lib/test/test_unicodedata.py"]
 status = "skip"
@@ -487,12 +493,12 @@ status = "fail"
 reason = "time: timezone strings + monotonic stability under leap seconds"
 
 [tests."cpython/Lib/test/test_datetime.py"]
-status = "fail"
-reason = "measured (non-target): load_tests() calls import_fresh_module('datetime', fresh=['datetime','_pydatetime','_strptime'], blocked=['_datetime']) to exercise the pure-Python vs C implementations separately. WeavePy ships a single native datetime (no _pydatetime), so the C/py dual-module split can't be satisfied and load_tests errors. Revisit when datetime is re-split into _pydatetime + _datetime accelerator."
+status = "pass"
+reason = "measured (RFC 0041 WS-datetime): 518 run, OK (48 skipped). Re-split datetime into a verbatim pure-Python `_pydatetime` plus the `Lib/datetime.py` shim (`from _datetime import *` with the `from _pydatetime import *` fallback), so `load_tests`' `import_fresh_module('datetime', blocked=['_datetime'])` dual-module probe runs the `_Pure` suite (the native `_datetime` accelerator is deferred, so its `_Fast` classes skip cleanly). Required native edges, all CPython-faithful: `time.strftime` accepts a `WStr` format and round-trips lone surrogates through the PUA bridge (`'%y\\ud800%m'`, surrogate tznames in `%Z`); the `%c` printf code accepts an int code point in the surrogate range and a one-codepoint `WStr` (un-bridged at the `%` boundary); `time.ctime`/`time.asctime` (libc asctime layout, space-padded day); `struct_time` carries the hidden `tm_gmtoff`/`tm_zone` extras read by `_pydatetime._local_timezone` without leaking them into the 9-element sequence view; `time.localtime`/`gmtime` raise `OverflowError` (not `TypeError`) for out-of-range/non-finite timestamps; `array.byteswap()` for tzfile parsing; and `pickle`'s Python-2 `BINSTRING`/`SHORT_BINSTRING` opcodes plus `_assertNotWarns` for the test harness."
 
 [tests."cpython/Lib/test/test_csv.py"]
-status = "fail"
-reason = "measured (RFC 0038 WS-C): 20 pass, 36 fail, 59 error. The Rust `_csv` accelerator diverges from CPython: `writerow` rejects non-list/tuple rows (`writerow: row must be list/tuple`), dialect/typecode validation gaps (`bad typecode: 'w'` from the 3.13 array 'w' unicode typecode), and reader iteration returns None. Needs a faithful `_csv` port; deferred."
+status = "pass"
+reason = "RFC 0041 WS-csv: native `_csv` rewritten as a faithful port of CPython's Modules/_csv.c (DFA reader, writer, Dialect getset type, field_size_limit, `_csv.Error`), paired with the verbatim Lib/csv.py. Also fixed universal-newline line splitting for native file iteration (`PyFile::read_line_bytes`) and added the 3.13 array `'w'` (Py_UCS4) typecode. 124 tests, 5 skipped."
 
 [tests."cpython/Lib/test/test_email.py"]
 status = "fail"

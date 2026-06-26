@@ -79,6 +79,11 @@ INT = b"I"
 LONG = b"L"
 FLOAT = b"F"
 STRING = b"S"
+# Python-2-era 8-bit `str` opcodes; carried by cross-version compat blobs
+# (e.g. `datetimetester.test_compat_unpickle`). Decoded via the unpickler's
+# `encoding` like CPython's `load_binstring`/`load_short_binstring`.
+BINSTRING = b"T"
+SHORT_BINSTRING = b"U"
 UNICODE = b"V"
 LIST = b"l"
 DICT = b"d"
@@ -124,11 +129,11 @@ def dump(obj, file, protocol=None, *, fix_imports=True, buffer_callback=None):
 
 
 def loads(data, *, fix_imports=True, encoding="ASCII", errors="strict"):
-    return _Unpickler(io.BytesIO(data)).load()
+    return _Unpickler(io.BytesIO(data), encoding=encoding, errors=errors).load()
 
 
 def load(file, *, fix_imports=True, encoding="ASCII", errors="strict"):
-    return _Unpickler(file).load()
+    return _Unpickler(file, encoding=encoding, errors=errors).load()
 
 
 # --- pickler --------------------------------------------------------------
@@ -514,11 +519,20 @@ class _Pickler:
 
 
 class _Unpickler:
-    def __init__(self, file):
+    def __init__(self, file, *, encoding="ASCII", errors="strict"):
         self.file = file
         self.stack = []
         self.markers = []
         self.memo = {}
+        # Used to turn the Python-2 8-bit-string opcodes (STRING / BINSTRING /
+        # SHORT_BINSTRING) into `str` (or `bytes` when encoding == "bytes").
+        self.encoding = encoding
+        self.errors = errors
+
+    def _decode_string(self, value):
+        if self.encoding == "bytes":
+            return value
+        return value.decode(self.encoding, self.errors)
 
     def load(self):
         while True:
@@ -599,6 +613,18 @@ def _binbytes(u):
 def _short_binbytes(u):
     n = u.file.read(1)[0]
     u.stack.append(u.file.read(n))
+
+
+def _binstring(u):
+    n = struct.unpack("<i", u._read_short(4))[0]
+    if n < 0:
+        raise UnpicklingError("BINSTRING pickle has negative byte count")
+    u.stack.append(u._decode_string(u.file.read(n)))
+
+
+def _short_binstring(u):
+    n = u.file.read(1)[0]
+    u.stack.append(u._decode_string(u.file.read(n)))
 
 
 def _binbytes8(u):
@@ -947,6 +973,8 @@ _OPCODES = {
     LONG: _long_op,
     FLOAT: _float_op,
     STRING: _string_op,
+    BINSTRING: _binstring,
+    SHORT_BINSTRING: _short_binstring,
     UNICODE: _unicode_op,
     LIST: _list_op,
     DICT: _dict_op,

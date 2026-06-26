@@ -88,16 +88,18 @@ def import_fresh_module(name, fresh=(), blocked=(), *, deprecated=False):
         for modname in fresh:
             sys.modules.pop(modname, None)
 
-        # Block requested names by installing a finder that raises.
-        class _Blocker:
-            def find_spec(self, fullname, path=None, target=None):
-                if fullname in blocked or fullname == name and name in blocked:
-                    raise ImportError(f'import of {fullname!r} blocked')
-                return None
+        # Block requested names exactly like CPython's real
+        # ``_save_and_block_module``: a ``None`` entry in ``sys.modules`` is
+        # the import machinery's "halted" sentinel, so any attempt to import
+        # the name raises ``ModuleNotFoundError``. WeavePy honours this in its
+        # builtin/frozen importer, so blocking a C accelerator (e.g. ``_heapq``
+        # / ``_bisect``) forces the pure-Python fallback inside the wrapper
+        # module — which is precisely how ``test_heapq``/``test_bisect`` build
+        # their C-vs-Python test pairs. (A ``sys.meta_path`` finder can't do
+        # this: builtin modules are resolved before ``meta_path`` is consulted.)
+        for modname in blocked:
+            sys.modules[modname] = None
 
-        blocker = _Blocker() if blocked else None
-        if blocker is not None:
-            sys.meta_path.insert(0, blocker)
         try:
             # CPython contract: if any *fresh* module can't be imported the
             # whole call answers None — `import_fresh_module('functools',
@@ -126,11 +128,6 @@ def import_fresh_module(name, fresh=(), blocked=(), *, deprecated=False):
                 return fresh_mod
             return mod
         finally:
-            if blocker is not None:
-                try:
-                    sys.meta_path.remove(blocker)
-                except ValueError:
-                    pass
             # Restore the original module table.
             for modname in list(sys.modules):
                 if modname == name or modname in fresh or modname in blocked:

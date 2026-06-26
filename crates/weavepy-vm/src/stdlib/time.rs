@@ -58,6 +58,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             b("strftime", time_strftime),
         );
         d.insert(
+            DictKey(Object::from_static("ctime")),
+            b("ctime", time_ctime),
+        );
+        d.insert(
+            DictKey(Object::from_static("asctime")),
+            b("asctime", time_asctime),
+        );
+        d.insert(
             DictKey(Object::from_static("localtime")),
             b("localtime", time_localtime),
         );
@@ -402,20 +410,123 @@ fn tuple_to_dt(args: Option<&Object>) -> Result<DateTime<Local>, RuntimeError> {
 }
 
 fn time_strftime(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fmt = match args.first() {
-        Some(Object::Str(s)) => s.to_string(),
-        _ => return Err(type_error("strftime expects format string")),
+    // A format string may carry lone surrogates: `_pydatetime._wrap_strftime`
+    // splices the object's `%Z`/`%z`/`%f` values in *before* calling us, so a
+    // surrogate tzname (`datetimetester.test_zones`) or a surrogate literal
+    // (`t.strftime('%y\ud800%m')`) arrives as an `Object::WStr`. Bridge the
+    // code points into the PUA window so `chrono`'s UTF-8 formatter copies
+    // them through as opaque literals, then map them back — exactly how the
+    // `%`/`str.format` engines preserve surrogates.
+    let cps = match args.first() {
+        Some(o @ (Object::Str(_) | Object::WStr(_))) => o.str_codepoints().unwrap_or_default(),
+        Some(other) => {
+            return Err(type_error(format!(
+                "strftime() argument 1 must be str, not {}",
+                other.type_name()
+            )))
+        }
+        None => return Err(type_error("strftime expects format string")),
     };
+    let fmt = crate::builtins::bridge_encode_cps(&cps);
     let dt = if args.len() >= 2 {
         tuple_to_dt(args.get(1))?
     } else {
         Local::now()
     };
-    Ok(Object::from_str(dt.format(&fmt).to_string()))
+    // `chrono`'s `DelayedFormat` reports an unsupported/invalid directive (e.g.
+    // the glibc extension `%4Y`) by returning `Err` from its `Display` impl;
+    // calling `.to_string()` on that panics. Render through `write!` so we can
+    // surface a Python-level `ValueError` instead of aborting the interpreter
+    // (CPython's `time.strftime` likewise raises on a bad format string).
+    use std::fmt::Write as _;
+    let mut rendered = String::new();
+    match write!(rendered, "{}", dt.format(&fmt)) {
+        Ok(()) => Ok(crate::builtins::bridge_to_object(&rendered)),
+        Err(_) => Err(crate::error::value_error("Invalid format string")),
+    }
+}
+
+/// `time.asctime([t])` / `time.ctime([secs])` shared formatter — CPython's
+/// `asctime`/`ctime` both render `"%a %b %e %H:%M:%S %Y"` (the libc
+/// `asctime` layout: day-of-month *space*-padded to width 2), which is what
+/// `_pydatetime.date.ctime()` reproduces with its `"%s %s %2d …"` format.
+fn format_ctime_local(dt: DateTime<Local>) -> Object {
+    Object::from_str(dt.format("%a %b %e %H:%M:%S %Y").to_string())
+}
+
+fn time_asctime(args: &[Object]) -> Result<Object, RuntimeError> {
+    let dt = if args.first().is_some_and(|o| !matches!(o, Object::None)) {
+        tuple_to_dt(args.first())?
+    } else {
+        Local::now()
+    };
+    Ok(format_ctime_local(dt))
+}
+
+fn time_ctime(args: &[Object]) -> Result<Object, RuntimeError> {
+    let dt = match args.first() {
+        None | Some(Object::None) => Local::now(),
+        Some(Object::Int(i)) => local_from_timestamp(*i)?,
+        Some(Object::Float(f)) => local_from_timestamp(float_to_timestamp(*f)?)?,
+        Some(other) => {
+            return Err(type_error(format!(
+                "ctime() argument must be a number, not '{}'",
+                other.type_name()
+            )))
+        }
+    };
+    Ok(format_ctime_local(dt))
+}
+
+/// Convert a float timestamp to whole seconds, raising CPython's
+/// `OverflowError` for the non-finite / out-of-`time_t`-range values that
+/// `datetimetester.test_insane_fromtimestamp` feeds in (`±1e200`).
+fn float_to_timestamp(f: f64) -> Result<i64, RuntimeError> {
+    if !f.is_finite() || f < i64::MIN as f64 || f >= i64::MAX as f64 {
+        return Err(crate::error::overflow_error(
+            "timestamp out of range for platform time_t",
+        ));
+    }
+    Ok(f as i64)
+}
+
+fn local_from_timestamp(secs: i64) -> Result<DateTime<Local>, RuntimeError> {
+    Local
+        .timestamp_opt(secs, 0)
+        .single()
+        .ok_or_else(|| crate::error::overflow_error("timestamp out of range for platform time_t"))
+}
+
+fn utc_from_timestamp(secs: i64) -> Result<DateTime<Utc>, RuntimeError> {
+    Utc.timestamp_opt(secs, 0)
+        .single()
+        .ok_or_else(|| crate::error::overflow_error("timestamp out of range for platform time_t"))
+}
+
+/// Attach the two hidden `struct_time` extras (`tm_gmtoff`, `tm_zone`) by
+/// name. CPython's `struct_time` carries them as named-but-unindexed members;
+/// `_pydatetime._local_timezone` reads `localtm.tm_gmtoff`/`.tm_zone` straight
+/// off the `localtime()` result (`test_subclass_alternate_constructors_*`).
+fn with_tz_extras(obj: Object, gmtoff: i64, zone: &str) -> Object {
+    if let Object::Instance(inst) = &obj {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("tm_gmtoff")),
+            Object::Int(gmtoff),
+        );
+        d.insert(
+            DictKey(Object::from_static("tm_zone")),
+            Object::from_str(zone.to_owned()),
+        );
+    }
+    obj
 }
 
 fn struct_time_from_local(dt: DateTime<Local>) -> Object {
-    make_struct_time(vec![
+    use chrono::Offset;
+    let gmtoff = i64::from(dt.offset().fix().local_minus_utc());
+    let zone = dt.format("%Z").to_string();
+    let base = make_struct_time(vec![
         Object::Int(i64::from(dt.year())),
         Object::Int(i64::from(dt.month())),
         Object::Int(i64::from(dt.day())),
@@ -425,11 +536,12 @@ fn struct_time_from_local(dt: DateTime<Local>) -> Object {
         Object::Int(i64::from(dt.weekday().num_days_from_monday())),
         Object::Int(i64::from(dt.ordinal())),
         Object::Int(-1),
-    ])
+    ]);
+    with_tz_extras(base, gmtoff, &zone)
 }
 
 fn struct_time_from_utc(dt: DateTime<Utc>) -> Object {
-    make_struct_time(vec![
+    let base = make_struct_time(vec![
         Object::Int(i64::from(dt.year())),
         Object::Int(i64::from(dt.month())),
         Object::Int(i64::from(dt.day())),
@@ -439,25 +551,17 @@ fn struct_time_from_utc(dt: DateTime<Utc>) -> Object {
         Object::Int(i64::from(dt.weekday().num_days_from_monday())),
         Object::Int(i64::from(dt.ordinal())),
         Object::Int(0),
-    ])
+    ]);
+    with_tz_extras(base, 0, "UTC")
 }
 
 fn time_localtime(args: &[Object]) -> Result<Object, RuntimeError> {
+    // An out-of-range or non-finite seconds value is an `OverflowError`, not a
+    // `TypeError` — `datetime.fromtimestamp(1e200)` relies on this
+    // (`datetimetester.test_insane_fromtimestamp`).
     let dt = match args.first() {
-        Some(Object::Int(i)) => {
-            let secs = *i;
-            Local
-                .timestamp_opt(secs, 0)
-                .single()
-                .ok_or_else(|| type_error("invalid timestamp"))?
-        }
-        Some(Object::Float(f)) => {
-            let secs = *f as i64;
-            Local
-                .timestamp_opt(secs, 0)
-                .single()
-                .ok_or_else(|| type_error("invalid timestamp"))?
-        }
+        Some(Object::Int(i)) => local_from_timestamp(*i)?,
+        Some(Object::Float(f)) => local_from_timestamp(float_to_timestamp(*f)?)?,
         None | Some(Object::None) => Local::now(),
         _ => return Err(type_error("localtime expects a number")),
     };
@@ -466,14 +570,8 @@ fn time_localtime(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn time_gmtime(args: &[Object]) -> Result<Object, RuntimeError> {
     let dt = match args.first() {
-        Some(Object::Int(i)) => Utc
-            .timestamp_opt(*i, 0)
-            .single()
-            .ok_or_else(|| type_error("invalid timestamp"))?,
-        Some(Object::Float(f)) => Utc
-            .timestamp_opt(*f as i64, 0)
-            .single()
-            .ok_or_else(|| type_error("invalid timestamp"))?,
+        Some(Object::Int(i)) => utc_from_timestamp(*i)?,
+        Some(Object::Float(f)) => utc_from_timestamp(float_to_timestamp(*f)?)?,
         None | Some(Object::None) => Utc::now(),
         _ => return Err(type_error("gmtime expects a number")),
     };

@@ -11,9 +11,15 @@
 # Behaviour (group semantics, greedy/lazy scanning, empty-match
 # handling, split/sub/subn rules) follows CPython 3.13 exactly.
 
+import sys
 import _sre
 from . import _parser
 from ._constants import error as PatternError
+
+# Largest position the native core (and CPython's `Py_ssize_t` argument
+# clinic) accepts; a `pos`/`endpos` beyond this is an OverflowError, not a
+# silent clamp (`test_json.test_scanstring.test_overflow`).
+_MAXSIZE = sys.maxsize
 
 __all__ = ["Pattern", "Match", "compile_pattern"]
 
@@ -33,8 +39,34 @@ def compile_pattern(pattern, flags, code, groups, groupindex, indexgroup):
     return Pattern(handle, pattern, flags, groups, groupindex, indexgroup)
 
 
+# Code-point length is O(n) for WeavePy's UTF-8 `str`, and regex-driven
+# scanners (`json`'s pure-Python decoder, tokenizers, `finditer`) call
+# match/search on the *same* subject at many advancing positions. Caching
+# the most recent subject's length — identity-keyed, holding the object so a
+# hit can never be stale — keeps a full scan O(n) instead of O(n^2). The
+# cache is a single immutable tuple so concurrent threads can only miss,
+# never observe a torn (wrong) value.
+_len_cache = (None, 0)
+
+
+def _subject_len(string):
+    if type(string) is str:
+        global _len_cache
+        cache = _len_cache
+        if string is cache[0]:
+            return cache[1]
+        n = len(string)
+        _len_cache = (string, n)
+        return n
+    return len(string)
+
+
 def _clamp_span(string, pos, endpos):
-    length = len(string)
+    if pos is not None and not -_MAXSIZE - 1 <= pos <= _MAXSIZE:
+        raise OverflowError("Python int too large to convert to C ssize_t")
+    if endpos is not None and not -_MAXSIZE - 1 <= endpos <= _MAXSIZE:
+        raise OverflowError("Python int too large to convert to C ssize_t")
+    length = _subject_len(string)
     if pos is None:
         pos = 0
     if endpos is None:
@@ -159,7 +191,7 @@ class Pattern:
         n = 0
         last = 0
         pos = 0
-        endpos = len(string)
+        endpos = _subject_len(string)
         must_advance = False
         while pos <= endpos:
             if count and n >= count:
@@ -186,7 +218,7 @@ class Pattern:
         n = 0
         last = 0
         pos = 0
-        endpos = len(string)
+        endpos = _subject_len(string)
         must_advance = False
         while pos <= endpos:
             if maxsplit and n >= maxsplit:
