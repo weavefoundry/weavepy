@@ -52,7 +52,6 @@ pub mod signal_mod;
 pub mod socket_mod;
 pub mod sqlite3_mod;
 pub mod sre_mod;
-pub mod ssl_mod;
 pub mod statistics_accel;
 pub mod struct_mod;
 pub mod subprocess_mod;
@@ -64,6 +63,7 @@ pub mod testinternalcapi_mod;
 pub mod thread;
 pub mod time;
 pub mod tracemalloc_real;
+mod unicode_decomp_data;
 pub mod unicodedata_mod;
 pub mod uuid_mod;
 pub mod weakref_mod;
@@ -142,7 +142,11 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_shutil", shutil_mod::build);
     cache.register_builtin("_functools", functools_mod::build);
     cache.register_builtin("_itertools", itertools_mod::build);
-    cache.register_builtin("ssl", ssl_mod::build);
+    // RFC 0042 WS2 — TLS unification. The native rustls core is `_ssl`; the
+    // public `ssl` module is the CPython-shaped frozen `ssl.py`
+    // (`SSLContext`/`SSLSocket`/`SSLObject`) that sits on top of it, exactly
+    // like CPython's `Lib/ssl.py` over its `_ssl` C extension.
+    cache.register_builtin("_ssl", ssl_real::build);
     cache.register_builtin("zlib", zlib_mod::build);
     cache.register_builtin("_struct", struct_mod::build);
     cache.register_builtin("_codecs", codecs_mod::build);
@@ -859,6 +863,13 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/socket.py"),
             is_package: false,
         },
+        // RFC 0042 WS2 — CPython-shaped `ssl` over the native rustls `_ssl`
+        // core (mirrors CPython's `Lib/ssl.py` over its `_ssl` C extension).
+        FrozenSource {
+            name: "ssl",
+            source: include_str!("python/ssl.py"),
+            is_package: false,
+        },
         FrozenSource {
             name: "selectors",
             source: include_str!("python/selectors.py"),
@@ -922,7 +933,10 @@ fn frozen_sources() -> &'static [FrozenSource] {
             source: include_str!("python/html_entities.py"),
             is_package: false,
         },
-        // `urllib` is a package containing three submodules.
+        // RFC 0042 WS4 — `urllib`, vendored verbatim from
+        // `vendor/cpython/Lib/urllib/` (the `__init__` is empty upstream).
+        // `request`/`response`/`error` now ride the WS1 `socket.makefile()`
+        // and WS2 `ssl` stacks; `parse` was already verbatim.
         FrozenSource {
             name: "urllib",
             source: "",
@@ -930,69 +944,266 @@ fn frozen_sources() -> &'static [FrozenSource] {
         },
         FrozenSource {
             name: "urllib.parse",
-            source: include_str!("python/urllib_parse.py"),
+            source: include_str!("python/urllib/parse.py"),
             is_package: false,
         },
         FrozenSource {
             name: "urllib.error",
-            source: include_str!("python/urllib_error.py"),
+            source: include_str!("python/urllib/error.py"),
             is_package: false,
         },
         FrozenSource {
             name: "urllib.response",
-            source: include_str!("python/urllib_response.py"),
+            source: include_str!("python/urllib/response.py"),
             is_package: false,
         },
         FrozenSource {
             name: "urllib.request",
-            source: include_str!("python/urllib_request.py"),
+            source: include_str!("python/urllib/request.py"),
             is_package: false,
         },
-        // `http` package and submodules.
+        // RFC 0042 WS3 — `http`, vendored verbatim from
+        // `vendor/cpython/Lib/http/`. The real `__init__` exports the
+        // `HTTPStatus`/`HTTPMethod` enums; `client`/`server` run over the WS1
+        // `socket.makefile()` + WS2 `ssl` stacks. `cookiejar` (WS4) lets
+        // `urllib.request.HTTPCookieProcessor` work unchanged.
         FrozenSource {
             name: "http",
-            source: "",
+            source: include_str!("python/http/__init__.py"),
             is_package: true,
         },
         FrozenSource {
             name: "http.client",
-            source: include_str!("python/http_client.py"),
+            source: include_str!("python/http/client.py"),
             is_package: false,
         },
         FrozenSource {
             name: "http.server",
-            source: include_str!("python/http_server.py"),
+            source: include_str!("python/http/server.py"),
             is_package: false,
         },
         FrozenSource {
             name: "http.cookies",
-            source: include_str!("python/http_cookies.py"),
+            source: include_str!("python/http/cookies.py"),
             is_package: false,
         },
-        // `email` package and submodules.
+        FrozenSource {
+            name: "http.cookiejar",
+            source: include_str!("python/http/cookiejar.py"),
+            is_package: false,
+        },
+        // RFC 0042 WS3/WS5 — the real CPython `email` package, vendored
+        // verbatim from `vendor/cpython/Lib/email/`. `http.client` parses
+        // response headers with `email.parser`/`email.message`, and the
+        // WS5 mail clients (`smtplib` etc.) build messages with `email.mime`.
         FrozenSource {
             name: "email",
-            source: include_str!("python/email_init.py"),
+            source: include_str!("python/email/__init__.py"),
             is_package: true,
         },
         FrozenSource {
-            name: "email.message",
-            source: include_str!("python/email_message.py"),
+            name: "email._encoded_words",
+            source: include_str!("python/email/_encoded_words.py"),
             is_package: false,
         },
         FrozenSource {
-            name: "email.parser",
-            source: include_str!("python/email_parser.py"),
+            name: "email._header_value_parser",
+            source: include_str!("python/email/_header_value_parser.py"),
             is_package: false,
         },
         FrozenSource {
-            name: "email.utils",
-            source: include_str!("python/email_utils.py"),
+            name: "email._parseaddr",
+            source: include_str!("python/email/_parseaddr.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email._policybase",
+            source: include_str!("python/email/_policybase.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.base64mime",
+            source: include_str!("python/email/base64mime.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.charset",
+            source: include_str!("python/email/charset.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.contentmanager",
+            source: include_str!("python/email/contentmanager.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.encoders",
+            source: include_str!("python/email/encoders.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.errors",
+            source: include_str!("python/email/errors.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.feedparser",
+            source: include_str!("python/email/feedparser.py"),
             is_package: false,
         },
         FrozenSource {
             name: "email.generator",
-            source: include_str!("python/email_generator.py"),
+            source: include_str!("python/email/generator.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.header",
+            source: include_str!("python/email/header.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.headerregistry",
+            source: include_str!("python/email/headerregistry.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.iterators",
+            source: include_str!("python/email/iterators.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.message",
+            source: include_str!("python/email/message.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.parser",
+            source: include_str!("python/email/parser.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.policy",
+            source: include_str!("python/email/policy.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.quoprimime",
+            source: include_str!("python/email/quoprimime.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.utils",
+            source: include_str!("python/email/utils.py"),
+            is_package: false,
+        },
+        // `email.mime.*` — message construction helpers (WS5 mail clients).
+        FrozenSource {
+            name: "email.mime",
+            source: include_str!("python/email/mime/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "email.mime.application",
+            source: include_str!("python/email/mime/application.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.mime.audio",
+            source: include_str!("python/email/mime/audio.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.mime.base",
+            source: include_str!("python/email/mime/base.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.mime.image",
+            source: include_str!("python/email/mime/image.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.mime.message",
+            source: include_str!("python/email/mime/message.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.mime.multipart",
+            source: include_str!("python/email/mime/multipart.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.mime.nonmultipart",
+            source: include_str!("python/email/mime/nonmultipart.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "email.mime.text",
+            source: include_str!("python/email/mime/text.py"),
+            is_package: false,
+        },
+        // `quopri` — quoted-printable codec used by `email`'s encoders/parsers
+        // (verbatim CPython, over the native `binascii` a2b_qp/b2a_qp).
+        FrozenSource {
+            name: "quopri",
+            source: include_str!("python/quopri.py"),
+            is_package: false,
+        },
+        // `_scproxy` — macOS system-proxy shim (reports "no system proxy"); the
+        // verbatim `urllib.request` imports it unconditionally on darwin.
+        FrozenSource {
+            name: "_scproxy",
+            source: include_str!("python/_scproxy.py"),
+            is_package: false,
+        },
+        // `stringprep` (RFC 3454 tables) + the `encodings.idna`/`encodings.punycode`
+        // codecs. WeavePy serves most codecs natively, but `idna`/`punycode` are
+        // pure-Python in CPython and are resolved on demand by `codecs.lookup`
+        // (see `python/codecs.py`). `http.client`/`urllib` need `idna` to encode
+        // non-ASCII hostnames. The `encodings` package is intentionally minimal
+        // (just these two modules); it is NOT the codec search bootstrap.
+        FrozenSource {
+            name: "stringprep",
+            source: include_str!("python/stringprep.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings",
+            source: include_str!("python/encodings/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "encodings.idna",
+            source: include_str!("python/encodings/idna.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "encodings.punycode",
+            source: include_str!("python/encodings/punycode.py"),
+            is_package: false,
+        },
+        // RFC 0042 WS5 — application-protocol clients, vendored verbatim from
+        // CPython 3.13. They ride the WS1 `socket`/`makefile()` and WS2 `ssl`
+        // stacks (`*_SSL` variants, `starttls`/`stls`). `nntplib`/`telnetlib`
+        // were removed upstream in 3.13, so they are intentionally absent.
+        FrozenSource {
+            name: "ftplib",
+            source: include_str!("python/ftplib.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "poplib",
+            source: include_str!("python/poplib.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "imaplib",
+            source: include_str!("python/imaplib.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "smtplib",
+            source: include_str!("python/smtplib.py"),
             is_package: false,
         },
         // `xml` package and submodules — only `etree.ElementTree`.

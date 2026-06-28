@@ -15,6 +15,18 @@ import warnings
 
 
 @contextlib.contextmanager
+def check_no_warnings(testcase, message='', category=Warning, force_gc=False):
+    """Assert that no warnings matching *category*/*message* are emitted."""
+    with warnings.catch_warnings(record=True) as warns:
+        warnings.filterwarnings('always', message=message, category=category)
+        yield
+        if force_gc:
+            from test.support import gc_collect
+            gc_collect()
+    testcase.assertEqual(warns, [])
+
+
+@contextlib.contextmanager
 def check_no_resource_warning(testcase):
     """Assert no ``ResourceWarning`` is raised inside the block."""
     with warnings.catch_warnings(record=True) as warns:

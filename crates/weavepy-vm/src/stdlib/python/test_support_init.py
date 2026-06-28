@@ -331,6 +331,20 @@ def requires_resource(resource):
     return unittest.skip("resource %r is not enabled" % resource)
 
 
+def system_must_validate_cert(f):
+    """Skip the test on TLS certificate validation failures (verbatim 3.13)."""
+    @functools.wraps(f)
+    def dec(*args, **kwargs):
+        try:
+            f(*args, **kwargs)
+        except OSError as e:
+            if "CERTIFICATE_VERIFY_FAILED" in str(e):
+                raise unittest.SkipTest("system does not contain "
+                                        "necessary certificates")
+            raise
+    return dec
+
+
 def _is_gui_available():
     return False
 
@@ -1430,6 +1444,10 @@ run_doctest = run_doctest
 # ---------------------------------------------------------------------------
 
 TEST_DATA_DIR = os.path.join(TEST_HOME_DIR, "data")
+
+# A fixed external URL string used by the urllib tests that monkeypatch
+# ``urlopen`` (so the host is never actually contacted). Mirrors CPython.
+TEST_HTTP_URL = "http://www.pythontest.net"
 
 
 def open_urlresource(url, *args, **kw):

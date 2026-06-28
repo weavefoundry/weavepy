@@ -17,6 +17,10 @@ HOST = "localhost"
 HOSTv4 = "127.0.0.1"
 HOSTv6 = "::1"
 
+# CPython 3.13 gates a few tests on whether ``gethostname`` works (false only
+# under WASI). WeavePy always has a usable hostname on its POSIX hosts.
+has_gethostname = True
+
 # Network-ish errnos that should turn a test into a *skip*, not a fail.
 _TRANSIENT_ERRNOS = frozenset(filter(None, (
     getattr(errno, "ECONNREFUSED", None),
@@ -67,6 +71,18 @@ def bind_unix_socket(sock, addr):
         sock.close()
         import unittest
         raise unittest.SkipTest('cannot bind AF_UNIX sockets')
+
+
+def create_unix_domain_name():
+    """Create a UNIX domain name suitable for binding (CPython parity).
+
+    Returns a unique, not-yet-existing path under the current directory so an
+    ``AF_UNIX`` server can ``bind()`` it. The short ``dir=os.path.curdir``
+    keeps the path under ``sun_path``'s ~108-byte limit.
+    """
+    import tempfile
+    return tempfile.mktemp(prefix="test_python_", suffix='.sock',
+                           dir=os.path.curdir)
 
 
 def _is_ipv6_enabled():

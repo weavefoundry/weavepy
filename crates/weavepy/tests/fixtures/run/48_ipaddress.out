@@ -7,4 +7,4 @@ net contains 10.1.2.3: True
 net contains 11.1.2.3: False
 v6: ::1 loopback: True
 generic: 172.16.0.1 version: 4
-interface: 192.168.1.10 network: 192.168.1.0/24
+interface: 192.168.1.10/24 network: 192.168.1.0/24

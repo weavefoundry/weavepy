@@ -16,6 +16,7 @@ import sys
 import time as _time
 import traceback as _traceback
 import contextlib as _contextlib
+import functools as _functools
 # Exposed as a module attribute so the flattened `unittest.case` alias
 # (built at the bottom of this module) carries a `warnings` reference,
 # which CPython's `test_warnings` saves/restores in setUp/tearDown.
@@ -116,13 +117,16 @@ def skip(reason):
             test_item.__unittest_skip_why__ = reason
             return test_item
 
+        # `functools.wraps` copies `test_item.__dict__` onto the wrapper, so
+        # custom attributes the test harness attached to the function (e.g.
+        # test_socket's `client_skip`) survive being skip-wrapped — matching
+        # CPython. Plain `__name__`/`__doc__` copies would drop them.
+        @_functools.wraps(test_item)
         def skip_wrapper(*args, **kwargs):
             raise SkipTest(reason)
 
         skip_wrapper.__unittest_skip__ = True
         skip_wrapper.__unittest_skip_why__ = reason
-        skip_wrapper.__name__ = getattr(test_item, "__name__", "skip_wrapper")
-        skip_wrapper.__doc__ = getattr(test_item, "__doc__", None)
         return skip_wrapper
 
     if isinstance(reason, type):

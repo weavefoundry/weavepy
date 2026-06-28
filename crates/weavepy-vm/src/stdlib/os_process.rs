@@ -1110,9 +1110,11 @@ fn os_wait4(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 #[cfg(unix)]
+// `tv_usec` is `i64` on Linux (`__suseconds_t`) and `i32` on macOS, so the `as`
+// coercion is lossless on one target and not the other; `f64::from` won't
+// compile on Linux (no `From<i64> for f64`).
+#[allow(clippy::cast_lossless)]
 fn build_rusage(ru: &libc::rusage) -> Object {
-    // `tv_usec` is `i64` on Linux (`__suseconds_t`) and `i32` on macOS, so
-    // coerce with `as` rather than `f64::from` (no `From<i64>` for `f64`).
     let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0;
     Object::new_tuple(vec![
         Object::Float(tv(ru.ru_utime)),

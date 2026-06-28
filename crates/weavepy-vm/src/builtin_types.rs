@@ -2427,6 +2427,16 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
             call_kw: None,
         })),
     );
+    // CPython exposes `errno`/`strerror`/`filename`/`filename2`/`winerror`
+    // as getset descriptors on the `OSError` type that default to `None`.
+    // Subclasses that override `__init__` *without* chaining to
+    // `OSError.__init__` (e.g. `urllib.error.URLError`, which only sets
+    // `args`/`reason`) still expect `inst.filename` to resolve — so provide
+    // the defaults at the type level, where instance-dict entries shadow
+    // them once a real value is assigned.
+    for name in ["errno", "strerror", "filename", "filename2", "winerror"] {
+        dict.insert(DictKey(Object::from_static(name)), Object::None);
+    }
 }
 
 /// Which of the three concrete unicode errors we're installing dunders

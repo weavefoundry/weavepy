@@ -96,13 +96,29 @@ fn build_inner_ucd() -> Rc<PyModule> {
             DictKey(Object::from_static("unidata_version")),
             Object::from_static("3.2.0"),
         );
+        // Expose the *same* engine functions as the top-level module. The
+        // historical 3.2.0 snapshot shares WeavePy's current UCD tables (not
+        // bit-perfect for ancient code points), but consumers like
+        // `stringprep`/`encodings.idna` need the full surface —
+        // `normalize`/`bidirectional`/`category`/… — to run IDNA nameprep at
+        // all (`test_httplib.test_connect_with_tunnel_idna`).
         for (name, fn_) in [
             (
                 "name",
                 unicodedata_name as fn(&[Object]) -> Result<Object, RuntimeError>,
             ),
-            ("category", unicodedata_category),
             ("lookup", unicodedata_lookup),
+            ("category", unicodedata_category),
+            ("bidirectional", unicodedata_bidirectional),
+            ("combining", unicodedata_combining),
+            ("mirrored", unicodedata_mirrored),
+            ("decimal", unicodedata_decimal),
+            ("digit", unicodedata_digit),
+            ("numeric", unicodedata_numeric),
+            ("decomposition", unicodedata_decomposition),
+            ("normalize", unicodedata_normalize),
+            ("is_normalized", unicodedata_is_normalized),
+            ("east_asian_width", unicodedata_east_asian_width),
         ] {
             d.insert(DictKey(Object::from_static(name)), builtin(name, fn_));
         }
@@ -123,12 +139,19 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
     }))
 }
 
-fn first_char(args: &[Object], fn_name: &str) -> Result<char, RuntimeError> {
+/// The single code point of a one-character string argument, accepting both
+/// plain `str` (`Object::Str`) and surrogate-bearing `str` (`Object::WStr`,
+/// e.g. `chr(0xD800)`). CPython's `unicodedata` functions accept lone
+/// surrogates — `test_urlparse`'s `test_urlsplit_normalization` sweeps
+/// `map(chr, range(0x21, 0x10000))`, which includes the surrogate range — so
+/// we hand back the raw `u32` code point and let each caller decide how to
+/// treat an unpaired surrogate (which has no Rust `char`).
+fn first_codepoint(args: &[Object], fn_name: &str) -> Result<u32, RuntimeError> {
     match args.first() {
-        Some(Object::Str(s)) => {
-            let mut it = s.chars();
-            match (it.next(), it.next()) {
-                (Some(c), None) => Ok(c),
+        Some(obj) if obj.is_str() => {
+            let cps = obj.str_codepoints().unwrap_or_default();
+            match cps.as_slice() {
+                [cp] => Ok(*cp),
                 _ => Err(type_error(format!(
                     "{fn_name}() argument must be a unicode character"
                 ))),
@@ -178,8 +201,8 @@ fn category_str(g: GeneralCategory) -> &'static str {
 }
 
 fn unicodedata_name(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "name")?;
-    if let Some(name) = char_name(ch) {
+    let cp = first_codepoint(args, "name")?;
+    if let Some(name) = char::from_u32(cp).and_then(char_name) {
         return Ok(Object::from_str(name));
     }
     if let Some(default) = args.get(1) {
@@ -200,12 +223,21 @@ fn unicodedata_lookup(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn unicodedata_category(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "category")?;
-    Ok(Object::from_static(category_str(ch.general_category())))
+    let cp = first_codepoint(args, "category")?;
+    match char::from_u32(cp) {
+        Some(ch) => Ok(Object::from_static(category_str(ch.general_category()))),
+        // A lone surrogate (U+D800..U+DFFF) has general category `Cs`.
+        None => Ok(Object::from_static("Cs")),
+    }
 }
 
 fn unicodedata_bidirectional(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "bidirectional")?;
+    let cp = first_codepoint(args, "bidirectional")?;
+    // A lone surrogate carries the default Bidi class (`L`), matching the
+    // `Surrogate` arm below.
+    let Some(ch) = char::from_u32(cp) else {
+        return Ok(Object::from_static("L"));
+    };
     // Bidi class isn't exposed by unicode-properties directly; we
     // approximate the common buckets using the general category. CPython
     // also returns "" for unassigned chars.
@@ -246,31 +278,32 @@ fn unicodedata_bidirectional(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn unicodedata_combining(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "combining")?;
+    let cp = first_codepoint(args, "combining")?;
     // Canonical combining class — we use 230 for common combining
     // marks (the usual default) and 0 otherwise. The full table is
     // not exposed by unicode-properties; this is a pragmatic
     // approximation that gets the common `unicodedata.combining`
-    // usage (testing for non-zero) correct.
-    Ok(Object::Int(match ch.general_category() {
-        GeneralCategory::NonspacingMark => 230,
-        GeneralCategory::EnclosingMark | GeneralCategory::SpacingMark => 0,
-        _ => 0,
-    }))
+    // usage (testing for non-zero) correct. Lone surrogates are 0.
+    Ok(Object::Int(
+        match char::from_u32(cp).map(|ch| ch.general_category()) {
+            Some(GeneralCategory::NonspacingMark) => 230,
+            _ => 0,
+        },
+    ))
 }
 
 fn unicodedata_mirrored(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "mirrored")?;
+    let cp = first_codepoint(args, "mirrored")?;
     let mirrored = matches!(
-        ch,
-        '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\u{27E8}' | '\u{27E9}'
+        char::from_u32(cp),
+        Some('(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\u{27E8}' | '\u{27E9}')
     );
     Ok(Object::Int(i64::from(mirrored)))
 }
 
 fn unicodedata_decimal(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "decimal")?;
-    if let Some(d) = ch.to_digit(10) {
+    let cp = first_codepoint(args, "decimal")?;
+    if let Some(d) = char::from_u32(cp).and_then(|ch| ch.to_digit(10)) {
         return Ok(Object::Int(i64::from(d)));
     }
     if let Some(default) = args.get(1) {
@@ -280,8 +313,8 @@ fn unicodedata_decimal(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn unicodedata_digit(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "digit")?;
-    if let Some(d) = ch.to_digit(10) {
+    let cp = first_codepoint(args, "digit")?;
+    if let Some(d) = char::from_u32(cp).and_then(|ch| ch.to_digit(10)) {
         return Ok(Object::Int(i64::from(d)));
     }
     if let Some(default) = args.get(1) {
@@ -291,27 +324,28 @@ fn unicodedata_digit(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn unicodedata_numeric(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "numeric")?;
-    if let Some(d) = ch.to_digit(36) {
+    let cp = first_codepoint(args, "numeric")?;
+    let ch = char::from_u32(cp);
+    if let Some(d) = ch.and_then(|c| c.to_digit(36)) {
         if d < 10 {
             return Ok(Object::Float(f64::from(d)));
         }
     }
     // Cover the common Unicode fraction characters.
     let v = match ch {
-        '½' => Some(0.5),
-        '⅓' => Some(1.0 / 3.0),
-        '¼' => Some(0.25),
-        '⅕' => Some(0.2),
-        '⅙' => Some(1.0 / 6.0),
-        '⅛' => Some(0.125),
-        '⅔' => Some(2.0 / 3.0),
-        '⅖' => Some(0.4),
-        '⅗' => Some(0.6),
-        '⅘' => Some(0.8),
-        '¾' => Some(0.75),
-        '⅝' => Some(0.625),
-        '⅞' => Some(0.875),
+        Some('½') => Some(0.5),
+        Some('⅓') => Some(1.0 / 3.0),
+        Some('¼') => Some(0.25),
+        Some('⅕') => Some(0.2),
+        Some('⅙') => Some(1.0 / 6.0),
+        Some('⅛') => Some(0.125),
+        Some('⅔') => Some(2.0 / 3.0),
+        Some('⅖') => Some(0.4),
+        Some('⅗') => Some(0.6),
+        Some('⅘') => Some(0.8),
+        Some('¾') => Some(0.75),
+        Some('⅝') => Some(0.625),
+        Some('⅞') => Some(0.875),
         _ => None,
     };
     if let Some(x) = v {
@@ -324,17 +358,16 @@ fn unicodedata_numeric(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn unicodedata_decomposition(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "decomposition")?;
-    // Render the NFD decomposition as a CPython-style hex string.
-    let decomp: String = ch.to_string().nfd().collect();
-    if decomp.chars().count() == 1 && decomp.starts_with(ch) {
-        return Ok(Object::from_static(""));
+    let cp = first_codepoint(args, "decomposition")?;
+    // Look up the authoritative UCD decomposition (canonical *and*
+    // compatibility, with the `<tag>` prefixes that NFD/NFKD can't recover),
+    // generated verbatim from CPython. Code points without a decomposition —
+    // including lone surrogates — return "".
+    let table = crate::stdlib::unicode_decomp_data::DECOMPOSITIONS;
+    match table.binary_search_by_key(&cp, |&(c, _)| c) {
+        Ok(i) => Ok(Object::from_static(table[i].1)),
+        Err(_) => Ok(Object::from_static("")),
     }
-    let hex: Vec<String> = decomp
-        .chars()
-        .map(|c| format!("{:04X}", c as u32))
-        .collect();
-    Ok(Object::from_str(hex.join(" ")))
 }
 
 fn unicodedata_normalize(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1367,8 +1400,7 @@ const EAW_RANGES: &[(u32, u32, &str)] = &[
 ];
 
 fn unicodedata_east_asian_width(args: &[Object]) -> Result<Object, RuntimeError> {
-    let ch = first_char(args, "east_asian_width")?;
-    let code = ch as u32;
+    let code = first_codepoint(args, "east_asian_width")?;
     let idx = EAW_RANGES.partition_point(|&(start, _, _)| start <= code);
     let class = if idx > 0 {
         let (_, end, cls) = EAW_RANGES[idx - 1];

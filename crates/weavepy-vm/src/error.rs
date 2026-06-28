@@ -455,6 +455,35 @@ pub fn os_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("OSError", message))
 }
 
+/// Build an `OSError` with a populated `errno`/`strerror` (and the matching
+/// `(errno, strerror)` `args`), so callers that branch on `exc.errno`
+/// — e.g. `asyncore`'s `_DISCONNECTED` check, `socket`/`ssl` cleanup paths
+/// — classify it correctly. Mirrors CPython's `OSError(errno, strerror)`.
+pub fn os_error_with_errno(errno: i32, strerror: impl Into<String>) -> RuntimeError {
+    use crate::object::{DictKey, Object};
+    let strerror = strerror.into();
+    let pe = PyException::from_builtin("OSError", strerror.clone());
+    if let Object::Instance(inst) = &pe.instance {
+        let mut d = inst.dict.borrow_mut();
+        d.insert(
+            DictKey(Object::from_static("errno")),
+            Object::Int(i64::from(errno)),
+        );
+        d.insert(
+            DictKey(Object::from_static("strerror")),
+            Object::from_str(strerror.clone()),
+        );
+        d.insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![
+                Object::Int(i64::from(errno)),
+                Object::from_str(strerror),
+            ]),
+        );
+    }
+    RuntimeError::PyException(pe)
+}
+
 pub fn blocking_io_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::PyException(PyException::from_builtin("BlockingIOError", message))
 }

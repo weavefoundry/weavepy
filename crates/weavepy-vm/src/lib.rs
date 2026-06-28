@@ -54,9 +54,10 @@ pub mod weakref_registry;
 
 use crate::builtin_types::{builtin_types, instance_is_subclass, make_exception_with_class};
 use crate::error::{
-    attribute_error, import_error, index_error, key_error, module_not_found_error, name_error,
-    overflow_error, recursion_error, runtime_error, stop_async_iteration, stop_iteration,
-    stop_iteration_with, type_error, value_error, zero_division_error, TracebackEntry,
+    attribute_error, import_error, index_error, key_error, key_error_object,
+    module_not_found_error, name_error, overflow_error, recursion_error, runtime_error,
+    stop_async_iteration, stop_iteration, stop_iteration_with, type_error, value_error,
+    zero_division_error, TracebackEntry,
 };
 pub use crate::error::{PyException, RuntimeError};
 pub use crate::import::ModuleCache;
@@ -4175,7 +4176,22 @@ impl Interpreter {
                 let g = frame.globals.clone();
                 if let Object::Instance(_) = &target {
                     if let Some(method) = instance_method(&target, "__setitem__") {
-                        self.call(&method, &[i.clone(), value], &[], &g)?;
+                        // A native-backed builtin subclass (`class C(list)`,
+                        // `class C(bytearray)`, …) that doesn't *override*
+                        // `__setitem__` resolves to the inherited native slot.
+                        // Its slice path materializes the RHS with the native
+                        // iteration protocol, which can't drive VM iterables
+                        // (generators/`yield`). Route slice assignment through
+                        // `store_subscr` instead — it collects the RHS via the
+                        // full VM protocol (`collect_iterable`) and splices the
+                        // unwrapped native payload, exactly as for a bare list.
+                        if matches!(i, Object::Slice(_))
+                            && bound_is_native_builtin(&method, "__setitem__")
+                        {
+                            self.store_subscr(&target, &i, value, &g)?;
+                        } else {
+                            self.call(&method, &[i.clone(), value], &[], &g)?;
+                        }
                     } else {
                         self.store_subscr(&target, &i, value, &g)?;
                     }
@@ -13479,6 +13495,16 @@ impl Interpreter {
                     buf.borrow_mut().extend_from_slice(&extra);
                     return Ok(a.clone());
                 }
+                // A PEP 688 buffer exporter (e.g. `array.array`): CPython's
+                // `bytearray_iadd` accepts any bytes-like, so extend in place
+                // via the buffer protocol, preserving the bytearray's identity.
+                inst @ Object::Instance(_)
+                    if crate::instance_method(inst, "__buffer__").is_some() =>
+                {
+                    let extra = crate::builtins::bytes_argview(inst)?;
+                    buf.borrow_mut().extend_from_slice(&extra);
+                    return Ok(a.clone());
+                }
                 _ => {}
             },
             // `bytearray *= n` repeats in place, preserving identity
@@ -13717,6 +13743,29 @@ impl Interpreter {
                 };
                 return binary_op(&left, &right, op);
             }
+        }
+        // `bytes`/`bytearray` `+` a PEP 688 buffer exporter (e.g.
+        // `array.array`): CPython's `bytes_concat` accepts any object exposing
+        // a buffer and returns `bytes`/`bytearray`. Native `binary_op` only
+        // knows the built-in bytes-likes, so bridge user instances here via the
+        // buffer protocol — this is what makes `b'' + array('b', ...)` (and the
+        // `+=` form that falls back to this path) work, e.g.
+        // `http.client.HTTPConnection.send(array(...))` in test_httplib.
+        if matches!(op, BinOpKind::Add)
+            && matches!(a, Object::Bytes(_) | Object::ByteArray(_))
+            && instance_method(b, "__buffer__").is_some()
+        {
+            let extra = crate::builtins::bytes_argview(b)?;
+            let mut out = match a {
+                Object::Bytes(x) => x.to_vec(),
+                Object::ByteArray(x) => x.borrow().clone(),
+                _ => unreachable!(),
+            };
+            out.extend_from_slice(&extra);
+            return Ok(match a {
+                Object::ByteArray(_) => Object::new_bytearray(out),
+                _ => Object::new_bytes(out),
+            });
         }
         binary_op(a, b, op)
     }
@@ -16025,7 +16074,7 @@ impl Interpreter {
                 let d = d.borrow();
                 d.get(&DictKey(key.clone()))
                     .cloned()
-                    .ok_or_else(|| key_error(key.repr()))
+                    .ok_or_else(|| key_error_object(key.clone()))
             }
             (Object::List(items), Object::Slice(s)) => {
                 let items = items.borrow();
@@ -16165,7 +16214,7 @@ impl Interpreter {
                 let d = d.borrow();
                 d.get(&DictKey(key.clone()))
                     .cloned()
-                    .ok_or_else(|| key_error(key.repr()))
+                    .ok_or_else(|| key_error_object(key.clone()))
             }
             (Object::SimpleNamespace(d), key) => {
                 let d = d.borrow();
@@ -16506,7 +16555,7 @@ impl Interpreter {
             (Object::Dict(d), key) => {
                 crate::builtins::ensure_hashable(key)?;
                 if d.borrow_mut().shift_remove(&DictKey(key.clone())).is_none() {
-                    return Err(key_error(key.repr()));
+                    return Err(key_error_object(key.clone()));
                 }
                 Ok(())
             }
@@ -16633,6 +16682,7 @@ impl Interpreter {
                         | "enumerate"
                         | "prod"
                         | "getsizeof"
+                        | "from_bytes"
                 )
         }
         let _ = outer_globals;
@@ -16866,6 +16916,33 @@ impl Interpreter {
                     }
                     if b.name == "sum" {
                         return self.do_sum_call(args, kwargs, outer_globals);
+                    }
+                    if b.name == "from_bytes" {
+                        // `int.from_bytes` accepts an iterable of ints, not
+                        // just bytes-like objects. Materialize a non-bytes
+                        // iterable *through the VM* so `map(...)`, generators,
+                        // and Python-callable iterables work (e.g.
+                        // `ipaddress`'s `map(cls._parse_octet, octets)`), then
+                        // hand the native helper a concrete sequence.
+                        let off = usize::from(
+                            args.first()
+                                .map(|o| o.is_int_like() || matches!(o, Object::Type(_)))
+                                .unwrap_or(false),
+                        );
+                        if let Some(data) = args.get(off) {
+                            let bytes_like = data.as_bytes_view().is_some()
+                                || matches!(
+                                    data,
+                                    Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+                                );
+                            if !bytes_like {
+                                let items = self.collect_iterable(data, outer_globals)?;
+                                let mut new_args = args.to_vec();
+                                new_args[off] = Object::new_tuple(items);
+                                return (b.call)(&new_args);
+                            }
+                        }
+                        return (b.call)(args);
                     }
                     if b.name == "map" && args.len() >= 2 {
                         return self.do_map_call(args, outer_globals);
@@ -17722,6 +17799,35 @@ impl Interpreter {
                         let owner = Object::Type(crate::builtins::class_of(&bm.receiver));
                         let target = self.descriptor_get(&bm.function, &bm.receiver, &owner)?;
                         return self.call(&target, args, kwargs, outer_globals);
+                    }
+                }
+                // `dict.__getitem__` invoked as a *bound method* on a `dict`
+                // subclass — e.g. `quoter = Quoter(safe).__getitem__;
+                // quoter(b)` (urllib.parse's byte quoter) — must dispatch a
+                // user `__missing__(key)` on a cache miss, exactly like the
+                // `BINARY_SUBSCR` opcode does for `obj[key]`. The native
+                // `dict_getitem` is a plain `fn(&[Object])` with no VM access,
+                // so the dispatch has to happen here, at the interpreter-aware
+                // call site.
+                if let Object::Builtin(b) = &bm.function {
+                    if b.name == "__getitem__"
+                        && matches!(&bm.receiver, Object::Instance(_))
+                        && matches!(bm.receiver.native_value(), Some(Object::Dict(_)))
+                    {
+                        let mut combined: Vec<Object> = Vec::with_capacity(args.len() + 1);
+                        combined.push(bm.receiver.clone());
+                        combined.extend_from_slice(args);
+                        return match self.call(&bm.function, &combined, kwargs, outer_globals) {
+                            Err(RuntimeError::PyException(exc))
+                                if exc.type_name() == "KeyError" =>
+                            {
+                                match instance_method(&bm.receiver, "__missing__") {
+                                    Some(miss) => self.call(&miss, args, &[], outer_globals),
+                                    None => Err(RuntimeError::PyException(exc)),
+                                }
+                            }
+                            other => other,
+                        };
                     }
                 }
                 let mut combined: Vec<Object> = Vec::with_capacity(args.len() + 1);
@@ -23595,6 +23701,20 @@ pub(crate) fn metaclass_method(v: &Object, name: &str) -> Option<Object> {
     }
 }
 
+/// True when `method` (as produced by [`instance_method`]) is the *inherited
+/// native* slot of `name` — a `BoundMethod` whose function is an
+/// `Object::Builtin` of that name — rather than a user-class override. Used by
+/// the `STORE_SUBSCR` path to tell "subclass that didn't override `__setitem__`"
+/// from a real Python `__setitem__`.
+pub(crate) fn bound_is_native_builtin(method: &Object, name: &str) -> bool {
+    if let Object::BoundMethod(bm) = method {
+        if let Object::Builtin(b) = &bm.function {
+            return b.name == name;
+        }
+    }
+    false
+}
+
 pub(crate) fn instance_method(obj: &Object, name: &str) -> Option<Object> {
     let inst = match obj {
         Object::Instance(i) => i.clone(),
@@ -25249,7 +25369,15 @@ pub(crate) fn percent_format_with(
                             item.type_name_owned()
                         )));
                     }
-                    format_via_spec_percent(&item, &spec)?
+                    // Unwrap `int` subclasses (enum/IntFlag members like
+                    // `ssl.OP_ALL`, `_NamedIntConstant`) to their native integer so
+                    // the radix formatter sees a real `int` instead of routing to
+                    // `object.__format__`, which rejects the `x`/`o` spec.
+                    let numeric = match &item {
+                        Object::Instance(_) => item.native_value().unwrap_or_else(|| item.clone()),
+                        _ => item.clone(),
+                    };
+                    format_via_spec_percent(&numeric, &spec)?
                 }
                 'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
                     // Unwrap int/float *subclass* instances to their native

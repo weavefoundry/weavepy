@@ -708,10 +708,34 @@ fn libregrtest_bootstrap(file: &RegrtestFile) -> Option<String> {
     let path = file.path.display().to_string();
     Some(format!(
         r#"
-import sys
+import sys, os
 sys.path.insert(0, {lib_dir:?})
 sys.argv = [{path:?}]
 import unittest
+# Enable the test-resource model the way libregrtest's `-u` flag would, so
+# `support.requires('network')` / `@requires_resource('network')` exercise the
+# loopback subset instead of raising ResourceDenied. Driven by
+# WEAVEPY_REGRTEST_RESOURCES (comma-separated).
+#
+# The default is deliberately minimal: only `network` (the loopback-safe
+# subset — never reaches an external host, no `urlfetch`) and `subprocess`,
+# which are what the RFC 0042 networking suites need to grade instead of
+# skip. We intentionally do NOT enable `cpu`/`walltime`/`decimal`/`tzdata`
+# here: those gate slow, host-sensitive stress cases (e.g. `math`'s
+# `sumprod` ULP stress, `io`'s PEP 475 EINTR signal retries, the
+# `datetime`/`json`/`statistics` walltime sweeps) that the checked-in
+# baseline was calibrated to skip. Turning them on surfaces pre-existing,
+# non-networking failures/timeouts unrelated to this harness's job. A caller
+# can still opt in via WEAVEPY_REGRTEST_RESOURCES.
+_res = os.environ.get("WEAVEPY_REGRTEST_RESOURCES")
+_reslist = [r for r in _res.split(",") if r] if _res else [
+    "network", "subprocess",
+]
+try:
+    import test.support as _support
+    _support.use_resources = _reslist
+except Exception:
+    pass
 try:
     mod = __import__("test.{name}", fromlist=["__spec__"])
 except unittest.SkipTest as e:
@@ -826,6 +850,25 @@ fn run_subprocess(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.env("WEAVEPY_REGRTEST_CHILD", "1");
+    // Put the child in its own process group so a timeout can SIGKILL the whole
+    // tree, not just the direct child. Tests that re-exec `weavepy` (subprocess,
+    // multiprocessing spawn/forkserver — which leave a `resource_tracker` and
+    // pool workers running) otherwise leak grandchildren that *inherit the
+    // stdout/stderr pipe*; killing only the parent leaves the pipe's write end
+    // open, so the draining `read_to_end` never sees EOF and the runner hangs.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    // Resource model for the child (and any further weavepy children it spawns):
+    // enable the loopback-safe `-u` set so `requires('network')` grades instead
+    // of skipping. Honors a caller-provided override.
+    cmd.env(
+        "WEAVEPY_REGRTEST_RESOURCES",
+        std::env::var("WEAVEPY_REGRTEST_RESOURCES")
+            .unwrap_or_else(|_| "network,subprocess".to_owned()),
+    );
     // Export the external CPython `Lib` dir so child interpreters spawned
     // by the test (`assert_python_ok`, `multiprocessing` spawn,
     // `subprocess` re-execs) inherit it on their default `sys.path` even
@@ -941,10 +984,21 @@ fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> Child
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
+                    // SIGKILL the *whole process group* (the child is a group
+                    // leader, see `spawn_subprocess`) so any grandchildren that
+                    // re-exec'd `weavepy` (multiprocessing resource_tracker /
+                    // pool workers, subprocess re-execs) die too and release the
+                    // inherited stdout/stderr pipe — otherwise `read_to_end`
+                    // below never reaches EOF and the runner hangs.
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     // Join the readers so the threads don't outlive us;
-                    // the pipes close on kill, so they return promptly.
+                    // the pipes close once the whole group is gone, so they
+                    // return promptly.
                     let _ = collect(out_handle);
                     let _ = collect(err_handle);
                     return ChildOutcome::TimedOut;

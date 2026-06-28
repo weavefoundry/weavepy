@@ -246,6 +246,25 @@ def _utf_8_sig_decode(input, errors="strict"):
     return (output, consumed + prefix)
 
 
+# ---------- stateless codec base class ----------
+#
+# CPython's `codecs.Codec` is the stateless encode/decode base that the pure-
+# Python `encodings.*` codecs (e.g. `idna`, `punycode`) subclass. WeavePy serves
+# most codecs natively, but those two are frozen Python modules that do
+# `class Codec(codecs.Codec)` / `class StreamWriter(Codec, codecs.StreamWriter)`,
+# so the name must exist here for class-definition (import) time to succeed.
+
+
+class Codec:
+    """Stateless encoder/decoder base (CPython ``codecs.Codec``)."""
+
+    def encode(self, input, errors="strict"):
+        raise NotImplementedError
+
+    def decode(self, input, errors="strict"):
+        raise NotImplementedError
+
+
 # ---------- incremental codec base classes ----------
 #
 # These base classes must precede the concrete `_UTF8Sig*` /
@@ -577,6 +596,17 @@ def _lookup_uncached(encoding):
     # dedicated frozen module loaded on first use.
     if norm in ("euc_jis_2004", "euc_jis2004", "eucjis2004", "jisx0213"):
         return _euc_jis_2004_codecinfo()
+    # `idna` (RFC 3490) and `punycode` (RFC 3492) are pure-Python codecs in
+    # CPython's `encodings` package; WeavePy freezes just those two and resolves
+    # them lazily here (the engine's native `_codecs.lookup` doesn't carry them).
+    # `http.client`/`urllib` use `idna` to ASCII-encode non-ASCII hostnames, and
+    # `encodings.idna` itself re-enters this lookup for `punycode`.
+    if norm == "idna":
+        import encodings.idna as _idna_mod
+        return _idna_mod.getregentry()
+    if norm == "punycode":
+        import encodings.punycode as _punycode_mod
+        return _punycode_mod.getregentry()
     if encoding in _PURE_CODECS or _normalise(encoding) in _PURE_CODECS:
         key = encoding if encoding in _PURE_CODECS else _normalise(encoding)
         encode_fn, decode_fn = _PURE_CODECS[key]

@@ -2229,6 +2229,11 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
 /// Unix branch field-for-field so a `dir_fd` stat is indistinguishable from a
 /// path stat.
 #[cfg(unix)]
+// `libc::stat` field widths are platform-dependent (e.g. `st_dev`/`st_rdev`/
+// `st_nlink` are 32-/16-bit on macOS but 64-bit on Linux), so the `as i64`
+// coercions are lossless on some targets and narrowing on others; a blanket
+// `i64::from` won't compile on the 64-bit targets (no `From<u64> for i64`).
+#[allow(clippy::cast_lossless)]
 fn stat_result_from_libc_stat(st: &libc::stat) -> Object {
     use crate::types::PyInstance;
     let ty = stat_result_type();
@@ -4723,6 +4728,18 @@ pub(crate) fn struct_seq_type(
         struct_seq_method(&mut dict, "__len__", move |_args| {
             Ok(Object::Int(fields.len() as i64))
         });
+        // Now that struct sequences subclass `tuple` (for `isinstance` parity),
+        // the inherited `tuple.__iter__` would look at native tuple storage,
+        // which these dict-backed instances don't have. Override `__iter__` to
+        // walk the visible fields (`list(time.localtime())`, `for x in st`).
+        struct_seq_method(&mut dict, "__iter__", move |args| {
+            let Some(Object::Instance(inst)) = args.first() else {
+                return Err(type_error("__iter__ requires a struct sequence instance"));
+            };
+            let values = struct_seq_values(fields, inst);
+            let it = Object::new_list(values).make_iter()?;
+            Ok(Object::Iter(Rc::new(RefCell::new(it))))
+        });
         // CPython struct sequences expose their members as read-only getset
         // descriptors and carry no instance `__dict__`, so *any* attribute
         // assignment raises `AttributeError` (`test_os.test_stat_attributes`
@@ -4758,9 +4775,21 @@ pub(crate) fn struct_seq_type(
         struct_seq_method(&mut dict, "__hash__", move |args| {
             struct_seq_hash(fields, args)
         });
+        // CPython's `structseq_repr`: `module.name(field=repr, …)` over the
+        // visible named members (e.g. `time.struct_time(tm_year=2033, …)`),
+        // *not* the bare tuple repr the native `tuple` base would otherwise give
+        // now that struct sequences subclass `tuple`.
+        struct_seq_method(&mut dict, "__repr__", move |args| {
+            struct_seq_repr(name, module, fields, args)
+        });
+        // CPython struct sequences subclass `tuple` (`type(os.stat(...))`'s MRO
+        // is `(stat_result, tuple, object)`), so `isinstance(x, tuple)` is True
+        // — `imaplib.Time2Internaldate` and lots of stdlib code branch on this.
+        // The visible fields are still served by the `__getitem__`/`__len__`
+        // overrides above; basing on `tuple` only affects the type's MRO.
         let cls = TypeObject::new_with_flags(
             name,
-            vec![bt.object_.clone()],
+            vec![bt.tuple_.clone()],
             dict,
             TypeFlags {
                 is_exception: false,
@@ -4904,6 +4933,35 @@ fn struct_seq_values(
         .collect()
 }
 
+/// `repr()` for a struct sequence — `module.name(field=value, …)` over the
+/// visible named members, reading the *named* values from the instance dict
+/// (so `stat_result`'s `st_atime` shows as the float, like CPython).
+fn struct_seq_repr(
+    name: &'static str,
+    module: &'static str,
+    fields: &'static [&'static str],
+    args: &[Object],
+) -> Result<Object, RuntimeError> {
+    let Some(Object::Instance(inst)) = args.first() else {
+        return Err(type_error(format!(
+            "{name}.__repr__ requires a {name} instance"
+        )));
+    };
+    let d = inst.dict.borrow();
+    let body = fields
+        .iter()
+        .map(|f| {
+            let v = d
+                .get(&DictKey(Object::from_static(f)))
+                .cloned()
+                .unwrap_or(Object::Int(0));
+            format!("{f}={}", v.repr())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Object::from_str(format!("{module}.{name}({body})")))
+}
+
 /// `__reduce__` for a struct sequence: `(type, (visible_tuple, hidden_dict))`.
 ///
 /// Mirrors CPython's `structseq_reduce`. The visible tuple carries the
@@ -5013,13 +5071,32 @@ pub(crate) fn struct_seq_instance(
     fields: &'static [&'static str],
     values: Vec<Object>,
 ) -> Object {
-    let inst = crate::types::PyInstance::new(ty);
+    let mut inst = crate::types::PyInstance::new(ty);
     {
         let mut d = inst.dict.borrow_mut();
         for (field, value) in fields.iter().zip(values) {
             d.insert(DictKey(Object::from_static(field)), value);
         }
     }
+    // Struct sequences subclass `tuple`, so give the instance a native tuple
+    // "view" of its visible fields. The inherited `tuple` slots
+    // (`__contains__`, `__add__`, `__mul__`, `index`, `count`, …) unwrap this
+    // payload, so they operate on the same values the `__getitem__`/`__len__`
+    // overrides expose — without us re-implementing every sequence method.
+    let visible: Vec<Object> = {
+        let d = inst.dict.borrow();
+        fields
+            .iter()
+            .map(|f| {
+                let v = d
+                    .get(&DictKey(Object::from_static(f)))
+                    .cloned()
+                    .unwrap_or(Object::Int(0));
+                struct_seq_slot(f, v)
+            })
+            .collect()
+    };
+    inst.native = Some(Object::new_tuple(visible));
     Object::Instance(Rc::new(inst))
 }
 

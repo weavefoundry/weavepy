@@ -108,6 +108,11 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("interrupt_main")),
             b("interrupt_main", interrupt_main),
         );
+        d.insert(DictKey(Object::from_static("exit")), b("exit", thread_exit));
+        d.insert(
+            DictKey(Object::from_static("exit_thread")),
+            b("exit_thread", thread_exit),
+        );
         d.insert(
             DictKey(Object::from_static("_set_sentinel")),
             b("_set_sentinel", set_sentinel),
@@ -1257,6 +1262,30 @@ fn is_system_exit(err: &RuntimeError) -> bool {
         return false;
     };
     matches!(&exc.instance, Object::Instance(inst) if inst.cls().name == "SystemExit")
+}
+
+/// `_thread.exit()` (alias `exit_thread`) — synonymous with raising
+/// `SystemExit` with no arguments. In a worker thread the spawn shim
+/// swallows it (CPython only the main thread terminates the process); on
+/// the main thread it propagates like `sys.exit()`.
+fn thread_exit(_args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = crate::builtin_types::make_exception_with_class(
+        crate::builtin_types::builtin_types().system_exit.clone(),
+        "",
+    );
+    if let Object::Instance(inst_rc) = &inst {
+        inst_rc
+            .dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static("code")), Object::None);
+        inst_rc.dict.borrow_mut().insert(
+            DictKey(Object::from_static("args")),
+            Object::new_tuple(vec![]),
+        );
+    }
+    Err(RuntimeError::PyException(crate::error::PyException::new(
+        inst,
+    )))
 }
 
 fn interrupt_main(args: &[Object]) -> Result<Object, RuntimeError> {

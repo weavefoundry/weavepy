@@ -369,6 +369,22 @@ struct Matcher<'a> {
     repeats: Vec<RepeatCtx>,
     cur_repeat: Option<usize>,
     depth: u32,
+    /// Set while the *iterative* greedy `MAX_UNTIL` driver
+    /// ([`Matcher::max_until_iterative`]) is scanning its repeated body: it
+    /// holds that driver's `MAX_UNTIL` op position and repeat index. When
+    /// `do_match` flows back to *that exact* op (one full body iteration), the
+    /// op dispatch returns `Ok(true)` immediately instead of recursing —
+    /// turning per-repetition recursion into a loop so adversarial inputs (e.g.
+    /// `http.cookies`' `test_unquote_large`, 10^6 escapes under
+    /// `"(?:[^\\"]|\\.)*"`) don't blow the recursion guard. Saved/restored
+    /// across nested drivers so the innermost active body owns the signal.
+    repeat_stop: Option<(usize, usize)>,
+    /// Set while the *recursive* fallback ([`Matcher::max_until_recursive`]) is
+    /// driving a repeat (the iterative driver bailed because the greedy maximum
+    /// needs backtracking). It routes the body's flow-back to that op into the
+    /// recursive per-repetition step instead of re-engaging the iterative
+    /// driver. Saved/restored so it nests with `repeat_stop`.
+    repeat_recur: Option<(usize, usize)>,
 }
 
 impl<'a> Matcher<'a> {
@@ -388,6 +404,8 @@ impl<'a> Matcher<'a> {
             repeats: Vec::new(),
             cur_repeat: None,
             depth: 0,
+            repeat_stop: None,
+            repeat_recur: None,
         }
     }
 
@@ -413,6 +431,199 @@ impl<'a> Matcher<'a> {
         self.marks.clone_from(&snap.marks);
         self.lastmark = snap.lastmark;
         self.lastindex = snap.lastindex;
+    }
+
+    /// `true` if repeat `idx`'s body contains a `MARK` opcode (a capturing
+    /// group) anywhere — including nested sub-patterns, since the body occupies
+    /// the contiguous code range `[item, max_until_op)`. The scan is a sound
+    /// over-approximation: `MARK` *is* opcode 17, so a real group can never be
+    /// missed (no false negatives); at worst an unrelated operand byte equal to
+    /// 17 yields a false positive, which only routes the repeat to the
+    /// (correct) recursive engine. The iterative greedy driver intentionally
+    /// declines capturing bodies: it can't replay the per-repetition mark
+    /// snapshots the recursive engine keeps (e.g. restoring `group(1)` after a
+    /// failed trailing iteration of `(x)*`), so capturing repeats stay on the
+    /// recursive path and keep CPython's exact capture-backtracking semantics.
+    fn repeat_body_has_mark(&self, idx: usize) -> bool {
+        let rpat = self.repeats[idx].pattern;
+        let skip = self.code[rpat] as usize;
+        let start = rpat + 3;
+        let end = rpat + skip;
+        end <= self.code.len() && self.code[start..end].contains(&OP_MARK)
+    }
+
+    /// The faithful pre-3.11 recursive `MAX_UNTIL` (CPython `_sre`'s
+    /// `SRE_OP_MAX_UNTIL`): greedily match the repeated item, recursing per
+    /// repetition, then fall through to the tail. Retained verbatim for the
+    /// nested / capture-bearing / empty-width cases the iterative driver
+    /// declines, so their backtracking semantics are byte-for-byte unchanged.
+    fn max_until_recursive(
+        &mut self,
+        idx: usize,
+        ptr: usize,
+        pat: usize,
+        toplevel: bool,
+    ) -> Result<bool, RuntimeError> {
+        let code = self.code;
+        self.ptr = ptr;
+        let count = self.repeats[idx].count + 1;
+        let rpat = self.repeats[idx].pattern;
+        let rmin = code[rpat + 1] as isize;
+        let rmax = code[rpat + 2];
+        let item = rpat + 3;
+        if count < rmin {
+            self.repeats[idx].count = count;
+            self.ptr = ptr;
+            // Repeated-item matches inherit `toplevel` (CPython `DO_JUMP` for
+            // JUMP_MAX_UNTIL_1/_2): when the item can match empty (e.g.
+            // `(a?)*`), the recursion bottoms out at the tail SUCCESS, which
+            // must still see the `must_advance`/`match_all` guards.
+            if self.do_match(item, toplevel)? {
+                return Ok(true);
+            }
+            self.repeats[idx].count = count - 1;
+            self.ptr = ptr;
+            return Ok(false);
+        }
+        if (count < rmax as isize || rmax == MAXREPEAT)
+            && (ptr as isize) != self.repeats[idx].last_ptr
+        {
+            self.repeats[idx].count = count;
+            let save = self.snapshot();
+            let saved_last = self.repeats[idx].last_ptr;
+            self.repeats[idx].last_ptr = ptr as isize;
+            self.ptr = ptr;
+            if self.do_match(item, toplevel)? {
+                return Ok(true);
+            }
+            self.repeats[idx].last_ptr = saved_last;
+            self.restore(&save);
+            self.repeats[idx].count = count - 1;
+            self.ptr = ptr;
+        }
+        let prev = self.repeats[idx].prev;
+        self.cur_repeat = prev;
+        self.ptr = ptr;
+        // Tail continuation inherits `toplevel` (CPython `DO_JUMP`) so the
+        // trailing SUCCESS still honours the `must_advance`/`match_all` guards.
+        let r = self.do_match(pat, toplevel)?;
+        self.cur_repeat = Some(idx);
+        if r {
+            return Ok(true);
+        }
+        self.ptr = ptr;
+        Ok(false)
+    }
+
+    /// Iterative greedy descent for the outermost `MAX_UNTIL`. Matches the
+    /// repeated body in a loop — instead of recursing once per repetition —
+    /// then makes the tail attempt **at the greediest count only**, which is
+    /// byte-for-byte the recursive engine's *first* attempt. If that tail
+    /// attempt fails (i.e. the match needs backtracking — body alternatives or
+    /// fewer repetitions), the driver restores the entry state and hands the
+    /// whole repeat to [`Matcher::max_until_recursive`], so every backtracking
+    /// path keeps its exact prior semantics.
+    ///
+    /// Net effect: results are identical to the recursive engine in every case;
+    /// the only difference is that a *successful greedy* match (the common and
+    /// adversarial-stress shape — e.g. `http.cookies`' `test_unquote_large`,
+    /// 10^6 escapes under `"(?:[^\\"]|\\.)*"`) no longer consumes one native
+    /// stack frame per repetition, so it can't trip the recursion guard.
+    fn max_until_iterative(
+        &mut self,
+        op_pos: usize,
+        idx: usize,
+        ptr0: usize,
+        pat: usize,
+        toplevel: bool,
+    ) -> Result<bool, RuntimeError> {
+        let code = self.code;
+        let rmax = code[self.repeats[idx].pattern + 2];
+        let rmin = code[self.repeats[idx].pattern + 1] as isize;
+        let item = self.repeats[idx].pattern + 3;
+        let saved_count = self.repeats[idx].count;
+        let saved_last = self.repeats[idx].last_ptr;
+        let init = self.snapshot();
+        // Preserve any enclosing driver's signals; this repeat may be nested
+        // inside another driver's body (e.g. the deep `"(?:[^\\"]|\\.)*"` sits
+        // inside `http.cookies`' outer `(... )?`). Each is restored before we
+        // leave so the enclosing driver keeps owning its own flow-back.
+        let saved_stop = self.repeat_stop;
+        let saved_recur = self.repeat_recur;
+
+        // Greedy phase: match the body repeatedly, looping rather than
+        // recursing. `repeat_stop` makes a body iteration that flows back to
+        // *this* `MAX_UNTIL` return immediately (see the op dispatch), so each
+        // `do_match(item)` advances exactly one repetition at O(1) stack depth.
+        // Nested repeats inside the body engage their own drivers (they save and
+        // restore these fields), keeping the whole match off the native stack.
+        let mut cur = ptr0;
+        let mut n: isize = 0;
+        let mut empty = false;
+        self.repeat_stop = Some((op_pos, idx));
+        loop {
+            // Honour the upper bound (`{,m}`); `MAXREPEAT` means unbounded.
+            if rmax != MAXREPEAT && (n as u32) >= rmax {
+                break;
+            }
+            self.ptr = cur;
+            self.cur_repeat = Some(idx);
+            let matched = match self.do_match(item, false) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.repeat_stop = saved_stop;
+                    self.repeat_recur = saved_recur;
+                    return Err(e);
+                }
+            };
+            if !matched {
+                self.ptr = cur;
+                break;
+            }
+            let next = self.ptr;
+            if next == cur {
+                // Zero-width body: the recursive engine's `last_ptr` guard has
+                // subtle semantics here; defer the whole repeat to it.
+                empty = true;
+                break;
+            }
+            n += 1;
+            cur = next;
+        }
+        // Body scan finished: hand the flow-back signal back to the enclosing
+        // driver (if any) so this driver's own tail — which continues into that
+        // enclosing body — can reach it.
+        self.repeat_stop = saved_stop;
+
+        // Tail at the greediest count == the recursive engine's first attempt.
+        // (A capturing body leaves the live marks at the final repetition's
+        // state — exactly what the recursive engine holds at greedy maximum —
+        // so no restore is needed before this attempt.)
+        if !empty && n >= rmin {
+            self.cur_repeat = self.repeats[idx].prev;
+            self.ptr = cur;
+            let r = self.do_match(pat, toplevel)?;
+            self.cur_repeat = Some(idx);
+            if r {
+                return Ok(true);
+            }
+        }
+
+        // Greedy maximum didn't yield a match: every remaining possibility
+        // requires backtracking. Reset to the entry state and replay through
+        // the recursive engine, preserving its exact semantics (and its stack
+        // behaviour) for these non-greedy paths. `repeat_recur` makes the
+        // body's flow-back to this op take the recursive step (the op dispatch)
+        // rather than re-engaging the iterative driver.
+        self.restore(&init);
+        self.repeats[idx].count = saved_count;
+        self.repeats[idx].last_ptr = saved_last;
+        self.cur_repeat = Some(idx);
+        self.ptr = ptr0;
+        self.repeat_recur = Some((op_pos, idx));
+        let r = self.max_until_recursive(idx, ptr0, pat, toplevel);
+        self.repeat_recur = saved_recur;
+        r
     }
 
     fn at(&self, ptr: usize, atcode: u32) -> bool {
@@ -994,59 +1205,37 @@ impl<'a> Matcher<'a> {
                     return r;
                 }
                 OP_MAX_UNTIL => {
+                    let op_pos = pat - 1;
                     let idx = self
                         .cur_repeat
                         .ok_or_else(|| runtime_error("internal: MAX_UNTIL without REPEAT"))?;
-                    self.ptr = ptr;
-                    let count = self.repeats[idx].count + 1;
-                    let rpat = self.repeats[idx].pattern;
-                    let rmin = code[rpat + 1] as isize;
-                    let rmax = code[rpat + 2];
-                    let item = rpat + 3;
-                    if count < rmin {
-                        self.repeats[idx].count = count;
+                    // (1) The active iterative driver's body just completed one
+                    // iteration (flowed back to its own op): report it without
+                    // recursing. Checked first so it wins even when this op also
+                    // carries a stale `repeat_recur` from an outer fallback.
+                    if self.repeat_stop == Some((op_pos, idx)) {
                         self.ptr = ptr;
-                        // Repeated-item matches inherit `toplevel` (CPython
-                        // `DO_JUMP` for JUMP_MAX_UNTIL_1/_2): when the item can
-                        // match empty (e.g. `(a?)*`), the recursion bottoms out
-                        // at the tail SUCCESS, which must still see the
-                        // `must_advance`/`match_all` guards.
-                        if self.do_match(item, toplevel)? {
-                            return Ok(true);
-                        }
-                        self.repeats[idx].count = count - 1;
-                        self.ptr = ptr;
-                        return Ok(false);
-                    }
-                    if (count < rmax as isize || rmax == MAXREPEAT)
-                        && (ptr as isize) != self.repeats[idx].last_ptr
-                    {
-                        self.repeats[idx].count = count;
-                        let save = self.snapshot();
-                        let saved_last = self.repeats[idx].last_ptr;
-                        self.repeats[idx].last_ptr = ptr as isize;
-                        self.ptr = ptr;
-                        if self.do_match(item, toplevel)? {
-                            return Ok(true);
-                        }
-                        self.repeats[idx].last_ptr = saved_last;
-                        self.restore(&save);
-                        self.repeats[idx].count = count - 1;
-                        self.ptr = ptr;
-                    }
-                    let prev = self.repeats[idx].prev;
-                    self.cur_repeat = prev;
-                    self.ptr = ptr;
-                    // Tail continuation inherits `toplevel` (CPython
-                    // `DO_JUMP`) so the trailing SUCCESS still honours the
-                    // `must_advance`/`match_all` guards.
-                    let r = self.do_match(pat, toplevel)?;
-                    self.cur_repeat = Some(idx);
-                    if r {
                         return Ok(true);
                     }
-                    self.ptr = ptr;
-                    return Ok(false);
+                    // (2) This op is being driven by the recursive fallback
+                    // (its iterative driver bailed): run the per-repetition
+                    // recursive step so backtracking semantics are unchanged.
+                    if self.repeat_recur == Some((op_pos, idx)) {
+                        return self.max_until_recursive(idx, ptr, pat, toplevel);
+                    }
+                    // (3) Fresh repeat. A capturing body needs the recursive
+                    // engine's per-repetition mark snapshots, so route it there
+                    // (via `repeat_recur`, exactly as the iterative bail does).
+                    if self.repeat_body_has_mark(idx) {
+                        let saved_recur = self.repeat_recur;
+                        self.repeat_recur = Some((op_pos, idx));
+                        let r = self.max_until_recursive(idx, ptr, pat, toplevel);
+                        self.repeat_recur = saved_recur;
+                        return r;
+                    }
+                    // Non-capturing body: drive it iteratively so recursion
+                    // depth no longer scales with the repetition count.
+                    return self.max_until_iterative(op_pos, idx, ptr, pat, toplevel);
                 }
                 OP_MIN_UNTIL => {
                     let idx = self
@@ -1378,7 +1567,20 @@ fn subject_to_vec(obj: &Object) -> Result<Vec<u32>, RuntimeError> {
         Object::WStr(s) => Ok(s.to_vec()),
         Object::Bytes(b) => Ok(b.iter().map(|&x| u32::from(x)).collect()),
         Object::ByteArray(b) => Ok(b.borrow().iter().map(|&x| u32::from(x)).collect()),
-        _ => Err(type_error("expected string or bytes-like object")),
+        // `str`/`bytes` subclass instances (e.g. email's `ValueTerminal(str)`):
+        // CPython's `_sre` accepts any `PyUnicode`/buffer, subclasses
+        // included. Unwrap the native payload the subclass instance carries.
+        other => {
+            if let Some(native) = other.native_value() {
+                if matches!(
+                    native,
+                    Object::Str(_) | Object::WStr(_) | Object::Bytes(_) | Object::ByteArray(_)
+                ) {
+                    return subject_to_vec(&native);
+                }
+            }
+            Err(type_error("expected string or bytes-like object"))
+        }
     }
 }
 
