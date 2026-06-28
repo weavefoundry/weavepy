@@ -155,6 +155,9 @@ pub fn ensure_initialised() {
             crate::types::PyEllipsis_Type.as_ptr(),
         );
         crate::errors::init_static_exceptions();
+        // Bridge C `tp_traverse` / `tp_clear` into the tracing collector
+        // (RFC 0044, WS4) before any extension GC type can be created.
+        crate::gc_bridge::install();
     });
 }
 

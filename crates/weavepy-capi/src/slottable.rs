@@ -163,6 +163,12 @@ pub unsafe fn slot_table_for(ty: *mut crate::types::PyTypeObject) -> Option<&'st
     if ty.is_null() {
         return None;
     }
+    // Readied stock types (RFC 0044) keep their decoded slots in a side
+    // registry — their 416-byte struct has no embedded `PyTypeObjectBox`
+    // and they don't carry `Py_TPFLAGS_HEAPTYPE`. Check that first.
+    if let Some(table) = crate::types::readied_slot_table(ty) {
+        return Some(table);
+    }
     let flags = unsafe { (*ty).tp_flags };
     if (flags & crate::types::PY_TPFLAGS_HEAPTYPE as u64) == 0 {
         return None;

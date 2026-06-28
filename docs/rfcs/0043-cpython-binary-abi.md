@@ -200,12 +200,15 @@ fixture-proven:
   bridge for scalars + the core containers; immortality fidelity; the
   high-frequency symbol core; a stock-headers proof extension; loader/installer
   tag recognition.
-- **Wave 2.** The full type-suite round trip: `PyNumberMethods`/
-  `PySequenceMethods`/`PyMappingMethods`/`PyAsyncMethods`/`PyBufferProcs` read
-  from stock static types and heap types; descriptor (`tp_descr_get/set`),
-  `tp_getattro`/`tp_setattro`, `tp_call`, `tp_iter`/`tp_iternext`,
-  `tp_richcompare` dispatch from the faithful slots; GC integration
-  (`tp_traverse`/`tp_clear` participating in WeavePy's cycle collector).
+- **Wave 2** (detailed in **RFC 0044**, *Binary ABI: the type suite*). The full
+  type-suite round trip: `PyNumberMethods`/`PySequenceMethods`/`PyMappingMethods`/
+  `PyAsyncMethods`/`PyBufferProcs` read from stock static types and heap types;
+  descriptor (`tp_descr_get/set`), `tp_call`, `tp_iter`/`tp_iternext`,
+  `tp_richcompare` dispatch from the faithful slots; the classic static
+  `PyTypeObject` + `PyType_Ready` finalisation path; GC integration
+  (`tp_traverse`/`tp_clear` participating in WeavePy's cycle collector). Landed
+  and fixture-proven by `_stocktype` - see RFC 0044 for the design and measured
+  outcome.
 - **Wave 3.** The numpy *C-API surface*: the `PyArray_*` import capsule shape,
   `__array_struct__`/`__array_interface__`, the ufunc registration path, plus
   the long tail of `_multiarray_umath`'s symbol dependencies (the "is it our

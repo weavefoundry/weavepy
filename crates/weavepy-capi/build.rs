@@ -21,7 +21,7 @@ use std::process::Command;
 /// build-script flat (no globals).
 struct ExtensionBuild<'a> {
     cc: &'a str,
-    manifest_dir: &'a Path,
+    include_dir: &'a Path,
     out_dir: &'a Path,
     target_os: &'a str,
     suffix: &'a str,
@@ -106,7 +106,7 @@ fn main() {
     fn build_extension(opts: ExtensionBuild<'_>) {
         let ExtensionBuild {
             cc,
-            manifest_dir,
+            include_dir,
             out_dir,
             target_os,
             suffix,
@@ -125,7 +125,7 @@ fn main() {
             .arg("-fvisibility=default")
             .arg("-O0")
             .arg("-Wno-error")
-            .arg(format!("-I{}", manifest_dir.join("include").display()))
+            .arg(format!("-I{}", include_dir.display()))
             .arg(src)
             .arg("-o")
             .arg(&dylib);
@@ -147,10 +147,11 @@ fn main() {
         }
     }
 
+    let weavepy_inc = manifest_dir.join("include");
     let smalltest_src = workspace_root.join("tests/capi_ext/_smalltest.c");
     build_extension(ExtensionBuild {
         cc: &cc,
-        manifest_dir: &manifest_dir,
+        include_dir: &weavepy_inc,
         out_dir: &out_dir,
         target_os: &target_os,
         suffix,
@@ -161,7 +162,7 @@ fn main() {
     let ndarray_src = workspace_root.join("tests/capi_ext/_ndarray.c");
     build_extension(ExtensionBuild {
         cc: &cc,
-        manifest_dir: &manifest_dir,
+        include_dir: &weavepy_inc,
         out_dir: &out_dir,
         target_os: &target_os,
         suffix,
@@ -172,7 +173,7 @@ fn main() {
     let numpylike_src = workspace_root.join("tests/capi_ext/_numpylike.c");
     build_extension(ExtensionBuild {
         cc: &cc,
-        manifest_dir: &manifest_dir,
+        include_dir: &weavepy_inc,
         out_dir: &out_dir,
         target_os: &target_os,
         suffix,
@@ -182,55 +183,52 @@ fn main() {
     });
 
     // ----------------------------------------------------------------
-    // 2b) RFC 0043 wave-1 hermetic proof: compile `_stockabi.c` against
-    //     the host's *stock* CPython 3.13 headers (full, non-limited
-    //     API → real inlined macros), NOT WeavePy's `include/Python.h`.
+    // 2b) RFC 0043 binary-ABI hermetic proofs: compile the proof
+    //     fixtures against the host's *stock* CPython 3.13 headers
+    //     (full, non-limited API → real inlined macros and the genuine
+    //     416-byte `PyTypeObject`), NOT WeavePy's `include/Python.h`.
+    //
+    //       * `_stockabi.c`  — wave 1: faithful object mirrors, inlined
+    //         head/field macros, refcount poke, `tp_dealloc`.
+    //       * `_stocktype.c` — wave 2 (RFC 0044): classic static
+    //         `PyTypeObject` + `PyType_Ready`, method suites, richcompare,
+    //         call/iter/descriptor protocols, and a `Py_TPFLAGS_HAVE_GC`
+    //         type with `tp_traverse`/`tp_clear`.
+    //
     //     Skipped (with a note) when CPython 3.13 dev headers aren't
-    //     present, so a bare CI host still builds and the
-    //     stock-ABI test self-skips.
+    //     present, so a bare CI host still builds and the stock proofs
+    //     self-skip.
     // ----------------------------------------------------------------
-    let stockabi_src = workspace_root.join("tests/capi_ext/_stockabi.c");
-    if stockabi_src.is_file() {
-        match stock_python_include() {
-            Some(inc) => {
-                println!("cargo:rerun-if-changed={}", stockabi_src.display());
-                let dylib = out_dir.join(format!("_stockabi.{suffix}"));
-                let mut cmd = Command::new(&cc);
-                cmd.arg("-shared")
-                    .arg("-fPIC")
-                    .arg("-fvisibility=default")
-                    .arg("-O0")
-                    .arg("-Wno-error")
-                    .arg(format!("-I{inc}"))
-                    .arg(&stockabi_src)
-                    .arg("-o")
-                    .arg(&dylib);
-                if target_os == "macos" {
-                    cmd.arg("-undefined").arg("dynamic_lookup");
-                }
-                match cmd.output() {
-                    Ok(out) if out.status.success() => {
-                        println!(
-                            "cargo:rustc-env=WEAVEPY_CAPI_STOCKABI_EXTENSION={}",
-                            dylib.display()
-                        );
-                        println!("cargo:rustc-env=WEAVEPY_STOCK_PYTHON_INCLUDE={inc}");
-                    }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        println!("cargo:warning=_stockabi cc failed (stock headers): {stderr}");
-                    }
-                    Err(err) => {
-                        println!("cargo:warning=could not run cc for _stockabi: {err}");
-                    }
-                }
-            }
-            None => {
-                println!(
-                    "cargo:warning=stock CPython 3.13 headers not found; \
-                     skipping the _stockabi binary-ABI proof fixture"
-                );
-            }
+    match stock_python_include() {
+        Some(inc) => {
+            println!("cargo:rustc-env=WEAVEPY_STOCK_PYTHON_INCLUDE={inc}");
+            let stock_inc = PathBuf::from(&inc);
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stockabi.c"),
+                name: "_stockabi",
+                env_var: "WEAVEPY_CAPI_STOCKABI_EXTENSION",
+            });
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stocktype.c"),
+                name: "_stocktype",
+                env_var: "WEAVEPY_CAPI_STOCKTYPE_EXTENSION",
+            });
+        }
+        None => {
+            println!(
+                "cargo:warning=stock CPython 3.13 headers not found; \
+                 skipping the _stockabi/_stocktype binary-ABI proof fixtures"
+            );
         }
     }
 

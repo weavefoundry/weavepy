@@ -71,6 +71,21 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
         return ptr::null_mut();
     }
 
+    // For a stock type finalised via `PyType_Ready` (RFC 0044, WS5)
+    // seed the payload with a real `Object::Instance` bound to the
+    // bridged class, so the extension's `tp_new`/`tp_init` and
+    // `PyObject_SetAttrString` operate on a genuine instance whose
+    // `__dict__` round-trips through `clone_object`. Other types keep
+    // the historical `Object::None` placeholder (the `PyType_FromSpec`
+    // fixtures construct their instances through the VM's default
+    // `__new__`, not through this allocator).
+    let payload_obj = match crate::types::readied_bridge(ty) {
+        Some(cls) => Object::Instance(weavepy_vm::sync::Rc::new(
+            weavepy_vm::types::PyInstance::new(cls),
+        )),
+        None => Object::None,
+    };
+
     // Use placement-style initialisation: write a fresh PyObjectBox
     // header into the start of the allocation. We use ptr::write
     // (not deref-assign) because the underlying storage is
@@ -84,7 +99,7 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
                     ob_refcnt: 1,
                     ob_type: ty,
                 },
-                payload: PayloadCell::from_object(Object::None),
+                payload: PayloadCell::from_object(payload_obj),
             },
         );
         crate::object::Py_IncRef(ty as *mut PyObject);

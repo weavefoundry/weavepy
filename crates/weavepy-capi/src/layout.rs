@@ -303,46 +303,148 @@ const _: () = {
 };
 
 // ---------------------------------------------------------------------------
-// Method-suite structs (defined faithfully now; dispatched in wave 2).
+// Method-suite structs (RFC 0044, wave 2, WS1).
 // ---------------------------------------------------------------------------
 //
-// We model these as fixed-size opaque blobs of the correct byte length
-// rather than spelling out every binaryfunc/ternaryfunc slot, because
-// wave 1 does not *call* through them — it only needs `tp_as_number`
-// (etc.) to point at correctly-sized storage so a stock extension that
-// reads `nb_add` at its real offset sees a real (possibly null) slot
-// rather than running off the end. Wave 2 replaces these with fully
-// spelled-out slot tables.
+// Spelled out field-by-field, byte-faithful to CPython 3.13. Wave 2
+// *dispatches* through these: a stock extension defines a type with
+// `tp_as_number = &my_number`, and `PyType_Ready` reads `nb_add` at
+// offset 0, `nb_multiply` at 16, … to populate the `SlotTable`.
+//
+// Every slot is typed `*mut c_void` (the ABI is pointer-width and the
+// harvest stores the raw pointer in the `SlotTable`, casting to the
+// concrete `unsafe extern "C" fn` only at the call site). This matches
+// how `crate::types::PyTypeObject` types its `tp_*` slots. The
+// canonical C signature for each slot is given in the doc comment. The
+// reserved holes CPython keeps (`nb_reserved`, `was_sq_slice`,
+// `was_sq_ass_slice`) are named so the offset asserts cover the whole
+// struct.
 
-macro_rules! opaque_suite {
-    ($name:ident, $bytes:literal) => {
-        #[repr(C)]
-        #[derive(Debug)]
-        pub struct $name {
-            _bytes: [u8; $bytes],
-        }
-        impl Default for $name {
-            fn default() -> Self {
-                Self {
-                    _bytes: [0; $bytes],
-                }
-            }
-        }
-    };
+/// `PyNumberMethods` — the numeric protocol suite (`tp_as_number`).
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyNumberMethods {
+    pub nb_add: *mut c_void,       // 0   binaryfunc
+    pub nb_subtract: *mut c_void,  // 8   binaryfunc
+    pub nb_multiply: *mut c_void,  // 16  binaryfunc
+    pub nb_remainder: *mut c_void, // 24  binaryfunc
+    pub nb_divmod: *mut c_void,    // 32  binaryfunc
+    pub nb_power: *mut c_void,     // 40  ternaryfunc
+    pub nb_negative: *mut c_void,  // 48  unaryfunc
+    pub nb_positive: *mut c_void,  // 56  unaryfunc
+    pub nb_absolute: *mut c_void,  // 64  unaryfunc
+    pub nb_bool: *mut c_void,      // 72  inquiry
+    pub nb_invert: *mut c_void,    // 80  unaryfunc
+    pub nb_lshift: *mut c_void,    // 88  binaryfunc
+    pub nb_rshift: *mut c_void,    // 96  binaryfunc
+    pub nb_and: *mut c_void,       // 104 binaryfunc
+    pub nb_xor: *mut c_void,       // 112 binaryfunc
+    pub nb_or: *mut c_void,        // 120 binaryfunc
+    pub nb_int: *mut c_void,       // 128 unaryfunc
+    /// Reserved (was `nb_long`); always null.
+    pub nb_reserved: *mut c_void, // 136
+    pub nb_float: *mut c_void,     // 144 unaryfunc
+    pub nb_inplace_add: *mut c_void, // 152 binaryfunc
+    pub nb_inplace_subtract: *mut c_void, // 160 binaryfunc
+    pub nb_inplace_multiply: *mut c_void, // 168 binaryfunc
+    pub nb_inplace_remainder: *mut c_void, // 176 binaryfunc
+    pub nb_inplace_power: *mut c_void, // 184 ternaryfunc
+    pub nb_inplace_lshift: *mut c_void, // 192 binaryfunc
+    pub nb_inplace_rshift: *mut c_void, // 200 binaryfunc
+    pub nb_inplace_and: *mut c_void, // 208 binaryfunc
+    pub nb_inplace_xor: *mut c_void, // 216 binaryfunc
+    pub nb_inplace_or: *mut c_void, // 224 binaryfunc
+    pub nb_floor_divide: *mut c_void, // 232 binaryfunc
+    pub nb_true_divide: *mut c_void, // 240 binaryfunc
+    pub nb_inplace_floor_divide: *mut c_void, // 248 binaryfunc
+    pub nb_inplace_true_divide: *mut c_void, // 256 binaryfunc
+    pub nb_index: *mut c_void,     // 264 unaryfunc
+    pub nb_matrix_multiply: *mut c_void, // 272 binaryfunc
+    pub nb_inplace_matrix_multiply: *mut c_void, // 280 binaryfunc
 }
 
-opaque_suite!(PyNumberMethods, 288);
-opaque_suite!(PySequenceMethods, 80);
-opaque_suite!(PyMappingMethods, 24);
-opaque_suite!(PyAsyncMethods, 32);
-opaque_suite!(PyBufferProcs, 16);
+/// `PySequenceMethods` — the sequence protocol suite (`tp_as_sequence`).
+#[repr(C)]
+#[derive(Debug)]
+pub struct PySequenceMethods {
+    pub sq_length: *mut c_void, // 0  lenfunc
+    pub sq_concat: *mut c_void, // 8  binaryfunc
+    pub sq_repeat: *mut c_void, // 16 ssizeargfunc
+    pub sq_item: *mut c_void,   // 24 ssizeargfunc
+    /// Reserved (was `sq_slice`); always null.
+    pub was_sq_slice: *mut c_void, // 32
+    pub sq_ass_item: *mut c_void, // 40 ssizeobjargproc
+    /// Reserved (was `sq_ass_slice`); always null.
+    pub was_sq_ass_slice: *mut c_void, // 48
+    pub sq_contains: *mut c_void, // 56 objobjproc
+    pub sq_inplace_concat: *mut c_void, // 64 binaryfunc
+    pub sq_inplace_repeat: *mut c_void, // 72 ssizeargfunc
+}
+
+/// `PyMappingMethods` — the mapping protocol suite (`tp_as_mapping`).
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyMappingMethods {
+    pub mp_length: *mut c_void,        // 0  lenfunc
+    pub mp_subscript: *mut c_void,     // 8  binaryfunc
+    pub mp_ass_subscript: *mut c_void, // 16 objobjargproc
+}
+
+/// `PyAsyncMethods` — the async protocol suite (`tp_as_async`).
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyAsyncMethods {
+    pub am_await: *mut c_void, // 0  unaryfunc
+    pub am_aiter: *mut c_void, // 8  unaryfunc
+    pub am_anext: *mut c_void, // 16 unaryfunc
+    pub am_send: *mut c_void,  // 24 sendfunc
+}
+
+/// `PyBufferProcs` — the PEP 3118 buffer suite (`tp_as_buffer`).
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyBufferProcs {
+    pub bf_getbuffer: *mut c_void,     // 0 getbufferproc
+    pub bf_releasebuffer: *mut c_void, // 8 releasebufferproc
+}
 
 const _: () = {
     assert!(std::mem::size_of::<PyNumberMethods>() == 288);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_add) == 0);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_multiply) == 16);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_power) == 40);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_bool) == 72);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_int) == 128);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_reserved) == 136);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_float) == 144);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_inplace_add) == 152);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_floor_divide) == 232);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_true_divide) == 240);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_index) == 264);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_matrix_multiply) == 272);
+    assert!(std::mem::offset_of!(PyNumberMethods, nb_inplace_matrix_multiply) == 280);
+
     assert!(std::mem::size_of::<PySequenceMethods>() == 80);
+    assert!(std::mem::offset_of!(PySequenceMethods, sq_length) == 0);
+    assert!(std::mem::offset_of!(PySequenceMethods, sq_item) == 24);
+    assert!(std::mem::offset_of!(PySequenceMethods, sq_ass_item) == 40);
+    assert!(std::mem::offset_of!(PySequenceMethods, sq_contains) == 56);
+    assert!(std::mem::offset_of!(PySequenceMethods, sq_inplace_repeat) == 72);
+
     assert!(std::mem::size_of::<PyMappingMethods>() == 24);
+    assert!(std::mem::offset_of!(PyMappingMethods, mp_length) == 0);
+    assert!(std::mem::offset_of!(PyMappingMethods, mp_subscript) == 8);
+    assert!(std::mem::offset_of!(PyMappingMethods, mp_ass_subscript) == 16);
+
     assert!(std::mem::size_of::<PyAsyncMethods>() == 32);
+    assert!(std::mem::offset_of!(PyAsyncMethods, am_await) == 0);
+    assert!(std::mem::offset_of!(PyAsyncMethods, am_aiter) == 8);
+    assert!(std::mem::offset_of!(PyAsyncMethods, am_anext) == 16);
+    assert!(std::mem::offset_of!(PyAsyncMethods, am_send) == 24);
+
     assert!(std::mem::size_of::<PyBufferProcs>() == 16);
+    assert!(std::mem::offset_of!(PyBufferProcs, bf_getbuffer) == 0);
+    assert!(std::mem::offset_of!(PyBufferProcs, bf_releasebuffer) == 8);
 };
 
 // ---------------------------------------------------------------------------

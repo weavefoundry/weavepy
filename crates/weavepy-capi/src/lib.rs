@@ -103,6 +103,7 @@ pub mod dunder_shim;
 pub mod errors;
 pub mod ffi;
 pub mod force_link_table;
+pub mod gc_bridge;
 pub mod genericalloc;
 pub mod getset;
 pub mod interp;
