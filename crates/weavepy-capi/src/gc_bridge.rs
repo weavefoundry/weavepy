@@ -234,6 +234,13 @@ pub unsafe extern "C" fn PyObject_GC_Del(op: *mut c_void) {
         return;
     }
     let p = op as *mut PyObject;
+    // RFC 0045 (wave 3): a faithful inline instance body is owned by its
+    // native instance. A stock GC-type `tp_dealloc` that ends with
+    // `PyObject_GC_Del(self)` is absorbed — the block is reclaimed when
+    // the instance is collected, not here.
+    if unsafe { crate::mirror::is_instance_body(p) } {
+        return;
+    }
     let obj = unsafe { crate::object::clone_object(p) };
     weavepy_vm::gc_trace::untrack(&obj);
     drop(obj);

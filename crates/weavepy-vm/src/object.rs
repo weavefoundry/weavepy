@@ -213,6 +213,60 @@ pub enum Object {
     /// which `traceback.walk_stack`'s hardcoded `f_back` hop count
     /// relies on.
     LazyIter(Rc<PyLazyIter>),
+    /// A C-API `PyCapsule` (RFC 0029 / RFC 0045, wave 3).
+    ///
+    /// A capsule is a *cpyext* concept — pure-Python code never mints one —
+    /// but it routinely lives in a place the VM owns: a module dict
+    /// (`module._API`, the numpy `import_array()` idiom) or an attribute
+    /// (`obj.__array_struct__`). The VM therefore must hold *some* value
+    /// for it. This is that value: an opaque, identity-stable token whose
+    /// payload the VM never interprets. The binary-ABI layer
+    /// (`weavepy-capi`) owns the capsule's C storage and registers a free
+    /// callback (via [`register_capsule_free`]) that runs when the last
+    /// reference here drops. See [`PyCapsuleSoul`].
+    Capsule(Rc<PyCapsuleSoul>),
+}
+
+/// VM-side soul of a C-API `PyCapsule` (see [`Object::Capsule`]).
+///
+/// The capsule's real state (the wrapped `void*`, its name, context, and
+/// destructor) lives in `weavepy-capi`'s heap-allocated capsule box. This
+/// struct is only the VM's *handle* onto it, so a capsule can round-trip
+/// `C -> VM (module dict / attribute) -> C` as the **same** pointer: the
+/// cpyext layer retains the box while a soul is alive and hands the very
+/// same pointer back out on each crossing.
+///
+/// `handle` is stored as a `usize` (not a pointer) on purpose: it keeps
+/// `Object: Send + Sync` (the compile-time assertion above), matching the
+/// faithful-instance-body hook. The VM never dereferences it.
+#[derive(Debug)]
+pub struct PyCapsuleSoul {
+    /// Capsule name (e.g. `"_stockarray._ARRAY_API"`), used only for
+    /// `repr`. A capsule may be unnamed, hence `Option`.
+    pub name: Option<Rc<str>>,
+    /// Opaque handle owned by the cpyext layer (the retained capsule
+    /// `PyObject*`, as an integer). Never dereferenced by the VM.
+    pub handle: usize,
+}
+
+impl Drop for PyCapsuleSoul {
+    fn drop(&mut self) {
+        if let Some(free) = CAPSULE_FREE.get() {
+            free(self.handle);
+        }
+    }
+}
+
+/// Free hook for a capsule's cpyext-side storage, registered by
+/// `weavepy-capi` during interpreter init (the same additive-hook pattern
+/// as [`crate::types::register_instance_body_free`]). Inert in a pure-VM
+/// build, where no capsule is ever created.
+static CAPSULE_FREE: std::sync::OnceLock<fn(usize)> = std::sync::OnceLock::new();
+
+/// Register the capsule free hook (RFC 0045, wave 3). Idempotent — a
+/// second registration is ignored.
+pub fn register_capsule_free(f: fn(usize)) {
+    let _ = CAPSULE_FREE.set(f);
 }
 
 impl fmt::Debug for Object {
@@ -284,6 +338,10 @@ impl fmt::Debug for Object {
                 m.finish()
             }
             Object::LazyIter(l) => write!(f, "<{} object>", l.type_name()),
+            Object::Capsule(c) => match &c.name {
+                Some(n) => write!(f, "<capsule object \"{n}\" at 0x{:x}>", c.handle),
+                None => write!(f, "<capsule object NULL at 0x{:x}>", c.handle),
+            },
         }
     }
 }
@@ -5187,7 +5245,8 @@ impl Object {
             | Object::ClassMethod(_)
             | Object::SlotDescriptor(_)
             | Object::Frame(_)
-            | Object::Traceback(_) => true,
+            | Object::Traceback(_)
+            | Object::Capsule(_) => true,
             Object::MemoryView(mv) => mv.len.get() > 0,
             Object::MappingProxy(d) => !d.borrow().is_empty(),
             Object::DictView(v) => !v.dict.borrow().is_empty(),
@@ -5279,6 +5338,7 @@ impl Object {
             (Object::DictView(a), Object::DictView(b)) => Rc::ptr_eq(a, b),
             (Object::SimpleNamespace(a), Object::SimpleNamespace(b)) => Rc::ptr_eq(a, b),
             (Object::LazyIter(a), Object::LazyIter(b)) => Rc::ptr_eq(a, b),
+            (Object::Capsule(a), Object::Capsule(b)) => Rc::ptr_eq(a, b),
             (Object::Unbound, Object::Unbound) => true,
             _ => false,
         }
@@ -5878,6 +5938,7 @@ impl Object {
             Object::DictView(v) => v.kind.type_name(),
             Object::SimpleNamespace(_) => "SimpleNamespace",
             Object::LazyIter(l) => l.type_name(),
+            Object::Capsule(_) => "PyCapsule",
         }
     }
 
@@ -6295,6 +6356,10 @@ impl Object {
                     Rc::as_ptr(l) as usize
                 )
             }
+            Object::Capsule(c) => match &c.name {
+                Some(n) => format!("<capsule object \"{n}\" at 0x{:x}>", c.handle),
+                None => format!("<capsule object NULL at 0x{:x}>", c.handle),
+            },
             Object::SimpleNamespace(d) => {
                 let dict = d.borrow();
                 // PEP 585/604 runtime forms repr as type expressions
@@ -6726,6 +6791,7 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
         Object::MemoryView(r) => rot(Rc::as_ptr(r).cast()),
         Object::SimpleNamespace(r) => rot(Rc::as_ptr(r).cast()),
         Object::LazyIter(r) => rot(Rc::as_ptr(r).cast()),
+        Object::Capsule(r) => rot(Rc::as_ptr(r).cast()),
         // Value-hashable variants never reach here (handled by
         // `py_hash_value`); anything else gets a stable constant.
         _ => 0,

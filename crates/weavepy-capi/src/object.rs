@@ -142,7 +142,21 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
     if crate::mirror::obj_is_faithful(&obj) {
         return crate::mirror::mirror_out(obj);
     }
+    // RFC 0045 (wave 3): a capsule round-trips as its original retained box
+    // (the same pointer C first saw), not a fresh per-crossing box.
+    if let Object::Capsule(rc) = &obj {
+        return crate::capsule::capsule_box_from_soul(rc);
+    }
     let ty = crate::types::type_for_object(&obj);
+    // RFC 0045 (wave 3): an instance of an inline-storage extension type
+    // crosses into C as its single, stable faithful body (so `self->field`
+    // reads the same bytes on every crossing), not a fresh per-crossing
+    // box. Every other object keeps the legacy `PyObjectBox`.
+    if let Object::Instance(inst) = &obj {
+        if crate::types::is_inline_instance_type(ty) {
+            return crate::instance::instance_body_out(inst, ty);
+        }
+    }
     let boxed = Box::new(PyObjectBox {
         head: PyObject {
             ob_refcnt: 1,
@@ -164,6 +178,18 @@ pub fn into_owned_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
     // byte-faithful and resolves back through the prefix.
     if crate::mirror::type_is_faithful(ty) {
         return crate::mirror::mirror_out_with_type(obj, ty);
+    }
+    // RFC 0045 (wave 3): a capsule round-trips as its original retained box
+    // regardless of the advertised type (see [`into_owned`]).
+    if let Object::Capsule(rc) = &obj {
+        return crate::capsule::capsule_box_from_soul(rc);
+    }
+    // RFC 0045 (wave 3): inline-storage extension instances cross as their
+    // stable faithful body (see [`into_owned`]).
+    if let Object::Instance(inst) = &obj {
+        if crate::types::is_inline_instance_type(ty) {
+            return crate::instance::instance_body_out(inst, ty);
+        }
     }
     let boxed = Box::new(PyObjectBox {
         head: PyObject {
@@ -213,6 +239,13 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
         {
             return Object::Type(t);
         }
+    }
+    // RFC 0045 (wave 3): a capsule carries its state in `user_data`, not in
+    // `payload.obj` (which is `None`) — without this it would collapse to
+    // `None` on crossing into the VM and break `import_array()`. Resolve it
+    // to its identity-stable soul, which round-trips back to the same box.
+    if unsafe { crate::capsule::is_capsule(p) } {
+        return unsafe { crate::capsule::capsule_soul(p) };
     }
     let raw = if unsafe { crate::mirror::is_mirror(p) } {
         unsafe { crate::mirror::native_of(p) }
@@ -332,6 +365,16 @@ unsafe fn free_box(p: *mut PyObject) {
     // box's address so subsequent reuse of the slab doesn't return
     // stale items from the old container.
     crate::containers::invalidate_borrowed_cache(p);
+
+    // RFC 0045 (wave 3): a faithful *instance body*'s lifetime is owned by
+    // its native `PyInstance`, not by C's refcount. Reaching zero here
+    // only ends *C's* borrow (drops the strong pin); the block is freed
+    // when the instance is collected (via the free hook). Checked before
+    // `free_mirror`, since an instance body is also a mirror.
+    if unsafe { crate::mirror::is_instance_body(p) } {
+        unsafe { crate::instance::release_c_ownership(p) };
+        return;
+    }
 
     // Faithful mirrors are raw-allocated with a negative-offset prefix;
     // free them through the mirror bridge (which runs any destructor,

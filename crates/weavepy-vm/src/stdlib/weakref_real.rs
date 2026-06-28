@@ -668,6 +668,7 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        c_body: crate::types::CBody::default(),
     });
     // Back-pointer so `obj.__weakref__` / `getweakrefs(obj)` can return
     // this same wrapper object.
