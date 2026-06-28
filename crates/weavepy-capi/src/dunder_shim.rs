@@ -53,6 +53,14 @@ type GetAttroFunc = unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut P
 type SetAttroFunc = unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> c_int;
 type HashFunc = unsafe extern "C" fn(*mut PyObject) -> isize;
 type InitProc = unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> c_int;
+type DescrGetFunc =
+    unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject;
+type DescrSetFunc = unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> c_int;
+type NewFunc = unsafe extern "C" fn(
+    *mut crate::types::PyTypeObject,
+    *mut PyObject,
+    *mut PyObject,
+) -> *mut PyObject;
 
 // ----------------------------------------------------------------
 // Dunder synthesis.
@@ -224,6 +232,18 @@ pub fn install_dunder_shims(table: &SlotTable, type_name: String) -> Vec<(String
         &name,
     );
     install_setattro(&mut out, table, ids::Py_tp_setattro, "__setattr__", &name);
+
+    // Descriptor protocol → __get__ / __set__ (RFC 0044, WS3).
+    install_descr_get(&mut out, table, ids::Py_tp_descr_get, &name);
+    install_descr_set(&mut out, table, ids::Py_tp_descr_set, &name);
+
+    // Async protocol → __await__ / __aiter__ / __anext__ (RFC 0044, WS3).
+    install_get_iter(&mut out, table, ids::Py_am_await, "__await__", &name);
+    install_get_iter(&mut out, table, ids::Py_am_aiter, "__aiter__", &name);
+    install_anext(&mut out, table, ids::Py_am_anext, "__anext__", &name);
+
+    // Construction → __new__ (RFC 0044, WS3).
+    install_new(&mut out, table, ids::Py_tp_new, &name);
 
     out
 }
@@ -1001,6 +1021,225 @@ fn install_setattro(
             binds_instance: true,
             call: Box::new(f),
             call_kw: None,
+        })),
+    ));
+}
+
+/// `tp_descr_get` → `__get__(self, obj, type)`. Following CPython's
+/// `wrap_descr_get`, a `None` `obj`/`type` is passed to the C slot as
+/// `NULL` (extension descriptors test `obj == NULL` to mean "accessed
+/// on the class").
+fn install_descr_get(
+    out: &mut Vec<(String, Object)>,
+    table: &SlotTable,
+    slot_id: c_int,
+    type_name: &Rc<str>,
+) {
+    let slot = table.get(slot_id);
+    if slot.is_null() {
+        return;
+    }
+    let tn = type_name.clone();
+    let f = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let func: DescrGetFunc = unsafe { slot.cast() };
+        if args.is_empty() {
+            return Err(type_error(format!("{tn}.__get__() requires self")));
+        }
+        let self_p = crate::object::into_owned(args[0].clone());
+        let obj_p = match args.get(1) {
+            Some(Object::None) | None => std::ptr::null_mut(),
+            Some(o) => crate::object::into_owned(o.clone()),
+        };
+        let type_p = match args.get(2) {
+            Some(Object::None) | None => std::ptr::null_mut(),
+            Some(o) => crate::object::into_owned(o.clone()),
+        };
+        let raw = crate::interp::ensure_active(|| unsafe { func(self_p, obj_p, type_p) });
+        unsafe {
+            crate::object::Py_DecRef(self_p);
+            if !obj_p.is_null() {
+                crate::object::Py_DecRef(obj_p);
+            }
+            if !type_p.is_null() {
+                crate::object::Py_DecRef(type_p);
+            }
+        }
+        unwrap_pyobject(raw)
+    };
+    out.push((
+        "__get__".to_owned(),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__get__",
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        })),
+    ));
+}
+
+/// `tp_descr_set` → `__set__(self, obj, value)`.
+fn install_descr_set(
+    out: &mut Vec<(String, Object)>,
+    table: &SlotTable,
+    slot_id: c_int,
+    type_name: &Rc<str>,
+) {
+    let slot = table.get(slot_id);
+    if slot.is_null() {
+        return;
+    }
+    let tn = type_name.clone();
+    let f = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let func: DescrSetFunc = unsafe { slot.cast() };
+        if args.len() != 3 {
+            return Err(type_error(format!(
+                "{tn}.__set__() takes 3 args ({} given)",
+                args.len()
+            )));
+        }
+        let self_p = crate::object::into_owned(args[0].clone());
+        let obj_p = crate::object::into_owned(args[1].clone());
+        let val_p = crate::object::into_owned(args[2].clone());
+        let r = crate::interp::ensure_active(|| unsafe { func(self_p, obj_p, val_p) });
+        unsafe {
+            crate::object::Py_DecRef(self_p);
+            crate::object::Py_DecRef(obj_p);
+            crate::object::Py_DecRef(val_p);
+        }
+        if r < 0 {
+            return Err(take_pending_or_default());
+        }
+        Ok(Object::None)
+    };
+    out.push((
+        "__set__".to_owned(),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__set__",
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        })),
+    ));
+}
+
+/// `am_anext` → `__anext__`. Like [`install_iter_next`] but a NULL
+/// return without a pending exception raises `StopAsyncIteration`.
+fn install_anext(
+    out: &mut Vec<(String, Object)>,
+    table: &SlotTable,
+    slot_id: c_int,
+    name: &str,
+    type_name: &Rc<str>,
+) {
+    let slot = table.get(slot_id);
+    if slot.is_null() {
+        return;
+    }
+    let mname = name.to_owned();
+    let static_name: &'static str = Box::leak(name.to_string().into_boxed_str());
+    let tn = type_name.clone();
+    let f = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let func: IterNextFunc = unsafe { slot.cast() };
+        let self_p = primary_self(args, static_name, &tn)?;
+        let raw = crate::interp::ensure_active(|| unsafe { func(self_p) });
+        unsafe { crate::object::Py_DecRef(self_p) };
+        if raw.is_null() {
+            if let Some(p) = crate::errors::take_pending() {
+                return Err(crate::errors::to_runtime_error(p));
+            }
+            return Err(weavepy_vm::error::RuntimeError::PyException(
+                weavepy_vm::error::PyException::new(weavepy_vm::builtin_types::make_exception(
+                    "StopAsyncIteration",
+                    String::new(),
+                )),
+            ));
+        }
+        let out = unsafe { crate::object::clone_object(raw) };
+        unsafe { crate::object::Py_DecRef(raw) };
+        Ok(out)
+    };
+    out.push((
+        mname,
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: static_name,
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        })),
+    ));
+}
+
+/// `tp_new` → `__new__(cls, *args, **kwargs)`. Installed as a plain
+/// `Builtin` (not a `staticmethod`-wrapped sentinel), so the VM's
+/// construction path treats it as a user `__new__`: it is looked up on
+/// the class and called with `cls` pushed in front of the constructor
+/// args. The C `newfunc` receives the `*mut PyTypeObject` for `cls`.
+fn install_new(
+    out: &mut Vec<(String, Object)>,
+    table: &SlotTable,
+    slot_id: c_int,
+    type_name: &Rc<str>,
+) {
+    let slot = table.get(slot_id);
+    if slot.is_null() {
+        return;
+    }
+    fn cls_ptr(
+        arg: &Object,
+        tn: &Rc<str>,
+    ) -> Result<*mut crate::types::PyTypeObject, RuntimeError> {
+        match arg {
+            Object::Type(t) => Ok(crate::types::install_user_type(t)),
+            _ => Err(type_error(format!("{tn}.__new__(X): X is not a type"))),
+        }
+    }
+    let tn = type_name.clone();
+    let f_pos = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let func: NewFunc = unsafe { slot.cast() };
+        if args.is_empty() {
+            return Err(type_error(
+                "__new__() requires the type as its first argument",
+            ));
+        }
+        let type_ptr = cls_ptr(&args[0], &tn)?;
+        let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
+        let kw = crate::object::into_owned(Object::new_dict());
+        let raw = crate::interp::ensure_active(|| unsafe { func(type_ptr, arg_tuple, kw) });
+        unsafe {
+            crate::object::Py_DecRef(arg_tuple);
+            crate::object::Py_DecRef(kw);
+        }
+        unwrap_pyobject(raw)
+    };
+    let tn_kw = type_name.clone();
+    let f_kw =
+        move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
+            let func: NewFunc = unsafe { slot.cast() };
+            if args.is_empty() {
+                return Err(type_error(
+                    "__new__() requires the type as its first argument",
+                ));
+            }
+            let type_ptr = cls_ptr(&args[0], &tn_kw)?;
+            let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
+            let kw_dict = build_kw_dict(kwargs);
+            let kw_p = crate::object::into_owned(Object::Dict(Rc::new(
+                weavepy_vm::sync::RefCell::new(kw_dict),
+            )));
+            let raw = crate::interp::ensure_active(|| unsafe { func(type_ptr, arg_tuple, kw_p) });
+            unsafe {
+                crate::object::Py_DecRef(arg_tuple);
+                crate::object::Py_DecRef(kw_p);
+            }
+            unwrap_pyobject(raw)
+        };
+    out.push((
+        "__new__".to_owned(),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__new__",
+            binds_instance: false,
+            call: Box::new(f_pos),
+            call_kw: Some(Box::new(f_kw)),
         })),
     ));
 }

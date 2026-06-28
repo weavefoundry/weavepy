@@ -668,17 +668,20 @@ static PyObject *build_one(const char **fmt, va_list *ap) {
     }
 }
 
-PyObject *Py_BuildValue(const char *fmt, ...) {
-    if (!fmt) return _WeavePy_Build_None();
-    va_list ap;
-    va_start(ap, fmt);
-    PyObject *result = NULL;
-    /* If the format starts with a single unit, return that; otherwise
-     * wrap in a tuple. */
+/* Shared core for Py_BuildValue / Py_VaBuildValue.
+ *
+ * CPython's `va_build_value` semantics: a format string with a single
+ * top-level unit yields *that* unit; two or more top-level units yield
+ * a *tuple* of them. Both the `...` and `va_list` entry points must
+ * agree — a previous version open-coded the single-unit case in
+ * `Py_VaBuildValue`, so `PyObject_CallFunction(c, "ll", a, b)` (which
+ * routes through `Py_VaBuildValue`) silently dropped every argument
+ * past the first and called `c` with a 1-tuple. */
+static PyObject *build_value_impl(const char *fmt, va_list *ap) {
     const char *p = fmt;
-    /* Quick scan to count top-level units. A unit at depth 0 is
-     * either an alpha format code (`i`, `s`, `O`, etc.) or an
-     * opening bracket that begins a nested tuple/list/dict. */
+    /* Count top-level units. A unit at depth 0 is either an alpha
+     * format code (`i`, `s`, `O`, …) or an opening bracket that begins
+     * a nested tuple/list/dict. */
     int top_units = 0;
     int depth = 0;
     for (const char *q = fmt; *q; q++) {
@@ -694,25 +697,34 @@ PyObject *Py_BuildValue(const char *fmt, ...) {
         }
     }
     if (top_units == 1) {
-        result = build_one(&p, &ap);
-    } else {
-        PyObject **items = NULL;
-        Py_ssize_t n = 0;
-        Py_ssize_t cap = top_units > 0 ? top_units : 1;
-        items = (PyObject **)malloc(cap * sizeof(PyObject *));
-        while (*p) {
-            PyObject *one = build_one(&p, &ap);
-            if (!one) {
-                for (Py_ssize_t i = 0; i < n; i++) Py_DECREF(items[i]);
-                free(items);
-                va_end(ap);
-                return NULL;
-            }
-            items[n++] = one;
-        }
-        result = _WeavePy_Build_TupleFromArray(n, items);
-        free(items);
+        return build_one(&p, ap);
     }
+    PyObject **items = NULL;
+    Py_ssize_t n = 0;
+    Py_ssize_t cap = top_units > 0 ? top_units : 1;
+    items = (PyObject **)malloc((size_t)cap * sizeof(PyObject *));
+    if (!items) {
+        return NULL;
+    }
+    while (*p) {
+        PyObject *one = build_one(&p, ap);
+        if (!one) {
+            for (Py_ssize_t i = 0; i < n; i++) Py_DECREF(items[i]);
+            free(items);
+            return NULL;
+        }
+        items[n++] = one;
+    }
+    PyObject *result = _WeavePy_Build_TupleFromArray(n, items);
+    free(items);
+    return result;
+}
+
+PyObject *Py_BuildValue(const char *fmt, ...) {
+    if (!fmt) return _WeavePy_Build_None();
+    va_list ap;
+    va_start(ap, fmt);
+    PyObject *result = build_value_impl(fmt, &ap);
     va_end(ap);
     return result;
 }
@@ -722,7 +734,7 @@ PyObject *Py_VaBuildValue(const char *fmt, va_list ap) {
     /* Re-establish a real va_list local (see `PyArg_VaParse`). */
     va_list local;
     va_copy(local, ap);
-    PyObject *result = build_one(&fmt, &local);
+    PyObject *result = build_value_impl(fmt, &local);
     va_end(local);
     return result;
 }

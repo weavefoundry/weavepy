@@ -493,13 +493,26 @@ fn find_type_ptr(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
             }
         }
     }
-    HEAP_TYPES.with(|cell| {
+    let from_heap = HEAP_TYPES.with(|cell| {
         for &p in cell.borrow().iter() {
             unsafe {
                 let bridge = (*p).bridge;
                 if !bridge.is_null() && Rc::as_ptr(&*bridge) == target {
                     return Some(p);
                 }
+            }
+        }
+        None
+    });
+    if from_heap.is_some() {
+        return from_heap;
+    }
+    // Readied stock types (RFC 0044): match on the bridge and return
+    // the extension's own pointer so instances carry its `ob_type`.
+    READIED_TYPES.with(|cell| {
+        for rt in cell.borrow().iter() {
+            if Rc::as_ptr(&rt.bridge) == target {
+                return Some(rt.ext_ptr);
             }
         }
         None
@@ -571,6 +584,12 @@ pub unsafe fn bridge_type(ty: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
     if ty.is_null() {
         return None;
     }
+    // Readied stock types (RFC 0044) keep their bridge in a side
+    // registry — their struct is only 416 bytes and has no `bridge`
+    // field to read. Check that first.
+    if let Some(rt) = readied_for(ty) {
+        return Some(rt.bridge.clone());
+    }
     let bridge = unsafe { (*ty).bridge };
     if bridge.is_null() {
         return None;
@@ -622,6 +641,139 @@ pub const PY_TPFLAGS_HAVE_GC: u32 = 1 << 14;
 pub const PY_TPFLAGS_DEFAULT: u32 = 1 << 18;
 pub const PY_TPFLAGS_HAVE_VECTORCALL: u32 = 1 << 11;
 pub const PY_TPFLAGS_DISALLOW_INSTANTIATION: u32 = 1 << 7;
+/// `Py_TPFLAGS_READY` — set on `tp_flags` once a type is finalised.
+pub const PY_TPFLAGS_READY: u64 = 1 << 12;
+
+/// Assemble a heap/readied type's `__dict__`: `__doc__` / `__module__`
+/// / `__qualname__`, the method/getset/member descriptors, and the
+/// synthesised dunder shims that forward to the C slots. Shared by
+/// [`PyType_FromMetaclass`] and [`PyType_Ready`] (RFC 0044, WS2) so the
+/// two type-definition styles converge on identical dispatch.
+fn assemble_type_dict(
+    qualified: &str,
+    bare: &str,
+    slot_table: &SlotTable,
+    methods: &[crate::module::MethodEntry],
+    getset_pairs: Vec<(String, Object)>,
+    member_pairs: Vec<(String, Object)>,
+    doc: Option<&str>,
+) -> DictData {
+    let mut dict = DictData::new();
+    if let Some(d) = doc {
+        dict.insert(
+            DictKey(Object::from_static("__doc__")),
+            Object::from_str(d.to_owned()),
+        );
+    }
+    dict.insert(
+        DictKey(Object::from_static("__module__")),
+        if let Some(idx) = qualified.rfind('.') {
+            Object::from_str(qualified[..idx].to_owned())
+        } else {
+            Object::from_static("builtins")
+        },
+    );
+    dict.insert(
+        DictKey(Object::from_static("__qualname__")),
+        Object::from_str(bare.to_owned()),
+    );
+    for entry in methods {
+        dict.insert(
+            DictKey(Object::from_str(entry.name.clone())),
+            entry.bind_unbound(),
+        );
+    }
+    for (name, obj) in getset_pairs {
+        dict.insert(DictKey(Object::from_str(name)), obj);
+    }
+    for (name, obj) in member_pairs {
+        dict.insert(DictKey(Object::from_str(name)), obj);
+    }
+    let dunder_pairs = crate::dunder_shim::install_dunder_shims(slot_table, qualified.to_owned());
+    for (name, obj) in dunder_pairs {
+        dict.insert(DictKey(Object::from_str(name)), obj);
+    }
+    dict
+}
+
+// ----------------------------------------------------------------
+// Readied stock types (RFC 0044, WS2).
+//
+// A stock extension defines a *static* `PyTypeObject` (exactly 416
+// bytes — the CPython layout, with no room for WeavePy's private
+// `bridge`/`slot_table` trailing fields) and calls `PyType_Ready`.
+// We therefore cannot stash the bridge in the caller's struct; the
+// bridge + decoded slot table live in this side registry, keyed by
+// the extension's own type pointer (which is what flows through
+// `PyModule_AddObject`, instance `ob_type`, `type(x)`, …).
+//
+// Entries are `Box::leak`'d (types live for the process lifetime,
+// exactly like `HEAP_TYPES`), so the `&'static` borrows handed out by
+// `bridge_type` / `slot_table_for` stay valid.
+// ----------------------------------------------------------------
+
+/// WeavePy-owned data backing a readied stock type.
+pub struct ReadiedType {
+    /// The extension's own `&MyType` pointer (the canonical identity).
+    pub ext_ptr: *mut PyTypeObject,
+    /// Bridge to the native type.
+    pub bridge: Rc<TypeObject>,
+    /// Slots decoded from the faithful struct + method suites.
+    pub slot_table: SlotTable,
+}
+
+unsafe impl Send for ReadiedType {}
+unsafe impl Sync for ReadiedType {}
+
+thread_local! {
+    /// Map from an extension type pointer to its readied data.
+    static READIED_BY_PTR: std::cell::RefCell<std::collections::HashMap<usize, &'static ReadiedType>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Insertion-ordered list for the `Rc<TypeObject>` → pointer scan.
+    static READIED_TYPES: std::cell::RefCell<Vec<&'static ReadiedType>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Look up the readied-type data for an extension type pointer.
+fn readied_for(ty: *mut PyTypeObject) -> Option<&'static ReadiedType> {
+    if ty.is_null() {
+        return None;
+    }
+    READIED_BY_PTR.with(|m| m.borrow().get(&(ty as usize)).copied())
+}
+
+/// The decoded slot table for a readied stock type, or `None` if `ty`
+/// was not readied via [`PyType_Ready`]. Used by
+/// [`crate::slottable::slot_table_for`] so readied static types (which
+/// don't carry the `Py_TPFLAGS_HEAPTYPE` bit and have no embedded
+/// `PyTypeObjectBox`) still expose their slots for direct dispatch
+/// (buffer protocol, vectorcall, GC traverse, …).
+pub fn readied_slot_table(ty: *mut PyTypeObject) -> Option<&'static SlotTable> {
+    readied_for(ty).map(|rt| &rt.slot_table)
+}
+
+/// True if `ty` is a stock type finalised through [`PyType_Ready`]
+/// (RFC 0044). Used by [`crate::genericalloc::PyType_GenericAlloc`] to
+/// decide whether a freshly-allocated instance should carry a real
+/// `Object::Instance` payload (so the extension's `tp_init` /
+/// `PyObject_SetAttrString` operate on a genuine instance dict).
+pub fn is_readied_type(ty: *mut PyTypeObject) -> bool {
+    readied_for(ty).is_some()
+}
+
+/// The native bridge type for a readied stock type, if any.
+pub fn readied_bridge(ty: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
+    readied_for(ty).map(|rt| rt.bridge.clone())
+}
+
+/// The live `PyTypeObject *` backing `cls`, if `cls` is bridged from a
+/// C type — static, heap (`PyType_FromSpec`), or readied
+/// (`PyType_Ready`). Public so the GC bridge (RFC 0044, WS4) can reach
+/// an instance's `tp_traverse` / `tp_clear` slots; returns `None` for a
+/// pure-Python class (no C `PyTypeObject` exists to consult).
+pub fn type_ptr_for_class(cls: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
+    find_type_ptr(cls)
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn PyType_FromSpec(spec: *mut PyType_Spec) -> *mut PyObject {
@@ -805,43 +957,18 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
 
     // ----------------------------------------------------------------
     // Build the type's dict: doc + module + methods + getset/member
-    // descriptors + synthesised dunder shims.
+    // descriptors + synthesised dunder shims. Shared with the
+    // `PyType_Ready` path (RFC 0044, WS2) via [`assemble_type_dict`].
     // ----------------------------------------------------------------
-    let mut dict = DictData::new();
-    if let Some(d) = doc.as_ref() {
-        dict.insert(
-            DictKey(Object::from_static("__doc__")),
-            Object::from_str(d.clone()),
-        );
-    }
-    dict.insert(
-        DictKey(Object::from_static("__module__")),
-        if let Some(idx) = qualified.rfind('.') {
-            Object::from_str(qualified[..idx].to_owned())
-        } else {
-            Object::from_static("builtins")
-        },
+    let dict = assemble_type_dict(
+        &qualified,
+        &bare,
+        &slot_table,
+        &methods,
+        getset_pairs,
+        member_pairs,
+        doc.as_deref(),
     );
-    dict.insert(
-        DictKey(Object::from_static("__qualname__")),
-        Object::from_str(bare.clone()),
-    );
-    for entry in &methods {
-        dict.insert(
-            DictKey(Object::from_str(entry.name.clone())),
-            entry.bind_unbound(),
-        );
-    }
-    for (name, obj) in getset_pairs {
-        dict.insert(DictKey(Object::from_str(name)), obj);
-    }
-    for (name, obj) in member_pairs {
-        dict.insert(DictKey(Object::from_str(name)), obj);
-    }
-    let dunder_pairs = crate::dunder_shim::install_dunder_shims(&slot_table, qualified.clone());
-    for (name, obj) in dunder_pairs {
-        dict.insert(DictKey(Object::from_str(name)), obj);
-    }
 
     let ty = match TypeObject::new_user(&bare, bases_resolved, dict) {
         Ok(ty) => ty,
@@ -935,11 +1062,301 @@ pub unsafe extern "C" fn PyType_FromModuleAndSpec(
     unsafe { PyType_FromSpecWithBases(spec, bases) }
 }
 
+/// True if `ty` is a WeavePy-owned type object (a static built-in or a
+/// `PyType_FromSpec` heap type) — i.e. its struct carries the private
+/// `bridge`/`slot_table` trailing fields and is already "ready". Decided
+/// purely by pointer identity so we never read past a 416-byte stock
+/// struct.
+fn is_weavepy_owned_type(ty: *mut PyTypeObject) -> bool {
+    for slot in STATIC_TYPE_TABLE {
+        if slot.as_ptr() == ty {
+            return true;
+        }
+    }
+    HEAP_TYPES.with(|cell| cell.borrow().contains(&ty))
+}
+
+/// Decode a faithfully-laid-out `PyTypeObject` (a stock extension's
+/// statically-initialised type + its method suites) into a
+/// [`SlotTable`] plus the dict ingredients (RFC 0044, WS2).
+struct Harvested {
+    slot_table: SlotTable,
+    methods: Vec<crate::module::MethodEntry>,
+    getset_pairs: Vec<(String, Object)>,
+    member_pairs: Vec<(String, Object)>,
+    doc: Option<String>,
+    base: Option<Rc<TypeObject>>,
+}
+
+/// Read every populated slot of a faithful `PyTypeObject` into a
+/// [`SlotTable`]. The direct `tp_*` function pointers map to their
+/// `Py_tp_*` ids; each non-null method suite (`tp_as_number`, …) is
+/// decomposed into its `Py_nb_*` / `Py_sq_*` / `Py_mp_*` / `Py_am_*` /
+/// `Py_bf_*` ids at the faithful offsets pinned in [`crate::layout`].
+///
+/// # Safety
+/// `ty` must point at a readable, faithfully-laid-out `PyTypeObject`
+/// (at least the 416-byte CPython prefix).
+unsafe fn harvest_faithful(ty: *mut PyTypeObject) -> Harvested {
+    use crate::slottable as ids;
+    let mut t = SlotTable::empty();
+
+    unsafe fn put(t: &mut SlotTable, id: c_int, p: *mut c_void) {
+        if !p.is_null() {
+            t.install(id, p);
+        }
+    }
+
+    let tref = unsafe { &*ty };
+
+    // Direct type-level slots.
+    unsafe {
+        put(&mut t, ids::Py_tp_call, tref.tp_call);
+        put(&mut t, ids::Py_tp_init, tref.tp_init);
+        put(&mut t, ids::Py_tp_new, tref.tp_new);
+        put(&mut t, ids::Py_tp_iter, tref.tp_iter);
+        put(&mut t, ids::Py_tp_iternext, tref.tp_iternext);
+        put(&mut t, ids::Py_tp_richcompare, tref.tp_richcompare);
+        put(&mut t, ids::Py_tp_getattro, tref.tp_getattro);
+        put(&mut t, ids::Py_tp_setattro, tref.tp_setattro);
+        put(&mut t, ids::Py_tp_descr_get, tref.tp_descr_get);
+        put(&mut t, ids::Py_tp_descr_set, tref.tp_descr_set);
+        put(&mut t, ids::Py_tp_hash, tref.tp_hash);
+        put(&mut t, ids::Py_tp_repr, tref.tp_repr);
+        put(&mut t, ids::Py_tp_str, tref.tp_str);
+        put(&mut t, ids::Py_tp_traverse, tref.tp_traverse);
+        put(&mut t, ids::Py_tp_clear, tref.tp_clear);
+        put(&mut t, ids::Py_tp_alloc, tref.tp_alloc);
+        put(&mut t, ids::Py_tp_free, tref.tp_free);
+        put(&mut t, ids::Py_tp_getattr, tref.tp_getattr);
+        put(&mut t, ids::Py_tp_setattr, tref.tp_setattr);
+    }
+
+    // Number suite.
+    if !tref.tp_as_number.is_null() {
+        let n = unsafe { &*(tref.tp_as_number as *const crate::layout::PyNumberMethods) };
+        unsafe {
+            put(&mut t, ids::Py_nb_add, n.nb_add);
+            put(&mut t, ids::Py_nb_subtract, n.nb_subtract);
+            put(&mut t, ids::Py_nb_multiply, n.nb_multiply);
+            put(&mut t, ids::Py_nb_remainder, n.nb_remainder);
+            put(&mut t, ids::Py_nb_divmod, n.nb_divmod);
+            put(&mut t, ids::Py_nb_power, n.nb_power);
+            put(&mut t, ids::Py_nb_negative, n.nb_negative);
+            put(&mut t, ids::Py_nb_positive, n.nb_positive);
+            put(&mut t, ids::Py_nb_absolute, n.nb_absolute);
+            put(&mut t, ids::Py_nb_bool, n.nb_bool);
+            put(&mut t, ids::Py_nb_invert, n.nb_invert);
+            put(&mut t, ids::Py_nb_lshift, n.nb_lshift);
+            put(&mut t, ids::Py_nb_rshift, n.nb_rshift);
+            put(&mut t, ids::Py_nb_and, n.nb_and);
+            put(&mut t, ids::Py_nb_xor, n.nb_xor);
+            put(&mut t, ids::Py_nb_or, n.nb_or);
+            put(&mut t, ids::Py_nb_int, n.nb_int);
+            put(&mut t, ids::Py_nb_float, n.nb_float);
+            put(&mut t, ids::Py_nb_inplace_add, n.nb_inplace_add);
+            put(&mut t, ids::Py_nb_inplace_subtract, n.nb_inplace_subtract);
+            put(&mut t, ids::Py_nb_inplace_multiply, n.nb_inplace_multiply);
+            put(&mut t, ids::Py_nb_inplace_remainder, n.nb_inplace_remainder);
+            put(&mut t, ids::Py_nb_inplace_power, n.nb_inplace_power);
+            put(&mut t, ids::Py_nb_inplace_lshift, n.nb_inplace_lshift);
+            put(&mut t, ids::Py_nb_inplace_rshift, n.nb_inplace_rshift);
+            put(&mut t, ids::Py_nb_inplace_and, n.nb_inplace_and);
+            put(&mut t, ids::Py_nb_inplace_xor, n.nb_inplace_xor);
+            put(&mut t, ids::Py_nb_inplace_or, n.nb_inplace_or);
+            put(&mut t, ids::Py_nb_floor_divide, n.nb_floor_divide);
+            put(&mut t, ids::Py_nb_true_divide, n.nb_true_divide);
+            put(
+                &mut t,
+                ids::Py_nb_inplace_floor_divide,
+                n.nb_inplace_floor_divide,
+            );
+            put(
+                &mut t,
+                ids::Py_nb_inplace_true_divide,
+                n.nb_inplace_true_divide,
+            );
+            put(&mut t, ids::Py_nb_index, n.nb_index);
+            put(&mut t, ids::Py_nb_matrix_multiply, n.nb_matrix_multiply);
+            put(
+                &mut t,
+                ids::Py_nb_inplace_matrix_multiply,
+                n.nb_inplace_matrix_multiply,
+            );
+        }
+    }
+
+    // Sequence suite.
+    if !tref.tp_as_sequence.is_null() {
+        let s = unsafe { &*(tref.tp_as_sequence as *const crate::layout::PySequenceMethods) };
+        unsafe {
+            put(&mut t, ids::Py_sq_length, s.sq_length);
+            put(&mut t, ids::Py_sq_concat, s.sq_concat);
+            put(&mut t, ids::Py_sq_repeat, s.sq_repeat);
+            put(&mut t, ids::Py_sq_item, s.sq_item);
+            put(&mut t, ids::Py_sq_ass_item, s.sq_ass_item);
+            put(&mut t, ids::Py_sq_contains, s.sq_contains);
+            put(&mut t, ids::Py_sq_inplace_concat, s.sq_inplace_concat);
+            put(&mut t, ids::Py_sq_inplace_repeat, s.sq_inplace_repeat);
+        }
+    }
+
+    // Mapping suite.
+    if !tref.tp_as_mapping.is_null() {
+        let m = unsafe { &*(tref.tp_as_mapping as *const crate::layout::PyMappingMethods) };
+        unsafe {
+            put(&mut t, ids::Py_mp_length, m.mp_length);
+            put(&mut t, ids::Py_mp_subscript, m.mp_subscript);
+            put(&mut t, ids::Py_mp_ass_subscript, m.mp_ass_subscript);
+        }
+    }
+
+    // Async suite.
+    if !tref.tp_as_async.is_null() {
+        let a = unsafe { &*(tref.tp_as_async as *const crate::layout::PyAsyncMethods) };
+        unsafe {
+            put(&mut t, ids::Py_am_await, a.am_await);
+            put(&mut t, ids::Py_am_aiter, a.am_aiter);
+            put(&mut t, ids::Py_am_anext, a.am_anext);
+            put(&mut t, ids::Py_am_send, a.am_send);
+        }
+    }
+
+    // Buffer suite.
+    if !tref.tp_as_buffer.is_null() {
+        let b = unsafe { &*(tref.tp_as_buffer as *const crate::layout::PyBufferProcs) };
+        unsafe {
+            put(&mut t, ids::Py_bf_getbuffer, b.bf_getbuffer);
+            put(&mut t, ids::Py_bf_releasebuffer, b.bf_releasebuffer);
+        }
+    }
+
+    // Descriptor tables + doc + base for the dict / linearisation.
+    let methods = if tref.tp_methods.is_null() {
+        Vec::new()
+    } else {
+        unsafe {
+            crate::module::collect_methods(tref.tp_methods as *mut crate::module::PyMethodDef)
+        }
+    };
+    let getset_pairs = if tref.tp_getset.is_null() {
+        Vec::new()
+    } else {
+        unsafe { crate::getset::collect_getsets(tref.tp_getset as *mut crate::getset::PyGetSetDef) }
+    };
+    let member_pairs = if tref.tp_members.is_null() {
+        Vec::new()
+    } else {
+        unsafe {
+            crate::getset::collect_members(tref.tp_members as *mut crate::getset::PyMemberDef)
+        }
+    };
+    let doc = if tref.tp_doc.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(tref.tp_doc) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    let base = if tref.tp_base.is_null() {
+        None
+    } else {
+        unsafe { bridge_type(tref.tp_base) }
+    };
+
+    Harvested {
+        slot_table: t,
+        methods,
+        getset_pairs,
+        member_pairs,
+        doc,
+        base,
+    }
+}
+
+/// `PyType_Ready(t)` — finalise a type object.
+///
+/// For WeavePy's own types (static built-ins, `PyType_FromSpec` heap
+/// types) this is a no-op: they are ready the moment their bridge is
+/// installed. For a **stock extension's statically-initialised
+/// `PyTypeObject`** (RFC 0044, WS2) it harvests the faithful struct +
+/// method suites into a [`SlotTable`], builds the bridged native type
+/// with synthesised dunder shims, and registers it in the readied-type
+/// side table — then writes `ob_type` and the `Py_TPFLAGS_READY` bit
+/// back into the caller's struct (both at offsets inside the faithful
+/// 416-byte region, so a stock struct is never overrun).
 #[no_mangle]
-pub unsafe extern "C" fn PyType_Ready(_t: *mut PyTypeObject) -> c_int {
-    // Type objects in WeavePy are always "ready" the moment their
-    // bridge is installed. CPython uses `PyType_Ready` to lazily
-    // populate slot tables; we don't have that complication.
+pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
+    if t.is_null() {
+        return 0;
+    }
+    crate::interp::ensure_initialised();
+    // Idempotent: already readied, or one of our own ready types.
+    if readied_for(t).is_some() || is_weavepy_owned_type(t) {
+        return 0;
+    }
+
+    let h = unsafe { harvest_faithful(t) };
+
+    // Resolve name (qualified + bare) from tp_name.
+    let raw_name = unsafe { (*t).tp_name };
+    let qualified = if raw_name.is_null() {
+        "<readied>".to_owned()
+    } else {
+        unsafe { CStr::from_ptr(raw_name) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let bare = qualified
+        .rsplit('.')
+        .next()
+        .unwrap_or(&qualified)
+        .to_owned();
+
+    let bases = vec![h
+        .base
+        .clone()
+        .unwrap_or_else(|| weavepy_vm::builtin_types::builtin_types().object_.clone())];
+
+    let dict = assemble_type_dict(
+        &qualified,
+        &bare,
+        &h.slot_table,
+        &h.methods,
+        h.getset_pairs,
+        h.member_pairs,
+        h.doc.as_deref(),
+    );
+
+    let ty = match TypeObject::new_user(&bare, bases, dict) {
+        Ok(ty) => ty,
+        Err(_) => {
+            crate::errors::set_runtime_error("PyType_Ready: could not linearise bases");
+            return -1;
+        }
+    };
+
+    let readied: &'static ReadiedType = Box::leak(Box::new(ReadiedType {
+        ext_ptr: t,
+        bridge: ty,
+        slot_table: h.slot_table,
+    }));
+    READIED_BY_PTR.with(|m| m.borrow_mut().insert(t as usize, readied));
+    READIED_TYPES.with(|v| v.borrow_mut().push(readied));
+
+    // Write-back into the caller's struct — both offsets live inside
+    // the faithful 416-byte CPython prefix, so a stock static type is
+    // never overrun.
+    unsafe {
+        (*t).head.ob_type = PyType_Type.as_ptr();
+        (*t).head.ob_refcnt = IMMORTAL_REFCNT;
+        (*t).tp_flags |= PY_TPFLAGS_READY;
+        if (*t).tp_dealloc.is_none() {
+            (*t).tp_dealloc = Some(crate::object::_PyWeavePy_Dealloc);
+        }
+    }
     0
 }
 

@@ -23,6 +23,7 @@ use crate::capsule;
 use crate::containers;
 use crate::datetime_api as dt;
 use crate::errors;
+use crate::gc_bridge;
 use crate::genericalloc;
 use crate::lifecycle;
 use crate::memory;
@@ -465,6 +466,13 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(genericalloc::Py_HashPointer),
     addr!(genericalloc::_Py_HashBytes),
     addr!(genericalloc::Py_GenericAlias),
+    // gc_bridge.rs — GC allocation + tracking C-API (RFC 0044).
+    addr!(gc_bridge::_PyObject_GC_New),
+    addr!(gc_bridge::_PyObject_GC_NewVar),
+    addr!(gc_bridge::PyObject_GC_Track),
+    addr!(gc_bridge::PyObject_GC_UnTrack),
+    addr!(gc_bridge::PyObject_GC_IsTracked),
+    addr!(gc_bridge::PyObject_GC_Del),
     // slice.rs
     addr!(slice::PySlice_New),
     addr!(slice::PySlice_Check),
