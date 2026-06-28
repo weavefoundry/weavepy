@@ -1,6 +1,6 @@
 5
 caught: cannot divide by zero
-key: 'missing'
+key: missing
 idx: index out of range
 any Exception
 11
