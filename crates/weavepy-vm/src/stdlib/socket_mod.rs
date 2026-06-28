@@ -2323,9 +2323,9 @@ fn servby_proto(
     }
 }
 
-/// `getservbyname(servicename[, protocolname])` → port number, via libc's
-/// `/etc/services` lookup. CPython holds the GIL across the (static-buffered,
-/// non-reentrant) call; so do we.
+/// `getservbyname(servicename[, protocolname])` → port number, via the
+/// platform's `/etc/services` (or `%SystemRoot%\…\services`) lookup. CPython
+/// holds the GIL across the (static-buffered, non-reentrant) call; so do we.
 fn mod_getservbyname(args: &[Object]) -> Result<Object, RuntimeError> {
     let name = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
@@ -2334,13 +2334,10 @@ fn mod_getservbyname(args: &[Object]) -> Result<Object, RuntimeError> {
     let c_name = std::ffi::CString::new(name)
         .map_err(|_| value_error("getservbyname: embedded null character"))?;
     let proto = servby_proto(args.get(1), "getservbyname")?;
-    let proto_ptr = proto.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-    let sp = unsafe { libc::getservbyname(c_name.as_ptr(), proto_ptr) };
-    if sp.is_null() {
-        return Err(os_error("service/proto not found"));
-    }
-    // `s_port` is stored in network byte order; CPython returns `ntohs(s_port)`.
-    let port = u16::from_be(unsafe { (*sp).s_port } as u16);
+    let port = match servbyname_lookup(&c_name, proto.as_deref()) {
+        Some(p) => p,
+        None => return Err(os_error("service/proto not found")),
+    };
     Ok(Object::Int(i64::from(port)))
 }
 
@@ -2355,15 +2352,125 @@ fn mod_getservbyport(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(overflow_error("getservbyport: port must be 0-65535."));
     }
     let proto = servby_proto(args.get(1), "getservbyport")?;
-    let proto_ptr = proto.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-    // libc wants the port in network byte order (`htons`).
+    // The service database lookup wants the port in network byte order (`htons`).
     let net_port = i32::from((port as u16).to_be());
+    let name = match servbyport_lookup(net_port, proto.as_deref()) {
+        Some(n) => n,
+        None => return Err(os_error("port/proto not found")),
+    };
+    Ok(Object::from_str(name))
+}
+
+// ---- `getservby*` platform shim ----
+//
+// POSIX exposes `getservbyname(3)`/`getservbyport(3)` through `libc`; Windows
+// keeps the same calls in Winsock (`ws2_32`), which the `libc` crate does not
+// bind on `*-pc-windows-*`. The thin wrappers below let the `socket` module's
+// service-name lookups build and behave the same on every target.
+
+/// Look up a service port by name, returning it in host byte order
+/// (`None` when the service/proto pair is unknown).
+#[cfg(unix)]
+fn servbyname_lookup(name: &std::ffi::CStr, proto: Option<&std::ffi::CStr>) -> Option<u16> {
+    let proto_ptr = proto.map_or(std::ptr::null(), |c| c.as_ptr());
+    let sp = unsafe { libc::getservbyname(name.as_ptr(), proto_ptr) };
+    if sp.is_null() {
+        return None;
+    }
+    // `s_port` is stored in network byte order; CPython returns `ntohs(s_port)`.
+    Some(u16::from_be(unsafe { (*sp).s_port } as u16))
+}
+
+/// Look up a service name by (network-byte-order) port, returning an owned
+/// copy of the name (`None` when the port/proto pair is unknown).
+#[cfg(unix)]
+fn servbyport_lookup(net_port: i32, proto: Option<&std::ffi::CStr>) -> Option<String> {
+    let proto_ptr = proto.map_or(std::ptr::null(), |c| c.as_ptr());
     let sp = unsafe { libc::getservbyport(net_port, proto_ptr) };
     if sp.is_null() {
-        return Err(os_error("port/proto not found"));
+        return None;
     }
     let name = unsafe { std::ffi::CStr::from_ptr((*sp).s_name) };
-    Ok(Object::from_str(name.to_string_lossy().into_owned()))
+    Some(name.to_string_lossy().into_owned())
+}
+
+#[cfg(windows)]
+fn servbyname_lookup(name: &std::ffi::CStr, proto: Option<&std::ffi::CStr>) -> Option<u16> {
+    winsock::ensure_started();
+    let proto_ptr = proto.map_or(std::ptr::null(), |c| c.as_ptr());
+    let sp = unsafe { winsock::getservbyname(name.as_ptr(), proto_ptr) };
+    if sp.is_null() {
+        return None;
+    }
+    // `s_port` is stored in network byte order; CPython returns `ntohs(s_port)`.
+    Some(u16::from_be(unsafe { (*sp).s_port } as u16))
+}
+
+#[cfg(windows)]
+fn servbyport_lookup(net_port: i32, proto: Option<&std::ffi::CStr>) -> Option<String> {
+    winsock::ensure_started();
+    let proto_ptr = proto.map_or(std::ptr::null(), |c| c.as_ptr());
+    let sp = unsafe { winsock::getservbyport(net_port, proto_ptr) };
+    if sp.is_null() {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr((*sp).s_name) };
+    Some(name.to_string_lossy().into_owned())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn servbyname_lookup(_name: &std::ffi::CStr, _proto: Option<&std::ffi::CStr>) -> Option<u16> {
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn servbyport_lookup(_net_port: i32, _proto: Option<&std::ffi::CStr>) -> Option<String> {
+    None
+}
+
+/// Winsock (`ws2_32`) bindings for the service-database lookups that `libc`
+/// only exposes on Unix. The `servent` layout here is the 64-bit `_WIN64`
+/// one from `<winsock2.h>` — where `s_port` precedes `s_proto` — which is the
+/// only Windows architecture WeavePy builds for.
+#[cfg(windows)]
+mod winsock {
+    use std::os::raw::{c_char, c_int, c_short};
+    use std::sync::Once;
+
+    #[allow(dead_code)] // `s_aliases`/`s_proto` are part of the C layout, never read.
+    #[repr(C)]
+    pub(super) struct Servent {
+        pub(super) s_name: *mut c_char,
+        pub(super) s_aliases: *mut *mut c_char,
+        pub(super) s_port: c_short,
+        pub(super) s_proto: *mut c_char,
+    }
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        pub(super) fn getservbyname(name: *const c_char, proto: *const c_char) -> *mut Servent;
+        pub(super) fn getservbyport(port: c_int, proto: *const c_char) -> *mut Servent;
+        #[link_name = "WSAStartup"]
+        fn wsa_startup(version: u16, data: *mut u8) -> c_int;
+    }
+
+    /// Winsock requires `WSAStartup` before any name-resolution call. `std`
+    /// and `socket2` arm it on first socket use, but `getservby*` can be a
+    /// program's first networking call, so initialize defensively. The call
+    /// is refcounted and idempotent (CPython likewise starts Winsock when
+    /// `_socket` is imported); we never pair it with `WSACleanup`, matching
+    /// CPython's process-lifetime initialization.
+    pub(super) fn ensure_started() {
+        static START: Once = Once::new();
+        START.call_once(|| {
+            // `WSADATA` is ~408 bytes on x64; 512 leaves headroom and we never
+            // read it back. `MAKEWORD(2, 2)` requests Winsock 2.2.
+            let mut data = [0u8; 512];
+            unsafe {
+                let _ = wsa_startup(0x0202, data.as_mut_ptr());
+            }
+        });
+    }
 }
 
 /// `gethostbyname_ex(name)` → `(hostname, aliaslist, ipaddrlist)`.
