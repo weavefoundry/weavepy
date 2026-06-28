@@ -5932,6 +5932,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        c_body: crate::types::CBody::default(),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -6001,6 +6002,7 @@ pub(crate) fn build_super_proxy(
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        c_body: crate::types::CBody::default(),
     };
     Object::Instance(Rc::new(inst))
 }
@@ -6347,6 +6349,11 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         }
         Object::Frame(_) => bt.frame_.clone(),
         Object::Traceback(_) => bt.traceback_.clone(),
+        // A C-API capsule is an opaque cpyext token with no dedicated
+        // VM type; report the base `object` type (it never reaches a
+        // Python-level `type()` in practice — capsules flow C -> module
+        // dict -> C). See RFC 0045.
+        Object::Capsule(_) => bt.object_.clone(),
     }
 }
 
@@ -6455,6 +6462,7 @@ fn object_identity(obj: &Object) -> i64 {
         Object::Cell(c) => Rc::as_ptr(c) as usize as i64,
         Object::Iter(i) => Rc::as_ptr(i) as usize as i64,
         Object::LazyIter(l) => Rc::as_ptr(l) as usize as i64,
+        Object::Capsule(c) => Rc::as_ptr(c) as usize as i64,
         Object::Int(i) => i.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64),
         Object::Float(f) => (f.to_bits() as i64) ^ 0x0123_4567_89AB_CDEFu64 as i64,
         Object::Bool(b) => {

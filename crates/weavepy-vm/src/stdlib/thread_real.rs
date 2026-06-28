@@ -546,6 +546,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        c_body: crate::types::CBody::default(),
     });
     Object::Instance(inst)
 }
@@ -715,6 +716,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        c_body: crate::types::CBody::default(),
     });
     Object::Instance(inst)
 }
@@ -1556,6 +1558,7 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
         finalize_ran: crate::sync::Cell::new(false),
+        c_body: crate::types::CBody::default(),
     });
     Object::Instance(inst)
 }

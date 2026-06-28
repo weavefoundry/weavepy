@@ -44,8 +44,19 @@ use crate::types::{self, PyTypeObject};
 pub struct MirrorPrefix {
     /// The owning native object. Holding it here pins the value (its
     /// `Rc`s) for as long as C holds a reference; dropped when the
-    /// mirror's refcount reaches zero.
+    /// mirror's refcount reaches zero. For a wave-3 **instance body**
+    /// (see [`inst`](Self::inst)) this is [`Object::None`] — the body
+    /// only *borrows* its instance, so it must not own a strong `Rc`.
     pub obj: Object,
+    /// For a faithful **instance body** (RFC 0045, wave 3) this is a
+    /// `Weak` back-reference to the owning native [`PyInstance`]; `None`
+    /// for every built-in mirror (which carries its value in
+    /// [`obj`](Self::obj)). A `Weak` rather than the strong
+    /// `Object::Instance` is what breaks the body↔instance ownership
+    /// cycle: the *instance* owns the body (and frees it on drop, via the
+    /// `register_instance_body_free` hook), while the body only borrows
+    /// back so [`native_of`] can resolve the pointer to its instance.
+    pub inst: Option<weavepy_vm::sync::Weak<weavepy_vm::types::PyInstance>>,
     /// Extra C-side state (capsule pointer, module-state, …). Mirrors
     /// do not use this today but the slot keeps parity with the legacy
     /// box so shared accessors are uniform.
@@ -101,7 +112,9 @@ pub unsafe fn prefix_of(p: *mut PyObject) -> *mut MirrorPrefix {
 /// True if `p` is a faithful mirror (as opposed to a legacy
 /// `PyObjectBox` or a static singleton/type). Decided by the object's
 /// type: every value of a faithful built-in type is minted as a mirror,
-/// so the type pointer is a sound, deref-free discriminator.
+/// and (RFC 0045, wave 3) every instance of an inline-storage extension
+/// type is minted as a faithful instance body — so the type pointer is a
+/// sound, deref-free discriminator for both.
 ///
 /// # Safety
 /// `p` must be non-null and point at a valid object head (`ob_type`
@@ -113,7 +126,7 @@ pub unsafe fn is_mirror(p: *mut PyObject) -> bool {
         return false;
     }
     let ty = unsafe { (*p).ob_type };
-    type_is_faithful(ty)
+    type_is_faithful(ty) || types::is_inline_instance_type(ty)
 }
 
 /// The set of built-in types whose instances are minted as faithful
@@ -192,6 +205,7 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
             pre,
             MirrorPrefix {
                 obj,
+                inst: None,
                 user_data: ptr::null_mut(),
                 destructor: None,
                 alloc_size: total,
@@ -204,6 +218,98 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
     body
 }
 
+/// Allocate a faithful, zeroed **instance body** (RFC 0045, wave 3): a
+/// `[MirrorPrefix | tp_basicsize (+ var-data)]` block whose body begins
+/// with `PyObject_HEAD` so a stock reader pokes the extension's inline
+/// fields at their declared offsets (`((MyType *)self)->field`).
+///
+/// `body_bytes` is the full body size (`tp_basicsize + nitems *
+/// tp_itemsize`, clamped to at least `sizeof(PyObject)`); the head's
+/// refcount starts at 1 and `ob_type` is `ty`. The prefix *borrows* the
+/// owning instance through `weak` (no strong `Rc`, so there is no
+/// ownership cycle); the instance frees the block on drop via
+/// [`free_instance_body`].
+pub fn alloc_instance_body(
+    ty: *mut PyTypeObject,
+    body_bytes: usize,
+    weak: weavepy_vm::sync::Weak<weavepy_vm::types::PyInstance>,
+) -> *mut PyObject {
+    let body_bytes = body_bytes.max(std::mem::size_of::<PyObject>());
+    let total = PREFIX_SIZE + body_bytes;
+    let layout = Layout::from_size_align(total, BODY_ALIGN).expect("instance body layout");
+    let raw = unsafe { alloc(layout) };
+    assert!(!raw.is_null(), "instance body allocation failed");
+    unsafe { ptr::write_bytes(raw, 0, total) };
+
+    let body = unsafe { raw.add(PREFIX_SIZE) } as *mut PyObject;
+    unsafe {
+        (*body).ob_refcnt = 1;
+        (*body).ob_type = ty;
+    }
+    let pre = raw as *mut MirrorPrefix;
+    unsafe {
+        ptr::write(
+            pre,
+            MirrorPrefix {
+                obj: Object::None,
+                inst: Some(weak),
+                user_data: ptr::null_mut(),
+                destructor: None,
+                alloc_size: total,
+                aux_ptr: ptr::null_mut(),
+                aux_size: 0,
+                magic: MIRROR_MAGIC,
+            },
+        );
+    }
+    body
+}
+
+/// True iff `p` is a faithful **instance body** (RFC 0045, wave 3) — a
+/// mirror whose prefix carries the [`MIRROR_MAGIC`] sentinel *and* a
+/// `Weak<PyInstance>` back-reference. Used by
+/// [`crate::object::free_box`] to route a C refcount-zero through "end
+/// C's borrow" rather than the immediate deallocate path, and by
+/// [`crate::memory::PyObject_Free`] to *absorb* a stock `tp_dealloc`'s
+/// `tp_free(self)` on a body the owning instance still owns.
+///
+/// The magic check is what makes this sound to call on an *arbitrary*
+/// pointer (e.g. a scratch buffer handed to `PyObject_Free`): a
+/// non-mirror's bytes would have to both name a registered inline type
+/// at `ob_type` *and* carry the 8-byte sentinel at the prefix offset,
+/// which does not happen in practice.
+///
+/// # Safety
+/// `p` must be non-null and readable for `[prefix .. head + 8]`.
+pub unsafe fn is_instance_body(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let pre = unsafe { prefix_of(p) };
+    unsafe { (*pre).magic == MIRROR_MAGIC && (*pre).inst.is_some() }
+}
+
+/// Free a faithful instance body's allocation (RFC 0045, wave 3). Called
+/// from the `register_instance_body_free` hook when the owning native
+/// instance is collected — never from the C refcount path. Drops the
+/// prefix (its `Weak` back-reference) and releases the block.
+///
+/// # Safety
+/// `p` must be an instance body ([`is_instance_body`]) that the owning
+/// instance is releasing; it must not be used afterwards.
+pub unsafe fn free_instance_body(p: *mut PyObject) {
+    let pre = unsafe { prefix_of(p) };
+    if let Some(d) = unsafe { (*pre).destructor } {
+        unsafe { d(p) };
+    }
+    let alloc_size = unsafe { (*pre).alloc_size };
+    // Drop the prefix in place (`obj` is None; the `Weak` back-reference
+    // decrements the instance's weak count) before releasing the block.
+    unsafe { ptr::drop_in_place(pre) };
+    let layout = Layout::from_size_align(alloc_size, BODY_ALIGN).expect("instance body layout");
+    unsafe { dealloc(pre as *mut u8, layout) };
+}
+
 /// Clone the native object out of a mirror without touching the C-side
 /// refcount.
 ///
@@ -211,6 +317,17 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
 /// `p` must satisfy [`is_mirror`].
 pub unsafe fn native_of(p: *mut PyObject) -> Object {
     let pre = unsafe { prefix_of(p) };
+    // RFC 0045 (wave 3): a faithful instance body resolves through its
+    // `Weak` back-reference to the owning native instance, so every
+    // crossing of the same pointer yields the *same* `PyInstance` (and
+    // thus the same `__dict__`, identity, and inline body). The `Weak`
+    // still upgrades here — the body is alive, so the instance is too.
+    if let Some(weak) = unsafe { (*pre).inst.as_ref() } {
+        return match weak.upgrade() {
+            Some(inst) => Object::Instance(inst),
+            None => Object::None,
+        };
+    }
     unsafe { (*pre).obj.clone() }
 }
 

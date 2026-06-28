@@ -784,6 +784,54 @@ fn compute_c3(
     Ok(merged)
 }
 
+/// The stable, layout-faithful C "inline body" a C-extension instance
+/// owns once it has crossed into an extension that reads its fields at
+/// fixed offsets (RFC 0045, wave 3). Holds the body pointer as a
+/// `usize` (`0` = no body). `Send + Sync` because the underlying
+/// [`Cell`] is.
+///
+/// **Excluded from the structural clone of [`PyInstance`].** A cloned
+/// instance is a *distinct* object that owns no body — most importantly
+/// the wave-2 finalizer-resurrection net (`PyInstance::drop`) shallow-
+/// copies a dying instance, and duplicating the raw body pointer there
+/// would double-free it. `Clone` therefore yields the empty state; the
+/// freshly-cloned instance lazily mints its own body if it ever crosses
+/// into C again.
+#[derive(Debug, Default)]
+pub struct CBody(Cell<usize>);
+
+impl CBody {
+    /// The body pointer (`0` when the instance has no faithful body).
+    #[inline]
+    pub fn get(&self) -> usize {
+        self.0.get()
+    }
+    /// Record the body pointer this instance now owns.
+    #[inline]
+    pub fn set(&self, p: usize) {
+        self.0.set(p);
+    }
+}
+
+impl Clone for CBody {
+    fn clone(&self) -> Self {
+        CBody(Cell::new(0))
+    }
+}
+
+/// Process-global hook that frees a C-extension instance's faithful
+/// inline body. Registered once by `weavepy-capi` at interpreter init
+/// (the same additive-hook pattern wave 2 used for
+/// `register_traverse`/`register_clear`); inert in a pure-VM build, so a
+/// run with no C extension loaded is byte-for-byte unchanged.
+static INSTANCE_BODY_FREE: std::sync::OnceLock<fn(usize)> = std::sync::OnceLock::new();
+
+/// Register the faithful-instance-body free hook (RFC 0045, wave 3).
+/// Idempotent — a second registration is ignored.
+pub fn register_instance_body_free(f: fn(usize)) {
+    let _ = INSTANCE_BODY_FREE.set(f);
+}
+
 /// An instance of a user-defined class.
 ///
 /// `dict` mirrors CPython's `__dict__` — attribute writes land here
@@ -842,6 +890,13 @@ pub struct PyInstance {
     /// `test_multiprocessing_*` `test_release_task_refs` leaked one
     /// `CountedObject` per race).
     pub finalize_ran: Cell<bool>,
+    /// The stable C "inline body" this instance owns once it has crossed
+    /// into a C extension that reads its fields at fixed `tp_basicsize`
+    /// offsets (RFC 0045, wave 3). `0` for the overwhelmingly common case
+    /// (pure-Python instances, and C instances that store state in
+    /// `__dict__`). Freed exactly once, in [`PyInstance`]'s `Drop`, via
+    /// the [`register_instance_body_free`] hook.
+    pub c_body: CBody,
 }
 
 impl PyInstance {
@@ -854,6 +909,7 @@ impl PyInstance {
             slots: RefCell::new(None),
             hash_cache: Cell::new(None),
             finalize_ran: Cell::new(false),
+            c_body: CBody::default(),
         }
     }
 
@@ -868,6 +924,7 @@ impl PyInstance {
             slots: RefCell::new(None),
             hash_cache: Cell::new(None),
             finalize_ran: Cell::new(false),
+            c_body: CBody::default(),
         }
     }
 
@@ -940,6 +997,20 @@ impl Drop for PyInstance {
     /// a shallow copy that shares the dying instance's `__dict__`/slots/native
     /// value onto the VM's pending-finalizer queue so `__del__` still runs.
     fn drop(&mut self) {
+        // RFC 0045 (wave 3): release the faithful C inline body this
+        // instance owns, if it ever crossed into a C extension that reads
+        // its fields at fixed `tp_basicsize` offsets. Runs before the
+        // finalizer net (and its early returns) so the body is freed
+        // exactly once regardless of `__del__` state. Inert (one `Cell`
+        // read) for every instance that never grew a body — i.e. all
+        // pure-Python instances and all dict-backed C instances.
+        let body = self.c_body.get();
+        if body != 0 {
+            self.c_body.set(0);
+            if let Some(free) = INSTANCE_BODY_FREE.get() {
+                free(body);
+            }
+        }
         // Already finalized (cascade/GC/this net's resurrected copy): the
         // common case for finalizable instances and the *only* path for the
         // overwhelmingly common finalizer-free instance — a single `Cell`
@@ -967,6 +1038,9 @@ impl Drop for PyInstance {
             slots: RefCell::new(self.slots.borrow().clone()),
             hash_cache: Cell::new(self.hash_cache.get()),
             finalize_ran: Cell::new(true),
+            // The resurrected copy is a distinct object that owns no C
+            // body (the dying `self` already freed its own above).
+            c_body: CBody::default(),
         }));
         crate::vm_singletons::try_push_pending_finalizer(resurrected);
     }

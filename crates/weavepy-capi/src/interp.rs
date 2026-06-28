@@ -158,6 +158,12 @@ pub fn ensure_initialised() {
         // Bridge C `tp_traverse` / `tp_clear` into the tracing collector
         // (RFC 0044, WS4) before any extension GC type can be created.
         crate::gc_bridge::install();
+        // Install the hook that frees an inline instance's faithful body
+        // when its native instance is collected (RFC 0045, WS1).
+        crate::instance::install();
+        // Install the hook that releases a capsule's retained box when its
+        // VM-side soul drops (RFC 0045, WS5 — the `import_array()` idiom).
+        crate::capsule::install();
     });
 }
 

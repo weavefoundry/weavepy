@@ -106,6 +106,7 @@ pub mod force_link_table;
 pub mod gc_bridge;
 pub mod genericalloc;
 pub mod getset;
+pub mod instance;
 pub mod interp;
 pub mod layout;
 pub mod lifecycle;

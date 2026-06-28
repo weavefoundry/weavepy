@@ -51,6 +51,23 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
         return ptr::null_mut();
     }
     crate::interp::ensure_initialised();
+
+    // RFC 0045 (wave 3): an inline-storage type (`tp_basicsize >
+    // sizeof(PyObject)`) gets a faithful `tp_basicsize`-wide body whose
+    // fields live at their declared offsets — the `PyArrayObject` shape —
+    // rather than the legacy `PyObjectBox` (whose Rust payload would sit
+    // exactly where the extension expects `self->field`). The fresh
+    // instance is owned by the VM and pinned for C's borrow.
+    if crate::types::is_inline_instance_type(ty) {
+        let body = crate::instance::make_inline_instance(ty, nitems);
+        if body.is_null() {
+            crate::errors::set_runtime_error("PyType_GenericAlloc: type is not bridged");
+            return ptr::null_mut();
+        }
+        unsafe { crate::object::Py_IncRef(ty as *mut PyObject) };
+        return body;
+    }
+
     let basicsize = unsafe { (*ty).tp_basicsize };
     let itemsize = unsafe { (*ty).tp_itemsize };
     let total = basicsize.max(std::mem::size_of::<PyObjectBox>() as PySsizeT)

@@ -26,11 +26,14 @@
 //!   preserve the dotted-name → import-and-fetch behaviour
 //!   numpy / scipy rely on.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 
-use weavepy_vm::object::Object;
+use weavepy_vm::object::{Object, PyCapsuleSoul};
+use weavepy_vm::sync::Rc;
 
 use crate::object::{PyObject, PyObjectBox};
 
@@ -95,6 +98,105 @@ fn capsule_state(p: *mut PyObject) -> Option<*mut CapsuleState> {
     }
     let bx = unsafe { &*(p as *const PyObjectBox) };
     Some(bx.payload.user_data as *mut CapsuleState)
+}
+
+// ---------------------------------------------------------------------------
+// Capsule <-> VM round-trip (RFC 0045, wave 3)
+//
+// A capsule is a legacy `PyObjectBox` whose *identity* is the box pointer and
+// whose state (the wrapped `void*`, name, …) lives in `user_data` — its
+// `payload.obj` is `Object::None`. That made it collapse to `None` the moment
+// it crossed into the VM (a module dict / attribute), breaking the load-bearing
+// `import_array()` idiom: `PyModule_AddObject(m, "_API", capsule)` stored
+// `None`, so a later `PyCapsule_Import(...)` fetched a non-capsule and failed.
+//
+// The fix mirrors wave 3's stable-instance-body design: the capsule keeps its
+// box, but the VM holds an identity-stable [`Object::Capsule`] *soul* that maps
+// back to the **same** box. The soul retains one C reference on the box for its
+// whole life, hands that same pointer back out on each crossing, and releases
+// the retain when the last soul drops (the [`capsule_soul_free`] hook).
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Dedup map `capsule box pointer -> Weak<soul>`. Lets a capsule that
+    /// crosses into the VM more than once resolve to the *same* soul (so
+    /// `cap is cap` holds and exactly one VM-side retain is kept). Advisory:
+    /// a missing/stale entry only costs an extra soul, never correctness —
+    /// each soul independently balances its own retain.
+    static CAPSULE_SOULS: RefCell<HashMap<usize, weavepy_vm::sync::Weak<PyCapsuleSoul>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Install the VM hook that releases a capsule's retained box when its
+/// VM-side [`PyCapsuleSoul`] drops (RFC 0045, wave 3). Idempotent; called
+/// from [`crate::interp::ensure_initialised`].
+pub fn install() {
+    weavepy_vm::object::register_capsule_free(capsule_soul_free);
+}
+
+/// True if `p` is a live capsule box (its `ob_type` is `PyCapsule_Type`).
+pub fn is_capsule(p: *mut PyObject) -> bool {
+    capsule_state(p).is_some()
+}
+
+/// Resolve a capsule box crossing into the VM to its identity-stable
+/// [`Object::Capsule`] soul (RFC 0045). On the **first** crossing the box
+/// is retained once (the soul's lifelong reference) and registered; later
+/// crossings of the same box return the same soul without a new retain.
+///
+/// # Safety
+/// `p` must be a live capsule box ([`is_capsule`]).
+pub unsafe fn capsule_soul(p: *mut PyObject) -> Object {
+    let key = p as usize;
+    if let Some(existing) = CAPSULE_SOULS.with(|m| {
+        m.borrow()
+            .get(&key)
+            .and_then(weavepy_vm::sync::Weak::upgrade)
+    }) {
+        return Object::Capsule(existing);
+    }
+    // First crossing: read the name for `repr`, take the soul's lifelong
+    // retain on the box, and register the soul for dedup.
+    let name = capsule_state(p).and_then(|s| unsafe {
+        (*s).name.as_deref().map(|bytes| {
+            let text = CStr::from_bytes_with_nul(bytes)
+                .ok()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+            weavepy_vm::sync::Rc::<str>::from(text.as_str())
+        })
+    });
+    unsafe { crate::object::Py_IncRef(p) };
+    let soul = Rc::new(PyCapsuleSoul { name, handle: key });
+    CAPSULE_SOULS.with(|m| m.borrow_mut().insert(key, Rc::downgrade(&soul)));
+    Object::Capsule(soul)
+}
+
+/// Hand a capsule soul back to C as its original box (RFC 0045): bump the
+/// box's C refcount and return the same pointer. The box is guaranteed
+/// live — the soul holds a retain on it for as long as it exists.
+pub fn capsule_box_from_soul(soul: &Rc<PyCapsuleSoul>) -> *mut PyObject {
+    let p = soul.handle as *mut PyObject;
+    unsafe { crate::object::Py_IncRef(p) };
+    p
+}
+
+/// VM hook (registered by [`install`]): the last [`PyCapsuleSoul`] for a
+/// capsule has dropped, so release the lifelong retain its box was holding.
+/// Drops the dedup entry first, then decrefs — the decref may reach zero and
+/// free the box (running any `PyCapsule` destructor), which must not see a
+/// borrow of [`CAPSULE_SOULS`] held.
+fn capsule_soul_free(handle: usize) {
+    if handle == 0 {
+        return;
+    }
+    // Best-effort dedup cleanup. Advisory only: removing the wrong entry (a
+    // pathological cross-thread reuse of the same address) costs at most an
+    // extra soul later, never a refcount imbalance.
+    CAPSULE_SOULS.with(|m| {
+        m.borrow_mut().remove(&handle);
+    });
+    unsafe { crate::object::Py_DecRef(handle as *mut PyObject) };
 }
 
 #[no_mangle]

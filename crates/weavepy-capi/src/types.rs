@@ -474,6 +474,10 @@ pub fn type_for_object(o: &Object) -> *mut PyTypeObject {
         O::Instance(inst) => {
             find_type_ptr(&inst.cls()).unwrap_or_else(|| PyBaseObject_Type.as_ptr())
         }
+        // RFC 0045 (wave 3): capsules round-trip as their retained box in
+        // `into_owned`, but report the faithful `PyCapsule_Type` for any
+        // direct `Py_TYPE`-style query that reaches here.
+        O::Capsule(_) => PyCapsule_Type.as_ptr(),
         _ => PyBaseObject_Type.as_ptr(),
     }
 }
@@ -732,6 +736,47 @@ thread_local! {
     /// Insertion-ordered list for the `Rc<TypeObject>` → pointer scan.
     static READIED_TYPES: std::cell::RefCell<Vec<&'static ReadiedType>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// Types whose instances get a faithful **inline `tp_basicsize`
+    /// body** (RFC 0045, wave 3): C-extension types finalised by
+    /// `PyType_FromSpec` / `PyType_Ready` that declare storage beyond the
+    /// object head. Membership is the opt-in gate that
+    /// [`crate::object::into_owned`] and
+    /// [`crate::genericalloc::PyType_GenericAlloc`] consult; a type absent
+    /// from this set keeps the wave-1/2 `PyObjectBox` instance shape, so
+    /// the change is purely additive (pure-Python classes and every
+    /// dict-backed fixture are unaffected).
+    static INLINE_TYPES: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Register `ty` as an inline-instance type iff it declares storage
+/// beyond `PyObject_HEAD` (`tp_basicsize > sizeof(PyObject)`) — i.e. it
+/// has real inline fields a stock reader pokes at fixed offsets (the
+/// `PyArrayObject` shape). Called at `PyType_FromSpec` / `PyType_Ready`
+/// finalisation. Types that keep all state in `__dict__`
+/// (`tp_basicsize <= sizeof(PyObject)`, which is every current fixture)
+/// are not registered and keep the legacy box (RFC 0045, WS1).
+pub fn maybe_register_inline_type(ty: *mut PyTypeObject) {
+    if ty.is_null() {
+        return;
+    }
+    let basicsize = unsafe { (*ty).tp_basicsize } as usize;
+    if basicsize > std::mem::size_of::<PyObject>() {
+        INLINE_TYPES.with(|s| s.borrow_mut().insert(ty as usize));
+    }
+}
+
+/// True if instances of `ty` use a faithful inline `tp_basicsize` body
+/// (RFC 0045, wave 3). O(1) hash lookup; false for every non-extension
+/// type, so the wave-1/2 paths are unchanged for them.
+pub fn is_inline_instance_type(ty: *mut PyTypeObject) -> bool {
+    if ty.is_null() {
+        return false;
+    }
+    INLINE_TYPES.with(|s| s.borrow().contains(&(ty as usize)))
 }
 
 /// Look up the readied-type data for an extension type pointer.
@@ -999,6 +1044,9 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
     let leaked = Box::leak(bx);
     let ty_ptr = &mut leaked.head as *mut PyTypeObject;
     register_heap_type(ty_ptr);
+    // RFC 0045 (wave 3): a heap type that declares inline fields beyond
+    // the object head gets faithful `tp_basicsize` instance storage.
+    maybe_register_inline_type(ty_ptr);
     ty_ptr as *mut PyObject
 }
 
@@ -1345,6 +1393,10 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
     }));
     READIED_BY_PTR.with(|m| m.borrow_mut().insert(t as usize, readied));
     READIED_TYPES.with(|v| v.borrow_mut().push(readied));
+    // RFC 0045 (wave 3): a readied static type that declares inline
+    // fields beyond the object head gets faithful `tp_basicsize`
+    // instance storage (the `PyArrayObject` shape).
+    maybe_register_inline_type(t);
 
     // Write-back into the caller's struct — both offsets live inside
     // the faithful 416-byte CPython prefix, so a stock static type is

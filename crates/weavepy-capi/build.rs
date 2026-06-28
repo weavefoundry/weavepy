@@ -194,6 +194,11 @@ fn main() {
     //         `PyTypeObject` + `PyType_Ready`, method suites, richcompare,
     //         call/iter/descriptor protocols, and a `Py_TPFLAGS_HAVE_GC`
     //         type with `tp_traverse`/`tp_clear`.
+    //       * `_stockarray.c` — wave 3 (RFC 0045): inline `tp_basicsize`
+    //         instance storage (`PyArrayObject` shape), real `tp_members`
+    //         at fixed offsets, the `__array_interface__`/`__array_struct__`
+    //         interchange protocols, and the `import_array()` array-C-API
+    //         capsule pattern.
     //
     //     Skipped (with a note) when CPython 3.13 dev headers aren't
     //     present, so a bare CI host still builds and the stock proofs
@@ -222,6 +227,16 @@ fn main() {
                 src: &workspace_root.join("tests/capi_ext/_stocktype.c"),
                 name: "_stocktype",
                 env_var: "WEAVEPY_CAPI_STOCKTYPE_EXTENSION",
+            });
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stockarray.c"),
+                name: "_stockarray",
+                env_var: "WEAVEPY_CAPI_STOCKARRAY_EXTENSION",
             });
         }
         None => {

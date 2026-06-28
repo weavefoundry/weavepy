@@ -209,10 +209,17 @@ fixture-proven:
   (`tp_traverse`/`tp_clear` participating in WeavePy's cycle collector). Landed
   and fixture-proven by `_stocktype` - see RFC 0044 for the design and measured
   outcome.
-- **Wave 3.** The numpy *C-API surface*: the `PyArray_*` import capsule shape,
-  `__array_struct__`/`__array_interface__`, the ufunc registration path, plus
-  the long tail of `_multiarray_umath`'s symbol dependencies (the "is it our
-  bug or theirs" hermetic fixtures expand here).
+- **Wave 3** (detailed in **RFC 0045**, *Inline instance storage + the numpy
+  array C-API surface*). The faithful **inline `tp_basicsize` instance storage**
+  wave 2 deferred (a stock type reading `self->field` at a fixed offset in its
+  own instance block - the `PyArrayObject` shape), real `tp_members` at those
+  offsets, plus the numpy *C-API surface* that rides on it: the array interchange
+  protocols (`__array_struct__`/`__array_interface__`) and the array-C-API import
+  *capsule* pattern (`import_array()` ->
+  `PyCapsule_Import(...._ARRAY_API)` -> a `void **` table). Landed and
+  fixture-proven by `_stockarray` - see RFC 0045 for the design and measured
+  outcome. (Real numpy from source, the full ufunc-loop machinery, and the
+  complete private `_multiarray_umath` symbol tail are wave 4.)
 - **Wave 4.** Build **real numpy** from source against the now-faithful host
   ABI; gate CI on `import numpy; numpy.zeros((3,3)) @ numpy.ones((3,3))`.
 - **Wave 5.** pandas / Cython-generated extensions (the full-API,
