@@ -105,23 +105,46 @@ class _Call:
     """
 
     def __init__(self, value=(), name=None, parent=None, two=False, from_kall=True):
+        # Parse `value` exactly like CPython's ``_Call.__new__``: a 3-tuple is
+        # ``(name, args, kwargs)``; a 2-tuple is ``(name, args|kwargs)`` when the
+        # first element is a str, else ``(args, kwargs)``; a 1-tuple is one of
+        # name / args / kwargs by type.
         args = ()
         kwargs = {}
-        n = name or ""
+        n = name if name is not None else ""
         if not isinstance(value, tuple):
             value = (value,)
-        if len(value) == 3:
+        len_value = len(value)
+        if len_value == 3:
             n, args, kwargs = value
-        elif len(value) == 2:
-            args, kwargs = value
-        elif len(value) == 1:
-            args = value[0] if isinstance(value[0], tuple) else (value[0],)
+        elif len_value == 2:
+            first, second = value
+            if isinstance(first, str):
+                n = first
+                if isinstance(second, tuple):
+                    args = second
+                else:
+                    kwargs = second
+            else:
+                args, kwargs = first, second
+        elif len_value == 1:
+            (only,) = value
+            if isinstance(only, str):
+                n = only
+            elif isinstance(only, tuple):
+                args = only
+            else:
+                kwargs = only
         self._mock_name = n
         self._mock_args = tuple(args)
         self._mock_kwargs = dict(kwargs)
-        self._named = name is not None
+        # CPython's `two` flag selects the *shape* of the underlying tuple:
+        # ``call_args`` is the 2-tuple ``(args, kwargs)`` (``two=True``); every
+        # other record (notably ``mock_calls`` entries) is the 3-tuple
+        # ``(name, args, kwargs)``, so ``mock_calls[i][1]`` is the args tuple.
+        self._named = not two
         self._tuple = (
-            (n, self._mock_args, self._mock_kwargs)
+            (self._mock_name, self._mock_args, self._mock_kwargs)
             if self._named
             else (self._mock_args, self._mock_kwargs)
         )
@@ -171,7 +194,10 @@ class _Call:
         return hash((self._mock_name, self._mock_args, tuple(sorted(self._mock_kwargs.items()))))
 
     def __repr__(self):
-        return f"call({self._mock_args}, {self._mock_kwargs})"
+        name = self._mock_name or "call"
+        parts = [repr(a) for a in self._mock_args]
+        parts += [f"{k}={v!r}" for k, v in self._mock_kwargs.items()]
+        return f"{name}({', '.join(parts)})"
 
 
 call = _Call()
@@ -454,10 +480,14 @@ class Mock(NonCallableMock):
     def __call__(self, *args, **kwargs):
         object.__setattr__(self, "_mock_called", True)
         object.__setattr__(self, "_mock_call_count", self._mock_call_count + 1)
-        c = _Call((args, kwargs))
+        # `call_args`/`call_args_list` are the 2-tuple ``(args, kwargs)`` form;
+        # `mock_calls` entries are the 3-tuple ``(name, args, kwargs)`` form
+        # (name '' for a direct call), so ``mock_calls[i][1]`` is the args
+        # tuple — CPython parity (e.g. test_httplib's tunnel send assertion).
+        c = _Call((args, kwargs), two=True)
         object.__setattr__(self, "_mock_call_args", c)
         self._mock_call_args_list.append(c)
-        self._mock_mock_calls.append(c)
+        self._mock_mock_calls.append(_Call(("", args, kwargs)))
         if self._mock_side_effect is not None:
             effect = self._mock_side_effect
             # An exception *class* is callable, so this must precede the

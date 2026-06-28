@@ -964,6 +964,36 @@ pub struct PyDictView {
     pub kind: DictViewKind,
 }
 
+/// Set-like equality for `dict_keys` / `dict_items` views (CPython
+/// `dictview_richcompare`). A `dict_keys` view equals another keys view
+/// when they hold the same *set* of keys (order-independent); a
+/// `dict_items` view equals another items view when they hold the same set
+/// of `(key, value)` pairs — i.e. dict equality. `dict_values` views are
+/// **not** set-like and only ever compare equal by identity, so they fall
+/// through to the caller's identity tail.
+fn dict_view_set_eq(a: &PyDictView, b: &PyDictView) -> bool {
+    if a.kind != b.kind {
+        return false;
+    }
+    match a.kind {
+        DictViewKind::Values => false,
+        DictViewKind::Keys => {
+            let da = a.dict.borrow();
+            let db = b.dict.borrow();
+            da.len() == db.len() && da.iter().all(|(k, _)| db.contains_key(k))
+        }
+        DictViewKind::Items => {
+            let da = a.dict.borrow();
+            let db = b.dict.borrow();
+            da.len() == db.len()
+                && da.iter().all(|(k, v)| match db.get(k) {
+                    Some(v2) => v.is_same(v2) || v.eq_value(v2),
+                    None => false,
+                })
+        }
+    }
+}
+
 /// Internal payload for [`Object::StaticMethod`] / [`Object::ClassMethod`].
 ///
 /// Besides the wrapped callable, CPython's `classmethod` and
@@ -5415,6 +5445,13 @@ impl Object {
                     _ => a.function.eq_value(&b.function),
                 };
                 func_eq && a.receiver.is_same(&b.receiver)
+            }
+            // `dict_keys` / `dict_items` views are set-like (CPython
+            // `dictview_richcompare`): equal when they hold the same set of
+            // keys / `(key, value)` pairs, regardless of insertion order or
+            // which backing dict they came from.
+            (Object::DictView(a), Object::DictView(b)) => {
+                Rc::ptr_eq(a, b) || dict_view_set_eq(a, b)
             }
             // CPython's default `tp_richcompare` (no user `__eq__`) falls
             // back to *identity*: `x == x` is True and `x == y` is False

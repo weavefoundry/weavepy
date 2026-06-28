@@ -1498,10 +1498,27 @@ fn decode_utf32(bytes: &[u8], explicit_be: Option<bool>) -> Result<String, Runti
 }
 
 fn encoding_key(s: &str) -> String {
-    s.chars()
+    let normalised: String = s
+        .chars()
         .filter(|c| !c.is_ascii_whitespace() && *c != '-' && *c != '_')
         .map(|c| c.to_ascii_lowercase())
-        .collect()
+        .collect();
+    // Canonicalise the common `Lib/encodings/aliases.py` spellings onto the keys
+    // the native fast paths (`encode_special`/`decode_special`/
+    // `encode_codepoints`) switch on. This matters for correctness, not just
+    // dispatch: without it `us-ascii`/`cp819`/… miss the strict native codecs and
+    // fall through to `lookup_encoding`, where `encoding_rs` resolves the
+    // `us-ascii` and `iso-8859-1` *labels* to the lenient WHATWG windows-1252
+    // superset — so e.g. `'\xeb'.encode('us-ascii')` would wrongly succeed
+    // instead of raising `UnicodeEncodeError` (breaks RFC 2047 header folding).
+    match normalised.as_str() {
+        "usascii" | "iso646us" | "646" | "cp367" | "ibm367" | "csascii" | "us" => {
+            "ascii".to_owned()
+        }
+        "latin" | "cp819" | "l1" | "8859" | "csisolatin1" | "ibm819" | "isoir100"
+        | "iso885911987" => "latin1".to_owned(),
+        _ => normalised,
+    }
 }
 
 // ---------- UTF-8 ----------
@@ -1745,6 +1762,19 @@ fn handle_encode_error(
             out.extend_from_slice(s.as_bytes());
             Ok(())
         }
+        // `surrogateescape`/`surrogatepass` only have meaning for *surrogate*
+        // code points (U+DC80..U+DCFF / U+D800..U+DFFF). This strict-`str`
+        // encode path operates on a Rust `&str`, whose chars can never be
+        // surrogates, so a non-encodable char here is a genuine error: CPython
+        // raises `UnicodeEncodeError` (e.g. `'ë'.encode('ascii',
+        // 'surrogateescape')`), not "unknown error handler".
+        "surrogateescape" | "surrogatepass" => Err(crate::error::unicode_encode_error(
+            encoding,
+            source,
+            pos,
+            pos + 1,
+            reason,
+        )),
         _ => Err(value_error(format!("unknown error handler: {errors}"))),
     }
 }

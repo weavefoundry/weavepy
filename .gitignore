@@ -49,6 +49,7 @@ __pycache__/
 
 # Local scratch / throwaway diagnostics
 .scratch/
+.regrscratch/
 /tmp/
 
 # Vendored CPython checkout for the regrtest harness (opt-in, machine-local).

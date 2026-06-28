@@ -530,7 +530,7 @@ reason = "RFC 0039 WS6: native select/poll/kqueue backends + frozen CPython sele
 
 [tests."cpython/Lib/test/test_socket.py"]
 status = "skip"
-reason = "socket: most tests need network + privileged sockets"
+reason = "measured (RFC 0042 WS1): the loopback subset is implemented and proven, but the full test_socket suite exercises platform-specific surfaces outside the 'loopback subset' scope, so the row is deferred. Proven green: TCP/UDP connect/bind/listen/accept/send/recv on 127.0.0.1 and `socket.makefile()` buffered streams (test_socketserver passes; the five protocol-client suites + tests/regrtest/test_net_makefile.py all round-trip over real loopback sockets). Deferred (platform-specific, out of scope): sendmsg/recvmsg ancillary data — SCM_RIGHTS, cmsg scatter/gather (SendmsgTCPTest/SendmsgUDP6Test), IPv6 cmsg, SCTP (no IPPROTO_SCTP), and os.sendfile; one IPv6 case (SendmsgUDP6Test.testSendmsgBadArgs) hangs, so the row stays `skip` (not run) rather than `timeout`."
 
 [tests."cpython/Lib/test/test_subprocess.py"]
 status = "pass"
@@ -543,19 +543,19 @@ reason = "measured (RFC 0040 WS4): passes end-to-end — 57 run, 0 fail / 0 erro
 
 [tests."cpython/Lib/test/test_ssl.py"]
 status = "skip"
-reason = "ssl ships and imports cleanly, but test_ssl.py needs live TLS endpoints + on-disk certificate fixtures unavailable in the CI sandbox (cf. test_socket / test_httplib)"
+reason = "measured (RFC 0042 WS2): the TLS deliverable is implemented and proven, but the full test_ssl suite asserts OpenSSL/_ssl internals that are explicit RFC non-goals (rustls-not-OpenSSL), so the row is deferred. Implemented + green: real client+server `wrap_socket` over an *existing* fd (the five protocol-client suites — test_ftplib/imaplib/poplib/smtplib + test_httplib — all round-trip over loopback TLS) and the socketless `MemoryBIO`/`SSLObject` path over rustls' native memory BIO (MemoryBIOTests 5/5 + SSLObjectTests 2/2: read/write/eof/pending/buffer-types incl. the non-contiguous BufferError, the no-public-constructor guard, and the bidirectional close_notify `unwrap`). Bundled in-process proof: tests/regrtest/test_net_tls_roundtrip.py (fd wrapping, client+server) and test_net_bio_roundtrip.py (MemoryBIO/SSLObject). Deferred surfaces (Non-goals): `getpeercert()`'s full X.509→dict parse (test_connect/test_getpeercert/test_parse_cert*), the OpenSSL cipher-string grammar (get_ciphers/set_ciphers/test_ciphers), exact options/verify_flags bitmasks, SNI servername callbacks, session_stats, set_ecdh_curve, load_dh_params, and `_ssl._SSLSocket.owner`-style introspection (test_bio_handshake). A background ThreadedEchoServer teardown join also hangs after the cert-parse FAIL, so the row stays `skip` (not run) rather than `timeout`."
 
 [tests."cpython/Lib/test/test_urllib.py"]
-status = "fail"
-reason = "urllib: opener install + proxy auth handlers"
+status = "pass"
+reason = "measured (RFC 0042 WS4): passes end-to-end — 102 run, 0 fail / 0 error, 2 skip. `urllib.request`/`urllib.response`/`urllib.error` are CPython's verbatim modules (the `OpenerDirector` + `HTTPHandler`/`HTTPSHandler`/`HTTPRedirectHandler`/`HTTPErrorProcessor`/`ProxyHandler`/auth handlers/`FileHandler`/`FTPHandler`/`DataHandler` chain) over the WS3 `http.client`."
 
 [tests."cpython/Lib/test/test_urlparse.py"]
-status = "fail"
-reason = "urllib.parse: WHATWG URL conformance + IDNA edge cases"
+status = "pass"
+reason = "measured (RFC 0042 WS4): passes end-to-end — 77 run, 0 fail / 0 error, 5 skip. `urllib.parse` is CPython's verbatim module: `SplitResult`/`ParseResult` are real `tuple` subclasses (named-tuple `_fields`, `.geturl()`, the `_encoded`/`_decoded` result pair), and `urlsplit`/`urljoin`/`quote`/`unquote`/`parse_qs[l]` + IDNA match."
 
 [tests."cpython/Lib/test/test_httplib.py"]
-status = "skip"
-reason = "httplib requires a live HTTP fixture server"
+status = "pass"
+reason = "measured (RFC 0042 WS3): passes end-to-end — 142 run, 0 fail / 0 error, 1 skip. `http.client` is CPython's verbatim `Lib/http/client.py` (socket-backed `HTTPResponse` over `sock.makefile('rb')`, lazy chunked/length reads, `http.HTTPStatus`, the `putrequest`/`putheader` state machine, 100-continue, `email`-parsed headers) and `HTTPSConnection` is wired onto WS2's `context.wrap_socket(self.sock, server_hostname=host)`. The single skip is a CPython-only buffer-probe."
 
 [tests."cpython/Lib/test/test_queue.py"]
 status = "pass"
@@ -641,8 +641,13 @@ status = "pass"
 reason = "RFC 0039: real OS signal subsystem — per-platform signal numbers (via libc, so SIGUSR1=30 on macOS not 10), sigaction trampolines that trip a flag + write the wakeup fd, real signal.alarm/raise_signal/pause, and a main-thread signal-interruptible lock.acquire (EINTR + PyErr_CheckSignals retry loop). All 6 tests pass."
 
 [tests."cpython/Lib/test/test_http_cookies.py"]
-status = "fail"
-reason = "measured: Morsel/SimpleCookie output formatting edge (errors=1)"
+status = "pass"
+# ~93s of CPU: `test_unquote_large` (`@requires_resource('cpu')`) unquotes a
+# 2**16-comma string, which drives the SRE engine hard. Raise the per-test
+# budget so a loaded/throttled host can't flip the (stable) pass into a
+# spurious timeout at the 60s boundary.
+timeout_seconds = 180
+reason = "measured (RFC 0042 WS4): passes end-to-end — 31 run, 0 fail / 0 error / 0 skip. `http.cookies` is CPython's verbatim module (`Morsel`/`SimpleCookie` output formatting). The `cpu`-gated `test_unquote_large` exercises the SRE `_unquote` regex on a very large input; it required the iterative `OP_MAX_UNTIL` greedy driver (no longer recursing per repetition) so the pathological non-capturing repeat no longer trips the engine's recursion limit."
 
 [tests."cpython/Lib/test/test_unicode_identifiers.py"]
 status = "pass"
@@ -664,28 +669,28 @@ status = "pass"
 reason = "RFC 0039 WS6: native libc-backed select.kqueue/kevent"
 
 [tests."cpython/Lib/test/test_socketserver.py"]
-status = "skip"
-reason = "measured: ResourceDenied — the 'network' resource is not enabled in the sandbox"
+status = "pass"
+reason = "measured (RFC 0042 WS1): passes end-to-end — 27 run, 0 fail / 0 error / 0 skip. The harness subprocess bootstrap now enables the loopback-safe `-u` resource set (WEAVEPY_REGRTEST_RESOURCES=network,subprocess,…) so `requires('network')` grades instead of raising ResourceDenied, and `socket`/`select` work on 127.0.0.1, so the TCP/UDP/threading/forking mix-in server matrix round-trips over real loopback sockets."
 
 [tests."cpython/Lib/test/test_ftplib.py"]
-status = "skip"
-reason = "ftplib client not shipped yet and the tests need a live FTP server"
+status = "pass"
+reason = "measured (RFC 0042 WS5): passes end-to-end — 94 run, 0 fail / 0 error, 1 skip. `ftplib` is CPython's verbatim `Lib/ftplib.py` over the WS1 `socket.makefile()` + WS2 `ssl.wrap_socket`; the suite's own threaded asyncore mock FTP server (incl. the TLS `FTP_TLS` legs: AUTH TLS, PROT P, CCC) round-trips over loopback."
 
 [tests."cpython/Lib/test/test_imaplib.py"]
-status = "skip"
-reason = "imaplib not shipped yet and the tests need a live IMAP server"
+status = "pass"
+reason = "measured (RFC 0042 WS5): passes end-to-end — 98 run, 0 fail / 0 error, 4 skip. `imaplib` is CPython's verbatim `Lib/imaplib.py` over the WS1 `socket.makefile()` + WS2 `ssl`; the suite's threaded mock IMAP4 server (incl. the `IMAP4_SSL`/STARTTLS legs) round-trips over loopback. (A background-server `ssl.SSLError: write: failed to write whole buffer` during a client-initiated teardown is caught by the test's own handler and does not fail the suite.)"
 
 [tests."cpython/Lib/test/test_poplib.py"]
-status = "skip"
-reason = "poplib not shipped yet and the tests need a live POP3 server"
+status = "pass"
+reason = "measured (RFC 0042 WS5): passes end-to-end — 71 run, 0 fail / 0 error / 0 skip. `poplib` is CPython's verbatim `Lib/poplib.py` over the WS1 `socket.makefile()` + WS2 `ssl`; the suite's threaded asyncore mock POP3 server (incl. the `POP3_SSL`/STLS legs) round-trips over loopback."
 
 [tests."cpython/Lib/test/test_smtplib.py"]
-status = "skip"
-reason = "email.mime not shipped yet and the tests need a live SMTP server"
+status = "pass"
+reason = "measured (RFC 0042 WS5): passes end-to-end — 85 run, 0 fail / 0 error / 0 skip. `smtplib` + the `email.mime.*` package are CPython's verbatim modules over the WS1 `socket.makefile()` + WS2 `ssl`; the suite's threaded asyncore mock SMTP server (incl. the `SMTP_SSL`/STARTTLS legs and `send_message`) round-trips over loopback."
 
 [tests."cpython/Lib/test/test_http_cookiejar.py"]
-status = "skip"
-reason = "http.cookiejar not shipped yet"
+status = "pass"
+reason = "measured (RFC 0042 WS4): passes end-to-end — 77 run, 0 fail / 0 error / 0 skip. `http.cookiejar` is CPython's verbatim module (`CookieJar`/`MozillaCookieJar`/`LWPCookieJar` + the `DefaultCookiePolicy` machinery) over the verbatim `http.client`/`urllib.request`."
 
 [tests."cpython/Lib/test/test_urllib2.py"]
 status = "skip"

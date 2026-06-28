@@ -1099,6 +1099,7 @@ impl Compiler {
         let mut assigned = HashSet::new();
         for s in &module.body {
             collect_assigned(s, &mut assigned);
+            collect_walrus_stmt(s, &mut assigned);
         }
         for n in assigned {
             self.bindings.insert(n, Binding::Global);
@@ -1119,6 +1120,9 @@ impl Compiler {
         let mut assigned = HashSet::new();
         for s in body {
             collect_decls(s, &mut globals, &mut nonlocals, &mut assigned);
+            // Walrus targets bind in this scope too (PEP 572) but live inside
+            // expressions that `collect_decls` doesn't descend into.
+            collect_walrus_stmt(s, &mut assigned);
         }
         self.explicit_globals = globals.clone();
         for n in globals {
@@ -6209,6 +6213,283 @@ fn collect_assigned(stmt: &Stmt, out: &mut HashSet<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Collect walrus (`:=`) target names that bind in the *current* scope.
+///
+/// PEP 572: a named expression binds in the nearest enclosing function or
+/// module scope, including walruses written inside an `if`/`while`
+/// condition, a `return`/`assert`/expression statement, or a
+/// default/decorator/base expression. [`collect_decls`]/[`collect_assigned`]
+/// only walk *statements*, so they miss these expression-borne bindings —
+/// which is why a comprehension that reads such a name failed to
+/// cell-promote it (`UnboundLocalError`). We deliberately treat nested
+/// `def`/`lambda`/comprehension scopes as opaque: a walrus there binds to
+/// *that* scope (the comprehension-leak case is handled at emission time),
+/// so descending would over-collect.
+fn collect_walrus_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
+    match &stmt.kind {
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => collect_walrus_expr(e, out),
+        StmtKind::Assign { targets, value } => {
+            collect_walrus_expr(value, out);
+            for t in targets {
+                collect_walrus_expr(t, out);
+            }
+        }
+        StmtKind::AugAssign { target, value, .. } => {
+            collect_walrus_expr(target, out);
+            collect_walrus_expr(value, out);
+        }
+        StmtKind::AnnAssign {
+            target,
+            annotation,
+            value,
+        } => {
+            collect_walrus_expr(target, out);
+            collect_walrus_expr(annotation, out);
+            if let Some(v) = value {
+                collect_walrus_expr(v, out);
+            }
+        }
+        StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
+            collect_walrus_expr(test, out);
+            for s in body {
+                collect_walrus_stmt(s, out);
+            }
+            for s in orelse {
+                collect_walrus_stmt(s, out);
+            }
+        }
+        StmtKind::For {
+            target,
+            iter,
+            body,
+            orelse,
+        }
+        | StmtKind::AsyncFor {
+            target,
+            iter,
+            body,
+            orelse,
+        } => {
+            collect_walrus_expr(target, out);
+            collect_walrus_expr(iter, out);
+            for s in body {
+                collect_walrus_stmt(s, out);
+            }
+            for s in orelse {
+                collect_walrus_stmt(s, out);
+            }
+        }
+        // Nested `def`/`class` scopes: only the parts evaluated in THIS scope
+        // (decorators, default args, bases, keywords) can bind a walrus here;
+        // the body belongs to the inner scope.
+        StmtKind::FunctionDef {
+            args,
+            decorator_list,
+            ..
+        }
+        | StmtKind::AsyncFunctionDef {
+            args,
+            decorator_list,
+            ..
+        } => {
+            for d in decorator_list {
+                collect_walrus_expr(d, out);
+            }
+            for d in &args.defaults {
+                collect_walrus_expr(d, out);
+            }
+            for d in args.kw_defaults.iter().flatten() {
+                collect_walrus_expr(d, out);
+            }
+        }
+        StmtKind::ClassDef {
+            bases,
+            keywords,
+            decorator_list,
+            ..
+        } => {
+            for d in decorator_list {
+                collect_walrus_expr(d, out);
+            }
+            for b in bases {
+                collect_walrus_expr(b, out);
+            }
+            for k in keywords {
+                collect_walrus_expr(&k.value, out);
+            }
+        }
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            for s in body {
+                collect_walrus_stmt(s, out);
+            }
+            for h in handlers {
+                if let Some(t) = &h.type_ {
+                    collect_walrus_expr(t, out);
+                }
+                for s in &h.body {
+                    collect_walrus_stmt(s, out);
+                }
+            }
+            for s in orelse {
+                collect_walrus_stmt(s, out);
+            }
+            for s in finalbody {
+                collect_walrus_stmt(s, out);
+            }
+        }
+        StmtKind::Raise { exc, cause } => {
+            if let Some(e) = exc {
+                collect_walrus_expr(e, out);
+            }
+            if let Some(c) = cause {
+                collect_walrus_expr(c, out);
+            }
+        }
+        StmtKind::With { items, body } | StmtKind::AsyncWith { items, body } => {
+            for it in items {
+                collect_walrus_expr(&it.context_expr, out);
+                if let Some(t) = &it.optional_vars {
+                    collect_walrus_expr(t, out);
+                }
+            }
+            for s in body {
+                collect_walrus_stmt(s, out);
+            }
+        }
+        StmtKind::Assert { test, msg } => {
+            collect_walrus_expr(test, out);
+            if let Some(m) = msg {
+                collect_walrus_expr(m, out);
+            }
+        }
+        StmtKind::Delete(targets) => {
+            for t in targets {
+                collect_walrus_expr(t, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect walrus target names bound by an expression in the current scope
+/// (see [`collect_walrus_stmt`]). Mirrors the structure of
+/// [`collect_reads_deep`] but records `NAME := …` targets and stops at
+/// `lambda`/comprehension boundaries (their walruses are a separate scope's
+/// concern).
+fn collect_walrus_expr(expr: &Expr, out: &mut HashSet<String>) {
+    match &expr.kind {
+        ExprKind::NamedExpr { target, value } => {
+            collect_target_names(target, out);
+            collect_walrus_expr(value, out);
+        }
+        ExprKind::Name(_) | ExprKind::Constant(_) => {}
+        ExprKind::Attribute { value, .. } | ExprKind::Starred(value) => {
+            collect_walrus_expr(value, out);
+        }
+        ExprKind::Subscript { value, slice } => {
+            collect_walrus_expr(value, out);
+            collect_walrus_expr(slice, out);
+        }
+        ExprKind::Slice { lower, upper, step } => {
+            for x in [lower.as_deref(), upper.as_deref(), step.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                collect_walrus_expr(x, out);
+            }
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            collect_walrus_expr(left, out);
+            collect_walrus_expr(right, out);
+        }
+        ExprKind::BoolOp { values, .. } => {
+            for v in values {
+                collect_walrus_expr(v, out);
+            }
+        }
+        ExprKind::UnaryOp { operand, .. } => collect_walrus_expr(operand, out),
+        ExprKind::Compare {
+            left, comparators, ..
+        } => {
+            collect_walrus_expr(left, out);
+            for c in comparators {
+                collect_walrus_expr(c, out);
+            }
+        }
+        ExprKind::IfExp { test, body, orelse } => {
+            collect_walrus_expr(test, out);
+            collect_walrus_expr(body, out);
+            collect_walrus_expr(orelse, out);
+        }
+        ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } => {
+            collect_walrus_expr(func, out);
+            for a in args {
+                collect_walrus_expr(a, out);
+            }
+            for k in keywords {
+                collect_walrus_expr(&k.value, out);
+            }
+        }
+        // `lambda` defaults evaluate in this scope; its body is a separate
+        // scope whose walruses bind there.
+        ExprKind::Lambda { args, .. } => {
+            for d in &args.defaults {
+                collect_walrus_expr(d, out);
+            }
+            for d in args.kw_defaults.iter().flatten() {
+                collect_walrus_expr(d, out);
+            }
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) | ExprKind::Set(items) => {
+            for x in items {
+                collect_walrus_expr(x, out);
+            }
+        }
+        ExprKind::Dict { keys, values } => {
+            for k in keys.iter().flatten() {
+                collect_walrus_expr(k, out);
+            }
+            for v in values {
+                collect_walrus_expr(v, out);
+            }
+        }
+        // Comprehensions are their own scope; their walrus-leak semantics are
+        // handled when the comprehension itself is compiled.
+        ExprKind::ListComp { .. }
+        | ExprKind::SetComp { .. }
+        | ExprKind::GeneratorExp { .. }
+        | ExprKind::DictComp { .. } => {}
+        ExprKind::Yield(value) => {
+            if let Some(v) = value {
+                collect_walrus_expr(v, out);
+            }
+        }
+        ExprKind::YieldFrom(v) | ExprKind::Await(v) => collect_walrus_expr(v, out),
+        ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                collect_walrus_expr(p, out);
+            }
+        }
+        ExprKind::FormattedValue {
+            value, format_spec, ..
+        } => {
+            collect_walrus_expr(value, out);
+            if let Some(fs) = format_spec.as_deref() {
+                collect_walrus_expr(fs, out);
+            }
+        }
     }
 }
 

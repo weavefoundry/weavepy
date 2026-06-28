@@ -7511,12 +7511,22 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
                 saw_surrogate = true;
                 parts.push(bridge_encode_cps(cps));
             }
-            other => {
-                return Err(type_error(format!(
-                    "sequence item: expected str instance, {} found",
-                    other.type_name()
-                )))
-            }
+            // Accept `str` subclass instances (e.g. email's `ValueTerminal`):
+            // CPython's `str.join` treats any `PyUnicode` — subclasses
+            // included — as a string item. Unwrap the native payload.
+            other => match other.native_value() {
+                Some(Object::Str(s)) => parts.push(s.to_string()),
+                Some(Object::WStr(cps)) => {
+                    saw_surrogate = true;
+                    parts.push(bridge_encode_cps(&cps));
+                }
+                _ => {
+                    return Err(type_error(format!(
+                        "sequence item: expected str instance, {} found",
+                        other.type_name()
+                    )))
+                }
+            },
         }
     }
     let joined = parts.join(&sep);
@@ -8307,9 +8317,24 @@ fn str_format_map(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
+    // CPython's `str.translate(table)` accepts *any* object supporting
+    // `table[ord(c)]`: a `dict` (the `str.maketrans` case), or a sequence
+    // indexed by ordinal (`email.quoprimime` passes a 256-entry `list`).
+    // A missing key / out-of-range index leaves the character unchanged; a
+    // value of `None` deletes it.
+    enum Table {
+        Dict(Object),
+        Seq(Vec<Object>),
+    }
     let table = match args.get(1) {
-        Some(Object::Dict(d)) => d.clone(),
-        _ => return Err(type_error("translate() argument must be a dict")),
+        Some(d @ Object::Dict(_)) => Table::Dict(d.clone()),
+        Some(Object::List(l)) => Table::Seq(l.borrow().clone()),
+        Some(Object::Tuple(t)) => Table::Seq(t.to_vec()),
+        _ => {
+            return Err(type_error(
+                "translate() argument must be a mapping or sequence",
+            ))
+        }
     };
     let mut out = String::new();
     let mut saw_surrogate = matches!(args.first(), Some(Object::WStr(_)));
@@ -8334,8 +8359,14 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
         } else {
             cp
         };
-        let key = DictKey(Object::Int(i64::from(real_cp)));
-        let entry = table.borrow().get(&key).cloned();
+        let entry = match &table {
+            Table::Dict(Object::Dict(d)) => d
+                .borrow()
+                .get(&DictKey(Object::Int(i64::from(real_cp))))
+                .cloned(),
+            Table::Dict(_) => None,
+            Table::Seq(v) => v.get(real_cp as usize).cloned(),
+        };
         match entry {
             Some(Object::None) => {}
             Some(Object::Int(i)) => push_cp(&mut out, i as u32, &mut saw_surrogate),
@@ -8344,7 +8375,12 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
                 saw_surrogate = true;
                 out.push_str(&bridge_encode_cps(&cps));
             }
-            _ => out.push(c),
+            // `str` subclass value, etc.: fall back to its text view.
+            Some(other) => match other.native_value() {
+                Some(Object::Str(v)) => out.push_str(&v),
+                _ => out.push_str(&other.to_str()),
+            },
+            None => out.push(c),
         }
     }
     Ok(if saw_surrogate {
@@ -8840,7 +8876,11 @@ fn dict_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .ok_or_else(|| type_error("__getitem__ expected 1 argument"))?;
     let found = d.borrow().get(&DictKey(key.clone())).cloned();
-    found.ok_or_else(|| key_error(key.repr()))
+    // CPython's `KeyError` carries the missing key *object* as `args[0]`
+    // (`e.args[0] is key`), not its repr string; `str(e)` still renders
+    // `repr(key)`. A `dict` subclass's `__missing__` also receives this
+    // exact object when the bound-method path re-raises.
+    found.ok_or_else(|| key_error_object(key.clone()))
 }
 
 fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8851,7 +8891,7 @@ fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     if d.borrow_mut().shift_remove(&DictKey(key.clone())).is_some() {
         Ok(Object::None)
     } else {
-        Err(key_error(key.repr()))
+        Err(key_error_object(key.clone()))
     }
 }
 
@@ -8906,7 +8946,7 @@ fn dict_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     } else if let Some(default) = args.get(2).cloned() {
         Ok(default)
     } else {
-        Err(key_error(key.repr()))
+        Err(key_error_object(key.clone()))
     }
 }
 

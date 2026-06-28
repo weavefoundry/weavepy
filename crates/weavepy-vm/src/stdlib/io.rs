@@ -2894,6 +2894,84 @@ fn find_line(s: &str, mode: NewlineMode) -> (&str, usize) {
     (&s[..end], end)
 }
 
+/// `True` when `s` already contains a complete logical line terminator for the
+/// given newline `mode`. Used by the streaming (non-seekable) `readline` path
+/// to decide whether another raw chunk must be pulled from the buffer. A
+/// *trailing* lone `\r` in universal mode is deliberately treated as "not
+/// ready" — it may be the front half of a `\r\n` split across two reads, and
+/// CPython's incremental newline decoder holds it back until the following byte
+/// (or EOF) settles whether it is a bare `\r` or the start of `\r\n`.
+fn streaming_line_ready(s: &str, mode: NewlineMode) -> bool {
+    let b = s.as_bytes();
+    match mode {
+        NewlineMode::Lf => b.contains(&b'\n'),
+        NewlineMode::Cr => b.contains(&b'\r'),
+        NewlineMode::CrLf => b.windows(2).any(|w| w == b"\r\n"),
+        NewlineMode::Universal | NewlineMode::Passthrough => {
+            if b.contains(&b'\n') {
+                return true;
+            }
+            match b.iter().position(|&x| x == b'\r') {
+                Some(p) => p + 1 < b.len(),
+                None => false,
+            }
+        }
+    }
+}
+
+/// Length of the largest prefix of `b` that does **not** end in the middle of a
+/// multi-byte UTF-8 sequence, so the prefix can be decoded now and a partial
+/// tail held back for the next chunk. Only meaningful for UTF-8; single-byte
+/// codecs never split a code point, and the rare UTF-16/32 split-unit case is
+/// accepted as a limitation (the whole buffer is decoded for those).
+fn utf8_complete_prefix_len(b: &[u8]) -> usize {
+    let n = b.len();
+    if n == 0 {
+        return 0;
+    }
+    // Walk back over up to three continuation bytes (0b10xxxxxx) to the lead.
+    let mut i = n;
+    let mut steps = 0;
+    while i > 0 && (b[i - 1] & 0xC0) == 0x80 && steps < 3 {
+        i -= 1;
+        steps += 1;
+    }
+    if i == 0 {
+        // Window is all continuation bytes — no lead to anchor on; let the
+        // decoder report the error rather than holding back forever.
+        return n;
+    }
+    let lead = b[i - 1];
+    let need = if lead < 0x80 {
+        1
+    } else if lead >> 5 == 0b110 {
+        2
+    } else if lead >> 4 == 0b1110 {
+        3
+    } else if lead >> 3 == 0b11110 {
+        4
+    } else {
+        1 // invalid lead byte; treat as one and let the decoder report it
+    };
+    let have = n - (i - 1);
+    if have >= need {
+        n
+    } else {
+        i - 1
+    }
+}
+
+/// Whether `encoding` is a UTF-8 variant, for which incremental decoding must
+/// hold back a partial trailing sequence between chunks.
+fn encoding_is_utf8(encoding: &str) -> bool {
+    let e: String = encoding
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(e.as_str(), "utf8" | "utf8sig" | "u8" | "cp65001")
+}
+
 /// Materialise the underlying binary stream into a decoded character buffer
 /// on first read. CPython's `TextIOWrapper` keeps an incrementally-decoded
 /// snapshot buffer and serves `read`/`readline` from it; we read the whole
@@ -2957,9 +3035,21 @@ fn tw_ensure_decoded(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeE
     if matches!(tw_get(inst, "_dec_done"), Some(Object::Bool(true))) {
         return Ok(());
     }
+    // A non-seekable stream (socket/pipe) is decoded *incrementally* — the
+    // snapshot is grown one raw chunk at a time by `tw_fill_chunk`, driven
+    // lazily from `read`/`readline`. Once initialised, this function is a no-op
+    // for those streams; the eager full-drain below would block forever on an
+    // EOF that an interactive peer never sends.
+    if tw_is_streaming(inst) {
+        return Ok(());
+    }
     // Flush any pending text-layer writes before reading back through the buffer
     // (CPython's read path runs `_writeflush` first on an r+ stream).
     tw_writeflush(inst)?;
+    if !tw_buffer_seekable(inst) {
+        tw_init_stream(inst);
+        return Ok(());
+    }
     // Record the underlying byte position the snapshot starts at, so `tell()`
     // can map a character offset back to a byte cookie (`_dec_start +
     // encoded-length-of-consumed-chars`) even though we drain the whole buffer
@@ -3009,6 +3099,137 @@ fn tw_ensure_decoded(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeE
     Ok(())
 }
 
+/// `True` once the decode snapshot is in incremental/streaming mode (the
+/// underlying buffer is non-seekable, so chunks are pulled on demand rather
+/// than drained to EOF up front).
+fn tw_is_streaming(inst: &crate::types::PyInstance) -> bool {
+    matches!(tw_get(inst, "_dec_stream"), Some(Object::Bool(true)))
+}
+
+/// `True` once the underlying stream has reported EOF and the snapshot is
+/// complete (no more chunks will arrive).
+fn tw_dec_is_done(inst: &crate::types::PyInstance) -> bool {
+    matches!(tw_get(inst, "_dec_done"), Some(Object::Bool(true)))
+}
+
+/// Is the underlying buffer seekable? Probed through the buffer object's own
+/// `seekable()` so a monkeypatched/Python stream is honoured. Anything that
+/// cannot answer is *assumed seekable*, preserving the historical eager-drain
+/// behaviour for in-memory and file streams (only a definite `False` opts into
+/// the incremental path).
+fn tw_buffer_seekable(inst: &crate::types::PyInstance) -> bool {
+    match tw_get(inst, "buffer") {
+        Some(buf) => match py_call(&buf, "seekable", &[]) {
+            Ok(o) => o.is_truthy(),
+            Err(_) => true,
+        },
+        None => true,
+    }
+}
+
+/// Initialise an empty incremental decode snapshot for a non-seekable stream.
+fn tw_init_stream(inst: &crate::types::PyInstance) {
+    tw_set(inst, "_dec_buf", Object::from_str(String::new()));
+    tw_set(inst, "_dec_pos", Object::Int(0));
+    tw_set(inst, "_dec_wstr", Object::Bool(false));
+    tw_set(inst, "_dec_partial", Object::new_bytes(Vec::new()));
+    tw_set(inst, "_dec_start", Object::Int(0));
+    tw_set(inst, "_dec_done", Object::Bool(false));
+    tw_set(inst, "_dec_stream", Object::Bool(true));
+}
+
+/// Pull a single raw chunk from a non-seekable buffer (one underlying read,
+/// `read1` semantics — never a drain to EOF), decode the part that forms whole
+/// characters, append it to the snapshot, and hold back any partial trailing
+/// multi-byte sequence for the next call. Sets `_dec_done` when the stream
+/// reports EOF. This is the streaming analogue of `tw_ensure_decoded`'s eager
+/// drain and is the key to `readline()` over sockets/pipes returning as soon as
+/// a line is available instead of blocking for an EOF that never comes.
+fn tw_fill_chunk(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeError> {
+    if tw_dec_is_done(inst) {
+        return Ok(());
+    }
+    let chunk = match tw_get(inst, "_CHUNK_SIZE") {
+        Some(Object::Int(n)) if n > 0 => n as usize,
+        _ => 8192,
+    };
+    let raw: Vec<u8> = match tw_buffer_target(inst)? {
+        RawTarget::Native(file) => {
+            if matches!(
+                file.io_kind.get(),
+                crate::object::IoKind::Text | crate::object::IoKind::StringIO
+            ) {
+                return Err(type_error(
+                    "underlying read() should have returned a bytes-like object, not 'str'",
+                ));
+            }
+            // `read_bytes(Some(n))` performs exactly one backend read of up to
+            // `n` bytes, so a pipe yields whatever is available without blocking
+            // for the full chunk.
+            file.read_bytes(Some(chunk))?
+        }
+        RawTarget::Py(buffer) => {
+            let has_read1 = crate::vm_singletons::current_interpreter_ptr()
+                .map(|ptr| {
+                    // SAFETY: published by the enclosing VM frame on this thread.
+                    let interp = unsafe { &mut *ptr };
+                    interp.load_attr_public(&buffer, "read1").is_ok()
+                })
+                .unwrap_or(false);
+            let method = if has_read1 { "read1" } else { "read" };
+            let part_obj = py_call(&buffer, method, &[Object::Int(chunk as i64)])?;
+            match &part_obj {
+                Object::None => Vec::new(),
+                _ => match part_obj.as_bytes_view() {
+                    Some(b) => b,
+                    None => {
+                        return Err(type_error(format!(
+                            "underlying read() should have returned a bytes-like object, not '{}'",
+                            part_obj.type_name()
+                        )))
+                    }
+                },
+            }
+        }
+    };
+    let eof = raw.is_empty();
+    // Prepend any held-back partial multi-byte tail from the previous chunk.
+    let mut combined = match tw_get(inst, "_dec_partial") {
+        Some(o) => o.as_bytes_view().unwrap_or_default(),
+        None => Vec::new(),
+    };
+    combined.extend_from_slice(&raw);
+    let encoding = tw_encoding(inst);
+    let errors = tw_errors(inst);
+    // At EOF everything must be decoded (a still-incomplete sequence becomes a
+    // decode error under `strict`, matching CPython's final flush); otherwise
+    // hold back a partial trailing UTF-8 sequence so it isn't mis-decoded.
+    let safe = if eof || !encoding_is_utf8(&encoding) {
+        combined.len()
+    } else {
+        utf8_complete_prefix_len(&combined)
+    };
+    let (to_decode, leftover) = combined.split_at(safe);
+    let text_obj = crate::stdlib::codecs_mod::decode_bytes_obj(to_decode, &encoding, &errors)?;
+    let is_wstr = matches!(text_obj, Object::WStr(_));
+    let text = crate::builtins::bridge_str_of(&text_obj).unwrap_or_default();
+    if !text.is_empty() {
+        let (buf, _pos) = tw_dec_state(inst);
+        let mut joined = String::with_capacity(buf.len() + text.len());
+        joined.push_str(&buf);
+        joined.push_str(&text);
+        tw_set(inst, "_dec_buf", Object::from_str(joined));
+    }
+    if is_wstr {
+        tw_set(inst, "_dec_wstr", Object::Bool(true));
+    }
+    tw_set(inst, "_dec_partial", Object::new_bytes(leftover.to_vec()));
+    if eof {
+        tw_set(inst, "_dec_done", Object::Bool(true));
+    }
+    Ok(())
+}
+
 /// `True` when the active decode snapshot holds bridged lone surrogates, so
 /// read output must be un-bridged back into a `WStr`.
 fn tw_dec_is_wstr(inst: &crate::types::PyInstance) -> bool {
@@ -3035,6 +3256,8 @@ fn tw_reset_decoded(inst: &crate::types::PyInstance) {
         "_dec_done",
         "_dec_start",
         "_dec_wstr",
+        "_dec_partial",
+        "_dec_stream",
     ] {
         d.shift_remove(&DictKey(Object::from_static(k)));
     }
@@ -3275,14 +3498,32 @@ fn tw_read(args: &[Object]) -> Result<Object, RuntimeError> {
     tw_set(&inst, "_read_started", Object::Bool(true));
     tw_ensure_decoded(&inst)?;
     let mode = tw_newline_mode(&inst);
-    let (buf, pos) = tw_dec_state(&inst);
-    let remaining = &buf[pos..];
     // Size is measured in characters of the *translated* output; a missing,
     // `None`, or negative size means "read all".
     let size = match args.get(1) {
         Some(Object::Int(n)) if *n >= 0 => Some(*n as usize),
         _ => None,
     };
+    // Non-seekable streams pull chunks on demand: for a sized read, fill until
+    // enough characters are buffered (or EOF); for a full read, drain to EOF.
+    if tw_is_streaming(&inst) {
+        match size {
+            None => {
+                while !tw_dec_is_done(&inst) {
+                    tw_fill_chunk(&inst)?;
+                }
+            }
+            Some(n) => loop {
+                let (buf, pos) = tw_dec_state(&inst);
+                if buf[pos..].chars().count() >= n || tw_dec_is_done(&inst) {
+                    break;
+                }
+                tw_fill_chunk(&inst)?;
+            },
+        }
+    }
+    let (buf, pos) = tw_dec_state(&inst);
+    let remaining = &buf[pos..];
     let (out, consumed) = match mode {
         NewlineMode::Universal => translate_universal(remaining, size),
         _ => {
@@ -3304,11 +3545,43 @@ fn tw_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     tw_set(&inst, "_read_started", Object::Bool(true));
     tw_ensure_decoded(&inst)?;
     let mode = tw_newline_mode(&inst);
+    // `readline(size)`: a non-negative cap bounds the returned line.
+    let limit = match args.get(1) {
+        Some(Object::Int(n)) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    };
+    // Non-seekable streams pull chunks on demand until a full line terminator is
+    // buffered, the size cap is reached, or EOF — this is what lets `readline()`
+    // over a socket return the moment a line arrives rather than blocking.
+    if tw_is_streaming(&inst) {
+        loop {
+            let (buf, pos) = tw_dec_state(&inst);
+            let remaining = &buf[pos..];
+            if streaming_line_ready(remaining, mode) {
+                break;
+            }
+            if let Some(lim) = limit {
+                if remaining.chars().count() >= lim {
+                    break;
+                }
+            }
+            if tw_dec_is_done(&inst) {
+                break;
+            }
+            tw_fill_chunk(&inst)?;
+        }
+    }
     let (buf, pos) = tw_dec_state(&inst);
-    let remaining = &buf[pos..];
-    if remaining.is_empty() {
+    let full = &buf[pos..];
+    if full.is_empty() {
         return Ok(Object::from_str(String::new()));
     }
+    // Honour an explicit size cap on the streaming path (CPython `readline(size)`);
+    // the eager/seekable path keeps its prior behaviour of ignoring the cap.
+    let remaining: &str = match (tw_is_streaming(&inst), limit) {
+        (true, Some(lim)) => take_chars(full, Some(lim)).0,
+        _ => full,
+    };
     let (line, consumed) = find_line(remaining, mode);
     let out = match mode {
         NewlineMode::Universal => translate_universal(line, None).0,
