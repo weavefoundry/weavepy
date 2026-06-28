@@ -167,6 +167,8 @@ static FORCE_LINK: &[FnPtr] = &[
     addr!(object::Py_DecRef),
     addr!(object::Py_NewRef),
     addr!(object::Py_XNewRef),
+    addr!(object::_Py_Dealloc),
+    addr!(object::_PyWeavePy_Dealloc),
     // numbers.rs
     addr!(numbers::PyLong_FromLong),
     addr!(numbers::PyLong_FromLongLong),
@@ -548,6 +550,27 @@ static FORCE_LINK: &[FnPtr] = &[
     addr_static!(singletons::_Py_FalseStruct),
     addr_static!(singletons::_Py_NotImplementedStruct),
     addr_static!(singletons::_Py_EllipsisObject),
+    // types.rs — the static built-in type objects. A stock extension
+    // compares `Py_TYPE(o) == &PyFloat_Type` etc., so these data
+    // symbols must be in the host's dynamic symbol table (RFC 0043).
+    addr_static!(types::PyType_Type),
+    addr_static!(types::PyBaseObject_Type),
+    addr_static!(types::PyLong_Type),
+    addr_static!(types::PyFloat_Type),
+    addr_static!(types::PyBool_Type),
+    addr_static!(types::PyComplex_Type),
+    addr_static!(types::PyUnicode_Type),
+    addr_static!(types::PyBytes_Type),
+    addr_static!(types::PyByteArray_Type),
+    addr_static!(types::PyTuple_Type),
+    addr_static!(types::PyList_Type),
+    addr_static!(types::PyDict_Type),
+    addr_static!(types::PySet_Type),
+    addr_static!(types::PyFrozenSet_Type),
+    addr_static!(types::PyRange_Type),
+    addr_static!(types::PyModule_Type),
+    addr_static!(types::PySlice_Type),
+    addr_static!(types::PyCapsule_Type),
     // datetime_api.rs
     addr_static!(mut dt::PyDateTimeAPI),
     addr_static!(dt::PyDateTimeAPI_Instance),

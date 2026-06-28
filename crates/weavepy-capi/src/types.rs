@@ -35,37 +35,181 @@ use crate::slottable::SlotTable;
 
 /// Layout of a type object as the C side sees it.
 ///
-/// The first field shadows [`PyObject`] exactly. Subsequent fields
-/// are deliberately a *subset* of CPython's full `PyTypeObject` —
-/// extensions that compile against `Py_LIMITED_API` only see the
-/// header through opaque accessors, so we don't need to expose the
-/// hundred-odd CPython slots verbatim. The `_bridge` slot at the end
-/// stores the `Rc<TypeObject>` we use for native dispatch.
+/// As of RFC 0043 (wave 1) this is **byte-faithful to CPython 3.13's
+/// full `PyTypeObject`** for the entire documented prefix (offsets `0`
+/// through `416`, i.e. `ob_base` … `tp_vectorcall` + the
+/// `tp_watched`/`tp_versions_used` tail). The exact field offsets are
+/// pinned, and machine-checked against the host's stock headers, in
+/// [`crate::layout::PyTypeObjectFull`]; `debug_assert_type_layout`
+/// cross-checks this live struct against that spec.
+///
+/// WeavePy's *private* bookkeeping (`tp_slots`, the native `bridge`)
+/// lives **after** the 416-byte faithful region. Because CPython types
+/// are variable-size (`tp_itemsize`) and extensions only ever read the
+/// documented slots, those trailing fields are invisible to stock code
+/// while letting native dispatch keep its `Rc<TypeObject>`.
 #[repr(C)]
 pub struct PyTypeObject {
-    pub head: PyObject,
+    // --- byte-faithful CPython 3.13 prefix (offsets 0..416) ---
+    pub head: PyObject, // 0
+    /// `PyVarObject.ob_size`. Types are var-objects; this is 0 for the
+    /// built-ins (CPython keeps it 0 too).
+    pub ob_size: PySsizeT, // 16
     /// Type's qualified name (`module.Name` for heap types).
-    pub tp_name: *const c_char,
-    /// Reserved for future use; mirrors CPython's `tp_basicsize`.
-    pub tp_basicsize: PySsizeT,
-    pub tp_itemsize: PySsizeT,
-    pub tp_flags: u32,
-    /// Extension-supplied [`crate::ffi::PyType_Slot`] table, or
-    /// null if the type wasn't built from a spec.
+    pub tp_name: *const c_char, // 24
+    pub tp_basicsize: PySsizeT, // 32
+    pub tp_itemsize: PySsizeT, // 40
+    /// Instance destructor. Stock inlined `Py_DECREF` → `_Py_Dealloc`
+    /// reads this slot, so it must sit at offset 48 and be valid: for
+    /// faithful built-ins it routes to the mirror/box free path.
+    pub tp_dealloc: Option<crate::layout::destructor>, // 48
+    pub tp_vectorcall_offset: PySsizeT, // 56
+    pub tp_getattr: *mut c_void, // 64
+    pub tp_setattr: *mut c_void, // 72
+    pub tp_as_async: *mut c_void, // 80
+    pub tp_repr: *mut c_void, // 88
+    pub tp_as_number: *mut c_void, // 96
+    pub tp_as_sequence: *mut c_void, // 104
+    pub tp_as_mapping: *mut c_void, // 112
+    pub tp_hash: *mut c_void, // 120
+    pub tp_call: *mut c_void, // 128
+    pub tp_str: *mut c_void, // 136
+    pub tp_getattro: *mut c_void, // 144
+    pub tp_setattro: *mut c_void, // 152
+    pub tp_as_buffer: *mut c_void, // 160
+    /// CPython `unsigned long tp_flags`. 64-bit, at offset 168.
+    pub tp_flags: u64, // 168
+    pub tp_doc: *const c_char, // 176
+    pub tp_traverse: *mut c_void, // 184
+    pub tp_clear: *mut c_void, // 192
+    pub tp_richcompare: *mut c_void, // 200
+    pub tp_weaklistoffset: PySsizeT, // 208
+    pub tp_iter: *mut c_void, // 216
+    pub tp_iternext: *mut c_void, // 224
+    pub tp_methods: *mut c_void, // 232
+    pub tp_members: *mut c_void, // 240
+    pub tp_getset: *mut c_void, // 248
+    pub tp_base: *mut PyTypeObject, // 256
+    pub tp_dict: *mut PyObject, // 264
+    pub tp_descr_get: *mut c_void, // 272
+    pub tp_descr_set: *mut c_void, // 280
+    pub tp_dictoffset: PySsizeT, // 288
+    pub tp_init: *mut c_void, // 296
+    pub tp_alloc: *mut c_void, // 304
+    pub tp_new: *mut c_void, // 312
+    pub tp_free: *mut c_void, // 320
+    pub tp_is_gc: *mut c_void, // 328
+    pub tp_bases: *mut PyObject, // 336
+    pub tp_mro: *mut PyObject, // 344
+    pub tp_cache: *mut PyObject, // 352
+    pub tp_subclasses: *mut c_void, // 360
+    pub tp_weaklist: *mut PyObject, // 368
+    pub tp_del: *mut c_void, // 376
+    pub tp_version_tag: u64, // 384 (unsigned int + pad)
+    pub tp_finalize: *mut c_void, // 392
+    pub tp_vectorcall: *mut c_void, // 400
+    /// `unsigned char tp_watched` + `uint16_t tp_versions_used` + pad.
+    pub tp_tail: [u8; 8], // 408
+    // --- WeavePy private fields (offset >= 416, invisible to C) ---
+    /// Extension-supplied [`crate::ffi::PyType_Slot`] table, or null.
     pub tp_slots: *mut PyType_Slot,
-    /// Bridge to the WeavePy native type. Boxed
-    /// `Rc<TypeObject>` (Rc keeps refcount); the box is leaked
-    /// when the type is materialised. For heap types whose lifetime
-    /// is bound to an extension's scope we drop this box on
-    /// `tp_free`; static types have a sentinel that's never freed.
+    /// Bridge to the WeavePy native type. Boxed `Rc<TypeObject>`.
     pub bridge: *mut Rc<TypeObject>,
-    /// Static type vs. heap-allocated type marker. Set to
-    /// `IMMORTAL_REFCNT` for static types so the refcount machinery
-    /// is a no-op.
-    _filler: [usize; 4],
+    _filler: [usize; 2],
 }
 
 unsafe impl Sync for PyTypeObject {}
+
+impl PyTypeObject {
+    /// A fully-zeroed faithful type with only the head set. Used as the
+    /// `..` base for the initialisers so each site spells out just the
+    /// fields it cares about.
+    pub const fn new_zeroed() -> Self {
+        PyTypeObject {
+            head: PyObject {
+                ob_refcnt: IMMORTAL_REFCNT,
+                ob_type: ptr::null_mut(),
+            },
+            ob_size: 0,
+            tp_name: ptr::null(),
+            tp_basicsize: 0,
+            tp_itemsize: 0,
+            tp_dealloc: None,
+            tp_vectorcall_offset: 0,
+            tp_getattr: ptr::null_mut(),
+            tp_setattr: ptr::null_mut(),
+            tp_as_async: ptr::null_mut(),
+            tp_repr: ptr::null_mut(),
+            tp_as_number: ptr::null_mut(),
+            tp_as_sequence: ptr::null_mut(),
+            tp_as_mapping: ptr::null_mut(),
+            tp_hash: ptr::null_mut(),
+            tp_call: ptr::null_mut(),
+            tp_str: ptr::null_mut(),
+            tp_getattro: ptr::null_mut(),
+            tp_setattro: ptr::null_mut(),
+            tp_as_buffer: ptr::null_mut(),
+            tp_flags: 0,
+            tp_doc: ptr::null(),
+            tp_traverse: ptr::null_mut(),
+            tp_clear: ptr::null_mut(),
+            tp_richcompare: ptr::null_mut(),
+            tp_weaklistoffset: 0,
+            tp_iter: ptr::null_mut(),
+            tp_iternext: ptr::null_mut(),
+            tp_methods: ptr::null_mut(),
+            tp_members: ptr::null_mut(),
+            tp_getset: ptr::null_mut(),
+            tp_base: ptr::null_mut(),
+            tp_dict: ptr::null_mut(),
+            tp_descr_get: ptr::null_mut(),
+            tp_descr_set: ptr::null_mut(),
+            tp_dictoffset: 0,
+            tp_init: ptr::null_mut(),
+            tp_alloc: ptr::null_mut(),
+            tp_new: ptr::null_mut(),
+            tp_free: ptr::null_mut(),
+            tp_is_gc: ptr::null_mut(),
+            tp_bases: ptr::null_mut(),
+            tp_mro: ptr::null_mut(),
+            tp_cache: ptr::null_mut(),
+            tp_subclasses: ptr::null_mut(),
+            tp_weaklist: ptr::null_mut(),
+            tp_del: ptr::null_mut(),
+            tp_version_tag: 0,
+            tp_finalize: ptr::null_mut(),
+            tp_vectorcall: ptr::null_mut(),
+            tp_tail: [0; 8],
+            tp_slots: ptr::null_mut(),
+            bridge: ptr::null_mut(),
+            _filler: [0; 2],
+        }
+    }
+}
+
+/// Cross-check the live [`PyTypeObject`] against the machine-checked
+/// faithful spec in [`crate::layout`]. Compile-time; zero runtime cost.
+const _: () = {
+    use crate::layout::PyTypeObjectFull as F;
+    assert!(std::mem::offset_of!(PyTypeObject, tp_name) == std::mem::offset_of!(F, tp_name));
+    assert!(
+        std::mem::offset_of!(PyTypeObject, tp_basicsize) == std::mem::offset_of!(F, tp_basicsize)
+    );
+    assert!(
+        std::mem::offset_of!(PyTypeObject, tp_itemsize) == std::mem::offset_of!(F, tp_itemsize)
+    );
+    assert!(std::mem::offset_of!(PyTypeObject, tp_dealloc) == std::mem::offset_of!(F, tp_dealloc));
+    assert!(std::mem::offset_of!(PyTypeObject, tp_flags) == std::mem::offset_of!(F, tp_flags));
+    assert!(std::mem::offset_of!(PyTypeObject, tp_base) == std::mem::offset_of!(F, tp_base));
+    assert!(
+        std::mem::offset_of!(PyTypeObject, tp_finalize) == std::mem::offset_of!(F, tp_finalize)
+    );
+    assert!(
+        std::mem::offset_of!(PyTypeObject, tp_vectorcall) == std::mem::offset_of!(F, tp_vectorcall)
+    );
+    // The private fields must begin at or after the faithful region.
+    assert!(std::mem::offset_of!(PyTypeObject, tp_slots) >= std::mem::size_of::<F>());
+};
 
 /// Re-export of the C `PyType_Slot` shape.
 #[repr(C)]
@@ -131,19 +275,7 @@ unsafe impl Sync for StaticType {}
 
 impl StaticType {
     pub const fn new() -> Self {
-        Self(UnsafeCell::new(PyTypeObject {
-            head: PyObject {
-                ob_refcnt: IMMORTAL_REFCNT,
-                ob_type: ptr::null_mut(),
-            },
-            tp_name: ptr::null(),
-            tp_basicsize: 0,
-            tp_itemsize: 0,
-            tp_flags: 0,
-            tp_slots: ptr::null_mut(),
-            bridge: ptr::null_mut(),
-            _filler: [0; 4],
-        }))
+        Self(UnsafeCell::new(PyTypeObject::new_zeroed()))
     }
 
     pub fn as_ptr(&self) -> *mut PyTypeObject {
@@ -210,6 +342,12 @@ pub fn init_static_types() {
             ty.head.ob_refcnt = IMMORTAL_REFCNT;
             ty.head.ob_type = PyType_Type.as_ptr();
             ty.tp_name = name.as_ptr() as *const c_char;
+            // `_Py_Dealloc` (stock inlined `Py_DECREF`) reads
+            // `Py_TYPE(inst)->tp_dealloc`; route to the host free path so
+            // a stock extension that drops the last ref to one of our
+            // objects releases the mirror/box instead of jumping through
+            // a garbage slot.
+            ty.tp_dealloc = Some(crate::object::_PyWeavePy_Dealloc);
             ty.bridge = Box::into_raw(Box::new(rc));
         }
     }
@@ -266,6 +404,42 @@ pub fn init_static_types() {
         "builtin_function_or_method",
     );
     install_synth(&PyMethod_Type, b"method\0", "method");
+
+    // Set the `Py_TPFLAGS_*_SUBCLASS` fast-subclass bits (and a
+    // baseline `Py_TPFLAGS_DEFAULT`) on the built-in static types.
+    // Stock CPython 3.13 headers inline the `PyX_Check` family as
+    // `PyType_FastSubclass(Py_TYPE(o), Py_TPFLAGS_X_SUBCLASS)`, reading
+    // `tp_flags` directly, and the *full*-API macros (`PyTuple_GET_ITEM`
+    // etc.) `assert(PyX_Check(o))` in non-`NDEBUG` builds. Without these
+    // bits a stock extension aborts the moment it touches one of our
+    // objects. (RFC 0043 WS3/WS4.)
+    use crate::layout::tpflags;
+    unsafe fn add_flags(slot: &StaticType, flags: u64) {
+        unsafe {
+            (*slot.as_ptr()).tp_flags |= tpflags::DEFAULT | flags;
+        }
+    }
+    unsafe {
+        add_flags(&PyType_Type, tpflags::TYPE_SUBCLASS | tpflags::BASETYPE);
+        add_flags(&PyBaseObject_Type, tpflags::BASETYPE);
+        add_flags(&PyLong_Type, tpflags::LONG_SUBCLASS | tpflags::BASETYPE);
+        // bool is an int subclass, so `PyLong_Check(True)` must hold.
+        add_flags(&PyBool_Type, tpflags::LONG_SUBCLASS);
+        add_flags(&PyList_Type, tpflags::LIST_SUBCLASS | tpflags::BASETYPE);
+        add_flags(&PyTuple_Type, tpflags::TUPLE_SUBCLASS | tpflags::BASETYPE);
+        add_flags(&PyBytes_Type, tpflags::BYTES_SUBCLASS | tpflags::BASETYPE);
+        add_flags(
+            &PyUnicode_Type,
+            tpflags::UNICODE_SUBCLASS | tpflags::BASETYPE,
+        );
+        add_flags(&PyDict_Type, tpflags::DICT_SUBCLASS | tpflags::BASETYPE);
+        // Types that have no fast-subclass bit still want DEFAULT.
+        add_flags(&PyFloat_Type, tpflags::BASETYPE);
+        add_flags(&PyComplex_Type, tpflags::BASETYPE);
+        add_flags(&PyByteArray_Type, tpflags::BASETYPE);
+        add_flags(&PySet_Type, tpflags::BASETYPE);
+        add_flags(&PyFrozenSet_Type, 0);
+    }
 }
 
 /// Map a runtime [`Object`] to the static [`PyTypeObject`] pointer
@@ -421,11 +595,9 @@ pub fn install_user_type(t: &Rc<TypeObject>) -> *mut PyTypeObject {
             },
             tp_name: owned_name.as_ptr() as *const c_char,
             tp_basicsize: std::mem::size_of::<crate::object::PyObjectBox>() as PySsizeT,
-            tp_itemsize: 0,
-            tp_flags: 0,
-            tp_slots: ptr::null_mut(),
+            tp_dealloc: Some(crate::object::_PyWeavePy_Dealloc),
             bridge: Box::into_raw(Box::new(t.clone())),
-            _filler: [0; 4],
+            ..PyTypeObject::new_zeroed()
         },
         owned_name,
         slot_table: SlotTable::empty(),
@@ -688,10 +860,11 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
             tp_name: owned_name.as_ptr() as *const c_char,
             tp_basicsize: spec_ref.basicsize as PySsizeT,
             tp_itemsize: spec_ref.itemsize as PySsizeT,
-            tp_flags: spec_ref.flags | PY_TPFLAGS_HEAPTYPE,
+            tp_flags: (spec_ref.flags | PY_TPFLAGS_HEAPTYPE) as u64,
+            tp_dealloc: Some(crate::object::_PyWeavePy_Dealloc),
             tp_slots: spec_ref.slots,
             bridge: Box::into_raw(Box::new(ty)),
-            _filler: [0; 4],
+            ..PyTypeObject::new_zeroed()
         },
         owned_name,
         slot_table,
@@ -719,6 +892,7 @@ pub unsafe extern "C" fn PyType_HasFeature(ty: *mut PyTypeObject, flag: u32) -> 
         return 0;
     }
     let f = unsafe { (*ty).tp_flags };
+    let flag = flag as u64;
     if (f & flag) == flag {
         1
     } else {
@@ -727,12 +901,13 @@ pub unsafe extern "C" fn PyType_HasFeature(ty: *mut PyTypeObject, flag: u32) -> 
 }
 
 /// `PyType_GetFlags(type)` — return the type's `tp_flags` field.
+/// CPython returns `unsigned long` (`c_ulong`, 64-bit on LP64).
 #[no_mangle]
-pub unsafe extern "C" fn PyType_GetFlags(ty: *mut PyTypeObject) -> u32 {
+pub unsafe extern "C" fn PyType_GetFlags(ty: *mut PyTypeObject) -> std::os::raw::c_ulong {
     if ty.is_null() {
         return 0;
     }
-    unsafe { (*ty).tp_flags }
+    unsafe { (*ty).tp_flags as std::os::raw::c_ulong }
 }
 
 /// `PyType_GetQualName(type)` — return the type's qualified name as

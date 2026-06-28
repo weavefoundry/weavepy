@@ -311,8 +311,7 @@ pub unsafe extern "C" fn PyTuple_SetItem(
             }
             v[pos as usize] = unsafe { crate::object::clone_object(item) };
             unsafe {
-                let bx = &mut *(tuple as *mut crate::object::PyObjectBox);
-                bx.payload.obj = Object::Tuple(Rc::from(v.into_boxed_slice()));
+                crate::object::set_payload(tuple, Object::Tuple(Rc::from(v.into_boxed_slice())));
             }
             0
         }
