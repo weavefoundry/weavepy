@@ -50,11 +50,36 @@ pub struct PyObject {
 pub type PySsizeT = isize;
 pub type PyHashT = isize;
 
-/// Refcount value used to mark an object as immortal. Chosen to be
-/// large enough that no realistic refcount churn ever decrements
-/// the value to zero, matching CPython's
-/// `_Py_IMMORTAL_REFCNT` sentinel.
-pub const IMMORTAL_REFCNT: PySsizeT = (PySsizeT::MAX / 2) - 1;
+/// Refcount value used to mark an object as immortal.
+///
+/// This mirrors CPython 3.13's `_Py_IMMORTAL_REFCNT` **exactly**: on a
+/// 64-bit build it is `UINT_MAX` (`0xFFFF_FFFF`), i.e. all of the *low*
+/// 32 bits set. The precise value matters for binary-ABI compatibility
+/// (RFC 0043): a stock CPython extension compiled against the real
+/// headers carries an *inlined* `Py_INCREF`/`Py_DECREF` that the host
+/// cannot intercept, and those inline forms decide immortality by
+/// reading the low 32-bit half-word (`_Py_IsImmortal` tests
+/// `(int32_t)ob_refcnt < 0`, true for `0xFFFF_FFFF`). With the old
+/// `isize::MAX/2 - 1` sentinel the low half-word was `0xFFFF_FFFE`, so a
+/// stock inlined refcount op would *not* recognise a WeavePy singleton /
+/// static type as immortal and could mutate (and ultimately free) it.
+///
+/// On 64-bit the high 32 bits are zero, so a `>= IMMORTAL_REFCNT` test
+/// still cleanly separates the (immortal) statics from realistic mortal
+/// counts, and [`is_immortal_refcnt`] additionally accepts any value
+/// whose low-32 sign bit is set (matching `_Py_IsImmortal`).
+pub const IMMORTAL_REFCNT: PySsizeT = 0xFFFF_FFFF;
+
+/// CPython-faithful immortality predicate (`_Py_IsImmortal`).
+///
+/// On 64-bit, an object is immortal iff the low 32 bits, read as a
+/// signed `i32`, are negative — i.e. bit 31 is set. This matches the
+/// inline check stock extensions compile in, so the function-call and
+/// inlined refcount paths agree on the same object.
+#[inline]
+pub fn is_immortal_refcnt(refcnt: PySsizeT) -> bool {
+    ((refcnt as u32) as i32) < 0
+}
 
 /// Heap-allocated extended box.
 ///
@@ -110,6 +135,13 @@ impl PayloadCell {
 /// arranges its own decref).
 #[allow(clippy::missing_safety_doc)]
 pub fn into_owned(obj: Object) -> *mut PyObject {
+    // Faithful built-in types cross into C as layout-faithful mirrors
+    // (RFC 0043) so a stock extension's *inlined* field reads land on
+    // real CPython-shaped memory. Everything else keeps the legacy
+    // `PyObjectBox` (head + Rust payload) representation.
+    if crate::mirror::obj_is_faithful(&obj) {
+        return crate::mirror::mirror_out(obj);
+    }
     let ty = crate::types::type_for_object(&obj);
     let boxed = Box::new(PyObjectBox {
         head: PyObject {
@@ -126,6 +158,13 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
 /// alone isn't precise enough — e.g. when constructing an instance
 /// of a heap-allocated user type from `PyType_FromSpec`).
 pub fn into_owned_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject {
+    // If the *advertised* type is a faithful built-in (e.g. the
+    // tuple-staging case where `obj` is an `Object::List` but the type
+    // is `PyTuple_Type`), mint a mirror so the public pointer stays
+    // byte-faithful and resolves back through the prefix.
+    if crate::mirror::type_is_faithful(ty) {
+        return crate::mirror::mirror_out_with_type(obj, ty);
+    }
     let boxed = Box::new(PyObjectBox {
         head: PyObject {
             ob_refcnt: 1,
@@ -175,8 +214,12 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
             return Object::Type(t);
         }
     }
-    let bx = unsafe { &*(p as *const PyObjectBox) };
-    let raw = bx.payload.obj.clone();
+    let raw = if unsafe { crate::mirror::is_mirror(p) } {
+        unsafe { crate::mirror::native_of(p) }
+    } else {
+        let bx = unsafe { &*(p as *const PyObjectBox) };
+        bx.payload.obj.clone()
+    };
     // `PyTuple_New` allocates a mutable staging List but advertises
     // `PyTuple_Type` so it round-trips as a tuple. Freeze the list
     // into an immutable tuple on every external clone — this is the
@@ -207,8 +250,75 @@ pub unsafe fn raw_payload(p: *mut PyObject) -> Option<Object> {
     {
         return None;
     }
+    if unsafe { crate::mirror::is_mirror(p) } {
+        return Some(unsafe { crate::mirror::native_of(p) });
+    }
     let bx = unsafe { &*(p as *const PyObjectBox) };
     Some(bx.payload.obj.clone())
+}
+
+/// Overwrite the native object backing `p` (its prefix for a mirror, or
+/// its payload for a legacy box). Used by `PyTuple_SetItem` when it must
+/// rewrite an already-frozen tuple in place.
+///
+/// # Safety
+/// `p` must be a heap object produced by [`into_owned`] /
+/// [`into_owned_with_type`] (not a static singleton/type).
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn set_payload(p: *mut PyObject, obj: Object) {
+    if unsafe { crate::mirror::is_mirror(p) } {
+        let pre = unsafe { crate::mirror::prefix_of(p) };
+        unsafe { (*pre).obj = obj };
+    } else {
+        let bx = unsafe { &mut *(p as *mut PyObjectBox) };
+        bx.payload.obj = obj;
+    }
+}
+
+/// Default `tp_dealloc` for WeavePy's faithful built-in and heap types.
+///
+/// Stock CPython's *inlined* `Py_DECREF` calls `_Py_Dealloc(op)` when an
+/// object's refcount reaches zero, which reads `Py_TYPE(op)->tp_dealloc`
+/// and invokes it. Because that path is compiled into the wheel and the
+/// host cannot intercept it, every type WeavePy exposes installs this as
+/// its `tp_dealloc` (at the CPython-faithful offset 48) so a stock
+/// extension dropping the last reference to one of our objects releases
+/// the storage correctly instead of jumping through a garbage slot.
+///
+/// # Safety
+/// `op` must be a live heap object (mirror or legacy box) with a zero
+/// refcount, exactly as `_Py_Dealloc` guarantees.
+#[no_mangle]
+pub unsafe extern "C" fn _PyWeavePy_Dealloc(op: *mut PyObject) {
+    if op.is_null() {
+        return;
+    }
+    unsafe { free_box(op) };
+}
+
+/// `_Py_Dealloc(op)` — CPython's object-deallocation entry point.
+///
+/// Stock release-build headers compile an *inlined* `Py_DECREF` that, on
+/// reaching refcount zero, calls this external symbol; it must therefore
+/// exist in the host. Faithfully, it dispatches to `Py_TYPE(op)->tp_dealloc`
+/// (which WeavePy points at [`_PyWeavePy_Dealloc`] for every type it
+/// exposes), falling back to the direct free path.
+///
+/// # Safety
+/// `op` must be a live heap object whose refcount has reached zero.
+#[no_mangle]
+pub unsafe extern "C" fn _Py_Dealloc(op: *mut PyObject) {
+    if op.is_null() {
+        return;
+    }
+    let ty = unsafe { (*op).ob_type };
+    if !ty.is_null() {
+        if let Some(dealloc) = unsafe { (*ty).tp_dealloc } {
+            unsafe { dealloc(op) };
+            return;
+        }
+    }
+    unsafe { free_box(op) };
 }
 
 /// Drop a box's storage, running its destructor (if any) first.
@@ -222,6 +332,15 @@ unsafe fn free_box(p: *mut PyObject) {
     // box's address so subsequent reuse of the slab doesn't return
     // stale items from the old container.
     crate::containers::invalidate_borrowed_cache(p);
+
+    // Faithful mirrors are raw-allocated with a negative-offset prefix;
+    // free them through the mirror bridge (which runs any destructor,
+    // drops the owning native object, and releases the block + any
+    // out-of-line buffer).
+    if unsafe { crate::mirror::is_mirror(p) } {
+        unsafe { crate::mirror::free_mirror(p) };
+        return;
+    }
 
     let bx = unsafe { Box::from_raw(p as *mut PyObjectBox) };
     if let Some(d) = bx.payload.destructor {
@@ -246,7 +365,7 @@ pub unsafe extern "C" fn Py_IncRef(op: *mut PyObject) {
         return;
     }
     let head = unsafe { &mut *op };
-    if head.ob_refcnt >= IMMORTAL_REFCNT {
+    if is_immortal_refcnt(head.ob_refcnt) {
         return;
     }
     head.ob_refcnt += 1;
@@ -264,7 +383,7 @@ pub unsafe extern "C" fn Py_DecRef(op: *mut PyObject) {
         return;
     }
     let head = unsafe { &mut *op };
-    if head.ob_refcnt >= IMMORTAL_REFCNT {
+    if is_immortal_refcnt(head.ob_refcnt) {
         return;
     }
     head.ob_refcnt -= 1;
@@ -296,5 +415,5 @@ pub fn is_heap_object(op: *mut PyObject) -> bool {
         return false;
     }
     let head = unsafe { &*op };
-    head.ob_refcnt < IMMORTAL_REFCNT
+    !is_immortal_refcnt(head.ob_refcnt)
 }

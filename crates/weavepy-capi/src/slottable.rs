@@ -164,7 +164,7 @@ pub unsafe fn slot_table_for(ty: *mut crate::types::PyTypeObject) -> Option<&'st
         return None;
     }
     let flags = unsafe { (*ty).tp_flags };
-    if (flags & crate::types::PY_TPFLAGS_HEAPTYPE) == 0 {
+    if (flags & crate::types::PY_TPFLAGS_HEAPTYPE as u64) == 0 {
         return None;
     }
     let bx = ty as *const crate::types::PyTypeObjectBox;

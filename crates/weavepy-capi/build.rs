@@ -30,6 +30,33 @@ struct ExtensionBuild<'a> {
     env_var: &'a str,
 }
 
+/// Locate the host's stock CPython 3.13 include directory (the one
+/// containing `Python.h`) so the wave-1 binary-ABI proof can be compiled
+/// against the *real* headers. Returns `None` if no CPython 3.13 is
+/// installed or its `Python.h` is missing, in which case the proof
+/// fixture is skipped. Honours `WEAVEPY_STOCK_PYTHON` to override the
+/// interpreter used for the probe.
+fn stock_python_include() -> Option<String> {
+    println!("cargo:rerun-if-env-changed=WEAVEPY_STOCK_PYTHON");
+    let interp = env::var("WEAVEPY_STOCK_PYTHON").unwrap_or_else(|_| "python3.13".to_owned());
+    let out = Command::new(&interp)
+        .arg("-c")
+        .arg("import sysconfig; print(sysconfig.get_path('include'))")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let inc = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+    if inc.is_empty() {
+        return None;
+    }
+    if !Path::new(&inc).join("Python.h").is_file() {
+        return None;
+    }
+    Some(inc)
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -153,6 +180,59 @@ fn main() {
         name: "_numpylike",
         env_var: "WEAVEPY_CAPI_NUMPYLIKE_EXTENSION",
     });
+
+    // ----------------------------------------------------------------
+    // 2b) RFC 0043 wave-1 hermetic proof: compile `_stockabi.c` against
+    //     the host's *stock* CPython 3.13 headers (full, non-limited
+    //     API → real inlined macros), NOT WeavePy's `include/Python.h`.
+    //     Skipped (with a note) when CPython 3.13 dev headers aren't
+    //     present, so a bare CI host still builds and the
+    //     stock-ABI test self-skips.
+    // ----------------------------------------------------------------
+    let stockabi_src = workspace_root.join("tests/capi_ext/_stockabi.c");
+    if stockabi_src.is_file() {
+        match stock_python_include() {
+            Some(inc) => {
+                println!("cargo:rerun-if-changed={}", stockabi_src.display());
+                let dylib = out_dir.join(format!("_stockabi.{suffix}"));
+                let mut cmd = Command::new(&cc);
+                cmd.arg("-shared")
+                    .arg("-fPIC")
+                    .arg("-fvisibility=default")
+                    .arg("-O0")
+                    .arg("-Wno-error")
+                    .arg(format!("-I{inc}"))
+                    .arg(&stockabi_src)
+                    .arg("-o")
+                    .arg(&dylib);
+                if target_os == "macos" {
+                    cmd.arg("-undefined").arg("dynamic_lookup");
+                }
+                match cmd.output() {
+                    Ok(out) if out.status.success() => {
+                        println!(
+                            "cargo:rustc-env=WEAVEPY_CAPI_STOCKABI_EXTENSION={}",
+                            dylib.display()
+                        );
+                        println!("cargo:rustc-env=WEAVEPY_STOCK_PYTHON_INCLUDE={inc}");
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        println!("cargo:warning=_stockabi cc failed (stock headers): {stderr}");
+                    }
+                    Err(err) => {
+                        println!("cargo:warning=could not run cc for _stockabi: {err}");
+                    }
+                }
+            }
+            None => {
+                println!(
+                    "cargo:warning=stock CPython 3.13 headers not found; \
+                     skipping the _stockabi binary-ABI proof fixture"
+                );
+            }
+        }
+    }
 
     // Re-export the include directory so dependent crates can see
     // `Python.h` via `DEP_WEAVEPY_CAPI_INCLUDE`.
