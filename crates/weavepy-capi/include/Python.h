@@ -607,6 +607,8 @@ PyAPI_FUNC(int) PyUnicode_CompareWithASCIIString(PyObject *o, const char *s);
 
 PyAPI_FUNC(PyObject *) PyBytes_FromString(const char *s);
 PyAPI_FUNC(PyObject *) PyBytes_FromStringAndSize(const char *s, Py_ssize_t n);
+PyAPI_FUNC(PyObject *) PyBytes_FromFormat(const char *format, ...);
+PyAPI_FUNC(PyObject *) PyBytes_FromFormatV(const char *format, va_list vargs);
 PyAPI_FUNC(char *) PyBytes_AsString(PyObject *o);
 PyAPI_FUNC(int) PyBytes_AsStringAndSize(PyObject *o, char **buffer, Py_ssize_t *length);
 PyAPI_FUNC(Py_ssize_t) PyBytes_Size(PyObject *o);
@@ -856,6 +858,7 @@ PyAPI_FUNC(int) PyGILState_Check(void);
 typedef struct _ts PyThreadState;
 
 PyAPI_FUNC(PyThreadState *) PyThreadState_Get(void);
+PyAPI_FUNC(int) PyThreadState_SetAsyncExc(unsigned long id, PyObject *exc);
 PyAPI_FUNC(PyThreadState *) PyEval_SaveThread(void);
 PyAPI_FUNC(void) PyEval_RestoreThread(PyThreadState *tstate);
 

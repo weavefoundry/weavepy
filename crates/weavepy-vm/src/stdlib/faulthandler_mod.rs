@@ -48,7 +48,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static WATCHDOG_GEN: AtomicU64 = AtomicU64::new(0);
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(

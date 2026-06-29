@@ -26,7 +26,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
     let path_mod = build_path(cache);
     cache.insert("os.path", Object::Module(path_mod.clone()));
 
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -704,7 +704,7 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
 }
 
 pub fn build_path(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -938,7 +938,7 @@ fn fsdecode_osstr(s: &std::ffi::OsStr) -> Object {
 }
 
 fn initial_environ() -> Object {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     // `vars_os` (not `vars`) so an undecodable env value doesn't panic; each
     // entry is fsdecoded with `surrogateescape` (PEP 383) for a faithful
     // round-trip through `os.environ` / `os.environb`
@@ -1092,7 +1092,7 @@ fn sysconf_name_table() -> &'static [(&'static str, libc::c_int)] {
 /// `os.sysconf_names` — the `{name: id}` mapping CPython exposes.
 #[cfg(unix)]
 fn build_sysconf_names() -> Object {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     for (name, id) in sysconf_name_table() {
         d.insert(
             DictKey(Object::from_static(name)),
@@ -1176,7 +1176,7 @@ fn pathconf_name_table() -> &'static [(&'static str, libc::c_int)] {
 /// `os.pathconf_names` — the `{name: id}` mapping CPython exposes.
 #[cfg(unix)]
 fn build_pathconf_names() -> Object {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     for (name, id) in pathconf_name_table() {
         d.insert(
             DictKey(Object::from_static(name)),
@@ -2750,7 +2750,7 @@ fn build_scandir_iterator(entries: Vec<Object>) -> Object {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         scandir_method(&mut dict, "__iter__", scandir_self);
         scandir_method(&mut dict, "__next__", scandir_next);
         scandir_method(&mut dict, "__enter__", scandir_self);
@@ -2806,7 +2806,7 @@ fn scandir_self(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn scandir_next(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(Object::Instance(inst)) = args.first() {
-        if let Some(Object::Iter(it)) = &inst.native {
+        if let Some(Object::Iter(it)) = inst.native.get() {
             return match it.borrow_mut().next_value() {
                 Some(v) => Ok(v),
                 None => {
@@ -2923,7 +2923,7 @@ pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         // `os.DirEntry` is only ever minted by `scandir` (CPython's type has
         // no `tp_new`): `os.DirEntry()` raises `TypeError`
         // (`test_os.TestDirEntry.test_uninstantiable`). Internal construction
@@ -4591,7 +4591,7 @@ fn path_like_type_singleton(name: &str) -> Rc<crate::types::TypeObject> {
     use crate::object::{BuiltinFn, MethodWrapper};
     use crate::types::{TypeFlags, TypeObject};
     let bt = builtin_types();
-    let mut dict = DictData::new();
+    let mut dict = DictData::default();
     // `os.PathLike` is an ABC; `os.PathLike.register(C)` marks `C` as a virtual
     // subclass (CPython's `pathlib._local` does `os.PathLike.register(PurePath)`
     // at import). Membership here is checked structurally (any `__fspath__`),
@@ -4703,7 +4703,7 @@ pub(crate) fn struct_seq_type(
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         // `__module__`/`__qualname__` let `pickle`/`copy` find the type by
         // reference (e.g. `os.stat_result`) instead of guessing `builtins`.
         dict.insert(
@@ -4979,7 +4979,7 @@ fn struct_seq_reduce(
         return Err(type_error("struct sequence reduce requires an instance"));
     };
     let visible = Object::new_tuple(struct_seq_values(fields, inst));
-    let extra = Rc::new(RefCell::new(DictData::new()));
+    let extra = Rc::new(RefCell::new(DictData::default()));
     {
         let d = inst.dict.borrow();
         let mut e = extra.borrow_mut();
@@ -5071,7 +5071,7 @@ pub(crate) fn struct_seq_instance(
     fields: &'static [&'static str],
     values: Vec<Object>,
 ) -> Object {
-    let mut inst = crate::types::PyInstance::new(ty);
+    let inst = crate::types::PyInstance::new(ty);
     {
         let mut d = inst.dict.borrow_mut();
         for (field, value) in fields.iter().zip(values) {
@@ -5096,7 +5096,7 @@ pub(crate) fn struct_seq_instance(
             })
             .collect()
     };
-    inst.native = Some(Object::new_tuple(visible));
+    let _ = inst.native.set(Object::new_tuple(visible));
     Object::Instance(Rc::new(inst))
 }
 

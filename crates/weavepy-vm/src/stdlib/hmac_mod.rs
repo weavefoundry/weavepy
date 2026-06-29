@@ -186,7 +186,7 @@ fn hmac_class() -> Rc<TypeObject> {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         macro_rules! method {
             ($name:literal, $body:expr) => {
                 dict.insert(
@@ -253,7 +253,7 @@ fn mac_copy(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(

@@ -43,7 +43,7 @@ pub const FILTER_ARMTHUMB: i64 = 0x08;
 pub const FILTER_SPARC: i64 = 0x09;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -253,7 +253,7 @@ fn to_lzma_filters(owned: &mut [OwnedFilter]) -> Vec<lzma_sys::lzma_filter> {
 }
 
 fn dict_get(dict: &DictData, key: &str) -> Option<Object> {
-    dict.get(&DictKey(Object::from_str(key))).cloned()
+    dict.get(&crate::object::StrKey(key)).cloned()
 }
 
 /// Reject any dict key not in `allowed` (CPython rejects unknown filter
@@ -509,7 +509,7 @@ impl Coder {
                 let before_out = s.total_out();
                 let status = s
                     .process(input, output, action)
-                    .map_err(|e| lzma_error(&format!("{e:?}")))?;
+                    .map_err(|e| lzma_stream_error(&e))?;
                 Ok((
                     (s.total_in() - before_in) as usize,
                     (s.total_out() - before_out) as usize,
@@ -579,7 +579,7 @@ fn b_decode_filter_properties(args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// Build a `{"id": …, …}` dict from a decoded filter's options.
 fn build_filter_spec(id: i64, options: *mut c_void) -> Result<Object, RuntimeError> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(DictKey(Object::from_static("id")), Object::Int(id));
@@ -684,7 +684,7 @@ fn lzma_error_class() -> Rc<TypeObject> {
         TypeObject::new_with_flags(
             "LZMAError",
             vec![bt.exception.clone()],
-            DictData::new(),
+            DictData::default(),
             TypeFlags {
                 is_exception: true,
                 is_builtin: true,
@@ -698,6 +698,27 @@ fn lzma_error_class() -> Rc<TypeObject> {
 fn lzma_error(msg: &str) -> RuntimeError {
     let inst = crate::builtin_types::make_exception_with_class(lzma_error_class(), msg);
     RuntimeError::PyException(PyException::new(inst))
+}
+
+/// Translate an `xz2`/liblzma stream error into the exact `LZMAError` message
+/// CPython's `_lzma` module produces (`Modules/_lzmamodule.c: catch_lzma_error`).
+/// pandas' `read_xml` compression tests assert on the wording verbatim — e.g.
+/// decoding a non-XZ stream as `xz` must read
+/// `"Input format not supported by decoder"`, not xz2's terse `Debug` (`Format`).
+fn lzma_stream_error(e: &xz2::stream::Error) -> RuntimeError {
+    use xz2::stream::Error;
+    let msg = match e {
+        Error::Mem => "Cannot allocate memory",
+        Error::MemLimit => "Memory usage limit exceeded",
+        Error::Format => "Input format not supported by decoder",
+        Error::Options => "Invalid or unsupported options",
+        Error::Data => "Corrupt input data",
+        Error::Program => "Internal error",
+        // `NoCheck` / `UnsupportedCheck` (and any future variants) surface as
+        // the generic liblzma error text.
+        _ => "Internal error",
+    };
+    lzma_error(msg)
 }
 
 fn eof_error(msg: &str) -> RuntimeError {
@@ -875,7 +896,7 @@ fn compressor_class() -> Rc<TypeObject> {
     static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
     CLS.get_or_init(|| {
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         class_method_kw(&mut dict, "__init__", compressor_init);
         class_method(&mut dict, "compress", compressor_compress);
         class_method(&mut dict, "flush", compressor_flush);
@@ -900,7 +921,7 @@ fn decompressor_class() -> Rc<TypeObject> {
     static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
     CLS.get_or_init(|| {
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         class_method_kw(&mut dict, "__init__", decompressor_init);
         class_method_kw(&mut dict, "decompress", decompressor_decompress);
         class_method(&mut dict, "__reduce__", no_pickle);

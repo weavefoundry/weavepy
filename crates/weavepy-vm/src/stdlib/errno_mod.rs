@@ -18,8 +18,8 @@ use crate::import::ModuleCache;
 use crate::object::{DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
-    let mut errorcode = DictData::new();
+    let dict = Rc::new(RefCell::new(DictData::default()));
+    let mut errorcode = DictData::default();
     {
         let mut d = dict.borrow_mut();
         d.insert(

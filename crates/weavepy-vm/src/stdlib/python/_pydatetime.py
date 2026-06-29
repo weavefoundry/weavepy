@@ -27,6 +27,12 @@ MINYEAR = 1
 MAXYEAR = 9999
 _MAXORDINAL = 3652059  # date.max.toordinal()
 
+# Sentinel distinguishing a genuinely-missing constructor argument from an
+# explicit `None`, so `date()`/`datetime(2000)` raise the C implementation's
+# "function missing required argument '…' (pos N)" TypeError while
+# `datetime(None)` still reports the NoneType-to-integer failure.
+_REQUIRED = object()
+
 # Utility functions, adapted from Python's Demo/classes/Dates.py, which
 # also assumes the current Gregorian calendar indefinitely extended in
 # both directions.  Difference:  Dates.py calls January 1 of year 0 day
@@ -525,13 +531,24 @@ def _check_date_fields(year, month, day):
     year = _index(year)
     month = _index(month)
     day = _index(day)
+    # NB: messages mirror CPython's *C* `_datetime` (`check_date_args`),
+    # the implementation user code observes, rather than the two-tuple
+    # `(msg, value)` form the upstream pure-Python fallback raises.
+    # A year outside C `int` range fails argument conversion *before* the
+    # range check in the C module, raising OverflowError — pandas'
+    # `parse_datetime_string` catches exactly that to produce
+    # OutOfBoundsDatetime for e.g. `to_datetime("08335394550")`.
+    if year > 2147483647:
+        raise OverflowError('signed integer is greater than maximum')
+    if year < -2147483648:
+        raise OverflowError('signed integer is less than minimum')
     if not MINYEAR <= year <= MAXYEAR:
-        raise ValueError('year must be in %d..%d' % (MINYEAR, MAXYEAR), year)
+        raise ValueError('year %i is out of range' % year)
     if not 1 <= month <= 12:
-        raise ValueError('month must be in 1..12', month)
+        raise ValueError('month must be in 1..12')
     dim = _days_in_month(year, month)
     if not 1 <= day <= dim:
-        raise ValueError('day must be in 1..%d' % dim, day)
+        raise ValueError('day is out of range for month')
     return year, month, day
 
 def _check_time_fields(hour, minute, second, microsecond, fold):
@@ -539,16 +556,18 @@ def _check_time_fields(hour, minute, second, microsecond, fold):
     minute = _index(minute)
     second = _index(second)
     microsecond = _index(microsecond)
+    # Single-arg messages match CPython's C `_datetime` (`check_time_args`),
+    # not the pure-Python fallback's `(msg, value)` two-tuple form.
     if not 0 <= hour <= 23:
-        raise ValueError('hour must be in 0..23', hour)
+        raise ValueError('hour must be in 0..23')
     if not 0 <= minute <= 59:
-        raise ValueError('minute must be in 0..59', minute)
+        raise ValueError('minute must be in 0..59')
     if not 0 <= second <= 59:
-        raise ValueError('second must be in 0..59', second)
+        raise ValueError('second must be in 0..59')
     if not 0 <= microsecond <= 999999:
-        raise ValueError('microsecond must be in 0..999999', microsecond)
+        raise ValueError('microsecond must be in 0..999999')
     if fold not in (0, 1):
-        raise ValueError('fold must be either 0 or 1', fold)
+        raise ValueError('fold must be either 0 or 1')
     return hour, minute, second, microsecond, fold
 
 def _check_tzinfo_arg(tz):
@@ -928,14 +947,20 @@ class date:
     """
     __slots__ = '_year', '_month', '_day', '_hashcode'
 
-    def __new__(cls, year, month=None, day=None):
+    def __new__(cls, year=_REQUIRED, month=_REQUIRED, day=_REQUIRED):
         """Constructor.
 
         Arguments:
 
         year, month, day (required, base 1)
         """
-        if (month is None and
+        # The C implementation parses arguments with
+        # PyArg_ParseTupleAndKeywords("lll", ...), whose missing-argument
+        # TypeError differs from the Python-level signature error. Tests
+        # (pandas' Timestamp constructor suite) match the C text exactly.
+        if year is _REQUIRED:
+            raise TypeError("function missing required argument 'year' (pos 1)")
+        if (month is _REQUIRED and
             isinstance(year, (bytes, str)) and len(year) == 4 and
             1 <= ord(year[2:3]) <= 12):
             # Pickle support
@@ -952,6 +977,10 @@ class date:
             self.__setstate(year)
             self._hashcode = -1
             return self
+        if month is _REQUIRED:
+            raise TypeError("function missing required argument 'month' (pos 2)")
+        if day is _REQUIRED:
+            raise TypeError("function missing required argument 'day' (pos 3)")
         year, month, day = _check_date_fields(year, month, day)
         self = object.__new__(cls)
         self._year = year
@@ -1167,6 +1196,25 @@ class date:
         if isinstance(other, date):
             days1 = self.toordinal()
             days2 = other.toordinal()
+            return timedelta(days1 - days2)
+        return NotImplemented
+
+    def __rsub__(self, other):
+        # WeavePy: the C datetime module surfaces `nb_subtract` as an
+        # `__rsub__` slot wrapper too, and third-party date subclasses
+        # lean on it: a subclass `__sub__` that returns NotImplemented
+        # (pandas `Timestamp - datetime` when the difference overflows
+        # its ns range) expects the *base* subtraction to run via the
+        # right operand's reflected slot, yielding a plain `timedelta`.
+        # The C slot declines when either operand is a datetime (the
+        # datetime type's own slot owns that case).
+        if (
+            isinstance(other, date)
+            and not isinstance(other, datetime)
+            and not isinstance(self, datetime)
+        ):
+            days1 = other.toordinal()
+            days2 = self.toordinal()
             return timedelta(days1 - days2)
         return NotImplemented
 
@@ -1471,7 +1519,9 @@ class time:
             if allow_mixed:
                 return 2 # arbitrary non-zero value
             else:
-                raise TypeError("cannot compare naive and aware times")
+                # C accelerator wording (see datetime.__sub__).
+                raise TypeError("can't compare offset-naive and "
+                                "offset-aware times")
         myhhmm = self._hour * 60 + self._minute - myoff//timedelta(minutes=1)
         othhmm = other._hour * 60 + other._minute - otoff//timedelta(minutes=1)
         return _cmp((myhhmm, self._second, self._microsecond),
@@ -1684,11 +1734,15 @@ class datetime(date):
     """
     __slots__ = time.__slots__
 
-    def __new__(cls, year, month=None, day=None, hour=0, minute=0, second=0,
-                microsecond=0, tzinfo=None, *, fold=0):
+    def __new__(cls, year=_REQUIRED, month=_REQUIRED, day=_REQUIRED, hour=0,
+                minute=0, second=0, microsecond=0, tzinfo=None, *, fold=0):
+        # C-faithful missing-argument errors; see `date.__new__`.
+        if year is _REQUIRED:
+            raise TypeError("function missing required argument 'year' (pos 1)")
         if (isinstance(year, (bytes, str)) and len(year) == 10 and
             1 <= ord(year[2:3])&0x7F <= 12):
-            # Pickle support
+            # Pickle support (the second positional argument, when present,
+            # is the tzinfo state — not a month).
             if isinstance(year, str):
                 try:
                     year = bytes(year, 'latin1')
@@ -1699,9 +1753,13 @@ class datetime(date):
                         "a datetime object. "
                         "pickle.load(data, encoding='latin1') is assumed.")
             self = object.__new__(cls)
-            self.__setstate(year, month)
+            self.__setstate(year, None if month is _REQUIRED else month)
             self._hashcode = -1
             return self
+        if month is _REQUIRED:
+            raise TypeError("function missing required argument 'month' (pos 2)")
+        if day is _REQUIRED:
+            raise TypeError("function missing required argument 'day' (pos 3)")
         year, month, day = _check_date_fields(year, month, day)
         hour, minute, second, microsecond, fold = _check_time_fields(
             hour, minute, second, microsecond, fold)
@@ -2192,7 +2250,9 @@ class datetime(date):
             if allow_mixed:
                 return 2 # arbitrary non-zero value
             else:
-                raise TypeError("cannot compare naive and aware datetimes")
+                # C accelerator wording (see datetime.__sub__).
+                raise TypeError("can't compare offset-naive and "
+                                "offset-aware datetimes")
         # XXX What follows could be done more efficiently...
         diff = self - other     # this will take offsets into account
         if diff.days < 0:
@@ -2208,7 +2268,16 @@ class datetime(date):
                           minutes=self._minute,
                           seconds=self._second,
                           microseconds=self._microsecond)
-        delta += other
+        # WeavePy: mirror the C `_datetime` module, which combines the operand
+        # through its raw GET_TD_DAYS/SECONDS/MICROSECONDS fields rather than a
+        # Python-level `+`. Adding `other` directly defers to a `timedelta`
+        # *subclass*'s reflected `__radd__` (pandas `Timedelta`, whose
+        # ns-resolution constructor overflows on the ~734503-day intermediate
+        # `delta`), spuriously raising `OutOfBoundsTimedelta` where CPython's C
+        # datetime succeeds (e.g. `datetime(2012, 1, 1) - Timedelta("1 day")`).
+        # Normalising to a base `timedelta` is a round-trip no-op for a plain
+        # `timedelta` and reproduces the C field reads exactly.
+        delta += timedelta(other.days, other.seconds, other.microseconds)
         hour, rem = divmod(delta.seconds, 3600)
         minute, second = divmod(rem, 60)
         if 0 < delta.days <= _MAXORDINAL:
@@ -2241,8 +2310,21 @@ class datetime(date):
         if myoff == otoff:
             return base
         if myoff is None or otoff is None:
-            raise TypeError("cannot mix naive and timezone-aware time")
+            # The C accelerator's wording (CPython ships `_datetime`; its
+            # pure-python twin says "cannot mix naive and timezone-aware
+            # time"). pandas' test_subtraction_ops_with_tz asserts on it.
+            raise TypeError("can't subtract offset-naive and "
+                            "offset-aware datetimes")
         return base + otoff - myoff
+
+    def __rsub__(self, other):
+        # WeavePy: mirror the C module's `__rsub__` slot wrapper (see
+        # `date.__rsub__`): `other - self` where a subclass `__sub__`
+        # declined. Only the datetime-minus-datetime case belongs to
+        # this type's slot.
+        if isinstance(other, datetime):
+            return datetime.__sub__(other, self)
+        return NotImplemented
 
     def __hash__(self):
         if self._hashcode == -1:
@@ -2441,6 +2523,17 @@ UTC = timezone.utc = timezone._create(timedelta(0))
 timezone.min = timezone._create(-timedelta(hours=23, minutes=59))
 timezone.max = timezone._create(timedelta(hours=23, minutes=59))
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+# CPython ships these as C static types whose `tp_name` carries the dotted
+# module prefix; `tp_name`-based error text ("'>' not supported between
+# instances of 'float' and 'datetime.datetime'") prints it while `__name__`
+# stays bare, and `__module__` (derived from `tp_name` for static types)
+# reads "datetime". Mirror both for the pure-Python implementations.
+for _cls in (date, datetime, time, timedelta, timezone, tzinfo,
+             _IsoCalendarDate):
+    __weavepy_set_tp_name__(_cls, "datetime." + _cls.__name__)
+    _cls.__module__ = "datetime"
+del _cls
 
 # Some time zone algebra.  For a datetime x, let
 #     x.n = x stripped of its timezone -- its naive time.

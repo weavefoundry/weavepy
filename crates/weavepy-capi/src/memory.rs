@@ -1,88 +1,48 @@
 //! `PyMem_*` and `PyObject_Malloc/Free`.
 //!
 //! Extensions allocate scratch buffers via these helpers; we route
-//! through the system allocator. CPython has a per-allocator
-//! abstraction (raw, mem, object); WeavePy uses the same allocator
-//! for all three for now.
+//! straight through the **system allocator** (`malloc`/`free`), exactly
+//! like CPython built with `PYTHONMALLOC=malloc` (and matching release
+//! pymalloc's observable contract, whose `address_in_range` check makes
+//! `PyObject_Free` accept any malloc-family pointer).
+//!
+//! Faithfulness matters more than it looks: wheels *mix* allocators
+//! across module boundaries. pandas' Cython code `Py_DECREF`s objects
+//! whose `tp_dealloc` funnels into `PyObject_Free`, numpy hands
+//! `PyDataMem_NEW` (plain `malloc`) buffers to code that releases them
+//! with `PyMem_Free`, and khash headers pair `PyMem_Malloc` with plain
+//! `free`. A private header-prefixed allocator (WeavePy's previous
+//! scheme) corrupts the heap on every such crossing — reading a garbage
+//! "size" at `p - 8` and, when `p` happens to sit at the start of an
+//! mmap'd region, faulting outright (SIGBUS in pandas'
+//! `get_indexer_non_unique` under `test_loc.py`). The system allocator
+//! needs no size bookkeeping, so any pointer from any malloc-family
+//! source is freeable everywhere.
 
-use std::alloc::{alloc, alloc_zeroed, dealloc, realloc, Layout};
 use std::os::raw::c_int;
-use std::ptr;
 
-const ALIGN: usize = if std::mem::align_of::<usize>() > 8 {
-    std::mem::align_of::<usize>()
-} else {
-    8
-};
-
-#[repr(C)]
-struct AllocHeader {
-    size: usize,
-}
-
-unsafe fn header_layout() -> Layout {
-    Layout::from_size_align(std::mem::size_of::<AllocHeader>(), ALIGN).unwrap()
-}
-
-fn alloc_with_header(size: usize, zero: bool) -> *mut u8 {
-    let header_layout = unsafe { header_layout() };
-    let total = header_layout.size() + size;
-    let layout = Layout::from_size_align(total, ALIGN).unwrap();
-    let p = if zero {
-        unsafe { alloc_zeroed(layout) }
-    } else {
-        unsafe { alloc(layout) }
-    };
-    if p.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe {
-        (p as *mut AllocHeader).write(AllocHeader { size });
-        p.add(header_layout.size())
-    }
-}
-
-unsafe fn free_with_header(p: *mut u8) {
-    if p.is_null() {
-        return;
-    }
-    let header_layout = unsafe { header_layout() };
-    let header_ptr = unsafe { p.sub(header_layout.size()) };
-    let header = unsafe { (header_ptr as *mut AllocHeader).read() };
-    let total = header_layout.size() + header.size;
-    let layout = Layout::from_size_align(total, ALIGN).unwrap();
-    unsafe { dealloc(header_ptr, layout) };
-}
-
-unsafe fn realloc_with_header(p: *mut u8, new_size: usize) -> *mut u8 {
-    if p.is_null() {
-        return alloc_with_header(new_size, false);
-    }
-    let header_layout = unsafe { header_layout() };
-    let header_ptr = unsafe { p.sub(header_layout.size()) };
-    let header = unsafe { (header_ptr as *mut AllocHeader).read() };
-    let old_total = header_layout.size() + header.size;
-    let new_total = header_layout.size() + new_size;
-    let old_layout = Layout::from_size_align(old_total, ALIGN).unwrap();
-    let np = unsafe { realloc(header_ptr, old_layout, new_total) };
-    if np.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe {
-        (np as *mut AllocHeader).write(AllocHeader { size: new_size });
-        np.add(header_layout.size())
-    }
+extern "C" {
+    fn malloc(size: usize) -> *mut std::ffi::c_void;
+    fn calloc(nelem: usize, elsize: usize) -> *mut std::ffi::c_void;
+    fn realloc(p: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void;
+    fn free(p: *mut std::ffi::c_void);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyMem_Malloc(n: usize) -> *mut std::ffi::c_void {
-    alloc_with_header(n, false) as *mut std::ffi::c_void
+    // CPython guarantees a unique, freeable pointer for n == 0.
+    unsafe { malloc(n.max(1)) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyMem_Calloc(nelem: usize, elsize: usize) -> *mut std::ffi::c_void {
-    let total = nelem.saturating_mul(elsize);
-    alloc_with_header(total, true) as *mut std::ffi::c_void
+    // calloc(0, x) may return NULL on some platforms; normalise like CPython.
+    let (n, e) = if nelem == 0 || elsize == 0 {
+        (1, 1)
+    } else {
+        (nelem, elsize)
+    };
+    unsafe { calloc(n, e) }
 }
 
 #[no_mangle]
@@ -90,12 +50,15 @@ pub unsafe extern "C" fn PyMem_Realloc(
     p: *mut std::ffi::c_void,
     n: usize,
 ) -> *mut std::ffi::c_void {
-    unsafe { realloc_with_header(p as *mut u8, n) as *mut std::ffi::c_void }
+    unsafe { realloc(p, n.max(1)) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyMem_Free(p: *mut std::ffi::c_void) {
-    unsafe { free_with_header(p as *mut u8) };
+    if p.is_null() {
+        return;
+    }
+    unsafe { free(p) };
 }
 
 #[no_mangle]
@@ -145,11 +108,22 @@ pub unsafe extern "C" fn PyObject_Free(p: *mut std::ffi::c_void) {
     // native instance, not by C's allocator. A stock `tp_dealloc` that
     // ends with `tp_free(self)` / `PyObject_Free(self)` must be absorbed —
     // the block is reclaimed when the owning instance is collected, and
-    // freeing it here (it has no `PyMem` allocation header) would corrupt
-    // the heap. The check is strict (mirror magic + `Weak` back-ref), so
-    // it never mistakes a genuine `PyObject_Free` scratch buffer for one.
+    // freeing it here (it was minted through Rust's allocator with a
+    // negative-offset prefix) would corrupt the heap. The check is strict
+    // (mirror magic + `Weak` back-ref), so it never mistakes a genuine
+    // `PyObject_Free` scratch buffer for one.
     if !p.is_null() && unsafe { crate::mirror::is_instance_body(p as *mut crate::object::PyObject) }
     {
+        return;
+    }
+    // A WeavePy-minted *object* (box or mirror) must never reach the raw
+    // system `free` — boxes are `Box`-allocated with a Rust layout and
+    // mirrors carry the negative-offset prefix. A stock `tp_dealloc`
+    // chain (`_Py_Dealloc` → extension dealloc → `tp_free` == this
+    // function) can land one here; route it through the owning release
+    // path instead.
+    if !p.is_null() && crate::object::is_weavepy_owned(p as *mut crate::object::PyObject) {
+        unsafe { crate::object::free_owned_storage(p as *mut crate::object::PyObject) };
         return;
     }
     unsafe { PyMem_Free(p) };

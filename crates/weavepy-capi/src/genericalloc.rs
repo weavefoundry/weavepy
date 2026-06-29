@@ -52,13 +52,30 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
     }
     crate::interp::ensure_initialised();
 
+    if std::env::var_os("WEAVEPY_TRACE_CTOR").is_some() {
+        eprintln!(
+            "[CTOR] genericalloc name={} ty={:p} inline={} readied={} basicsize={} nitems={}",
+            crate::types::ctor_trace_name(ty),
+            ty,
+            crate::types::is_inline_instance_type(ty),
+            crate::types::is_readied_type(ty),
+            unsafe { (*ty).tp_basicsize },
+            nitems,
+        );
+    }
+
     // RFC 0045 (wave 3): an inline-storage type (`tp_basicsize >
     // sizeof(PyObject)`) gets a faithful `tp_basicsize`-wide body whose
     // fields live at their declared offsets — the `PyArrayObject` shape —
     // rather than the legacy `PyObjectBox` (whose Rust payload would sit
     // exactly where the extension expects `self->field`). The fresh
     // instance is owned by the VM and pinned for C's borrow.
-    if crate::types::is_inline_instance_type(ty) {
+    //
+    // RFC 0047 (wave 5): container-body types (VM list/tuple subclasses)
+    // take the same route — a plain box carrying their `ob_type` would be
+    // misclassified as a mirror by the type-keyed `is_mirror`. The zeroed
+    // body reads as a safe empty container until initialised.
+    if crate::types::is_inline_instance_type(ty) || crate::types::is_container_body_type(ty) {
         let body = crate::instance::make_inline_instance(ty, nitems);
         if body.is_null() {
             crate::errors::set_runtime_error("PyType_GenericAlloc: type is not bridged");
@@ -88,15 +105,17 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
         return ptr::null_mut();
     }
 
-    // For a stock type finalised via `PyType_Ready` (RFC 0044, WS5)
-    // seed the payload with a real `Object::Instance` bound to the
-    // bridged class, so the extension's `tp_new`/`tp_init` and
+    // Seed the payload with a real `Object::Instance` bound to the bridged
+    // class, so the extension's `tp_new`/`tp_init` and
     // `PyObject_SetAttrString` operate on a genuine instance whose
-    // `__dict__` round-trips through `clone_object`. Other types keep
-    // the historical `Object::None` placeholder (the `PyType_FromSpec`
-    // fixtures construct their instances through the VM's default
-    // `__new__`, not through this allocator).
-    let payload_obj = match crate::types::readied_bridge(ty) {
+    // `__dict__` round-trips through `clone_object`. This covers both stock
+    // types finalised via `PyType_Ready` (RFC 0044, WS5) and the heap
+    // mirrors minted by `install_user_type` for a *VM* class that a foreign
+    // C `tp_new` allocates — pandas' `class NAType(C_NAType)`, whose cdef
+    // base's `__pyx_tp_new` calls `NAType->tp_alloc(NAType, 0)` and expects
+    // back a real `NAType` instance (not the `Object::None` placeholder).
+    // A foreign (un-bridged) extension type keeps the historical `None`.
+    let payload_obj = match unsafe { crate::types::bridge_type(ty) } {
         Some(cls) => Object::Instance(weavepy_vm::sync::Rc::new(
             weavepy_vm::types::PyInstance::new(cls),
         )),
@@ -122,6 +141,15 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
         crate::object::Py_IncRef(ty as *mut PyObject);
     }
     crate::object::register_minted(raw as *mut PyObject);
+    if crate::object::freebox_trace_enabled() {
+        let tyname = unsafe { crate::object::debug_type_name(raw as *mut PyObject) };
+        if tyname.contains("Engine") {
+            eprintln!(
+                "[ALLOC] genericalloc p=0x{:x} type={}",
+                raw as usize, tyname
+            );
+        }
+    }
     raw as *mut PyObject
 }
 
@@ -189,23 +217,110 @@ pub unsafe extern "C" fn PyObject_InitVar(
     unsafe { PyObject_Init(o, ty) }
 }
 
-/// `PyObject_GenericGetAttr(o, name)` — default `__getattribute__`.
-/// Walks the type's MRO + the instance dict.
+/// `PyObject_GenericGetAttr(o, name)` — default `__getattribute__`:
+/// data descriptor → instance dict → class attr, the `object.__getattribute__`
+/// body.
+///
+/// Crucially this is the **generic** body, not full attribute dispatch: a C
+/// extension type routinely sets `tp_getattro = PyObject_GenericGetAttr` (or
+/// calls it as the fallback inside its own `tp_getattro`, e.g. a proxy that
+/// special-cases one name). Delegating to [`PyObject_GetAttr`] would re-enter
+/// that very slot — the VM's `LOAD_ATTR` dispatches the type's
+/// `__getattribute__`, which is the C slot — and recurse until the stack
+/// overflows. For a bridged instance we therefore call the VM's *default*
+/// `object.__getattribute__` body, which never re-dispatches the override.
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_GenericGetAttr(
     o: *mut PyObject,
     name: *mut PyObject,
 ) -> *mut PyObject {
+    if o.is_null() || name.is_null() {
+        return ptr::null_mut();
+    }
+    let obj = unsafe { crate::object::clone_object(o) };
+    // Only a bridged *instance* can route attribute access back through its
+    // type's `tp_getattro`; every other shape keeps the historical full
+    // dispatch (and so its `__getattr__` fallback, special getsets, …).
+    if matches!(obj, Object::Instance(_)) {
+        let key = match unsafe { crate::object::clone_object(name) } {
+            Object::Str(s) => s.to_string(),
+            _ => {
+                crate::errors::set_pending(
+                    Some(
+                        weavepy_vm::builtin_types::builtin_types()
+                            .type_error
+                            .clone(),
+                    ),
+                    Object::from_str("attribute name must be string"),
+                );
+                return ptr::null_mut();
+            }
+        };
+        if let Some(res) = crate::interp::ensure_active(|| {
+            crate::interp::with_interp_mut(|interp| interp.generic_getattr_public(&obj, &key))
+        }) {
+            return match res {
+                Ok(v) => crate::object::into_owned(v),
+                Err(e) => {
+                    crate::errors::set_pending_from_runtime(e);
+                    ptr::null_mut()
+                }
+            };
+        }
+    }
     unsafe { crate::abstract_::PyObject_GetAttr(o, name) }
 }
 
-/// `PyObject_GenericSetAttr(o, name, value)` — default `__setattr__`.
+/// `PyObject_GenericSetAttr(o, name, value)` — default `__setattr__` /
+/// `__delattr__` (`value == NULL` deletes).
+///
+/// See [`PyObject_GenericGetAttr`]: this is the generic `object.__setattr__`
+/// body, *not* full dispatch, so a C type whose `tp_setattro` calls
+/// `PyObject_GenericSetAttr` does not recurse back into its own slot.
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_GenericSetAttr(
     o: *mut PyObject,
     name: *mut PyObject,
     value: *mut PyObject,
 ) -> c_int {
+    if o.is_null() || name.is_null() {
+        return -1;
+    }
+    let obj = unsafe { crate::object::clone_object(o) };
+    if matches!(obj, Object::Instance(_)) {
+        let key = match unsafe { crate::object::clone_object(name) } {
+            Object::Str(s) => s.to_string(),
+            _ => {
+                crate::errors::set_pending(
+                    Some(
+                        weavepy_vm::builtin_types::builtin_types()
+                            .type_error
+                            .clone(),
+                    ),
+                    Object::from_str("attribute name must be string"),
+                );
+                return -1;
+            }
+        };
+        let val = if value.is_null() {
+            None
+        } else {
+            Some(unsafe { crate::object::clone_object(value) })
+        };
+        if let Some(res) = crate::interp::ensure_active(|| {
+            crate::interp::with_interp_mut(|interp| {
+                interp.generic_setattr_public(&obj, &key, val.clone())
+            })
+        }) {
+            return match res {
+                Ok(()) => 0,
+                Err(e) => {
+                    crate::errors::set_pending_from_runtime(e);
+                    -1
+                }
+            };
+        }
+    }
     unsafe { crate::abstract_::PyObject_SetAttr(o, name, value) }
 }
 
@@ -333,9 +448,12 @@ pub unsafe extern "C" fn _Py_HashBytes(src: *const std::ffi::c_void, len: PySsiz
     }
 }
 
-/// `Py_GenericAlias(a, b)` — fallback for `list.__class_getitem__`-
-/// style aliasing. Returns a fresh tuple `(a, b)` mimicking the
-/// `types.GenericAlias` shape that CPython would build.
+/// `Py_GenericAlias(origin, args)` — the C implementation behind
+/// `__class_getitem__ = classmethod(Py_GenericAlias)` (numpy's `dtype`,
+/// stdlib C container types). Builds the VM's generic-alias shape (a
+/// namespace carrying `__origin__`/`__args__`/`__parameters__`) so the
+/// result unions (`dtype[np.character] | StringDType`), reprs, and
+/// introspects like any other alias — a bare tuple did none of that.
 #[no_mangle]
 pub unsafe extern "C" fn Py_GenericAlias(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
     if a.is_null() || b.is_null() {
@@ -343,5 +461,5 @@ pub unsafe extern "C" fn Py_GenericAlias(a: *mut PyObject, b: *mut PyObject) -> 
     }
     let oa = unsafe { crate::object::clone_object(a) };
     let ob = unsafe { crate::object::clone_object(b) };
-    crate::object::into_owned(Object::new_tuple(vec![oa, ob]))
+    crate::object::into_owned(weavepy_vm::make_generic_alias_public(oa, ob))
 }

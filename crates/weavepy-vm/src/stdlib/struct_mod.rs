@@ -323,7 +323,15 @@ fn element_size(code: char, endian: Endian) -> Result<usize, RuntimeError> {
     Ok(match code {
         'x' | 'b' | 'B' | 'c' | 's' | 'p' | '?' => 1,
         'h' | 'H' | 'e' => 2,
-        'i' | 'I' | 'l' | 'L' | 'f' => 4,
+        'i' | 'I' | 'f' => 4,
+        // C `long` is the one code whose native size differs from its
+        // standard size: 8 bytes on an LP64 target (native/`@` mode), 4
+        // bytes in the standard/explicit-endian modes. This must match
+        // `sizeof(c_long)` so `ctypes._check_size(c_long)` agrees.
+        'l' | 'L' => match endian {
+            Endian::Native => std::mem::size_of::<libc::c_long>(),
+            _ => 4,
+        },
         'q' | 'Q' | 'd' => 8,
         'n' | 'N' => match endian {
             Endian::Native => std::mem::size_of::<isize>(),
@@ -344,7 +352,8 @@ fn native_align(code: char) -> usize {
     match code {
         'x' | 'b' | 'B' | 'c' | 's' | 'p' | '?' => 1,
         'h' | 'H' | 'e' => 2,
-        'i' | 'I' | 'l' | 'L' | 'f' => 4,
+        'i' | 'I' | 'f' => 4,
+        'l' | 'L' => std::mem::align_of::<libc::c_long>(),
         'q' | 'Q' | 'd' => 8,
         'n' | 'N' => std::mem::size_of::<isize>(),
         'P' => std::mem::size_of::<usize>(),
@@ -425,14 +434,30 @@ fn encode_one(
         }
         'h' => write_int!(i16, write_i16, true),
         'H' => write_int!(u16, write_u16, false),
-        'i' | 'l' => write_int!(i32, write_i32, true),
-        'I' | 'L' => write_int!(u32, write_u32, false),
+        'i' => write_int!(i32, write_i32, true),
+        'I' => write_int!(u32, write_u32, false),
+        // Native `long`/`unsigned long` are 8-byte on LP64; standard modes
+        // keep them 4-byte (see `element_size`).
+        'l' => {
+            if matches!(endian, Endian::Native) {
+                write_int!(i64, write_i64, true)
+            } else {
+                write_int!(i32, write_i32, true)
+            }
+        }
+        'L' => {
+            if matches!(endian, Endian::Native) {
+                write_int!(u64, write_u64, false)
+            } else {
+                write_int!(u32, write_u32, false)
+            }
+        }
         'q' => write_int!(i64, write_i64, true),
         'Q' => write_int!(u64, write_u64, false),
         'f' => {
-            let f = value
-                .as_f64()
-                .ok_or_else(|| struct_error("required argument is not a float"))?;
+            // Strip the WeavePy NaN identity tag — CPython packs the
+            // object's canonical `ob_fval` bits (see `untag_nan`).
+            let f = crate::object::untag_nan(require_float(value)?);
             // A finite double whose magnitude rounds above `FLT_MAX`
             // overflows binary32. CPython's `_PyFloat_Pack4` reports this
             // as `OverflowError` (not `struct.error`), so the frozen
@@ -451,9 +476,7 @@ fn encode_one(
             Ok(())
         }
         'd' => {
-            let f = value
-                .as_f64()
-                .ok_or_else(|| struct_error("required argument is not a float"))?;
+            let f = crate::object::untag_nan(require_float(value)?);
             let mut buf = [0u8; 8];
             match endian {
                 Endian::Native => NativeEndian::write_f64(&mut buf, f),
@@ -467,9 +490,7 @@ fn encode_one(
             // Half-precision IEEE 754, converted from the double with
             // round-half-to-even (CPython `_PyFloat_Pack2`), not via an
             // intermediate `f32` truncation.
-            let f = value
-                .as_f64()
-                .ok_or_else(|| struct_error("required argument is not a float"))?;
+            let f = crate::object::untag_nan(require_float(value)?);
             let half = f64_to_half(f)?;
             let mut buf = [0u8; 2];
             match endian {
@@ -513,8 +534,28 @@ fn decode_one(code: char, endian: Endian, buf: &[u8]) -> Result<(Object, usize),
         '?' => Object::Bool(buf[0] != 0),
         'h' => Object::Int(i64::from(read_i16(endian, &buf[..2]))),
         'H' => Object::Int(i64::from(read_u16(endian, &buf[..2]))),
-        'i' | 'l' => Object::Int(i64::from(read_i32(endian, &buf[..4]))),
-        'I' | 'L' => Object::Int(i64::from(read_u32(endian, &buf[..4]))),
+        'i' => Object::Int(i64::from(read_i32(endian, &buf[..4]))),
+        'I' => Object::Int(i64::from(read_u32(endian, &buf[..4]))),
+        // Native `long` is 8-byte on LP64; standard modes keep it 4-byte.
+        'l' => {
+            if matches!(endian, Endian::Native) {
+                Object::Int(read_i64(endian, &buf[..8]))
+            } else {
+                Object::Int(i64::from(read_i32(endian, &buf[..4])))
+            }
+        }
+        'L' => {
+            if matches!(endian, Endian::Native) {
+                let v = read_u64(endian, &buf[..8]);
+                if i64::try_from(v).is_ok() {
+                    Object::Int(v as i64)
+                } else {
+                    Object::int_from_bigint(num_bigint::BigInt::from(v))
+                }
+            } else {
+                Object::Int(i64::from(read_u32(endian, &buf[..4])))
+            }
+        }
         'q' => Object::Int(read_i64(endian, &buf[..8])),
         'Q' => {
             let v = read_u64(endian, &buf[..8]);
@@ -524,9 +565,17 @@ fn decode_one(code: char, endian: Endian, buf: &[u8]) -> Result<(Object, usize),
                 Object::int_from_bigint(num_bigint::BigInt::from(v))
             }
         }
-        'f' => Object::Float(f64::from(read_f32(endian, &buf[..4]))),
-        'd' => Object::Float(read_f64(endian, &buf[..8])),
-        'e' => Object::Float(f64::from(half_to_f32(read_u16(endian, &buf[..2])))),
+        // A canonical NaN read from bytes gets a fresh identity (CPython
+        // allocates a new object); an exotic payload is kept verbatim so
+        // `pack(unpack(b)) == b` round-trips — see `tag_unpacked_nan`.
+        'f' => Object::Float(crate::object::tag_unpacked_nan(f64::from(read_f32(
+            endian,
+            &buf[..4],
+        )))),
+        'd' => Object::Float(crate::object::tag_unpacked_nan(read_f64(endian, &buf[..8]))),
+        'e' => Object::Float(crate::object::tag_unpacked_nan(f64::from(half_to_f32(
+            read_u16(endian, &buf[..2]),
+        )))),
         'n' => {
             let v = NativeEndian::read_int(
                 &buf[..std::mem::size_of::<isize>()],
@@ -729,10 +778,30 @@ fn require_int(v: &Object) -> Result<i128, RuntimeError> {
         Object::Long(b) => num_traits::ToPrimitive::to_i128(&**b)
             .ok_or_else(|| struct_error("int too large to pack")),
         Object::Bool(b) => Ok(i128::from(i64::from(*b))),
-        _ => Err(struct_error(format!(
-            "required argument is not an integer (got '{}')",
-            v.type_name()
-        ))),
+        // CPython's `_struct` runs a non-int through `PyNumber_Index`
+        // (`__index__`) for the integer formats, so a numpy integer scalar
+        // (`np.int64`, as produced by pandas `Tick` offset arithmetic) or any
+        // `__index__`-bearing object packs correctly. A float or an object
+        // with no `__index__` still errors below.
+        _ => match crate::builtins::try_coerce_index_i64(v) {
+            Some(r) => r.map(i128::from),
+            None => Err(struct_error(format!(
+                "required argument is not an integer (got '{}')",
+                v.type_name()
+            ))),
+        },
+    }
+}
+
+/// Coerce a `struct.pack` float-format argument (`f`/`d`/`e`) to `f64`.
+/// CPython's `_struct` runs these through `PyFloat_AsDouble`, honouring
+/// `__float__`/`nb_float` (then `__index__`), so a numpy float scalar
+/// (`np.float64`) or any real-number-like object packs correctly instead
+/// of being rejected as "not a float".
+fn require_float(v: &Object) -> Result<f64, RuntimeError> {
+    match crate::builtins::coerce_f64_opt(v)? {
+        Some(f) => Ok(f),
+        None => Err(struct_error("required argument is not a float")),
     }
 }
 
@@ -748,7 +817,7 @@ fn struct_error(msg: impl Into<String>) -> RuntimeError {
 // ---------- public API surface ----------
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(

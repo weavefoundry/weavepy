@@ -16,11 +16,11 @@ use crate::types::{PyInstance, TypeFlags, TypeObject};
 
 thread_local! {
     static CONTEXT_STACK: RefCell<Vec<Rc<RefCell<DictData>>>> =
-        RefCell::new(vec![Rc::new(RefCell::new(DictData::new()))]);
+        RefCell::new(vec![Rc::new(RefCell::new(DictData::default()))]);
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -65,14 +65,14 @@ fn current_context() -> Rc<RefCell<DictData>> {
         s.borrow()
             .last()
             .cloned()
-            .unwrap_or_else(|| Rc::new(RefCell::new(DictData::new())))
+            .unwrap_or_else(|| Rc::new(RefCell::new(DictData::default())))
     })
 }
 
 fn contextvar_type() -> Rc<TypeObject> {
     use crate::builtin_types::builtin_types;
     let bt = builtin_types();
-    let mut td = DictData::new();
+    let mut td = DictData::default();
     for (name, fn_) in [
         (
             "__init__",
@@ -107,7 +107,7 @@ fn contextvar_type() -> Rc<TypeObject> {
 fn context_type() -> Rc<TypeObject> {
     use crate::builtin_types::builtin_types;
     let bt = builtin_types();
-    let mut td = DictData::new();
+    let mut td = DictData::default();
     for (name, fn_) in [
         (
             "__init__",
@@ -151,7 +151,7 @@ fn token_type() -> Rc<TypeObject> {
     TypeObject::new_with_flags(
         "Token",
         vec![bt.object_.clone()],
-        DictData::new(),
+        DictData::default(),
         TypeFlags {
             is_exception: false,
             is_builtin: true,
@@ -219,7 +219,7 @@ fn cv_set(args: &[Object]) -> Result<Object, RuntimeError> {
     let prev = ctx.borrow().get(&key).cloned();
     ctx.borrow_mut().insert(key, value);
     // Return a token: a SimpleNamespace recording (var, prev).
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     d.insert(
         DictKey(Object::from_static("var")),
         Object::Instance(inst.clone()),

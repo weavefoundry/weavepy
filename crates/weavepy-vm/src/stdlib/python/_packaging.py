@@ -925,12 +925,45 @@ def parse_wheel_filename(name: str):
     return dist, version, build, tags
 
 
+def _is_weavepy() -> bool:
+    """Whether we're running under WeavePy (vs. vendored on stock CPython)."""
+    try:
+        return sys.implementation.name == 'weavepy'
+    except Exception:
+        return False
+
+
 def compatible_tags():
     """Yield :class:`WheelTag` triples the running interpreter can satisfy.
 
     The order matches CPython's pip: most specific first, fallback last.
+
+    Because WeavePy mirrors the CPython 3.13 binary ABI (RFC 0043), it
+    consumes the *stock* CPython wheel matrix verbatim — the same
+    ``cp313`` / ``abi3`` interpreter+ABI tags over the full
+    manylinux / macOS / musllinux platform set a real numpy or pandas
+    wheel ships. On top of that it accepts an optional **provenance**
+    tag (``weavepy``) for wheels a publisher built and verified against
+    WeavePy specifically; see below.
     """
     major, minor = sys.version_info[:2]
+    plats = _platform_tags()
+
+    # RFC 0047 (wave 5): WeavePy *provenance* tags. A wheel built and
+    # verified specifically against WeavePy's mirrored ABI may advertise
+    # the `weavepy` interpreter tag (e.g. `pkg-1.0-weavepy-cp313-<plat>.whl`).
+    # Such a wheel is invisible to stock CPython (which never emits a
+    # `weavepy` tag) yet is the *most preferred* match here — ahead of the
+    # generic stock `cp313` wheel it shadows — so a project can ship a
+    # WeavePy-blessed build alongside its PyPI artifacts. Emitted only
+    # when actually running under WeavePy, keeping this module
+    # byte-for-byte CPython-faithful if vendored elsewhere.
+    if _is_weavepy():
+        for abi in ('cp%d%d' % (major, minor), 'abi3', 'none'):
+            for plat in plats:
+                yield WheelTag('weavepy', abi, plat)
+        yield WheelTag('weavepy', 'none', 'any')
+
     pys = [
         'cp%d%d' % (major, minor),
         'cp%d' % major,
@@ -939,7 +972,6 @@ def compatible_tags():
         'py3', 'py2.py3',
     ]
     abis = ['cp%d%d' % (major, minor), 'abi3', 'none']
-    plats = _platform_tags()
     for py in pys:
         for abi in abis:
             for plat in plats:
@@ -949,13 +981,15 @@ def compatible_tags():
         yield WheelTag(py, 'none', 'any')
 
 
-def _platform_tags():
+def _platform_tags(plat=None, machine=None):
+    """Platform compatibility tags for ``plat``/``machine`` (defaulting to
+    the running host). The parameters exist for testability — the matrix
+    is otherwise host-derived."""
     out = ['any']
-    plat = sys.platform
-    if hasattr(os, 'uname'):
-        machine = os.uname().machine
-    else:
-        machine = 'x86_64'
+    if plat is None:
+        plat = sys.platform
+    if machine is None:
+        machine = os.uname().machine if hasattr(os, 'uname') else 'x86_64'
     if not machine:
         machine = 'x86_64'
     if plat == 'darwin':
@@ -971,6 +1005,14 @@ def _platform_tags():
         out.append('manylinux2014_%s' % machine)
         for minor in range(17, 40):
             out.append('manylinux_2_%d_%s' % (minor, machine))
+        # PEP 656 musllinux (Alpine / musl libc). numpy and pandas both
+        # publish `musllinux_1_1` and `musllinux_1_2` wheels next to their
+        # manylinux ones; omitting these makes the resolver skip every
+        # binary wheel on a musl host. `musllinux_${maj}_${min}` is keyed
+        # on the musl ABI version (currently 1.2), so we span 1_0..1_5 for
+        # forward headroom, mirroring the manylinux range above.
+        for minor in range(0, 6):
+            out.append('musllinux_1_%d_%s' % (minor, machine))
     elif plat == 'win32':
         out.append('win_amd64')
         out.append('win32')
@@ -994,7 +1036,11 @@ def wheel_score(filename: str) -> int:
     """Return a priority score; higher = more preferred.
 
     Mirrors pip's tie-breaking: prefer cp-tagged wheels over abi3 over
-    none, prefer arch-specific platform tags over `any`.
+    none, prefer arch-specific platform tags over `any`. A WeavePy
+    *provenance* wheel (interpreter tag ``weavepy``, RFC 0047) outranks
+    the generic stock build it shadows — it is only ever a candidate when
+    running under WeavePy (``compatible_tags`` gates it), so the boost
+    never perturbs selection elsewhere.
     """
     try:
         _, _, _, tags = parse_wheel_filename(filename)
@@ -1003,7 +1049,9 @@ def wheel_score(filename: str) -> int:
     best = 0
     for t in tags:
         s = 0
-        if t.python.startswith('cp'):
+        if t.python == 'weavepy':
+            s += 16
+        elif t.python.startswith('cp'):
             s += 8
         if t.abi != 'none':
             s += 4

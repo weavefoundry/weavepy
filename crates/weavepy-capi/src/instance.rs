@@ -40,8 +40,8 @@
 //!   long as the VM still references the instance, and is reclaimed with
 //!   the instance otherwise.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use weavepy_vm::sync::Rc;
 use weavepy_vm::types::PyInstance;
@@ -49,19 +49,23 @@ use weavepy_vm::types::PyInstance;
 use crate::object::{PyObject, PySsizeT};
 use crate::types::PyTypeObject;
 
-thread_local! {
-    /// C-side ownership of inline instances: `body pointer -> Rc<PyInstance>`.
-    ///
-    /// An entry exists exactly while the body's C refcount is positive —
-    /// i.e. while a C extension holds a reference. It is the strong edge
-    /// that keeps the native instance (and therefore its faithful body)
-    /// alive for C even after the VM has dropped its last reference. The
-    /// [`MirrorPrefix`](crate::mirror::MirrorPrefix)'s back-reference is a
-    /// `Weak`, so this map is the *only* strong C→instance link and there
-    /// is no ownership cycle.
-    static STRONG: RefCell<HashMap<usize, Rc<PyInstance>>> =
-        RefCell::new(HashMap::new());
-}
+/// C-side ownership of inline instances: `body pointer -> Rc<PyInstance>`.
+///
+/// An entry exists exactly while the body's C refcount is positive —
+/// i.e. while a C extension holds a reference. It is the strong edge
+/// that keeps the native instance (and therefore its faithful body)
+/// alive for C even after the VM has dropped its last reference. The
+/// [`MirrorPrefix`](crate::mirror::MirrorPrefix)'s back-reference is a
+/// `Weak`, so this map is the *only* strong C→instance link and there
+/// is no ownership cycle.
+///
+/// Process-global (RFC 0047, wave 5): an instance pinned on the importing
+/// thread is released from whichever `threading.Thread` drops the last C
+/// reference, so a per-thread map would leak the pin (and, worse, let a
+/// worker misroute the body's free). Guard is a plain `Mutex`; every
+/// mutation drops removed values *after* the lock is released because
+/// dropping an `Rc<PyInstance>` can re-enter this map.
+static STRONG: Mutex<Option<HashMap<usize, Rc<PyInstance>>>> = Mutex::new(None);
 
 /// Install the VM hook that frees an instance's faithful body when the
 /// instance is collected (RFC 0045, wave 3). Idempotent; called from
@@ -87,12 +91,35 @@ pub fn instance_body_out(inst: &Rc<PyInstance>, ty: *mut PyTypeObject) -> *mut P
         let basicsize =
             unsafe { (*ty).tp_basicsize }.max(std::mem::size_of::<PyObject>() as PySsizeT) as usize;
         let body = attach_body(inst, ty, basicsize);
+        // RFC 0029 (wave 5): a `datetime`/`date`/`time`/`timedelta`
+        // instance crossing into C is materialised into a byte-faithful
+        // body so the inlined `PyDateTime_GET_*` accessor macros (which
+        // pandas' tslibs read directly) see correct data. A no-op for
+        // every other inline type.
+        crate::datetime_api::maybe_pack_datetime_body(body, ty, inst);
         return body;
     }
 
     // Re-crossing: the body already exists and outlived any previous C
     // reference (the instance owns it). Re-establish C's borrow.
     let body = existing as *mut PyObject;
+    if crate::mirror::body_trace_enabled() {
+        // Verify the cached body still resolves back to *this* instance.
+        let resolved = unsafe { crate::mirror::native_of(body) };
+        let matches = matches!(&resolved, weavepy_vm::object::Object::Instance(other)
+            if weavepy_vm::sync::Rc::ptr_eq(other, inst));
+        if !matches {
+            let tn = unsafe { crate::object::debug_type_name(body) };
+            eprintln!(
+                "[STALE-CBODY] inst=0x{:x} cls={} c_body=0x{:x} body-type={} resolved-to={}",
+                weavepy_vm::sync::Rc::as_ptr(inst) as usize,
+                inst.cls().name,
+                body as usize,
+                tn,
+                resolved.type_name_owned(),
+            );
+        }
+    }
     let head = unsafe { &mut *body };
     if head.ob_refcnt <= 0 {
         head.ob_refcnt = 1;
@@ -101,6 +128,66 @@ pub fn instance_body_out(inst: &Rc<PyInstance>, ty: *mut PyTypeObject) -> *mut P
         head.ob_refcnt += 1;
     }
     body
+}
+
+/// Hand a **container-subclass** instance — a VM `class C(list)` /
+/// `class C(tuple)` (pandas' `FrozenList`, every `namedtuple`) — to C as
+/// a faithful `PyListObject`/`PyTupleObject`-shaped body (RFC 0047,
+/// wave 5). CPython lays such instances out as real container structs
+/// with the subclass in `ob_type`, and stock extensions classify with
+/// `PyList_Check`/`PyTuple_Check` (a `tp_flags` bit test) then read the
+/// layout through the `PyList_GET_ITEM`/`PyTuple_GET_ITEM`/`Py_SIZE`
+/// macros — no function call to interpose. A plain identity box (Rust
+/// payload where C expects `ob_item`) read that way is garbage: pandas'
+/// ujson serializer walked `FrozenList`'s payload bytes as a pointer
+/// array and segfaulted on `to_json(orient="table")`.
+///
+/// Same identity / caching / [`STRONG`]-pinning contract as
+/// [`instance_body_out`]. Returns `None` when `ty` is not a registered
+/// container-body type — the caller falls through to the identity box.
+pub fn container_body_out(inst: &Rc<PyInstance>, ty: *mut PyTypeObject) -> Option<*mut PyObject> {
+    if !crate::types::is_container_body_type(ty) {
+        return None;
+    }
+    let existing = inst.c_body.get();
+    if existing != 0 {
+        // Re-crossing: same pointer, re-establish C's borrow (mirrors
+        // `instance_body_out`).
+        let body = existing as *mut PyObject;
+        let head = unsafe { &mut *body };
+        if head.ob_refcnt <= 0 {
+            head.ob_refcnt = 1;
+            strong_pin(body, inst);
+        } else {
+            head.ob_refcnt += 1;
+        }
+        return Some(body);
+    }
+    use crate::layout::tpflags;
+    let flags = unsafe { (*ty).tp_flags };
+    let is_list = flags & tpflags::LIST_SUBCLASS != 0;
+    let basicsize =
+        unsafe { (*ty).tp_basicsize }.max(std::mem::size_of::<PyObject>() as PySsizeT) as usize;
+    let body_bytes = if is_list {
+        basicsize.max(std::mem::size_of::<crate::layout::PyListObject>())
+    } else {
+        // Tuple elements live inline after the var head.
+        let n = match inst.native.get() {
+            Some(weavepy_vm::object::Object::Tuple(t)) => t.len(),
+            _ => 0,
+        };
+        basicsize.max(
+            std::mem::size_of::<crate::layout::PyVarObject>()
+                + n * std::mem::size_of::<*mut PyObject>(),
+        )
+    };
+    let body = attach_body(inst, ty, body_bytes);
+    if is_list {
+        unsafe { crate::mirror::pack_list_subclass_body(body) };
+    } else {
+        unsafe { crate::mirror::pack_tuple_subclass_body(body) };
+    }
+    Some(body)
 }
 
 /// Allocate a faithful, zeroed inline instance for `ty` directly from C
@@ -114,10 +201,35 @@ pub fn make_inline_instance(ty: *mut PyTypeObject, nitems: PySsizeT) -> *mut PyO
     };
     let basicsize =
         unsafe { (*ty).tp_basicsize }.max(std::mem::size_of::<PyObject>() as PySsizeT) as usize;
-    let itemsize = unsafe { (*ty).tp_itemsize }.max(0) as usize;
-    let body_bytes = basicsize + nitems.max(0) as usize * itemsize;
+    let mut itemsize = unsafe { (*ty).tp_itemsize }.max(0) as usize;
+    let mut min_body = 0usize;
+    // A container-body type (RFC 0047, wave 5) needs at least the real
+    // container struct: its synthesised `tp_basicsize`/`tp_itemsize` are
+    // identity-box values, not CPython's.
+    if crate::types::is_container_body_type(ty) {
+        use crate::layout::tpflags;
+        let flags = unsafe { (*ty).tp_flags };
+        if flags & tpflags::LIST_SUBCLASS != 0 {
+            min_body = std::mem::size_of::<crate::layout::PyListObject>();
+        } else {
+            min_body = std::mem::size_of::<crate::layout::PyVarObject>();
+            itemsize = itemsize.max(std::mem::size_of::<*mut PyObject>());
+        }
+    }
+    let body_bytes = (basicsize + nitems.max(0) as usize * itemsize).max(min_body);
     let inst = Rc::new(PyInstance::new(cls));
-    attach_body(&inst, ty, body_bytes)
+    let body = attach_body(&inst, ty, body_bytes);
+    // CPython's `PyType_GenericAlloc` initialises a var-sized instance with
+    // `PyObject_InitVar`, which stamps `ob_size = nitems`. numpy's
+    // `PyArray_Scalar` depends on this for STRING scalars: it calls
+    // `type->tp_alloc(type, itemsize)` and then memcpys the payload into
+    // `ob_sval` *without* touching the size — a zeroed `ob_size` reads back
+    // as an empty `np.bytes_`.
+    if !body.is_null() && unsafe { (*ty).tp_itemsize } != 0 {
+        let vo = body as *mut crate::layout::PyVarObject;
+        unsafe { (*vo).ob_size = nitems.max(0) };
+    }
+    body
 }
 
 /// Allocate the faithful body, record it on `inst`, and pin C's borrow.
@@ -136,7 +248,17 @@ fn attach_body(inst: &Rc<PyInstance>, ty: *mut PyTypeObject, body_bytes: usize) 
 /// `Rc<PyInstance>` can run `PyInstance::drop` → the free hook → back
 /// into [`STRONG`], which would otherwise re-borrow it mutably.
 fn strong_pin(body: *mut PyObject, inst: &Rc<PyInstance>) {
-    let previous = STRONG.with(|m| m.borrow_mut().insert(body as usize, inst.clone()));
+    if crate::mirror::body_trace_enabled() {
+        let tn = unsafe { crate::object::debug_type_name(body) };
+        if tn.contains("Engine") || tn.contains("BlockManager") {
+            let rc = unsafe { (*body).ob_refcnt };
+            eprintln!("[PIN] body=0x{:x} type={} refcnt={}", body as usize, tn, rc);
+        }
+    }
+    let previous = STRONG.lock().ok().and_then(|mut g| {
+        g.get_or_insert_with(HashMap::new)
+            .insert(body as usize, inst.clone())
+    });
     drop(previous);
 }
 
@@ -149,19 +271,50 @@ fn strong_pin(body: *mut PyObject, inst: &Rc<PyInstance>) {
 /// `p` must be a faithful instance body
 /// ([`crate::mirror::is_instance_body`]).
 pub unsafe fn release_c_ownership(p: *mut PyObject) {
+    if crate::mirror::body_trace_enabled() {
+        let tn = unsafe { crate::object::debug_type_name(p) };
+        if tn.contains("Engine") || tn.contains("BlockManager") {
+            let rc = unsafe { (*p).ob_refcnt };
+            eprintln!(
+                "[RELEASE-C] body=0x{:x} type={} refcnt={}",
+                p as usize, tn, rc
+            );
+        }
+    }
     // Take the pin out *before* dropping it: dropping the last `Rc` runs
     // `PyInstance::drop`, which calls the free hook, which touches
-    // `STRONG` again — so the borrow must already be released.
-    //
-    // `try_with`, not `with`: at thread/process teardown the `STRONG`
-    // thread-local may itself be mid-destruction, and a plain `.with`
-    // there panics (`AccessError`) — which, in a `Drop`, aborts the
-    // process (RFC 0046, wave 4). If the map is gone the pins are gone
-    // too; there is nothing to remove.
+    // `STRONG` again — so the lock must already be released. (`Mutex`,
+    // unlike the old thread-local `RefCell`, would deadlock rather than
+    // panic on re-entry — same discipline, harder failure.)
     let pinned = STRONG
-        .try_with(|m| m.borrow_mut().remove(&(p as usize)))
+        .lock()
         .ok()
-        .flatten();
+        .and_then(|mut g| g.as_mut().and_then(|m| m.remove(&(p as usize))));
+    if let Some(inst) = &pinned {
+        // C just dropped what may be this instance's last program-visible
+        // reference (CPython would run `tp_dealloc` right here). If the VM
+        // side still pins it through GC-handle / weakref-registry clones, a
+        // plain `Rc` drop below cannot reap it — a *tracked* extension
+        // temporary that dies inside a C call (a Cython generator abandoned
+        // by `BlockManager.iget`, still holding `self` in its closure) would
+        // otherwise stay pinned by its own handle until the next full
+        // collection, keeping everything it references alive with it
+        // (pandas' `_is_view_after_cow_rules` then reads a stale live
+        // `Block` weakref). Park it for the eval loop's between-bytecodes
+        // reap; anything still genuinely alive fails the drain's
+        // refcount-dead test untouched.
+        //
+        // Only a *GC-tracked* instance needs the park: an untracked one has
+        // no handle pinning it, so the plain `Rc` drop below reclaims it
+        // immediately (running `tp_dealloc` through the free hook) — and a
+        // queued clone would instead keep it alive until the next eval-loop
+        // safe point, which never comes for a drop performed outside
+        // bytecode execution (an embedding host dropping its last handle).
+        let obj = weavepy_vm::object::Object::Instance(inst.clone());
+        if weavepy_vm::gc_trace::is_tracked(weavepy_vm::weakref_registry::id_of(&obj)) {
+            weavepy_vm::vm_singletons::queue_cext_dropped(&obj);
+        }
+    }
     drop(pinned);
 }
 
@@ -176,6 +329,10 @@ fn free_instance_body_hook(body: usize) {
         return;
     }
     let p = body as *mut PyObject;
+    if crate::mirror::body_trace_enabled() {
+        let tn = unsafe { crate::object::debug_type_name(p) };
+        eprintln!("[FREE-HOOK] body=0x{body:x} type={tn}");
+    }
     // RFC 0046 (wave 4): a *non-inline* instance's `c_body` holds a plain
     // identity `PyObjectBox`, not a faithful mirror body. That box is owned
     // by C's refcount and reclaimed by `free_box` (which clears `c_body`
@@ -192,16 +349,12 @@ fn free_instance_body_hook(body: usize) {
     // The instance only reaches `Drop` once its strong count is zero, and
     // a live `STRONG` pin *is* a strong count — so no pin can remain here.
     //
-    // `try_with`, not `with`: at thread/process teardown this hook fires
-    // *from within* the `STRONG` map's own destructor (dropping its
-    // pinned `Rc<PyInstance>`s runs `PyInstance::drop` → here). The map is
-    // then mid-destruction, so a plain `.with` panics with `AccessError`
-    // — and panicking in a TLS destructor aborts the process (the exit
-    // 133 / "thread local panicked on drop" abort, RFC 0046 wave 4). When
-    // the TLS is gone the process is exiting; the OS reclaims the block,
-    // so bail without freeing rather than touch more (possibly destroyed)
-    // capi thread-locals (`unregister_minted`, the mirror registry).
-    match STRONG.try_with(|m| m.borrow_mut().remove(&body)) {
+    // A poisoned mutex means a panic already aborted a mutation mid-flight;
+    // bail without freeing rather than compound the damage.
+    match STRONG
+        .lock()
+        .map(|mut g| g.as_mut().and_then(|m| m.remove(&body)))
+    {
         Ok(stale) => {
             debug_assert!(
                 stale.is_none(),
@@ -215,14 +368,86 @@ fn free_instance_body_hook(body: usize) {
     unsafe {
         let ty = (*p).ob_type;
         if !ty.is_null() {
-            if let Some(dealloc) = (*ty).tp_dealloc {
-                // Skip our own default dealloc (it would recurse into
-                // `free_box`); run only a genuine extension `tp_dealloc`
-                // for faithful resource cleanup.
-                let default_dealloc: unsafe extern "C" fn(*mut PyObject) =
-                    crate::object::_PyWeavePy_Dealloc;
-                if dealloc as usize != default_dealloc as usize {
+            // CPython's `subtype_dealloc` semantics: a Python-defined
+            // subclass of an extension type carries the *default* dealloc
+            // on its own synthesised `PyTypeObject`, but its instances
+            // still own C struct fields at the base's offsets (a pandas
+            // `_iLocIndexer(NDFrameIndexerBase)` stores `self->obj` /
+            // `self->_name` through Cython's `__init__`). Walk `tp_base`
+            // to the first genuine extension `tp_dealloc` — exactly the
+            // `while (basedealloc == subtype_dealloc) base = base->tp_base`
+            // loop in `Objects/typeobject.c` — so those fields are
+            // released when the instance dies rather than leaking their
+            // referents until the next cyclic collection (RFC 0047: the
+            // leaked `self->obj` pinned the intermediate DataFrame whose
+            // weakref pandas' `_check_setitem_copy` needs cleared).
+            let default_dealloc: unsafe extern "C" fn(*mut PyObject) =
+                crate::object::_PyWeavePy_Dealloc;
+            let mut dealloc_ty = ty;
+            let mut chosen: Option<unsafe extern "C" fn(*mut PyObject)> = None;
+            while !dealloc_ty.is_null() {
+                match (*dealloc_ty).tp_dealloc {
+                    Some(d) if d as usize != default_dealloc as usize => {
+                        chosen = Some(d);
+                        break;
+                    }
+                    Some(_) => dealloc_ty = (*dealloc_ty).tp_base,
+                    None => break,
+                }
+            }
+            {
+                if let Some(dealloc) = chosen {
+                    // RFC 0045 (wave 5): neutralise a Cython `@cython.freelist`
+                    // dealloc for the duration of this call. A `@cython.freelist`
+                    // `cdef class` — pandas' `BlockManager`, `Block`,
+                    // `BlockPlacement`, … — ends its `tp_dealloc` with
+                    //
+                    //   if (freecount < N & Py_TYPE(o)->tp_basicsize == sizeof)
+                    //       freelist[freecount++] = o;      // stash raw pointer
+                    //   else
+                    //       Py_TYPE(o)->tp_free(o);         // release
+                    //
+                    // (verified by disassembling the pandas 2.3 wheel: the stash
+                    // is gated *only* on `freecount < N` and the exact
+                    // `tp_basicsize` — the `!HasFeature(IS_ABSTRACT | HEAPTYPE)`
+                    // guard some Cython versions add is absent here, so flag
+                    // manipulation does not divert it).
+                    //
+                    // The stash keeps a **raw** pointer to `o` past refcount
+                    // zero, but WeavePy is about to `free_instance_body(p)` —
+                    // returning that block to the allocator. The dangling
+                    // freelist entry is then handed back by a later `tp_new`
+                    // (`o = freelist[--freecount]; memset(o,…); PyObject_INIT`)
+                    // *after* the block has been re-minted as an unrelated
+                    // object, aliasing e.g. a `slice` onto a `BlockManager`
+                    // (`'slice' object is not iterable`) or an `ndarray` onto an
+                    // `IndexEngine` (`'ndarray' has no attribute 'is_unique'`).
+                    // Faithful instance bodies are owned by the VM instance, not
+                    // a C freelist.
+                    //
+                    // Perturbing `tp_basicsize` for the duration of the call
+                    // fails the `tp_basicsize == sizeof` term, so the dealloc
+                    // takes the `tp_free(o)` branch instead. Readied types wire
+                    // `tp_free = PyObject_Free`, which *absorbs* the free of a
+                    // body (`crate::memory::PyObject_Free`) because `ob_type`
+                    // is untouched — the body is still recognised as an instance
+                    // body. No entry is stashed, so `freecount` stays 0 and the
+                    // matching `tp_new` reuse branch (`freecount > 0`) never
+                    // fires either: every instance is minted afresh through
+                    // `tp_alloc` (`PyType_GenericAlloc`), exactly as WeavePy's
+                    // ownership model requires. `tp_basicsize` is restored
+                    // immediately (before `free_instance_body` and before any
+                    // subsequent allocation reads it).
+                    let orig_basicsize = (*ty).tp_basicsize;
+                    (*ty).tp_basicsize = orig_basicsize.wrapping_add(8);
+                    // A `tp_dealloc` is extension code: its decref chains can
+                    // re-enter the VM, and any bytecode that runs beneath it
+                    // must see a live C frame (RFC 0047 — the prompt reaper's
+                    // borrowed-pointer window).
+                    let _cext_guard = weavepy_vm::vm_singletons::enter_cext_call();
                     dealloc(p);
+                    drop(_cext_guard);
+                    (*ty).tp_basicsize = orig_basicsize;
                 }
             }
         }

@@ -13,8 +13,10 @@
 //!    pointer, returning 0 on success or a negative number to
 //!    signal a parse failure.
 
+use std::collections::HashMap;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
+use std::sync::Mutex;
 
 use num_traits::ToPrimitive;
 use weavepy_vm::object::Object;
@@ -84,10 +86,30 @@ pub unsafe extern "C" fn _WeavePy_Arg_Long(arg: *mut PyObject, dest: *mut i64) -
                 -1
             }
         },
-        _ => {
-            crate::errors::set_type_error("an integer is required");
-            -1
-        }
+        // CPython's integer format codes ('i'/'l'/'n'/'L'...) run the arg
+        // through `PyLong_As*`, which coerces via `__index__` — so a numpy
+        // integer scalar passed positionally is accepted. Mirror that.
+        _ => match unsafe { crate::numbers::index_to_builtin_int(arg) } {
+            Some(Object::Int(i)) => {
+                unsafe { *dest = i };
+                0
+            }
+            Some(Object::Bool(b)) => {
+                unsafe { *dest = i64::from(b) };
+                0
+            }
+            Some(Object::Long(big)) => match big.to_i64() {
+                Some(v) => {
+                    unsafe { *dest = v };
+                    0
+                }
+                None => {
+                    crate::errors::set_overflow_error("Python int too large for C long");
+                    -1
+                }
+            },
+            _ => -1,
+        },
     }
 }
 
@@ -127,9 +149,20 @@ pub unsafe extern "C" fn _WeavePy_Arg_Double(arg: *mut PyObject, dest: *mut f64)
             unsafe { *dest = f64::from(b as i32) };
             0
         }
+        // CPython's 'd'/'f' format codes run the argument through
+        // `PyFloat_AsDouble`, which honours the `nb_float`/`__float__`
+        // (then `__index__`) protocol. Route the fallback through it so a
+        // numpy `float64` scalar or a `float` subclass passed positionally
+        // converts here exactly as under CPython instead of being rejected
+        // outright — the "corr"/"quantile" style Cython paths in pandas
+        // hand numpy floats straight to `PyArg_ParseTuple(…"d"…)`.
         _ => {
-            crate::errors::set_type_error("a float is required");
-            -1
+            let v = unsafe { crate::numbers::PyFloat_AsDouble(arg) };
+            if v == -1.0 && crate::errors::pending().is_some() {
+                return -1;
+            }
+            unsafe { *dest = v };
+            0
         }
     }
 }
@@ -156,16 +189,56 @@ pub unsafe extern "C" fn _WeavePy_Arg_StringAndSize(
     dest: *mut *const c_char,
     dest_len: *mut isize,
 ) -> c_int {
-    let mut sz: isize = 0;
-    let p = unsafe { crate::strings::PyUnicode_AsUTF8AndSize(arg, &raw mut sz) };
-    if p.is_null() {
+    if arg.is_null() || dest.is_null() {
         return -1;
     }
-    unsafe {
-        *dest = p;
-        *dest_len = sz;
+    // CPython's `s#` accepts a str (UTF-8, true byte length — embedded
+    // NULs included) *or* any read-only bytes-like object; a rejected
+    // argument raises the buffer protocol's canonical TypeError. pandas'
+    // ujson `ujson_loads(None)` asserts that exact message.
+    match unsafe { crate::object::clone_object(arg) } {
+        Object::Str(_) => {
+            let mut sz: isize = 0;
+            let p = unsafe { crate::strings::PyUnicode_AsUTF8AndSize(arg, &raw mut sz) };
+            if p.is_null() {
+                return -1;
+            }
+            unsafe {
+                *dest = p;
+                *dest_len = sz;
+            }
+            0
+        }
+        Object::Bytes(b) => {
+            let mut bytes: Vec<u8> = b.to_vec();
+            bytes.push(0);
+            let leaked: Box<[u8]> = bytes.into_boxed_slice();
+            let n = leaked.len() - 1;
+            unsafe {
+                *dest = Box::leak(leaked).as_ptr() as *const c_char;
+                *dest_len = n as isize;
+            }
+            0
+        }
+        Object::ByteArray(b) => {
+            let mut bytes: Vec<u8> = b.borrow().to_vec();
+            bytes.push(0);
+            let leaked: Box<[u8]> = bytes.into_boxed_slice();
+            let n = leaked.len() - 1;
+            unsafe {
+                *dest = Box::leak(leaked).as_ptr() as *const c_char;
+                *dest_len = n as isize;
+            }
+            0
+        }
+        other => {
+            crate::errors::set_type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                other.type_name()
+            ));
+            -1
+        }
     }
-    0
 }
 
 #[no_mangle]
@@ -176,11 +249,87 @@ pub unsafe extern "C" fn _WeavePy_Arg_Object(
     if arg.is_null() || dest.is_null() {
         return -1;
     }
+    // CPython's `O` conversion stores a **borrowed** reference — no
+    // incref. The borrow's lifetime is guaranteed by the tether the
+    // parse loop attaches to the fetched item (see
+    // [`_WeavePy_Arg_Tether`]): the item stays alive until the args
+    // tuple / kwargs dict it came from is released after the C call,
+    // exactly CPython's contract. The old unconditional `Py_IncRef`
+    // here leaked one C reference per `O` unit parsed — every VM
+    // object that ever crossed `PyArg_ParseTuple` was pinned immortal
+    // (its identity box never hit refcount zero), which inflated
+    // `sys.getrefcount` and broke pandas' CoW refcount probes.
     unsafe {
-        crate::object::Py_IncRef(arg);
         *dest = arg;
     }
     0
+}
+
+/// Number of live tethered references across all owners. Lets the free
+/// paths skip the map lookup entirely when nothing is tethered.
+static TETHER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// owner pointer → references owned *by* that owner's C lifetime.
+/// See [`_WeavePy_Arg_Tether`].
+static TETHERED: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
+
+/// Transfer ownership of one reference on `arg` to `owner`'s C lifetime
+/// (RFC 0047, wave 5). The parse loop fetches each argument with a new
+/// reference (`_WeavePy_Arg_Item` mints/increfs a box); a format unit
+/// like `O` then stores the pointer *borrowed*, per CPython. CPython's
+/// borrow is backed by the args tuple, which owns its items for the
+/// whole call; our fetched box may be a *fresh* mint the tuple mirror
+/// does not own, so dropping the fetch reference immediately could free
+/// the box while the extension still holds the borrowed pointer.
+/// Tethering parks that reference on the owner (the args tuple, kwargs
+/// dict, or a group's sequence element) and releases it when the
+/// owner's own C reference count reaches zero — the exact lifetime
+/// CPython gives the borrow.
+#[no_mangle]
+pub unsafe extern "C" fn _WeavePy_Arg_Tether(owner: *mut PyObject, arg: *mut PyObject) {
+    if arg.is_null() {
+        return;
+    }
+    if owner.is_null() {
+        // No owner to pin the borrow to: keep the old behaviour of
+        // releasing the fetch reference immediately.
+        unsafe { crate::object::Py_DecRef(arg) };
+        return;
+    }
+    let Ok(mut guard) = TETHERED.lock() else {
+        return;
+    };
+    guard
+        .get_or_insert_with(HashMap::new)
+        .entry(owner as usize)
+        .or_default()
+        .push(arg as usize);
+    TETHER_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Release every reference tethered to `owner` (called by the box and
+/// mirror free paths). The entries are moved out before any decref runs
+/// — a decref can recurse into a free path, which would otherwise
+/// deadlock on the map's mutex.
+pub(crate) fn drop_tethered(owner: *mut PyObject) {
+    if TETHER_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let taken = {
+        let Ok(mut guard) = TETHERED.lock() else {
+            return;
+        };
+        guard
+            .as_mut()
+            .and_then(|m| m.remove(&(owner as usize)))
+            .unwrap_or_default()
+    };
+    if !taken.is_empty() {
+        TETHER_COUNT.fetch_sub(taken.len(), std::sync::atomic::Ordering::AcqRel);
+        for p in taken {
+            unsafe { crate::object::Py_DecRef(p as *mut PyObject) };
+        }
+    }
 }
 
 #[no_mangle]

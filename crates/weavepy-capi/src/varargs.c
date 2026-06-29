@@ -78,22 +78,89 @@
 
 #include <execinfo.h>
 #include <unistd.h>
+#include <sys/ucontext.h>
 
-static void weavepy_crash_handler(int sig) {
-    void *frames[256];
-    int n = backtrace(frames, 256);
-    const char *msg = "\n[weavepy] caught fatal signal; native backtrace:\n";
+/* Async-signal-safe hex writer for the fault diagnostic below. */
+static void weavepy_write_hex(const char *label, unsigned long long v) {
+    char buf[32];
+    int i = 0;
+    buf[i++] = ' ';
+    static const char hex[] = "0123456789abcdef";
+    buf[i++] = '0';
+    buf[i++] = 'x';
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        buf[i++] = hex[(v >> shift) & 0xf];
+    }
+    buf[i++] = '\n';
+    write(2, label, strlen(label));
+    write(2, buf, i);
+}
+
+static void weavepy_crash_handler_si(int sig, siginfo_t *info, void *ucv) {
+    const char *msg = "\n[weavepy] FAULTV2 caught fatal signal; native backtrace:\n";
     write(2, msg, strlen(msg));
+    weavepy_write_hex("[weavepy] fault addr:",
+                      (unsigned long long)(uintptr_t)(info ? info->si_addr : (void *)0));
+    void *frames[512];
+    int n = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (ucv) {
+        ucontext_t *uc = (ucontext_t *)ucv;
+        if (uc->uc_mcontext) {
+            unsigned long long pc = (unsigned long long)uc->uc_mcontext->__ss.__pc;
+            unsigned long long lr = (unsigned long long)uc->uc_mcontext->__ss.__lr;
+            unsigned long long fp = (unsigned long long)uc->uc_mcontext->__ss.__fp;
+            weavepy_write_hex("[weavepy] pc:", pc);
+            weavepy_write_hex("[weavepy] lr:", lr);
+            /* Manually walk the arm64 frame-pointer chain from the
+             * interrupted context. backtrace() from a signal handler on
+             * macOS only sees the handler's own (alt-stack) frames, so to
+             * capture the *faulting* stack (e.g. a recursion cycle that
+             * overflowed) we chase [fp] = {saved_fp, saved_lr}. */
+            frames[n++] = (void *)pc;
+            if (lr) frames[n++] = (void *)lr;
+            unsigned long long cur = fp;
+            unsigned long long prev = 0;
+            while (cur && cur > prev && n < 500) {
+                unsigned long long next = *(unsigned long long *)cur;
+                unsigned long long ret = *(unsigned long long *)(cur + 8);
+                if (!ret) break;
+                frames[n++] = (void *)ret;
+                prev = cur;
+                cur = next;
+            }
+        }
+    }
+#endif
+    if (n == 0) {
+        n = backtrace(frames, 512);
+    }
     backtrace_symbols_fd(frames, n, 2);
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
+/* Alternate signal stack so the handler can run even when the main
+ * stack is exhausted (the recursion-driven stack-overflow case). */
+static char weavepy_altstack[SIGSTKSZ > 65536 ? SIGSTKSZ : 65536];
+
 void weavepy_install_crash_handler(void) {
-    signal(SIGSEGV, weavepy_crash_handler);
-    signal(SIGBUS, weavepy_crash_handler);
-    signal(SIGABRT, weavepy_crash_handler);
-    signal(SIGILL, weavepy_crash_handler);
+    stack_t ss;
+    memset(&ss, 0, sizeof(ss));
+    ss.ss_sp = weavepy_altstack;
+    ss.ss_size = sizeof(weavepy_altstack);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = weavepy_crash_handler_si;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
 }
 
 #else /* _WIN32 */
@@ -118,6 +185,7 @@ extern int _WeavePy_Arg_Bool(PyObject *arg, int *dest);
 extern PyObject *_WeavePy_Kwargs_Pop(PyObject *kwargs, const char *key);
 extern int _WeavePy_Kwargs_Len(PyObject *kwargs);
 extern const char *_WeavePy_Kwargs_KeyAt(PyObject *kwargs, int i);
+extern void _WeavePy_Arg_Tether(PyObject *owner, PyObject *arg);
 
 extern PyObject *_WeavePy_Build_None(void);
 extern PyObject *_WeavePy_Build_FromI64(long long v);
@@ -176,11 +244,28 @@ static PyObject *fetch_arg(PyObject *args, int index) {
     return _WeavePy_Arg_Item(args, index);
 }
 
+/* Nested-sequence group support (CPython `converttuple`). Forward-
+ * declared here because `parse_one` and `parse_group` are mutually
+ * recursive (a group element may itself be a group). */
+static int parse_group(fmt_state *st, PyObject *arg, va_list *ap);
+static int count_group_units(const char *p);
+
 /* Convert a single format unit into the va_arg destination(s).
  * Returns 0 on success, -1 on failure (with an exception set). */
 static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
     char unit = *st->fmt;
     if (unit == 0) return -1;
+
+    /* A `(...)` group binds to *one* argument that must itself be a
+     * sequence; its units are unpacked against that sequence's items
+     * (CPython `converttuple`). Extensions lean on this heavily —
+     * numpy's `array_setstate` parses its pickle state with
+     * `"(iO!O!iO):__setstate__"`, so without group support every
+     * ndarray (hence Index/Series/DataFrame) failed to unpickle with
+     * "function requires more arguments than were given". */
+    if (unit == '(') {
+        return parse_group(st, arg, ap);
+    }
 
     /* The 's#'/'y#'/'z#' family takes both a buffer pointer and a length. */
     bool has_len_flag = (st->fmt[1] == '#');
@@ -208,6 +293,14 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
             st->fmt++;
             return 0;
         }
+        case 'H': {
+            unsigned short *dest = va_arg(*ap, unsigned short *);
+            long long tmp = 0;
+            if (_WeavePy_Arg_Long(arg, &tmp) != 0) return -1;
+            *dest = (unsigned short)tmp;
+            st->fmt++;
+            return 0;
+        }
         case 'b': case 'B': {
             unsigned char *dest = va_arg(*ap, unsigned char *);
             int tmp = 0;
@@ -221,6 +314,22 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
             long long tmp = 0;
             if (_WeavePy_Arg_Long(arg, &tmp) != 0) return -1;
             *dest = (long)tmp;
+            st->fmt++;
+            return 0;
+        }
+        case 'k': {
+            /* unsigned long. numpy's `arraydescr_setstate` parses its
+             * pickle state with `"(iOOOOnnkO)"` — the `k` slot is the
+             * dtype's `flags` word. A missing case here fell through to
+             * `default` WITHOUT consuming the `unsigned long *`, which
+             * desynced the trailing `O` (datetime `metadata`) onto the
+             * flags pointer and left numpy dereferencing an uninitialised
+             * `metadata` — SIGSEGV unpickling any `datetime64`/`timedelta64`
+             * dtype (hence every DatetimeIndex/TimedeltaIndex/Period). */
+            unsigned long *dest = va_arg(*ap, unsigned long *);
+            long long tmp = 0;
+            if (_WeavePy_Arg_Long(arg, &tmp) != 0) return -1;
+            *dest = (unsigned long)tmp;
             st->fmt++;
             return 0;
         }
@@ -327,9 +436,158 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
             return 0;
         }
         default:
-            /* Unknown unit — log and skip the slot. */
+            /* Unknown *conversion* code. Every CPython single-letter
+             * conversion writes through exactly one pointer destination,
+             * so consume one `void *` to keep the `va_list` in sync — a
+             * silent skip here desyncs every later unit and segfaults the
+             * caller (this is exactly how the missing `k` above corrupted
+             * numpy's dtype `__setstate__`). Punctuation (which carries no
+             * va_arg) is filtered out before we reach the switch, so only
+             * alpha codes hit this branch. */
+            if (isalpha((unsigned char)unit)) {
+                (void)va_arg(*ap, void *);
+            }
             st->fmt++;
             return 0;
+    }
+}
+
+/* Count the top-level format units inside a `(...)` group. `p` points
+ * just past the opening `(`; scanning stops at the matching `)` (or a
+ * `:`/`;`/NUL terminator for a malformed format). Nested groups count
+ * as a single unit; only alpha unit-letters (bar the exponent flag
+ * `e`) and `(` groups consume a sequence element. Mirrors the counting
+ * pass of CPython's `converttuple`. */
+static int count_group_units(const char *p) {
+    int level = 0;
+    int n = 0;
+    for (;; p++) {
+        char c = *p;
+        if (c == '\0' || c == ':' || c == ';') {
+            break;
+        }
+        if (c == '(') {
+            if (level == 0) n++;
+            level++;
+            continue;
+        }
+        if (c == ')') {
+            if (level == 0) break;
+            level--;
+            continue;
+        }
+        if (level == 0 && isalpha((unsigned char)c) && c != 'e') {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Parse a `(...)` nested-sequence group. On entry `st->fmt` points at
+ * the `(`. The bound argument must be a sequence whose length equals
+ * the number of top-level units inside the group; each element is then
+ * converted against the corresponding inner unit (recursing through
+ * `parse_one`, so groups nest). Mirrors CPython's `converttuple`. */
+static int parse_group(fmt_state *st, PyObject *arg, va_list *ap) {
+    int n = count_group_units(st->fmt + 1);
+    int len = _WeavePy_Arg_Length(arg);
+    if (len < 0) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "expected a sequence (%d-tuple)", n);
+        PyErr_SetString(PyExc_TypeError, buf);
+        return -1;
+    }
+    if (len != n) {
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "must be sequence of length %d, not %d", n, len);
+        PyErr_SetString(PyExc_TypeError, buf);
+        return -1;
+    }
+    st->fmt++; /* consume '(' */
+    int i = 0;
+    while (*st->fmt && *st->fmt != ')') {
+        char c = *st->fmt;
+        /* Whitespace / commas are cosmetic separators inside a group. */
+        if (c == ' ' || c == '\t' || c == ',') {
+            st->fmt++;
+            continue;
+        }
+        PyObject *elem = fetch_arg(arg, i);
+        if (!elem) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "PyArg_ParseTuple: NULL group element");
+            return -1;
+        }
+        int rc = parse_one(st, elem, ap);
+        if (rc != 0) {
+            Py_DECREF(elem);
+            return -1;
+        }
+        /* An inner `O` unit stored `elem` borrowed (CPython semantics);
+         * transfer the fetch reference to the group sequence's lifetime
+         * instead of dropping it, so the borrow stays valid until the
+         * call's argument objects are released. */
+        _WeavePy_Arg_Tether(arg, elem);
+        i++;
+    }
+    if (*st->fmt == ')') st->fmt++;
+    return 0;
+}
+
+/* Advance `st->fmt` over one format unit *and* consume the matching
+ * number of `va_arg` destination pointers WITHOUT storing anything —
+ * CPython's `skipitem()`. This must run for every optional slot the
+ * caller did not supply, otherwise the `va_list` desynchronises and
+ * every later unit writes through the wrong destination. (pandas'
+ * `ujson_dumps` uses `O|OiOssOOi` and omits `encode_html_chars`; without
+ * this the kw `date_unit='ms'` landed in the `orient` pointer, raising
+ * "Invalid value 'ms' for option 'orient'".)
+ *
+ * Every PyArg parse destination is a pointer (the `#` length slots and
+ * `O&`'s converter are all pointer-sized), so reading each skipped slot
+ * as `void *` is ABI-correct on every supported target. The fmt-cursor
+ * advancement mirrors `parse_one` exactly. */
+static void skip_one(fmt_state *st, va_list *ap) {
+    char unit = *st->fmt;
+    if (unit == 0) return;
+    char modifier = st->fmt[1];
+    switch (unit) {
+        case 'O':
+            if (modifier == '!' || modifier == '&') {
+                (void)va_arg(*ap, void *);
+                (void)va_arg(*ap, void *);
+                st->fmt += 2;
+            } else {
+                (void)va_arg(*ap, void *);
+                st->fmt++;
+            }
+            return;
+        case 's': case 'z': case 'y':
+            (void)va_arg(*ap, void *); /* buffer pointer */
+            if (modifier == '#') {
+                (void)va_arg(*ap, void *); /* length pointer */
+                st->fmt += 2;
+            } else {
+                st->fmt++;
+            }
+            return;
+        case 'i': case 'I': case 'h': case 'H': case 'b': case 'B':
+        case 'l': case 'k': case 'L': case 'q': case 'K': case 'Q':
+        case 'n': case 'f': case 'd': case 'p': case 'U':
+        case 'c': case 'C':
+            (void)va_arg(*ap, void *);
+            st->fmt++;
+            return;
+        default:
+            /* Unknown conversion code: consume one pointer to stay in sync
+             * (see the matching note in `parse_one`). Only alpha codes carry
+             * a va_arg; punctuation is handled by the callers. */
+            if (isalpha((unsigned char)unit)) {
+                (void)va_arg(*ap, void *);
+            }
+            st->fmt++;
+            return;
     }
 }
 
@@ -353,12 +611,31 @@ static int parse_args_from(PyObject *args, const char *fmt, va_list *ap) {
     int n_args = _WeavePy_Arg_Length(args);
     int idx = 0;
     int min_required = 0;
-    /* First pass: count required slots (units before `|`). */
-    for (const char *p = fmt; *p; p++) {
-        if (*p == '|') break;
-        if (*p == ':' || *p == ';') break;
-        if (isalpha((unsigned char)*p)) min_required++;
-        if (*p == '#') min_required--; /* `#` is paired with the previous unit */
+    /* First pass: count required slots (units before `|`). A `(...)`
+     * group is a *single* argument (a nested sequence), so its inner
+     * unit-letters must not be counted individually — otherwise a
+     * format like numpy's `"(iO!O!iO)"` demands 5 args when the caller
+     * legitimately passes 1 (the state tuple). Track paren depth and
+     * count only depth-0 units. */
+    {
+        int level = 0;
+        for (const char *p = fmt; *p; p++) {
+            char c = *p;
+            if (level == 0 && c == '|') break;
+            if (c == ':' || c == ';') break;
+            if (c == '(') {
+                if (level == 0) min_required++;
+                level++;
+                continue;
+            }
+            if (c == ')') {
+                if (level > 0) level--;
+                continue;
+            }
+            if (level > 0) continue;
+            if (isalpha((unsigned char)c)) min_required++;
+            if (c == '#') min_required--; /* `#` is paired with the previous unit */
+        }
     }
     if (n_args < 0 || n_args < min_required) {
         PyErr_SetString(PyExc_TypeError, "function requires more arguments than were given");
@@ -387,8 +664,15 @@ static int parse_args_from(PyObject *args, const char *fmt, va_list *ap) {
             return 0;
         }
         int rc = parse_one(&st, arg, ap);
-        Py_DECREF(arg);
-        if (rc != 0) return 0;
+        if (rc != 0) {
+            Py_DECREF(arg);
+            return 0;
+        }
+        /* An `O`/`U` unit stored `arg` borrowed (CPython semantics);
+         * transfer the fetch reference to the args tuple's lifetime so
+         * the borrow stays valid until the bridge releases the tuple
+         * after the C call returns — exactly CPython's contract. */
+        _WeavePy_Arg_Tether(args, arg);
         idx++;
     }
     return 1;
@@ -471,9 +755,11 @@ static int parse_args_kw_from(PyObject *args, PyObject *kwargs, const char *fmt,
                 PyErr_SetString(PyExc_TypeError, "missing required argument");
                 return 0;
             }
-            /* Consume the format slot without touching the va_list. */
-            st.fmt++;
-            if (*st.fmt == '#') st.fmt++;
+            /* Optional slot not supplied: advance the format AND consume
+             * the matching va_arg destination(s) (CPython's skipitem),
+             * so a later keyword-supplied unit still writes through its
+             * own pointer rather than this skipped slot's. */
+            skip_one(&st, ap);
             slot_idx++;
             continue;
         }
@@ -491,18 +777,37 @@ static int parse_args_kw_from(PyObject *args, PyObject *kwargs, const char *fmt,
             }
         }
         int rc = parse_one(&st, arg, ap);
-        Py_DECREF(arg);
-        if (rc != 0) return 0;
+        if (rc != 0) {
+            Py_DECREF(arg);
+            return 0;
+        }
+        /* Same borrowed-`O` contract as the positional loop: park the
+         * fetch reference on the args tuple (present for both positional
+         * and keyword-sourced values — the bridge frees args and kwargs
+         * together after the call). */
+        _WeavePy_Arg_Tether(args ? args : kwargs, arg);
         slot_idx++;
     }
 
-    /* Detect "unexpected keyword argument". */
+    /* Detect the CPython "invalid keyword argument" TypeError, with its
+     * exact message shape (getargs.c): the function name comes from the
+     * format's ":name" suffix, else "this function". pandas'
+     * `pytest.raises(..., match=...)` tests match on this text
+     * (np.datetime64(..., dtype=...) in test_td_floordiv_invalid_scalar). */
     if (kwargs && n_consumed_kw < kw_remaining) {
         const char *bad = _WeavePy_Kwargs_KeyAt(kwargs, 0);
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-                 "unexpected keyword argument '%s'",
-                 bad ? bad : "?");
+        const char *fname = strchr(fmt, ':');
+        if (fname) fname++;
+        char buf[256];
+        if (fname && *fname) {
+            snprintf(buf, sizeof(buf),
+                     "'%s' is an invalid keyword argument for %s()",
+                     bad ? bad : "?", fname);
+        } else {
+            snprintf(buf, sizeof(buf),
+                     "'%s' is an invalid keyword argument for this function",
+                     bad ? bad : "?");
+        }
         PyErr_SetString(PyExc_TypeError, buf);
         return 0;
     }
@@ -545,7 +850,12 @@ int PyArg_UnpackTuple(PyObject *args, const char *name, Py_ssize_t min,
             va_end(ap);
             return 0;
         }
-        Py_DECREF(item); /* convert the +1 from fetch_arg into a borrowed ref */
+        /* CPython hands out borrowed references backed by the args
+         * tuple. Our fetch may have minted a fresh box the tuple does
+         * not own, so park the fetch reference on the tuple's lifetime
+         * rather than dropping it (a plain DECREF could free the box
+         * while the caller still holds the borrowed pointer). */
+        _WeavePy_Arg_Tether(args, item);
         *dest = item;
     }
     va_end(ap);
@@ -796,6 +1106,164 @@ PyObject *PyTuple_Pack(Py_ssize_t n, ...) {
     free(items);
     va_end(ap);
     return t;
+}
+
+/* --------------------------------------------------------------
+ * PyBytes_FromFormat / PyBytes_FromFormatV.
+ *
+ * Mirrors CPython's `bytesobject.c` grammar exactly (which is NOT
+ * C's printf): supported units are `%%`, `%c`, `%d`, `%u`, `%i`,
+ * `%x`, `%s`, `%p`, with the `l`/`z` length flags on `%d`/`%u`,
+ * a parsed-and-ignored width, and a `%.Ns` precision that truncates
+ * the C string. `%c` range-checks [0; 255] with OverflowError. An
+ * unrecognised unit copies the rest of the format verbatim from the
+ * `%` and stops (so `b"%"` → `b"%"` and `b"x=%i y=%"` → `b"x=2 y=%"`).
+ * `%p` is guaranteed to start `0x` regardless of the platform printf.
+ * -------------------------------------------------------------- */
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} bytes_writer;
+
+static int bw_reserve(bytes_writer *w, size_t extra) {
+    if (w->len + extra <= w->cap) return 0;
+    size_t cap = w->cap ? w->cap * 2 : 64;
+    while (cap < w->len + extra) cap *= 2;
+    char *nb = (char *)realloc(w->buf, cap);
+    if (!nb) return -1;
+    w->buf = nb;
+    w->cap = cap;
+    return 0;
+}
+
+static int bw_write(bytes_writer *w, const char *s, size_t n) {
+    if (bw_reserve(w, n) != 0) return -1;
+    memcpy(w->buf + w->len, s, n);
+    w->len += n;
+    return 0;
+}
+
+PyObject *PyBytes_FromFormatV(const char *format, va_list vargs) {
+    bytes_writer w = {NULL, 0, 0};
+    char buffer[64];
+    const char *f;
+
+    for (f = format; *f; f++) {
+        if (*f != '%') {
+            if (bw_write(&w, f, 1) != 0) goto nomem;
+            continue;
+        }
+        const char *p = f;
+        f++;
+        /* ignore the width (ex: 10 in "%10s") */
+        while (isdigit((unsigned char)*f)) f++;
+        /* parse the precision (ex: 10 in "%.10s") */
+        size_t prec = 0;
+        int has_prec = 0;
+        if (*f == '.') {
+            has_prec = 1;
+            f++;
+            for (; isdigit((unsigned char)*f); f++) {
+                prec = prec * 10 + (size_t)(*f - '0');
+            }
+        }
+        /* length flags, only for the integer units (CPython parity) */
+        int longflag = 0, size_tflag = 0;
+        if (*f == 'l' && (f[1] == 'd' || f[1] == 'u')) { longflag = 1; f++; }
+        else if (*f == 'z' && (f[1] == 'd' || f[1] == 'u')) { size_tflag = 1; f++; }
+
+        switch (*f) {
+        case '%':
+            if (bw_write(&w, "%", 1) != 0) goto nomem;
+            break;
+        case 'c': {
+            int c = va_arg(vargs, int);
+            if (c < 0 || c > 255) {
+                PyErr_SetString(PyExc_OverflowError,
+                                "PyBytes_FromFormat(): %c format "
+                                "expected an integer in range [0; 255]");
+                goto error;
+            }
+            buffer[0] = (char)(unsigned char)c;
+            if (bw_write(&w, buffer, 1) != 0) goto nomem;
+            break;
+        }
+        case 'd': {
+            int n;
+            if (longflag) n = snprintf(buffer, sizeof(buffer), "%ld", va_arg(vargs, long));
+            else if (size_tflag) n = snprintf(buffer, sizeof(buffer), "%zd", va_arg(vargs, Py_ssize_t));
+            else n = snprintf(buffer, sizeof(buffer), "%d", va_arg(vargs, int));
+            if (n > 0 && bw_write(&w, buffer, (size_t)n) != 0) goto nomem;
+            break;
+        }
+        case 'u': {
+            int n;
+            if (longflag) n = snprintf(buffer, sizeof(buffer), "%lu", va_arg(vargs, unsigned long));
+            else if (size_tflag) n = snprintf(buffer, sizeof(buffer), "%zu", va_arg(vargs, size_t));
+            else n = snprintf(buffer, sizeof(buffer), "%u", va_arg(vargs, unsigned int));
+            if (n > 0 && bw_write(&w, buffer, (size_t)n) != 0) goto nomem;
+            break;
+        }
+        case 'i': {
+            int n = snprintf(buffer, sizeof(buffer), "%i", va_arg(vargs, int));
+            if (n > 0 && bw_write(&w, buffer, (size_t)n) != 0) goto nomem;
+            break;
+        }
+        case 'x': {
+            int n = snprintf(buffer, sizeof(buffer), "%x", va_arg(vargs, int));
+            if (n > 0 && bw_write(&w, buffer, (size_t)n) != 0) goto nomem;
+            break;
+        }
+        case 's': {
+            const char *s = va_arg(vargs, const char *);
+            size_t n = strlen(s ? s : "");
+            if (has_prec && n > prec) n = prec;
+            if (s && bw_write(&w, s, n) != 0) goto nomem;
+            break;
+        }
+        case 'p': {
+            int n = snprintf(buffer, sizeof(buffer), "%p", va_arg(vargs, void *));
+            if (n <= 0) break;
+            /* CPython guarantees a leading "0x" whatever the libc does. */
+            if (buffer[1] == 'X') {
+                buffer[1] = 'x';
+            }
+            else if (buffer[1] != 'x') {
+                memmove(buffer + 2, buffer, (size_t)n);
+                buffer[0] = '0';
+                buffer[1] = 'x';
+                n += 2;
+            }
+            if (bw_write(&w, buffer, (size_t)n) != 0) goto nomem;
+            break;
+        }
+        default: {
+            /* Invalid format unit: copy the rest verbatim and stop. */
+            size_t n = strlen(p);
+            if (bw_write(&w, p, n) != 0) goto nomem;
+            goto done;
+        }
+        }
+    }
+done:;
+    PyObject *result = _WeavePy_Build_FromBytesAndSize(w.buf ? w.buf : "", (Py_ssize_t)w.len);
+    free(w.buf);
+    return result;
+nomem:
+    PyErr_SetString(PyExc_MemoryError, "PyBytes_FromFormat(): out of memory");
+error:
+    free(w.buf);
+    return NULL;
+}
+
+PyObject *PyBytes_FromFormat(const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    PyObject *r = PyBytes_FromFormatV(format, ap);
+    va_end(ap);
+    return r;
 }
 
 /* --------------------------------------------------------------

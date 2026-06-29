@@ -413,6 +413,14 @@ pub struct PyFrame {
     /// dispatcher fires an `'opcode'` event before every instruction
     /// (used by `bdb`/`pdb` instruction stepping). Defaults to `false`.
     pub trace_opcodes: Cell<bool>,
+    /// Count of live activations of this frame across *all*
+    /// interpreter call stacks. Incremented on push, decremented on
+    /// pop. `frame.clear()` consults it so a frame executing on a
+    /// different OS thread (its `Rc` handed across via a traceback,
+    /// `sys._current_frames()`, …) is refused like CPython's
+    /// "cannot clear an executing frame" — the caller's own
+    /// `frame_stack` can't see other threads' activations.
+    pub on_stack: Cell<u32>,
 }
 
 impl fmt::Debug for PyFrame {
@@ -423,6 +431,30 @@ impl fmt::Debug for PyFrame {
             self.code.name,
             self.current_lineno()
         )
+    }
+}
+
+impl Drop for PyFrame {
+    fn drop(&mut self) {
+        // Iteratively tear down the `back` chain. A plain recursive drop
+        // would drop this frame's `back` Arc, whose own drop drops the
+        // *next* frame's `back`, and so on — one native stack frame per
+        // link. A deep traceback that pins the whole call chain (e.g. a
+        // `RecursionError` raised ~1000 frames down) then overflows the
+        // native stack and `abort()`s the process the moment the
+        // exception is finally released. Walking the list here keeps
+        // teardown O(depth) in heap but O(1) in native stack: each frame
+        // we unwrap has its own `back` detached *before* it falls out of
+        // scope, so its Drop sees an empty chain and never recurses.
+        let mut link = self.back.borrow_mut().take();
+        while let Some(frame) = link {
+            match Rc::try_unwrap(frame) {
+                Ok(inner) => link = inner.back.borrow_mut().take(),
+                // Still referenced elsewhere (an alive generator frame, a
+                // retained `f_back`): that owner keeps the tail alive.
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -541,6 +573,22 @@ pub struct PyTraceback {
     pub lineno: u32,
     pub lasti: u32,
     pub next: RefCell<Option<Rc<PyTraceback>>>,
+}
+
+impl Drop for PyTraceback {
+    fn drop(&mut self) {
+        // Same unbounded-recursion hazard as `PyFrame::drop`: a traceback
+        // is a `tb_next` linked list one node per stack level, so a
+        // ~1000-deep traceback (a `RecursionError`) would drop recursively
+        // and overflow the native stack. Tear the chain down iteratively.
+        let mut link = self.next.borrow_mut().take();
+        while let Some(tb) = link {
+            match Rc::try_unwrap(tb) {
+                Ok(inner) => link = inner.next.borrow_mut().take(),
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 // ---- bytearray buffer-export accounting ----
@@ -1120,7 +1168,7 @@ impl MethodWrapper {
                     crate::builtins::code_docstring(&code).unwrap_or(Object::None)
                 });
                 let annotations = pinned("__annotations__", &|| {
-                    Object::Dict(Rc::new(RefCell::new(DictData::new())))
+                    Object::Dict(Rc::new(RefCell::new(DictData::default())))
                 });
                 [
                     ("__module__", module),
@@ -1136,7 +1184,7 @@ impl MethodWrapper {
             // Builtin callables: no seeding. (Also load-bearing: these
             // wrappers are built *during* `builtin_types()` init, so
             // this arm must not call back into the type registry.)
-            Object::Builtin(_) => DictData::new(),
+            Object::Builtin(_) => DictData::default(),
             // Non-function callables only carry the attributes they
             // actually have; for builtin singletons/values that is just
             // the type docstring (`staticmethod(None).__dict__` ==
@@ -1150,7 +1198,7 @@ impl MethodWrapper {
                     )]
                     .into_iter()
                     .collect(),
-                    _ => DictData::new(),
+                    _ => DictData::default(),
                 }
             }
         }
@@ -1239,7 +1287,8 @@ pub struct SlotDescriptor {
 }
 
 /// Ordered set backing for [`Object::Set`] and [`Object::FrozenSet`].
-pub type SetData = indexmap::IndexSet<DictKey>;
+/// Fast-hashed for the same reason as [`DictData`].
+pub type SetData = indexmap::IndexSet<DictKey, crate::fasthash::FxBuildHasher>;
 
 /// Backing object for [`Object::FrozenSet`]: the element storage plus a
 /// lazily-computed hash cache.
@@ -1336,6 +1385,25 @@ pub fn int_from_i128(v: i128) -> Object {
         Ok(x) => Object::Int(x),
         Err(_) => Object::Long(Rc::new(num_bigint::BigInt::from(v))),
     }
+}
+
+/// Number of elements a `range` yields, as an `i128` (never negative;
+/// `0` for an empty or zero-step range). Mirrors CPython's
+/// `compute_range_length` and is shared by `range` equality *and*
+/// hashing so the two always agree (`hash` must match `==`).
+pub(crate) fn range_len_i128(r: &Range) -> i128 {
+    let span = if r.step > 0 {
+        (r.stop - r.start).max(0)
+    } else if r.step < 0 {
+        (r.start - r.stop).max(0)
+    } else {
+        return 0;
+    };
+    if span == 0 {
+        return 0;
+    }
+    let step = r.step.unsigned_abs() as i128;
+    (span + step - 1) / step
 }
 
 /// Run any tripped Python signal handler on the main thread, mirroring
@@ -1575,6 +1643,78 @@ impl fmt::Debug for PyModule {
 #[derive(Clone, Debug)]
 pub struct DictKey(pub Object);
 
+/// Zero-allocation probe key for `str`-keyed [`DictData`] lookups.
+///
+/// `map.get(&StrKey(name))` replaces the historic
+/// `map.get(&crate::object::StrKey(name))`, which heap-allocated a
+/// fresh `Rc<str>` *per probe* — measurable on every attribute/global
+/// lookup. Hash must mirror [`DictKey`]'s exactly for `Object::Str`
+/// (the canonical Python hash fed to the table hasher), so a probe
+/// lands in the same bucket as the stored key.
+///
+/// Equality is *faithful* to [`DictKey`]'s: the overwhelmingly common
+/// stored plain `Object::Str` compares natively (pure, never re-enters
+/// Python), and only a hash-colliding exotic stored key (a `str`
+/// subclass instance, a hash-mimicking object) falls back to the full
+/// `DictKey` comparison — allocating the temporary `Object::Str` and
+/// possibly dispatching Python `__eq__`, exactly as the old probe did.
+/// Callers holding sensitive borrows across a probe can consult
+/// [`exotic_str_keys_possible`] to know whether the re-entrant branch
+/// is reachable for class dicts.
+#[derive(Debug, Clone, Copy)]
+pub struct StrKey<'a>(pub &'a str);
+
+impl Hash for StrKey<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Bit-for-bit the `DictKey` hash of `Object::Str(self.0)`.
+        py_str_hash(self.0).hash(state);
+    }
+}
+
+impl indexmap::Equivalent<DictKey> for StrKey<'_> {
+    #[inline]
+    fn equivalent(&self, key: &DictKey) -> bool {
+        match &key.0 {
+            Object::Str(s) => &**s == self.0,
+            // A `WStr` always carries a lone surrogate (module invariant),
+            // so it can never equal a valid `&str`.
+            Object::WStr(_) => false,
+            // Exotic stored key sharing the bucket: defer to the full
+            // `DictKey` comparison (identity, native value, Python
+            // `__eq__`). Rare enough that the temporary allocation is
+            // irrelevant.
+            _ => DictKey(Object::from_str(self.0)) == *key,
+        }
+    }
+}
+
+/// Count of "exotic" keys ever inserted into a *class* dict: any key
+/// that is not a plain `Object::Str`. While zero (every real-world
+/// program), `TypeObject::lookup`'s native [`StrKey`] walk is
+/// authoritative and the Python-`__eq__` fallback probe is skipped
+/// entirely. Bumped by the class-creation seams that can accept an
+/// arbitrary mapping namespace (`type(name, bases, ns)`, class bodies
+/// with computed keys); monotone, never reset.
+static EXOTIC_CLASS_KEYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Record that `key` is entering a class dict; bumps the global exotic
+/// counter when it is not a plain interned-string key.
+#[inline]
+pub fn note_class_dict_key(key: &DictKey) {
+    if !matches!(key.0, Object::Str(_)) {
+        EXOTIC_CLASS_KEYS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// True once any class dict anywhere has held a non-`str` key, i.e.
+/// the moment `StrKey`-only MRO walks stop being authoritative for
+/// misses.
+#[inline]
+pub fn exotic_str_keys_possible() -> bool {
+    EXOTIC_CLASS_KEYS.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
 /// Reach for the running interpreter to compute a user instance's Python
 /// `__hash__`. `DictKey`'s `Hash`/`Eq` impls have no interpreter handle, so
 /// they borrow the thread's published interpreter pointer — the same bridge
@@ -1633,9 +1773,31 @@ pub(crate) fn instance_has_custom_dunder(obj: &Object, name: &str) -> bool {
         // value-wrapping subclasses (`class C(int)`, struct sequences)
         // keep their native structural comparison via `native`.
         Some((_, owner)) => {
-            inst.native.is_none()
+            inst.native.get().is_none()
                 && !Rc::ptr_eq(&owner, &crate::builtin_types::builtin_types().object_)
         }
+    }
+}
+
+/// True when a `set`/`dict` key needs Python-level `__eq__` dispatch rather
+/// than the native [`Object::eq_value`] fast path: a foreign extension
+/// scalar (numpy `int64`/`float64`/…), a user instance with a custom
+/// `__eq__`, or a *hashable container* (`tuple`/`frozenset`) that
+/// transitively holds one. `eq_value` compares only native pairs, so it
+/// returns `false` for two distinct foreign scalars even when numpy's
+/// `tp_richcompare` deems them equal; a `tuple` such as
+/// `(np.int64(0), np.int64(1))` therefore never matched an equal stored key
+/// (its hash *does* match — see [`DictKey::hash`]). That silently broke
+/// `pd.IntervalIndex` uniqueness/dedup: `is_unique` keys `(left, right)`
+/// numpy-scalar pairs in a `set`, and `intersection`/`_is_strictly_
+/// monotonic_increasing` build on it. Recursion is bounded because only
+/// immutable, bottom-up-built containers are hashable enough to be keys.
+pub(crate) fn key_needs_interp_eq(obj: &Object) -> bool {
+    match obj {
+        Object::Foreign(_) => true,
+        Object::Tuple(items) => items.iter().any(key_needs_interp_eq),
+        Object::FrozenSet(s) => s.iter().any(|k| key_needs_interp_eq(&k.0)),
+        _ => instance_has_custom_dunder(obj, "__eq__"),
     }
 }
 
@@ -1658,7 +1820,29 @@ pub(crate) fn member_eq(a: &Object, b: &Object) -> Result<bool, RuntimeError> {
     if a.is_same(b) {
         return Ok(true);
     }
-    if instance_has_custom_dunder(a, "__eq__") || instance_has_custom_dunder(b, "__eq__") {
+    // Dispatch the full Python comparison whenever an operand can carry
+    // custom `__eq__` semantics: a pure-Python instance with a user dunder,
+    // OR a foreign (C-extension) object whose `tp_richcompare` the native
+    // `eq_value` fast path cannot see. Without the foreign case, `dtype in
+    // (a, b)` / `[dtype].count(other)` compare a numpy dtype/scalar against a
+    // primitive via `eq_value` (always unequal) even though `dtype == "int8"`
+    // is `True` through the reflected richcompare. A matching *container*
+    // pair can carry such an element at any depth (`[(1, Timestamp), …]
+    // .index((1, Timestamp))` in pandas' `test_factorize`), so a
+    // container-vs-container pair dispatches too — `deep_equal_collection`
+    // recurses per element through the interpreter.
+    fn deep_dispatch(o: &Object) -> bool {
+        matches!(
+            o,
+            Object::Tuple(_) | Object::List(_) | Object::Dict(_) | Object::Slice(_)
+        )
+    }
+    if instance_has_custom_dunder(a, "__eq__")
+        || instance_has_custom_dunder(b, "__eq__")
+        || matches!(a, Object::Foreign(_))
+        || matches!(b, Object::Foreign(_))
+        || (deep_dispatch(a) && deep_dispatch(b))
+    {
         if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
             // SAFETY: see `current_interp_eq`.
             let interp = unsafe { &mut *ptr };
@@ -1747,9 +1931,18 @@ impl PartialEq for DictKey {
         // so a class defining `__eq__`/`__hash__` works as a `set`/`dict`
         // key. Plain instances (no custom `__eq__`) keep identity semantics,
         // already decided by the `eq_value` fast path above.
-        if instance_has_custom_dunder(&self.0, "__eq__")
-            || instance_has_custom_dunder(&other.0, "__eq__")
-        {
+        //
+        // A foreign extension scalar (numpy `int64`/…) compares to the equal
+        // Python scalar only through its `tp_richcompare` — `eq_value` above
+        // knows only native pairs — so route it through the interpreter too.
+        // With the shared `tp_hash` (see `py_hash_value`) this is what lets
+        // `d[np.int64(0)]` find the `0` key (numpy's `np.roll` shifts dict).
+        // The same holds for a `tuple`/`frozenset` *containing* such a scalar
+        // (`key_needs_interp_eq` recurses): a native element-wise `eq_value`
+        // can't equate two distinct numpy scalars, so the whole container is
+        // compared via Python `==` (`pd.IntervalIndex` dedup keys `(left,
+        // right)` numpy pairs in a `set`).
+        if key_needs_interp_eq(&self.0) || key_needs_interp_eq(&other.0) {
             if let Some(eq) = current_interp_eq(&self.0, &other.0) {
                 return eq;
             }
@@ -1817,7 +2010,15 @@ impl Hash for DictKey {
     }
 }
 
-pub type DictData = indexmap::IndexMap<DictKey, Object>;
+/// Backing store of every Python dict / instance `__dict__` / class dict.
+///
+/// Keyed by the *Python* hash ([`DictKey`]'s `Hash` feeds the canonical
+/// `py_hash_value` into the table hasher), so the table hasher itself only
+/// ever sees one pre-mixed 64-bit word — [`crate::fasthash::FxBuildHasher`]
+/// (one multiply) instead of SipHash, which profiled as a top-ten CPU
+/// consumer under pandas. Not attacker-relevant: collision resistance
+/// comes from the Python-level hash, exactly as in CPython's own tables.
+pub type DictData = indexmap::IndexMap<DictKey, Object, crate::fasthash::FxBuildHasher>;
 
 #[derive(Clone)]
 pub struct PyFunction {
@@ -1876,7 +2077,7 @@ impl PyFunction {
     pub fn slot(&self, name: &str) -> Option<Object> {
         self.slots
             .borrow()
-            .get(&DictKey(Object::from_str(name)))
+            .get(&crate::object::StrKey(name))
             .cloned()
     }
 
@@ -3057,7 +3258,7 @@ impl PyFile {
     }
 
     /// The error-handler name to feed the codec layer (`"strict"` default).
-    fn errors_name(&self) -> String {
+    pub(crate) fn errors_name(&self) -> String {
         self.errors
             .borrow()
             .clone()
@@ -3072,6 +3273,14 @@ impl PyFile {
         match self.newline.borrow().as_deref() {
             Some("\r") => s.replace('\n', "\r"),
             Some("\r\n") => s.replace('\n', "\r\n"),
+            // `StringIO(newline=None)` translates *on write* (CPython's
+            // `_io.StringIO.write` drives the incremental newline decoder over
+            // the incoming text), so the buffer — and thus `getvalue()` —
+            // holds the collapsed form. Byte-backed text files translate on
+            // *read* instead (`translate_newlines_read`).
+            None if self.io_kind.get() == IoKind::StringIO && s.as_bytes().contains(&b'\r') => {
+                s.replace("\r\n", "\n").replace('\r', "\n")
+            }
             _ => s.to_owned(),
         }
     }
@@ -3173,13 +3382,37 @@ impl PyFile {
     /// Decode a text-mode read through the file's codec, honouring the
     /// configured `errors=` handler and universal-newline translation.
     pub fn decode_text(&self, bytes: Vec<u8>) -> Result<String, RuntimeError> {
+        // `surrogateescape`/`surrogatepass` can decode to *lone surrogates*,
+        // which a Rust `String` cannot hold — route those through the
+        // Object-producing decoder and bridge surrogates into the PUA window
+        // (the same scheme `StringIO` uses); `stream_text_object` un-bridges
+        // on the way out.
+        fn decode_or_bridge(bytes: &[u8], enc: &str, errors: &str) -> Result<String, RuntimeError> {
+            if matches!(errors, "surrogateescape" | "surrogatepass") {
+                let obj = crate::stdlib::codecs_mod::decode_bytes_obj(bytes, enc, errors)?;
+                return crate::builtins::bridge_str_of(&obj)
+                    .ok_or_else(|| value_error("codec did not return a str"));
+            }
+            crate::stdlib::codecs_mod::decode_bytes(bytes, enc, errors)
+        }
         let errors = self.errors_name();
         let decoded = match &*self.encoding.borrow() {
-            Some(enc) => crate::stdlib::codecs_mod::decode_bytes(&bytes, enc, &errors)?,
+            Some(enc) => decode_or_bridge(&bytes, enc, &errors)?,
             None if errors == "strict" => {
-                String::from_utf8(bytes).map_err(|e| value_error(e.to_string()))?
+                // Fast, zero-copy path for the overwhelmingly common valid-UTF-8
+                // case; on malformed input fall back to the codec so the failure
+                // surfaces as a CPython-faithful `UnicodeDecodeError` ("'utf-8'
+                // codec can't decode byte …") rather than a Rust `Utf8Error`
+                // string wrapped in a bare `ValueError` — pandas' `read_csv`/
+                // `read_json` (GH39450) match on the former.
+                match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::stdlib::codecs_mod::decode_bytes(&e.into_bytes(), "utf-8", &errors)?
+                    }
+                }
             }
-            None => crate::stdlib::codecs_mod::decode_bytes(&bytes, "utf-8", &errors)?,
+            None => decode_or_bridge(&bytes, "utf-8", &errors)?,
         };
         Ok(self.translate_newlines_read(decoded))
     }
@@ -3193,8 +3426,22 @@ impl PyFile {
     /// boundary — `open(p, encoding="utf-8").read(2)` over "héllo" yields "hé",
     /// not a half-decoded 2-byte slice that raises a UTF-8 error.
     pub fn read_text_n(&self, n: usize) -> Result<String, RuntimeError> {
-        if matches!(&*self.backend.borrow(), FileBackend::MemText { .. }) {
-            let bytes = self.read_bytes(Some(n))?;
+        let mem_text_bytes = {
+            if let FileBackend::MemText { data, pos } = &mut *self.backend.borrow_mut() {
+                // `pos` is a byte offset into valid UTF-8; advance it by `n`
+                // whole characters so a multibyte char is never split
+                // (`StringIO("h\u00e9llo").read(2)` == "h\u00e9"). The raw
+                // `read_bytes` path deliberately counts *bytes*, not chars.
+                let s = &data[*pos..];
+                let end_rel = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
+                let out = s.as_bytes()[..end_rel].to_vec();
+                *pos += end_rel;
+                Some(out)
+            } else {
+                None
+            }
+        };
+        if let Some(bytes) = mem_text_bytes {
             return self.decode_text(bytes);
         }
         let mut bytes: Vec<u8> = Vec::new();
@@ -3274,7 +3521,16 @@ impl PyFile {
         // skip the `codecs.lookup` probe entirely and pin the fast path.
         let decided = match &*self.encoding.borrow() {
             None => false,
-            Some(enc) => crate::stdlib::codecs_mod::codec_one_shot_decode_is_none(enc),
+            Some(enc) => {
+                // Two reasons a byte-backed text stream must use the incremental
+                // decoder: (1) a custom incremental-only codec whose one-shot
+                // `decode` is `None`, and (2) a "newline-unsafe" codec
+                // (UTF-16/32) where the encoded newline spans multiple bytes, so
+                // line boundaries can only be found in *decoded* text — CPython's
+                // `TextIOWrapper` always drives the incremental decoder for these.
+                crate::stdlib::codecs_mod::codec_one_shot_decode_is_none(enc)
+                    || crate::stdlib::codecs_mod::codec_is_newline_unsafe(enc)
+            }
         };
         self.text_incr_gate.set(Some(decided));
         decided
@@ -3342,6 +3598,35 @@ impl PyFile {
         let chars: String = t.decoded[offset..end].iter().collect();
         t.decoded_used = end;
         chars
+    }
+
+    /// `_rewind_decoded_chars(n)` — push `n` already-handed-out characters back
+    /// into the decoded buffer (used by `readline` to un-consume the tail past
+    /// the line ending). Saturates rather than panicking on an out-of-range `n`.
+    fn text_rewind_decoded_chars(&self, n: usize) {
+        if let Some(t) = self.text_incr.borrow_mut().as_mut() {
+            t.decoded_used = t.decoded_used.saturating_sub(n);
+        }
+    }
+
+    /// Whether the current decoded-char buffer is empty (mirrors CPython's
+    /// `if self._decoded_chars:` truthiness test on the whole buffer).
+    fn text_decoded_is_empty(&self) -> bool {
+        self.text_incr
+            .borrow()
+            .as_ref()
+            .map(|t| t.decoded.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// `_set_decoded_chars('')` + `_snapshot = None` — the EOF reset performed
+    /// by `read`/`readline` when the stream is exhausted.
+    fn text_set_decoded_empty(&self) {
+        if let Some(t) = self.text_incr.borrow_mut().as_mut() {
+            t.decoded.clear();
+            t.decoded_used = 0;
+            t.snapshot = None;
+        }
     }
 
     /// `_read_chunk` — read and decode the next raw chunk, replacing the
@@ -3426,6 +3711,107 @@ impl PyFile {
                 Ok(result)
             }
         }
+    }
+
+    /// `TextIOWrapper.readline(size)` over the incremental decoder — a faithful
+    /// port of `_pyio.TextIOWrapper.readline`. The crucial difference from the
+    /// fast [`read_line_bytes`](Self::read_line_bytes) path is that the line
+    /// boundary is located in the *decoded* character buffer, never in raw
+    /// bytes, so it is correct for the newline-unsafe UTF-16/UTF-32 codecs
+    /// whose encoded newline occupies several bytes (and where a `0x0A`/`0x0D`
+    /// byte can appear inside an unrelated code unit). `size` is `None` for
+    /// "no cap", `Some(n)` to stop after `n` characters.
+    pub fn readline_text_incr(&self, size: Option<usize>) -> Result<String, RuntimeError> {
+        self.ensure_text_decoder()?;
+        // Newline policy, mirroring `_pyio`'s `_readtranslate`/`_readuniversal`/
+        // `_readnl` derived from the `newline=` argument.
+        let newline = self.newline.borrow().clone();
+        let readtranslate = newline.is_none();
+        let readuniversal = matches!(newline.as_deref(), None | Some(""));
+        let readnl: Vec<char> = newline.as_deref().unwrap_or("").chars().collect();
+
+        // Grab all currently-decoded text (any extra past the line end is
+        // rewound below).
+        let mut line: Vec<char> = self.text_get_decoded_chars(None).chars().collect();
+        let mut start = 0usize;
+        let endpos: usize;
+        loop {
+            let mut found: Option<usize> = None;
+            if readtranslate {
+                // Newlines already translated to `\n` by the newline decoder.
+                if let Some(rel) = line[start..].iter().position(|&c| c == '\n') {
+                    found = Some(start + rel + 1);
+                } else {
+                    start = line.len();
+                }
+            } else if readuniversal {
+                // Search for any of `\r`, `\r\n`, `\n`; the newline decoder
+                // guarantees a `\r\n` pair is never split across chunks.
+                let nlpos = line[start..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map(|p| start + p);
+                let crpos = line[start..]
+                    .iter()
+                    .position(|&c| c == '\r')
+                    .map(|p| start + p);
+                match (crpos, nlpos) {
+                    (None, None) => start = line.len(),
+                    (None, Some(nl)) => found = Some(nl + 1),
+                    (Some(cr), None) => found = Some(cr + 1),
+                    (Some(cr), Some(nl)) if nl < cr => found = Some(nl + 1),
+                    (Some(cr), Some(nl)) if nl == cr + 1 => found = Some(cr + 2),
+                    (Some(cr), Some(_)) => found = Some(cr + 1),
+                }
+            } else if !readnl.is_empty() {
+                // Non-universal: an exact line-terminator string.
+                if let Some(pos) = line
+                    .windows(readnl.len())
+                    .position(|w| w == readnl.as_slice())
+                {
+                    found = Some(pos + readnl.len());
+                }
+            }
+            if let Some(e) = found {
+                endpos = e;
+                break;
+            }
+            if let Some(sz) = size {
+                if line.len() >= sz {
+                    endpos = sz;
+                    break;
+                }
+            }
+            // No line ending seen yet — pull the next decoded chunk(s).
+            let mut have = false;
+            while self.text_read_chunk()? {
+                if !self.text_decoded_is_empty() {
+                    have = true;
+                    break;
+                }
+            }
+            if !have {
+                // A final-flush chunk at EOF can still yield decoded chars.
+                have = !self.text_decoded_is_empty();
+            }
+            if have {
+                let more = self.text_get_decoded_chars(None);
+                line.extend(more.chars());
+            } else {
+                // End of file.
+                self.text_set_decoded_empty();
+                return Ok(line.into_iter().collect());
+            }
+        }
+        let mut endpos = endpos;
+        if let Some(sz) = size {
+            if endpos > sz {
+                endpos = sz;
+            }
+        }
+        // Rewind the decoded buffer to just past the line ending we returned.
+        self.text_rewind_decoded_chars(line.len() - endpos);
+        Ok(line[..endpos].iter().collect())
     }
 
     /// `TextIOWrapper.tell()` over the incremental decoder — packs the opaque
@@ -3822,18 +4208,17 @@ impl PyFile {
                 }
             }
             (FileBackend::MemText { data, pos }, Some(n)) => {
+                // Raw *byte* semantics — callers that need character counts
+                // (`read_text_n`) handle MemText themselves. Line iteration
+                // (`read_line_bytes`) probes one byte at a time and would
+                // drop trailing bytes of a multibyte char if this grouped by
+                // character.
                 let bytes = data.as_bytes();
-                let mut end = *pos;
-                let mut taken = 0;
-                while taken < n && end < bytes.len() {
-                    let ch_len = u32::from(bytes[end]).leading_ones().max(1) as usize;
-                    let ch_len = if bytes[end] < 0x80 { 1 } else { ch_len };
-                    let stop = (end + ch_len).min(bytes.len());
-                    buf.extend_from_slice(&bytes[end..stop]);
-                    end = stop;
-                    taken += 1;
+                if *pos < bytes.len() {
+                    let end = (*pos + n).min(bytes.len());
+                    buf.extend_from_slice(&bytes[*pos..end]);
+                    *pos = end;
                 }
-                *pos = end;
             }
             (FileBackend::Stdout(_) | FileBackend::Stderr(_), _) => {
                 return Err(os_error("not readable"));
@@ -3992,6 +4377,18 @@ impl PyFile {
     }
 
     pub fn readline_obj(&self) -> Result<Option<Object>, RuntimeError> {
+        // Native file iteration (`for line in f`) must honour the same
+        // incremental-decoder gate as explicit `readline()`, or a UTF-16/32
+        // stream would be byte-scanned for newlines and mis-decoded (this is
+        // the path the CSV parser and `readlines()` iterate through).
+        if !self.binary && self.text_incr_active_gate() {
+            let line = self.readline_text_incr(None)?;
+            return Ok(if line.is_empty() {
+                None
+            } else {
+                Some(Object::from_str(line))
+            });
+        }
         let out = self.read_line_bytes(None)?;
         if out.is_empty() {
             return Ok(None);
@@ -3999,7 +4396,11 @@ impl PyFile {
         if self.binary {
             Ok(Some(Object::new_bytes(out)))
         } else {
-            Ok(Some(Object::from_str(self.decode_text(out)?)))
+            // Un-bridge PUA-window code points back to lone surrogates
+            // (StringIO buffers and surrogate-producing error handlers).
+            Ok(Some(crate::builtins::bridge_to_object(
+                &self.decode_text(out)?,
+            )))
         }
     }
 
@@ -5218,7 +5619,8 @@ impl Object {
             Object::Int(i) => *i != 0,
             Object::Long(b) => !b.is_zero(),
             Object::Complex(c) => c.real != 0.0 || c.imag != 0.0,
-            Object::Float(f) => *f != 0.0 && !f.is_nan(),
+            // IEEE 754: NaN != 0.0, so NaN is truthy (CPython agrees).
+            Object::Float(f) => *f != 0.0,
             Object::Str(s) => !s.is_empty(),
             // A `WStr` always holds >= 1 code point (the surrogate), so it is
             // never the empty string and is always truthy.
@@ -5273,7 +5675,7 @@ impl Object {
                 // wrapped value unless the class overrides __bool__/__len__.
                 if inst.cls().lookup("__bool__").is_none() && inst.cls().lookup("__len__").is_none()
                 {
-                    if let Some(native) = &inst.native {
+                    if let Some(native) = inst.native.get() {
                         return native.is_truthy();
                     }
                 }
@@ -5308,8 +5710,15 @@ impl Object {
             // identity. A future RFC may intern the small-int range
             // explicitly.
             (Object::Complex(a), Object::Complex(b)) => {
+                // Bit-equality as an identity proxy is safe only for non-NaN
+                // parts: a NaN-bearing complex is observable through the
+                // `a is b or a == b` container rule (`==` is False), so two
+                // distinct allocations must stay distinct — Rc identity only,
+                // exactly like CPython's pointer identity.
                 Rc::ptr_eq(a, b)
-                    || (a.real.to_bits() == b.real.to_bits()
+                    || (!a.real.is_nan()
+                        && !a.imag.is_nan()
+                        && a.real.to_bits() == b.real.to_bits()
                         && a.imag.to_bits() == b.imag.to_bits())
             }
             (Object::Float(a), Object::Float(b)) => a.to_bits() == b.to_bits(),
@@ -5527,6 +5936,30 @@ impl Object {
             (Object::DictView(a), Object::DictView(b)) => {
                 Rc::ptr_eq(a, b) || dict_view_set_eq(a, b)
             }
+            // `range` compares by the *sequence it generates*, not the raw
+            // `(start, stop, step)` triple (CPython `range_equals`): equal
+            // iff the lengths match, and — when non-empty — the starts match,
+            // and — when length > 1 — the steps match. So `range(0, 3, 2) ==
+            // range(0, 4, 2)` (both yield `[0, 2]`) and every empty range
+            // compares equal (`range(0) == range(5, 5)`), while `range(3) !=
+            // range(4)`. `pandas.RangeIndex.equals` (and thus `DataFrame`
+            // round-trip equality) rides on this. Kept bit-for-bit consistent
+            // with the `range` hash in `py_hash_value`.
+            (Object::Range(a), Object::Range(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                let la = range_len_i128(a);
+                if la != range_len_i128(b) {
+                    false
+                } else if la == 0 {
+                    true
+                } else if a.start != b.start {
+                    false
+                } else {
+                    la == 1 || a.step == b.step
+                }
+            }
             // CPython's default `tp_richcompare` (no user `__eq__`) falls
             // back to *identity*: `x == x` is True and `x == y` is False
             // for distinct objects. This covers reference types without
@@ -5601,11 +6034,21 @@ impl Object {
                 let b = b.borrow();
                 seq_cmp(&a, &b)
             }
-            _ => Err(type_error(format!(
-                "'<' not supported between instances of '{}' and '{}'",
-                self.type_name_owned(),
-                other.type_name_owned()
-            ))),
+            _ => {
+                if std::env::var_os("WEAVEPY_CMP_BT").is_some() {
+                    eprintln!(
+                        "[CMP_BT vm-lt] '{}' vs '{}'\n{:?}",
+                        self.type_name_owned(),
+                        other.type_name_owned(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+                Err(type_error(format!(
+                    "'<' not supported between instances of '{}' and '{}'",
+                    self.type_name_owned(),
+                    other.type_name_owned()
+                )))
+            }
         }
     }
 
@@ -5727,7 +6170,7 @@ impl Object {
             // A built-in-subclass instance (`class C(dict)`, …) contains
             // through its wrapped native payload — the receiver-side
             // analogue of CPython dispatching `sq_contains` on the base.
-            Object::Instance(inst) => match &inst.native {
+            Object::Instance(inst) => match inst.native.get() {
                 Some(native) => native.contains(item),
                 None => Err(type_error(format!(
                     "argument of type '{}' is not iterable",
@@ -5831,9 +6274,21 @@ impl Object {
                 if mv.released.get() {
                     return Err(value_error("memoryview: released"));
                 }
-                let snapshot: Rc<[u8]> = Rc::from(mv.to_bytes().into_boxed_slice());
-                Ok(PyIterator::Bytes {
-                    data: snapshot,
+                // CPython's `memoryiter` yields *format-unpacked elements*
+                // (an `int64` exporter iterates as Python ints, `'d'` as
+                // floats), not raw bytes — pandas' `Index(memoryview(arr))`
+                // takes `list(data)` and depends on it. Multi-dimensional
+                // iteration would yield sub-views; CPython raises
+                // NotImplementedError there and so do we.
+                let shape = mv.shape_dims();
+                if shape.len() > 1 {
+                    return Err(crate::error::not_implemented_error(
+                        "multi-dimensional sub-views are not implemented",
+                    ));
+                }
+                let items = crate::mv_element_objects(mv)?;
+                Ok(PyIterator::List {
+                    items: Rc::new(RefCell::new(items)),
                     index: 0,
                 })
             }
@@ -5896,9 +6351,51 @@ impl Object {
             // partial consumption (`zip(range(n), it)`) must leave `it`
             // positioned at the first unconsumed element.
             Object::Iter(it) => Ok(PyIterator::Shared(it.clone())),
+            // Iterables the object-level factory can't build a `PyIterator`
+            // for on its own — they need the running interpreter to drive
+            // their `__iter__`/`__next__` (or `tp_iter`/`tp_iternext`):
+            //   * `Instance`  — a user/extension class (incl. a bridged
+            //     Cython generator or generator-expression, which crosses
+            //     into the VM as an `Instance` of its bridged type).
+            //   * `Foreign`   — an opaque C object (numpy array iterator,
+            //     any C `tp_iter` type).
+            //   * `Generator` / `Coroutine` — VM generators driven by
+            //     `send`.
+            // A builtin invoked from C reaches here (Cython compiles
+            // `sum(stop - start for start, stop in slices)` in pandas'
+            // `get_blkno_indexers`, reached by `merge`/`reindex`/`drop`, to
+            // a C `sum()` over a generator object). Drive it through the
+            // active interpreter's iterator protocol and materialise the
+            // elements — every builtin routed here (`sum`/`min`/`max`/
+            // `sorted`/`list`/`tuple`/`any`/`all`/…) consumes the iterable
+            // in full, so eager collection matches their semantics.
+            Object::Instance(_)
+            | Object::Foreign(_)
+            | Object::Generator(_)
+            | Object::Coroutine(_) => {
+                let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                    type_error(format!(
+                        "'{}' object is not iterable",
+                        self.type_name_owned()
+                    ))
+                })?;
+                // SAFETY: published by the enclosing VM frame still live on
+                // this thread; the GIL keeps the access exclusive. Same
+                // reentrant-callback pattern as `current_interp_eq` above.
+                let interp = unsafe { &mut *ptr };
+                let iter = interp.iter_object(self.clone())?;
+                let mut items = Vec::new();
+                while let Some(v) = interp.iter_next_object(iter.clone())? {
+                    items.push(v);
+                }
+                Ok(PyIterator::List {
+                    items: Rc::new(RefCell::new(items)),
+                    index: 0,
+                })
+            }
             _ => Err(type_error(format!(
                 "'{}' object is not iterable",
-                self.type_name()
+                self.type_name_owned()
             ))),
         }
     }
@@ -5963,9 +6460,32 @@ impl Object {
     /// `Object::Instance` instead of the static placeholder.
     pub fn type_name_owned(&self) -> String {
         match self {
-            Object::Instance(inst) => inst.cls().name.clone(),
-            Object::Type(t) => format!("type[{}]", t.name),
-            Object::Foreign(s) => s.type_name.to_string(),
+            // A bridged extension class renders its C `tp_name`
+            // (`'numpy.ndarray'`), exactly as CPython's `tp_name`-based
+            // `TypeError` text does; pure-Python classes keep the bare name.
+            Object::Instance(inst) => {
+                let cls = inst.cls();
+                match cls.c_tp_name.get() {
+                    Some(full) => full.to_owned(),
+                    None => cls.name.clone(),
+                }
+            }
+            // `type_name_owned` is `type(obj).__name__`. For a *class* object
+            // that is its metaclass (`type` for a plain class, `ABCMeta`/an
+            // `EnumMeta`, … otherwise) — never a `type[<name>]` alias. CPython's
+            // error text ("'<' not supported between instances of 'type' and
+            // 'type'", which pandas' groupby idxmax/idxmin over an object column
+            // matches on) depends on this being the bare metaclass name.
+            Object::Type(t) => t
+                .metaclass
+                .try_borrow()
+                .ok()
+                .and_then(|m| m.as_ref().map(|mc| mc.name.clone()))
+                .unwrap_or_else(|| "type".to_string()),
+            // `type_name_owned` feeds CPython-style `TypeError` text, which
+            // uses the raw `tp_name` (`'numpy.float64'`,
+            // `'pandas._libs.tslibs.offsets.Nano'`) — not the bare `__name__`.
+            Object::Foreign(s) => s.tp_name.to_string(),
             other => other.type_name().to_owned(),
         }
     }
@@ -6168,7 +6688,7 @@ impl Object {
                     Object::Instance(i) => {
                         let pick = |key: &str| -> Option<String> {
                             if let Some(Object::Str(s)) =
-                                i.dict.borrow().get(&DictKey(Object::from_str(key)))
+                                i.dict.borrow().get(&crate::object::StrKey(key))
                             {
                                 return Some(s.to_string());
                             }
@@ -6270,7 +6790,9 @@ impl Object {
                 // `set_repr` (`Py_TYPE(so) != &PySet_Type`). The native
                 // payload carries the elements; the class name comes from
                 // the instance's type.
-                if let Some(native_set @ (Object::Set(_) | Object::FrozenSet(_))) = &inst.native {
+                if let Some(native_set @ (Object::Set(_) | Object::FrozenSet(_))) =
+                    inst.native.get()
+                {
                     let repr_key = DictKey(Object::from_static("__repr__"));
                     let bt = crate::builtin_types::builtin_types();
                     // CPython's `set_repr` keys off `Py_TYPE(so) != &PySet_Type`,
@@ -6469,13 +6991,29 @@ impl Object {
             Object::DictView(v) => Ok(v.dict.borrow().len()),
             // A subclass of a built-in container (`class C(list)`, …)
             // measures the length of the native payload it wraps.
-            Object::Instance(inst) => match &inst.native {
+            Object::Instance(inst) => match inst.native.get() {
                 Some(native) => native.len(),
-                None => Err(type_error(format!(
-                    "object of type '{}' has no len()",
-                    self.type_name()
-                ))),
+                None => {
+                    if std::env::var_os("WEAVEPY_LEN_DBG").is_some() {
+                        eprintln!(
+                            "[LEN_DBG] Instance cls={} c_body={:#x} native=None",
+                            inst.cls().name,
+                            inst.c_body.get()
+                        );
+                    }
+                    Err(type_error(format!(
+                        "object of type '{}' has no len()",
+                        self.type_name()
+                    )))
+                }
             },
+            // A foreign extension object (an ndarray slice handed to the
+            // *builtin* `len` by Cython's `roll_apply`) carries its length
+            // in its C `sq_length`/`mp_length` slot — consult the bridge,
+            // exactly as CPython's `PyObject_Size` slot dispatch would.
+            // The bridge propagates the C-side error (including its
+            // faithful "object of type '…' has no len()" TypeError).
+            Object::Foreign(s) => Ok(crate::foreign::length(s)?.max(0) as usize),
             _ => Err(type_error(format!(
                 "object of type '{}' has no len()",
                 self.type_name()
@@ -6599,6 +7137,96 @@ pub(crate) fn i64_cmp_f64(a: i64, b: f64) -> Result<Ordering, RuntimeError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NaN identity tags
+// ---------------------------------------------------------------------------
+//
+// CPython heap-allocates every `float`, so two separately created NaNs are
+// distinct *objects*: `float('nan') is float('nan')` is False, `hash(nan)`
+// is pointer-derived per object (3.10+, gh-43475), and a `set`/`dict` keeps
+// separately created NaNs apart (the `a is b or a == b` key rule finds only
+// the *same* NaN). WeavePy's `Object::Float` is an unboxed `f64`, where all
+// canonical NaNs are bit-identical — collapsing that distinction (pandas'
+// `IntervalIndex._intersection_non_unique` deliberately exploits it to keep
+// one NaN row; CPython's own float tests pin `hash(nan)` to the object).
+//
+// Identity is restored by *tagging*: every seam where CPython would allocate
+// a fresh float object for a NaN (literal parse, `PyFloat_FromDouble`,
+// arithmetic producing NaN) stamps a unique counter into the low mantissa
+// bits. Bit 51 (quiet) stays set, bit 50 marks "WeavePy tag", bits 0..50
+// carry the counter, and the sign bit is preserved. `is_same` (bit
+// comparison) then separates distinct NaNs exactly like CPython pointer
+// identity, and `py_hash_double` hashes the bits — stable per object,
+// different across objects.
+//
+// The tag must never leak where CPython would expose *canonical* NaN bits:
+// `struct.pack`, `PyFloat_AsDouble` (numpy ingests array elements through
+// it; `pandas.util.hash_pandas_object` hashes the raw buffer), pickle /
+// marshal payloads, and mirror float bodies (`ob_fval` is read by the
+// `PyFloat_AS_DOUBLE` macro). Those seams call [`untag_nan`], which strips
+// only the marker-bearing tags and leaves genuine (bit-50-clear) payloads —
+// e.g. from `struct.unpack` of exotic bytes — untouched, so byte-level
+// round-trips stay faithful.
+
+/// Marker bit distinguishing WeavePy identity tags from genuine NaN
+/// payloads that entered through byte-level APIs.
+const NAN_TAG_MARKER: u64 = 1 << 50;
+/// Mask of the counter field within the tag (bits 0..50).
+const NAN_TAG_COUNTER_MASK: u64 = NAN_TAG_MARKER - 1;
+
+/// Stamp a fresh identity tag into a NaN, preserving its sign. Non-NaN
+/// values pass through unchanged. Each call yields a distinct bit pattern,
+/// mirroring CPython allocating a distinct object.
+#[inline]
+pub fn tag_nan(v: f64) -> f64 {
+    if !v.is_nan() {
+        return v;
+    }
+    fresh_nan_bits(v)
+}
+
+#[cold]
+fn fresh_nan_bits(v: f64) -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_NAN_TAG: AtomicU64 = AtomicU64::new(1);
+    let counter = NEXT_NAN_TAG.fetch_add(1, Ordering::Relaxed) & NAN_TAG_COUNTER_MASK;
+    let sign = v.to_bits() & (1u64 << 63);
+    // Exponent all-ones + quiet bit keeps it a quiet NaN on every platform.
+    f64::from_bits(sign | 0x7ff8_0000_0000_0000 | NAN_TAG_MARKER | counter)
+}
+
+/// Construct an `Object::Float`, giving a NaN result a fresh identity —
+/// used at every seam where CPython would allocate a new float object.
+#[inline]
+pub fn fresh_float(v: f64) -> Object {
+    Object::Float(tag_nan(v))
+}
+
+/// Strip a WeavePy identity tag, restoring the canonical quiet NaN (sign
+/// preserved) CPython would expose. Genuine payloads (marker bit clear) and
+/// non-NaN values pass through unchanged.
+#[inline]
+pub fn untag_nan(v: f64) -> f64 {
+    if v.is_nan() && v.to_bits() & NAN_TAG_MARKER != 0 {
+        let sign = v.to_bits() & (1u64 << 63);
+        return f64::from_bits(sign | 0x7ff8_0000_0000_0000);
+    }
+    v
+}
+
+/// Re-tag a NaN read back from a byte-level API (`struct.unpack`, pickle,
+/// marshal). A *canonical* payload gets a fresh identity — CPython builds a
+/// new object whose canonical bits round-trip anyway — while an exotic
+/// payload is preserved verbatim so `pack(unpack(bytes)) == bytes` holds
+/// bit-for-bit (identity fidelity yields to byte fidelity there).
+#[inline]
+pub fn tag_unpacked_nan(v: f64) -> f64 {
+    if v.is_nan() && v.to_bits() & !(1u64 << 63) == 0x7ff8_0000_0000_0000 {
+        return fresh_nan_bits(v);
+    }
+    v
+}
+
 /// Width of the Python numeric hash reduction: `_PyHASH_BITS` (61 on
 /// 64-bit, so the modulus is the Mersenne prime `2**61 - 1`).
 const PY_HASH_BITS: u32 = 61;
@@ -6638,9 +7266,13 @@ pub(crate) fn py_hash_double(v: f64) -> i64 {
         if v.is_infinite() {
             return if v > 0.0 { PY_HASH_INF } else { -PY_HASH_INF };
         }
-        // NaN. CPython 3.10+ uses the object's identity; for value hashing
-        // 0 is a stable, collision-tolerant choice (matches sys.hash_info.nan).
-        return 0;
+        // NaN. CPython 3.10+ (gh-43475) derives the hash from the object's
+        // *identity* so distinct NaNs land in different buckets. WeavePy's
+        // identity for a NaN float is its (tagged) bit pattern — see
+        // [`tag_nan`] — so hash the bits: stable for the same object, unique
+        // per creation, exactly the property `object.__hash__` gives CPython.
+        let v = (v.to_bits().rotate_right(4) as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64);
+        return if v == -1 { -2 } else { v };
     }
     let (mut m, mut e) = py_frexp(v);
     let sign: i64 = if m < 0.0 {
@@ -6728,7 +7360,30 @@ pub(crate) fn numeric_hash(obj: &Object) -> Option<i64> {
         Object::Int(i) => Some(py_hash_long_i64(*i)),
         Object::Long(b) => Some(py_hash_long_bigint(b)),
         Object::Float(f) => Some(py_hash_double(*f)),
-        Object::Complex(c) => Some(py_hash_complex(c.real, c.imag)),
+        Object::Complex(c) => {
+            // CPython 3.10+ `complex_hash` runs `_Py_HashDouble((PyObject*)v,
+            // part)`, so a NaN part contributes the *object's* pointer hash —
+            // distinct complex allocations with NaN parts hash apart. Our
+            // `Object::Complex` carries Rc identity; fold that in for the NaN
+            // case (both parts see the same identity, as in CPython).
+            if c.real.is_nan() || c.imag.is_nan() {
+                let ident = (Rc::as_ptr(c) as usize as u64).rotate_right(4) as i64;
+                let re_h = if c.real.is_nan() {
+                    ident
+                } else {
+                    py_hash_double(c.real)
+                };
+                let im_h = if c.imag.is_nan() {
+                    ident
+                } else {
+                    py_hash_double(c.imag)
+                };
+                let combined =
+                    (re_h as u64).wrapping_add(PY_HASH_IMAG.wrapping_mul(im_h as u64)) as i64;
+                return Some(if combined == -1 { -2 } else { combined });
+            }
+            Some(py_hash_complex(c.real, c.imag))
+        }
         _ => None,
     }
 }
@@ -6742,19 +7397,57 @@ const PY_HASH_NONE: i64 = 0xFCA8_6420;
 /// we don't need to reproduce its exact output — only to be stable within a
 /// run so equal strings bucket together. `hash("") == hash(b"") == 0`,
 /// matching CPython, and the reserved `-1` is remapped to `-2`.
+///
+/// Uses the internal Fx fold rather than SipHash: this function sits under
+/// *every* string-keyed dict probe (attribute lookups, globals, keyword
+/// matching), where profiling showed SipHash itself as a top-ten CPU
+/// consumer. Python-level `hash(s)` carries no cross-process stability
+/// contract, and the byte length is folded in so prefixes don't collide.
 fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
     if bytes.is_empty() {
         return 0;
     }
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
+    use std::hash::Hasher;
+    let mut h = crate::fasthash::FxHasher::default();
+    h.write(bytes);
+    h.write_usize(bytes.len());
     let v = h.finish() as i64;
     if v == -1 {
         -2
     } else {
         v
     }
+}
+
+/// Interpreter-independent hash of a `str` — the exact value `hash(s)`
+/// yields (the same one [`py_hash_value`] computes for `Object::Str`).
+///
+/// The C-API layer mirrors this into a faithful `str`'s `hash` field so
+/// that macro-heavy Cython, which reads `((PyASCIIObject*)s)->hash`
+/// *directly* off the struct to match keyword arguments
+/// (`__Pyx_MatchKeywordArg_str`), sees the same value WeavePy would
+/// compute — without it every Cython call with a keyword argument fails
+/// with a spurious "unexpected keyword argument".
+pub fn py_str_hash(s: &str) -> i64 {
+    py_hash_bytes_slice(s.as_bytes())
+}
+
+/// Interpreter-independent hash of a `bytes` value — the exact value
+/// `hash(b)` yields (the same one [`py_hash_value`] computes for
+/// `Object::Bytes`). Used by the C-API's faithful `PyBytes_Type.tp_hash`.
+pub fn py_bytes_hash(b: &[u8]) -> i64 {
+    py_hash_bytes_slice(b)
+}
+
+/// Interpreter-independent hash of a surrogate-bearing `WStr` — the exact
+/// value [`py_hash_value`] computes for `Object::WStr`. Used by the
+/// C-API's faithful `PyUnicode_Type.tp_hash`.
+pub fn py_wstr_hash(cps: &[u32]) -> i64 {
+    let mut bytes = Vec::with_capacity(cps.len() * 4);
+    for &c in cps {
+        bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    py_hash_bytes_slice(&bytes)
 }
 
 /// Identity-based hash for objects that hash by allocation identity in
@@ -6855,6 +7548,31 @@ fn native_is_immutable(native: Option<&Object>) -> bool {
 ///
 /// Returns `None` for objects with no *value* hash (identity-hashable or
 /// unhashable); callers fall back to [`identity_hash`].
+/// CPython 3.13 `tuplehash` (Objects/tupleobject.c), bit-exact: an
+/// xxHash-derived mix over the element hashes. `test_tuple`'s
+/// `test_hash_exact` pins specific 64-bit results, so the constants and the
+/// rotate/multiply order must match CPython exactly. Shared by the value
+/// hasher below and the interpreter's `hash()` (which dispatches each lane's
+/// `__hash__` so element errors propagate).
+pub(crate) fn combine_tuple_hash(lanes: &[i64]) -> i64 {
+    const XXPRIME_1: u64 = 11_400_714_785_074_694_791;
+    const XXPRIME_2: u64 = 14_029_467_366_897_019_727;
+    const XXPRIME_5: u64 = 2_870_177_450_012_600_261;
+    let mut acc: u64 = XXPRIME_5;
+    for &lane in lanes {
+        acc = acc.wrapping_add((lane as u64).wrapping_mul(XXPRIME_2));
+        acc = acc.rotate_left(31);
+        acc = acc.wrapping_mul(XXPRIME_1);
+    }
+    acc = acc.wrapping_add((lanes.len() as u64) ^ (XXPRIME_5 ^ 3_527_539));
+    let v = acc as i64;
+    if v == -1 {
+        1_546_275_796
+    } else {
+        v
+    }
+}
+
 pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
     if let Some(h) = numeric_hash(obj) {
         return Some(h);
@@ -6875,23 +7593,11 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
         }
         Object::Bytes(b) => Some(py_hash_bytes_slice(b)),
         Object::Tuple(items) => {
-            // CPython 3.13 `tuplehash` (Objects/tupleobject.c), bit-exact:
-            // an xxHash-derived mix over the element hashes. `test_tuple`'s
-            // `test_hash_exact` pins specific 64-bit results, so the constants
-            // and the rotate/multiply order must match CPython exactly.
-            const XXPRIME_1: u64 = 11_400_714_785_074_694_791;
-            const XXPRIME_2: u64 = 14_029_467_366_897_019_727;
-            const XXPRIME_5: u64 = 2_870_177_450_012_600_261;
-            let mut acc: u64 = XXPRIME_5;
-            for x in items.iter() {
-                let lane = py_hash_value(x).unwrap_or_else(|| identity_hash(x)) as u64;
-                acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
-                acc = acc.rotate_left(31);
-                acc = acc.wrapping_mul(XXPRIME_1);
-            }
-            acc = acc.wrapping_add((items.len() as u64) ^ (XXPRIME_5 ^ 3_527_539));
-            let v = acc as i64;
-            Some(if v == -1 { 1_546_275_796 } else { v })
+            let lanes: Vec<i64> = items
+                .iter()
+                .map(|x| py_hash_value(x).unwrap_or_else(|| identity_hash(x)))
+                .collect();
+            Some(combine_tuple_hash(&lanes))
         }
         Object::FrozenSet(s) => {
             // A frozenset is immutable, so its hash is computed once and
@@ -6941,7 +7647,7 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
                 // conditionally-raising `__hash__` (test_dict's `BadHash`)
                 // wraps no native value, so it is *never* cached and is
                 // re-invoked on every probe exactly like CPython.
-                if native_is_immutable(inst.native.as_ref()) {
+                if native_is_immutable(inst.native.get()) {
                     if let Some(h) = inst.hash_cache.get() {
                         return Some(h);
                     }
@@ -6953,7 +7659,7 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
                 }
                 return current_interp_hash(obj);
             }
-            if let Some(native) = &inst.native {
+            if let Some(native) = inst.native.get() {
                 // int/str/… subclass instance hashes as the wrapped value.
                 return py_hash_value(native);
             }
@@ -6961,6 +7667,35 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             // interpreter or only the inherited identity hash) falls through
             // to `identity_hash` at the call site.
             current_interp_hash(obj)
+        }
+        // A foreign extension scalar (numpy `int64`/`float64`/`bool_`, …)
+        // hashes through its own `tp_hash` slot so it collides with the equal
+        // Python scalar in a dict/set — CPython guarantees
+        // `hash(np.int64(0)) == hash(0)`. numpy's `np.roll` keys its `shifts`
+        // dict by axis with numpy ints, then looks it up with the Python-int
+        // axis; without the shared hash the lookup raises `KeyError`. The
+        // `no_gil_handoff` guard mirrors `current_interp_hash`: this may run
+        // while a container holds its cell mutex during a probe.
+        Object::Foreign(s) => {
+            let _no_yield = crate::gil::no_gil_handoff();
+            crate::foreign::hash(s).ok()
+        }
+        // `range` hashes as CPython's `range_hash`: the hash of the
+        // `(length, start | None, step | None)` triple. Collapsing start/step
+        // to `None` for empty / length-1 ranges keeps the hash in lock-step
+        // with `eq_value` above — equal ranges (same generated sequence) share
+        // a hash and can therefore key a `dict`/`set` (or a pandas index).
+        Object::Range(r) => {
+            let len = range_len_i128(r);
+            let (start_obj, step_obj) = if len == 0 {
+                (Object::None, Object::None)
+            } else if len == 1 {
+                (int_from_i128(r.start), Object::None)
+            } else {
+                (int_from_i128(r.start), int_from_i128(r.step))
+            };
+            let triple = Object::Tuple(Rc::from(vec![int_from_i128(len), start_obj, step_obj]));
+            py_hash_value(&triple)
         }
         _ => None,
     }
@@ -7001,7 +7736,7 @@ pub(crate) fn bigint_from_f64_trunc(f: f64) -> BigInt {
 /// uses exponential form, so `1e100` would otherwise print as a 101-digit
 /// integer. We recover the shortest digits + decimal exponent from
 /// `{:e}` (Ryū) and reassemble them under CPython's rules.
-pub(crate) fn float_repr(f: f64) -> String {
+pub fn float_repr(f: f64) -> String {
     if f.is_nan() {
         return "nan".to_owned();
     }
@@ -7247,10 +7982,17 @@ fn set_repr(items: &[Object], name: &str, id: usize) -> String {
 
 fn seq_cmp(a: &[Object], b: &[Object]) -> Result<Ordering, RuntimeError> {
     for (x, y) in a.iter().zip(b.iter()) {
-        match x.cmp(y)? {
-            Ordering::Equal => continue,
-            ord => return Ok(ord),
+        // CPython's sequence comparison first scans for the first *non-equal*
+        // pair (identity-shortcut `==` via `PyObject_RichCompareBool`), and
+        // only that pair is ordered with `<`. Identical-but-unorderable
+        // elements therefore never see the ordering op: sorting
+        // `[(Timestamp, "day"), (Timestamp, "floor")]` compares the two type
+        // objects for equality only (pandas' `test_nat` builds exactly this).
+        // The old `cmp`-first walk raised `'<' not supported` on the tie.
+        if member_eq(x, y)? {
+            continue;
         }
+        return x.cmp(y);
     }
     Ok(a.len().cmp(&b.len()))
 }
@@ -7343,7 +8085,7 @@ impl Object {
     }
 
     pub fn new_dict() -> Self {
-        Object::Dict(Rc::new(RefCell::new(DictData::new())))
+        Object::Dict(Rc::new(RefCell::new(DictData::default())))
     }
 
     /// Build a fresh module value whose dict is empty.
@@ -7351,16 +8093,16 @@ impl Object {
         Object::Module(Rc::new(PyModule {
             name: name.into(),
             filename,
-            dict: Rc::new(RefCell::new(DictData::new())),
+            dict: Rc::new(RefCell::new(DictData::default())),
         }))
     }
 
     pub fn new_set() -> Self {
-        Object::Set(Rc::new(RefCell::new(SetData::new())))
+        Object::Set(Rc::new(RefCell::new(SetData::default())))
     }
 
     pub fn new_set_from(iter: impl IntoIterator<Item = Object>) -> Self {
-        let mut s = SetData::new();
+        let mut s = SetData::default();
         for v in iter {
             s.insert(DictKey(v));
         }
@@ -7368,7 +8110,7 @@ impl Object {
     }
 
     pub fn new_frozenset_from(iter: impl IntoIterator<Item = Object>) -> Self {
-        let mut s = SetData::new();
+        let mut s = SetData::default();
         for v in iter {
             s.insert(DictKey(v));
         }
@@ -7431,7 +8173,7 @@ impl Object {
     #[inline]
     pub fn native_value(&self) -> Option<Object> {
         match self {
-            Object::Instance(inst) => inst.native.clone(),
+            Object::Instance(inst) => inst.native.get().cloned(),
             _ => None,
         }
     }
@@ -7441,7 +8183,7 @@ impl Object {
             Object::Bool(b) => Some(i64::from(*b)),
             Object::Int(i) => Some(*i),
             Object::Long(b) => b.to_i64(),
-            Object::Instance(inst) => inst.native.as_ref().and_then(Object::as_i64),
+            Object::Instance(inst) => inst.native.get().and_then(Object::as_i64),
             _ => None,
         }
     }
@@ -7453,7 +8195,7 @@ impl Object {
             Object::Bool(b) => Some(usize::from(*b)),
             Object::Int(i) if *i >= 0 => usize::try_from(*i).ok(),
             Object::Long(b) if !b.is_negative() => b.to_usize(),
-            Object::Instance(inst) => inst.native.as_ref().and_then(Object::as_usize),
+            Object::Instance(inst) => inst.native.get().and_then(Object::as_usize),
             _ => None,
         }
     }
@@ -7509,7 +8251,8 @@ mod tests {
         assert!(!Object::Int(0).is_truthy());
         assert!(Object::Int(1).is_truthy());
         assert!(!Object::Float(0.0).is_truthy());
-        assert!(!Object::Float(f64::NAN).is_truthy());
+        // NaN is truthy in Python: bool(float('nan')) is True.
+        assert!(Object::Float(f64::NAN).is_truthy());
         assert!(Object::Float(1.5).is_truthy());
         assert!(!Object::from_str("").is_truthy());
         assert!(Object::from_str("x").is_truthy());

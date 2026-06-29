@@ -27,7 +27,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -95,7 +95,7 @@ fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) ->
 /// indistinguishable from an uncontended real lock.
 fn allocate_lock(_args: &[Object]) -> Result<Object, RuntimeError> {
     let state = Rc::new(RefCell::new(false));
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     let s_for_acquire = state.clone();
     let acquire = move |_args: &[Object]| -> Result<Object, RuntimeError> {
         *s_for_acquire.borrow_mut() = true;

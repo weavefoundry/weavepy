@@ -37,9 +37,25 @@ pub fn parse_module(source: &str) -> Result<Module, ParseError> {
 pub fn parse_module_with_warnings(
     source: &str,
 ) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
+    parse_with_warnings(source, parser::parse)
+}
+
+/// Like [`parse_module_with_warnings`], but with CPython's `eval` start
+/// rule (`expressions NEWLINE* ENDMARKER`): statement syntax is a bare
+/// "invalid syntax" at the first token the expression grammar can't
+/// accept, never a statement-level diagnostic. Backs `eval(...)` and
+/// `compile(..., mode="eval")`.
+pub fn parse_eval_with_warnings(source: &str) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
+    parse_with_warnings(source, parser::parse_eval)
+}
+
+fn parse_with_warnings(
+    source: &str,
+    parse: fn(&str, Vec<weavepy_lexer::Token>) -> Result<Module, ParseError>,
+) -> (Result<Module, ParseError>, Vec<EscapeWarning>) {
     let (tok_result, warnings) = weavepy_lexer::tokenize_with_escapes(source);
     let module = match tok_result {
-        Ok(tokens) => parser::parse(source, tokens),
+        Ok(tokens) => parse(source, tokens),
         // An f-string field left open at the literal's own terminator:
         // CPython's pegen parses the partial field expression first, so
         // a specialized *inner* error ("Perhaps you forgot a comma?")

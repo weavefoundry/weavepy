@@ -24,7 +24,7 @@ use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use crate::types::{PyInstance, TypeObject};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -607,7 +607,7 @@ fn compress_class() -> Rc<TypeObject> {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         method_into(&mut dict, "compress", compress_compress);
         method_into(&mut dict, "flush", compress_flush);
         let cls = TypeObject::new_user("zlib.Compress", vec![bt.object_.clone()], dict)
@@ -623,7 +623,7 @@ fn decompress_class() -> Rc<TypeObject> {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         method_into_kw(&mut dict, "decompress", decompress_decompress);
         method_into(&mut dict, "flush", decompress_flush);
         let cls = TypeObject::new_user("zlib.Decompress", vec![bt.object_.clone()], dict)
@@ -815,7 +815,7 @@ fn read_bytes_attr(args: &[Object], name: &str) -> Vec<u8> {
         if let Some(Object::Bytes(b)) = inst
             .dict
             .borrow()
-            .get(&DictKey(Object::from_str(name.to_owned())))
+            .get(&crate::object::StrKey(name))
             .cloned()
         {
             return b.to_vec();
@@ -869,7 +869,7 @@ fn zlibdecompressor_class() -> Rc<TypeObject> {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         method_into_kw(&mut dict, "decompress", zlibdecompressor_decompress);
         // `_ZlibDecompressor` objects are unpicklable in CPython.
         method_into(&mut dict, "__reduce__", zlibdecompressor_no_pickle);

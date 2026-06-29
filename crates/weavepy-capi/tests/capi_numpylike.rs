@@ -10,6 +10,7 @@
 //! other dlopen tests.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 use weavepy_capi::loader::load_extension_module;
 use weavepy_vm::object::{DictKey, Object};
@@ -29,7 +30,21 @@ fn lookup(module: &Object, key: &str) -> Option<Object> {
     d.get(&k).cloned()
 }
 
-fn load_module() -> Option<(Interpreter, Object)> {
+/// Serialize the tests in this binary. Each test constructs its own
+/// `Interpreter`, but the C-API bridge keeps *process-global* state (the
+/// `LAST_INTERPRETER` fallback pointer, the shared dlopen'd extension's
+/// static state), so libtest's default parallel execution can route a
+/// re-entrant C-API call into a different test's interpreter mid-run. The
+/// guard is returned by the loader and held for the whole test.
+fn serialize() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    // A poisoned lock only means another test's assertion failed while
+    // holding it — the serialization itself is still valid.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn load_module() -> Option<(MutexGuard<'static, ()>, Interpreter, Object)> {
+    let guard = serialize();
     let path = extension_path()?;
     if !path.is_file() {
         eprintln!(
@@ -48,7 +63,7 @@ fn load_module() -> Option<(Interpreter, Object)> {
             return None;
         }
     };
-    Some((interp, module))
+    Some((guard, interp, module))
 }
 
 fn call(interp: &mut Interpreter, fn_obj: Object, args: &[Object]) -> Object {
@@ -128,7 +143,7 @@ fn numpylike_skipped_when_missing() {
 
 #[test]
 fn numpylike_module_surface() {
-    let Some((_interp, module)) = load_module() else {
+    let Some((_lock, _interp, module)) = load_module() else {
         return;
     };
     assert!(lookup(&module, "ndarray").is_some());
@@ -145,7 +160,7 @@ fn numpylike_module_surface() {
 
 #[test]
 fn numpylike_dtype_constants() {
-    let Some((_interp, module)) = load_module() else {
+    let Some((_lock, _interp, module)) = load_module() else {
         return;
     };
     let f64_const = lookup(&module, "FLOAT64").expect("FLOAT64 constant");
@@ -157,7 +172,7 @@ fn numpylike_dtype_constants() {
 
 #[test]
 fn numpylike_array_shape_and_dtype() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, vec![5]);
@@ -177,7 +192,7 @@ fn numpylike_array_shape_and_dtype() {
 
 #[test]
 fn numpylike_arange_and_sum() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arange = lookup(&module, "arange").expect("arange missing");
@@ -192,7 +207,7 @@ fn numpylike_arange_and_sum() {
 
 #[test]
 fn numpylike_setitem_and_getitem() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arr = make_array(&mut interp, &module, vec![4]);
@@ -212,7 +227,7 @@ fn numpylike_setitem_and_getitem() {
 
 #[test]
 fn numpylike_unary_ufunc() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arange = lookup(&module, "arange").expect("arange");
@@ -225,7 +240,7 @@ fn numpylike_unary_ufunc() {
 
 #[test]
 fn numpylike_binary_ufunc() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arange = lookup(&module, "arange").expect("arange");
@@ -239,7 +254,7 @@ fn numpylike_binary_ufunc() {
 
 #[test]
 fn numpylike_scalar_broadcast() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arange = lookup(&module, "arange").expect("arange");
@@ -252,7 +267,7 @@ fn numpylike_scalar_broadcast() {
 
 #[test]
 fn numpylike_dot1d() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arange = lookup(&module, "arange").expect("arange");
@@ -269,7 +284,7 @@ fn numpylike_dot1d() {
 
 #[test]
 fn numpylike_reshape_2d() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arange = lookup(&module, "arange").expect("arange");
@@ -285,7 +300,7 @@ fn numpylike_reshape_2d() {
 
 #[test]
 fn numpylike_mask_select() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arange = lookup(&module, "arange").expect("arange");
@@ -309,7 +324,7 @@ fn numpylike_mask_select() {
 
 #[test]
 fn numpylike_datetime_capi_year_diff() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let func = lookup(&module, "datetime_year_diff").expect("datetime_year_diff");
@@ -336,7 +351,7 @@ fn numpylike_datetime_capi_year_diff() {
 
 #[test]
 fn numpylike_arange_with_keywords() {
-    let Some((mut interp, module)) = load_module() else {
+    let Some((_lock, mut interp, module)) = load_module() else {
         return;
     };
     let arange = lookup(&module, "arange").expect("arange");

@@ -17,7 +17,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -50,7 +50,12 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("inf")),
             Object::Float(f64::INFINITY),
         );
-        d.insert(DictKey(Object::from_static("nan")), Object::Float(f64::NAN));
+        // One tagged NaN, minted once: `math.nan is math.nan` (same module
+        // attribute object) while staying distinct from every other NaN.
+        d.insert(
+            DictKey(Object::from_static("nan")),
+            crate::object::fresh_float(f64::NAN),
+        );
 
         // Total f64 → f64 wrappers, where every input is in-domain.
         // Partial functions like sqrt/log live below as explicit fns
@@ -274,9 +279,38 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
     Object::Builtin(Rc::new(BuiltinFn {
         name,
         binds_instance: false,
-        call: Box::new(body),
+        // Every math function returns a *fresh* float in CPython (all go
+        // through `PyFloat_FromDouble`), so a NaN result — necessarily
+        // propagated from a NaN input, since domain errors raise — must not
+        // alias the input's identity tag. Freshen NaNs on the way out
+        // (including inside a `frexp`/`modf` result tuple).
+        call: Box::new(move |args: &[Object]| freshen_result(body(args))),
         call_kw: None,
     }))
+}
+
+/// Re-tag any NaN float in a math result (top level or one tuple deep) with
+/// a fresh identity — see [`crate::object::fresh_float`].
+fn freshen_result(r: Result<Object, RuntimeError>) -> Result<Object, RuntimeError> {
+    fn freshen(o: &Object) -> Option<Object> {
+        match o {
+            Object::Float(f) if f.is_nan() => Some(crate::object::fresh_float(*f)),
+            Object::Tuple(items)
+                if items
+                    .iter()
+                    .any(|x| matches!(x, Object::Float(f) if f.is_nan())) =>
+            {
+                Some(Object::new_tuple(
+                    items
+                        .iter()
+                        .map(|x| freshen(x).unwrap_or_else(|| x.clone()))
+                        .collect(),
+                ))
+            }
+            _ => None,
+        }
+    }
+    r.map(|o| freshen(&o).unwrap_or(o))
 }
 
 /// Total real-valued unary functions over `f64`: every input is
@@ -336,7 +370,7 @@ fn make_checked1(name: &'static str, f: fn(f64) -> f64, can_overflow: bool) -> O
         binds_instance: false,
         call: Box::new(move |args: &[Object]| {
             let x = to_f64(args, name, 0)?;
-            finish1(x, f(x), can_overflow)
+            freshen_result(finish1(x, f(x), can_overflow))
         }),
         call_kw: None,
     }))
@@ -609,7 +643,13 @@ fn math_pow(args: &[Object]) -> Result<Object, RuntimeError> {
 fn float_to_int_obj(f: f64) -> Result<Object, RuntimeError> {
     use num_traits::FromPrimitive;
     if !f.is_finite() {
-        return Err(value_error("cannot convert float infinity to integer"));
+        // CPython `math.floor`/`ceil`/`trunc`: NaN → ValueError, ±inf →
+        // OverflowError (both via `float.__trunc__`-style conversion).
+        return Err(if f.is_nan() {
+            value_error("cannot convert float NaN to integer")
+        } else {
+            overflow_error("cannot convert float infinity to integer")
+        });
     }
     if (i64::MIN as f64..=i64::MAX as f64).contains(&f) {
         Ok(Object::Int(f as i64))

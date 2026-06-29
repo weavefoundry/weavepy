@@ -4924,14 +4924,25 @@ impl Compiler {
             CompKind::Dict => OpCode::MapAdd,
             CompKind::Generator => OpCode::YieldValue,
         };
-        // Free-variable resolution from outer scope.
+        // Free-variable resolution from outer scope. The *outermost*
+        // iterable is excluded: it is evaluated eagerly in the enclosing
+        // scope and handed in as `.0` (CPython's symtable does the same),
+        // so a name read only there must NOT become a freevar — that would
+        // spuriously cell-promote the enclosing local. Load-bearing for
+        // `sys.getrefcount` parity: `any(x.f() for x in self.things)`
+        // must not promote `self` to a cell, because the cell seed holds
+        // an extra strong reference for the whole activation, and pandas'
+        // chained-assignment detection (`getrefcount(self) <= 3` in
+        // `DataFrame.__setitem__`) is calibrated against CPython counts.
         let mut reads = HashSet::new();
         collect_reads_expr(elt, &mut reads);
         if let Some(v) = value {
             collect_reads_expr(v, &mut reads);
         }
-        for g in generators {
-            collect_reads_expr(&g.iter, &mut reads);
+        for (gi, g) in generators.iter().enumerate() {
+            if gi > 0 {
+                collect_reads_expr(&g.iter, &mut reads);
+            }
             collect_reads_expr(&g.target, &mut reads);
             for i in &g.ifs {
                 collect_reads_expr(i, &mut reads);
@@ -5900,8 +5911,21 @@ fn collect_inner_free_expr(
             }
             let mut reads = HashSet::new();
             collect_reads_deep(elt, &mut reads);
-            for g in generators {
-                collect_reads_deep(&g.iter, &mut reads);
+            for (gi, g) in generators.iter().enumerate() {
+                // The outermost iterable evaluates in the *enclosing*
+                // scope (it's passed in as `.0`), so its direct name
+                // reads are ordinary enclosing-scope reads — recording
+                // them here would spuriously cell-promote enclosing
+                // locals (breaking `sys.getrefcount` parity for e.g.
+                // `any(... for b in self._mgr.blocks)` inside pandas'
+                // `DataFrame.__setitem__`). A nested scope *inside*
+                // that iterable still closes over the enclosing frame,
+                // so recurse for those.
+                if gi == 0 {
+                    collect_inner_free_expr(&g.iter, outer_bindings, out);
+                } else {
+                    collect_reads_deep(&g.iter, &mut reads);
+                }
                 for i in &g.ifs {
                     collect_reads_deep(i, &mut reads);
                 }
@@ -5924,8 +5948,14 @@ fn collect_inner_free_expr(
             let mut reads = HashSet::new();
             collect_reads_deep(key, &mut reads);
             collect_reads_deep(value, &mut reads);
-            for g in generators {
-                collect_reads_deep(&g.iter, &mut reads);
+            for (gi, g) in generators.iter().enumerate() {
+                // See the ListComp arm: the outermost iterable belongs
+                // to the enclosing scope.
+                if gi == 0 {
+                    collect_inner_free_expr(&g.iter, outer_bindings, out);
+                } else {
+                    collect_reads_deep(&g.iter, &mut reads);
+                }
                 for i in &g.ifs {
                     collect_reads_deep(i, &mut reads);
                 }

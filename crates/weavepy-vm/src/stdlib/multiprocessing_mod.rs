@@ -59,7 +59,7 @@ use crate::sync::RefCell;
 /// signal instead of a confusing `AttributeError` later.
 #[cfg(not(unix))]
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     dict.borrow_mut().insert(
         DictKey(Object::from_static("__name__")),
         Object::from_static("_multiprocessing"),
@@ -92,7 +92,7 @@ use crate::types::{PyInstance, TypeFlags, TypeObject};
 
 #[cfg(unix)]
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -276,7 +276,7 @@ fn semlock_type() -> Rc<TypeObject> {
         if let Some(t) = cell.borrow().clone() {
             return t;
         }
-        let mut d = DictData::new();
+        let mut d = DictData::default();
         d.insert(
             DictKey(Object::from_static("__module__")),
             Object::from_static("_multiprocessing"),
@@ -427,7 +427,7 @@ fn semlock_rebuild(args: &[Object]) -> Result<Object, RuntimeError> {
 /// method closures that capture the shared [`SemInner`].
 #[cfg(unix)]
 fn make_semlock_instance(inner: Arc<SemInner>) -> Object {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -513,7 +513,7 @@ fn make_semlock_instance(inner: Arc<SemInner>) -> Object {
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(semlock_type()),
         dict,
-        native: None,
+        native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
@@ -864,7 +864,7 @@ impl Drop for ConnInner {
 #[cfg(unix)]
 fn build_connection(fd: i32) -> Object {
     let inner = std::sync::Arc::new(Mutex::new(ConnInner { fd, closed: false }));
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let i = inner.clone();
         let send_bytes = move |args: &[Object]| -> Result<Object, RuntimeError> {
@@ -1123,7 +1123,7 @@ fn make_shared_memory(args: &[Object]) -> Result<Object, RuntimeError> {
         size: final_size,
         closed: false,
     }));
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let i = inner.clone();
         let close = move |_args: &[Object]| -> Result<Object, RuntimeError> {
@@ -1631,7 +1631,7 @@ fn arg_bytes_obj(o: &Object, label: &str) -> Result<Vec<u8>, RuntimeError> {
 
 #[cfg(unix)]
 pub fn build_posixshmem(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -1656,7 +1656,7 @@ pub fn build_posixshmem(_cache: &ModuleCache) -> Rc<PyModule> {
 
 #[cfg(not(unix))]
 pub fn build_posixshmem(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     dict.borrow_mut().insert(
         DictKey(Object::from_static("__name__")),
         Object::from_static("_posixshmem"),

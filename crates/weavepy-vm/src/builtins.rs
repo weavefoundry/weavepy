@@ -126,7 +126,7 @@ pub(crate) fn b_slice(args: &[Object]) -> Result<Object, RuntimeError> {
 
 /// Build the dict that backs the `builtins` module.
 pub fn default_builtins() -> DictData {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     macro_rules! reg {
         ($name:literal, $body:expr) => {{
             let f = BuiltinFn {
@@ -248,6 +248,7 @@ pub fn default_builtins() -> DictData {
     reg!("breakpoint", b_breakpoint);
     reg!("memoryview", b_memoryview);
     reg!("__weavepy_typevar__", b_typevar);
+    reg!("__weavepy_set_tp_name__", b_set_tp_name);
     // PEP 695 `type X = …` lowers (in the parser) to a call to this
     // name; it's a VM intrinsic (needs interpreter access to import
     // `typing` and mint typevars) so the real work runs in
@@ -450,7 +451,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "lower" => Some(method("lower", str_lower)),
             "title" => Some(method("title", str_title)),
             "capitalize" => Some(method("capitalize", str_capitalize)),
-            "casefold" => Some(method("casefold", str_lower)),
+            "casefold" => Some(method("casefold", str_casefold)),
             "swapcase" => Some(method("swapcase", str_swapcase)),
             "strip" => Some(method("strip", str_strip)),
             "lstrip" => Some(method("lstrip", str_lstrip)),
@@ -475,9 +476,10 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "isspace" => Some(method("isspace", str_isspace)),
             "isupper" => Some(method("isupper", str_isupper)),
             "islower" => Some(method("islower", str_islower)),
+            "istitle" => Some(method("istitle", str_istitle)),
             "isascii" => Some(method("isascii", str_isascii)),
-            "isnumeric" => Some(method("isnumeric", str_isdigit)),
-            "isdecimal" => Some(method("isdecimal", str_isdigit)),
+            "isnumeric" => Some(method("isnumeric", str_isnumeric)),
+            "isdecimal" => Some(method("isdecimal", str_isdecimal)),
             "isidentifier" => Some(method("isidentifier", str_isidentifier)),
             "isprintable" => Some(method("isprintable", str_isprintable)),
             "zfill" => Some(method("zfill", str_zfill)),
@@ -485,10 +487,10 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "rjust" => Some(method("rjust", str_rjust)),
             "center" => Some(method("center", str_center)),
             "expandtabs" => Some(method("expandtabs", str_expandtabs)),
-            "encode" => Some(method("encode", str_encode)),
+            "encode" => Some(method_kw("encode", str_encode)),
             "removeprefix" => Some(method("removeprefix", str_removeprefix)),
             "removesuffix" => Some(method("removesuffix", str_removesuffix)),
-            "format" => Some(method(".format", str_format)),
+            "format" => Some(method_kw(".format", str_format_kw)),
             "format_map" => Some(method(".format_map", str_format_map)),
             "translate" => Some(method("translate", str_translate)),
             "maketrans" => Some(method("maketrans", str_maketrans)),
@@ -518,6 +520,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
                 weavepy_compiler::BinOpKind::Mod,
                 false,
             )),
+            "__rmod__" => Some(method("__rmod__", str_dunder_rmod)),
             _ => None,
         },
         Object::List(_) => match name {
@@ -556,6 +559,14 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             )),
             "__iadd__" => Some(method("__iadd__", list_iadd)),
             "__imul__" => Some(method("__imul__", list_imul)),
+            _ => None,
+        },
+        // `range` is a genuine immutable sequence: CPython exposes `.index`
+        // and `.count` on it (pandas' `RangeIndex.get_loc` calls
+        // `self._range.index(int(key))` to locate a label).
+        Object::Range(_) => match name {
+            "index" => Some(method("index", range_index)),
+            "count" => Some(method("count", range_count)),
             _ => None,
         },
         Object::Dict(_) => match name {
@@ -926,8 +937,8 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
         Object::Int(_) | Object::Long(_) | Object::Bool(_) => match name {
             "bit_length" => Some(method("bit_length", int_bit_length)),
             "bit_count" => Some(method("bit_count", int_bit_count)),
-            "to_bytes" => Some(method("to_bytes", int_to_bytes)),
-            "from_bytes" => Some(method("from_bytes", int_from_bytes_method)),
+            "to_bytes" => Some(method_kw("to_bytes", int_to_bytes)),
+            "from_bytes" => Some(method_kw("from_bytes", int_from_bytes_method)),
             "is_integer" => Some(method("is_integer", int_is_integer)),
             "as_integer_ratio" => Some(method("as_integer_ratio", int_as_integer_ratio)),
             "conjugate" => Some(method("conjugate", int_conjugate)),
@@ -949,6 +960,11 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "fromhex" => Some(method("fromhex", float_fromhex)),
             "as_integer_ratio" => Some(method("as_integer_ratio", float_as_integer_ratio)),
             "conjugate" => Some(method("conjugate", float_conjugate)),
+            // CPython's `float` exposes `__int__` (truncation toward zero,
+            // raising on non-finite values). A C extension reaching `float`'s
+            // `nb_int` slot goes through the C-ABI bridge, but the Python-level
+            // dunder must exist too (`hasattr(float, "__int__")`).
+            "__int__" => Some(method("__int__", float_int)),
             "__trunc__" => Some(method("__trunc__", float_trunc)),
             "__floor__" => Some(method("__floor__", float_floor)),
             "__ceil__" => Some(method("__ceil__", float_ceil)),
@@ -1100,7 +1116,16 @@ fn seq_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => {
             let i = coerce_index_i64(index)?;
             let seq = as_seq(recv);
-            let idx = crate::normalize_index(i, seq.len())?;
+            // Match CPython's per-type `IndexError` text (`sq_item` wrappers);
+            // `bytes` (and any fallback) stays bare `"index out of range"`.
+            let msg = match recv {
+                Object::List(_) => "list index out of range",
+                Object::Tuple(_) => "tuple index out of range",
+                Object::Str(_) => "string index out of range",
+                Object::ByteArray(_) => "bytearray index out of range",
+                _ => "index out of range",
+            };
+            let idx = crate::normalize_index_msg(i, seq.len(), msg)?;
             Ok(seq[idx].clone())
         }
     }
@@ -1521,7 +1546,7 @@ pub(crate) fn numeric_dunder(self_repr: &Object, name: &str) -> Option<BuiltinFn
 /// instance; its wrapped native payload is the base-type value.
 fn instance_getnewargs(args: &[Object]) -> Result<Object, RuntimeError> {
     let native = match args.first() {
-        Some(Object::Instance(inst)) => inst.native.clone(),
+        Some(Object::Instance(inst)) => inst.native.get().cloned(),
         other => other.cloned(),
     };
     match native {
@@ -1610,7 +1635,7 @@ pub fn builtin_classmethod(type_name: &str, attr: &str) -> Option<Object> {
     let f = match (type_name, attr) {
         ("str", "maketrans") => Some(method("maketrans", str_maketrans)),
         ("bytes", "fromhex") | ("bytearray", "fromhex") => Some(method("fromhex", bytes_fromhex)),
-        ("int", "from_bytes") => Some(method("from_bytes", int_from_bytes_method)),
+        ("int", "from_bytes") => Some(method_kw("from_bytes", int_from_bytes_method)),
         ("float", "fromhex") => Some(method("fromhex", float_fromhex)),
         ("dict", "fromkeys") => Some(method("fromkeys", dict_fromkeys)),
         _ => None,
@@ -1930,6 +1955,23 @@ fn builtin_type_dunder_uncached(base_name: &str, name: &str) -> Option<Object> {
         }
         return None;
     }
+    // Rich-comparison slots are *object*'s defaults (identity `==`/`!=`,
+    // `NotImplemented` orderings). The value types (str/int/float/bytes/
+    // tuple/list/…) install their own value-based comparisons into their type
+    // dict via `install_value_richcmp`. `builtin_slot_wrapper` walks the MRO
+    // calling this helper *before* consulting each base's dict, so returning
+    // object's identity slot for e.g. `str` shadowed str's real `__eq__` and
+    // made `"c".__eq__("c")` decline with `NotImplemented` (instance-level
+    // dunder access only — `str.__eq__` on the type still hit the dict). Only
+    // surface these at `object`; every other base falls through so its own
+    // dict entry wins (or it inherits object's later in the MRO walk).
+    if matches!(
+        name,
+        "__eq__" | "__ne__" | "__lt__" | "__le__" | "__gt__" | "__ge__"
+    ) && base_name != "object"
+    {
+        return None;
+    }
     let (static_name, f): (&'static str, fn(&[Object]) -> Result<Object, RuntimeError>) = match name
     {
         "__repr__" => ("__repr__", slot_repr),
@@ -2075,7 +2117,7 @@ fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
             Object::Dict(inst.dict.clone())
         };
         if !slots.is_empty() {
-            let mut slot_dict = crate::object::DictData::new();
+            let mut slot_dict = crate::object::DictData::default();
             for (name, value) in slots {
                 slot_dict.insert(DictKey(Object::from_str(name)), value);
             }
@@ -2139,42 +2181,107 @@ pub(crate) fn seq_index_bound(o: &Object) -> Result<i64, RuntimeError> {
 }
 
 pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
-    if let Some(v) = o.as_i64() {
-        return Ok(v);
-    }
-    // A big integer is a valid `__index__` value, but it can't fit the C
-    // ssize_t the caller wants → `OverflowError`, matching CPython
-    // (`test_io.test_reconfigure_errors`: `line_buffering=2**1000`).
-    if matches!(o, Object::Long(_)) {
-        return Err(crate::error::overflow_error(
-            "cannot fit 'int' into an index-sized integer",
-        ));
-    }
-    if let Object::Instance(_) = o {
-        if let Some(method) = crate::instance_method(o, "__index__") {
-            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
-                // SAFETY: the pointer was published by an enclosing VM frame
-                // still live on this thread; the GIL keeps the access exclusive.
-                let interp = unsafe { &mut *ptr };
-                let globals = interp.builtins_dict();
-                let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
-                if let Some(v) = r.as_i64() {
-                    return Ok(v);
-                }
-                // `__index__` returned an int too large for an index-sized C
-                // integer (CPython raises `OverflowError`, not `TypeError`).
-                if matches!(r, Object::Long(_)) {
-                    return Err(crate::error::overflow_error(
-                        "cannot fit 'int' into an index-sized integer",
-                    ));
-                }
-            }
-        }
+    if let Some(res) = try_coerce_index_i64(o) {
+        return res;
     }
     Err(type_error(format!(
         "'{}' object cannot be interpreted as an integer",
         o.type_name()
     )))
+}
+
+/// CPython's `PyNumber_Index` without the C-ssize_t narrowing: coerce `o`
+/// through `__index__` and return the resulting int *object* (Int or Long)
+/// at full width. `hex()`/`oct()`/`bin()` accept any magnitude — a
+/// `np.uint64` above `i64::MAX` must format, not raise `OverflowError`.
+fn coerce_index_object(o: &Object) -> Result<Object, RuntimeError> {
+    match o {
+        Object::Int(_) | Object::Long(_) => return Ok(o.clone()),
+        Object::Bool(b) => return Ok(Object::Int(i64::from(*b))),
+        _ => {}
+    }
+    if !matches!(o, Object::Instance(_) | Object::Foreign(_)) {
+        return Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            o.type_name()
+        )));
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+        type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            o.type_name()
+        ))
+    })?;
+    // SAFETY: published by an enclosing VM frame still live on this thread.
+    let interp = unsafe { &mut *ptr };
+    let Ok(method) = interp.load_attr_public(o, "__index__") else {
+        return Err(type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            o.type_name()
+        )));
+    };
+    let globals = interp.builtins_dict();
+    let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+    match r {
+        Object::Int(_) | Object::Long(_) => Ok(r),
+        Object::Bool(b) => Ok(Object::Int(i64::from(b))),
+        other => Err(type_error(format!(
+            "__index__ returned non-int (type {})",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Like [`coerce_index_i64`], but distinguishes "has no `__index__`" (→
+/// `None`, so a caller can raise a context-specific message such as "tuple
+/// indices must be integers") from "has `__index__`, here is its (possibly
+/// failing) result" (→ `Some(..)`).
+///
+/// Unlike the old `instance_method`-only lookup, this resolves `__index__`
+/// through full attribute resolution, so a **C-slot** `nb_index` reached only
+/// via the bridge — a `numpy` integer scalar (`np.intp`, used to index
+/// `BlockManager.blocks[blknos[i]]`) — is honoured, matching CPython's
+/// `PyNumber_Index`.
+pub(crate) fn try_coerce_index_i64(o: &Object) -> Option<Result<i64, RuntimeError>> {
+    if let Some(v) = o.as_i64() {
+        return Some(Ok(v));
+    }
+    // A big integer is a valid `__index__` value, but it can't fit the C
+    // ssize_t the caller wants → `OverflowError`, matching CPython
+    // (`test_io.test_reconfigure_errors`: `line_buffering=2**1000`).
+    if matches!(o, Object::Long(_)) {
+        return Some(Err(crate::error::overflow_error(
+            "cannot fit 'int' into an index-sized integer",
+        )));
+    }
+    if !matches!(o, Object::Instance(_) | Object::Foreign(_)) {
+        return None;
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: the pointer was published by an enclosing VM frame still live on
+    // this thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let Ok(method) = interp.load_attr_public(o, "__index__") else {
+        return None;
+    };
+    let globals = interp.builtins_dict();
+    Some((|| {
+        let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+        if let Some(v) = r.as_i64() {
+            return Ok(v);
+        }
+        // `__index__` returned an int too large for an index-sized C integer
+        // (CPython raises `OverflowError`, not `TypeError`).
+        if matches!(r, Object::Long(_)) {
+            return Err(crate::error::overflow_error(
+                "cannot fit 'int' into an index-sized integer",
+            ));
+        }
+        Err(type_error(format!(
+            "__index__ returned non-int (type {})",
+            r.type_name()
+        )))
+    })())
 }
 
 /// Coerce `o` to an `f64` the way CPython's float-accepting C functions
@@ -2204,7 +2311,7 @@ pub(crate) fn coerce_f64_opt(o: &Object) -> Result<Option<f64>, RuntimeError> {
             }
         }
         Object::Instance(inst) => {
-            if let Some(native) = &inst.native {
+            if let Some(native) = inst.native.get() {
                 let native = native.clone();
                 return coerce_f64_opt(&native);
             }
@@ -2221,6 +2328,22 @@ pub(crate) fn coerce_f64_opt(o: &Object) -> Result<Option<f64>, RuntimeError> {
                 }
             }
             Ok(None)
+        }
+        Object::Foreign(s) => {
+            // A foreign extension scalar (numpy `float64`/`int64`/…) exposes
+            // its value through the binary-ABI `nb_float`/`nb_index` slots,
+            // exactly as `float(x)` consumes it (`do_float_call`). Without this
+            // `math.isclose`/`math.dist`/`statistics.*` rejected `float64`
+            // operands ("must be a real number, not 'object'") that pandas'
+            // `assert_almost_equal`, `Series.cov`/`corr`, etc. feed them —
+            // CPython's `PyFloat_AsDouble` honours `nb_float` then `nb_index`.
+            match crate::foreign::as_float(s) {
+                Ok(v) => coerce_f64_opt(&v),
+                Err(_) => match crate::foreign::as_index(s) {
+                    Ok(v) => coerce_f64_opt(&v),
+                    Err(_) => Ok(None),
+                },
+            }
         }
         _ => Ok(None),
     }
@@ -2407,7 +2530,7 @@ fn method_wrapper_set_func(args: &[Object]) {
     match args.first() {
         Some(Object::StaticMethod(w) | Object::ClassMethod(w)) => w.set_func(func),
         Some(Object::Instance(i)) => {
-            if let Some(Object::StaticMethod(w) | Object::ClassMethod(w)) = i.native.as_ref() {
+            if let Some(Object::StaticMethod(w) | Object::ClassMethod(w)) = i.native.get() {
                 w.set_func(func);
             }
         }
@@ -2712,7 +2835,6 @@ fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
             | Object::Builtin(_)
             | Object::BoundMethod(_)
             | Object::Type(_)
-            | Object::Generator(_)
             // Since Python 3.10 (bpo-43682) `staticmethod` objects are
             // themselves callable, forwarding to the wrapped function.
             | Object::StaticMethod(_)
@@ -2874,7 +2996,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                     if f.kw_defaults.is_empty() {
                         Some(Object::None)
                     } else {
-                        let mut d = crate::object::DictData::new();
+                        let mut d = crate::object::DictData::default();
                         for (k, v) in &f.kw_defaults {
                             d.insert(crate::object::DictKey(Object::from_str(k)), v.clone());
                         }
@@ -3475,11 +3597,12 @@ pub(crate) fn b_int_compat(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Bool(b) => Ok(Object::Int(i64::from(*b))),
         Object::Float(f) => {
             if !f.is_finite() {
-                return Err(value_error(if f.is_nan() {
-                    "cannot convert float NaN to integer"
+                // CPython: `int(nan)` → ValueError, `int(±inf)` → OverflowError.
+                return Err(if f.is_nan() {
+                    value_error("cannot convert float NaN to integer")
                 } else {
-                    "cannot convert float infinity to integer"
-                }));
+                    crate::error::overflow_error("cannot convert float infinity to integer")
+                });
             }
             // Truncate toward zero, like Python.
             let truncated = f.trunc();
@@ -3732,14 +3855,18 @@ fn int_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_tuple(vec![v.clone(), Object::Int(1)]))
 }
 
-fn int_to_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
+// CPython signature: `int.to_bytes(length=1, byteorder='big', *, signed=False)`.
+// `length`/`byteorder` are positional-or-keyword and `signed` is
+// keyword-only, so this must accept keywords (pandas' offsets / hypothesis
+// call `n.to_bytes(length, byteorder, signed=...)` by keyword).
+fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let n_obj = args
         .first()
         .ok_or_else(|| type_error("to_bytes() requires self"))?;
     let n = n_obj
         .as_bigint()
         .ok_or_else(|| type_error("to_bytes(): self is not an integer"))?;
-    let length = match args.get(1) {
+    let length = match arg_or_kw(args, 1, kwargs, "length") {
         Some(Object::Int(i)) if *i >= 0 => *i as usize,
         Some(Object::Bool(b)) => usize::from(*b),
         Some(Object::Long(b)) if !b.is_negative() => b
@@ -3752,12 +3879,12 @@ fn int_to_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
             ))
         }
     };
-    let byteorder = match args.get(2) {
+    let byteorder = match arg_or_kw(args, 2, kwargs, "byteorder") {
         Some(Object::Str(s)) => s.to_string(),
         None => "big".to_owned(),
         _ => return Err(type_error("byteorder must be a string")),
     };
-    let signed = match args.get(3) {
+    let signed = match arg_or_kw(args, 3, kwargs, "signed") {
         Some(o) => o.is_truthy(),
         None => false,
     };
@@ -3765,7 +3892,12 @@ fn int_to_bytes(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_bytes(bytes))
 }
 
-fn int_from_bytes_method(args: &[Object]) -> Result<Object, RuntimeError> {
+// CPython signature: `int.from_bytes(bytes, byteorder='big', *, signed=False)`.
+// `byteorder` is positional-or-keyword, `signed` keyword-only.
+fn int_from_bytes_method(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     // Bound-method form passes self as args[0] (the int class itself
     // in CPython). We treat any int-like first arg as the binding
     // receiver and ignore it.
@@ -3797,12 +3929,12 @@ fn int_from_bytes_method(args: &[Object]) -> Result<Object, RuntimeError> {
             })
         })
         .ok_or_else(|| type_error("from_bytes() requires bytes-like"))?;
-    let byteorder = match args.get(offset + 1) {
+    let byteorder = match arg_or_kw(args, offset + 1, kwargs, "byteorder") {
         Some(Object::Str(s)) => s.to_string(),
         None => "big".to_owned(),
         _ => return Err(type_error("byteorder must be a string")),
     };
-    let signed = match args.get(offset + 2) {
+    let signed = match arg_or_kw(args, offset + 2, kwargs, "signed") {
         Some(o) => o.is_truthy(),
         None => false,
     };
@@ -3985,6 +4117,29 @@ fn float_trunc(args: &[Object]) -> Result<Object, RuntimeError> {
             crate::object::bigint_from_f64_trunc(f.trunc()),
         )),
         _ => Err(type_error("__trunc__: float expected")),
+    }
+}
+
+/// `float.__int__(self)` — truncate toward zero, raising the same errors
+/// CPython does for non-finite inputs (`ValueError` for NaN, `OverflowError`
+/// for ±inf). Kept behaviourally identical to the type-dict `float.__int__`
+/// so instance- and type-level access agree.
+fn float_int(args: &[Object]) -> Result<Object, RuntimeError> {
+    match one(args, "__int__")? {
+        Object::Float(f) => {
+            if f.is_nan() {
+                return Err(value_error("cannot convert float NaN to integer"));
+            }
+            if f.is_infinite() {
+                return Err(crate::error::overflow_error(
+                    "cannot convert float infinity to integer",
+                ));
+            }
+            Ok(Object::int_from_bigint(
+                crate::object::bigint_from_f64_trunc(f.trunc()),
+            ))
+        }
+        _ => Err(type_error("__int__: float expected")),
     }
 }
 
@@ -4331,7 +4486,10 @@ fn parse_inf_or_nan(s: &[u8], start: usize) -> Option<(f64, usize)> {
         ))
     } else if ci_match(s, i, b"nan") {
         i += 3;
-        Some((if negate { -f64::NAN } else { f64::NAN }, i))
+        // Fresh identity per parse — CPython allocates a new float object
+        // (see `tag_nan` in object.rs).
+        let nan = crate::object::tag_nan(if negate { -f64::NAN } else { f64::NAN });
+        Some((nan, i))
     } else {
         None
     }
@@ -4358,10 +4516,13 @@ fn finish_hex_tail(s: &[u8], mut i: usize, val: f64) -> Result<f64, RuntimeError
 // binds `cls` to args[0], so each helper just discards args[0] and
 // routes the rest through the underlying body.
 
-pub(crate) fn b_int_from_bytes_cls(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_int_from_bytes_cls(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+) -> Result<Object, RuntimeError> {
     // CPython's `int.from_bytes` calls `cls(result)` for subclasses so
     // e.g. `IntEnum.from_bytes(...)` resolves to the matching member.
-    let result = int_from_bytes_method(args)?;
+    let result = int_from_bytes_method(args, kwargs)?;
     fromhex_wrap_subclass(args.first(), "int", result)
 }
 
@@ -4539,9 +4700,10 @@ fn parse_float_text(raw: &str) -> Option<f64> {
     match cleaned.to_ascii_lowercase().as_str() {
         "inf" | "infinity" | "+inf" | "+infinity" => return Some(f64::INFINITY),
         "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
-        "nan" | "+nan" => return Some(f64::NAN),
+        // Fresh identity per parse (CPython allocates a new float object).
+        "nan" | "+nan" => return Some(crate::object::tag_nan(f64::NAN)),
         // Preserve the sign bit so `copysign(1.0, float('-nan'))` is -1.0.
-        "-nan" => return Some(-f64::NAN),
+        "-nan" => return Some(crate::object::tag_nan(-f64::NAN)),
         _ => {}
     }
     // Reject the bare `inf`/`infinity`/`nan` tokens that Rust's parser also
@@ -4627,7 +4789,7 @@ fn b_bool(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(args[0].is_truthy()))
 }
 
-pub(crate) fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
+pub fn b_complex(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         return Ok(Object::new_complex(0.0, 0.0));
     }
@@ -4761,7 +4923,10 @@ fn parse_double_prefix(b: &[u8]) -> Option<(f64, usize)> {
         |word: &[u8]| rest.len() >= word.len() && rest[..word.len()].eq_ignore_ascii_case(word);
     let finish = |end: usize| -> Option<(f64, usize)> {
         let slice = std::str::from_utf8(&b[..end]).ok()?;
-        slice.parse::<f64>().ok().map(|v| (v, end))
+        slice
+            .parse::<f64>()
+            .ok()
+            .map(|v| (crate::object::tag_nan(v), end))
     };
     if starts(b"infinity") {
         return finish(i + 8);
@@ -4934,7 +5099,7 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     // re-iterating as a sequence of pairs (which would fail, since
     // iter(dict) yields keys, not items).
     if let Object::Dict(src) = &args[0] {
-        let mut d = DictData::new();
+        let mut d = DictData::default();
         for (k, v) in src.borrow().iter() {
             d.insert(k.clone(), v.clone());
         }
@@ -4946,7 +5111,7 @@ fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     // handled by the VM before dispatching here — see
     // `Vm::do_dict_call`. Anything left over is an iterable of pairs.
     let mut it = args[0].make_iter()?;
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     let mut i = 0usize;
     while let Some(pair) = it.next_value() {
         // CPython `PyDict_MergeFromSeq2`: each element must itself be a
@@ -5018,14 +5183,14 @@ fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
         )));
     }
     let out = if args.is_empty() {
-        crate::object::SetData::new()
+        crate::object::SetData::default()
     } else {
         // `set([[]])` raises `TypeError: unhashable type: 'list'` — check
         // each element as it is admitted, like CPython's `set_init`. A
         // custom `__eq__`/`__hash__` that raises during a collision aborts
         // construction (test_badcmp `set([BadCmp(), BadCmp()])`).
         let mut it = args[0].make_iter()?;
-        let mut out = crate::object::SetData::new();
+        let mut out = crate::object::SetData::default();
         while let Some(v) = it.next_value() {
             let key = set_insert_key(&v)?;
             crate::object::key_cmp_scope(|| out.insert(key))?;
@@ -5059,7 +5224,7 @@ fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
         return Ok(args[0].clone());
     }
     let mut it = args[0].make_iter()?;
-    let mut out = crate::object::SetData::new();
+    let mut out = crate::object::SetData::default();
     while let Some(v) = it.next_value() {
         let key = set_insert_key(&v)?;
         crate::object::key_cmp_scope(|| out.insert(key))?;
@@ -5172,7 +5337,7 @@ fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, Runti
             // (gh-29159); any other exception propagates (gh-34974).
             let indexable = inst
                 .native
-                .as_ref()
+                .get()
                 .map(|n| n.as_i64().is_some())
                 .unwrap_or(false)
                 || crate::instance_method(src, "__index__").is_some();
@@ -5185,7 +5350,7 @@ fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, Runti
             }
             // Buffer protocol: a bytes/bytearray subclass instance
             // carries its payload natively.
-            if let Some(native) = &inst.native {
+            if let Some(native) = inst.native.get() {
                 if matches!(
                     native,
                     Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
@@ -5215,11 +5380,21 @@ fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, Runti
                     }
                 }
             }
+            // C-level buffer protocol: a faithful C instance whose type fills
+            // `bf_getbuffer` (numpy's `ndarray`, Cython memoryviews). CPython's
+            // `bytes()` prefers the buffer over iteration, so `bytes(ndarray)`
+            // is the raw C-order bytes, not per-item ints (pandas'
+            // `test_byteswap` feeds `bytes(uint8_array)` to its readers).
+            if crate::foreign::is_installed() {
+                if let Ok(Object::MemoryView(mv)) = crate::foreign::get_buffer_obj(src) {
+                    return Ok(mv.to_bytes());
+                }
+            }
             // Iterable (including legacy `__getitem__` sequences) via
             // interpreter reentry; `__iter__` exceptions propagate.
             let iterable = crate::instance_method(src, "__iter__").is_some()
                 || crate::instance_method(src, "__getitem__").is_some()
-                || inst.native.is_some();
+                || inst.native.get().is_some();
             if !iterable {
                 return Err(type_error(format!(
                     "cannot convert '{}' object to {}",
@@ -5230,7 +5405,27 @@ fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, Runti
             bytes_from_iterable_reentrant(src, type_name)
         }
         other => {
-            if other.make_iter().is_err() && !matches!(other, Object::Generator(_)) {
+            // A foreign integer (`bytes(np.int64(3))`) zero-fills like a VM
+            // int; a foreign buffer exporter yields its raw bytes (see the
+            // Instance arm). Both take priority over iteration, as in CPython.
+            if let Object::Foreign(soul) = other {
+                if let Ok(n) = crate::foreign::as_index(soul).and_then(|o| {
+                    o.as_i64()
+                        .ok_or_else(|| type_error("index did not fit in i64"))
+                }) {
+                    return zero_fill(n);
+                }
+                if let Ok(Object::MemoryView(mv)) = crate::foreign::get_buffer(soul) {
+                    return Ok(mv.to_bytes());
+                }
+            }
+            // Probe iterability *without* consuming the source: for a
+            // generator, `make_iter` materialises the whole thing through
+            // the live interpreter — probing first would exhaust it, and
+            // the real collection below would then see zero items
+            // (`bytes(x for x in …)` returned `b''`). Generators are
+            // always iterable; everything else gets the cheap probe.
+            if !matches!(other, Object::Generator(_)) && other.make_iter().is_err() {
                 return Err(type_error(format!(
                     "cannot convert '{}' object to {}",
                     other.type_name(),
@@ -5333,7 +5528,7 @@ fn bytes_construct(
     // String sources require an encoding; non-string sources reject one.
     let as_str: Option<Rc<str>> = match src {
         Object::Str(s) => Some(s.clone()),
-        Object::Instance(inst) => match &inst.native {
+        Object::Instance(inst) => match inst.native.get() {
             Some(Object::Str(s)) => Some(s.clone()),
             _ => None,
         },
@@ -5393,7 +5588,7 @@ fn b_bytes_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
                     let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
                     let is_bytes = matches!(&r, Object::Bytes(_))
                         || matches!(&r, Object::Instance(inst)
-                            if matches!(&inst.native, Some(Object::Bytes(_))));
+                            if matches!(inst.native.get(), Some(Object::Bytes(_))));
                     if !is_bytes {
                         return Err(type_error(format!(
                             "__bytes__ returned non-bytes (type {})",
@@ -5679,7 +5874,9 @@ pub(crate) fn b_abs(args: &[Object]) -> Result<Object, RuntimeError> {
             None => Ok(Object::int_from_bigint(num_bigint::BigInt::from(*i).abs())),
         },
         Object::Long(b) => Ok(Object::int_from_bigint(b.abs())),
-        Object::Float(f) => Ok(Object::Float(f.abs())),
+        // `abs(nan)` allocates in CPython — fresh identity (`abs(x) is x`
+        // is False even for a positive NaN).
+        Object::Float(f) => Ok(crate::object::fresh_float(f.abs())),
         Object::Complex(c) => {
             // `hypot` (CPython's `_Py_c_abs`) avoids the spurious overflow
             // of `sqrt(re²+im²)`; a non-finite result from finite parts is
@@ -5935,7 +6132,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
     let inst = crate::types::PyInstance {
         class: RefCell::new(builtin_types().super_.clone()),
         dict: Rc::new(RefCell::new({
-            let mut d = DictData::new();
+            let mut d = DictData::default();
             d.insert(DictKey(Object::from_static("__self__")), Object::None);
             d.insert(
                 DictKey(Object::from_static("__thisclass__")),
@@ -5943,7 +6140,7 @@ pub(crate) fn make_unbound_super(class: Rc<crate::types::TypeObject>) -> Object 
             );
             d
         })),
-        native: None,
+        native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
@@ -5995,7 +6192,7 @@ pub(crate) fn build_super_proxy(
     let inst = crate::types::PyInstance {
         class: RefCell::new(proxy_type),
         dict: Rc::new(RefCell::new({
-            let mut d = DictData::new();
+            let mut d = DictData::default();
             d.insert(DictKey(Object::from_static("__self__")), receiver);
             d.insert(
                 DictKey(Object::from_static("__thisclass__")),
@@ -6013,7 +6210,7 @@ pub(crate) fn build_super_proxy(
             );
             d
         })),
-        native: None,
+        native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
@@ -6583,7 +6780,7 @@ fn b_hash(args: &[Object]) -> Result<Object, RuntimeError> {
 /// fall back to a small list of dunder names. We deliberately keep
 /// this loose because runtime helpers (typing, dataclasses, abc)
 /// only need it to enumerate user attributes.
-pub(crate) fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
+pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
     use std::collections::BTreeSet;
     let mut names: BTreeSet<String> = BTreeSet::new();
     let obj = one(args, "dir")?;
@@ -6615,6 +6812,45 @@ pub(crate) fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             for k in m.dict.borrow().keys() {
                 if let Object::Str(s) = &k.0 {
                     names.insert(s.to_string());
+                }
+            }
+        }
+        Object::Function(f) => {
+            // CPython's `function.__dir__` = type attributes ∪ instance
+            // `__dict__`. The instance part matters to code that *copies*
+            // attributes by enumerating `dir(fn)` — hypothesis's `@given`
+            // transplants pytest marks onto its wrapper that way, so a dir
+            // that hid `f.pytestmark` silently dropped every
+            // `@pytest.mark.parametrize` stacked under `@given`.
+            for k in f.attrs.borrow().keys() {
+                if let Object::Str(s) = &k.0 {
+                    names.insert(s.to_string());
+                }
+            }
+            for n in [
+                "__annotations__",
+                "__builtins__",
+                "__call__",
+                "__closure__",
+                "__code__",
+                "__defaults__",
+                "__dict__",
+                "__doc__",
+                "__get__",
+                "__globals__",
+                "__kwdefaults__",
+                "__module__",
+                "__name__",
+                "__qualname__",
+                "__type_params__",
+            ] {
+                names.insert(n.to_string());
+            }
+            for t in class_of(obj).mro.borrow().iter() {
+                for k in t.dict.borrow().keys() {
+                    if let Object::Str(s) = &k.0 {
+                        names.insert(s.to_string());
+                    }
                 }
             }
         }
@@ -6725,8 +6961,9 @@ fn b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Bool(b) => Ok(Object::from_str(format!("0x{}", i64::from(*b)))),
-        // The `__index__` protocol (CPython `PyNumber_Index`).
-        other => b_hex(&[Object::Int(coerce_index_i64(other)?)]),
+        // The `__index__` protocol (CPython `PyNumber_Index`), full-width:
+        // a `np.uint64` above `i64::MAX` still formats.
+        other => b_hex(&[coerce_index_object(other)?]),
     }
 }
 
@@ -6749,7 +6986,7 @@ fn b_oct(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         Object::Bool(b) => Ok(Object::from_str(format!("0o{}", i64::from(*b)))),
         // The `__index__` protocol (CPython `PyNumber_Index`).
-        other => b_oct(&[Object::Int(coerce_index_i64(other)?)]),
+        other => b_oct(&[coerce_index_object(other)?]),
     }
 }
 
@@ -6771,8 +7008,8 @@ fn b_bin(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Bool(b) => Ok(Object::from_str(format!("0b{}", i64::from(*b)))),
-        // The `__index__` protocol (CPython `PyNumber_Index`).
-        other => b_bin(&[Object::Int(coerce_index_i64(other)?)]),
+        // The `__index__` protocol (CPython `PyNumber_Index`), full-width.
+        other => b_bin(&[coerce_index_object(other)?]),
     }
 }
 
@@ -6790,7 +7027,10 @@ fn b_chr(args: &[Object]) -> Result<Object, RuntimeError> {
             // a `WStr` for the surrogate range and a plain `Str` otherwise.
             Ok(Object::str_from_codepoints(vec![n]))
         }
-        _ => Err(type_error("chr() expected int")),
+        // Anything with `__index__` (bool, numpy integer scalars — pandas'
+        // merge code does `chr(ord("a") + np.int64(i))`); CPython parses the
+        // argument with the `i` converter, which coerces via `__index__`.
+        other => b_chr(&[Object::Int(coerce_index_i64(other)?)]),
     }
 }
 
@@ -6951,6 +7191,33 @@ fn pow_simple(base: &Object, exp: &Object) -> Result<Object, RuntimeError> {
                 Err(value_error("pow() exponent too large"))
             }
         }
+        // CPython's `pow()` is `PyNumber_Power` — the full binary-op
+        // protocol, honouring `__pow__`/`__rpow__` and foreign C number
+        // slots. Anything with a dispatchable operand (a user instance, a
+        // foreign scalar like `np.int64`, or a metaclass operator) routes
+        // through the interpreter's `**` dispatch; only when no interpreter
+        // is live (or dispatch itself declines) does the canonical
+        // TypeError below fire. pandas' decimal extension tests reach this
+        // with `pow(2.0, np.int64(...))`.
+        (a, b)
+            if matches!(
+                a,
+                Object::Instance(_) | Object::Foreign(_) | Object::Type(_)
+            ) || matches!(
+                b,
+                Object::Instance(_) | Object::Foreign(_) | Object::Type(_)
+            ) =>
+        {
+            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                // SAFETY: published by an enclosing VM frame still live on
+                // this thread; the GIL keeps the access exclusive.
+                let interp = unsafe { &mut *ptr };
+                let globals = interp.builtins_dict();
+                interp.dispatch_binary_op(a, b, weavepy_compiler::BinOpKind::Pow, &globals)
+            } else {
+                crate::binary_op(a, b, weavepy_compiler::BinOpKind::Pow)
+            }
+        }
         _ => Err(type_error(format!(
             "unsupported operand type(s) for pow(): '{}' and '{}'",
             base.type_name(),
@@ -7055,7 +7322,7 @@ pub(crate) fn b_typevar(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(other) => other.to_str(),
         None => "T".to_owned(),
     };
-    let mut d = crate::object::DictData::new();
+    let mut d = crate::object::DictData::default();
     d.insert(
         crate::object::DictKey(Object::from_static("__name__")),
         Object::from_str(&name),
@@ -7067,6 +7334,25 @@ pub(crate) fn b_typevar(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::SimpleNamespace(Rc::new(crate::sync::RefCell::new(
         d,
     ))))
+}
+
+/// `__weavepy_set_tp_name__(cls, name)` — internal hook for stdlib
+/// Python modules that re-implement CPython *C static types* in pure
+/// Python (`re.Pattern`, `re.Match`). CPython's `tp_name` for those
+/// carries the dotted module prefix, and `tp_name`-based error text
+/// ("'re.Pattern' object is not callable") prints it; the pure-Python
+/// class's bare `__name__` stays untouched.
+pub(crate) fn b_set_tp_name(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args {
+        [Object::Type(t), Object::Str(s)] => {
+            t.c_tp_name
+                .set(Some(Box::leak(s.to_string().into_boxed_str())));
+            Ok(Object::None)
+        }
+        _ => Err(type_error(
+            "__weavepy_set_tp_name__(cls, name) expects a class and a str",
+        )),
+    }
 }
 
 /// `memoryview(obj)` — returns a `MemoryView` over a bytes-like
@@ -7088,10 +7374,23 @@ pub fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
                 .expect("shared_buffer present per guard");
             crate::object::PyMemoryView::from_shared(buf)
         }
+        // A foreign buffer exporter (numpy's `ndarray`, a Cython `cdef
+        // class` with `__getbuffer__`, …). Route through the cpyext
+        // bridge, which drives `PyObject_GetBuffer` and returns a
+        // faithfully-typed memoryview (`format`/`itemsize`/`shape`).
+        Object::Foreign(soul) => return crate::foreign::get_buffer(soul),
+        // A faithful C instance that exports the buffer protocol crosses as
+        // `Object::Instance` wearing its real type (numpy's `ndarray` is built
+        // by its own `tp_new`, not proxied as `Foreign`). Drive its
+        // `bf_getbuffer` through the cpyext bridge. A non-exporter instance
+        // surfaces the C-side `TypeError`, matching CPython.
+        Object::Instance(_) if crate::foreign::is_installed() => {
+            return crate::foreign::get_buffer_obj(arg);
+        }
         other => {
             return Err(type_error(format!(
                 "memoryview: a bytes-like object is required, not '{}'",
-                other.type_name()
+                other.type_name_owned()
             )));
         }
     };
@@ -7190,6 +7489,27 @@ pub(crate) fn b_divmod(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("divmod expected 2 arguments"));
     }
+    // Float divmod is a single fused operation in CPython with its own
+    // ZeroDivisionError message ("float divmod()"), and computing `//`
+    // and `%` separately would double-raise with the wrong text.
+    fn float_operand(o: &Object) -> Option<f64> {
+        match o {
+            Object::Float(f) => Some(*f),
+            Object::Int(i) => Some(*i as f64),
+            Object::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Object::Long(b) => b.to_f64(),
+            _ => None,
+        }
+    }
+    if matches!(&args[0], Object::Float(_)) || matches!(&args[1], Object::Float(_)) {
+        if let (Some(x), Some(y)) = (float_operand(&args[0]), float_operand(&args[1])) {
+            let (q, r) = crate::py_float_divmod(x, y, "float divmod()")?;
+            return Ok(Object::new_tuple(vec![
+                crate::object::fresh_float(q),
+                crate::object::fresh_float(r),
+            ]));
+        }
+    }
     let q = crate::binary_op(&args[0], &args[1], weavepy_compiler::BinOpKind::FloorDiv)?;
     let r = crate::binary_op(&args[0], &args[1], weavepy_compiler::BinOpKind::Mod)?;
     Ok(Object::new_tuple(vec![q, r]))
@@ -7235,8 +7555,8 @@ pub(crate) fn b_round(args: &[Object]) -> Result<Object, RuntimeError> {
                 Ok(float_to_int_obj(round_ties_even(*f)))
             }
             // `round(x, n)` returns a `float`, correctly rounded (ties-to-even)
-            // to `n` decimal places.
-            Some(n) => double_round(*f, n).map(Object::Float),
+            // to `n` decimal places. Fresh object in CPython (NaN identity).
+            Some(n) => double_round(*f, n).map(crate::object::fresh_float),
         },
         _ => Err(type_error("round() argument must be int or float")),
     }
@@ -7442,6 +7762,333 @@ fn str_upper(args: &[Object]) -> Result<Object, RuntimeError> {
 fn str_lower(args: &[Object]) -> Result<Object, RuntimeError> {
     let lo = str_self(args)?.to_lowercase();
     Ok(str_result(args, lo))
+}
+
+/// `str.casefold()` — aggressive, caseless-matching fold. Distinct from
+/// `.lower()`: e.g. `"ß".casefold() == "ss"` and `"ς".casefold() == "σ"`.
+/// Applies the per-character full case-folding mapping (`casefold_char`)
+/// where it diverges from the simple lowercase mapping, and falls back
+/// to `char::to_lowercase()` otherwise. Case folding is context-free
+/// (no Greek final-sigma special-casing), so a per-`char` pass is exact.
+fn str_casefold(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match casefold_char(c) {
+            Some(folded) => out.push_str(folded),
+            None => out.extend(c.to_lowercase()),
+        }
+    }
+    Ok(str_result(args, out))
+}
+
+/// Full Unicode case-folding overlay (`CaseFolding.txt` C+F status),
+/// covering only the code points whose fold differs from their simple
+/// `char::to_lowercase()` mapping; all others fold to their lowercase
+/// form (applied by the caller). Generated from CPython's own
+/// `str.casefold()` over the entire code-point space, so it tracks the
+/// same Unicode version CPython ships.
+fn casefold_char(c: char) -> Option<&'static str> {
+    match c {
+        '\u{b5}' => Some("\u{3bc}"),
+        '\u{df}' => Some("\u{73}\u{73}"),
+        '\u{149}' => Some("\u{2bc}\u{6e}"),
+        '\u{17f}' => Some("\u{73}"),
+        '\u{1f0}' => Some("\u{6a}\u{30c}"),
+        '\u{345}' => Some("\u{3b9}"),
+        '\u{390}' => Some("\u{3b9}\u{308}\u{301}"),
+        '\u{3b0}' => Some("\u{3c5}\u{308}\u{301}"),
+        '\u{3c2}' => Some("\u{3c3}"),
+        '\u{3d0}' => Some("\u{3b2}"),
+        '\u{3d1}' => Some("\u{3b8}"),
+        '\u{3d5}' => Some("\u{3c6}"),
+        '\u{3d6}' => Some("\u{3c0}"),
+        '\u{3f0}' => Some("\u{3ba}"),
+        '\u{3f1}' => Some("\u{3c1}"),
+        '\u{3f5}' => Some("\u{3b5}"),
+        '\u{587}' => Some("\u{565}\u{582}"),
+        '\u{13a0}' => Some("\u{13a0}"),
+        '\u{13a1}' => Some("\u{13a1}"),
+        '\u{13a2}' => Some("\u{13a2}"),
+        '\u{13a3}' => Some("\u{13a3}"),
+        '\u{13a4}' => Some("\u{13a4}"),
+        '\u{13a5}' => Some("\u{13a5}"),
+        '\u{13a6}' => Some("\u{13a6}"),
+        '\u{13a7}' => Some("\u{13a7}"),
+        '\u{13a8}' => Some("\u{13a8}"),
+        '\u{13a9}' => Some("\u{13a9}"),
+        '\u{13aa}' => Some("\u{13aa}"),
+        '\u{13ab}' => Some("\u{13ab}"),
+        '\u{13ac}' => Some("\u{13ac}"),
+        '\u{13ad}' => Some("\u{13ad}"),
+        '\u{13ae}' => Some("\u{13ae}"),
+        '\u{13af}' => Some("\u{13af}"),
+        '\u{13b0}' => Some("\u{13b0}"),
+        '\u{13b1}' => Some("\u{13b1}"),
+        '\u{13b2}' => Some("\u{13b2}"),
+        '\u{13b3}' => Some("\u{13b3}"),
+        '\u{13b4}' => Some("\u{13b4}"),
+        '\u{13b5}' => Some("\u{13b5}"),
+        '\u{13b6}' => Some("\u{13b6}"),
+        '\u{13b7}' => Some("\u{13b7}"),
+        '\u{13b8}' => Some("\u{13b8}"),
+        '\u{13b9}' => Some("\u{13b9}"),
+        '\u{13ba}' => Some("\u{13ba}"),
+        '\u{13bb}' => Some("\u{13bb}"),
+        '\u{13bc}' => Some("\u{13bc}"),
+        '\u{13bd}' => Some("\u{13bd}"),
+        '\u{13be}' => Some("\u{13be}"),
+        '\u{13bf}' => Some("\u{13bf}"),
+        '\u{13c0}' => Some("\u{13c0}"),
+        '\u{13c1}' => Some("\u{13c1}"),
+        '\u{13c2}' => Some("\u{13c2}"),
+        '\u{13c3}' => Some("\u{13c3}"),
+        '\u{13c4}' => Some("\u{13c4}"),
+        '\u{13c5}' => Some("\u{13c5}"),
+        '\u{13c6}' => Some("\u{13c6}"),
+        '\u{13c7}' => Some("\u{13c7}"),
+        '\u{13c8}' => Some("\u{13c8}"),
+        '\u{13c9}' => Some("\u{13c9}"),
+        '\u{13ca}' => Some("\u{13ca}"),
+        '\u{13cb}' => Some("\u{13cb}"),
+        '\u{13cc}' => Some("\u{13cc}"),
+        '\u{13cd}' => Some("\u{13cd}"),
+        '\u{13ce}' => Some("\u{13ce}"),
+        '\u{13cf}' => Some("\u{13cf}"),
+        '\u{13d0}' => Some("\u{13d0}"),
+        '\u{13d1}' => Some("\u{13d1}"),
+        '\u{13d2}' => Some("\u{13d2}"),
+        '\u{13d3}' => Some("\u{13d3}"),
+        '\u{13d4}' => Some("\u{13d4}"),
+        '\u{13d5}' => Some("\u{13d5}"),
+        '\u{13d6}' => Some("\u{13d6}"),
+        '\u{13d7}' => Some("\u{13d7}"),
+        '\u{13d8}' => Some("\u{13d8}"),
+        '\u{13d9}' => Some("\u{13d9}"),
+        '\u{13da}' => Some("\u{13da}"),
+        '\u{13db}' => Some("\u{13db}"),
+        '\u{13dc}' => Some("\u{13dc}"),
+        '\u{13dd}' => Some("\u{13dd}"),
+        '\u{13de}' => Some("\u{13de}"),
+        '\u{13df}' => Some("\u{13df}"),
+        '\u{13e0}' => Some("\u{13e0}"),
+        '\u{13e1}' => Some("\u{13e1}"),
+        '\u{13e2}' => Some("\u{13e2}"),
+        '\u{13e3}' => Some("\u{13e3}"),
+        '\u{13e4}' => Some("\u{13e4}"),
+        '\u{13e5}' => Some("\u{13e5}"),
+        '\u{13e6}' => Some("\u{13e6}"),
+        '\u{13e7}' => Some("\u{13e7}"),
+        '\u{13e8}' => Some("\u{13e8}"),
+        '\u{13e9}' => Some("\u{13e9}"),
+        '\u{13ea}' => Some("\u{13ea}"),
+        '\u{13eb}' => Some("\u{13eb}"),
+        '\u{13ec}' => Some("\u{13ec}"),
+        '\u{13ed}' => Some("\u{13ed}"),
+        '\u{13ee}' => Some("\u{13ee}"),
+        '\u{13ef}' => Some("\u{13ef}"),
+        '\u{13f0}' => Some("\u{13f0}"),
+        '\u{13f1}' => Some("\u{13f1}"),
+        '\u{13f2}' => Some("\u{13f2}"),
+        '\u{13f3}' => Some("\u{13f3}"),
+        '\u{13f4}' => Some("\u{13f4}"),
+        '\u{13f5}' => Some("\u{13f5}"),
+        '\u{13f8}' => Some("\u{13f0}"),
+        '\u{13f9}' => Some("\u{13f1}"),
+        '\u{13fa}' => Some("\u{13f2}"),
+        '\u{13fb}' => Some("\u{13f3}"),
+        '\u{13fc}' => Some("\u{13f4}"),
+        '\u{13fd}' => Some("\u{13f5}"),
+        '\u{1c80}' => Some("\u{432}"),
+        '\u{1c81}' => Some("\u{434}"),
+        '\u{1c82}' => Some("\u{43e}"),
+        '\u{1c83}' => Some("\u{441}"),
+        '\u{1c84}' => Some("\u{442}"),
+        '\u{1c85}' => Some("\u{442}"),
+        '\u{1c86}' => Some("\u{44a}"),
+        '\u{1c87}' => Some("\u{463}"),
+        '\u{1c88}' => Some("\u{a64b}"),
+        '\u{1e96}' => Some("\u{68}\u{331}"),
+        '\u{1e97}' => Some("\u{74}\u{308}"),
+        '\u{1e98}' => Some("\u{77}\u{30a}"),
+        '\u{1e99}' => Some("\u{79}\u{30a}"),
+        '\u{1e9a}' => Some("\u{61}\u{2be}"),
+        '\u{1e9b}' => Some("\u{1e61}"),
+        '\u{1e9e}' => Some("\u{73}\u{73}"),
+        '\u{1f50}' => Some("\u{3c5}\u{313}"),
+        '\u{1f52}' => Some("\u{3c5}\u{313}\u{300}"),
+        '\u{1f54}' => Some("\u{3c5}\u{313}\u{301}"),
+        '\u{1f56}' => Some("\u{3c5}\u{313}\u{342}"),
+        '\u{1f80}' => Some("\u{1f00}\u{3b9}"),
+        '\u{1f81}' => Some("\u{1f01}\u{3b9}"),
+        '\u{1f82}' => Some("\u{1f02}\u{3b9}"),
+        '\u{1f83}' => Some("\u{1f03}\u{3b9}"),
+        '\u{1f84}' => Some("\u{1f04}\u{3b9}"),
+        '\u{1f85}' => Some("\u{1f05}\u{3b9}"),
+        '\u{1f86}' => Some("\u{1f06}\u{3b9}"),
+        '\u{1f87}' => Some("\u{1f07}\u{3b9}"),
+        '\u{1f88}' => Some("\u{1f00}\u{3b9}"),
+        '\u{1f89}' => Some("\u{1f01}\u{3b9}"),
+        '\u{1f8a}' => Some("\u{1f02}\u{3b9}"),
+        '\u{1f8b}' => Some("\u{1f03}\u{3b9}"),
+        '\u{1f8c}' => Some("\u{1f04}\u{3b9}"),
+        '\u{1f8d}' => Some("\u{1f05}\u{3b9}"),
+        '\u{1f8e}' => Some("\u{1f06}\u{3b9}"),
+        '\u{1f8f}' => Some("\u{1f07}\u{3b9}"),
+        '\u{1f90}' => Some("\u{1f20}\u{3b9}"),
+        '\u{1f91}' => Some("\u{1f21}\u{3b9}"),
+        '\u{1f92}' => Some("\u{1f22}\u{3b9}"),
+        '\u{1f93}' => Some("\u{1f23}\u{3b9}"),
+        '\u{1f94}' => Some("\u{1f24}\u{3b9}"),
+        '\u{1f95}' => Some("\u{1f25}\u{3b9}"),
+        '\u{1f96}' => Some("\u{1f26}\u{3b9}"),
+        '\u{1f97}' => Some("\u{1f27}\u{3b9}"),
+        '\u{1f98}' => Some("\u{1f20}\u{3b9}"),
+        '\u{1f99}' => Some("\u{1f21}\u{3b9}"),
+        '\u{1f9a}' => Some("\u{1f22}\u{3b9}"),
+        '\u{1f9b}' => Some("\u{1f23}\u{3b9}"),
+        '\u{1f9c}' => Some("\u{1f24}\u{3b9}"),
+        '\u{1f9d}' => Some("\u{1f25}\u{3b9}"),
+        '\u{1f9e}' => Some("\u{1f26}\u{3b9}"),
+        '\u{1f9f}' => Some("\u{1f27}\u{3b9}"),
+        '\u{1fa0}' => Some("\u{1f60}\u{3b9}"),
+        '\u{1fa1}' => Some("\u{1f61}\u{3b9}"),
+        '\u{1fa2}' => Some("\u{1f62}\u{3b9}"),
+        '\u{1fa3}' => Some("\u{1f63}\u{3b9}"),
+        '\u{1fa4}' => Some("\u{1f64}\u{3b9}"),
+        '\u{1fa5}' => Some("\u{1f65}\u{3b9}"),
+        '\u{1fa6}' => Some("\u{1f66}\u{3b9}"),
+        '\u{1fa7}' => Some("\u{1f67}\u{3b9}"),
+        '\u{1fa8}' => Some("\u{1f60}\u{3b9}"),
+        '\u{1fa9}' => Some("\u{1f61}\u{3b9}"),
+        '\u{1faa}' => Some("\u{1f62}\u{3b9}"),
+        '\u{1fab}' => Some("\u{1f63}\u{3b9}"),
+        '\u{1fac}' => Some("\u{1f64}\u{3b9}"),
+        '\u{1fad}' => Some("\u{1f65}\u{3b9}"),
+        '\u{1fae}' => Some("\u{1f66}\u{3b9}"),
+        '\u{1faf}' => Some("\u{1f67}\u{3b9}"),
+        '\u{1fb2}' => Some("\u{1f70}\u{3b9}"),
+        '\u{1fb3}' => Some("\u{3b1}\u{3b9}"),
+        '\u{1fb4}' => Some("\u{3ac}\u{3b9}"),
+        '\u{1fb6}' => Some("\u{3b1}\u{342}"),
+        '\u{1fb7}' => Some("\u{3b1}\u{342}\u{3b9}"),
+        '\u{1fbc}' => Some("\u{3b1}\u{3b9}"),
+        '\u{1fbe}' => Some("\u{3b9}"),
+        '\u{1fc2}' => Some("\u{1f74}\u{3b9}"),
+        '\u{1fc3}' => Some("\u{3b7}\u{3b9}"),
+        '\u{1fc4}' => Some("\u{3ae}\u{3b9}"),
+        '\u{1fc6}' => Some("\u{3b7}\u{342}"),
+        '\u{1fc7}' => Some("\u{3b7}\u{342}\u{3b9}"),
+        '\u{1fcc}' => Some("\u{3b7}\u{3b9}"),
+        '\u{1fd2}' => Some("\u{3b9}\u{308}\u{300}"),
+        '\u{1fd3}' => Some("\u{3b9}\u{308}\u{301}"),
+        '\u{1fd6}' => Some("\u{3b9}\u{342}"),
+        '\u{1fd7}' => Some("\u{3b9}\u{308}\u{342}"),
+        '\u{1fe2}' => Some("\u{3c5}\u{308}\u{300}"),
+        '\u{1fe3}' => Some("\u{3c5}\u{308}\u{301}"),
+        '\u{1fe4}' => Some("\u{3c1}\u{313}"),
+        '\u{1fe6}' => Some("\u{3c5}\u{342}"),
+        '\u{1fe7}' => Some("\u{3c5}\u{308}\u{342}"),
+        '\u{1ff2}' => Some("\u{1f7c}\u{3b9}"),
+        '\u{1ff3}' => Some("\u{3c9}\u{3b9}"),
+        '\u{1ff4}' => Some("\u{3ce}\u{3b9}"),
+        '\u{1ff6}' => Some("\u{3c9}\u{342}"),
+        '\u{1ff7}' => Some("\u{3c9}\u{342}\u{3b9}"),
+        '\u{1ffc}' => Some("\u{3c9}\u{3b9}"),
+        '\u{ab70}' => Some("\u{13a0}"),
+        '\u{ab71}' => Some("\u{13a1}"),
+        '\u{ab72}' => Some("\u{13a2}"),
+        '\u{ab73}' => Some("\u{13a3}"),
+        '\u{ab74}' => Some("\u{13a4}"),
+        '\u{ab75}' => Some("\u{13a5}"),
+        '\u{ab76}' => Some("\u{13a6}"),
+        '\u{ab77}' => Some("\u{13a7}"),
+        '\u{ab78}' => Some("\u{13a8}"),
+        '\u{ab79}' => Some("\u{13a9}"),
+        '\u{ab7a}' => Some("\u{13aa}"),
+        '\u{ab7b}' => Some("\u{13ab}"),
+        '\u{ab7c}' => Some("\u{13ac}"),
+        '\u{ab7d}' => Some("\u{13ad}"),
+        '\u{ab7e}' => Some("\u{13ae}"),
+        '\u{ab7f}' => Some("\u{13af}"),
+        '\u{ab80}' => Some("\u{13b0}"),
+        '\u{ab81}' => Some("\u{13b1}"),
+        '\u{ab82}' => Some("\u{13b2}"),
+        '\u{ab83}' => Some("\u{13b3}"),
+        '\u{ab84}' => Some("\u{13b4}"),
+        '\u{ab85}' => Some("\u{13b5}"),
+        '\u{ab86}' => Some("\u{13b6}"),
+        '\u{ab87}' => Some("\u{13b7}"),
+        '\u{ab88}' => Some("\u{13b8}"),
+        '\u{ab89}' => Some("\u{13b9}"),
+        '\u{ab8a}' => Some("\u{13ba}"),
+        '\u{ab8b}' => Some("\u{13bb}"),
+        '\u{ab8c}' => Some("\u{13bc}"),
+        '\u{ab8d}' => Some("\u{13bd}"),
+        '\u{ab8e}' => Some("\u{13be}"),
+        '\u{ab8f}' => Some("\u{13bf}"),
+        '\u{ab90}' => Some("\u{13c0}"),
+        '\u{ab91}' => Some("\u{13c1}"),
+        '\u{ab92}' => Some("\u{13c2}"),
+        '\u{ab93}' => Some("\u{13c3}"),
+        '\u{ab94}' => Some("\u{13c4}"),
+        '\u{ab95}' => Some("\u{13c5}"),
+        '\u{ab96}' => Some("\u{13c6}"),
+        '\u{ab97}' => Some("\u{13c7}"),
+        '\u{ab98}' => Some("\u{13c8}"),
+        '\u{ab99}' => Some("\u{13c9}"),
+        '\u{ab9a}' => Some("\u{13ca}"),
+        '\u{ab9b}' => Some("\u{13cb}"),
+        '\u{ab9c}' => Some("\u{13cc}"),
+        '\u{ab9d}' => Some("\u{13cd}"),
+        '\u{ab9e}' => Some("\u{13ce}"),
+        '\u{ab9f}' => Some("\u{13cf}"),
+        '\u{aba0}' => Some("\u{13d0}"),
+        '\u{aba1}' => Some("\u{13d1}"),
+        '\u{aba2}' => Some("\u{13d2}"),
+        '\u{aba3}' => Some("\u{13d3}"),
+        '\u{aba4}' => Some("\u{13d4}"),
+        '\u{aba5}' => Some("\u{13d5}"),
+        '\u{aba6}' => Some("\u{13d6}"),
+        '\u{aba7}' => Some("\u{13d7}"),
+        '\u{aba8}' => Some("\u{13d8}"),
+        '\u{aba9}' => Some("\u{13d9}"),
+        '\u{abaa}' => Some("\u{13da}"),
+        '\u{abab}' => Some("\u{13db}"),
+        '\u{abac}' => Some("\u{13dc}"),
+        '\u{abad}' => Some("\u{13dd}"),
+        '\u{abae}' => Some("\u{13de}"),
+        '\u{abaf}' => Some("\u{13df}"),
+        '\u{abb0}' => Some("\u{13e0}"),
+        '\u{abb1}' => Some("\u{13e1}"),
+        '\u{abb2}' => Some("\u{13e2}"),
+        '\u{abb3}' => Some("\u{13e3}"),
+        '\u{abb4}' => Some("\u{13e4}"),
+        '\u{abb5}' => Some("\u{13e5}"),
+        '\u{abb6}' => Some("\u{13e6}"),
+        '\u{abb7}' => Some("\u{13e7}"),
+        '\u{abb8}' => Some("\u{13e8}"),
+        '\u{abb9}' => Some("\u{13e9}"),
+        '\u{abba}' => Some("\u{13ea}"),
+        '\u{abbb}' => Some("\u{13eb}"),
+        '\u{abbc}' => Some("\u{13ec}"),
+        '\u{abbd}' => Some("\u{13ed}"),
+        '\u{abbe}' => Some("\u{13ee}"),
+        '\u{abbf}' => Some("\u{13ef}"),
+        '\u{fb00}' => Some("\u{66}\u{66}"),
+        '\u{fb01}' => Some("\u{66}\u{69}"),
+        '\u{fb02}' => Some("\u{66}\u{6c}"),
+        '\u{fb03}' => Some("\u{66}\u{66}\u{69}"),
+        '\u{fb04}' => Some("\u{66}\u{66}\u{6c}"),
+        '\u{fb05}' => Some("\u{73}\u{74}"),
+        '\u{fb06}' => Some("\u{73}\u{74}"),
+        '\u{fb13}' => Some("\u{574}\u{576}"),
+        '\u{fb14}' => Some("\u{574}\u{565}"),
+        '\u{fb15}' => Some("\u{574}\u{56b}"),
+        '\u{fb16}' => Some("\u{57e}\u{576}"),
+        '\u{fb17}' => Some("\u{574}\u{56d}"),
+        _ => None,
+    }
 }
 
 fn str_strip(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8082,7 +8729,21 @@ fn str_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
 fn str_isdigit(args: &[Object]) -> Result<Object, RuntimeError> {
     let s = str_self(args)?;
     Ok(Object::Bool(
-        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
+        !s.is_empty() && s.chars().all(crate::unicode_numeric::is_digit_char),
+    ))
+}
+
+fn str_isnumeric(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    Ok(Object::Bool(
+        !s.is_empty() && s.chars().all(crate::unicode_numeric::is_numeric_char),
+    ))
+}
+
+fn str_isdecimal(args: &[Object]) -> Result<Object, RuntimeError> {
+    let s = str_self(args)?;
+    Ok(Object::Bool(
+        !s.is_empty() && s.chars().all(crate::unicode_numeric::is_decimal_char),
     ))
 }
 
@@ -8133,6 +8794,35 @@ fn str_islower(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     Ok(Object::Bool(has_cased))
+}
+
+fn str_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython `unicode_istitle_impl`: a titlecased string has each cased run
+    // starting with an upper/titlecase char, and there is >=1 cased char.
+    // (Titlecase Lt chars are treated as uppercase for the run-start test;
+    // Rust's std lacks a general-category API, so uppercase covers Lu — the
+    // ASCII and dominant Unicode case, matching our other `is*` helpers.)
+    let s = str_self(args)?;
+    let mut cased = false;
+    let mut prev_cased = false;
+    for c in s.chars() {
+        if c.is_uppercase() {
+            if prev_cased {
+                return Ok(Object::Bool(false));
+            }
+            prev_cased = true;
+            cased = true;
+        } else if c.is_lowercase() {
+            if !prev_cased {
+                return Ok(Object::Bool(false));
+            }
+            prev_cased = true;
+            cased = true;
+        } else {
+            prev_cased = false;
+        }
+    }
+    Ok(Object::Bool(cased))
 }
 
 fn str_isascii(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8286,7 +8976,10 @@ fn str_expandtabs(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(str_result(args, out))
 }
 
-fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
+// CPython signature: `str.encode(encoding='utf-8', errors='strict')`; both
+// are positional-or-keyword, so this must accept keywords (pandas' interchange
+// buffer path and much stdlib call `s.encode(encoding=..., errors=...)`).
+fn str_encode(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     // Accept both `str` and surrogate-bearing `WStr` receivers so
     // `chr(0xD800).encode('utf-8', 'surrogatepass')` works.
     let recv = args
@@ -8295,12 +8988,12 @@ fn str_encode(args: &[Object]) -> Result<Object, RuntimeError> {
     if !recv.is_str() {
         return Err(type_error("expected str method receiver"));
     }
-    let encoding = match args.get(1) {
+    let encoding = match arg_or_kw(args, 1, kwargs, "encoding") {
         Some(Object::Str(e)) => e.to_string(),
         None => "utf-8".to_owned(),
         _ => return Err(type_error("encode() expected str")),
     };
-    let errors = match args.get(2) {
+    let errors = match arg_or_kw(args, 2, kwargs, "errors") {
         Some(Object::Str(e)) => e.to_string(),
         None => "strict".to_owned(),
         _ => "strict".to_owned(),
@@ -8343,11 +9036,17 @@ fn str_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(str_result(args, out))
 }
 
-fn str_format(args: &[Object]) -> Result<Object, RuntimeError> {
+/// Keyword-aware `str.format`. The VM's dispatch loop special-cases the
+/// `.format` method and threads kwargs through `do_str_format`, so this body
+/// only runs when the *bound method object* is invoked through the C-API
+/// (`PyObject_Call` with a kwargs dict) — e.g. Cython building an error
+/// message with `TEMPLATE.format(cls=..., own_freq=..., other_freq=...)`
+/// (pandas' `DIFFERENT_FREQ`/`IncompatibleFrequency`). Without a `call_kw`
+/// the C-API dispatch raised a spurious "format() takes no keyword arguments".
+fn str_format_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let template = str_self(args)?.into_owned();
     let rest = &args[1..];
-    let kwargs: Vec<(String, Object)> = Vec::new();
-    crate::str_format_impl(&template, rest, &kwargs).map(|s| str_result(args, s))
+    crate::str_format_impl(&template, rest, kwargs).map(|s| str_result(args, s))
 }
 
 fn str_format_map(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -8435,7 +9134,7 @@ fn str_translate(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_maketrans(args: &[Object]) -> Result<Object, RuntimeError> {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     match args.len() {
         1 => match &args[0] {
             Object::Dict(map) => {
@@ -8492,7 +9191,7 @@ fn list_self(args: &[Object]) -> Result<Rc<RefCell<Vec<Object>>>, RuntimeError> 
         // A subclass of `list` (`class C(list)`) carries its items in the
         // wrapped native payload. Unbound calls — `list.append(c, x)`,
         // `super().append(x)` — pass the instance, so unwrap it here.
-        Some(Object::Instance(inst)) => match &inst.native {
+        Some(Object::Instance(inst)) => match inst.native.get() {
             Some(Object::List(l)) => Ok(l.clone()),
             _ => Err(type_error("expected list method receiver")),
         },
@@ -8526,6 +9225,16 @@ fn list_index_arg(l_len: usize, idx: &Object, what: &str) -> Result<usize, Runti
             }
         }
         Object::Bool(b) => list_index_arg(l_len, &Object::Int(i64::from(*b)), what),
+        // Honour the full `__index__` protocol (CPython `PyNumber_Index`) —
+        // a numpy integer scalar indexing through `super().__getitem__` on a
+        // list subclass (pandas' `FrozenList._reorder_ilevels`).
+        idx @ (Object::Instance(_) | Object::Foreign(_)) => match try_coerce_index_i64(idx) {
+            Some(res) => list_index_arg(l_len, &Object::Int(res?), what),
+            None => Err(type_error(format!(
+                "list indices must be integers or slices, not {}",
+                idx.type_name()
+            ))),
+        },
         _ => Err(type_error(format!(
             "list indices must be integers or slices, not {}",
             idx.type_name()
@@ -8563,12 +9272,18 @@ fn list_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
         while let Some(v) = it.next_value() {
             replacement.push(v);
         }
-        crate::apply_slice_assignment(&mut l.borrow_mut(), s, replacement)?;
+        let replaced = crate::apply_slice_assignment(&mut l.borrow_mut(), s, replacement)?;
+        for old in replaced {
+            queue_removed(old);
+        }
         return Ok(Object::None);
     }
-    let mut l = l.borrow_mut();
-    let n = list_index_arg(l.len(), key, "__setitem__")?;
-    l[n] = val.clone();
+    let old = {
+        let mut l = l.borrow_mut();
+        let n = list_index_arg(l.len(), key, "__setitem__")?;
+        std::mem::replace(&mut l[n], val.clone())
+    };
+    queue_removed(old);
     Ok(Object::None)
 }
 
@@ -8582,13 +9297,16 @@ fn list_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut indices = crate::slice_indices(l.len(), s)?;
         indices.sort_unstable();
         for i in indices.into_iter().rev() {
-            l.remove(i);
+            queue_removed(l.remove(i));
         }
         return Ok(Object::None);
     }
-    let mut l = l.borrow_mut();
-    let n = list_index_arg(l.len(), key, "__delitem__")?;
-    l.remove(n);
+    let removed = {
+        let mut l = l.borrow_mut();
+        let n = list_index_arg(l.len(), key, "__delitem__")?;
+        l.remove(n)
+    };
+    queue_removed(removed);
     Ok(Object::None)
 }
 
@@ -8740,9 +9458,16 @@ fn list_remove(args: &[Object]) -> Result<Object, RuntimeError> {
             b[i].clone()
         };
         if crate::object::member_eq(&x, &args[1])? {
-            let mut b = l.borrow_mut();
-            if i < b.len() {
-                b.remove(i);
+            let removed = {
+                let mut b = l.borrow_mut();
+                if i < b.len() {
+                    Some(b.remove(i))
+                } else {
+                    None
+                }
+            };
+            if let Some(removed) = removed {
+                queue_removed(removed);
             }
             return Ok(Object::None);
         }
@@ -8807,6 +9532,108 @@ fn list_count(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(n))
 }
 
+// ---- range.index / range.count -------------------------------------------
+//
+// CPython's `range_index`/`range_count` take an arithmetic fast path for
+// real integers (`PyLong`/`bool`) and fall back to a linear
+// `_PySequence_IterSearch` for anything else (a float that equals an int, a
+// numpy scalar). We mirror both.
+
+fn range_self(args: &[Object], meth: &str) -> Result<Rc<crate::object::Range>, RuntimeError> {
+    match args.first() {
+        Some(Object::Range(r)) => Ok(r.clone()),
+        _ => Err(type_error(format!(
+            "descriptor '{meth}' for 'range' objects doesn't apply to the given object"
+        ))),
+    }
+}
+
+fn range_len_i128(r: &crate::object::Range) -> i128 {
+    if r.step > 0 {
+        if r.stop > r.start {
+            (r.stop - r.start + r.step - 1) / r.step
+        } else {
+            0
+        }
+    } else if r.stop < r.start {
+        (r.start - r.stop + (-r.step) - 1) / (-r.step)
+    } else {
+        0
+    }
+}
+
+/// The 0-based position of integer `v` within `r`, or `None` if `v` is not a
+/// member. Mirrors CPython's `range_contains_long` + index arithmetic.
+fn range_position(r: &crate::object::Range, v: i128) -> Option<i128> {
+    if r.step > 0 {
+        if v < r.start || v >= r.stop {
+            return None;
+        }
+    } else if v > r.start || v <= r.stop {
+        return None;
+    }
+    let diff = v - r.start;
+    if diff % r.step != 0 {
+        return None;
+    }
+    Some(diff / r.step)
+}
+
+fn int_like_to_i128(o: &Object) -> Option<i128> {
+    match o {
+        Object::Int(i) => Some(i128::from(*i)),
+        Object::Bool(b) => Some(i128::from(*b)),
+        Object::Long(b) => b.to_i128(),
+        _ => None,
+    }
+}
+
+fn range_index(args: &[Object]) -> Result<Object, RuntimeError> {
+    let r = range_self(args, "index")?;
+    let value = args
+        .get(1)
+        .ok_or_else(|| type_error("index() takes exactly one argument (0 given)"))?;
+    if let Some(v) = int_like_to_i128(value) {
+        if let Some(idx) = range_position(&r, v) {
+            return Ok(crate::object::int_from_i128(idx));
+        }
+        return Err(value_error(format!("{} is not in range", value.repr())));
+    }
+    // Non-integer: linear search comparing each element with `__eq__`
+    // (CPython `_PySequence_IterSearch(..., PY_ITERSEARCH_INDEX)`).
+    let n = range_len_i128(&r);
+    let mut k: i128 = 0;
+    while k < n {
+        let elem = crate::object::int_from_i128(r.start + k * r.step);
+        if crate::object::member_eq(&elem, value)? {
+            return Ok(crate::object::int_from_i128(k));
+        }
+        k += 1;
+    }
+    Err(value_error(format!("{} is not in range", value.repr())))
+}
+
+fn range_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    let r = range_self(args, "count")?;
+    let value = args
+        .get(1)
+        .ok_or_else(|| type_error("count() takes exactly one argument (0 given)"))?;
+    if let Some(v) = int_like_to_i128(value) {
+        return Ok(Object::Int(i64::from(range_position(&r, v).is_some())));
+    }
+    let n = range_len_i128(&r);
+    let mut cnt: i64 = 0;
+    let mut k: i128 = 0;
+    while k < n {
+        let elem = crate::object::int_from_i128(r.start + k * r.step);
+        if crate::object::member_eq(&elem, value)? {
+            cnt += 1;
+        }
+        k += 1;
+    }
+    Ok(Object::Int(cnt))
+}
+
 fn list_sort(args: &[Object]) -> Result<Object, RuntimeError> {
     let l = list_self(args)?;
     let mut err: Option<RuntimeError> = None;
@@ -8837,7 +9664,10 @@ fn list_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 1 {
         return Err(type_error("clear() takes no arguments (1 given)"));
     }
-    list_self(args)?.borrow_mut().clear();
+    let evicted: Vec<Object> = std::mem::take(&mut *list_self(args)?.borrow_mut());
+    for v in evicted {
+        queue_removed(v);
+    }
     Ok(Object::None)
 }
 
@@ -8868,7 +9698,7 @@ fn dict_self(args: &[Object]) -> Result<Rc<RefCell<DictData>>, RuntimeError> {
         // A subclass of `dict` (`class C(dict)`) carries its entries in the
         // wrapped native payload. Unbound calls — `dict.__setitem__(c, k, v)`,
         // `super().__setitem__(k, v)` — pass the instance, so unwrap it here.
-        Some(Object::Instance(inst)) => match &inst.native {
+        Some(Object::Instance(inst)) => match inst.native.get() {
             Some(Object::Dict(d)) => Ok(d.clone()),
             _ => Err(type_error("expected dict method receiver")),
         },
@@ -8910,7 +9740,10 @@ fn dict_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let val = args
         .get(2)
         .ok_or_else(|| type_error("__setitem__ expected 2 arguments"))?;
-    d.borrow_mut().insert(DictKey(key.clone()), val.clone());
+    let old = d.borrow_mut().insert(DictKey(key.clone()), val.clone());
+    if let Some(old) = old {
+        queue_removed(old);
+    }
     Ok(Object::None)
 }
 
@@ -8927,12 +9760,24 @@ fn dict_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
     found.ok_or_else(|| key_error_object(key.clone()))
 }
 
+/// Route a key/value evicted by a container mutator to the prompt-reap
+/// queue (see [`crate::vm_singletons::queue_container_removed`]) before
+/// dropping our reference. The queue holds a clone; the eval loop reaps it
+/// at the next between-bytecodes safe point if the eviction was its last
+/// program-visible reference.
+pub(crate) fn queue_removed(v: Object) {
+    crate::vm_singletons::queue_container_removed(&v);
+}
+
 fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     let d = dict_self(args)?;
     let key = args
         .get(1)
         .ok_or_else(|| type_error("__delitem__ expected 1 argument"))?;
-    if d.borrow_mut().shift_remove(&DictKey(key.clone())).is_some() {
+    let removed = d.borrow_mut().shift_remove_entry(&DictKey(key.clone()));
+    if let Some((k, v)) = removed {
+        queue_removed(k.0);
+        queue_removed(v);
         Ok(Object::None)
     } else {
         Err(key_error_object(key.clone()))
@@ -8984,8 +9829,11 @@ fn dict_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     let key = args
         .get(1)
         .ok_or_else(|| type_error("dict.pop() expected at least 1 argument"))?;
-    let mut d = d.borrow_mut();
-    if let Some(v) = d.shift_remove(&DictKey(key.clone())) {
+    let removed = d.borrow_mut().shift_remove_entry(&DictKey(key.clone()));
+    if let Some((k, v)) = removed {
+        // The *stored* key (equal to, but possibly distinct from, the
+        // lookup key) is evicted too; the value is returned to the caller.
+        queue_removed(k.0);
         Ok(v)
     } else if let Some(default) = args.get(2).cloned() {
         Ok(default)
@@ -9012,7 +9860,9 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
                     .collect();
                 let mut dst = d.borrow_mut();
                 for (k, v) in entries {
-                    dst.insert(k, v);
+                    if let Some(old) = dst.insert(k, v) {
+                        queue_removed(old);
+                    }
                 }
             }
             Object::MappingProxy(o) => {
@@ -9023,7 +9873,9 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
                     .collect();
                 let mut dst = d.borrow_mut();
                 for (k, v) in entries {
-                    dst.insert(k, v);
+                    if let Some(old) = dst.insert(k, v) {
+                        queue_removed(old);
+                    }
                 }
             }
             _ => return Err(type_error("dict.update() expected dict")),
@@ -9033,7 +9885,12 @@ fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn dict_clear(args: &[Object]) -> Result<Object, RuntimeError> {
-    dict_self(args)?.borrow_mut().clear();
+    let d = dict_self(args)?;
+    let evicted: Vec<(DictKey, Object)> = d.borrow_mut().drain(..).collect();
+    for (k, v) in evicted {
+        queue_removed(k.0);
+        queue_removed(v);
+    }
     Ok(Object::None)
 }
 
@@ -9135,7 +9992,7 @@ fn dict_fromkeys(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(it_idx)
         .ok_or_else(|| type_error("fromkeys() expects iterable"))?;
     let value = args.get(value_idx).cloned().unwrap_or(Object::None);
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     let mut iter = it.make_iter()?;
     while let Some(k) = iter.next_value() {
         d.insert(DictKey(k), value.clone());
@@ -9174,9 +10031,15 @@ fn apply_set_inplace_op(s: &mut crate::object::SetData, op: SetInplaceOp) {
             s.insert(k);
         }
         SetInplaceOp::Discard(k) => {
-            s.shift_remove(&k);
+            if let Some(removed) = s.shift_take(&k) {
+                queue_removed(removed.0);
+            }
         }
-        SetInplaceOp::Clear => s.clear(),
+        SetInplaceOp::Clear => {
+            for k in s.drain(..) {
+                queue_removed(k.0);
+            }
+        }
     }
 }
 
@@ -9375,7 +10238,9 @@ fn set_update(args: &[Object]) -> Result<Object, RuntimeError> {
 fn set_result_like(receiver: Option<&Object>, body: crate::object::SetData) -> Object {
     let frozen = match receiver {
         Some(Object::FrozenSet(_)) => true,
-        Some(Object::Instance(inst)) => matches!(inst.native, Some(Object::FrozenSet(_))),
+        Some(Object::Instance(inst)) => {
+            matches!(inst.native.get().cloned(), Some(Object::FrozenSet(_)))
+        }
         _ => false,
     };
     if frozen {
@@ -9386,7 +10251,7 @@ fn set_result_like(receiver: Option<&Object>, body: crate::object::SetData) -> O
 }
 
 fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
-    let mut out = crate::object::SetData::new();
+    let mut out = crate::object::SetData::default();
     if let Some(first) = args.first() {
         for k in set_iter_items(first)? {
             out.insert(k);
@@ -9403,7 +10268,7 @@ fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
 fn set_intersection(args: &[Object]) -> Result<Object, RuntimeError> {
     let mut acc = match args.first() {
         Some(first) => {
-            let mut s = crate::object::SetData::new();
+            let mut s = crate::object::SetData::default();
             for k in set_iter_items(first)? {
                 s.insert(k);
             }
@@ -9421,7 +10286,7 @@ fn set_intersection(args: &[Object]) -> Result<Object, RuntimeError> {
 fn set_difference(args: &[Object]) -> Result<Object, RuntimeError> {
     let mut acc = match args.first() {
         Some(first) => {
-            let mut s = crate::object::SetData::new();
+            let mut s = crate::object::SetData::default();
             for k in set_iter_items(first)? {
                 s.insert(k);
             }
@@ -9445,7 +10310,7 @@ fn set_symmetric_difference(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(other) => set_iter_items(other)?.into_iter().collect(),
         None => return Ok(set_result_like(args.first(), a)),
     };
-    let mut out = crate::object::SetData::new();
+    let mut out = crate::object::SetData::default();
     for k in a.iter().filter(|k| !b.contains(*k)) {
         out.insert(k.clone());
     }
@@ -9526,7 +10391,7 @@ fn set_symmetric_difference_update(args: &[Object]) -> Result<Object, RuntimeErr
             None => return Ok(Object::None),
         };
         let a: crate::object::SetData = s.borrow().clone();
-        let mut out = crate::object::SetData::new();
+        let mut out = crate::object::SetData::default();
         for k in a.iter().filter(|k| !b.contains(*k)) {
             out.insert(k.clone());
         }
@@ -9574,7 +10439,7 @@ pub(crate) fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
         Object::MemoryView(mv) => Ok(mv.to_bytes()),
         Object::Instance(inst) => {
             // bytes/bytearray subclasses carry their payload natively.
-            if let Some(native) = &inst.native {
+            if let Some(native) = inst.native.get() {
                 let native = native.clone();
                 if matches!(
                     native,
@@ -9978,7 +10843,7 @@ fn bytearray_receiver_guard(args: &[Object]) -> Option<crate::object::ByteArrayE
         Some(Object::ByteArray(cell)) => {
             Some(crate::object::ByteArrayExportGuard::new(cell.clone()))
         }
-        Some(Object::Instance(inst)) => match &inst.native {
+        Some(Object::Instance(inst)) => match inst.native.get() {
             Some(Object::ByteArray(cell)) => {
                 Some(crate::object::ByteArrayExportGuard::new(cell.clone()))
             }
@@ -10388,6 +11253,34 @@ fn bytes_dunder_mod(args: &[Object]) -> Result<Object, RuntimeError> {
         interp.bytes_percent_format(receiver, other, &globals)
     } else {
         Err(type_error("bytes %-formatting requires the interpreter"))
+    }
+}
+
+/// `str.__rmod__`: CPython exposes the reflected wrapper of `unicode_mod`
+/// on `str` itself (`'__rmod__' in vars(str)` is True). It matters for
+/// `str` *subclasses* whose MRO carries a foreign `__rmod__` further up:
+/// numpy's `str_` inherits `str.__rmod__` ahead of `generic.__rmod__` (the
+/// `remainder` ufunc, which raises on strings), so `"'%s'" % np.str_(…)`
+/// must resolve to this wrapper. Formats only when the left operand is a
+/// genuine `str`; otherwise `NotImplemented`.
+fn str_dunder_rmod(args: &[Object]) -> Result<Object, RuntimeError> {
+    let receiver = args
+        .first()
+        .ok_or_else(|| type_error("__rmod__ requires a receiver"))?;
+    let other = args
+        .get(1)
+        .ok_or_else(|| type_error("__rmod__ expected 1 argument"))?;
+    if !other.is_str() {
+        return Ok(crate::vm_singletons::not_implemented());
+    }
+    if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+        // SAFETY: published by an enclosing VM frame still live on this
+        // thread; the GIL keeps the access exclusive.
+        let interp = unsafe { &mut *ptr };
+        let globals = interp.builtins_dict();
+        interp.percent_mod_left_slot(other, receiver, &globals)
+    } else {
+        crate::binary_op(other, receiver, weavepy_compiler::BinOpKind::Mod)
     }
 }
 
@@ -10913,7 +11806,7 @@ fn bytearray_only(args: &[Object], name: &str) -> Result<Rc<RefCell<Vec<u8>>>, R
         Some(Object::ByteArray(b)) => Ok(b.clone()),
         // Unbound calls on subclass instances (`bytearray.append(me, …)`)
         // reach the native payload.
-        Some(Object::Instance(inst)) => match &inst.native {
+        Some(Object::Instance(inst)) => match inst.native.get() {
             Some(Object::ByteArray(b)) => Ok(b.clone()),
             _ => Err(type_error(format!(
                 "{name}() requires a bytearray receiver"
@@ -11031,7 +11924,7 @@ fn bytes_isspace(args: &[Object]) -> Result<Object, RuntimeError> {
 fn bytearray_self(args: &[Object]) -> Result<Rc<crate::sync::RefCell<Vec<u8>>>, RuntimeError> {
     match args.first() {
         Some(Object::ByteArray(b)) => Ok(b.clone()),
-        Some(Object::Instance(inst)) => match &inst.native {
+        Some(Object::Instance(inst)) => match inst.native.get() {
             Some(Object::ByteArray(b)) => Ok(b.clone()),
             _ => Err(type_error("expected bytearray receiver")),
         },
@@ -11209,7 +12102,7 @@ pub(crate) fn file_self(args: &[Object]) -> Result<Rc<crate::object::PyFile>, Ru
         // A subclass of `io.BytesIO`/`io.StringIO` is a `PyInstance` that
         // wraps the native stream in `native`; unwrap so every inherited
         // file method (read/write/seek/…) operates on the real buffer.
-        Some(Object::Instance(inst)) => match &inst.native {
+        Some(Object::Instance(inst)) => match inst.native.get() {
             Some(Object::File(f)) => Ok(f.clone()),
             _ => Err(type_error("expected file receiver")),
         },
@@ -11232,10 +12125,14 @@ pub(crate) fn file_check_open(f: &Rc<crate::object::PyFile>) -> Result<(), Runti
 /// File-backed text streams never contain bridge-window code points, so they
 /// take the plain `Object::Str` path.
 fn stream_text_object(f: &Rc<crate::object::PyFile>, s: String) -> Object {
-    if matches!(
+    let bridged = matches!(
         &*f.backend.borrow(),
         crate::object::FileBackend::MemText { .. }
-    ) {
+    ) || matches!(
+        f.errors_name().as_str(),
+        "surrogateescape" | "surrogatepass"
+    );
+    if bridged {
         bridge_to_object(&s)
     } else {
         Object::from_str(s)
@@ -11308,7 +12205,7 @@ pub(crate) fn file_peek(args: &[Object]) -> Result<Object, RuntimeError> {
 fn inst_native_bytearray(obj: &Object) -> Option<crate::sync::Rc<RefCell<Vec<u8>>>> {
     match obj {
         Object::ByteArray(b) => Some(b.clone()),
-        Object::Instance(inst) => match &inst.native {
+        Object::Instance(inst) => match inst.native.get() {
             Some(Object::ByteArray(b)) => Some(b.clone()),
             _ => None,
         },
@@ -11410,7 +12307,7 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let target = match args.get(1) {
         Some(Object::ByteArray(b)) => b.clone(),
-        Some(Object::Instance(inst)) => match &inst.native {
+        Some(Object::Instance(inst)) => match inst.native.get() {
             Some(Object::ByteArray(b)) => b.clone(),
             _ => {
                 return Err(type_error(format!(
@@ -11456,6 +12353,13 @@ pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
     };
+    // A byte-backed text stream on a newline-unsafe codec (UTF-16/32) or a
+    // custom incremental-only codec must find the line boundary in *decoded*
+    // text — raw byte scanning would split multi-byte code units and corrupt
+    // the decode. Route these through the faithful `TextIOWrapper` readline.
+    if !f.binary && f.text_incr_active_gate() {
+        return Ok(stream_text_object(&f, f.readline_text_incr(limit)?));
+    }
     // Where a line ends depends on the stream's newline policy; the shared
     // `PyFile::read_line_bytes` scans raw bytes for the right terminator
     // (binary/`\n`/`\r`/`\r\n`/universal) and `decode_text` then applies any
@@ -11844,7 +12748,7 @@ fn mem_dict_slot(receiver: &Object) -> Object {
             if attrs.is_empty() {
                 Object::None
             } else {
-                let mut d = crate::object::DictData::new();
+                let mut d = crate::object::DictData::default();
                 for (k, v) in attrs.iter() {
                     d.insert(DictKey(Object::from_str(k.clone())), v.clone());
                 }
@@ -12134,12 +13038,47 @@ fn memoryview_tolist(args: &[Object]) -> Result<Object, RuntimeError> {
     if mv.released.get() {
         return Err(value_error("memoryview: released"));
     }
-    Ok(Object::new_list(
-        mv.to_bytes()
-            .into_iter()
-            .map(|b| Object::Int(i64::from(b)))
-            .collect(),
-    ))
+    // CPython `memoryview.tolist` unpacks elements per the view's format
+    // (`'l'` → ints, `'d'` → floats, …), nesting one list per dimension.
+    let shape = mv.shape_dims();
+    let strides = mv.stride_bytes();
+    let itemsize = mv.itemsize.get().max(1);
+    let fmt = crate::mv_format_char(&mv.format.borrow());
+    fn build(
+        all: &[u8],
+        shape: &[usize],
+        strides: &[isize],
+        off: isize,
+        itemsize: usize,
+        fmt: char,
+    ) -> Result<Object, RuntimeError> {
+        if shape.is_empty() {
+            let o = off as usize;
+            return crate::mv_unpack_single(fmt, &all[o..o + itemsize]);
+        }
+        let mut out = Vec::with_capacity(shape[0]);
+        for i in 0..shape[0] {
+            out.push(build(
+                all,
+                &shape[1..],
+                &strides[1..],
+                off + i as isize * strides[0],
+                itemsize,
+                fmt,
+            )?);
+        }
+        Ok(Object::new_list(out))
+    }
+    mv.buffer.with_read(|all| {
+        build(
+            all,
+            &shape,
+            &strides,
+            mv.start.get() as isize,
+            itemsize,
+            fmt,
+        )
+    })
 }
 
 fn memoryview_release(args: &[Object]) -> Result<Object, RuntimeError> {

@@ -46,7 +46,7 @@ thread_local! {
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -289,7 +289,7 @@ fn ref_type() -> Rc<TypeObject> {
         if let Some(t) = cell.borrow().clone() {
             return t;
         }
-        let mut type_dict = DictData::new();
+        let mut type_dict = DictData::default();
         type_dict.insert(
             DictKey(Object::from_static("__call__")),
             m("__call__", ref_type_call),
@@ -458,7 +458,7 @@ fn proxy_type() -> Rc<TypeObject> {
         if let Some(t) = cell.borrow().clone() {
             return t;
         }
-        let mut td = DictData::new();
+        let mut td = DictData::default();
         install_proxy_forwarding(&mut td);
         let t = TypeObject::new_with_flags(
             "weakproxy",
@@ -480,7 +480,7 @@ fn callable_proxy_type() -> Rc<TypeObject> {
         if let Some(t) = cell.borrow().clone() {
             return t;
         }
-        let mut td = DictData::new();
+        let mut td = DictData::default();
         install_proxy_forwarding(&mut td);
         let t = TypeObject::new_with_flags(
             "weakcallableproxy",
@@ -589,7 +589,7 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
         crate::gc_trace::note_weakref_finalizable(target_id);
     }
 
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
 
     let class = match kind_tag {
         kind::PROXY => proxy_type(),
@@ -663,7 +663,7 @@ fn make_ref_object(target: Object, callback: Option<Object>, kind_tag: u8) -> Ob
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(class),
         dict,
-        native: None,
+        native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),

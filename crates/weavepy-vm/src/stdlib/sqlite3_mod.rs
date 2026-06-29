@@ -31,7 +31,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -114,7 +114,7 @@ fn b_connect(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn make_connection_obj(conn: Rc<Conn>) -> Object {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -190,9 +190,10 @@ fn make_connection_obj(conn: Rc<Conn>) -> Object {
 }
 
 fn make_cursor_obj(conn: Rc<Conn>) -> Object {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     let rows: Rc<RefCell<VecDeque<Vec<Object>>>> = Rc::new(RefCell::new(VecDeque::new()));
     let description: Rc<RefCell<Object>> = Rc::new(RefCell::new(Object::None));
+    let decltypes: Rc<RefCell<Object>> = Rc::new(RefCell::new(Object::None));
     let rowcount: Rc<Cell<i64>> = Rc::new(Cell::new(-1));
     let lastrowid: Rc<Cell<i64>> = Rc::new(Cell::new(0));
     {
@@ -205,12 +206,21 @@ fn make_cursor_obj(conn: Rc<Conn>) -> Object {
         let conn_e = conn.clone();
         let rows_e = rows.clone();
         let desc_e = description.clone();
+        let decl_e = decltypes.clone();
         let rowcount_e = rowcount.clone();
         let lastrowid_e = lastrowid.clone();
         d.insert(
             DictKey(Object::from_static("execute")),
             builtin("execute", move |args: &[Object]| {
-                run_execute(&conn_e, args, &rows_e, &desc_e, &rowcount_e, &lastrowid_e)?;
+                run_execute(
+                    &conn_e,
+                    args,
+                    &rows_e,
+                    &desc_e,
+                    &decl_e,
+                    &rowcount_e,
+                    &lastrowid_e,
+                )?;
                 Ok(Object::None)
             }),
         );
@@ -292,6 +302,13 @@ fn make_cursor_obj(conn: Rc<Conn>) -> Object {
                 Ok(desc_ref.borrow().clone())
             }),
         );
+        let decl_ref = decltypes.clone();
+        d.insert(
+            DictKey(Object::from_static("get_decltypes")),
+            builtin("get_decltypes", move |_args: &[Object]| {
+                Ok(decl_ref.borrow().clone())
+            }),
+        );
         let rc_ref = rowcount.clone();
         d.insert(
             DictKey(Object::from_static("get_rowcount")),
@@ -315,6 +332,7 @@ fn run_execute(
     args: &[Object],
     rows: &Rc<RefCell<VecDeque<Vec<Object>>>>,
     description: &Rc<RefCell<Object>>,
+    decltypes: &Rc<RefCell<Object>>,
     rowcount: &Rc<Cell<i64>>,
     lastrowid: &Rc<Cell<i64>>,
 ) -> Result<(), RuntimeError> {
@@ -333,10 +351,12 @@ fn run_execute(
     let bound = bind_params(&params)?;
     rows.borrow_mut().clear();
     *description.borrow_mut() = Object::None;
+    *decltypes.borrow_mut() = Object::None;
     let col_count = stmt.column_count();
     if col_count > 0 {
         let cols = column_descriptions(&stmt);
         *description.borrow_mut() = cols;
+        *decltypes.borrow_mut() = column_decltypes(&stmt);
         let mut q = stmt
             .query(params_from_iter(bound.iter()))
             .map_err(|e| value_error(format!("sqlite: {e}")))?;
@@ -434,6 +454,18 @@ fn sql_to_object(v: SqlValue) -> Object {
         SqlValue::Text(s) => Object::from_str(s),
         SqlValue::Blob(b) => Object::new_bytes(b),
     }
+}
+
+fn column_decltypes(stmt: &rusqlite::Statement) -> Object {
+    let out: Vec<Object> = stmt
+        .columns()
+        .iter()
+        .map(|c| match c.decl_type() {
+            Some(t) => Object::from_str(t.to_owned()),
+            None => Object::None,
+        })
+        .collect();
+    Object::new_tuple(out)
 }
 
 fn column_descriptions(stmt: &rusqlite::Statement) -> Object {

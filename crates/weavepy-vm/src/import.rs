@@ -59,7 +59,7 @@ pub struct ModuleCache {
 impl Default for ModuleCache {
     fn default() -> Self {
         Self {
-            modules: Rc::new(RefCell::new(DictData::new())),
+            modules: Rc::new(RefCell::new(DictData::default())),
             path: Rc::new(RefCell::new(Vec::new())),
             argv: Rc::new(RefCell::new(Vec::new())),
             builtins: Rc::new(RefCell::new(HashMap::new())),

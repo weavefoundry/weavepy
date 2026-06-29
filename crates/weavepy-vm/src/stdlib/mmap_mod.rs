@@ -23,7 +23,7 @@ pub const ACCESS_WRITE: i64 = 2;
 pub const ACCESS_COPY: i64 = 3;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -90,7 +90,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 fn mmap_type() -> Rc<TypeObject> {
     use crate::builtin_types::builtin_types;
     let bt = builtin_types();
-    let mut td = DictData::new();
+    let mut td = DictData::default();
     for (name, fn_) in [
         (
             "__init__",
@@ -122,6 +122,22 @@ fn mmap_type() -> Rc<TypeObject> {
             })),
         );
     }
+    // `mmap(fileno, length, access=..., flags=..., prot=..., offset=...)` is
+    // routinely constructed with keyword arguments — pandas' memory-mapped
+    // reader does `mmap.mmap(fileno, 0, access=mmap.ACCESS_READ)`. Override
+    // the positional-only `__init__` inserted above with a kwargs-aware entry
+    // that folds the documented keywords into the positional slots `mm_init`
+    // reads, so the call no longer trips "`__init__` does not accept keyword
+    // arguments".
+    td.insert(
+        DictKey(Object::from_static("__init__")),
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: "__init__",
+            binds_instance: true,
+            call: Box::new(mm_init),
+            call_kw: Some(Box::new(mm_init_kw)),
+        })),
+    );
     TypeObject::new_with_flags(
         "mmap",
         vec![bt.object_.clone()],
@@ -333,6 +349,32 @@ fn mm_init(args: &[Object]) -> Result<Object, RuntimeError> {
         .borrow_mut()
         .insert(DictKey(Object::from_static("_id")), Object::Int(id as i64));
     Ok(Object::None)
+}
+
+fn mm_init_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // Fold the CPython `mmap()` keyword arguments into the positional layout
+    // `mm_init` consumes (`[self, fileno, length, access]`). `flags`/`prot`/
+    // `offset`/`tagname` are accepted for signature parity but not consulted
+    // by this shim, which derives the file view purely from `access`.
+    let mut pos: Vec<Object> = args.to_vec();
+    for (k, val) in kwargs {
+        let slot = match k.as_str() {
+            "fileno" => 1,
+            "length" => 2,
+            "access" => 3,
+            "flags" | "prot" | "offset" | "tagname" => continue,
+            _ => {
+                return Err(type_error(format!(
+                    "'{k}' is an invalid keyword argument for mmap()"
+                )))
+            }
+        };
+        while pos.len() <= slot {
+            pos.push(Object::None);
+        }
+        pos[slot] = val.clone();
+    }
+    mm_init(&pos)
 }
 
 fn mmap_bytes(state: &MmapState) -> &[u8] {

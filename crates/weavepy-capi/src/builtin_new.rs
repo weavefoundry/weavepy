@@ -30,7 +30,7 @@
 //! CPython-compatible offset, so the object handed back is byte-identical
 //! to what a stock interpreter would produce.
 
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_void};
 
 use weavepy_vm::object::Object;
 
@@ -108,9 +108,11 @@ pub unsafe extern "C" fn float_new(
         return std::ptr::null_mut();
     }
     // `PyFloatObject.ob_fval` is at offset 16 (asserted in `layout.rs`); a
-    // `float` subtype is layout-compatible and inherits that slot.
+    // `float` subtype is layout-compatible and inherits that slot. C reads
+    // it via `PyFloat_AS_DOUBLE` — canonical NaN bits, never the identity
+    // tag.
     unsafe {
-        *((obj as *mut u8).add(16) as *mut f64) = value;
+        *((obj as *mut u8).add(16) as *mut f64) = weavepy_vm::object::untag_nan(value);
     }
     obj
 }
@@ -151,7 +153,9 @@ fn parse_py_float(s: &str) -> Result<f64, ()> {
     let parsed = match lower.as_str() {
         "inf" | "+inf" | "infinity" | "+infinity" => Some(f64::INFINITY),
         "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
-        "nan" | "+nan" | "-nan" => Some(f64::NAN),
+        // Fresh identity per parse — CPython allocates a new float object.
+        "nan" | "+nan" => Some(weavepy_vm::object::tag_nan(f64::NAN)),
+        "-nan" => Some(weavepy_vm::object::tag_nan(-f64::NAN)),
         _ => cleaned.parse::<f64>().ok(),
     };
     match parsed {
@@ -161,6 +165,370 @@ fn parse_py_float(s: &str) -> Result<f64, ()> {
             Err(())
         }
     }
+}
+
+// ====================================================================
+// str
+// ====================================================================
+
+/// Borrow a positional or keyword argument from a `tp_new` `(args, kwds)`
+/// pair: positional index `i` first, falling back to the keyword whose
+/// (NUL-terminated) name is `kw`. Borrowed (no refcount change).
+unsafe fn arg_or_kw(
+    args: *mut PyObject,
+    kwds: *mut PyObject,
+    i: PySsizeT,
+    kw: &[u8],
+) -> Option<*mut PyObject> {
+    let nargs = if args.is_null() {
+        0
+    } else {
+        unsafe { crate::containers::PyTuple_Size(args) }.max(0)
+    };
+    if i < nargs {
+        let it = unsafe { crate::containers::PyTuple_GetItem(args, i) };
+        if !it.is_null() {
+            return Some(it);
+        }
+    }
+    if !kwds.is_null() {
+        let v =
+            unsafe { crate::containers::PyDict_GetItemString(kwds, kw.as_ptr() as *const c_char) };
+        if !v.is_null() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Resolve the `str` value a `str(...)` call would produce from its
+/// `tp_new` `(args, kwds)`, mirroring CPython's `unicode_new` /
+/// `unicode_new_impl` (`str(object='', encoding=…, errors=…)`):
+///
+/// * no `object`              → the empty string,
+/// * `object` only           → `str(object)` (`PyObject_Str`),
+/// * `object` + encoding/errors → `object.decode(encoding, errors)`.
+///
+/// Returns `Err` with a pending exception on failure.
+unsafe fn str_value(args: *mut PyObject, kwds: *mut PyObject) -> Result<String, ()> {
+    let object = unsafe { arg_or_kw(args, kwds, 0, b"object\0") };
+    let encoding = unsafe { arg_or_kw(args, kwds, 1, b"encoding\0") };
+    let errors = unsafe { arg_or_kw(args, kwds, 2, b"errors\0") };
+
+    let Some(object) = object else {
+        return Ok(String::new());
+    };
+
+    let result = if encoding.is_none() && errors.is_none() {
+        unsafe { crate::abstract_::PyObject_Str(object) }
+    } else {
+        // `str(bytes-like, encoding, errors)` — decode. The codec names
+        // default to CPython's (`utf-8` / `strict`) when omitted.
+        let enc = encoding
+            .map(|e| unsafe { crate::strings::PyUnicode_AsUTF8(e) })
+            .filter(|p| !p.is_null())
+            .unwrap_or(b"utf-8\0".as_ptr() as *const c_char);
+        let err = errors
+            .map(|e| unsafe { crate::strings::PyUnicode_AsUTF8(e) })
+            .filter(|p| !p.is_null())
+            .unwrap_or(b"strict\0".as_ptr() as *const c_char);
+        unsafe { crate::strings::PyUnicode_FromEncodedObject(object, enc, err) }
+    };
+    if result.is_null() {
+        return Err(());
+    }
+    let out = match unsafe { clone_object(result) } {
+        Object::Str(t) => t.to_string(),
+        _ => String::new(),
+    };
+    unsafe { crate::object::Py_DecRef(result) };
+    Ok(out)
+}
+
+/// Write one PEP 393 code point of the given `kind` (1/2/4 bytes) into
+/// `data[i]`.
+///
+/// # Safety
+/// `data` must address a writable buffer with room for `i + 1` units.
+#[inline]
+unsafe fn write_codepoint(data: *mut u8, kind: u32, i: usize, cp: u32) {
+    match kind {
+        1 => unsafe { *data.add(i) = cp as u8 },
+        2 => unsafe { *(data as *mut u16).add(i) = cp as u16 },
+        _ => unsafe { *(data as *mut u32).add(i) = cp },
+    }
+}
+
+/// Build a faithful `str` **subtype** instance for `value`, mirroring
+/// CPython's `unicode_subtype_new`: allocate the subtype body through its
+/// `tp_alloc` (the faithful inline body, RFC 0045) and populate a
+/// **legacy / non-compact** `PyUnicodeObject` — the character data lives
+/// in a separately allocated buffer reached through `data.any` (offset 56),
+/// not inline, because a subtype's fixed `tp_basicsize` body has no room
+/// for it (numpy's `PyUnicodeScalarObject` packs `obval`/`buffer_fmt`
+/// right after the unicode base). A stock reader resolves the buffer via
+/// `PyUnicode_DATA`'s non-compact branch, so the result is byte-identical
+/// to what `numpy.str_.__new__` expects back from `PyUnicode_Type.tp_new`.
+unsafe fn unicode_subtype_new(ty: *mut PyTypeObject, value: &str) -> *mut PyObject {
+    let chars: Vec<u32> = value.chars().map(|c| c as u32).collect();
+    let length = chars.len();
+    let maxchar = chars.iter().copied().max().unwrap_or(0);
+    let (kind, ascii, char_size): (u32, bool, usize) = if maxchar < 0x80 {
+        (crate::layout::ustate::KIND_1BYTE, true, 1)
+    } else if maxchar < 0x100 {
+        (crate::layout::ustate::KIND_1BYTE, false, 1)
+    } else if maxchar < 0x1_0000 {
+        (crate::layout::ustate::KIND_2BYTE, false, 2)
+    } else {
+        (crate::layout::ustate::KIND_4BYTE, false, 4)
+    };
+
+    let obj = unsafe { subtype_alloc(ty, 0) };
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    // One extra code unit for the NUL terminator CPython always keeps.
+    let nbytes = (length + 1) * char_size;
+    let data = unsafe { crate::memory::PyMem_Malloc(nbytes) } as *mut u8;
+    if data.is_null() {
+        unsafe { crate::object::Py_DecRef(obj) };
+        unsafe { crate::errors::PyErr_NoMemory() };
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        std::ptr::write_bytes(data, 0, nbytes);
+        for (i, &cp) in chars.iter().enumerate() {
+            write_codepoint(data, kind, i, cp);
+        }
+        // PyASCIIObject head: length / hash(-1, unhashed) / state.
+        let ao = obj as *mut crate::layout::PyASCIIObject;
+        (*ao).length = length as PySsizeT;
+        (*ao).hash = -1;
+        (*ao).state = crate::layout::ustate::pack(0, kind, false, ascii, false);
+        // PyCompactUnicodeObject head: UTF-8 cache left empty (computed
+        // lazily by `PyUnicode_AsUTF8`).
+        let co = obj as *mut crate::layout::PyCompactUnicodeObject;
+        (*co).utf8 = std::ptr::null_mut();
+        (*co).utf8_length = 0;
+        // PyUnicodeObject `data.any` → the out-of-line character buffer.
+        let uo = obj as *mut crate::layout::PyUnicodeObject;
+        (*uo).data = data as *mut c_void;
+    }
+    obj
+}
+
+/// `str.__new__(type, object='', encoding=…, errors=…)` — RFC 0046.
+///
+/// For the exact `str` type returns a native [`Object::Str`]; for a
+/// subtype (e.g. `numpy.str_`) builds the faithful legacy unicode body via
+/// [`unicode_subtype_new`], mirroring CPython's `unicode_new`. NumPy's
+/// `unicode_arrtype_new` calls this slot directly (`PyUnicode_Type.tp_new`)
+/// to let `str` do the value conversion before stamping its own scalar
+/// fields, so a NULL slot SIGSEGV'd on `np.str_(...)` / `arr.astype(str)`.
+pub unsafe extern "C" fn str_new(
+    ty: *mut PyTypeObject,
+    args: *mut PyObject,
+    kwds: *mut PyObject,
+) -> *mut PyObject {
+    let value = match unsafe { str_value(args, kwds) } {
+        Ok(v) => v,
+        Err(()) => return std::ptr::null_mut(),
+    };
+    if unsafe { is_exact(ty, &crate::types::PyUnicode_Type) } {
+        return crate::object::into_owned(Object::from_str(value));
+    }
+    unsafe { unicode_subtype_new(ty, &value) }
+}
+
+// ====================================================================
+// bytes
+// ====================================================================
+
+/// Build the native `bytes` value a `bytes(...)` call would produce from
+/// the `tp_new` `(args, kwds)`, mirroring CPython's `bytes_new` argument
+/// handling (`bytes(source=b'', encoding=…, errors=…)`):
+///
+/// * no `source`                     → the empty byte string,
+/// * `source` str + `encoding`       → `source.encode(encoding, errors)`,
+/// * `source` str without `encoding` → `TypeError`,
+/// * any other `source`              → `PyBytes_FromObject` (a bytes-like
+///   object, or an iterable of ints).
+///
+/// Returns an **owned** native `bytes` `PyObject*` (for a bytes-like
+/// source, a new reference to an equal value), or NULL with a pending
+/// exception on failure.
+unsafe fn bytes_value_obj(args: *mut PyObject, kwds: *mut PyObject) -> *mut PyObject {
+    let source = unsafe { arg_or_kw(args, kwds, 0, b"source\0") };
+    let encoding = unsafe { arg_or_kw(args, kwds, 1, b"encoding\0") };
+    let errors = unsafe { arg_or_kw(args, kwds, 2, b"errors\0") };
+
+    let Some(source) = source else {
+        if encoding.is_some() || errors.is_some() {
+            crate::errors::set_type_error("encoding or errors without a string argument");
+            return std::ptr::null_mut();
+        }
+        return unsafe { crate::strings::PyBytes_FromStringAndSize(std::ptr::null(), 0) };
+    };
+
+    // A `str` source (including numpy's `str_`, which clones to `Object::Str`)
+    // must be encoded and *requires* an encoding, matching CPython.
+    if matches!(unsafe { clone_object(source) }, Object::Str(_)) {
+        if encoding.is_none() {
+            crate::errors::set_type_error("string argument without an encoding");
+            return std::ptr::null_mut();
+        }
+        // The codec/errors names are accepted; the current codec layer
+        // resolves them to UTF-8 (see `PyUnicode_AsEncodedString`).
+        let _ = errors;
+        return unsafe {
+            crate::strings::PyUnicode_AsEncodedString(source, std::ptr::null(), std::ptr::null())
+        };
+    }
+    if encoding.is_some() || errors.is_some() {
+        crate::errors::set_type_error("encoding or errors without a string argument");
+        return std::ptr::null_mut();
+    }
+    unsafe { crate::strings::PyBytes_FromObject(source) }
+}
+
+/// `bytes.__new__(type, source=b'', encoding=…, errors=…)` — RFC 0046.
+///
+/// For the exact `bytes` type returns the native [`Object::Bytes`] value;
+/// for a subtype (e.g. `numpy.bytes_`) builds the faithful variable-length
+/// `PyBytesObject` body, mirroring CPython's `bytes_subtype_new`: allocate
+/// `n` items through the subtype's `tp_alloc` (the faithful inline body,
+/// RFC 0045) and write `ob_size` / `ob_shash` / the inline `ob_sval` char
+/// array (with its trailing NUL) at the CPython offsets, so a stock reader
+/// (`PyBytes_AS_STRING` / `PyBytes_GET_SIZE`) sees a real bytes object.
+///
+/// NumPy's `string_arrtype_new` calls this slot directly
+/// (`PyBytes_Type.tp_new`) to let `bytes` do the value conversion before
+/// stamping its own scalar fields, so a NULL slot SIGSEGV'd on
+/// `np.bytes_(...)` / `arr.astype("S")`.
+pub unsafe extern "C" fn bytes_new(
+    ty: *mut PyTypeObject,
+    args: *mut PyObject,
+    kwds: *mut PyObject,
+) -> *mut PyObject {
+    let value_obj = unsafe { bytes_value_obj(args, kwds) };
+    if value_obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    if unsafe { is_exact(ty, &crate::types::PyBytes_Type) } {
+        return value_obj;
+    }
+    // Snapshot the raw bytes, then drop the temporary native `bytes`.
+    let data: Vec<u8> = match unsafe { clone_object(value_obj) } {
+        Object::Bytes(b) => b.to_vec(),
+        _ => Vec::new(),
+    };
+    unsafe { crate::object::Py_DecRef(value_obj) };
+
+    let n = data.len() as PySsizeT;
+    let obj = unsafe { subtype_alloc(ty, n) };
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Faithful `PyBytesObject` body: `ob_size` (16), `ob_shash` (24,
+    // unhashed sentinel `-1`), inline `ob_sval` (32) + trailing NUL.
+    unsafe {
+        let bo = obj as *mut crate::layout::PyBytesObject;
+        (*bo).ob_base.ob_size = n;
+        (*bo).ob_shash = -1;
+        let sval = (*bo).ob_sval.as_mut_ptr() as *mut u8;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), sval, data.len());
+        *sval.add(data.len()) = 0;
+    }
+    obj
+}
+
+// ====================================================================
+// complex
+// ====================================================================
+
+/// Gather the (up to two) constructor arguments a `complex(...)` call
+/// receives through its `tp_new` `(args, kwds)` into native [`Object`]s,
+/// honouring the `real`/`imag` keyword names. Positional arguments take
+/// precedence; a keyword only fills a position the positional args did not.
+unsafe fn complex_args(args: *mut PyObject, kwds: *mut PyObject) -> Vec<Object> {
+    let mut objs: Vec<Object> = Vec::new();
+    let nargs = if args.is_null() {
+        0
+    } else {
+        unsafe { crate::containers::PyTuple_Size(args) }.max(0)
+    };
+    for i in 0..nargs {
+        let it = unsafe { crate::containers::PyTuple_GetItem(args, i) };
+        if it.is_null() {
+            break;
+        }
+        objs.push(unsafe { clone_object(it) });
+    }
+    if !kwds.is_null() {
+        // `real` fills position 0 when no positional `real` was given.
+        if objs.is_empty() {
+            let r = unsafe {
+                crate::containers::PyDict_GetItemString(kwds, b"real\0".as_ptr() as *const c_char)
+            };
+            if !r.is_null() {
+                objs.push(unsafe { clone_object(r) });
+            }
+        }
+        // `imag` fills position 1; CPython allows `complex(imag=…)` with a
+        // defaulted real, so materialise a zero real first if needed.
+        if objs.len() < 2 {
+            let im = unsafe {
+                crate::containers::PyDict_GetItemString(kwds, b"imag\0".as_ptr() as *const c_char)
+            };
+            if !im.is_null() {
+                if objs.is_empty() {
+                    objs.push(Object::Float(0.0));
+                }
+                objs.push(unsafe { clone_object(im) });
+            }
+        }
+    }
+    objs
+}
+
+/// `complex.__new__(type, real=0, imag=0)` — RFC 0047, wave 5.
+///
+/// For the exact `complex` type returns a native [`Object::Complex`]; for a
+/// subtype (e.g. `numpy.complex128`, whose scalar `tp_new` calls this slot
+/// directly and whose `CDOUBLE_setitem` uses it to parse a string element)
+/// allocates the faithful body and writes the `Py_complex cval` at
+/// `offsetof(PyComplexObject, cval) == 16`, mirroring CPython's
+/// `complex_subtype_from_c_complex`. A NULL slot SIGSEGV'd `complex128("1+2j")`
+/// / `arr.astype(complex)` on a string array.
+pub unsafe extern "C" fn complex_new(
+    ty: *mut PyTypeObject,
+    args: *mut PyObject,
+    kwds: *mut PyObject,
+) -> *mut PyObject {
+    let objs = unsafe { complex_args(args, kwds) };
+    let (real, imag) = match weavepy_vm::builtins::b_complex(&objs) {
+        Ok(Object::Complex(c)) => (c.real, c.imag),
+        Ok(_) => (0.0, 0.0),
+        Err(e) => {
+            crate::errors::set_pending_from_runtime(e);
+            return std::ptr::null_mut();
+        }
+    };
+    if unsafe { is_exact(ty, &crate::types::PyComplex_Type) } {
+        return unsafe { crate::numbers::PyComplex_FromDoubles(real, imag) };
+    }
+    let obj = unsafe { subtype_alloc(ty, 0) };
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    // `PyComplexObject.cval` is at offset 16 (`PyObject_HEAD` + the
+    // `Py_complex` pair); a `complex` subtype is layout-compatible and
+    // inherits that field.
+    unsafe {
+        *((obj as *mut u8).add(16) as *mut crate::layout::PyComplexValue) =
+            crate::layout::PyComplexValue { real, imag };
+    }
+    obj
 }
 
 // ====================================================================
@@ -178,5 +546,23 @@ pub fn install_builtin_constructors() {
             *mut PyObject,
         ) -> *mut PyObject = float_new;
         (*crate::types::PyFloat_Type.as_ptr()).tp_new = fnew as *mut c_void;
+        let snew: unsafe extern "C" fn(
+            *mut PyTypeObject,
+            *mut PyObject,
+            *mut PyObject,
+        ) -> *mut PyObject = str_new;
+        (*crate::types::PyUnicode_Type.as_ptr()).tp_new = snew as *mut c_void;
+        let bnew: unsafe extern "C" fn(
+            *mut PyTypeObject,
+            *mut PyObject,
+            *mut PyObject,
+        ) -> *mut PyObject = bytes_new;
+        (*crate::types::PyBytes_Type.as_ptr()).tp_new = bnew as *mut c_void;
+        let cnew: unsafe extern "C" fn(
+            *mut PyTypeObject,
+            *mut PyObject,
+            *mut PyObject,
+        ) -> *mut PyObject = complex_new;
+        (*crate::types::PyComplex_Type.as_ptr()).tp_new = cnew as *mut c_void;
     }
 }

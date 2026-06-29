@@ -29,6 +29,7 @@
 //! 3.13 dev headers (or `cc`) aren't available on the build host.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 use weavepy_capi::loader::load_extension_module;
 use weavepy_vm::error::RuntimeError;
@@ -54,10 +55,24 @@ fn lookup(module: &Object, key: &str) -> Option<Object> {
     None
 }
 
+/// Serialize the tests in this binary. Each test constructs its own
+/// `Interpreter`, but the C-API bridge keeps *process-global* state (the
+/// `LAST_INTERPRETER` fallback pointer, the shared dlopen'd extension's
+/// static state), so libtest's default parallel execution can route a
+/// re-entrant C-API call into a different test's interpreter mid-run. The
+/// guard is returned by the loader and held for the whole test.
+fn serialize() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    // A poisoned lock only means another test's assertion failed while
+    // holding it — the serialization itself is still valid.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Load `_stockarray` and register it in the interpreter's module cache,
 /// so the in-C `PyCapsule_Import("_stockarray._ARRAY_API")` (the
 /// `import_array()` path) can re-import the module by name.
-fn load() -> Option<(Interpreter, Object)> {
+fn load() -> Option<(MutexGuard<'static, ()>, Interpreter, Object)> {
+    let guard = serialize();
     let path = extension_path()?;
     if !path.is_file() {
         eprintln!(
@@ -72,7 +87,7 @@ fn load() -> Option<(Interpreter, Object)> {
     match load_extension_module(interp_ptr, &path, "_stockarray") {
         Ok(m) => {
             interp.module_cache().insert("_stockarray", m.clone());
-            Some((interp, m))
+            Some((guard, interp, m))
         }
         Err(err) => {
             eprintln!("dlopen of stock-array extension failed (treating as skip): {err}");
@@ -181,7 +196,7 @@ fn stockarray_skipped_when_extension_missing() {
 
 #[test]
 fn stockarray_module_loads_with_type_and_capsule() {
-    let Some((_interp, module)) = load() else {
+    let Some((_lock, _interp, module)) = load() else {
         return;
     };
     assert!(
@@ -203,7 +218,7 @@ fn stockarray_module_loads_with_type_and_capsule() {
 /// the faithful body is the **same block** across both crossings.
 #[test]
 fn stockarray_inline_storage_persists_across_calls() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let ty = lookup(&module, "StockArray").expect("StockArray");
@@ -222,7 +237,7 @@ fn stockarray_inline_storage_persists_across_calls() {
 /// offsets, and READONLY members reject assignment.
 #[test]
 fn stockarray_members_read_inline_fields() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let ty = lookup(&module, "StockArray").expect("StockArray");
@@ -253,7 +268,7 @@ fn stockarray_members_read_inline_fields() {
 /// A writable member round-trips through the same inline field.
 #[test]
 fn stockarray_member_write_roundtrips() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let ty = lookup(&module, "StockArray").expect("StockArray");
@@ -271,7 +286,7 @@ fn stockarray_member_write_roundtrips() {
 /// direct evidence the instance presents one stable body.
 #[test]
 fn stockarray_data_pointer_is_stable() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let ty = lookup(&module, "StockArray").expect("StockArray");
@@ -287,7 +302,7 @@ fn stockarray_data_pointer_is_stable() {
 /// (`sum`) — the bytes live in the shared body, not a transient box.
 #[test]
 fn stockarray_fill_then_sum() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let ty = lookup(&module, "StockArray").expect("StockArray");
@@ -304,7 +319,7 @@ fn stockarray_fill_then_sum() {
 /// `__array_interface__` exposes shape + the live inline data address.
 #[test]
 fn stockarray_array_interface() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let ty = lookup(&module, "StockArray").expect("StockArray");
@@ -342,7 +357,7 @@ fn stockarray_array_interface() {
 /// reads back with the right layout.
 #[test]
 fn stockarray_array_struct_capsule() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let ty = lookup(&module, "StockArray").expect("StockArray");
@@ -370,7 +385,7 @@ fn stockarray_array_struct_capsule() {
 /// result is a real inline-storage instance whose `sum()` works.
 #[test]
 fn stockarray_import_array_capsule_roundtrip() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let made = call_module_fn(&mut interp, &module, "capi_roundtrip", &[Object::Int(4)]);
@@ -399,7 +414,7 @@ fn stockarray_import_array_capsule_roundtrip() {
 /// instance was collected, regardless of concurrent deallocs.
 #[test]
 fn stockarray_dealloc_frees_buffer() {
-    let Some((mut interp, module)) = load() else {
+    let Some((_lock, mut interp, module)) = load() else {
         return;
     };
     let ty = lookup(&module, "StockArray").expect("StockArray");

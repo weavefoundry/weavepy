@@ -62,7 +62,7 @@ thread_local! {
 static NEXT_IDENT: AtomicU64 = AtomicU64::new(2);
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -310,6 +310,40 @@ fn resolve_acquire_args(
 /// internal nanosecond deadline without overflow.
 const TIMEOUT_MAX_SECS: f64 = 9_223_372_036.0;
 
+/// A *type-level* trampoline for a special method whose real implementation
+/// lives in the **instance** dict.
+///
+/// The lock / RLock methods capture per-instance `Arc<RealLock>` state in
+/// closures, so they're stored on each instance rather than the shared type.
+/// CPython, however, exposes a lock's `__enter__`/`__exit__` on the *type* —
+/// and the implicit context-manager protocol is a *type-only* lookup
+/// (`_PyType_Lookup`, which a Cython `with` statement performs directly). This
+/// trampoline lives on the type, recovers `self` (the bound instance), and
+/// forwards to that instance's own closure, so both the VM's instance-dict
+/// path and a C extension's type-level lookup reach the identical
+/// implementation.
+fn instance_dunder_trampoline(name: &'static str) -> Object {
+    Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(move |args: &[Object]| -> Result<Object, RuntimeError> {
+            let Some(Object::Instance(inst)) = args.first() else {
+                return Err(type_error(format!("{name}() requires an instance")));
+            };
+            let closure = inst
+                .dict
+                .borrow()
+                .get(&DictKey(Object::from_static(name)))
+                .cloned();
+            match closure {
+                Some(Object::Builtin(b)) => (b.call)(&args[1..]),
+                _ => Err(type_error(format!("instance has no {name}"))),
+            }
+        }),
+        call_kw: None,
+    }))
+}
+
 /// Returns the user-visible "lock" type. Built lazily so
 /// `type(lock).__name__ == 'lock'` matches CPython.
 fn lock_type() -> Rc<TypeObject> {
@@ -317,7 +351,7 @@ fn lock_type() -> Rc<TypeObject> {
         if let Some(t) = cell.borrow().clone() {
             return t;
         }
-        let mut d = DictData::new();
+        let mut d = DictData::default();
         d.insert(
             DictKey(Object::from_static("__module__")),
             Object::from_static("_thread"),
@@ -330,6 +364,18 @@ fn lock_type() -> Rc<TypeObject> {
                 call: Box::new(lock_repr),
                 call_kw: None,
             })),
+        );
+        // Expose the context-manager protocol on the *type* (CPython's
+        // `_thread.lock` does), so a C extension's type-only `_PyType_Lookup`
+        // for `with lock:` finds them. They forward to the per-instance
+        // closures that hold the `Arc<RealLock>`.
+        d.insert(
+            DictKey(Object::from_static("__enter__")),
+            instance_dunder_trampoline("__enter__"),
+        );
+        d.insert(
+            DictKey(Object::from_static("__exit__")),
+            instance_dunder_trampoline("__exit__"),
         );
         let t = TypeObject::new_with_flags(
             "lock",
@@ -377,7 +423,7 @@ fn rlock_type() -> Rc<TypeObject> {
         if let Some(t) = cell.borrow().clone() {
             return t;
         }
-        let mut d = DictData::new();
+        let mut d = DictData::default();
         d.insert(
             DictKey(Object::from_static("__module__")),
             Object::from_static("_thread"),
@@ -390,6 +436,16 @@ fn rlock_type() -> Rc<TypeObject> {
                 call: Box::new(rlock_repr),
                 call_kw: None,
             })),
+        );
+        // Same as `lock`: surface the context-manager protocol on the type so
+        // `with rlock:` resolves through a C extension's type-only lookup.
+        d.insert(
+            DictKey(Object::from_static("__enter__")),
+            instance_dunder_trampoline("__enter__"),
+        );
+        d.insert(
+            DictKey(Object::from_static("__exit__")),
+            instance_dunder_trampoline("__exit__"),
         );
         let t = TypeObject::new_with_flags(
             "RLock",
@@ -456,7 +512,7 @@ pub fn new_rlock_object() -> Object {
 }
 
 fn make_lock_object(lock: Arc<RealLock>) -> Object {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     let acquire_lock = lock.clone();
     let acquire =
         move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
@@ -541,7 +597,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(lock_type()),
         dict,
-        native: None,
+        native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
@@ -555,7 +611,7 @@ fn make_lock_object(lock: Arc<RealLock>) -> Object {
 /// `Arc<RealRLock>`. Same shape as [`make_lock_object`] but
 /// reentrant for the owning thread.
 fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     let acquire_lock = rlock.clone();
     let acquire =
         move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
@@ -711,7 +767,7 @@ fn make_rlock_object(rlock: Arc<RealRLock>) -> Object {
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(rlock_type()),
         dict,
-        native: None,
+        native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),
@@ -1436,7 +1492,7 @@ fn thread_handle_type() -> Rc<TypeObject> {
         let t = TypeObject::new_with_flags(
             "_ThreadHandle",
             vec![crate::builtin_types::builtin_types().object_.clone()],
-            DictData::new(),
+            DictData::default(),
             TypeFlags {
                 is_exception: false,
                 is_builtin: true,
@@ -1456,7 +1512,7 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
     let hid = NEXT_HANDLE_ID.fetch_add(1, Ordering::AcqRel);
     handle_registry().lock().insert(hid, state.clone());
 
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
 
     let is_done_state = state.clone();
     let is_done = move |_args: &[Object]| -> Result<Object, RuntimeError> {
@@ -1553,7 +1609,7 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
     let inst = Rc::new(PyInstance {
         class: crate::sync::RefCell::new(thread_handle_type()),
         dict,
-        native: None,
+        native: std::sync::OnceLock::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(None),
         hash_cache: crate::sync::Cell::new(None),

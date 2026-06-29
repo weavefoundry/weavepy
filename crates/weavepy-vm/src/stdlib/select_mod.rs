@@ -35,7 +35,7 @@ use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use std::time::{Duration, Instant};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -451,7 +451,7 @@ fn poll_type() -> Rc<crate::types::TypeObject> {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         for (name, m) in [
             ("register", method("register", poll_register)),
             ("modify", method("modify", poll_modify)),
@@ -785,7 +785,7 @@ mod kqueue_impl {
                 return c.clone();
             }
             let bt = crate::builtin_types::builtin_types();
-            let mut dict = DictData::new();
+            let mut dict = DictData::default();
             for (name, m) in [
                 ("__init__", method("__init__", kevent_init)),
                 ("__repr__", method("__repr__", kevent_repr)),
@@ -812,7 +812,7 @@ mod kqueue_impl {
     }
 
     fn get_field(inst: &PyInstance, name: &str) -> i64 {
-        match inst.dict.borrow().get(&DictKey(Object::from_str(name))) {
+        match inst.dict.borrow().get(&crate::object::StrKey(name)) {
             Some(Object::Int(n)) => *n,
             Some(Object::Bool(b)) => i64::from(*b),
             _ => 0,
@@ -947,7 +947,7 @@ mod kqueue_impl {
                 return c.clone();
             }
             let bt = crate::builtin_types::builtin_types();
-            let mut dict = DictData::new();
+            let mut dict = DictData::default();
             for (name, m) in [
                 ("__init__", method("__init__", kqueue_init)),
                 ("__enter__", method("__enter__", kqueue_enter)),

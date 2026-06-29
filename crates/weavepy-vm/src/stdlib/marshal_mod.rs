@@ -77,7 +77,7 @@ const TYPE_SHORT_ASCII_INTERNED: u8 = b'Z';
 const FLAG_REF: u8 = 0x80;
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -208,12 +208,17 @@ impl MarshalWriter {
             Object::Long(b) => self.write_long_object(b)?,
             Object::Float(f) => {
                 self.write_byte(TYPE_BINARY_FLOAT);
-                self.buf.extend_from_slice(&f.to_le_bytes());
+                // Canonical NaN bits on the wire — never WeavePy's identity
+                // tag (see `untag_nan`).
+                self.buf
+                    .extend_from_slice(&crate::object::untag_nan(*f).to_le_bytes());
             }
             Object::Complex(c) => {
                 self.write_byte(TYPE_BINARY_COMPLEX);
-                self.buf.extend_from_slice(&c.real.to_le_bytes());
-                self.buf.extend_from_slice(&c.imag.to_le_bytes());
+                self.buf
+                    .extend_from_slice(&crate::object::untag_nan(c.real).to_le_bytes());
+                self.buf
+                    .extend_from_slice(&crate::object::untag_nan(c.imag).to_le_bytes());
             }
             Object::Str(s) => {
                 let bytes = s.as_bytes();
@@ -526,13 +531,17 @@ impl<'a> MarshalReader<'a> {
                 let bytes = self.read_n_bytes(len)?;
                 let s =
                     std::str::from_utf8(&bytes).map_err(|_| value_error("bad marshal float"))?;
-                Ok(Object::Float(s.parse().unwrap_or(0.0)))
+                Ok(crate::object::fresh_float(s.parse().unwrap_or(0.0)))
             }
             TYPE_BINARY_FLOAT => {
                 let bytes = self.read_n_bytes(8)?;
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&bytes);
-                Ok(Object::Float(f64::from_le_bytes(buf)))
+                // Fresh identity for a canonical NaN; exotic payloads kept
+                // verbatim (see `tag_unpacked_nan`).
+                Ok(Object::Float(crate::object::tag_unpacked_nan(
+                    f64::from_le_bytes(buf),
+                )))
             }
             TYPE_BINARY_COMPLEX => {
                 let real = self.read_n_bytes(8)?;

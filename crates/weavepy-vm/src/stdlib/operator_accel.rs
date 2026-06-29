@@ -27,7 +27,7 @@ use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use weavepy_compiler::{BinOpKind, CompareKind, UnaryKind};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -120,6 +120,44 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::new_list(names),
         );
 
+        // CPython's `attrgetter` / `itemgetter` / `methodcaller` are C types:
+        // calling one pushes no Python frame. pandas'
+        // `find_stack_level()`-based warnings count stack frames between the
+        // warn site and the caller, so the pure-Python `__call__` of the
+        // frozen `operator` module misattributes warnings (a
+        // `<frozen operator>` frame where CPython has none). The frozen
+        // module splices these natives in as `__call__`.
+        type CallBox = Box<dyn Fn(&[Object]) -> Result<Object, RuntimeError> + Send + Sync>;
+        // The dotted-internal names display as `__call__`
+        // (`builtin_display_name`) while keeping each function's
+        // `__text_signature__` distinct (`builtin_text_signature`), so
+        // `inspect.signature(attrgetter('a'))` reports CPython's `(obj, /)`.
+        for (export, name, f) in [
+            (
+                "_attrgetter_call",
+                ".attrgetter.__call__",
+                Box::new(attrgetter_call) as CallBox,
+            ),
+            (
+                "_itemgetter_call",
+                ".itemgetter.__call__",
+                Box::new(itemgetter_call) as CallBox,
+            ),
+            (
+                "_methodcaller_call",
+                ".methodcaller.__call__",
+                Box::new(methodcaller_call) as CallBox,
+            ),
+        ] {
+            let obj = Object::Builtin(Rc::new(BuiltinFn {
+                name,
+                binds_instance: false,
+                call: f,
+                call_kw: None,
+            }));
+            d.insert(DictKey(Object::from_static(export)), obj);
+        }
+
         let compare_digest_fn = Object::Builtin(Rc::new(BuiltinFn {
             name: "_compare_digest",
             binds_instance: false,
@@ -184,9 +222,13 @@ fn inplace(args: &[Object], op: BinOpKind, name: &str) -> Result<Object, Runtime
 
 fn compare(args: &[Object], op: CompareKind, name: &str) -> Result<Object, RuntimeError> {
     let (a, b) = two_args(args, name)?;
-    Ok(Object::Bool(with_interp(|interp| {
-        interp.op_compare(a, b, op)
-    })?))
+    // `operator.gt(a, b)` is the *expression* `a > b`, not `bool(a > b)`: it
+    // must return the raw rich-comparison result, so a foreign object (a numpy
+    // `ndarray`) yields its element-wise bool array rather than a coerced
+    // scalar. pandas' `comparison_op` dispatches `Series > x` through
+    // `operator.gt`; a scalar result there makes pandas treat the whole
+    // comparison as invalid (`invalid_comparison`) and boolean masks break.
+    with_interp(|interp| interp.rich_compare_public(a, b, op))
 }
 
 fn unary(args: &[Object], op: UnaryKind, name: &str) -> Result<Object, RuntimeError> {
@@ -212,6 +254,87 @@ fn op_is(args: &[Object]) -> Result<Object, RuntimeError> {
 fn op_is_not(args: &[Object]) -> Result<Object, RuntimeError> {
     let (a, b) = two_args(args, "is_not")?;
     Ok(Object::Bool(!a.is_same(b)))
+}
+
+/// `attrgetter.__call__(self, obj, /)` without a Python frame. Reads the
+/// stored `_attrs` tuple and traverses each (possibly dotted) attribute
+/// path through the interpreter's attribute machinery.
+fn attrgetter_call(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (slf, obj) = two_args(args, "attrgetter.__call__")?;
+    with_interp(|interp| {
+        let attrs = interp.load_attr_public(slf, "_attrs")?;
+        let Object::Tuple(attrs) = &attrs else {
+            return Err(type_error("attrgetter '_attrs' must be a tuple"));
+        };
+        let mut results = Vec::with_capacity(attrs.len());
+        for attr in attrs.iter() {
+            let Object::Str(path) = attr else {
+                return Err(type_error("attribute name must be a string"));
+            };
+            let mut cur = obj.clone();
+            for name in path.split('.') {
+                cur = interp.load_attr_public(&cur, name)?;
+            }
+            results.push(cur);
+        }
+        if results.len() == 1 {
+            Ok(results.pop().expect("one result"))
+        } else {
+            Ok(Object::new_tuple(results))
+        }
+    })
+}
+
+/// `itemgetter.__call__(self, obj, /)` without a Python frame. Subscripts
+/// `obj` with each stored item through the interpreter (dunders and all).
+fn itemgetter_call(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (slf, obj) = two_args(args, "itemgetter.__call__")?;
+    with_interp(|interp| {
+        let items = interp.load_attr_public(slf, "_items")?;
+        let Object::Tuple(items) = &items else {
+            return Err(type_error("itemgetter '_items' must be a tuple"));
+        };
+        let mut results = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            results.push(interp.subscr_get_public(obj, item)?);
+        }
+        if results.len() == 1 {
+            Ok(results.pop().expect("one result"))
+        } else {
+            Ok(Object::new_tuple(results))
+        }
+    })
+}
+
+/// `methodcaller.__call__(self, obj, /)` without a Python frame. Looks up
+/// the stored method name on `obj` and tail-calls it with the stored
+/// args/kwargs through the interpreter.
+fn methodcaller_call(args: &[Object]) -> Result<Object, RuntimeError> {
+    let (slf, obj) = two_args(args, "methodcaller.__call__")?;
+    with_interp(|interp| {
+        let name = interp.load_attr_public(slf, "_name")?;
+        let Object::Str(name) = &name else {
+            return Err(type_error("method name must be a string"));
+        };
+        let stored_args = interp.load_attr_public(slf, "_args")?;
+        let stored_kwargs = interp.load_attr_public(slf, "_kwargs")?;
+        let call_args: Vec<Object> = match &stored_args {
+            Object::Tuple(xs) => xs.to_vec(),
+            _ => return Err(type_error("methodcaller '_args' must be a tuple")),
+        };
+        let mut call_kwargs: Vec<(String, Object)> = Vec::new();
+        if let Object::Dict(d) = &stored_kwargs {
+            for (k, v) in d.borrow().iter() {
+                let Object::Str(s) = &k.0 else {
+                    return Err(type_error("keywords must be strings"));
+                };
+                call_kwargs.push((s.to_string(), v.clone()));
+            }
+        }
+        let method = interp.load_attr_public(obj, name)?;
+        let globals = interp.builtins_dict();
+        interp.call(&method, &call_args, &call_kwargs, &globals)
+    })
 }
 
 /// Constant-time comparison, ported from CPython's `_tscmp`. Returns `true`

@@ -208,32 +208,33 @@ pub(crate) fn try_enter(frame: &mut super::Frame) -> JitEntry {
     };
 
     // Phase 2: entry type-guard on the live-in locals.
-    for &slot in &cf.livein {
-        let ty = match cf.local_types.get(slot as usize).copied().flatten() {
-            Some(t) => t,
-            None => return JitEntry::Skip,
-        };
-        let ok = frame
-            .locals
-            .get(slot as usize)
-            .and_then(|o| pack(o, ty))
-            .is_some();
-        if !ok {
-            JIT.with(|cell| cell.borrow_mut().stats.entry_guard_failures += 1);
-            return JitEntry::Skip;
+    {
+        let locals = frame.locals.borrow();
+        for &slot in &cf.livein {
+            let ty = match cf.local_types.get(slot as usize).copied().flatten() {
+                Some(t) => t,
+                None => return JitEntry::Skip,
+            };
+            let ok = locals
+                .get(slot as usize)
+                .and_then(|o| pack(o, ty))
+                .is_some();
+            if !ok {
+                JIT.with(|cell| cell.borrow_mut().stats.entry_guard_failures += 1);
+                return JitEntry::Skip;
+            }
         }
     }
 
     // Phase 3: marshal locals and enter native code.
     let n = cf.n_locals as usize;
     let mut locals_buf = vec![0u64; n];
-    for (slot, dst) in locals_buf.iter_mut().enumerate() {
-        if let Some(ty) = cf.local_types[slot] {
-            *dst = frame
-                .locals
-                .get(slot)
-                .and_then(|o| pack(o, ty))
-                .unwrap_or(0);
+    {
+        let locals = frame.locals.borrow();
+        for (slot, dst) in locals_buf.iter_mut().enumerate() {
+            if let Some(ty) = cf.local_types[slot] {
+                *dst = locals.get(slot).and_then(|o| pack(o, ty)).unwrap_or(0);
+            }
         }
     }
     let cap = cf.max_stack as usize + 1;
@@ -271,9 +272,12 @@ pub(crate) fn try_enter(frame: &mut super::Frame) -> JitEntry {
         JitStatus::Deopt => {
             // Write back managed locals, rebuild the operand stack from
             // the spill, and resume at the deopt pc.
-            for (slot, &bits) in locals_buf.iter().enumerate() {
-                if let Some(ty) = cf.local_types[slot] {
-                    frame.locals[slot] = unpack_ty(bits, ty);
+            {
+                let mut locals = frame.locals.borrow_mut();
+                for (slot, &bits) in locals_buf.iter().enumerate() {
+                    if let Some(ty) = cf.local_types[slot] {
+                        locals[slot] = unpack_ty(bits, ty);
+                    }
                 }
             }
             for i in 0..jf.stack_len as usize {

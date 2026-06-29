@@ -273,6 +273,21 @@ pub fn current_worker_thread_id() -> u64 {
     native
 }
 
+/// `True` when `id` is the public ident (`threading.get_ident()`
+/// value) of a currently-live thread: the caller itself, a live
+/// worker, or the main interpreter thread. Backs
+/// `PyThreadState_SetAsyncExc`'s "number of thread states modified"
+/// return (0 for a nonsense id).
+pub fn thread_ident_is_live(id: u64) -> bool {
+    if id == current_worker_thread_id() {
+        return true;
+    }
+    if worker_map().lock().values().any(|v| *v == id) {
+        return true;
+    }
+    id == crate::gil::main_thread_id()
+}
+
 // ---------------------------------------------------------------------------
 // RFC 0025 — per-thread interpreter routing.
 //
@@ -424,6 +439,262 @@ pub fn has_pending_resource_warnings() -> bool {
 pub fn take_pending_resource_warnings() -> Vec<String> {
     PENDING_RW_FLAG.store(false, std::sync::atomic::Ordering::Release);
     PENDING_RESOURCE_WARNINGS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+thread_local! {
+    /// Depth of live VM→C-extension transitions on this thread's stack
+    /// (RFC 0047, wave 5). Bumped by `weavepy-capi`'s single bridged-call
+    /// choke point (`interp::ensure_active`) for the duration of every C
+    /// slot / `PyCFunction` / descriptor invocation, including the
+    /// bytecode a C extension re-enters through `PyObject_Call`.
+    ///
+    /// The prompt reaper consults this to decide whether it may *reclaim*
+    /// a refcount-dead subgraph containing C-escaped instances: while any
+    /// extension frame is live (`depth > 0`), C code may hold a borrowed
+    /// (uncounted) body pointer across its re-entrant call into the VM, so
+    /// freeing the body would be a use-after-free; at `depth == 0` the VM
+    /// is executing plain bytecode with no extension frame below it, no
+    /// borrow can be in flight, and reclaiming is exactly as safe as
+    /// CPython's own refcount-driven `tp_dealloc` at the same point.
+    static CEXT_CALL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Objects whose last C-side reference was dropped *inside* an
+    /// extension call (RFC 0047, wave 5). CPython would run their
+    /// `tp_dealloc` chain at that instant — clearing weakrefs of
+    /// anything that died with them — but WeavePy's prompt reaper only
+    /// fires from eval-loop sites, and a C-internal drop (a Cython
+    /// `self.blocks = new` setter decref'ing the old tuple of `Block`s)
+    /// leaves the dead objects pinned by their GC handles with their
+    /// weakrefs still live. The capi boundary parks the dropped payload
+    /// here instead; the eval loop reaps it at the next
+    /// between-bytecodes safe point — before any subsequent Python-level
+    /// weakref read can observe the stale referent.
+    static PENDING_CEXT_DROPS: RefCell<Vec<Object>> = const { RefCell::new(Vec::new()) };
+    /// Cheap "is this thread's C-drop queue non-empty?" probe for the
+    /// eval-loop safe point. Thread-local (unlike `PENDING_RW_FLAG`)
+    /// because the queues are: a global flag cleared by whichever thread
+    /// drains first would strand another thread's queued objects with
+    /// their weakrefs never cleared.
+    static PENDING_CEXT_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// Object ids currently being torn down by the prompt reaper's cascade
+    /// on this thread (RFC 0047, wave 5). While an object is mid-cascade,
+    /// the teardown itself crosses it back into C — `traverse_object` runs
+    /// the GC bridge's `tp_traverse`, which mints a transient self box and
+    /// releases it — and that release would *re-queue* the object through
+    /// [`queue_cext_dropped`]. The queued clone then makes the cascade's
+    /// own deadness re-check see the object as externally alive, aborting
+    /// the teardown, and the drained clone starts the cascade over: a
+    /// livelock that pinned `repr(DataFrame)` at 100% CPU indefinitely.
+    /// A queue request for an id in this set is the cascade observing
+    /// itself and is dropped; requests for *other* objects (a child body
+    /// whose last C pin fell during the teardown) still queue normally.
+    static CASCADING_IDS: RefCell<std::collections::HashSet<u64>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// RAII marker for one object's trip through the prompt reaper's cascade;
+/// see [`CASCADING_IDS`]. Created by [`enter_cascade`].
+#[derive(Debug)]
+pub struct CascadeGuard {
+    id: u64,
+    owner: bool,
+}
+
+impl Drop for CascadeGuard {
+    fn drop(&mut self) {
+        if self.owner {
+            let _ = CASCADING_IDS.try_with(|c| {
+                if let Ok(mut set) = c.try_borrow_mut() {
+                    set.remove(&self.id);
+                }
+            });
+        }
+    }
+}
+
+/// Mark `id` as mid-cascade for the guard's lifetime. Nesting-safe: a
+/// guard for an id already in the set is a no-op on drop (the outer
+/// guard owns the entry).
+pub fn enter_cascade(id: u64) -> CascadeGuard {
+    let owner = CASCADING_IDS
+        .try_with(|c| {
+            c.try_borrow_mut()
+                .map(|mut set| set.insert(id))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    CascadeGuard { id, owner }
+}
+
+/// Is `id` currently being torn down by the prompt reaper's cascade on
+/// this thread?
+fn in_cascade(id: u64) -> bool {
+    CASCADING_IDS
+        .try_with(|c| c.try_borrow().map(|set| set.contains(&id)).unwrap_or(true))
+        .unwrap_or(false)
+}
+
+/// Park an object dropped by C extension code for a prompt-reap pass at
+/// the next eval-loop safe point. Only object kinds that can carry (or
+/// anchor) finalizers/weakrefs/tracked children are queued; scalars and
+/// other leaves drop inline as before. Teardown-safe: silently drops the
+/// request when thread-local storage is gone.
+pub fn queue_cext_dropped(obj: &Object) {
+    if !matches!(
+        obj,
+        Object::Instance(_)
+            | Object::List(_)
+            | Object::Tuple(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::FrozenSet(_)
+            | Object::Generator(_)
+            | Object::Coroutine(_)
+            | Object::AsyncGenerator(_)
+    ) {
+        return;
+    }
+    queue_parked_drop(obj);
+}
+
+/// Park a value evicted from a native container by a *mutating* method or
+/// opcode — `dict.clear`/`__delitem__`/replacing `__setitem__`, `del d[k]`,
+/// `list.remove`/`clear`/slice assignment, `set.discard`, … — for a
+/// prompt-reap pass at the next eval-loop safe point. These mutators run as
+/// plain builtin fns without interpreter access, so the reference they drop
+/// can't go through `prompt_reap_dropped` inline; without the park, an
+/// object whose *last* reference lived in the container stayed pinned by
+/// its weakref registry entry / GC handle until the next cyclic collection.
+/// CPython frees it on the spot (pandas' `_item_cache.clear()` relies on
+/// the evicted Series — and its CoW `Block` — dying immediately: a stale
+/// block kept `refs.has_reference()` true, misfiring the chained-assignment
+/// `FutureWarning` in `Series.__setitem__`). Same kind filter as
+/// [`queue_cext_dropped`]: scalars and other leaves drop inline as before.
+pub fn queue_container_removed(obj: &Object) {
+    queue_cext_dropped(obj);
+}
+
+/// As [`queue_cext_dropped`] but with **no kind filter** — the entry point
+/// for the prompt reaper's escaped-subgraph park (RFC 0047, wave 5). The
+/// reaper has already established the object is refcount-dead and anchors
+/// an escaped instance, so the park must not lose it: a closure *function*
+/// (the compiler's `<genexpr>`/`<listcomp>` temporary, or any `def` whose
+/// parameter is promoted to a cell) is GC-tracked yet fell through the
+/// C-drop kind filter above, so its park request was silently discarded —
+/// leaving it pinned by its own GC handle, still holding `cell(self)`.
+/// Every `PyObject_GetAttr(mgr, "shape")` a Cython caller issued leaked
+/// one reference to the manager that way (pandas' `shape` getter compiles
+/// with `self` as a cellvar), inflating `sys.getrefcount` and keeping CoW
+/// intermediates alive until the next full collection.
+pub fn queue_parked_drop(obj: &Object) {
+    // The cycle collector marshals candidates into transient C boxes for
+    // `tp_traverse`/`tp_clear` (gc_bridge); freeing those boxes lands here.
+    // Queuing a strong clone of an object *currently under collection*
+    // would (a) inflate its externally-visible refcount — the mark phase
+    // seeds reachability from `Rc::strong_count`, so each pass would make
+    // the candidate look more reachable, pinning cyclic garbage forever —
+    // and (b) re-pin objects the collector is about to reclaim. Anything
+    // dropped mid-collection is either a candidate (the collector owns its
+    // fate) or reachable from one (the next pass sees it); either way the
+    // queue adds nothing but the pin.
+    if crate::gc_trace::collector_active() {
+        return;
+    }
+    // The prompt reaper's own teardown of this object (see
+    // [`CASCADING_IDS`]): the transient C crossings the cascade performs
+    // must not re-queue the object it is in the middle of freeing.
+    if in_cascade(crate::weakref_registry::id_of(obj)) {
+        return;
+    }
+    let pushed = PENDING_CEXT_DROPS
+        .try_with(|cell| {
+            if let Ok(mut queue) = cell.try_borrow_mut() {
+                queue.push(obj.clone());
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+    if pushed {
+        if std::env::var_os("WEAVEPY_REAP_TRACE").is_some() {
+            eprintln!(
+                "[CEXT-DROP] queued {} id={:#x}",
+                obj.type_name_owned(),
+                crate::weakref_registry::id_of(obj)
+            );
+            if std::env::var_os("WEAVEPY_REAP_BT").is_some() {
+                thread_local! {
+                    static N: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+                }
+                let n = N.with(|c| {
+                    let v = c.get() + 1;
+                    c.set(v);
+                    v
+                });
+                let every: usize = std::env::var("WEAVEPY_REAP_BT_EVERY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5000);
+                if n.is_multiple_of(every) {
+                    eprintln!(
+                        "[CEXT-DROP-BT]\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
+        let _ = PENDING_CEXT_FLAG.try_with(|c| c.set(true));
+    }
+}
+
+/// Cheap probe for the eval-loop safe point: are any C-dropped objects
+/// awaiting a prompt-reap pass on this thread?
+pub fn has_pending_cext_drops() -> bool {
+    PENDING_CEXT_FLAG
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+}
+
+/// Drain this thread's queue of C-dropped objects.
+pub fn drain_pending_cext_drops() -> Vec<Object> {
+    let _ = PENDING_CEXT_FLAG.try_with(|c| c.set(false));
+    PENDING_CEXT_DROPS
+        .try_with(|cell| {
+            cell.try_borrow_mut()
+                .map(|mut q| std::mem::take(&mut *q))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// RAII guard for one VM→C-extension transition; see [`enter_cext_call`].
+#[derive(Debug)]
+pub struct CextCallGuard(());
+
+impl Drop for CextCallGuard {
+    fn drop(&mut self) {
+        let _ = CEXT_CALL_DEPTH.try_with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Record that a C-extension call is now live on this thread's stack.
+/// The returned guard decrements the depth when dropped.
+pub fn enter_cext_call() -> CextCallGuard {
+    let _ = CEXT_CALL_DEPTH.try_with(|c| c.set(c.get() + 1));
+    CextCallGuard(())
+}
+
+/// Is any C-extension call live on this thread's stack? `false` means
+/// the VM is executing plain bytecode and no extension can hold a
+/// borrowed pointer across the current instruction.
+pub fn cext_call_active() -> bool {
+    CEXT_CALL_DEPTH.try_with(|c| c.get() > 0).unwrap_or(true)
 }
 
 /// `True` once interpreter shutdown (finalizer sweep) has begun —

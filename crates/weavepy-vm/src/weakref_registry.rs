@@ -159,6 +159,49 @@ struct RegistryInner {
     /// "version" counter so cache-invalidation paths can know
     /// when to re-scan.
     version: u64,
+    /// Bloom-style pre-filter over watched ids (4096 bits). The prompt
+    /// reaper probes `count`/`strong_clone_count` for *every* dropped
+    /// object; once any weakref exists the `is_empty` fast path is gone
+    /// and each probe pays a `BTreeMap` walk. A clear bit here proves
+    /// the id was never registered, so the overwhelmingly common
+    /// "dropped object was never weakly referenced" case stays O(1).
+    /// Bits are set on register and only rebuilt on [`WeakRefRegistry::
+    /// shrink`]; stale bits merely cost the tree lookup they'd have paid
+    /// anyway.
+    filter: IdFilter,
+}
+
+/// Fixed-size bit set keyed by a multiplicative hash of the object id.
+struct IdFilter([u64; 64]);
+
+impl Default for IdFilter {
+    fn default() -> Self {
+        IdFilter([0; 64])
+    }
+}
+
+impl IdFilter {
+    #[inline]
+    fn slot(id: ObjectId) -> (usize, u64) {
+        let h = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52; // 12 bits
+        ((h >> 6) as usize, 1u64 << (h & 63))
+    }
+
+    #[inline]
+    fn insert(&mut self, id: ObjectId) {
+        let (w, b) = Self::slot(id);
+        self.0[w] |= b;
+    }
+
+    #[inline]
+    fn may_contain(&self, id: ObjectId) -> bool {
+        let (w, b) = Self::slot(id);
+        self.0[w] & b != 0
+    }
+
+    fn clear(&mut self) {
+        self.0 = [0; 64];
+    }
 }
 
 impl WeakRefRegistry {
@@ -172,6 +215,7 @@ impl WeakRefRegistry {
     pub fn register(&self, slot: Arc<WeakRefSlot>) {
         let mut g = self.inner.borrow_mut();
         g.version = g.version.wrapping_add(1);
+        g.filter.insert(slot.target_id);
         let entry = g.slots.entry(slot.target_id).or_default();
         entry.retain(|w| w.strong_count() > 0);
         entry.push(Arc::downgrade(&slot));
@@ -203,6 +247,11 @@ impl WeakRefRegistry {
     /// Number of live weakrefs targeting `id`.
     pub fn count(&self, id: ObjectId) -> usize {
         let g = self.inner.borrow();
+        // Hot path: consulted for every dropped object by the prompt
+        // reaper; skip the tree lookup when `id` was never registered.
+        if g.slots.is_empty() || !g.filter.may_contain(id) {
+            return 0;
+        }
         g.slots
             .get(&id)
             .map(|v| v.iter().filter(|w| w.strong_count() > 0).count())
@@ -219,6 +268,9 @@ impl WeakRefRegistry {
     /// would never self-clean after `del obj; gc.collect()`.
     pub fn strong_clone_count(&self, id: ObjectId) -> usize {
         let g = self.inner.borrow();
+        if g.slots.is_empty() || !g.filter.may_contain(id) {
+            return 0;
+        }
         g.slots
             .get(&id)
             .map(|v| {
@@ -258,6 +310,13 @@ impl WeakRefRegistry {
             v.retain(|w| w.strong_count() > 0);
             !v.is_empty()
         });
+        // Rebuild the pre-filter from the surviving ids so bits for
+        // long-dead referents stop forcing tree lookups.
+        g.filter.clear();
+        let ids: Vec<ObjectId> = g.slots.keys().copied().collect();
+        for id in ids {
+            g.filter.insert(id);
+        }
     }
 
     /// Snapshot one live target `Object` per watched id. Feeds the

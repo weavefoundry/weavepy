@@ -18,7 +18,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -97,7 +97,7 @@ fn new_proxy(args: &[Object]) -> Result<Object, RuntimeError> {
         .cloned()
         .ok_or_else(|| type_error("proxy() requires at least 1 argument"))?;
     let callback = args.get(1).cloned().unwrap_or(Object::None);
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(DictKey(Object::from_static("__weakref_target__")), target);
@@ -127,7 +127,7 @@ fn getweakrefs(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// dict (a dict that doubles as a record of the ref state); calling
 /// it returns the live target.
 fn build_ref_object(target: Object, callback: Object) -> Object {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     let target_cell = Rc::new(RefCell::new(Some(target)));
     let dead = Rc::new(RefCell::new(false));
     let t_clone = target_cell.clone();

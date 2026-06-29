@@ -1,25 +1,12 @@
 //! Tiny float formatter used by [`crate::abstract_::PyObject_Repr`].
 //!
-//! CPython's `repr(float)` uses `repr(n)` which is implemented by
-//! the `dtoa_short` shortest-decimal algorithm. We approximate with
-//! Rust's default `{}` (which is also shortest-decimal for most
-//! values) plus the `1.0` suffix rule that Python always renders.
+//! Delegates to the VM's CPython-faithful `float_repr` (shortest
+//! round-trip digits with CPython's fixed/exponential switchover at
+//! `decpt <= -4 || decpt > 16`). Rust's plain `{}` never switches to
+//! exponential form, so `repr(1e-05)` through the C bridge printed
+//! `0.00001` — pandas' `assert_almost_equal` message (built by Cython
+//! via `PyFloat_Type.tp_repr`) then failed the test's regex.
 
 pub fn format_float(f: f64) -> String {
-    if f.is_nan() {
-        return "nan".to_owned();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 {
-            "inf".to_owned()
-        } else {
-            "-inf".to_owned()
-        };
-    }
-    let s = format!("{f}");
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        s
-    } else {
-        format!("{s}.0")
-    }
+    weavepy_vm::object::float_repr(f)
 }

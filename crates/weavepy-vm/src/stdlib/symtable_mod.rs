@@ -95,7 +95,7 @@ struct Block {
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -951,7 +951,7 @@ fn update_symbols(
 
 fn to_object(arena: &[Block], idx: usize) -> Object {
     let b = &arena[idx];
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     d.insert(
         DictKey(Object::from_static("type")),
         Object::Int(b.ty.cpython()),
@@ -970,7 +970,7 @@ fn to_object(arena: &[Block], idx: usize) -> Object {
         Object::Bool(b.nested),
     );
 
-    let mut syms = DictData::new();
+    let mut syms = DictData::default();
     for (name, flags) in &b.symbols {
         syms.insert(DictKey(Object::from_str(name.clone())), Object::Int(*flags));
     }

@@ -16,11 +16,13 @@ from _packaging import (
     SpecifierSet,
     Version,
     canonicalize_name,
+    compatible_tags,
     default_environment,
     parse_wheel_filename,
     wheel_is_compatible,
     wheel_score,
 )
+from _packaging import _platform_tags
 
 
 def assert_eq(a, b, label=''):
@@ -117,6 +119,37 @@ def test_wheel_filename():
     # Tag-based compatibility & scoring.
     assert_true(wheel_is_compatible('foo-1.0-py3-none-any.whl'))
     assert_true(wheel_score('numpy-2.0.0-cp313-cp313-macosx_11_0_arm64.whl') > 0)
+
+
+def test_wheel_matrix_wave5():
+    # RFC 0047 (wave 5): the full manylinux / macOS / musllinux platform
+    # matrix a real numpy/pandas wheel ships. Parameterised so the test is
+    # host-independent.
+    linux = _platform_tags('linux', 'x86_64')
+    assert_true('manylinux_2_17_x86_64' in linux, 'manylinux present')
+    assert_true('manylinux2014_x86_64' in linux, 'legacy manylinux present')
+    assert_true('musllinux_1_1_x86_64' in linux, 'musllinux_1_1 present')
+    assert_true('musllinux_1_2_x86_64' in linux, 'musllinux_1_2 present')
+    mac = _platform_tags('darwin', 'arm64')
+    assert_true('macosx_11_0_arm64' in mac, 'macOS arm64 present')
+    assert_true('macosx_11_0_universal2' in mac, 'macOS universal2 present')
+
+
+def test_wheel_provenance_wave5():
+    # RFC 0047 (wave 5): the WeavePy provenance interpreter tag. Only
+    # meaningful when running under WeavePy (it is gated on the
+    # interpreter); on stock CPython `compatible_tags` never emits it.
+    import sys
+    if sys.implementation.name != 'weavepy':
+        return
+    accept = {(t.python, t.abi, t.platform) for t in compatible_tags()}
+    assert_true(('weavepy', 'none', 'any') in accept, 'weavepy-none-any accepted')
+    assert_true(wheel_is_compatible('foo-1.0-weavepy-none-any.whl'),
+                'weavepy provenance wheel compatible')
+    # A provenance wheel outranks the stock cp313 wheel it shadows.
+    prov = wheel_score('numpy-2.0.0-weavepy-cp313-manylinux_2_17_x86_64.whl')
+    stock = wheel_score('numpy-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl')
+    assert_true(prov > stock, 'provenance outranks stock ({} vs {})'.format(prov, stock))
 
 
 def main():

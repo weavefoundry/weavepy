@@ -54,6 +54,10 @@ from _packaging import (
 __all__ = ['main']
 
 VERSION = '24.0.0+weavepy'
+
+# Real pip exposes `pip.__version__`; tooling probes it (pandas'
+# `show_versions` raises "Can't determine version for pip" without it).
+__version__ = VERSION
 DEFAULT_INDEX = 'https://pypi.org/simple/'
 USER_AGENT = 'weavepy-pip/{}'.format(VERSION)
 

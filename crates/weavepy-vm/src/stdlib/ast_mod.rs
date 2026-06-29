@@ -33,7 +33,7 @@ use crate::import::ModuleCache;
 use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -128,7 +128,7 @@ struct Builder<'a> {
 /// Build a node `dict` with `_type`, the given fields, and the four
 /// location attributes derived from `span`.
 fn node(ty: &str, fields: Vec<(&str, Object)>, span: Span, lm: &LineMap) -> Object {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     d.insert(DictKey(Object::from_static("_type")), Object::from_str(ty));
     for (k, v) in fields {
         d.insert(DictKey(Object::from_str(k)), v);
@@ -153,7 +153,7 @@ fn node(ty: &str, fields: Vec<(&str, Object)>, span: Span, lm: &LineMap) -> Obje
 /// `keyword`*, `alias`*, `withitem`, `match_case`). (* some do carry
 /// positions in 3.13; WeavePy lacks spans for them, so we omit.)
 fn node_noloc(ty: &str, fields: Vec<(&str, Object)>) -> Object {
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     d.insert(DictKey(Object::from_static("_type")), Object::from_str(ty));
     for (k, v) in fields {
         d.insert(DictKey(Object::from_str(k)), v);

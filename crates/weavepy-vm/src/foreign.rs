@@ -39,9 +39,17 @@ use crate::sync::Rc;
 pub struct PyForeignSoul {
     /// The raw `*mut PyObject`, as an integer.
     pub ptr: usize,
-    /// Cached `Py_TYPE(ptr)->tp_name`, so `type(x).__name__`, `repr`
-    /// fallbacks and error messages need no C round-trip.
+    /// The *bare* type name (the tail of `tp_name` after the last `.`), i.e.
+    /// what Python's `type(x).__name__` reports (`float64`, `Nano`). Cached so
+    /// `repr` fallbacks and `__name__` need no C round-trip.
     pub type_name: Rc<str>,
+    /// The full, unmodified `Py_TYPE(ptr)->tp_name` (`numpy.float64`,
+    /// `pandas._libs.tslibs.offsets.Nano`, but bare `Timestamp` when the C
+    /// type itself sets no module prefix). This is exactly the string CPython
+    /// interpolates into `tp_name`-based `TypeError` messages
+    /// (`unsupported operand type(s) for /: 'float' and 'X'`, `'X' object is
+    /// not iterable`, …), so error text must use *this*, never `type_name`.
+    pub tp_name: Rc<str>,
 }
 
 impl std::fmt::Debug for PyForeignSoul {
@@ -89,6 +97,14 @@ pub struct ForeignHooks {
     pub setitem: fn(usize, &Object, Option<&Object>) -> Result<(), RuntimeError>,
     /// `PyObject_Length(ptr)`.
     pub length: fn(usize) -> Result<isize, RuntimeError>,
+    /// `PySequence_Check(ptr)` — true iff the foreign type exposes
+    /// `tp_as_sequence->sq_item`. Used to replicate CPython's
+    /// `PyObject_GetIter` legacy-sequence fallback: an object with no
+    /// `tp_iter` but a sequence `__getitem__` (numpy's `_array_converter`,
+    /// reached by `np.unique`/`np.quantile`) is still iterable via
+    /// `PySeqIter`. Without this the VM reported such an object as
+    /// "not iterable" and unpacking (`ar_, = conv`) raised.
+    pub sequence_check: fn(usize) -> bool,
     /// `PyObject_GetIter(ptr)`.
     pub iter: fn(usize) -> Result<Object, RuntimeError>,
     /// `PyIter_Next(ptr)` — `Ok(None)` at exhaustion.
@@ -102,6 +118,44 @@ pub struct ForeignHooks {
     /// Resolve `type(ptr)` to a VM object (an [`Object::Type`] when the
     /// type is bridged; falls back to a foreign proxy of the type).
     pub get_type: fn(usize) -> Object,
+    /// `PyNumber_Float(ptr)` — drive the foreign type's `nb_float`
+    /// (then `nb_index`) conversion. Returns an [`Object::Float`]. Lets
+    /// `float(np.float64(x))` and friends round-trip a numpy scalar
+    /// without WeavePy having to interpret its bytes.
+    pub as_float: fn(usize) -> Result<Object, RuntimeError>,
+    /// `PyNumber_Long(ptr)` — drive `nb_int` (then `nb_index`). Returns an
+    /// `Object::Int`/`Long`/`Bool` (`int(np.uint32(x))`).
+    pub as_int: fn(usize) -> Result<Object, RuntimeError>,
+    /// `PyNumber_Index(ptr)` — drive `nb_index` (loss-less integer view).
+    /// Returns an `Object::Int`/`Long`/`Bool`; errors when the type has no
+    /// `nb_index` (e.g. a float scalar used as an index).
+    pub as_index: fn(usize) -> Result<Object, RuntimeError>,
+    /// `memoryview(ptr)` — acquire the foreign object's buffer
+    /// (`PyObject_GetBuffer` with `PyBUF_FULL_RO`) and wrap it in a VM
+    /// [`Object::MemoryView`] that faithfully carries the exporter's
+    /// `format`/`itemsize`/`shape`/`strides` (e.g. numpy's `'O'`/8 object
+    /// arrays). Errors when the type does not export the buffer protocol.
+    pub get_buffer: fn(usize) -> Result<Object, RuntimeError>,
+    /// `memoryview(obj)` for an arbitrary VM object that crosses into C with
+    /// its own buffer protocol — a numpy `ndarray` crosses as a faithful
+    /// [`Object::Instance`] (wearing its real C type), not an
+    /// [`Object::Foreign`], so it has no raw soul pointer. The bridge marshals
+    /// the object to a `*mut PyObject` ([`crate::object::into_owned`]) and
+    /// drives `PyMemoryView_FromObject` on it. Errors (with the C-side
+    /// `TypeError`) when the type does not export the buffer protocol.
+    pub get_buffer_obj: fn(&Object) -> Result<Object, RuntimeError>,
+    /// Convert an *owned* `PyObject*` — a `new` reference returned by a C
+    /// function — into a VM object, consuming the reference. NULL raises
+    /// the pending C exception. Backs ctypes' `py_object` restype
+    /// (`pythonapi.PyBytes_FromFormat(...)` in `test_bytes.test_from_format`).
+    pub steal_object: fn(usize) -> Result<Object, RuntimeError>,
+    /// Marshal a VM object to a *new owned* `PyObject*` reference — the
+    /// ctypes `py_object` argument direction. Pair every call with a
+    /// [`Self::release_object_ptr`] once the C call has returned.
+    pub object_to_owned_ptr: fn(&Object) -> usize,
+    /// Release an owned `PyObject*` minted by [`Self::object_to_owned_ptr`]
+    /// (a plain `Py_DECREF`).
+    pub release_object_ptr: fn(usize),
 }
 
 static HOOKS: OnceLock<ForeignHooks> = OnceLock::new();
@@ -123,17 +177,41 @@ fn hooks() -> Result<&'static ForeignHooks, RuntimeError> {
 }
 
 /// Construct a foreign proxy soul for `ptr`, pinning one reference.
-/// `type_name` is the foreign type's `tp_name`. Returns the raw soul;
-/// the caller wraps it in [`Object::Foreign`].
-pub fn wrap(ptr: usize, type_name: Rc<str>) -> Rc<PyForeignSoul> {
+/// `type_name` is the *bare* tail; `tp_name` is the full C `tp_name`.
+/// Returns the raw soul; the caller wraps it in [`Object::Foreign`].
+pub fn wrap(ptr: usize, type_name: Rc<str>, tp_name: Rc<str>) -> Rc<PyForeignSoul> {
     if let Some(h) = HOOKS.get() {
         (h.incref)(ptr);
     }
-    Rc::new(PyForeignSoul { ptr, type_name })
+    Rc::new(PyForeignSoul {
+        ptr,
+        type_name,
+        tp_name,
+    })
 }
 
 // --- VM-facing operations (thin wrappers that surface a clean error
 //     when the bridge is absent). ---
+
+/// Consume an owned `PyObject*` returned by a C function and produce the
+/// VM object it denotes (ctypes `py_object` restype). NULL surfaces the
+/// pending C exception.
+pub fn steal_object(ptr: usize) -> Result<Object, RuntimeError> {
+    (hooks()?.steal_object)(ptr)
+}
+
+/// Mint a new owned `PyObject*` for `obj` (ctypes `py_object` argument).
+/// Release it with [`release_object_ptr`] after the call returns.
+pub fn object_to_owned_ptr(obj: &Object) -> Result<usize, RuntimeError> {
+    Ok((hooks()?.object_to_owned_ptr)(obj))
+}
+
+/// Release an owned `PyObject*` minted by [`object_to_owned_ptr`].
+pub fn release_object_ptr(ptr: usize) {
+    if let Some(h) = HOOKS.get() {
+        (h.release_object_ptr)(ptr);
+    }
+}
 
 pub fn repr(s: &PyForeignSoul) -> Result<String, RuntimeError> {
     match hooks() {
@@ -158,6 +236,19 @@ pub fn is_true(s: &PyForeignSoul) -> bool {
         Ok(h) => (h.is_true)(s.ptr).unwrap_or(true),
         Err(_) => true,
     }
+}
+
+/// `PyObject_IsTrue(ptr)` that *propagates* a pending C exception as a
+/// `RuntimeError` rather than swallowing it to `true`. CPython truth-tests
+/// with `PyObject_IsTrue`, and a *multi-element* numpy array's `nb_bool`
+/// raises `ValueError` ("The truth value of an array with more than one
+/// element is ambiguous"). Every boolean context that can surface an error
+/// — `PyObject_RichCompareBool` (membership / `list.index` / equality
+/// containment), `any`/`all`/`filter` — must see that raise; the infallible
+/// [`is_true`] above is only for the short-circuit sites (`if`, `and`/`or`)
+/// whose ambient error check catches the pending exception separately.
+pub fn is_true_checked(s: &PyForeignSoul) -> Result<bool, RuntimeError> {
+    (hooks()?.is_true)(s.ptr)
 }
 
 pub fn call(
@@ -192,6 +283,17 @@ pub fn length(s: &PyForeignSoul) -> Result<isize, RuntimeError> {
     (hooks()?.length)(s.ptr)
 }
 
+/// True iff the foreign object's C type is a sequence (`sq_item` set).
+/// Falls back to `false` when the bridge is absent (pure-VM build has no
+/// foreign objects). Mirrors `PySequence_Check` for the legacy-iterator
+/// fallback in [`crate::Interpreter::make_iter`].
+pub fn sequence_check(s: &PyForeignSoul) -> bool {
+    match hooks() {
+        Ok(h) => (h.sequence_check)(s.ptr),
+        Err(_) => false,
+    }
+}
+
 pub fn iter(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
     (hooks()?.iter)(s.ptr)
 }
@@ -213,4 +315,24 @@ pub fn get_type(s: &PyForeignSoul) -> Object {
         Ok(h) => (h.get_type)(s.ptr),
         Err(_) => Object::None,
     }
+}
+
+pub fn as_float(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
+    (hooks()?.as_float)(s.ptr)
+}
+
+pub fn as_int(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
+    (hooks()?.as_int)(s.ptr)
+}
+
+pub fn as_index(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
+    (hooks()?.as_index)(s.ptr)
+}
+
+pub fn get_buffer(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
+    (hooks()?.get_buffer)(s.ptr)
+}
+
+pub fn get_buffer_obj(obj: &Object) -> Result<Object, RuntimeError> {
+    (hooks()?.get_buffer_obj)(obj)
 }

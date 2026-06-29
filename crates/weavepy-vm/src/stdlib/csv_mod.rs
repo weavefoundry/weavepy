@@ -47,7 +47,7 @@ static FIELD_LIMIT: AtomicI64 = AtomicI64::new(128 * 1024);
 // ---------------------------------------------------------------------------
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(key("__name__"), Object::from_static("_csv"));
@@ -179,7 +179,7 @@ fn error_class() -> Rc<TypeObject> {
 /// `_csv._dialects`.
 fn dialects() -> &'static Rc<RefCell<DictData>> {
     static REG: OnceLock<Rc<RefCell<DictData>>> = OnceLock::new();
-    REG.get_or_init(|| Rc::new(RefCell::new(DictData::new())))
+    REG.get_or_init(|| Rc::new(RefCell::new(DictData::default())))
 }
 
 fn is_dialect_instance(o: &Object) -> bool {
@@ -194,7 +194,7 @@ fn dialect_type() -> Rc<TypeObject> {
     static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
     CLS.get_or_init(|| {
         let bt = builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         // `tp_new` does all validation and can return an existing dialect
         // (the reuse path). Registered as a plain builtin so the VM's
         // instantiate path treats it as a user `__new__` and uses its
@@ -652,7 +652,7 @@ impl Parser {
             self.fields.push(Object::None);
         } else {
             let s = std::mem::take(&mut self.field);
-            let mut val = Object::from_str(s);
+            let mut val = crate::builtins::bridge_to_object(&s);
             if self.unquoted && self.field_len != 0 && (q == QUOTE_NONNUMERIC || q == QUOTE_STRINGS)
             {
                 val = interp.call_object(
@@ -831,7 +831,10 @@ fn self_inst(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
 fn str_chars(o: &Object) -> Option<String> {
     match o {
         Object::Str(s) => Some(s.to_string()),
-        Object::WStr(cps) => Some(cps.iter().filter_map(|&c| char::from_u32(c)).collect()),
+        // Lone surrogates (e.g. a file read with `errors="surrogatepass"`)
+        // ride through the DFA bridged into the PUA window; `save_field`
+        // un-bridges them so fields keep the surrogate code points.
+        Object::WStr(cps) => Some(crate::builtins::bridge_encode_cps(cps)),
         _ => None,
     }
 }
@@ -933,7 +936,7 @@ fn reader_type() -> Rc<TypeObject> {
     static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
     CLS.get_or_init(|| {
         let bt = builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         dict.insert(key("__iter__"), method("__iter__", reader_iter_self));
         dict.insert(key("__next__"), method("__next__", reader_iternext));
         dict.insert(
@@ -1201,7 +1204,7 @@ fn writer_type() -> Rc<TypeObject> {
     static CLS: OnceLock<Rc<TypeObject>> = OnceLock::new();
     CLS.get_or_init(|| {
         let bt = builtin_types();
-        let mut dict = DictData::new();
+        let mut dict = DictData::default();
         dict.insert(key("writerow"), method("writerow", writer_writerow));
         dict.insert(key("writerows"), method("writerows", writer_writerows));
         dict.insert(

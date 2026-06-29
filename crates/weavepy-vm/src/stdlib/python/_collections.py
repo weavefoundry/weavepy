@@ -13,6 +13,11 @@ reference pure-Python implementations run instead.
 
 __all__ = ["deque", "defaultdict", "_count_elements"]
 
+# CPython's C `deque`/`defaultdict` expose `__class_getitem__` so PEP 585
+# subscription (`deque[int]`) yields a `types.GenericAlias`. `types` only
+# imports `sys`, so this is import-cycle safe from this low-level module.
+from types import GenericAlias as _GenericAlias
+
 
 def _count_elements(mapping, iterable):
     """Tally elements from the iterable (Counter's inner loop)."""
@@ -74,6 +79,8 @@ class defaultdict(dict):
         new = type(self)(self.default_factory, other)
         new.update(self)
         return new
+
+    __class_getitem__ = classmethod(_GenericAlias)
 
 
 class deque:
@@ -269,6 +276,8 @@ class deque:
         return self._data >= other._data
 
     __hash__ = None
+
+    __class_getitem__ = classmethod(_GenericAlias)
 
     def __reduce__(self):
         return type(self), (list(self._data), self._maxlen)

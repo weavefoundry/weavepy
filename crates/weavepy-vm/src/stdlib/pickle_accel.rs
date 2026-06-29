@@ -25,7 +25,7 @@ use crate::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
 use crate::types::{TypeFlags, TypeObject};
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -87,7 +87,7 @@ fn make_exc(name: &'static str, base: Rc<TypeObject>) -> Rc<TypeObject> {
     TypeObject::new_with_flags(
         name,
         vec![base],
-        DictData::new(),
+        DictData::default(),
         TypeFlags {
             is_exception: true,
             is_builtin: true,

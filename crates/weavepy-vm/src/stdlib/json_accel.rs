@@ -42,7 +42,7 @@ fn key(s: &'static str) -> DictKey {
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
 
     let scanstring = bkw("scanstring", json_scanstring);
     let eb = b("encode_basestring", json_encode_basestring);
@@ -899,7 +899,7 @@ fn finish_object(
         let arg = Object::new_list(pair_objs);
         return interp.call_object(cfg.object_pairs_hook.clone(), &[arg], &[]);
     }
-    let mut d = DictData::new();
+    let mut d = DictData::default();
     for (k, v) in pairs {
         d.insert(DictKey(k), v);
     }

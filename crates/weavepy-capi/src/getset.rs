@@ -24,6 +24,12 @@ use weavepy_vm::sync::Rc;
 
 use crate::object::{PyObject, PySsizeT};
 
+fn blocks_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_BLOCKS_DIAG").is_some())
+}
+
 fn take_pending_or_default() -> RuntimeError {
     if let Some(err) = crate::errors::take_pending_error_runtime() {
         err
@@ -145,21 +151,56 @@ fn make_getter(
             )));
         }
         let self_p = crate::object::into_owned(args[0].clone());
-        let raw = unsafe { g(self_p, closure as *mut std::ffi::c_void) };
+        let self_body = self_p as usize;
+        let raw =
+            crate::interp::ensure_active(|| unsafe { g(self_p, closure as *mut std::ffi::c_void) });
         unsafe { crate::object::Py_DecRef(self_p) };
         if raw.is_null() {
             return Err(take_pending_or_default());
         }
         let out = unsafe { crate::object::clone_object(raw) };
+        if name == "blocks" {
+            let on = out.type_name_owned();
+            if blocks_diag_enabled() && on != "tuple" && on != "list" {
+                let rawty = unsafe { crate::object::debug_type_name(raw) };
+                eprintln!(
+                    "[BLOCKS-BAD] self_body=0x{:x} raw=0x{:x} rawtype={} out={}",
+                    self_body, raw as usize, rawty, on,
+                );
+                if let Some(hist) = crate::mirror::lookup_free_bt(raw as usize) {
+                    eprintln!(
+                        "[BLOCKS-BAD] raw 0x{:x} free history ({} frees):",
+                        raw as usize,
+                        hist.len()
+                    );
+                    for (i, (freed_ty, bt)) in hist.iter().enumerate() {
+                        eprintln!("  free #{i}: type={freed_ty} :: {bt}");
+                    }
+                } else {
+                    eprintln!(
+                        "[BLOCKS-BAD] raw 0x{:x} has no recorded mirror-free (freed via non-mirror path?)",
+                        raw as usize
+                    );
+                }
+            }
+            if crate::mirror::watch_enabled() && (on == "tuple" || on == "list") {
+                crate::mirror::watch_ptr(raw as usize);
+            }
+        }
         unsafe { crate::object::Py_DecRef(raw) };
         Ok(out)
     };
-    Object::Builtin(Rc::new(BuiltinFn {
+    let getter = Object::Builtin(Rc::new(BuiltinFn {
         name,
         binds_instance: false,
         call: Box::new(body),
         call_kw: None,
-    }))
+    }));
+    // A getset getter is named after the C attribute (`numpy.dtype.str`);
+    // tag it so the VM invokes this closure directly rather than routing a
+    // `BuiltinFn { name: "str" }` through the `str(obj)` builtin fast-path.
+    weavepy_vm::descr_registry::mark_native_descr_accessor(&getter);
+    getter
 }
 
 fn make_setter(
@@ -175,7 +216,9 @@ fn make_setter(
         }
         let self_p = crate::object::into_owned(args[0].clone());
         let val_p = crate::object::into_owned(args[1].clone());
-        let r = unsafe { s(self_p, val_p, closure as *mut std::ffi::c_void) };
+        let r = crate::interp::ensure_active(|| unsafe {
+            s(self_p, val_p, closure as *mut std::ffi::c_void)
+        });
         unsafe {
             crate::object::Py_DecRef(self_p);
             crate::object::Py_DecRef(val_p);
@@ -185,12 +228,14 @@ fn make_setter(
         }
         Ok(Object::None)
     };
-    Object::Builtin(Rc::new(BuiltinFn {
+    let setter = Object::Builtin(Rc::new(BuiltinFn {
         name,
         binds_instance: false,
         call: Box::new(body),
         call_kw: None,
-    }))
+    }));
+    weavepy_vm::descr_registry::mark_native_descr_accessor(&setter);
+    setter
 }
 
 /// Decode a null-terminated `PyMemberDef[]` array into descriptor pairs.
@@ -260,12 +305,14 @@ fn make_member(name: &'static str, ty: c_int, offset: PySsizeT, readonly: bool) 
             unsafe { crate::object::Py_DecRef(self_p) };
             Ok(out)
         };
-        Object::Builtin(Rc::new(BuiltinFn {
+        let getter = Object::Builtin(Rc::new(BuiltinFn {
             name,
             binds_instance: false,
             call: Box::new(g),
             call_kw: None,
-        }))
+        }));
+        weavepy_vm::descr_registry::mark_native_descr_accessor(&getter);
+        getter
     };
     let setter = if readonly {
         Object::None
@@ -289,12 +336,14 @@ fn make_member(name: &'static str, ty: c_int, offset: PySsizeT, readonly: bool) 
             unsafe { crate::object::Py_DecRef(self_p) };
             res.map(|()| Object::None)
         };
-        Object::Builtin(Rc::new(BuiltinFn {
+        let setter = Object::Builtin(Rc::new(BuiltinFn {
             name,
             binds_instance: false,
             call: Box::new(s),
             call_kw: None,
-        }))
+        }));
+        weavepy_vm::descr_registry::mark_native_descr_accessor(&setter);
+        setter
     };
     Object::Property(Rc::new(PyProperty::new(
         getter,

@@ -228,7 +228,7 @@ pub(crate) fn raw_fd_for_handle(handle: i64) -> Option<i64> {
 // ---- module entry ----
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -500,7 +500,7 @@ fn socket_class() -> Rc<TypeObject> {
     SOCKET_CLASS
         .get_or_init(|| {
             let bt = crate::builtin_types::builtin_types();
-            let mut dict = DictData::new();
+            let mut dict = DictData::default();
             for (name, method) in socket_methods() {
                 dict.insert(DictKey(Object::from_str(name)), method);
             }
@@ -1871,7 +1871,7 @@ fn sock_makefile(args: &[Object]) -> Result<Object, RuntimeError> {
         .first()
         .cloned()
         .ok_or_else(|| type_error("missing self"))?;
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     let self_for_read = self_obj.clone();
     let read = move |a: &[Object]| -> Result<Object, RuntimeError> {
         let n = match a.first() {

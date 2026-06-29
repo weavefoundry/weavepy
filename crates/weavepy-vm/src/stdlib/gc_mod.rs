@@ -20,7 +20,7 @@ thread_local! {
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
-    let dict = Rc::new(RefCell::new(DictData::new()));
+    let dict = Rc::new(RefCell::new(DictData::default()));
     {
         let mut d = dict.borrow_mut();
         d.insert(
@@ -235,7 +235,7 @@ fn zero(_args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn get_stats(_args: &[Object]) -> Result<Object, RuntimeError> {
-    let mut stat = DictData::new();
+    let mut stat = DictData::default();
     stat.insert(DictKey(Object::from_static("collections")), Object::Int(0));
     stat.insert(DictKey(Object::from_static("collected")), Object::Int(0));
     stat.insert(
