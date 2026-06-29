@@ -147,6 +147,14 @@ static INIT: Once = Once::new();
 /// statically-initialised exception pointers.
 pub fn ensure_initialised() {
     INIT.call_once(|| {
+        // RFC 0046 (wave 4): optional native crash backtrace for debugging
+        // faults inside a freshly-loaded extension's initialiser.
+        if std::env::var_os("WEAVEPY_CRASH_BT").is_some() {
+            extern "C" {
+                fn weavepy_install_crash_handler();
+            }
+            unsafe { weavepy_install_crash_handler() };
+        }
         crate::types::init_static_types();
         crate::singletons::init_singleton_types(
             crate::types::_PyNone_Type.as_ptr(),
@@ -164,6 +172,10 @@ pub fn ensure_initialised() {
         // Install the hook that releases a capsule's retained box when its
         // VM-side soul drops (RFC 0045, WS5 — the `import_array()` idiom).
         crate::capsule::install();
+        // Install the foreign-object proxy bridge so a `PyObject` the
+        // extension minted itself (numpy ndarray/descr/ufunc) round-trips
+        // through the VM opaquely (RFC 0046, wave 4).
+        crate::foreign::install();
     });
 }
 

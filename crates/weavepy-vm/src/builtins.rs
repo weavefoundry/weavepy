@@ -248,6 +248,22 @@ pub fn default_builtins() -> DictData {
     reg!("breakpoint", b_breakpoint);
     reg!("memoryview", b_memoryview);
     reg!("__weavepy_typevar__", b_typevar);
+    // PEP 695 `type X = …` lowers (in the parser) to a call to this
+    // name; it's a VM intrinsic (needs interpreter access to import
+    // `typing` and mint typevars) so the real work runs in
+    // `Interpreter::do_type_alias_call`.
+    {
+        let f = BuiltinFn {
+            name: "__vm:type_alias",
+            binds_instance: false,
+            call: Box::new(b_type_alias_unsupported),
+            call_kw: None,
+        };
+        d.insert(
+            DictKey(Object::from_static("__weavepy_type_alias__")),
+            Object::Builtin(Rc::new(f)),
+        );
+    }
     {
         let f = BuiltinFn {
             name: "__vm:input",
@@ -6354,6 +6370,14 @@ pub fn class_of(obj: &Object) -> crate::sync::Rc<crate::types::TypeObject> {
         // Python-level `type()` in practice — capsules flow C -> module
         // dict -> C). See RFC 0045.
         Object::Capsule(_) => bt.object_.clone(),
+        // A foreign cpyext object's true type is its (often un-bridged)
+        // C `PyTypeObject`. When the extension's type is bridged the
+        // foreign `get_type` hook yields an `Object::Type`; otherwise we
+        // report the base `object` (RFC 0046, wave 4).
+        Object::Foreign(s) => match crate::foreign::get_type(s) {
+            Object::Type(t) => t,
+            _ => bt.object_.clone(),
+        },
     }
 }
 
@@ -6463,6 +6487,9 @@ fn object_identity(obj: &Object) -> i64 {
         Object::Iter(i) => Rc::as_ptr(i) as usize as i64,
         Object::LazyIter(l) => Rc::as_ptr(l) as usize as i64,
         Object::Capsule(c) => Rc::as_ptr(c) as usize as i64,
+        // `id()` of a foreign proxy is the underlying `PyObject*` — the
+        // cpyext identity, consistent with `is`/`eq` (RFC 0046).
+        Object::Foreign(s) => s.ptr as i64,
         Object::Int(i) => i.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64),
         Object::Float(f) => (f.to_bits() as i64) ^ 0x0123_4567_89AB_CDEFu64 as i64,
         Object::Bool(b) => {
@@ -6825,6 +6852,15 @@ fn b_input_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
     Err(runtime_error("input() must be called through the VM"))
 }
 
+/// Placeholder for the `__weavepy_type_alias__` PEP 695 intrinsic; the
+/// VM intercepts it (it needs interpreter state to import `typing` and
+/// mint typevars), so reaching this body means the dispatcher missed it.
+fn b_type_alias_unsupported(_args: &[Object]) -> Result<Object, RuntimeError> {
+    Err(runtime_error(
+        "__weavepy_type_alias__() must be called through the VM",
+    ))
+}
+
 /// `pow(base, exp[, mod])` — modular exponentiation when `mod` is
 /// given, otherwise `base ** exp`. Mirrors CPython's three-arg
 /// `pow` including the negative-exponent + mod case (the modular
@@ -7013,7 +7049,7 @@ fn b_breakpoint(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// `def f[T](...)`, and `class C[T]:`. Behaves enough like
 /// `typing.TypeVar` that consumers can subscript / index / repr it
 /// without importing `typing`.
-fn b_typevar(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_typevar(args: &[Object]) -> Result<Object, RuntimeError> {
     let name = match args.first() {
         Some(Object::Str(s)) => s.to_string(),
         Some(other) => other.to_str(),

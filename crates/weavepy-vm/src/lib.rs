@@ -30,6 +30,7 @@ pub mod builtins;
 pub mod descr_registry;
 pub mod error;
 pub mod ext_loader;
+pub mod foreign;
 pub mod frozen_code_cache;
 pub mod gc_trace;
 pub mod gil;
@@ -940,6 +941,29 @@ impl Interpreter {
         let _handles = self.activate_thread_handles();
         let globals = self.builtins.clone();
         self.make_iter(&value, &globals)
+    }
+
+    /// Build a CPython `seqiterobject` over `seq` — the lazy
+    /// `__getitem__`-indexed iterator that the C-API's `PySeqIter_New`
+    /// returns. Used by `PySeqIter_New` in the C-API.
+    ///
+    /// Crucially this does **not** consult `seq.__iter__`: numpy's
+    /// `array_iter` (the ndarray `tp_iter`) returns `PySeqIter_New(self)`,
+    /// so routing through `__iter__` here would recurse forever
+    /// (`__iter__` → `array_iter` → `PySeqIter_New` → `__iter__` …) and
+    /// overflow the native stack. The indexing iterator instead drives
+    /// `seq[0]`, `seq[1]`, … until `IndexError`, exactly like CPython.
+    pub fn seq_iter_object(&mut self, seq: Object) -> Result<Object, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let _handles = self.activate_thread_handles();
+        let globals = self.builtins.clone();
+        match self.make_seq_iterator(&seq, &globals)? {
+            Some(it) => Ok(it),
+            None => Err(type_error(
+                "PySeqIter_New: sequence-iterator helper unavailable",
+            )),
+        }
     }
 
     /// Pull the next value out of an iterator (`next(it)`), returning
@@ -4164,6 +4188,20 @@ impl Interpreter {
                     } else {
                         self.binary_subscr(&v, &i)?
                     }
+                } else if matches!(&v, Object::Foreign(_)) {
+                    // A foreign extension object (e.g. numpy's `flatiter`)
+                    // reads through its own `__getitem__` slot wrapper — the
+                    // mirror of the `Foreign` `STORE_SUBSCR` arm. `binary_subscr`
+                    // only knows VM-native containers.
+                    match self.load_attr(&v, "__getitem__") {
+                        Ok(method) => self.call(
+                            &method,
+                            std::slice::from_ref(&i),
+                            &[],
+                            &frame.globals.clone(),
+                        )?,
+                        Err(_) => self.binary_subscr(&v, &i)?,
+                    }
                 } else {
                     self.binary_subscr(&v, &i)?
                 };
@@ -4194,6 +4232,25 @@ impl Interpreter {
                         }
                     } else {
                         self.store_subscr(&target, &i, value, &g)?;
+                    }
+                } else if matches!(&target, Object::Foreign(_)) {
+                    // A foreign extension object (e.g. numpy's `flatiter`,
+                    // whose type numpy does not expose for `PyType_Ready`, so
+                    // it crosses as `Object::Foreign` rather than an
+                    // `Object::Instance` like `ndarray`) assigns through its
+                    // own `__setitem__` slot wrapper — the same bound method
+                    // an explicit `obj.__setitem__(k, v)` resolves. `store_subscr`
+                    // only knows VM-native containers, and `PyObject_SetItem`
+                    // does not forward to the object's C `mp_ass_subscript`;
+                    // dispatching the method reaches numpy's slot directly.
+                    // This is what makes `numpy.eye` (`m.flat[i::M+1] = 1`) work.
+                    match self.load_attr(&target, "__setitem__") {
+                        Ok(method) => {
+                            self.call(&method, &[i.clone(), value], &[], &g)?;
+                        }
+                        // No `__setitem__`: fall back for the canonical
+                        // "does not support item assignment" TypeError.
+                        Err(_) => self.store_subscr(&target, &i, value, &g)?,
                     }
                 } else {
                     self.store_subscr(&target, &i, value, &g)?;
@@ -6465,6 +6522,22 @@ impl Interpreter {
                     name
                 ))),
             },
+            // RFC 0046 (wave 4): a foreign extension object (numpy descr,
+            // scalar, …) resolves attributes through its bridged type's
+            // descriptors first — `PyType_Ready` harvested the C
+            // `tp_getset`/`tp_members`/`tp_methods` into the type dict, so
+            // `descr.type`, `descr.kind`, array methods, … apply the normal
+            // descriptor protocol with the foreign object as `self`. Names
+            // the bridged type does not carry fall back to the extension's
+            // own `tp_getattro` (instance `__dict__`, computed attributes),
+            // which dispatches to the object's C slot — not back into this
+            // arm — so there is no recursion.
+            Object::Foreign(s) => {
+                if let Some(res) = self.resolve_foreign_via_type(obj, name) {
+                    return res;
+                }
+                crate::foreign::getattr(s, name)
+            }
             Object::Instance(inst) => self.load_attr_instance(inst, obj, name),
             Object::Type(ty) => self.load_attr_type(ty, name),
             Object::Property(p) => match name {
@@ -6913,9 +6986,17 @@ impl Interpreter {
                 "__name__" | "__qualname__" => {
                     Ok(Object::from_static(builtin_display_name(b.name)))
                 }
-                "__module__" => Ok(Object::from_static(
-                    crate::descr_registry::module_of(obj).unwrap_or("builtins"),
-                )),
+                "__module__" => {
+                    // RFC 0046 (wave 4): a runtime `func.__module__ = …`
+                    // assignment (numpy's `_reconstruct`) wins over the
+                    // static attribution.
+                    if let Some(v) = crate::descr_registry::builtin_module_value(obj) {
+                        return Ok(v);
+                    }
+                    Ok(Object::from_static(
+                        crate::descr_registry::module_of(obj).unwrap_or("builtins"),
+                    ))
+                }
                 "__doc__" => Ok(builtin_doc(b.name)
                     .map(Object::from_static)
                     .unwrap_or(Object::None)),
@@ -7901,6 +7982,24 @@ impl Interpreter {
     /// Run the descriptor protocol against `attr` (already resolved
     /// from a class MRO). `instance` is `Object::None` when accessed
     /// directly on the class (e.g. `Foo.bar`).
+    /// Resolve `name` on a foreign extension object through its bridged
+    /// type's descriptors (RFC 0046, wave 4), applying the descriptor
+    /// protocol with `obj` as `self`. Returns `None` when the bridged type
+    /// does not carry the name (the caller then consults the extension's
+    /// own `tp_getattro`); `Some(Ok|Err)` once the bridged type owns the
+    /// resolution. Must *not* itself fall back to the foreign getattr hook
+    /// — that would recurse through the C bridge.
+    pub fn resolve_foreign_via_type(
+        &mut self,
+        obj: &Object,
+        name: &str,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let t = crate::builtins::class_of(obj);
+        let attr = t.lookup(name)?;
+        let owner = Object::Type(t);
+        Some(self.descriptor_get(&attr, obj, &owner))
+    }
+
     pub(crate) fn descriptor_get(
         &mut self,
         attr: &Object,
@@ -10792,13 +10891,11 @@ impl Interpreter {
         }
     }
 
-    /// Crate-visible attribute load for builtins that need full
-    /// dispatch (e.g. weakproxy forwarding).
-    pub(crate) fn load_attr_public(
-        &mut self,
-        obj: &Object,
-        name: &str,
-    ) -> Result<Object, RuntimeError> {
+    /// Attribute load with full `LOAD_ATTR` dispatch, for builtins and
+    /// the C-API bridge (`PyObject_GetAttr*`) that need the same
+    /// resolution the bytecode path performs (descriptors, function/
+    /// generator slots, `__getattr__`, foreign objects, …).
+    pub fn load_attr_public(&mut self, obj: &Object, name: &str) -> Result<Object, RuntimeError> {
         self.load_attr(obj, name)
     }
 
@@ -10870,6 +10967,14 @@ impl Interpreter {
                 return Ok(r.to_str());
             }
             return self.repr_of(v, globals);
+        }
+        // RFC 0046 (wave 4): a foreign extension object's `str` comes from its
+        // own `tp_str` (falling back to `tp_repr`), not the VM's repr-only
+        // `to_str`. numpy's `str(dtype)` is `'float64'` (its `tp_str`),
+        // distinct from `repr(dtype)` = `dtype('float64')`; routing through
+        // `repr` here collapsed the two.
+        if let Object::Foreign(s) = v {
+            return crate::foreign::str_(s);
         }
         if let Object::Long(b) = v {
             crate::builtins::long_str_limit_check(b)?;
@@ -15368,6 +15473,24 @@ impl Interpreter {
                     Ok(())
                 }
             },
+            // RFC 0046 (wave 4): a `builtin_function_or_method` carries a
+            // single writable member, `__module__` (CPython's `m_module`).
+            // Extensions assign it at import (numpy's `_reconstruct`); every
+            // other attribute is a read-only getset / absent.
+            Object::Builtin(_) => match name {
+                "__module__" => {
+                    crate::descr_registry::set_builtin_module(obj, value);
+                    Ok(())
+                }
+                "__doc__" | "__name__" | "__qualname__" | "__self__" | "__text_signature__" => {
+                    Err(attribute_error(format!(
+                        "attribute '{name}' of 'builtin_function_or_method' objects is not writable"
+                    )))
+                }
+                _ => Err(attribute_error(format!(
+                    "'builtin_function_or_method' object has no attribute '{name}'"
+                ))),
+            },
             _ => Err(type_error(format!(
                 "'{}' object has no attribute '{}'",
                 obj.type_name(),
@@ -17081,6 +17204,9 @@ impl Interpreter {
                     let _ = kwargs;
                     if b.name == "__vm:input" {
                         return self.do_input_call(args, outer_globals);
+                    }
+                    if b.name == "__vm:type_alias" {
+                        return self.do_type_alias_call(args, outer_globals);
                     }
                     if b.name == "__vm:__import__" {
                         // ``__import__(name, globals=None, locals=None,
@@ -21164,6 +21290,59 @@ impl Interpreter {
             }
             Err(e) => Err(crate::error::os_error(e.to_string())),
         }
+    }
+
+    /// PEP 695 `type Name[T, U] = body` runtime constructor.
+    ///
+    /// The parser lowers the statement to
+    /// `__weavepy_type_alias__('Name', ('T', 'U'), lambda T, U: body)`.
+    /// We mint one TypeVar-shaped placeholder per declared parameter and
+    /// build a lazy `typing.TypeAliasType`, so the body thunk runs only
+    /// when `Name.__value__` is first read — matching CPython, and
+    /// crucially letting numpy's `_typing` aliases (`type ArrayLike =
+    /// Buffer | _DualArrayLike[np.dtype, …]`) be *defined* without
+    /// eagerly building unions or subscripting sibling aliases.
+    fn do_type_alias_call(
+        &mut self,
+        args: &[Object],
+        outer_globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        let name = match args.first() {
+            Some(s @ Object::Str(_)) => s.clone(),
+            Some(other) => Object::from_str(other.to_str()),
+            None => return Err(type_error("__weavepy_type_alias__() missing name")),
+        };
+        let param_names: Vec<Object> = match args.get(1) {
+            Some(Object::Tuple(t)) => t.iter().cloned().collect(),
+            Some(Object::None) | None => Vec::new(),
+            Some(other) => {
+                return Err(type_error(format!(
+                    "__weavepy_type_alias__() type-params must be a tuple, not '{}'",
+                    other.type_name()
+                )))
+            }
+        };
+        let thunk = match args.get(2) {
+            Some(obj) => obj.clone(),
+            None => {
+                return Err(type_error(
+                    "__weavepy_type_alias__() missing lazy-value thunk",
+                ))
+            }
+        };
+        let mut typevars: Vec<Object> = Vec::with_capacity(param_names.len());
+        for pn in &param_names {
+            typevars.push(crate::builtins::b_typevar(std::slice::from_ref(pn))?);
+        }
+        let ctor = self.module_attr("typing", "TypeAliasType").ok_or_else(|| {
+            runtime_error("typing.TypeAliasType unavailable for PEP 695 `type` alias")
+        })?;
+        self.call(
+            &ctor,
+            &[name, Object::new_tuple(typevars), thunk],
+            &[],
+            outer_globals,
+        )
     }
 
     /// Parse `source`, replaying any tokenizer-collected invalid-escape
@@ -27223,6 +27402,18 @@ fn is_union_eligible(obj: &Object) -> bool {
     matches!(obj, Object::Type(_) | Object::None)
         || is_pep604_union(obj).is_some()
         || is_generic_alias(obj)
+        || is_typevar_like(obj)
+}
+
+/// True if `obj` is a PEP 695 / `typing.TypeVar`-shaped placeholder (a
+/// `SimpleNamespace` carrying the `__weavepy_typevar__` sentinel that
+/// [`crate::builtins::b_typevar`] stamps). CPython's `TypeVar` defines
+/// `__or__`/`__ror__`, so a type parameter is a valid PEP 604 union arg —
+/// numpy's `_typing` builds `…[DTypeT] | … | BuiltinT | …` over bare type
+/// parameters when its PEP 695 `type` aliases are evaluated.
+fn is_typevar_like(obj: &Object) -> bool {
+    matches!(obj, Object::SimpleNamespace(d)
+        if d.borrow().get(&DictKey(Object::from_static("__weavepy_typevar__"))).is_some())
 }
 
 /// A PEP 604 union can only be *initiated* by an operand that carries
@@ -27231,7 +27422,10 @@ fn is_union_eligible(obj: &Object) -> bool {
 /// but cannot start one, so `None | None` raises `TypeError` like
 /// CPython.
 fn is_union_initiator(obj: &Object) -> bool {
-    matches!(obj, Object::Type(_)) || is_pep604_union(obj).is_some() || is_generic_alias(obj)
+    matches!(obj, Object::Type(_))
+        || is_pep604_union(obj).is_some()
+        || is_generic_alias(obj)
+        || is_typevar_like(obj)
 }
 
 /// Detect whether `obj` is a PEP 604 union. Returns the flattened

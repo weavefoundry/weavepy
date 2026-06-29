@@ -92,6 +92,34 @@ pub fn module_of_builtin(b: &Rc<crate::object::BuiltinFn>) -> Option<&'static st
     BUILTIN_MODULE.read().get(&k).copied()
 }
 
+thread_local! {
+    /// Writable `__module__` for a `builtin_function_or_method` (RFC 0046,
+    /// wave 4). CPython's `PyCFunctionObject` exposes `m_module` as a
+    /// writable member, and extensions assign it at import time — numpy's
+    /// `multiarray.py` does `_reconstruct.__module__ = 'numpy._core.multiarray'`
+    /// so the reconstructor pickles by reference. We store the assigned
+    /// object keyed by the builtin's `Rc` identity (stable for the process
+    /// lifetime) and let [`module_of`]'s static attribution remain the
+    /// fallback. Thread-local: extension import runs on one interpreter
+    /// thread, matching [`DESCR_META`].
+    static BUILTIN_WRITABLE_MODULE: RefCell<HashMap<usize, Object>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Record a runtime `__module__` assignment on a builtin function.
+/// Returns `false` if `obj` is not a taggable representation.
+pub fn set_builtin_module(obj: &Object, value: Object) -> bool {
+    let Some(k) = key(obj) else { return false };
+    BUILTIN_WRITABLE_MODULE.with(|m| m.borrow_mut().insert(k, value));
+    true
+}
+
+/// A runtime `__module__` assigned via [`set_builtin_module`], if any.
+pub fn builtin_module_value(obj: &Object) -> Option<Object> {
+    let k = key(obj)?;
+    BUILTIN_WRITABLE_MODULE.with(|m| m.borrow().get(&k).cloned())
+}
+
 /// The pointer key for a descriptor object, or `None` if `obj` is not a
 /// representation we ever tag.
 fn key(obj: &Object) -> Option<usize> {

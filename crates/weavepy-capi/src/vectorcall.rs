@@ -51,19 +51,116 @@ pub type VectorcallFunc = unsafe extern "C" fn(
     kwnames: *mut PyObject,
 ) -> *mut PyObject;
 
-/// `PyVectorcall_Function(callable)` — return the vectorcall slot
-/// for `callable`'s type, or null if the callable doesn't support
-/// vectorcall.
+/// `Py_TPFLAGS_HAVE_VECTORCALL` — the type advertises a per-instance
+/// `vectorcallfunc` projected through `tp_vectorcall_offset`.
+const HAVE_VECTORCALL: u64 = 1 << 11;
+
+/// Read the **per-instance** `vectorcallfunc` of `callable` the way
+/// CPython's inlined `PyVectorcall_Function` does: require
+/// `Py_TPFLAGS_HAVE_VECTORCALL` on the type, then load the function
+/// pointer from `*(char *)callable + tp->tp_vectorcall_offset`.
+///
+/// This is the load-bearing piece for vectorcall types whose `tp_call`
+/// is `PyVectorcall_Call` (the standard idiom — numpy's
+/// `_ArrayFunctionDispatcher` stores `dispatcher_vectorcall` in a
+/// per-instance `vectorcall` field). Routing such a call back through
+/// `PyObject_Call` would re-enter `tp_call` and recurse forever.
+///
+/// # Safety
+/// `callable` must be non-null and its `ob_type` a faithful `PyTypeObject`.
+unsafe fn instance_vectorcall_func(callable: *mut PyObject) -> *mut std::ffi::c_void {
+    let tp = unsafe { (*callable).ob_type } as *mut crate::types::PyTypeObject;
+    if tp.is_null() {
+        return ptr::null_mut();
+    }
+    let flags = unsafe { (*tp).tp_flags };
+    if flags & HAVE_VECTORCALL == 0 {
+        return ptr::null_mut();
+    }
+    let offset = unsafe { (*tp).tp_vectorcall_offset };
+    if offset <= 0 {
+        return ptr::null_mut();
+    }
+    let slot =
+        unsafe { (callable as *const u8).offset(offset as isize) } as *const *mut std::ffi::c_void;
+    unsafe { *slot }
+}
+
+/// `PyVectorcall_Function(callable)` — return the vectorcall entry point
+/// for `callable`, or null if it doesn't support vectorcall. Prefers the
+/// per-instance `vectorcallfunc` (the `tp_vectorcall_offset` projection),
+/// falling back to a type-level `tp_vectorcall` slot.
 #[no_mangle]
 pub unsafe extern "C" fn PyVectorcall_Function(callable: *mut PyObject) -> *mut std::ffi::c_void {
     if callable.is_null() {
         return ptr::null_mut();
+    }
+    let inst = unsafe { instance_vectorcall_func(callable) };
+    if !inst.is_null() {
+        return inst;
     }
     let head = unsafe { &*callable };
     let Some(slot_table) = (unsafe { crate::slottable::slot_table_for(head.ob_type) }) else {
         return ptr::null_mut();
     };
     slot_table.get(crate::slottable::Py_tp_vectorcall).0
+}
+
+/// Invoke a per-instance `vectorcallfunc` with arguments supplied as a
+/// CPython `(args_tuple, kwargs_dict)` pair, translating into the
+/// vectorcall convention: a flat `args` array of positionals followed by
+/// the keyword values, with `kwnames` a tuple of the keyword names and
+/// `nargsf` the positional count.
+///
+/// # Safety
+/// `func` must be a valid `vectorcallfunc`; `callable` non-null.
+unsafe fn call_via_vectorcall(
+    callable: *mut PyObject,
+    func: *mut std::ffi::c_void,
+    tuple: *mut PyObject,
+    kw: *mut PyObject,
+) -> *mut PyObject {
+    let f: VectorcallFunc = unsafe { std::mem::transmute(func) };
+    let nargs = if tuple.is_null() {
+        0
+    } else {
+        unsafe { crate::containers::PyTuple_Size(tuple) }
+    };
+    let nargs = if nargs < 0 { 0usize } else { nargs as usize };
+    let mut argvec: Vec<*mut PyObject> = Vec::with_capacity(nargs + 4);
+    for i in 0..nargs {
+        // Borrowed references owned by the tuple (alive across the call).
+        argvec.push(unsafe { crate::containers::PyTuple_GetItem(tuple, i as PySsizeT) });
+    }
+    let mut kwnames: *mut PyObject = ptr::null_mut();
+    let mut owned_values: Vec<*mut PyObject> = Vec::new();
+    if !kw.is_null() {
+        if let Object::Dict(d) = unsafe { crate::object::clone_object(kw) } {
+            let items: Vec<(Object, Object)> = d
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.0.clone(), v.clone()))
+                .collect();
+            if !items.is_empty() {
+                let mut names = Vec::with_capacity(items.len());
+                for (k, v) in items {
+                    names.push(k);
+                    let vp = crate::object::into_owned(v);
+                    owned_values.push(vp);
+                    argvec.push(vp);
+                }
+                kwnames = crate::object::into_owned(Object::new_tuple(names));
+            }
+        }
+    }
+    let result = unsafe { f(callable, argvec.as_ptr(), nargs, kwnames) };
+    for vp in owned_values {
+        unsafe { crate::object::Py_DecRef(vp) };
+    }
+    if !kwnames.is_null() {
+        unsafe { crate::object::Py_DecRef(kwnames) };
+    }
+    result
 }
 
 /// `PyObject_Vectorcall(callable, args, nargsf, kwnames)` — fast
@@ -87,12 +184,18 @@ pub unsafe extern "C" fn PyObject_Vectorcall(
         return unsafe { f(callable, args, nargsf, kwnames) };
     }
 
-    // 2) Fallback: decode and forward to PyObject_Call.
+    // 2) Fallback: decode and forward to PyObject_Call. A keyword-less
+    //    call forwards a NULL `kwds` (CPython's convention) rather than a
+    //    fresh empty dict — extensions branch on `kwds != NULL`.
     let (positional, kwargs) = unsafe { decode_vectorcall(args, nargsf, kwnames) };
     let arg_tuple = crate::object::into_owned(Object::new_tuple(positional));
-    let kw_dict = crate::object::into_owned(Object::Dict(weavepy_vm::sync::Rc::new(
-        weavepy_vm::sync::RefCell::new(kwargs),
-    )));
+    let kw_dict = if kwargs.is_empty() {
+        ptr::null_mut()
+    } else {
+        crate::object::into_owned(Object::Dict(weavepy_vm::sync::Rc::new(
+            weavepy_vm::sync::RefCell::new(kwargs),
+        )))
+    };
     let result = unsafe { crate::abstract_::PyObject_Call(callable, arg_tuple, kw_dict) };
     unsafe { crate::object::Py_DecRef(arg_tuple) };
     unsafe { crate::object::Py_DecRef(kw_dict) };
@@ -121,15 +224,31 @@ pub unsafe extern "C" fn PyObject_VectorcallDict(
     result
 }
 
-/// `PyVectorcall_Call(callable, tuple, kw)` — slow-path entry from
-/// inside extensions that want to forward a `(args, kwargs)` pair
-/// through the vectorcall protocol.
+/// `PyVectorcall_Call(callable, tuple, kw)` — forward a `(args, kwargs)`
+/// pair through the vectorcall protocol.
+///
+/// CPython types that opt into vectorcall set `tp_call = PyVectorcall_Call`
+/// and store the real `vectorcallfunc` per instance. We therefore read
+/// that per-instance function and invoke it directly. Falling back to
+/// `PyObject_Call` here (the previous behaviour) re-entered the same
+/// `tp_call` slot and recursed without bound (numpy's
+/// `_ArrayFunctionDispatcher`, called as `ones(...)`, overflowed the
+/// stack). Only when the callable exposes no vectorcall do we forward to
+/// the generic call machinery.
 #[no_mangle]
 pub unsafe extern "C" fn PyVectorcall_Call(
     callable: *mut PyObject,
     tuple: *mut PyObject,
     kw: *mut PyObject,
 ) -> *mut PyObject {
+    if callable.is_null() {
+        crate::errors::set_type_error("PyVectorcall_Call: NULL callable");
+        return ptr::null_mut();
+    }
+    let func = unsafe { instance_vectorcall_func(callable) };
+    if !func.is_null() {
+        return unsafe { call_via_vectorcall(callable, func, tuple, kw) };
+    }
     unsafe { crate::abstract_::PyObject_Call(callable, tuple, kw) }
 }
 
@@ -159,14 +278,18 @@ pub unsafe extern "C" fn PyObject_VectorcallMethod(
     let positional = unsafe { collect_positional_after(args, nargs, nargsf) };
     let arg_tuple = crate::object::into_owned(Object::new_tuple(positional));
 
-    let kwargs = if kwnames.is_null() {
-        weavepy_vm::object::DictData::new()
+    let kw_dict = if kwnames.is_null() {
+        ptr::null_mut()
     } else {
-        unsafe { kwnames_to_dict(kwnames, args, nargs, nargsf) }
+        let kwargs = unsafe { kwnames_to_dict(kwnames, args, nargs, nargsf) };
+        if kwargs.is_empty() {
+            ptr::null_mut()
+        } else {
+            crate::object::into_owned(Object::Dict(weavepy_vm::sync::Rc::new(
+                weavepy_vm::sync::RefCell::new(kwargs),
+            )))
+        }
     };
-    let kw_dict = crate::object::into_owned(Object::Dict(weavepy_vm::sync::Rc::new(
-        weavepy_vm::sync::RefCell::new(kwargs),
-    )));
 
     let result = unsafe { crate::abstract_::PyObject_Call(method, arg_tuple, kw_dict) };
     unsafe { crate::object::Py_DecRef(arg_tuple) };

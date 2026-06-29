@@ -225,6 +225,13 @@ pub enum Object {
     /// callback (via [`register_capsule_free`]) that runs when the last
     /// reference here drops. See [`PyCapsuleSoul`].
     Capsule(Rc<PyCapsuleSoul>),
+    /// A "foreign" `PyObject` minted by a C extension itself (a numpy
+    /// builtin function, a static `PyArray_Descr`, a module-defined type
+    /// object, …) rather than by WeavePy's binary-ABI allocator. The VM
+    /// holds it as an opaque, identity-stable proxy and routes every
+    /// operation back through the cpyext bridge (RFC 0046, wave 4). See
+    /// [`crate::foreign::PyForeignSoul`].
+    Foreign(Rc<crate::foreign::PyForeignSoul>),
 }
 
 /// VM-side soul of a C-API `PyCapsule` (see [`Object::Capsule`]).
@@ -342,6 +349,7 @@ impl fmt::Debug for Object {
                 Some(n) => write!(f, "<capsule object \"{n}\" at 0x{:x}>", c.handle),
                 None => write!(f, "<capsule object NULL at 0x{:x}>", c.handle),
             },
+            Object::Foreign(s) => write!(f, "<foreign {} at 0x{:x}>", s.type_name, s.ptr),
         }
     }
 }
@@ -5247,6 +5255,9 @@ impl Object {
             | Object::Frame(_)
             | Object::Traceback(_)
             | Object::Capsule(_) => true,
+            // Foreign proxies route truthiness through the extension's
+            // `nb_bool`/`sq_length` (numpy: a 0-d/1-elem array's truth).
+            Object::Foreign(s) => crate::foreign::is_true(s),
             Object::MemoryView(mv) => mv.len.get() > 0,
             Object::MappingProxy(d) => !d.borrow().is_empty(),
             Object::DictView(v) => !v.dict.borrow().is_empty(),
@@ -5339,6 +5350,9 @@ impl Object {
             (Object::SimpleNamespace(a), Object::SimpleNamespace(b)) => Rc::ptr_eq(a, b),
             (Object::LazyIter(a), Object::LazyIter(b)) => Rc::ptr_eq(a, b),
             (Object::Capsule(a), Object::Capsule(b)) => Rc::ptr_eq(a, b),
+            // Two foreign proxies are the *same* object iff they wrap the
+            // same `PyObject*` (cpyext identity), even across distinct souls.
+            (Object::Foreign(a), Object::Foreign(b)) => a.ptr == b.ptr,
             (Object::Unbound, Object::Unbound) => true,
             _ => false,
         }
@@ -5939,6 +5953,9 @@ impl Object {
             Object::SimpleNamespace(_) => "SimpleNamespace",
             Object::LazyIter(l) => l.type_name(),
             Object::Capsule(_) => "PyCapsule",
+            // The real (dynamic) `tp_name` is only available via
+            // type_name_owned; this static placeholder mirrors Instance.
+            Object::Foreign(_) => "object",
         }
     }
 
@@ -5948,6 +5965,7 @@ impl Object {
         match self {
             Object::Instance(inst) => inst.cls().name.clone(),
             Object::Type(t) => format!("type[{}]", t.name),
+            Object::Foreign(s) => s.type_name.to_string(),
             other => other.type_name().to_owned(),
         }
     }
@@ -6360,6 +6378,10 @@ impl Object {
                 Some(n) => format!("<capsule object \"{n}\" at 0x{:x}>", c.handle),
                 None => format!("<capsule object NULL at 0x{:x}>", c.handle),
             },
+            // Infallible fallback; the VM's `repr_of` routes a foreign
+            // proxy through the extension's `tp_repr` (numpy array repr).
+            Object::Foreign(s) => crate::foreign::repr(s)
+                .unwrap_or_else(|_| format!("<{} object at 0x{:x}>", s.type_name, s.ptr)),
             Object::SimpleNamespace(d) => {
                 let dict = d.borrow();
                 // PEP 585/604 runtime forms repr as type expressions
@@ -6792,6 +6814,10 @@ pub(crate) fn identity_hash(obj: &Object) -> i64 {
         Object::SimpleNamespace(r) => rot(Rc::as_ptr(r).cast()),
         Object::LazyIter(r) => rot(Rc::as_ptr(r).cast()),
         Object::Capsule(r) => rot(Rc::as_ptr(r).cast()),
+        // Identity hash keyed on the foreign `PyObject*` (matches the
+        // `is`-identity used by `eq`/`id`). A value-hashable foreign
+        // object (numpy scalar) is handled earlier via the hash hook.
+        Object::Foreign(s) => rot((s.ptr as *const u8).cast()),
         // Value-hashable variants never reach here (handled by
         // `py_hash_value`); anything else gets a stable constant.
         _ => 0,

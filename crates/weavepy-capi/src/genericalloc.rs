@@ -121,6 +121,7 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
         );
         crate::object::Py_IncRef(ty as *mut PyObject);
     }
+    crate::object::register_minted(raw as *mut PyObject);
     raw as *mut PyObject
 }
 

@@ -11,6 +11,57 @@ use weavepy_vm::object::{Object, PyComplex};
 
 use crate::object::PyObject;
 
+/// Read a `*const c_char` `tp_name` for diagnostics — best-effort, returns
+/// `"?"` for a NULL chain.
+unsafe fn debug_type_name(o: *mut PyObject) -> String {
+    if o.is_null() {
+        return "<null>".to_owned();
+    }
+    let ty = unsafe { (*o).ob_type };
+    if ty.is_null() {
+        return "<null-type>".to_owned();
+    }
+    let name = unsafe { (*ty).tp_name };
+    if name.is_null() {
+        return "<null-name>".to_owned();
+    }
+    unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// RFC 0046 (wave 4): invoke a no-arg numeric dunder (`__float__`,
+/// `__index__`, `__complex__`) on `o` and coerce the result to an
+/// `Object`. Returns `None` if `o` has no such attribute (the caller then
+/// tries the next protocol or raises); `Some(None)` if the call or
+/// conversion failed with an exception already set.
+///
+/// CPython's `PyFloat_AsDouble` / `PyComplex_AsCComplex` consult the
+/// number-protocol slots (`nb_float`, `nb_index`); a stock extension
+/// exposes those as the matching dunder, so a `PyObject_GetAttrString`
+/// reaches them through the type's `tp_getattro` (numpy scalars included).
+unsafe fn call_number_dunder(o: *mut PyObject, name: &str) -> Option<Option<Object>> {
+    let cname = match std::ffi::CString::new(name) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let meth = unsafe { crate::abstract_::PyObject_GetAttrString(o, cname.as_ptr()) };
+    if meth.is_null() {
+        // No such attribute — clear the AttributeError and let the caller
+        // fall through to the next protocol.
+        let _ = crate::errors::take_pending();
+        return None;
+    }
+    let res = unsafe { crate::abstract_::PyObject_CallNoArgs(meth) };
+    unsafe { crate::object::Py_DecRef(meth) };
+    if res.is_null() {
+        return Some(None);
+    }
+    let obj = unsafe { crate::object::clone_object(res) };
+    unsafe { crate::object::Py_DecRef(res) };
+    Some(Some(obj))
+}
+
 // ---------- PyLong (Python `int`) ----------
 
 #[no_mangle]
@@ -345,6 +396,33 @@ pub unsafe extern "C" fn PyFloat_AsDouble(o: *mut PyObject) -> f64 {
         Object::Long(big) => big.to_f64().unwrap_or(f64::INFINITY),
         Object::Bool(b) => f64::from(b as i32),
         _ => {
+            // RFC 0046 (wave 4): consult `__float__` then `__index__`
+            // (CPython's `nb_float` / `nb_index` fallback) so a numpy scalar
+            // or user instance converts faithfully.
+            for attr in ["__float__", "__index__"] {
+                if let Some(result) = unsafe { call_number_dunder(o, attr) } {
+                    return match result {
+                        Some(Object::Float(f)) => f,
+                        Some(Object::Int(i)) => i as f64,
+                        Some(Object::Long(big)) => big.to_f64().unwrap_or(f64::INFINITY),
+                        Some(Object::Bool(b)) => f64::from(b as i32),
+                        Some(_) => {
+                            crate::errors::set_type_error("__float__ returned non-float");
+                            -1.0
+                        }
+                        None => -1.0,
+                    };
+                }
+            }
+            if std::env::var_os("WEAVEPY_TRACE_CONV").is_some() {
+                let owned = crate::object::is_weavepy_owned(o);
+                let variant = format!("{:?}", unsafe { crate::object::clone_object(o) });
+                let short: String = variant.chars().take(80).collect();
+                eprintln!(
+                    "[conv] PyFloat_AsDouble: no float protocol on {} ptr={o:p} weavepy_owned={owned} clone={short}",
+                    unsafe { debug_type_name(o) },
+                );
+            }
             crate::errors::set_type_error("a float is required");
             -1.0
         }
@@ -490,8 +568,23 @@ pub unsafe extern "C" fn PyComplex_RealAsDouble(o: *mut PyObject) -> f64 {
         Object::Int(i) => i as f64,
         Object::Long(big) => big.to_f64().unwrap_or(f64::INFINITY),
         _ => {
-            crate::errors::set_type_error("a complex is required");
-            -1.0
+            // RFC 0046 (wave 4): CPython tries `__complex__` (real part),
+            // then falls back to the float protocol (`__float__` /
+            // `__index__`, via `PyFloat_AsDouble`).
+            if let Some(result) = unsafe { call_number_dunder(o, "__complex__") } {
+                return match result {
+                    Some(Object::Complex(c)) => c.real,
+                    Some(Object::Float(f)) => f,
+                    Some(Object::Int(i)) => i as f64,
+                    Some(Object::Long(big)) => big.to_f64().unwrap_or(f64::INFINITY),
+                    Some(_) => {
+                        crate::errors::set_type_error("__complex__ returned non-complex");
+                        -1.0
+                    }
+                    None => -1.0,
+                };
+            }
+            unsafe { PyFloat_AsDouble(o) }
         }
     }
 }
@@ -503,7 +596,19 @@ pub unsafe extern "C" fn PyComplex_ImagAsDouble(o: *mut PyObject) -> f64 {
     }
     match unsafe { crate::object::clone_object(o) } {
         Object::Complex(c) => c.imag,
-        _ => 0.0,
+        Object::Float(_) | Object::Int(_) | Object::Long(_) | Object::Bool(_) => 0.0,
+        _ => {
+            // RFC 0046 (wave 4): `__complex__` carries the imaginary part; a
+            // real-only object (no `__complex__`) has imag 0.
+            if let Some(result) = unsafe { call_number_dunder(o, "__complex__") } {
+                return match result {
+                    Some(Object::Complex(c)) => c.imag,
+                    Some(_) => 0.0,
+                    None => -1.0,
+                };
+            }
+            0.0
+        }
     }
 }
 

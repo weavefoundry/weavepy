@@ -152,7 +152,16 @@ pub unsafe fn release_c_ownership(p: *mut PyObject) {
     // Take the pin out *before* dropping it: dropping the last `Rc` runs
     // `PyInstance::drop`, which calls the free hook, which touches
     // `STRONG` again — so the borrow must already be released.
-    let pinned = STRONG.with(|m| m.borrow_mut().remove(&(p as usize)));
+    //
+    // `try_with`, not `with`: at thread/process teardown the `STRONG`
+    // thread-local may itself be mid-destruction, and a plain `.with`
+    // there panics (`AccessError`) — which, in a `Drop`, aborts the
+    // process (RFC 0046, wave 4). If the map is gone the pins are gone
+    // too; there is nothing to remove.
+    let pinned = STRONG
+        .try_with(|m| m.borrow_mut().remove(&(p as usize)))
+        .ok()
+        .flatten();
     drop(pinned);
 }
 
@@ -167,14 +176,41 @@ fn free_instance_body_hook(body: usize) {
         return;
     }
     let p = body as *mut PyObject;
+    // RFC 0046 (wave 4): a *non-inline* instance's `c_body` holds a plain
+    // identity `PyObjectBox`, not a faithful mirror body. That box is owned
+    // by C's refcount and reclaimed by `free_box` (which clears `c_body`
+    // first), so the box's strong payload pins the instance and this hook
+    // can only see it if some future refactor breaks that invariant. Guard
+    // defensively: routing a non-body through the faithful free path below
+    // would read a mirror prefix that does not exist. `free_box` frees it
+    // correctly instead. `is_instance_body` only reads `ob_type`, so it is
+    // sound on a live box.
+    if !unsafe { crate::mirror::is_instance_body(p) } {
+        unsafe { crate::object::free_box(p) };
+        return;
+    }
     // The instance only reaches `Drop` once its strong count is zero, and
     // a live `STRONG` pin *is* a strong count — so no pin can remain here.
-    let stale = STRONG.with(|m| m.borrow_mut().remove(&body));
-    debug_assert!(
-        stale.is_none(),
-        "RFC 0045: instance collected while C still owned its body"
-    );
-    drop(stale);
+    //
+    // `try_with`, not `with`: at thread/process teardown this hook fires
+    // *from within* the `STRONG` map's own destructor (dropping its
+    // pinned `Rc<PyInstance>`s runs `PyInstance::drop` → here). The map is
+    // then mid-destruction, so a plain `.with` panics with `AccessError`
+    // — and panicking in a TLS destructor aborts the process (the exit
+    // 133 / "thread local panicked on drop" abort, RFC 0046 wave 4). When
+    // the TLS is gone the process is exiting; the OS reclaims the block,
+    // so bail without freeing rather than touch more (possibly destroyed)
+    // capi thread-locals (`unregister_minted`, the mirror registry).
+    match STRONG.try_with(|m| m.borrow_mut().remove(&body)) {
+        Ok(stale) => {
+            debug_assert!(
+                stale.is_none(),
+                "RFC 0045: instance collected while C still owned its body"
+            );
+            drop(stale);
+        }
+        Err(_) => return,
+    }
 
     unsafe {
         let ty = (*p).ob_type;

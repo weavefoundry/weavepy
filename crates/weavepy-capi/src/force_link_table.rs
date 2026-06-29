@@ -36,6 +36,7 @@ use crate::slice;
 use crate::strings;
 use crate::types;
 use crate::vectorcall;
+use crate::wave4;
 
 // The variadic helpers live in `varargs.c` and would otherwise be
 // dead-stripped from the host binary, since nothing on the Rust
@@ -120,6 +121,19 @@ extern "C" {
         callable: *mut crate::object::PyObject,
         ...
     ) -> *mut crate::object::PyObject;
+    // RFC 0046 (wave 4): variadic tail numpy links, defined in varargs.c.
+    fn PyOS_snprintf(
+        str: *mut core::ffi::c_char,
+        size: usize,
+        fmt: *const core::ffi::c_char,
+        ...
+    ) -> core::ffi::c_int;
+    fn PyErr_WarnFormat(
+        category: *mut crate::object::PyObject,
+        stack_level: isize,
+        fmt: *const core::ffi::c_char,
+        ...
+    ) -> core::ffi::c_int;
 }
 
 macro_rules! addr {
@@ -647,6 +661,125 @@ static FORCE_LINK: &[FnPtr] = &[
     addr_static!(mut errors::PyExc_UnicodeWarning),
     addr_static!(mut errors::PyExc_BytesWarning),
     addr_static!(mut errors::PyExc_ResourceWarning),
+    // ----------------------------------------------------------------
+    // RFC 0046 (wave 4): the CPython 3.13 C-API tail stock numpy's
+    // `_multiarray_umath` links. New leaf implementations live in
+    // `wave4.rs`; the rest were already implemented in waves 1-3 but had
+    // never been pinned into the dynamic symbol table.
+    // ----------------------------------------------------------------
+    // wave4.rs — predicates / iteration
+    addr!(wave4::PyCallable_Check),
+    addr!(wave4::PyIndex_Check),
+    addr!(wave4::PyIter_Check),
+    addr!(wave4::PyObject_SelfIter),
+    addr!(wave4::PySeqIter_New),
+    // wave4.rs — sound no-ops
+    addr!(wave4::PyErr_CheckSignals),
+    addr!(wave4::PyTraceMalloc_Track),
+    addr!(wave4::PyTraceMalloc_Untrack),
+    addr!(wave4::PyType_Modified),
+    addr!(wave4::PyMutex_Lock),
+    addr!(wave4::PyMutex_Unlock),
+    addr!(wave4::PyObject_ClearWeakRefs),
+    addr!(wave4::PyErr_WriteUnraisable),
+    // wave4.rs — exception chaining
+    addr!(wave4::PyException_SetCause),
+    addr!(wave4::PyException_SetContext),
+    addr!(wave4::PyException_SetTraceback),
+    // wave4.rs — dict tail
+    addr!(wave4::PyDict_GetItemWithError),
+    addr!(wave4::PyDict_GetItemRef),
+    addr!(wave4::PyDict_GetItemStringRef),
+    addr!(wave4::PyDict_ContainsString),
+    addr!(wave4::PyDict_SetDefaultRef),
+    addr!(wave4::PyDictProxy_New),
+    // wave4.rs — numbers
+    addr!(wave4::PyComplex_AsCComplex),
+    addr!(wave4::PyComplex_FromCComplex),
+    addr!(wave4::_PyLong_Sign),
+    addr!(wave4::_Py_HashDouble),
+    addr!(wave4::PyLong_FromUnicodeObject),
+    addr!(wave4::PyFloat_FromString),
+    // wave4.rs — unicode tail
+    addr!(wave4::PyUnicode_AsUCS4),
+    addr!(wave4::PyUnicode_AsUCS4Copy),
+    addr!(wave4::PyUnicode_Format),
+    addr!(wave4::_PyUnicode_IsAlpha),
+    addr!(wave4::_PyUnicode_IsDecimalDigit),
+    addr!(wave4::_PyUnicode_IsDigit),
+    addr!(wave4::_PyUnicode_IsNumeric),
+    addr!(wave4::_PyUnicode_IsLowercase),
+    addr!(wave4::_PyUnicode_IsUppercase),
+    addr!(wave4::_PyUnicode_IsTitlecase),
+    addr!(wave4::_PyUnicode_IsWhitespace),
+    addr_static!(wave4::_Py_ascii_whitespace),
+    // wave4.rs — OS string parsing
+    addr!(wave4::PyOS_string_to_double),
+    addr!(wave4::PyOS_strtol),
+    addr!(wave4::PyOS_strtoul),
+    // wave4.rs — object tail
+    addr!(wave4::PyObject_AsFileDescriptor),
+    addr!(wave4::PyObject_GetOptionalAttr),
+    addr!(wave4::PyObject_Print),
+    addr!(wave4::PyMethod_New),
+    // wave4.rs — import / sys / eval
+    addr!(wave4::PyImport_Import),
+    addr!(wave4::PySys_GetObject),
+    addr!(wave4::PyEval_GetBuiltins),
+    addr!(wave4::PyInterpreterState_Main),
+    // wave4.rs — errors
+    addr!(wave4::_PyErr_BadInternalCall),
+    addr!(wave4::PyErr_SetFromErrno),
+    // wave4.rs — contextvars
+    addr!(wave4::PyContextVar_New),
+    addr!(wave4::PyContextVar_Get),
+    addr!(wave4::PyContextVar_Set),
+    // varargs.c — wave-4 variadic shims
+    addr!(PyOS_snprintf),
+    addr!(PyErr_WarnFormat),
+    // Already implemented in waves 1-3, now pinned for numpy.
+    addr!(numbers::PyLong_AsLongAndOverflow),
+    addr!(numbers::PyLong_AsLongLongAndOverflow),
+    addr!(numbers::PyLong_AsVoidPtr),
+    addr!(numbers::PyLong_FromVoidPtr),
+    addr!(ab::PyNumber_And),
+    addr!(ab::PyNumber_AsSsize_t),
+    addr!(ab::PyNumber_Divmod),
+    addr!(ab::PyNumber_Index),
+    addr!(ab::PyNumber_Invert),
+    addr!(ab::PyNumber_Lshift),
+    addr!(ab::PyNumber_Or),
+    addr!(ab::PyNumber_Rshift),
+    addr!(ab::PyNumber_Xor),
+    addr!(ab::PyObject_Bytes),
+    addr!(ab::PyObject_Format),
+    addr!(ab::PyObject_LengthHint),
+    addr!(ab::PySequence_Concat),
+    addr!(ab::PySequence_InPlaceConcat),
+    addr!(ab::PySequence_InPlaceRepeat),
+    addr!(ab::PySequence_Repeat),
+    addr!(containers::PySequence_Fast),
+    addr!(strings::PyUnicode_AsASCIIString),
+    addr!(strings::PyUnicode_AsLatin1String),
+    addr!(strings::PyUnicode_Compare),
+    addr!(strings::PyUnicode_Contains),
+    addr!(strings::PyUnicode_FromEncodedObject),
+    addr!(strings::PyUnicode_FromKindAndData),
+    addr!(strings::PyUnicode_Replace),
+    addr!(strings::PyUnicode_Substring),
+    addr!(strings::PyUnicode_Tailmatch),
+    addr!(ab::Py_EnterRecursiveCall),
+    addr!(ab::Py_LeaveRecursiveCall),
+    addr!(strings::PyUnicode_InternFromString),
+    // wave-4 type-object statics (numpy compares `Py_TYPE(x) == &…`).
+    addr_static!(types::PyMemoryView_Type),
+    addr_static!(types::PyDictProxy_Type),
+    addr_static!(types::PyGetSetDescr_Type),
+    addr_static!(types::PyMemberDescr_Type),
+    addr_static!(types::PyMethodDescr_Type),
+    addr_static!(types::PyModuleDef_Type),
+    // IOError alias of OSError.
+    addr_static!(mut errors::PyExc_IOError),
 ];
 
 /// Hand-out of the table to ensure the static is referenced from

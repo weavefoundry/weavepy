@@ -106,6 +106,48 @@ pub fn install_dunder_shims(table: &SlotTable, type_name: String) -> Vec<(String
         &name,
     );
 
+    // Reflected numeric dunders (`__radd__`, `__rmul__`, …). CPython has no
+    // dedicated reflected C slot — the *same* `nb_*` slot serves both
+    // directions: `binary_op1` tries the right operand's `nb_*` with the
+    // operands in their original order when the left operand's slot declines.
+    // A numpy scalar/array defines `nb_multiply` but no Python-level
+    // `__rmul__`, so `1 * np.float64(2)` — where the VM `int` on the left
+    // cannot handle the numpy RHS — must still reach the RHS's `nb_multiply`.
+    // The reflected shim forwards to the forward slot with the operands
+    // swapped back into original (left, right) order (see
+    // [`install_binary_reflected`]).
+    install_binary_reflected(&mut out, table, ids::Py_nb_add, "__radd__", &name);
+    install_binary_reflected(&mut out, table, ids::Py_nb_subtract, "__rsub__", &name);
+    install_binary_reflected(&mut out, table, ids::Py_nb_multiply, "__rmul__", &name);
+    install_binary_reflected(&mut out, table, ids::Py_nb_remainder, "__rmod__", &name);
+    install_binary_reflected(&mut out, table, ids::Py_nb_divmod, "__rdivmod__", &name);
+    install_binary_reflected(
+        &mut out,
+        table,
+        ids::Py_nb_floor_divide,
+        "__rfloordiv__",
+        &name,
+    );
+    install_binary_reflected(
+        &mut out,
+        table,
+        ids::Py_nb_true_divide,
+        "__rtruediv__",
+        &name,
+    );
+    install_binary_reflected(&mut out, table, ids::Py_nb_lshift, "__rlshift__", &name);
+    install_binary_reflected(&mut out, table, ids::Py_nb_rshift, "__rrshift__", &name);
+    install_binary_reflected(&mut out, table, ids::Py_nb_and, "__rand__", &name);
+    install_binary_reflected(&mut out, table, ids::Py_nb_xor, "__rxor__", &name);
+    install_binary_reflected(&mut out, table, ids::Py_nb_or, "__ror__", &name);
+    install_binary_reflected(
+        &mut out,
+        table,
+        ids::Py_nb_matrix_multiply,
+        "__rmatmul__",
+        &name,
+    );
+
     install_binary(&mut out, table, ids::Py_nb_inplace_add, "__iadd__", &name);
     install_binary(
         &mut out,
@@ -185,22 +227,40 @@ pub fn install_dunder_shims(table: &SlotTable, type_name: String) -> Vec<(String
     install_ssize_arg(&mut out, table, ids::Py_sq_item, "__getitem__", &name);
     install_ssize_obj_arg(&mut out, table, ids::Py_sq_ass_item, "__setitem__", &name);
     install_obj_obj(&mut out, table, ids::Py_sq_contains, "__contains__", &name);
-    install_binary(&mut out, table, ids::Py_sq_concat, "__add__", &name);
-    install_ssize_arg(&mut out, table, ids::Py_sq_repeat, "__mul__", &name);
-    install_binary(
-        &mut out,
-        table,
-        ids::Py_sq_inplace_concat,
-        "__iadd__",
-        &name,
-    );
-    install_ssize_arg(
-        &mut out,
-        table,
-        ids::Py_sq_inplace_repeat,
-        "__imul__",
-        &name,
-    );
+    // `__add__`/`__mul__` (and their in-place forms) are shared between the
+    // number and sequence protocols. CPython resolves the dunder to the
+    // *number* slot when the type defines one, falling back to the sequence
+    // slot only when it does not (`slot_nb_add` precedes `slot_sq_concat` in
+    // `slotdefs`). A numpy ndarray defines BOTH `nb_add` (real elementwise
+    // add) and `sq_concat` (`array_concat`, which deliberately raises
+    // "Concatenation operation is not implemented"); installing the concat
+    // shim unconditionally last would clobber the numeric one and make
+    // `arr + arr` raise. Only install the sequence shim when the numeric
+    // counterpart is absent.
+    if table.get(ids::Py_nb_add).is_null() {
+        install_binary(&mut out, table, ids::Py_sq_concat, "__add__", &name);
+    }
+    if table.get(ids::Py_nb_multiply).is_null() {
+        install_ssize_arg(&mut out, table, ids::Py_sq_repeat, "__mul__", &name);
+    }
+    if table.get(ids::Py_nb_inplace_add).is_null() {
+        install_binary(
+            &mut out,
+            table,
+            ids::Py_sq_inplace_concat,
+            "__iadd__",
+            &name,
+        );
+    }
+    if table.get(ids::Py_nb_inplace_multiply).is_null() {
+        install_ssize_arg(
+            &mut out,
+            table,
+            ids::Py_sq_inplace_repeat,
+            "__imul__",
+            &name,
+        );
+    }
 
     // Mapping protocol takes precedence over sq_item where both are
     // defined: install the mapping shim last so its dunder
@@ -296,6 +356,43 @@ fn install_binary(
         let func: BinaryFunc = unsafe { slot.cast() };
         let (a, b) = binary_args(args, static_name, &tn)?;
         invoke_binary(func, a, b)
+    };
+    out.push((
+        mname,
+        Object::Builtin(Rc::new(BuiltinFn {
+            name: static_name,
+            binds_instance: true,
+            call: Box::new(f),
+            call_kw: None,
+        })),
+    ));
+}
+
+/// Reflected sibling of [`install_binary`]: installs `__radd__`-style
+/// dunders that forward to a *forward* `nb_*` slot. A reflected dunder
+/// `self.__rop__(other)` computes `other OP self`; the C slot computes
+/// `left OP right`, so the operands — which arrive bound as `(self, other)`
+/// — are swapped back to `(other, self)` before the call. CPython reaches
+/// the same slot through `binary_op1` trying the right operand's `nb_*`
+/// with the operands in their original order.
+fn install_binary_reflected(
+    out: &mut Vec<(String, Object)>,
+    table: &SlotTable,
+    slot_id: c_int,
+    name: &str,
+    type_name: &Rc<str>,
+) {
+    let slot = table.get(slot_id);
+    if slot.is_null() {
+        return;
+    }
+    let mname = name.to_owned();
+    let static_name: &'static str = Box::leak(name.to_string().into_boxed_str());
+    let tn = type_name.clone();
+    let f = move |args: &[Object]| -> Result<Object, RuntimeError> {
+        let func: BinaryFunc = unsafe { slot.cast() };
+        let (self_p, other_p) = binary_args(args, static_name, &tn)?;
+        invoke_binary(func, other_p, self_p)
     };
     out.push((
         mname,
@@ -793,12 +890,12 @@ fn install_call(
         }
         let self_p = crate::object::into_owned(args[0].clone());
         let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
-        let kw = crate::object::into_owned(Object::new_dict());
+        // No keyword arguments → CPython hands the slot a NULL `kwds`.
+        let kw: *mut PyObject = std::ptr::null_mut();
         let raw = crate::interp::ensure_active(|| unsafe { func(self_p, arg_tuple, kw) });
         unsafe {
             crate::object::Py_DecRef(self_p);
             crate::object::Py_DecRef(arg_tuple);
-            crate::object::Py_DecRef(kw);
         }
         unwrap_pyobject(raw)
     };
@@ -810,10 +907,7 @@ fn install_call(
             }
             let self_p = crate::object::into_owned(args[0].clone());
             let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
-            let kw_dict = build_kw_dict(kwargs);
-            let kw_p = crate::object::into_owned(Object::Dict(weavepy_vm::sync::Rc::new(
-                weavepy_vm::sync::RefCell::new(kw_dict),
-            )));
+            let kw_p = kwds_ptr(kwargs);
             let raw = crate::interp::ensure_active(|| unsafe { func(self_p, arg_tuple, kw_p) });
             unsafe {
                 crate::object::Py_DecRef(self_p);
@@ -854,12 +948,12 @@ fn install_init(
         }
         let self_p = crate::object::into_owned(args[0].clone());
         let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
-        let kw = crate::object::into_owned(Object::new_dict());
+        // No keyword arguments → CPython hands `tp_init` a NULL `kwds`.
+        let kw: *mut PyObject = std::ptr::null_mut();
         let r = crate::interp::ensure_active(|| unsafe { func(self_p, arg_tuple, kw) });
         unsafe {
             crate::object::Py_DecRef(self_p);
             crate::object::Py_DecRef(arg_tuple);
-            crate::object::Py_DecRef(kw);
         }
         if r < 0 {
             return Err(take_pending_or_default());
@@ -874,10 +968,7 @@ fn install_init(
             }
             let self_p = crate::object::into_owned(args[0].clone());
             let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
-            let kw_dict = build_kw_dict(kwargs);
-            let kw_p = crate::object::into_owned(Object::Dict(weavepy_vm::sync::Rc::new(
-                weavepy_vm::sync::RefCell::new(kw_dict),
-            )));
+            let kw_p = kwds_ptr(kwargs);
             let r = crate::interp::ensure_active(|| unsafe { func(self_p, arg_tuple, kw_p) });
             unsafe {
                 crate::object::Py_DecRef(self_p);
@@ -1203,11 +1294,11 @@ fn install_new(
         }
         let type_ptr = cls_ptr(&args[0], &tn)?;
         let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
-        let kw = crate::object::into_owned(Object::new_dict());
+        // No keyword arguments → CPython hands `tp_new` a NULL `kwds`.
+        let kw: *mut PyObject = std::ptr::null_mut();
         let raw = crate::interp::ensure_active(|| unsafe { func(type_ptr, arg_tuple, kw) });
         unsafe {
             crate::object::Py_DecRef(arg_tuple);
-            crate::object::Py_DecRef(kw);
         }
         unwrap_pyobject(raw)
     };
@@ -1222,10 +1313,7 @@ fn install_new(
             }
             let type_ptr = cls_ptr(&args[0], &tn_kw)?;
             let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
-            let kw_dict = build_kw_dict(kwargs);
-            let kw_p = crate::object::into_owned(Object::Dict(Rc::new(
-                weavepy_vm::sync::RefCell::new(kw_dict),
-            )));
+            let kw_p = kwds_ptr(kwargs);
             let raw = crate::interp::ensure_active(|| unsafe { func(type_ptr, arg_tuple, kw_p) });
             unsafe {
                 crate::object::Py_DecRef(arg_tuple);
@@ -1325,6 +1413,26 @@ fn build_kw_dict(kwargs: &[(String, Object)]) -> weavepy_vm::object::DictData {
         out.insert(DictKey(Object::from_str(k.clone())), v.clone());
     }
     out
+}
+
+/// Build the `kwds` argument for a C `(args, kwds)` slot (`tp_new`,
+/// `tp_init`, ternary `METH_KEYWORDS`-style calls).
+///
+/// Returns **NULL** when there are no keyword arguments, exactly as
+/// CPython's `type_call` / `PyObject_Call` hand the callee. Extensions
+/// branch on `kwds != NULL` (numpy's `array_converter_new` raises
+/// "Array creation helper doesn't support keywords." for any non-NULL,
+/// non-empty `kwds`), and reading an *empty* WeavePy dict mirror through
+/// the `PyDict_GET_SIZE` macro yields garbage — so a keyword-less call
+/// must pass a genuine NULL, not a fresh empty dict.
+fn kwds_ptr(kwargs: &[(String, Object)]) -> *mut PyObject {
+    if kwargs.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let kw_dict = build_kw_dict(kwargs);
+    crate::object::into_owned(Object::Dict(Rc::new(weavepy_vm::sync::RefCell::new(
+        kw_dict,
+    ))))
 }
 
 // Suppress dead-code on the unused SlotPtr re-export helper.

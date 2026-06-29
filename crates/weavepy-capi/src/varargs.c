@@ -50,12 +50,57 @@
 #include "../include/Python.h"
 
 #include <ctype.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* --------------------------------------------------------------
+ * Debug crash handler (RFC 0046, wave 4).
+ *
+ * Dumping a native backtrace on SIGSEGV/SIGBUS/SIGABRT is invaluable
+ * when a freshly-loaded C extension (e.g. numpy's `_multiarray_umath`
+ * `Py_mod_exec`) faults deep inside its own initialiser, where lldb is
+ * unavailable. The handler uses async-signal-safe `backtrace*` and then
+ * re-raises with the default disposition so the real exit status is
+ * preserved. Installed only when `WEAVEPY_CRASH_BT` is set.
+ *
+ * `execinfo.h`/`backtrace*`, `<unistd.h>`, and signals such as `SIGBUS`
+ * are POSIX-only, so on Windows the installer is a no-op that still
+ * resolves the `extern` symbol referenced from `interp.rs`.
+ * -------------------------------------------------------------- */
+
+#if !defined(_WIN32)
+
+#include <execinfo.h>
+#include <unistd.h>
+
+static void weavepy_crash_handler(int sig) {
+    void *frames[256];
+    int n = backtrace(frames, 256);
+    const char *msg = "\n[weavepy] caught fatal signal; native backtrace:\n";
+    write(2, msg, strlen(msg));
+    backtrace_symbols_fd(frames, n, 2);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void weavepy_install_crash_handler(void) {
+    signal(SIGSEGV, weavepy_crash_handler);
+    signal(SIGBUS, weavepy_crash_handler);
+    signal(SIGABRT, weavepy_crash_handler);
+    signal(SIGILL, weavepy_crash_handler);
+}
+
+#else /* _WIN32 */
+
+void weavepy_install_crash_handler(void) {}
+
+#endif /* _WIN32 */
 
 /* --------------------------------------------------------------
  * Forward declarations of Rust helpers (matching argparse.rs).
@@ -757,24 +802,267 @@ PyObject *PyTuple_Pack(Py_ssize_t n, ...) {
  * String / error formatters.
  * -------------------------------------------------------------- */
 
-static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_list ap) {
-    /* Translate CPython %-specs that don't appear in C's printf
-     * (`%S`, `%R`, `%U`, `%V`, `%T`, `%A`) into placeholders.
-     * Everything else is forwarded to vsnprintf. */
-    char tmp[8192];
-    int written = 0;
-    char *out = bufsize > sizeof(tmp) ? buf : tmp;
-    size_t outsize = bufsize > sizeof(tmp) ? bufsize : sizeof(tmp);
-    int n = vsnprintf(out, outsize, fmt, ap);
-    if (n < 0) return -1;
-    if (out != buf) {
-        size_t copy = (size_t)n < bufsize ? (size_t)n : bufsize - 1;
-        memcpy(buf, out, copy);
-        buf[copy] = '\0';
-        n = (int)copy;
+static void wpy_append(char *buf, size_t bufsize, size_t *pos, const char *s, size_t len) {
+    if (*pos + 1 >= bufsize || s == NULL) {
+        return;
     }
-    written = n;
-    return written;
+    size_t room = bufsize - 1 - *pos;
+    size_t copy = len < room ? len : room;
+    memcpy(buf + *pos, s, copy);
+    *pos += copy;
+    buf[*pos] = '\0';
+}
+
+/* CPython's `PyUnicode_FromFormat` / `PyErr_Format` accept a printf-like
+ * grammar that is *not* C's printf: it adds object conversions (`%S` str,
+ * `%R` repr, `%A` ascii, `%U` unicode, `%V` unicode-or-fallback, `%T`
+ * fully-qualified type name) and only a documented subset of the integer
+ * family. C's `vsnprintf` mangles `%R` (prints a literal `R` and consumes
+ * no argument), so we must walk the format ourselves: object specs are
+ * rendered by calling the object protocol and the result is spliced in
+ * (honouring width/precision); standard specs are reconstructed verbatim
+ * and handed to `snprintf` one directive at a time with the correctly
+ * typed argument peeled off the `va_list`. */
+static int weavepy_format_into(char *buf, size_t bufsize, const char *fmt, va_list ap) {
+    if (bufsize == 0) {
+        return 0;
+    }
+    size_t pos = 0;
+    buf[0] = '\0';
+    const char *p = fmt;
+    char tmp[8192];
+    while (*p) {
+        if (*p != '%') {
+            wpy_append(buf, bufsize, &pos, p, 1);
+            p++;
+            continue;
+        }
+        const char *start = p;
+        p++; /* skip '%' */
+        if (*p == '%') {
+            wpy_append(buf, bufsize, &pos, "%", 1);
+            p++;
+            continue;
+        }
+        /* flags */
+        char flags[8];
+        int nf = 0;
+        while (*p && strchr("-+ 0#", *p)) {
+            if (nf < 7) flags[nf++] = *p;
+            p++;
+        }
+        flags[nf] = '\0';
+        /* width */
+        char width[16];
+        int nw = 0;
+        int width_star = 0;
+        if (*p == '*') {
+            width_star = 1;
+            p++;
+        } else {
+            while (isdigit((unsigned char)*p)) {
+                if (nw < 15) width[nw++] = *p;
+                p++;
+            }
+        }
+        width[nw] = '\0';
+        /* precision */
+        char prec[16];
+        int npr = 0;
+        int prec_star = 0;
+        int has_prec = 0;
+        if (*p == '.') {
+            has_prec = 1;
+            p++;
+            if (*p == '*') {
+                prec_star = 1;
+                p++;
+            } else {
+                while (isdigit((unsigned char)*p)) {
+                    if (npr < 15) prec[npr++] = *p;
+                    p++;
+                }
+            }
+        }
+        prec[npr] = '\0';
+        /* length modifiers */
+        char length[4];
+        int nl = 0;
+        while (*p && strchr("hljztL", *p)) {
+            if (nl < 3) length[nl++] = *p;
+            p++;
+        }
+        length[nl] = '\0';
+        char conv = *p;
+        if (conv == '\0') {
+            /* dangling '%': emit verbatim. */
+            wpy_append(buf, bufsize, &pos, start, (size_t)(p - start));
+            break;
+        }
+        p++;
+
+        /* Object conversions: render via the object protocol, then apply
+         * width/precision by reformatting the resulting C string with a
+         * synthesised `%[flags][width][.prec]s` directive. */
+        if (conv == 'S' || conv == 'R' || conv == 'A' || conv == 'U' ||
+            conv == 'V' || conv == 'T') {
+            int wv = 0, pv = 0;
+            if (width_star) wv = va_arg(ap, int);
+            if (prec_star) pv = va_arg(ap, int);
+            PyObject *owned = NULL;
+            const char *cs = NULL;
+            if (conv == 'V') {
+                PyObject *o = va_arg(ap, PyObject *);
+                const char *fb = va_arg(ap, const char *);
+                if (o) {
+                    owned = PyObject_Str(o);
+                    cs = owned ? PyUnicode_AsUTF8(owned) : fb;
+                } else {
+                    cs = fb;
+                }
+            } else if (conv == 'T') {
+                PyObject *o = va_arg(ap, PyObject *);
+                cs = o ? PyType_GetName(Py_TYPE(o)) : "NULL";
+            } else {
+                PyObject *o = va_arg(ap, PyObject *);
+                if (o == NULL) {
+                    cs = "NULL";
+                } else if (conv == 'S') {
+                    owned = PyObject_Str(o);
+                    cs = owned ? PyUnicode_AsUTF8(owned) : NULL;
+                } else if (conv == 'R') {
+                    owned = PyObject_Repr(o);
+                    cs = owned ? PyUnicode_AsUTF8(owned) : NULL;
+                } else if (conv == 'A') {
+                    owned = PyObject_ASCII(o);
+                    cs = owned ? PyUnicode_AsUTF8(owned) : NULL;
+                } else { /* 'U' */
+                    cs = PyUnicode_AsUTF8(o);
+                }
+            }
+            if (cs == NULL) cs = "<error>";
+            /* Reformat with width/precision if either was requested. */
+            if (nf || nw || width_star || has_prec) {
+                char sspec[48];
+                if (width_star && prec_star) {
+                    snprintf(sspec, sizeof(sspec), "%%%s%d.%ds", flags, wv, pv);
+                } else if (width_star) {
+                    snprintf(sspec, sizeof(sspec), "%%%s%d%s%ss", flags, wv,
+                             has_prec ? "." : "", has_prec ? prec : "");
+                } else if (prec_star) {
+                    snprintf(sspec, sizeof(sspec), "%%%s%s.%ds", flags, width, pv);
+                } else {
+                    snprintf(sspec, sizeof(sspec), "%%%s%s%s%ss", flags, width,
+                             has_prec ? "." : "", has_prec ? prec : "");
+                }
+                int n = snprintf(tmp, sizeof(tmp), sspec, cs);
+                if (n > 0) wpy_append(buf, bufsize, &pos, tmp, (size_t)n);
+            } else {
+                wpy_append(buf, bufsize, &pos, cs, strlen(cs));
+            }
+            Py_XDECREF(owned);
+            continue;
+        }
+
+        /* Standard C conversions: rebuild the directive verbatim and hand
+         * it to snprintf with a correctly typed argument. */
+        char dir[48];
+        {
+            size_t dl = (size_t)(p - start);
+            if (dl >= sizeof(dir)) dl = sizeof(dir) - 1;
+            memcpy(dir, start, dl);
+            dir[dl] = '\0';
+        }
+        int wv = 0, pv = 0;
+        if (width_star) wv = va_arg(ap, int);
+        if (prec_star) pv = va_arg(ap, int);
+        int n = 0;
+        int is_ll = (nl >= 2 && length[0] == 'l' && length[1] == 'l');
+        int is_l = (nl == 1 && length[0] == 'l');
+        int is_z = (nl >= 1 && length[0] == 'z');
+        int is_j = (nl >= 1 && length[0] == 'j');
+        int is_t = (nl >= 1 && length[0] == 't');
+#define WPY_SNPRINTF(argexpr)                                                  \
+    do {                                                                       \
+        if (width_star && prec_star)                                           \
+            n = snprintf(tmp, sizeof(tmp), dir, wv, pv, argexpr);              \
+        else if (width_star || prec_star)                                      \
+            n = snprintf(tmp, sizeof(tmp), dir, (width_star ? wv : pv),        \
+                         argexpr);                                             \
+        else                                                                   \
+            n = snprintf(tmp, sizeof(tmp), dir, argexpr);                      \
+    } while (0)
+        switch (conv) {
+            case 'd':
+            case 'i': {
+                if (is_ll) {
+                    WPY_SNPRINTF(va_arg(ap, long long));
+                } else if (is_l) {
+                    WPY_SNPRINTF(va_arg(ap, long));
+                } else if (is_z) {
+                    WPY_SNPRINTF(va_arg(ap, Py_ssize_t));
+                } else if (is_j) {
+                    WPY_SNPRINTF(va_arg(ap, intmax_t));
+                } else if (is_t) {
+                    WPY_SNPRINTF(va_arg(ap, ptrdiff_t));
+                } else {
+                    WPY_SNPRINTF(va_arg(ap, int));
+                }
+                break;
+            }
+            case 'u':
+            case 'o':
+            case 'x':
+            case 'X': {
+                if (is_ll) {
+                    WPY_SNPRINTF(va_arg(ap, unsigned long long));
+                } else if (is_l) {
+                    WPY_SNPRINTF(va_arg(ap, unsigned long));
+                } else if (is_z) {
+                    WPY_SNPRINTF(va_arg(ap, size_t));
+                } else if (is_j) {
+                    WPY_SNPRINTF(va_arg(ap, uintmax_t));
+                } else if (is_t) {
+                    WPY_SNPRINTF(va_arg(ap, size_t));
+                } else {
+                    WPY_SNPRINTF(va_arg(ap, unsigned int));
+                }
+                break;
+            }
+            case 'c': {
+                WPY_SNPRINTF(va_arg(ap, int));
+                break;
+            }
+            case 'e':
+            case 'E':
+            case 'f':
+            case 'F':
+            case 'g':
+            case 'G': {
+                WPY_SNPRINTF(va_arg(ap, double));
+                break;
+            }
+            case 's': {
+                WPY_SNPRINTF(va_arg(ap, const char *));
+                break;
+            }
+            case 'p': {
+                WPY_SNPRINTF(va_arg(ap, void *));
+                break;
+            }
+            default: {
+                /* Unknown spec: emit verbatim, consume nothing. */
+                wpy_append(buf, bufsize, &pos, start, (size_t)(p - start));
+                n = -1;
+                break;
+            }
+        }
+#undef WPY_SNPRINTF
+        if (n > 0) {
+            wpy_append(buf, bufsize, &pos, tmp, (size_t)n);
+        }
+    }
+    return (int)pos;
 }
 
 PyObject *PyUnicode_FromFormatV(const char *fmt, va_list ap) {
@@ -915,4 +1203,35 @@ PyObject *PyObject_CallFunctionObjArgs(PyObject *callable, ...) {
     PyObject *result = PyObject_Call(callable, args, NULL);
     Py_DECREF(args);
     return result;
+}
+
+/* --------------------------------------------------------------
+ * RFC 0046 (wave 4): variadic tail numpy links.
+ * -------------------------------------------------------------- */
+
+/* PyOS_snprintf — a thin, locale-independent vsnprintf wrapper, matching
+ * CPython's behaviour of always NUL-terminating the buffer. */
+int PyOS_snprintf(char *str, size_t size, const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    int n = vsnprintf(str, size, format, ap);
+    va_end(ap);
+    if (size > 0) {
+        str[size - 1] = '\0';
+    }
+    return n;
+}
+
+/* PyErr_WarnFormat — format the message and route it through the
+ * non-variadic PyErr_WarnEx. Warnings are advisory; a failure to render
+ * the warning never aborts the caller. */
+int PyErr_WarnFormat(PyObject *category, Py_ssize_t stack_level,
+                     const char *format, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(buf, sizeof(buf), format, ap);
+    va_end(ap);
+    buf[sizeof(buf) - 1] = '\0';
+    return PyErr_WarnEx(category, buf, stack_level);
 }
