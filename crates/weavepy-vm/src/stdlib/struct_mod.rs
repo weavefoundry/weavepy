@@ -323,7 +323,15 @@ fn element_size(code: char, endian: Endian) -> Result<usize, RuntimeError> {
     Ok(match code {
         'x' | 'b' | 'B' | 'c' | 's' | 'p' | '?' => 1,
         'h' | 'H' | 'e' => 2,
-        'i' | 'I' | 'l' | 'L' | 'f' => 4,
+        'i' | 'I' | 'f' => 4,
+        // C `long` is the one code whose native size differs from its
+        // standard size: 8 bytes on an LP64 target (native/`@` mode), 4
+        // bytes in the standard/explicit-endian modes. This must match
+        // `sizeof(c_long)` so `ctypes._check_size(c_long)` agrees.
+        'l' | 'L' => match endian {
+            Endian::Native => std::mem::size_of::<libc::c_long>(),
+            _ => 4,
+        },
         'q' | 'Q' | 'd' => 8,
         'n' | 'N' => match endian {
             Endian::Native => std::mem::size_of::<isize>(),
@@ -344,7 +352,8 @@ fn native_align(code: char) -> usize {
     match code {
         'x' | 'b' | 'B' | 'c' | 's' | 'p' | '?' => 1,
         'h' | 'H' | 'e' => 2,
-        'i' | 'I' | 'l' | 'L' | 'f' => 4,
+        'i' | 'I' | 'f' => 4,
+        'l' | 'L' => std::mem::align_of::<libc::c_long>(),
         'q' | 'Q' | 'd' => 8,
         'n' | 'N' => std::mem::size_of::<isize>(),
         'P' => std::mem::size_of::<usize>(),
@@ -425,8 +434,24 @@ fn encode_one(
         }
         'h' => write_int!(i16, write_i16, true),
         'H' => write_int!(u16, write_u16, false),
-        'i' | 'l' => write_int!(i32, write_i32, true),
-        'I' | 'L' => write_int!(u32, write_u32, false),
+        'i' => write_int!(i32, write_i32, true),
+        'I' => write_int!(u32, write_u32, false),
+        // Native `long`/`unsigned long` are 8-byte on LP64; standard modes
+        // keep them 4-byte (see `element_size`).
+        'l' => {
+            if matches!(endian, Endian::Native) {
+                write_int!(i64, write_i64, true)
+            } else {
+                write_int!(i32, write_i32, true)
+            }
+        }
+        'L' => {
+            if matches!(endian, Endian::Native) {
+                write_int!(u64, write_u64, false)
+            } else {
+                write_int!(u32, write_u32, false)
+            }
+        }
         'q' => write_int!(i64, write_i64, true),
         'Q' => write_int!(u64, write_u64, false),
         'f' => {
@@ -513,8 +538,28 @@ fn decode_one(code: char, endian: Endian, buf: &[u8]) -> Result<(Object, usize),
         '?' => Object::Bool(buf[0] != 0),
         'h' => Object::Int(i64::from(read_i16(endian, &buf[..2]))),
         'H' => Object::Int(i64::from(read_u16(endian, &buf[..2]))),
-        'i' | 'l' => Object::Int(i64::from(read_i32(endian, &buf[..4]))),
-        'I' | 'L' => Object::Int(i64::from(read_u32(endian, &buf[..4]))),
+        'i' => Object::Int(i64::from(read_i32(endian, &buf[..4]))),
+        'I' => Object::Int(i64::from(read_u32(endian, &buf[..4]))),
+        // Native `long` is 8-byte on LP64; standard modes keep it 4-byte.
+        'l' => {
+            if matches!(endian, Endian::Native) {
+                Object::Int(read_i64(endian, &buf[..8]))
+            } else {
+                Object::Int(i64::from(read_i32(endian, &buf[..4])))
+            }
+        }
+        'L' => {
+            if matches!(endian, Endian::Native) {
+                let v = read_u64(endian, &buf[..8]);
+                if i64::try_from(v).is_ok() {
+                    Object::Int(v as i64)
+                } else {
+                    Object::int_from_bigint(num_bigint::BigInt::from(v))
+                }
+            } else {
+                Object::Int(i64::from(read_u32(endian, &buf[..4])))
+            }
+        }
         'q' => Object::Int(read_i64(endian, &buf[..8])),
         'Q' => {
             let v = read_u64(endian, &buf[..8]);

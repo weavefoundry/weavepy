@@ -459,13 +459,18 @@ fn try_install_well_known_capsule(
     parent_module: *mut PyObject,
 ) -> Option<*mut PyObject> {
     if dotted == "datetime.datetime_CAPI" {
-        // Build the capsule from the static API table.
+        // RFC 0029 (wave 5): mint the faithful datetime types + dynamic
+        // capsule table (size-correct type slots) before publishing, and
+        // best-effort fill the `TimeZone_UTC` singleton. Falls back to
+        // the static table (NULL type slots) if `datetime` can't be
+        // located, which keeps the function-pointer constructors usable.
+        crate::datetime_api::ensure_datetime_bridge();
+        crate::datetime_api::fill_utc_singleton();
         let name = match CString::new("datetime.datetime_CAPI") {
             Ok(s) => s,
             Err(_) => return None,
         };
-        let payload =
-            &crate::datetime_api::PyDateTimeAPI_Instance as *const _ as *mut std::ffi::c_void;
+        let payload = crate::datetime_api::capi_table_void_ptr();
         let capsule = unsafe { PyCapsule_New(payload, name.as_ptr(), None) };
         if capsule.is_null() {
             return None;
@@ -480,11 +485,10 @@ fn try_install_well_known_capsule(
             crate::abstract_::PyObject_SetAttrString(parent_module, attr.as_ptr(), capsule)
         };
         // Also publish the global pointer for the `PyDateTimeAPI`
-        // macro in `Python.h`.
+        // macro in `Python.h` (the dynamic table when ready, else static).
         unsafe {
-            crate::datetime_api::PyDateTimeAPI = &crate::datetime_api::PyDateTimeAPI_Instance
-                as *const _
-                as *mut crate::datetime_api::PyDateTimeCAPI;
+            crate::datetime_api::PyDateTimeAPI =
+                payload as *mut crate::datetime_api::PyDateTimeCAPI;
         }
         return Some(capsule);
     }

@@ -13,6 +13,7 @@
 
 import sys
 import _sre
+from types import GenericAlias as _GenericAlias
 from . import _parser
 from ._constants import error as PatternError
 
@@ -84,6 +85,10 @@ def _clamp_span(string, pos, endpos):
 
 class Pattern:
     __module__ = 're'
+
+    # PEP 585: `re.Pattern[str]` / `re.Pattern[bytes]` yield a
+    # `types.GenericAlias` (CPython exposes this on the C `Pattern` type).
+    __class_getitem__ = classmethod(_GenericAlias)
 
     def __init__(self, handle, pattern, flags, groups, groupindex, indexgroup):
         self._handle = handle
@@ -293,6 +298,9 @@ def _flags_repr(flags):
 
 class Match:
     __module__ = 're'
+
+    # PEP 585: `re.Match[str]` / `re.Match[bytes]` yield a `types.GenericAlias`.
+    __class_getitem__ = classmethod(_GenericAlias)
 
     def __init__(self, pattern, string, pos, endpos, r):
         self.re = pattern

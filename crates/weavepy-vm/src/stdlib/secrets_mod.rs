@@ -168,22 +168,42 @@ fn randbelow(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int((raw % n as u64) as i64))
 }
 
+/// `secrets.randbits(k)` — a non-negative int with `k` cryptographically
+/// secure random bits (CPython's `SystemRandom.getrandbits`). Faithful at
+/// any width: numpy's `SeedSequence` default-seeds with `randbits(128)`,
+/// so we read `ceil(k/8)` OS-entropy bytes, trim the top byte to the exact
+/// bit count, and normalise to a machine `Int` or a big `Long`.
 fn randbits(args: &[Object]) -> Result<Object, RuntimeError> {
     let k = match args.first() {
-        Some(Object::Int(n)) => *n as u32,
+        Some(Object::Int(n)) => *n,
+        Some(Object::Bool(b)) => i64::from(*b),
+        Some(Object::Long(b)) => {
+            use num_traits::ToPrimitive;
+            b.to_i64()
+                .ok_or_else(|| value_error("number of bits is too large"))?
+        }
         _ => return Err(type_error("randbits: arg must be int")),
     };
+    if k < 0 {
+        return Err(value_error("number of bits must be non-negative"));
+    }
     if k == 0 {
         return Ok(Object::Int(0));
     }
-    if k > 63 {
-        return Err(value_error("randbits: max 63 in WeavePy"));
-    }
-    let mut bytes = [0u8; 8];
+    let k = k as usize;
+    let nbytes = k.div_ceil(8);
+    let mut bytes = vec![0u8; nbytes];
     os_random(&mut bytes)?;
-    let raw = u64::from_le_bytes(bytes);
-    let mask = if k == 64 { u64::MAX } else { (1u64 << k) - 1 };
-    Ok(Object::Int((raw & mask) as i64))
+    let rem = k % 8;
+    if rem != 0 {
+        let last = nbytes - 1;
+        bytes[last] &= (1u8 << rem) - 1;
+    }
+    let big = num_bigint::BigUint::from_bytes_le(&bytes);
+    Ok(Object::int_from_bigint(num_bigint::BigInt::from_biguint(
+        num_bigint::Sign::Plus,
+        big,
+    )))
 }
 
 fn compare_digest(args: &[Object]) -> Result<Object, RuntimeError> {

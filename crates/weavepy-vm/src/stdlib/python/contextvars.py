@@ -13,6 +13,10 @@ and reentry-safe for the async / single-thread cooperative case.
 
 __all__ = ["ContextVar", "Context", "Token", "copy_context"]
 
+# `ContextVar[int]` yields a `types.GenericAlias` (CPython exposes this on
+# the C `ContextVar`). `types` only imports `sys`, so this is safe here.
+from types import GenericAlias as _GenericAlias
+
 
 _MISSING = object()
 
@@ -45,6 +49,8 @@ class ContextVar:
     """A variable whose value depends on the active `Context`."""
 
     __slots__ = ("_name", "_default", "_id")
+
+    __class_getitem__ = classmethod(_GenericAlias)
 
     _counter = 0
 

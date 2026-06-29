@@ -15,7 +15,7 @@ use weavepy_vm::sync::RefCell;
 
 use weavepy_vm::object::{DictData, DictKey, Object, SetData};
 
-use crate::object::{PyObject, PySsizeT};
+use crate::object::{PyHashT, PyObject, PySsizeT};
 
 thread_local! {
     /// Interned `*mut PyObject` cache for `PyTuple_GetItem` /
@@ -75,6 +75,35 @@ fn dict_retain_value(dict: *mut PyObject, key: String, value: *mut PyObject) {
 /// C setter and is still live. A *borrowed* reference (not incref'd).
 fn dict_cached_value(dict: *mut PyObject, key: &str) -> Option<*mut PyObject> {
     DICT_BOX_CACHE.with(|cell| cell.borrow().get(&(dict as usize, key.to_owned())).copied())
+}
+
+/// Diagnostic: log `_engine`/`_cache` dict operations (RFC 0045 body-reuse
+/// debugging). Gated on `WEAVEPY_BODY_TRACE`.
+fn engine_dict_trace(tag: &str, dict: *mut PyObject, key_id: &str, found: bool, boxp: *mut PyObject) {
+    if !crate::mirror::body_trace_enabled() {
+        return;
+    }
+    if !key_id.contains("_engine") {
+        return;
+    }
+    let ty = if boxp.is_null() {
+        "<null>".to_string()
+    } else {
+        unsafe { crate::object::debug_type_name(boxp) }
+    };
+    let cached = dict_cached_value(dict, key_id)
+        .map(|p| p as usize)
+        .unwrap_or(0);
+    eprintln!(
+        "[EDICT] {} dict=0x{:x} key={} found={} box=0x{:x} boxtype={} cached=0x{:x}",
+        tag,
+        dict as usize,
+        key_id,
+        found,
+        boxp as usize,
+        ty,
+        cached,
+    );
 }
 
 /// Drop every cached dict value box pinned to `container`.
@@ -600,7 +629,9 @@ pub unsafe extern "C" fn PyDict_SetItem(
             let val = unsafe { crate::object::clone_object(v) };
             let key_id = dict_key_id(&key);
             rc.borrow_mut().insert(DictKey(key), val);
-            dict_retain_value(d, key_id, v);
+            dict_retain_value(d, key_id.clone(), v);
+            engine_dict_trace("SET", d, &key_id, true, v);
+            unsafe { crate::mirror::sync_dict_ma_used(d) };
             0
         }
         _ => {
@@ -626,6 +657,7 @@ pub unsafe extern "C" fn PyDict_SetItemString(
             let key_id = dict_key_id(&Object::from_str(key.clone()));
             rc.borrow_mut().insert(DictKey(Object::from_str(key)), val);
             dict_retain_value(d, key_id, v);
+            unsafe { crate::mirror::sync_dict_ma_used(d) };
             0
         }
         Object::Module(m) => {
@@ -654,8 +686,15 @@ pub unsafe extern "C" fn PyDict_GetItem(d: *mut PyObject, k: *mut PyObject) -> *
             let key_id = dict_key_id(&key);
             let result = rc.borrow().get(&DictKey(key)).cloned();
             match result {
-                Some(v) => dict_borrowed_box(d, key_id, v),
-                None => ptr::null_mut(),
+                Some(v) => {
+                    let bx = dict_borrowed_box(d, key_id.clone(), v);
+                    engine_dict_trace("GET", d, &key_id, true, bx);
+                    bx
+                }
+                None => {
+                    engine_dict_trace("GET", d, &key_id, false, ptr::null_mut());
+                    ptr::null_mut()
+                }
             }
         }
         _ => ptr::null_mut(),
@@ -676,6 +715,29 @@ fn dict_borrowed_box(dict: *mut PyObject, key_id: String, value: Object) -> *mut
     dict_retain_value(dict, key_id, p);
     unsafe { crate::object::Py_DecRef(p) };
     p
+}
+
+/// A *borrowed* box for a dict *key*, pinned for the dict's lifetime like
+/// [`dict_borrowed_box`] but under a private namespace so a key box never
+/// collides with the value box stored under the same `key_id`. Used by
+/// [`PyDict_Next`], whose key reference is borrowed and which Cython's
+/// vectorcall kwargs path immediately increfs.
+fn dict_borrowed_key_box(dict: *mut PyObject, key_id: String, key: Object) -> *mut PyObject {
+    dict_borrowed_box(dict, format!("\u{0}__key__\u{0}{key_id}"), key)
+}
+
+/// `_PyDict_GetItem_KnownHash(dict, key, hash)` — a private dict lookup
+/// that accepts a precomputed `key` hash to skip rehashing. WeavePy's dict
+/// hashes the key internally, so the supplied hash is advisory; we delegate
+/// to [`PyDict_GetItem`] (same borrowed-reference, error-suppressing
+/// contract). Cython's `__Pyx_PyDict_GetItem` fast path links this.
+#[no_mangle]
+pub unsafe extern "C" fn _PyDict_GetItem_KnownHash(
+    d: *mut PyObject,
+    k: *mut PyObject,
+    _hash: PyHashT,
+) -> *mut PyObject {
+    unsafe { PyDict_GetItem(d, k) }
 }
 
 #[no_mangle]
@@ -706,6 +768,7 @@ pub unsafe extern "C" fn PyDict_DelItem(d: *mut PyObject, k: *mut PyObject) -> c
         Object::Dict(rc) => {
             let key = unsafe { crate::object::clone_object(k) };
             if rc.borrow_mut().shift_remove(&DictKey(key)).is_some() {
+                unsafe { crate::mirror::sync_dict_ma_used(d) };
                 0
             } else {
                 crate::errors::set_value_error("KeyError");
@@ -729,6 +792,7 @@ pub unsafe extern "C" fn PyDict_DelItemString(d: *mut PyObject, k: *const c_char
                 .shift_remove(&DictKey(Object::from_str(key)))
                 .is_some()
             {
+                unsafe { crate::mirror::sync_dict_ma_used(d) };
                 0
             } else {
                 -1
@@ -746,9 +810,20 @@ pub unsafe extern "C" fn PyDict_Contains(d: *mut PyObject, k: *mut PyObject) -> 
     match unsafe { crate::object::clone_object(d) } {
         Object::Dict(rc) => {
             let key = unsafe { crate::object::clone_object(k) };
-            i32::from(rc.borrow().contains_key(&DictKey(key)))
+            let key_id = dict_key_id(&key);
+            let has = rc.borrow().contains_key(&DictKey(key));
+            engine_dict_trace("CONTAINS", d, &key_id, has, ptr::null_mut());
+            i32::from(has)
         }
-        _ => -1,
+        other => {
+            if std::env::var_os("WEAVEPY_TRACE_NULL").is_some() {
+                eprintln!(
+                    "[WEAVEPY_TRACE_NULL] PyDict_Contains: d is not a dict, got {}",
+                    other.type_name()
+                );
+            }
+            -1
+        }
     }
 }
 
@@ -778,24 +853,35 @@ pub unsafe extern "C" fn PyDict_Next(
         _ => return 0,
     };
     let pos = unsafe { *ppos };
-    let dict_borrow = dict.borrow();
-    if pos < 0 || pos >= dict_borrow.len() as PySsizeT {
-        return 0;
-    }
-    let entry = dict_borrow.get_index(pos as usize);
+    // Clone the entry out and *drop the dict borrow* before minting any
+    // boxes: `dict_borrowed_box` can re-enter (into_owned / cache ops),
+    // and we must not hold the RefCell borrow across that.
+    let entry = {
+        let dict_borrow = dict.borrow();
+        if pos < 0 || pos >= dict_borrow.len() as PySsizeT {
+            return 0;
+        }
+        dict_borrow
+            .get_index(pos as usize)
+            .map(|(k, v)| (k.0.clone(), v.clone()))
+    };
     match entry {
-        Some((k, v)) => {
+        Some((key_obj, val_obj)) => {
+            // CPython's `PyDict_Next` hands back *borrowed* references the
+            // dict keeps alive — the caller may then `Py_INCREF` them (as
+            // Cython's `__Pyx_PyVectorcall_FastCallDict_kw` does for the
+            // `size=` kwarg). Mint each box once and pin it in the dict's
+            // borrowed-box cache for the dict's lifetime; never hand back a
+            // box we immediately free (that was a use-after-free that
+            // crashed `Generator.integers`).
+            let key_id = dict_key_id(&key_obj);
             unsafe {
                 *ppos = pos + 1;
                 if !pkey.is_null() {
-                    let p = crate::object::into_owned(k.0.clone());
-                    crate::object::Py_DecRef(p);
-                    *pkey = p;
+                    *pkey = dict_borrowed_key_box(d, key_id.clone(), key_obj);
                 }
                 if !pvalue.is_null() {
-                    let p = crate::object::into_owned(v.clone());
-                    crate::object::Py_DecRef(p);
-                    *pvalue = p;
+                    *pvalue = dict_borrowed_box(d, key_id, val_obj);
                 }
             }
             1
@@ -948,12 +1034,15 @@ pub unsafe extern "C" fn PyDict_Merge(
         _ => return -1,
     };
     let src_snapshot = src_dict.borrow().clone();
-    let mut dst_borrow = dst.borrow_mut();
-    for (k, v) in src_snapshot {
-        if override_ != 0 || !dst_borrow.contains_key(&k) {
-            dst_borrow.insert(k, v);
+    {
+        let mut dst_borrow = dst.borrow_mut();
+        for (k, v) in src_snapshot {
+            if override_ != 0 || !dst_borrow.contains_key(&k) {
+                dst_borrow.insert(k, v);
+            }
         }
     }
+    unsafe { crate::mirror::sync_dict_ma_used(a) };
     0
 }
 
@@ -965,6 +1054,7 @@ pub unsafe extern "C" fn PyDict_Clear(d: *mut PyObject) -> c_int {
     match unsafe { crate::object::clone_object(d) } {
         Object::Dict(rc) => {
             rc.borrow_mut().clear();
+            unsafe { crate::mirror::sync_dict_ma_used(d) };
             0
         }
         _ => -1,
@@ -1015,7 +1105,35 @@ fn seed_set(data: &mut SetData, iterable: *mut PyObject) {
                 data.insert(DictKey(item.clone()));
             }
         }
-        _ => {}
+        // Any other iterable — a `dict` (its *keys*), `set`/`frozenset`, `str`,
+        // `range`, a generator, or a foreign extension iterable — is drained
+        // through the iteration protocol, exactly as CPython's
+        // `set_update_internal` does for the non-list/tuple case. The prior
+        // `_ => {}` silently produced an *empty* set, so a Cython `set(x)`
+        // (which Cython compiles to `PySet_New(x)`) over anything but a
+        // list/tuple came back empty — e.g. pandas' `Timedelta(days=1)` kwarg
+        // validation does `set(kwargs)` over a dict.
+        other => {
+            if std::env::var_os("WEAVEPY_TRACE_SETSEED").is_some() {
+                eprintln!(
+                    "[WEAVEPY_TRACE_SETSEED] seed_set general-iter over {}",
+                    other.type_name()
+                );
+            }
+            let it = unsafe { crate::abstract_::PyObject_GetIter(iterable) };
+            if it.is_null() {
+                return;
+            }
+            loop {
+                let item = unsafe { crate::abstract_::PyIter_Next(it) };
+                if item.is_null() {
+                    break;
+                }
+                data.insert(DictKey(unsafe { crate::object::clone_object(item) }));
+                unsafe { crate::object::Py_DecRef(item) };
+            }
+            unsafe { crate::object::Py_DecRef(it) };
+        }
     }
 }
 
@@ -1028,6 +1146,7 @@ pub unsafe extern "C" fn PySet_Add(s: *mut PyObject, item: *mut PyObject) -> c_i
         Object::Set(rc) => {
             rc.borrow_mut()
                 .insert(DictKey(unsafe { crate::object::clone_object(item) }));
+            unsafe { crate::mirror::sync_set_used(s) };
             0
         }
         _ => -1,
@@ -1060,6 +1179,7 @@ pub unsafe extern "C" fn PySet_Discard(s: *mut PyObject, item: *mut PyObject) ->
         Object::Set(rc) => {
             rc.borrow_mut()
                 .shift_remove(&DictKey(unsafe { crate::object::clone_object(item) }));
+            unsafe { crate::mirror::sync_set_used(s) };
             0
         }
         _ => -1,
@@ -1180,6 +1300,7 @@ pub unsafe extern "C" fn PyDict_SetDefault(
                 };
                 map.insert(key, default_o.clone());
                 drop(map);
+                unsafe { crate::mirror::sync_dict_ma_used(d) };
                 crate::object::into_owned(default_o)
             }
         }
@@ -1201,7 +1322,10 @@ pub unsafe extern "C" fn PyDict_Pop(
             let key = DictKey(unsafe { crate::object::clone_object(k) });
             let popped = rc.borrow_mut().shift_remove(&key);
             match popped {
-                Some(v) => crate::object::into_owned(v),
+                Some(v) => {
+                    unsafe { crate::mirror::sync_dict_ma_used(d) };
+                    crate::object::into_owned(v)
+                }
                 None => {
                     if default.is_null() {
                         crate::errors::set_pending(
@@ -1286,6 +1410,7 @@ pub unsafe extern "C" fn PySet_Pop(s: *mut PyObject) -> *mut PyObject {
                 Some(k) => {
                     set.shift_remove(&k);
                     drop(set);
+                    unsafe { crate::mirror::sync_set_used(s) };
                     crate::object::into_owned(k.0)
                 }
                 None => {
@@ -1309,6 +1434,7 @@ pub unsafe extern "C" fn PySet_Clear(s: *mut PyObject) -> c_int {
     match unsafe { crate::object::clone_object(s) } {
         Object::Set(rc) => {
             rc.borrow_mut().clear();
+            unsafe { crate::mirror::sync_set_used(s) };
             0
         }
         _ => -1,
@@ -1359,16 +1485,28 @@ pub unsafe extern "C" fn PySequence_Fast(o: *mut PyObject, msg: *const c_char) -
                     let items: Vec<Object> = rc.borrow().keys().map(|k| k.0.clone()).collect();
                     crate::object::into_owned(Object::new_list(items))
                 }
-                _ => {
-                    crate::errors::set_type_error(if msg.is_null() {
-                        "expected list, tuple, or iterable".to_owned()
-                    } else {
-                        unsafe { CStr::from_ptr(msg) }
-                            .to_string_lossy()
-                            .into_owned()
-                    });
-                    ptr::null_mut()
-                }
+                // Any other iterable (a `cdef class` instance, a foreign
+                // extension object with `__iter__`, a generator, …) is
+                // coerced through its iterator protocol, matching CPython's
+                // `PySequence_Fast` (which calls `PySequence_List` for the
+                // non-fast path). The previous hard error broke
+                // `PySequence_Fast(cdef_instance)`.
+                _ => match unsafe { crate::abstract_::collect_iterable(o) } {
+                    Some(items) => crate::object::into_owned(Object::new_list(items)),
+                    None => {
+                        if !msg.is_null() && crate::errors::pending().is_some() {
+                            // Replace the generic iterator TypeError with the
+                            // caller-supplied context message, as CPython does.
+                            crate::errors::clear_thread_local();
+                            crate::errors::set_type_error(
+                                unsafe { CStr::from_ptr(msg) }
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            );
+                        }
+                        ptr::null_mut()
+                    }
+                },
             }
         }
     }

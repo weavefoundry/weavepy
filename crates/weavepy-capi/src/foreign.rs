@@ -34,6 +34,18 @@ use crate::object::PyObject;
 /// valid C string (every real type sets it).
 pub unsafe fn wrap_foreign(p: *mut PyObject) -> Object {
     let type_name = unsafe { foreign_type_name(p) };
+    if crate::object::freebox_trace_enabled()
+        && (type_name.contains("Engine")
+            || type_name.contains("Index")
+            || type_name.contains("ndarray"))
+    {
+        eprintln!(
+            "[FOREIGN-WRAP] p=0x{:x} type={} refcnt={}",
+            p as usize,
+            type_name,
+            unsafe { (*p).ob_refcnt }
+        );
+    }
     Object::Foreign(foreign::wrap(p as usize, type_name))
 }
 
@@ -52,6 +64,21 @@ unsafe fn foreign_type_name(p: *mut PyObject) -> Rc<str> {
     // tail is what Python's `type(x).__name__` reports.
     let bare = s.rsplit('.').next().unwrap_or(&s);
     Rc::from(bare)
+}
+
+/// Run `body` (a call into compiled extension/Cython code) after
+/// re-publishing every seeded faithful list's `ob_item` from its prefix
+/// `Rc`. This is the VM→C boundary: a Python-side `list.__setitem__` on a
+/// C-resident `cdef public list` (pandas' `BlockManager.axes[0] = …`) only
+/// updated the prefix `Rc`, but the extension reads the list back through
+/// the inlined `PyList_GET_ITEM` macro, which consults the C `ob_item`
+/// buffer. Flushing here keeps the two coherent. Gated on an atomic, so a
+/// program that never crossed a list into C pays a single relaxed load.
+#[inline]
+fn c_call<R>(body: impl FnOnce() -> R) -> R {
+    // `ensure_active` performs the seeded-list flush at the outermost VM→C
+    // transition, so the foreign-hook path needs nothing extra here.
+    ensure_active(body)
 }
 
 // --- result/error marshalling (mirrors dunder_shim's private helpers) ---
@@ -82,35 +109,52 @@ fn to_string(raw: *mut PyObject) -> Result<String, RuntimeError> {
 // --- the hooks ---
 
 fn fwd_incref(p: usize) {
+    crate::object::soul_inc(p);
     unsafe { crate::object::Py_IncRef(p as *mut PyObject) };
 }
 
 fn fwd_decref(p: usize) {
+    // Drop the live-soul count *before* the decref: the last soul's own
+    // decref frees the box, and free_box must then see a zero count.
+    crate::object::soul_dec(p);
     unsafe { crate::object::Py_DecRef(p as *mut PyObject) };
 }
 
 fn fwd_repr(p: usize) -> Result<String, RuntimeError> {
-    let raw = ensure_active(|| unsafe { crate::abstract_::PyObject_Repr(p as *mut PyObject) });
+    let raw = c_call(|| unsafe { crate::abstract_::PyObject_Repr(p as *mut PyObject) });
     to_string(raw)
 }
 
 fn fwd_str(p: usize) -> Result<String, RuntimeError> {
-    let raw = ensure_active(|| unsafe { crate::abstract_::PyObject_Str(p as *mut PyObject) });
+    let raw = c_call(|| unsafe { crate::abstract_::PyObject_Str(p as *mut PyObject) });
     to_string(raw)
 }
 
 fn fwd_hash(p: usize) -> Result<i64, RuntimeError> {
-    let h = ensure_active(|| unsafe { crate::abstract_::PyObject_Hash(p as *mut PyObject) });
-    if h == -1 {
-        if let Some(pe) = crate::errors::take_pending() {
-            return Err(crate::errors::to_runtime_error(pe));
+    // Call the foreign type's own `tp_hash` slot, NOT `PyObject_Hash`: the
+    // latter routes back through the VM (`hash_public`), and the VM routes a
+    // foreign object right back here — an unbounded ping-pong that overflows
+    // the stack (`hash(np.int64(0))`). `hash_via_slot` consults only the C
+    // slot, so a numpy scalar hashes like the equal Python int.
+    let o = p as *mut PyObject;
+    match c_call(|| unsafe { crate::abstract_::hash_via_slot(o) }) {
+        Some(h) => {
+            if h == -1 {
+                if let Some(pe) = crate::errors::take_pending() {
+                    return Err(crate::errors::to_runtime_error(pe));
+                }
+            }
+            Ok(h as i64)
         }
+        // No `tp_hash` slot ⇒ an unhashable foreign type. Report failure so
+        // the VM falls back to an identity hash (its prior behavior) rather
+        // than mistaking a sentinel for a real hash value.
+        None => Err(runtime_error("unhashable foreign type")),
     }
-    Ok(h as i64)
 }
 
 fn fwd_is_true(p: usize) -> Result<bool, RuntimeError> {
-    let r = ensure_active(|| unsafe { crate::abstract_::PyObject_IsTrue(p as *mut PyObject) });
+    let r = c_call(|| unsafe { crate::abstract_::PyObject_IsTrue(p as *mut PyObject) });
     if r < 0 {
         return Err(pending_or_default());
     }
@@ -122,6 +166,14 @@ fn fwd_call(
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
+    if std::env::var_os("WEAVEPY_TRACE_CALL").is_some() {
+        let keys: Vec<&str> = kwargs.iter().map(|(k, _)| k.as_str()).collect();
+        eprintln!(
+            "[TRACE_FWDCALL] nargs={} kwargs={:?}",
+            args.len(),
+            keys
+        );
+    }
     let callable = p as *mut PyObject;
     let args_tuple = crate::object::into_owned(Object::new_tuple(args.to_vec()));
     let kw = if kwargs.is_empty() {
@@ -137,7 +189,7 @@ fn fwd_call(
         crate::object::into_owned(Object::Dict(Rc::new(weavepy_vm::sync::RefCell::new(d))))
     };
     let raw =
-        ensure_active(|| unsafe { crate::abstract_::PyObject_Call(callable, args_tuple, kw) });
+        c_call(|| unsafe { crate::abstract_::PyObject_Call(callable, args_tuple, kw) });
     unsafe {
         crate::object::Py_DecRef(args_tuple);
         if !kw.is_null() {
@@ -148,9 +200,17 @@ fn fwd_call(
 }
 
 fn fwd_getattr(p: usize, name: &str) -> Result<Object, RuntimeError> {
+    if crate::object::freebox_trace_enabled() && (name == "is_unique" || name == "unique") {
+        let tyname = unsafe { crate::object::debug_type_name(p as *mut PyObject) };
+        let rc = unsafe { (*(p as *mut PyObject)).ob_refcnt };
+        eprintln!(
+            "[GETATTR] name={} p=0x{:x} type={} refcnt={}",
+            name, p, tyname, rc
+        );
+    }
     let cname = std::ffi::CString::new(name)
         .map_err(|_| runtime_error("attribute name contains a NUL byte"))?;
-    let raw = ensure_active(|| unsafe {
+    let raw = c_call(|| unsafe {
         crate::abstract_::PyObject_GetAttrString(p as *mut PyObject, cname.as_ptr())
     });
     unwrap(raw)
@@ -163,7 +223,7 @@ fn fwd_setattr(p: usize, name: &str, value: Option<&Object>) -> Result<(), Runti
         Some(v) => crate::object::into_owned(v.clone()),
         None => std::ptr::null_mut(),
     };
-    let rc = ensure_active(|| unsafe {
+    let rc = c_call(|| unsafe {
         crate::abstract_::PyObject_SetAttrString(p as *mut PyObject, cname.as_ptr(), val)
     });
     if !val.is_null() {
@@ -178,7 +238,7 @@ fn fwd_setattr(p: usize, name: &str, value: Option<&Object>) -> Result<(), Runti
 fn fwd_getitem(p: usize, key: &Object) -> Result<Object, RuntimeError> {
     let kp = crate::object::into_owned(key.clone());
     let raw =
-        ensure_active(|| unsafe { crate::abstract_::PyObject_GetItem(p as *mut PyObject, kp) });
+        c_call(|| unsafe { crate::abstract_::PyObject_GetItem(p as *mut PyObject, kp) });
     unsafe { crate::object::Py_DecRef(kp) };
     unwrap(raw)
 }
@@ -188,14 +248,14 @@ fn fwd_setitem(p: usize, key: &Object, value: Option<&Object>) -> Result<(), Run
     let rc = match value {
         Some(v) => {
             let vp = crate::object::into_owned(v.clone());
-            let rc = ensure_active(|| unsafe {
+            let rc = c_call(|| unsafe {
                 crate::abstract_::PyObject_SetItem(p as *mut PyObject, kp, vp)
             });
             unsafe { crate::object::Py_DecRef(vp) };
             rc
         }
         None => {
-            ensure_active(|| unsafe { crate::abstract_::PyObject_DelItem(p as *mut PyObject, kp) })
+            c_call(|| unsafe { crate::abstract_::PyObject_DelItem(p as *mut PyObject, kp) })
         }
     };
     unsafe { crate::object::Py_DecRef(kp) };
@@ -206,7 +266,7 @@ fn fwd_setitem(p: usize, key: &Object, value: Option<&Object>) -> Result<(), Run
 }
 
 fn fwd_length(p: usize) -> Result<isize, RuntimeError> {
-    let n = ensure_active(|| unsafe { crate::abstract_::PyObject_Size(p as *mut PyObject) });
+    let n = c_call(|| unsafe { crate::abstract_::PyObject_Size(p as *mut PyObject) });
     if n < 0 {
         return Err(pending_or_default());
     }
@@ -214,12 +274,12 @@ fn fwd_length(p: usize) -> Result<isize, RuntimeError> {
 }
 
 fn fwd_iter(p: usize) -> Result<Object, RuntimeError> {
-    let raw = ensure_active(|| unsafe { crate::abstract_::PyObject_GetIter(p as *mut PyObject) });
+    let raw = c_call(|| unsafe { crate::abstract_::PyObject_GetIter(p as *mut PyObject) });
     unwrap(raw)
 }
 
 fn fwd_iternext(p: usize) -> Result<Option<Object>, RuntimeError> {
-    let raw = ensure_active(|| unsafe { crate::abstract_::PyIter_Next(p as *mut PyObject) });
+    let raw = c_call(|| unsafe { crate::abstract_::PyIter_Next(p as *mut PyObject) });
     if raw.is_null() {
         // NULL with no pending exception ⇒ normal exhaustion.
         if let Some(pe) = crate::errors::take_pending() {
@@ -238,7 +298,7 @@ fn fwd_binop(op: BinOpKind, a: &Object, b: &Object) -> Result<Object, RuntimeErr
     use BinOpKind as B;
     let ap = crate::object::into_owned(a.clone());
     let bp = crate::object::into_owned(b.clone());
-    let raw = ensure_active(|| unsafe {
+    let raw = c_call(|| unsafe {
         match op {
             // `**` takes a third (modulus) argument; pass None.
             B::Pow => {
@@ -288,7 +348,18 @@ fn fwd_compare(op: CompareKind, a: &Object, b: &Object) -> Result<Object, Runtim
     };
     let ap = crate::object::into_owned(a.clone());
     let bp = crate::object::into_owned(b.clone());
-    let raw = ensure_active(|| unsafe { crate::abstract_::PyObject_RichCompare(ap, bp, opid) });
+    // This is the VM→C bridge: the VM's `rich_compare_obj` already decided
+    // an operand is foreign and is asking the C side whether it can compare
+    // the pair. Consult ONLY the operands' C `tp_richcompare` slots
+    // (`richcompare_via_slot`) — NOT the full `PyObject_RichCompare`, which
+    // on a slot decline falls back to `richcompare_via_vm` and re-enters the
+    // VM for the *same* pair, producing an unbounded VM↔C ping-pong that
+    // overflows the native stack (seen with pandas `pivot_table`, where two
+    // foreign operands both carry declining/absent C compare slots). A
+    // `NotImplemented` from the C slots is returned to the VM caller, which
+    // then applies the native default (identity for `==`/`!=`, `TypeError`
+    // for an ordering) exactly as CPython's `do_richcompare` does.
+    let raw = c_call(|| unsafe { crate::abstract_::richcompare_via_slot(ap, bp, opid) });
     unsafe {
         crate::object::Py_DecRef(ap);
         crate::object::Py_DecRef(bp);
@@ -302,6 +373,46 @@ fn fwd_get_type(p: usize) -> Object {
         return Object::None;
     }
     unsafe { crate::object::clone_object(ty as *mut PyObject) }
+}
+
+fn fwd_as_float(p: usize) -> Result<Object, RuntimeError> {
+    let raw = c_call(|| unsafe { crate::abstract_::PyNumber_Float(p as *mut PyObject) });
+    unwrap(raw)
+}
+
+fn fwd_as_int(p: usize) -> Result<Object, RuntimeError> {
+    let raw = c_call(|| unsafe { crate::abstract_::PyNumber_Long(p as *mut PyObject) });
+    unwrap(raw)
+}
+
+fn fwd_as_index(p: usize) -> Result<Object, RuntimeError> {
+    let raw = c_call(|| unsafe { crate::abstract_::PyNumber_Index(p as *mut PyObject) });
+    unwrap(raw)
+}
+
+/// `memoryview(foreign)` — wrap a foreign buffer exporter (numpy's
+/// `ndarray`, a Cython `cdef class` with `__getbuffer__`, …) in a VM
+/// memoryview. Routes through [`crate::memoryview::PyMemoryView_FromObject`]
+/// which drives `PyObject_GetBuffer(PyBUF_FULL_RO)` and preserves the
+/// exporter's faithful `format`/`itemsize`/`shape`/`strides`.
+fn fwd_get_buffer(p: usize) -> Result<Object, RuntimeError> {
+    let raw = c_call(|| unsafe {
+        crate::memoryview::PyMemoryView_FromObject(p as *mut PyObject)
+    });
+    unwrap(raw)
+}
+
+/// `memoryview(obj)` for an arbitrary VM object — a numpy `ndarray` crosses
+/// as a faithful [`Object::Instance`] (wearing its real C type), so it has no
+/// foreign soul pointer. Marshal it to a `*mut PyObject` and drive
+/// `PyMemoryView_FromObject`, which calls the exporter's `bf_getbuffer`. The
+/// temporary cross-reference is released afterwards; the resulting memoryview
+/// snapshots the buffer, so it does not depend on `p` staying alive.
+fn fwd_get_buffer_obj(obj: &Object) -> Result<Object, RuntimeError> {
+    let p = crate::object::into_owned(obj.clone());
+    let raw = c_call(|| unsafe { crate::memoryview::PyMemoryView_FromObject(p) });
+    unsafe { crate::object::Py_DecRef(p) };
+    unwrap(raw)
 }
 
 /// Install the foreign-object bridge into the VM. Idempotent.
@@ -324,5 +435,10 @@ pub fn install() {
         binop: fwd_binop,
         compare: fwd_compare,
         get_type: fwd_get_type,
+        as_float: fwd_as_float,
+        as_int: fwd_as_int,
+        as_index: fwd_as_index,
+        get_buffer: fwd_get_buffer,
+        get_buffer_obj: fwd_get_buffer_obj,
     });
 }

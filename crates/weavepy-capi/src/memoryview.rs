@@ -58,35 +58,150 @@ pub unsafe extern "C" fn PyMemoryView_FromObject(exporter: *mut PyObject) -> *mu
         Object::ByteArray(b) => PyMemoryView::from_bytearray(b.clone()),
         Object::MemoryView(other) => clone_memoryview(other),
         _ => {
-            // Generic path: drive the buffer protocol on the
-            // exporter and build a memoryview from the results.
+            // Generic path: drive the buffer protocol on the exporter and
+            // build a faithful memoryview from the results. Request the
+            // full read-only buffer (format + ndim + strides) exactly like
+            // CPython's `PyMemoryView_FromObject`, so an exporter such as
+            // numpy reports its real `format`/`itemsize` — `'O'`/8 for an
+            // `dtype=object` array, `'l'`/8 for `int64`, etc. A bare
+            // `PyBUF_SIMPLE` (flags=0) request loses the format string and
+            // collapses every view to bytes, which breaks Cython
+            // fused-type dispatch: `map_fused_type` resolves `ndarray[object]`
+            // only when `memoryview(arr)` reports `itemsize == sizeof(void*)`
+            // and a parseable `'O'` format (pandas' `lib.map_infer_mask`).
+            const PYBUF_FULL_RO: c_int = 0x011C; // INDIRECT | STRIDES | ND | FORMAT
             let mut view = Py_buffer::zeroed();
-            let rc = unsafe { crate::buffer::PyObject_GetBuffer(exporter, &raw mut view, 0) };
+            let rc =
+                unsafe { crate::buffer::PyObject_GetBuffer(exporter, &raw mut view, PYBUF_FULL_RO) };
             if rc != 0 {
                 return ptr::null_mut();
             }
-            let bytes_data = if view.buf.is_null() || view.len <= 0 {
-                Vec::new()
-            } else {
-                unsafe { std::slice::from_raw_parts(view.buf as *const u8, view.len as usize) }
-                    .to_vec()
-            };
             let readonly = view.readonly != 0;
             // Snapshot the scalar fields before [`PyBuffer_Release`]
             // tears down `view`'s exporter-owned arrays.
             let view_len = view.len.max(0) as usize;
             let view_itemsize = view.itemsize.max(1) as usize;
+            let format = if view.format.is_null() {
+                "B".to_owned()
+            } else {
+                unsafe { core::ffi::CStr::from_ptr(view.format) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+
+            // Capture the exporter's multi-dimensional geometry before
+            // `PyBuffer_Release` frees the exporter-owned shape/stride
+            // arrays. CPython's memoryview references the exporter's memory
+            // and keeps its `ndim`/`shape`/`strides`; WeavePy copies the
+            // bytes, so we snapshot the geometry and re-materialise the data
+            // in C order to stay self-consistent. Collapsing every view to
+            // 1-D (the old behaviour) breaks Cython typed-memoryview
+            // dispatch, which validates `buf.ndim` — e.g. pandas'
+            // `group_last(int64_t[:, ::1] out, ndarray[int64_t, ndim=2]
+            // values, ...)` rejects a flattened `values` with "Buffer has
+            // wrong number of dimensions (expected 2, got 1)".
+            let ndim = view.ndim.max(0) as usize;
+            let shape: Vec<usize> = if ndim >= 1 && !view.shape.is_null() {
+                (0..ndim)
+                    .map(|i| unsafe { *view.shape.add(i) }.max(0) as usize)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let strides: Vec<isize> = if ndim >= 1 && !view.strides.is_null() {
+                (0..ndim)
+                    .map(|i| unsafe { *view.strides.add(i) } as isize)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // Materialise the bytes in C-contiguous order. A C-contiguous
+            // source (numpy's usual case, and any array whose only gaps come
+            // from size-1 axes) is a straight `view.len`-byte copy; a
+            // strided/transposed/reversed source is gathered element by
+            // element following `strides`, matching `memoryview.tobytes()`.
+            let bytes_data = if view.buf.is_null() || view_len == 0 {
+                Vec::new()
+            } else if shape.len() >= 2 && !is_c_contiguous_dims(&shape, &strides, view_itemsize) {
+                gather_c_order(view.buf as *const u8, &shape, &strides, view_itemsize)
+            } else {
+                unsafe { std::slice::from_raw_parts(view.buf as *const u8, view_len) }.to_vec()
+            };
+
             unsafe { crate::buffer::PyBuffer_Release(&raw mut view) };
-            PyMemoryView::contiguous_1d(
+            if std::env::var_os("WEAVEPY_TRACE_BUF").is_some() {
+                eprintln!(
+                    "[WEAVEPY_TRACE_BUF]   FromObject built mv format={format:?} itemsize={view_itemsize} ndim={ndim} len={view_len}"
+                );
+            }
+            let built = PyMemoryView::contiguous_1d(
                 MemoryViewBuffer::Bytes(bytes_data.into()),
                 view_len,
                 readonly,
-                "B".to_owned(),
+                format,
                 view_itemsize,
-            )
+            );
+            // Store the ≥2-D shape so `ndim`/`shape` survive the copy; leave
+            // `strides` empty so the VM derives C-contiguous strides that
+            // match the C-order bytes we just materialised. (A 1-D view's
+            // derived `[len / itemsize]` shape already matches, so there is
+            // nothing extra to record.)
+            if shape.len() >= 2 {
+                *built.shape.borrow_mut() = shape;
+            }
+            built
         }
     };
     crate::object::into_owned(Object::MemoryView(weavepy_vm::sync::Rc::new(mv)))
+}
+
+/// C-contiguity test that mirrors numpy's: axes of length 0 or 1 impose
+/// no layout constraint, so an `(n, 1)` view (a transposed row, common in
+/// pandas' `_call_cython_op`) still counts as contiguous and takes the
+/// fast linear-copy path.
+fn is_c_contiguous_dims(shape: &[usize], strides: &[isize], itemsize: usize) -> bool {
+    if strides.is_empty() {
+        return true;
+    }
+    let mut expected = itemsize as isize;
+    for i in (0..shape.len()).rev() {
+        if shape[i] > 1 && strides[i] != expected {
+            return false;
+        }
+        expected *= shape[i] as isize;
+    }
+    true
+}
+
+/// Gather a strided buffer into a fresh C-order byte vector, walking the
+/// multi-index last-axis-fastest exactly like `memoryview.tobytes()`.
+/// Handles negative strides (`arr[::-1]`), where `buf` points at the first
+/// logical element and offsets run backwards through the allocation.
+fn gather_c_order(buf: *const u8, shape: &[usize], strides: &[isize], itemsize: usize) -> Vec<u8> {
+    let total: usize = shape.iter().product();
+    let mut out = Vec::with_capacity(total * itemsize);
+    if total == 0 {
+        return out;
+    }
+    let ndim = shape.len();
+    let mut index = vec![0usize; ndim];
+    for _ in 0..total {
+        let mut off: isize = 0;
+        for d in 0..ndim {
+            off += index[d] as isize * strides[d];
+        }
+        let src = unsafe { buf.offset(off) };
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, itemsize) });
+        for d in (0..ndim).rev() {
+            index[d] += 1;
+            if index[d] < shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    out
 }
 
 fn clone_memoryview(other: &PyMemoryView) -> PyMemoryView {
@@ -268,23 +383,58 @@ pub unsafe extern "C" fn PyMemoryView_GET_BUFFER(mv: *mut PyObject) -> *mut Py_b
     let buf_ptr = buf_box.as_mut_ptr() as *mut std::ffi::c_void;
     let format = view.format.borrow().clone() + "\0";
     let format_storage: Box<[u8]> = format.into_bytes().into_boxed_slice();
+    let itemsize = view.itemsize.get().max(1);
+
+    // Element shape/stride: honour an explicit shape, else derive a 1-D
+    // `[len / itemsize]` C-contiguous layout so `shape`/`itemsize`/`len`
+    // stay self-consistent (`shape[0] == len / itemsize`, not `len`).
+    let stored_shape = view.shape.borrow();
+    let (shape_box, strides_box): (Box<[PySsizeT]>, Box<[PySsizeT]>) = if stored_shape.is_empty() {
+        let n = if itemsize > 0 { len / itemsize } else { 0 };
+        (
+            Box::new([n as PySsizeT]),
+            Box::new([itemsize as PySsizeT]),
+        )
+    } else {
+        let shape: Vec<PySsizeT> = stored_shape.iter().map(|&s| s as PySsizeT).collect();
+        let stored_strides = view.strides.borrow();
+        let strides: Vec<PySsizeT> = if stored_strides.is_empty() {
+            let mut st = vec![0 as PySsizeT; shape.len()];
+            let mut acc = itemsize as PySsizeT;
+            for i in (0..shape.len()).rev() {
+                st[i] = acc;
+                acc *= shape[i];
+            }
+            st
+        } else {
+            stored_strides.iter().map(|&s| s as PySsizeT).collect()
+        };
+        (shape.into_boxed_slice(), strides.into_boxed_slice())
+    };
+    let ndim = shape_box.len() as c_int;
 
     let internal = Box::new(crate::buffer::BufferInternal {
         owned_buf: Some(buf_box),
-        shape: Box::new([len as PySsizeT]),
-        strides: Box::new([view.itemsize.get() as PySsizeT]),
+        shape: shape_box,
+        strides: strides_box,
         suboffsets: Box::new([]),
         format: format_storage,
     });
     let internal_ptr = Box::into_raw(internal);
     let internal_ref = unsafe { &mut *internal_ptr };
+    if std::env::var_os("WEAVEPY_TRACE_BUF").is_some() {
+        eprintln!(
+            "[WEAVEPY_TRACE_BUF]   GET_BUFFER mv format={:?} itemsize={itemsize} ndim={ndim} len={len}",
+            view.format.borrow()
+        );
+    }
     let pyb = Py_buffer {
         buf: buf_ptr,
         obj: mv,
         len: len as PySsizeT,
-        itemsize: view.itemsize.get() as PySsizeT,
+        itemsize: itemsize as PySsizeT,
         readonly: c_int::from(view.readonly.get()),
-        ndim: 1,
+        ndim,
         format: internal_ref.format.as_ptr() as *mut c_char,
         shape: internal_ref.shape.as_mut_ptr(),
         strides: internal_ref.strides.as_mut_ptr(),

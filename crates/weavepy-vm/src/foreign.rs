@@ -102,6 +102,32 @@ pub struct ForeignHooks {
     /// Resolve `type(ptr)` to a VM object (an [`Object::Type`] when the
     /// type is bridged; falls back to a foreign proxy of the type).
     pub get_type: fn(usize) -> Object,
+    /// `PyNumber_Float(ptr)` — drive the foreign type's `nb_float`
+    /// (then `nb_index`) conversion. Returns an [`Object::Float`]. Lets
+    /// `float(np.float64(x))` and friends round-trip a numpy scalar
+    /// without WeavePy having to interpret its bytes.
+    pub as_float: fn(usize) -> Result<Object, RuntimeError>,
+    /// `PyNumber_Long(ptr)` — drive `nb_int` (then `nb_index`). Returns an
+    /// `Object::Int`/`Long`/`Bool` (`int(np.uint32(x))`).
+    pub as_int: fn(usize) -> Result<Object, RuntimeError>,
+    /// `PyNumber_Index(ptr)` — drive `nb_index` (loss-less integer view).
+    /// Returns an `Object::Int`/`Long`/`Bool`; errors when the type has no
+    /// `nb_index` (e.g. a float scalar used as an index).
+    pub as_index: fn(usize) -> Result<Object, RuntimeError>,
+    /// `memoryview(ptr)` — acquire the foreign object's buffer
+    /// (`PyObject_GetBuffer` with `PyBUF_FULL_RO`) and wrap it in a VM
+    /// [`Object::MemoryView`] that faithfully carries the exporter's
+    /// `format`/`itemsize`/`shape`/`strides` (e.g. numpy's `'O'`/8 object
+    /// arrays). Errors when the type does not export the buffer protocol.
+    pub get_buffer: fn(usize) -> Result<Object, RuntimeError>,
+    /// `memoryview(obj)` for an arbitrary VM object that crosses into C with
+    /// its own buffer protocol — a numpy `ndarray` crosses as a faithful
+    /// [`Object::Instance`] (wearing its real C type), not an
+    /// [`Object::Foreign`], so it has no raw soul pointer. The bridge marshals
+    /// the object to a `*mut PyObject` ([`crate::object::into_owned`]) and
+    /// drives `PyMemoryView_FromObject` on it. Errors (with the C-side
+    /// `TypeError`) when the type does not export the buffer protocol.
+    pub get_buffer_obj: fn(&Object) -> Result<Object, RuntimeError>,
 }
 
 static HOOKS: OnceLock<ForeignHooks> = OnceLock::new();
@@ -213,4 +239,24 @@ pub fn get_type(s: &PyForeignSoul) -> Object {
         Ok(h) => (h.get_type)(s.ptr),
         Err(_) => Object::None,
     }
+}
+
+pub fn as_float(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
+    (hooks()?.as_float)(s.ptr)
+}
+
+pub fn as_int(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
+    (hooks()?.as_int)(s.ptr)
+}
+
+pub fn as_index(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
+    (hooks()?.as_index)(s.ptr)
+}
+
+pub fn get_buffer(s: &PyForeignSoul) -> Result<Object, RuntimeError> {
+    (hooks()?.get_buffer)(s.ptr)
+}
+
+pub fn get_buffer_obj(obj: &Object) -> Result<Object, RuntimeError> {
+    (hooks()?.get_buffer_obj)(obj)
 }

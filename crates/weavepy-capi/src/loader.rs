@@ -61,6 +61,10 @@ pub fn load_extension_module(
 ) -> Result<Object, LoadError> {
     crate::interp::ensure_initialised();
 
+    let trace_loader = std::env::var_os("WEAVEPY_TRACE_LOADER").is_some();
+    if trace_loader {
+        eprintln!("[LOADER] dlopen path={path:?} module={module_name}");
+    }
     let lib =
         unsafe { Library::new(path) }.map_err(|e| LoadError::Dlopen(format!("{path:?}: {e}")))?;
 
@@ -114,14 +118,34 @@ pub fn load_extension_module(
     });
 
     if raw.is_null() {
-        let pending = crate::errors::take_pending().map(|p| {
-            format!(
-                "{}: {:?}",
-                p.ty.as_ref()
+        if trace_loader {
+            let peek = crate::errors::take_pending().map(|p| {
+                let ty = p
+                    .ty
+                    .as_ref()
                     .map(|t| t.name.clone())
-                    .unwrap_or_else(|| "Exception".to_owned()),
-                p.value
-            )
+                    .unwrap_or_else(|| "Exception".to_owned());
+                let msg = crate::errors::message_for(&p.value);
+                let s = format!("{ty}: {msg}");
+                crate::errors::set_pending(p.ty, p.value);
+                s
+            });
+            eprintln!(
+                "[LOADER] FAILED (null init) module={module_name} pending={peek:?}"
+            );
+        }
+        let pending = crate::errors::take_pending().map(|p| {
+            let ty = p
+                .ty
+                .as_ref()
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| "Exception".to_owned());
+            let msg = crate::errors::message_for(&p.value);
+            if msg.is_empty() {
+                ty
+            } else {
+                format!("{ty}: {msg}")
+            }
         });
         return Err(LoadError::NullInit { pending });
     }
@@ -148,6 +172,9 @@ pub fn load_extension_module(
     // process; otherwise its symbols (and therefore the module's
     // function pointers) would dangle. Leaking is correct here.
     let _: &'static Library = Box::leak(Box::new(lib));
+    if trace_loader {
+        eprintln!("[LOADER] OK (lib leaked) module={module_name}");
+    }
 
     Ok(result)
 }
@@ -196,9 +223,14 @@ pub fn extension_suffixes() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
         &[".cpython-313-darwin.so", ".abi3.so", ".so", ".dylib"]
     } else if cfg!(target_os = "linux") {
+        // glibc (manylinux) and musl (musllinux, RFC 0047 wave 5) carry
+        // distinct SOABI suffixes; the loader probes both so a wheel from
+        // either Linux ABI resolves to its `.so`.
         &[
             ".cpython-313-x86_64-linux-gnu.so",
             ".cpython-313-aarch64-linux-gnu.so",
+            ".cpython-313-x86_64-linux-musl.so",
+            ".cpython-313-aarch64-linux-musl.so",
             ".abi3.so",
             ".so",
         ]

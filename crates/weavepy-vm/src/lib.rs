@@ -843,6 +843,19 @@ impl Interpreter {
         self.repr_of(v, &globals)
     }
 
+    /// Public `str(v)` entry point for the C-API (`PyObject_Str`). Dispatches
+    /// the full `__str__` protocol — including a `__str__` *inherited* from a
+    /// Python base class — exactly as the `str()` builtin would, so a C
+    /// extension calling `PyObject_Str` on a VM instance (e.g. Cython's
+    /// `str(tz)` on a pytz `DstTzInfo`) sees the object's real string form
+    /// rather than the `<Foo object>` placeholder.
+    pub fn str_object(&mut self, v: &Object) -> Result<String, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let globals = self.builtins.clone();
+        self.stringify(v, &globals)
+    }
+
     /// Apply a binary operator to two objects, dispatching the full
     /// `__op__`/`__rop__` protocol exactly as the `BINARY_OP` bytecode would.
     /// Backs the `_operator` accelerator (`operator.add`, …) so those
@@ -901,6 +914,22 @@ impl Interpreter {
                 }
             };
         }
+        // A faithful foreign numeric scalar (numpy `int64`/`float64`) reaches
+        // its unary op only through the bridged C-slot dunder; `unary_op` knows
+        // only VM-native scalars.
+        if matches!(v, Object::Foreign(_))
+            && matches!(op, UnaryKind::Neg | UnaryKind::Pos | UnaryKind::Invert)
+        {
+            let globals = self.builtins.clone();
+            let dunder = match op {
+                UnaryKind::Neg => "__neg__",
+                UnaryKind::Pos => "__pos__",
+                _ => "__invert__",
+            };
+            if let Ok(method) = self.load_attr(v, dunder) {
+                return self.call(&method, &[], &[], &globals);
+            }
+        }
         unary_op(v, op)
     }
 
@@ -931,6 +960,20 @@ impl Interpreter {
                 other.type_name()
             ))),
         }
+    }
+
+    /// Public `len(o)` entry point. Mirrors CPython's `PyObject_Length`
+    /// slot dispatch (`__len__` → native length → bridged C length slot).
+    /// Used by `PyObject_Length` in the C-API so that a `list`/`dict`/…
+    /// *subclass* instance resolves its length through the interpreter —
+    /// its C mirror's generic `sq_length` bridge would otherwise call
+    /// straight back into `PyObject_Length` and recurse forever
+    /// (`np.array(FrozenList(...))` after `PySequence_Check` succeeds).
+    pub fn len_object(&mut self, value: &Object) -> Result<i64, RuntimeError> {
+        let _interp_guard =
+            crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
+        let _handles = self.activate_thread_handles();
+        self.accel_len(value)
     }
 
     /// Public iterator-construction entry point. Mirrors `iter(o)`.
@@ -1171,6 +1214,29 @@ impl Interpreter {
     /// reachable is left to the cycle collector.
     fn reap_dead_subgraph(&mut self, dropped: Object) {
         if !Self::is_refcount_dead(&dropped, 1) {
+            return;
+        }
+        // RFC 0045 (wave 5): if the dead subgraph contains any instance
+        // that has escaped into a C extension (owns a faithful inline
+        // body), do not reap it here. The reaper's deadness test is
+        // `Rc`-refcount only and cannot see a *borrowed* C reference — a
+        // raw body pointer an extension holds across a re-entrant call
+        // (pandas caches `Index._engine` and reads it back through
+        // `PyDict_GetItem` as a borrowed ref; an `Index`/`DataFrame` holds
+        // its `ndarray`/`BlockManager` the same way). The reaper reclaims
+        // the *pure-Python* holder (`Index`, whose own `c_body` is 0)
+        // whose `_cache`/`__dict__` transitively owns the escaped body;
+        // freeing it drops the body, the allocator hands the slot to the
+        // next `ndarray`, and the extension's borrowed pointer becomes a
+        // type-confused use-after-free (`'ndarray' has no attribute
+        // 'is_unique'` in `Index.unique` during `merge`). Leaving the
+        // subgraph to the tracing cycle collector is always safe — prompt
+        // reaping is only a `__del__`-timing optimisation, and a tracked
+        // object stays alive through its GC handle until C's transient
+        // borrows are gone. Every cascade child lives in `dropped`'s
+        // subgraph, so this single scan covers the whole walk. Inert for
+        // pure-Python programs (no instance ever owns a body).
+        if Self::subgraph_contains_escaped(&dropped) {
             return;
         }
         // RFC 0039 (WS4): cascade through the dead *acyclic* subgraph,
@@ -1675,6 +1741,112 @@ impl Interpreter {
         let registry_holds = usize::from(gc_trace::is_tracked(id));
         let weak_clones = crate::weakref_registry::strong_clone_count(id);
         gc_trace::strong_count_for(obj) <= local_refs + registry_holds + weak_clones
+    }
+
+    /// Has `obj` escaped into a C extension — does it own a faithful
+    /// inline instance body (RFC 0045, `c_body != 0`)? Such an instance's
+    /// pointer may be held *borrowed* (uncounted) by a C extension across
+    /// a re-entrant call into the VM, so the prompt reaper — whose
+    /// deadness test sees only VM `Rc` references — must not reclaim it
+    /// (that would free the body and let the allocator reuse it under the
+    /// extension's live pointer). The tracing cycle collector reclaims it
+    /// later, once C's transient borrows are gone. A single `Cell` read;
+    /// `false` for every pure-Python instance and non-instance object.
+    #[inline]
+    fn instance_escaped_to_c(obj: &Object) -> bool {
+        matches!(obj, Object::Instance(inst) if inst.c_body.get() != 0)
+    }
+
+    /// Does the acyclic subgraph rooted at `root` contain any instance
+    /// that has escaped into a C extension (see [`instance_escaped_to_c`])?
+    /// Used by the prompt reaper to leave such subgraphs to the tracing
+    /// cycle collector (a C extension may hold a borrowed pointer into one
+    /// of the bodies). A bounded breadth-first walk over the same edges
+    /// `gc_trace::traverse_object` exposes, deduplicated by object id and
+    /// capped so a pathological structure can never make frame exit
+    /// quadratic; hitting the cap conservatively reports `true` (skip the
+    /// reap — always safe). Returns immediately for the overwhelmingly
+    /// common all-scalar / pure-Python subgraph.
+    fn subgraph_contains_escaped(root: &Object) -> bool {
+        // Fast path: a root that can hold no references (scalar, string,
+        // …) trivially has no escaped instance in its subgraph. This
+        // covers the overwhelming majority of reaped temporaries at zero
+        // allocation cost.
+        if Self::instance_escaped_to_c(root) {
+            return true;
+        }
+        if !Self::object_can_hold_refs(root) {
+            return false;
+        }
+        // Bounded DFS reusing a thread-local scratch stack + visited set so
+        // the hot reap path allocates nothing. Cap chosen well above
+        // pandas' shallow `_cache`/`__dict__` fan-out; on overflow we
+        // proceed with the reap (return `false`) — the only structures big
+        // enough to hit it are large escaped-free graphs, and a pandas
+        // escaped body is always shallow.
+        const VISIT_CAP: usize = 2048;
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<(
+                Vec<Object>,
+                std::collections::HashSet<crate::weakref_registry::ObjectId>,
+            )> = std::cell::RefCell::new((Vec::new(), std::collections::HashSet::new()));
+        }
+        SCRATCH.with(|cell| {
+            let Ok(mut guard) = cell.try_borrow_mut() else {
+                // Re-entrant (a finalizer walked here): fall back to a
+                // conservative "skip the reap" rather than risk aliasing
+                // the scratch buffers.
+                return true;
+            };
+            let (stack, seen) = &mut *guard;
+            stack.clear();
+            seen.clear();
+            gc_trace::traverse_object(root, &mut |child| stack.push(child.clone()));
+            let mut visited = 0usize;
+            let mut found = false;
+            while let Some(obj) = stack.pop() {
+                if !seen.insert(crate::weakref_registry::id_of(&obj)) {
+                    continue;
+                }
+                if Self::instance_escaped_to_c(&obj) {
+                    found = true;
+                    break;
+                }
+                visited += 1;
+                if visited > VISIT_CAP {
+                    break;
+                }
+                if Self::object_can_hold_refs(&obj) {
+                    gc_trace::traverse_object(&obj, &mut |child| stack.push(child.clone()));
+                }
+            }
+            stack.clear();
+            seen.clear();
+            found
+        })
+    }
+
+    /// Cheap discriminator: can `obj` hold references to other objects
+    /// (and therefore possibly reach an escaped instance)? `false` for
+    /// scalars/strings/bytes and other leaves, letting
+    /// [`subgraph_contains_escaped`] skip the walk entirely.
+    #[inline]
+    fn object_can_hold_refs(obj: &Object) -> bool {
+        matches!(
+            obj,
+            Object::List(_)
+                | Object::Tuple(_)
+                | Object::Dict(_)
+                | Object::Set(_)
+                | Object::FrozenSet(_)
+                | Object::MappingProxy(_)
+                | Object::SimpleNamespace(_)
+                | Object::Instance(_)
+                | Object::Cell(_)
+                | Object::BoundMethod(_)
+                | Object::Function(_)
+                | Object::Type(_)
+        )
     }
 
     /// Emulate CPython deleting a terminating thread's thread-state
@@ -4212,7 +4384,7 @@ impl Interpreter {
                 let target = frame.pop()?;
                 let value = frame.pop()?;
                 let g = frame.globals.clone();
-                if let Object::Instance(_) = &target {
+                if let Object::Instance(inst) = &target {
                     if let Some(method) = instance_method(&target, "__setitem__") {
                         // A native-backed builtin subclass (`class C(list)`,
                         // `class C(bytearray)`, …) that doesn't *override*
@@ -4223,7 +4395,15 @@ impl Interpreter {
                         // `store_subscr` instead — it collects the RHS via the
                         // full VM protocol (`collect_iterable`) and splices the
                         // unwrapped native payload, exactly as for a bare list.
+                        // This detour only applies to instances carrying a VM
+                        // native payload (`inst.native`); a faithful inline
+                        // foreign instance (numpy `ndarray`, `native == None`)
+                        // whose bridged `__setitem__` is *also* an
+                        // `Object::Builtin` must dispatch its own C slot — that
+                        // slot handles strided slice assignment correctly,
+                        // which `store_subscr` (VM containers only) cannot.
                         if matches!(i, Object::Slice(_))
+                            && inst.native.is_some()
                             && bound_is_native_builtin(&method, "__setitem__")
                         {
                             self.store_subscr(&target, &i, value, &g)?;
@@ -4317,6 +4497,31 @@ impl Interpreter {
                                     unary_op(&v.native_value().unwrap_or_else(|| v.clone()), kind)?
                                 }
                             }
+                        }
+                    }
+                } else if matches!(v, Object::Foreign(_))
+                    && matches!(
+                        kind,
+                        UnaryKind::Neg | UnaryKind::Pos | UnaryKind::Invert
+                    )
+                {
+                    // A faithful foreign numeric scalar (numpy `int64`/`float64`)
+                    // reaches its unary op only through the bridged C-slot dunder
+                    // (`nb_negative`/`nb_positive`/`nb_invert`); `unary_op` knows
+                    // only VM-native scalars. Resolve the slot wrapper and
+                    // dispatch it, falling back to the native payload (if any)
+                    // when the type lacks the dunder so the canonical
+                    // "bad operand type for unary …" TypeError still surfaces.
+                    let g = frame.globals.clone();
+                    let dunder = match kind {
+                        UnaryKind::Neg => "__neg__",
+                        UnaryKind::Pos => "__pos__",
+                        _ => "__invert__",
+                    };
+                    match self.load_attr(&v, dunder) {
+                        Ok(method) => self.call(&method, &[], &[], &g)?,
+                        Err(_) => {
+                            unary_op(&v.native_value().unwrap_or_else(|| v.clone()), kind)?
                         }
                     }
                 } else {
@@ -4583,6 +4788,7 @@ impl Interpreter {
                         | Object::Generator(_)
                         | Object::Instance(_)
                         | Object::LazyIter(_)
+                        | Object::Foreign(_)
                 ) {
                     let fresh = self.make_iter(&it_obj, &frame.globals)?;
                     if let Some(slot) = frame.stack.last_mut() {
@@ -4630,6 +4836,13 @@ impl Interpreter {
                                 ));
                             }
                         }
+                    }
+                    // A foreign/extension iterator (numpy array iterator,
+                    // Cython generator, any C `tp_iternext`) advances via its
+                    // `__next__`; `StopIteration` terminates the loop.
+                    Object::Foreign(_) => {
+                        let g = frame.globals.clone();
+                        self.foreign_iter_next(&it_obj, &g)?
                     }
                     _ => {
                         return Err(RuntimeError::Internal(
@@ -5999,6 +6212,44 @@ impl Interpreter {
         }
     }
 
+    /// Attach a traceback to a C-raised exception *instance* so that
+    /// `exc.__traceback__` is a real (non-None) traceback object.
+    ///
+    /// CPython attaches a traceback as an exception unwinds through Cython
+    /// C code (`__Pyx_AddTraceback` → `PyTraceBack_Here`). WeavePy raises
+    /// C-side exceptions purely through the pending-exception cell, so the
+    /// instance would otherwise carry `__traceback__ = None`. That breaks
+    /// Cython's `except SomeError:` handler: its `__Pyx__GetException`
+    /// fetches the traceback via `PyException_GetTraceback` and, on handler
+    /// exit, does an **unguarded** `Py_DECREF` on it — dereferencing NULL
+    /// and SIGSEGV'ing (seen catching `OutOfBoundsTimedelta` inside
+    /// `pandas` `_Timedelta.__hash__`). Seeding a real traceback pointing at
+    /// the current Python frame restores CPython's invariant. No-op when the
+    /// instance already has a traceback or no Python frame is on the stack.
+    pub fn attach_c_traceback(&self, exc: &Object) {
+        let Object::Instance(inst) = exc else {
+            return;
+        };
+        let key = DictKey(Object::from_static("__traceback__"));
+        if let Some(existing) = inst.dict.borrow().get(&key) {
+            if !matches!(existing, Object::None) {
+                return;
+            }
+        }
+        let Some(py_frame) = self.frame_stack.borrow().last().cloned() else {
+            return;
+        };
+        let new_tb = Rc::new(PyTraceback {
+            lineno: py_frame.last_line.get().unwrap_or(1),
+            lasti: py_frame.lasti.get(),
+            frame: py_frame,
+            next: RefCell::new(None),
+        });
+        inst.dict
+            .borrow_mut()
+            .insert(key, Object::Traceback(new_tb));
+    }
+
     /// If the most-recent handled exception is still active when
     /// `raise X` runs, attach it as the new exception's `__context__`
     /// so chained tracebacks render `During handling of the above
@@ -7252,6 +7503,19 @@ impl Interpreter {
                         _ => {}
                     }
                 }
+                // `range.start` / `.stop` / `.step` read-only data
+                // attributes (CPython's `range` members). Unlike `slice`
+                // these are always concrete ints. pandas' `range_to_ndarray`
+                // reads `rng.start/stop/step` when building a frame column
+                // from a `range`.
+                if let Object::Range(r) = obj {
+                    match name {
+                        "start" => return Ok(crate::object::int_from_i128(r.start)),
+                        "stop" => return Ok(crate::object::int_from_i128(r.stop)),
+                        "step" => return Ok(crate::object::int_from_i128(r.step)),
+                        _ => {}
+                    }
+                }
                 // Plain iterators expose the iterator protocol as real
                 // attributes (`hasattr(it, '__next__')` gates e.g.
                 // `dataclasses._get_slots`' iterator rejection). Wrapped in
@@ -7345,6 +7609,17 @@ impl Interpreter {
         instance_obj: &Object,
         name: &str,
     ) -> Result<Object, RuntimeError> {
+        if (name == "is_unique" || name == "unique") && std::env::var_os("WEAVEPY_ISU_DIAG").is_some()
+        {
+            eprintln!(
+                "[ISU] getattr name={} inst=0x{:x} cls={} c_body=0x{:x} strong={}",
+                name,
+                Rc::as_ptr(inst) as usize,
+                inst.cls().name,
+                inst.c_body.get(),
+                Rc::strong_count(inst),
+            );
+        }
         let result = if let Some(getattribute) = self.user_getattribute(&inst.cls()) {
             // `dispatch` (not `new`): a `__getattribute__` that is itself a
             // descriptor (`__getattribute__ = SomeDescriptor()`) must have
@@ -8608,6 +8883,38 @@ impl Interpreter {
                 Err(unsupported_format_string(value))
             };
         }
+        // A foreign extension scalar (numpy's `np.uint32`, …) overrides
+        // `__format__` — its scalars delegate to the matching `int`/`float`
+        // formatter — so dispatch through the binary-ABI bridge rather than
+        // the native mini-language. This is what makes `format(np.uint32(x),
+        // 'd')` and `str(ndarray)` (numpy formats each element with a spec)
+        // work; `object.__format__`'s native fallback would reject the spec.
+        if let Object::Foreign(s) = value {
+            // A numpy *scalar* (`np.uint32`, …) overrides `__format__`; use it.
+            // A numpy `dtype`/`ndarray` (and most extension objects) instead
+            // inherit `object.__format__`, which the foreign getattr bridge
+            // can't synthesise — so a missing slot falls back to
+            // `object.__format__` semantics (str(self) for an empty spec, a
+            // TypeError otherwise), never a spurious AttributeError. pandas'
+            // `invalid_comparison` builds `f"...dtype={left.dtype}..."`.
+            match crate::foreign::getattr(s, "__format__") {
+                Ok(method) => {
+                    let r = self.call(&method, &[Object::from_str(spec)], &[], globals)?;
+                    return Ok(match r {
+                        Object::Str(s) => s.to_string(),
+                        other => other.to_str(),
+                    });
+                }
+                Err(_) => {
+                    let text = self.stringify(value, globals)?;
+                    return if spec.is_empty() {
+                        Ok(text)
+                    } else {
+                        Err(unsupported_format_string(value))
+                    };
+                }
+            }
+        }
         format_via_spec(value, spec)
     }
 
@@ -8648,7 +8955,30 @@ impl Interpreter {
                 ))),
             };
         }
-        Ok(Object::Int(v.len()? as i64))
+        match v.len() {
+            Ok(n) => Ok(Object::Int(n as i64)),
+            Err(e) => {
+                // A foreign C-extension instance (e.g. a `numpy` dtype) exposes
+                // `__len__` only through its bridged type's C length slot
+                // (`mp_length`/`sq_length`), which the lightweight
+                // `instance_method` lookup above does not see — but full
+                // attribute resolution synthesises it from the slot. Consult
+                // that before giving up so `len(np.dtype('f8'))` answers `0`
+                // (pandas' `Series.__init__` does `if len(data.dtype):` to
+                // detect compound dtypes).
+                if let Ok(lenf) = self.load_attr_public(v, "__len__") {
+                    let r = self.call(&lenf, &[], &[], globals)?;
+                    return match r {
+                        Object::Int(i) => Ok(Object::Int(i)),
+                        other => Err(type_error(format!(
+                            "'__len__' should return int, not '{}'",
+                            other.type_name()
+                        ))),
+                    };
+                }
+                Err(e)
+            }
+        }
     }
 
     /// `abs(x)` — dispatch `__abs__` for class instances (CPython calls
@@ -8663,6 +8993,19 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         if let Some(method) = instance_method(v, "__abs__") {
             return self.call(&method, &[], &[], globals);
+        }
+        // A faithful foreign numeric scalar (numpy `int64`/`float64`, and
+        // numpy arrays) exposes its magnitude only through the bridged
+        // C-slot dunder (`nb_absolute` → `__abs__`); `b_abs` knows only
+        // VM-native scalars. Mirror the `UnaryOp` dispatch: resolve
+        // `__abs__` via normal attribute lookup and call it before falling
+        // back. Without this, `abs(np.float64(x))` (e.g. pandas' own
+        // `abs(a - b)` reduction checks) tripped `b_abs`'s guard with the
+        // useless "bad operand type for abs(): 'object'".
+        if matches!(v, Object::Foreign(_)) {
+            if let Ok(method) = self.load_attr(v, "__abs__") {
+                return self.call(&method, &[], &[], globals);
+            }
         }
         // A built-in numeric subclass with no `__abs__` override (e.g.
         // `class CS(complex)`) unwraps to its native payload so `abs()`
@@ -8685,6 +9028,18 @@ impl Interpreter {
             if let Some(method) = instance_method(value, "__round__") {
                 let extra: &[Object] = if args.len() >= 2 { &args[1..2] } else { &[] };
                 return self.call(&method, extra, &[], globals);
+            }
+            // A faithful foreign numeric scalar (numpy `float64`/`int64`)
+            // exposes `__round__` only through its bridged type; `b_round`
+            // knows only VM-native scalars. Mirror `do_abs_call`: resolve
+            // `__round__` by normal attribute lookup and call it, so
+            // `round(np.float64(x), n)` (pandas' `.corr()`/`.cov()` results
+            // are numpy scalars) works instead of tripping the guard below.
+            if matches!(value, Object::Foreign(_)) {
+                if let Ok(method) = self.load_attr(value, "__round__") {
+                    let extra: &[Object] = if args.len() >= 2 { &args[1..2] } else { &[] };
+                    return self.call(&method, extra, &[], globals);
+                }
             }
         }
         // Unwrap a built-in numeric subclass with no `__round__` override
@@ -9170,6 +9525,13 @@ impl Interpreter {
                 // subclass inherits the base type's value-returning `__int__`,
                 // so this also covers `int(IntSubclass())`.
                 if !has_base {
+                    // A foreign extension scalar (numpy's `np.int64`, …) is
+                    // opaque to `instance_method`; drive its `nb_int`/`nb_index`
+                    // slot through the binary-ABI bridge (CPython's
+                    // `PyNumber_Long`). `int(np.uint32(x))` reaches here.
+                    if let Object::Foreign(s) = other {
+                        return self.check_int_result(other, "__int__", crate::foreign::as_int(s)?);
+                    }
                     if let Some(method) = instance_method(other, "__int__") {
                         let r = self.call(&method, &[], &[], globals)?;
                         return self.check_int_result(other, "__int__", r);
@@ -9325,6 +9687,14 @@ impl Interpreter {
             | Object::ByteArray(_) => builtins::b_float_compat(args),
             Object::MemoryView(_) => builtins::b_float_compat(args),
             other => {
+                // A foreign extension scalar (numpy's `np.float64`, the result
+                // of `array.sum()`/`.mean()`, …) is opaque to `instance_method`;
+                // drive its `nb_float`/`nb_index` slot through the binary-ABI
+                // bridge (CPython's `PyNumber_Float`). `float(a.sum())` reaches
+                // here.
+                if let Object::Foreign(s) = other {
+                    return self.check_float_result(other, crate::foreign::as_float(s)?);
+                }
                 // CPython's `PyNumber_Float`: try `__float__` (which must
                 // return a float; a strict subclass is accepted with a
                 // DeprecationWarning), then `__index__` (an int, converted with
@@ -10050,7 +10420,13 @@ impl Interpreter {
             // we'd compute by default, so skip it to avoid recursion.
             if !Rc::ptr_eq(&meta, &builtin_types().type_) {
                 if let Some(hook) = meta.lookup("__instancecheck__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                    // `dispatch` (not `new`) so a descriptor-wrapped hook
+                    // honours its `__get__`: pandas builds `ABCSeries` etc.
+                    // from a metaclass whose `__instancecheck__` is a
+                    // `@classmethod`, and CPython's `_PyObject_LookupSpecial`
+                    // binds it via the descriptor protocol. A plain-function
+                    // hook still falls through to the receiver-prepend path.
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
                         Object::Type(cls.clone()),
                         hook,
                     )));
@@ -10224,7 +10600,10 @@ impl Interpreter {
             let meta = info_cls.metaclass_or_type();
             if !Rc::ptr_eq(&meta, &builtin_types().type_) {
                 if let Some(hook) = meta.lookup("__subclasscheck__") {
-                    let bound = Object::BoundMethod(Rc::new(BoundMethod::new(
+                    // `dispatch` so a `@classmethod` (pandas' ABC shims) or
+                    // other descriptor-wrapped hook honours its `__get__`;
+                    // plain functions still take the receiver-prepend path.
+                    let bound = Object::BoundMethod(Rc::new(BoundMethod::dispatch(
                         Object::Type(info_cls.clone()),
                         hook,
                     )));
@@ -10899,8 +11278,201 @@ impl Interpreter {
         self.load_attr(obj, name)
     }
 
-    /// Crate-visible attribute store (weakproxy `__setattr__` forwarding).
-    pub(crate) fn store_attr_public(
+    /// Public binary-operator entry for the C-API bridge
+    /// (`PyNumber_Add`/…). Dispatches the full `__op__`/`__rop__` protocol
+    /// exactly as the `BINARY_OP` bytecode would — so `str % args`
+    /// formatting, sequence concatenation/repetition, and user-class
+    /// operator overloads all resolve identically to the interpreter.
+    pub fn binary_op_public(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: weavepy_compiler::BinOpKind,
+    ) -> Result<Object, RuntimeError> {
+        self.op_binary(a, b, op)
+    }
+
+    /// Public rich-comparison entry for the C-API bridge
+    /// (`PyObject_RichCompare`). Dispatches the full `do_richcompare`
+    /// protocol exactly as the `COMPARE_OP` bytecode would — forward then
+    /// reflected `__lt__`/`__eq__`/… dunders, `__ne__`-from-`__eq__`,
+    /// foreign `tp_richcompare` slots, and the recursive per-element
+    /// comparison for native containers (tuple/list ordering, the case
+    /// Cython's import-time `(major, minor)` version checks hit). The
+    /// capi's own `compare_objects` only knew built-in scalars, so
+    /// `tuple >= tuple` was a spurious `TypeError`.
+    pub fn rich_compare_public(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+    ) -> Result<Object, RuntimeError> {
+        let globals = self.builtins.clone();
+        self.rich_compare_obj(a, b, op, &globals)
+    }
+
+    /// Public hash entry for the C-API bridge (`PyObject_Hash`). Routes
+    /// through the same `do_hash_call` the `hash()` builtin uses, so a
+    /// value hashed from inside a C extension (Cython's
+    /// `hash(tuple(self._items))`) lands on the *identical* CPython-faithful
+    /// hash the VM computes — the capi's old `DefaultHasher`-on-`DictKey`
+    /// produced a divergent value, breaking cross-path hash equality.
+    pub fn hash_public(&mut self, obj: &Object) -> Result<i64, RuntimeError> {
+        let globals = self.builtins.clone();
+        match self.do_hash_call(obj, &globals)? {
+            Object::Int(i) => Ok(i),
+            Object::Bool(b) => Ok(i64::from(b)),
+            Object::Long(b) => Ok(crate::object::py_hash_long_bigint(&b)),
+            other => Err(type_error(format!(
+                "__hash__ method should return an integer, not '{}'",
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// Public subscript-read entry for the C-API bridge
+    /// (`PyObject_GetItem` / `PyMapping_GetItem`). Dispatches the full
+    /// `__getitem__` protocol exactly as the `BINARY_SUBSCR` bytecode would:
+    /// a user-defined instance `__getitem__` (honouring `__missing__` for
+    /// `dict` subclasses), a metaclass `__getitem__` then `__class_getitem__`
+    /// / PEP 585 alias for a class operand, and a foreign extension object's
+    /// own `__getitem__` slot wrapper (numpy's `flatiter`, an `ndarray`'s
+    /// `mp_subscript`). The capi's own `get_item` only knew native
+    /// containers, so subscripting any of these crossed back as a spurious
+    /// "not subscriptable" `TypeError`.
+    pub fn subscr_get_public(&mut self, v: &Object, i: &Object) -> Result<Object, RuntimeError> {
+        let g = self.builtins.clone();
+        if let Object::Instance(inst) = v {
+            let user_getitem = inst
+                .cls()
+                .lookup_with_owner("__getitem__")
+                .filter(|(_, owner)| !owner.flags.is_builtin || inst.native.is_none())
+                .map(|(m, _)| m);
+            if let Some(m) = user_getitem {
+                let method = Object::BoundMethod(Rc::new(BoundMethod::dispatch(v.clone(), m)));
+                return self.call(&method, std::slice::from_ref(i), &[], &g);
+            }
+            return match self.binary_subscr(v, i) {
+                Err(RuntimeError::PyException(exc))
+                    if exc.type_name() == "KeyError"
+                        && matches!(v.native_value(), Some(Object::Dict(_))) =>
+                {
+                    match instance_method(v, "__missing__") {
+                        Some(miss) => self.call(&miss, std::slice::from_ref(i), &[], &g),
+                        None => Err(RuntimeError::PyException(exc)),
+                    }
+                }
+                r => r,
+            };
+        }
+        if let Object::Type(ty) = v {
+            let meta = ty.metaclass_or_type();
+            let bt = builtin_types();
+            let meta_getitem = if Rc::ptr_eq(&meta, &bt.type_) {
+                None
+            } else {
+                meta.lookup("__getitem__")
+            };
+            if let Some(method) = meta_getitem {
+                let bound =
+                    Object::BoundMethod(Rc::new(BoundMethod::new(Object::Type(ty.clone()), method)));
+                return self.call(&bound, std::slice::from_ref(i), &[], &g);
+            }
+            if let Some(method) = ty.lookup("__class_getitem__") {
+                let callable = match method {
+                    Object::ClassMethod(inner) => inner.func(),
+                    Object::StaticMethod(inner) => inner.func(),
+                    other => other,
+                };
+                return self.call(&callable, &[Object::Type(ty.clone()), i.clone()], &[], &g);
+            }
+            if ty.flags.is_builtin && !ty.flags.is_exception {
+                return Ok(make_generic_alias(Object::Type(ty.clone()), i.clone()));
+            }
+            return self.binary_subscr(v, i);
+        }
+        if matches!(v, Object::Foreign(_)) {
+            return match self.load_attr(v, "__getitem__") {
+                Ok(method) => self.call(&method, std::slice::from_ref(i), &[], &g),
+                Err(_) => self.binary_subscr(v, i),
+            };
+        }
+        self.binary_subscr(v, i)
+    }
+
+    /// Public subscript-store entry for the C-API bridge
+    /// (`PyObject_SetItem` / `PyMapping_SetItem`). Mirrors `STORE_SUBSCR`:
+    /// an instance `__setitem__` (with the native-slice fast path for a
+    /// builtin-backed subclass), a foreign object's `__setitem__` slot
+    /// wrapper (numpy `m.flat[i::M+1] = 1`), else the native container
+    /// store. The capi previously only handled `dict`/`list`, so assigning
+    /// into a numpy array crossed back as "object does not support item
+    /// assignment".
+    pub fn subscr_set_public(
+        &mut self,
+        target: &Object,
+        i: &Object,
+        value: Object,
+    ) -> Result<(), RuntimeError> {
+        let g = self.builtins.clone();
+        if let Object::Instance(inst) = target {
+            if let Some(method) = instance_method(target, "__setitem__") {
+                // Slice assignment detours to `store_subscr` only for a VM
+                // native-backed builtin subclass (`inst.native` set); a
+                // faithful inline foreign instance (numpy `ndarray`) dispatches
+                // its own bridged C `__setitem__` slot, which handles strided
+                // slice assignment that `store_subscr` cannot.
+                if matches!(i, Object::Slice(_))
+                    && inst.native.is_some()
+                    && bound_is_native_builtin(&method, "__setitem__")
+                {
+                    return self.store_subscr(target, i, value, &g);
+                }
+                self.call(&method, &[i.clone(), value], &[], &g)?;
+                return Ok(());
+            }
+            return self.store_subscr(target, i, value, &g);
+        }
+        if matches!(target, Object::Foreign(_)) {
+            return match self.load_attr(target, "__setitem__") {
+                Ok(method) => {
+                    self.call(&method, &[i.clone(), value], &[], &g)?;
+                    Ok(())
+                }
+                Err(_) => self.store_subscr(target, i, value, &g),
+            };
+        }
+        self.store_subscr(target, i, value, &g)
+    }
+
+    /// Public subscript-delete entry for the C-API bridge
+    /// (`PyObject_DelItem` / `PyMapping_DelItem`). Mirrors `DELETE_SUBSCR`:
+    /// an instance `__delitem__`, a foreign object's `__delitem__` slot
+    /// wrapper, else the native container delete.
+    pub fn subscr_del_public(&mut self, target: &Object, i: &Object) -> Result<(), RuntimeError> {
+        let g = self.builtins.clone();
+        if let Object::Instance(_) = target {
+            if let Some(method) = instance_method(target, "__delitem__") {
+                self.call(&method, std::slice::from_ref(i), &[], &g)?;
+                return Ok(());
+            }
+            return self.delete_subscr(target, i);
+        }
+        if matches!(target, Object::Foreign(_)) {
+            return match self.load_attr(target, "__delitem__") {
+                Ok(method) => {
+                    self.call(&method, std::slice::from_ref(i), &[], &g)?;
+                    Ok(())
+                }
+                Err(_) => self.delete_subscr(target, i),
+            };
+        }
+        self.delete_subscr(target, i)
+    }
+
+    /// Attribute store mirroring `STORE_ATTR` (weakproxy `__setattr__`
+    /// forwarding; the C-API `PyObject_SetAttr` bridge in `weavepy-capi`).
+    pub fn store_attr_public(
         &mut self,
         obj: &Object,
         name: &str,
@@ -10909,8 +11481,9 @@ impl Interpreter {
         self.store_attr(obj, name, value)
     }
 
-    /// Crate-visible attribute delete (weakproxy `__delattr__` forwarding).
-    pub(crate) fn delete_attr_public(
+    /// Attribute delete mirroring `DELETE_ATTR` (weakproxy `__delattr__`
+    /// forwarding; the C-API `PyObject_SetAttr(o, n, NULL)` bridge).
+    pub fn delete_attr_public(
         &mut self,
         obj: &Object,
         name: &str,
@@ -11087,6 +11660,40 @@ impl Interpreter {
         Ok(false)
     }
 
+    /// CPython `PySequence_Contains` / the `in` operator, exposed for the
+    /// C-API bridge. Mirrors the `ContainsOp` bytecode handler: an
+    /// instance/metaclass `__contains__` wins; a built-in-container subclass
+    /// tests through its wrapped native payload; a pure-Python class falls
+    /// back to iteration (`_PySequence_IterSearch`); otherwise the native
+    /// [`Object::contains`] (covering dict / set / mappingproxy / range /
+    /// bytes / …). The C-API `PySequence_Contains` previously listed only a
+    /// handful of container shapes and returned a silent `-1` (error with no
+    /// exception) for everything else — a dict in particular, which is how
+    /// Cython compiles `val in module_global_dict` (pandas' `_try_infer_map`).
+    pub fn py_contains(
+        &mut self,
+        container: &Object,
+        item: &Object,
+    ) -> Result<bool, RuntimeError> {
+        if let Some(method) = instance_method(container, "__contains__")
+            .or_else(|| metaclass_method(container, "__contains__"))
+        {
+            let g = self.builtins.clone();
+            let r = self.call(&method, std::slice::from_ref(item), &[], &g)?;
+            return Ok(r.is_truthy());
+        }
+        if let Object::Instance(inst) = container {
+            return match inst.native.clone() {
+                Some(native) => native.contains(item),
+                None => {
+                    let g = self.builtins.clone();
+                    self.contains_via_iter(container, item, &g)
+                }
+            };
+        }
+        container.contains(item)
+    }
+
     /// `item in <list/tuple>` with CPython `PySequence_Contains`
     /// semantics: identity first, then rich `==` per element. The fast
     /// native equality is used unless a user-defined `__eq__` could be
@@ -11198,6 +11805,24 @@ impl Interpreter {
                         let native = native.clone();
                         return self.make_iter(&native, globals);
                     }
+                }
+                Err(type_error(format!(
+                    "'{}' object is not iterable",
+                    v.type_name_owned()
+                )))
+            }
+            // A foreign/extension object (numpy array, a Cython generator,
+            // any C type exposing `tp_iter`) becomes iterable through the
+            // Python iterator protocol: call `__iter__` and hand back the
+            // resulting iterator (frequently the object itself). `FOR_ITER`
+            // / `iter_next` then drive it via `__next__`. Without this,
+            // `for x in <cython generator>` — e.g. pandas'
+            // `libinternals.get_blkno_placements`, reached by
+            // `merge`/`reindex`/`drop` — raised a spurious
+            // "'object' object is not iterable".
+            Object::Foreign(_) => {
+                if let Ok(method) = self.load_attr(v, "__iter__") {
+                    return self.call(&method, &[], &[], globals);
                 }
                 Err(type_error(format!(
                     "'{}' object is not iterable",
@@ -11494,7 +12119,37 @@ impl Interpreter {
                 }
                 Err(e) => Err(e),
             },
+            // A foreign/extension iterator (numpy array iterator, Cython
+            // generator, any C `tp_iternext`) is advanced through its
+            // `__next__`, with `StopIteration` meaning exhaustion.
+            Object::Foreign(_) => self.foreign_iter_next(iter, globals),
             _ => Err(type_error(format!(
+                "'{}' object is not an iterator",
+                iter.type_name_owned()
+            ))),
+        }
+    }
+
+    /// Advance a foreign/extension iterator by dispatching its `__next__`
+    /// through normal attribute lookup, translating `StopIteration` into
+    /// exhaustion (`Ok(None)`). This is the generic bridge that lets any C
+    /// iterator — numpy array iterators, Cython generators
+    /// (`yield`-functions compiled to C), user extension types — drive
+    /// `for` loops, `list()`, `tuple()`, comprehensions, etc.
+    fn foreign_iter_next(
+        &mut self,
+        iter: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Option<Object>, RuntimeError> {
+        match self.load_attr(iter, "__next__") {
+            Ok(method) => match self.call(&method, &[], &[], globals) {
+                Ok(v) => Ok(Some(v)),
+                Err(RuntimeError::PyException(exc)) if exc.type_name() == "StopIteration" => {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            },
+            Err(_) => Err(type_error(format!(
                 "'{}' object is not an iterator",
                 iter.type_name_owned()
             ))),
@@ -13709,6 +14364,22 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
         let (dunder, rdunder) = binop_dunders(op);
+        // RFC 0047 (wave 5): a *foreign* operand carries its arithmetic in
+        // its C `tp_as_number` slots, invisible to the VM dunder lookup
+        // below. Route through the foreign binop hook (CPython's slot
+        // protocol over the C number suite — `float32 - float32` from
+        // numpy's import-time `getlimits` math lands here). The hook raises
+        // the canonical TypeError when C declines for both operands; only
+        // swallow *that* so a Python `__op__`/`__rop__` on a non-foreign
+        // partner still gets its turn, and propagate any other error.
+        if matches!(a, Object::Foreign(_)) || matches!(b, Object::Foreign(_)) {
+            match crate::foreign::binop(op, a, b) {
+                Ok(r) if !r.is_same(&crate::vm_singletons::not_implemented()) => return Ok(r),
+                Ok(_) => {}
+                Err(e) if is_type_error(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
         // CPython's `binary_op1`: try `a.__op__(b)`, then `b.__rop__(a)`.
         // Either may *decline* by returning `NotImplemented`, in which case
         // we must keep looking rather than propagate the sentinel — a
@@ -13744,7 +14415,15 @@ impl Interpreter {
                 }
             }
         }
-        if let Some(method) = instance_method(a, dunder) {
+        // A *class* operand carries its operator on its metaclass
+        // (`c_int * 4` is `type(c_int).__mul__(c_int, 4)`; ctypes builds
+        // array types this way). `instance_method` only walks the operand's
+        // own MRO, so fall back to the metaclass dunder for `Type` operands
+        // (`metaclass_method` returns `None` for the plain `type` metaclass,
+        // so built-in classes like `int`/`str` are unaffected).
+        if let Some(method) =
+            instance_method(a, dunder).or_else(|| metaclass_method(a, dunder))
+        {
             let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
             if !r.is_same(&not_impl) {
                 return Ok(r);
@@ -13752,7 +14431,9 @@ impl Interpreter {
             a_declined = true;
         }
         if !reflected_tried {
-            if let Some(method) = instance_method(b, rdunder) {
+            if let Some(method) =
+                instance_method(b, rdunder).or_else(|| metaclass_method(b, rdunder))
+            {
                 let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
                 if !r.is_same(&not_impl) {
                     return Ok(r);
@@ -14024,6 +14705,19 @@ impl Interpreter {
         // and only if *both* decline fall through to the native default
         // (identity for ==/!=, `TypeError` for an ordering).
         let not_impl = crate::vm_singletons::not_implemented();
+        // RFC 0047 (wave 5): a foreign operand compares through its C
+        // `tp_richcompare` slot, not the VM dunders below. Route through the
+        // foreign compare hook (CPython's `do_richcompare`). A
+        // `NotImplemented` decline falls through to the VM path so `==`/`!=`
+        // still get the identity / `__eq__`-derived defaults.
+        if matches!(a, Object::Foreign(_)) || matches!(b, Object::Foreign(_)) {
+            match crate::foreign::compare(op, a, b) {
+                Ok(r) if !r.is_same(&not_impl) => return Ok(r),
+                Ok(_) => {}
+                Err(e) if is_type_error(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
         if let Some(method) = self.cmp_method(a, dunder, globals) {
             let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
             if !r.is_same(&not_impl) {
@@ -15535,6 +16229,63 @@ impl Interpreter {
         self.generic_setattr_instance(inst, obj, name, value)
     }
 
+    /// CPython `PyObject_GenericGetAttr` — the `object.__getattribute__` slot
+    /// body, exposed for the C-API bridge. Resolves data descriptors →
+    /// instance dict → class attrs *without* re-dispatching a
+    /// `__getattribute__` / `tp_getattro` override and *without* consulting
+    /// `__getattr__` (matching CPython, where the slot wrapper, not the
+    /// generic body, runs the hook).
+    ///
+    /// A C extension type whose `tp_getattro` is set to
+    /// `PyObject_GenericGetAttr` — the universal CPython idiom, e.g. a proxy
+    /// that special-cases one name then defers to the generic fallback —
+    /// otherwise recurses without bound: the bridge's full `LOAD_ATTR` would
+    /// re-enter the type's own `tp_getattro`, which calls
+    /// `PyObject_GenericGetAttr` again. This entry point breaks the cycle.
+    pub fn generic_getattr_public(
+        &mut self,
+        obj: &Object,
+        name: &str,
+    ) -> Result<Object, RuntimeError> {
+        match obj {
+            Object::Instance(inst) => {
+                let inst = inst.clone();
+                self.load_attr_instance_default(&inst, obj, name)
+            }
+            // Other shapes have no `tp_*attro` shim that re-enters the bridge,
+            // so the full lookup is both safe and the correct generic result.
+            _ => self.load_attr(obj, name),
+        }
+    }
+
+    /// CPython `PyObject_GenericSetAttr` — the `object.__setattr__` /
+    /// `object.__delattr__` slot body, exposed for the C-API bridge. A `value`
+    /// of `None` is the delete form (`PyObject_GenericSetAttr(o, name, NULL)`).
+    /// Never re-dispatches a user `__setattr__` / `__delattr__` /
+    /// `tp_setattro`, so a C type whose `tp_setattro` calls
+    /// `PyObject_GenericSetAttr` does not recurse (see
+    /// [`Interpreter::generic_getattr_public`]).
+    pub fn generic_setattr_public(
+        &mut self,
+        obj: &Object,
+        name: &str,
+        value: Option<Object>,
+    ) -> Result<(), RuntimeError> {
+        match obj {
+            Object::Instance(inst) => {
+                let inst = inst.clone();
+                match value {
+                    Some(v) => self.generic_setattr_instance(&inst, obj, name, v),
+                    None => self.generic_delattr_instance(&inst, obj, name),
+                }
+            }
+            _ => match value {
+                Some(v) => self.store_attr_public(obj, name, v),
+                None => self.delete_attr_public(obj, name),
+            },
+        }
+    }
+
     /// CPython `PyObject_GenericSetAttr` — the `object.__setattr__`
     /// slot body: honours data descriptors, `__class__`/`__dict__`
     /// special handling and `__slots__` enforcement, but does *not*
@@ -16146,11 +16897,19 @@ impl Interpreter {
                 coerced_index = Object::Slice(Rc::new(resolve_slice_ints(s)?));
                 &coerced_index
             }
-            inst @ Object::Instance(_)
-                if is_sequence && instance_method(inst, "__index__").is_some() =>
-            {
-                coerced_index = Object::Int(crate::builtins::coerce_index_i64(inst)?);
-                &coerced_index
+            idx @ (Object::Instance(_) | Object::Foreign(_)) if is_sequence => {
+                // Honour the full `__index__` protocol (CPython's
+                // `PyNumber_Index`), including a C-slot `nb_index` reached only
+                // through the bridge — a `numpy` integer scalar indexing a
+                // tuple/list (`BlockManager.blocks[blknos[i]]`). A value with no
+                // `__index__` falls through to the sequence-specific TypeError.
+                match crate::builtins::try_coerce_index_i64(idx) {
+                    Some(res) => {
+                        coerced_index = Object::Int(res?);
+                        &coerced_index
+                    }
+                    None => index,
+                }
             }
             Object::Long(_) if is_sequence => {
                 return Err(index_error("cannot fit 'int' into an index-sized integer"))
@@ -16415,11 +17174,19 @@ impl Interpreter {
                 coerced_index = Object::Slice(Rc::new(resolve_slice_ints(s)?));
                 &coerced_index
             }
-            inst @ Object::Instance(_)
-                if is_sequence && instance_method(inst, "__index__").is_some() =>
-            {
-                coerced_index = Object::Int(crate::builtins::coerce_index_i64(inst)?);
-                &coerced_index
+            idx @ (Object::Instance(_) | Object::Foreign(_)) if is_sequence => {
+                // Honour the full `__index__` protocol (CPython's
+                // `PyNumber_Index`), including a C-slot `nb_index` reached only
+                // through the bridge — a `numpy` integer scalar indexing a
+                // tuple/list (`BlockManager.blocks[blknos[i]]`). A value with no
+                // `__index__` falls through to the sequence-specific TypeError.
+                match crate::builtins::try_coerce_index_i64(idx) {
+                    Some(res) => {
+                        coerced_index = Object::Int(res?);
+                        &coerced_index
+                    }
+                    None => index,
+                }
             }
             Object::Long(_) if is_sequence => {
                 return Err(index_error("cannot fit 'int' into an index-sized integer"))
@@ -16657,11 +17424,19 @@ impl Interpreter {
                 coerced_index = Object::Slice(Rc::new(resolve_slice_ints(s)?));
                 &coerced_index
             }
-            inst @ Object::Instance(_)
-                if is_sequence && instance_method(inst, "__index__").is_some() =>
-            {
-                coerced_index = Object::Int(crate::builtins::coerce_index_i64(inst)?);
-                &coerced_index
+            idx @ (Object::Instance(_) | Object::Foreign(_)) if is_sequence => {
+                // Honour the full `__index__` protocol (CPython's
+                // `PyNumber_Index`), including a C-slot `nb_index` reached only
+                // through the bridge — a `numpy` integer scalar indexing a
+                // tuple/list (`BlockManager.blocks[blknos[i]]`). A value with no
+                // `__index__` falls through to the sequence-specific TypeError.
+                match crate::builtins::try_coerce_index_i64(idx) {
+                    Some(res) => {
+                        coerced_index = Object::Int(res?);
+                        &coerced_index
+                    }
+                    None => index,
+                }
             }
             _ => index,
         };
@@ -17698,6 +18473,14 @@ impl Interpreter {
                     return call_kw(args, kwargs);
                 }
                 if !kwargs.is_empty() {
+                    if std::env::var_os("WEAVEPY_TRACE_INIT").is_some() {
+                        let keys: Vec<&str> = kwargs.iter().map(|(k, _)| k.as_str()).collect();
+                        eprintln!(
+                            "[BLTKW] builtin {:?} rejected kwargs {keys:?}\n{}",
+                            b.name,
+                            std::backtrace::Backtrace::force_capture()
+                        );
+                    }
                     return Err(type_error(format!(
                         "builtin '{}' does not accept keyword arguments",
                         b.name
@@ -18350,6 +19133,27 @@ impl Interpreter {
                 resolved_bases.push(b.clone());
                 continue;
             }
+            // PEP 585 generic alias base — `class PrettyDict(dict[_KT, _VT])`.
+            // CPython's `GenericAlias.__mro_entries__` substitutes the origin
+            // class, so the real base is `dict`. Our alias is a
+            // `SimpleNamespace` carrying `__origin__` with no `__mro_entries__`
+            // attribute; left unresolved it stays a base, and because its class
+            // is `GenericAlias` it then *wins* the metaclass race and class
+            // creation miscalls `GenericAlias(name, bases, ns)` ("GenericAlias
+            // expected 2 arguments, got 3"). Resolve it to its origin here.
+            if is_generic_alias(b) {
+                if let Object::SimpleNamespace(d) = b {
+                    if let Some(origin) = d
+                        .borrow()
+                        .get(&DictKey(Object::from_static("__origin__")))
+                        .cloned()
+                    {
+                        resolved_bases.push(origin);
+                        bases_replaced = true;
+                        continue;
+                    }
+                }
+            }
             // CPython's `map`/`filter`/`zip`/`enumerate` are real types and
             // subclassable. WeavePy dispatches *calls* to them through fast
             // builtin functions, but a class statement naming one as a base
@@ -18967,6 +19771,15 @@ impl Interpreter {
                 .collect::<Result<_, _>>()?,
             _ => return Err(type_error("type() arg 2 must be tuple of bases")),
         };
+        if std::env::var_os("WEAVEPY_TRACE_SUPER").is_some()
+            && (name == "TimeRE" || name == "TimeRE")
+        {
+            let bn: Vec<String> = bases
+                .iter()
+                .map(|b| format!("{}({:?})", b.name, b.mro.borrow().iter().map(|t| t.name.clone()).collect::<Vec<_>>()))
+                .collect();
+            eprintln!("[MKCLASS] name={name} bases={bn:?}");
+        }
         let ns_dict_obj = args[2].clone();
         let mut ns = match &args[2] {
             Object::Dict(d) => d.borrow().clone(),
@@ -19022,6 +19835,10 @@ impl Interpreter {
             }
         }
         let ty = TypeObject::new_user(&name, effective_bases.clone(), ns)?;
+        if std::env::var_os("WEAVEPY_TRACE_SUPER").is_some() && name == "TimeRE" {
+            let m: Vec<String> = ty.mro.borrow().iter().map(|t| t.name.clone()).collect();
+            eprintln!("[MKCLASS2] created TimeRE ptr={:p} mro={m:?}", Rc::as_ptr(&ty));
+        }
         ty.set_metaclass(metaclass.clone());
         if let Some(Object::Cell(cell)) = classcell {
             *cell.borrow_mut() = Object::Type(ty.clone());
@@ -20424,6 +21241,16 @@ impl Interpreter {
                         Object::Builtin(b) if b.name == "__init__" && b.call_kw.is_none()
                     );
                 let init_kwargs: &[(String, Object)] = if drop_init_kwargs { &[] } else { kwargs };
+                if !init_kwargs.is_empty()
+                    && matches!(&init, Object::Builtin(b) if b.name == "__init__" && b.call_kw.is_none())
+                    && std::env::var_os("WEAVEPY_TRACE_INIT").is_some()
+                {
+                    let keys: Vec<&str> = init_kwargs.iter().map(|(k, _)| k.as_str()).collect();
+                    eprintln!(
+                        "[INIT] cls={} is_object_new={is_object_new} init=builtin __init__ kwargs={keys:?}",
+                        cls.name
+                    );
+                }
                 let bound = Object::BoundMethod(Rc::new(BoundMethod::new(instance.clone(), init)));
                 let result = self.call(
                     &bound,
@@ -22166,7 +22993,18 @@ impl Interpreter {
                         }
                     }
                     let sub_name = format!("{absolute}.{s}");
-                    let _ = self.import_path(&sub_name);
+                    if let Err(e) = self.import_path(&sub_name) {
+                        if std::env::var_os("WEAVEPY_DEBUG_FROMLIST").is_some() {
+                            match &e {
+                                RuntimeError::PyException(pe) => eprintln!(
+                                    "[fromlist] {sub_name}: {}: {}",
+                                    pe.type_name(),
+                                    pe.message()
+                                ),
+                                other => eprintln!("[fromlist] {sub_name}: {other}"),
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -22504,6 +23342,10 @@ impl Interpreter {
     }
 
     fn meta_path_import_inner(&mut self, full: &str) -> Result<Option<Object>, RuntimeError> {
+        // Tag the `_weave_import_fallback` helper uses for a module it built and
+        // registered itself (PEP 451 create/exec, no code object). Kept byte
+        // identical to `_LIVE_MODULE` in `_weave_import_fallback.py`.
+        const LIVE_MODULE_SENTINEL: &str = "\u{0}weave-live-module";
         let helper = match self.import_path("_weave_import_fallback") {
             Ok(Object::Module(m)) => m,
             _ => return Ok(None),
@@ -22531,6 +23373,25 @@ impl Interpreter {
             Object::Tuple(t) => t,
             _ => return Ok(None),
         };
+        // A finder that builds its *own* module (PEP 451
+        // create_module/exec_module, no code object) — six's
+        // `_SixMetaPathImporter` for the virtual `six.moves`, consumed by
+        // `dateutil.tz`'s `from six.moves import _thread`. The helper has
+        // already constructed, registered (`sys.modules[full]`) and executed
+        // it; cache and return the live object verbatim. It may be a
+        // `types.ModuleType` *subclass* instance (six's `_MovedItems`), not a
+        // native `Object::Module`, so attribute access on it goes through the
+        // normal descriptor/`__getattr__` path rather than module-dict lookup.
+        if let Some(Object::Str(tag)) = payload.first() {
+            if tag.as_ref() == LIVE_MODULE_SENTINEL {
+                let module_obj = payload.get(1).cloned().unwrap_or(Object::None);
+                if matches!(module_obj, Object::None) {
+                    return Ok(None);
+                }
+                self.cache.insert(full, module_obj.clone());
+                return Ok(Some(module_obj));
+            }
+        }
         let Some(Object::Code(code_rc)) = payload.first().cloned() else {
             return Ok(None);
         };
@@ -22686,7 +23547,14 @@ impl Interpreter {
             self.cache.remove(full);
             return Err(e);
         }
-        Ok(module_obj)
+        // CPython `_load_unlocked`: after the body runs the module is
+        // re-read from `sys.modules` (`module = sys.modules.pop(name)`),
+        // because the body may have *replaced* its own entry. `decimal.py`
+        // does exactly this when the C `_decimal` accelerator is absent —
+        // `import _pydecimal; sys.modules[__name__] = _pydecimal` — so the
+        // public `decimal` module must become `_pydecimal` (with all 80+
+        // names such as `InvalidOperation`), not the 7-key shell we seeded.
+        Ok(self.cache.get(full).unwrap_or(module_obj))
     }
 
     /// Read, parse, compile, and execute the module's source.
@@ -22757,7 +23625,11 @@ impl Interpreter {
             self.cache.remove(full);
             return Err(e);
         }
-        Ok(module_obj)
+        // CPython `_load_unlocked` re-reads `sys.modules[name]` after the
+        // body runs: a module may replace its own entry (e.g. `decimal.py`
+        // sets `sys.modules[__name__] = _pydecimal`). Hand back whatever is
+        // bound now, not the shell we seeded before execution.
+        Ok(self.cache.get(full).unwrap_or(module_obj))
     }
 
     /// `IMPORT_FROM` runtime side. Looks up `name` on the module on
@@ -22820,6 +23692,33 @@ impl Interpreter {
                     crate::error::set_exception_attr(&err, "path", Object::Str(path.clone()));
                 }
                 Err(err)
+            }
+            // Not a *native* `Object::Module`, but `sys.modules` may legitimately
+            // hold any object — most importantly a `types.ModuleType` *subclass*
+            // instance. six's virtual `six.moves` is such a `_MovedItems`, and
+            // `dateutil.tz` does `from six.moves import _thread`. Mirror
+            // CPython's `import_from`: try a plain attribute access first (six
+            // resolves `_thread`/`range`/… through a lazy class descriptor that
+            // imports the real target on `__get__`), then fall back to a
+            // `{pkg}.{name}` submodule the fromlist machinery may have already
+            // placed in `sys.modules` (or that the finder can build on demand).
+            Object::Instance(_) => {
+                match self.load_attr(module, name) {
+                    Ok(v) => Ok(v),
+                    Err(e) if self.is_attribute_error(&e) => {
+                        if let Ok(Object::Str(pkg)) = self.load_attr(module, "__name__") {
+                            let candidate = format!("{pkg}.{name}");
+                            if let Some(sub) = self.cache.get(&candidate) {
+                                return Ok(sub);
+                            }
+                            if let Ok(sub) = self.load_one(&candidate) {
+                                return Ok(sub);
+                            }
+                        }
+                        Err(import_error(format!("cannot import name '{name}'")))
+                    }
+                    Err(e) => Err(e),
+                }
             }
             other => Err(type_error(format!(
                 "IMPORT_FROM on non-module: '{}'",
@@ -23299,12 +24198,21 @@ pub(crate) fn slice_bound_index(o: &Object) -> Result<Option<i64>, RuntimeError>
                 i64::MAX
             })))
         }
-        Object::Instance(_) => Ok(Some(crate::builtins::coerce_index_i64(o).map_err(
-            |_| type_error("slice indices must be integers or None or have an __index__ method"),
-        )?)),
-        _ => Err(type_error(
-            "slice indices must be integers or None or have an __index__ method",
-        )),
+        // Any other object is a valid slice bound iff it implements
+        // `__index__` (CPython's `_PyEval_SliceIndex` → `PyNumber_Index`).
+        // This covers user classes (`Object::Instance`) *and* C-extension
+        // integer scalars reached through the bridge (`Object::Foreign` —
+        // e.g. a numpy `intp` from `BlockManager.blknos[loc]`, sliced as
+        // `old_blocks[:blkno]` in pandas' outer-merge block split).
+        // `try_coerce_index_i64` returns `Some(Err(..))` when `__index__`
+        // exists but raises (propagate that real error) and `None` when the
+        // type has no `__index__` (raise the slice `TypeError`).
+        _ => match crate::builtins::try_coerce_index_i64(o) {
+            Some(res) => Ok(Some(res?)),
+            None => Err(type_error(
+                "slice indices must be integers or None or have an __index__ method",
+            )),
+        },
     }
 }
 

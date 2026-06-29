@@ -196,6 +196,15 @@ pub unsafe extern "C" fn PyObject_GC_Track(op: *mut c_void) {
     if op.is_null() {
         return;
     }
+    // A *foreign* pointer is never enrolled in WeavePy's cycle tracker (only
+    // `Object::Instance` is), and `clone_object` on a foreign pointer takes an
+    // owning reference (incref, then decref on drop). When a foreign type's
+    // `tp_dealloc` calls this at refcount 0, that transient toggle re-enters
+    // `free_box` → `tp_dealloc` (infinite recursion, seen in pandas' Cython
+    // `IndexEngine` dealloc). Skip foreign pointers entirely.
+    if !crate::object::is_weavepy_owned(op as *mut PyObject) {
+        return;
+    }
     let obj = unsafe { crate::object::clone_object(op as *mut PyObject) };
     if matches!(obj, Object::Instance(_)) {
         weavepy_vm::gc_trace::track(obj);
@@ -213,6 +222,13 @@ pub unsafe extern "C" fn PyObject_GC_UnTrack(op: *mut c_void) {
     if op.is_null() {
         return;
     }
+    // Foreign objects are never tracked (see [`PyObject_GC_Track`]), and
+    // `clone_object`-ing one here takes/drops an owning reference — fatal when
+    // a foreign `tp_dealloc` calls this at refcount 0 (re-entrant free →
+    // infinite recursion). Untracking a foreign pointer is a guaranteed no-op.
+    if !crate::object::is_weavepy_owned(op as *mut PyObject) {
+        return;
+    }
     let obj = unsafe { crate::object::clone_object(op as *mut PyObject) };
     weavepy_vm::gc_trace::untrack(&obj);
 }
@@ -225,6 +241,10 @@ pub unsafe extern "C" fn PyObject_GC_UnTrack(op: *mut c_void) {
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_GC_IsTracked(op: *mut c_void) -> c_int {
     if op.is_null() {
+        return 0;
+    }
+    // Foreign objects are never tracked; avoid the owning `clone_object`.
+    if !crate::object::is_weavepy_owned(op as *mut PyObject) {
         return 0;
     }
     let obj = unsafe { crate::object::clone_object(op as *mut PyObject) };
@@ -249,6 +269,15 @@ pub unsafe extern "C" fn PyObject_GC_Del(op: *mut c_void) {
     // `PyObject_GC_Del(self)` is absorbed — the block is reclaimed when
     // the instance is collected, not here.
     if unsafe { crate::mirror::is_instance_body(p) } {
+        return;
+    }
+    // A *foreign* object's storage is not ours to reclaim, and both
+    // `clone_object` (which takes an owning reference) and
+    // `_PyWeavePy_Dealloc` (which re-dispatches `tp_dealloc`) would re-enter
+    // the very dealloc that called this `tp_free`, recursing until the stack
+    // overflows (pandas' Cython `IndexEngine`). `tp_free` on a foreign block
+    // is a no-op here (the extension keeps its own storage model).
+    if !crate::object::is_weavepy_owned(p) {
         return;
     }
     let obj = unsafe { crate::object::clone_object(p) };

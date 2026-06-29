@@ -850,6 +850,19 @@ fn install_richcmp(
         let f = move |args: &[Object]| -> Result<Object, RuntimeError> {
             let func: RichCmpFunc = unsafe { slot.cast() };
             let (a, b) = binary_args(args, static_name, &tn)?;
+            // TEMP diagnostic: catch dangling operands before numpy derefs them.
+            if std::env::var_os("WEAVEPY_RCMP_DIAG").is_some() {
+                wp_rcmp_diag(&args[0], a, "self");
+                wp_rcmp_diag(&args[1], b, "other");
+                if (a as usize) <= 0x10000 || (b as usize) <= 0x10000 {
+                    eprintln!("[RCMP-BAD] skipping func call to avoid crash");
+                    unsafe {
+                        crate::object::Py_DecRef(a);
+                        crate::object::Py_DecRef(b);
+                    }
+                    return Ok(weavepy_vm::vm_singletons::not_implemented());
+                }
+            }
             let raw = crate::interp::ensure_active(|| unsafe { func(a, b, op) });
             unsafe {
                 crate::object::Py_DecRef(a);
@@ -882,7 +895,8 @@ fn install_call(
     }
     let mname = name.to_owned();
     let static_name: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let _ = type_name;
+    let tname_pos: &'static str = Box::leak(type_name.to_string().into_boxed_str());
+    let tname_kw = tname_pos;
     let f_pos = move |args: &[Object]| -> Result<Object, RuntimeError> {
         let func: TernaryFunc = unsafe { slot.cast() };
         if args.is_empty() {
@@ -896,6 +910,9 @@ fn install_call(
         unsafe {
             crate::object::Py_DecRef(self_p);
             crate::object::Py_DecRef(arg_tuple);
+        }
+        if raw.is_null() && std::env::var_os("WEAVEPY_TRACE_NULL").is_some() {
+            eprintln!("[WEAVEPY_TRACE_NULL] __call__ NULL from type {tname_pos}");
         }
         unwrap_pyobject(raw)
     };
@@ -913,6 +930,9 @@ fn install_call(
                 crate::object::Py_DecRef(self_p);
                 crate::object::Py_DecRef(arg_tuple);
                 crate::object::Py_DecRef(kw_p);
+            }
+            if raw.is_null() && std::env::var_os("WEAVEPY_TRACE_NULL").is_some() {
+                eprintln!("[WEAVEPY_TRACE_NULL] __call__ NULL from type {tname_kw}");
             }
             unwrap_pyobject(raw)
         };
@@ -1037,6 +1057,21 @@ fn install_getattro(
     if slot.is_null() {
         return;
     }
+    // A type whose `tp_getattro` is WeavePy's own generic getattr resolves
+    // attributes through the default `object.__getattribute__` — which the
+    // VM's `load_attr_instance` already performs natively. Installing a
+    // `__getattribute__` shim that calls `PyObject_GenericGetAttr` would
+    // re-enter the full dispatch (`load_attr_instance` → shim →
+    // `PyObject_GenericGetAttr` → `PyObject_GetAttr` → `load_attr_instance`)
+    // and recurse until the stack overflows. CPython likewise only wraps a
+    // *custom* `tp_getattro`; the generic one is never exposed as a dict
+    // `__getattribute__`. Mirrors [`crate::abstract_::foreign_getattr_dispatch`].
+    let generic_getattro = crate::genericalloc::PyObject_GenericGetAttr
+        as unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject
+        as usize;
+    if slot.as_void() as usize == generic_getattro {
+        return;
+    }
     let mname = name.to_owned();
     let static_name: &'static str = Box::leak(name.to_string().into_boxed_str());
     let tn = type_name.clone();
@@ -1078,6 +1113,15 @@ fn install_setattro(
 ) {
     let slot = table.get(slot_id);
     if slot.is_null() {
+        return;
+    }
+    // Symmetric to `install_getattro`: a type using WeavePy's generic
+    // `tp_setattro` uses the default `object.__setattr__`; wrapping it
+    // would recurse through `PyObject_GenericSetAttr` → `PyObject_SetAttr`.
+    let generic_setattro = crate::genericalloc::PyObject_GenericSetAttr
+        as unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> c_int
+        as usize;
+    if slot.as_void() as usize == generic_setattro {
         return;
     }
     let mname = name.to_owned();
@@ -1265,6 +1309,52 @@ fn install_anext(
 /// construction path treats it as a user `__new__`: it is looked up on
 /// the class and called with `cls` pushed in front of the constructor
 /// args. The C `newfunc` receives the `*mut PyTypeObject` for `cls`.
+/// Choose the `tp_new` to invoke for a `cls` resolved inside a `__new__`
+/// shim, mirroring CPython's `type_call` (which calls `type->tp_new`).
+///
+/// A `__new__` shim is installed per bridged base type and captures *that
+/// base's* `tp_new` (`captured`). Python-level `__new__` resolution walks
+/// the MRO and picks the **first** base that carries a `__new__` — which,
+/// for a class that multiply-inherits C extension types, need not be the
+/// *solid base* (`best_base`, the base owning the widest inline instance
+/// layout). CPython instead inherits `type->tp_new` from the solid base,
+/// so its `cdef object` fields get initialised (Cython's `__pyx_tp_new`
+/// zeroes them to `None`).
+///
+/// `install_user_type` / `synth_type_for_class` already bake the solid
+/// base's faithful `tp_new` into the resolved `cls`'s own type struct. So
+/// when `cls` is an inline-body type whose own `tp_new` is a real
+/// (non-generic) slot differing from this shim's captured base slot, that
+/// is the solid-base constructor — dispatch to it. This is the fix for
+/// pandas' `MultiIndexUIntEngine(BaseMultiIndexCodesEngine, UInt64Engine)`,
+/// whose MRO-first base leaves the inherited `IndexEngine` fields NULL.
+///
+/// In every other case (`cls` is the bridged base itself, or a
+/// single-solid-base subclass, or a non-inline subclass) `cls->tp_new`
+/// equals `captured` or is the generic allocator, so the captured slot is
+/// kept and behaviour is unchanged.
+fn effective_new_slot(type_ptr: *mut crate::types::PyTypeObject, captured: SlotPtr) -> SlotPtr {
+    if type_ptr.is_null() {
+        return captured;
+    }
+    let own = unsafe { (*type_ptr).tp_new };
+    let generic: unsafe extern "C" fn(
+        *mut crate::types::PyTypeObject,
+        *mut PyObject,
+        *mut PyObject,
+    ) -> *mut PyObject = crate::genericalloc::PyType_GenericNew;
+    let own_addr = own as usize;
+    if own_addr != 0
+        && own_addr != captured.0 as usize
+        && own_addr != generic as usize
+        && crate::types::is_inline_instance_type(type_ptr)
+    {
+        SlotPtr(own)
+    } else {
+        captured
+    }
+}
+
 fn install_new(
     out: &mut Vec<(String, Object)>,
     table: &SlotTable,
@@ -1280,19 +1370,45 @@ fn install_new(
         tn: &Rc<str>,
     ) -> Result<*mut crate::types::PyTypeObject, RuntimeError> {
         match arg {
-            Object::Type(t) => Ok(crate::types::install_user_type(t)),
+            // Resolve `cls` to its *canonical* C `PyTypeObject*` — the
+            // registered static / heap / readied pointer — exactly as
+            // `crate::object::into_owned(Object::Type)` does. A bare
+            // `install_user_type` would mint a fresh generic mirror that
+            // drops the real type's `tp_basicsize`/inline-storage/`tp_alloc`
+            // setup, so a faithful `tp_new` (e.g. the datetime shells') would
+            // allocate a plain box and write the subclass's inline fields over
+            // the box payload (RFC 0029: pandas `_NaT.__new__(NaTType, …)`).
+            Object::Type(t) => Ok(crate::types::type_ptr_for_class(t)
+                .or_else(|| crate::types::synth_type_for_class(t))
+                .unwrap_or_else(|| crate::types::install_user_type(t))),
             _ => Err(type_error(format!("{tn}.__new__(X): X is not a type"))),
         }
     }
     let tn = type_name.clone();
     let f_pos = move |args: &[Object]| -> Result<Object, RuntimeError> {
-        let func: NewFunc = unsafe { slot.cast() };
+        if slot.0.is_null() {
+            return Err(type_error(format!(
+                "{tn}.__new__: tp_new slot is NULL (unbound base constructor)"
+            )));
+        }
+        if std::env::var_os("WEAVEPY_TRACE_NEW").is_some() {
+            let a0 = match args.first() {
+                Some(Object::Type(t)) => format!("Type({})", t.name),
+                Some(other) => format!("{:?}", std::mem::discriminant(other)),
+                None => "none".to_owned(),
+            };
+            eprintln!("[NEW] type={tn:?} slot={:p} args0={a0}", slot.0);
+        }
         if args.is_empty() {
             return Err(type_error(
                 "__new__() requires the type as its first argument",
             ));
         }
         let type_ptr = cls_ptr(&args[0], &tn)?;
+        // Dispatch to `cls->tp_new` when it is the faithful solid-base slot
+        // (mirrors CPython's `type_call`); falls back to this shim's captured
+        // base slot otherwise (identical for single-solid-base subclasses).
+        let func: NewFunc = unsafe { effective_new_slot(type_ptr, slot).cast() };
         let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
         // No keyword arguments → CPython hands `tp_new` a NULL `kwds`.
         let kw: *mut PyObject = std::ptr::null_mut();
@@ -1305,13 +1421,21 @@ fn install_new(
     let tn_kw = type_name.clone();
     let f_kw =
         move |args: &[Object], kwargs: &[(String, Object)]| -> Result<Object, RuntimeError> {
-            let func: NewFunc = unsafe { slot.cast() };
+            if slot.0.is_null() {
+                return Err(type_error(format!(
+                    "{tn_kw}.__new__: tp_new slot is NULL (unbound base constructor)"
+                )));
+            }
+            if std::env::var_os("WEAVEPY_TRACE_NEW").is_some() {
+                eprintln!("[NEW-KW] type={tn_kw:?} slot={:p} nargs={}", slot.0, args.len());
+            }
             if args.is_empty() {
                 return Err(type_error(
                     "__new__() requires the type as its first argument",
                 ));
             }
             let type_ptr = cls_ptr(&args[0], &tn_kw)?;
+            let func: NewFunc = unsafe { effective_new_slot(type_ptr, slot).cast() };
             let arg_tuple = crate::object::into_owned(Object::new_tuple(args[1..].to_vec()));
             let kw_p = kwds_ptr(kwargs);
             let raw = crate::interp::ensure_active(|| unsafe { func(type_ptr, arg_tuple, kw_p) });
@@ -1348,6 +1472,46 @@ fn primary_self(
         )));
     }
     Ok(crate::object::into_owned(args[0].clone()))
+}
+
+/// TEMP diagnostic: describe an operand and its marshalled pointer,
+/// flagging dangling/near-null pointers before a C slot dereferences them.
+fn wp_rcmp_diag(obj: &Object, p: *mut PyObject, role: &str) {
+    let kind = match obj {
+        Object::Foreign(s) => format!("Foreign({}) ptr=0x{:x}", s.type_name, s.ptr),
+        Object::Instance(i) => {
+            format!("Instance(cls={} c_body=0x{:x})", i.cls().name, i.c_body.get())
+        }
+        Object::None => "None".to_string(),
+        Object::Int(_) => "Int".to_string(),
+        Object::Str(_) => "Str".to_string(),
+        Object::List(_) => "List".to_string(),
+        Object::Tuple(_) => "Tuple".to_string(),
+        _ => "other".to_string(),
+    };
+    let pv = p as usize;
+    if pv <= 0x10000 {
+        eprintln!("[RCMP-BAD] {role} obj={kind} p=0x{pv:x} <near-null ptr>");
+        return;
+    }
+    let rc = unsafe { (*p).ob_refcnt } as i64;
+    if rc > 0 && rc < (1i64 << 40) {
+        return; // looks healthy
+    }
+    let ty = unsafe { (*p).ob_type };
+    let tyname = if (ty as usize) > 0x10000 {
+        let np = unsafe { (*(ty as *mut crate::layout::PyTypeObjectFull)).tp_name };
+        if np.is_null() {
+            "<null>".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(np) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    } else {
+        format!("<bad ty 0x{:x}>", ty as usize)
+    };
+    eprintln!("[RCMP-BAD] {role} obj={kind} p=0x{pv:x} refcnt={rc} ty={tyname}");
 }
 
 fn binary_args(
@@ -1401,6 +1565,12 @@ fn take_pending_or_default() -> RuntimeError {
     if let Some(p) = crate::errors::take_pending() {
         crate::errors::to_runtime_error(p)
     } else {
+        if std::env::var_os("WEAVEPY_TRACE_NULL").is_some() {
+            eprintln!(
+                "[WEAVEPY_TRACE_NULL] C slot returned NULL with no exception set\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         weavepy_vm::error::runtime_error(
             "C extension reported failure without setting an exception",
         )

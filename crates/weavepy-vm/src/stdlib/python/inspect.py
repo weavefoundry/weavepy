@@ -12,6 +12,7 @@ import sys
 import linecache
 import types
 import functools
+import enum
 
 
 __all__ = [
@@ -609,6 +610,102 @@ def getsource(obj):
     return "".join(lines)
 
 
+class EndOfBlock(Exception):
+    pass
+
+
+class BlockFinder:
+    """Provide a tokeneater() method to detect the end of a code block.
+
+    Verbatim port of CPython 3.13's ``inspect.BlockFinder``; used by
+    :func:`getblock` to trim a list of source lines down to the first
+    complete ``def``/``class``/``lambda`` block. Libraries such as
+    hypothesis rely on ``inspect.getblock`` to recover lambda source."""
+
+    def __init__(self):
+        self.indent = 0
+        self.islambda = False
+        self.started = False
+        self.passline = False
+        self.indecorator = False
+        self.decoratorhasargs = False
+        self.last = 1
+        self.body_col0 = None
+
+    def tokeneater(self, type, token, srowcol, erowcol, line):
+        import tokenize as _tokenize
+        if not self.started and not self.indecorator:
+            # skip any decorators
+            if token == "@":
+                self.indecorator = True
+            # look for the first "def", "class" or "lambda"
+            elif token in ("def", "class", "lambda"):
+                if token == "lambda":
+                    self.islambda = True
+                self.started = True
+            self.passline = True    # skip to the end of the line
+        elif token == "(":
+            if self.indecorator:
+                self.decoratorhasargs = True
+        elif token == ")":
+            if self.indecorator:
+                self.indecorator = False
+                self.decoratorhasargs = False
+        elif type == _tokenize.NEWLINE:
+            self.passline = False   # stop skipping when a NEWLINE is seen
+            self.last = srowcol[0]
+            if self.islambda:       # lambdas always end at the first NEWLINE
+                raise EndOfBlock
+            # hitting a NEWLINE when in a decorator without args
+            # ends the decorator
+            if self.indecorator and not self.decoratorhasargs:
+                self.indecorator = False
+        elif self.passline:
+            pass
+        elif type == _tokenize.INDENT:
+            if self.body_col0 is None and self.started:
+                self.body_col0 = erowcol[1]
+            self.indent = self.indent + 1
+            self.passline = True
+        elif type == _tokenize.DEDENT:
+            self.indent = self.indent - 1
+            # the end of matching indent/dedent pairs end a block
+            # (note that this only works for "def"/"class" blocks,
+            #  not e.g. for "if: else:" or "try: finally:" blocks)
+            if self.indent <= 0:
+                raise EndOfBlock
+        elif type == _tokenize.COMMENT:
+            if self.body_col0 is not None and srowcol[1] >= self.body_col0:
+                # When saw a comment, must be inside the block
+                self.last = srowcol[0]
+        elif self.indent == 0 and type not in (_tokenize.COMMENT, _tokenize.NL):
+            # any other token on the same indentation level end the previous
+            # block as well, except the pseudo-tokens COMMENT and NL.
+            raise EndOfBlock
+
+
+def getblock(lines):
+    """Extract the block of code at the top of the given list of lines."""
+    import tokenize as _tokenize
+    blockfinder = BlockFinder()
+    _token = None
+    try:
+        tokens = _tokenize.generate_tokens(iter(lines).__next__)
+        for _token in tokens:
+            blockfinder.tokeneater(*_token)
+    except (EndOfBlock, IndentationError):
+        pass
+    except SyntaxError as e:
+        if "unmatched" not in (getattr(e, "msg", "") or "") or _token is None:
+            raise e from None
+        _, *_token_info = _token
+        try:
+            blockfinder.tokeneater(_tokenize.NEWLINE, *_token_info)
+        except (EndOfBlock, IndentationError):
+            pass
+    return lines[:blockfinder.last]
+
+
 def getabsfile(obj, _filename=None):
     """Return an absolute path to the source or compiled file for an object.
 
@@ -1069,6 +1166,15 @@ class _empty:
     pass
 
 
+# Distinct "argument not supplied" sentinel for `replace()`. It must differ
+# from `_empty`, because `_empty` is itself a legitimate value a caller may
+# want to install (e.g. hypothesis strips annotations via
+# `param.replace(annotation=Parameter.empty)`); conflating the two silently
+# keeps the old annotation. Mirrors CPython's private `inspect._void`.
+class _void:
+    pass
+
+
 def formatannotation(annotation, base_module=None):
     if getattr(annotation, '__module__', None) == 'typing':
         import re
@@ -1107,12 +1213,37 @@ def unwrap(func, *, stop=None):
     return func
 
 
-class Parameter:
+class _ParameterKind(enum.IntEnum):
+    # Mirrors CPython `inspect._ParameterKind`: an `IntEnum` so that
+    # `param.kind == Parameter.VAR_POSITIONAL` keeps its integer semantics
+    # while introspection (`param.kind.name`, `.description`) also works —
+    # hypothesis reads `p.kind.name.startswith("POSITIONAL_")`.
     POSITIONAL_ONLY = 0
     POSITIONAL_OR_KEYWORD = 1
     VAR_POSITIONAL = 2
     KEYWORD_ONLY = 3
     VAR_KEYWORD = 4
+
+    @property
+    def description(self):
+        return _PARAM_NAME_MAPPING[self]
+
+
+_PARAM_NAME_MAPPING = {
+    _ParameterKind.POSITIONAL_ONLY: "positional-only",
+    _ParameterKind.POSITIONAL_OR_KEYWORD: "positional or keyword",
+    _ParameterKind.VAR_POSITIONAL: "variadic positional",
+    _ParameterKind.KEYWORD_ONLY: "keyword-only",
+    _ParameterKind.VAR_KEYWORD: "variadic keyword",
+}
+
+
+class Parameter:
+    POSITIONAL_ONLY = _ParameterKind.POSITIONAL_ONLY
+    POSITIONAL_OR_KEYWORD = _ParameterKind.POSITIONAL_OR_KEYWORD
+    VAR_POSITIONAL = _ParameterKind.VAR_POSITIONAL
+    KEYWORD_ONLY = _ParameterKind.KEYWORD_ONLY
+    VAR_KEYWORD = _ParameterKind.VAR_KEYWORD
 
     empty = _empty
 
@@ -1140,13 +1271,16 @@ class Parameter:
     def annotation(self):
         return self._annotation
 
-    def replace(self, *, name=None, kind=None, default=_empty, annotation=_empty):
-        return Parameter(
-            name if name is not None else self._name,
-            kind if kind is not None else self._kind,
-            default=default if default is not _empty else self._default,
-            annotation=annotation if annotation is not _empty else self._annotation,
-        )
+    def replace(self, *, name=_void, kind=_void, default=_void, annotation=_void):
+        if name is _void:
+            name = self._name
+        if kind is _void:
+            kind = self._kind
+        if default is _void:
+            default = self._default
+        if annotation is _void:
+            annotation = self._annotation
+        return type(self)(name, kind, default=default, annotation=annotation)
 
     def __repr__(self):
         formatted = self._name
@@ -1262,10 +1396,10 @@ class Signature:
     def return_annotation(self):
         return self._return_annotation
 
-    def replace(self, *, parameters=_empty, return_annotation=_empty):
-        params = list(self._parameters.values()) if parameters is _empty else list(parameters)
-        ret = self._return_annotation if return_annotation is _empty else return_annotation
-        return Signature(params, return_annotation=ret)
+    def replace(self, *, parameters=_void, return_annotation=_void):
+        params = list(self._parameters.values()) if parameters is _void else list(parameters)
+        ret = self._return_annotation if return_annotation is _void else return_annotation
+        return type(self)(params, return_annotation=ret)
 
     def _hash_basis(self):
         # CPython: keyword-only parameters compare order-insensitively.
@@ -1386,8 +1520,10 @@ class Signature:
         return self.format()
 
     @classmethod
-    def from_callable(cls, func):
-        return signature(func)
+    def from_callable(cls, func, *, follow_wrapped=True,
+                      globals=None, locals=None, eval_str=False):
+        return signature(func, follow_wrapped=follow_wrapped,
+                         globals=globals, locals=locals, eval_str=eval_str)
 
 
 def _signature_drop_first(sig):
@@ -1517,20 +1653,21 @@ def _signature_from_text(text):
     return Signature(pending)
 
 
-def signature(callable_, *, follow_wrapped=True):
+def signature(callable_, *, follow_wrapped=True, globals=None, locals=None, eval_str=False):
     if not callable(callable_):
         raise TypeError(f"{callable_!r} is not a callable object")
+    _sig_kw = dict(globals=globals, locals=locals, eval_str=eval_str)
     obj = callable_
     if ismethod(obj):
         # Bound method: signature of the underlying function minus the
         # bound argument.
-        return _signature_drop_first(signature(obj.__func__))
+        return _signature_drop_first(signature(obj.__func__, **_sig_kw))
     # Was this function wrapped by a decorator? An explicit
     # `__signature__` anywhere on the chain stops the walk.
     if follow_wrapped:
         obj = unwrap(obj, stop=lambda f: hasattr(f, "__signature__"))
         if ismethod(obj):
-            return _signature_drop_first(signature(obj.__func__))
+            return _signature_drop_first(signature(obj.__func__, **_sig_kw))
     explicit = getattr(obj, "__signature__", None)
     if explicit is not None:
         # CPython: `__signature__` may be a string, or a callable
@@ -1546,7 +1683,7 @@ def signature(callable_, *, follow_wrapped=True):
                 "unexpected object {!r} in __signature__ attribute".format(explicit))
         return sig
     if isinstance(obj, functools.partial):
-        return _signature_get_partial(signature(obj.func), obj)
+        return _signature_get_partial(signature(obj.func, **_sig_kw), obj)
     if isclass(obj):
         # A metaclass with a custom `__call__` takes over construction
         # entirely (CPython `_signature_from_callable`): derive the
@@ -1563,7 +1700,7 @@ def signature(callable_, *, follow_wrapped=True):
                     break
             if meta_call is not None:
                 if isfunction(meta_call):
-                    sig = signature(meta_call)
+                    sig = signature(meta_call, **_sig_kw)
                     params = list(sig.parameters.values())[1:]
                     return Signature(params, return_annotation=sig.return_annotation)
                 raise ValueError(f"no signature found for {obj!r}")
@@ -1571,12 +1708,12 @@ def signature(callable_, *, follow_wrapped=True):
         # fall back to __init__. A class signature carries no return annotation.
         new = getattr(obj, "__new__", None)
         if new is not None and new is not object.__new__:
-            sig = signature(new)
+            sig = signature(new, **_sig_kw)
             params = [p for name, p in sig.parameters.items() if name != "cls"]
             return Signature(params)
         init = getattr(obj, "__init__", None)
         if init is not None and init is not object.__init__:
-            sig = signature(init)
+            sig = signature(init, **_sig_kw)
             params = [p for name, p in sig.parameters.items() if name != "self"]
             return Signature(params)
         return Signature([])
@@ -1591,7 +1728,7 @@ def signature(callable_, *, follow_wrapped=True):
         # signature from the type's __call__, dropping the bound `self`.
         call = getattr(type(obj), "__call__", None)
         if call is not None and (isfunction(call) or ismethod(call)):
-            sig = signature(call)
+            sig = signature(call, **_sig_kw)
             params = [p for name, p in sig.parameters.items() if name != "self"]
             return Signature(params, return_annotation=sig.return_annotation)
         # Best effort: return an "unknown" signature.
@@ -1605,23 +1742,35 @@ def signature(callable_, *, follow_wrapped=True):
     n_args = len(spec.args)
     f = _func_of(callable_)
     posonly = getattr(f.__code__, "co_posonlyargcount", 0) if f is not None else 0
+    # With `eval_str=True` (PEP 563 / stringized annotations), resolve the raw
+    # `str` annotations to their runtime objects via `get_annotations`; mirrors
+    # CPython threading `globals`/`locals`/`eval_str` into the annotation dict.
+    if eval_str:
+        try:
+            anns = get_annotations(
+                callable_, globals=globals, locals=locals, eval_str=True
+            )
+        except Exception:
+            anns = spec.annotations
+    else:
+        anns = spec.annotations
     for i, name in enumerate(spec.args):
         if i >= n_args - n_defaults:
             default = defaults[i - (n_args - n_defaults)]
         else:
             default = _empty
-        annotation = spec.annotations.get(name, _empty)
+        annotation = anns.get(name, _empty)
         kind = Parameter.POSITIONAL_ONLY if i < posonly else Parameter.POSITIONAL_OR_KEYWORD
         params.append(Parameter(name, kind,
                                 default=default, annotation=annotation))
     if spec.varargs:
         params.append(Parameter(spec.varargs, Parameter.VAR_POSITIONAL,
-                                annotation=spec.annotations.get(spec.varargs, _empty)))
+                                annotation=anns.get(spec.varargs, _empty)))
     for name in spec.kwonlyargs:
         params.append(Parameter(name, Parameter.KEYWORD_ONLY,
                                 default=spec.kwonlydefaults.get(name, _empty),
-                                annotation=spec.annotations.get(name, _empty)))
+                                annotation=anns.get(name, _empty)))
     if spec.varkw:
         params.append(Parameter(spec.varkw, Parameter.VAR_KEYWORD,
-                                annotation=spec.annotations.get(spec.varkw, _empty)))
-    return Signature(params, return_annotation=spec.annotations.get("return", _empty))
+                                annotation=anns.get(spec.varkw, _empty)))
+    return Signature(params, return_annotation=anns.get("return", _empty))

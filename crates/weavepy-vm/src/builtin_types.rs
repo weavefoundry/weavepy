@@ -357,7 +357,7 @@ impl BuiltinTypes {
         }
         install_field_defaults(&attribute_error, &["name", "obj"]);
         install_field_defaults(&name_error, &["name"]);
-        install_field_defaults(&import_error, &["name", "path", "name_from"]);
+        install_field_defaults(&import_error, &["msg", "name", "path", "name_from"]);
         install_import_error_init(&import_error);
         let os_error = exc("OSError", exception.clone());
         install_os_error_init(&os_error);
@@ -652,6 +652,10 @@ impl BuiltinTypes {
             pair!(name_error, "NameError"),
             pair!(not_implemented_error, "NotImplementedError"),
             pair!(os_error, "OSError"),
+            // `IOError` and `EnvironmentError` are the same object as `OSError`
+            // in Python 3 (`IOError is OSError`), kept as builtin aliases.
+            pair!(os_error, "IOError"),
+            pair!(os_error, "EnvironmentError"),
             pair!(overflow_error, "OverflowError"),
             pair!(floating_point_error, "FloatingPointError"),
             pair!(runtime_error, "RuntimeError"),
@@ -750,7 +754,7 @@ impl BuiltinTypes {
             "LookupError" => Some(self.lookup_error.clone()),
             "NameError" => Some(self.name_error.clone()),
             "NotImplementedError" => Some(self.not_implemented_error.clone()),
-            "OSError" => Some(self.os_error.clone()),
+            "OSError" | "IOError" | "EnvironmentError" => Some(self.os_error.clone()),
             "OverflowError" => Some(self.overflow_error.clone()),
             "FloatingPointError" => Some(self.floating_point_error.clone()),
             "RuntimeError" => Some(self.runtime_error.clone()),
@@ -2872,10 +2876,16 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
                     [single] => {
                         if is_key_error {
                             Object::from_str(single.repr())
-                        } else if matches!(single, Object::Instance(_)) {
-                            // A nested exception (or other instance) needs
-                            // its own __str__ dispatched: CPython's
-                            // BaseException.__str__ is `str(args[0])`.
+                        } else if matches!(single, Object::Instance(_) | Object::Foreign(_)) {
+                            // A nested exception, other instance, or a
+                            // *foreign* extension object (e.g. a numpy
+                            // scalar) needs its own `__str__`/`tp_str`
+                            // dispatched: CPython's `BaseException.__str__`
+                            // is `str(args[0])`, not `repr`. Without this a
+                            // `OutOfBoundsTimedelta(np.timedelta64(...))`
+                            // stringified to its repr
+                            // (`np.timedelta64(...,'h')`) instead of
+                            // `"... hours"`.
                             Object::from_str(
                                 crate::builtins::str_reentrant(single)
                                     .unwrap_or_else(|| single.to_str()),
@@ -3147,6 +3157,7 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
     let is_os = is_subclass_by_name(&class, "OSError");
     let is_syntax = is_subclass_by_name(&class, "SyntaxError");
     let is_stop_iteration = is_subclass_by_name(&class, "StopIteration");
+    let is_import = is_subclass_by_name(&class, "ImportError");
     let inst = PyInstance::new(class);
     let msg = Object::from_str(message);
     // A messageless raise (`StopIteration()`, `GeneratorExit()`, …)
@@ -3191,6 +3202,18 @@ pub fn make_exception_with_class(class: Rc<TypeObject>, message: impl Into<Strin
             for name in ["errno", "strerror", "filename", "winerror", "filename2"] {
                 dict.insert(DictKey(Object::from_static(name)), Object::None);
             }
+        }
+        if is_import {
+            // ImportError/ModuleNotFoundError expose `msg` (the message
+            // string). CPython always defines the slot; a Rust-raised
+            // ImportError must answer `.msg` so consumers (e.g. numpy's
+            // `_core/__init__` error handling, which reads `exc.msg`) don't
+            // AttributeError. `name`/`path`/`name_from` are intentionally
+            // *not* pre-set on the instance here so the import machinery's
+            // `set_exception_attr` (which skips already-present keys) can
+            // still populate the real module name; their type-level
+            // defaults keep attribute access from raising in the meantime.
+            dict.insert(DictKey(Object::from_static("msg")), msg.clone());
         }
         if is_syntax {
             // SyntaxError exposes `msg` plus a location payload. CPython
@@ -4224,7 +4247,38 @@ fn install_numeric_class_methods(bt: &BuiltinTypes) {
             ))),
         }
     }
+    // CPython's `float.__int__` truncates toward zero, raising on non-finite
+    // values (`ValueError` for NaN, `OverflowError` for ±inf). Faithful via a
+    // bigint so magnitudes past the i64 range convert exactly.
+    fn float_as_int(args: &[Object]) -> Result<Object, RuntimeError> {
+        let o = args
+            .first()
+            .ok_or_else(|| crate::error::type_error("__int__ requires an argument"))?;
+        let native = o.native_value();
+        match native.as_ref().unwrap_or(o) {
+            Object::Float(f) => {
+                if f.is_nan() {
+                    return Err(crate::error::value_error(
+                        "cannot convert float NaN to integer",
+                    ));
+                }
+                if f.is_infinite() {
+                    return Err(crate::error::overflow_error(
+                        "cannot convert float infinity to integer",
+                    ));
+                }
+                Ok(Object::int_from_bigint(crate::object::bigint_from_f64_trunc(
+                    f.trunc(),
+                )))
+            }
+            other => Err(crate::error::type_error(format!(
+                "descriptor '__int__' requires a 'float' object but received a '{}'",
+                other.type_name()
+            ))),
+        }
+    }
     install_method(&bt.int_, "__int__", self_as_int);
     install_method(&bt.int_, "__index__", self_as_int);
     install_method(&bt.float_, "__float__", self_as_float);
+    install_method(&bt.float_, "__int__", float_as_int);
 }

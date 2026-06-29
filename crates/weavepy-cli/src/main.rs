@@ -305,7 +305,37 @@ The following implementation-specific options are available:
 -X int_max_str_digits  : set sys.int_info.str_digits_check_threshold.
 ";
 
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn backtrace(array: *mut *mut std::ffi::c_void, size: i32) -> i32;
+    fn backtrace_symbols_fd(array: *const *mut std::ffi::c_void, size: i32, fd: i32);
+}
+
+extern "C" fn weavepy_segv_backtrace(sig: i32) {
+    // Native (dladdr-based) backtrace first: it resolves frames inside a
+    // dlopen'd `.so` (e.g. a Cython extension's static helpers) to their
+    // real `module + symbol + offset`, which Rust's `std::backtrace`
+    // mis-attributes to the nearest exported libsystem symbol.
+    let mut frames: [*mut std::ffi::c_void; 96] = [std::ptr::null_mut(); 96];
+    let n = unsafe { backtrace(frames.as_mut_ptr(), 96) };
+    eprintln!("\n=== WEAVEPY signal {sig} native backtrace ===");
+    unsafe { backtrace_symbols_fd(frames.as_ptr(), n, 2) };
+    eprintln!("=== end native backtrace ===");
+    let bt = std::backtrace::Backtrace::force_capture();
+    eprintln!("=== WEAVEPY signal {sig} rust backtrace ===\n{bt}\n=== end backtrace ===");
+    unsafe {
+        signal(sig, 0);
+    }
+    std::process::abort();
+}
+
 fn main() -> ExitCode {
+    if std::env::var_os("WEAVEPY_SEGV_BT").is_some() {
+        unsafe {
+            signal(11, weavepy_segv_backtrace as usize); // SIGSEGV
+            signal(10, weavepy_segv_backtrace as usize); // SIGBUS
+        }
+    }
     // Undo Rust's pre-`main` `sanitize_standard_fds` (which re-opens any closed
     // std fd onto `/dev/null`) so an inherited-closed stdin/stdout/stderr stays
     // closed, matching CPython (`test_posix.test_close_file`). Must run before
@@ -340,6 +370,14 @@ fn run_on_large_stack(entry: fn() -> ExitCode) -> ExitCode {
     weavepy::vm::stdlib::signal_mod::block_async_signals_current_thread();
 
     let vm_entry = move || -> ExitCode {
+        // TEMP: register the native crash handler + per-thread sigaltstack on
+        // the VM thread itself so a stack-overflow SIGSEGV can be caught here.
+        if std::env::var_os("WEAVEPY_CRASH_BT").is_some() {
+            extern "C" {
+                fn weavepy_install_crash_handler();
+            }
+            unsafe { weavepy_install_crash_handler() };
+        }
         weavepy::vm::stdlib::signal_mod::unblock_async_signals_current_thread();
         // Arm SIGINT -> KeyboardInterrupt at startup (CPython does this during
         // interpreter init), so even scripts that never `import signal` raise

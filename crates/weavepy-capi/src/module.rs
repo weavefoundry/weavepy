@@ -8,7 +8,7 @@ use weavepy_vm::sync::Rc;
 use weavepy_vm::sync::RefCell;
 
 use weavepy_vm::error::{type_error, RuntimeError};
-use weavepy_vm::object::{BuiltinFn, DictData, DictKey, Object, PyModule};
+use weavepy_vm::object::{BuiltinFn, DictData, DictKey, MethodWrapper, Object, PyModule};
 
 use crate::object::PyObject;
 
@@ -158,6 +158,10 @@ unsafe fn call_fastcall(
     kwargs: &[(String, Object)],
     flags: c_int,
 ) -> *mut PyObject {
+    if std::env::var_os("WEAVEPY_TRACE_CALL").is_some() && !kwargs.is_empty() {
+        let keys: Vec<&str> = kwargs.iter().map(|(k, _)| k.as_str()).collect();
+        eprintln!("[TRACE_FASTCALL] nargs={} kwargs={:?}", args.len(), keys);
+    }
     let mut argv: Vec<*mut PyObject> = Vec::with_capacity(args.len() + kwargs.len());
     for a in args {
         argv.push(crate::object::into_owned(a.clone()));
@@ -276,6 +280,14 @@ fn bridge_invoke(
     let Some(func) = func else {
         return Err(type_error(format!("'{static_name}' is null")));
     };
+    if std::env::var_os("WEAVEPY_TRACE_CALL").is_some() {
+        let keys: Vec<&str> = kwargs.iter().map(|(k, _)| k.as_str()).collect();
+        eprintln!(
+            "[TRACE_BRIDGE] {static_name}() flags={flags:#x} nargs={} kwargs={:?}",
+            args.len(),
+            keys
+        );
+    }
     crate::interp::ensure_initialised();
     crate::errors::clear_thread_local();
 
@@ -526,6 +538,25 @@ pub unsafe extern "C" fn PyModule_Create2(def: *mut PyModuleDef, _api: c_int) ->
         filename: None,
         dict,
     });
+    // PEP 3121: a single-phase extension that declares `m_size > 0` (pandas'
+    // vendored ujson) allocates per-module state here and writes into it via
+    // `PyModule_GetState`. Key the block by the module's native `Rc` identity
+    // (stable across the fresh per-crossing C boxes) before the `Rc` is moved
+    // into the crossing.
+    if def_ref.m_size > 0 {
+        let key = Rc::as_ptr(&module) as usize;
+        crate::wave5_pandas::ensure_module_state(key, def_ref.m_size as usize);
+    }
+    // CPython adds a single-phase module with per-interpreter state
+    // (`m_size >= 0`) to `interp->modules_by_index`, so the extension can later
+    // re-fetch it via `PyState_FindModule(def)`. pandas' vendored ujson relies
+    // on this to reach its cached `Series`/`DataFrame`/`Index` types.
+    if def_ref.m_size >= 0 {
+        crate::wave5_pandas::register_find_module(
+            def as *mut core::ffi::c_void,
+            Object::Module(module.clone()),
+        );
+    }
     crate::object::into_owned(Object::Module(module))
 }
 
@@ -604,12 +635,21 @@ pub unsafe fn run_multiphase_init(
     // Phase 1: create the module object.
     let create_slot = slots.iter().find(|s| s.slot == PY_MOD_CREATE);
     let module: *mut PyObject = if let Some(slot) = create_slot {
+        if trace {
+            eprintln!("[mpi] {full_name}: create slot -> calling");
+        }
         let create: unsafe extern "C" fn(*mut PyObject, *mut PyModuleDef) -> *mut PyObject =
             unsafe { std::mem::transmute(slot.value) };
         let spec = unsafe { build_module_spec(full_name) };
+        if trace {
+            eprintln!("[mpi] {full_name}: build_module_spec -> {}", if spec.is_null() { "NULL" } else { "ok" });
+        }
         let m = unsafe { create(spec, def) };
         if !spec.is_null() {
             unsafe { crate::object::Py_DecRef(spec) };
+        }
+        if trace {
+            eprintln!("[mpi] {full_name}: create slot -> {}", if m.is_null() { "NULL" } else { "ok" });
         }
         m
     } else {
@@ -618,19 +658,45 @@ pub unsafe fn run_multiphase_init(
     };
     if module.is_null() {
         let pending = crate::errors::take_pending()
-            .map(|p| format!("{:?}", p.value))
+            .map(|p| {
+                let ty = p
+                    .ty
+                    .as_ref()
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| "Exception".to_owned());
+                let msg = crate::errors::message_for(&p.value);
+                if msg.is_empty() {
+                    format!("module create slot raised {ty}")
+                } else {
+                    format!("module create slot raised {ty}: {msg}")
+                }
+            })
             .unwrap_or_else(|| "module creation slot returned NULL".to_owned());
         return Err(pending);
     }
 
     // Make the module discoverable under its full dotted name while the
     // exec slots run (numpy reads `__name__` and re-imports siblings).
+    // CPython's import machinery also sets `__package__` (the parent
+    // package) before running a module's body; an extension's relative
+    // imports (`from ._pcg64 cimport …` in numpy.random._generator) resolve
+    // against it, so derive it from the dotted name here. A leaf module's
+    // package is its name minus the last component; a top-level module's is
+    // empty.
     unsafe {
         if let Object::Module(m) = crate::object::clone_object(module) {
             let mut d = m.dict.borrow_mut();
             d.insert(
                 DictKey(Object::from_static("__name__")),
                 Object::from_str(full_name.to_owned()),
+            );
+            let package = match full_name.rsplit_once('.') {
+                Some((head, _)) => head.to_owned(),
+                None => String::new(),
+            };
+            d.insert(
+                DictKey(Object::from_static("__package__")),
+                Object::from_str(package),
             );
         }
     }
@@ -663,8 +729,18 @@ pub unsafe fn run_multiphase_init(
             return Err(pending);
         }
         if let Some(p) = crate::errors::take_pending() {
+            let ty = p
+                .ty
+                .as_ref()
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| "Exception".to_owned());
+            let msg = crate::errors::message_for(&p.value);
             unsafe { crate::object::Py_DecRef(module) };
-            return Err(format!("{:?}", p.value));
+            return Err(if msg.is_empty() {
+                format!("exec slot {i} left pending {ty}")
+            } else {
+                format!("exec slot {i} left pending {ty}: {msg}")
+            });
         }
     }
     Ok(module)
@@ -932,6 +1008,66 @@ pub unsafe extern "C" fn PyImport_AddModule(name: *const c_char) -> *mut PyObjec
     }
 }
 
+/// `PyImport_AddModuleRef(name)` (3.13) — like `PyImport_AddModule` but
+/// returns a **new** reference. WeavePy's `PyImport_AddModule` already
+/// hands back an owned reference, so this is the same call. Cython's
+/// `__Pyx_PyImport_AddModuleRef` is `#define`d to this on 3.13.
+#[no_mangle]
+pub unsafe extern "C" fn PyImport_AddModuleRef(name: *const c_char) -> *mut PyObject {
+    unsafe { PyImport_AddModule(name) }
+}
+
+/// `PyImport_GetModuleDict()` — the genuine `sys.modules` dict (a borrowed
+/// reference in CPython). WeavePy's `sys.modules` *is* a real dict backed
+/// by the interpreter's [`ModuleCache`], so registrations Cython performs
+/// here (`PyDict_SetItemString(modules, "cyreal", m)`) flow into the live
+/// module table. We hand back an owned reference to that same dict; the
+/// underlying storage is interpreter-lived, so treating it as borrowed
+/// (the caller never decrefs) does not free it.
+#[no_mangle]
+pub unsafe extern "C" fn PyImport_GetModuleDict() -> *mut PyObject {
+    crate::interp::ensure_initialised();
+    crate::interp::with_current(|ctx| {
+        let interp = unsafe { &*ctx.interp };
+        let modules = interp.module_cache().modules.clone();
+        crate::object::into_owned(Object::Dict(modules))
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
+/// `PyModule_NewObject(name)` — create a fresh module object named `name`
+/// (a unicode object) **without** registering it in `sys.modules`, matching
+/// CPython. Cython's PEP 489 create slot (`__pyx_pymod_create`) calls this.
+#[no_mangle]
+pub unsafe extern "C" fn PyModule_NewObject(name: *mut PyObject) -> *mut PyObject {
+    crate::interp::ensure_initialised();
+    let s = match unsafe { crate::object::clone_object(name) } {
+        Object::Str(s) => s.to_string(),
+        other => {
+            crate::errors::set_type_error(format!(
+                "PyModule_NewObject: name must be a string, not {}",
+                other.type_name()
+            ));
+            return ptr::null_mut();
+        }
+    };
+    let dict = Rc::new(RefCell::new(DictData::new()));
+    dict.borrow_mut().insert(
+        DictKey(Object::from_static("__name__")),
+        Object::from_str(s.clone()),
+    );
+    dict.borrow_mut().insert(
+        DictKey(Object::from_static("__doc__")),
+        Object::None,
+    );
+    let module = Object::Module(Rc::new(PyModule {
+        name: s,
+        filename: None,
+        dict,
+    }));
+    crate::object::into_owned(module)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn PyImport_GetModule(name: *mut PyObject) -> *mut PyObject {
     let name_str = match unsafe { crate::object::clone_object(name) } {
@@ -944,6 +1080,80 @@ pub unsafe extern "C" fn PyImport_GetModule(name: *mut PyObject) -> *mut PyObjec
     })
     .flatten()
     .map_or(ptr::null_mut(), |m| crate::object::into_owned(m))
+}
+
+/// `PyClassMethod_New(callable)` — wrap `callable` in a `classmethod`
+/// descriptor, returning a new reference (Python `classmethod(callable)`).
+/// Cython emits this for a `@classmethod` assigned in a class body — e.g.
+/// frozenlist's `__class_getitem__ = classmethod(types.GenericAlias)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyClassMethod_New(callable: *mut PyObject) -> *mut PyObject {
+    if callable.is_null() {
+        crate::errors::set_type_error("PyClassMethod_New: callable is NULL");
+        return ptr::null_mut();
+    }
+    let func = unsafe { crate::object::clone_object(callable) };
+    crate::object::into_owned(Object::ClassMethod(MethodWrapper::new(func)))
+}
+
+/// `PyDescr_NewClassMethod(type, method)` — build a `classmethod_descriptor`
+/// from a single C `PyMethodDef` for installation in `type`'s dict. Read
+/// later as `Type.method`, the descriptor binds `Type` as the call's first
+/// argument (the classmethod protocol). WeavePy bridges the C function into
+/// a builtin and wraps it in [`Object::ClassMethod`], whose MRO-lookup path
+/// (`crate::abstract_`) binds the owning class — so a subsequent
+/// `Type.method(...)` reaches the C function with the type as `self`.
+#[no_mangle]
+pub unsafe extern "C" fn PyDescr_NewClassMethod(
+    _type: *mut crate::types::PyTypeObject,
+    method: *mut PyMethodDef,
+) -> *mut PyObject {
+    if method.is_null() {
+        crate::errors::set_type_error("PyDescr_NewClassMethod: method is NULL");
+        return ptr::null_mut();
+    }
+    let entry = unsafe { *method };
+    if entry.ml_name.is_null() {
+        crate::errors::set_type_error("PyDescr_NewClassMethod: method has no name");
+        return ptr::null_mut();
+    }
+    let name = unsafe { CStr::from_ptr(entry.ml_name) }
+        .to_string_lossy()
+        .into_owned();
+    let callable = wrap_c_function(name, entry.ml_meth, entry.ml_flags, None);
+    crate::object::into_owned(Object::ClassMethod(MethodWrapper::new(callable)))
+}
+
+/// `PyCFunction_NewEx(ml, self, module)` — build a builtin function/method
+/// object from a single `PyMethodDef`, binding `self` (NULL → unbound). The
+/// `module` owner is informational under WeavePy's model. Used by
+/// [`crate::wave5_pandas::PyCMethod_New`] and any method-table install that
+/// reaches for the public constructor.
+#[no_mangle]
+pub unsafe extern "C" fn PyCFunction_NewEx(
+    ml: *mut PyMethodDef,
+    self_: *mut PyObject,
+    _module: *mut PyObject,
+) -> *mut PyObject {
+    if ml.is_null() {
+        crate::errors::set_type_error("PyCFunction_NewEx: method def is NULL");
+        return ptr::null_mut();
+    }
+    let entry = unsafe { *ml };
+    if entry.ml_name.is_null() {
+        crate::errors::set_type_error("PyCFunction_NewEx: method has no name");
+        return ptr::null_mut();
+    }
+    let name = unsafe { CStr::from_ptr(entry.ml_name) }
+        .to_string_lossy()
+        .into_owned();
+    let self_obj = if self_.is_null() || std::ptr::eq(self_, crate::singletons::none_ptr()) {
+        None
+    } else {
+        Some(unsafe { crate::object::clone_object(self_) })
+    };
+    let callable = wrap_c_function(name, entry.ml_meth, entry.ml_flags, self_obj);
+    crate::object::into_owned(callable)
 }
 
 fn install_runtime_error(err: RuntimeError) {

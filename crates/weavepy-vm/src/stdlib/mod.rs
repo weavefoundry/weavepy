@@ -72,6 +72,7 @@ pub mod zlib_mod;
 pub mod abc_mod;
 pub mod atexit_mod;
 pub mod contextvars_mod;
+pub mod ctypes_native;
 pub mod https_mod;
 pub mod io_full;
 pub mod locale_mod;
@@ -191,6 +192,12 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_locale", locale_mod::build);
     cache.register_builtin("_abc", abc_mod::build);
     cache.register_builtin("_contextvars", contextvars_mod::build);
+    // RFC 0046 (wave 5): native primitive layer behind the frozen `_ctypes`
+    // reimplementation (memory peek/poke, dlopen/dlsym, platform C type
+    // sizes, libffi call bridge) that backs the verbatim CPython `ctypes`
+    // package. The host `_ctypes.*.so` is core-built (links `_PyRuntime`),
+    // so it cannot be dlopen'd like a stable-ABI wheel — we reimplement it.
+    cache.register_builtin("_ctypes_native", ctypes_native::build);
     cache.register_builtin("atexit", atexit_mod::build);
     cache.register_builtin("_https", https_mod::build);
     // RFC 0026 — POSIX-flavoured stdlib that user code (and the
@@ -215,8 +222,29 @@ pub fn register_all(cache: &ModuleCache) {
     // binary-ABI loader imports the genuine `numpy._core._multiarray_umath`
     // extension instead.
     let suppress_numpy_shim = std::env::var_os("WEAVEPY_NO_NUMPY_SHIM").is_some();
+    // Mirror of `WEAVEPY_NO_NUMPY_SHIM` for the frozen `pytest`/`pluggy`/
+    // `iniconfig` shims: suppressing them lets a real pytest installed on
+    // `sys.path` load instead (or an editable copy of our shim during
+    // development), rather than being shadowed by the frozen source.
+    let suppress_pytest_shim = std::env::var_os("WEAVEPY_NO_PYTEST_SHIM").is_some();
+    // General-purpose escape hatch (comma-separated module names) so a frozen
+    // module can be shadowed by an editable copy on `sys.path` during
+    // development — the same idea as the two shims above, but for arbitrary
+    // modules while iterating on their pure-Python source without a rebuild.
+    let suppress_list = std::env::var("WEAVEPY_SUPPRESS_FROZEN").unwrap_or_default();
+    let suppressed: std::collections::HashSet<&str> = suppress_list
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     for src in frozen_sources() {
         if suppress_numpy_shim && matches!(src.name, "numpy" | "_numpy_pure") {
+            continue;
+        }
+        if suppress_pytest_shim && matches!(src.name, "pytest" | "pluggy" | "iniconfig") {
+            continue;
+        }
+        if suppressed.contains(src.name) {
             continue;
         }
         cache.register_frozen(*src);
@@ -228,6 +256,58 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "builtins",
             source: include_str!("python/builtins.py"),
+            is_package: false,
+        },
+        // RFC 0046 (wave 5): `ctypes`. The verbatim CPython `ctypes` package
+        // runs over our frozen `_ctypes` reimplementation (CPython's real
+        // `_ctypes` is a core-built C extension linking `_PyRuntime`, so it
+        // can't be dlopen'd like a stable-ABI wheel). `_ctypes` in turn sits
+        // on the native `_ctypes_native` primitive module (memory, dlopen,
+        // platform C type sizes, libffi). pandas imports `ctypes`
+        // unconditionally (`pandas.errors`).
+        FrozenSource {
+            name: "_ctypes",
+            source: include_str!("python/_ctypes.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes",
+            source: include_str!("python/ctypes/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "ctypes._endian",
+            source: include_str!("python/ctypes/_endian.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.util",
+            source: include_str!("python/ctypes/util.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.wintypes",
+            source: include_str!("python/ctypes/wintypes.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.macholib",
+            source: include_str!("python/ctypes/macholib/__init__.py"),
+            is_package: true,
+        },
+        FrozenSource {
+            name: "ctypes.macholib.dyld",
+            source: include_str!("python/ctypes/macholib/dyld.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.macholib.dylib",
+            source: include_str!("python/ctypes/macholib/dylib.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "ctypes.macholib.framework",
+            source: include_str!("python/ctypes/macholib/framework.py"),
             is_package: false,
         },
         // RFC 0040 WS1 — upgrades the native `os` module's `environ`/
@@ -1590,6 +1670,11 @@ fn frozen_sources() -> &'static [FrozenSource] {
         FrozenSource {
             name: "pickle",
             source: include_str!("python/pickle.py"),
+            is_package: false,
+        },
+        FrozenSource {
+            name: "_compat_pickle",
+            source: include_str!("python/_compat_pickle.py"),
             is_package: false,
         },
         FrozenSource {

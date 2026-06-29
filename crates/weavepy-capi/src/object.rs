@@ -109,10 +109,105 @@ pub struct PyObjectBox {
 // proxied into the VM as [`weavepy_vm::object::Object::Foreign`].
 // ---------------------------------------------------------------------------
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Mutex;
 
 static MINTED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+// ---- TEMP foreign-soul liveness tracker (WEAVEPY_TRACK_SOULS) ------------
+// Precise premature-free detector for foreign proxies. `fwd_incref` /
+// `fwd_decref` (the ForeignHooks incref/decref) are called *exactly* when a
+// `PyForeignSoul` is born / dies, so this map counts how many live souls
+// reference each foreign pointer. If `free_box` frees a foreign box while its
+// soul count is still > 0, some path over-decref'd the C refcount and the VM
+// still holds a dangling proxy — the merge UAF. Gated on an env var.
+static SOULS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+pub fn track_souls_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_TRACK_SOULS").is_some())
+}
+
+pub fn soul_inc(p: usize) {
+    if !track_souls_enabled() || p == 0 {
+        return;
+    }
+    if let Ok(mut g) = SOULS.lock() {
+        *g.get_or_insert_with(HashMap::new).entry(p).or_insert(0) += 1;
+    }
+}
+
+/// Decrement the live-soul count for `p`. Must be called *before* the
+/// underlying `Py_DecRef`, so that the last soul's own decref (which frees
+/// the box) sees a zero count and is not flagged.
+pub fn soul_dec(p: usize) {
+    if !track_souls_enabled() || p == 0 {
+        return;
+    }
+    if let Ok(mut g) = SOULS.lock() {
+        if let Some(m) = g.as_mut() {
+            if let Some(c) = m.get_mut(&p) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    m.remove(&p);
+                }
+            }
+        }
+    }
+}
+
+fn soul_count(p: usize) -> u32 {
+    if !track_souls_enabled() || p == 0 {
+        return 0;
+    }
+    SOULS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(&p).copied()))
+        .unwrap_or(0)
+}
+
+pub fn freebox_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WEAVEPY_FREEBOX_TRACE").is_some())
+}
+
+thread_local! {
+    static FREEBOX_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct FreeBoxDepthGuard;
+impl FreeBoxDepthGuard {
+    fn enter() -> Self {
+        FREEBOX_DEPTH.with(|c| c.set(c.get() + 1));
+        FreeBoxDepthGuard
+    }
+}
+impl Drop for FreeBoxDepthGuard {
+    fn drop(&mut self) {
+        FREEBOX_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) unsafe fn debug_type_name(p: *mut PyObject) -> String {
+    if p.is_null() {
+        return "<null>".to_string();
+    }
+    let ty = unsafe { (*p).ob_type };
+    if ty.is_null() {
+        return "<null-type>".to_string();
+    }
+    let np = unsafe { (*(ty as *mut crate::layout::PyTypeObjectFull)).tp_name };
+    if np.is_null() {
+        return "<null-name>".to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr(np) }
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// Record `p` as a WeavePy-minted public pointer. Called by every mint
 /// site (box, mirror body, instance body, capsule) so [`is_weavepy_owned`]
@@ -120,6 +215,12 @@ static MINTED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 pub fn register_minted(p: *mut PyObject) {
     if p.is_null() {
         return;
+    }
+    if freebox_trace_enabled() {
+        let tyname = unsafe { debug_type_name(p) };
+        if tyname.contains("Engine") {
+            eprintln!("[MINT] register p=0x{:x} type={}", p as usize, tyname);
+        }
     }
     if let Ok(mut g) = MINTED.lock() {
         g.get_or_insert_with(HashSet::new).insert(p as usize);
@@ -238,11 +339,26 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
     // registered `PyTypeObject*` (static, heap, or readied) and hand C a
     // fresh reference to that.
     if let Object::Type(t) = &obj {
-        if let Some(p) = crate::types::type_ptr_for_class(t) {
-            let p = p as *mut PyObject;
-            unsafe { Py_IncRef(p) };
-            return p;
-        }
+        // A type's canonical `PyObject*` is always a `PyTypeObject`. If
+        // none is registered yet (a Python-defined class — e.g. a stdlib
+        // type like `enum.Enum` — crossing into C for the first time),
+        // mint one on demand rather than falling through to the generic
+        // instance-box path, which would hand C a box wearing bare `type`
+        // and lose the real metaclass (`Py_TYPE(cls)`).
+        //
+        // Use the *same* resolver order as `type_for_object` does for an
+        // instance — `find → synth → install` — so a protocol class (one
+        // whose instances drive a C-level `tp_iter`/`tp_iternext`/… read,
+        // e.g. `itertools.cycle`) registers its slot-bearing synth type,
+        // not a bare `install_user_type` shell. Otherwise the bare type
+        // pollutes the registry and a later instance crossing finds it
+        // first, losing `tp_iternext` ("cycle object is not an iterator").
+        let p = crate::types::type_ptr_for_class(t)
+            .or_else(|| crate::types::synth_type_for_class(t))
+            .unwrap_or_else(|| crate::types::install_user_type(t));
+        let p = p as *mut PyObject;
+        unsafe { Py_IncRef(p) };
+        return p;
     }
     // Faithful built-in types cross into C as layout-faithful mirrors
     // (RFC 0043) so a stock extension's *inlined* field reads land on
@@ -262,6 +378,24 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
     // reads the same bytes on every crossing), not a fresh per-crossing
     // box. Every other object keeps the legacy `PyObjectBox`.
     if let Object::Instance(inst) = &obj {
+        if std::env::var_os("WEAVEPY_TRACE_CTOR").is_some() {
+            let path = if crate::types::is_inline_instance_type(ty) {
+                "inline"
+            } else if inst.c_body.get() != 0 {
+                "cached_box"
+            } else {
+                "mint_box"
+            };
+            eprintln!(
+                "[CTOR] into_owned name={} ty={:p} inline={} basicsize={} cls={} path={}",
+                crate::types::ctor_trace_name(ty),
+                ty,
+                crate::types::is_inline_instance_type(ty),
+                unsafe { (*ty).tp_basicsize },
+                inst.cls().name,
+                path,
+            );
+        }
         if crate::types::is_inline_instance_type(ty) {
             return crate::instance::instance_body_out(inst, ty);
         }
@@ -381,11 +515,12 @@ pub fn into_owned_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
     // `PyTypeObject*` (see [`into_owned`]); the advertised `ty` (the
     // metaclass) is irrelevant to a class's canonical pointer.
     if let Object::Type(t) = &obj {
-        if let Some(p) = crate::types::type_ptr_for_class(t) {
-            let p = p as *mut PyObject;
-            unsafe { Py_IncRef(p) };
-            return p;
-        }
+        let p = crate::types::type_ptr_for_class(t)
+            .or_else(|| crate::types::synth_type_for_class(t))
+            .unwrap_or_else(|| crate::types::install_user_type(t));
+        let p = p as *mut PyObject;
+        unsafe { Py_IncRef(p) };
+        return p;
     }
     // If the *advertised* type is a faithful built-in (e.g. the
     // tuple-staging case where `obj` is an `Object::List` but the type
@@ -453,22 +588,19 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
     if std::ptr::eq(head, crate::singletons::_Py_EllipsisObject.as_ptr()) {
         return weavepy_vm::vm_singletons::ellipsis();
     }
-    // PyTypeObject extends PyObject; static type slots short-circuit
-    // here because their bridge field carries the native Rc. We
-    // *must* verify the metaclass FIRST — reading `(*ty).bridge`
-    // requires that `p` actually point at a `PyTypeObjectBox`.
-    if !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyType_Type.as_ptr()) {
-        if let Some(t) = unsafe { crate::types::bridge_type(p as *mut crate::types::PyTypeObject) }
-        {
-            return Object::Type(t);
-        }
-    }
-    // RFC 0046 (wave 4): an extension type whose metaclass is *not* `type`
-    // (numpy's DType classes carry `ob_type == &PyArrayDTypeMeta_Type`)
-    // still resolves to its bridged `Object::Type` if we readied it — a
-    // safe pointer-keyed lookup that must precede the foreign fallback so
-    // such a class is not opaquely proxied.
-    if let Some(t) = crate::types::readied_bridge(p as *mut crate::types::PyTypeObject) {
+    // PyTypeObject extends PyObject; resolve any WeavePy-owned type box
+    // (static, heap, or readied) back to its bridged `Object::Type`.
+    //
+    // `bridge_type` is pointer-identity-safe: it checks the readied side
+    // table and the static/heap registries *before* reading the private
+    // `bridge` field, so it never dereferences offset 424 of a foreign or
+    // non-type box. It must NOT be gated on `ob_type == PyType_Type`: a
+    // WeavePy class whose metaclass is not bare `type` (e.g. `enum.Enum`,
+    // whose `ob_type` is now its real `EnumType` mirror, or numpy's DType
+    // classes carrying `ob_type == &PyArrayDTypeMeta_Type`) would
+    // otherwise fail this check and be opaquely proxied as a foreign
+    // `'object'` — breaking `cls.__mro__`, `isinstance(x, cls)`, etc.
+    if let Some(t) = unsafe { crate::types::bridge_type(p as *mut crate::types::PyTypeObject) } {
         return Object::Type(t);
     }
     // RFC 0046 (wave 4): a pointer WeavePy did not mint — a static numpy
@@ -628,10 +760,36 @@ pub unsafe extern "C" fn _Py_Dealloc(op: *mut PyObject) {
 /// helpers. Static singletons short-circuit through the immortal
 /// check in [`Py_DecRef`].
 pub(crate) unsafe fn free_box(p: *mut PyObject) {
+    if crate::mirror::is_watched(p as usize) {
+        eprintln!(
+            "[WATCH] FREE-BOX 0x{:x} type={}",
+            p as usize,
+            unsafe { debug_type_name(p) }
+        );
+        crate::mirror::unwatch_ptr(p as usize);
+    }
     // Invalidate any borrowed-item cache entries pinned to this
     // box's address so subsequent reuse of the slab doesn't return
     // stale items from the old container.
     crate::containers::invalidate_borrowed_cache(p);
+
+    if freebox_trace_enabled() {
+        let tyname = unsafe { debug_type_name(p) };
+        if tyname.contains("Engine") || tyname.contains("index.") {
+            let owned = is_weavepy_owned(p);
+            let is_body = unsafe { crate::mirror::is_instance_body(p) };
+            let is_mir = unsafe { crate::mirror::is_mirror(p) };
+            eprintln!(
+                "[FREEBOX-ENTRY] p=0x{:x} type={} owned={} body={} mirror={} depth={}",
+                p as usize,
+                tyname,
+                owned,
+                is_body,
+                is_mir,
+                FREEBOX_DEPTH.with(|c| c.get()),
+            );
+        }
+    }
 
     // RFC 0046 (wave 4): a *foreign* object (extension-minted, never in our
     // registry) must never be `Box::from_raw`-d or `free_mirror`-d as one of
@@ -646,9 +804,35 @@ pub(crate) unsafe fn free_box(p: *mut PyObject) {
     // dispatch to the extension's own `tp_dealloc` (numpy frees its array
     // data, etc.); with no `tp_dealloc` we leak rather than corrupt.
     if !is_weavepy_owned(p) {
+        let live = soul_count(p as usize);
+        if live > 0 {
+            let tyname = unsafe { debug_type_name(p) };
+            eprintln!(
+                "[SOUL-UAF] freeing foreign p=0x{:x} type={} while {} soul(s) alive",
+                p as usize, tyname, live
+            );
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
+        if crate::object::freebox_trace_enabled() {
+            let tyname = unsafe { debug_type_name(p) };
+            if tyname.contains("Engine")
+                || tyname.contains("Index")
+                || tyname.contains("ndarray")
+                || FREEBOX_DEPTH.with(|c| c.get()) > 0
+            {
+                eprintln!(
+                    "[FREEBOX] depth={} FOREIGN-FREE p=0x{:x} type={} souls={}",
+                    FREEBOX_DEPTH.with(|c| c.get()),
+                    p as usize,
+                    tyname,
+                    live,
+                );
+            }
+        }
         let ty = unsafe { (*p).ob_type };
         if !ty.is_null() {
             if let Some(dealloc) = unsafe { (*ty).tp_dealloc } {
+                let _g = FreeBoxDepthGuard::enter();
                 unsafe { dealloc(p) };
             }
         }
@@ -729,6 +913,14 @@ pub unsafe extern "C" fn Py_DecRef(op: *mut PyObject) {
         return;
     }
     head.ob_refcnt -= 1;
+    if head.ob_refcnt <= 0 && crate::mirror::is_watched(op as usize) {
+        eprintln!(
+            "[WATCH] FREE-AT-DEC 0x{:x} refcnt={}\n{}",
+            op as usize,
+            head.ob_refcnt,
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
     if head.ob_refcnt == 0 {
         unsafe { free_box(op) };
     }

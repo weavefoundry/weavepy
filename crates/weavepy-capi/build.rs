@@ -238,11 +238,41 @@ fn main() {
                 name: "_stockarray",
                 env_var: "WEAVEPY_CAPI_STOCKARRAY_EXTENSION",
             });
+            // `_stockcython.c` — wave 5 (RFC 0047): a Cython-shaped
+            // extension that subclasses an extension-defined base and
+            // reads inherited slots directly off `Py_TYPE(self)` (the
+            // `inherit_slots` proof), plus the Cython C-API runtime tail.
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stockcython.c"),
+                name: "_stockcython",
+                env_var: "WEAVEPY_CAPI_STOCKCYTHON_EXTENSION",
+            });
+            // `_stockdatetime.c` — wave 5 (RFC 0029): a datetime consumer
+            // compiled against the real `datetime.h`, exercising
+            // `PyDateTime_IMPORT`, the inlined `PyDateTime_GET_*` accessor
+            // macros, the capsule constructors, and the `tp_basicsize`
+            // size-check — the exact ABI surface pandas' `tslibs` uses.
+            build_extension(ExtensionBuild {
+                cc: &cc,
+                include_dir: &stock_inc,
+                out_dir: &out_dir,
+                target_os: &target_os,
+                suffix,
+                src: &workspace_root.join("tests/capi_ext/_stockdatetime.c"),
+                name: "_stockdatetime",
+                env_var: "WEAVEPY_CAPI_STOCKDATETIME_EXTENSION",
+            });
         }
         None => {
             println!(
                 "cargo:warning=stock CPython 3.13 headers not found; \
-                 skipping the _stockabi/_stocktype binary-ABI proof fixtures"
+                 skipping the _stockabi/_stocktype/_stockarray/_stockcython \
+                 binary-ABI proof fixtures"
             );
         }
     }

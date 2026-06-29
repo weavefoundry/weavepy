@@ -62,6 +62,36 @@ unsafe fn call_number_dunder(o: *mut PyObject, name: &str) -> Option<Option<Obje
     Some(Some(obj))
 }
 
+/// CPython's `PyLong_As*` extractors coerce a non-`int` argument through
+/// `__index__` (`_PyNumber_Index`) before failing with a `TypeError`
+/// (see `Objects/longobject.c`). A numpy integer scalar (`np.int64`) is a
+/// *foreign* object carrying `__index__` in its C `nb_index` slot, so
+/// routing through [`crate::abstract_::PyNumber_Index`] reaches it exactly
+/// as CPython does — unblocking numpy's `timedelta64(np.int64(...), unit)`
+/// constructor and any Cython code feeding numpy scalars to `PyLong_As*`.
+///
+/// On success returns a *builtin* integer `Object` (`Int`/`Long`/`Bool`),
+/// which callers convert without re-entering this fallback. Returns `None`
+/// with a `TypeError` (or the `nb_index` slot's own exception) left pending
+/// when `o` cannot be interpreted as an integer.
+pub(crate) unsafe fn index_to_builtin_int(o: *mut PyObject) -> Option<Object> {
+    let idx = unsafe { crate::abstract_::PyNumber_Index(o) };
+    if idx.is_null() {
+        return None;
+    }
+    let obj = unsafe { crate::object::clone_object(idx) };
+    unsafe { crate::object::Py_DecRef(idx) };
+    match obj {
+        Object::Int(_) | Object::Long(_) | Object::Bool(_) => Some(obj),
+        _ => {
+            crate::errors::set_type_error(
+                "__index__ returned non-int (the object cannot be interpreted as an integer)",
+            );
+            None
+        }
+    }
+}
+
 // ---------- PyLong (Python `int`) ----------
 
 #[no_mangle]
@@ -160,15 +190,27 @@ pub unsafe extern "C" fn PyLong_AsLong(o: *mut PyObject) -> i64 {
         Object::Long(big) => match big.to_i64() {
             Some(v) => v,
             None => {
+                if std::env::var_os("WEAVEPY_TRACE_OVERFLOW").is_some() {
+                    eprintln!(
+                        "[WEAVEPY_TRACE_OVERFLOW] PyLong_AsLong overflow on value with {} bits\n{}",
+                        big.bits(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
                 crate::errors::set_overflow_error("Python int too large to convert to C long");
                 -1
             }
         },
         Object::Float(f) => f.trunc() as i64,
-        _ => {
-            crate::errors::set_type_error("an integer is required");
-            -1
-        }
+        _ => match unsafe { index_to_builtin_int(o) } {
+            Some(Object::Int(i)) => i,
+            Some(Object::Bool(b)) => i64::from(b),
+            Some(Object::Long(big)) => big.to_i64().unwrap_or_else(|| {
+                crate::errors::set_overflow_error("Python int too large to convert to C long");
+                -1
+            }),
+            _ => -1,
+        },
     }
 }
 
@@ -177,16 +219,71 @@ pub unsafe extern "C" fn PyLong_AsLongLong(o: *mut PyObject) -> i64 {
     unsafe { PyLong_AsLong(o) }
 }
 
+/// `PyLong_AsUnsignedLong(o)` — the full unsigned 64-bit range `[0, 2^64)`
+/// on LP64/LLP64 (where `unsigned long` is 64-bit). Routing through the
+/// *signed* [`PyLong_AsLong`] (as a prior version did) wrongly rejected
+/// `[2^63, 2^64)` — exactly the 64-bit seed/state words numpy's
+/// `numpy.random` feeds through `np.uint64(...)` during `mtrand` init.
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_AsUnsignedLong(o: *mut PyObject) -> u64 {
-    let v = unsafe { PyLong_AsLong(o) };
-    if v < 0 {
-        if crate::errors::pending().is_none() {
-            crate::errors::set_overflow_error("can't convert negative value to unsigned int");
-        }
+    if o.is_null() {
+        crate::errors::set_type_error("PyLong_AsUnsignedLong: NULL");
         return u64::MAX;
     }
-    v as u64
+    match unsafe { crate::object::clone_object(o) } {
+        Object::Int(i) => {
+            if i < 0 {
+                crate::errors::set_overflow_error(
+                    "can't convert negative value to unsigned int",
+                );
+                u64::MAX
+            } else {
+                i as u64
+            }
+        }
+        Object::Bool(b) => u64::from(b),
+        Object::Long(big) => match big.to_u64() {
+            Some(v) => v,
+            None => {
+                if big.sign() == num_bigint::Sign::Minus {
+                    crate::errors::set_overflow_error(
+                        "can't convert negative value to unsigned int",
+                    );
+                } else {
+                    crate::errors::set_overflow_error(
+                        "Python int too large to convert to C unsigned long",
+                    );
+                }
+                u64::MAX
+            }
+        },
+        _ => match unsafe { index_to_builtin_int(o) } {
+            Some(Object::Int(i)) => {
+                if i < 0 {
+                    crate::errors::set_overflow_error(
+                        "can't convert negative value to unsigned int",
+                    );
+                    u64::MAX
+                } else {
+                    i as u64
+                }
+            }
+            Some(Object::Bool(b)) => u64::from(b),
+            Some(Object::Long(big)) => big.to_u64().unwrap_or_else(|| {
+                if big.sign() == num_bigint::Sign::Minus {
+                    crate::errors::set_overflow_error(
+                        "can't convert negative value to unsigned int",
+                    );
+                } else {
+                    crate::errors::set_overflow_error(
+                        "Python int too large to convert to C unsigned long",
+                    );
+                }
+                u64::MAX
+            }),
+            _ => u64::MAX,
+        },
+    }
 }
 
 #[no_mangle]
@@ -262,10 +359,21 @@ pub unsafe extern "C" fn PyLong_AsLongAndOverflow(o: *mut PyObject, overflow: *m
             }
         },
         Object::Float(f) => f.trunc() as i64,
-        _ => {
-            crate::errors::set_type_error("an integer is required");
-            -1
-        }
+        _ => match unsafe { index_to_builtin_int(o) } {
+            Some(Object::Int(i)) => i,
+            Some(Object::Bool(b)) => i64::from(b),
+            Some(Object::Long(big)) => big.to_i64().unwrap_or_else(|| {
+                if !overflow.is_null() {
+                    let sign = match big.sign() {
+                        num_bigint::Sign::Minus => -1,
+                        _ => 1,
+                    };
+                    unsafe { *overflow = sign };
+                }
+                -1
+            }),
+            _ => -1,
+        },
     }
 }
 
@@ -295,10 +403,12 @@ pub unsafe extern "C" fn _PyLong_AsByteArray(
         Object::Int(i) => BigInt::from(i),
         Object::Long(b) => (*b).clone(),
         Object::Bool(b) => BigInt::from(b as i64),
-        _ => {
-            crate::errors::set_type_error("an integer is required");
-            return -1;
-        }
+        _ => match unsafe { index_to_builtin_int(o) } {
+            Some(Object::Int(i)) => BigInt::from(i),
+            Some(Object::Long(b)) => (*b).clone(),
+            Some(Object::Bool(b)) => BigInt::from(b as i64),
+            _ => return -1,
+        },
     };
     let mut buf: Vec<u8> = if is_signed != 0 {
         big.to_signed_bytes_le()

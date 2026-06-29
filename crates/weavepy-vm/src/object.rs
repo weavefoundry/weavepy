@@ -1338,6 +1338,25 @@ pub fn int_from_i128(v: i128) -> Object {
     }
 }
 
+/// Number of elements a `range` yields, as an `i128` (never negative;
+/// `0` for an empty or zero-step range). Mirrors CPython's
+/// `compute_range_length` and is shared by `range` equality *and*
+/// hashing so the two always agree (`hash` must match `==`).
+pub(crate) fn range_len_i128(r: &Range) -> i128 {
+    let span = if r.step > 0 {
+        (r.stop - r.start).max(0)
+    } else if r.step < 0 {
+        (r.start - r.stop).max(0)
+    } else {
+        return 0;
+    };
+    if span == 0 {
+        return 0;
+    }
+    let step = r.step.unsigned_abs() as i128;
+    (span + step - 1) / step
+}
+
 /// Run any tripped Python signal handler on the main thread, mirroring
 /// `os::service_pending_signals`. Used by the buffered-write flush so an
 /// `EINTR` from a blocking `write(2)` runs the handler before retrying
@@ -1747,7 +1766,15 @@ impl PartialEq for DictKey {
         // so a class defining `__eq__`/`__hash__` works as a `set`/`dict`
         // key. Plain instances (no custom `__eq__`) keep identity semantics,
         // already decided by the `eq_value` fast path above.
-        if instance_has_custom_dunder(&self.0, "__eq__")
+        //
+        // A foreign extension scalar (numpy `int64`/…) compares to the equal
+        // Python scalar only through its `tp_richcompare` — `eq_value` above
+        // knows only native pairs — so route it through the interpreter too.
+        // With the shared `tp_hash` (see `py_hash_value`) this is what lets
+        // `d[np.int64(0)]` find the `0` key (numpy's `np.roll` shifts dict).
+        if matches!(self.0, Object::Foreign(_))
+            || matches!(other.0, Object::Foreign(_))
+            || instance_has_custom_dunder(&self.0, "__eq__")
             || instance_has_custom_dunder(&other.0, "__eq__")
         {
             if let Some(eq) = current_interp_eq(&self.0, &other.0) {
@@ -5527,6 +5554,30 @@ impl Object {
             (Object::DictView(a), Object::DictView(b)) => {
                 Rc::ptr_eq(a, b) || dict_view_set_eq(a, b)
             }
+            // `range` compares by the *sequence it generates*, not the raw
+            // `(start, stop, step)` triple (CPython `range_equals`): equal
+            // iff the lengths match, and — when non-empty — the starts match,
+            // and — when length > 1 — the steps match. So `range(0, 3, 2) ==
+            // range(0, 4, 2)` (both yield `[0, 2]`) and every empty range
+            // compares equal (`range(0) == range(5, 5)`), while `range(3) !=
+            // range(4)`. `pandas.RangeIndex.equals` (and thus `DataFrame`
+            // round-trip equality) rides on this. Kept bit-for-bit consistent
+            // with the `range` hash in `py_hash_value`.
+            (Object::Range(a), Object::Range(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                let la = range_len_i128(a);
+                if la != range_len_i128(b) {
+                    false
+                } else if la == 0 {
+                    true
+                } else if a.start != b.start {
+                    false
+                } else {
+                    la == 1 || a.step == b.step
+                }
+            }
             // CPython's default `tp_richcompare` (no user `__eq__`) falls
             // back to *identity*: `x == x` is True and `x == y` is False
             // for distinct objects. This covers reference types without
@@ -5601,11 +5652,21 @@ impl Object {
                 let b = b.borrow();
                 seq_cmp(&a, &b)
             }
-            _ => Err(type_error(format!(
-                "'<' not supported between instances of '{}' and '{}'",
-                self.type_name_owned(),
-                other.type_name_owned()
-            ))),
+            _ => {
+                if std::env::var_os("WEAVEPY_CMP_BT").is_some() {
+                    eprintln!(
+                        "[CMP_BT vm-lt] '{}' vs '{}'\n{:?}",
+                        self.type_name_owned(),
+                        other.type_name_owned(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+                Err(type_error(format!(
+                    "'<' not supported between instances of '{}' and '{}'",
+                    self.type_name_owned(),
+                    other.type_name_owned()
+                )))
+            }
         }
     }
 
@@ -5896,9 +5957,51 @@ impl Object {
             // partial consumption (`zip(range(n), it)`) must leave `it`
             // positioned at the first unconsumed element.
             Object::Iter(it) => Ok(PyIterator::Shared(it.clone())),
+            // Iterables the object-level factory can't build a `PyIterator`
+            // for on its own — they need the running interpreter to drive
+            // their `__iter__`/`__next__` (or `tp_iter`/`tp_iternext`):
+            //   * `Instance`  — a user/extension class (incl. a bridged
+            //     Cython generator or generator-expression, which crosses
+            //     into the VM as an `Instance` of its bridged type).
+            //   * `Foreign`   — an opaque C object (numpy array iterator,
+            //     any C `tp_iter` type).
+            //   * `Generator` / `Coroutine` — VM generators driven by
+            //     `send`.
+            // A builtin invoked from C reaches here (Cython compiles
+            // `sum(stop - start for start, stop in slices)` in pandas'
+            // `get_blkno_indexers`, reached by `merge`/`reindex`/`drop`, to
+            // a C `sum()` over a generator object). Drive it through the
+            // active interpreter's iterator protocol and materialise the
+            // elements — every builtin routed here (`sum`/`min`/`max`/
+            // `sorted`/`list`/`tuple`/`any`/`all`/…) consumes the iterable
+            // in full, so eager collection matches their semantics.
+            Object::Instance(_)
+            | Object::Foreign(_)
+            | Object::Generator(_)
+            | Object::Coroutine(_) => {
+                let ptr = crate::vm_singletons::current_interpreter_ptr().ok_or_else(|| {
+                    type_error(format!(
+                        "'{}' object is not iterable",
+                        self.type_name_owned()
+                    ))
+                })?;
+                // SAFETY: published by the enclosing VM frame still live on
+                // this thread; the GIL keeps the access exclusive. Same
+                // reentrant-callback pattern as `current_interp_eq` above.
+                let interp = unsafe { &mut *ptr };
+                let iter = interp.iter_object(self.clone())?;
+                let mut items = Vec::new();
+                while let Some(v) = interp.iter_next_object(iter.clone())? {
+                    items.push(v);
+                }
+                Ok(PyIterator::List {
+                    items: Rc::new(RefCell::new(items)),
+                    index: 0,
+                })
+            }
             _ => Err(type_error(format!(
                 "'{}' object is not iterable",
-                self.type_name()
+                self.type_name_owned()
             ))),
         }
     }
@@ -6757,6 +6860,19 @@ fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
     }
 }
 
+/// Interpreter-independent hash of a `str` — the exact value `hash(s)`
+/// yields (the same one [`py_hash_value`] computes for `Object::Str`).
+///
+/// The C-API layer mirrors this into a faithful `str`'s `hash` field so
+/// that macro-heavy Cython, which reads `((PyASCIIObject*)s)->hash`
+/// *directly* off the struct to match keyword arguments
+/// (`__Pyx_MatchKeywordArg_str`), sees the same value WeavePy would
+/// compute — without it every Cython call with a keyword argument fails
+/// with a spurious "unexpected keyword argument".
+pub fn py_str_hash(s: &str) -> i64 {
+    py_hash_bytes_slice(s.as_bytes())
+}
+
 /// Identity-based hash for objects that hash by allocation identity in
 /// CPython (functions, types, modules, plain instances without a custom
 /// `__hash__`, …). Mirrors CPython's pointer hash: rotate so the low
@@ -6961,6 +7077,36 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             // interpreter or only the inherited identity hash) falls through
             // to `identity_hash` at the call site.
             current_interp_hash(obj)
+        }
+        // A foreign extension scalar (numpy `int64`/`float64`/`bool_`, …)
+        // hashes through its own `tp_hash` slot so it collides with the equal
+        // Python scalar in a dict/set — CPython guarantees
+        // `hash(np.int64(0)) == hash(0)`. numpy's `np.roll` keys its `shifts`
+        // dict by axis with numpy ints, then looks it up with the Python-int
+        // axis; without the shared hash the lookup raises `KeyError`. The
+        // `no_gil_handoff` guard mirrors `current_interp_hash`: this may run
+        // while a container holds its cell mutex during a probe.
+        Object::Foreign(s) => {
+            let _no_yield = crate::gil::no_gil_handoff();
+            crate::foreign::hash(s).ok()
+        }
+        // `range` hashes as CPython's `range_hash`: the hash of the
+        // `(length, start | None, step | None)` triple. Collapsing start/step
+        // to `None` for empty / length-1 ranges keeps the hash in lock-step
+        // with `eq_value` above — equal ranges (same generated sequence) share
+        // a hash and can therefore key a `dict`/`set` (or a pandas index).
+        Object::Range(r) => {
+            let len = range_len_i128(r);
+            let (start_obj, step_obj) = if len == 0 {
+                (Object::None, Object::None)
+            } else if len == 1 {
+                (int_from_i128(r.start), Object::None)
+            } else {
+                (int_from_i128(r.start), int_from_i128(r.step))
+            };
+            let triple =
+                Object::Tuple(Rc::from(vec![int_from_i128(len), start_obj, step_obj]));
+            py_hash_value(&triple)
         }
         _ => None,
     }

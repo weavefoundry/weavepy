@@ -475,6 +475,7 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "isspace" => Some(method("isspace", str_isspace)),
             "isupper" => Some(method("isupper", str_isupper)),
             "islower" => Some(method("islower", str_islower)),
+            "istitle" => Some(method("istitle", str_istitle)),
             "isascii" => Some(method("isascii", str_isascii)),
             "isnumeric" => Some(method("isnumeric", str_isdigit)),
             "isdecimal" => Some(method("isdecimal", str_isdigit)),
@@ -556,6 +557,14 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             )),
             "__iadd__" => Some(method("__iadd__", list_iadd)),
             "__imul__" => Some(method("__imul__", list_imul)),
+            _ => None,
+        },
+        // `range` is a genuine immutable sequence: CPython exposes `.index`
+        // and `.count` on it (pandas' `RangeIndex.get_loc` calls
+        // `self._range.index(int(key))` to locate a label).
+        Object::Range(_) => match name {
+            "index" => Some(method("index", range_index)),
+            "count" => Some(method("count", range_count)),
             _ => None,
         },
         Object::Dict(_) => match name {
@@ -949,6 +958,11 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
             "fromhex" => Some(method("fromhex", float_fromhex)),
             "as_integer_ratio" => Some(method("as_integer_ratio", float_as_integer_ratio)),
             "conjugate" => Some(method("conjugate", float_conjugate)),
+            // CPython's `float` exposes `__int__` (truncation toward zero,
+            // raising on non-finite values). A C extension reaching `float`'s
+            // `nb_int` slot goes through the C-ABI bridge, but the Python-level
+            // dunder must exist too (`hasattr(float, "__int__")`).
+            "__int__" => Some(method("__int__", float_int)),
             "__trunc__" => Some(method("__trunc__", float_trunc)),
             "__floor__" => Some(method("__floor__", float_floor)),
             "__ceil__" => Some(method("__ceil__", float_ceil)),
@@ -2139,42 +2153,65 @@ pub(crate) fn seq_index_bound(o: &Object) -> Result<i64, RuntimeError> {
 }
 
 pub(crate) fn coerce_index_i64(o: &Object) -> Result<i64, RuntimeError> {
-    if let Some(v) = o.as_i64() {
-        return Ok(v);
-    }
-    // A big integer is a valid `__index__` value, but it can't fit the C
-    // ssize_t the caller wants → `OverflowError`, matching CPython
-    // (`test_io.test_reconfigure_errors`: `line_buffering=2**1000`).
-    if matches!(o, Object::Long(_)) {
-        return Err(crate::error::overflow_error(
-            "cannot fit 'int' into an index-sized integer",
-        ));
-    }
-    if let Object::Instance(_) = o {
-        if let Some(method) = crate::instance_method(o, "__index__") {
-            if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
-                // SAFETY: the pointer was published by an enclosing VM frame
-                // still live on this thread; the GIL keeps the access exclusive.
-                let interp = unsafe { &mut *ptr };
-                let globals = interp.builtins_dict();
-                let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
-                if let Some(v) = r.as_i64() {
-                    return Ok(v);
-                }
-                // `__index__` returned an int too large for an index-sized C
-                // integer (CPython raises `OverflowError`, not `TypeError`).
-                if matches!(r, Object::Long(_)) {
-                    return Err(crate::error::overflow_error(
-                        "cannot fit 'int' into an index-sized integer",
-                    ));
-                }
-            }
-        }
+    if let Some(res) = try_coerce_index_i64(o) {
+        return res;
     }
     Err(type_error(format!(
         "'{}' object cannot be interpreted as an integer",
         o.type_name()
     )))
+}
+
+/// Like [`coerce_index_i64`], but distinguishes "has no `__index__`" (→
+/// `None`, so a caller can raise a context-specific message such as "tuple
+/// indices must be integers") from "has `__index__`, here is its (possibly
+/// failing) result" (→ `Some(..)`).
+///
+/// Unlike the old `instance_method`-only lookup, this resolves `__index__`
+/// through full attribute resolution, so a **C-slot** `nb_index` reached only
+/// via the bridge — a `numpy` integer scalar (`np.intp`, used to index
+/// `BlockManager.blocks[blknos[i]]`) — is honoured, matching CPython's
+/// `PyNumber_Index`.
+pub(crate) fn try_coerce_index_i64(o: &Object) -> Option<Result<i64, RuntimeError>> {
+    if let Some(v) = o.as_i64() {
+        return Some(Ok(v));
+    }
+    // A big integer is a valid `__index__` value, but it can't fit the C
+    // ssize_t the caller wants → `OverflowError`, matching CPython
+    // (`test_io.test_reconfigure_errors`: `line_buffering=2**1000`).
+    if matches!(o, Object::Long(_)) {
+        return Some(Err(crate::error::overflow_error(
+            "cannot fit 'int' into an index-sized integer",
+        )));
+    }
+    if !matches!(o, Object::Instance(_) | Object::Foreign(_)) {
+        return None;
+    }
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: the pointer was published by an enclosing VM frame still live on
+    // this thread; the GIL keeps the access exclusive.
+    let interp = unsafe { &mut *ptr };
+    let Ok(method) = interp.load_attr_public(o, "__index__") else {
+        return None;
+    };
+    let globals = interp.builtins_dict();
+    Some((|| {
+        let r = interp.call_object_with_globals(&method, &[], &[], &globals)?;
+        if let Some(v) = r.as_i64() {
+            return Ok(v);
+        }
+        // `__index__` returned an int too large for an index-sized C integer
+        // (CPython raises `OverflowError`, not `TypeError`).
+        if matches!(r, Object::Long(_)) {
+            return Err(crate::error::overflow_error(
+                "cannot fit 'int' into an index-sized integer",
+            ));
+        }
+        Err(type_error(format!(
+            "__index__ returned non-int (type {})",
+            r.type_name()
+        )))
+    })())
 }
 
 /// Coerce `o` to an `f64` the way CPython's float-accepting C functions
@@ -3985,6 +4022,29 @@ fn float_trunc(args: &[Object]) -> Result<Object, RuntimeError> {
             crate::object::bigint_from_f64_trunc(f.trunc()),
         )),
         _ => Err(type_error("__trunc__: float expected")),
+    }
+}
+
+/// `float.__int__(self)` — truncate toward zero, raising the same errors
+/// CPython does for non-finite inputs (`ValueError` for NaN, `OverflowError`
+/// for ±inf). Kept behaviourally identical to the type-dict `float.__int__`
+/// so instance- and type-level access agree.
+fn float_int(args: &[Object]) -> Result<Object, RuntimeError> {
+    match one(args, "__int__")? {
+        Object::Float(f) => {
+            if f.is_nan() {
+                return Err(value_error("cannot convert float NaN to integer"));
+            }
+            if f.is_infinite() {
+                return Err(crate::error::overflow_error(
+                    "cannot convert float infinity to integer",
+                ));
+            }
+            Ok(Object::int_from_bigint(
+                crate::object::bigint_from_f64_trunc(f.trunc()),
+            ))
+        }
+        _ => Err(type_error("__int__: float expected")),
     }
 }
 
@@ -7088,6 +7148,19 @@ pub fn b_memoryview(args: &[Object]) -> Result<Object, RuntimeError> {
                 .expect("shared_buffer present per guard");
             crate::object::PyMemoryView::from_shared(buf)
         }
+        // A foreign buffer exporter (numpy's `ndarray`, a Cython `cdef
+        // class` with `__getbuffer__`, …). Route through the cpyext
+        // bridge, which drives `PyObject_GetBuffer` and returns a
+        // faithfully-typed memoryview (`format`/`itemsize`/`shape`).
+        Object::Foreign(soul) => return crate::foreign::get_buffer(soul),
+        // A faithful C instance that exports the buffer protocol crosses as
+        // `Object::Instance` wearing its real type (numpy's `ndarray` is built
+        // by its own `tp_new`, not proxied as `Foreign`). Drive its
+        // `bf_getbuffer` through the cpyext bridge. A non-exporter instance
+        // surfaces the C-side `TypeError`, matching CPython.
+        Object::Instance(_) if crate::foreign::is_installed() => {
+            return crate::foreign::get_buffer_obj(arg);
+        }
         other => {
             return Err(type_error(format!(
                 "memoryview: a bytes-like object is required, not '{}'",
@@ -8135,6 +8208,35 @@ fn str_islower(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(has_cased))
 }
 
+fn str_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
+    // CPython `unicode_istitle_impl`: a titlecased string has each cased run
+    // starting with an upper/titlecase char, and there is >=1 cased char.
+    // (Titlecase Lt chars are treated as uppercase for the run-start test;
+    // Rust's std lacks a general-category API, so uppercase covers Lu — the
+    // ASCII and dominant Unicode case, matching our other `is*` helpers.)
+    let s = str_self(args)?;
+    let mut cased = false;
+    let mut prev_cased = false;
+    for c in s.chars() {
+        if c.is_uppercase() {
+            if prev_cased {
+                return Ok(Object::Bool(false));
+            }
+            prev_cased = true;
+            cased = true;
+        } else if c.is_lowercase() {
+            if !prev_cased {
+                return Ok(Object::Bool(false));
+            }
+            prev_cased = true;
+            cased = true;
+        } else {
+            prev_cased = false;
+        }
+    }
+    Ok(Object::Bool(cased))
+}
+
 fn str_isascii(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(str_self(args)?.is_ascii()))
 }
@@ -8805,6 +8907,108 @@ fn list_count(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     Ok(Object::Int(n))
+}
+
+// ---- range.index / range.count -------------------------------------------
+//
+// CPython's `range_index`/`range_count` take an arithmetic fast path for
+// real integers (`PyLong`/`bool`) and fall back to a linear
+// `_PySequence_IterSearch` for anything else (a float that equals an int, a
+// numpy scalar). We mirror both.
+
+fn range_self(args: &[Object], meth: &str) -> Result<Rc<crate::object::Range>, RuntimeError> {
+    match args.first() {
+        Some(Object::Range(r)) => Ok(r.clone()),
+        _ => Err(type_error(format!(
+            "descriptor '{meth}' for 'range' objects doesn't apply to the given object"
+        ))),
+    }
+}
+
+fn range_len_i128(r: &crate::object::Range) -> i128 {
+    if r.step > 0 {
+        if r.stop > r.start {
+            (r.stop - r.start + r.step - 1) / r.step
+        } else {
+            0
+        }
+    } else if r.stop < r.start {
+        (r.start - r.stop + (-r.step) - 1) / (-r.step)
+    } else {
+        0
+    }
+}
+
+/// The 0-based position of integer `v` within `r`, or `None` if `v` is not a
+/// member. Mirrors CPython's `range_contains_long` + index arithmetic.
+fn range_position(r: &crate::object::Range, v: i128) -> Option<i128> {
+    if r.step > 0 {
+        if v < r.start || v >= r.stop {
+            return None;
+        }
+    } else if v > r.start || v <= r.stop {
+        return None;
+    }
+    let diff = v - r.start;
+    if diff % r.step != 0 {
+        return None;
+    }
+    Some(diff / r.step)
+}
+
+fn int_like_to_i128(o: &Object) -> Option<i128> {
+    match o {
+        Object::Int(i) => Some(i128::from(*i)),
+        Object::Bool(b) => Some(i128::from(*b)),
+        Object::Long(b) => b.to_i128(),
+        _ => None,
+    }
+}
+
+fn range_index(args: &[Object]) -> Result<Object, RuntimeError> {
+    let r = range_self(args, "index")?;
+    let value = args
+        .get(1)
+        .ok_or_else(|| type_error("index() takes exactly one argument (0 given)"))?;
+    if let Some(v) = int_like_to_i128(value) {
+        if let Some(idx) = range_position(&r, v) {
+            return Ok(crate::object::int_from_i128(idx));
+        }
+        return Err(value_error(format!("{} is not in range", value.repr())));
+    }
+    // Non-integer: linear search comparing each element with `__eq__`
+    // (CPython `_PySequence_IterSearch(..., PY_ITERSEARCH_INDEX)`).
+    let n = range_len_i128(&r);
+    let mut k: i128 = 0;
+    while k < n {
+        let elem = crate::object::int_from_i128(r.start + k * r.step);
+        if crate::object::member_eq(&elem, value)? {
+            return Ok(crate::object::int_from_i128(k));
+        }
+        k += 1;
+    }
+    Err(value_error(format!("{} is not in range", value.repr())))
+}
+
+fn range_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    let r = range_self(args, "count")?;
+    let value = args
+        .get(1)
+        .ok_or_else(|| type_error("count() takes exactly one argument (0 given)"))?;
+    if let Some(v) = int_like_to_i128(value) {
+        return Ok(Object::Int(i64::from(range_position(&r, v).is_some())));
+    }
+    let n = range_len_i128(&r);
+    let mut cnt: i64 = 0;
+    let mut k: i128 = 0;
+    while k < n {
+        let elem = crate::object::int_from_i128(r.start + k * r.step);
+        if crate::object::member_eq(&elem, value)? {
+            cnt += 1;
+        }
+        k += 1;
+    }
+    Ok(Object::Int(cnt))
 }
 
 fn list_sort(args: &[Object]) -> Result<Object, RuntimeError> {

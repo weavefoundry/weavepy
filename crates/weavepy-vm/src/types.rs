@@ -270,10 +270,26 @@ impl TypeObject {
         mut dict: DictData,
         flags: TypeFlags,
     ) -> Result<Rc<Self>, RuntimeError> {
-        // CPython `type_new`: `__qualname__` is removed from the class
-        // namespace and stored on the type itself.
-        let qualname = match dict.shift_remove(&DictKey(Object::from_static("__qualname__"))) {
-            Some(Object::Str(s)) => Some(s.to_string()),
+        // CPython `type_new`: a *string* `__qualname__` in the class
+        // namespace is removed and stored on the type itself.
+        //
+        // A getset/member *descriptor* named `__qualname__` is different:
+        // it describes the type's *instances* (Cython's
+        // `cython_function_or_method`, the generator/coroutine getsets, a
+        // `__slots__ = ["__qualname__"]` member) and must stay in the dict
+        // — the type's own qualname then falls back to its name, exactly as
+        // CPython does (those descriptors arrive via `tp_getset`/
+        // `tp_members`, never the `type_new` namespace). The C-API spec/
+        // ready bridge merges harvested descriptors into this same dict, so
+        // we recognise that case here rather than choking on it.
+        let qualname = match dict.get(&DictKey(Object::from_static("__qualname__"))) {
+            Some(Object::Str(_)) => {
+                match dict.shift_remove(&DictKey(Object::from_static("__qualname__"))) {
+                    Some(Object::Str(s)) => Some(s.to_string()),
+                    _ => None,
+                }
+            }
+            Some(v) if is_instance_descriptor(v) => None,
             Some(other) => {
                 return Err(type_error(format!(
                     "type __qualname__ must be a str, not {}",
@@ -739,6 +755,22 @@ impl TypeObject {
             None | Some("builtins") | Some("") => qual,
             Some(m) => format!("{m}.{qual}"),
         }
+    }
+}
+
+/// Is `obj` a descriptor that describes a type's *instances* (rather than
+/// being a plain class attribute)? Used by [`TypeObject::new_with_flags`]
+/// to tell a getset/member `__qualname__` (which must stay in the dict)
+/// from a class-body `__qualname__` string/value.
+fn is_instance_descriptor(obj: &Object) -> bool {
+    match obj {
+        Object::Property(_) | Object::SlotDescriptor(_) => true,
+        Object::Instance(inst) => {
+            inst.cls().lookup("__get__").is_some()
+                || inst.cls().lookup("__set__").is_some()
+                || inst.cls().lookup("__delete__").is_some()
+        }
+        _ => false,
     }
 }
 

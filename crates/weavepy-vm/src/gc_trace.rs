@@ -1856,12 +1856,28 @@ pub fn traverse_object(obj: &Object, visit: &mut dyn FnMut(&Object)) {
 /// Sync` and lives in a `OnceLock`. Each thread sees the same
 /// table — registrations are a global, additive operation.
 fn run_external_traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
-    let table = TRAVERSE_TABLE.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
-    let entries = table.lock();
-    for entry in entries.iter() {
-        if (entry.matches)(obj) {
-            (entry.traverse)(obj, visit);
-        }
+    let Some(table) = TRAVERSE_TABLE.get() else {
+        return;
+    };
+    // Snapshot the matching traverse fns, then *release* the table lock
+    // before invoking them. A C extension's `tp_traverse` calls our
+    // visitproc, which recurses back through the collector
+    // (`exc_has_finalizable` → `traverse_object`) and can re-enter
+    // `run_external_traverse` for a *nested* foreign object on the same
+    // thread — e.g. collecting a cycle through pandas' `BaseOffset`.
+    // `parking_lot::Mutex` is not reentrant, so holding the lock across the
+    // callback self-deadlocks. The table is registration-only and its
+    // entries are plain `fn` pointers, so a cheap snapshot is sound.
+    let matched: Vec<fn(&Object, &mut dyn FnMut(&Object))> = {
+        let entries = table.lock();
+        entries
+            .iter()
+            .filter(|e| (e.matches)(obj))
+            .map(|e| e.traverse)
+            .collect()
+    };
+    for traverse in matched {
+        traverse(obj, visit);
     }
 }
 
@@ -1901,11 +1917,20 @@ fn run_external_clear(obj: &Object) {
     let Some(table) = CLEAR_TABLE.get() else {
         return;
     };
-    let entries = table.lock();
-    for entry in entries.iter() {
-        if (entry.matches)(obj) {
-            (entry.clear)(obj);
-        }
+    // Snapshot then release the lock before invoking, mirroring
+    // `run_external_traverse`: a C extension's `tp_clear` can re-enter the
+    // collector and thus this function for a nested foreign object on the
+    // same thread, which would self-deadlock on the non-reentrant mutex.
+    let matched: Vec<fn(&Object)> = {
+        let entries = table.lock();
+        entries
+            .iter()
+            .filter(|e| (e.matches)(obj))
+            .map(|e| e.clear)
+            .collect()
+    };
+    for clear in matched {
+        clear(obj);
     }
 }
 

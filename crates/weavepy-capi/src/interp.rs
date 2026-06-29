@@ -121,8 +121,21 @@ pub fn effective_interpreter_mut() -> Option<*mut Interpreter> {
 /// (best-effort, may be stale).
 pub fn ensure_active<R>(body: impl FnOnce() -> R) -> R {
     if current_interpreter_mut().is_some() {
+        if std::env::var_os("WEAVEPY_TRACE_EA").is_some() {
+            eprintln!("[EA] nested (skip flush)");
+        }
         return body();
     }
+    if std::env::var_os("WEAVEPY_TRACE_EA").is_some() {
+        eprintln!("[EA] outermost (flush)");
+    }
+    // Outermost VM→C transition. Re-publish any VM-mutated faithful list
+    // mirrors into their `ob_item` buffers first, so a stock extension's
+    // inlined `PyList_GET_ITEM` macro reads the VM's latest mutations rather
+    // than the buffer that was current when the list was last seeded. This is
+    // the single choke point through which *every* bridged C call (foreign
+    // hooks, tp_call, dunder shims, descriptors) passes (RFC 0047, wave 5).
+    unsafe { crate::mirror::flush_seeded_lists() };
     let interp = if let Some(p) = weavepy_vm::vm_singletons::current_interpreter_ptr() {
         p
     } else {

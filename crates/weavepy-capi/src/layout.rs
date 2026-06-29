@@ -211,6 +211,106 @@ const _: () = {
     assert!(std::mem::offset_of!(PyListObject, allocated) == 32);
 };
 
+/// `PyDictObject` (CPython 3.13):
+/// ```c
+/// typedef struct {
+///     PyObject_HEAD
+///     Py_ssize_t ma_used;
+///     uint64_t ma_version_tag;
+///     PyDictKeysObject *ma_keys;
+///     PyDictValues *ma_values;
+/// } PyDictObject;
+/// ```
+/// RFC 0047 (wave 5): macro-heavy Cython reads `ma_used` *directly* off
+/// this struct — `PyDict_GET_SIZE(d)` is `((PyDictObject*)d)->ma_used`,
+/// and `__Pyx_PyVectorcall_FastCallDict_kw` reads it to pre-size the
+/// kwnames allocation when a Cython method is called with keyword
+/// arguments (`rng.integers(0, 100, size=4)`). A non-faithful dict body
+/// returns garbage there and the over-sized cleanup loop dereferences
+/// uninitialised slots. The entries themselves are reached only through
+/// the C-API functions (`PyDict_Next`, `PyDict_GetItem`), which WeavePy
+/// services from the mirror prefix's native dict, so `ma_keys` /
+/// `ma_values` stay NULL.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyDictObject {
+    pub ob_base: PyObject,
+    pub ma_used: PySsizeT,
+    pub ma_version_tag: u64,
+    pub ma_keys: *mut core::ffi::c_void,
+    pub ma_values: *mut core::ffi::c_void,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PyDictObject>() == 48);
+    assert!(std::mem::offset_of!(PyDictObject, ma_used) == 16);
+    assert!(std::mem::offset_of!(PyDictObject, ma_version_tag) == 24);
+    assert!(std::mem::offset_of!(PyDictObject, ma_keys) == 32);
+    assert!(std::mem::offset_of!(PyDictObject, ma_values) == 40);
+};
+
+/// `PySet_MINSIZE` — the fixed size of a set's inline `smalltable`
+/// (CPython `Objects/setobject.c`). A freshly created empty set points
+/// `table` at its own `smalltable` with `mask == PySet_MINSIZE - 1`.
+pub const PYSET_MINSIZE: usize = 8;
+
+/// `PySetObject` (CPython 3.13, `Include/cpython/setobject.h`):
+/// ```c
+/// typedef struct {
+///     PyObject *key;
+///     Py_hash_t hash;
+/// } setentry;
+/// typedef struct {
+///     PyObject_HEAD
+///     Py_ssize_t fill;    /* # Active + # Dummy */
+///     Py_ssize_t used;    /* # Active */
+///     Py_ssize_t mask;
+///     setentry *table;
+///     Py_hash_t hash;     /* only used by frozenset objects */
+///     Py_ssize_t finger;  /* search finger for pop() */
+///     setentry smalltable[PySet_MINSIZE];
+///     PyObject *weakreflist;
+/// } PySetObject;
+/// ```
+/// RFC 0047 (wave 5): macro-heavy Cython reads `used` *directly* off this
+/// struct — `PySet_GET_SIZE(so)` / `PyFrozenSet_GET_SIZE(so)` expand to
+/// `((PySetObject*)so)->used`, and Cython lowers both `len(s)` and the
+/// truthiness test `if s:` on a set-typed value to that macro. pandas'
+/// `Timedelta.__new__` guards its keyword parsing with
+/// `if set(kwargs).difference_update(...) ... : raise`, so a non-faithful
+/// set body (a bare 16-byte `PyObject` head) returns a stray heap word for
+/// `used` and the guard fires spuriously. The entries themselves are only
+/// ever reached through the C-API (`PySet_Size`, `tp_iter`), served from
+/// the prefix's native set, so `table` points at the (empty) inline
+/// `smalltable` and `hash`/`finger` stay zero/-1 — exactly the shape of a
+/// freshly-initialised CPython set, but with `fill`/`used` published to
+/// match the real element count.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PySetObject {
+    pub ob_base: PyObject,           // 0
+    pub fill: PySsizeT,              // 16
+    pub used: PySsizeT,              // 24
+    pub mask: PySsizeT,              // 32
+    pub table: *mut c_void,          // 40  (setentry *)
+    pub hash: PyHashT,               // 48
+    pub finger: PySsizeT,            // 56
+    pub smalltable: [PySsizeT; 16],  // 64  (PySet_MINSIZE setentries = 128 bytes)
+    pub weakreflist: *mut PyObject,  // 192
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PySetObject>() == 200);
+    assert!(std::mem::offset_of!(PySetObject, fill) == 16);
+    assert!(std::mem::offset_of!(PySetObject, used) == 24);
+    assert!(std::mem::offset_of!(PySetObject, mask) == 32);
+    assert!(std::mem::offset_of!(PySetObject, table) == 40);
+    assert!(std::mem::offset_of!(PySetObject, hash) == 48);
+    assert!(std::mem::offset_of!(PySetObject, finger) == 56);
+    assert!(std::mem::offset_of!(PySetObject, smalltable) == 64);
+    assert!(std::mem::offset_of!(PySetObject, weakreflist) == 192);
+};
+
 // ---------------------------------------------------------------------------
 // Built-in function objects.
 // ---------------------------------------------------------------------------
@@ -264,6 +364,119 @@ const _: () = {
     assert!(std::mem::offset_of!(PyCFunctionObject, m_module) == 32);
     assert!(std::mem::offset_of!(PyCFunctionObject, m_weakreflist) == 40);
     assert!(std::mem::offset_of!(PyCFunctionObject, vectorcall) == 48);
+};
+
+/// `PyMethodObject` — `Include/cpython/classobject.h`. A *bound method*
+/// (`instance.meth`). RFC 0047 (wave 5): macro-heavy Cython unpacks a
+/// bound method by reading `im_func` / `im_self` **directly off the C
+/// struct** via the `PyMethod_GET_FUNCTION` / `PyMethod_GET_SELF` macros
+/// — its `with` / `for` / call fast paths all do
+/// `if (PyMethod_Check(m)) { self = m->im_self; func = m->im_func; … }`
+/// (numpy.random's `RandomState` acquires `self.lock` exactly this way).
+/// A WeavePy `Object::BoundMethod` therefore must cross into C as this
+/// faithful layout, with `im_func`/`im_self` populated, rather than as an
+/// opaque box (whose Rust payload bytes would be misread as those
+/// pointers and crash the subsequent indirect call).
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyMethodObject {
+    pub ob_base: PyObject,             // 0
+    pub im_func: *mut PyObject,        // 16
+    pub im_self: *mut PyObject,        // 24
+    pub im_weakreflist: *mut PyObject, // 32
+    pub vectorcall: *mut c_void,       // 40 (vectorcallfunc)
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PyMethodObject>() == 48);
+    assert!(std::mem::offset_of!(PyMethodObject, im_func) == 16);
+    assert!(std::mem::offset_of!(PyMethodObject, im_self) == 24);
+    assert!(std::mem::offset_of!(PyMethodObject, im_weakreflist) == 32);
+    assert!(std::mem::offset_of!(PyMethodObject, vectorcall) == 40);
+};
+
+/// `PySliceObject { PyObject_HEAD; PyObject *start, *stop, *step; }`.
+///
+/// RFC 0047 (wave 5): macro-heavy Cython reads these three fields *directly*
+/// off the struct rather than through `PySlice_Unpack`. pandas'
+/// `internals.slice_canonize(slice s)` does `<Py_ssize_t>s.step` etc., which
+/// compiles to `((PySliceObject*)s)->step` plus an inline incref/decref — so
+/// a slice crossing into C must be a faithful `PySliceObject`, not a
+/// `PyObjectBox` whose Rust payload sits where C expects `start`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PySliceObject {
+    pub ob_base: PyObject,    // 0
+    pub start: *mut PyObject, // 16
+    pub stop: *mut PyObject,  // 24
+    pub step: *mut PyObject,  // 32
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PySliceObject>() == 40);
+    assert!(std::mem::offset_of!(PySliceObject, start) == 16);
+    assert!(std::mem::offset_of!(PySliceObject, stop) == 24);
+    assert!(std::mem::offset_of!(PySliceObject, step) == 32);
+};
+
+/// `PyMemoryViewObject` (CPython 3.13, `Include/cpython/memoryobject.h`):
+///
+/// ```c
+/// typedef struct {
+///     PyObject_VAR_HEAD
+///     _PyManagedBufferObject *mbuf;
+///     Py_hash_t hash;
+///     int flags;
+///     Py_ssize_t exports;
+///     Py_buffer view;
+///     PyObject *weakreflist;
+///     Py_ssize_t ob_array[1];
+/// } PyMemoryViewObject;
+/// ```
+///
+/// RFC 0047 (wave 5): `PyMemoryView_GET_BUFFER(op)` is a **macro** —
+/// `&((PyMemoryViewObject *)(op))->view` — and Cython's fused-type
+/// dispatch reads the embedded buffer's `ndim`/`itemsize`/`format`
+/// straight off this struct (`__Pyx_PyMemoryView_Get_itemsize`,
+/// `__Pyx_PyMemoryView_Get_ndim`) without calling `bf_getbuffer`. pandas'
+/// `lib.map_infer_mask` resolves its `ndarray[object]` specialization only
+/// when `memoryview(arr)->view.itemsize == 8` and `->view.format == "O"`,
+/// so a memoryview crossing into C must be a faithful `PyMemoryViewObject`
+/// with a populated inline `view`, not a `PyObjectBox`. The flexible
+/// `ob_array` tail (CPython points `view.shape`/`strides`/`suboffsets`
+/// into it) is omitted: the mirror points those at its out-of-line aux
+/// buffer instead, and no stock reader walks `ob_array` directly.
+#[repr(C)]
+pub struct PyMemoryViewObject {
+    pub ob_base: PyVarObject,             // 0  (24)
+    pub mbuf: *mut c_void,                // 24
+    pub hash: PyHashT,                    // 32
+    pub flags: c_int,                     // 40
+    pub exports: PySsizeT,                // 48 (4 bytes pad after `flags`)
+    pub view: crate::buffer::Py_buffer,   // 56 (80)
+    pub weakreflist: *mut PyObject,       // 136
+}
+
+const _: () = {
+    assert!(std::mem::offset_of!(PyMemoryViewObject, mbuf) == 24);
+    assert!(std::mem::offset_of!(PyMemoryViewObject, hash) == 32);
+    assert!(std::mem::offset_of!(PyMemoryViewObject, flags) == 40);
+    assert!(std::mem::offset_of!(PyMemoryViewObject, exports) == 48);
+    assert!(std::mem::offset_of!(PyMemoryViewObject, view) == 56);
+    assert!(std::mem::offset_of!(PyMemoryViewObject, weakreflist) == 136);
+    // The embedded `Py_buffer`'s hot fields land where the macros read
+    // them: `view.itemsize` at 56+24=80, `view.ndim` at 56+36=92,
+    // `view.format` at 56+40=96.
+    assert!(
+        std::mem::offset_of!(PyMemoryViewObject, view)
+            + std::mem::offset_of!(crate::buffer::Py_buffer, ndim)
+            == 92
+    );
+    assert!(
+        std::mem::offset_of!(PyMemoryViewObject, view)
+            + std::mem::offset_of!(crate::buffer::Py_buffer, itemsize)
+            == 80
+    );
 };
 
 // ---------------------------------------------------------------------------

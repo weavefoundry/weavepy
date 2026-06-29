@@ -475,6 +475,12 @@ pub unsafe extern "C" fn PyUnicode_AsUCS4(
     };
     let chars: Vec<u32> = text.chars().map(|c| c as u32).collect();
     let need = chars.len() + if copy_null != 0 { 1 } else { 0 };
+    if std::env::var_os("WEAVEPY_TRACE_UCS4").is_some() {
+        eprintln!(
+            "[UCS4] AsUCS4({u:p}, buf={buffer:p}, buflen={buflen}, copy_null={copy_null}) value={text:?} nchars={}",
+            chars.len()
+        );
+    }
     if buflen < need as isize {
         crate::errors::set_value_error("PyUnicode_AsUCS4: buffer too small");
         return ptr::null_mut();

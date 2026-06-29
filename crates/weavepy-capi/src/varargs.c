@@ -78,22 +78,89 @@
 
 #include <execinfo.h>
 #include <unistd.h>
+#include <sys/ucontext.h>
 
-static void weavepy_crash_handler(int sig) {
-    void *frames[256];
-    int n = backtrace(frames, 256);
-    const char *msg = "\n[weavepy] caught fatal signal; native backtrace:\n";
+/* Async-signal-safe hex writer for the fault diagnostic below. */
+static void weavepy_write_hex(const char *label, unsigned long long v) {
+    char buf[32];
+    int i = 0;
+    buf[i++] = ' ';
+    static const char hex[] = "0123456789abcdef";
+    buf[i++] = '0';
+    buf[i++] = 'x';
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        buf[i++] = hex[(v >> shift) & 0xf];
+    }
+    buf[i++] = '\n';
+    write(2, label, strlen(label));
+    write(2, buf, i);
+}
+
+static void weavepy_crash_handler_si(int sig, siginfo_t *info, void *ucv) {
+    const char *msg = "\n[weavepy] FAULTV2 caught fatal signal; native backtrace:\n";
     write(2, msg, strlen(msg));
+    weavepy_write_hex("[weavepy] fault addr:",
+                      (unsigned long long)(uintptr_t)(info ? info->si_addr : (void *)0));
+    void *frames[512];
+    int n = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (ucv) {
+        ucontext_t *uc = (ucontext_t *)ucv;
+        if (uc->uc_mcontext) {
+            unsigned long long pc = (unsigned long long)uc->uc_mcontext->__ss.__pc;
+            unsigned long long lr = (unsigned long long)uc->uc_mcontext->__ss.__lr;
+            unsigned long long fp = (unsigned long long)uc->uc_mcontext->__ss.__fp;
+            weavepy_write_hex("[weavepy] pc:", pc);
+            weavepy_write_hex("[weavepy] lr:", lr);
+            /* Manually walk the arm64 frame-pointer chain from the
+             * interrupted context. backtrace() from a signal handler on
+             * macOS only sees the handler's own (alt-stack) frames, so to
+             * capture the *faulting* stack (e.g. a recursion cycle that
+             * overflowed) we chase [fp] = {saved_fp, saved_lr}. */
+            frames[n++] = (void *)pc;
+            if (lr) frames[n++] = (void *)lr;
+            unsigned long long cur = fp;
+            unsigned long long prev = 0;
+            while (cur && cur > prev && n < 500) {
+                unsigned long long next = *(unsigned long long *)cur;
+                unsigned long long ret = *(unsigned long long *)(cur + 8);
+                if (!ret) break;
+                frames[n++] = (void *)ret;
+                prev = cur;
+                cur = next;
+            }
+        }
+    }
+#endif
+    if (n == 0) {
+        n = backtrace(frames, 512);
+    }
     backtrace_symbols_fd(frames, n, 2);
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
+/* Alternate signal stack so the handler can run even when the main
+ * stack is exhausted (the recursion-driven stack-overflow case). */
+static char weavepy_altstack[SIGSTKSZ > 65536 ? SIGSTKSZ : 65536];
+
 void weavepy_install_crash_handler(void) {
-    signal(SIGSEGV, weavepy_crash_handler);
-    signal(SIGBUS, weavepy_crash_handler);
-    signal(SIGABRT, weavepy_crash_handler);
-    signal(SIGILL, weavepy_crash_handler);
+    stack_t ss;
+    memset(&ss, 0, sizeof(ss));
+    ss.ss_sp = weavepy_altstack;
+    ss.ss_size = sizeof(weavepy_altstack);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = weavepy_crash_handler_si;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
 }
 
 #else /* _WIN32 */
@@ -333,6 +400,57 @@ static int parse_one(fmt_state *st, PyObject *arg, va_list *ap) {
     }
 }
 
+/* Advance `st->fmt` over one format unit *and* consume the matching
+ * number of `va_arg` destination pointers WITHOUT storing anything —
+ * CPython's `skipitem()`. This must run for every optional slot the
+ * caller did not supply, otherwise the `va_list` desynchronises and
+ * every later unit writes through the wrong destination. (pandas'
+ * `ujson_dumps` uses `O|OiOssOOi` and omits `encode_html_chars`; without
+ * this the kw `date_unit='ms'` landed in the `orient` pointer, raising
+ * "Invalid value 'ms' for option 'orient'".)
+ *
+ * Every PyArg parse destination is a pointer (the `#` length slots and
+ * `O&`'s converter are all pointer-sized), so reading each skipped slot
+ * as `void *` is ABI-correct on every supported target. The fmt-cursor
+ * advancement mirrors `parse_one` exactly. */
+static void skip_one(fmt_state *st, va_list *ap) {
+    char unit = *st->fmt;
+    if (unit == 0) return;
+    char modifier = st->fmt[1];
+    switch (unit) {
+        case 'O':
+            if (modifier == '!' || modifier == '&') {
+                (void)va_arg(*ap, void *);
+                (void)va_arg(*ap, void *);
+                st->fmt += 2;
+            } else {
+                (void)va_arg(*ap, void *);
+                st->fmt++;
+            }
+            return;
+        case 's': case 'z': case 'y':
+            (void)va_arg(*ap, void *); /* buffer pointer */
+            if (modifier == '#') {
+                (void)va_arg(*ap, void *); /* length pointer */
+                st->fmt += 2;
+            } else {
+                st->fmt++;
+            }
+            return;
+        case 'i': case 'I': case 'h': case 'b': case 'B':
+        case 'l': case 'L': case 'q': case 'K': case 'Q':
+        case 'n': case 'f': case 'd': case 'p': case 'U':
+            (void)va_arg(*ap, void *);
+            st->fmt++;
+            return;
+        default:
+            /* Unknown unit: `parse_one` advances the cursor without a
+             * `va_arg`, so mirror that here too. */
+            st->fmt++;
+            return;
+    }
+}
+
 /* NB: `va_list` is an *array type* on the x86_64 SysV ABI
  * (`__va_list_tag[1]`). Passing it by value to a function makes the
  * parameter decay to `__va_list_tag *`, so `&ap` inside the callee
@@ -471,9 +589,11 @@ static int parse_args_kw_from(PyObject *args, PyObject *kwargs, const char *fmt,
                 PyErr_SetString(PyExc_TypeError, "missing required argument");
                 return 0;
             }
-            /* Consume the format slot without touching the va_list. */
-            st.fmt++;
-            if (*st.fmt == '#') st.fmt++;
+            /* Optional slot not supplied: advance the format AND consume
+             * the matching va_arg destination(s) (CPython's skipitem),
+             * so a later keyword-supplied unit still writes through its
+             * own pointer rather than this skipped slot's. */
+            skip_one(&st, ap);
             slot_idx++;
             continue;
         }
