@@ -1239,6 +1239,27 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
             return interp.type_call_default(&cls, &args[1..], &[]);
         }
     }
+    // CPython: a subclass of `types.GenericAlias` (collections.abc's
+    // `_CallableGenericAlias`, typing's private aliases, …) inherits
+    // `GenericAlias.tp_new`, so a delegating `super().__new__(cls, origin,
+    // args)` builds a parameterised alias rather than reaching the strict
+    // `object.__new__`. WeavePy keys alias construction on the *built-in*
+    // type's name in `type_call_default`, which a user subclass bypasses, so
+    // honour the inherited constructor here: `(origin, params)` becomes a
+    // duck-typed generic alias. (numpy's `_array_like` builds
+    // `collections.abc.Callable[..., Any]` exactly this way during import.)
+    {
+        let bt = builtin_types();
+        if args.len() == 3
+            && !Rc::ptr_eq(&cls, &bt.generic_alias_)
+            && cls.is_subclass_of(&bt.generic_alias_)
+        {
+            return Ok(crate::make_generic_alias_public(
+                args[1].clone(),
+                args[2].clone(),
+            ));
+        }
+    }
     // CPython `object_new` arity policy (bpo-31506): excess arguments
     // are an error unless exactly one of `__new__`/`__init__` is
     // overridden (the overriding side owns the signature).

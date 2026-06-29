@@ -84,6 +84,18 @@ Literal = _SpecialForm("Literal")
 # (``tuple[int]``) yields ``Unpack[self]`` exactly once, mirroring
 # CPython's ``ga_iternext`` (which lazily reaches ``typing.Unpack``).
 Unpack = _SpecialForm("Unpack")
+# PEP 655 (``Required`` / ``NotRequired`` for ``TypedDict`` items),
+# PEP 675 (``LiteralString``), PEP 647/742 (``TypeGuard`` / ``TypeIs``),
+# ``TypeAlias`` (PEP 613) and ``Concatenate`` (PEP 612). numpy's
+# ``_typing`` imports several of these at module scope.
+Required = _SpecialForm("Required")
+NotRequired = _SpecialForm("NotRequired")
+ReadOnly = _SpecialForm("ReadOnly")
+LiteralString = _SpecialForm("LiteralString")
+TypeAlias = _SpecialForm("TypeAlias")
+TypeGuard = _SpecialForm("TypeGuard")
+TypeIs = _SpecialForm("TypeIs")
+Concatenate = _SpecialForm("Concatenate")
 
 
 def Optional(*params):
@@ -160,6 +172,65 @@ class TypeVarTuple(TypeVar):
     # ``typevartuple_iter`` in ``Objects/typevarobject.c``.
     def __iter__(self):
         yield Unpack[self]
+
+
+# ---- PEP 695 type aliases ---------------------------------------------------
+
+
+class TypeAliasType:
+    """Runtime object for a PEP 695 ``type X = ...`` statement.
+
+    Mirrors CPython 3.12+'s ``typing.TypeAliasType``: the alias *body*
+    is **lazily** evaluated. The compiler wraps the body in a thunk
+    (``lambda <type-params>: body``) and the VM's
+    ``__weavepy_type_alias__`` intrinsic constructs this object, passing
+    the freshly-minted type parameters. The thunk is only invoked — with
+    those parameters bound — the first time :attr:`__value__` is read.
+
+    Deferring evaluation is what lets aliases that build unions or
+    subscript *other* aliases be defined at import time without forcing
+    the referenced machinery to exist yet, e.g. numpy's::
+
+        type _DualArrayLike[DTypeT, BuiltinT] = (
+            _SupportsArray[DTypeT] | _NestedSequence[...] | BuiltinT
+        )
+        type ArrayLike = Buffer | _DualArrayLike[np.dtype, complex]
+    """
+
+    def __init__(self, name, type_params, evaluate):
+        # No ``__slots__`` — attributes live in ``__dict__`` so the lazy
+        # cache fields don't need to be predeclared.
+        self.__name__ = name
+        self.__type_params__ = tuple(type_params)
+        self._evaluate = evaluate
+        self._evaluated = False
+        self._value = None
+
+    @property
+    def __value__(self):
+        if not self._evaluated:
+            self._value = self._evaluate(*self.__type_params__)
+            self._evaluated = True
+        return self._value
+
+    def __or__(self, other):
+        return Union[self, other]
+
+    def __ror__(self, other):
+        return Union[other, self]
+
+    def __getitem__(self, params):
+        # ``Alias[args]`` — parameterise. Matches CPython, which returns
+        # a ``typing._GenericAlias`` whose ``__origin__`` is the alias.
+        if not isinstance(params, tuple):
+            params = (params,)
+        return _GenericAlias(self, params)
+
+    def __repr__(self):
+        return self.__name__
+
+    def __call__(self, *args, **kwargs):
+        raise TypeError(f"Cannot instantiate type alias {self.__name__!r}")
 
 
 # ---- generic alias ----------------------------------------------------------
@@ -840,6 +911,79 @@ def _namedtuple_mro_entries(bases):
 
 
 NamedTuple.__mro_entries__ = _namedtuple_mro_entries
+
+
+# ---- TypedDict (PEP 589 / 655) ---------------------------------------------
+
+
+class _TypedDictMeta(type):
+    """Metaclass backing ``class X(TypedDict): ...``.
+
+    At runtime a ``TypedDict`` is just a ``dict`` subclass; the metaclass
+    records ``__annotations__`` plus the ``__required_keys__`` /
+    ``__optional_keys__`` split (honouring ``total=`` and
+    ``Required[...]`` / ``NotRequired[...]`` item markers). We never
+    enforce the schema — there is no static checker — but the surface is
+    enough for libraries (numpy's ``_DTypeDict``) that subclass it for
+    annotation purposes only.
+    """
+
+    def __new__(mcls, name, bases, ns, total=True, **kwargs):
+        # Bootstrap of the ``TypedDict`` sentinel base itself, and plain
+        # ``type.__new__`` paths, carry no TypedDict base — pass through.
+        if not any(isinstance(b, _TypedDictMeta) for b in bases):
+            return super().__new__(mcls, name, bases, ns)
+
+        own = dict(ns.get("__annotations__", {}))
+        annotations = {}
+        required = set()
+        optional = set()
+        # Merge inherited TypedDict schemas first (CPython order).
+        for b in bases:
+            if isinstance(b, _TypedDictMeta):
+                annotations.update(getattr(b, "__annotations__", {}) or {})
+                required |= getattr(b, "__required_keys__", frozenset())
+                optional |= getattr(b, "__optional_keys__", frozenset())
+        for key, ann in own.items():
+            annotations[key] = ann
+            req = total
+            marker = getattr(getattr(ann, "__origin__", None), "_name", None)
+            if marker == "Required":
+                req = True
+            elif marker == "NotRequired":
+                req = False
+            required.discard(key)
+            optional.discard(key)
+            (required if req else optional).add(key)
+
+        tp_dict = super().__new__(mcls, name, (dict,), ns)
+        tp_dict.__annotations__ = annotations
+        tp_dict.__required_keys__ = frozenset(required)
+        tp_dict.__optional_keys__ = frozenset(optional)
+        tp_dict.__total__ = total
+        return tp_dict
+
+    def __call__(cls, *args, **kwargs):
+        # ``TypedDict`` values are constructed like plain dicts.
+        return dict(*args, **kwargs)
+
+
+def TypedDict(typename, fields=None, /, *, total=True, **kwargs):
+    """Functional form: ``Movie = TypedDict('Movie', {'name': str})``."""
+    if fields is None:
+        fields = kwargs
+    ns = {"__annotations__": dict(fields)}
+    return _TypedDictMeta(typename, (_TypedDict,), ns, total=total)
+
+
+_TypedDict = type.__new__(_TypedDictMeta, "TypedDict", (), {})
+
+
+def _typeddict_mro_entries(bases):
+    return (_TypedDict,)
+
+
+TypedDict.__mro_entries__ = _typeddict_mro_entries
 
 
 # ---- nominal collections wrappers (PEP 585 aliases) ------------------------

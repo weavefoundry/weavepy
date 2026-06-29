@@ -27,6 +27,16 @@ pub unsafe extern "C" fn PyObject_Repr(o: *mut PyObject) -> *mut PyObject {
         return ptr::null_mut();
     }
     let obj = unsafe { crate::object::clone_object(o) };
+    // RFC 0046 (wave 4): a *foreign* object's `repr` must come from its own
+    // `tp_repr` (numpy's `dtype` prints as `dtype('float64')`); the VM-side
+    // `repr_for` only sees an opaque `Object::Foreign` and would emit the
+    // debug `<foreign … at 0x…>` placeholder.
+    if matches!(obj, Object::Foreign(_)) {
+        let r = unsafe { foreign_repr_or_str(o, true) };
+        if !r.is_null() {
+            return r;
+        }
+    }
     let s = repr_for(&obj);
     crate::object::into_owned(Object::from_str(s))
 }
@@ -37,8 +47,95 @@ pub unsafe extern "C" fn PyObject_Str(o: *mut PyObject) -> *mut PyObject {
         return ptr::null_mut();
     }
     let obj = unsafe { crate::object::clone_object(o) };
+    // RFC 0046 (wave 4): a foreign object's `str` comes from its `tp_str`
+    // (falling back to `tp_repr`, exactly as CPython's `PyObject_Str`).
+    if matches!(obj, Object::Foreign(_)) {
+        let r = unsafe { foreign_repr_or_str(o, false) };
+        if !r.is_null() {
+            return r;
+        }
+    }
     let s = str_for(&obj);
     crate::object::into_owned(Object::from_str(s))
+}
+
+/// CPython-faithful `repr`/`str` for a *foreign* extension object
+/// (RFC 0046, wave 4): call `tp_repr` (when `want_repr`) or `tp_str`,
+/// `tp_str` falling back to `tp_repr` as CPython does. Returns a new
+/// reference, or null when no slot is defined (caller uses the VM
+/// placeholder).
+///
+/// # Safety
+/// `o` must be a live, non-null `PyObject*` whose `ob_type` is readable.
+unsafe fn foreign_repr_or_str(o: *mut PyObject, want_repr: bool) -> *mut PyObject {
+    let ty = unsafe { (*o).ob_type } as *mut crate::layout::PyTypeObjectFull;
+    if ty.is_null() {
+        return ptr::null_mut();
+    }
+    // CPython bakes inherited slots into each subtype during `PyType_Ready`
+    // (`inherit_slots`). WeavePy's `PyType_Ready` does not, so a stock
+    // subclass such as numpy's `Float64DType` carries a NULL `tp_repr` even
+    // though its base `np.dtype` defines `arraydescr_repr`. Walk the
+    // `tp_base` chain to recover the inherited slot, mirroring the effect of
+    // `inherit_slots` for the repr/str path.
+    let slot = unsafe { inherited_repr_str_slot(ty, want_repr) };
+    if slot.is_null() {
+        return ptr::null_mut();
+    }
+    let f: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject =
+        unsafe { std::mem::transmute(slot) };
+    let r = unsafe { f(o) };
+    // When the slot raises (returns NULL with a pending exception), the
+    // caller falls back to the VM placeholder. We must consume the pending
+    // exception here so it does not leak into the next VM operation — the
+    // fallback is a best-effort cosmetic repr/str, not a propagated error.
+    if r.is_null() {
+        let _ = crate::errors::take_pending();
+    }
+    r
+}
+
+/// Resolve the effective `tp_repr` (when `want_repr`) or `tp_str` for `ty`,
+/// walking the `tp_base` chain when the slot is NULL on the subtype. `str`
+/// with no `tp_str` anywhere in the chain falls back to `tp_repr`, exactly
+/// as CPython's `PyObject_Str`.
+///
+/// # Safety
+/// `ty` must be a live, non-null `PyTypeObjectFull*` with a readable
+/// (possibly NULL-terminated) `tp_base` chain.
+unsafe fn inherited_repr_str_slot(
+    ty: *mut crate::layout::PyTypeObjectFull,
+    want_repr: bool,
+) -> *mut std::os::raw::c_void {
+    unsafe fn walk(
+        mut ty: *mut crate::layout::PyTypeObjectFull,
+        repr: bool,
+    ) -> *mut std::os::raw::c_void {
+        // Bound the walk defensively against a cyclic/corrupt base chain.
+        for _ in 0..256 {
+            if ty.is_null() {
+                break;
+            }
+            let s = if repr {
+                unsafe { (*ty).tp_repr }
+            } else {
+                unsafe { (*ty).tp_str }
+            };
+            if !s.is_null() {
+                return s;
+            }
+            ty = unsafe { (*ty).tp_base };
+        }
+        ptr::null_mut()
+    }
+    let primary = unsafe { walk(ty, want_repr) };
+    if !primary.is_null() {
+        return primary;
+    }
+    if !want_repr {
+        return unsafe { walk(ty, true) };
+    }
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -120,8 +217,34 @@ pub unsafe extern "C" fn PyObject_GetAttrString(
 
 fn do_getattr(o: *mut PyObject, key: &str) -> *mut PyObject {
     let obj = unsafe { crate::object::clone_object(o) };
-    match attr_lookup(&obj, key) {
-        Some(v) => crate::object::into_owned(v),
+    // RFC 0046 (wave 4): a foreign extension object resolves attributes
+    // through its own slots, never through the VM's `Foreign` arm (which
+    // would loop back here via the foreign getattr hook). See
+    // [`foreign_getattr_dispatch`].
+    if matches!(obj, Object::Foreign(_)) {
+        return foreign_getattr_dispatch(o, &obj, key);
+    }
+    // Fast path: the handful of container/instance shapes `attr_lookup`
+    // resolves without re-entering the interpreter.
+    if let Some(v) = attr_lookup(&obj, key) {
+        return crate::object::into_owned(v);
+    }
+    // RFC 0046 (wave 4): everything else — functions, builtins, generators,
+    // foreign extension objects, and every genuine miss — resolves through
+    // the VM's full `LOAD_ATTR` machinery, so the C-API agrees with the
+    // bytecode path on both the value and (on failure) the *exact*
+    // exception. numpy reads `dispatcher.__qualname__` / `__name__` on a
+    // plain `function` through here while wrapping `__array_function__`
+    // implementations; the legacy `_ => None` arm wrongly reported
+    // "'function' object has no attribute '__qualname__'".
+    match crate::interp::ensure_active(|| {
+        crate::interp::with_interp_mut(|interp| interp.load_attr_public(&obj, key))
+    }) {
+        Some(Ok(v)) => crate::object::into_owned(v),
+        Some(Err(e)) => {
+            crate::errors::set_pending_from_runtime(e);
+            ptr::null_mut()
+        }
         None => {
             crate::errors::set_pending(
                 Some(
@@ -132,6 +255,58 @@ fn do_getattr(o: *mut PyObject, key: &str) -> *mut PyObject {
                 Object::from_str(format!(
                     "'{}' object has no attribute '{}'",
                     type_name(&obj),
+                    key
+                )),
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Resolve `name` on a *foreign* extension object (RFC 0046, wave 4),
+/// mirroring CPython's `PyObject_GetAttr` dispatch:
+///
+/// 1. A **custom** `tp_getattro` (one the extension installed itself, e.g.
+///    `ndarray`'s) is the object's own resolution — call it directly.
+/// 2. Otherwise (the slot is null or our generic `PyObject_GenericGetAttr`)
+///    resolve through the bridged type's harvested descriptors via the VM
+///    ([`Interpreter::resolve_foreign_via_type`]). This invokes getset
+///    getters / binds methods with the foreign object as `self`, and never
+///    re-enters the foreign getattr hook — so there is no recursion.
+fn foreign_getattr_dispatch(o: *mut PyObject, obj: &Object, key: &str) -> *mut PyObject {
+    let tp = unsafe { (*o).ob_type };
+    if !tp.is_null() {
+        let getattro = unsafe { (*tp).tp_getattro };
+        let generic = crate::genericalloc::PyObject_GenericGetAttr
+            as unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject
+            as usize;
+        if !getattro.is_null() && getattro as usize != generic {
+            let name_obj = crate::object::into_owned(Object::from_str(key));
+            let f: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject =
+                unsafe { std::mem::transmute(getattro) };
+            let r = unsafe { f(o, name_obj) };
+            unsafe { crate::object::Py_DecRef(name_obj) };
+            return r;
+        }
+    }
+    match crate::interp::ensure_active(|| {
+        crate::interp::with_interp_mut(|interp| interp.resolve_foreign_via_type(obj, key))
+    }) {
+        Some(Some(Ok(v))) => crate::object::into_owned(v),
+        Some(Some(Err(e))) => {
+            crate::errors::set_pending_from_runtime(e);
+            ptr::null_mut()
+        }
+        _ => {
+            crate::errors::set_pending(
+                Some(
+                    weavepy_vm::builtin_types::builtin_types()
+                        .attribute_error
+                        .clone(),
+                ),
+                Object::from_str(format!(
+                    "'{}' object has no attribute '{}'",
+                    type_name(obj),
                     key
                 )),
             );
@@ -508,7 +683,76 @@ pub unsafe extern "C" fn PyObject_IsTrue(o: *mut PyObject) -> c_int {
         return -1;
     }
     let obj = unsafe { crate::object::clone_object(o) };
+    // RFC 0046 (wave 4): a *foreign* object (a numpy scalar such as
+    // `np.bool_`, a 0-d array, …) is opaque to the VM. Cloning it yields an
+    // `Object::Foreign`, which `truthy`'s catch-all reports as `true` — so a
+    // *false* `np.bool_` would test truthy. numpy's `polyfit` does
+    // `if rank != order and not full:` where `rank != order` is exactly an
+    // `np.bool_`; the false positive raised a spurious `RankWarning` that
+    // `_mac_os_check` escalates to a hard `RuntimeError` on import. Dispatch
+    // through the object's own `nb_bool` / `mp_length` / `sq_length` slots,
+    // faithful to CPython's `PyObject_IsTrue`.
+    if matches!(obj, Object::Foreign(_)) {
+        return unsafe { foreign_is_true(o) };
+    }
     truthy(&obj).into()
+}
+
+/// CPython-faithful truthiness for a *foreign* extension object
+/// (RFC 0046, wave 4): consult `nb_bool`, then `mp_length`, then
+/// `sq_length`, defaulting to true when none is defined — exactly the
+/// fallback chain in CPython's `PyObject_IsTrue`.
+///
+/// # Safety
+/// `o` must be a live, non-null `PyObject*` whose `ob_type` is readable.
+unsafe fn foreign_is_true(o: *mut PyObject) -> c_int {
+    let ty = unsafe { (*o).ob_type } as *mut crate::layout::PyTypeObjectFull;
+    if ty.is_null() {
+        return 1;
+    }
+    // `nb_bool` (inquiry): `int (*)(PyObject*)` returning 1 / 0 / -1.
+    let nb = unsafe { (*ty).tp_as_number };
+    if !nb.is_null() {
+        let slot = unsafe { (*nb).nb_bool };
+        if !slot.is_null() {
+            let f: unsafe extern "C" fn(*mut PyObject) -> c_int =
+                unsafe { std::mem::transmute(slot) };
+            return unsafe { f(o) };
+        }
+    }
+    // `mp_length` / `sq_length` (lenfunc): `Py_ssize_t (*)(PyObject*)`;
+    // truthy iff non-zero, propagating a negative (error) result.
+    let mp = unsafe { (*ty).tp_as_mapping };
+    if !mp.is_null() {
+        let slot = unsafe { (*mp).mp_length };
+        if !slot.is_null() {
+            return len_to_truth(unsafe {
+                let f: unsafe extern "C" fn(*mut PyObject) -> PySsizeT = std::mem::transmute(slot);
+                f(o)
+            });
+        }
+    }
+    let sq = unsafe { (*ty).tp_as_sequence };
+    if !sq.is_null() {
+        let slot = unsafe { (*sq).sq_length };
+        if !slot.is_null() {
+            return len_to_truth(unsafe {
+                let f: unsafe extern "C" fn(*mut PyObject) -> PySsizeT = std::mem::transmute(slot);
+                f(o)
+            });
+        }
+    }
+    1
+}
+
+/// Map a `lenfunc` result to a `PyObject_IsTrue` code: negative is an
+/// error (passed through), zero is false, positive is true.
+fn len_to_truth(n: PySsizeT) -> c_int {
+    match n.cmp(&0) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
 }
 
 #[no_mangle]
@@ -1072,7 +1316,20 @@ pub unsafe extern "C" fn PyNumber_Long(o: *mut PyObject) -> *mut PyObject {
                 ptr::null_mut()
             }
         },
-        _ => {
+        other => {
+            // RFC 0046 (wave 4): CPython's `PyNumber_Long` consults
+            // `nb_int`, then `nb_index`, then `__trunc__`. A numpy scalar /
+            // foreign object (or a user instance) reaches us here, so try
+            // `__int__` then `__index__` via the dunder shim — the same
+            // route `PyNumber_Index` already uses for `__index__`.
+            for attr in ["__int__", "__index__"] {
+                if let Some(dunder) = attr_lookup(&other, attr) {
+                    let dunder_o = crate::object::into_owned(dunder);
+                    let result = unsafe { PyObject_CallOneArg(dunder_o, o) };
+                    unsafe { crate::object::Py_DecRef(dunder_o) };
+                    return result;
+                }
+            }
             crate::errors::set_type_error("cannot convert to int");
             ptr::null_mut()
         }

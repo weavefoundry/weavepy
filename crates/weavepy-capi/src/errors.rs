@@ -224,6 +224,7 @@ exc_cell! {
     PyExc_NameError;
     PyExc_NotImplementedError;
     PyExc_OSError;
+    PyExc_IOError;
     PyExc_OverflowError;
     PyExc_RecursionError;
     PyExc_ReferenceError;
@@ -328,6 +329,9 @@ pub fn init_static_exceptions() {
             bt.not_implemented_error.clone(),
         );
         publish(&raw mut PyExc_OSError, bt.os_error.clone());
+        // IOError is an alias of OSError in Python 3; share the slot so
+        // `PyExc_IOError is PyExc_OSError`.
+        publish(&raw mut PyExc_IOError, bt.os_error.clone());
         publish(&raw mut PyExc_OverflowError, bt.overflow_error.clone());
         publish(&raw mut PyExc_RecursionError, bt.recursion_error.clone());
         publish(&raw mut PyExc_ReferenceError, bt.runtime_error.clone());

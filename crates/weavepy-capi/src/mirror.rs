@@ -144,6 +144,12 @@ pub fn type_is_faithful(ty: *mut PyTypeObject) -> bool {
         || ty == types::PyUnicode_Type.as_ptr()
         || ty == types::PyTuple_Type.as_ptr()
         || ty == types::PyList_Type.as_ptr()
+        // RFC 0046 (wave 4): `builtin_function_or_method`. WeavePy mints
+        // *every* `PyCFunction` (we expose no `PyCFunction_NewEx`, and
+        // `type_for_object(Builtin)` is the sole writer of this type), so a
+        // type-keyed discriminator is sound: no foreign object ever carries
+        // `PyCFunction_Type`.
+        || ty == types::PyCFunction_Type.as_ptr()
 }
 
 /// True if a native [`Object`] is mirrored with a faithful body (rather
@@ -161,6 +167,7 @@ pub fn obj_is_faithful(obj: &Object) -> bool {
             | Object::Str(_)
             | Object::Tuple(_)
             | Object::List(_)
+            | Object::Builtin(_)
     )
 }
 
@@ -215,6 +222,7 @@ pub fn mirror_out_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
             },
         );
     }
+    crate::object::register_minted(body);
     body
 }
 
@@ -262,6 +270,7 @@ pub fn alloc_instance_body(
             },
         );
     }
+    crate::object::register_minted(body);
     body
 }
 
@@ -298,6 +307,7 @@ pub unsafe fn is_instance_body(p: *mut PyObject) -> bool {
 /// `p` must be an instance body ([`is_instance_body`]) that the owning
 /// instance is releasing; it must not be used afterwards.
 pub unsafe fn free_instance_body(p: *mut PyObject) {
+    crate::object::unregister_minted(p);
     let pre = unsafe { prefix_of(p) };
     if let Some(d) = unsafe { (*pre).destructor } {
         unsafe { d(p) };
@@ -328,7 +338,334 @@ pub unsafe fn native_of(p: *mut PyObject) -> Object {
             None => Object::None,
         };
     }
+    // RFC 0046 (wave 4): a faithful tuple's inline `ob_item` is the source
+    // of truth (a stock `PyTuple_SET_ITEM` writes it directly, bypassing
+    // our functions), so reconstruct from the C body rather than the
+    // staged prefix object.
+    if unsafe { is_faithful_tuple(p) } {
+        return unsafe { read_tuple(p) };
+    }
+    // RFC 0046 (wave 4): likewise a faithful list's `ob_item` buffer is the
+    // source of truth (a stock `PyList_SET_ITEM` writes it directly), so
+    // reconstruct from the C body rather than the staged prefix object.
+    if unsafe { is_faithful_list(p) } {
+        return unsafe { read_list(p) };
+    }
     unsafe { (*pre).obj.clone() }
+}
+
+/// True iff `p` is a faithful **tuple** mirror — a mirror whose advertised
+/// type is `PyTuple_Type` and whose inline `ob_item` array holds the
+/// elements (RFC 0046, wave 4). A stock extension fills such a tuple with
+/// the `PyTuple_SET_ITEM` macro and reads it with `PyTuple_GET_ITEM`, both
+/// of which touch the inline array directly, so the C body — not the
+/// prefix's staged [`Object`] — is authoritative on every read.
+///
+/// # Safety
+/// `p` must be non-null and readable for `[prefix .. head + 16]`.
+pub unsafe fn is_faithful_tuple(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let head = unsafe { &*p };
+    !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyTuple_Type.as_ptr())
+}
+
+/// Reconstruct an [`Object::Tuple`] by reading a faithful tuple mirror's
+/// inline `ob_item` array (`ob_size` entries). Each non-NULL slot is
+/// resolved with [`crate::object::clone_object`] so a foreign element
+/// round-trips opaquely and a DType class resolves to its bridged type.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_tuple`].
+pub unsafe fn read_tuple(p: *mut PyObject) -> Object {
+    let vo = p as *const layout::PyVarObject;
+    let n = unsafe { (*vo).ob_size };
+    let n = if n < 0 { 0 } else { n as usize };
+    let to = p as *const layout::PyTupleObject;
+    let base = ptr::addr_of!((*to).ob_item) as *const *mut PyObject;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let slot = unsafe { *base.add(i) };
+        out.push(if slot.is_null() {
+            Object::None
+        } else {
+            unsafe { crate::object::clone_object(slot) }
+        });
+    }
+    if std::env::var_os("WEAVEPY_DEBUG_TUPLE").is_some() && n == 2 {
+        let s0 = unsafe { *base.add(0) };
+        let s1 = unsafe { *base.add(1) };
+        let k1 = match out.get(1) {
+            Some(Object::Foreign(_)) => "Foreign",
+            Some(Object::None) => "None",
+            Some(Object::Type(_)) => "Type",
+            Some(Object::Tuple(_)) => "Tuple",
+            Some(_) => "other",
+            None => "MISSING",
+        };
+        eprintln!("[read_tuple n=2] slot0={s0:p} slot1={s1:p} out1_kind={k1}");
+    }
+    Object::new_tuple(out)
+}
+
+/// True iff `p` is a faithful **list** mirror — a mirror whose advertised
+/// type is `PyList_Type` and whose `ob_item` buffer holds the elements
+/// (RFC 0046, wave 4). A stock extension fills such a list with the
+/// `PyList_SET_ITEM` macro (numpy builds `__cpu_dispatch__` this way:
+/// `PyList_New(n)` then `PyList_SET_ITEM(list, i, str)`), which writes the
+/// `ob_item` array directly — so the C body, not the prefix's staged
+/// [`Object`], is authoritative on every read-back.
+///
+/// # Safety
+/// `p` must be non-null and readable for `[prefix .. head + 16]`.
+pub unsafe fn is_faithful_list(p: *mut PyObject) -> bool {
+    if !unsafe { is_mirror(p) } {
+        return false;
+    }
+    let head = unsafe { &*p };
+    !head.ob_type.is_null() && std::ptr::eq(head.ob_type, crate::types::PyList_Type.as_ptr())
+}
+
+/// Reconstruct an [`Object::List`] by reading a faithful list mirror's
+/// `ob_item` buffer (`ob_size` entries). Each non-NULL slot is resolved
+/// with [`crate::object::clone_object`]; a NULL slot (a `PyList_New(n)`
+/// placeholder a stock extension never filled) reads as `None`, matching
+/// CPython, where such a slot is the `NULL` that `PyList_SET_ITEM` expects
+/// to overwrite.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+pub unsafe fn read_list(p: *mut PyObject) -> Object {
+    let vo = p as *const layout::PyVarObject;
+    let n = unsafe { (*vo).ob_size };
+    let n = if n < 0 { 0 } else { n as usize };
+    let lo = p as *const layout::PyListObject;
+    let base = unsafe { (*lo).ob_item };
+    let mut out = Vec::with_capacity(n);
+    if !base.is_null() {
+        for i in 0..n {
+            let slot = unsafe { *base.add(i) };
+            out.push(if slot.is_null() {
+                Object::None
+            } else {
+                unsafe { crate::object::clone_object(slot) }
+            });
+        }
+    }
+    Object::new_list(out)
+}
+
+/// Borrow the `pos`-th inline `ob_item` slot of a faithful tuple mirror
+/// (RFC 0046, wave 4). Returns a *borrowed* pointer (no incref), matching
+/// `PyTuple_GetItem`'s contract; `None` for an out-of-range index.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_tuple`].
+pub unsafe fn tuple_slot(p: *mut PyObject, pos: PySsizeT) -> Option<*mut PyObject> {
+    let vo = p as *const layout::PyVarObject;
+    let n = unsafe { (*vo).ob_size };
+    if pos < 0 || pos >= n {
+        return None;
+    }
+    let to = p as *const layout::PyTupleObject;
+    let base = ptr::addr_of!((*to).ob_item) as *const *mut PyObject;
+    Some(unsafe { *base.add(pos as usize) })
+}
+
+/// Overwrite the `pos`-th inline `ob_item` slot of a faithful tuple mirror,
+/// stealing `item` (CPython's `PyTuple_SetItem` semantics) and releasing
+/// the slot's previous occupant. Returns `false` for an out-of-range index
+/// (the caller then disposes of `item`).
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_tuple`]; `item` is a strong reference
+/// whose ownership transfers to the tuple.
+pub unsafe fn tuple_store(p: *mut PyObject, pos: PySsizeT, item: *mut PyObject) -> bool {
+    let vo = p as *const layout::PyVarObject;
+    let n = unsafe { (*vo).ob_size };
+    if pos < 0 || pos >= n {
+        return false;
+    }
+    let to = p as *mut layout::PyTupleObject;
+    let base = ptr::addr_of_mut!((*to).ob_item) as *mut *mut PyObject;
+    let slot = unsafe { base.add(pos as usize) };
+    let prev = unsafe { *slot };
+    unsafe { *slot = item };
+    if !prev.is_null() {
+        unsafe { crate::object::Py_DecRef(prev) };
+    }
+    true
+}
+
+/// Number of live elements in a faithful list mirror (its `ob_size`).
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+pub unsafe fn list_size(p: *mut PyObject) -> PySsizeT {
+    let vo = p as *const layout::PyVarObject;
+    unsafe { (*vo).ob_size }.max(0)
+}
+
+/// Borrow the `pos`-th `ob_item` slot of a faithful list mirror (no
+/// incref, matching `PyList_GetItem`); `None` for an out-of-range index.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+pub unsafe fn list_slot(p: *mut PyObject, pos: PySsizeT) -> Option<*mut PyObject> {
+    let n = unsafe { list_size(p) };
+    if pos < 0 || pos >= n {
+        return None;
+    }
+    let lo = p as *const layout::PyListObject;
+    let base = unsafe { (*lo).ob_item };
+    if base.is_null() {
+        return None;
+    }
+    Some(unsafe { *base.add(pos as usize) })
+}
+
+/// Ensure the faithful list `p` can hold at least `min_cap` slots,
+/// (re)allocating its out-of-line `ob_item` buffer and syncing both the
+/// `PyListObject` (`ob_item` / `allocated`) and the mirror prefix's aux
+/// tracking (`aux_ptr` / `aux_size`, which [`free_mirror`] uses to
+/// release the buffer and decref its occupants). New slots are NULL.
+/// Returns the (possibly new) base pointer.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+unsafe fn list_reserve(p: *mut PyObject, min_cap: usize) -> *mut *mut PyObject {
+    let lo = p as *mut layout::PyListObject;
+    let cur_alloc = unsafe { (*lo).allocated }.max(0) as usize;
+    let cur_base = unsafe { (*lo).ob_item };
+    if min_cap <= cur_alloc && !cur_base.is_null() {
+        return cur_base;
+    }
+    // CPython-style over-allocation (`list_resize`) keeps amortised O(1)
+    // append: grow to `min_cap + (min_cap >> 3) + 6`, never below double
+    // the current capacity.
+    let grow = min_cap + (min_cap >> 3) + 6;
+    let new_cap = grow.max(cur_alloc.saturating_mul(2)).max(4);
+    let new_bytes = new_cap * std::mem::size_of::<*mut PyObject>();
+    let layout = Layout::from_size_align(new_bytes, BODY_ALIGN).expect("ob_item layout");
+    let new_buf = unsafe { alloc(layout) } as *mut *mut PyObject;
+    assert!(!new_buf.is_null(), "ob_item allocation failed");
+    unsafe { ptr::write_bytes(new_buf as *mut u8, 0, new_bytes) };
+    let n = unsafe { list_size(p) } as usize;
+    if !cur_base.is_null() {
+        for i in 0..n {
+            unsafe { *new_buf.add(i) = *cur_base.add(i) };
+        }
+    }
+    let pre = unsafe { prefix_of(p) };
+    let old_aux = unsafe { (*pre).aux_ptr };
+    let old_aux_size = unsafe { (*pre).aux_size };
+    if !old_aux.is_null() && old_aux_size > 0 {
+        let old_layout = Layout::from_size_align(old_aux_size, BODY_ALIGN).expect("aux layout");
+        unsafe { dealloc(old_aux, old_layout) };
+    }
+    unsafe {
+        (*lo).ob_item = new_buf;
+        (*lo).allocated = new_cap as PySsizeT;
+        (*pre).aux_ptr = new_buf as *mut u8;
+        (*pre).aux_size = new_bytes;
+    }
+    new_buf
+}
+
+/// Append `item` to a faithful list mirror, taking a new strong
+/// reference (CPython `PyList_Append` semantics — the caller keeps its
+/// own reference). Writes the inline `ob_item` buffer, the source of
+/// truth for every read-back.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`]; `item` must be a live,
+/// non-null `PyObject*`.
+pub unsafe fn list_append(p: *mut PyObject, item: *mut PyObject) {
+    let n = unsafe { list_size(p) } as usize;
+    let base = unsafe { list_reserve(p, n + 1) };
+    unsafe { crate::object::Py_IncRef(item) };
+    unsafe { *base.add(n) = item };
+    let vo = p as *mut layout::PyVarObject;
+    unsafe { (*vo).ob_size = (n + 1) as PySsizeT };
+}
+
+/// Insert `item` before `pos` (clamped to `[0, len]`) in a faithful list
+/// mirror, taking a new strong reference.
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`]; `item` must be a live,
+/// non-null `PyObject*`.
+pub unsafe fn list_insert(p: *mut PyObject, pos: PySsizeT, item: *mut PyObject) {
+    let n = unsafe { list_size(p) } as usize;
+    let base = unsafe { list_reserve(p, n + 1) };
+    let at = pos.clamp(0, n as PySsizeT) as usize;
+    for i in (at..n).rev() {
+        unsafe { *base.add(i + 1) = *base.add(i) };
+    }
+    unsafe { crate::object::Py_IncRef(item) };
+    unsafe { *base.add(at) = item };
+    let vo = p as *mut layout::PyVarObject;
+    unsafe { (*vo).ob_size = (n + 1) as PySsizeT };
+}
+
+/// Overwrite the `pos`-th slot of a faithful list mirror, **stealing**
+/// `item` (CPython `PyList_SetItem`) and releasing the prior occupant.
+/// Returns `false` for an out-of-range index (the caller then disposes
+/// of `item`).
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`]; `item` is a strong reference
+/// whose ownership transfers to the list.
+pub unsafe fn list_store(p: *mut PyObject, pos: PySsizeT, item: *mut PyObject) -> bool {
+    let n = unsafe { list_size(p) };
+    if pos < 0 || pos >= n {
+        return false;
+    }
+    let lo = p as *mut layout::PyListObject;
+    let base = unsafe { (*lo).ob_item };
+    let slot = unsafe { base.add(pos as usize) };
+    let prev = unsafe { *slot };
+    unsafe { *slot = item };
+    if !prev.is_null() {
+        unsafe { crate::object::Py_DecRef(prev) };
+    }
+    true
+}
+
+/// Snapshot the `ob_item` pointers of a faithful list mirror (borrowed;
+/// no refcount change). Used by in-place permutations (reverse / sort).
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`].
+pub unsafe fn list_ptrs(p: *mut PyObject) -> Vec<*mut PyObject> {
+    let n = unsafe { list_size(p) } as usize;
+    let lo = p as *const layout::PyListObject;
+    let base = unsafe { (*lo).ob_item };
+    let mut out = Vec::with_capacity(n);
+    if !base.is_null() {
+        for i in 0..n {
+            out.push(unsafe { *base.add(i) });
+        }
+    }
+    out
+}
+
+/// Write back a permutation of the list's own pointers (same multiset,
+/// same length — a pure reordering, so no refcount change). Used by
+/// reverse / sort after [`list_ptrs`].
+///
+/// # Safety
+/// `p` must satisfy [`is_faithful_list`] and `ptrs.len() == list_size(p)`.
+pub unsafe fn list_permute(p: *mut PyObject, ptrs: &[*mut PyObject]) {
+    let lo = p as *mut layout::PyListObject;
+    let base = unsafe { (*lo).ob_item };
+    if base.is_null() {
+        return;
+    }
+    for (i, &pp) in ptrs.iter().enumerate() {
+        unsafe { *base.add(i) = pp };
+    }
 }
 
 /// Borrow the C-side state pointer stored in the prefix.
@@ -347,6 +684,7 @@ pub unsafe fn user_data(p: *mut PyObject) -> *mut c_void {
 /// `p` must satisfy [`is_mirror`] and have a zero (or about-to-be-zero)
 /// refcount; it must not be used afterwards.
 pub unsafe fn free_mirror(p: *mut PyObject) {
+    crate::object::unregister_minted(p);
     let pre = unsafe { prefix_of(p) };
     let destructor = unsafe { (*pre).destructor };
     if let Some(d) = destructor {
@@ -355,6 +693,40 @@ pub unsafe fn free_mirror(p: *mut PyObject) {
     let alloc_size = unsafe { (*pre).alloc_size };
     let aux_ptr = unsafe { (*pre).aux_ptr };
     let aux_size = unsafe { (*pre).aux_size };
+
+    // A non-null aux buffer is a list's out-of-line `ob_item` (RFC 0046,
+    // wave 4); the list owns one reference to each element (including any
+    // a stock `PyList_SET_ITEM` stored directly), so release them before
+    // freeing the buffer. Immortal singletons (None/bool) no-op.
+    if !aux_ptr.is_null() && aux_size > 0 {
+        let n = (aux_size / std::mem::size_of::<*mut PyObject>()) as isize;
+        let slots = aux_ptr as *mut *mut PyObject;
+        for i in 0..n {
+            let elem = unsafe { *slots.offset(i) };
+            if !elem.is_null() {
+                unsafe { crate::object::Py_DecRef(elem) };
+            }
+        }
+    }
+
+    // RFC 0046 (wave 4): a faithful tuple owns one reference to each inline
+    // `ob_item` element (materialised on creation or stored by a stock
+    // `PyTuple_SET_ITEM`), so release them before the block goes away.
+    // Immortal singletons (None/bool placeholders) no-op.
+    if unsafe { is_faithful_tuple(p) } {
+        let vo = p as *const layout::PyVarObject;
+        let n = unsafe { (*vo).ob_size };
+        if n > 0 {
+            let to = p as *mut layout::PyTupleObject;
+            let base = ptr::addr_of_mut!((*to).ob_item) as *mut *mut PyObject;
+            for i in 0..n as usize {
+                let elem = unsafe { *base.add(i) };
+                if !elem.is_null() {
+                    unsafe { crate::object::Py_DecRef(elem) };
+                }
+            }
+        }
+    }
 
     // Drop the owning native object (releasing its Rc clones).
     unsafe { ptr::drop_in_place(ptr::addr_of_mut!((*pre).obj)) };
@@ -387,6 +759,17 @@ enum BodyKind {
     Bytes,
     Str,
     Tuple,
+    /// Faithful `PyListObject` with an out-of-line `ob_item` buffer
+    /// (RFC 0046, wave 4). numpy builds module lists by `PyList_New(n)`
+    /// then writing `ob_item[i]` directly (the `PyList_SET_ITEM` macro),
+    /// so the buffer must be a real, writable `PyObject*` array.
+    List,
+    /// Faithful `PyCFunctionObject` with an inline, writable `PyMethodDef`
+    /// (RFC 0046, wave 4). numpy's `add_docstring` walks
+    /// `((PyCFunctionObject *)f)->m_ml->ml_doc` directly to read and then
+    /// write a function's docstring, so `m_ml` must point at a real,
+    /// writable `PyMethodDef` (carried just past the object body).
+    CFunction,
     /// Head-only body; the native value lives only in the prefix.
     Generic,
 }
@@ -425,6 +808,21 @@ impl BodyPlan {
                 kind: BodyKind::Tuple,
                 // varhead(24) + n pointers.
                 body_size: round_up(24 + t.len() * 8, 8).max(24),
+            },
+            Object::List(_) => BodyPlan {
+                kind: BodyKind::List,
+                // The list's `ob_item` is out-of-line (a separate aux
+                // buffer); the body is exactly `PyListObject`.
+                body_size: std::mem::size_of::<layout::PyListObject>(),
+            },
+            Object::Builtin(_) => BodyPlan {
+                kind: BodyKind::CFunction,
+                // `PyCFunctionObject` followed by an inline `PyMethodDef`
+                // (pointed at by `m_ml`); both live in the one block so a
+                // stock `f->m_ml->ml_doc` read/write stays in bounds and the
+                // method def is released with the object.
+                body_size: std::mem::size_of::<layout::PyCFunctionObject>()
+                    + std::mem::size_of::<layout::PyMethodDef>(),
             },
             _ => BodyPlan {
                 kind: BodyKind::Generic,
@@ -487,11 +885,103 @@ unsafe fn fill_body(
                 let to = body as *mut layout::PyTupleObject;
                 let base = ptr::addr_of_mut!((*to).ob_item) as *mut *mut PyObject;
                 for (i, elem) in t.iter().enumerate() {
-                    // Each element is itself mirrored (owned by this tuple).
-                    let ep = mirror_out(elem.clone());
+                    // RFC 0046 (wave 4): the inline `ob_item` array is the
+                    // tuple's *source of truth* — a stock `PyTuple_GET_ITEM`
+                    // reads it directly and `PyTuple_SET_ITEM` writes it, so
+                    // each element is an owned reference materialised here
+                    // (and released in `free_mirror`). `into_owned` round-
+                    // trips a foreign proxy to its original pointer and a
+                    // type object to its own `PyTypeObject*`. None/bool reuse
+                    // their immortal singletons so a `PyTuple_SET_ITEM`
+                    // overwrite (which does not decref the prior slot) of a
+                    // staged placeholder cannot leak.
+                    let ep = match elem {
+                        Object::None => crate::singletons::none_ptr(),
+                        Object::Bool(true) => crate::singletons::true_ptr(),
+                        Object::Bool(false) => crate::singletons::false_ptr(),
+                        _ => crate::object::into_owned(elem.clone()),
+                    };
+                    if std::env::var_os("WEAVEPY_DEBUG_TUPLE").is_some() && t.len() == 2 {
+                        let k = match elem {
+                            Object::Foreign(_) => "Foreign",
+                            Object::None => "None",
+                            Object::Type(_) => "Type",
+                            Object::Tuple(_) => "Tuple",
+                            _ => "other",
+                        };
+                        eprintln!("[fill_body tuple n=2] i={i} kind={k} ep={ep:p}");
+                    }
                     unsafe { *base.add(i) = ep };
                 }
             }
+        }
+        BodyKind::List => {
+            if let Object::List(l) = obj {
+                let items = l.borrow();
+                let n = items.len();
+                let vo = body as *mut layout::PyVarObject;
+                unsafe { (*vo).ob_size = n as PySsizeT };
+                let lo = body as *mut layout::PyListObject;
+                if n == 0 {
+                    // CPython's empty list has `ob_item == NULL`.
+                    unsafe {
+                        (*lo).ob_item = ptr::null_mut();
+                        (*lo).allocated = 0;
+                    }
+                } else {
+                    let bytes = n * std::mem::size_of::<*mut PyObject>();
+                    let buf_layout =
+                        Layout::from_size_align(bytes, BODY_ALIGN).expect("ob_item layout");
+                    let buf = unsafe { alloc(buf_layout) };
+                    assert!(!buf.is_null(), "ob_item allocation failed");
+                    unsafe { ptr::write_bytes(buf, 0, bytes) };
+                    let slots = buf as *mut *mut PyObject;
+                    for (i, elem) in items.iter().enumerate() {
+                        // Each element is materialised as an owned reference
+                        // held by the list. None/bool reuse their immortal
+                        // singletons so a stock `PyList_SET_ITEM` overwrite
+                        // (which does *not* decref the prior slot) of a
+                        // `PyList_New(n)` placeholder cannot leak.
+                        let ep = match elem {
+                            Object::None => crate::singletons::none_ptr(),
+                            Object::Bool(true) => crate::singletons::true_ptr(),
+                            Object::Bool(false) => crate::singletons::false_ptr(),
+                            _ => crate::object::into_owned(elem.clone()),
+                        };
+                        unsafe { *slots.add(i) = ep };
+                    }
+                    unsafe {
+                        (*lo).ob_item = slots;
+                        (*lo).allocated = n as PySsizeT;
+                    }
+                    *aux_ptr = buf;
+                    *aux_size = bytes;
+                }
+            }
+        }
+        BodyKind::CFunction => {
+            // Lay a faithful `PyCFunctionObject` over the body and point its
+            // `m_ml` at the inline `PyMethodDef` that follows. The def is
+            // left zeroed (`ml_doc == NULL`), so numpy's `add_docstring`
+            // takes the "first docstring" branch and *writes* `ml_doc` in
+            // place rather than `strcmp`-ing a garbage pointer. `m_self` /
+            // `m_module` / `vectorcall` stay NULL — calls and `__module__`
+            // are served by the VM through the prefix, never through these
+            // fields. `ml_name` is NULL for the same reason (`f.__name__`
+            // resolves in the VM); it is read by `add_docstring` only on the
+            // never-taken mismatch path.
+            let cf = body as *mut layout::PyCFunctionObject;
+            let def =
+                unsafe { (body as *mut u8).add(std::mem::size_of::<layout::PyCFunctionObject>()) }
+                    as *mut layout::PyMethodDef;
+            unsafe {
+                (*cf).m_ml = def;
+                (*cf).m_self = ptr::null_mut();
+                (*cf).m_module = ptr::null_mut();
+                (*cf).m_weakreflist = ptr::null_mut();
+                (*cf).vectorcall = ptr::null_mut();
+            }
+            let _ = (aux_ptr, aux_size);
         }
         BodyKind::Generic => {
             // Head-only: nothing to fill. Suppress "unused" on a list's

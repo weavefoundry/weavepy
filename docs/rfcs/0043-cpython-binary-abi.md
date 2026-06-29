@@ -220,8 +220,18 @@ fixture-proven:
   fixture-proven by `_stockarray` - see RFC 0045 for the design and measured
   outcome. (Real numpy from source, the full ufunc-loop machinery, and the
   complete private `_multiarray_umath` symbol tail are wave 4.)
-- **Wave 4.** Build **real numpy** from source against the now-faithful host
-  ABI; gate CI on `import numpy; numpy.zeros((3,3)) @ numpy.ones((3,3))`.
+- **Wave 4** (detailed in **RFC 0046**, *Real numpy from source against the
+  faithful host ABI*). Build **real numpy** from source against the
+  now-faithful host ABI; gate CI on
+  `import numpy; numpy.zeros((3,3)) @ numpy.ones((3,3))`. Landed against stock
+  **numpy 2.5.0** with `import numpy`'s self-checks live and unpatched: the
+  discovered `_multiarray_umath` C-API leaf tail (`wave4.rs` + the C-variadic
+  members), plus the faithfulness hardening real numpy surfaced that the
+  wave-3 fixture had not (builtin-subclass scalar `tp_new`, `np._NoValue`
+  pointer identity, the foreign C truthiness protocol, the inlined-`Py_DECREF`
+  lifecycle interaction, a foreign double-free, foreign subscript dispatch,
+  and foreign `repr`/`str` slot dispatch). See RFC 0046 for the design and
+  measured outcome.
 - **Wave 5.** pandas / Cython-generated extensions (the full-API,
   heavily-macro'd Cython surface) and the manylinux/macos wheel matrix.
 

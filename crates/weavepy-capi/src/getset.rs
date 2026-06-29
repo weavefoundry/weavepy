@@ -242,7 +242,17 @@ fn make_member(name: &'static str, ty: c_int, offset: PySsizeT, readonly: bool) 
                 .first()
                 .ok_or_else(|| type_error(format!("member '{name}' getter expects self")))?;
             let self_p = crate::object::into_owned(self_obj.clone());
-            let out = if unsafe { crate::mirror::is_instance_body(self_p) } {
+            // A `tp_members` field lives at a fixed offset in the instance's
+            // C struct. That storage exists for two kinds of object: one of
+            // *our* inline-storage instances (RFC 0045) and a *foreign*
+            // object the extension allocated itself (its `PyObject*` points
+            // at a real C struct laid out by the declaring type — numpy's
+            // `PyArray_Descr.typeobj` is read this way). For a plain
+            // dict-backed instance the offset names no real field, so it
+            // reads as `None`.
+            let has_field = matches!(self_obj, Object::Foreign(_))
+                || unsafe { crate::mirror::is_instance_body(self_p) };
+            let out = if has_field {
                 unsafe { read_member(self_p, ty, offset) }
             } else {
                 Object::None
@@ -267,7 +277,9 @@ fn make_member(name: &'static str, ty: c_int, offset: PySsizeT, readonly: bool) 
                 )));
             }
             let self_p = crate::object::into_owned(args[0].clone());
-            let res = if unsafe { crate::mirror::is_instance_body(self_p) } {
+            let has_field = matches!(&args[0], Object::Foreign(_))
+                || unsafe { crate::mirror::is_instance_body(self_p) };
+            let res = if has_field {
                 unsafe { write_member(self_p, ty, offset, &args[1]) }
             } else {
                 Err(type_error(format!(

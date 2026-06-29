@@ -76,11 +76,15 @@ fn traverse(obj: &Object, visit: &mut dyn FnMut(&Object)) {
     }
     let func: TraverseProc = unsafe { std::mem::transmute::<*mut c_void, TraverseProc>(slot) };
 
-    // Borrow the instance into C as its declared type. `into_owned_with_type`
-    // shares the same underlying `Object`, so an attribute read inside
-    // `tp_traverse` (e.g. to locate this node's side-table slot) sees the
-    // genuine instance dict.
-    let self_box = crate::object::into_owned_with_type(obj.clone(), ty);
+    // Borrow the instance into C as its declared type via a *fresh*,
+    // uncached box (RFC 0046, wave 4): traverse must not touch the refcount
+    // of the cached identity box that a C-held cycle edge points at, or the
+    // subsequent `tp_clear` cascade that runs the extension `tp_dealloc`
+    // would be throttled (see [`crate::object::into_owned_with_type_uncached`]).
+    // The fresh box shares the same underlying `Object`, so an attribute read
+    // inside `tp_traverse` (e.g. to locate this node's side-table slot) still
+    // sees the genuine instance dict.
+    let self_box = crate::object::into_owned_with_type_uncached(obj.clone(), ty);
 
     // Park the (fat) visitor behind a thin pointer we can smuggle through
     // the C `void *arg`.
@@ -104,7 +108,13 @@ fn clear(obj: &Object) {
         return;
     }
     let func: InquiryProc = unsafe { std::mem::transmute::<*mut c_void, InquiryProc>(slot) };
-    let self_box = crate::object::into_owned_with_type(obj.clone(), ty);
+    // Fresh, uncached box (RFC 0046, wave 4): `tp_clear` decrefs the *child*
+    // edges it owns, so the cached cycle-child boxes must be at exactly the
+    // refcount the extension expects for the stock `Py_CLEAR` cascade to run
+    // each node's `tp_dealloc` once. Borrowing `self` through the cache would
+    // pin one of those children and skip its cleanup. See
+    // [`crate::object::into_owned_with_type_uncached`].
+    let self_box = crate::object::into_owned_with_type_uncached(obj.clone(), ty);
     crate::interp::ensure_active(|| unsafe {
         func(self_box);
     });

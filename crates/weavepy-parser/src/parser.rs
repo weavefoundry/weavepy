@@ -336,14 +336,10 @@ impl<'src> Parser<'src> {
         self.consume_stmt_end()?;
         let span = type_tok.span.merge(value.span);
         let target = Expr {
-            kind: ExprKind::Name(name),
+            kind: ExprKind::Name(name.clone()),
             span: name_tok.span,
         };
-        let rhs = if type_params.is_empty() {
-            value
-        } else {
-            wrap_in_type_param_lambda(value, &type_params, name_tok.span)
-        };
+        let rhs = build_lazy_type_alias(&name, value, &type_params, name_tok.span);
         Ok(Stmt {
             kind: StmtKind::Assign {
                 targets: vec![target],
@@ -4965,9 +4961,28 @@ fn big_to_i64(b: &num_bigint::BigInt) -> Option<i64> {
     }
 }
 
-/// PEP 695 helper — wrap `body` in a `(lambda T, U: body)(TypeVar('T'), TypeVar('U'))`
-/// call so type-parameter names bind locally to typevar instances.
-fn wrap_in_type_param_lambda(body: Expr, names: &[String], span: Span) -> Expr {
+/// PEP 695 helper — lower a `type` alias to a **lazy** `TypeAliasType`
+/// constructor call so the alias body is *not* evaluated at definition
+/// time (matching CPython 3.12+ `typing.TypeAliasType`):
+///
+/// ```python
+/// type Name[T, U] = body
+/// # lowers to
+/// Name = __weavepy_type_alias__('Name', ('T', 'U'), lambda T, U: body)
+///
+/// type Name = body
+/// # lowers to
+/// Name = __weavepy_type_alias__('Name', (), lambda: body)
+/// ```
+///
+/// The `__weavepy_type_alias__` intrinsic mints one `TypeVar`-shaped
+/// placeholder per name, records them as `__type_params__`, and only
+/// invokes the thunk (with those placeholders bound to the lambda's
+/// parameters) the first time `Name.__value__` is read. Deferring the
+/// body is what lets numpy's `_typing` aliases — e.g.
+/// `type ArrayLike = Buffer | _DualArrayLike[np.dtype, …]` — be defined
+/// without eagerly building unions / subscripting other aliases.
+fn build_lazy_type_alias(name: &str, body: Expr, names: &[String], span: Span) -> Expr {
     let args = Arguments {
         posonlyargs: Vec::new(),
         args: names
@@ -4984,34 +4999,36 @@ fn wrap_in_type_param_lambda(body: Expr, names: &[String], span: Span) -> Expr {
         kwarg: None,
         defaults: Vec::new(),
     };
-    let lambda = Expr {
+    let thunk = Expr {
         kind: ExprKind::Lambda {
             args,
             body: Box::new(body),
         },
         span,
     };
-    let typevar_calls: Vec<Expr> = names
-        .iter()
-        .map(|n| Expr {
-            kind: ExprKind::Call {
-                func: Box::new(Expr {
-                    kind: ExprKind::Name("__weavepy_typevar__".to_owned()),
-                    span,
-                }),
-                args: vec![Expr {
+    let name_str = Expr {
+        kind: ExprKind::Constant(Constant::Str(name.to_owned())),
+        span,
+    };
+    let params_tuple = Expr {
+        kind: ExprKind::Tuple(
+            names
+                .iter()
+                .map(|n| Expr {
                     kind: ExprKind::Constant(Constant::Str(n.clone())),
                     span,
-                }],
-                keywords: Vec::new(),
-            },
-            span,
-        })
-        .collect();
+                })
+                .collect(),
+        ),
+        span,
+    };
     Expr {
         kind: ExprKind::Call {
-            func: Box::new(lambda),
-            args: typevar_calls,
+            func: Box::new(Expr {
+                kind: ExprKind::Name("__weavepy_type_alias__".to_owned()),
+                span,
+            }),
+            args: vec![name_str, params_tuple, thunk],
             keywords: Vec::new(),
         },
         span,

@@ -42,5 +42,5 @@ True
 === sys.implementation ===
 weavepy
 3
-alias name: GenericAlias
+alias name: TypeAliasType
 ok

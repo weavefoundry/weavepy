@@ -321,6 +321,17 @@ decl_static_type! {
     pub PyGen_Type;
     pub PyCoro_Type;
     pub PyAsyncGen_Type;
+    // RFC 0046 (wave 4): types numpy's `_multiarray_umath` references by
+    // address (`Py_TYPE(x) == &PyMemoryView_Type`, descriptor/proxy slots).
+    pub PyMemoryView_Type;
+    pub PyDictProxy_Type;
+    pub PyGetSetDescr_Type;
+    pub PyMemberDescr_Type;
+    pub PyMethodDescr_Type;
+    // RFC 0046 (wave 4): tags a `PyModuleDef` returned by
+    // `PyModuleDef_Init`, so the loader can recognise a multi-phase
+    // (PEP 489) extension and run its create/exec slots.
+    pub PyModuleDef_Type;
 }
 
 /// Initialise the static type table from the running interpreter's
@@ -404,6 +415,26 @@ pub fn init_static_types() {
         "builtin_function_or_method",
     );
     install_synth(&PyMethod_Type, b"method\0", "method");
+    // RFC 0046 (wave 4): numpy references these by address. Synthetic
+    // minimal types are enough for symbol resolution + pointer identity.
+    install_synth(&PyMemoryView_Type, b"memoryview\0", "memoryview");
+    install_synth(&PyDictProxy_Type, b"mappingproxy\0", "mappingproxy");
+    install_synth(
+        &PyGetSetDescr_Type,
+        b"getset_descriptor\0",
+        "getset_descriptor",
+    );
+    install_synth(
+        &PyMemberDescr_Type,
+        b"member_descriptor\0",
+        "member_descriptor",
+    );
+    install_synth(
+        &PyMethodDescr_Type,
+        b"method_descriptor\0",
+        "method_descriptor",
+    );
+    install_synth(&PyModuleDef_Type, b"moduledef\0", "moduledef");
 
     // Set the `Py_TPFLAGS_*_SUBCLASS` fast-subclass bits (and a
     // baseline `Py_TPFLAGS_DEFAULT`) on the built-in static types.
@@ -440,6 +471,13 @@ pub fn init_static_types() {
         add_flags(&PySet_Type, tpflags::BASETYPE);
         add_flags(&PyFrozenSet_Type, 0);
     }
+
+    // RFC 0046 (wave 4): give the exported value built-ins a faithful
+    // `tp_new`. A C type that subclasses one of them (numpy's
+    // `float64 ← float`, `str_ ← str`, `bytes_ ← bytes`) inherits and may
+    // directly call the base's `tp_new`; a NULL slot is a jump through
+    // address 0 (`np.float64(1.0)` and numpy's import self-checks crash).
+    crate::builtin_new::install_builtin_constructors();
 }
 
 /// Map a runtime [`Object`] to the static [`PyTypeObject`] pointer
@@ -497,8 +535,9 @@ fn find_type_ptr(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
             }
         }
     }
-    let from_heap = HEAP_TYPES.with(|cell| {
-        for &p in cell.borrow().iter() {
+    let from_heap = HEAP_TYPES.lock().ok().and_then(|g| {
+        for &addr in g.iter() {
+            let p = addr as *mut PyTypeObject;
             unsafe {
                 let bridge = (*p).bridge;
                 if !bridge.is_null() && Rc::as_ptr(&*bridge) == target {
@@ -523,19 +562,27 @@ fn find_type_ptr(t: &Rc<TypeObject>) -> Option<*mut PyTypeObject> {
     })
 }
 
-thread_local! {
-    /// Registry of heap-allocated `PyTypeObject *` produced by
-    /// `PyType_FromSpec[WithBases]`. Looked up by [`find_type_ptr`]
-    /// when an `Object::Instance` is materialised back into a
-    /// boxed `*mut PyObject`, so the box's `ob_type` matches the
-    /// extension's declared type.
-    ///
-    /// Heap types live forever (`Box::leak`'d at construction),
-    /// so we store raw pointers — they're stable for the process
-    /// lifetime.
-    static HEAP_TYPES: std::cell::RefCell<Vec<*mut PyTypeObject>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Registry of heap-allocated `PyTypeObject *` produced by
+/// `PyType_FromSpec[WithBases]` (and the bridged `PyExc_*` statics,
+/// installed via [`install_user_type`]). Looked up by [`find_type_ptr`]
+/// when an `Object::Instance` is materialised back into a boxed
+/// `*mut PyObject`, so the box's `ob_type` matches the extension's
+/// declared type, and by [`is_weavepy_owned_type`] to decide whether
+/// `bridge_type` may read the trailing `bridge` field.
+///
+/// RFC 0046 (wave 4): process-global, **not** thread-local. A heap
+/// type's identity is a property of the process, not of one OS thread:
+/// the boxes are `Box::leak`'d (immortal, stable pointers) and their
+/// bridge is an `Arc<TypeObject>` (`Send + Sync`). The `PyExc_*`
+/// statics in particular are published once (under a global lock) on
+/// whatever thread first initialises the runtime, then read from
+/// *every* thread — so a thread-local registry made
+/// `clone_object(PyExc_ValueError)` resolve to a foreign proxy on any
+/// other thread, collapsing `PyErr_SetString(PyExc_ValueError, …)` to a
+/// bare `RuntimeError`. Stored as `usize` addresses so the `static` is
+/// `Send` (mirrors [`crate::object`]'s `MINTED` set). The interpreter
+/// runs single-threaded under the GIL, so the mutex is uncontended.
+static HEAP_TYPES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Register a heap-allocated type pointer so subsequent
 /// `Object::Instance` boxes get the extension's declared
@@ -544,7 +591,11 @@ pub fn register_heap_type(p: *mut PyTypeObject) {
     if p.is_null() {
         return;
     }
-    HEAP_TYPES.with(|cell| cell.borrow_mut().push(p));
+    if let Ok(mut g) = HEAP_TYPES.lock() {
+        if !g.contains(&(p as usize)) {
+            g.push(p as usize);
+        }
+    }
 }
 
 /// Static table used by [`find_type_ptr`]. Listed once so we don't
@@ -594,11 +645,46 @@ pub unsafe fn bridge_type(ty: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
     if let Some(rt) = readied_for(ty) {
         return Some(rt.bridge.clone());
     }
+    // RFC 0046 (wave 4): the private `bridge` field sits at offset 424 —
+    // *past* the 416-byte stock `PyTypeObject`. A foreign extension type
+    // (numpy's metatypes, an un-readied static type) is exactly that stock
+    // size, so reading `.bridge` would be an out-of-bounds heap read (it
+    // surfaced as a misaligned-pointer fault on a numpy type). Only our own
+    // static/heap type boxes carry the field; decide by pointer identity.
+    if !is_weavepy_owned_type(ty) {
+        return None;
+    }
     let bridge = unsafe { (*ty).bridge };
     if bridge.is_null() {
         return None;
     }
     Some(unsafe { (*bridge).clone() })
+}
+
+/// Resolve a `PyTypeObject*` to its bridged [`TypeObject`], readying it
+/// on demand if it has not been bridged yet.
+///
+/// CPython's `PyType_Ready` finalises a type's **bases before the type
+/// itself** (`type_ready` → `type_ready_mro`, which `PyType_Ready`s each
+/// base). A stock extension that readies a subtype before its base —
+/// numpy registers `Float16DType` before `PyType_Ready(&PyArrayDescr_Type)`
+/// has run in some import orders — would otherwise lose the base entirely:
+/// `bridge_type` returns `None`, the bridged type silently falls back to
+/// `object`, and the subtype's MRO collapses to `[Self, object]`. That
+/// dropped every getset the base declares (e.g. `numpy.dtype.type`).
+///
+/// SAFETY: `ty` must be null or a valid (own or stock) `PyTypeObject*`.
+pub unsafe fn bridge_or_ready(ty: *mut PyTypeObject) -> Option<Rc<TypeObject>> {
+    if ty.is_null() {
+        return None;
+    }
+    if let Some(t) = unsafe { bridge_type(ty) } {
+        return Some(t);
+    }
+    // Not yet bridged: ready it (idempotent) and retry. Foreign stock
+    // types get harvested; our own types short-circuit inside PyType_Ready.
+    unsafe { PyType_Ready(ty) };
+    unsafe { bridge_type(ty) }
 }
 
 /// Find the static [`PyTypeObject`] pointer that bridges to `t`,
@@ -711,9 +797,12 @@ fn assemble_type_dict(
 // the extension's own type pointer (which is what flows through
 // `PyModule_AddObject`, instance `ob_type`, `type(x)`, …).
 //
-// Entries are `Box::leak`'d (types live for the process lifetime,
-// exactly like `HEAP_TYPES`), so the `&'static` borrows handed out by
-// `bridge_type` / `slot_table_for` stay valid.
+// Entries are `Box::leak`'d (readied types live for the process
+// lifetime), so the `&'static` borrows handed out by `bridge_type` /
+// `slot_table_for` stay valid. The map itself is thread-local: a stock
+// extension readies its types and uses them on the same thread, so
+// (unlike the cross-thread `PyExc_*` statics in the now-global
+// `HEAP_TYPES`) no cross-thread visibility is required here.
 // ----------------------------------------------------------------
 
 /// WeavePy-owned data backing a readied stock type.
@@ -878,7 +967,7 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
                 x if x == crate::slottable::Py_tp_base => {
                     if !slot.pfunc.is_null() {
                         let ty_ptr = slot.pfunc as *mut PyTypeObject;
-                        if let Some(t) = unsafe { bridge_type(ty_ptr) } {
+                        if let Some(t) = unsafe { bridge_or_ready(ty_ptr) } {
                             spec_base = Some(t);
                         }
                     }
@@ -1115,13 +1204,16 @@ pub unsafe extern "C" fn PyType_FromModuleAndSpec(
 /// `bridge`/`slot_table` trailing fields and is already "ready". Decided
 /// purely by pointer identity so we never read past a 416-byte stock
 /// struct.
-fn is_weavepy_owned_type(ty: *mut PyTypeObject) -> bool {
+pub(crate) fn is_weavepy_owned_type(ty: *mut PyTypeObject) -> bool {
     for slot in STATIC_TYPE_TABLE {
         if slot.as_ptr() == ty {
             return true;
         }
     }
-    HEAP_TYPES.with(|cell| cell.borrow().contains(&ty))
+    HEAP_TYPES
+        .lock()
+        .map(|g| g.contains(&(ty as usize)))
+        .unwrap_or(false)
 }
 
 /// Decode a faithfully-laid-out `PyTypeObject` (a stock extension's
@@ -1311,7 +1403,7 @@ unsafe fn harvest_faithful(ty: *mut PyTypeObject) -> Harvested {
     let base = if tref.tp_base.is_null() {
         None
     } else {
-        unsafe { bridge_type(tref.tp_base) }
+        unsafe { bridge_or_ready(tref.tp_base) }
     };
 
     Harvested {
@@ -1401,12 +1493,70 @@ pub unsafe extern "C" fn PyType_Ready(t: *mut PyTypeObject) -> c_int {
     // Write-back into the caller's struct — both offsets live inside
     // the faithful 416-byte CPython prefix, so a stock static type is
     // never overrun.
+    //
+    // RFC 0046 (wave 4): only *fill* a missing metaclass. CPython's
+    // `PyType_Ready` sets `ob_type` to `Py_TYPE(tp_base)` (defaulting to
+    // `&PyType_Type`) only when it is NULL; it must never clobber a
+    // metaclass the extension pre-installed. numpy mallocs each DType
+    // class with `ob_type = &PyArrayDTypeMeta_Type` (its metaclass) and
+    // relies on the stock inlined `PyObject_TypeCheck(dt,
+    // &PyArrayDTypeMeta_Type)` — a direct `ob_type` pointer compare — so
+    // overwriting it with `&PyType_Type` made every DType fail
+    // validation ("provided object … is not a DType").
     unsafe {
-        (*t).head.ob_type = PyType_Type.as_ptr();
+        if (*t).head.ob_type.is_null() {
+            (*t).head.ob_type = PyType_Type.as_ptr();
+        }
         (*t).head.ob_refcnt = IMMORTAL_REFCNT;
         (*t).tp_flags |= PY_TPFLAGS_READY;
         if (*t).tp_dealloc.is_none() {
             (*t).tp_dealloc = Some(crate::object::_PyWeavePy_Dealloc);
+        }
+        // RFC 0046 (wave 4): CPython's `PyType_Ready` installs a default
+        // `tp_free` (`PyObject_Free`) when the type provides none. An
+        // extension `tp_dealloc` that ends with `Py_TYPE(self)->tp_free(self)`
+        // — numpy's `boundarraymethod_dealloc` does — would otherwise call
+        // through a NULL slot. Our `PyObject_Free` absorbs the free of a
+        // faithful instance body (its block is owned by the native
+        // instance) and `PyMem_Free`s a plain block.
+        if (*t).tp_free.is_null() {
+            let free_fp: unsafe extern "C" fn(*mut c_void) = crate::memory::PyObject_Free;
+            (*t).tp_free = free_fp as *mut c_void;
+        }
+        // RFC 0046 (wave 4): likewise default `tp_alloc` to
+        // `PyType_GenericAlloc`. CPython inherits it from `object`; an
+        // extension that calls `subtype->tp_alloc(subtype, 0)` directly —
+        // numpy's `arraydescr_new` does, to mint a fresh DType instance —
+        // would otherwise jump through a NULL slot.
+        if (*t).tp_alloc.is_null() {
+            let alloc_fp: unsafe extern "C" fn(*mut PyTypeObject, PySsizeT) -> *mut PyObject =
+                crate::genericalloc::PyType_GenericAlloc;
+            (*t).tp_alloc = alloc_fp as *mut c_void;
+        }
+    }
+
+    // RFC 0046 (wave 4): reflect a *foreign* metaclass onto the bridged
+    // type so metatype-level descriptors resolve through the VM's
+    // `load_attr_type` (CPython's `type_getattro` searches `Py_TYPE(type)`
+    // first). numpy mallocs each DType class (`Float64DType`, …) with
+    // `ob_type = &PyArrayDTypeMeta_Type`, whose `_DTypeMeta` exposes
+    // `_legacy` / `_abstract` / the `type` property as getsets; a dtype's
+    // `arraydescr_repr` / `.name` read `type(dtype)._legacy`. Without the
+    // metaclass link `metaclass_or_type()` collapses to `type`, those reads
+    // raise `AttributeError`, and dtype `repr`/`str`/`.name` degrade to the
+    // foreign placeholder. Only adopt a genuine *foreign* metatype (never
+    // our own `PyType_Type`, never the type itself), readied on demand so
+    // its getsets are harvested.
+    unsafe {
+        let meta_ptr = (*t).head.ob_type;
+        if !meta_ptr.is_null()
+            && meta_ptr != t
+            && meta_ptr != PyType_Type.as_ptr()
+            && !is_weavepy_owned_type(meta_ptr)
+        {
+            if let Some(meta_t) = bridge_or_ready(meta_ptr) {
+                readied.bridge.set_metaclass(meta_t);
+            }
         }
     }
     0

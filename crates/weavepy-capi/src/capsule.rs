@@ -85,7 +85,9 @@ pub unsafe extern "C" fn PyCapsule_New(
             destructor,
         },
     });
-    Box::into_raw(bx) as *mut PyObject
+    let raw = Box::into_raw(bx) as *mut PyObject;
+    crate::object::register_minted(raw);
+    raw
 }
 
 fn capsule_state(p: *mut PyObject) -> Option<*mut CapsuleState> {

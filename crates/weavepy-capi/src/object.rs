@@ -92,6 +92,66 @@ pub struct PyObjectBox {
     pub payload: PayloadCell,
 }
 
+// ---------------------------------------------------------------------------
+// WeavePy-minted pointer registry (RFC 0046, wave 4).
+//
+// A real C extension (numpy) allocates many objects of its *own* — static
+// `PyArray_Descr`s, builtin function objects, type objects — by paths that
+// never touch WeavePy's allocator. Such a "foreign" `*mut PyObject` is not a
+// `PyObjectBox`, a mirror, an instance body, or a capsule; interpreting its
+// bytes as any of those corrupts memory ([`clone_object`] reading a bogus
+// payload; [`free_box`] `Box::from_raw`-ing foreign storage).
+//
+// To tell ours from foreign *soundly* (no speculative reads at guessed
+// offsets) we record every public pointer WeavePy hands to C in this set and
+// remove it when the storage is released. A pointer that is **not** present
+// (and is neither a static singleton nor a type object) is foreign, and is
+// proxied into the VM as [`weavepy_vm::object::Object::Foreign`].
+// ---------------------------------------------------------------------------
+
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+static MINTED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Record `p` as a WeavePy-minted public pointer. Called by every mint
+/// site (box, mirror body, instance body, capsule) so [`is_weavepy_owned`]
+/// can later distinguish it from a foreign extension object.
+pub fn register_minted(p: *mut PyObject) {
+    if p.is_null() {
+        return;
+    }
+    if let Ok(mut g) = MINTED.lock() {
+        g.get_or_insert_with(HashSet::new).insert(p as usize);
+    }
+}
+
+/// Drop `p` from the minted set when its storage is released.
+pub fn unregister_minted(p: *mut PyObject) {
+    if p.is_null() {
+        return;
+    }
+    if let Ok(mut g) = MINTED.lock() {
+        if let Some(set) = g.as_mut() {
+            set.remove(&(p as usize));
+        }
+    }
+}
+
+/// True iff `p` is a live pointer WeavePy itself minted (box / mirror /
+/// instance body / capsule). A non-owned, non-singleton, non-type
+/// pointer is a *foreign* extension object.
+pub fn is_weavepy_owned(p: *mut PyObject) -> bool {
+    if p.is_null() {
+        return false;
+    }
+    MINTED
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.contains(&(p as usize))))
+        .unwrap_or(false)
+}
+
 impl std::fmt::Debug for PyObjectBox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PyObjectBox")
@@ -135,6 +195,55 @@ impl PayloadCell {
 /// arranges its own decref).
 #[allow(clippy::missing_safety_doc)]
 pub fn into_owned(obj: Object) -> *mut PyObject {
+    // RFC 0046 (wave 4): `None` crosses into C as the canonical
+    // `&_Py_NoneStruct` singleton, never a fresh box. Stock extensions
+    // test for it by pointer identity — the header's `Py_None` macro is
+    // `(&_Py_NoneStruct)` and code writes `if (x == Py_None)` (numpy's
+    // `_ArrayFunctionDispatcher.__new__` does exactly this on its first
+    // argument). A minted box would compare unequal and silently take the
+    // wrong branch. The singleton is immortal, so it needs no refcount
+    // bump and is never freed.
+    if matches!(obj, Object::None) {
+        return crate::singletons::none_ptr();
+    }
+    // RFC 0046 (wave 4): `Ellipsis` and `NotImplemented` are likewise
+    // pointer-identity singletons on the C side. numpy's index parser
+    // (`prepare_index` in `mapping.c`) recognises the ellipsis with a bare
+    // `op == Py_Ellipsis` test; a freshly-minted box would compare unequal,
+    // so `arr[-1, ...] = x` (numpy's own `linspace`) would raise "only
+    // integers, slices (`:`), ellipsis (`...`) … are valid indices". Hand C
+    // the static singletons (immortal, never freed) instead.
+    if weavepy_vm::vm_singletons::is_ellipsis(&obj) {
+        return crate::singletons::ellipsis_ptr();
+    }
+    if weavepy_vm::vm_singletons::is_not_implemented(&obj) {
+        return crate::singletons::not_implemented_ptr();
+    }
+    // RFC 0046 (wave 4): a foreign proxy round-trips back to the *same*
+    // `PyObject*` the extension first gave us (identity is load-bearing —
+    // numpy compares descrs/types by pointer). Hand C a fresh reference.
+    if let Object::Foreign(s) = &obj {
+        let p = s.ptr as *mut PyObject;
+        if p.is_null() && std::env::var_os("WEAVEPY_DEBUG_TUPLE").is_some() {
+            eprintln!("[into_owned] FOREIGN with NULL ptr!");
+        }
+        unsafe { Py_IncRef(p) };
+        return p;
+    }
+    // RFC 0046 (wave 4): a type object's canonical `PyObject*` is the
+    // `PyTypeObject` itself — numpy compares DType classes by pointer and
+    // validates them with `Py_IS_TYPE(cls, &PyArrayDTypeMeta_Type)` (a
+    // direct `cls->ob_type` read). Boxing an `Object::Type` would instead
+    // mint an *instance* whose `ob_type` is the class, so resolve it to the
+    // registered `PyTypeObject*` (static, heap, or readied) and hand C a
+    // fresh reference to that.
+    if let Object::Type(t) = &obj {
+        if let Some(p) = crate::types::type_ptr_for_class(t) {
+            let p = p as *mut PyObject;
+            unsafe { Py_IncRef(p) };
+            return p;
+        }
+    }
     // Faithful built-in types cross into C as layout-faithful mirrors
     // (RFC 0043) so a stock extension's *inlined* field reads land on
     // real CPython-shaped memory. Everything else keeps the legacy
@@ -156,6 +265,21 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
         if crate::types::is_inline_instance_type(ty) {
             return crate::instance::instance_body_out(inst, ty);
         }
+        // RFC 0046 (wave 4): a *non-inline* instance crosses as a single,
+        // stable identity box cached in `c_body`. Stock extensions cache an
+        // object by pointer and test it with `==`: numpy stashes
+        // `npy_static_pydata._NoValue` at import and a ufunc reduction
+        // detects "no initial value given" with `initial == _NoValue`. A
+        // fresh per-crossing box would compare unequal, so numpy would treat
+        // the `_NoValue` *sentinel* as a real initial value and try to coerce
+        // it to the output dtype (`float(_NoValue)` → "a float is required").
+        // Returning the same pointer every time makes the identity test hold.
+        // The box still owns the instance strongly and is freed by C's
+        // refcount exactly like the legacy box — `free_box` clears the cache.
+        if let Some(p) = cached_instance_box(inst) {
+            return p;
+        }
+        return mint_instance_box(inst, ty);
     }
     let boxed = Box::new(PyObjectBox {
         head: PyObject {
@@ -164,7 +288,81 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
         },
         payload: PayloadCell::from_object(obj),
     });
-    Box::into_raw(boxed) as *mut PyObject
+    let raw = Box::into_raw(boxed) as *mut PyObject;
+    register_minted(raw);
+    raw
+}
+
+/// Return the cached identity box for a non-inline `inst` if one already
+/// exists, with a fresh C reference (RFC 0046, wave 4). The box outlives
+/// any single C reference because it owns the instance strongly; it is
+/// reclaimed only when C's refcount reaches zero (see [`free_box`]).
+fn cached_instance_box(
+    inst: &weavepy_vm::sync::Rc<weavepy_vm::types::PyInstance>,
+) -> Option<*mut PyObject> {
+    let cached = inst.c_body.get();
+    if cached == 0 {
+        return None;
+    }
+    let p = cached as *mut PyObject;
+    unsafe { Py_IncRef(p) };
+    Some(p)
+}
+
+/// Mint the single identity box for a non-inline `inst`, record it in
+/// `inst.c_body`, and return it with one C reference (RFC 0046, wave 4).
+/// The payload holds a strong clone of the instance, so the box pins the
+/// instance for as long as C holds a reference.
+fn mint_instance_box(
+    inst: &weavepy_vm::sync::Rc<weavepy_vm::types::PyInstance>,
+    ty: *mut PyTypeObject,
+) -> *mut PyObject {
+    let boxed = Box::new(PyObjectBox {
+        head: PyObject {
+            ob_refcnt: 1,
+            ob_type: ty,
+        },
+        payload: PayloadCell::from_object(Object::Instance(inst.clone())),
+    });
+    let raw = Box::into_raw(boxed) as *mut PyObject;
+    register_minted(raw);
+    inst.c_body.set(raw as usize);
+    raw
+}
+
+/// Like [`into_owned_with_type`] but for a *non-inline* instance, never
+/// consults or populates the identity cache (`c_body`): it always mints a
+/// **fresh** box.
+///
+/// RFC 0046 (wave 4): the cycle collector's `tp_traverse` / `tp_clear`
+/// bridge must borrow an instance into C *without* perturbing the
+/// refcount of the cached identity box a C-held cycle edge points at. A
+/// stock GC type breaks a cycle by `Py_CLEAR`-ing the child it owns; that
+/// stock, inlined `Py_DECREF` drives the child box to zero and runs the
+/// extension's `tp_dealloc` (e.g. `Node_dealloc`, which decrements a live
+/// counter and frees the node) via [`_Py_Dealloc`]. If the bridge handed
+/// `tp_clear` the *cached* box (with the usual `+1`), that extra reference
+/// would stop the cascade from reaching zero, so the node would instead be
+/// reclaimed later through [`free_box`] — which is `tp_free`, not
+/// `tp_dealloc`, and therefore skips the extension's cleanup, leaking the
+/// node and desyncing its counter. A fresh, uncached box keeps the cached
+/// edge at exactly the refcount the extension expects.
+pub fn into_owned_with_type_uncached(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject {
+    if let Object::Instance(inst) = &obj {
+        if !crate::types::is_inline_instance_type(ty) && !crate::mirror::type_is_faithful(ty) {
+            let boxed = Box::new(PyObjectBox {
+                head: PyObject {
+                    ob_refcnt: 1,
+                    ob_type: ty,
+                },
+                payload: PayloadCell::from_object(Object::Instance(inst.clone())),
+            });
+            let raw = Box::into_raw(boxed) as *mut PyObject;
+            register_minted(raw);
+            return raw;
+        }
+    }
+    into_owned_with_type(obj, ty)
 }
 
 /// Build a box that wraps `obj` and is associated with the given
@@ -172,6 +370,23 @@ pub fn into_owned(obj: Object) -> *mut PyObject {
 /// alone isn't precise enough — e.g. when constructing an instance
 /// of a heap-allocated user type from `PyType_FromSpec`).
 pub fn into_owned_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject {
+    // RFC 0046 (wave 4): a foreign proxy ignores the advertised type and
+    // round-trips to its original pointer (see [`into_owned`]).
+    if let Object::Foreign(s) = &obj {
+        let p = s.ptr as *mut PyObject;
+        unsafe { Py_IncRef(p) };
+        return p;
+    }
+    // RFC 0046 (wave 4): a type object round-trips to its own
+    // `PyTypeObject*` (see [`into_owned`]); the advertised `ty` (the
+    // metaclass) is irrelevant to a class's canonical pointer.
+    if let Object::Type(t) = &obj {
+        if let Some(p) = crate::types::type_ptr_for_class(t) {
+            let p = p as *mut PyObject;
+            unsafe { Py_IncRef(p) };
+            return p;
+        }
+    }
     // If the *advertised* type is a faithful built-in (e.g. the
     // tuple-staging case where `obj` is an `Object::List` but the type
     // is `PyTuple_Type`), mint a mirror so the public pointer stays
@@ -190,6 +405,12 @@ pub fn into_owned_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
         if crate::types::is_inline_instance_type(ty) {
             return crate::instance::instance_body_out(inst, ty);
         }
+        // RFC 0046 (wave 4): non-inline instances cross as their single,
+        // stable identity box (see [`into_owned`]).
+        if let Some(p) = cached_instance_box(inst) {
+            return p;
+        }
+        return mint_instance_box(inst, ty);
     }
     let boxed = Box::new(PyObjectBox {
         head: PyObject {
@@ -198,7 +419,9 @@ pub fn into_owned_with_type(obj: Object, ty: *mut PyTypeObject) -> *mut PyObject
         },
         payload: PayloadCell::from_object(obj),
     });
-    Box::into_raw(boxed) as *mut PyObject
+    let raw = Box::into_raw(boxed) as *mut PyObject;
+    register_minted(raw);
+    raw
 }
 
 /// Clone the wrapped [`Object`] out of a box. The C-side reference
@@ -225,10 +448,10 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
         return Object::Bool(false);
     }
     if std::ptr::eq(head, crate::singletons::_Py_NotImplementedStruct.as_ptr()) {
-        return Object::None;
+        return weavepy_vm::vm_singletons::not_implemented();
     }
     if std::ptr::eq(head, crate::singletons::_Py_EllipsisObject.as_ptr()) {
-        return Object::None;
+        return weavepy_vm::vm_singletons::ellipsis();
     }
     // PyTypeObject extends PyObject; static type slots short-circuit
     // here because their bridge field carries the native Rc. We
@@ -239,6 +462,24 @@ pub unsafe fn clone_object(p: *mut PyObject) -> Object {
         {
             return Object::Type(t);
         }
+    }
+    // RFC 0046 (wave 4): an extension type whose metaclass is *not* `type`
+    // (numpy's DType classes carry `ob_type == &PyArrayDTypeMeta_Type`)
+    // still resolves to its bridged `Object::Type` if we readied it — a
+    // safe pointer-keyed lookup that must precede the foreign fallback so
+    // such a class is not opaquely proxied.
+    if let Some(t) = crate::types::readied_bridge(p as *mut crate::types::PyTypeObject) {
+        return Object::Type(t);
+    }
+    // RFC 0046 (wave 4): a pointer WeavePy did not mint — a static numpy
+    // `PyArray_Descr`, an extension-built function object, an un-bridged
+    // type — is *foreign*. It is none of the shapes below, so interpreting
+    // it as one corrupts memory. Decided BEFORE the capsule/mirror checks
+    // because `is_mirror` is type-based and would mis-claim a foreign object
+    // whose (readied) type was registered for inline storage. Proxy it
+    // opaquely; it round-trips back to the same pointer via `into_owned`.
+    if !crate::object::is_weavepy_owned(p) {
+        return unsafe { crate::foreign::wrap_foreign(p) };
     }
     // RFC 0045 (wave 3): a capsule carries its state in `user_data`, not in
     // `payload.obj` (which is `None`) — without this it would collapse to
@@ -344,6 +585,32 @@ pub unsafe extern "C" fn _Py_Dealloc(op: *mut PyObject) {
     if op.is_null() {
         return;
     }
+    // RFC 0046 (wave 4): a faithful *instance body*'s lifetime is owned by
+    // its native `PyInstance`, not by C's refcount (RFC 0045). A stock
+    // extension compiles CPython's *inlined* `Py_DECREF`, which on
+    // reaching zero calls this symbol **directly** — bypassing
+    // [`Py_DecRef`]/[`free_box`]. Running the type's `tp_dealloc` here
+    // (e.g. numpy's `array_dealloc`) would free the live object's payload
+    // — its `data`/`dimensions`/`descr` — out from under the VM instance
+    // that still owns it: the block is absorbed by [`crate::memory::
+    // PyObject_Free`] and survives, but every field is gone, so the next
+    // VM access reads a half-destroyed array (a NULL `descr` crashed
+    // numpy's `convert_ufunc_arguments`). This is the exact refcount cycle
+    // a temporary view drives: `v[:, ::-1]` incref's its base `v`, and the
+    // view's collection decref's `v` back through zero. Route through
+    // `free_box`, which ends *C's* borrow (drops the strong pin) and keeps
+    // the body intact; the real `tp_dealloc` runs only when the owning
+    // instance is collected (the `free_instance_body` hook).
+    //
+    // The `is_weavepy_owned` guard is load-bearing: `is_instance_body` is
+    // type-keyed and reads a `MirrorPrefix` at a *negative* offset, so on a
+    // foreign numpy pointer it would interpret numpy's bytes as our prefix.
+    // A foreign object is never one of our bodies; let its own `tp_dealloc`
+    // (below) run.
+    if unsafe { is_weavepy_owned(op) && crate::mirror::is_instance_body(op) } {
+        unsafe { free_box(op) };
+        return;
+    }
     let ty = unsafe { (*op).ob_type };
     if !ty.is_null() {
         if let Some(dealloc) = unsafe { (*ty).tp_dealloc } {
@@ -360,11 +627,33 @@ pub unsafe extern "C" fn _Py_Dealloc(op: *mut PyObject) {
 /// [`into_owned`] / [`into_owned_with_type`] / capsule / module
 /// helpers. Static singletons short-circuit through the immortal
 /// check in [`Py_DecRef`].
-unsafe fn free_box(p: *mut PyObject) {
+pub(crate) unsafe fn free_box(p: *mut PyObject) {
     // Invalidate any borrowed-item cache entries pinned to this
     // box's address so subsequent reuse of the slab doesn't return
     // stale items from the old container.
     crate::containers::invalidate_borrowed_cache(p);
+
+    // RFC 0046 (wave 4): a *foreign* object (extension-minted, never in our
+    // registry) must never be `Box::from_raw`-d or `free_mirror`-d as one of
+    // our objects. This check MUST precede `is_instance_body`/`is_mirror`:
+    // those are *type-keyed* (a deref-free discriminator), so a foreign numpy
+    // object whose type WeavePy readied for inline storage (or a faithful
+    // built-in type) is mis-claimed as a mirror — and `free_mirror` then
+    // `dealloc`s a pointer numpy allocated, aborting the process
+    // (`POINTER_BEING_FREED_WAS_NOT_ALLOCATED`, seen dropping `numpy.eye`'s
+    // flatiter temporaries). `clone_object` decides foreign-ness first for
+    // exactly this reason. When a foreign proxy's last VM reference drops,
+    // dispatch to the extension's own `tp_dealloc` (numpy frees its array
+    // data, etc.); with no `tp_dealloc` we leak rather than corrupt.
+    if !is_weavepy_owned(p) {
+        let ty = unsafe { (*p).ob_type };
+        if !ty.is_null() {
+            if let Some(dealloc) = unsafe { (*ty).tp_dealloc } {
+                unsafe { dealloc(p) };
+            }
+        }
+        return;
+    }
 
     // RFC 0045 (wave 3): a faithful *instance body*'s lifetime is owned by
     // its native `PyInstance`, not by C's refcount. Reaching zero here
@@ -385,7 +674,17 @@ unsafe fn free_box(p: *mut PyObject) {
         return;
     }
 
+    unregister_minted(p);
+
     let bx = unsafe { Box::from_raw(p as *mut PyObjectBox) };
+    // RFC 0046 (wave 4): if this is an instance's cached identity box, drop
+    // the `c_body` cache so a subsequent crossing re-mints a fresh box
+    // rather than handing C this about-to-be-freed pointer (use-after-free).
+    if let Object::Instance(inst) = &bx.payload.obj {
+        if inst.c_body.get() == p as usize {
+            inst.c_body.set(0);
+        }
+    }
     if let Some(d) = bx.payload.destructor {
         let raw = Box::into_raw(bx);
         unsafe { d(raw as *mut PyObject) };

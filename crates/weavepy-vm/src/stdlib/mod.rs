@@ -208,7 +208,17 @@ pub fn register_all(cache: &ModuleCache) {
     cache.register_builtin("_xxsubinterpreters", interpreters_mod::build);
 
     // Frozen Python sources (pure-Python stdlib).
+    //
+    // RFC 0046 (wave 4): `numpy`/`_numpy_pure` are a pure-Python compatibility
+    // shim that, being frozen, would otherwise shadow a real numpy installed on
+    // `sys.path`. Setting `WEAVEPY_NO_NUMPY_SHIM` suppresses the shim so the
+    // binary-ABI loader imports the genuine `numpy._core._multiarray_umath`
+    // extension instead.
+    let suppress_numpy_shim = std::env::var_os("WEAVEPY_NO_NUMPY_SHIM").is_some();
     for src in frozen_sources() {
+        if suppress_numpy_shim && matches!(src.name, "numpy" | "_numpy_pure") {
+            continue;
+        }
         cache.register_frozen(*src);
     }
 }

@@ -212,6 +212,61 @@ const _: () = {
 };
 
 // ---------------------------------------------------------------------------
+// Built-in function objects.
+// ---------------------------------------------------------------------------
+//
+// `builtin_function_or_method` (`PyCFunctionObject`) and the
+// `PyMethodDef` it points at. RFC 0046 (wave 4): numpy's `add_docstring`
+// reaches *through* a function object — `((PyCFunctionObject *)f)->m_ml->ml_doc`
+// — to install (and dedupe) docstrings, a direct struct walk the host
+// cannot interpose. A WeavePy `Object::Builtin` therefore crosses into C
+// as a faithful `PyCFunctionObject` whose `m_ml` points at a real,
+// writable `PyMethodDef` (carried inline, just past the object) so the
+// read of `ml_doc` and the subsequent `ml_doc = docstr` write both land
+// on valid memory.
+
+/// `PyMethodDef { const char *ml_name; PyCFunction ml_meth; int ml_flags;
+/// const char *ml_doc; }` — `Include/methodobject.h`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyMethodDef {
+    pub ml_name: *const c_char, // 0
+    pub ml_meth: *mut c_void,   // 8  (PyCFunction)
+    pub ml_flags: c_int,        // 16 (+4 pad)
+    _flags_pad: u32,
+    pub ml_doc: *const c_char, // 24
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PyMethodDef>() == 32);
+    assert!(std::mem::offset_of!(PyMethodDef, ml_name) == 0);
+    assert!(std::mem::offset_of!(PyMethodDef, ml_meth) == 8);
+    assert!(std::mem::offset_of!(PyMethodDef, ml_flags) == 16);
+    assert!(std::mem::offset_of!(PyMethodDef, ml_doc) == 24);
+};
+
+/// `PyCFunctionObject` — `Include/cpython/methodobject.h`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyCFunctionObject {
+    pub ob_base: PyObject,            // 0
+    pub m_ml: *mut PyMethodDef,       // 16
+    pub m_self: *mut PyObject,        // 24
+    pub m_module: *mut PyObject,      // 32
+    pub m_weakreflist: *mut PyObject, // 40
+    pub vectorcall: *mut c_void,      // 48 (vectorcallfunc)
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PyCFunctionObject>() == 56);
+    assert!(std::mem::offset_of!(PyCFunctionObject, m_ml) == 16);
+    assert!(std::mem::offset_of!(PyCFunctionObject, m_self) == 24);
+    assert!(std::mem::offset_of!(PyCFunctionObject, m_module) == 32);
+    assert!(std::mem::offset_of!(PyCFunctionObject, m_weakreflist) == 40);
+    assert!(std::mem::offset_of!(PyCFunctionObject, vectorcall) == 48);
+};
+
+// ---------------------------------------------------------------------------
 // PEP 393 flexible unicode representation.
 // ---------------------------------------------------------------------------
 

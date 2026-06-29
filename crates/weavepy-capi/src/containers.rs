@@ -26,6 +26,74 @@ thread_local! {
     /// return the same `*mut PyObject` (matching CPython).
     static BORROWED_ITEM_CACHE: StdRefCell<HashMap<(usize, isize), *mut PyObject>> =
         StdRefCell::new(HashMap::new());
+
+    /// Per-dict value-box cache (RFC 0046, wave 4). A C extension that
+    /// `PyDict_New()`s a dict, stores it under a key, then `Py_DECREF`s its
+    /// own reference relies on the *parent* dict keeping the value's
+    /// `PyObject` alive — and frequently retains the raw pointer (numpy
+    /// stashes module sub-dicts in `npy_static_pydata`). WeavePy's parent
+    /// dict only retains the *native* value, so the freshly-minted value
+    /// box would be freed by that `Py_DECREF`, dangling the extension's
+    /// pointer. Keyed on `(dict box ptr, key repr)`, this holds one
+    /// reference to each stored value box for as long as the dict lives, so
+    /// `PyDict_GetItem*` round-trips the *same* pointer the setter stored.
+    /// Drained by [`invalidate_borrowed_cache`] when the dict is freed.
+    static DICT_BOX_CACHE: StdRefCell<HashMap<(usize, String), *mut PyObject>> =
+        StdRefCell::new(HashMap::new());
+}
+
+/// A stable cache key for a dict key object (matches `==`-equal keys, the
+/// dict contract numpy relies on for string / int / DType-class keys).
+fn dict_key_id(key: &Object) -> String {
+    match key {
+        Object::Str(s) => format!("s\0{s}"),
+        Object::Int(_) | Object::Long(_) | Object::Bool(_) => format!("i\0{}", key.to_str()),
+        other => format!("r\0{}", other.repr()),
+    }
+}
+
+/// Retain `value` (the *caller's* box) as `dict[key]`'s canonical C
+/// reference, releasing any previous box for that slot. Increfs `value`
+/// so it survives the caller's matching `Py_DECREF`.
+fn dict_retain_value(dict: *mut PyObject, key: String, value: *mut PyObject) {
+    if value.is_null() {
+        return;
+    }
+    unsafe { crate::object::Py_IncRef(value) };
+    let old = DICT_BOX_CACHE.with(|cell| cell.borrow_mut().insert((dict as usize, key), value));
+    if let Some(old) = old {
+        if old != value {
+            unsafe { crate::object::Py_DecRef(old) };
+        } else {
+            // Same pointer re-stored: undo the extra incref.
+            unsafe { crate::object::Py_DecRef(value) };
+        }
+    }
+}
+
+/// The canonical value box for `dict[key]`, if one was stored through a
+/// C setter and is still live. A *borrowed* reference (not incref'd).
+fn dict_cached_value(dict: *mut PyObject, key: &str) -> Option<*mut PyObject> {
+    DICT_BOX_CACHE.with(|cell| cell.borrow().get(&(dict as usize, key.to_owned())).copied())
+}
+
+/// Drop every cached dict value box pinned to `container`.
+fn invalidate_dict_box_cache(container: *mut PyObject) {
+    let key = container as usize;
+    let drained: Vec<*mut PyObject> = DICT_BOX_CACHE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let stale: Vec<(usize, String)> = map.keys().filter(|(c, _)| *c == key).cloned().collect();
+        let mut out = Vec::with_capacity(stale.len());
+        for k in stale {
+            if let Some(p) = map.remove(&k) {
+                out.push(p);
+            }
+        }
+        out
+    });
+    for p in drained {
+        unsafe { crate::object::Py_DecRef(p) };
+    }
 }
 
 /// Install or reuse the interned borrowed-reference pointer for the
@@ -75,6 +143,7 @@ pub(crate) fn invalidate_borrowed_cache(container: *mut crate::object::PyObject)
     for p in drained {
         unsafe { crate::object::Py_DecRef(p) };
     }
+    invalidate_dict_box_cache(container);
 }
 
 // ----------------------------------------------------------------
@@ -92,6 +161,15 @@ pub unsafe extern "C" fn PyList_Append(list: *mut PyObject, item: *mut PyObject)
     if list.is_null() || item.is_null() {
         return -1;
     }
+    // RFC 0046 (wave 4): a faithful list stores its elements in the inline
+    // `ob_item` buffer (the source of truth every read-back — including a
+    // stock `PyList_GET_ITEM` macro — consults), so the append must land
+    // there, not on the now-vestigial staged native list.
+    if unsafe { crate::mirror::is_faithful_list(list) } {
+        unsafe { crate::mirror::list_append(list, item) };
+        return 0;
+    }
+    // Defensive fallback for a (today unreachable) non-mirror list box.
     match unsafe { crate::object::clone_object(list) } {
         Object::List(rc) => {
             rc.borrow_mut()
@@ -113,6 +191,10 @@ pub unsafe extern "C" fn PyList_Insert(
 ) -> c_int {
     if list.is_null() || item.is_null() {
         return -1;
+    }
+    if unsafe { crate::mirror::is_faithful_list(list) } {
+        unsafe { crate::mirror::list_insert(list, index, item) };
+        return 0;
     }
     match unsafe { crate::object::clone_object(list) } {
         Object::List(rc) => {
@@ -136,6 +218,20 @@ pub unsafe extern "C" fn PyList_SetItem(
     item: *mut PyObject,
 ) -> c_int {
     if list.is_null() {
+        return -1;
+    }
+    // RFC 0046 (wave 4): a faithful list stores elements inline; steal
+    // `item` straight into the `ob_item` slot (CPython `PyList_SetItem`
+    // takes ownership), releasing the prior occupant. This is the write
+    // that keeps the inline buffer — the source of truth — coherent.
+    if unsafe { crate::mirror::is_faithful_list(list) } {
+        if unsafe { crate::mirror::list_store(list, index, item) } {
+            return 0;
+        }
+        if !item.is_null() {
+            unsafe { crate::object::Py_DecRef(item) };
+        }
+        crate::errors::set_value_error("list assignment index out of range");
         return -1;
     }
     let result = match unsafe { crate::object::clone_object(list) } {
@@ -167,6 +263,23 @@ pub unsafe extern "C" fn PyList_SetItem(
 pub unsafe extern "C" fn PyList_GetItem(list: *mut PyObject, index: PySsizeT) -> *mut PyObject {
     if list.is_null() {
         return ptr::null_mut();
+    }
+    // RFC 0046 (wave 4): hand back the actual `ob_item` slot (a borrowed
+    // reference, per `PyList_GetItem`'s contract) so the pointer is the
+    // exact one a prior `PyList_SetItem` / `PyList_Append` stored — stock
+    // code compares list elements by identity.
+    if unsafe { crate::mirror::is_faithful_list(list) } {
+        let n = unsafe { crate::mirror::list_size(list) };
+        if index < 0 || index >= n {
+            crate::errors::set_value_error("list index out of range");
+            return ptr::null_mut();
+        }
+        return match unsafe { crate::mirror::list_slot(list, index) } {
+            Some(slot) if !slot.is_null() => slot,
+            // A NULL placeholder (`PyList_New(n)` slot never filled) reads
+            // as the immortal `None`, matching CPython's NULL-slot handling.
+            _ => crate::singletons::none_ptr(),
+        };
     }
     match unsafe { crate::object::clone_object(list) } {
         Object::List(rc) => {
@@ -212,6 +325,15 @@ pub unsafe extern "C" fn PyList_Reverse(list: *mut PyObject) -> c_int {
     if list.is_null() {
         return -1;
     }
+    // RFC 0046 (wave 4): permute the inline `ob_item` pointers in place
+    // (a pure reordering — no refcount change) so the source of truth is
+    // reversed, not a throwaway reconstruction.
+    if unsafe { crate::mirror::is_faithful_list(list) } {
+        let mut ptrs = unsafe { crate::mirror::list_ptrs(list) };
+        ptrs.reverse();
+        unsafe { crate::mirror::list_permute(list, &ptrs) };
+        return 0;
+    }
     match unsafe { crate::object::clone_object(list) } {
         Object::List(rc) => {
             rc.borrow_mut().reverse();
@@ -225,6 +347,20 @@ pub unsafe extern "C" fn PyList_Reverse(list: *mut PyObject) -> c_int {
 pub unsafe extern "C" fn PyList_Sort(list: *mut PyObject) -> c_int {
     if list.is_null() {
         return -1;
+    }
+    // RFC 0046 (wave 4): sort the inline `ob_item` pointers by their
+    // resolved values, then write the permutation back — keeping every
+    // element's identity (the same `PyObject*`) and the inline buffer
+    // authoritative.
+    if unsafe { crate::mirror::is_faithful_list(list) } {
+        let mut ptrs = unsafe { crate::mirror::list_ptrs(list) };
+        ptrs.sort_by(|&a, &b| {
+            let oa = unsafe { crate::object::clone_object(a) };
+            let ob = unsafe { crate::object::clone_object(b) };
+            natural_cmp(&oa, &ob)
+        });
+        unsafe { crate::mirror::list_permute(list, &ptrs) };
+        return 0;
     }
     match unsafe { crate::object::clone_object(list) } {
         Object::List(rc) => {
@@ -256,17 +392,17 @@ pub unsafe extern "C" fn PyList_Check(o: *mut PyObject) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyTuple_New(n: PySsizeT) -> *mut PyObject {
-    // The new-then-fill pattern needs mutable storage, but tuples
-    // are immutable on the WeavePy side. Carry the staging area in a
-    // `List` payload but advertise `PyTuple_Type` so callers see it
-    // as a tuple; `PyObject_GetItem` / `PyTuple_GetItem` /
-    // `clone_object` all special-case the tuple-typed list and
-    // freeze it into an `Object::Tuple` on read.
+    // RFC 0046 (wave 4): mint a faithful tuple mirror whose inline
+    // `ob_item` array is `n` immortal-`None` placeholders. A stock
+    // extension fills it with the `PyTuple_SET_ITEM` macro — a direct
+    // write into that inline array — and reads it back with
+    // `PyTuple_GET_ITEM`; both touch the C body, so it must be a real
+    // `PyTupleObject` (not the old `List`-staged stand-in, whose
+    // out-of-line `ob_item` pointer sits exactly where the macro would
+    // scribble element 0). `clone_object` reconstructs the native tuple
+    // from this inline array on read.
     let len = n.max(0) as usize;
-    crate::object::into_owned_with_type(
-        Object::new_list(vec![Object::None; len]),
-        crate::types::PyTuple_Type.as_ptr(),
-    )
+    crate::object::into_owned(Object::new_tuple(vec![Object::None; len]))
 }
 
 #[no_mangle]
@@ -276,6 +412,20 @@ pub unsafe extern "C" fn PyTuple_SetItem(
     item: *mut PyObject,
 ) -> c_int {
     if tuple.is_null() {
+        return -1;
+    }
+    // RFC 0046 (wave 4): a faithful tuple stores its elements inline; steal
+    // `item` into the slot (CPython's `PyTuple_SetItem` takes ownership)
+    // and release the prior occupant. This is also what keeps the inline
+    // array — the source of truth for every read — in sync.
+    if unsafe { crate::mirror::is_faithful_tuple(tuple) } {
+        if unsafe { crate::mirror::tuple_store(tuple, pos, item) } {
+            return 0;
+        }
+        if !item.is_null() {
+            unsafe { crate::object::Py_DecRef(item) };
+        }
+        crate::errors::set_value_error("tuple assignment index out of range");
         return -1;
     }
     // Use the raw payload here (not `clone_object`) so the
@@ -334,6 +484,18 @@ pub unsafe extern "C" fn PyTuple_GetItem(tuple: *mut PyObject, pos: PySsizeT) ->
     if tuple.is_null() {
         return ptr::null_mut();
     }
+    // RFC 0046 (wave 4): a faithful tuple's inline `ob_item` is the source
+    // of truth; return the borrowed slot directly (as CPython does) so the
+    // pointer numpy stored with `PyTuple_SET_ITEM` round-trips by identity.
+    if unsafe { crate::mirror::is_faithful_tuple(tuple) } {
+        return match unsafe { crate::mirror::tuple_slot(tuple, pos) } {
+            Some(p) => p,
+            None => {
+                crate::errors::set_value_error("tuple index out of range");
+                ptr::null_mut()
+            }
+        };
+    }
     // Use the raw payload so a staged-list-backed tuple still works
     // when read mid-fill.
     let raw = match unsafe { crate::object::raw_payload(tuple) } {
@@ -373,6 +535,12 @@ pub unsafe extern "C" fn PyTuple_GetItem(tuple: *mut PyObject, pos: PySsizeT) ->
 pub unsafe extern "C" fn PyTuple_Size(tuple: *mut PyObject) -> PySsizeT {
     if tuple.is_null() {
         return -1;
+    }
+    // RFC 0046 (wave 4): read `ob_size` straight off a faithful tuple so we
+    // don't materialise (and incref/decref) every element just to count.
+    if unsafe { crate::mirror::is_faithful_tuple(tuple) } {
+        let vo = tuple as *const crate::layout::PyVarObject;
+        return unsafe { (*vo).ob_size };
     }
     match unsafe { crate::object::clone_object(tuple) } {
         Object::Tuple(items) => items.len() as PySsizeT,
@@ -430,7 +598,9 @@ pub unsafe extern "C" fn PyDict_SetItem(
         Object::Dict(rc) => {
             let key = unsafe { crate::object::clone_object(k) };
             let val = unsafe { crate::object::clone_object(v) };
+            let key_id = dict_key_id(&key);
             rc.borrow_mut().insert(DictKey(key), val);
+            dict_retain_value(d, key_id, v);
             0
         }
         _ => {
@@ -453,16 +623,20 @@ pub unsafe extern "C" fn PyDict_SetItemString(
     match unsafe { crate::object::clone_object(d) } {
         Object::Dict(rc) => {
             let val = unsafe { crate::object::clone_object(v) };
+            let key_id = dict_key_id(&Object::from_str(key.clone()));
             rc.borrow_mut().insert(DictKey(Object::from_str(key)), val);
+            dict_retain_value(d, key_id, v);
             0
         }
         Object::Module(m) => {
             // Convenience: PyDict_SetItemString on a module's dict
             // is a common idiom.
             let val = unsafe { crate::object::clone_object(v) };
+            let key_id = dict_key_id(&Object::from_str(key.clone()));
             m.dict
                 .borrow_mut()
                 .insert(DictKey(Object::from_str(key)), val);
+            dict_retain_value(d, key_id, v);
             0
         }
         _ => -1,
@@ -477,18 +651,31 @@ pub unsafe extern "C" fn PyDict_GetItem(d: *mut PyObject, k: *mut PyObject) -> *
     match unsafe { crate::object::clone_object(d) } {
         Object::Dict(rc) => {
             let key = unsafe { crate::object::clone_object(k) };
+            let key_id = dict_key_id(&key);
             let result = rc.borrow().get(&DictKey(key)).cloned();
             match result {
-                Some(v) => {
-                    let p = crate::object::into_owned(v);
-                    unsafe { crate::object::Py_DecRef(p) };
-                    p
-                }
+                Some(v) => dict_borrowed_box(d, key_id, v),
                 None => ptr::null_mut(),
             }
         }
         _ => ptr::null_mut(),
     }
+}
+
+/// Return a *borrowed* (non-incref'd) box for a dict value: the canonical
+/// box a C setter stored if one exists, otherwise a freshly minted box
+/// retained in the dict cache so it lives as long as the dict (the
+/// borrowed-reference contract). RFC 0046, wave 4.
+fn dict_borrowed_box(dict: *mut PyObject, key_id: String, value: Object) -> *mut PyObject {
+    if let Some(p) = dict_cached_value(dict, &key_id) {
+        return p;
+    }
+    let p = crate::object::into_owned(value);
+    // `dict_retain_value` increfs; balance the `into_owned` +1 so the
+    // cache holds exactly one reference (released when the dict is freed).
+    dict_retain_value(dict, key_id, p);
+    unsafe { crate::object::Py_DecRef(p) };
+    p
 }
 
 #[no_mangle]
@@ -502,13 +689,10 @@ pub unsafe extern "C" fn PyDict_GetItemString(d: *mut PyObject, k: *const c_char
         Object::Module(m) => m.dict.clone(),
         _ => return ptr::null_mut(),
     };
+    let key_id = dict_key_id(&Object::from_str(key.clone()));
     let result = dict.borrow().get(&DictKey(Object::from_str(key))).cloned();
     match result {
-        Some(v) => {
-            let p = crate::object::into_owned(v);
-            unsafe { crate::object::Py_DecRef(p) };
-            p
-        }
+        Some(v) => dict_borrowed_box(d, key_id, v),
         None => ptr::null_mut(),
     }
 }
@@ -641,11 +825,72 @@ pub unsafe extern "C" fn PyDict_Values(d: *mut PyObject) -> *mut PyObject {
     }
     match unsafe { crate::object::clone_object(d) } {
         Object::Dict(rc) => {
-            let values: Vec<Object> = rc.borrow().values().cloned().collect();
-            crate::object::into_owned(Object::new_list(values))
+            // RFC 0046 (wave 4): hand back *new references to the dict's
+            // canonical value boxes* (the very pointers `PyDict_GetItem`
+            // returns, pinned in `DICT_BOX_CACHE` for the dict's lifetime) —
+            // never freshly-minted throwaway boxes. CPython's `PyDict_Values`
+            // returns new refs to the same objects the dict still owns, and
+            // numpy's `resolve_implementation_info` leans on that: it borrows
+            // an element of `PyDict_Values(ufunc->_loops)` into `*out_info`,
+            // then `Py_DECREF`s the values list. A throwaway box owned solely
+            // by that list is freed by the decref and the borrowed pointer
+            // dangles — a use-after-free that surfaces as a NULL `ob_type`
+            // read deep in ufunc dispatch (`promote_and_get_info_and_ufuncimpl`).
+            // The cache keeps each box alive until the dict itself is freed.
+            let pairs: Vec<(String, Object)> = rc
+                .borrow()
+                .iter()
+                .map(|(k, v)| (dict_key_id(&k.0), v.clone()))
+                .collect();
+            let boxes: Vec<*mut PyObject> = pairs
+                .into_iter()
+                .map(|(kid, v)| {
+                    let b = dict_borrowed_box(d, kid, v);
+                    unsafe { crate::object::Py_IncRef(b) };
+                    b
+                })
+                .collect();
+            unsafe { list_owning_boxes(boxes) }
         }
         _ => ptr::null_mut(),
     }
+}
+
+/// Build a faithful list that *owns* the supplied boxes outright: each box
+/// is written straight into the list's `ob_item` buffer — the buffer a
+/// stock `PyList_GET_ITEM` / `PySequence_Fast_GET_ITEM` reads and that
+/// WeavePy's `read_list` treats as authoritative — so the elements keep
+/// their exact pointer identity (no per-crossing rebox). One reference per
+/// box is consumed; `free_mirror` releases them when the list dies.
+///
+/// # Safety
+/// Each pointer in `boxes` must be a live owned reference the caller hands
+/// over.
+unsafe fn list_owning_boxes(boxes: Vec<*mut PyObject>) -> *mut PyObject {
+    let n = boxes.len();
+    let list = unsafe { PyList_New(n as PySsizeT) };
+    let ok = !list.is_null() && unsafe { crate::mirror::is_faithful_list(list) };
+    let base = if ok {
+        let lo = list as *mut crate::layout::PyListObject;
+        unsafe { (*lo).ob_item }
+    } else {
+        ptr::null_mut()
+    };
+    if base.is_null() {
+        for b in boxes {
+            if !b.is_null() {
+                unsafe { crate::object::Py_DecRef(b) };
+            }
+        }
+        return list;
+    }
+    for (i, b) in boxes.into_iter().enumerate() {
+        // The slot currently holds an immortal `None` placeholder from
+        // `PyList_New` (no decref needed — `None` is immortal); overwrite it
+        // so the buffer owns exactly the boxes handed in.
+        unsafe { *base.add(i) = b };
+    }
+    list
 }
 
 #[no_mangle]
@@ -990,6 +1235,17 @@ pub unsafe extern "C" fn PyList_Extend(list: *mut PyObject, iterable: *mut PyObj
             return -1;
         }
     };
+    // RFC 0046 (wave 4): append each element to the inline `ob_item`
+    // buffer (the source of truth), materialising it as an owned C
+    // reference and handing the list its own reference.
+    if unsafe { crate::mirror::is_faithful_list(list) } {
+        for item in new_items {
+            let p = crate::object::into_owned(item);
+            unsafe { crate::mirror::list_append(list, p) };
+            unsafe { crate::object::Py_DecRef(p) };
+        }
+        return 0;
+    }
     match unsafe { crate::object::clone_object(list) } {
         Object::List(rc) => {
             rc.borrow_mut().append(&mut new_items);
